@@ -138,8 +138,16 @@ contract MockDelegationPool {
         return delegatedStakes[validator];
     }
 
+    function getTotalOpenTierDelegatedStake(address) external pure returns (uint256) {
+        return 0;
+    }
+
     function distributePoolRewards(address validator, uint256 amount) external {
         distributedRewards[validator] += amount;
+    }
+
+    function distributePoolRewards(address validator, uint256 trackAAmount, uint256 trackBAmount) external {
+        distributedRewards[validator] += trackAAmount + trackBAmount;
     }
 }
 

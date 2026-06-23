@@ -19,6 +19,9 @@ interface IDelegationPool {
         uint256 pendingValidatorRewards;
         bool acceptingDelegations;
         uint256 slashPerShareAccum;
+        // Track B: open-tier (non-whitelisted) delegators — independent reward stream
+        uint256 openTierDelegated;
+        uint256 openRewardPerShareAccum;
     }
 
     /// @notice Per-delegator position within a validator's pool
@@ -30,6 +33,7 @@ interface IDelegationPool {
         uint256 undelegateAmount;
         uint256 slashDebt;
         uint64 lastDelegateEpoch; // epoch of most recent delegation — same-epoch rewards excluded (DP-NEW-002)
+        bool openTier; // immutable after entry; true = Track B (open-tier), false = Track A (whitelisted)
     }
 
     /// @notice Pending commission increase awaiting activation
@@ -215,14 +219,27 @@ interface IDelegationPool {
 
     // === RewardDistributor integration ===
 
-    /// @notice Distribute ERC-20 RLS rewards to a validator's delegation pool
-    /// @dev Only callable by RewardDistributor
-    /// @dev RewardDistributor must transfer RLS tokens before calling this
+    /// @notice Distribute ERC-20 RLS rewards to a validator's delegation pool (legacy single-amount)
+    /// @dev Only callable by ConsensusRegistry or RewardDistributor
+    /// @dev Caller must transfer RLS tokens before calling this
+    /// @dev Splits the amount proportionally between Track A and Track B by stake
     /// @param validatorAddress The validator receiving rewards
     /// @param amount The amount of RLS tokens to distribute
     function distributePoolRewards(
         address validatorAddress,
         uint256 amount
+    ) external;
+
+    /// @notice Distribute ERC-20 RLS rewards to a validator's pool with per-track amounts
+    /// @dev Only callable by RewardDistributor
+    /// @dev RewardDistributor must transfer (trackAAmount + trackBAmount) RLS tokens before calling
+    /// @param validatorAddress The validator receiving rewards
+    /// @param trackAAmount RLS to distribute to whitelisted (Track A) delegators
+    /// @param trackBAmount RLS to distribute to open-tier (Track B) delegators
+    function distributePoolRewards(
+        address validatorAddress,
+        uint256 trackAAmount,
+        uint256 trackBAmount
     ) external;
 
     /// @notice Apply a slash to a validator's delegation pool
@@ -242,9 +259,14 @@ interface IDelegationPool {
     /// @notice Check if a pool is registered for a validator
     function poolRegistered(address validatorAddress) external view returns (bool);
 
-    /// @notice Get the total delegated stake for a validator
+    /// @notice Get the total delegated stake for a validator (Track A + Track B combined)
     /// @dev Intended for Rust consensus to read for future weighted voting power
     function getTotalDelegatedStake(
+        address validatorAddress
+    ) external view returns (uint256);
+
+    /// @notice Get the open-tier (Track B) delegated stake for a validator
+    function getTotalOpenTierDelegatedStake(
         address validatorAddress
     ) external view returns (uint256);
 

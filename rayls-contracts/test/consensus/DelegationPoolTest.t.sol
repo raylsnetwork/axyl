@@ -1876,13 +1876,18 @@ contract DelegationPoolTest is Test {
 
     // --- gate enabled: revert paths ---
 
-    function testRevert_whitelist_twoArgNotVerified() public {
+    function test_whitelist_twoArgNotVerified_delegatesAsOpenTier() public {
         _wlRegisterPool();
         _wlEnableGate();
 
+        // Non-verified callers no longer revert — they are routed to open-tier (Track B)
         vm.prank(delegator1);
-        vm.expectRevert(abi.encodeWithSelector(IDelegationPool.NotWhitelisted.selector, delegator1));
         pool.delegate(validator1, 5e18);
+
+        IDelegationPool.DelegatorPosition memory pos = pool.getDelegatorPosition(validator1, delegator1);
+        assertEq(pos.amount, 5e18);
+        assertTrue(pos.openTier);
+        assertFalse(pool.isWhitelistVerified(delegator1));
     }
 
     function testRevert_whitelist_emptyProof() public {
@@ -1939,32 +1944,26 @@ contract DelegationPoolTest is Test {
 
     // --- toggling ---
 
-    function test_whitelist_toggleGateOff_lettingOutsiderDelegate_thenBackOn() public {
+    function test_whitelist_toggleGateOff_tierAssignmentFollowsGate() public {
         _wlRegisterPool();
         _wlEnableGate();
 
-        // outsider blocked
-        vm.prank(outsider);
-        vm.expectRevert(abi.encodeWithSelector(IDelegationPool.NotWhitelisted.selector, outsider));
-        pool.delegate(validator1, 5e18);
-
-        // admin disables gate
-        vm.prank(owner);
-        pool.disableWhitelist();
-
-        // outsider now succeeds, and no cache entry gets written
+        // Gate on + not verified → open-tier (Track B)
         vm.prank(outsider);
         pool.delegate(validator1, 5e18);
         assertFalse(pool.isWhitelistVerified(outsider));
+        assertTrue(pool.getDelegatorPosition(validator1, outsider).openTier);
         assertEq(pool.getDelegatorPosition(validator1, outsider).amount, 5e18);
 
-        // re-enable by re-setting the root — outsider is blocked again (no cache)
+        // Admin disables gate — all new delegations become Track A (isOpenTier=false).
+        // Existing open-tier positions keep their locked tier, so outsider can still top up.
         vm.prank(owner);
-        pool.setWhitelistRoot(wlRoot);
+        pool.disableWhitelist();
 
         vm.prank(outsider);
-        vm.expectRevert(abi.encodeWithSelector(IDelegationPool.NotWhitelisted.selector, outsider));
         pool.delegate(validator1, 5e18);
+        assertEq(pool.getDelegatorPosition(validator1, outsider).amount, 10e18);
+        assertTrue(pool.getDelegatorPosition(validator1, outsider).openTier);
     }
 
     function test_whitelist_cachedEntrySurvivesGateToggle() public {

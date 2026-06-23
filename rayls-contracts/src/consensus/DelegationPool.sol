@@ -219,7 +219,9 @@ contract DelegationPool is
             rewardPerShareAccum: 0,
             pendingValidatorRewards: 0,
             acceptingDelegations: true,
-            slashPerShareAccum: 0
+            slashPerShareAccum: 0,
+            openTierDelegated: 0,
+            openRewardPerShareAccum: 0
         });
 
         emit PoolRegistered(msg.sender, commissionBps);
@@ -368,7 +370,9 @@ contract DelegationPool is
         address validatorAddress,
         uint256 amount
     ) external override nonReentrant {
-        _delegate(validatorAddress, amount);
+        DelegationPoolStorage storage $ = _getDelegationPoolStorage();
+        bool isOpenTier = $.whitelistEnabled && !$.whitelistVerified[msg.sender];
+        _delegate(validatorAddress, amount, isOpenTier);
     }
 
     /// @inheritdoc IDelegationPool
@@ -390,16 +394,15 @@ contract DelegationPool is
             $.whitelistVerified[msg.sender] = true;
             emit WhitelistVerified(msg.sender);
         }
-        _delegate(validatorAddress, amount);
+        // Proof submission always routes to Track A (whitelisted tier)
+        _delegate(validatorAddress, amount, false);
     }
 
-    function _delegate(address validatorAddress, uint256 amount) internal {
+    function _delegate(address validatorAddress, uint256 amount, bool isOpenTier) internal {
         if (validatorAddress == address(0)) revert ZeroAddress();
         if (amount == 0) revert ZeroAmount();
 
         DelegationPoolStorage storage $ = _getDelegationPoolStorage();
-        if ($.whitelistEnabled && !$.whitelistVerified[msg.sender])
-            revert NotWhitelisted(msg.sender);
 
         if (!$.poolRegistered[validatorAddress])
             revert PoolNotRegistered(validatorAddress);
@@ -414,9 +417,11 @@ contract DelegationPool is
         if (amount < $.config.minDelegation)
             revert InsufficientDelegation(amount, $.config.minDelegation);
 
-        DelegatorPosition storage pos = $.positions[validatorAddress][
-            msg.sender
-        ];
+        DelegatorPosition storage pos = $.positions[validatorAddress][msg.sender];
+
+        // Existing positions keep their locked tier so open-tier holders can top up
+        // even after the whitelist is disabled (when isOpenTier would otherwise be false).
+        if (pos.amount > 0) isOpenTier = pos.openTier;
 
         // settle pending rewards and slashes before changing position
         _settlePosition(pool, pos);
@@ -426,11 +431,11 @@ contract DelegationPool is
         if (newDelegatorTotal > $.config.maxDelegation)
             revert ExceedsMaxDelegation(newDelegatorTotal, $.config.maxDelegation);
 
-        // check per-validator max
-        uint256 newPoolTotal = pool.totalDelegated + amount;
-        if (newPoolTotal > $.config.maxValidatorDelegation)
+        // check combined pool cap (Track A + Track B together)
+        uint256 combinedPoolTotal = pool.totalDelegated + pool.openTierDelegated;
+        if (combinedPoolTotal + amount > $.config.maxValidatorDelegation)
             revert ExceedsMaxValidatorDelegation(
-                newPoolTotal,
+                combinedPoolTotal + amount,
                 $.config.maxValidatorDelegation
             );
 
@@ -438,17 +443,21 @@ contract DelegationPool is
         $.rls.safeTransferFrom(msg.sender, address(this), amount);
 
         pos.amount = newDelegatorTotal;
-        pos.rewardDebt =
-            (pos.amount * pool.rewardPerShareAccum) /
-            PRECISION;
+        pos.openTier = isOpenTier;
+
+        uint256 accum = isOpenTier ? pool.openRewardPerShareAccum : pool.rewardPerShareAccum;
+        pos.rewardDebt = (pos.amount * accum) / PRECISION;
         // Ceiling division for slashDebt — counterpart to ceiling in _settlePosition
-        pos.slashDebt =
-            (pos.amount * pool.slashPerShareAccum + PRECISION - 1) /
-            PRECISION;
+        pos.slashDebt = (pos.amount * pool.slashPerShareAccum + PRECISION - 1) / PRECISION;
         // Record delegation epoch — same-epoch rewards are excluded to prevent
         // sandwich attacks on distributePoolRewards.
         pos.lastDelegateEpoch = uint64($.consensusRegistry.getCurrentEpoch());
-        pool.totalDelegated = newPoolTotal;
+
+        if (isOpenTier) {
+            pool.openTierDelegated += amount;
+        } else {
+            pool.totalDelegated += amount;
+        }
 
         emit Delegated(validatorAddress, msg.sender, amount);
     }
@@ -488,9 +497,8 @@ contract DelegationPool is
 
         // update position
         pos.amount -= amount;
-        pos.rewardDebt =
-            (pos.amount * pool.rewardPerShareAccum) /
-            PRECISION;
+        uint256 accum = pos.openTier ? pool.openRewardPerShareAccum : pool.rewardPerShareAccum;
+        pos.rewardDebt = (pos.amount * accum) / PRECISION;
         // Ceiling division for slashDebt — counterpart to ceiling in _settlePosition
         pos.slashDebt =
             (pos.amount * pool.slashPerShareAccum + PRECISION - 1) /
@@ -500,8 +508,12 @@ contract DelegationPool is
         uint32 currentEpoch = $.consensusRegistry.getCurrentEpoch();
         pos.undelegateEpoch = uint64(currentEpoch) + $.config.unbondingEpochs;
 
-        // reduce pool total
-        pool.totalDelegated -= amount;
+        // reduce the correct track's total
+        if (pos.openTier) {
+            pool.openTierDelegated -= amount;
+        } else {
+            pool.totalDelegated -= amount;
+        }
 
         emit UndelegationRequested(
             validatorAddress,
@@ -598,7 +610,8 @@ contract DelegationPool is
     // =========================================================================
 
     /// @inheritdoc IDelegationPool
-    /// @dev RewardDistributor must transfer RLS tokens to this contract before calling
+    /// @dev Caller must transfer RLS tokens to this contract before calling
+    /// @dev Splits amount proportionally between Track A and Track B by stake
     function distributePoolRewards(
         address validatorAddress,
         uint256 amount
@@ -609,27 +622,75 @@ contract DelegationPool is
         if (!$.poolRegistered[validatorAddress]) return;
 
         ValidatorPool storage pool = $.validatorPools[validatorAddress];
+        uint256 totalAll = pool.totalDelegated + pool.openTierDelegated;
 
-        if (pool.totalDelegated == 0) {
-            // no delegators: all rewards go to validator as commission
+        if (totalAll == 0) {
             pool.pendingValidatorRewards += amount;
             emit PoolRewardsDistributed(validatorAddress, amount);
             return;
         }
 
-        // split into commission and delegator rewards
-        uint256 commission = (amount * pool.commissionBps) /
-            MAX_COMMISSION_BPS;
-        uint256 delegatorRewards = amount - commission;
+        // proportional split by stake
+        uint256 trackAAmount = (amount * pool.totalDelegated) / totalAll;
+        uint256 trackBAmount = amount - trackAAmount;
+        _distributePoolRewardsInternal(validatorAddress, pool, trackAAmount, trackBAmount);
+    }
 
-        pool.pendingValidatorRewards += commission;
+    /// @inheritdoc IDelegationPool
+    /// @dev RewardDistributor must transfer (trackAAmount + trackBAmount) RLS before calling
+    function distributePoolRewards(
+        address validatorAddress,
+        uint256 trackAAmount,
+        uint256 trackBAmount
+    ) external override onlyRewardSources {
+        if (trackAAmount == 0 && trackBAmount == 0) return;
 
-        // update reward accumulator
-        pool.rewardPerShareAccum +=
-            (delegatorRewards * PRECISION) /
-            pool.totalDelegated;
+        DelegationPoolStorage storage $ = _getDelegationPoolStorage();
+        if (!$.poolRegistered[validatorAddress]) return;
 
-        emit PoolRewardsDistributed(validatorAddress, amount);
+        ValidatorPool storage pool = $.validatorPools[validatorAddress];
+        _distributePoolRewardsInternal(validatorAddress, pool, trackAAmount, trackBAmount);
+    }
+
+    function _distributePoolRewardsInternal(
+        address validatorAddress,
+        ValidatorPool storage pool,
+        uint256 trackAAmount,
+        uint256 trackBAmount
+    ) internal {
+        uint256 totalAll = pool.totalDelegated + pool.openTierDelegated;
+
+        if (totalAll == 0) {
+            pool.pendingValidatorRewards += trackAAmount + trackBAmount;
+            emit PoolRewardsDistributed(validatorAddress, trackAAmount + trackBAmount);
+            return;
+        }
+
+        // Track A: commission + accumulator update
+        if (trackAAmount > 0) {
+            if (pool.totalDelegated == 0) {
+                pool.pendingValidatorRewards += trackAAmount;
+            } else {
+                uint256 commissionA = (trackAAmount * pool.commissionBps) / MAX_COMMISSION_BPS;
+                pool.pendingValidatorRewards += commissionA;
+                pool.rewardPerShareAccum +=
+                    ((trackAAmount - commissionA) * PRECISION) / pool.totalDelegated;
+            }
+        }
+
+        // Track B: commission + accumulator update
+        if (trackBAmount > 0) {
+            if (pool.openTierDelegated == 0) {
+                pool.pendingValidatorRewards += trackBAmount;
+            } else {
+                uint256 commissionB = (trackBAmount * pool.commissionBps) / MAX_COMMISSION_BPS;
+                pool.pendingValidatorRewards += commissionB;
+                pool.openRewardPerShareAccum +=
+                    ((trackBAmount - commissionB) * PRECISION) / pool.openTierDelegated;
+            }
+        }
+
+        emit PoolRewardsDistributed(validatorAddress, trackAAmount + trackBAmount);
     }
 
     /// @inheritdoc IDelegationPool
@@ -644,26 +705,30 @@ contract DelegationPool is
         if (!$.poolRegistered[validatorAddress]) return 0;
 
         ValidatorPool storage pool = $.validatorPools[validatorAddress];
+        uint256 totalAll = pool.totalDelegated + pool.openTierDelegated;
 
-        if (pool.totalDelegated == 0) {
+        if (totalAll == 0) {
             emit PoolSlashed(validatorAddress, 0);
             return 0;
         }
 
-        // cap slash at totalDelegated
-        effectiveSlash = amount > pool.totalDelegated
-            ? pool.totalDelegated
-            : amount;
+        // cap slash at combined delegated total
+        effectiveSlash = amount > totalAll ? totalAll : amount;
 
         // Compute per-share slash increment (rounds down due to integer division).
         // Derive actualSlash from the rounded value so the transfer matches what
         // the accumulator records. Dust stays in the contract as a solvency buffer,
         // preventing balance < aggregate claims over many slashes.
-        uint256 slashPerShare = (effectiveSlash * PRECISION) / pool.totalDelegated;
-        uint256 actualSlash = (slashPerShare * pool.totalDelegated) / PRECISION;
+        uint256 slashPerShare = (effectiveSlash * PRECISION) / totalAll;
+        uint256 actualSlash = (slashPerShare * totalAll) / PRECISION;
 
         pool.slashPerShareAccum += slashPerShare;
-        pool.totalDelegated -= actualSlash;
+
+        // Reduce each track proportionally so their totals stay accurate for reward distribution.
+        uint256 slashA = (actualSlash * pool.totalDelegated) / totalAll;
+        uint256 slashB = actualSlash - slashA;
+        pool.totalDelegated -= slashA;
+        pool.openTierDelegated -= slashB;
 
         // transfer only what the accumulator accounts for
         $.rls.safeTransfer(address($.consensusRegistry), actualSlash);
@@ -682,7 +747,15 @@ contract DelegationPool is
     function getTotalDelegatedStake(
         address validatorAddress
     ) external view override returns (uint256) {
-        return _getDelegationPoolStorage().validatorPools[validatorAddress].totalDelegated;
+        ValidatorPool storage pool = _getDelegationPoolStorage().validatorPools[validatorAddress];
+        return pool.totalDelegated + pool.openTierDelegated;
+    }
+
+    /// @inheritdoc IDelegationPool
+    function getTotalOpenTierDelegatedStake(
+        address validatorAddress
+    ) external view override returns (uint256) {
+        return _getDelegationPoolStorage().validatorPools[validatorAddress].openTierDelegated;
     }
 
     /// @inheritdoc IDelegationPool
@@ -763,8 +836,50 @@ contract DelegationPool is
         if (config_.commissionDelayEpochs == 0) revert InvalidConfig();
     }
 
-    /// @dev Calculates effective position after applying pending slashes and rewards.
-    /// Mirrors the arithmetic path of `_settlePosition` exactly for consistency.
+    /// @dev Pure settlement arithmetic shared by _settlePosition (mutating) and _getEffectivePosition (view).
+    /// Slash-first ordering prevents insolvency: rewards are computed on the post-slash amount,
+    /// which is consistent with how rewardPerShareAccum was updated on a reduced totalDelegated.
+    /// Returns (effectiveAmount, rewardDelta, newRewardDebt, newSlashDebt).
+    /// On full slash all four return values are zero.
+    function _settleArithmetic(
+        ValidatorPool storage pool,
+        DelegatorPosition storage pos,
+        uint64 currentEpoch
+    ) internal view returns (
+        uint256 effectiveAmount,
+        uint256 rewardDelta,
+        uint256 newRewardDebt,
+        uint256 newSlashDebt
+    ) {
+        uint256 accum = pos.openTier ? pool.openRewardPerShareAccum : pool.rewardPerShareAccum;
+
+        // 1. slash — ceiling division so per-delegator sum >= pool's actualSlash (solvency invariant)
+        uint256 accumulatedSlash = (pos.amount * pool.slashPerShareAccum + PRECISION - 1) / PRECISION;
+        uint256 slashAmount = accumulatedSlash > pos.slashDebt ? accumulatedSlash - pos.slashDebt : 0;
+
+        uint256 scaledRewardDebt = pos.rewardDebt;
+        if (slashAmount > 0) {
+            if (slashAmount >= pos.amount) return (0, 0, 0, 0);
+            effectiveAmount = pos.amount - slashAmount;
+            // round UP to prevent overcrediting rewards after slash
+            scaledRewardDebt = (pos.rewardDebt * effectiveAmount + pos.amount - 1) / pos.amount;
+        } else {
+            effectiveAmount = pos.amount;
+        }
+
+        // 2. rewards on post-slash amount — skip same-epoch delegations (sandwich protection)
+        if (pos.lastDelegateEpoch != currentEpoch) {
+            uint256 accumulated = (effectiveAmount * accum) / PRECISION;
+            if (accumulated > scaledRewardDebt) {
+                rewardDelta = accumulated - scaledRewardDebt;
+            }
+        }
+
+        // 3. updated debts
+        newRewardDebt = (effectiveAmount * accum) / PRECISION;
+        newSlashDebt = (effectiveAmount * pool.slashPerShareAccum + PRECISION - 1) / PRECISION;
+    }
+
     function _getEffectivePosition(
         address validatorAddress,
         address delegator
@@ -772,72 +887,25 @@ contract DelegationPool is
         DelegationPoolStorage storage $ = _getDelegationPoolStorage();
         ValidatorPool storage pool = $.validatorPools[validatorAddress];
         DelegatorPosition storage pos = $.positions[validatorAddress][delegator];
-
         if (pos.amount == 0) return (0, pos.pendingRewards);
-
-        // 1. simulate slash settlement — mirror ceiling division in _settlePosition
-        uint256 accumulatedSlash = (pos.amount * pool.slashPerShareAccum + PRECISION - 1) / PRECISION;
-        uint256 slashAmount = accumulatedSlash > pos.slashDebt ? accumulatedSlash - pos.slashDebt : 0;
-
-        if (slashAmount >= pos.amount) {
-            return (0, pos.pendingRewards);
-        }
-
-        effectiveAmount = pos.amount - slashAmount;
-
-        // 2. simulate reward settlement — mirrors _settlePosition exactly
-        //    Round rewardDebt UP after slash (same as _settlePosition ceiling division)
-        pendingRewards = pos.pendingRewards;
-        if (pos.lastDelegateEpoch != uint64($.consensusRegistry.getCurrentEpoch())) {
-            uint256 scaledRewardDebt = (pos.rewardDebt * effectiveAmount + pos.amount - 1) / pos.amount;
-            uint256 accumulated = (effectiveAmount * pool.rewardPerShareAccum) / PRECISION;
-            if (accumulated > scaledRewardDebt) {
-                pendingRewards += accumulated - scaledRewardDebt;
-            }
-        }
+        uint64 currentEpoch = uint64($.consensusRegistry.getCurrentEpoch());
+        uint256 rewardDelta;
+        (effectiveAmount, rewardDelta,,) = _settleArithmetic(pool, pos, currentEpoch);
+        pendingRewards = pos.pendingRewards + rewardDelta;
     }
 
-    /// @dev Settles pending slashes and rewards for a delegator position.
     /// @dev Must be called before any position mutation.
-    /// @dev Order: apply slash -> scale rewardDebt -> settle rewards (post-slash) -> recalculate debts.
-    /// Slash-first ordering prevents insolvency that would occur if rewards were calculated
-    /// on pre-slash amounts when rewardPerShareAccum was computed on a reduced totalDelegated.
     function _settlePosition(
         ValidatorPool storage pool,
         DelegatorPosition storage pos
     ) internal {
         if (pos.amount == 0) return;
-
-        // 1. apply slash — round UP so per-delegator slash sum >= pool's actualSlash,
-        //    keeping the pool solvent across slash cycles (counterpart to DP-001 floor in applyPoolSlash).
-        uint256 accumulatedSlash = (pos.amount * pool.slashPerShareAccum + PRECISION - 1) / PRECISION;
-        uint256 slashAmount = accumulatedSlash > pos.slashDebt ? accumulatedSlash - pos.slashDebt : 0;
-        if (slashAmount > 0) {
-            uint256 preSlashAmount = pos.amount;
-            if (slashAmount >= pos.amount) {
-                pos.amount = 0;
-                pos.rewardDebt = 0;
-            } else {
-                pos.amount -= slashAmount;
-                // Round rewardDebt UP to prevent overcrediting rewards after slash
-                pos.rewardDebt = (pos.rewardDebt * pos.amount + preSlashAmount - 1) / preSlashAmount;
-            }
-        }
-
-        // 2. settle rewards using post-slash amount
-        // Skip rewards for positions delegated in the current epoch to prevent
-        // sandwich attacks on distributePoolRewards.
         uint64 currentEpoch = uint64(_getDelegationPoolStorage().consensusRegistry.getCurrentEpoch());
-        if (pos.amount > 0 && pos.lastDelegateEpoch != currentEpoch) {
-            uint256 accumulated = (pos.amount * pool.rewardPerShareAccum) / PRECISION;
-            if (accumulated > pos.rewardDebt) {
-                pos.pendingRewards += accumulated - pos.rewardDebt;
-            }
-        }
-
-        // 3. recalculate debts based on new amount
-        pos.rewardDebt = (pos.amount * pool.rewardPerShareAccum) / PRECISION;
-        // Ceiling division for slashDebt to mirror accumulatedSlash above
-        pos.slashDebt = (pos.amount * pool.slashPerShareAccum + PRECISION - 1) / PRECISION;
+        (uint256 effectiveAmount, uint256 rewardDelta, uint256 newRewardDebt, uint256 newSlashDebt) =
+            _settleArithmetic(pool, pos, currentEpoch);
+        pos.amount = effectiveAmount;
+        if (rewardDelta > 0) pos.pendingRewards += rewardDelta;
+        pos.rewardDebt = newRewardDebt;
+        pos.slashDebt = newSlashDebt;
     }
 }

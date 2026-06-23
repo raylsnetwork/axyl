@@ -42,6 +42,7 @@ interface IRewardDistributor {
     event AccumulatorTopUpFailed(uint256 pullAmount);
     event AccumulatorUpdated(address indexed oldAccumulator, address indexed newAccumulator);
     event TargetApyBpsUpdated(uint256 oldApyBps, uint256 newApyBps);
+    event OpenTierApyBpsUpdated(uint256 oldApyBps, uint256 newApyBps);
 
     /// @notice Receive ERC-20 RLS rewards from FeeAggregator
     /// @dev Called by FeeAggregator after swapping USDr to RLS
@@ -97,10 +98,17 @@ interface IRewardDistributor {
     /// @param newAccumulator The new accumulator address
     function setAccumulator(address newAccumulator) external;
 
-    /// @notice Get the target APY in basis points
+    /// @notice Get the target APY in basis points for whitelisted (Track A) stakers
     function targetApyBps() external view returns (uint256);
 
-    /// @notice Set the target APY in basis points (e.g., 5000 = 50%)
+    /// @notice Set the target APY in basis points for whitelisted (Track A) stakers
     /// @param newApyBps The new target APY
     function setTargetApyBps(uint256 newApyBps) external;
+
+    /// @notice Get the target APY in basis points for open-tier (Track B) stakers
+    function openTierTargetApyBps() external view returns (uint256);
+
+    /// @notice Set the target APY in basis points for open-tier (Track B) stakers
+    /// @param newApyBps The new target APY
+    function setOpenTierTargetApyBps(uint256 newApyBps) external;
 }
