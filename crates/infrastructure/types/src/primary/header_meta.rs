@@ -1,8 +1,11 @@
 //! Lightweight metadata projections over a stored `ConsensusHeader`.
 
+use std::collections::BTreeSet;
+
 use crate::{
-    bcs_layout::{BcsCursor, BcsLayoutError},
-    crypto, AuthorityIdentifier, Certificate, Epoch, ReputationScores, Round, B256,
+    bcs_layout::{skip_bytes, BcsCursor, BcsLayoutError},
+    crypto, AuthorityIdentifier, BlockHash, BlockNumHash, Certificate, CertificateDigest, Epoch,
+    ReputationScores, Round, SignatureVerificationState, TimestampSec, WorkerId, B256,
 };
 
 /// Leader projection of a stored `ConsensusHeader`: who led the sub-dag and at
@@ -89,6 +92,62 @@ fn embedded_certificate_digest(c: &mut BcsCursor<'_>) -> Result<B256, BcsLayoutE
     let mut hasher = crypto::DefaultHashFunction::new();
     hasher.update(header_bytes);
     Ok(B256::from_slice(hasher.finalize().as_bytes()))
+}
+
+/// Projects the sub-dag's leader epoch and every batch digest its certificates reference, from a
+/// BCS-encoded `ConsensusHeader`, without materializing the certificates.
+///
+/// The digests come out in the exact order a full walk yields them (each certificate's `payload`
+/// keys in insertion order, certificates in vector order), so the cold archiver can group and
+/// relocate batches straight from the projection instead of decoding the whole sub-dag. The
+/// per-certificate walk mirrors `Certificate`/`Header`'s BCS layout, reading the payload keys and
+/// skipping everything else; a field added to either type without updating it diverges from a full
+/// decode and fails the pinning test below.
+pub fn leader_epoch_and_batch_digests(
+    bytes: &[u8],
+) -> Result<(Epoch, Vec<BlockHash>), BcsLayoutError> {
+    let mut c = BcsCursor::new(bytes);
+    c.skip::<B256>()?; // parent_hash
+
+    // sub_dag.certificates: Vec<Certificate>; collect each certificate's payload digests in order.
+    let cert_count = c.read_len()?;
+    let mut digests = Vec::new();
+    for _ in 0..cert_count {
+        read_certificate_payload_digests(&mut c, &mut digests)?;
+    }
+
+    // sub_dag.leader: Certificate; the committing epoch is its header's epoch, after author/round.
+    c.skip::<AuthorityIdentifier>()?.skip::<Round>()?;
+    let leader_epoch = c.read::<Epoch>()?;
+    Ok((leader_epoch, digests))
+}
+
+/// Walks one BCS-encoded `Certificate`, pushing its header `payload` digests onto `out`.
+///
+/// Mirrors `Certificate::skip` and `Header::skip`: read the payload keys, skip every other field.
+fn read_certificate_payload_digests(
+    c: &mut BcsCursor<'_>,
+    out: &mut Vec<BlockHash>,
+) -> Result<(), BcsLayoutError> {
+    // Header prefix: author, round, epoch, created_at.
+    c.skip::<AuthorityIdentifier>()?.skip::<Round>()?.skip::<Epoch>()?.skip::<TimestampSec>()?;
+
+    // Header.payload: IndexMap<BlockHash, WorkerId>, on the wire as a length-prefixed sequence of
+    // (digest, worker) pairs in insertion order. Keep the keys, skip the worker ids.
+    let entries = c.read_len()?;
+    out.reserve(entries);
+    for _ in 0..entries {
+        out.push(c.read::<BlockHash>()?);
+        c.skip::<WorkerId>()?;
+    }
+
+    // Header tail: parents, latest_execution_block.
+    c.skip::<BTreeSet<CertificateDigest>>()?.skip::<BlockNumHash>()?;
+    // Certificate tail: signature_verification_state, signed_authorities (roaring bitmap), created.
+    c.skip::<SignatureVerificationState>()?;
+    skip_bytes(c)?;
+    c.skip::<TimestampSec>()?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -228,5 +287,37 @@ mod tests {
         assert_eq!(m.leader_author, AuthorityIdentifier::dummy_for_test(0xEE));
         assert_eq!(m.leader_round, 14);
         assert_eq!(m.leader_epoch, 1);
+    }
+
+    /// The digest projection must equal a full decode's `certificates -> payload keys` walk, in
+    /// order, and recover the leader epoch. Multiple certs, multi-entry payloads, and populated
+    /// parents/sig-state exercise every skip in the per-certificate walk.
+    #[test]
+    fn projection_matches_full_decode_walk() {
+        let leader = make_cert(0xEE, 14, 7, vec![(BlockHash::repeat_byte(9), 0)], 2);
+        let certs = vec![
+            make_cert(
+                0x01,
+                13,
+                7,
+                vec![(BlockHash::repeat_byte(2), 1), (BlockHash::repeat_byte(5), 3)],
+                0,
+            ),
+            make_cert(0x02, 13, 7, vec![], 3),
+            make_cert(0x03, 13, 7, vec![(BlockHash::repeat_byte(8), 2)], 1),
+        ];
+        let h = make_header(leader, certs);
+        let bytes = crate::encode(&h);
+
+        let (epoch, digests) = leader_epoch_and_batch_digests(&bytes).unwrap();
+
+        let expected: Vec<BlockHash> = h
+            .sub_dag
+            .certificates
+            .iter()
+            .flat_map(|c| c.header().payload().keys().copied())
+            .collect();
+        assert_eq!(epoch, h.sub_dag.leader_epoch(), "projected leader epoch");
+        assert_eq!(digests, expected, "projected digests must match the full-decode walk");
     }
 }

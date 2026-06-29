@@ -45,6 +45,16 @@ pub trait DbTx {
     /// Returns the value for the given key from the map, if it exists.
     fn get<T: Table>(&self, key: &T::Key) -> eyre::Result<Option<T::Value>>;
 
+    /// Returns the stored value for the given key as its raw on-disk bytes, if it exists.
+    ///
+    /// The bytes are the same canonical value encoding [`get`](Self::get) decodes, so a caller
+    /// that only relocates a payload (cold archival) skips the decode/re-encode round trip.
+    /// Backends that can lend the bytes from their backing store return `Cow::Borrowed` (valid for
+    /// the transaction); the default re-encodes the decoded value, which any backend can satisfy.
+    fn raw_get<T: Table>(&self, key: &T::Key) -> eyre::Result<Option<Cow<'_, [u8]>>> {
+        Ok(self.get::<T>(key)?.map(|value| Cow::Owned(crate::encode(&value))))
+    }
+
     /// Returns true if the map contains a value for the specified key.
     fn contains_key<T: Table>(&self, key: &T::Key) -> eyre::Result<bool> {
         Ok(self.get::<T>(key)?.is_some())
@@ -83,6 +93,16 @@ pub trait DbTxMut: DbTx {
 
     /// Removes the entry for the given key from the map.
     fn remove<T: Table>(&mut self, key: &T::Key) -> eyre::Result<()>;
+
+    /// Removes a key from the durable store within this transaction, bypassing any in-memory write
+    /// cache.
+    ///
+    /// Layered backends override this to delete from the persistent layer without planting an
+    /// in-memory tombstone, so a cold-storage archiver can drop permanently-removed keys without
+    /// shadowing a read fall-through tier or leaking tombstones. The default delegates to `remove`.
+    fn evict_persistent<T: Table>(&mut self, key: &T::Key) -> eyre::Result<()> {
+        self.remove::<T>(key)
+    }
 
     /// Removes every key-value pair from the table.
     fn clear_table<T: Table>(&mut self) -> eyre::Result<()>;
