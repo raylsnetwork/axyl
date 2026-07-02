@@ -10,15 +10,15 @@
 //! validator without any per-index logic baked in here:
 //!
 //! - `RELAY_SEED_HEX` (required): 64 hex chars (32 bytes) used as the ed25519 secret seed. This
-//!   fixes the relay's peer id; it must match the peer id baked into the validators' node-info
-//!   (see `etc/test-network/RELAY_KEYS.md`).
+//!   fixes the relay's peer id; it must match the peer id baked into the validators' node-info (see
+//!   `etc/test-network/RELAY_KEYS.md`).
 //! - `RELAY_PORT` (required): UDP (QUIC) and TCP listen port, bound on `0.0.0.0`.
 //! - `RELAY_MAX_CIRCUIT_DURATION_SECS` (optional): tighten circuit lifetime. Defaults to
 //!   effectively unlimited (libp2p's own default of 120s would force-close consensus links).
 //! - `RELAY_MAX_CIRCUIT_BYTES` (optional): tighten per-circuit byte cap. Defaults to unlimited
 //!   (libp2p's own default is 128 KiB).
-//! - `RELAY_MAX_RESERVATIONS` / `RELAY_MAX_CIRCUITS` (optional): tighten global caps
-//!   (defaults raised to 1024).
+//! - `RELAY_MAX_RESERVATIONS` / `RELAY_MAX_CIRCUITS` (optional): tighten global caps (defaults
+//!   raised to 1024).
 
 use futures::StreamExt as _;
 use libp2p::{
@@ -50,10 +50,7 @@ where
     T::Err: std::fmt::Display,
 {
     match env::var(key) {
-        Ok(v) => v
-            .parse::<T>()
-            .map(Some)
-            .map_err(|e| eyre::eyre!("invalid {key}: {e}")),
+        Ok(v) => v.parse::<T>().map(Some).map_err(|e| eyre::eyre!("invalid {key}: {e}")),
         Err(_) => Ok(None),
     }
 }
@@ -104,14 +101,15 @@ fn keypair_from_seed_env() -> eyre::Result<identity::Keypair> {
 #[tokio::main]
 async fn main() -> eyre::Result<()> {
     let _ = tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        )
         .try_init();
 
     let key = keypair_from_seed_env()?;
     let local_peer_id = PeerId::from(key.public());
-    let port: u16 = env_required("RELAY_PORT")?
-        .parse()
-        .map_err(|e| eyre::eyre!("invalid RELAY_PORT: {e}"))?;
+    let port: u16 =
+        env_required("RELAY_PORT")?.parse().map_err(|e| eyre::eyre!("invalid RELAY_PORT: {e}"))?;
 
     info!(%local_peer_id, port, "starting rayls relay");
 
@@ -120,7 +118,10 @@ async fn main() -> eyre::Result<()> {
         .with_tcp(tcp::Config::default(), noise::Config::new, yamux::Config::default)?
         .with_quic()
         .with_behaviour(|key| Behaviour {
-            relay: relay::Behaviour::new(key.public().to_peer_id(), relay_config().expect("relay config")),
+            relay: relay::Behaviour::new(
+                key.public().to_peer_id(),
+                relay_config().expect("relay config"),
+            ),
             ping: ping::Behaviour::new(ping::Config::new()),
             identify: identify::Behaviour::new(identify::Config::new(
                 "/rayls-relay/0.0.1".to_string(),
@@ -134,9 +135,8 @@ async fn main() -> eyre::Result<()> {
         .with(Protocol::Ip4(Ipv4Addr::UNSPECIFIED))
         .with(Protocol::Udp(port))
         .with(Protocol::QuicV1);
-    let tcp_addr = Multiaddr::empty()
-        .with(Protocol::Ip4(Ipv4Addr::UNSPECIFIED))
-        .with(Protocol::Tcp(port));
+    let tcp_addr =
+        Multiaddr::empty().with(Protocol::Ip4(Ipv4Addr::UNSPECIFIED)).with(Protocol::Tcp(port));
     swarm.listen_on(quic_addr)?;
     swarm.listen_on(tcp_addr)?;
 

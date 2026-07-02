@@ -85,6 +85,13 @@ pub(crate) struct PeerManager {
     discovery_peers: HashMap<PeerId, Vec<Multiaddr>>,
     /// Consecutive heartbeats with zero connected peers for dial backoff.
     isolation_streak: u32,
+    /// Circuit-relay-v2 servers referenced by peers' `/p2p-circuit` addresses.
+    ///
+    /// Relays only speak the circuit protocol, not the consensus protocols (gossipsub, kad,
+    /// req/res), so ordinary peer scoring would immediately ban them and tear down the reservation
+    /// and every circuit routed through them. These peer ids are therefore exempt from penalties
+    /// and pruning.
+    relay_peers: HashSet<PeerId>,
 }
 
 impl PeerManager {
@@ -113,6 +120,7 @@ impl PeerManager {
             isolation_streak: 0,
             temporarily_banned,
             discovery_peers: Default::default(),
+            relay_peers: Default::default(),
         }
     }
 
@@ -418,10 +426,45 @@ impl PeerManager {
     /// Some reports are propagated to libp2p network layer. Caller is responsible
     /// for specifying the severity of the penalty to apply.
     pub(crate) fn process_penalty(&mut self, peer_id: PeerId, penalty: Penalty) {
+        // Relays only speak the circuit protocol, so consensus-layer penalties (e.g. kad/gossip
+        // "unsupported protocol") must never ban them - that would drop the reservation and all
+        // circuits routed through the relay.
+        if self.relay_peers.contains(&peer_id) {
+            trace!(target: "peer-manager", ?peer_id, ?penalty, "ignoring penalty for relay peer");
+            return;
+        }
+
         let action = self.peers.process_penalty(&peer_id, penalty);
 
         trace!(target: "peer-manager", ?peer_id, ?action, "processed penalty");
         self.apply_peer_action(peer_id, action);
+    }
+
+    /// Record the relay servers referenced by any `/p2p-circuit` addresses so they are treated as
+    /// protected infrastructure (never penalized or pruned).
+    fn register_relays_from_addrs(&mut self, addrs: &[Multiaddr]) {
+        for addr in addrs {
+            if let Some(relay_id) = Self::extract_relay_peer_id(addr) {
+                if self.relay_peers.insert(relay_id) {
+                    debug!(target: "peer-manager", ?relay_id, "registered relay peer (exempt from penalties)");
+                }
+            }
+        }
+    }
+
+    /// Extract the relay server's [PeerId] from a circuit address of the form
+    /// `<relay-addr>/p2p/<relay-id>/p2p-circuit/p2p/<dst-id>`: the `P2p` component immediately
+    /// preceding the `P2pCircuit` protocol. Returns `None` for non-relayed addresses.
+    fn extract_relay_peer_id(addr: &Multiaddr) -> Option<PeerId> {
+        let mut last_p2p = None;
+        for proto in addr.iter() {
+            match proto {
+                Protocol::P2p(peer) => last_p2p = Some(peer),
+                Protocol::P2pCircuit => return last_p2p,
+                _ => {}
+            }
+        }
+        None
     }
 
     /// Process newly banned IP addresses.
@@ -553,7 +596,10 @@ impl PeerManager {
         let ready_to_prune = connected_peers
             .iter()
             .filter_map(|(peer_id, peer)| {
-                if !self.is_peer_validator(peer_id) && !peer.is_trusted() {
+                if !self.is_peer_validator(peer_id)
+                    && !peer.is_trusted()
+                    && !self.relay_peers.contains(peer_id)
+                {
                     Some(**peer_id)
                 } else {
                     None
@@ -716,6 +762,9 @@ impl PeerManager {
         self.known_peers.insert(bls_key, info.clone());
         self.known_peers_time_added.insert(bls_key, now());
         self.known_peerids.insert(peer_id, bls_key);
+
+        // Learn the relay servers this peer is reached through so they are exempt from banning.
+        self.register_relays_from_addrs(&info.multiaddrs);
 
         // Cleanup if we've exceeded the maximum known peers limit
         self.cleanup_known_peers();
