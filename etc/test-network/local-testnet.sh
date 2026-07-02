@@ -162,6 +162,35 @@ set_high_priority() {
     fi
 }
 
+# Derive the fixed relay ed25519 seed for a validator index (0-based): the byte (index+1) repeated
+# 32x, as hex. Must stay in sync with RELAY_PEER_IDS / RELAY_KEYS.md and the rayls-relay identity.
+relay_seed_hex() {
+    local idx=$1
+    local byte
+    byte=$(printf '%02x' $((idx+1)))
+    local seed="" c
+    for ((c=0; c<32; c++)); do seed="${seed}${byte}"; done
+    echo "$seed"
+}
+
+# Spawn one rayls-relay per validator, indexed: relay-(i+1) listens on ${RELAY_HOST}:$((RELAY_BASE_PORT+i))
+# with the fixed identity for that index (so its peer id matches the validators' baked addresses).
+start_relays() {
+    local ROOTDIR="$scriptDir/local-validators"
+    for ((i=0; i<NUM_VALIDATORS; i++)); do
+        local port=$((RELAY_BASE_PORT + i))
+        local seed
+        seed=$(relay_seed_hex "$i")
+        echo "Starting relay-$((i+1)) on ${RELAY_HOST}:${port} (peer ${RELAY_PEER_IDS[$i]})"
+        RELAY_SEED_HEX="$seed" RELAY_PORT="$port" \
+            "$scriptDir/../../target/${BUILD_CONFIG}/rayls-relay" \
+            >> "${ROOTDIR}/relay-$((i+1)).log" 2>&1 &
+        echo $! > "${ROOTDIR}/relay-$((i+1)).pid"
+    done
+    # Give relays a moment to bind before validators try to reserve/dial through them.
+    sleep 1
+}
+
 while [ "$1" != "" ]; do
     case $1 in
         --start )
@@ -317,6 +346,10 @@ fi
 if [[ "$BUILD_CONFIG" = "release" ]]; then
     BUILD_ARGS+=( "--release" )
 fi
+# In relay mode also build the local relay-server binary.
+if [[ "$RELAY_MODE" == "true" ]]; then
+    BUILD_ARGS+=( "--bin" "rayls-relay" )
+fi
 RUSTFLAGS="-C target-cpu=native" cargo build "${BUILD_ARGS[@]}"
 # Example of using redb for the consensus DB
 # cargo build --bin rayls-network --features redb --release
@@ -455,6 +488,11 @@ if [[ -n "$STOP_VALIDATOR" ]]; then
 fi
 
 if [ "$START" = true ]; then
+    # In relay mode, bring the relays up before validators so reservations/dials succeed.
+    if [[ "$RELAY_MODE" == "true" ]]; then
+        start_relays
+    fi
+
     for ((i=0; i<$NUM_VALIDATORS; i++)); do
         VALIDATOR="${VALIDATORS[$i]}"
         DATADIR="${ROOTDIR}/${VALIDATOR}"
@@ -547,6 +585,11 @@ if [ "$START" = true ]; then
     fi
 
     TOTAL_NODES=$((NUM_VALIDATORS+NUM_OBSERVERS))
-    echo "$TOTAL_NODES nodes started in background, \
+    if [[ "$RELAY_MODE" == "true" ]]; then
+        echo "$TOTAL_NODES nodes + $NUM_VALIDATORS relays started in background, \
+    use 'killall rayls-network rayls-relay' to bring the test network down"
+    else
+        echo "$TOTAL_NODES nodes started in background, \
     use 'killall rayls-network' to bring the test network down"
+    fi
 fi

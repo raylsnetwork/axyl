@@ -13,11 +13,12 @@
 //!   fixes the relay's peer id; it must match the peer id baked into the validators' node-info
 //!   (see `etc/test-network/RELAY_KEYS.md`).
 //! - `RELAY_PORT` (required): UDP (QUIC) and TCP listen port, bound on `0.0.0.0`.
-//! - `RELAY_MAX_CIRCUIT_DURATION_SECS` (optional): override circuit lifetime. libp2p default is
-//!   120s, which force-closes long-lived consensus links; raise it for stable runs.
-//! - `RELAY_MAX_CIRCUIT_BYTES` (optional): override per-circuit byte cap. libp2p default is
-//!   131072 (128 KiB); raise it for stable runs.
-//! - `RELAY_MAX_RESERVATIONS` / `RELAY_MAX_CIRCUITS` (optional): override global caps.
+//! - `RELAY_MAX_CIRCUIT_DURATION_SECS` (optional): tighten circuit lifetime. Defaults to
+//!   effectively unlimited (libp2p's own default of 120s would force-close consensus links).
+//! - `RELAY_MAX_CIRCUIT_BYTES` (optional): tighten per-circuit byte cap. Defaults to unlimited
+//!   (libp2p's own default is 128 KiB).
+//! - `RELAY_MAX_RESERVATIONS` / `RELAY_MAX_CIRCUITS` (optional): tighten global caps
+//!   (defaults raised to 1024).
 
 use futures::StreamExt as _;
 use libp2p::{
@@ -57,9 +58,22 @@ where
     }
 }
 
-/// Build the relay config from libp2p defaults, applying any env overrides.
+/// Build the relay config, applying any env overrides.
+///
+/// The libp2p defaults describe a *limited* relay (2 min / 128 KiB per circuit) which force-closes
+/// the long-lived, high-volume links a consensus network needs. Since this is a dedicated test
+/// relay that all traffic hairpins through, we start from effectively-unlimited caps and let env
+/// vars tighten them if desired.
 fn relay_config() -> eyre::Result<relay::Config> {
     let mut cfg = relay::Config::default();
+    // Effectively unlimited: max_circuit_duration may not exceed u32::MAX seconds (~136 years).
+    cfg.max_circuit_duration = Duration::from_secs(u32::MAX as u64);
+    cfg.max_circuit_bytes = u64::MAX;
+    cfg.max_reservations = 1024;
+    cfg.max_reservations_per_peer = 64;
+    cfg.max_circuits = 1024;
+    cfg.max_circuits_per_peer = 64;
+
     if let Some(secs) = env_parse::<u64>("RELAY_MAX_CIRCUIT_DURATION_SECS")? {
         cfg.max_circuit_duration = Duration::from_secs(secs);
     }
