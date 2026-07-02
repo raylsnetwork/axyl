@@ -1,0 +1,33 @@
+[package]
+name = "rayls-relay"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license = "BUSL-1.1"
+homepage.workspace = true
+repository.workspace = true
+authors.workspace = true
+description.workspace = true
+exclude.workspace = true
+
+[dependencies]
+libp2p = { workspace = true, features = [
+    "tokio",
+    "quic",
+    "tcp",
+    "noise",
+    "yamux",
+    "relay",
+    "ping",
+    "identify",
+    "macros",
+] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "signal"] }
+futures = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
+eyre = { workspace = true }
+hex = { workspace = true }
+
+[lints]
+workspace = true
