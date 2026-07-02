@@ -190,6 +190,9 @@ while [ "$1" != "" ]; do
                 shift
                 GAS_LIMIT="$1"
                 ;;
+        --relay )
+                RELAY_MODE=true
+                ;;
         * )     echo "Invalid option: $1"
                 exit 1
     esac
@@ -230,6 +233,26 @@ ANVIL_VALIDATOR_ADDRESSES=(
     "0x976EA74026E726554dB657fA54763abd0C3a0aa9" # anvil idx 6
     "0x14dC79964da2C08b23698B3D3cc7Ca32193d9955" # anvil idx 7
     "0x23618e81E3f5cdF7f54C3d65f7FBc0aBf5B21E8f" # anvil idx 8
+)
+
+# --- circuit-relay-v2 test setup -------------------------------------------------
+# Pass --relay to generate validators that route p2p through a per-validator relay
+# (their advertised primary/worker addresses become <relay>/p2p-circuit/p2p/<node-key>).
+# Omit --relay for the normal direct-QUIC setup.
+#
+# The relay ip/port is derived from the validator index (0-based): validator-(i+1) uses
+# ${RELAY_HOST}:$((RELAY_BASE_PORT + i)). The relay PEER ID cannot be derived (libp2p requires it
+# in the circuit address and it is the hash of the relay's key), so the peer ids below are fixed to
+# deterministic ed25519 keys. Your relay app MUST run with the matching identity for each port:
+# the identity is ed25519 with a 32-byte seed equal to the byte (validator index + 1) repeated 32x
+# (i.e. 0x01*32 for validator-1, 0x02*32 for validator-2, ...). See RELAY_KEYS.md for the secrets.
+RELAY_HOST="127.0.0.1"
+RELAY_BASE_PORT=50000
+RELAY_PEER_IDS=(
+    "12D3KooWK99VoVxNE7XzyBwXEzW7xhK7Gpv85r9F3V3fyKSUKPH5" # validator-1 relay @ 127.0.0.1:50000 (seed 0x01*32)
+    "12D3KooWJWoaqZhDaoEFshF7Rh1bpY9ohihFhzcW6d69Lr2NASuq" # validator-2 relay @ 127.0.0.1:50001 (seed 0x02*32)
+    "12D3KooWRndVhVZPCiQwHBBBdg769GyrPUW13zxwqQyf9r3ANaba" # validator-3 relay @ 127.0.0.1:50002 (seed 0x03*32)
+    "12D3KooWPT98FXMfDQYavZm66EeVjTqP9Nnehn1gyaydqV8L8BQw" # validator-4 relay @ 127.0.0.1:50003 (seed 0x04*32)
 )
 
 declare -a VALIDATORS
@@ -319,10 +342,29 @@ else
         VALIDATOR="${VALIDATORS[$i]}"
         ADDRESS="${ADDRESSES[$i]}"
         DATADIR="${ROOTDIR}/${VALIDATOR}"
-        echo "creating validator keys/info for ${VALIDATOR}"
+
+        # In relay mode, derive this validator's relay address from its index and pass it to keytool
+        # so its advertised primary/worker addresses become <relay>/p2p-circuit/p2p/<node-key>.
+        RELAY_ARGS=()
+        if [[ "$RELAY_MODE" == "true" ]]; then
+            RELAY_PEER_ID="${RELAY_PEER_IDS[$i]}"
+            if [[ -z "$RELAY_PEER_ID" || "$RELAY_PEER_ID" == REPLACE_WITH_* ]]; then
+                echo "Error: --relay set but RELAY_PEER_IDS[$i] is not filled in for ${VALIDATOR}."
+                echo "Set the relay peer id near the top of this script (see RELAY_PEER_IDS)."
+                exit 1
+            fi
+            RELAY_PORT=$((RELAY_BASE_PORT + i))
+            RELAY_ADDR="/ip4/${RELAY_HOST}/udp/${RELAY_PORT}/quic-v1/p2p/${RELAY_PEER_ID}"
+            RELAY_ARGS=(--relay "$RELAY_ADDR")
+            echo "creating validator keys/info for ${VALIDATOR} (relay ${RELAY_ADDR})"
+        else
+            echo "creating validator keys/info for ${VALIDATOR}"
+        fi
+
         "$scriptDir/../../target/${BUILD_CONFIG}/rayls-network" keytool generate validator \
             --datadir "${DATADIR}" \
-            --address "${ADDRESS}"
+            --address "${ADDRESS}" \
+            "${RELAY_ARGS[@]}"
 
         # cp validator info into shared genesis dir
         echo "copying validator info to shared genesis dir"

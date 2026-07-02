@@ -84,6 +84,32 @@ pub struct KeygenArgs {
         value_delimiter = ','
     )]
     pub external_worker_addrs: Option<Vec<Multiaddr>>,
+
+    /// Optional circuit-relay-v2 server address to route this node's p2p traffic through.
+    ///
+    /// When set, the node's advertised primary and worker addresses become
+    /// `<relay>/p2p-circuit/p2p/<node-network-key>` instead of direct QUIC addresses. The node
+    /// then reserves a slot on the relay and peers dial it through the relay. This takes
+    /// precedence over `--external-primary-addr` / `--external-worker-addrs`.
+    ///
+    /// The value MUST be the relay server's dialable QUIC multiaddr including its peer id, e.g.
+    /// /ip4/1.2.3.4/udp/4001/quic-v1/p2p/12D3Koo...
+    #[arg(long, value_name = "MULTIADDR", env = "RL_RELAY_ADDR")]
+    pub relay: Option<Multiaddr>,
+}
+
+/// Build a circuit-relay-v2 address for a node: `<relay>/p2p-circuit/p2p/<node-peer-id>`.
+///
+/// `relay` must be the relay server's dialable QUIC address including its `/p2p/<relay-peer-id>`
+/// segment; `node_p2p` is the node's own `Protocol::P2p(<node-peer-id>)`.
+fn relay_circuit_addr(relay: &Multiaddr, node_p2p: Protocol<'_>) -> eyre::Result<Multiaddr> {
+    if relay.iter().any(|p| matches!(p, Protocol::P2pCircuit)) {
+        eyre::bail!("relay address must not already contain a /p2p-circuit segment: {relay}");
+    }
+    if !relay.iter().any(|p| matches!(p, Protocol::P2p(_))) {
+        eyre::bail!("relay address must include the relay peer id (/p2p/<relay-peer-id>): {relay}");
+    }
+    Ok(relay.clone().with(Protocol::P2pCircuit).with(node_p2p))
 }
 
 impl KeygenArgs {
@@ -105,41 +131,43 @@ impl KeygenArgs {
         // network keypair for authority
         let network_publickey = key_config.primary_network_public_key();
         node_info.p2p_info.primary.network_key = network_publickey.clone();
-        node_info.p2p_info.primary.network_address =
-            if let Some(primary_addr) = &self.external_primary_addr {
-                primary_addr.clone().with_p2p(network_publickey.into()).map_err(|_| {
-                    eyre::eyre!("Primary address already contains a different P2P protocol")
-                })?
-            } else {
-                let primary_udp_port = get_available_udp_port("127.0.0.1").unwrap_or(49584);
-                let addr: Multiaddr =
-                    format!("/ip4/127.0.0.1/udp/{primary_udp_port}/quic-v1").parse()?;
-                addr.with(Protocol::P2p(network_publickey.into()))
-            };
+        node_info.p2p_info.primary.network_address = if let Some(relay) = &self.relay {
+            relay_circuit_addr(relay, Protocol::P2p(network_publickey.clone().into()))?
+        } else if let Some(primary_addr) = &self.external_primary_addr {
+            primary_addr.clone().with_p2p(network_publickey.into()).map_err(|_| {
+                eyre::eyre!("Primary address already contains a different P2P protocol")
+            })?
+        } else {
+            let primary_udp_port = get_available_udp_port("127.0.0.1").unwrap_or(49584);
+            let addr: Multiaddr =
+                format!("/ip4/127.0.0.1/udp/{primary_udp_port}/quic-v1").parse()?;
+            addr.with(Protocol::P2p(network_publickey.into()))
+        };
 
         info!(target: "rl::generate_keys", primary=?node_info.p2p_info.primary.network_address, "updating primary external network address");
 
         // network keypair for workers
         let network_publickey = key_config.worker_network_public_key();
         node_info.p2p_info.worker.network_key = network_publickey.clone();
-        node_info.p2p_info.worker.network_address =
-            if let Some(worker_addrs) = &self.external_worker_addrs {
-                if let Some(worker_addr) = worker_addrs.first() {
-                    worker_addr.clone().with_p2p(network_publickey.into()).map_err(|_| {
-                        eyre::eyre!("worker address already contains a different P2P protocol")
-                    })?
-                } else {
-                    let worker_udp_port = get_available_udp_port("127.0.0.1").unwrap_or(49584);
-                    let addr: Multiaddr =
-                        format!("/ip4/127.0.0.1/udp/{worker_udp_port}/quic-v1").parse()?;
-                    addr.with(Protocol::P2p(network_publickey.into()))
-                }
+        node_info.p2p_info.worker.network_address = if let Some(relay) = &self.relay {
+            relay_circuit_addr(relay, Protocol::P2p(network_publickey.clone().into()))?
+        } else if let Some(worker_addrs) = &self.external_worker_addrs {
+            if let Some(worker_addr) = worker_addrs.first() {
+                worker_addr.clone().with_p2p(network_publickey.into()).map_err(|_| {
+                    eyre::eyre!("worker address already contains a different P2P protocol")
+                })?
             } else {
                 let worker_udp_port = get_available_udp_port("127.0.0.1").unwrap_or(49584);
                 let addr: Multiaddr =
                     format!("/ip4/127.0.0.1/udp/{worker_udp_port}/quic-v1").parse()?;
                 addr.with(Protocol::P2p(network_publickey.into()))
-            };
+            }
+        } else {
+            let worker_udp_port = get_available_udp_port("127.0.0.1").unwrap_or(49584);
+            let addr: Multiaddr =
+                format!("/ip4/127.0.0.1/udp/{worker_udp_port}/quic-v1").parse()?;
+            addr.with(Protocol::P2p(network_publickey.into()))
+        };
 
         info!(target: "rl::generate_keys", worker=?node_info.p2p_info.worker.network_address, "updating worker external network address");
         Ok(())

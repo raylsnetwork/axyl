@@ -131,12 +131,16 @@ where
         let kad_store = KadStore::new(db.clone(), &key_config, kad_type);
         let kademlia = kad::Behaviour::with_config(peer_id, kad_store.clone(), kad_config);
 
-        // create custom behavior
-        let behavior = RLBehavior::new(gossipsub, req_res, kademlia, network_config.peer_config());
-
         let network_pubkey = keypair.public().into();
+        let peer_config = network_config.peer_config();
 
         // create swarm
+        //
+        // The relay client transport is added so this node can reserve a slot on a relay server
+        // and dial peers through it via `/p2p-circuit` addresses. The relayed connection is
+        // upgraded with noise + yamux (required by `with_relay_client`); the base hop to the relay
+        // remains QUIC. The `relay_client` behaviour is only exercised when a peer's advertised
+        // address is a circuit address, so direct-QUIC networks are unaffected.
         let mut swarm = SwarmBuilder::with_existing_identity(keypair)
             .with_tokio()
             .with_quic_config(|mut config| {
@@ -149,7 +153,11 @@ where
                 config.max_connection_data = network_config.quic_config().max_connection_data;
                 config
             })
-            .with_behaviour(|_| behavior)
+            .with_relay_client(libp2p::noise::Config::new, libp2p::yamux::Config::default)
+            .map_err(|_| NetworkError::BuildSwarm)?
+            .with_behaviour(|_, relay_client| {
+                RLBehavior::new(gossipsub, req_res, kademlia, peer_config, relay_client)
+            })
             .map_err(|_| NetworkError::BuildSwarm)?
             .with_swarm_config(|c| {
                 c.with_idle_connection_timeout(

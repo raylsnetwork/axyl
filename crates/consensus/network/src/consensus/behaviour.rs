@@ -5,6 +5,7 @@ use crate::{
 use libp2p::{
     gossipsub::{self},
     kad::{self},
+    relay::{self},
     request_response::{self, Codec},
     swarm::NetworkBehaviour,
 };
@@ -27,6 +28,12 @@ where
     pub(crate) peer_manager: peers::PeerManager,
     /// Used for peer discovery.
     pub(crate) kademlia: kad::Behaviour<KadStore<DB>>,
+    /// Circuit-relay-v2 client.
+    ///
+    /// Enables this node to reserve a slot on a relay server (by listening on a `/p2p-circuit`
+    /// address) and to dial other peers through that relay. Peers are reached over the relay
+    /// whenever their advertised address is a `/…/p2p-circuit/…` multiaddr.
+    pub(crate) relay_client: relay::client::Behaviour,
 }
 
 impl<C, DB> RLBehavior<C, DB>
@@ -40,8 +47,9 @@ where
         req_res: request_response::Behaviour<C>,
         kademlia: kad::Behaviour<KadStore<DB>>,
         peer_config: &PeerConfig,
+        relay_client: relay::client::Behaviour,
     ) -> Self {
         let peer_manager = PeerManager::new(peer_config);
-        Self { gossipsub, req_res, peer_manager, kademlia }
+        Self { gossipsub, req_res, peer_manager, kademlia, relay_client }
     }
 }

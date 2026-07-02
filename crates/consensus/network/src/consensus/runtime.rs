@@ -9,7 +9,7 @@ use futures::StreamExt as _;
 use libp2p::{kad::Mode, swarm::SwarmEvent};
 use rayls_infrastructure_types::{Database, RaylsSender};
 use std::time::{Duration, Instant};
-use tracing::{debug, error, info, instrument};
+use tracing::{debug, error, info, instrument, trace};
 
 impl<Req, Res, DB, Events> ConsensusNetwork<Req, Res, DB, Events>
 where
@@ -80,6 +80,11 @@ where
                 RLBehaviorEvent::ReqRes(event) => self.process_reqres_event(event)?,
                 RLBehaviorEvent::PeerManager(event) => self.process_peer_manager_event(event)?,
                 RLBehaviorEvent::Kademlia(event) => self.process_kad_event(event)?,
+                RLBehaviorEvent::RelayClient(event) => {
+                    // Relay reservation / circuit lifecycle events. Connectivity is driven by the
+                    // swarm + peer manager; we only trace these for observability.
+                    trace!(target: "network", ?event, "relay client event");
+                }
             },
             SwarmEvent::ExternalAddrConfirmed { address: _ } => {
                 // New confirmed address so lets publish/update or kademlia address rocord.
