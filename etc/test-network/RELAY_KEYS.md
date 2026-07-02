@@ -1,5 +1,8 @@
 # Local testnet relay identities
 
+> See `RELAY_DESIGN.md` for the topology and its security tradeoffs (chokepoint/SPOF, eclipse,
+> metadata/IP exposure) before relying on relay routing beyond local testing.
+
 Fixed, deterministic relay identities used by `local-testnet.sh --relay`. Each validator routes its
 p2p through the relay listening on the matching port. For a reservation to succeed, **your relay app
 must run with the exact identity below** for each port — the peer id baked into the validators'
