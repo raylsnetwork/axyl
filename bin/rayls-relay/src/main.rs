@@ -144,6 +144,12 @@ async fn main() -> eyre::Result<()> {
         tokio::select! {
             event = swarm.select_next_some() => match event {
                 SwarmEvent::NewListenAddr { address, .. } => {
+                    // Confirm each listen address as external so the relay includes it in the
+                    // reservations it grants. Without this the reservation carries no addresses and
+                    // clients fail with `NoAddressesInReservation` (the relay behaviour sources
+                    // reservation addrs from confirmed external addresses, not listen addresses,
+                    // and our clients don't run identify to teach the relay an observed address).
+                    swarm.add_external_address(address.clone());
                     info!(%address, %local_peer_id, "relay listening (dial as <addr>/p2p/{local_peer_id})");
                 }
                 SwarmEvent::Behaviour(BehaviourEvent::Relay(e)) => {
