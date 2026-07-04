@@ -36,6 +36,9 @@ Start with one of the pages below depending on what you are trying to do.
 - [`index.md`](index.md) — system overview: end-to-end transaction flow,
   architecture diagram, custom database tables, header-field encoding,
   RPC interface.
+- [`glossary.md`](glossary.md) — terms that mean different things in
+  different parts of Axyl (e.g. "network", "whitelist"). Check here before
+  using an overloaded term in a design doc or PR description.
 - [`node-lifecycle.md`](node-lifecycle.md) — the operational counterpart:
   which subsystem owns which stage of the node's life.
 - [`../SYNC.md`](../SYNC.md) — the trust-bootstrapping epoch chain and
