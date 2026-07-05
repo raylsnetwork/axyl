@@ -5,7 +5,10 @@ use crate::{
     types::{NetworkCommand, NetworkEvent, NetworkInfo, NetworkResult},
     ConsensusNetwork,
 };
-use libp2p::gossipsub::{IdentTopic, Topic, TopicHash};
+use libp2p::{
+    gossipsub::{IdentTopic, Topic, TopicHash},
+    multiaddr::Protocol,
+};
 use rayls_infrastructure_types::{now, Database, RaylsSender};
 use tracing::{debug, error, info, warn};
 
@@ -28,7 +31,23 @@ where
                 send_or_log_error!(reply, Ok(()), "UpdateAuthorizedPublishers");
             }
             NetworkCommand::StartListening { multiaddr, reply } => {
-                let res = self.swarm.listen_on(multiaddr);
+                // When listening on a relay circuit (a node may reserve on several relays for
+                // failover), protect that relay from banning/pruning so we don't tear down our own
+                // reservation. No-op for direct (non-circuit) listen addresses.
+                self.swarm
+                    .behaviour_mut()
+                    .peer_manager
+                    .register_relays_from_addrs(std::slice::from_ref(&multiaddr));
+                let is_relayed = multiaddr.iter().any(|p| matches!(p, Protocol::P2pCircuit));
+                let res = self.swarm.listen_on(multiaddr.clone());
+                // Track relay reservations so we can re-establish them if the relay drops and
+                // later comes back (see `retry_relay_reservations`).
+                if is_relayed {
+                    self.relay_listen_addrs.insert(multiaddr.clone());
+                    if let Ok(id) = &res {
+                        self.relay_listeners.insert(*id, multiaddr);
+                    }
+                }
                 send_or_log_error!(reply, res, "StartListening");
             }
             NetworkCommand::GetListener { reply } => {

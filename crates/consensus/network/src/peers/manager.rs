@@ -440,6 +440,12 @@ impl PeerManager {
         self.apply_peer_action(peer_id, action);
     }
 
+    /// Whether `peer_id` is a known relay server. Relays are exempt from penalties/pruning and are
+    /// kept out of the kademlia DHT (they only speak the circuit protocol).
+    pub(crate) fn is_relay(&self, peer_id: &PeerId) -> bool {
+        self.relay_peers.contains(peer_id)
+    }
+
     /// Record the relay servers referenced by any `/p2p-circuit` addresses so they are treated as
     /// protected infrastructure (never penalized or pruned).
     pub(crate) fn register_relays_from_addrs(&mut self, addrs: &[Multiaddr]) {

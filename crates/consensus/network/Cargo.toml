@@ -19,6 +19,7 @@ libp2p = { workspace = true, features = [
     "relay",
     "noise",
     "yamux",
+    "dns",
 ] }
 tokio = { workspace = true, features = ["rt", "net", "sync", "macros", "time"] }
 rayls-infrastructure-types = { workspace = true }

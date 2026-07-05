@@ -9,9 +9,10 @@ use crate::{
     NetworkMetrics,
 };
 use libp2p::{
+    core::transport::ListenerId,
     kad::QueryId,
     request_response::{InboundRequestId, OutboundRequestId},
-    PeerId, Swarm,
+    Multiaddr, PeerId, Swarm,
 };
 use rayls_infrastructure_config::{KeyConfig, LibP2pConfig};
 use rayls_infrastructure_types::{BlsPublicKey, Database, RaylsSender, TaskSpawner};
@@ -126,4 +127,11 @@ where
     network_metrics: Arc<NetworkMetrics>,
     /// A label for the network to use in metrics.
     network_label: &'static str,
+    /// Relay circuit listen addresses this node wants to keep reserved (the `/p2p-circuit`
+    /// addresses passed to `StartListening`). Used to re-establish a reservation if its relay goes
+    /// away and later comes back, without restarting the node.
+    relay_listen_addrs: HashSet<Multiaddr>,
+    /// Active listener ids for relay reservations, mapped to the address they serve, so a
+    /// `ListenerClosed` can be tied back to the relay address that needs re-listening.
+    relay_listeners: HashMap<ListenerId, Multiaddr>,
 }

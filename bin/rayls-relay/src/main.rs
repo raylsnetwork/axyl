@@ -70,6 +70,14 @@ fn relay_config() -> eyre::Result<relay::Config> {
     cfg.max_reservations_per_peer = 64;
     cfg.max_circuits = 1024;
     cfg.max_circuits_per_peer = 64;
+    // Drop the default per-peer/per-IP rate limiters. They cap circuits/reservations to
+    // 30 per 2 min per source peer and 60 per hour per source IP -- fine for a public relay, but
+    // this is a dedicated test relay that all validators hairpin through, often from the SAME IP
+    // (127.0.0.1 locally). Reconnect churn (killing/reviving relays, re-reservation retries) then
+    // trips the per-IP limiter and the relay denies circuits with ResourceLimitExceeded. Empty
+    // vecs = no rate limiting.
+    cfg.reservation_rate_limiters = Vec::new();
+    cfg.circuit_src_rate_limiters = Vec::new();
 
     if let Some(secs) = env_parse::<u64>("RELAY_MAX_CIRCUIT_DURATION_SECS")? {
         cfg.max_circuit_duration = Duration::from_secs(secs);

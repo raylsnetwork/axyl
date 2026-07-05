@@ -153,6 +153,11 @@ where
                 config.max_connection_data = network_config.quic_config().max_connection_data;
                 config
             })
+            // Resolve /dns4, /dns6 and /dnsaddr multiaddrs (e.g. relays addressed by hostname, and
+            // /dnsaddr records that fan out to multiple relays for failover). Wraps the transport,
+            // so relayed addresses like /dns4/relay/.../p2p/<relay>/p2p-circuit/p2p/<peer> resolve.
+            .with_dns()
+            .map_err(|_| NetworkError::BuildSwarm)?
             .with_relay_client(libp2p::noise::Config::new, libp2p::yamux::Config::default)
             .map_err(|_| NetworkError::BuildSwarm)?
             .with_behaviour(|_, relay_client| {
@@ -207,6 +212,8 @@ where
             last_cleanup: Instant::now(),
             network_metrics,
             network_label,
+            relay_listen_addrs: Default::default(),
+            relay_listeners: Default::default(),
         })
     }
 

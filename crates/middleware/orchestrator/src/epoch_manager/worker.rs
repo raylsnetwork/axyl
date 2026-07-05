@@ -113,6 +113,16 @@ where
                 consensus_config.worker_address(),
             )?;
             network_handle.inner_handle().start_listening(worker_address).await?;
+
+            // Reserve on any additional relays so the worker stays reachable if its main relay is
+            // lost. Uses the worker's own network key for the circuit listen address.
+            for relay_addr in Self::relay_listen_addresses(
+                "WORKER_RELAY_MULTIADDRS",
+                consensus_config.worker_networkkey(),
+            )? {
+                info!(target: "epoch-manager", ?relay_addr, "listening on additional worker relay");
+                network_handle.inner_handle().start_listening(relay_addr).await?;
+            }
         }
 
         // Rayls: Always rebuild identity mappings (known_peers, known_peerids) every epoch.

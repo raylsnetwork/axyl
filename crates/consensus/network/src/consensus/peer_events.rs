@@ -156,9 +156,18 @@ where
                 // register peer for request-response behaviour
                 // NOTE: gossipsub handles `FromSwarm::ConnectionEstablished`
                 self.swarm.add_peer_address(peer_id, addr.clone());
-                // add as a kademlia peer
-                self.swarm.behaviour_mut().kademlia.add_address(&peer_id, addr);
-                self.publish_our_data_to_peer(peer_id);
+                // Do NOT add relays to kademlia or share our record with them: relays only speak
+                // the circuit protocol, so putting them in the DHT makes other nodes discover and
+                // dial them as if they were peers. Those nodes then penalize/ban the relay for not
+                // speaking consensus protocols -- and on a shared IP (local testnet, everything on
+                // 127.0.0.1) an IP-level ban then knocks out every real peer behind that IP.
+                if self.swarm.behaviour().peer_manager.is_relay(&peer_id) {
+                    debug!(target: "network-kad", ?peer_id, "skipping kad add/publish for relay peer");
+                } else {
+                    // add as a kademlia peer
+                    self.swarm.behaviour_mut().kademlia.add_address(&peer_id, addr);
+                    self.publish_our_data_to_peer(peer_id);
+                }
 
                 // manage connected peers - avoid duplicates from rapid reconnects
                 if !self.connected_peers.contains(&peer_id) {

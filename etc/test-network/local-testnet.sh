@@ -173,11 +173,18 @@ relay_seed_hex() {
     echo "$seed"
 }
 
-# Spawn one rayls-relay per validator, indexed: relay-(i+1) listens on ${RELAY_HOST}:$((RELAY_BASE_PORT+i))
-# with the fixed identity for that index (so its peer id matches the validators' baked addresses).
+# Spawn relays per validator:
+#  - primary relay-(i+1) on ${RELAY_BASE_PORT+i} with the fixed identity for that index (its peer
+#    id matches the validators' baked node-info addresses / RELAY_PEER_IDS);
+#  - backup relay-(i+1)-b on ${RELAY_B_BASE_PORT+i} with a distinct fixed identity. Its address is
+#    read back from the relay's log and exported to the validator via PRIMARY/WORKER_RELAY_MULTIADDRS
+#    so the validator reserves on BOTH relays.
+# Populates the global RELAY_B_ADDR[] with each backup relay's dialable multiaddr.
 start_relays() {
     local ROOTDIR="$scriptDir/local-validators"
+    RELAY_B_ADDR=()
     for ((i=0; i<NUM_VALIDATORS; i++)); do
+        # primary relay (identity must match the baked node-info addresses)
         local port=$((RELAY_BASE_PORT + i))
         local seed
         seed=$(relay_seed_hex "$i")
@@ -186,6 +193,27 @@ start_relays() {
             "$scriptDir/../../target/${BUILD_CONFIG}/rayls-relay" \
             >> "${ROOTDIR}/relay-$((i+1)).log" 2>&1 &
         echo $! > "${ROOTDIR}/relay-$((i+1)).pid"
+
+        # backup relay (distinct fixed seed byte 0xb0+i; peer id read from its log)
+        local b_port=$((RELAY_B_BASE_PORT + i))
+        local b_byte b_seed c
+        b_byte=$(printf '%02x' $((0xb0 + i)))
+        b_seed=""
+        for ((c=0; c<32; c++)); do b_seed="${b_seed}${b_byte}"; done
+        local b_log="${ROOTDIR}/relay-$((i+1))-b.log"
+        RELAY_SEED_HEX="$b_seed" RELAY_PORT="$b_port" \
+            "$scriptDir/../../target/${BUILD_CONFIG}/rayls-relay" \
+            >> "$b_log" 2>&1 &
+        echo $! > "${ROOTDIR}/relay-$((i+1))-b.pid"
+        local b_peer=""
+        for _ in $(seq 1 40); do
+            b_peer=$(grep -ao '12D3KooW[A-Za-z0-9]*' "$b_log" 2>/dev/null | head -1 || true)
+            [[ -n "$b_peer" ]] && break
+            sleep 0.25
+        done
+        [[ -n "$b_peer" ]] || { echo "Error: backup relay-$((i+1))-b did not report a peer id (see $b_log)."; exit 1; }
+        RELAY_B_ADDR[$i]="/ip4/${RELAY_HOST}/udp/${b_port}/quic-v1/p2p/${b_peer}"
+        echo "Starting relay-$((i+1))-b (backup) on ${RELAY_HOST}:${b_port} (peer ${b_peer})"
     done
     # Give relays a moment to bind before validators try to reserve/dial through them.
     sleep 1
@@ -277,6 +305,11 @@ ANVIL_VALIDATOR_ADDRESSES=(
 # (i.e. 0x01*32 for validator-1, 0x02*32 for validator-2, ...). See RELAY_KEYS.md for the secrets.
 RELAY_HOST="127.0.0.1"
 RELAY_BASE_PORT=50000
+# Each validator also gets a second "backup" relay (ports 51000+i) so it reserves on two relays.
+# Kill a validator's primary relay (relay-N) and the validator should stay up on its backup
+# (relay-N-b) instead of shutting down -- that's the multi-reservation failover test. (Peers won't
+# re-reach it via the backup without /dnsaddr advertisement; the network continues on quorum.)
+RELAY_B_BASE_PORT=51000
 RELAY_PEER_IDS=(
     "12D3KooWK99VoVxNE7XzyBwXEzW7xhK7Gpv85r9F3V3fyKSUKPH5" # validator-1 relay @ 127.0.0.1:50000 (seed 0x01*32)
     "12D3KooWJWoaqZhDaoEFshF7Rh1bpY9ohihFhzcW6d69Lr2NASuq" # validator-2 relay @ 127.0.0.1:50001 (seed 0x02*32)
@@ -506,8 +539,18 @@ if [ "$START" = true ]; then
         fi
 
         echo "Starting ${VALIDATOR} in background, rpc http://localhost:$RPC_PORT ws ws://localhost:$WS_PORT"
+        # In relay mode, tell the validator to also reserve on its backup relay (so it survives
+        # losing its primary relay). Passed as env assignments via `env` so the big command below
+        # stays unchanged.
+        RELAY_ENV=()
+        if [[ "$RELAY_MODE" == "true" ]]; then
+            RELAY_ENV=(
+                "PRIMARY_RELAY_MULTIADDRS=${RELAY_B_ADDR[$i]}"
+                "WORKER_RELAY_MULTIADDRS=${RELAY_B_ADDR[$i]}"
+            )
+        fi
         # start validator
-        $heaptrackProfiling "$scriptDir/../../target/${BUILD_CONFIG}/rayls-network" node \
+        env "${RELAY_ENV[@]}" $heaptrackProfiling "$scriptDir/../../target/${BUILD_CONFIG}/rayls-network" node \
             --datadir "${DATADIR}" \
             --instance "${INSTANCE}" \
             --metrics "${CONSENSUS_METRICS}" \
@@ -586,8 +629,10 @@ if [ "$START" = true ]; then
 
     TOTAL_NODES=$((NUM_VALIDATORS+NUM_OBSERVERS))
     if [[ "$RELAY_MODE" == "true" ]]; then
-        echo "$TOTAL_NODES nodes + $NUM_VALIDATORS relays started in background, \
-    use 'killall rayls-network rayls-relay' to bring the test network down"
+        echo "$TOTAL_NODES nodes + $((NUM_VALIDATORS * 2)) relays (primary + backup per validator) started in background."
+        echo "Failover test: kill validator-1's PRIMARY relay with 'kill \$(cat ${ROOTDIR}/relay-1.pid)'"
+        echo "  and confirm ${VALIDATORS[0]} stays up (it keeps its backup reservation on relay-1-b)."
+        echo "Bring it all down with 'killall rayls-network rayls-relay'."
     else
         echo "$TOTAL_NODES nodes started in background, \
     use 'killall rayls-network' to bring the test network down"

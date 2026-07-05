@@ -9,7 +9,7 @@ use futures::StreamExt as _;
 use libp2p::{kad::Mode, swarm::SwarmEvent};
 use rayls_infrastructure_types::{Database, RaylsSender};
 use std::time::{Duration, Instant};
-use tracing::{debug, error, info, instrument, trace};
+use tracing::{debug, error, info, instrument, trace, warn};
 
 impl<Req, Res, DB, Events> ConsensusNetwork<Req, Res, DB, Events>
 where
@@ -40,8 +40,15 @@ where
         // Time-based cleanup interval (10 seconds)
         const CLEANUP_INTERVAL: Duration = Duration::from_secs(10);
 
+        // Periodically re-attempt any relay reservation whose relay went away, so a relay coming
+        // back restores the node's reachability without a restart.
+        let mut relay_retry = tokio::time::interval(Duration::from_secs(15));
+
         loop {
             tokio::select! {
+                _ = relay_retry.tick() => {
+                    self.retry_relay_reservations();
+                }
                 event = self.swarm.select_next_some() => {
                     self.process_event(event).await.inspect_err(|e| {
                         error!(target: "network", ?e, "network event error")
@@ -64,6 +71,34 @@ where
                         return Ok(())
                     }
                 },
+            }
+        }
+    }
+
+    /// Re-issue `listen_on` for any desired relay reservation that currently has no active
+    /// listener (its relay went away). Safe to call repeatedly: a still-down relay just closes
+    /// again and is retried on the next tick, while a recovered relay re-establishes the
+    /// reservation. Once re-reserved on the node's committee-advertised relay, peers reconnect on
+    /// their own without a restart.
+    fn retry_relay_reservations(&mut self) {
+        if self.relay_listen_addrs.is_empty() {
+            return;
+        }
+        let missing: Vec<_> = self
+            .relay_listen_addrs
+            .iter()
+            .filter(|addr| !self.relay_listeners.values().any(|active| active == *addr))
+            .cloned()
+            .collect();
+        for addr in missing {
+            match self.swarm.listen_on(addr.clone()) {
+                Ok(id) => {
+                    info!(target: "network", ?addr, "re-attempting relay reservation");
+                    self.relay_listeners.insert(id, addr);
+                }
+                Err(e) => {
+                    warn!(target: "network", ?addr, ?e, "failed to re-attempt relay reservation");
+                }
             }
         }
     }
@@ -106,10 +141,18 @@ where
                     "listener error"
                 );
             }
-            SwarmEvent::ListenerClosed { addresses, reason, .. } => {
+            SwarmEvent::ListenerClosed { listener_id, addresses, reason } => {
                 // log errors
                 if let Err(e) = reason {
                     error!(target: "network", ?e, "listener unexpectedly closed");
+                }
+
+                // If this was a relay reservation, drop it from the active set but keep it in the
+                // desired set so `retry_relay_reservations` re-establishes it when the relay
+                // returns (the address stays reachable via committee, so peers reconnect on their
+                // own once the reservation is back).
+                if let Some(addr) = self.relay_listeners.remove(&listener_id) {
+                    warn!(target: "network", ?addr, "relay reservation lost; will retry to re-reserve");
                 }
 
                 // critical failure

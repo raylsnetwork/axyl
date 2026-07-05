@@ -7,7 +7,7 @@ use rayls_consensus_state_sync::prime_consensus;
 use rayls_consensus_worker::WorkerNetworkHandle;
 use rayls_infrastructure_config::{ConsensusConfig, NetworkConfig, RaylsDirs};
 use rayls_infrastructure_types::{
-    BlsPublicKey, Database as ReDatabase, Multiaddr, NetworkPublicKey, TaskSpawner,
+    BlsPublicKey, Database as ReDatabase, Multiaddr, NetworkPublicKey, Protocol, TaskSpawner,
 };
 use std::{sync::Arc, time::Duration};
 use tracing::{debug, error, info, warn};
@@ -332,5 +332,36 @@ where
                     })
             })
             .unwrap_or(Ok(fallback))
+    }
+
+    /// Build circuit-relay-v2 listen addresses for a comma-separated list of relay base multiaddrs
+    /// in `env_var` (e.g. `/dns4/r2.example/udp/50002/quic-v1/p2p/<R2>,/dns4/r3.example/...`).
+    ///
+    /// Each relay yields `<relay>/p2p-circuit/p2p/<self>`, so the node reserves on *every* listed
+    /// relay in addition to the one in its node-info. That is what makes a node survive losing a
+    /// relay: the remaining reservations keep it reachable (and keep the swarm's listeners alive).
+    /// Returns an empty vec when the env var is unset.
+    pub(super) fn relay_listen_addresses(
+        env_var: &str,
+        network_pubkey: NetworkPublicKey,
+    ) -> eyre::Result<Vec<Multiaddr>> {
+        let list = match std::env::var(env_var) {
+            Ok(v) => v,
+            Err(_) => return Ok(vec![]),
+        };
+        let mut addrs = Vec::new();
+        for entry in list.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+            let relay: Multiaddr = entry.parse().map_err(|e| {
+                eyre::eyre!("Failed to parse relay multiaddr from env {env_var} ({entry})\n{e}")
+            })?;
+            let listen = relay
+                .with(Protocol::P2pCircuit)
+                .with_p2p(network_pubkey.clone().into())
+                .map_err(|_| {
+                eyre::eyre!("relay multiaddr from {env_var} ({entry}) has a conflicting P2P id")
+            })?;
+            addrs.push(listen);
+        }
+        Ok(addrs)
     }
 }

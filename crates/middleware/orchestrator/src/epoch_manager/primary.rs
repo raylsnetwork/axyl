@@ -108,6 +108,16 @@ where
             )?;
             info!(target: "epoch-manager", ?primary_address, "listening to {primary_address}");
             network_handle.inner_handle().start_listening(primary_address).await?;
+
+            // Reserve on any additional relays (comma-separated relay base multiaddrs) so the
+            // primary stays reachable if its main relay is lost.
+            for relay_addr in Self::relay_listen_addresses(
+                "PRIMARY_RELAY_MULTIADDRS",
+                consensus_config.primary_networkkey(),
+            )? {
+                info!(target: "epoch-manager", ?relay_addr, "listening on additional primary relay");
+                network_handle.inner_handle().start_listening(relay_addr).await?;
+            }
         }
 
         let mut peers = network_handle.connected_peers_count().await.unwrap_or(0);
