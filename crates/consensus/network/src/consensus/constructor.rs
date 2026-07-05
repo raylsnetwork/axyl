@@ -169,6 +169,16 @@ where
         // set external address
         swarm.add_external_address(external_addr.clone());
 
+        // If this node is reached via a relay, its own external address is a `/p2p-circuit` on that
+        // relay. Register that relay as protected so the node doesn't ban its own relay (which
+        // would drop the reservation and close its only listener). Committee peers' relays
+        // are registered via `add_known_peer`, but a node's own relay -- especially for
+        // non-committee nodes like observers -- is only visible here.
+        swarm
+            .behaviour_mut()
+            .peer_manager
+            .register_relays_from_addrs(std::slice::from_ref(&external_addr));
+
         let (handle, commands) = tokio::sync::mpsc::channel(100);
         let config = network_config.libp2p_config().clone();
         let pending_px_disconnects = HashMap::with_capacity(config.max_px_disconnects);

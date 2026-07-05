@@ -442,7 +442,7 @@ impl PeerManager {
 
     /// Record the relay servers referenced by any `/p2p-circuit` addresses so they are treated as
     /// protected infrastructure (never penalized or pruned).
-    fn register_relays_from_addrs(&mut self, addrs: &[Multiaddr]) {
+    pub(crate) fn register_relays_from_addrs(&mut self, addrs: &[Multiaddr]) {
         for addr in addrs {
             if let Some(relay_id) = Self::extract_relay_peer_id(addr) {
                 if self.relay_peers.insert(relay_id) {
