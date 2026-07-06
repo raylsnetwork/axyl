@@ -68,4 +68,4 @@ We welcome contributions and feedback from the community. If you're interested i
 
 ## License
 
-These contracts are licensed under the Business Source License 1.1 (BUSL-1.1) — see [LICENSE](./LICENSE) — except the LayerZero OFT interfaces (`IMintableBurnable`, `IOFT`), which keep their original MIT license. Contracts derived from Telcoin `tn-contracts` are under BUSL with attribution preserved in the repository [NOTICE](../NOTICE), which also reproduces the MIT terms for the LayerZero interfaces. See each file's SPDX header and the [LICENSE-APACHE](./LICENSE-APACHE) file.
+These contracts are licensed under the Business Source License 1.1 (BUSL-1.1) — see [LICENSE](./LICENSE) — except the LayerZero OFT interfaces (`IMintableBurnable`, `IOFT`), which keep their original MIT license. Contracts derived from Telcoin `tn-contracts` are under BUSL with attribution preserved in the repository [NOTICE](../NOTICE), which also reproduces the MIT terms for the LayerZero interfaces. See each file's SPDX header and the third-party [Apache 2.0 license text](./licenses/Apache-2.0.txt).

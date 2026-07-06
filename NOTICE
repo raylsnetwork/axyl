@@ -11,7 +11,7 @@ licensed under the **Business Source License 1.1 (BUSL-1.1)** — see [LICENSE](
 
 The repository incorporates and modifies code from the third-party projects listed below.
 Those portions remain copyright their respective authors under their original licenses —
-the [Apache License 2.0](./LICENSE-APACHE), or the MIT License for the bundled LayerZero
+the [Apache License 2.0](./licenses/Apache-2.0.txt), or the MIT License for the bundled LayerZero
 interfaces (reproduced in the LayerZero section below). The original works remain available
 from their upstreams under those licenses.
 
