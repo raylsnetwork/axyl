@@ -136,6 +136,16 @@ async fn main() -> eyre::Result<()> {
                 key.public(),
             )),
         })?
+        // CRITICAL: libp2p 0.56 defaults idle_connection_timeout to Duration::ZERO, which makes
+        // the relay drop any connection the instant it has no keep-alive-forcing substream. That
+        // closes peer connections during the brief circuit-setup window (outbound dials then time
+        // out) and tears down active circuits at any idle moment (the destination sees the circuit
+        // stream reset with Stopped(0) ~1ms after it establishes). A relay must never idle-close
+        // its reserving/relaying peers, so disable the idle timeout entirely -- exactly what the
+        // libp2p relay-server example does. (Connections carrying a live reservation/circuit are
+        // kept alive by the relay behaviour anyway; this also protects genuinely-idle ones from
+        // being reaped mid-handshake.)
+        .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(u64::MAX)))
         .build();
 
     // Listen on QUIC (what the axyl client dials) and TCP, both on 0.0.0.0:<port>.

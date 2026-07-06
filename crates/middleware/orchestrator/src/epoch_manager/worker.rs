@@ -11,7 +11,7 @@ use rayls_execution_evm::{
 use rayls_infrastructure_config::{ConsensusConfig, LibP2pConfig, RaylsDirs};
 use rayls_infrastructure_types::{
     gas_accumulator::GasAccumulator, BatchValidation, BlsPublicKey, Database as ReDatabase,
-    RaylsSender, TaskSpawner,
+    Protocol, RaylsSender, TaskSpawner,
 };
 use std::{collections::HashSet, sync::Arc};
 use tracing::{debug, info};
@@ -112,7 +112,13 @@ where
                 consensus_config.primary_networkkey(),
                 consensus_config.worker_address(),
             )?;
-            network_handle.inner_handle().start_listening(worker_address).await?;
+            // A `/dnsaddr` advertise address can't be listened on; reserve only on the relays from
+            // WORKER_RELAY_MULTIADDRS below in that mode.
+            if worker_address.iter().any(|p| matches!(p, Protocol::Dnsaddr(_))) {
+                info!(target: "epoch-manager", ?worker_address, "advertise-only /dnsaddr address; reserving via WORKER_RELAY_MULTIADDRS");
+            } else {
+                network_handle.inner_handle().start_listening(worker_address).await?;
+            }
 
             // Reserve on any additional relays so the worker stays reachable if its main relay is
             // lost. Uses the worker's own network key for the circuit listen address.

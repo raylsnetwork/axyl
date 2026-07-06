@@ -41,6 +41,11 @@ snap = { workspace = true }
 rand = { workspace = true }
 serde_with = { workspace = true }
 
+# custom DNS resolver config (matches the hickory-resolver libp2p-dns uses); lets us point at a
+# specific DNS server (e.g. a local dnsmasq for /dnsaddr) via RAYLS_DNS_SERVER without touching
+# the system resolver.
+hickory-resolver = "0.25"
+
 [dev-dependencies]
 tempfile = { workspace = true }
 rayls-execution-evm = { workspace = true, features = ["test-utils"] }

@@ -96,6 +96,22 @@ pub struct KeygenArgs {
     /// /ip4/1.2.3.4/udp/4001/quic-v1/p2p/12D3Koo...
     #[arg(long, value_name = "MULTIADDR", env = "RL_RELAY_ADDR")]
     pub relay: Option<Multiaddr>,
+
+    /// Advertise this node via a `/dnsaddr` name instead of a concrete relay address.
+    ///
+    /// The node's advertised primary/worker addresses become `/dnsaddr/<host>/p2p/<node-key>`. A
+    /// DNS TXT record at `_dnsaddr.<host>` then lists the actual relay circuit addresses, which
+    /// lets the node be reached through *several* relays (failover) and lets relays change
+    /// without editing committee.yaml. The concrete relays this node reserves on are supplied
+    /// at runtime via `PRIMARY_RELAY_MULTIADDRS` / `WORKER_RELAY_MULTIADDRS`. Takes precedence
+    /// over `--relay`.
+    #[arg(long, value_name = "HOST", env = "RL_ADVERTISE_DNSADDR")]
+    pub advertise_dnsaddr: Option<String>,
+}
+
+/// Build a `/dnsaddr/<host>/p2p/<node-peer-id>` advertise address.
+fn dnsaddr_addr(host: &str, node_p2p: Protocol<'_>) -> Multiaddr {
+    Multiaddr::empty().with(Protocol::Dnsaddr(host.into())).with(node_p2p)
 }
 
 /// Build a circuit-relay-v2 address for a node: `<relay>/p2p-circuit/p2p/<node-peer-id>`.
@@ -131,7 +147,9 @@ impl KeygenArgs {
         // network keypair for authority
         let network_publickey = key_config.primary_network_public_key();
         node_info.p2p_info.primary.network_key = network_publickey.clone();
-        node_info.p2p_info.primary.network_address = if let Some(relay) = &self.relay {
+        node_info.p2p_info.primary.network_address = if let Some(host) = &self.advertise_dnsaddr {
+            dnsaddr_addr(host, Protocol::P2p(network_publickey.clone().into()))
+        } else if let Some(relay) = &self.relay {
             relay_circuit_addr(relay, Protocol::P2p(network_publickey.clone().into()))?
         } else if let Some(primary_addr) = &self.external_primary_addr {
             primary_addr.clone().with_p2p(network_publickey.into()).map_err(|_| {
@@ -149,7 +167,9 @@ impl KeygenArgs {
         // network keypair for workers
         let network_publickey = key_config.worker_network_public_key();
         node_info.p2p_info.worker.network_key = network_publickey.clone();
-        node_info.p2p_info.worker.network_address = if let Some(relay) = &self.relay {
+        node_info.p2p_info.worker.network_address = if let Some(host) = &self.advertise_dnsaddr {
+            dnsaddr_addr(host, Protocol::P2p(network_publickey.clone().into()))
+        } else if let Some(relay) = &self.relay {
             relay_circuit_addr(relay, Protocol::P2p(network_publickey.clone().into()))?
         } else if let Some(worker_addrs) = &self.external_worker_addrs {
             if let Some(worker_addr) = worker_addrs.first() {

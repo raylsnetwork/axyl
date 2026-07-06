@@ -136,6 +136,16 @@ where
         /// Reply for connection outcome.
         reply: oneshot::Sender<NetworkResult<()>>,
     },
+    /// Register relays discovered from `/dnsaddr` resolution as protected.
+    ///
+    /// Sent by an off-loop discovery task (see `AddBootstrapPeers`) so the blocking DNS lookup
+    /// never runs on the swarm event loop -- blocking the loop stops the swarm from servicing
+    /// relayed (yamux-over-circuit) connections, which have no transport-level keep-alive and get
+    /// reset by peers. Registration itself is cheap and runs on the loop. Fire-and-forget.
+    RegisterRelays {
+        /// Circuit multiaddrs whose `/p2p/<relay>` peer ids should be exempted from banning.
+        circuits: Vec<Multiaddr>,
+    },
     /// Dial a peer to establish a connection.
     Dial {
         /// The peer's id.
@@ -149,6 +159,21 @@ where
     DialBls {
         /// The peer's bls public key.
         bls_key: BlsPublicKey,
+        /// Oneshot for reply
+        reply: oneshot::Sender<NetworkResult<()>>,
+    },
+    /// Dial a peer with a set of already-resolved addresses.
+    ///
+    /// Used by `DialBls` after resolving a committee peer's `/dnsaddr` to concrete
+    /// `/p2p-circuit` addresses off the swarm loop. The dialed address MUST be the concrete
+    /// circuit (not `/dnsaddr`): the relay client behaviour selects its connection handler by
+    /// multiaddr shape (`is_relayed`), so it has to see the `/p2p-circuit` to treat the
+    /// connection as relayed rather than as a direct link to a relay.
+    DialResolved {
+        /// The peer's id.
+        peer_id: PeerId,
+        /// Concrete addresses to dial (e.g. circuits via each advertised relay).
+        addrs: Vec<Multiaddr>,
         /// Oneshot for reply
         reply: oneshot::Sender<NetworkResult<()>>,
     },

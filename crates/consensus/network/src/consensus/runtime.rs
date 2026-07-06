@@ -63,7 +63,7 @@ where
                     }
                 },
                 command = self.commands.recv() => match command {
-                    Some(c) => self.process_command(c).inspect_err(|e| {
+                    Some(c) => self.process_command(c).await.inspect_err(|e| {
                         error!(target: "network", ?e, "network command error")
                     })?,
                     None => {

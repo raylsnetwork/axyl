@@ -183,6 +183,7 @@ relay_seed_hex() {
 start_relays() {
     local ROOTDIR="$scriptDir/local-validators"
     RELAY_B_ADDR=()
+    RELAY_A_ADDR=()
     for ((i=0; i<NUM_VALIDATORS; i++)); do
         # primary relay (identity must match the baked node-info addresses)
         local port=$((RELAY_BASE_PORT + i))
@@ -193,6 +194,8 @@ start_relays() {
             "$scriptDir/../../target/${BUILD_CONFIG}/rayls-relay" \
             >> "${ROOTDIR}/relay-$((i+1)).log" 2>&1 &
         echo $! > "${ROOTDIR}/relay-$((i+1)).pid"
+        # base dialable address of this primary relay (used by the /dnsaddr TXT records + env)
+        RELAY_A_ADDR[$i]="/ip4/${RELAY_HOST}/udp/${port}/quic-v1/p2p/${RELAY_PEER_IDS[$i]}"
 
         # backup relay (distinct fixed seed byte 0xb0+i; peer id read from its log)
         local b_port=$((RELAY_B_BASE_PORT + i))
@@ -216,6 +219,40 @@ start_relays() {
         echo "Starting relay-$((i+1))-b (backup) on ${RELAY_HOST}:${b_port} (peer ${b_peer})"
     done
     # Give relays a moment to bind before validators try to reserve/dial through them.
+    sleep 1
+}
+
+# Launch a local dnsmasq (high port, no systemd-resolved/NetworkManager conflict) that resolves
+# each validator's /dnsaddr/v<i>.${RELAY_DNS_DOMAIN} to BOTH its relays (primary + backup), for its
+# primary and worker peer ids. Requires RELAY_A_ADDR/RELAY_B_ADDR (set by start_relays). This is the
+# advertisement half that lets peers fail over to the backup relay.
+start_dnsmasq() {
+    local ROOTDIR="$scriptDir/local-validators"
+    command -v dnsmasq >/dev/null 2>&1 || { echo "Error: dnsmasq not found; install it or run --relay (without -dns)."; exit 1; }
+    # --conf-file=/dev/null + --no-hosts: ignore the system dnsmasq config and /etc/hosts so this
+    # instance serves ONLY our TXT records (avoids interference from /etc/dnsmasq.conf and
+    # /etc/dnsmasq.d/* on the host). --log-queries: show each lookup so failures are visible.
+    local args=(
+        --no-daemon --conf-file=/dev/null --no-resolv --no-hosts --log-queries
+        --port="$DNSMASQ_PORT" --listen-address=127.0.0.1 --bind-interfaces
+    )
+    for ((i=0; i<NUM_VALIDATORS; i++)); do
+        local host="v$((i+1)).${RELAY_DNS_DOMAIN}"
+        local ninfo="${ROOTDIR}/${VALIDATORS[$i]}/node-info.yaml"
+        # primary + worker peer ids = the trailing /p2p/<id> of the two /dnsaddr addresses baked
+        # into node-info (primary listed first, worker second).
+        local ids
+        mapfile -t ids < <(grep -oE '/p2p/12D3KooW[A-Za-z0-9]+' "$ninfo" | grep -oE '12D3KooW[A-Za-z0-9]+')
+        local dst
+        for dst in "${ids[0]}" "${ids[1]}"; do
+            [[ -n "$dst" ]] || { echo "Error: could not read peer id from $ninfo"; exit 1; }
+            args+=(--txt-record="_dnsaddr.${host},dnsaddr=${RELAY_A_ADDR[$i]}/p2p-circuit/p2p/${dst}")
+            args+=(--txt-record="_dnsaddr.${host},dnsaddr=${RELAY_B_ADDR[$i]}/p2p-circuit/p2p/${dst}")
+        done
+        echo "dnsmasq: ${host} -> relay ${RELAY_A_ADDR[$i]%%/p2p*}.. + backup ${RELAY_B_ADDR[$i]%%/p2p*}.."
+    done
+    dnsmasq "${args[@]}" >> "${ROOTDIR}/dnsmasq.log" 2>&1 &
+    echo $! > "${ROOTDIR}/dnsmasq.pid"
     sleep 1
 }
 
@@ -249,6 +286,13 @@ while [ "$1" != "" ]; do
                 ;;
         --relay )
                 RELAY_MODE=true
+                ;;
+        --relay-dns )
+                # Full peer-failover variant: validators advertise a /dnsaddr name that a local
+                # dnsmasq resolves to BOTH their relays, so peers fail over to the backup relay when
+                # the primary dies. Implies --relay (primary + backup relays are still spawned).
+                RELAY_MODE=true
+                RELAY_DNS_MODE=true
                 ;;
         * )     echo "Invalid option: $1"
                 exit 1
@@ -310,6 +354,10 @@ RELAY_BASE_PORT=50000
 # (relay-N-b) instead of shutting down -- that's the multi-reservation failover test. (Peers won't
 # re-reach it via the backup without /dnsaddr advertisement; the network continues on quorum.)
 RELAY_B_BASE_PORT=51000
+# --relay-dns only: validators advertise /dnsaddr/v<i>.${RELAY_DNS_DOMAIN}, resolved by a local
+# dnsmasq on 127.0.0.1:${DNSMASQ_PORT} (high port, no systemd-resolved/NetworkManager conflict).
+RELAY_DNS_DOMAIN="rayls.test"
+DNSMASQ_PORT=5353
 RELAY_PEER_IDS=(
     "12D3KooWK99VoVxNE7XzyBwXEzW7xhK7Gpv85r9F3V3fyKSUKPH5" # validator-1 relay @ 127.0.0.1:50000 (seed 0x01*32)
     "12D3KooWJWoaqZhDaoEFshF7Rh1bpY9ohihFhzcW6d69Lr2NASuq" # validator-2 relay @ 127.0.0.1:50001 (seed 0x02*32)
@@ -412,7 +460,11 @@ else
         # In relay mode, derive this validator's relay address from its index and pass it to keytool
         # so its advertised primary/worker addresses become <relay>/p2p-circuit/p2p/<node-key>.
         RELAY_ARGS=()
-        if [[ "$RELAY_MODE" == "true" ]]; then
+        if [[ "$RELAY_DNS_MODE" == "true" ]]; then
+            # Advertise via /dnsaddr; the concrete relays to reserve on are supplied at runtime.
+            RELAY_ARGS=(--advertise-dnsaddr "v$((i+1)).${RELAY_DNS_DOMAIN}")
+            echo "creating validator keys/info for ${VALIDATOR} (advertise /dnsaddr/v$((i+1)).${RELAY_DNS_DOMAIN})"
+        elif [[ "$RELAY_MODE" == "true" ]]; then
             RELAY_PEER_ID="${RELAY_PEER_IDS[$i]}"
             if [[ -z "$RELAY_PEER_ID" || "$RELAY_PEER_ID" == REPLACE_WITH_* ]]; then
                 echo "Error: --relay set but RELAY_PEER_IDS[$i] is not filled in for ${VALIDATOR}."
@@ -525,6 +577,10 @@ if [ "$START" = true ]; then
     if [[ "$RELAY_MODE" == "true" ]]; then
         start_relays
     fi
+    # In /dnsaddr mode, start the resolver that maps each validator's /dnsaddr to both its relays.
+    if [[ "$RELAY_DNS_MODE" == "true" ]]; then
+        start_dnsmasq
+    fi
 
     for ((i=0; i<$NUM_VALIDATORS; i++)); do
         VALIDATOR="${VALIDATORS[$i]}"
@@ -543,7 +599,15 @@ if [ "$START" = true ]; then
         # losing its primary relay). Passed as env assignments via `env` so the big command below
         # stays unchanged.
         RELAY_ENV=()
-        if [[ "$RELAY_MODE" == "true" ]]; then
+        if [[ "$RELAY_DNS_MODE" == "true" ]]; then
+            # node-info advertises /dnsaddr (not listened on), so reserve on BOTH relays via env,
+            # and resolve /dnsaddr against the local dnsmasq.
+            RELAY_ENV=(
+                "RAYLS_DNS_SERVER=127.0.0.1:${DNSMASQ_PORT}"
+                "PRIMARY_RELAY_MULTIADDRS=${RELAY_A_ADDR[$i]},${RELAY_B_ADDR[$i]}"
+                "WORKER_RELAY_MULTIADDRS=${RELAY_A_ADDR[$i]},${RELAY_B_ADDR[$i]}"
+            )
+        elif [[ "$RELAY_MODE" == "true" ]]; then
             RELAY_ENV=(
                 "PRIMARY_RELAY_MULTIADDRS=${RELAY_B_ADDR[$i]}"
                 "WORKER_RELAY_MULTIADDRS=${RELAY_B_ADDR[$i]}"
@@ -591,8 +655,15 @@ if [ "$START" = true ]; then
             OBSERVER_RPC_PORT=$((8545-NUM_VALIDATORS-o))
             OBSERVER_WS_PORT=$((8556-NUM_VALIDATORS-o))
             OBSERVER_METRICS="127.0.0.1:910$((NUM_VALIDATORS+o))"
-            echo "Starting $OBSERVER in background, rpc http://localhost:$OBSERVER_RPC_PORT ws ws://localhost:$OBSERVER_WS_PORT"
-            "$scriptDir/../../target/${BUILD_CONFIG}/rayls-network" node \
+            # In /dnsaddr mode the observer must also resolve committee `/dnsaddr` addresses against
+            # the local dnsmasq -- otherwise it queries the system/public resolver, gets NXDomain
+            # for *.rayls.test, resolves no circuits, and never connects to the committee. Observers
+            # don't reserve on relays (peers don't dial them), so only the resolver env is needed.
+            OBSERVER_ENV=()
+            if [[ "$RELAY_DNS_MODE" == "true" ]]; then
+                OBSERVER_ENV=("RAYLS_DNS_SERVER=127.0.0.1:${DNSMASQ_PORT}")
+            fi
+            env "${OBSERVER_ENV[@]}" "$scriptDir/../../target/${BUILD_CONFIG}/rayls-network" node \
                 --datadir "${ROOTDIR}/${OBSERVER}" \
                 --observer \
                 --instance "${OBSERVER_INSTANCE}" \
@@ -630,9 +701,16 @@ if [ "$START" = true ]; then
     TOTAL_NODES=$((NUM_VALIDATORS+NUM_OBSERVERS))
     if [[ "$RELAY_MODE" == "true" ]]; then
         echo "$TOTAL_NODES nodes + $((NUM_VALIDATORS * 2)) relays (primary + backup per validator) started in background."
-        echo "Failover test: kill validator-1's PRIMARY relay with 'kill \$(cat ${ROOTDIR}/relay-1.pid)'"
-        echo "  and confirm ${VALIDATORS[0]} stays up (it keeps its backup reservation on relay-1-b)."
-        echo "Bring it all down with 'killall rayls-network rayls-relay'."
+        if [[ "$RELAY_DNS_MODE" == "true" ]]; then
+            echo "Full-failover test (/dnsaddr via dnsmasq on :${DNSMASQ_PORT}):"
+            echo "  kill validator-1's PRIMARY relay: 'kill \$(cat ${ROOTDIR}/relay-1.pid)'"
+            echo "  peers re-resolve /dnsaddr and reconnect to ${VALIDATORS[0]} via relay-1-b -- it stays in the committee."
+            echo "Bring it all down with 'killall rayls-network rayls-relay dnsmasq'."
+        else
+            echo "Failover test: kill validator-1's PRIMARY relay with 'kill \$(cat ${ROOTDIR}/relay-1.pid)'"
+            echo "  and confirm ${VALIDATORS[0]} stays up (it keeps its backup reservation on relay-1-b)."
+            echo "Bring it all down with 'killall rayls-network rayls-relay'."
+        fi
     else
         echo "$TOTAL_NODES nodes started in background, \
     use 'killall rayls-network' to bring the test network down"

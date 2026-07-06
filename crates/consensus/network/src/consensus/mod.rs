@@ -134,4 +134,7 @@ where
     /// Active listener ids for relay reservations, mapped to the address they serve, so a
     /// `ListenerClosed` can be tied back to the relay address that needs re-listening.
     relay_listeners: HashMap<ListenerId, Multiaddr>,
+    /// Resolver for `/dnsaddr` committee peers, used to discover (and exempt) the relays a node
+    /// dials through -- so the relay set is learned from DNS rather than configured.
+    relay_resolver: hickory_resolver::TokioResolver,
 }

@@ -26,6 +26,8 @@ LOG_LEVEL="${LOG_LEVEL:-info}"
 # Relay ip/port convention must match local-testnet.sh.
 RELAY_HOST="127.0.0.1"
 RELAY_BASE_PORT=50000
+# Local dnsmasq port used by --relay-dns (must match local-testnet.sh's DNSMASQ_PORT).
+DNSMASQ_PORT="${DNSMASQ_PORT:-5353}"
 
 idx=$((NODE_NUM - 1))
 RELAY_PORT=$((RELAY_BASE_PORT + idx))
@@ -89,9 +91,20 @@ cp "${ROOTDIR}/genesis/genesis.yaml" "${DATADIR}/genesis/"
 cp "${ROOTDIR}/genesis/committee.yaml" "${DATADIR}/genesis/"
 cp "${ROOTDIR}/parameters.yaml" "${DATADIR}/"
 
+# If the network was started with --relay-dns, committee members are advertised as /dnsaddr and can
+# only be resolved against the local dnsmasq -- otherwise this node queries the system/public
+# resolver, gets NXDomain for *.rayls.test, resolves no circuit addresses, and never connects. Point
+# it at 127.0.0.1:$DNSMASQ_PORT like the base validators/observer do. This node's own address is a
+# concrete circuit (--relay above), so no DNS records are needed for it.
+NODE_ENV=()
+if grep -q '/dnsaddr/' "${DATADIR}/genesis/committee.yaml"; then
+    echo "committee uses /dnsaddr -> resolving via local dnsmasq at 127.0.0.1:${DNSMASQ_PORT}"
+    NODE_ENV=("RAYLS_DNS_SERVER=127.0.0.1:${DNSMASQ_PORT}")
+fi
+
 # --- 4. start the node; it dials the committee (via their relays) and syncs ---
 echo "Starting ${NODE_NAME} (instance ${INSTANCE}, rpc http://localhost:${HTTP_PORT} ws ws://localhost:${WS_PORT})..."
-"$BIN" node \
+env "${NODE_ENV[@]}" "$BIN" node \
     --datadir "$DATADIR" \
     --observer \
     --instance "$INSTANCE" \

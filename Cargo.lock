@@ -7927,6 +7927,7 @@ dependencies = [
  "bs58",
  "eyre",
  "futures",
+ "hickory-resolver",
  "libp2p",
  "prometheus",
  "rand 0.9.3",
