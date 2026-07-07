@@ -1,7 +1,13 @@
 name: Claude Code Review
 
+# Uses pull_request_target (not pull_request) so the job runs in the BASE repo
+# context and can access secrets + id-token on PRs from forks. Because that
+# grants secrets to a workflow that checks out untrusted fork code, the job is
+# gated (see `if:` below) to authors we trust, and only ever runs read-only
+# review tools. Fork PRs from anyone else fall back to the `@claude` mention
+# flow in claude.yml, which a maintainer triggers after eyeballing the diff.
 on:
-  pull_request:
+  pull_request_target:
     types: [opened, synchronize, ready_for_review, reopened]
     # Optional: Only run on specific file changes
     # paths:
@@ -12,10 +18,11 @@ on:
 
 jobs:
   claude-review:
-    # Optional: Filter by PR author
-    # if: |
-    #   github.event.pull_request.user.login == 'external-contributor' ||
-    #   github.event.pull_request.user.login == 'new-developer' ||
+    # Only auto-review same-repo PRs, or fork PRs from trusted authors (org
+    # members / collaborators). Everyone else uses the @claude mention flow.
+    if: >
+      github.event.pull_request.head.repo.full_name == github.repository ||
+      contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.pull_request.author_association)
 
     runs-on: ubuntu-latest
     permissions:
@@ -29,6 +36,9 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
+          # pull_request_target checks out the base by default; the `if:` gate
+          # above restricts this to trusted authors' PRs.
+          ref: ${{ github.event.pull_request.head.sha }}
           fetch-depth: 1
 
       - name: Run Claude Code Review
