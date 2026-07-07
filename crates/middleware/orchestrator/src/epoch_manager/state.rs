@@ -145,9 +145,12 @@ where
             }
             prev.digest()
         };
-        // Use deterministic sources: boundary_consensus_hash from the boundary
-        // output (immutable) and recent_blocks (stable after flush).
-        let parent_state = self.consensus_bus.recent_blocks().borrow().latest_block_num_hash();
+        // Use deterministic sources: boundary_consensus_hash from the boundary output (immutable)
+        // and the durable canonical tip. Read the reth canonical head directly rather than the
+        // in-memory recent_blocks (which is fed asynchronously by the engine-update task): the tip
+        // is the epoch-closing block the engine finalized before this runs, so parent_state is
+        // deterministic and race-free — and identical to the value the pre-anchor code committed.
+        let parent_state = engine.get_reth_env().await.canonical_tip().num_hash();
 
         let epoch_rec = EpochRecord {
             epoch,

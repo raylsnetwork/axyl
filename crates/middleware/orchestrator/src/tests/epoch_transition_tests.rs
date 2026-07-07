@@ -479,49 +479,12 @@ fn test_checkpoint_enables_epoch_record_recovery() {
     assert!(needs_clear, "crash before Cleared requires table clear + epoch record");
 }
 
-// ---------------------------------------------------------------------------
-// RANK 4 (MEDIUM): close_epoch vs spawn_engine_update_task Race
-// ---------------------------------------------------------------------------
-// The engine_update_task is node-scoped and continues after epoch shutdown.
-// If it writes a block from the old epoch after reset_for_epoch() clears
-// recent_blocks, the new epoch sees wrong state. The sequential phase design
-// fixes this by explicitly updating recent_blocks in close_epoch() before
-// the update task can race.
-
-/// RANK 4: Verify sequential phases prevent recent_blocks race.
-///
-/// In the new design, close_epoch() explicitly updates recent_blocks with the
-/// epoch-closing block BEFORE the engine_update_task can interfere. This test
-/// verifies that recent_blocks correctly reflects an explicit update.
-#[tokio::test]
-async fn test_sequential_execution_phase_prevents_recent_blocks_race() {
-    let bus = ConsensusBus::new();
-
-    // Simulate the engine_update_task writing a block.
-    let header1 = rayls_infrastructure_types::SealedHeader::seal_slow(
-        rayls_infrastructure_types::ExecHeader::default(),
-    );
-    bus.recent_blocks().send_modify(|blocks| blocks.push_latest(header1.clone()));
-
-    assert_eq!(bus.recent_blocks().borrow().latest_block_num_hash().number, 0);
-
-    // In the new design, close_epoch() explicitly pushes the closing block.
-    // This happens in the sequential ExecutionComplete phase, BEFORE any
-    // concurrent task can interfere.
-    let closing_header = {
-        let mut h = rayls_infrastructure_types::ExecHeader::default();
-        h.number = 100;
-        rayls_infrastructure_types::SealedHeader::seal_slow(h)
-    };
-    bus.recent_blocks().send_modify(|blocks| blocks.push_latest(closing_header.clone()));
-
-    // Verify the closing block is the latest.
-    assert_eq!(
-        bus.recent_blocks().borrow().latest_block_num_hash().number,
-        100,
-        "recent_blocks must reflect the epoch-closing block after explicit update"
-    );
-}
+// The former RANK 4 test (`test_sequential_execution_phase_prevents_recent_blocks_race`) was
+// removed: it guarded a race where `spawn_engine_update_task` could write a stale block into
+// `recent_blocks` and corrupt the epoch record's `parent_state`. That race no longer exists —
+// `write_epoch_record` now sources `parent_state` from the durable canonical tip
+// (`engine.get_reth_env().canonical_tip()`), not from the async-fed `recent_blocks`, so no
+// explicit push or sequential-phase ordering is needed to keep `parent_state` deterministic.
 
 /// RANK 4: Verify recent_blocks accurate after reset.
 ///

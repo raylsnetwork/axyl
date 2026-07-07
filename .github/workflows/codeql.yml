@@ -14,10 +14,12 @@ name: CodeQL
 permissions:
   contents: read
 
+# Runs on push to main + weekly, not on every PR: a full Rust extraction takes
+# ~40 min, CodeQL isn't a required check, and the Security > Code Scanning tab
+# is populated from main analyses (PR runs only add inline diff annotations).
+# Newly introduced issues are caught on merge to main + the weekly scan.
 on:
   push:
-    branches: [main]
-  pull_request:
     branches: [main]
   schedule:
     - cron: '0 6 * * 1' # 06:00 UTC every Monday
@@ -65,6 +67,18 @@ jobs:
         with:
           languages: ${{ matrix.language }}
           build-mode: ${{ matrix.build-mode }}
+          # Broader security coverage (default suite + extra security queries).
+          queries: security-extended
+          # Keep alerts on shipped code: drop test harnesses and fixtures.
+          # Note: inline #[cfg(test)] modules can't be path-excluded, but under
+          # build-mode: none the `test` cfg isn't enabled, so they aren't
+          # analyzed anyway — this targets the separate test dirs/crates.
+          config: |
+            paths-ignore:
+              - '**/tests/**'
+              - '**/benches/**'
+              - '**/examples/**'
+              - 'crates/testing/**'
 
       - name: Perform CodeQL analysis
         uses: github/codeql-action/analyze@54f647b7e1bb85c95cddabcd46b0c578ec92bc1a # v4.36.3

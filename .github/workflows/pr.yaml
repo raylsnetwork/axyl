@@ -6,6 +6,17 @@ on:
     branches:
       - main
 
+# Least privilege by default; the jobs that post PR comments re-grant
+# pull-requests: write in their own permissions block.
+permissions:
+  contents: read
+
+# Supersede in-flight runs when a PR is pushed/rebased instead of stacking
+# full build+test runs (the "require up-to-date branch" rule causes churn).
+concurrency:
+  group: pr-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   CARGO_INCREMENTAL: 0 # disable incremental compilation
   RUSTFLAGS: ""
@@ -120,7 +131,8 @@ jobs:
         run: |
           if [ -f trivy-results.txt ]; then
             echo "results<<EOF" >> $GITHUB_OUTPUT
-            cat trivy-results.txt >> $GITHUB_OUTPUT
+            # cap output so the sticky comment stays under GitHub's 65536-char limit
+            tail -c 60000 trivy-results.txt >> $GITHUB_OUTPUT
             echo "EOF" >> $GITHUB_OUTPUT
           else
             echo "results=No scan results available" >> $GITHUB_OUTPUT

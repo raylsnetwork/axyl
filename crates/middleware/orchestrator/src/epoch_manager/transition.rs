@@ -356,19 +356,14 @@ where
             EpochTransitionPhase::BoundaryDetected
             | EpochTransitionPhase::Draining
             | EpochTransitionPhase::ConsensusShutdown => {
-                // For early phases, the engine may or may not have received the
-                // boundary output. Check if execution already completed for the
-                // target hash by inspecting recent_blocks.
-                let latest = self.consensus_bus.recent_blocks().borrow().latest_block();
-                let execution_done =
-                    if latest.parent_beacon_block_root == Some(checkpoint.target_hash) {
-                        true
-                    } else {
-                        // recent_blocks is in-memory and may be stale after a crash.
-                        // Fall back to the persisted execution state as the source of truth.
-                        let tip_state = engine.epoch_state_from_canonical_tip().await?;
-                        tip_state.epoch > epoch
-                    };
+                // For early phases the engine may or may not have executed the boundary output.
+                // Decide from the durable execution state: the boundary output runs concludeEpoch,
+                // so if the closing epoch executed, the canonical tip's epoch state has advanced
+                // past it. (The former recent_blocks/parent_beacon fast-path was dead here —
+                // recent_blocks is empty this early in startup, before any replay — and fragile: a
+                // drained parked batch makes the tip's beacon differ from target_hash.)
+                let tip_state = engine.epoch_state_from_canonical_tip().await?;
+                let execution_done = tip_state.epoch > epoch;
 
                 if execution_done {
                     info!(target: "epoch-manager", "recovery: execution already complete for target hash");

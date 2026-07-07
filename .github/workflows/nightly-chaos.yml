@@ -64,7 +64,11 @@ jobs:
       # their own), so the test process itself must be root. `rustup which cargo`
       # resolves the toolchain binary as the runner user; sudo -E then runs it
       # as root with the environment (PATH, HOME, CARGO_HOME) preserved.
+      # Pass the dispatch input via env (not templated into the script) so it's
+      # treated as data, not shell code. Left unquoted so empty = run all.
       - name: Run chaos scenarios
+        env:
+          TEST: ${{ github.event.inputs.test }}
         run: |
           sudo -E "$(rustup which cargo)" test -p chaos-framework --test chaos_scenarios \
-            -- --ignored --exact --test-threads 1 ${{ github.event.inputs.test }}
+            -- --ignored --exact --test-threads 1 $TEST

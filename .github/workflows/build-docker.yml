@@ -73,13 +73,23 @@ jobs:
         env:
           INPUT_TAG: ${{ inputs.tag }}
         run: |
-          if [ "${{ github.event_name }}" = "push" ]; then
-            # Automatic release on a v* tag -> devnet image.
-            VERSION="${GITHUB_REF#refs/tags/}"
-            TAG="devnet-$VERSION"
-          else
+          if [ -n "$INPUT_TAG" ]; then
             # workflow_dispatch / workflow_call -> caller-supplied tag, as-is.
+            # Keyed off INPUT_TAG (not github.event_name) so a workflow_call from
+            # a push-triggered caller (tag-on-release.yml) still lands here —
+            # there github.event_name is 'push' but no v* tag was pushed.
             TAG="$INPUT_TAG"
+          else
+            # Direct v* tag push -> devnet image. Guard that the tag matches the
+            # committed workspace version so a hand-pushed tag can't mislabel the
+            # image (the automated path builds the two in lockstep already).
+            VERSION="${GITHUB_REF#refs/tags/}"
+            CARGO_VER=$(awk -F'"' '/^\[workspace\.package\]/{f=1} f&&/^version = "/{print $2; exit}' Cargo.toml)
+            if [ "$VERSION" != "v$CARGO_VER" ]; then
+              echo "::error::pushed tag $VERSION does not match Cargo.toml version v$CARGO_VER"
+              exit 1
+            fi
+            TAG="devnet-$VERSION"
           fi
 
           SHA="$(git rev-parse HEAD)"

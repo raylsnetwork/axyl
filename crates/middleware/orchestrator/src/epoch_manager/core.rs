@@ -24,10 +24,10 @@ use rayls_execution_evm::{reth_env::RethEnv, system_calls::EpochState};
 use rayls_infrastructure_config::{KeyConfig, LibP2pConfig, NetworkConfig, RaylsDirs};
 use rayls_infrastructure_storage::{tables::ConsensusBlocks, EpochStore as _};
 use rayls_infrastructure_types::{
-    error::HeaderError, gas_accumulator::GasAccumulator, BlockNumHash, BlsAggregateSignature,
-    BlsPublicKey, BlsSignature, CameFrom, ConsensusOutput, Database as ReDatabase, Epoch,
-    EpochCertificate, EpochRecord, EpochVote, Noticer, Notifier, RaylsReceiver, RaylsSender,
-    TaskJoinError, TaskKind, TaskManager, VotesAggregator, B256,
+    error::HeaderError, gas_accumulator::GasAccumulator, BlsAggregateSignature, BlsPublicKey,
+    BlsSignature, CameFrom, ConsensusOutput, Database as ReDatabase, Epoch, EpochCertificate,
+    EpochRecord, EpochVote, Noticer, Notifier, RaylsReceiver, RaylsSender, TaskJoinError, TaskKind,
+    TaskManager, VotesAggregator, B256,
 };
 use rayls_middleware_processor::{batch::BatchOrdering, reconstruct_batch_digests};
 use std::{
@@ -36,7 +36,6 @@ use std::{
     time::Duration,
 };
 use tokio::sync::{mpsc, oneshot, watch};
-use tokio_stream::StreamExt;
 use tracing::{debug, error, info, warn};
 
 /// Number of recent EVM blocks scanned to recover the restart execution anchor.
@@ -1158,11 +1157,13 @@ where
         Err(eyre::eyre!("consensus output channel closed before epoch boundary"))
     }
 
-    /// Wait for the engine to execute the epoch-closing block.
+    /// Wait for the engine to execute the epoch-closing boundary output.
     ///
-    /// This sends the boundary output to the engine and waits for the execution
-    /// result identified by `target_hash` in the block's `parent_beacon_block_root`.
-    /// Consensus shutdown must already be complete before calling this.
+    /// Sends the boundary output to the engine, then subscribes to the `executed_anchor` watch and
+    /// waits until `anchor.number >= boundary_output.number` — a monotonic, drop-free completion
+    /// signal, immune to which block ends up the canonical tip (e.g. a drained parked batch, whose
+    /// block anchors to a previous output). `target_hash` is used only for diagnostics, not
+    /// matching. Consensus shutdown must already be complete before calling this.
     pub(super) async fn await_epoch_execution(
         &self,
         engine: &ExecutionNode,
@@ -1170,61 +1171,52 @@ where
         boundary_output: ConsensusOutput,
         gas_accumulator: &GasAccumulator,
         target_hash: B256,
-    ) -> eyre::Result<BlockNumHash> {
-        // subscribe to engine blocks to confirm epoch closed on-chain
-        let mut executed_output = engine.canonical_block_stream().await;
+    ) -> eyre::Result<()> {
+        // Anchor on execution PROGRESS (the boundary output's number), NOT on a block's
+        // `parent_beacon_block_root`. The engine advances `executed_anchor` to each output's own
+        // consensus header as it finishes executing it, so `anchor.number >= boundary.number` is an
+        // unambiguous, monotonic completion signal. Matching a block's beacon instead fails when
+        // the boundary output drains a previously-parked batch: that block lands as the
+        // canonical tip but anchors to its ORIGIN output, so the tip's beacon never equals
+        // `target_hash` and the old loop timed out (network-wide) even though the output
+        // HAD executed. `executed_anchor` is a `watch`, so it also can't silently drop like
+        // the canonical broadcast stream.
+        let boundary_number = boundary_output.number;
+
+        // Subscribe BEFORE sending so we cannot miss the anchor update for the boundary output.
+        let mut anchor_rx = self.consensus_bus.executed_anchor().subscribe();
 
         // send the boundary output to the engine for execution
         to_engine.send((CameFrom::AwaitEpochExecution, boundary_output)).await?;
 
-        let latest = self.consensus_bus.recent_blocks().borrow().latest_block();
-        // DIAGNOSTIC: what did the one-shot fast-path see, and does it match target_hash?
-        info!(
-            target: "epoch-manager",
-            latest_number = latest.number,
-            latest_parent_beacon = ?latest.parent_beacon_block_root,
-            ?target_hash,
-            matched = latest.parent_beacon_block_root == Some(target_hash),
-            "await_epoch_execution: initial latest check"
-        );
-        // If we have already caught up execution then we are good, skip below loop.
-        if latest.parent_beacon_block_root == Some(target_hash) {
-            self.adjust_base_fees(gas_accumulator, latest.number);
-            gas_accumulator.clear();
-            return Ok(latest.num_hash());
-        }
-
-        // wait for execution result before proceeding
-        while let Some(output) = executed_output.next().await {
-            // DIAGNOSTIC: log every canon notification this subscription receives, so a stall
-            // (no log before the 180s timeout) is distinguishable from a mis-match (logged but
-            // parent_beacon != target_hash / tip is not the boundary block).
-            let tip_hdr = output.tip().sealed_header();
+        loop {
+            let anchor_number = anchor_rx.borrow_and_update().number;
             info!(
                 target: "epoch-manager",
-                tip = ?output.tip().num_hash(),
-                tip_parent_beacon = ?tip_hdr.parent_beacon_block_root,
+                anchor_number,
+                boundary_number,
                 ?target_hash,
-                matched = tip_hdr.parent_beacon_block_root == Some(target_hash),
-                "await_epoch_execution: received canon notification"
+                reached = anchor_number >= boundary_number,
+                "await_epoch_execution: executed-anchor check"
             );
-            if output.tip().sealed_header().parent_beacon_block_root == Some(target_hash) {
-                // Ensure recent_blocks reflects the epoch-closing block.
-                let tip_number = output.tip().sealed_header().number;
-                self.consensus_bus
-                    .recent_blocks()
-                    .send_modify(|blocks| blocks.push_latest(output.tip().clone_sealed_header()));
+            // Boundary output (and everything before it) has executed.
+            if anchor_number >= boundary_number {
+                // adjust base fees against the resulting EVM tip, then clear the accumulator.
+                let tip_number = engine.get_reth_env().await.canonical_tip().number;
                 self.adjust_base_fees(gas_accumulator, tip_number);
                 gas_accumulator.clear();
-                return Ok(output.tip().num_hash());
+                return Ok(());
+            }
+            // Wait for the next anchor advance. An error means the sender was dropped — the engine
+            // task is gone, so execution can never complete.
+            if anchor_rx.changed().await.is_err() {
+                error!(
+                    target: "epoch-manager",
+                    "executed_anchor sender dropped while awaiting engine execution for closing epoch",
+                );
+                return Err(eyre!("engine failed to report execution for closing epoch"));
             }
         }
-
-        error!(
-            target: "epoch-manager",
-            "canon state notifications dropped while awaiting engine execution for closing epoch",
-        );
-        Err(eyre!("engine failed to report output for closing epoch"))
     }
 }
 
