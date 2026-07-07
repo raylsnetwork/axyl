@@ -30,8 +30,12 @@ jobs:
   bump:
     name: Bump ${{ inputs.bump }} and open PR
     runs-on: ubuntu-latest
-    # Only named release managers may cut a release.
-    if: contains(fromJSON(vars.RELEASE_ACTORS || '[]'), github.actor)
+    # Only the canonical org repo (never a fork) AND only a named release
+    # manager may cut a release. The repository_owner check is a fork guard,
+    # not a membership check; actor gating is what restricts to specific people.
+    if: >
+      github.repository_owner == 'raylsnetwork' &&
+      contains(fromJSON(vars.RELEASE_ACTORS || '[]'), github.actor)
     steps:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
