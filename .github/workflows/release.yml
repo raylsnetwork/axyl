@@ -5,9 +5,11 @@ name: Release — bump version
 # Merging that PR triggers tag-on-release.yml, which tags v<version> and builds
 # the devnet image — so this workflow's only job is the version bump + PR.
 #
-# ACCESS: restricted to the logins in the RELEASE_ACTORS repo variable (a JSON
-# array, e.g. ["alice","bob"]). workflow_dispatch already requires write access;
-# this narrows it to named release managers and fails closed if the var is unset.
+# ACCESS: workflow_dispatch already requires write access to the repo, so only
+# collaborators / org members granted write can start a release. The job also
+# pins the canonical org repo (repository_owner) as a fork guard. To restrict
+# further to specific people, re-add an actor allowlist; to assert strict org
+# membership (excluding outside collaborators), a read:org PAT would be needed.
 
 on:
   workflow_dispatch:
@@ -30,12 +32,10 @@ jobs:
   bump:
     name: Bump ${{ inputs.bump }} and open PR
     runs-on: ubuntu-latest
-    # Only the canonical org repo (never a fork) AND only a named release
-    # manager may cut a release. The repository_owner check is a fork guard,
-    # not a membership check; actor gating is what restricts to specific people.
-    if: >
-      github.repository_owner == 'raylsnetwork' &&
-      contains(fromJSON(vars.RELEASE_ACTORS || '[]'), github.actor)
+    # Fork guard: only run on the canonical org repo. Who may trigger is already
+    # bounded by workflow_dispatch's write-access requirement (i.e. org members
+    # / collaborators with write), so no separate actor allowlist is enforced.
+    if: github.repository_owner == 'raylsnetwork'
     steps:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
