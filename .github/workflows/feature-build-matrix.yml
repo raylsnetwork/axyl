@@ -3,9 +3,9 @@ name: Feature Build Matrix
 # Builds the `rayls-network` binary across a matrix of cargo feature sets to catch
 # feature-gating breakage (a feature that doesn't compile alone, a conflicting
 # combination, or code gated behind the wrong feature). Mirrors the release build in
-# etc/docker-network/Dockerfile — same toolchain, system deps, and
-# `--release ${FEATURES:+--features ...}` invocation — so a green matrix means the
-# Docker image builds for every listed feature set.
+# etc/docker-network/Dockerfile — same toolchain and system deps, building
+# `--release` with each feature set — so a green matrix means the Docker image
+# builds for every listed feature set.
 #
 # Caching under a parallel matrix:
 #   * The `production` job builds the default-feature (shipping) binary AND warms the
@@ -38,7 +38,6 @@ env:
   CARGO_INCREMENTAL: 0
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
-  CARGO_PROFILE_DEV_DEBUG: 0
   # Route rustc through sccache and back it with the GitHub Actions cache.
   RUSTC_WRAPPER: sccache
   SCCACHE_GHA_ENABLED: "true"
@@ -85,6 +84,7 @@ jobs:
         run: cargo build --bin rayls-network --release --locked
 
       - name: sccache stats
+        if: always()
         run: sccache --show-stats
 
   variants:
@@ -97,14 +97,14 @@ jobs:
       matrix:
         include:
           - name: dev-single-node-setup
-            features: "dev-single-node-setup"
+            cargo_flags: "--features dev-single-node-setup"
           - name: faucet
-            features: "faucet"
+            cargo_flags: "--features faucet"
           - name: dev-and-faucet
-            features: "dev-single-node-setup,faucet"
+            cargo_flags: "--features dev-single-node-setup,faucet"
           # Guards against code that only compiles because a default feature is on.
           - name: no-default-features
-            features: "__NO_DEFAULT__"
+            cargo_flags: "--no-default-features"
     steps:
       - name: Checkout repository
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -137,14 +137,10 @@ jobs:
       - name: Build rayls-network (${{ matrix.name }})
         env:
           VERGEN_GIT_SHA: ${{ github.sha }}
-          FEATURES: ${{ matrix.features }}
-        run: |
-          if [ "$FEATURES" = "__NO_DEFAULT__" ]; then
-            cargo build --bin rayls-network --release --locked --no-default-features
-          else
-            # Same shape as the Dockerfile: only append --features when non-empty.
-            cargo build --bin rayls-network --release --locked ${FEATURES:+--features "$FEATURES"}
-          fi
+        # matrix.cargo_flags is a static, workflow-authored value (not user
+        # input), so expanding it into the run line is safe.
+        run: cargo build --bin rayls-network --release --locked ${{ matrix.cargo_flags }}
 
       - name: sccache stats
+        if: always()
         run: sccache --show-stats
