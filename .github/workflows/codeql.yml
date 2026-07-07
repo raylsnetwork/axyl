@@ -14,10 +14,12 @@ name: CodeQL
 permissions:
   contents: read
 
+# Runs on push to main + weekly, not on every PR: a full Rust extraction takes
+# ~40 min, CodeQL isn't a required check, and the Security > Code Scanning tab
+# is populated from main analyses (PR runs only add inline diff annotations).
+# Newly introduced issues are caught on merge to main + the weekly scan.
 on:
   push:
-    branches: [main]
-  pull_request:
     branches: [main]
   schedule:
     - cron: '0 6 * * 1' # 06:00 UTC every Monday
