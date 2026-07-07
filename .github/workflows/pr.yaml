@@ -52,7 +52,7 @@ jobs:
   # ===========================================================================
   tests:
     name: Tests
-    runs-on: ubuntu-latest-m
+    runs-on: ubuntu-latest
     steps:
       # exit immediately for drafts
       # - name: Check if draft PR
@@ -92,7 +92,7 @@ jobs:
   # ===========================================================================
   security-scan:
     name: Security Scan
-    runs-on: ubuntu-latest-m
+    runs-on: ubuntu-latest
     permissions:
       contents: read
       pull-requests: write

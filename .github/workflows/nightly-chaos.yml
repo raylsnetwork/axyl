@@ -37,7 +37,7 @@ env:
 jobs:
   chaos:
     name: Chaos scenarios
-    runs-on: ubuntu-latest-m
+    runs-on: ubuntu-latest
     timeout-minutes: 90
     steps:
       - name: Checkout repository
