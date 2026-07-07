@@ -67,6 +67,7 @@ jobs:
       mode: ${{ steps.plan.outputs.mode }}
       source_commit: ${{ steps.source.outputs.commit }}
       source_digest: ${{ steps.source.outputs.digest }}
+      rebuild_commit: ${{ steps.plan.outputs.rebuild_commit }}
     env:
       ECR_PRIVATE_REGISTRY: ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ vars.AWS_REGION_PRIVATE }}.amazonaws.com
     steps:
@@ -156,6 +157,7 @@ jobs:
       - name: Decide promotion strategy (re-tag vs rebuild)
         id: plan
         env:
+          GH_TOKEN: ${{ github.token }}
           REBUILD_REF: ${{ inputs.rebuild_ref }}
           SOURCE_COMMIT: ${{ steps.source.outputs.commit }}
         run: |
@@ -169,6 +171,12 @@ jobs:
           fi
 
           echo "mode=rebuild" >> $GITHUB_OUTPUT
+
+          # Resolve rebuild_ref to an immutable commit SHA. We build from this
+          # exact SHA (below) and the git-tag job tags the same SHA, so the image
+          # and the <stage>-v<version> git tag always agree on the commit.
+          REBUILD_COMMIT=$(gh api "repos/${{ github.repository }}/commits/$REBUILD_REF" --jq '.sha')
+          echo "rebuild_commit=$REBUILD_COMMIT" >> "$GITHUB_OUTPUT"
 
           # Sanity check: did chainspec.rs actually change vs the source build?
           # (rebuild proceeds regardless — this is a double-check, not a gate.)
@@ -306,5 +314,68 @@ jobs:
       id-token: write
     with:
       tag: ${{ needs.plan.outputs.target_tag }}
-      ref: ${{ inputs.rebuild_ref }}
+      # Build from the resolved SHA (not the branch), so the image and the
+      # git tag created afterwards point at the exact same commit.
+      ref: ${{ needs.plan.outputs.rebuild_commit }}
     secrets: inherit
+
+  # ===========================================================================
+  # GIT TAG - mark the promoted commit as <stage>-v<version> (e.g. testnet-v1.2.3),
+  # in addition to the origin v<version> tag which is never moved. Runs on both
+  # paths: on a re-tag it points at the source image's build commit (correct even
+  # for chained promotions — read from the image's revision label); on a rebuild
+  # it points at the rebuilt commit.
+  #
+  # Create-only and never moved: skip if the tag already points at this commit,
+  # fail if it exists pointing elsewhere. (The tag ruleset also blocks moves and
+  # deletions on all tags, so this is belt-and-suspenders.) The <stage>- prefix
+  # means these tags never match build-docker's `tags: v*` trigger.
+  # ===========================================================================
+  git-tag:
+    name: Tag promoted commit
+    needs: [plan, retag, rebuild]
+    if: ${{ !failure() && !cancelled() && (needs.retag.result == 'success' || needs.rebuild.result == 'success') }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Create git tag ${{ needs.plan.outputs.target_tag }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ needs.plan.outputs.target_tag }}
+          MODE: ${{ needs.plan.outputs.mode }}
+          SOURCE_COMMIT: ${{ needs.plan.outputs.source_commit }}
+          REBUILD_COMMIT: ${{ needs.plan.outputs.rebuild_commit }}
+        run: |
+          set -euo pipefail
+          if [ "$MODE" = "rebuild" ]; then
+            COMMIT="$REBUILD_COMMIT"
+          else
+            COMMIT="$SOURCE_COMMIT"
+          fi
+
+          if [ -z "$COMMIT" ]; then
+            echo "::warning::no build commit for $TAG (source image missing the revision label?) — skipping git tag"
+            exit 0
+          fi
+
+          # Idempotent + never-move: resolve any existing tag to its commit.
+          CUR=$(gh api "repos/$REPO/commits/$TAG" --jq '.sha' 2>/dev/null || true)
+          if [ -n "$CUR" ]; then
+            if [ "$CUR" = "$COMMIT" ]; then
+              echo "Tag $TAG already points at $COMMIT — nothing to do."
+              exit 0
+            fi
+            echo "::error::$TAG already exists at $CUR but this promotion built $COMMIT. Refusing to move the tag."
+            exit 1
+          fi
+
+          # Annotated tag (matches v<version> created by tag-on-release.yml).
+          TAGOBJ=$(gh api --method POST "repos/$REPO/git/tags" \
+            -f tag="$TAG" -f message="Promotion $TAG (commit $COMMIT)" \
+            -f object="$COMMIT" -f type=commit --jq '.sha')
+          gh api --method POST "repos/$REPO/git/refs" \
+            -f ref="refs/tags/$TAG" -f sha="$TAGOBJ"
+          echo "Created git tag $TAG -> $COMMIT"
+          echo "**Git tag:** \`$TAG\` → \`$COMMIT\`" >> "$GITHUB_STEP_SUMMARY"
