@@ -1,0 +1,72 @@
+name: Tag & build release
+
+# When the shared workspace version changes on main (via the release PR from
+# release.yml, or any manual edit to [workspace.package].version), create tag
+# v<version> and build the devnet image.
+#
+# We invoke build-docker.yml directly (workflow_call) rather than relying on the
+# tag push to trigger it: a tag created with the default GITHUB_TOKEN does NOT
+# trigger other workflows (GitHub's anti-recursion rule), so the `push: tags`
+# trigger would never fire for an auto-created tag.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'Cargo.toml'
+
+permissions:
+  contents: write   # create & push the tag
+
+jobs:
+  tag:
+    name: Tag if version bumped
+    runs-on: ubuntu-latest
+    outputs:
+      released: ${{ steps.detect.outputs.released }}
+      version: ${{ steps.detect.outputs.version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 2   # need the parent commit to diff the version
+
+      - name: Detect version bump
+        id: detect
+        run: |
+          set -euo pipefail
+          NEW=$(awk -F'"' '/^\[workspace\.package\]/{f=1} f&&/^version = "/{print $2; exit}' Cargo.toml)
+          OLD=$(git show HEAD~1:Cargo.toml 2>/dev/null \
+                | awk -F'"' '/^\[workspace\.package\]/{f=1} f&&/^version = "/{print $2; exit}' || true)
+          echo "version=$NEW" >> "$GITHUB_OUTPUT"
+          if [ "$NEW" != "$OLD" ] && ! git rev-parse -q --verify "refs/tags/v$NEW" >/dev/null; then
+            echo "released=true" >> "$GITHUB_OUTPUT"
+            echo "Version changed ${OLD:-<none>} -> $NEW; will tag v$NEW"
+          else
+            echo "released=false" >> "$GITHUB_OUTPUT"
+            echo "No release: old=${OLD:-<none>} new=$NEW (unchanged, or tag v$NEW already exists)"
+          fi
+
+      - name: Create and push tag
+        if: steps.detect.outputs.released == 'true'
+        env:
+          V: ${{ steps.detect.outputs.version }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "v$V" -m "Release v$V"
+          git push origin "v$V"
+
+  build:
+    name: Build devnet image
+    needs: tag
+    if: needs.tag.outputs.released == 'true'
+    uses: ./.github/workflows/build-docker.yml
+    permissions:
+      contents: read
+      id-token: write
+    with:
+      tag: devnet-v${{ needs.tag.outputs.version }}
+      ref: v${{ needs.tag.outputs.version }}
+    secrets: inherit
