@@ -46,6 +46,11 @@ jobs:
         uses: anthropics/claude-code-action@fbda2eb1bdc90d319b8d853f5deb53bca199a7c1 # v1
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          # Use the workflow's GITHUB_TOKEN directly instead of the Claude
+          # GitHub App: the OIDC->app-token exchange 401s unless the app is
+          # installed on the org. The job already grants pull-requests: write,
+          # so this token can post review comments (as github-actions[bot]).
+          github_token: ${{ secrets.GITHUB_TOKEN }}
           show_full_output: true
           track_progress: true
           exclude_comments_by_actor: 'github-actions[bot]'
