@@ -48,7 +48,7 @@ jobs:
   # shared sccache + registry caches that the variant matrix reuses.
   production:
     name: production (default features + warm cache)
-    runs-on: ubuntu-latest-m
+    runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
       - name: Checkout repository
@@ -77,8 +77,7 @@ jobs:
           cache-on-failure: true
 
       - name: Set up sccache
-        # TODO: pin to a SHA to match the rest of the workflows in this repo.
-        uses: mozilla-actions/sccache-action@v0.0.9
+        uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
 
       - name: Build rayls-network (production, default features)
         env:
@@ -91,7 +90,7 @@ jobs:
   variants:
     name: build (${{ matrix.name }})
     needs: production
-    runs-on: ubuntu-latest-m
+    runs-on: ubuntu-latest
     timeout-minutes: 60
     strategy:
       fail-fast: false
@@ -133,8 +132,7 @@ jobs:
           save-if: false
 
       - name: Set up sccache
-        # TODO: pin to a SHA to match the rest of the workflows in this repo.
-        uses: mozilla-actions/sccache-action@v0.0.9
+        uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
 
       - name: Build rayls-network (${{ matrix.name }})
         env:
