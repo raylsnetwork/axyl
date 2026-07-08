@@ -611,19 +611,40 @@ impl RethEnv {
             })
             .collect();
 
-        // Idempotency guard: scan StoragesHistory for (addr, hashed_slot) pairs
-        // already containing `block`. Scoping the rocksdb reference ensures it's
-        // dropped before the write transaction is opened below.
-        let already_fixed: HashSet<(Address, B256)> = {
+        // Idempotency + safety guard: for each genesis (addr, hashed_slot), walk every
+        // shard for that key and skip it if it already carries any block number —
+        // whether that's `block` itself (a previous run already applied the fix) or
+        // some other block (real post-genesis writes reached this slot). Genesis-alloc
+        // offers no guarantee a slot stays static after genesis, and
+        // insert_storage_history's write is an upsert of the `last` shard, not an
+        // append: applying it to a slot that already has history — of either kind —
+        // would silently overwrite it. Walking shards per-key keeps this bounded to the
+        // genesis slots (not an O(N) scan of the whole StoragesHistory table) while
+        // staying correct. Scoping the rocksdb reference ensures it's dropped before
+        // the write transaction is opened below.
+        let (already_fixed, has_other_history): (HashSet<(Address, B256)>, HashSet<(Address, B256)>) = {
             let rocksdb = self.provider_factory.rocksdb_provider();
-            let mut set = HashSet::new();
-            for entry in rocksdb.iter::<reth_db::tables::StoragesHistory>()? {
-                let (key, value) = entry?;
-                if value.contains(block) {
-                    set.insert((key.address, key.sharded_key.key));
+            let mut fixed = HashSet::new();
+            let mut other = HashSet::new();
+            for (addr, account) in &rehashed {
+                let Some(storage) = account.storage.as_ref() else { continue };
+                for slot in storage.keys() {
+                    let shards = rocksdb.storage_history_shards(*addr, *slot)?;
+                    let (has_block, has_other) = shards
+                        .iter()
+                        .flat_map(|(_, list)| list.iter())
+                        .fold((false, false), |(has_block, has_other), b| {
+                            (has_block || b == block, has_other || b != block)
+                        });
+                    if has_block {
+                        fixed.insert((*addr, *slot));
+                    }
+                    if has_other {
+                        other.insert((*addr, *slot));
+                    }
                 }
             }
-            set
+            (fixed, other)
         };
 
         if !already_fixed.is_empty() {
@@ -632,13 +653,28 @@ impl RethEnv {
                 already_fixed = already_fixed.len(),
                 "idempotency: skipping slots already present in StoragesHistory at genesis block"
             );
+        }
+
+        if !has_other_history.is_empty() {
+            warn!(
+                target: "rayls::reth",
+                slots = has_other_history.len(),
+                block,
+                "genesis-alloc storage slots already have post-genesis history; skipping re-key \
+                 to avoid overwriting it (these slots turned out not to be static)"
+            );
+        }
+
+        let skip: HashSet<(Address, B256)> =
+            already_fixed.union(&has_other_history).copied().collect();
+
+        if !skip.is_empty() {
             for (addr, account) in &mut rehashed {
                 if let Some(storage) = account.storage.as_mut() {
-                    storage.retain(|slot, _| !already_fixed.contains(&(*addr, *slot)));
+                    storage.retain(|slot, _| !skip.contains(&(*addr, *slot)));
                 }
             }
-            rehashed
-                .retain(|(_, account)| account.storage.as_ref().map_or(false, |s| !s.is_empty()));
+            rehashed.retain(|(_, account)| account.storage.as_ref().is_some_and(|s| !s.is_empty()));
         }
 
         let slots: usize =
