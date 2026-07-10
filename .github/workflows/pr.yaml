@@ -90,11 +90,7 @@ jobs:
             cache-key: pr-tests-dev
             cmd: cargo test -p rayls-infrastructure-types -p rayls-consensus-primary -p rayls-middleware-orchestrator --features dev-single-node-setup -- --quiet --test-threads 1
           # archive-replay is an evm-crate-local feature — NOT reachable from the
-          # rayls-network bin, so the feature-build matrix can't cover it. It
-          # gates no dedicated tests, but `cargo test` here compile-checks the
-          # alternate reth_env / chainspec / block-execution paths and re-runs the
-          # evm suite through the feature-gated test_utils branches. This is the
-          # only place archive-replay gets any CI coverage.
+          # rayls-network bin, so the feature-build matrix can't cover it.
           - name: archive-replay
             cache-key: pr-tests-archive-replay
             cmd: cargo test -p rayls-execution-evm --features archive-replay -- --quiet --test-threads 1
@@ -131,6 +127,23 @@ jobs:
       # nextest discovers a different set of tests, which has caused divergence
       - name: Run tests
         run: ${{ matrix.cmd }}
+
+  # ===========================================================================
+  # TESTS GATE - stable required-check target
+  # ===========================================================================
+  tests-gate:
+    name: Tests
+    runs-on: ubuntu-latest
+    needs: tests
+    if: always()
+    steps:
+      - name: Verify all test legs passed
+        run: |
+          if [[ "${{ needs.tests.result }}" != "success" ]]; then
+            echo "One or more Tests matrix legs did not succeed (result: ${{ needs.tests.result }})."
+            exit 1
+          fi
+          echo "All Tests matrix legs passed."
 
   # ===========================================================================
   # SECURITY SCAN - Trivy vulnerability scanning (filesystem/code)
