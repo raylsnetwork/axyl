@@ -11,6 +11,15 @@ fi
 export RL_BLS_PASSPHRASE="$RL_BLS_PASSPHRASE"
 export RAYLS_NETWORK="$RAYLS_NETWORK"
 
+# `--full` prunes account/storage history to ~10k blocks. Set DISABLE_PRUNING=1
+# (in .env or inline) to run this observer as a full archive so its datadir can
+# seed `rayls-replay` with complete history.
+FULL_FLAG="--full"
+if [[ "$DISABLE_PRUNING" == "1" || "$DISABLE_PRUNING" == "true" ]]; then
+    FULL_FLAG=""
+    echo "DISABLE_PRUNING set: running observer as a full archive (no --full)"
+fi
+
 nodeNum="$1"
 if [[ "$nodeNum" == "" ]]; then
     echo -e "Error: You must specify the validator as 'start-local-observer.sh 1'";
@@ -26,7 +35,7 @@ rm -rf "$logFile"
             --instance "$nodeNum" \
             --metrics "127.0.0.1:910$nodeNum" \
             --log.stdout.format log-fmt \
-            --full \
+            ${FULL_FLAG} \
             --storage.v2 \
             --db.growth-step 1MB \
             --consensus-db.growth-step 1MB \
