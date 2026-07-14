@@ -1,0 +1,601 @@
+# Circuit-relay-v2 isolation testnet: the relay is the validator's ONLY network neighbor.
+#
+# Every validator runs alone in its own `internal: true` network (its "private VPC"): no published
+# ports and no route to any other validator. Its relay is dual-homed into the VPC's DMZ - one leg
+# on the public net (the address the committee advertises), one leg inside the VPC - and is the
+# validator's DEFAULT GATEWAY: every packet the validator sends physically enters its own relay
+# host first, and nothing can dial IN. There is no other egress (the former per-VPC NAT routers
+# are gone). All validator<->validator traffic transits a relay circuit. An observer on the
+# public network follows the chain purely through the relays and republishes RPC to the host: a
+# progressing chain on http://127.0.0.1:7545 is the end-to-end connectivity proof.
+#
+# The restriction is kernel-enforced on BOTH ends, not just observed:
+#   - validator OUTPUT policy DROP: only loopback, the own relay's DMZ leg, and relay :4001/udp
+#     endpoints (circuit first hops, which transit the gateway) are allowed out;
+#   - relay FORWARD policy DROP: the only thing forwarded for the validator is udp/4001 to the
+#     other relays' public legs (MASQUERADEd on the public leg), plus established replies;
+#   - validator INPUT policy DROP: only loopback and replies to its own outbound connections
+#     (circuit-relay-v2 needs no inbound flows at all - every circuit rides the validator's
+#     outbound reservation connection; Docker backends differ in how strictly they isolate
+#     bridge networks, e.g. OrbStack routes between them, hence in-container enforcement).
+#
+# NOTE: circuit-relay-v2 cannot chain relays, so a v1->v2 circuit must be addressed to v2's
+# relay (the one holding v2's reservation). Those flows still NAME foreign relay IPs, but every
+# packet of them transits - and is filtered by - the validator's own relay. The only machine a
+# validator can exchange packets with at the link level is its own relay.
+#
+#   vpc1 (internal, 10.10.1.0/24): validator1 (.10) --default route--> relay1 DMZ leg (.3)
+#   vpc2..vpc4:                    same shape (10.10.N.0/24)
+#   public (10.20.0.0/24):         relay1..relay4 public legs (static .11-.14)
+#                                  + dns (.53, A/TXT records for relay + observer names)
+#                                  + observer1 (.21, host RPC 7545) + observer2 (.22, host RPC 7544)
+#                                    both also behind round-robin rpc.rayls.test
+#
+# Committee creation matches local-testnet.sh --relay: keytool bakes a concrete
+# /ip4/<relay-public>/udp/4001/quic-v1/p2p/<relay-id>/p2p-circuit/p2p/<node-key> advertise
+# address into each node-info (via RL_RELAY_ADDR), the relays run the fixed test identities from
+# etc/test-network/RELAY_KEYS.md, and each validator reserves ONLY on its own relay's DMZ leg
+# (PRIMARY/WORKER_RELAY_MULTIADDRS; the advertised public form is skipped - the relay matches
+# circuits to reservations by peer id). Backup reservations on neighbor relays are gone: they
+# would violate the only-own-relay restriction, peers could never re-reach a node through them
+# anyway (that needs /dnsaddr advertisement), and a swarm with zero listeners but desired relay
+# reservations is a retried state, not a shutdown - so losing the relay just means waiting it
+# out. With the relay as the gateway, own-relay loss is total darkness by design.
+
+# Relays are also their validator's egress gateway (forward + MASQUERADE), so they run as root
+# with NET_ADMIN and ip_forward; each service installs its FORWARD filter before exec'ing the
+# relay binary.
+x-relay-common: &relay-common
+  image: local-rayls-relay-network:latest
+  depends_on:
+    rayls-base:
+      condition: service_started
+  user: "root"
+  cap_add:
+    - NET_ADMIN
+  sysctls:
+    - net.ipv4.ip_forward=1
+
+x-setup-common: &setup-common
+  image: local-rayls-relay-network:latest
+  depends_on:
+    rayls-base:
+      condition: service_started
+  user: "root"
+  command: ["bash", "/setup_validator.sh"]
+
+# Validators run as root with NET_ADMIN only to install the default route via their relay's DMZ
+# leg and their firewall before exec'ing the node (internal networks come with no default route
+# at all).
+x-validator-common: &validator-common
+  image: local-rayls-relay-network:latest
+  user: "root"
+  cap_add:
+    - NET_ADMIN
+
+# Observers need the committee files and live relays; large txpool limits because they are the
+# network's tx ingestion points (reth's default of 16 account slots per sender rejects any
+# single-sender load test with "txpool is full", and every rejected tx is a nonce hole).
+x-observer-common: &observer-common
+  image: local-rayls-relay-network:latest
+  user: "1101:1101"
+  depends_on:
+    committee:
+      condition: service_completed_successfully
+    dns:
+      condition: service_started
+    relay1:
+      condition: service_started
+    relay2:
+      condition: service_started
+    relay3:
+      condition: service_started
+    relay4:
+      condition: service_started
+
+services:
+  # build image once
+  rayls-base:
+    image: local-rayls-relay-network:latest
+    build:
+      context: ../../
+      dockerfile: etc/relay-network/Dockerfile
+
+  # --- relays: fixed identities (RELAY_KEYS.md), sitting in each VPC's DMZ: a public leg
+  # --- (static 10.20.0.1N, what the committee advertises) plus a leg inside their own
+  # --- validator's VPC (static 10.10.N.3). The relay can reach its validator's subnet directly,
+  # --- while peers only ever see the relay's public address -- the validator's internal IP is
+  # --- never advertised (circuit-relay-v2 reservations carry only the relay's addresses). -------
+  # --- NOTE: a relay is dual-homed and Docker enumerates its two legs as eth0/eth1 in an order
+  # --- that is not stable across relays, so every firewall rule below matches on IP/subnet
+  # --- (-s/-d), never on interface (-i/-o). The topology must not depend on which leg won eth0;
+  # --- do not add an interface-scoped rule here.
+  relay1:
+    <<: *relay-common
+    environment:
+      - RELAY_SEED_HEX=0101010101010101010101010101010101010101010101010101010101010101
+      - RELAY_PORT=4001
+    # Gateway for validator1: forward ONLY udp/4001 to the relays' public legs (circuit first
+    # hops), masquerade on the public leg, drop everything else. The validator can reach nothing
+    # except through this box.
+    command:
+      - sh
+      - -c
+      - >
+        iptables -t nat -A POSTROUTING -s 10.10.1.0/24 ! -d 10.10.1.0/24 -j MASQUERADE &&
+        iptables -A FORWARD -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT &&
+        iptables -A FORWARD -s 10.10.1.10 -d 10.20.0.11 -p udp --dport 4001 -j ACCEPT &&
+        iptables -A FORWARD -s 10.10.1.10 -d 10.20.0.12 -p udp --dport 4001 -j ACCEPT &&
+        iptables -A FORWARD -s 10.10.1.10 -d 10.20.0.13 -p udp --dport 4001 -j ACCEPT &&
+        iptables -A FORWARD -s 10.10.1.10 -d 10.20.0.14 -p udp --dport 4001 -j ACCEPT &&
+        iptables -P FORWARD DROP &&
+        exec rayls-relay
+    networks:
+      public:
+        ipv4_address: 10.20.0.11
+      vpc1:
+        ipv4_address: 10.10.1.3
+  relay2:
+    <<: *relay-common
+    environment:
+      - RELAY_SEED_HEX=0202020202020202020202020202020202020202020202020202020202020202
+      - RELAY_PORT=4001
+    # Gateway for validator2: forward ONLY udp/4001 to the relays' public legs (circuit first
+    # hops), masquerade on the public leg, drop everything else. The validator can reach nothing
+    # except through this box.
+    command:
+      - sh
+      - -c
+      - >
+        iptables -t nat -A POSTROUTING -s 10.10.2.0/24 ! -d 10.10.2.0/24 -j MASQUERADE &&
+        iptables -A FORWARD -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT &&
+        iptables -A FORWARD -s 10.10.2.10 -d 10.20.0.11 -p udp --dport 4001 -j ACCEPT &&
+        iptables -A FORWARD -s 10.10.2.10 -d 10.20.0.12 -p udp --dport 4001 -j ACCEPT &&
+        iptables -A FORWARD -s 10.10.2.10 -d 10.20.0.13 -p udp --dport 4001 -j ACCEPT &&
+        iptables -A FORWARD -s 10.10.2.10 -d 10.20.0.14 -p udp --dport 4001 -j ACCEPT &&
+        iptables -P FORWARD DROP &&
+        exec rayls-relay
+    networks:
+      public:
+        ipv4_address: 10.20.0.12
+      vpc2:
+        ipv4_address: 10.10.2.3
+  relay3:
+    <<: *relay-common
+    environment:
+      - RELAY_SEED_HEX=0303030303030303030303030303030303030303030303030303030303030303
+      - RELAY_PORT=4001
+    # Gateway for validator3: forward ONLY udp/4001 to the relays' public legs (circuit first
+    # hops), masquerade on the public leg, drop everything else. The validator can reach nothing
+    # except through this box.
+    command:
+      - sh
+      - -c
+      - >
+        iptables -t nat -A POSTROUTING -s 10.10.3.0/24 ! -d 10.10.3.0/24 -j MASQUERADE &&
+        iptables -A FORWARD -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT &&
+        iptables -A FORWARD -s 10.10.3.10 -d 10.20.0.11 -p udp --dport 4001 -j ACCEPT &&
+        iptables -A FORWARD -s 10.10.3.10 -d 10.20.0.12 -p udp --dport 4001 -j ACCEPT &&
+        iptables -A FORWARD -s 10.10.3.10 -d 10.20.0.13 -p udp --dport 4001 -j ACCEPT &&
+        iptables -A FORWARD -s 10.10.3.10 -d 10.20.0.14 -p udp --dport 4001 -j ACCEPT &&
+        iptables -P FORWARD DROP &&
+        exec rayls-relay
+    networks:
+      public:
+        ipv4_address: 10.20.0.13
+      vpc3:
+        ipv4_address: 10.10.3.3
+  relay4:
+    <<: *relay-common
+    environment:
+      - RELAY_SEED_HEX=0404040404040404040404040404040404040404040404040404040404040404
+      - RELAY_PORT=4001
+    # Gateway for validator4: forward ONLY udp/4001 to the relays' public legs (circuit first
+    # hops), masquerade on the public leg, drop everything else. The validator can reach nothing
+    # except through this box.
+    command:
+      - sh
+      - -c
+      - >
+        iptables -t nat -A POSTROUTING -s 10.10.4.0/24 ! -d 10.10.4.0/24 -j MASQUERADE &&
+        iptables -A FORWARD -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT &&
+        iptables -A FORWARD -s 10.10.4.10 -d 10.20.0.11 -p udp --dport 4001 -j ACCEPT &&
+        iptables -A FORWARD -s 10.10.4.10 -d 10.20.0.12 -p udp --dport 4001 -j ACCEPT &&
+        iptables -A FORWARD -s 10.10.4.10 -d 10.20.0.13 -p udp --dport 4001 -j ACCEPT &&
+        iptables -A FORWARD -s 10.10.4.10 -d 10.20.0.14 -p udp --dport 4001 -j ACCEPT &&
+        iptables -P FORWARD DROP &&
+        exec rayls-relay
+    networks:
+      public:
+        ipv4_address: 10.20.0.14
+      vpc4:
+        ipv4_address: 10.10.4.3
+
+  # DNS for the relay endpoints, playing the role of public DNS infrastructure: an A record per
+  # relay name, served from the public net. Nodes resolve against it via RAYLS_DNS_SERVER (the
+  # node's hickory resolver then queries it exclusively), which is how /dns4 relay addresses and,
+  # later, /dnsaddr failover records work in this topology. Docker's embedded DNS cannot play this
+  # role: it only resolves names of containers sharing a network with the requester, so a
+  # validator could never resolve a foreign relay's name through it.
+  dns:
+    image: local-rayls-relay-network:latest
+    depends_on:
+      rayls-base:
+        condition: service_started
+    user: "root"
+    command:
+      - dnsmasq
+      - --no-daemon
+      - --conf-file=/dev/null
+      - --no-resolv
+      - --no-hosts
+      - --log-queries
+      - --port=53
+      - --address=/relay1.rayls.test/10.20.0.11
+      - --address=/relay2.rayls.test/10.20.0.12
+      - --address=/relay3.rayls.test/10.20.0.13
+      - --address=/relay4.rayls.test/10.20.0.14
+      - --host-record=observer1.rayls.test,10.20.0.21
+      - --host-record=observer2.rayls.test,10.20.0.22
+      # round-robin RPC name spanning both observers
+      - --host-record=rpc.rayls.test,10.20.0.21
+      - --host-record=rpc.rayls.test,10.20.0.22
+    networks:
+      public:
+        ipv4_address: 10.20.0.53
+
+  # --- key/node-info generation (reuses etc/docker-network/setup_validator.sh; keytool reads the
+  # --- relay circuit address from RL_RELAY_ADDR, the env form of local-testnet's --relay) -------
+  setup1:
+    <<: *setup-common
+    environment:
+      - RL_RELAY_ADDR=/ip4/10.20.0.11/udp/4001/quic-v1/p2p/12D3KooWK99VoVxNE7XzyBwXEzW7xhK7Gpv85r9F3V3fyKSUKPH5
+      - EXECUTION_ADDRESS=0x1111111111111111111111111111111111111111
+      - RL_BLS_PASSPHRASE=local
+    volumes:
+      - ../docker-network/setup_validator.sh:/setup_validator.sh
+      - validator1-data:/home/nonroot/data
+  setup2:
+    <<: *setup-common
+    environment:
+      - RL_RELAY_ADDR=/ip4/10.20.0.12/udp/4001/quic-v1/p2p/12D3KooWJWoaqZhDaoEFshF7Rh1bpY9ohihFhzcW6d69Lr2NASuq
+      - EXECUTION_ADDRESS=0x2222222222222222222222222222222222222222
+      - RL_BLS_PASSPHRASE=local
+    volumes:
+      - ../docker-network/setup_validator.sh:/setup_validator.sh
+      - validator2-data:/home/nonroot/data
+  setup3:
+    <<: *setup-common
+    environment:
+      - RL_RELAY_ADDR=/ip4/10.20.0.13/udp/4001/quic-v1/p2p/12D3KooWRndVhVZPCiQwHBBBdg769GyrPUW13zxwqQyf9r3ANaba
+      - EXECUTION_ADDRESS=0x3333333333333333333333333333333333333333
+      - RL_BLS_PASSPHRASE=local
+    volumes:
+      - ../docker-network/setup_validator.sh:/setup_validator.sh
+      - validator3-data:/home/nonroot/data
+  setup4:
+    <<: *setup-common
+    environment:
+      - RL_RELAY_ADDR=/ip4/10.20.0.14/udp/4001/quic-v1/p2p/12D3KooWPT98FXMfDQYavZm66EeVjTqP9Nnehn1gyaydqV8L8BQw
+      - EXECUTION_ADDRESS=0x4444444444444444444444444444444444444444
+      - RL_BLS_PASSPHRASE=local
+    volumes:
+      - ../docker-network/setup_validator.sh:/setup_validator.sh
+      - validator4-data:/home/nonroot/data
+
+  # create and distribute genesis / committee files (+ observer keys), same flow as
+  # local-testnet.sh: node-infos -> genesis/validators/ -> `rayls genesis` -> copy to each node
+  committee:
+    image: local-rayls-relay-network:latest
+    environment:
+      - RL_BLS_PASSPHRASE=local
+      - GASLESS=${GASLESS:-}
+      - GAS_LIMIT=${GAS_LIMIT:-}
+    user: "root"
+    command: ["bash", "/genesis.sh"]
+    depends_on:
+      setup1:
+        condition: service_completed_successfully
+      setup2:
+        condition: service_completed_successfully
+      setup3:
+        condition: service_completed_successfully
+      setup4:
+        condition: service_completed_successfully
+    volumes:
+      - ./genesis.sh:/genesis.sh
+      - sharedgenesisdir:/home/nonroot/data/genesis
+      - validator1-data:/home/nonroot/data/validator-1
+      - validator2-data:/home/nonroot/data/validator-2
+      - validator3-data:/home/nonroot/data/validator-3
+      - validator4-data:/home/nonroot/data/validator-4
+      - observer1-data:/home/nonroot/data/observer1
+      - observer2-data:/home/nonroot/data/observer2
+
+  # --- validators: one per VPC, reachable only through the relays -----------------------------
+  # No PRIMARY/WORKER_LISTENER_MULTIADDR overrides: the node must listen on its advertised
+  # /p2p-circuit address (the relay reservation), which becomes its ONLY listener -- it never
+  # opens a direct QUIC socket.
+  validator1:
+    <<: *validator-common
+    depends_on:
+      committee:
+        condition: service_completed_successfully
+      relay1:
+        condition: service_started
+    environment:
+      - RUST_LOG=info,execution=debug
+      - RL_BLS_PASSPHRASE=local
+      - RAYLS_NETWORK=local
+      # The single reservation: the own relay's DMZ leg. The advertised public form is skipped
+      # (the relay matches inbound circuits to reservations by peer id, so peers dialing
+      # 10.20.0.11 still reach this node) and there is no backup reservation - it would violate
+      # the only-own-relay restriction, and zero listeners with a desired reservation is a
+      # retried state, not a shutdown.
+      - PRIMARY_RELAY_MULTIADDRS=/ip4/10.10.1.3/udp/4001/quic-v1/p2p/12D3KooWK99VoVxNE7XzyBwXEzW7xhK7Gpv85r9F3V3fyKSUKPH5
+      - WORKER_RELAY_MULTIADDRS=/ip4/10.10.1.3/udp/4001/quic-v1/p2p/12D3KooWK99VoVxNE7XzyBwXEzW7xhK7Gpv85r9F3V3fyKSUKPH5
+    command:
+      - sh
+      - -c
+      - >
+        ip route add default via 10.10.1.3 &&
+        iptables -A INPUT -i lo -j ACCEPT &&
+        iptables -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT &&
+        iptables -P INPUT DROP &&
+        iptables -A OUTPUT -o lo -j ACCEPT &&
+        iptables -A OUTPUT -d 10.10.1.3 -j ACCEPT &&
+        iptables -A OUTPUT -d 10.20.0.11 -p udp --dport 4001 -j ACCEPT &&
+        iptables -A OUTPUT -d 10.20.0.12 -p udp --dport 4001 -j ACCEPT &&
+        iptables -A OUTPUT -d 10.20.0.13 -p udp --dport 4001 -j ACCEPT &&
+        iptables -A OUTPUT -d 10.20.0.14 -p udp --dport 4001 -j ACCEPT &&
+        iptables -A OUTPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT &&
+        iptables -P OUTPUT DROP &&
+        exec /usr/local/bin/rayls node --datadir /home/nonroot/data --metrics 127.0.0.1:9101
+        --log.stdout.format log-fmt --full --storage.v2
+        --txpool.pending-max-count 1000000 --txpool.pending-max-size 20971120000
+        --txpool.basefee-max-count 1000000 --txpool.basefee-max-size 20971120000
+        --txpool.queued-max-count 1000000 --txpool.queued-max-size 20971120000
+        --txpool.max-pending-txns 1000000 --txpool.max-new-txns 1000000
+        --txpool.minimal-protocol-fee 0 --txpool.gas-limit 999999999999
+        --txpool.max-tx-gas 999999999999 --txpool.max-tx-input-bytes 999999999999
+        --txpool.max-account-slots 1000000 --gpo.default-suggested-fee 0
+        --http --http.addr 0.0.0.0 --http.api all
+    volumes:
+      - validator1-data:/home/nonroot/data
+    networks:
+      vpc1:
+        ipv4_address: 10.10.1.10
+  validator2:
+    <<: *validator-common
+    depends_on:
+      committee:
+        condition: service_completed_successfully
+      relay2:
+        condition: service_started
+    environment:
+      - RUST_LOG=info,execution=debug
+      - RL_BLS_PASSPHRASE=local
+      - RAYLS_NETWORK=local
+      # the single reservation: own relay DMZ leg (see validator1)
+      - PRIMARY_RELAY_MULTIADDRS=/ip4/10.10.2.3/udp/4001/quic-v1/p2p/12D3KooWJWoaqZhDaoEFshF7Rh1bpY9ohihFhzcW6d69Lr2NASuq
+      - WORKER_RELAY_MULTIADDRS=/ip4/10.10.2.3/udp/4001/quic-v1/p2p/12D3KooWJWoaqZhDaoEFshF7Rh1bpY9ohihFhzcW6d69Lr2NASuq
+    command:
+      - sh
+      - -c
+      - >
+        ip route add default via 10.10.2.3 &&
+        iptables -A INPUT -i lo -j ACCEPT &&
+        iptables -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT &&
+        iptables -P INPUT DROP &&
+        iptables -A OUTPUT -o lo -j ACCEPT &&
+        iptables -A OUTPUT -d 10.10.2.3 -j ACCEPT &&
+        iptables -A OUTPUT -d 10.20.0.11 -p udp --dport 4001 -j ACCEPT &&
+        iptables -A OUTPUT -d 10.20.0.12 -p udp --dport 4001 -j ACCEPT &&
+        iptables -A OUTPUT -d 10.20.0.13 -p udp --dport 4001 -j ACCEPT &&
+        iptables -A OUTPUT -d 10.20.0.14 -p udp --dport 4001 -j ACCEPT &&
+        iptables -A OUTPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT &&
+        iptables -P OUTPUT DROP &&
+        exec /usr/local/bin/rayls node --datadir /home/nonroot/data --metrics 127.0.0.1:9101
+        --log.stdout.format log-fmt --full --storage.v2
+        --txpool.pending-max-count 1000000 --txpool.pending-max-size 20971120000
+        --txpool.basefee-max-count 1000000 --txpool.basefee-max-size 20971120000
+        --txpool.queued-max-count 1000000 --txpool.queued-max-size 20971120000
+        --txpool.max-pending-txns 1000000 --txpool.max-new-txns 1000000
+        --txpool.minimal-protocol-fee 0 --txpool.gas-limit 999999999999
+        --txpool.max-tx-gas 999999999999 --txpool.max-tx-input-bytes 999999999999
+        --txpool.max-account-slots 1000000 --gpo.default-suggested-fee 0
+        --http --http.addr 0.0.0.0 --http.api all
+    volumes:
+      - validator2-data:/home/nonroot/data
+    networks:
+      vpc2:
+        ipv4_address: 10.10.2.10
+  validator3:
+    <<: *validator-common
+    depends_on:
+      committee:
+        condition: service_completed_successfully
+      relay3:
+        condition: service_started
+    environment:
+      - RUST_LOG=info,execution=debug
+      - RL_BLS_PASSPHRASE=local
+      - RAYLS_NETWORK=local
+      # the single reservation: own relay DMZ leg (see validator1)
+      - PRIMARY_RELAY_MULTIADDRS=/ip4/10.10.3.3/udp/4001/quic-v1/p2p/12D3KooWRndVhVZPCiQwHBBBdg769GyrPUW13zxwqQyf9r3ANaba
+      - WORKER_RELAY_MULTIADDRS=/ip4/10.10.3.3/udp/4001/quic-v1/p2p/12D3KooWRndVhVZPCiQwHBBBdg769GyrPUW13zxwqQyf9r3ANaba
+    command:
+      - sh
+      - -c
+      - >
+        ip route add default via 10.10.3.3 &&
+        iptables -A INPUT -i lo -j ACCEPT &&
+        iptables -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT &&
+        iptables -P INPUT DROP &&
+        iptables -A OUTPUT -o lo -j ACCEPT &&
+        iptables -A OUTPUT -d 10.10.3.3 -j ACCEPT &&
+        iptables -A OUTPUT -d 10.20.0.11 -p udp --dport 4001 -j ACCEPT &&
+        iptables -A OUTPUT -d 10.20.0.12 -p udp --dport 4001 -j ACCEPT &&
+        iptables -A OUTPUT -d 10.20.0.13 -p udp --dport 4001 -j ACCEPT &&
+        iptables -A OUTPUT -d 10.20.0.14 -p udp --dport 4001 -j ACCEPT &&
+        iptables -A OUTPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT &&
+        iptables -P OUTPUT DROP &&
+        exec /usr/local/bin/rayls node --datadir /home/nonroot/data --metrics 127.0.0.1:9101
+        --log.stdout.format log-fmt --full --storage.v2
+        --txpool.pending-max-count 1000000 --txpool.pending-max-size 20971120000
+        --txpool.basefee-max-count 1000000 --txpool.basefee-max-size 20971120000
+        --txpool.queued-max-count 1000000 --txpool.queued-max-size 20971120000
+        --txpool.max-pending-txns 1000000 --txpool.max-new-txns 1000000
+        --txpool.minimal-protocol-fee 0 --txpool.gas-limit 999999999999
+        --txpool.max-tx-gas 999999999999 --txpool.max-tx-input-bytes 999999999999
+        --txpool.max-account-slots 1000000 --gpo.default-suggested-fee 0
+        --http --http.addr 0.0.0.0 --http.api all
+    volumes:
+      - validator3-data:/home/nonroot/data
+    networks:
+      vpc3:
+        ipv4_address: 10.10.3.10
+  validator4:
+    <<: *validator-common
+    depends_on:
+      committee:
+        condition: service_completed_successfully
+      relay4:
+        condition: service_started
+    environment:
+      - RUST_LOG=info,execution=debug
+      - RL_BLS_PASSPHRASE=local
+      - RAYLS_NETWORK=local
+      # the single reservation: own relay DMZ leg (see validator1)
+      - PRIMARY_RELAY_MULTIADDRS=/ip4/10.10.4.3/udp/4001/quic-v1/p2p/12D3KooWPT98FXMfDQYavZm66EeVjTqP9Nnehn1gyaydqV8L8BQw
+      - WORKER_RELAY_MULTIADDRS=/ip4/10.10.4.3/udp/4001/quic-v1/p2p/12D3KooWPT98FXMfDQYavZm66EeVjTqP9Nnehn1gyaydqV8L8BQw
+    command:
+      - sh
+      - -c
+      - >
+        ip route add default via 10.10.4.3 &&
+        iptables -A INPUT -i lo -j ACCEPT &&
+        iptables -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT &&
+        iptables -P INPUT DROP &&
+        iptables -A OUTPUT -o lo -j ACCEPT &&
+        iptables -A OUTPUT -d 10.10.4.3 -j ACCEPT &&
+        iptables -A OUTPUT -d 10.20.0.11 -p udp --dport 4001 -j ACCEPT &&
+        iptables -A OUTPUT -d 10.20.0.12 -p udp --dport 4001 -j ACCEPT &&
+        iptables -A OUTPUT -d 10.20.0.13 -p udp --dport 4001 -j ACCEPT &&
+        iptables -A OUTPUT -d 10.20.0.14 -p udp --dport 4001 -j ACCEPT &&
+        iptables -A OUTPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT &&
+        iptables -P OUTPUT DROP &&
+        exec /usr/local/bin/rayls node --datadir /home/nonroot/data --metrics 127.0.0.1:9101
+        --log.stdout.format log-fmt --full --storage.v2
+        --txpool.pending-max-count 1000000 --txpool.pending-max-size 20971120000
+        --txpool.basefee-max-count 1000000 --txpool.basefee-max-size 20971120000
+        --txpool.queued-max-count 1000000 --txpool.queued-max-size 20971120000
+        --txpool.max-pending-txns 1000000 --txpool.max-new-txns 1000000
+        --txpool.minimal-protocol-fee 0 --txpool.gas-limit 999999999999
+        --txpool.max-tx-gas 999999999999 --txpool.max-tx-input-bytes 999999999999
+        --txpool.max-account-slots 1000000 --gpo.default-suggested-fee 0
+        --http --http.addr 0.0.0.0 --http.api all
+    volumes:
+      - validator4-data:/home/nonroot/data
+    networks:
+      vpc4:
+        ipv4_address: 10.10.4.10
+
+  # --- observers: dial-out-only followers on the public network. They reach the committee
+  # --- exclusively through the relays, give the host RPC endpoints, and are the network's tx
+  # --- ingestion points. Addressed by DNS via the dns service: observerN.rayls.test per node plus
+  # --- a round-robin rpc.rayls.test spanning both. --------------------------------------------
+  observer1:
+    <<: *observer-common
+    environment:
+      - RUST_LOG=info
+      - RL_BLS_PASSPHRASE=local
+      - RAYLS_NETWORK=local
+      - RAYLS_DNS_SERVER=10.20.0.53:53
+      # Observers MUST listen on 0.0.0.0, not their node-info default of 127.0.0.1: libp2p-quic
+      # reuses the listening socket for outbound dials (port_use Reuse), and a loopback-bound
+      # socket cannot reach the relays -- dials then time out silently. (Validators are immune:
+      # in relay mode they have no direct QUIC listener, so dials use ephemeral sockets.)
+      - PRIMARY_LISTENER_MULTIADDR=/ip4/0.0.0.0/udp/49590/quic-v1
+      - WORKER_LISTENER_MULTIADDR=/ip4/0.0.0.0/udp/49595/quic-v1
+    command: >
+      /usr/local/bin/rayls node --observer --datadir /home/nonroot/data --metrics 127.0.0.1:9101
+      --log.stdout.format log-fmt --full --storage.v2
+      --txpool.pending-max-count 1000000 --txpool.pending-max-size 20971120000
+      --txpool.basefee-max-count 1000000 --txpool.basefee-max-size 20971120000
+      --txpool.queued-max-count 1000000 --txpool.queued-max-size 20971120000
+      --txpool.max-pending-txns 1000000 --txpool.max-new-txns 1000000
+      --txpool.minimal-protocol-fee 0 --txpool.max-tx-input-bytes 999999999999
+      --txpool.max-account-slots 1000000 --gpo.default-suggested-fee 0
+      --http --http.addr 0.0.0.0 --http.api all
+    ports:
+      - 7545:8545
+    volumes:
+      - observer1-data:/home/nonroot/data
+    networks:
+      public:
+        ipv4_address: 10.20.0.21
+  observer2:
+    <<: *observer-common
+    environment:
+      - RUST_LOG=info
+      - RL_BLS_PASSPHRASE=local
+      - RAYLS_NETWORK=local
+      - RAYLS_DNS_SERVER=10.20.0.53:53
+      - PRIMARY_LISTENER_MULTIADDR=/ip4/0.0.0.0/udp/49590/quic-v1
+      - WORKER_LISTENER_MULTIADDR=/ip4/0.0.0.0/udp/49595/quic-v1
+    command: >
+      /usr/local/bin/rayls node --observer --datadir /home/nonroot/data --metrics 127.0.0.1:9101
+      --log.stdout.format log-fmt --full --storage.v2
+      --txpool.pending-max-count 1000000 --txpool.pending-max-size 20971120000
+      --txpool.basefee-max-count 1000000 --txpool.basefee-max-size 20971120000
+      --txpool.queued-max-count 1000000 --txpool.queued-max-size 20971120000
+      --txpool.max-pending-txns 1000000 --txpool.max-new-txns 1000000
+      --txpool.minimal-protocol-fee 0 --txpool.max-tx-input-bytes 999999999999
+      --txpool.max-account-slots 1000000 --gpo.default-suggested-fee 0
+      --http --http.addr 0.0.0.0 --http.api all
+    ports:
+      - 7544:8545
+    volumes:
+      - observer2-data:/home/nonroot/data
+    networks:
+      public:
+        ipv4_address: 10.20.0.22
+
+volumes:
+  validator1-data:
+  validator2-data:
+  validator3-data:
+  validator4-data:
+  observer1-data:
+  observer2-data:
+  sharedgenesisdir:
+
+networks:
+  # one "private VPC" per validator: internal = no default route, no port publishing, no host
+  # route; the only egress is the validator's own relay (its default gateway)
+  vpc1:
+    internal: true
+    ipam:
+      config:
+        - subnet: 10.10.1.0/24
+  vpc2:
+    internal: true
+    ipam:
+      config:
+        - subnet: 10.10.2.0/24
+  vpc3:
+    internal: true
+    ipam:
+      config:
+        - subnet: 10.10.3.0/24
+  vpc4:
+    internal: true
+    ipam:
+      config:
+        - subnet: 10.10.4.0/24
+  # the simulated public internet: relay public legs, dns, observers
+  public:
+    ipam:
+      config:
+        - subnet: 10.20.0.0/24
