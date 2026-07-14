@@ -37,6 +37,8 @@ pub fn generate_validator_keys(
         address: execution_address,
         external_primary_addr: None,
         external_worker_addrs: None,
+        relay: None,
+        advertise_dnsaddr: None,
     };
     let key_path = datadir.node_keys_path();
     if !key_path.exists() {
