@@ -6,7 +6,7 @@ use rayls_consensus_primary::{
 };
 use rayls_infrastructure_config::{ConsensusConfig, LibP2pConfig, RaylsDirs};
 use rayls_infrastructure_types::{
-    quorum_threshold, BlsPublicKey, Database as ReDatabase, Protocol, RaylsSender, TaskSpawner,
+    quorum_threshold, BlsPublicKey, Database as ReDatabase, RaylsSender, TaskSpawner,
 };
 use std::{collections::HashSet, time::Duration};
 use tracing::{debug, info, warn};
@@ -106,25 +106,20 @@ where
                 consensus_config.primary_networkkey(),
                 consensus_config.primary_address(),
             )?;
-            // A `/dnsaddr` advertise address can't be listened on (it names relays via a DNS TXT
-            // record, not a concrete reservation). In that mode the node reserves only on the
-            // relays from PRIMARY_RELAY_MULTIADDRS below.
-            if primary_address.iter().any(|p| matches!(p, Protocol::Dnsaddr(_))) {
-                info!(target: "epoch-manager", ?primary_address, "advertise-only /dnsaddr address; reserving via PRIMARY_RELAY_MULTIADDRS");
-            } else {
-                info!(target: "epoch-manager", ?primary_address, "listening to {primary_address}");
-                network_handle.inner_handle().start_listening(primary_address).await?;
-            }
-
-            // Reserve on any additional relays (comma-separated relay base multiaddrs) so the
-            // primary stays reachable if its main relay is lost.
-            for relay_addr in Self::relay_listen_addresses(
+            // Explicit relay reservations (comma-separated relay base multiaddrs): an alternate
+            // leg of the advertised relay (e.g. a dual-homed DMZ relay's inside address) or
+            // additional relays for failover.
+            let relay_reservations = Self::relay_listen_addresses(
                 "PRIMARY_RELAY_MULTIADDRS",
                 consensus_config.primary_networkkey(),
-            )? {
-                info!(target: "epoch-manager", ?relay_addr, "listening on additional primary relay");
-                network_handle.inner_handle().start_listening(relay_addr).await?;
-            }
+            )?;
+            super::network::start_swarm_listeners(
+                network_handle.inner_handle(),
+                primary_address,
+                relay_reservations,
+                "PRIMARY_RELAY_MULTIADDRS",
+            )
+            .await?;
         }
 
         let mut peers = network_handle.connected_peers_count().await.unwrap_or(0);

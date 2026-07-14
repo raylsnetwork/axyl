@@ -7,6 +7,7 @@ pub use libp2p::gossipsub::MessageId;
 use libp2p::{
     core::transport::ListenerId,
     gossipsub::{PublishError, SubscriptionError, TopicHash},
+    multiaddr::Protocol,
     request_response::ResponseChannel,
     Multiaddr, PeerId, TransportError,
 };
@@ -24,6 +25,30 @@ mod network_types;
 
 /// The result for network operations.
 pub type NetworkResult<T> = Result<T, NetworkError>;
+
+/// Returns true when the address contains a `/dnsaddr` component.
+///
+/// Such an address is advertise-only: it names relay circuits via `_dnsaddr` DNS TXT records,
+/// so it can neither be listened on nor dialed raw (the relay client selects its connection
+/// handler from the literal address shape) - it must be resolved to concrete circuits first.
+pub fn is_dnsaddr(addr: &Multiaddr) -> bool {
+    addr.iter().any(|p| matches!(p, Protocol::Dnsaddr(_)))
+}
+
+/// Extracts the relay server's [`PeerId`] from a circuit address of the form
+/// `<relay-addr>/p2p/<relay-id>/p2p-circuit/p2p/<dst-id>`: the `P2p` component immediately
+/// preceding the `P2pCircuit` protocol. Returns `None` for non-relayed addresses.
+pub fn circuit_relay_peer_id(addr: &Multiaddr) -> Option<PeerId> {
+    let mut last_p2p = None;
+    for proto in addr.iter() {
+        match proto {
+            Protocol::P2p(peer) => last_p2p = Some(peer),
+            Protocol::P2pCircuit => return last_p2p,
+            _ => {}
+        }
+    }
+    None
+}
 
 /// Helper trait to cast lib-specific results into RPC messages.
 pub trait IntoResponse<M> {

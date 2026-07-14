@@ -492,27 +492,12 @@ impl PeerManager {
     /// protected infrastructure (never penalized or pruned).
     pub(crate) fn register_relays_from_addrs(&mut self, addrs: &[Multiaddr]) {
         for addr in addrs {
-            if let Some(relay_id) = Self::extract_relay_peer_id(addr) {
+            if let Some(relay_id) = crate::types::circuit_relay_peer_id(addr) {
                 if self.relay_peers.insert(relay_id) {
                     debug!(target: "peer-manager", ?relay_id, "registered relay peer (exempt from penalties)");
                 }
             }
         }
-    }
-
-    /// Extract the relay server's [PeerId] from a circuit address of the form
-    /// `<relay-addr>/p2p/<relay-id>/p2p-circuit/p2p/<dst-id>`: the `P2p` component immediately
-    /// preceding the `P2pCircuit` protocol. Returns `None` for non-relayed addresses.
-    fn extract_relay_peer_id(addr: &Multiaddr) -> Option<PeerId> {
-        let mut last_p2p = None;
-        for proto in addr.iter() {
-            match proto {
-                Protocol::P2p(peer) => last_p2p = Some(peer),
-                Protocol::P2pCircuit => return last_p2p,
-                _ => {}
-            }
-        }
-        None
     }
 
     /// Process newly banned IP addresses.

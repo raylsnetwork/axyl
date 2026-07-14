@@ -84,7 +84,7 @@ where
                     // Collect /dnsaddr advertise addresses so we can resolve them below and exempt
                     // the relays they're reached through (their committee address carries no
                     // circuit, so `add_known_peer` alone can't learn those relays).
-                    if info.network_address.iter().any(|p| matches!(p, Protocol::Dnsaddr(_))) {
+                    if crate::types::is_dnsaddr(&info.network_address) {
                         dnsaddrs.push(info.network_address.clone());
                     }
                     pm.add_known_peer(
@@ -139,9 +139,8 @@ where
                     return Ok(());
                 };
                 // Split committee `/dnsaddr` addresses from any already-concrete ones.
-                let (dnsaddrs, concrete): (Vec<_>, Vec<_>) = addrs
-                    .into_iter()
-                    .partition(|a| a.iter().any(|p| matches!(p, Protocol::Dnsaddr(_))));
+                let (dnsaddrs, concrete): (Vec<_>, Vec<_>) =
+                    addrs.into_iter().partition(crate::types::is_dnsaddr);
                 if dnsaddrs.is_empty() {
                     // Nothing to resolve; dial the concrete addresses directly.
                     self.swarm.behaviour_mut().peer_manager.dial_peer(
