@@ -14,9 +14,10 @@ use crate::{
 use assert_matches::assert_matches;
 use eyre::eyre;
 use libp2p::{
+    core::transport::ListenerId,
     gossipsub::{Message as GossipMessage, TopicHash},
     kad::{self, store::RecordStore, ProviderRecord, RecordKey},
-    PeerId,
+    Multiaddr, PeerId,
 };
 use rayls_execution_evm::test_utils::fixture_batch_with_transactions;
 use rayls_infrastructure_config::{ConsensusConfig, NetworkConfig};
@@ -2135,6 +2136,32 @@ async fn test_connected_peers_count_double_decrement() -> eyre::Result<()> {
          but asymmetric inc/dec in DisconnectPeer/PeerDisconnected/Banned handlers \
          causes the gauge to drift negative"
     );
+
+    Ok(())
+}
+
+/// A swarm with zero listeners must shut down only when nothing can re-create a listener: with
+/// relay reservations desired, `retry_relay_reservations` re-issues them, so an all-relays-down
+/// window (a boot race, a simultaneous relay outage) is retried instead of shutting the network
+/// down.
+#[tokio::test]
+async fn test_zero_listeners_retried_when_relay_reservations_desired() -> eyre::Result<()> {
+    let TestTypes { peer1, .. } = create_test_types::<TestPrimaryRequest, TestPrimaryResponse>();
+    let mut network = peer1.network;
+
+    // no listeners were started: a closed listener with no desired relay reservations is fatal
+    assert_matches!(
+        network.handle_listener_closed(ListenerId::next(), &[]),
+        Err(NetworkError::AllListenersClosed)
+    );
+
+    // with a desired relay reservation the same state is a retried outage, not a shutdown
+    let circuit: Multiaddr =
+        "/ip4/127.0.0.1/udp/4001/quic-v1/p2p/12D3KooWK99VoVxNE7XzyBwXEzW7xhK7Gpv85r9F3V3fyKSUKPH5/p2p-circuit/p2p/12D3KooWJWoaqZhDaoEFshF7Rh1bpY9ohihFhzcW6d69Lr2NASuq"
+            .parse()
+            .expect("valid circuit multiaddr");
+    network.relay_reservations.insert(circuit, None);
+    assert!(network.handle_listener_closed(ListenerId::next(), &[]).is_ok());
 
     Ok(())
 }

@@ -127,13 +127,11 @@ where
     network_metrics: Arc<NetworkMetrics>,
     /// A label for the network to use in metrics.
     network_label: &'static str,
-    /// Relay circuit listen addresses this node wants to keep reserved (the `/p2p-circuit`
-    /// addresses passed to `StartListening`). Used to re-establish a reservation if its relay goes
-    /// away and later comes back, without restarting the node.
-    relay_listen_addrs: HashSet<Multiaddr>,
-    /// Active listener ids for relay reservations, mapped to the address they serve, so a
-    /// `ListenerClosed` can be tied back to the relay address that needs re-listening.
-    relay_listeners: HashMap<ListenerId, Multiaddr>,
+    /// Desired relay reservations (the `/p2p-circuit` addresses passed to `StartListening`), each
+    /// mapped to its listener id while the reservation is established. `None` marks a reservation
+    /// whose relay went away; `retry_relay_reservations` re-issues it so a returning relay
+    /// restores reachability without a restart.
+    relay_reservations: HashMap<Multiaddr, Option<ListenerId>>,
     /// Resolver for `/dnsaddr` committee peers, used to discover (and exempt) the relays a node
     /// dials through -- so the relay set is learned from DNS rather than configured.
     relay_resolver: hickory_resolver::TokioResolver,

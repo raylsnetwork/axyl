@@ -243,8 +243,7 @@ where
             last_cleanup: Instant::now(),
             network_metrics,
             network_label,
-            relay_listen_addrs: Default::default(),
-            relay_listeners: Default::default(),
+            relay_reservations: Default::default(),
             relay_resolver,
         })
     }

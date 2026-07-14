@@ -21,7 +21,7 @@ where
     Events: RaylsSender<NetworkEvent<Req, Res>> + Send + 'static,
 {
     /// Process commands for the network.
-    pub(super) async fn process_command(
+    pub(super) fn process_command(
         &mut self,
         command: NetworkCommand<Req, Res>,
     ) -> NetworkResult<()> {
@@ -44,10 +44,7 @@ where
                 // Track relay reservations so we can re-establish them if the relay drops and
                 // later comes back (see `retry_relay_reservations`).
                 if is_relayed {
-                    self.relay_listen_addrs.insert(multiaddr.clone());
-                    if let Ok(id) = &res {
-                        self.relay_listeners.insert(*id, multiaddr);
-                    }
+                    self.relay_reservations.insert(multiaddr, res.as_ref().ok().copied());
                 }
                 send_or_log_error!(reply, res, "StartListening");
             }
