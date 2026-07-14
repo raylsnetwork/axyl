@@ -8428,6 +8428,7 @@ dependencies = [
  "futures",
  "hex",
  "libp2p",
+ "rayls-infrastructure-config",
  "tokio",
  "tracing",
  "tracing-subscriber 0.3.23",
