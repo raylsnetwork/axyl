@@ -27,6 +27,7 @@ use libp2p::{
     swarm::{NetworkBehaviour, SwarmEvent},
     tcp, yamux, PeerId,
 };
+use rayls_infrastructure_config::QuicConfig;
 use std::{env, net::Ipv4Addr, time::Duration};
 use tracing::info;
 use tracing_subscriber::EnvFilter;
@@ -121,15 +122,19 @@ async fn main() -> eyre::Result<()> {
 
     info!(%local_peer_id, port, "starting rayls relay");
 
+    let relay_cfg = relay_config()?;
     let mut swarm = libp2p::SwarmBuilder::with_existing_identity(key)
         .with_tokio()
         .with_tcp(tcp::Config::default(), noise::Config::new, yamux::Config::default)?
-        .with_quic()
+        // Apply the axyl node's QuicConfig instead of libp2p defaults. Every circuit to a
+        // validator multiplexes as a stream over that validator's single reservation connection,
+        // so the relay's per-connection flow-control window is the aggregate in-flight cap for
+        // ALL of the validator's consensus traffic; the libp2p defaults (15 MB connection / 10 MB
+        // stream) are ~7x smaller than what the nodes on either side of the circuit are
+        // provisioned for and would throttle the relay leg first.
+        .with_quic_config(|config| QuicConfig::default().apply(config))
         .with_behaviour(|key| Behaviour {
-            relay: relay::Behaviour::new(
-                key.public().to_peer_id(),
-                relay_config().expect("relay config"),
-            ),
+            relay: relay::Behaviour::new(key.public().to_peer_id(), relay_cfg),
             ping: ping::Behaviour::new(ping::Config::new()),
             identify: identify::Behaviour::new(identify::Config::new(
                 "/rayls-relay/0.0.1".to_string(),

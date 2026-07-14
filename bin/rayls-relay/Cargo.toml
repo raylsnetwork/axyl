@@ -22,6 +22,8 @@ libp2p = { workspace = true, features = [
     "identify",
     "macros",
 ] }
+# single source of the QUIC transport limits shared with the node swarms (QuicConfig::apply)
+rayls-infrastructure-config = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "signal"] }
 futures = { workspace = true }
 tracing = { workspace = true }

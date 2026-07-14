@@ -168,16 +168,7 @@ where
         // unaffected.
         let mut swarm = SwarmBuilder::with_existing_identity(keypair)
             .with_tokio()
-            .with_quic_config(|mut config| {
-                config.handshake_timeout = network_config.quic_config().handshake_timeout;
-                config.max_idle_timeout = network_config.quic_config().max_idle_timeout;
-                config.keep_alive_interval = network_config.quic_config().keep_alive_interval;
-                config.max_concurrent_stream_limit =
-                    network_config.quic_config().max_concurrent_stream_limit;
-                config.max_stream_data = network_config.quic_config().max_stream_data;
-                config.max_connection_data = network_config.quic_config().max_connection_data;
-                config
-            })
+            .with_quic_config(|config| network_config.quic_config().apply(config))
             .with_other_transport(|keypair| {
                 // `with_other_transport` boxes the muxer itself, so stop at `.multiplex`.
                 Ok::<_, Box<dyn std::error::Error + Send + Sync>>(
