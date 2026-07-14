@@ -99,6 +99,12 @@ where
             .validation_mode(gossipsub::ValidationMode::Strict)
             // RL specific: filter against authorized_publishers for certain topics
             .validate_messages()
+            // Announce IDONTWANT to mesh peers as soon as we publish, not only on receive:
+            // published batches approach max_transmit_size, and each duplicate a mesh peer sends
+            // back costs a full path transit (doubly so when links hairpin through relay
+            // circuits). Peers negotiate gossipsub v1.2 per connection, so this is a no-op toward
+            // peers that don't support it.
+            .idontwant_on_publish(true)
             .build()?;
         let gossipsub = gossipsub::Behaviour::new(
             gossipsub::MessageAuthenticity::Signed(keypair.clone()),
