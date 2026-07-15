@@ -24,10 +24,13 @@ where
         event: ReqResEvent<Req, Res>,
     ) -> NetworkResult<()> {
         match event {
-            ReqResEvent::Message { peer, message, connection_id: _ } => {
+            ReqResEvent::Message { peer, message, connection_id } => {
+                // the transport path this message actually traveled, for the relayed-topology
+                // audit trail (`None` only if the connection already closed)
+                let via = self.connection_paths.get(&connection_id).copied();
                 match message {
                     request_response::Message::Request { request_id, request, channel } => {
-                        debug!(target: "network", ?peer, ?request, "request received");
+                        debug!(target: "network", ?peer, ?via, ?request, "request received");
                         // intercept peer exchange messages
                         if let Some(peers) = request.peer_exchange_msg() {
                             debug!(target: "network", ?peers, "processing peer exchange");
@@ -85,6 +88,7 @@ where
                         }
                     }
                     request_response::Message::Response { request_id, response } => {
+                        debug!(target: "network", ?peer, ?via, ?request_id, "response received");
                         // check if response associated with PX disconnect
                         if self.pending_px_disconnects.remove(&request_id).is_some() {
                             let _ = self.swarm.disconnect_peer_id(peer);

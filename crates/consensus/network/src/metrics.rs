@@ -1,6 +1,9 @@
 //! Metrics for the network.
 
-use prometheus::{default_registry, register_int_gauge_vec_with_registry, IntGaugeVec, Registry};
+use prometheus::{
+    default_registry, register_int_counter_vec_with_registry, register_int_gauge_vec_with_registry,
+    IntCounterVec, IntGaugeVec, Registry,
+};
 
 #[derive(Clone, Debug)]
 pub struct NetworkMetrics {
@@ -14,6 +17,12 @@ pub struct NetworkMetrics {
     pub banned_peers: IntGaugeVec,
     /// peer scores by peer id.
     pub peer_scores: IntGaugeVec,
+    /// Established connections by transport path ("circuit", "relay_direct", "direct_nonrelay").
+    ///
+    /// In a relayed-only topology "direct_nonrelay" must stay 0: every connection is either a leg
+    /// to a relay server or a `/p2p-circuit` through one. Non-zero means the node opened a direct
+    /// connection to a peer, bypassing the relays.
+    pub connections_by_path: IntCounterVec,
 }
 
 impl NetworkMetrics {
@@ -47,6 +56,12 @@ impl NetworkMetrics {
                 "peer_scores",
                 "Peer scores by peer id",
                 &["peer_id", "kad_type"],
+                registry
+            )?,
+            connections_by_path: register_int_counter_vec_with_registry!(
+                "connections_by_path",
+                "Established connections classified by transport path",
+                &["path", "kad_type"],
                 registry
             )?,
         })

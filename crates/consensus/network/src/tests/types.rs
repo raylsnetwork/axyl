@@ -1,7 +1,8 @@
 //! Unit tests for network types.rs
 
-use super::NodeRecord;
+use super::{ConnectionPath, NodeRecord};
 use crate::common::create_multiaddr;
+use libp2p::{core::ConnectedPoint, Multiaddr, PeerId};
 use rayls_infrastructure_config::KeyConfig;
 use rayls_infrastructure_types::{BlsKeypair, BlsSigner};
 
@@ -25,4 +26,53 @@ fn test_node_record() {
     // assert incorrect pubkey fails
     let bad_keypair = BlsKeypair::generate(&mut rand::rng());
     assert!(node_record.verify(bad_keypair.public()).is_err());
+}
+
+/// Classification covers all four endpoint shapes: an outbound circuit and an inbound circuit are
+/// `Circuit` (the inbound marker sits on the local address, its send-back address is a bare
+/// `/p2p`), a direct leg to a known relay is `RelayDirect`, and a direct connection to anything
+/// else is `DirectNonRelay`.
+#[test]
+fn test_connection_path_classification() {
+    let relay = PeerId::random();
+    let dst = PeerId::random();
+    let src = PeerId::random();
+    let relay_leg: Multiaddr =
+        format!("/ip4/127.0.0.1/udp/4001/quic-v1/p2p/{relay}").parse().unwrap();
+    let outbound_circuit: Multiaddr =
+        format!("/ip4/127.0.0.1/udp/4001/quic-v1/p2p/{relay}/p2p-circuit/p2p/{dst}")
+            .parse()
+            .unwrap();
+
+    // outbound circuit: the dial address carries the marker and names the relay
+    let dialed = ConnectedPoint::Dialer {
+        address: outbound_circuit,
+        role_override: libp2p::core::Endpoint::Dialer,
+        port_use: libp2p::core::transport::PortUse::Reuse,
+    };
+    assert_eq!(
+        ConnectionPath::classify(&dialed, false),
+        ConnectionPath::Circuit { relay: Some(relay) }
+    );
+
+    // inbound circuit: the marker is on the local (listen) address; send-back is a bare /p2p
+    let inbound = ConnectedPoint::Listener {
+        local_addr: format!("/ip4/127.0.0.1/udp/4001/quic-v1/p2p/{relay}/p2p-circuit")
+            .parse()
+            .unwrap(),
+        send_back_addr: format!("/p2p/{src}").parse().unwrap(),
+    };
+    assert_eq!(
+        ConnectionPath::classify(&inbound, false),
+        ConnectionPath::Circuit { relay: Some(relay) }
+    );
+
+    // direct leg to a registered relay vs a direct connection to a non-relay peer
+    let direct = ConnectedPoint::Dialer {
+        address: relay_leg,
+        role_override: libp2p::core::Endpoint::Dialer,
+        port_use: libp2p::core::transport::PortUse::Reuse,
+    };
+    assert_eq!(ConnectionPath::classify(&direct, true), ConnectionPath::RelayDirect);
+    assert_eq!(ConnectionPath::classify(&direct, false), ConnectionPath::DirectNonRelay);
 }

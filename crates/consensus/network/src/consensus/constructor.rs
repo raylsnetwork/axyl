@@ -242,6 +242,7 @@ where
             network_label,
             relay_reservations: Default::default(),
             relay_resolver,
+            connection_paths: Default::default(),
         })
     }
 

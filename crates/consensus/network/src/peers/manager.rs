@@ -167,6 +167,11 @@ impl PeerManager {
         multiaddrs: Vec<Multiaddr>,
         reply: Option<oneshot::Sender<NetworkResult<()>>>,
     ) {
+        // A circuit dial rides on a direct leg to the relay named in the address; learn that
+        // relay before the leg comes up so it is penalty-exempt and classified as a relay
+        // connection. Dials resolved at dial time (e.g. `/dnsaddr` failover) may name a relay no
+        // earlier ingestion path has seen. No-op for non-circuit addresses.
+        self.register_relays_from_addrs(&multiaddrs);
         // return early if peer is banned, connected, or currently being dialed
         if let Some(peer) = self.peers.get_peer(&peer_id) {
             match peer.connection_status() {

@@ -5,13 +5,14 @@
 use crate::{
     codec::{RLCodec, RLMessage},
     consensus::behaviour::RLBehavior,
-    types::{KadQuery, NetworkCommand, NetworkEvent, NetworkResult, NodeRecord},
+    types::{ConnectionPath, KadQuery, NetworkCommand, NetworkEvent, NetworkResult, NodeRecord},
     NetworkMetrics,
 };
 use libp2p::{
     core::transport::ListenerId,
     kad::QueryId,
     request_response::{InboundRequestId, OutboundRequestId},
+    swarm::ConnectionId,
     Multiaddr, PeerId, Swarm,
 };
 use rayls_infrastructure_config::{KeyConfig, LibP2pConfig};
@@ -132,6 +133,13 @@ where
     /// whose relay went away; `retry_relay_reservations` re-issues it so a returning relay
     /// restores reachability without a restart.
     relay_reservations: HashMap<Multiaddr, Option<ListenerId>>,
+    /// The transport path each live connection was established over, classified once at
+    /// `ConnectionEstablished` and removed on `ConnectionClosed`.
+    ///
+    /// Lets every request/response be attributed to the path it traveled (circuit vs direct), the
+    /// audit trail proving a relayed-only node exchanges consensus messages exclusively through
+    /// its relays.
+    connection_paths: HashMap<ConnectionId, ConnectionPath>,
     /// Resolver for `/dnsaddr` committee peers, used to discover (and exempt) the relays a node
     /// dials through -- so the relay set is learned from DNS rather than configured.
     relay_resolver: hickory_resolver::TokioResolver,

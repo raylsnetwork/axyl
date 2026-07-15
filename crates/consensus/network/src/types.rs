@@ -50,6 +50,58 @@ pub fn circuit_relay_peer_id(addr: &Multiaddr) -> Option<PeerId> {
     None
 }
 
+/// The transport path a swarm connection was established over.
+///
+/// Every protocol (gossipsub, kademlia, request-response) is multiplexed over the swarm's
+/// connections, so classifying each connection once at establishment is sufficient to audit that
+/// a relayed-only node never exchanges a message with a peer outside a `/p2p-circuit`: a request
+/// cannot travel over a connection that does not exist.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectionPath {
+    /// A `/p2p-circuit` connection relayed through a relay server.
+    Circuit {
+        /// The relay server the circuit runs through, when the address names it.
+        relay: Option<PeerId>,
+    },
+    /// A direct connection to a registered relay server (the first-hop leg circuits ride on).
+    RelayDirect,
+    /// A direct connection to a non-relay peer.
+    ///
+    /// Forbidden in a relayed-only topology: a private validator must only ever hold relay legs
+    /// and circuits.
+    DirectNonRelay,
+}
+
+impl ConnectionPath {
+    /// Classifies the negotiated endpoint of an established connection.
+    ///
+    /// The circuit marker sits on the dial address for outbound connections and on the local
+    /// (listen) address for inbound ones - a relayed inbound's send-back address is a bare
+    /// `/p2p/<src>` with no transport to classify.
+    pub fn classify(endpoint: &libp2p::core::ConnectedPoint, peer_is_relay: bool) -> Self {
+        let path_addr = match endpoint {
+            libp2p::core::ConnectedPoint::Dialer { address, .. } => address,
+            libp2p::core::ConnectedPoint::Listener { local_addr, .. } => local_addr,
+        };
+        if path_addr.iter().any(|p| matches!(p, Protocol::P2pCircuit)) {
+            Self::Circuit { relay: circuit_relay_peer_id(path_addr) }
+        } else if peer_is_relay {
+            Self::RelayDirect
+        } else {
+            Self::DirectNonRelay
+        }
+    }
+
+    /// Returns the `path` label value for the `connections_by_path` metric.
+    pub fn metric_label(&self) -> &'static str {
+        match self {
+            Self::Circuit { .. } => "circuit",
+            Self::RelayDirect => "relay_direct",
+            Self::DirectNonRelay => "direct_nonrelay",
+        }
+    }
+}
+
 /// Helper trait to cast lib-specific results into RPC messages.
 pub trait IntoResponse<M> {
     /// Convert a [Result] into a [RLMessage] type.

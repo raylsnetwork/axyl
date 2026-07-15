@@ -2,7 +2,7 @@ use crate::{
     codec::{RLCodec, RLMessage},
     consensus::behaviour::RLBehaviorEvent,
     error::NetworkError,
-    types::{NetworkEvent, NetworkResult},
+    types::{ConnectionPath, NetworkEvent, NetworkResult},
     ConsensusNetwork,
 };
 use futures::StreamExt as _;
@@ -153,6 +153,36 @@ where
                     trace!(target: "network", ?event, "relay client event");
                 }
             },
+            SwarmEvent::ConnectionEstablished { peer_id, connection_id, endpoint, .. } => {
+                let path = ConnectionPath::classify(
+                    &endpoint,
+                    self.swarm.behaviour().peer_manager.is_relay(&peer_id),
+                );
+                self.network_metrics
+                    .connections_by_path
+                    .with_label_values(&[path.metric_label(), self.network_label])
+                    .inc();
+                // A node holding circuit reservations is a relayed node: its only legitimate
+                // connections are relay legs and circuits, so a direct connection to a non-relay
+                // peer breaks the relayed-only topology. On a direct (no-reservation) node the
+                // same classification is the normal case and stays at debug.
+                if matches!(path, ConnectionPath::DirectNonRelay)
+                    && !self.relay_reservations.is_empty()
+                {
+                    warn!(
+                        target: "network",
+                        ?peer_id,
+                        addr = ?endpoint.get_remote_address(),
+                        "direct connection to a non-relay peer on a relayed node"
+                    );
+                } else {
+                    debug!(target: "network", ?peer_id, ?connection_id, ?path, "connection path classified");
+                }
+                self.connection_paths.insert(connection_id, path);
+            }
+            SwarmEvent::ConnectionClosed { connection_id, .. } => {
+                self.connection_paths.remove(&connection_id);
+            }
             SwarmEvent::ExternalAddrConfirmed { address: _ } => {
                 // New confirmed address so lets publish/update or kademlia address rocord.
                 self.provide_our_data();
