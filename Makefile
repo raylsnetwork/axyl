@@ -138,10 +138,16 @@ down:
 
 # relay isolation testnet: validators in private networks, reachable only via relays
 relay-up:
-	docker compose -f ./etc/relay-network/compose.yaml up --build --remove-orphans --detach ;
+	VERGEN_GIT_SHA=$$(git rev-parse HEAD) docker compose -f ./etc/relay-network/compose.yaml up --build --remove-orphans --detach ;
 
 relay-down:
 	docker compose -f ./etc/relay-network/compose.yaml down --remove-orphans -v ;
+
+relay-failover-up:
+	VERGEN_GIT_SHA=$$(git rev-parse HEAD) docker --context desktop-linux compose -f ./etc/relay-network/compose.failover.yaml up --build --remove-orphans --detach ;
+
+relay-failover-down:
+	docker --context desktop-linux compose -f ./etc/relay-network/compose.failover.yaml down --remove-orphans -v ;
 
 # alternative approach to run 4 local validator nodes outside of docker on local machine
 validators:

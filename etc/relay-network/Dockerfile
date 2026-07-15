@@ -10,8 +10,6 @@ RUN apt-get update && \
     libclang-16-dev \
     pkg-config \
     libssl-dev \
-    tcpdump \
-    iputils-ping \
     libapr1-dev && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
@@ -51,6 +49,7 @@ RUN apt-get update && \
     iptables \
     tcpdump \
     iputils-ping \
+    netcat-traditional \
     dnsmasq && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*

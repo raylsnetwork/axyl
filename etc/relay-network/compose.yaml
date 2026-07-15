@@ -100,6 +100,10 @@ services:
     build:
       context: ../../
       dockerfile: etc/relay-network/Dockerfile
+      # .dockerignore excludes .git, so reth's build script sees no git info and panics slicing an
+      # empty short SHA. Pass the SHA in explicitly; `make relay-up` supplies it from `git`.
+      args:
+        VERGEN_GIT_SHA: ${VERGEN_GIT_SHA:-}
 
   # --- relays: fixed identities (RELAY_KEYS.md), sitting in each VPC's DMZ: a public leg
   # --- (static 10.20.0.1N, what the committee advertises) plus a leg inside their own
@@ -324,7 +328,9 @@ services:
       relay1:
         condition: service_started
     environment:
-      - RUST_LOG=info,execution=debug
+      # network=debug surfaces the connection-path classification and per-request via-path
+      # tracing that proves every peer flow transits a relay circuit (never a direct link).
+      - RUST_LOG=info,execution=debug,network=debug
       - RL_BLS_PASSPHRASE=local
       - RAYLS_NETWORK=local
       # The single reservation: the own relay's DMZ leg. The advertised public form is skipped
@@ -338,7 +344,7 @@ services:
       - sh
       - -c
       - >
-        ip route add default via 10.10.1.3 &&
+        ip route replace default via 10.10.1.3 &&
         iptables -A INPUT -i lo -j ACCEPT &&
         iptables -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT &&
         iptables -P INPUT DROP &&
@@ -351,7 +357,7 @@ services:
         iptables -A OUTPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT &&
         iptables -P OUTPUT DROP &&
         exec /usr/local/bin/rayls node --datadir /home/nonroot/data --metrics 127.0.0.1:9101
-        --log.stdout.format log-fmt --full --storage.v2
+        --log.stdout.format terminal -vvvv --full --storage.v2
         --txpool.pending-max-count 1000000 --txpool.pending-max-size 20971120000
         --txpool.basefee-max-count 1000000 --txpool.basefee-max-size 20971120000
         --txpool.queued-max-count 1000000 --txpool.queued-max-size 20971120000
@@ -373,7 +379,9 @@ services:
       relay2:
         condition: service_started
     environment:
-      - RUST_LOG=info,execution=debug
+      # network=debug surfaces the connection-path classification and per-request via-path
+      # tracing that proves every peer flow transits a relay circuit (never a direct link).
+      - RUST_LOG=info,execution=debug,network=debug
       - RL_BLS_PASSPHRASE=local
       - RAYLS_NETWORK=local
       # the single reservation: own relay DMZ leg (see validator1)
@@ -383,7 +391,7 @@ services:
       - sh
       - -c
       - >
-        ip route add default via 10.10.2.3 &&
+        ip route replace default via 10.10.2.3 &&
         iptables -A INPUT -i lo -j ACCEPT &&
         iptables -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT &&
         iptables -P INPUT DROP &&
@@ -396,7 +404,7 @@ services:
         iptables -A OUTPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT &&
         iptables -P OUTPUT DROP &&
         exec /usr/local/bin/rayls node --datadir /home/nonroot/data --metrics 127.0.0.1:9101
-        --log.stdout.format log-fmt --full --storage.v2
+        --log.stdout.format terminal -vvvv --full --storage.v2
         --txpool.pending-max-count 1000000 --txpool.pending-max-size 20971120000
         --txpool.basefee-max-count 1000000 --txpool.basefee-max-size 20971120000
         --txpool.queued-max-count 1000000 --txpool.queued-max-size 20971120000
@@ -418,7 +426,9 @@ services:
       relay3:
         condition: service_started
     environment:
-      - RUST_LOG=info,execution=debug
+      # network=debug surfaces the connection-path classification and per-request via-path
+      # tracing that proves every peer flow transits a relay circuit (never a direct link).
+      - RUST_LOG=info,execution=debug,network=debug
       - RL_BLS_PASSPHRASE=local
       - RAYLS_NETWORK=local
       # the single reservation: own relay DMZ leg (see validator1)
@@ -428,7 +438,7 @@ services:
       - sh
       - -c
       - >
-        ip route add default via 10.10.3.3 &&
+        ip route replace default via 10.10.3.3 &&
         iptables -A INPUT -i lo -j ACCEPT &&
         iptables -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT &&
         iptables -P INPUT DROP &&
@@ -441,7 +451,7 @@ services:
         iptables -A OUTPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT &&
         iptables -P OUTPUT DROP &&
         exec /usr/local/bin/rayls node --datadir /home/nonroot/data --metrics 127.0.0.1:9101
-        --log.stdout.format log-fmt --full --storage.v2
+        --log.stdout.format terminal -vvvv --full --storage.v2
         --txpool.pending-max-count 1000000 --txpool.pending-max-size 20971120000
         --txpool.basefee-max-count 1000000 --txpool.basefee-max-size 20971120000
         --txpool.queued-max-count 1000000 --txpool.queued-max-size 20971120000
@@ -463,7 +473,9 @@ services:
       relay4:
         condition: service_started
     environment:
-      - RUST_LOG=info,execution=debug
+      # network=debug surfaces the connection-path classification and per-request via-path
+      # tracing that proves every peer flow transits a relay circuit (never a direct link).
+      - RUST_LOG=info,execution=debug,network=debug
       - RL_BLS_PASSPHRASE=local
       - RAYLS_NETWORK=local
       # the single reservation: own relay DMZ leg (see validator1)
@@ -473,7 +485,7 @@ services:
       - sh
       - -c
       - >
-        ip route add default via 10.10.4.3 &&
+        ip route replace default via 10.10.4.3 &&
         iptables -A INPUT -i lo -j ACCEPT &&
         iptables -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT &&
         iptables -P INPUT DROP &&
@@ -486,7 +498,7 @@ services:
         iptables -A OUTPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT &&
         iptables -P OUTPUT DROP &&
         exec /usr/local/bin/rayls node --datadir /home/nonroot/data --metrics 127.0.0.1:9101
-        --log.stdout.format log-fmt --full --storage.v2
+        --log.stdout.format terminal -vvvv --full --storage.v2
         --txpool.pending-max-count 1000000 --txpool.pending-max-size 20971120000
         --txpool.basefee-max-count 1000000 --txpool.basefee-max-size 20971120000
         --txpool.queued-max-count 1000000 --txpool.queued-max-size 20971120000
@@ -508,7 +520,9 @@ services:
   observer1:
     <<: *observer-common
     environment:
-      - RUST_LOG=info
+      # network=debug surfaces the connection-path classification and per-request via-path
+      # tracing that proves every peer flow transits a relay circuit (never a direct link).
+      - RUST_LOG=info,network=debug
       - RL_BLS_PASSPHRASE=local
       - RAYLS_NETWORK=local
       - RAYLS_DNS_SERVER=10.20.0.53:53
@@ -520,7 +534,7 @@ services:
       - WORKER_LISTENER_MULTIADDR=/ip4/0.0.0.0/udp/49595/quic-v1
     command: >
       /usr/local/bin/rayls node --observer --datadir /home/nonroot/data --metrics 127.0.0.1:9101
-      --log.stdout.format log-fmt --full --storage.v2
+      --log.stdout.format terminal -vvvv --full --storage.v2
       --txpool.pending-max-count 1000000 --txpool.pending-max-size 20971120000
       --txpool.basefee-max-count 1000000 --txpool.basefee-max-size 20971120000
       --txpool.queued-max-count 1000000 --txpool.queued-max-size 20971120000
@@ -538,7 +552,9 @@ services:
   observer2:
     <<: *observer-common
     environment:
-      - RUST_LOG=info
+      # network=debug surfaces the connection-path classification and per-request via-path
+      # tracing that proves every peer flow transits a relay circuit (never a direct link).
+      - RUST_LOG=info,network=debug
       - RL_BLS_PASSPHRASE=local
       - RAYLS_NETWORK=local
       - RAYLS_DNS_SERVER=10.20.0.53:53
@@ -546,7 +562,7 @@ services:
       - WORKER_LISTENER_MULTIADDR=/ip4/0.0.0.0/udp/49595/quic-v1
     command: >
       /usr/local/bin/rayls node --observer --datadir /home/nonroot/data --metrics 127.0.0.1:9101
-      --log.stdout.format log-fmt --full --storage.v2
+      --log.stdout.format terminal -vvvv --full --storage.v2
       --txpool.pending-max-count 1000000 --txpool.pending-max-size 20971120000
       --txpool.basefee-max-count 1000000 --txpool.basefee-max-size 20971120000
       --txpool.queued-max-count 1000000 --txpool.queued-max-size 20971120000
@@ -572,25 +588,28 @@ volumes:
   sharedgenesisdir:
 
 networks:
-  # one "private VPC" per validator: internal = no default route, no port publishing, no host
-  # route; the only egress is the validator's own relay (its default gateway)
+  # One "private VPC" per validator. NOTE: deliberately NOT `internal: true`. Docker's `internal`
+  # drops a container's egress to anything outside its own subnet BEFORE it reaches a gateway.
+  # OrbStack ignores that (it routes between bridges), but Docker Desktop enforces it strictly - so
+  # on Docker Desktop an `internal` VPC stops a validator from reaching FOREIGN relays through its
+  # own relay (the circuit first hops), and consensus never forms. Isolation is not the network's
+  # job here: it is enforced by the in-container firewalls (validator OUTPUT/INPUT DROP + relay
+  # FORWARD DROP/MASQUERADE) plus Docker's per-bridge isolation. That is also the honest production
+  # model - a cloud VPC permits egress via a NAT gateway while security groups do the isolating -
+  # and it behaves identically on OrbStack and Docker Desktop.
   vpc1:
-    internal: true
     ipam:
       config:
         - subnet: 10.10.1.0/24
   vpc2:
-    internal: true
     ipam:
       config:
         - subnet: 10.10.2.0/24
   vpc3:
-    internal: true
     ipam:
       config:
         - subnet: 10.10.3.0/24
   vpc4:
-    internal: true
     ipam:
       config:
         - subnet: 10.10.4.0/24
