@@ -24,8 +24,8 @@ pub use crate::primary::Primary;
 mod consensus_bus;
 pub use consensus_bus::*;
 
-mod recent_blocks;
-pub use recent_blocks::*;
+mod recently_executed_blocks;
+pub use recently_executed_blocks::*;
 
 #[cfg(feature = "test-utils")]
 pub mod test_utils;

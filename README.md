@@ -134,6 +134,12 @@ curl 127.0.0.1:8545 \
     --data '{"method":"eth_chainId","params":[],"id":1,"jsonrpc":"2.0"}'
 ```
 
+## Security Audits
+
+The protocol has been independently audited by [Halborn](https://www.halborn.com/) —
+three assessments covering the consensus protocol, the network node, and the smart
+contracts. The full reports and their outcomes are in the [audits/](./audits/) directory.
+
 ## Acknowledgements
 
 Rayls Network is an EVM-compatible blockchain built with DAG-based consensus.

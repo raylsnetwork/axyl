@@ -91,7 +91,7 @@ impl<DB: Database> EngineToPrimary for EngineToPrimaryRpc<DB> {
             gc_round: *self.consensus_bus.gc_round_updates().borrow(),
             last_canonical_block: self
                 .consensus_bus
-                .recent_blocks()
+                .recently_executed_blocks()
                 .borrow()
                 .latest_block_num_hash()
                 .number,

@@ -1,0 +1,110 @@
+name: Release — bump version
+
+# Manually start a release. Bumps the shared workspace version
+# ([workspace.package].version, inherited by all crates) and opens a PR.
+# Merging that PR triggers tag-on-release.yml, which tags v<version> and builds
+# the devnet image — so this workflow's only job is the version bump + PR.
+#
+# ACCESS: workflow_dispatch already requires write access to the repo, so only
+# collaborators / org members granted write can start a release. The job also
+# pins the canonical org repo (repository_owner) as a fork guard. To restrict
+# further to specific people, re-add an actor allowlist; to assert strict org
+# membership (excluding outside collaborators), a read:org PAT would be needed.
+
+on:
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: 'Semver level to bump'
+        type: choice
+        required: true
+        default: patch
+        options:
+          - patch
+          - minor
+          - major
+
+permissions:
+  contents: write        # push the release/* branch
+  pull-requests: write   # open the release PR
+
+jobs:
+  bump:
+    name: Bump ${{ inputs.bump }} and open PR
+    runs-on: ubuntu-latest
+    # Fork guard: only run on the canonical org repo. Who may trigger is already
+    # bounded by workflow_dispatch's write-access requirement (i.e. org members
+    # / collaborators with write), so no separate actor allowlist is enforced.
+    if: github.repository_owner == 'raylsnetwork'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 1
+
+      # cargo (no compile) is needed only to sync Cargo.lock after the bump.
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
+        with:
+          toolchain: 1.91.0
+
+      - name: Bump workspace version
+        id: bump
+        env:
+          BUMP: ${{ inputs.bump }}
+        run: |
+          set -euo pipefail
+          # Read the shared version from [workspace.package] (the first
+          # `version = "..."` inside that table).
+          OLD=$(awk -F'"' '/^\[workspace\.package\]/{f=1} f&&/^version = "/{print $2; exit}' Cargo.toml)
+          [ -n "$OLD" ] || { echo "::error::could not read [workspace.package] version"; exit 1; }
+
+          # Compute the next version (drop any pre-release/build suffix first).
+          IFS='.' read -r MA MI PA <<< "${OLD%%[-+]*}"
+          case "$BUMP" in
+            major) MA=$((MA+1)); MI=0; PA=0 ;;
+            minor) MI=$((MI+1)); PA=0 ;;
+            patch) PA=$((PA+1)) ;;
+          esac
+          NEW="$MA.$MI.$PA"
+          echo "Bumping $OLD -> $NEW"
+
+          # Rewrite only the version inside [workspace.package]; members inherit
+          # it via `version.workspace = true`, so nothing else changes.
+          awk -v new="$NEW" '
+            /^\[workspace\.package\]/ { inwp=1 }
+            inwp && /^version = "/ { sub(/"[^"]*"/, "\"" new "\""); inwp=0 }
+            { print }
+          ' Cargo.toml > Cargo.toml.tmp && mv Cargo.toml.tmp Cargo.toml
+
+          # Sync Cargo.lock (only the workspace members' versions; leaves deps alone).
+          cargo update --workspace
+
+          GOT=$(awk -F'"' '/^\[workspace\.package\]/{f=1} f&&/^version = "/{print $2; exit}' Cargo.toml)
+          [ "$GOT" = "$NEW" ] || { echo "::error::bump verify failed ($GOT != $NEW)"; exit 1; }
+
+          echo "old=$OLD" >> "$GITHUB_OUTPUT"
+          echo "new=$NEW" >> "$GITHUB_OUTPUT"
+
+      - name: Create branch, commit, open PR
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NEW: ${{ steps.bump.outputs.new }}
+          OLD: ${{ steps.bump.outputs.old }}
+          BUMP: ${{ inputs.bump }}
+          ACTOR: ${{ github.actor }}
+        run: |
+          set -euo pipefail
+          BRANCH="release/v$NEW"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git switch -c "$BRANCH"
+          git add Cargo.toml Cargo.lock
+          git commit -m "chore(release): v$NEW"
+          git push --set-upstream origin "$BRANCH"
+          gh pr create --base main --head "$BRANCH" \
+            --title "chore(release): v$NEW" \
+            --assignee "$ACTOR" \
+            --body "Automated version bump \`$OLD\` → \`$NEW\` (level: \`$BUMP\`), triggered by @$ACTOR.
+
+          Merging this PR creates tag \`v$NEW\` and builds the \`devnet-v$NEW\` image (via \`tag-on-release.yml\`)."

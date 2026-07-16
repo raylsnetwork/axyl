@@ -16,8 +16,9 @@ impl<DB: Database> Proposer<DB> {
     /// `Some`.
     ///
     /// Reads the monotonic execution anchor - the leader round of the highest executed output - NOT
-    /// `recent_blocks().latest_block()`, whose tip regresses below the true frontier after a
-    /// drained parked (out-of-order seq) batch and would wedge the proposer permanently.
+    /// `recently_executed_blocks().latest_block()`, whose tip regresses below the true frontier
+    /// after a drained parked (out-of-order seq) batch and would wedge the proposer
+    /// permanently.
     pub(crate) fn execution_lag(&self) -> Option<u64> {
         let exec_round =
             self.consensus_bus.executed_anchor().borrow().sub_dag.leader_round() as u64;
@@ -28,7 +29,7 @@ impl<DB: Database> Proposer<DB> {
     /// Returns Ok on shutdown or an error to indicate a fatal condition.
     pub(super) async fn run(&mut self) -> ProposerResult<()> {
         // Wait for execution replay to complete before proposing headers.
-        // On restart, recent_blocks may be stale; replaying ensures we don't embed
+        // On restart, recently_executed_blocks may be stale; replaying ensures we don't embed
         // outdated exec_digest values that cause validator divergence.
         // Subscribe before borrowing to avoid TOCTOU deadlock  where the signal is marked "seen"
         // before we check it.

@@ -11,7 +11,7 @@ use rayls_consensus_primary::{
 use rayls_infrastructure_config::ConsensusConfig;
 use rayls_infrastructure_storage::{
     tables::{Batches, ConsensusBlockNumbersByDigest, ConsensusBlocks, ConsensusBlocksCache},
-    CertificateStore, CheckpointStore, ConsensusStore, EpochStore,
+    CertificateStore, CheckpointStore, ConsensusStore, EpochStore, ReadTimeout,
 };
 use rayls_infrastructure_types::{
     AuthorityIdentifier, ConsensusHeader, ConsensusOutput, Database, DbTx, DbTxMut, Epoch,
@@ -88,7 +88,7 @@ pub fn prime_consensus<DB: Database>(consensus_bus: &ConsensusBus, config: &Cons
     // rejoin gate and cert_manager's threshold see a consistent view.
     let gc_round = committed_round.saturating_sub(gc_depth);
     let (cert_store_max, cert_count) =
-        match config.node_storage().after_round(gc_round.saturating_add(1)) {
+        match config.node_storage().after_round(gc_round.saturating_add(1), ReadTimeout::Exempt) {
             Ok(certs) => {
                 let count = certs.len();
                 let max = certs.iter().map(|c| c.round()).max();
@@ -290,8 +290,8 @@ pub fn consensus_chain_tip<DB: Database>(config: &ConsensusConfig<DB>) -> Option
 /// Resolve the consensus header an executed EL block anchors to, via its
 /// `parent_beacon_block_root`. Returns `None` for a genesis/zero anchor or an absent header.
 ///
-/// Use at startup, before `recent_blocks` is primed, when the EL canonical tip is the only
-/// source of the last executed consensus header.
+/// Use at startup, before `recently_executed_blocks` is primed, when the EL canonical tip is the
+/// only source of the last executed consensus header.
 pub fn last_executed_consensus_from_anchor<DB: Database>(
     parent_beacon_block_root: Option<B256>,
     db: &DB,
@@ -449,7 +449,7 @@ fn collect_replayable_headers<DB: Database>(
 /// The manager's `recover_partial_transition()` runs BEFORE this function is called.
 /// That method checks for incomplete epoch transitions (via a DB checkpoint) and either
 /// completes the remaining phases or clears a stale checkpoint. By the time this
-/// function executes, the checkpoint system guarantees that `recent_blocks` accurately
+/// function executes, the checkpoint system guarantees that `recently_executed_blocks` accurately
 /// reflects the last executed block.
 ///
 /// If a checkpoint still exists when this function runs, it indicates an unexpected
@@ -746,7 +746,8 @@ async fn catch_up_consensus_from_to<DB: Database>(
 
         let base_execution_block = consensus_header.sub_dag.leader.header().latest_execution_block;
         if streamed.is_multiple_of(100) {
-            let recent_latest = consensus_bus.recent_blocks().borrow().latest_block_num_hash();
+            let recent_latest =
+                consensus_bus.recently_executed_blocks().borrow().latest_block_num_hash();
             info!(
                 target: "rayls-consensus-state-sync",
                 consensus_number = number,
@@ -765,7 +766,7 @@ async fn catch_up_consensus_from_to<DB: Database>(
         {
             // A genuine `Forked` recurs and needs an operator DB restore: catch-up cannot rebuild
             // forked committed history.
-            let recent = consensus_bus.recent_blocks().borrow();
+            let recent = consensus_bus.recently_executed_blocks().borrow();
             let recent_oldest = recent.oldest_block_number();
             let recent_latest = recent.latest_block_num_hash();
             let recent_len = recent.len();
@@ -777,10 +778,10 @@ async fn catch_up_consensus_from_to<DB: Database>(
                 consensus_leader_round = consensus_header.sub_dag.leader_round(),
                 base_exec_block_number = base_execution_block.number,
                 base_exec_block_hash = ?base_execution_block.hash,
-                recent_blocks_oldest = recent_oldest,
-                recent_blocks_latest_number = recent_latest.number,
-                recent_blocks_latest_hash = ?recent_latest.hash,
-                recent_blocks_len = recent_len,
+                recently_executed_blocks_oldest = recent_oldest,
+                recently_executed_blocks_latest_number = recent_latest.number,
+                recently_executed_blocks_latest_hash = ?recent_latest.hash,
+                recently_executed_blocks_len = recent_len,
                 %wait_err,
                 "catch-up could not confirm execution reached the referenced block"
             );
@@ -788,7 +789,7 @@ async fn catch_up_consensus_from_to<DB: Database>(
             return Err(eyre::eyre!(
                 "catch-up could not confirm execution of consensus header {} \
                  (references execution block {}, hash {:?}): {wait_err}. \
-                 recent_blocks range is [{}, {}] with {} blocks; the streamer will retry.",
+                 recently_executed_blocks range is [{}, {}] with {} blocks; the streamer will retry.",
                 number,
                 base_execution_block.number,
                 base_execution_block.hash,

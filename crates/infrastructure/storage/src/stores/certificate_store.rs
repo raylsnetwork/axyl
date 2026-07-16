@@ -7,7 +7,8 @@ use crate::{
     StoreResult,
 };
 use rayls_infrastructure_types::{
-    AuthorityIdentifier, Certificate, CertificateDigest, Database, DbTx, DbTxMut, Hash, Round,
+    AuthorityIdentifier, Certificate, CertificateDigest, Database, DbTx, DbTxMut, Hash,
+    ReadTimeout, Round,
 };
 use rayls_infrastructure_utils::NotifyRead;
 
@@ -73,8 +74,11 @@ pub trait CertificateStore {
     fn delete(&self, id: CertificateDigest) -> StoreResult<()>;
 
     /// Retrieves all the certificates with round >= the provided round.
-    /// The result is returned with certificates sorted in round asc order
-    fn after_round(&self, round: Round) -> StoreResult<Vec<Certificate>>;
+    /// The result is returned with certificates sorted in round asc order.
+    ///
+    /// `timeout` controls whether this (potentially large) scan is subject to the read-transaction
+    /// timeout; recovery-path callers pass [`ReadTimeout::Exempt`].
+    fn after_round(&self, round: Round, timeout: ReadTimeout) -> StoreResult<Vec<Certificate>>;
 
     /// Retrieves origins with certificates in each round >= the provided round.
     fn origins_after_round(
@@ -237,10 +241,15 @@ impl<DB: Database> CertificateStore for DB {
 
     /// Retrieves all the certificates with round >= the provided round.
     /// The result is returned with certificates sorted in round asc order
-    fn after_round(&self, round: Round) -> StoreResult<Vec<Certificate>> {
+    fn after_round(&self, round: Round, timeout: ReadTimeout) -> StoreResult<Vec<Certificate>> {
         // Collect digests within a properly scoped read transaction
         // to ensure MDBX can reclaim dirty pages after the iterator completes
         self.with_read_txn(|txn| {
+            if timeout == ReadTimeout::Exempt {
+                // Bounded one-shot recovery scan: opt out of the read-txn cap so a transient I/O
+                // stall can't force-reset the txn mid-recovery and fail the caller.
+                txn.disable_long_read_safety();
+            }
             let iter = if round > 0 {
                 txn.skip_to::<CertificateDigestByRound>(
                     &(round - 1, AuthorityIdentifier::default()),

@@ -80,6 +80,22 @@ struct Cli {
     #[arg(long, value_name = "BLOCK")]
     unwind_to: Option<u64>,
 
+    /// Repair genesis history indices on an existing archive, then exit (no
+    /// replay). Idempotent; run with the node stopped. Freshly built archives
+    /// are repaired automatically at the end of a normal replay, so this flag is
+    /// only for archives built before that behaviour existed (e.g. mainnet).
+    /// Fixes two v2 archive issues:
+    ///
+    /// 1. StoragesHistory re-key: reth writes genesis StoragesHistory under plain slots while the
+    ///    v2 read looks up by keccak256(slot), so genesis-seeded storage (e.g. the validator set)
+    ///    returns 0x0 at historical blocks.
+    ///
+    /// 2. AccountsHistory seed: IndexAccountHistoryStage clears AccountsHistory on first sync and
+    ///    never re-inserts accounts whose code/nonce/balance never change after genesis (immutable
+    ///    system contracts). Historical `eth_call` returns empty contract code for those accounts.
+    #[arg(long = "fix-genesis-history")]
+    fix_genesis_history: bool,
+
     /// Verify state root after every block (slow). Default: epoch boundaries only.
     #[arg(long)]
     verify_every_block: bool,
@@ -150,8 +166,6 @@ async fn run(cli: Cli) -> eyre::Result<()> {
         "loaded network configuration"
     );
 
-    let consensus_store = open_db(&consensus_db);
-
     // archive blocks build with the snapshot's committed close-epoch tally,
     // staged into `tally_store` per close block; snapshot env never builds.
     let tally_store = SnapshotTallyStore::default();
@@ -174,6 +188,19 @@ async fn run(cli: Cli) -> eyre::Result<()> {
     .await
     .wrap_err("open archive reth env")?;
 
+    // maintenance exit: repair genesis history on an existing archive, then exit
+    // before opening the snapshot env (no replay).
+    if cli.fix_genesis_history {
+        archive_evm.fix_genesis_history()?;
+        archive_evm.fix_genesis_account_history()?;
+        info!(
+            target: "rayls_replay::main",
+            archive_out = %cli.archive_out.display(),
+            "genesis-history fix complete"
+        );
+        return Ok(());
+    }
+
     // unwind exits before opening the snapshot env; only the archive is touched
     if let Some(target) = cli.unwind_to {
         archive_evm
@@ -188,6 +215,12 @@ async fn run(cli: Cli) -> eyre::Result<()> {
         );
         return Ok(());
     }
+
+    // snapshot-only setup: the consensus DB is the replay oracle and is unused by
+    // the fix-genesis and unwind early-return paths above, so open it only once
+    // we know we're actually replaying (avoids touching a dummy/bad path in those
+    // maintenance modes).
+    let consensus_store = open_db(&consensus_db);
 
     let snapshot_evm = RethEnv::new_for_archive_replay(
         Arc::clone(&base_chain),
@@ -245,6 +278,20 @@ async fn run(cli: Cli) -> eyre::Result<()> {
         );
         return Ok(());
     }
+
+    // archive is complete: repair the two genesis-history issues so it boots
+    // correct without a separate --fix-genesis-history pass. The re-key/seed
+    // read-merge with existing history, so running here (after replay) preserves
+    // every post-genesis change; a no-op on v1 archives and on any slot/account
+    // already carrying the genesis block. Only on normal completion — the
+    // graceful-stop path returns above, leaving the archive resumable.
+    archive_evm.fix_genesis_history()?;
+    archive_evm.fix_genesis_account_history()?;
+    info!(
+        target: "rayls_replay::main",
+        archive_out = %cli.archive_out.display(),
+        "genesis-history fix applied to freshly built archive"
+    );
 
     // close the DB envs before the copy so no MDBX handle still maps the files;
     // all three are unused past the flush above

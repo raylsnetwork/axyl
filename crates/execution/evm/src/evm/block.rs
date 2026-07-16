@@ -483,9 +483,7 @@ where
 
     /// Extract the epoch number from a header's nonce.
     fn extract_epoch_from_nonce(&self, nonce: u64) -> u32 {
-        // epochs are packed into nonce as 32 bits
-        let epoch = nonce >> 32;
-        epoch as u32
+        rayls_infrastructure_types::nonce::unpack_nonce(nonce).0
     }
 
     /// Applies the pre-block call to the EIP-4788 consensus root contract (cancun).

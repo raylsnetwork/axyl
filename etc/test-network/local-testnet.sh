@@ -269,6 +269,14 @@ fi
 if [[ "$EXPOSE_WS" == "1" ]]; then
     FLAG_WS_API="--ws"
 fi
+# Observers only: `--full` prunes account/storage history to ~10k blocks. Set
+# DISABLE_PRUNING=1 to run observers as full archives (no pruning) so their
+# datadir can seed `rayls-replay`. Validators are unaffected.
+OBSERVER_FULL_FLAG="--full"
+if [[ "$DISABLE_PRUNING" == "1" || "$DISABLE_PRUNING" == "true" ]]; then
+    OBSERVER_FULL_FLAG=""
+    echo "DISABLE_PRUNING set: observers will run as full archives (no --full)"
+fi
 FLAG_TX_POOL_MAX_COUNT="50000"
 FLAG_TX_POOL_MAX_SIZE="1048556000"
 if [[ "$TX_POOL_LARGE_LIMITS" == "1" ]]; then
@@ -467,7 +475,7 @@ if [ "$START" = true ]; then
                 --instance "${OBSERVER_INSTANCE}" \
                 --metrics "${OBSERVER_METRICS}" \
                 --log.stdout.format log-fmt \
-                --full \
+                ${OBSERVER_FULL_FLAG} \
                 --storage.v2 \
                 ${FLAG_DB_GROW} \
                 ${FLAG_CONSENSUS_DB_GROW} \

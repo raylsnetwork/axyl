@@ -150,7 +150,7 @@ impl Header {
 
     /// The nonce of this header used during execution.
     pub fn nonce(&self) -> u64 {
-        ((self.epoch as u64) << 32) | self.round as u64
+        crate::nonce::pack_nonce(self.epoch, self.round)
     }
 }
 

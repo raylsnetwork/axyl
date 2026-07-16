@@ -1,0 +1,146 @@
+name: Feature Build Matrix
+
+# Builds the `rayls-network` binary across a matrix of cargo feature sets to catch
+# feature-gating breakage (a feature that doesn't compile alone, a conflicting
+# combination, or code gated behind the wrong feature). Mirrors the release build in
+# etc/docker-network/Dockerfile — same toolchain and system deps, building
+# `--release` with each feature set — so a green matrix means the Docker image
+# builds for every listed feature set.
+#
+# Caching under a parallel matrix:
+#   * The `production` job builds the default-feature (shipping) binary AND warms the
+#     shared caches. It runs FIRST; the `variants` matrix `needs:` it, so by the time
+#     the parallel legs start, the caches are populated and visible to them.
+#   * sccache (GHA backend) is a single content-addressed store keyed per rustc
+#     invocation, so every crate `production` compiled is reused by any variant leg
+#     whose inputs match — only feature-affected crates recompile. All legs use
+#     `cargo build --release` (same profile) so their sccache keys line up.
+#   * rust-cache runs with `cache-targets: false` (registry/git downloads only, which
+#     are identical regardless of features); `production` saves it, variants restore.
+#
+# Add a new feature to cover = one line in `variants.matrix.include`.
+
+# Only reads the repo (checkout + build). Least-privilege.
+permissions:
+  contents: read
+
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# A newer push to the same PR/branch cancels the in-flight run.
+concurrency:
+  group: feature-build-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_INCREMENTAL: 0
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  # Route rustc through sccache and back it with the GitHub Actions cache.
+  RUSTC_WRAPPER: sccache
+  SCCACHE_GHA_ENABLED: "true"
+
+jobs:
+  # Builds the shipping binary (default features) and, as a side effect, warms the
+  # shared sccache + registry caches that the variant matrix reuses.
+  production:
+    name: production (default features + warm cache)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 1
+
+      - name: Install Rust 1.91.0
+        uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
+        with:
+          toolchain: 1.91.0
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake libclang-16-dev pkg-config libssl-dev libapr1-dev
+
+      # Registry/git downloads only — identical across feature sets, so shareable.
+      # This job writes the cache; the variant legs restore it read-only.
+      - name: Cache cargo registry
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          shared-key: feature-build
+          cache-targets: false
+          cache-on-failure: true
+
+      - name: Set up sccache
+        uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
+
+      - name: Build rayls-network (production, default features)
+        env:
+          VERGEN_GIT_SHA: ${{ github.sha }}
+        run: cargo build --bin rayls-network --release --locked
+
+      - name: sccache stats
+        if: always()
+        run: sccache --show-stats
+
+  variants:
+    name: build (${{ matrix.name }})
+    needs: production
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: dev-single-node-setup
+            cargo_flags: "--features dev-single-node-setup"
+          - name: faucet
+            cargo_flags: "--features faucet"
+          - name: dev-and-faucet
+            cargo_flags: "--features dev-single-node-setup,faucet"
+          # Guards against code that only compiles because a default feature is on.
+          - name: no-default-features
+            cargo_flags: "--no-default-features"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 1
+
+      - name: Install Rust 1.91.0
+        uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
+        with:
+          toolchain: 1.91.0
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake libclang-16-dev pkg-config libssl-dev libapr1-dev
+
+      # Restore only — `production` owns writes to this key, so parallel legs never
+      # race or clobber it.
+      - name: Restore cargo registry
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          shared-key: feature-build
+          cache-targets: false
+          save-if: false
+
+      - name: Set up sccache
+        uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
+
+      - name: Build rayls-network (${{ matrix.name }})
+        env:
+          VERGEN_GIT_SHA: ${{ github.sha }}
+        # matrix.cargo_flags is a static, workflow-authored value (not user
+        # input), so expanding it into the run line is safe.
+        run: cargo build --bin rayls-network --release --locked ${{ matrix.cargo_flags }}
+
+      - name: sccache stats
+        if: always()
+        run: sccache --show-stats

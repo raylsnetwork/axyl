@@ -248,8 +248,7 @@ impl RaylsEvmConfig {
         if close_epoch.is_none() {
             return Ok(None);
         }
-        let epoch = (nonce >> 32) as u32;
-        let last_round = nonce as u32;
+        let (epoch, last_round) = rayls_infrastructure_types::nonce::unpack_nonce(nonce);
         let tally = self
             .rewards_counter
             .tally(epoch, last_round)
