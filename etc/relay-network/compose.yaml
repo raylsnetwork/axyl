@@ -133,7 +133,8 @@ services:
         iptables -A FORWARD -s 10.10.1.10 -d 10.20.0.13 -p udp --dport 4001 -j ACCEPT &&
         iptables -A FORWARD -s 10.10.1.10 -d 10.20.0.14 -p udp --dport 4001 -j ACCEPT &&
         iptables -P FORWARD DROP &&
-        exec rayls-relay
+        mkdir -p /root/.cache/rayls-relay &&
+        exec rayls-relay >> /root/.cache/rayls-relay/relay.log 2>&1
     networks:
       public:
         ipv4_address: 10.20.0.11
@@ -158,7 +159,8 @@ services:
         iptables -A FORWARD -s 10.10.2.10 -d 10.20.0.13 -p udp --dport 4001 -j ACCEPT &&
         iptables -A FORWARD -s 10.10.2.10 -d 10.20.0.14 -p udp --dport 4001 -j ACCEPT &&
         iptables -P FORWARD DROP &&
-        exec rayls-relay
+        mkdir -p /root/.cache/rayls-relay &&
+        exec rayls-relay >> /root/.cache/rayls-relay/relay.log 2>&1
     networks:
       public:
         ipv4_address: 10.20.0.12
@@ -183,7 +185,8 @@ services:
         iptables -A FORWARD -s 10.10.3.10 -d 10.20.0.13 -p udp --dport 4001 -j ACCEPT &&
         iptables -A FORWARD -s 10.10.3.10 -d 10.20.0.14 -p udp --dport 4001 -j ACCEPT &&
         iptables -P FORWARD DROP &&
-        exec rayls-relay
+        mkdir -p /root/.cache/rayls-relay &&
+        exec rayls-relay >> /root/.cache/rayls-relay/relay.log 2>&1
     networks:
       public:
         ipv4_address: 10.20.0.13
@@ -208,7 +211,8 @@ services:
         iptables -A FORWARD -s 10.10.4.10 -d 10.20.0.13 -p udp --dport 4001 -j ACCEPT &&
         iptables -A FORWARD -s 10.10.4.10 -d 10.20.0.14 -p udp --dport 4001 -j ACCEPT &&
         iptables -P FORWARD DROP &&
-        exec rayls-relay
+        mkdir -p /root/.cache/rayls-relay &&
+        exec rayls-relay >> /root/.cache/rayls-relay/relay.log 2>&1
     networks:
       public:
         ipv4_address: 10.20.0.14
