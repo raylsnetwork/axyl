@@ -88,13 +88,19 @@ fn test_connection_path_classification() {
     assert_eq!(
         ConnectionPath::classify(&direct, true),
         ConnectionPath::RelayDirect {
-            endpoint: Some(Endpoint { addr: "127.0.0.1:4001".parse().unwrap(), transport: Transport::Quic }),
+            endpoint: Some(Endpoint {
+                addr: "127.0.0.1:4001".parse().unwrap(),
+                transport: Transport::Quic
+            }),
         }
     );
     assert_eq!(
         ConnectionPath::classify(&direct, false),
         ConnectionPath::DirectNonRelay {
-            endpoint: Some(Endpoint { addr: "127.0.0.1:4001".parse().unwrap(), transport: Transport::Quic }),
+            endpoint: Some(Endpoint {
+                addr: "127.0.0.1:4001".parse().unwrap(),
+                transport: Transport::Quic
+            }),
         }
     );
 }

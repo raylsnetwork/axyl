@@ -67,8 +67,9 @@ pub enum ConnectionPath {
         /// The relay server the circuit runs through, when the address names it.
         relay: Option<PeerId>,
         /// The relay server's transport endpoint (the first-hop leg the circuit rides on). This is
-        /// NOT the peer's own endpoint -- a relayed peer's address is never observable here (that's
-        /// the point of the relay) -- it's the relay we circuit through, for log correlation.
+        /// NOT the peer's own endpoint -- a relayed peer's address is never observable here
+        /// (that's the point of the relay) -- it's the relay we circuit through, for log
+        /// correlation.
         relay_endpoint: Option<Endpoint>,
     },
     /// A direct connection to a registered relay server (the first-hop leg circuits ride on).
