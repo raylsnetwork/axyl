@@ -31,21 +31,40 @@ use rayls_infrastructure_config::QuicConfig;
 use std::{
     collections::HashMap,
     env,
-    net::{IpAddr, Ipv4Addr},
+    net::{IpAddr, Ipv4Addr, SocketAddr},
     time::Duration,
 };
 use tracing::info;
 
-/// Extract the IPv4/IPv6 address from a multiaddr, if it names one. Used to annotate the relay's
-/// peer-id-only events with the IP of each peer's direct connection to this relay, so logs can be
-/// correlated by address during investigations (a relayed peer's *own* IP is never visible here --
-/// only the IP of whoever holds the direct leg to the relay).
-fn addr_ip(addr: &Multiaddr) -> Option<IpAddr> {
-    addr.iter().find_map(|p| match p {
-        Protocol::Ip4(ip) => Some(IpAddr::V4(ip)),
-        Protocol::Ip6(ip) => Some(IpAddr::V6(ip)),
-        _ => None,
-    })
+/// Render a peer's direct-connection endpoint (`ip:port/proto`, e.g. `127.0.0.1:54321/quic-v1`) for
+/// log annotation. The relay's events are peer-id-only and the swarm exposes no per-peer address
+/// lookup, so this is extracted from `ConnectionEstablished` and cached. A relayed peer's *own*
+/// address is never visible here -- only the endpoint of whoever holds the direct leg to the relay.
+/// Reads the multiaddr's typed protocols (not string parsing); `None` if it names no ip+port
+/// transport.
+fn endpoint_str(addr: &Multiaddr) -> Option<String> {
+    let mut ip = None;
+    let mut port = None;
+    let mut proto = "?";
+    for p in addr.iter() {
+        match p {
+            Protocol::Ip4(a) => ip = Some(IpAddr::V4(a)),
+            Protocol::Ip6(a) => ip = Some(IpAddr::V6(a)),
+            Protocol::Udp(x) => {
+                port = Some(x);
+                proto = "udp";
+            }
+            Protocol::Tcp(x) => {
+                port = Some(x);
+                proto = "tcp";
+            }
+            Protocol::QuicV1 | Protocol::Quic => proto = "quic-v1",
+            Protocol::Ws(_) | Protocol::Wss(_) => proto = "ws",
+            Protocol::P2p(_) | Protocol::P2pCircuit => break,
+            _ => {}
+        }
+    }
+    Some(format!("{}/{}", SocketAddr::new(ip?, port?), proto))
 }
 use tracing_subscriber::EnvFilter;
 
@@ -184,9 +203,9 @@ async fn main() -> eyre::Result<()> {
     // events can be logged with an address for easy correlation. The events themselves carry no
     // address (and the swarm exposes no per-peer address lookup), so we cache it from
     // `ConnectionEstablished` and evict when the peer's last connection closes.
-    let mut peer_ips: HashMap<PeerId, IpAddr> = HashMap::new();
-    let ip_of = |peer: &PeerId, m: &HashMap<PeerId, IpAddr>| {
-        m.get(peer).map(|ip| ip.to_string()).unwrap_or_else(|| "?".to_string())
+    let mut peer_eps: HashMap<PeerId, String> = HashMap::new();
+    let ep_of = |peer: &PeerId, m: &HashMap<PeerId, String>| {
+        m.get(peer).cloned().unwrap_or_else(|| "?".to_string())
     };
 
     loop {
@@ -202,35 +221,36 @@ async fn main() -> eyre::Result<()> {
                     info!(%address, %local_peer_id, "relay listening (dial as <addr>/p2p/{local_peer_id})");
                 }
                 SwarmEvent::Behaviour(BehaviourEvent::Relay(e)) => {
-                    // Annotate the high-traffic circuit/reservation events with the src/dst IPs the
-                    // relay sees (each peer's direct leg to this relay); fall back to the raw event.
+                    // Annotate the high-traffic circuit/reservation events with the src/dst
+                    // endpoints the relay sees (each peer's direct leg to this relay, ip:port/proto);
+                    // fall back to the raw event.
                     match &e {
                         relay::Event::ReservationReqAccepted { src_peer_id, renewed } => {
-                            info!(src = %src_peer_id, src_ip = %ip_of(src_peer_id, &peer_ips), renewed = *renewed, "reservation accepted");
+                            info!(src = %src_peer_id, src_addr = %ep_of(src_peer_id, &peer_eps), renewed = *renewed, "reservation accepted");
                         }
                         relay::Event::CircuitReqAccepted { src_peer_id, dst_peer_id } => {
-                            info!(src = %src_peer_id, src_ip = %ip_of(src_peer_id, &peer_ips), dst = %dst_peer_id, dst_ip = %ip_of(dst_peer_id, &peer_ips), "circuit accepted");
+                            info!(src = %src_peer_id, src_addr = %ep_of(src_peer_id, &peer_eps), dst = %dst_peer_id, dst_addr = %ep_of(dst_peer_id, &peer_eps), "circuit accepted");
                         }
                         relay::Event::CircuitReqDenied { src_peer_id, dst_peer_id, status } => {
-                            info!(src = %src_peer_id, src_ip = %ip_of(src_peer_id, &peer_ips), dst = %dst_peer_id, dst_ip = %ip_of(dst_peer_id, &peer_ips), ?status, "circuit denied");
+                            info!(src = %src_peer_id, src_addr = %ep_of(src_peer_id, &peer_eps), dst = %dst_peer_id, dst_addr = %ep_of(dst_peer_id, &peer_eps), ?status, "circuit denied");
                         }
                         relay::Event::CircuitClosed { src_peer_id, dst_peer_id, error } => {
-                            info!(src = %src_peer_id, src_ip = %ip_of(src_peer_id, &peer_ips), dst = %dst_peer_id, dst_ip = %ip_of(dst_peer_id, &peer_ips), ?error, "circuit closed");
+                            info!(src = %src_peer_id, src_addr = %ep_of(src_peer_id, &peer_eps), dst = %dst_peer_id, dst_addr = %ep_of(dst_peer_id, &peer_eps), ?error, "circuit closed");
                         }
                         _ => info!(?e, "relay event"),
                     }
                 }
                 SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } => {
                     let addr = endpoint.get_remote_address();
-                    if let Some(ip) = addr_ip(addr) {
-                        peer_ips.insert(peer_id, ip);
+                    if let Some(ep) = endpoint_str(addr) {
+                        peer_eps.insert(peer_id, ep);
                     }
                     info!(%peer_id, %addr, "connection established");
                 }
                 SwarmEvent::ConnectionClosed { peer_id, num_established, .. } => {
                     // Evict only when the peer has no remaining connections to this relay.
                     if num_established == 0 {
-                        peer_ips.remove(&peer_id);
+                        peer_eps.remove(&peer_id);
                     }
                     info!(%peer_id, "connection closed");
                 }

@@ -1,6 +1,6 @@
 //! Unit tests for network types.rs
 
-use super::{ConnectionPath, NodeRecord};
+use super::{ConnectionPath, Endpoint, NodeRecord, Transport};
 use crate::common::create_multiaddr;
 use libp2p::{core::ConnectedPoint, Multiaddr, PeerId};
 use rayls_infrastructure_config::KeyConfig;
@@ -54,7 +54,10 @@ fn test_connection_path_classification() {
         ConnectionPath::classify(&dialed, false),
         ConnectionPath::Circuit {
             relay: Some(relay),
-            relay_ip: Some("127.0.0.1".parse().unwrap())
+            relay_endpoint: Some(Endpoint {
+                addr: "127.0.0.1:4001".parse().unwrap(),
+                transport: Transport::Quic,
+            }),
         }
     );
 
@@ -69,7 +72,10 @@ fn test_connection_path_classification() {
         ConnectionPath::classify(&inbound, false),
         ConnectionPath::Circuit {
             relay: Some(relay),
-            relay_ip: Some("127.0.0.1".parse().unwrap())
+            relay_endpoint: Some(Endpoint {
+                addr: "127.0.0.1:4001".parse().unwrap(),
+                transport: Transport::Quic,
+            }),
         }
     );
 
@@ -81,10 +87,14 @@ fn test_connection_path_classification() {
     };
     assert_eq!(
         ConnectionPath::classify(&direct, true),
-        ConnectionPath::RelayDirect { ip: Some("127.0.0.1".parse().unwrap()) }
+        ConnectionPath::RelayDirect {
+            endpoint: Some(Endpoint { addr: "127.0.0.1:4001".parse().unwrap(), transport: Transport::Quic }),
+        }
     );
     assert_eq!(
         ConnectionPath::classify(&direct, false),
-        ConnectionPath::DirectNonRelay { ip: Some("127.0.0.1".parse().unwrap()) }
+        ConnectionPath::DirectNonRelay {
+            endpoint: Some(Endpoint { addr: "127.0.0.1:4001".parse().unwrap(), transport: Transport::Quic }),
+        }
     );
 }

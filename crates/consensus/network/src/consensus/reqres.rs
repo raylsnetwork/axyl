@@ -1,7 +1,7 @@
 use crate::{
     codec::RLMessage,
     peers::Penalty,
-    types::{NetworkEvent, NetworkResult},
+    types::{NetworkEvent, NetworkResult, NexthopFmt},
     ConsensusNetwork, PeerExchangeMap,
 };
 use libp2p::request_response::{
@@ -26,11 +26,12 @@ where
         match event {
             ReqResEvent::Message { peer, message, connection_id } => {
                 // the transport path this message actually traveled, for the relayed-topology
-                // audit trail (`None` only if the connection already closed)
-                let via = self.connection_paths.get(&connection_id).copied();
+                // audit trail. Cheap Copy wrapper; formatted lazily by the log macro only when the
+                // event is enabled ("closed" if the connection already closed).
+                let via = NexthopFmt(self.connection_paths.get(&connection_id).copied());
                 match message {
                     request_response::Message::Request { request_id, request, channel } => {
-                        debug!(target: "network", ?peer, ?via, ?request, "request received");
+                        debug!(target: "network", peer_id = %peer, ?via, ?request, "request received");
                         // intercept peer exchange messages
                         if let Some(peers) = request.peer_exchange_msg() {
                             debug!(target: "network", ?peers, "processing peer exchange");
@@ -88,7 +89,7 @@ where
                         }
                     }
                     request_response::Message::Response { request_id, response } => {
-                        debug!(target: "network", ?peer, ?via, ?request_id, "response received");
+                        debug!(target: "network", peer_id = %peer, ?via, ?request_id, "response received");
                         // check if response associated with PX disconnect
                         if self.pending_px_disconnects.remove(&request_id).is_some() {
                             let _ = self.swarm.disconnect_peer_id(peer);
