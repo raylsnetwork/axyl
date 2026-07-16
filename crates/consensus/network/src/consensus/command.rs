@@ -341,12 +341,14 @@ where
                     self.connected_peers.rotate_left(1);
                 }
 
-                // find first non-banned peer
-                if let Some(peer) = self
-                    .connected_peers
-                    .iter()
-                    .find(|p| !self.swarm.behaviour().peer_manager.peer_banned(p))
-                {
+                // find first non-banned peer that can actually serve a request. Relays are in
+                // `connected_peers` (the direct leg we route circuits over) but only speak the
+                // circuit protocol, so picking one as a request target always fails with
+                // `UnsupportedProtocols` -- skip them.
+                if let Some(peer) = self.connected_peers.iter().find(|p| {
+                    let pm = &self.swarm.behaviour().peer_manager;
+                    !pm.peer_banned(p) && !pm.is_relay(p)
+                }) {
                     let request_id = self.swarm.behaviour_mut().req_res.send_request(peer, request);
                     self.outbound_requests.insert((*peer, request_id), reply);
                 } else {
