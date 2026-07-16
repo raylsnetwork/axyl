@@ -6,7 +6,6 @@
 
 **The Rayls Network protocol client — EVM execution built on [reth], DAG-based BFT consensus (Narwhal + Bullshark).**
 
-[![CI][ci-badge]][ci-url]
 [![Nightly E2E][e2e-badge]][e2e-url]
 [![Nightly Fuzz][fuzz-badge]][fuzz-url]
 [![Version][version-badge]][version-url]
@@ -168,8 +167,6 @@ This repository is a derivative work that incorporates and modifies code from Te
 [reth]: https://github.com/paradigmxyz/reth
 [alloy]: https://github.com/alloy-rs/alloy
 
-[ci-badge]: https://github.com/raylsnetwork/axyl/actions/workflows/pr.yaml/badge.svg
-[ci-url]: https://github.com/raylsnetwork/axyl/actions/workflows/pr.yaml
 [e2e-badge]: https://github.com/raylsnetwork/axyl/actions/workflows/nightly-e2e.yml/badge.svg
 [e2e-url]: https://github.com/raylsnetwork/axyl/actions/workflows/nightly-e2e.yml
 [fuzz-badge]: https://github.com/raylsnetwork/axyl/actions/workflows/nightly-fuzz.yml/badge.svg
