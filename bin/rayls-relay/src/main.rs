@@ -19,6 +19,12 @@
 //!   (libp2p's own default is 128 KiB).
 //! - `RELAY_MAX_RESERVATIONS` / `RELAY_MAX_CIRCUITS` (optional): tighten global caps (defaults
 //!   raised to 1024).
+//! - `RELAY_ALLOWED_RESERVERS` (optional): `;`-separated list of peer ids allowed to reserve on
+//!   this relay (the validator(s) it fronts). When set, only those peers may hold a reservation;
+//!   every other peer's reservation is denied so the relay can't be squatted as free inbound
+//!   infrastructure. Circuit *sources* stay unrestricted -- other validators must still dial
+//!   through to reach a fronted one. Unset = any peer may reserve (the default the local testnet
+//!   relies on).
 
 use futures::StreamExt as _;
 use libp2p::{
@@ -29,7 +35,7 @@ use libp2p::{
 };
 use rayls_infrastructure_config::QuicConfig;
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     env,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     time::Duration,
@@ -92,6 +98,43 @@ where
     }
 }
 
+/// Parse a `;`-separated peer id list into an allow-list set.
+///
+/// Errors if any entry is not a valid peer id, or if the list yields no ids at all (that would deny
+/// every reservation and make the relay useless -- almost certainly a misconfiguration, so fail
+/// loudly rather than silently lock everyone out).
+fn parse_allowed_reservers(raw: &str) -> eyre::Result<HashSet<PeerId>> {
+    let set = raw
+        .split(';')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| {
+            s.parse::<PeerId>()
+                .map_err(|e| eyre::eyre!("invalid peer id {s:?} in RELAY_ALLOWED_RESERVERS: {e}"))
+        })
+        .collect::<eyre::Result<HashSet<PeerId>>>()?;
+    if set.is_empty() {
+        eyre::bail!("RELAY_ALLOWED_RESERVERS is set but lists no peer ids");
+    }
+    Ok(set)
+}
+
+/// Read `RELAY_ALLOWED_RESERVERS` into an allow-list set; `None` when the var is unset (allow-list
+/// disabled -- any peer may reserve).
+fn env_allowed_reservers() -> eyre::Result<Option<HashSet<PeerId>>> {
+    match env::var("RELAY_ALLOWED_RESERVERS") {
+        Ok(raw) => parse_allowed_reservers(&raw).map(Some),
+        Err(_) => Ok(None),
+    }
+}
+
+/// Build the reservation gate: a [`relay::RateLimiter`] that grants a reservation only to peers in
+/// `allowed`. `reservation_rate_limiters` is libp2p's only per-peer hook on the RESERVE path, so we
+/// use it as a plain membership check with no rate/time component (`now` is ignored).
+fn reservation_allow_list(allowed: HashSet<PeerId>) -> Box<dyn relay::RateLimiter> {
+    Box::new(move |peer: PeerId, _addr: &Multiaddr, _now| allowed.contains(&peer))
+}
+
 /// Build the relay config, applying any env overrides.
 ///
 /// The libp2p defaults describe a *limited* relay (2 min / 128 KiB per circuit) which force-closes
@@ -128,6 +171,21 @@ fn relay_config() -> eyre::Result<relay::Config> {
     if let Some(n) = env_parse::<usize>("RELAY_MAX_CIRCUITS")? {
         cfg.max_circuits = n;
     }
+
+    // Reservation allow-list. Each relay fronts a known, fixed set of validators, so only those
+    // peers should ever hold a reservation on it -- anyone else reserving is squatting a slot /
+    // using us as free inbound relay infrastructure. `reservation_rate_limiters` is libp2p's only
+    // per-peer hook on the RESERVE path, so we use it as a plain boolean gate (no rate component):
+    // a reservation is granted iff every limiter returns true, so one membership check denies all
+    // peers outside the set. `circuit_src_rate_limiters` is intentionally left open -- other
+    // validators must be able to open circuits *toward* a fronted one, and with no reservation of
+    // their own they can't use us for anything else. Unset = any peer may reserve (what the local
+    // testnet relies on).
+    if let Some(allowed) = env_allowed_reservers()? {
+        info!(count = allowed.len(), "reservation allow-list active: only these peers may reserve");
+        cfg.reservation_rate_limiters = vec![reservation_allow_list(allowed)];
+    }
+
     Ok(cfg)
 }
 
@@ -266,4 +324,194 @@ async fn main() -> eyre::Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use libp2p::{noise, yamux, Swarm, SwarmBuilder};
+    use web_time::Instant;
+
+    #[test]
+    fn parses_semicolon_list_trimming_whitespace_and_blanks() {
+        let a = PeerId::random();
+        let b = PeerId::random();
+        // leading/trailing spaces and a trailing empty segment must all be tolerated
+        let raw = format!("  {a} ; {b} ;  ");
+        assert_eq!(parse_allowed_reservers(&raw).unwrap(), HashSet::from([a, b]));
+    }
+
+    #[test]
+    fn rejects_malformed_peer_id() {
+        assert!(parse_allowed_reservers("not-a-peer-id").is_err());
+        let good = PeerId::random();
+        // one bad entry poisons the whole list rather than being silently dropped
+        assert!(parse_allowed_reservers(&format!("{good};nope")).is_err());
+    }
+
+    #[test]
+    fn rejects_list_with_no_ids() {
+        // set-but-empty would deny every reservation, so it must fail loudly, not parse to {}
+        assert!(parse_allowed_reservers("").is_err());
+        assert!(parse_allowed_reservers("  ;  ; ").is_err());
+    }
+
+    /// The built gate must grant reservations to listed peers and deny everyone else -- this
+    /// exercises the actual `RateLimiter` we install, proving enforcement, not just parsing.
+    #[test]
+    fn gate_allows_only_listed_peers() {
+        let allowed = PeerId::random();
+        let stranger = PeerId::random();
+        let mut gate = reservation_allow_list(HashSet::from([allowed]));
+        let addr: Multiaddr = "/ip4/127.0.0.1/udp/4001/quic-v1".parse().unwrap();
+
+        assert!(gate.try_next(allowed, &addr, Instant::now()), "listed peer may reserve");
+        assert!(!gate.try_next(stranger, &addr, Instant::now()), "unlisted peer is denied");
+    }
+
+    // ---- end-to-end: prove libp2p's relay behaviour actually enforces the allow-list ----
+    //
+    // The tests above prove our gate returns the right boolean; these prove libp2p consults it on
+    // the RESERVE path and denies. Two in-process swarms talk over QUIC (the production transport):
+    // a relay running our real `Behaviour`, and a relay *client* that requests a reservation.
+
+    /// A minimal relay-client node: enough to request a reservation over a circuit listen address.
+    #[derive(NetworkBehaviour)]
+    struct RelayClient {
+        relay: relay::client::Behaviour,
+    }
+
+    #[derive(Debug, PartialEq)]
+    enum Outcome {
+        Accepted,
+        Denied,
+        Timeout,
+    }
+
+    /// The relay under test. `allowed` mirrors the binary's `RELAY_ALLOWED_RESERVERS` branch
+    /// exactly: `Some(set)` installs the allow-list gate; `None` leaves the limiters empty (var
+    /// unset = open, any peer may reserve). QUIC + 30s idle timeout mirror the binary.
+    fn build_relay_swarm(allowed: Option<HashSet<PeerId>>) -> Swarm<Behaviour> {
+        let mut cfg = relay::Config::default();
+        cfg.reservation_rate_limiters = match allowed {
+            Some(set) => vec![reservation_allow_list(set)],
+            None => Vec::new(),
+        };
+        cfg.circuit_src_rate_limiters = Vec::new();
+        SwarmBuilder::with_new_identity()
+            .with_tokio()
+            .with_quic_config(|c| QuicConfig::default().apply(c))
+            .with_behaviour(|key| Behaviour {
+                relay: relay::Behaviour::new(key.public().to_peer_id(), cfg),
+                ping: ping::Behaviour::new(ping::Config::new()),
+                identify: identify::Behaviour::new(identify::Config::new(
+                    "/rayls-relay-test/1".to_string(),
+                    key.public(),
+                )),
+            })
+            .expect("relay behaviour")
+            .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(30)))
+            .build()
+    }
+
+    /// A relay client over QUIC. `with_relay_client` upgrades the relayed leg with noise+yamux --
+    /// the reason those are test-only deps (the relay server forwards bytes and needs neither).
+    fn build_client_swarm(key: identity::Keypair) -> Swarm<RelayClient> {
+        SwarmBuilder::with_existing_identity(key)
+            .with_tokio()
+            .with_quic_config(|c| QuicConfig::default().apply(c))
+            .with_relay_client(noise::Config::new, yamux::Config::default)
+            .expect("relay client transport")
+            .with_behaviour(|_key, relay| RelayClient { relay })
+            .expect("relay client behaviour")
+            .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(30)))
+            .build()
+    }
+
+    /// Bring up the relay, then have `client_key`'s node reserve through it; report what the relay
+    /// decided for that peer (or `Timeout` if neither event arrived).
+    async fn run_reservation(
+        allowed: Option<HashSet<PeerId>>,
+        client_key: identity::Keypair,
+    ) -> Outcome {
+        let client_peer = client_key.public().to_peer_id();
+
+        let mut relay = build_relay_swarm(allowed);
+        relay.listen_on("/ip4/127.0.0.1/udp/0/quic-v1".parse().unwrap()).expect("relay listen");
+
+        // learn the relay's ephemeral listen address, then confirm it external so a granted
+        // reservation carries an address (mirrors the binary's NewListenAddr handling).
+        let relay_addr = loop {
+            if let SwarmEvent::NewListenAddr { address, .. } = relay.select_next_some().await {
+                break address;
+            }
+        };
+        let relay_peer = *relay.local_peer_id();
+        relay.add_external_address(relay_addr.clone());
+
+        let circuit = relay_addr.with(Protocol::P2p(relay_peer)).with(Protocol::P2pCircuit);
+
+        let mut client = build_client_swarm(client_key);
+        // listening on a /p2p-circuit address is what triggers the reservation request.
+        client.listen_on(circuit).expect("client circuit listen");
+
+        let drive = async {
+            loop {
+                tokio::select! {
+                    ev = relay.select_next_some() => {
+                        if let SwarmEvent::Behaviour(BehaviourEvent::Relay(e)) = ev {
+                            match e {
+                                relay::Event::ReservationReqAccepted { src_peer_id, .. }
+                                    if src_peer_id == client_peer => return Outcome::Accepted,
+                                relay::Event::ReservationReqDenied { src_peer_id, .. }
+                                    if src_peer_id == client_peer => return Outcome::Denied,
+                                _ => {}
+                            }
+                        }
+                    }
+                    // drive the client so its dial + RESERVE actually make progress.
+                    _ = client.select_next_some() => {}
+                }
+            }
+        };
+
+        tokio::time::timeout(Duration::from_secs(15), drive).await.unwrap_or(Outcome::Timeout)
+    }
+
+    /// A peer absent from the allow-list must be refused a reservation by the relay behaviour.
+    #[tokio::test]
+    async fn non_listed_peer_reservation_is_denied() {
+        // relay fronts some other validator; the connecting client is not on the list.
+        let fronted = PeerId::random();
+        let stranger = identity::Keypair::generate_ed25519();
+        assert_eq!(
+            run_reservation(Some(HashSet::from([fronted])), stranger).await,
+            Outcome::Denied,
+            "a peer outside RELAY_ALLOWED_RESERVERS must not obtain a reservation",
+        );
+    }
+
+    /// The fronted validator (on the allow-list) must still get its reservation.
+    #[tokio::test]
+    async fn listed_peer_reservation_is_accepted() {
+        let key = identity::Keypair::generate_ed25519();
+        let peer = key.public().to_peer_id();
+        assert_eq!(
+            run_reservation(Some(HashSet::from([peer])), key).await,
+            Outcome::Accepted,
+            "the fronted validator must still obtain its reservation",
+        );
+    }
+
+    /// With no allow-list configured (`RELAY_ALLOWED_RESERVERS` unset), the relay must stay open --
+    /// any peer may reserve. Pins the default-open behaviour so it can't silently flip to closed.
+    #[tokio::test]
+    async fn open_relay_accepts_any_peer() {
+        let key = identity::Keypair::generate_ed25519();
+        assert_eq!(
+            run_reservation(None, key).await,
+            Outcome::Accepted,
+            "with no allow-list, any peer must be able to reserve",
+        );
+    }
 }
