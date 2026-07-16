@@ -59,11 +59,41 @@ jobs:
         run: cargo +nightly fmt --all --check
 
   # ===========================================================================
-  # TESTS - Rust workspace tests
+  # TESTS - Rust workspace tests, across feature sets
+  #
+  # The `default` leg runs the full workspace with default features. The other
+  # legs re-run just the crates whose tests (or behavior) are gated behind a
+  # non-default feature — without them, those tests are compiled by the
+  # feature-build matrix but never actually EXECUTE anywhere in CI:
+  #   * dev-single-node-setup: single-authority committee / sole-member consensus
+  #     & epoch-transition-mode unit tests in types, primary, and orchestrator
+  #     (plus the alternate single-node production branches those crates take).
+  #   * archive-replay: evm-crate-local branches not reachable from the shipping
+  #     binary, so the feature-build matrix can't cover them.
+  # Each leg gets its own rust-cache shared-key so their feature-divergent
+  # target dirs don't clobber one another. fail-fast: false so one failing
+  # feature set doesn't cancel the others' signal.
   # ===========================================================================
   tests:
-    name: Tests
+    name: Tests (${{ matrix.name }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: default
+            cache-key: pr-tests
+            cmd: cargo test --workspace --exclude rayls-execution-faucet --exclude e2e-tests -- --quiet --test-threads 1
+          # All three crates define `dev-single-node-setup`; orchestrator's
+          # variant transitively enables it in primary/worker/bridge/types.
+          - name: dev-single-node-setup
+            cache-key: pr-tests-dev
+            cmd: cargo test -p rayls-infrastructure-types -p rayls-consensus-primary -p rayls-middleware-orchestrator --features dev-single-node-setup -- --quiet --test-threads 1
+          # archive-replay is an evm-crate-local feature — NOT reachable from the
+          # rayls-network bin, so the feature-build matrix can't cover it.
+          - name: archive-replay
+            cache-key: pr-tests-archive-replay
+            cmd: cargo test -p rayls-execution-evm --features archive-replay -- --quiet --test-threads 1
     steps:
       # exit immediately for drafts
       # - name: Check if draft PR
@@ -86,17 +116,34 @@ jobs:
           toolchain: 1.91.0
           components: rustfmt, rust-src, clippy
 
-      # cache target/ and cargo registry across PRs via shared-key
+      # cache target/ and cargo registry across PRs via shared-key (per matrix leg)
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
-          shared-key: pr-tests
+          shared-key: ${{ matrix.cache-key }}
           cache-on-failure: true
 
       # use cargo test (not nextest) to match what developers run locally —
       # nextest discovers a different set of tests, which has caused divergence
       - name: Run tests
-        run: cargo test --workspace --exclude rayls-execution-faucet --exclude e2e-tests -- --quiet --test-threads 1
+        run: ${{ matrix.cmd }}
+
+  # ===========================================================================
+  # TESTS GATE - stable required-check target
+  # ===========================================================================
+  tests-gate:
+    name: Tests
+    runs-on: ubuntu-latest
+    needs: tests
+    if: always()
+    steps:
+      - name: Verify all test legs passed
+        run: |
+          if [[ "${{ needs.tests.result }}" != "success" ]]; then
+            echo "One or more Tests matrix legs did not succeed (result: ${{ needs.tests.result }})."
+            exit 1
+          fi
+          echo "All Tests matrix legs passed."
 
   # ===========================================================================
   # SECURITY SCAN - Trivy vulnerability scanning (filesystem/code)

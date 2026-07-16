@@ -11,7 +11,7 @@ use rayls_consensus_primary::{
 use rayls_infrastructure_config::ConsensusConfig;
 use rayls_infrastructure_storage::{
     tables::{Batches, ConsensusBlockNumbersByDigest, ConsensusBlocks, ConsensusBlocksCache},
-    CertificateStore, CheckpointStore, ConsensusStore, EpochStore,
+    CertificateStore, CheckpointStore, ConsensusStore, EpochStore, ReadTimeout,
 };
 use rayls_infrastructure_types::{
     AuthorityIdentifier, ConsensusHeader, ConsensusOutput, Database, DbTx, DbTxMut, Epoch,
@@ -88,7 +88,7 @@ pub fn prime_consensus<DB: Database>(consensus_bus: &ConsensusBus, config: &Cons
     // rejoin gate and cert_manager's threshold see a consistent view.
     let gc_round = committed_round.saturating_sub(gc_depth);
     let (cert_store_max, cert_count) =
-        match config.node_storage().after_round(gc_round.saturating_add(1)) {
+        match config.node_storage().after_round(gc_round.saturating_add(1), ReadTimeout::Exempt) {
             Ok(certs) => {
                 let count = certs.len();
                 let max = certs.iter().map(|c| c.round()).max();

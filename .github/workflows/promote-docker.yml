@@ -360,9 +360,9 @@ jobs:
             exit 0
           fi
 
-          # Idempotent + never-move: resolve any existing tag to its commit.
-          CUR=$(gh api "repos/$REPO/commits/$TAG" --jq '.sha' 2>/dev/null || true)
-          if [ -n "$CUR" ]; then
+          # Idempotent + never-move
+          if gh api "repos/$REPO/git/ref/tags/$TAG" >/dev/null 2>&1; then
+            CUR=$(gh api "repos/$REPO/commits/$TAG" --jq '.sha')
             if [ "$CUR" = "$COMMIT" ]; then
               echo "Tag $TAG already points at $COMMIT — nothing to do."
               exit 0
