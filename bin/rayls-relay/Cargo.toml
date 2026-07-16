@@ -14,9 +14,6 @@ exclude.workspace = true
 libp2p = { workspace = true, features = [
     "tokio",
     "quic",
-    "tcp",
-    "noise",
-    "yamux",
     "relay",
     "ping",
     "identify",

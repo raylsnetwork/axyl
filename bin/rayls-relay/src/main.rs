@@ -12,7 +12,7 @@
 //! - `RELAY_SEED_HEX` (required): 64 hex chars (32 bytes) used as the ed25519 secret seed. This
 //!   fixes the relay's peer id; it must match the peer id baked into the validators' node-info (see
 //!   `etc/test-network/RELAY_KEYS.md`).
-//! - `RELAY_PORT` (required): UDP (QUIC) and TCP listen port, bound on `0.0.0.0`.
+//! - `RELAY_PORT` (required): UDP port for the QUIC listener, bound on `0.0.0.0`.
 //! - `RELAY_MAX_CIRCUIT_DURATION_SECS` (optional): tighten circuit lifetime. Defaults to
 //!   effectively unlimited (libp2p's own default of 120s would force-close consensus links).
 //! - `RELAY_MAX_CIRCUIT_BYTES` (optional): tighten per-circuit byte cap. Defaults to unlimited
@@ -23,9 +23,9 @@
 use futures::StreamExt as _;
 use libp2p::{
     core::multiaddr::{Multiaddr, Protocol},
-    identify, identity, noise, ping, relay,
+    identify, identity, ping, relay,
     swarm::{NetworkBehaviour, SwarmEvent},
-    tcp, yamux, PeerId,
+    PeerId,
 };
 use rayls_infrastructure_config::QuicConfig;
 use std::{
@@ -161,7 +161,9 @@ async fn main() -> eyre::Result<()> {
     let relay_cfg = relay_config()?;
     let mut swarm = libp2p::SwarmBuilder::with_existing_identity(key)
         .with_tokio()
-        .with_tcp(tcp::Config::default(), noise::Config::new, yamux::Config::default)?
+        // QUIC only: validators dial the relay over /udp/<port>/quic-v1, so there is no TCP
+        // transport (and thus no TCP listener) -- the relay neither offers nor accepts TCP.
+        //
         // Apply the axyl node's QuicConfig instead of libp2p defaults. Every circuit to a
         // validator multiplexes as a stream over that validator's single reservation connection,
         // so the relay's per-connection flow-control window is the aggregate in-flight cap for
@@ -189,15 +191,12 @@ async fn main() -> eyre::Result<()> {
         .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(u64::MAX)))
         .build();
 
-    // Listen on QUIC (what the axyl client dials) and TCP, both on 0.0.0.0:<port>.
+    // Listen on QUIC (what the axyl client dials) on 0.0.0.0:<port>.
     let quic_addr = Multiaddr::empty()
         .with(Protocol::Ip4(Ipv4Addr::UNSPECIFIED))
         .with(Protocol::Udp(port))
         .with(Protocol::QuicV1);
-    let tcp_addr =
-        Multiaddr::empty().with(Protocol::Ip4(Ipv4Addr::UNSPECIFIED)).with(Protocol::Tcp(port));
     swarm.listen_on(quic_addr)?;
-    swarm.listen_on(tcp_addr)?;
 
     // peer id -> the IP of that peer's direct connection to this relay, so the peer-id-only relay
     // events can be logged with an address for easy correlation. The events themselves carry no
