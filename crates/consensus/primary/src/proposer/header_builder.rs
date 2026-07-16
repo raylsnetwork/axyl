@@ -77,7 +77,7 @@ impl<DB: Database> Proposer<DB> {
             current_epoch,
             payload_vec.into_iter().collect(),
             parents.iter().map(|x| x.digest()).collect(),
-            consensus_bus.recent_blocks().borrow().latest_block_num_hash(),
+            consensus_bus.recently_executed_blocks().borrow().latest_block_num_hash(),
         );
 
         // update metrics before sending/storing header

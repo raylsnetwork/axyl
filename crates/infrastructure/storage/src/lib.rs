@@ -24,7 +24,7 @@ pub mod mdbx;
 pub mod mem_db;
 pub mod redb;
 
-pub use rayls_infrastructure_types::error::StoreError;
+pub use rayls_infrastructure_types::{error::StoreError, ReadTimeout};
 
 use crate::mdbx::MdbxConfig;
 

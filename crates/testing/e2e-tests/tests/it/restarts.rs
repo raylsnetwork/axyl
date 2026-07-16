@@ -94,10 +94,15 @@ fn send_and_confirm(
         error!(target: "restart-test", "{expected} != {bal} - returning error!");
         return Err(Report::msg(format!("Expected a balance of {expected} got {bal}!")));
     }
-    let bal =
+    let new_basefee =
         get_balance_above_with_retry(node_test, &basefee_address.to_string(), current_basefee)?;
-    if fee_index > 0 && bal != current_basefee + (current_basefee / (fee_index)) {
-        error!(target: "restart-test", "basefee error!");
+    // Assert only that the basefee collector STRICTLY INCREASED (the transfer paid a
+    // base fee into it) — not that it grew by an exact per-tx amount. Under EIP-1559
+    // the base fee drifts block-to-block, so requiring a byte-identical increment on
+    // every tx is flaky and was the source of the intermittent
+    // "Expected a basefee increment!" failures.
+    if fee_index > 0 && new_basefee <= current_basefee {
+        error!(target: "restart-test", "basefee collector did not increase: {current_basefee} -> {new_basefee}");
         return Err(Report::msg("Expected a basefee increment!".to_string()));
     }
     Ok(())

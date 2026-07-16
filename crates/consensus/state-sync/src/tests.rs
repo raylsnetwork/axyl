@@ -119,8 +119,8 @@ async fn test_prime_consensus_recovers_committed_round_via_primary_path() {
 }
 
 /// `prime_consensus` derives its watermark from the SSOT `executed_anchor` channel alone,
-/// independent of `recent_blocks` and the producer/engine. Seeding the anchor at number N must
-/// drive committed_round off N (block-number fallback for the genesis-subdag header).
+/// independent of `recently_executed_blocks` and the producer/engine. Seeding the anchor at number
+/// N must drive committed_round off N (block-number fallback for the genesis-subdag header).
 #[tokio::test]
 async fn test_prime_consensus_reads_executed_anchor_ssot() {
     let fixture = CommitteeFixture::builder(MemDatabase::default)
@@ -135,7 +135,7 @@ async fn test_prime_consensus_reads_executed_anchor_ssot() {
     let anchor_number = 4242u64;
     let header = create_consensus_header_at_number(anchor_number, &committee);
 
-    // Seed the SSOT only - no recent_blocks, no DB rows, no engine.
+    // Seed the SSOT only - no recently_executed_blocks, no DB rows, no engine.
     let cb = ConsensusBus::new();
     cb.executed_anchor().send_replace(header);
 
@@ -484,10 +484,10 @@ fn chained_header(
 
 /// Push one recent execution block above genesis so `wait_for_execution` treats the genesis-
 /// subdag base block (number 0) as already executed and returns immediately.
-fn seed_recent_blocks(cb: &ConsensusBus) {
+fn seed_recently_executed_blocks(cb: &ConsensusBus) {
     let exec =
         SealedHeader::new(ExecHeader { number: 1, ..Default::default() }, B256::repeat_byte(0x01));
-    cb.recent_blocks().send_modify(|blocks| blocks.push_latest(exec));
+    cb.recently_executed_blocks().send_modify(|blocks| blocks.push_latest(exec));
 }
 
 /// Regression: a lagging node whose DB holds only header N must fill the gap `N+1..=M` by fetching
@@ -530,7 +530,7 @@ async fn test_catch_up_fills_gap_by_number_when_db_is_empty() {
     let net = serving_network(served.clone());
 
     let cb = ConsensusBus::new();
-    seed_recent_blocks(&cb);
+    seed_recently_executed_blocks(&cb);
     let mut rx = cb.consensus_header().subscribe();
 
     let result = catch_up_consensus_from_to(&config, &cb, &net, anchor.clone(), target.clone())
@@ -591,7 +591,7 @@ async fn test_gap_fetch_does_not_cache_mischained_header() {
     let net = serving_network(served);
 
     let cb = ConsensusBus::new();
-    seed_recent_blocks(&cb);
+    seed_recently_executed_blocks(&cb);
 
     let result = catch_up_consensus_from_to(&config, &cb, &net, anchor.clone(), target).await;
     assert!(result.is_err(), "a mis-chained gap header must fail the digest-chain guard");
@@ -639,7 +639,7 @@ async fn test_catch_up_mismatch_preserves_canonical_block() {
     .unwrap();
 
     let cb = ConsensusBus::new();
-    seed_recent_blocks(&cb);
+    seed_recently_executed_blocks(&cb);
 
     let net = no_peer_network();
     let result =
@@ -696,7 +696,7 @@ async fn test_catch_up_drops_poisoned_gap_row_and_recovers() {
     assert_ne!(bogus_101.digest(), real_101.digest(), "precondition: fabricated sub_dag diverges");
 
     let cb = ConsensusBus::new();
-    seed_recent_blocks(&cb);
+    seed_recently_executed_blocks(&cb);
     // A live subscriber keeps the broadcast `send` from erroring while headers stream.
     let _rx = cb.consensus_header().subscribe();
 
@@ -790,7 +790,7 @@ async fn test_save_consensus_prunes_superseded_bydigest_on_layered_db() {
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn test_wait_for_execution_bounded_trips_on_stall() {
     let cb = ConsensusBus::new();
-    cb.recent_blocks().send_modify(|b| b.push_latest(sealed_at(0)));
+    cb.recently_executed_blocks().send_modify(|b| b.push_latest(sealed_at(0)));
 
     let idle = std::time::Duration::from_secs(5);
     let target = sealed_at(5).num_hash(); // never produced
@@ -809,7 +809,7 @@ async fn test_wait_for_execution_bounded_trips_on_stall() {
 async fn test_wait_for_execution_reports_fork_on_hash_mismatch() {
     let cb = ConsensusBus::new();
     // Execution produced block 5, but with a different hash than the target references.
-    cb.recent_blocks().send_modify(|b| b.push_latest(sealed_at(5)));
+    cb.recently_executed_blocks().send_modify(|b| b.push_latest(sealed_at(5)));
 
     let mut target = sealed_at(5).num_hash();
     target.hash = B256::repeat_byte(0xFF); // same number, divergent hash
@@ -829,13 +829,13 @@ async fn test_wait_for_execution_reports_fork_on_hash_mismatch() {
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn test_wait_for_execution_bounded_tolerates_slow_progress() {
     let cb = ConsensusBus::new();
-    cb.recent_blocks().send_modify(|b| b.push_latest(sealed_at(0)));
+    cb.recently_executed_blocks().send_modify(|b| b.push_latest(sealed_at(0)));
 
     let idle = std::time::Duration::from_secs(5);
     let target = sealed_at(5).num_hash();
 
     // push one block per half-window: always inside the idle bound, so it never trips.
-    let tx = cb.recent_blocks().clone();
+    let tx = cb.recently_executed_blocks().clone();
     tokio::spawn(async move {
         for number in 1..=5 {
             tokio::time::sleep(idle / 2).await;

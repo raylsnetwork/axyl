@@ -479,19 +479,19 @@ fn test_checkpoint_enables_epoch_record_recovery() {
     assert!(needs_clear, "crash before Cleared requires table clear + epoch record");
 }
 
-// The former RANK 4 test (`test_sequential_execution_phase_prevents_recent_blocks_race`) was
-// removed: it guarded a race where `spawn_engine_update_task` could write a stale block into
-// `recent_blocks` and corrupt the epoch record's `parent_state`. That race no longer exists —
-// `write_epoch_record` now sources `parent_state` from the durable canonical tip
-// (`engine.get_reth_env().canonical_tip()`), not from the async-fed `recent_blocks`, so no
-// explicit push or sequential-phase ordering is needed to keep `parent_state` deterministic.
+// The former RANK 4 test (`test_sequential_execution_phase_prevents_recently_executed_blocks_race`)
+// was removed: it guarded a race where `spawn_engine_update_task` could write a stale block into
+// `recently_executed_blocks` and corrupt the epoch record's `parent_state`. That race no longer
+// exists — `write_epoch_record` now sources `parent_state` from the durable canonical tip
+// (`engine.get_reth_env().canonical_tip()`), not from the async-fed `recently_executed_blocks`, so
+// no explicit push or sequential-phase ordering is needed to keep `parent_state` deterministic.
 
-/// RANK 4: Verify recent_blocks accurate after reset.
+/// RANK 4: Verify recently_executed_blocks accurate after reset.
 ///
-/// After reset_for_epoch(), recent_blocks should carry over the latest block
+/// After reset_for_epoch(), recently_executed_blocks should carry over the latest block
 /// from the previous epoch (as the parent for the new epoch's first block).
 #[tokio::test]
-async fn test_recent_blocks_accurate_after_transition() {
+async fn test_recently_executed_blocks_accurate_after_transition() {
     let mut bus = ConsensusBus::new();
 
     // Push a block as if the epoch just ended.
@@ -500,13 +500,13 @@ async fn test_recent_blocks_accurate_after_transition() {
         h.number = 50;
         rayls_infrastructure_types::SealedHeader::seal_slow(h)
     };
-    bus.recent_blocks().send_modify(|blocks| blocks.push_latest(closing_header));
+    bus.recently_executed_blocks().send_modify(|blocks| blocks.push_latest(closing_header));
 
     // Reset for new epoch.
     bus.reset_for_epoch();
 
-    // After reset, recent_blocks should have exactly the last block from previous epoch.
-    let recent = bus.recent_blocks().borrow();
+    // After reset, recently_executed_blocks should have exactly the last block from previous epoch.
+    let recent = bus.recently_executed_blocks().borrow();
     assert_eq!(
         recent.latest_block_num_hash().number,
         50,
@@ -1167,18 +1167,18 @@ async fn test_recovery_boundary_detected_execution_done() {
     };
     db.save_checkpoint(&checkpoint).unwrap();
 
-    // Simulate that execution already completed: set recent_blocks to have the
+    // Simulate that execution already completed: set recently_executed_blocks to have the
     // closing block with the matching target hash.
     let mut closing_header = rayls_infrastructure_types::ExecHeader::default();
     closing_header.number = 200;
     closing_header.parent_beacon_block_root = Some(target_hash);
     let sealed = rayls_infrastructure_types::SealedHeader::seal_slow(closing_header);
-    bus.recent_blocks().send_modify(|blocks| blocks.push_latest(sealed));
+    bus.recently_executed_blocks().send_modify(|blocks| blocks.push_latest(sealed));
 
     // Simulate recovery logic (mirrors manager.rs:2132-2158).
-    let latest = bus.recent_blocks().borrow().latest_block();
+    let latest = bus.recently_executed_blocks().borrow().latest_block();
     assert_eq!(
-        latest.parent_beacon_block_root,
+        latest.subdag_consensus_digest().map(|d| d.get()),
         Some(target_hash),
         "execution should be done for this target"
     );
@@ -1206,16 +1206,16 @@ async fn test_recovery_boundary_detected_execution_not_done() {
     };
     db.save_checkpoint(&checkpoint).unwrap();
 
-    // recent_blocks has a different block (execution not done).
+    // recently_executed_blocks has a different block (execution not done).
     let mut header = rayls_infrastructure_types::ExecHeader::default();
     header.number = 50;
     // parent_beacon_block_root does NOT match target_hash.
     let sealed = rayls_infrastructure_types::SealedHeader::seal_slow(header);
-    bus.recent_blocks().send_modify(|blocks| blocks.push_latest(sealed));
+    bus.recently_executed_blocks().send_modify(|blocks| blocks.push_latest(sealed));
 
-    let latest = bus.recent_blocks().borrow().latest_block();
+    let latest = bus.recently_executed_blocks().borrow().latest_block();
     assert_ne!(
-        latest.parent_beacon_block_root,
+        latest.subdag_consensus_digest().map(|d| d.get()),
         Some(target_hash),
         "execution should NOT be done for this target"
     );
@@ -1596,7 +1596,7 @@ async fn test_full_epoch_transition_simulation() {
     closing_header.number = 100;
     closing_header.parent_beacon_block_root = Some(target_hash);
     let sealed = rayls_infrastructure_types::SealedHeader::seal_slow(closing_header);
-    bus.recent_blocks().send_modify(|blocks| blocks.push_latest(sealed));
+    bus.recently_executed_blocks().send_modify(|blocks| blocks.push_latest(sealed));
 
     db.save_checkpoint(&EpochTransitionCheckpoint {
         epoch,
@@ -1618,9 +1618,9 @@ async fn test_full_epoch_transition_simulation() {
     assert_eq!(*bus.committed_round_updates().borrow(), 0);
     assert!(bus.drain_signal().borrow().is_none());
 
-    // Verify recent_blocks carries over the closing block.
+    // Verify recently_executed_blocks carries over the closing block.
     assert_eq!(
-        bus.recent_blocks().borrow().latest_block_num_hash().number,
+        bus.recently_executed_blocks().borrow().latest_block_num_hash().number,
         100,
         "closing block must carry over to next epoch"
     );
@@ -1650,11 +1650,11 @@ async fn test_crash_recovery_then_successful_epoch() {
     closing_header.number = 500;
     closing_header.parent_beacon_block_root = Some(target_hash);
     let sealed = rayls_infrastructure_types::SealedHeader::seal_slow(closing_header);
-    bus.recent_blocks().send_modify(|blocks| blocks.push_latest(sealed));
+    bus.recently_executed_blocks().send_modify(|blocks| blocks.push_latest(sealed));
 
     // Recovery: detect execution done, clear tables, remove checkpoint.
-    let latest = bus.recent_blocks().borrow().latest_block();
-    assert_eq!(latest.parent_beacon_block_root, Some(target_hash));
+    let latest = bus.recently_executed_blocks().borrow().latest_block();
+    assert_eq!(latest.subdag_consensus_digest().map(|d| d.get()), Some(target_hash));
     db.clear_checkpoint(5).unwrap();
 
     // --- Next epoch starts clean ---

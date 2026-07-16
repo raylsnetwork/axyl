@@ -11,7 +11,7 @@ use crate::{
         state::{AuthVoteState, InFlightGuard, IN_FLIGHT_TTL},
     },
     state_sync::{CertificateCollector, StateSynchronizer},
-    ConsensusBus, NodeMode, RecentBlocks,
+    ConsensusBus, NodeMode, RecentlyExecutedBlocks,
 };
 use parking_lot::Mutex;
 use rayls_consensus_network::GossipMessage;
@@ -518,8 +518,10 @@ where
         // one kept check is a non-blocking breaker: refuse to vote if our own executed block at the
         // anchor already diverges, so a quorum cannot certify a forked anchor.
         let target = header.latest_execution_block;
-        let anchor_forked =
-            anchor_diverges_from_executed(&self.consensus_bus.recent_blocks().borrow(), target);
+        let anchor_forked = anchor_diverges_from_executed(
+            &self.consensus_bus.recently_executed_blocks().borrow(),
+            target,
+        );
         if anchor_forked {
             warn!(
                 target: "primary::handler",
@@ -949,7 +951,7 @@ fn collect_missing_certs_blocking<DB: Database>(
 ///
 /// Evidence-only: a target the node has not executed returns false, so a behind node still votes;
 /// only a node whose own executed state contradicts the anchor rejects.
-fn anchor_diverges_from_executed(recent: &RecentBlocks, target: BlockNumHash) -> bool {
+fn anchor_diverges_from_executed(recent: &RecentlyExecutedBlocks, target: BlockNumHash) -> bool {
     recent.block_at_number(target.number).is_some_and(|block| block.hash() != target.hash)
 }
 
@@ -994,7 +996,7 @@ fn evict_oldest_completed(cache: &mut AuthEquivocationMap, max_entries: usize) {
 #[cfg(test)]
 mod tests {
     use super::{anchor_diverges_from_executed, BehindTracker};
-    use crate::RecentBlocks;
+    use crate::RecentlyExecutedBlocks;
     use rayls_infrastructure_types::{BlockNumHash, ExecHeader, SealedHeader, B256};
     use std::time::Duration;
 
@@ -1010,7 +1012,7 @@ mod tests {
     /// votes on data availability and structure rather than waiting for execution to catch up.
     #[test]
     fn anchor_divergence_is_evidence_only() {
-        let mut recent = RecentBlocks::new(8);
+        let mut recent = RecentlyExecutedBlocks::new(8);
         recent.push_latest(sealed_at(5)); // executed block 5, hash repeat_byte(5)
 
         // matching anchor at an executed height: no divergence, vote.

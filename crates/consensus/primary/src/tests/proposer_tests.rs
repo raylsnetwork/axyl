@@ -51,16 +51,17 @@ fn anchor_at_round(round: u32) -> ConsensusHeader {
     ConsensusHeader { parent_hash: B256::default(), sub_dag, number: 1, extra: B256::default() }
 }
 
-/// Build a `recent_blocks` tip whose nonce encodes `round` (the EVM nonce packs `epoch << 32 |
-/// round`).
+/// Build a `recently_executed_blocks` tip whose nonce encodes `round` (the EVM nonce packs `epoch
+/// << 32 | round`).
 fn tip_at_round(round: u32) -> SealedHeader {
     let exec_header = ExecHeader { nonce: (round as u64).into(), ..Default::default() };
     SealedHeader::new(exec_header, B256::default())
 }
 
 /// Regression: the execution-lag throttle reads the monotonic execution anchor, NOT the
-/// `recent_blocks` tip. A drained parked batch regresses the tip's round far below the true
-/// execution frontier; reading it would compute a huge lag and wedge proposals forever (the halt).
+/// `recently_executed_blocks` tip. A drained parked batch regresses the tip's round far below the
+/// true execution frontier; reading it would compute a huge lag and wedge proposals forever (the
+/// halt).
 #[tokio::test]
 async fn execution_lag_reads_anchor_not_regressed_tip() {
     let fixture = CommitteeFixture::builder(MemDatabase::default).build();
@@ -79,9 +80,9 @@ async fn execution_lag_reads_anchor_not_regressed_tip() {
         TaskManager::default().get_spawner(),
     );
 
-    // Drained-parked-batch regression: the recent_blocks tip carries a stale, low round (200) while
-    // execution has actually reached the frontier (498).
-    cb.recent_blocks().send_modify(|b| b.push_latest(tip_at_round(200)));
+    // Drained-parked-batch regression: the recently_executed_blocks tip carries a stale, low round
+    // (200) while execution has actually reached the frontier (498).
+    cb.recently_executed_blocks().send_modify(|b| b.push_latest(tip_at_round(200)));
     cb.executed_anchor().send_replace(anchor_at_round(498));
 
     // Consensus round 500, anchor 498 -> lag 2 (< 100): the proposer MUST NOT throttle. Reading the

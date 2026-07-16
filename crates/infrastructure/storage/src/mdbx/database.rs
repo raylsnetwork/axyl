@@ -6,8 +6,10 @@ use std::{
     marker::PhantomData,
     path::Path,
     sync::{
-        mpsc::{self, SyncSender},
-        Arc, RwLock,
+        // Disabled with the MDBX metrics thread (removed in #54, f243308):
+        // mpsc::{self, SyncSender},
+        Arc,
+        RwLock,
     },
     time::Duration,
 };
@@ -355,21 +357,25 @@ impl DbTxMut for MdbxTxMut {
 pub struct MdbxDatabase {
     /// Libmdbx-sys environment.
     inner: Environment,
-    shutdown_tx: Arc<SyncSender<()>>,
+    // Disabled: metrics-thread shutdown channel, leftover after the thread was removed in #54.
+    // shutdown_tx: Arc<SyncSender<()>>,
     /// Cached MDBX DBIs.
     dbis: DbiCache,
 }
 
 impl Drop for MdbxDatabase {
     fn drop(&mut self) {
-        if Arc::strong_count(&self.shutdown_tx) <= 1 {
-            tracing::info!(target: "rayls::mdbx", "MDBX Dropping, shutting down metrics thread");
-            // shutdown_tx is a sync sender with no buffer so this should block until the thread
-            // reads it and shuts down.
-            if let Err(e) = self.shutdown_tx.send(()) {
-                tracing::error!(target: "rayls::mdbx", "Error while trying to send shutdown to MDBX metrics thread {e}");
-            }
-        }
+        // Disabled: the MDBX metrics thread was removed in #54 (f243308) but its shutdown channel
+        // was left behind. With the channel gone there is nothing to signal; the send below hit an
+        // already-closed channel and logged a spurious "sending on a closed channel" error on every
+        // shutdown. Kept as a no-op Drop. Do NOT re-enable as-is, and do NOT retain the rx to
+        // "fix" it: `sync_channel(0).send()` would then block forever on drop with no reader.
+        // if Arc::strong_count(&self.shutdown_tx) <= 1 {
+        //     tracing::info!(target: "rayls::mdbx", "MDBX Dropping, shutting down metrics thread");
+        //     if let Err(e) = self.shutdown_tx.send(()) {
+        //         tracing::error!(target: "rayls::mdbx", "Error while trying to send shutdown to
+        // MDBX metrics thread {e}");     }
+        // }
     }
 }
 
@@ -547,11 +553,12 @@ impl MdbxDatabase {
             }
         }
 
-        let (shutdown_tx, _rx) = mpsc::sync_channel::<()>(0);
+        // Metrics-thread shutdown channel disabled (thread removed in #54, f243308):
+        // let (shutdown_tx, _rx) = mpsc::sync_channel::<()>(0);
 
         Ok(MdbxDatabase {
             inner: env,
-            shutdown_tx: Arc::new(shutdown_tx),
+            // shutdown_tx: Arc::new(shutdown_tx),
             dbis: Arc::new(RwLock::new(HashMap::new())),
         })
     }

@@ -111,8 +111,7 @@ impl RethEnv {
 
     /// Extract the epoch number from a header's nonce.
     pub fn extract_epoch_from_header(header: &ExecHeader) -> Epoch {
-        let nonce: u64 = header.nonce.into();
-        (nonce >> 32) as u32
+        rayls_infrastructure_types::nonce::unpack_nonce(header.nonce.into()).0
     }
 
     /// Read the current epoch number from the [ConsensusRegistry] on-chain.

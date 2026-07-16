@@ -39,9 +39,9 @@ where
         Ok(engine)
     }
 
-    /// Spawn a node-scoped task to update `ConsensusBus::recent_blocks` every time the engine
-    /// produces a new final block. This task must outlive individual epochs because the engine
-    /// continues executing queued outputs after epoch shutdown.
+    /// Spawn a node-scoped task to update `ConsensusBus::recently_executed_blocks` every time the
+    /// engine produces a new final block. This task must outlive individual epochs because the
+    /// engine continues executing queued outputs after epoch shutdown.
     pub(super) fn spawn_engine_update_task(
         &self,
         shutdown_rx: Noticer,
@@ -55,12 +55,12 @@ where
             loop {
                 tokio::select!(
                     _ = &shutdown_rx => {
-                        info!(target: "engine", "received node shutdown, stopping recent blocks updater");
+                        info!(target: "engine", "received node shutdown, stopping recently-executed blocks updater");
                         break;
                     }
                     latest = engine_state.next() => {
                         if let Some(latest) = latest {
-                            consensus_bus.recent_blocks().send_modify(|blocks| blocks.push_latest(latest.tip().clone_sealed_header()));
+                            consensus_bus.recently_executed_blocks().send_modify(|blocks| blocks.push_latest(latest.tip().clone_sealed_header()));
                         } else {
                             error!(target: "engine", "engine state stream ended, node will exit");
                             break;

@@ -12,6 +12,7 @@ pub mod executed_batch_registry;
 pub mod gas_accumulator;
 mod genesis;
 mod helpers;
+pub mod nonce;
 mod notifier;
 mod primary;
 mod processor;

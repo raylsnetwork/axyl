@@ -256,7 +256,8 @@ where
         }
 
         // node-scoped (not epoch-scoped): engine drains queued outputs past epoch shutdown.
-        // epoch-scoped death would leave recent_blocks stale and re-replay executed outputs.
+        // epoch-scoped death would leave recently_executed_blocks stale and re-replay executed
+        // outputs.
         self.spawn_engine_update_task(
             self.node_shutdown.subscribe(),
             engine.canonical_block_stream().await,

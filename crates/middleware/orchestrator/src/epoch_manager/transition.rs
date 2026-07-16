@@ -359,9 +359,10 @@ where
                 // For early phases the engine may or may not have executed the boundary output.
                 // Decide from the durable execution state: the boundary output runs concludeEpoch,
                 // so if the closing epoch executed, the canonical tip's epoch state has advanced
-                // past it. (The former recent_blocks/parent_beacon fast-path was dead here —
-                // recent_blocks is empty this early in startup, before any replay — and fragile: a
-                // drained parked batch makes the tip's beacon differ from target_hash.)
+                // past it. (The former recently_executed_blocks/parent_beacon fast-path was dead
+                // here — recently_executed_blocks is empty this early in startup,
+                // before any replay — and fragile: a drained parked batch makes the
+                // tip's beacon differ from target_hash.)
                 let tip_state = engine.epoch_state_from_canonical_tip().await?;
                 let execution_done = tip_state.epoch > epoch;
 

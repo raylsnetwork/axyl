@@ -1,7 +1,7 @@
 use crate::{engine::ExecutionNode, epoch_manager::types::EpochManager, primary::PrimaryNode};
 use eyre::eyre;
-use rayls_consensus_primary::{NodeMode, RecentBlocks};
-use rayls_execution_evm::{reth_env::RethEnv, system_calls::ConsensusRegistry};
+use rayls_consensus_primary::{NodeMode, RecentlyExecutedBlocks};
+use rayls_execution_evm::system_calls::ConsensusRegistry;
 use rayls_infrastructure_config::{Config, ConfigFmt, ConfigTrait as _, RaylsDirs};
 use rayls_infrastructure_storage::{
     tables::{
@@ -147,9 +147,10 @@ where
         };
         // Use deterministic sources: boundary_consensus_hash from the boundary output (immutable)
         // and the durable canonical tip. Read the reth canonical head directly rather than the
-        // in-memory recent_blocks (which is fed asynchronously by the engine-update task): the tip
-        // is the epoch-closing block the engine finalized before this runs, so parent_state is
-        // deterministic and race-free — and identical to the value the pre-anchor code committed.
+        // in-memory recently_executed_blocks (which is fed asynchronously by the engine-update
+        // task): the tip is the epoch-closing block the engine finalized before this runs,
+        // so parent_state is deterministic and race-free — and identical to the value the
+        // pre-anchor code committed.
         let parent_state = engine.get_reth_env().await.canonical_tip().num_hash();
 
         let epoch_rec = EpochRecord {
@@ -276,64 +277,65 @@ where
 
     /// Restore execution state for the consensus components.
     pub(super) async fn try_restore_state(&self, engine: &ExecutionNode) -> eyre::Result<()> {
-        // Only restore recent_blocks from the chain DB on initial startup.
-        // On later epoch transitions, recent_blocks are already up to date
+        // Only restore recently_executed_blocks from the chain DB on initial startup.
+        // On later epoch transitions, recently_executed_blocks are already up to date
         // from the node-scoped engine update task and close_epoch(). Clearing
         // and restoring here would race with the reth DB flush and could
-        // revert recent_blocks to a stale state, causing get_missing_consensus()
+        // revert recently_executed_blocks to a stale state, causing get_missing_consensus()
         // to replay already-executed outputs.
         if self.initial_epoch {
             if self.sanitize_foreign_consensus_db()? {
                 info!(target: "epoch-manager", "foreign consensus DB sanitized");
             }
 
-            let block_capacity = self.consensus_bus.recent_blocks().borrow().block_capacity();
+            let block_capacity =
+                self.consensus_bus.recently_executed_blocks().borrow().block_capacity();
 
-            // clear recent_blocks before restoring to avoid ordering issues
+            // clear recently_executed_blocks before restoring to avoid ordering issues
             self.consensus_bus
-                .recent_blocks()
-                .send_replace(RecentBlocks::new(block_capacity as usize));
+                .recently_executed_blocks()
+                .send_replace(RecentlyExecutedBlocks::new(block_capacity as usize));
 
             // restore blocks from execution layer in ascending order
             let restored_blocks = engine.last_executed_output_blocks(block_capacity).await?;
             let restored_count = restored_blocks.len();
 
-            debug!(target: "epoch-manager", restored_blocks=?restored_blocks, "Restoring recent blocks from execution layer");
-            for recent_block in restored_blocks {
+            debug!(target: "epoch-manager", restored_blocks=?restored_blocks, "Restoring recently-executed blocks from execution layer");
+            for executed_block in restored_blocks {
                 self.consensus_bus
-                    .recent_blocks()
-                    .send_modify(|blocks| blocks.push_latest(recent_block));
+                    .recently_executed_blocks()
+                    .send_modify(|blocks| blocks.push_latest(executed_block));
             }
 
-            let recent = self.consensus_bus.recent_blocks().borrow();
+            let recent = self.consensus_bus.recently_executed_blocks().borrow();
             let latest = recent.latest_block();
-            let (epoch, round) = RethEnv::deconstruct_nonce(latest.nonce.into());
+            let (epoch, round) = (latest.subdag_leader_epoch(), latest.subdag_leader_round());
 
-            if recent.is_empty() && latest.number == 0 {
+            if recent.is_empty() && latest.number() == 0 {
                 trace!(
                     target: "epoch-manager",
-                    "recent_blocks empty - this is expected for fresh/genesis start"
+                    "recently_executed_blocks empty - this is expected for fresh/genesis start"
                 );
             } else if recent.is_empty() {
                 error!(
                     target: "epoch-manager",
                     restored_count,
-                    latest_block_number = latest.number,
-                    "CRITICAL: recent_blocks is empty despite having execution history! \
+                    latest_block_number = latest.number(),
+                    "CRITICAL: recently_executed_blocks is empty despite having execution history! \
                      State sync fork detection may not work correctly."
                 );
             }
 
             trace!(
                 target: "epoch-manager",
-                recent_blocks_len = recent.len(),
+                recently_executed_blocks_len = recent.len(),
                 restored_count,
-                latest_block_number = latest.number,
-                latest_block_nonce_epoch = epoch,
-                latest_block_nonce_round = round,
-                latest_parent_beacon_root = ?latest.header().parent_beacon_block_root,
+                latest_block_number = latest.number(),
+                latest_block_subdag_leader_epoch = %epoch,
+                latest_block_subdag_leader_round = %round,
+                latest_block_subdag_consensus_digest = ?latest.subdag_consensus_digest(),
                 oldest_block_number = recent.oldest_block_number(),
-                "restored recent_blocks from execution layer"
+                "restored recently_executed_blocks from execution layer"
             );
         }
 
@@ -345,10 +347,11 @@ where
 
         // log consensus DB state and check for potential desync
         {
-            let recent = self.consensus_bus.recent_blocks().borrow();
+            let recent = self.consensus_bus.recently_executed_blocks().borrow();
             let exec_latest = recent.latest_block_num_hash();
 
-            // check if consensus DB's referenced execution block is within recent_blocks window
+            // check if consensus DB's referenced execution block is within recently_executed_blocks
+            // window
             let consensus_exec_ref = last_db_block.sub_dag.leader.header().latest_execution_block;
             let in_window = consensus_exec_ref.number >= recent.oldest_block_number()
                 && consensus_exec_ref.number <= exec_latest.number;
@@ -374,7 +377,7 @@ where
                     target: "epoch-manager",
                     consensus_exec_ref_number = consensus_exec_ref.number,
                     consensus_exec_ref_hash = ?consensus_exec_ref.hash,
-                    "Consensus DB references execution block hash not in recent_blocks - \
+                    "Consensus DB references execution block hash not in recently_executed_blocks - \
                         MDBX has divergent blocks from a previous run. \
                         Forcing CvvInactive to resync from peers."
                 );

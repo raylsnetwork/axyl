@@ -240,7 +240,7 @@ fn spawn_consensus(
     let mut exec_header = ExecHeader::default();
     exec_header.parent_beacon_block_root = Some(B256::ZERO);
     let dummy_parent = SealedHeader::new(exec_header, B256::default());
-    consensus_bus.recent_blocks().send_modify(|blocks| blocks.push_latest(dummy_parent));
+    consensus_bus.recently_executed_blocks().send_modify(|blocks| blocks.push_latest(dummy_parent));
     Consensus::spawn(config, consensus_bus, bullshark, task_manager);
 }
 
@@ -320,7 +320,9 @@ async fn test_prime_consensus_recovers_committed_round_after_restart() -> eyre::
     // Create a FRESH ConsensusBus (simulating node restart) and seed the executed_anchor SSOT
     // with the recovered header, which is what core.rs does at boot from the highest-nonce block.
     let consensus_bus = ConsensusBus::new();
-    consensus_bus.recent_blocks().send_modify(|blocks| blocks.push_latest(sealed_header));
+    consensus_bus
+        .recently_executed_blocks()
+        .send_modify(|blocks| blocks.push_latest(sealed_header));
     consensus_bus.executed_anchor().send_replace(consensus_header.clone());
 
     // Verify initial state: committed_round should be 0 (default)
@@ -446,30 +448,32 @@ async fn test_prime_consensus_recovers_via_primary_path() -> eyre::Result<()> {
     exec_header.parent_beacon_block_root = Some(consensus_digest);
     let sealed_header = SealedHeader::new(exec_header, B256::default());
 
-    // Create ConsensusBus and populate recent_blocks (simulating try_restore_state)
+    // Create ConsensusBus and populate recently_executed_blocks (simulating try_restore_state)
     let consensus_bus = ConsensusBus::new();
 
-    // Verify recent_blocks is initially empty
+    // Verify recently_executed_blocks is initially empty
     assert!(
-        consensus_bus.recent_blocks().borrow().is_empty(),
-        "recent_blocks should be empty before population"
+        consensus_bus.recently_executed_blocks().borrow().is_empty(),
+        "recently_executed_blocks should be empty before population"
     );
 
-    // Push the sealed header to recent_blocks (what try_restore_state does)
-    consensus_bus.recent_blocks().send_modify(|blocks| blocks.push_latest(sealed_header.clone()));
+    // Push the sealed header to recently_executed_blocks (what try_restore_state does)
+    consensus_bus
+        .recently_executed_blocks()
+        .send_modify(|blocks| blocks.push_latest(sealed_header.clone()));
     // Seed the executed_anchor SSOT with the recovered header (core.rs does this at boot).
     consensus_bus.executed_anchor().send_replace(consensus_header.clone());
 
-    // Verify recent_blocks is now populated
+    // Verify recently_executed_blocks is now populated
     assert!(
-        !consensus_bus.recent_blocks().borrow().is_empty(),
-        "recent_blocks should be populated after push"
+        !consensus_bus.recently_executed_blocks().borrow().is_empty(),
+        "recently_executed_blocks should be populated after push"
     );
 
     // Verify the parent_beacon_block_root is set correctly
-    let latest_block = consensus_bus.recent_blocks().borrow().latest_block().clone();
+    let latest_block = consensus_bus.recently_executed_blocks().borrow().latest_block().clone();
     assert_eq!(
-        latest_block.header().parent_beacon_block_root,
+        latest_block.subdag_consensus_digest().map(|d| d.get()),
         Some(consensus_digest),
         "parent_beacon_block_root should match consensus_digest"
     );
@@ -482,7 +486,7 @@ async fn test_prime_consensus_recovers_via_primary_path() -> eyre::Result<()> {
     );
 
     // Act: Call prime_consensus (this is what happens during node startup)
-    // Now it should use the PRIMARY path: recent_blocks → parent_beacon_block_root →
+    // Now it should use the PRIMARY path: recently_executed_blocks → parent_beacon_block_root →
     // get_consensus_by_hash
     prime_consensus(&consensus_bus, &config);
 

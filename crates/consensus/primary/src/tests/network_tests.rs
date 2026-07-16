@@ -78,7 +78,7 @@ fn create_test_types() -> TestTypes {
     let parent = SealedHeader::seal_slow(ExecHeader::default());
 
     // set the latest execution result to genesis - test headers are proposed for round 1
-    cb.recent_blocks().send_modify(|blocks| blocks.push_latest(parent.clone()));
+    cb.recently_executed_blocks().send_modify(|blocks| blocks.push_latest(parent.clone()));
 
     let handler = RequestHandler::new(config.clone(), cb.clone(), synchronizer);
     TestTypes { committee, handler, parent, task_manager, consensus_bus: cb }

@@ -579,9 +579,9 @@ impl<DB: Database> Subscriber<DB> {
         //
         // Reads the SSOT `executed_anchor` channel (seeded once at boot from the highest-nonce
         // recent block, advanced live by the engine) instead of re-deriving from
-        // `recent_blocks().latest_block()`, whose tip can regress to a PREVIOUS output's anchor
-        // after a drained parked (out-of-order seq) batch. Number 0 means nothing executed yet,
-        // so fall back to `last_streamed_number`.
+        // `recently_executed_blocks().latest_block()`, whose tip can regress to a PREVIOUS output's
+        // anchor after a drained parked (out-of-order seq) batch. Number 0 means nothing
+        // executed yet, so fall back to `last_streamed_number`.
         let (anchor_number, mut accepted_position) = {
             let anchor = self.consensus_bus.executed_anchor().borrow();
             (anchor.number, AcceptedPosition::from_sub_dag(&anchor.sub_dag))
@@ -774,8 +774,9 @@ impl<DB: Database> Subscriber<DB> {
         // in sync, otherwise we could get out of order execution racing with Bullshark.
         let missing = get_missing_consensus(&self.config, &self.consensus_bus).await?;
         // Every output now produces at least one block, so replay waits solely on
-        // recent_blocks, which ticks whenever a block is produced.
-        let mut recent_blocks_sub = self.consensus_bus.recent_blocks().subscribe();
+        // recently_executed_blocks, which ticks whenever a block is produced.
+        let mut recently_executed_blocks_sub =
+            self.consensus_bus.recently_executed_blocks().subscribe();
 
         if !missing.is_empty() {
             info!(
@@ -819,10 +820,10 @@ impl<DB: Database> Subscriber<DB> {
                 error!(target: "subscriber", "error broadcasting consensus output for authority {:?}: {}", self.inner.authority_id, e);
                 return Err(SubscriberError::ClosedChannel("consensus_output".to_string()));
             }
-            // wait until execution advances: a block landed (recent_blocks ticks),
+            // wait until execution advances: a block landed (recently_executed_blocks ticks),
             // or shutdown fires, in which case we bail.
             tokio::select! {
-                _ = recent_blocks_sub.changed() => {}
+                _ = recently_executed_blocks_sub.changed() => {}
                 _ = &rx_shutdown => return Ok(()),
             }
         }
@@ -832,7 +833,7 @@ impl<DB: Database> Subscriber<DB> {
         execution_replay_done.send_replace(());
 
         // Signal that execution replay is complete. The proposer waits for this before
-        // creating headers, ensuring recent_blocks contains up-to-date execution state
+        // creating headers, ensuring recently_executed_blocks contains up-to-date execution state
         // rather than stale MDBX data from before replay. (FIX: XL-C3)
         self.consensus_bus.execution_replay_complete().send_replace(true);
 

@@ -4,7 +4,7 @@
 
 use crate::{
     certificate_fetcher::CertificateFetcherCommand, consensus::ConsensusRound,
-    proposer::OurDigestMessage, state_sync::CertificateManagerCommand, RecentBlocks,
+    proposer::OurDigestMessage, state_sync::CertificateManagerCommand, RecentlyExecutedBlocks,
 };
 use consensus_metrics::metered_channel::{self, channel_with_total_sender, MeteredMpscChannel};
 use parking_lot::Mutex;
@@ -195,12 +195,13 @@ struct ConsensusBusAppInner {
     /// Signals a new round
     tx_primary_round_updates: watch::Sender<Round>,
 
-    /// Watch tracking most recent blocks
-    tx_recent_blocks: watch::Sender<RecentBlocks>,
+    /// Watch tracking the most recently executed blocks
+    tx_recently_executed_blocks: watch::Sender<RecentlyExecutedBlocks>,
 
     /// The EVM-execution anchor: the consensus header the highest executed block commits to.
     /// Single source of truth for the restart/replay watermark, seeded once at boot from the
-    /// chain and advanced live by the engine, so consumers never re-derive it from recent_blocks.
+    /// chain and advanced live by the engine, so consumers never re-derive it from
+    /// recently_executed_blocks.
     tx_executed_anchor: watch::Sender<ConsensusHeader>,
 
     /// True when the node-scoped engine has executed everything it admitted (its queue is empty
@@ -238,7 +239,8 @@ struct ConsensusBusAppInner {
     executor_metrics: Arc<ExecutorMetrics>,
     /// Signal that the subscriber has finished replaying missed consensus outputs on startup.
     /// The proposer waits for this before creating headers, preventing stale exec_digest
-    /// from recent_blocks that was populated from MDBX before execution replay completed.
+    /// from recently_executed_blocks that was populated from MDBX before execution replay
+    /// completed.
     tx_execution_replay_complete: watch::Sender<bool>,
     /// Batch lifecycle tracker (app-lifetime, survives epoch transitions).
     batch_tracker: Arc<BatchTracker>,
@@ -254,7 +256,7 @@ struct ConsensusBusAppInner {
 }
 
 impl ConsensusBusAppInner {
-    fn new(initial_mode: NodeMode, recent_blocks: u32) -> Self {
+    fn new(initial_mode: NodeMode, recently_executed_blocks: u32) -> Self {
         let network_metrics = Arc::new(NetworkMetrics::default());
         let consensus_metrics = Arc::new(ConsensusMetrics::default());
         let primary_metrics = Arc::new(Metrics::default()); // Initialize the metrics
@@ -266,7 +268,8 @@ impl ConsensusBusAppInner {
         let (tx_primary_round_updates, _) = watch::channel(0u32);
         let (tx_last_consensus_header, _) = watch::channel(ConsensusHeader::default());
         let (tx_last_published_consensus_num_hash, _) = watch::channel((0, BlockHash::default()));
-        let (tx_recent_blocks, _) = watch::channel(RecentBlocks::new(recent_blocks as usize));
+        let (tx_recently_executed_blocks, _) =
+            watch::channel(RecentlyExecutedBlocks::new(recently_executed_blocks as usize));
         let (tx_executed_anchor, _) = watch::channel(ConsensusHeader::default());
         let (tx_engine_idle, _) = watch::channel(false);
         let (tx_execution_replay_complete, _) = watch::channel(false);
@@ -285,7 +288,7 @@ impl ConsensusBusAppInner {
             tx_gc_round_updates,
             tx_requested_missing_epoch,
             tx_primary_round_updates,
-            tx_recent_blocks,
+            tx_recently_executed_blocks,
             tx_executed_anchor,
             tx_engine_idle,
             tx_last_consensus_header,
@@ -319,12 +322,13 @@ impl ConsensusBusAppInner {
         // NOTE: promotion_barrier is intentionally NOT reset here. It is node-lifetime intent
         // that must survive the same-epoch mode-change restart the demotion itself triggers; it
         // self-invalidates via its epoch tag and is cleared lazily in try_rejoin_consensus.
-        let recent_blocks = self.tx_recent_blocks.borrow().block_capacity();
+        let recently_executed_blocks = self.tx_recently_executed_blocks.borrow().block_capacity();
         // Hang onto the last block of the previous epoch, clear the rest.
-        let latest = self.tx_recent_blocks.borrow().latest_block();
-        let mut recent_blocks = RecentBlocks::new(recent_blocks as usize);
-        recent_blocks.push_latest(latest);
-        self.tx_recent_blocks.send_replace(recent_blocks);
+        let latest = self.tx_recently_executed_blocks.borrow().latest_block();
+        let mut recently_executed_blocks =
+            RecentlyExecutedBlocks::new(recently_executed_blocks as usize);
+        recently_executed_blocks.push_latest(latest.into_header());
+        self.tx_recently_executed_blocks.send_replace(recently_executed_blocks);
     }
 }
 
@@ -478,8 +482,8 @@ impl ConsensusBus {
     }
 
     /// Create a bus with an explicit initial mode.
-    pub fn new_with_args(initial_mode: NodeMode, recent_blocks: u32) -> Self {
-        let inner_app = Arc::new(ConsensusBusAppInner::new(initial_mode, recent_blocks));
+    pub fn new_with_args(initial_mode: NodeMode, recently_executed_blocks: u32) -> Self {
+        let inner_app = Arc::new(ConsensusBusAppInner::new(initial_mode, recently_executed_blocks));
         let inner_epoch = Arc::new(ConsensusBusEpochInner::new(&inner_app));
         Self { inner_app, inner_epoch }
     }
@@ -619,17 +623,18 @@ impl ConsensusBus {
     ///
     /// For the frontier epoch/round read the monotonic [`Self::executed_anchor`] instead, or scan
     /// this window for the max-nonce block.
-    pub fn recent_blocks(&self) -> &watch::Sender<RecentBlocks> {
-        &self.inner_app.tx_recent_blocks
+    pub fn recently_executed_blocks(&self) -> &watch::Sender<RecentlyExecutedBlocks> {
+        &self.inner_app.tx_recently_executed_blocks
     }
 
     /// The EVM-execution anchor: the consensus header the highest executed block commits to.
     ///
     /// Single source of truth for the restart/replay watermark. Seeded once at boot from the
     /// chain (highest-nonce recent block) and advanced live by the engine on each executed output;
-    /// replay/catch-up consumers read this instead of re-deriving it from `recent_blocks` (whose
-    /// tip can lag behind after a drained parked batch). Distinct from the peer-derived
-    /// [`Self::last_consensus_header`], which is for header numbering only.
+    /// replay/catch-up consumers read this instead of re-deriving it from
+    /// `recently_executed_blocks` (whose tip can lag behind after a drained parked batch).
+    /// Distinct from the peer-derived [`Self::last_consensus_header`], which is for header
+    /// numbering only.
     pub fn executed_anchor(&self) -> &watch::Sender<ConsensusHeader> {
         &self.inner_app.tx_executed_anchor
     }
@@ -782,7 +787,8 @@ impl ConsensusBus {
     /// Resolves once the target block has executed, or returns a [`WaitForExecutionError`].
     ///
     /// The unbounded form returns `Forked` on a divergent hash at the target number or `Closed` if
-    /// `recent_blocks` closes; never `Stalled` (use [`Self::wait_for_execution_bounded`] for that).
+    /// `recently_executed_blocks` closes; never `Stalled` (use [`Self::wait_for_execution_bounded`]
+    /// for that).
     pub async fn wait_for_execution(
         &self,
         block: BlockNumHash,
@@ -807,26 +813,28 @@ impl ConsensusBus {
         block: BlockNumHash,
         idle_timeout: Option<Duration>,
     ) -> Result<(), WaitForExecutionError> {
-        let mut watch_execution_result = self.recent_blocks().subscribe();
+        let mut watch_execution_result = self.recently_executed_blocks().subscribe();
         let target_number = block.number;
         let target_hash = block.hash;
 
-        // Make sure that our recent blocks is not empty.  If it is we can have a race around block
-        // 0.
-        while self.recent_blocks().borrow().is_empty() {
+        // Make sure that our recently-executed window is not empty.  If it is we can have a race
+        // around block 0.
+        while self.recently_executed_blocks().borrow().is_empty() {
             await_execution_tick(&mut watch_execution_result, idle_timeout).await?;
         }
-        let mut current_number = self.recent_blocks().borrow().latest_block_num_hash().number;
+        let mut current_number =
+            self.recently_executed_blocks().borrow().latest_block_num_hash().number;
         while current_number < target_number {
             await_execution_tick(&mut watch_execution_result, idle_timeout).await?;
-            current_number = self.recent_blocks().borrow().latest_block_num_hash().number;
+            current_number =
+                self.recently_executed_blocks().borrow().latest_block_num_hash().number;
         }
 
-        let recent = self.recent_blocks().borrow();
+        let recent = self.recently_executed_blocks().borrow();
         let oldest_number = recent.oldest_block_number();
         let latest_number = recent.latest_block_num_hash().number;
 
-        // block older than recent_blocks window, assume already executed
+        // block older than recently_executed_blocks window, assume already executed
         if target_number < oldest_number {
             tracing::debug!(
                 target: "consensus-bus",
@@ -834,7 +842,7 @@ impl ConsensusBus {
                 oldest_number,
                 latest_number,
                 ?target_hash,
-                "wait_for_execution: block older than recent_blocks window, assuming already executed"
+                "wait_for_execution: block older than recently_executed_blocks window, assuming already executed"
             );
             return Ok(());
         }
@@ -854,7 +862,7 @@ impl ConsensusBus {
                 latest_number,
                 block_at_target_hash = ?block_at_target.map(|b| b.hash()),
                 "wait_for_execution: HASH MISMATCH - potential fork detected! \
-                 Expected hash not found in recent_blocks at target number."
+                 Expected hash not found in recently_executed_blocks at target number."
             );
             Err(WaitForExecutionError::Forked)
         }
@@ -865,12 +873,12 @@ impl ConsensusBus {
 /// a progressing chain resets it every block.
 pub const EXECUTION_STALL_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Await the next `recent_blocks` change, optionally bounded by `idle_timeout`.
+/// Await the next `recently_executed_blocks` change, optionally bounded by `idle_timeout`.
 ///
 /// Returns `Closed` if the receiver closes, or `Stalled` when `idle_timeout` is set and no change
 /// arrives within that window.
 async fn await_execution_tick(
-    rx: &mut watch::Receiver<RecentBlocks>,
+    rx: &mut watch::Receiver<RecentlyExecutedBlocks>,
     idle_timeout: Option<Duration>,
 ) -> Result<(), WaitForExecutionError> {
     match idle_timeout {
@@ -890,10 +898,10 @@ pub enum WaitForExecutionError {
     /// Execution made no progress within the bounded idle window (a stalled chain).
     #[error("execution made no progress within the idle timeout")]
     Stalled,
-    /// `recent_blocks` reported its sender closed. Defensive only: the sole sender is owned for
-    /// the app lifetime by the same `ConsensusBus` the wait borrows, so this is not expected
-    /// to fire.
-    #[error("recent_blocks closed before the target executed")]
+    /// `recently_executed_blocks` reported its sender closed. Defensive only: the sole sender is
+    /// owned for the app lifetime by the same `ConsensusBus` the wait borrows, so this is not
+    /// expected to fire.
+    #[error("recently_executed_blocks closed before the target executed")]
     Closed,
     /// Execution reached the target number but the block hash there differs: a fork.
     #[error("execution reached the target number with a divergent block hash")]

@@ -528,10 +528,11 @@ impl RethEnv {
     }
 
     /// Helper to deconstruct block nonce into epoch and round.
+    ///
+    /// Delegates to the canonical codec in `rayls_infrastructure_types::nonce` so the encode side
+    /// (`Header::nonce`) and every decode site share one definition of the layout.
     pub fn deconstruct_nonce(nonce: u64) -> (u32, u32) {
-        let epoch = (nonce >> 32) as u32; // Extract the upper 32 bits
-        let round = nonce as u32; // Extract the lower 32 bits (truncates upper bits)
-        (epoch, round)
+        rayls_infrastructure_types::nonce::unpack_nonce(nonce)
     }
 
     /// Get the epoch and round from the current execution tip.

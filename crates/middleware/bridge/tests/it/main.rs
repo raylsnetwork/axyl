@@ -37,12 +37,13 @@ async fn test_output_to_header() -> eyre::Result<()> {
 
     let mut consensus_output = consensus_bus.consensus_output().subscribe();
 
-    // prime recent_blocks BEFORE spawn so execution-wait paths have a tip; the subscriber's
-    // startup anchor now reads the SSOT `executed_anchor` (default number 0, nothing executed).
+    // prime recently_executed_blocks BEFORE spawn so execution-wait paths have a tip; the
+    // subscriber's startup anchor now reads the SSOT `executed_anchor` (default number 0,
+    // nothing executed).
     let mut exec_header = ExecHeader::default();
     exec_header.parent_beacon_block_root = Some(B256::ZERO);
     let dummy_parent = SealedHeader::new(exec_header, B256::default());
-    consensus_bus.recent_blocks().send_modify(|blocks| blocks.push_latest(dummy_parent));
+    consensus_bus.recently_executed_blocks().send_modify(|blocks| blocks.push_latest(dummy_parent));
 
     let (tx, mut rx) = mpsc::channel(5);
     tokio::spawn(async move {
@@ -126,7 +127,7 @@ async fn test_output_to_header() -> eyre::Result<()> {
 ///
 /// Regression test for the guard added at subscriber.rs:641. Without that guard
 /// the subscriber would send the output to `to_engine`, then wait forever on
-/// `recent_blocks_update.await` because no engine is running to execute the
+/// `recently_executed_blocks_update.await` because no engine is running to execute the
 /// block (it belongs to a past epoch).
 #[tokio::test]
 async fn test_missing_consensus_beyond_epoch_boundary() -> eyre::Result<()> {
@@ -189,8 +190,8 @@ async fn test_missing_consensus_beyond_epoch_boundary() -> eyre::Result<()> {
 
     // Keep the to_engine receiver alive but never read from it.
     // The old (broken) code path sends to_engine then waits on
-    // recent_blocks_update.await, which deadlocks because no engine
-    // is running to update recent_blocks. The guard must prevent
+    // recently_executed_blocks_update.await, which deadlocks because no engine
+    // is running to update recently_executed_blocks. The guard must prevent
     // reaching that code path.
     let (to_engine, _rx) = mpsc::channel(100);
 
@@ -247,11 +248,12 @@ async fn subscriber_drops_post_boundary_output_without_drain_signal() -> eyre::R
     });
     let network = PrimaryNetworkHandle::new_for_test(tx);
 
-    // Prime recent_blocks so the startup anchor path has a tip (nothing executed: anchor number 0).
+    // Prime recently_executed_blocks so the startup anchor path has a tip (nothing executed: anchor
+    // number 0).
     let mut exec_header = ExecHeader::default();
     exec_header.parent_beacon_block_root = Some(B256::ZERO);
     let dummy_parent = SealedHeader::new(exec_header, B256::default());
-    consensus_bus.recent_blocks().send_modify(|blocks| blocks.push_latest(dummy_parent));
+    consensus_bus.recently_executed_blocks().send_modify(|blocks| blocks.push_latest(dummy_parent));
 
     // Deterministic epoch boundary at timestamp 1000.
     const BOUNDARY: u64 = 1000;
@@ -381,10 +383,10 @@ async fn live_numbering_seeds_from_consensus_tip_across_lagging_anchor_restart()
     let mut exec_header = ExecHeader::default();
     exec_header.parent_beacon_block_root = Some(digest4);
     let exec_tip = SealedHeader::new(exec_header, B256::from([1u8; 32]));
-    consensus_bus.recent_blocks().send_modify(|blocks| blocks.push_latest(exec_tip));
+    consensus_bus.recently_executed_blocks().send_modify(|blocks| blocks.push_latest(exec_tip));
 
     // Stand in for the engine: each replayed output produces a block, so drain to_engine and tick
-    // recent_blocks per output - the signal the replay loop now waits on.
+    // recently_executed_blocks per output - the signal the replay loop now waits on.
     // Annotated because `engine_rx` is moved into `tokio::spawn` below before `spawn_subscriber`
     // constrains the channel type, so inference can't resolve it from the sender side in time.
     let (to_engine, mut engine_rx) = mpsc::channel::<(CameFrom, ConsensusOutput)>(100);
@@ -394,7 +396,7 @@ async fn live_numbering_seeds_from_consensus_tip_across_lagging_anchor_restart()
             let mut header = ExecHeader::default();
             header.number = output.number;
             let block = SealedHeader::new(header, B256::from([2u8; 32]));
-            engine_bus.recent_blocks().send_modify(|blocks| blocks.push_latest(block));
+            engine_bus.recently_executed_blocks().send_modify(|blocks| blocks.push_latest(block));
         }
     });
     spawn_subscriber(
