@@ -222,11 +222,17 @@ start_relays() {
     sleep 1
 }
 
-# Launch a local dnsmasq (high port, no systemd-resolved/NetworkManager conflict) that resolves
-# each validator's /dnsaddr/v<i>.${RELAY_DNS_DOMAIN} to BOTH its relays (primary + backup), for its
-# primary and worker peer ids. Requires RELAY_A_ADDR/RELAY_B_ADDR (set by start_relays). This is the
-# advertisement half that lets peers fail over to the backup relay.
+# Launch a local dnsmasq serving ONE view of the committee /dnsaddr records (high port, no
+# systemd-resolved/NetworkManager conflict). Args: <view> <port>.
+#   relay  -> each validator's /dnsaddr resolves to its relay circuits (primary + backup). The
+#             PUBLIC view: how an outsider reaches the committee, through the relays.
+#   direct -> resolves to each validator's direct 127.0.0.1:<port> listener only. The INSIDE/private
+#             view: co-located nodes connect directly and never touch a relay (needs MULTI_LISTEN,
+#             i.e. the nodes actually opened those direct listeners).
+# Requires RELAY_A_ADDR/RELAY_B_ADDR (set by start_relays). With MULTI_LISTEN the caller runs both
+# views on different ports; otherwise a single relay view on $DNSMASQ_PRIVATE_PORT.
 start_dnsmasq() {
+    local view="$1" port="$2"
     local ROOTDIR="$scriptDir/local-validators"
     command -v dnsmasq >/dev/null 2>&1 || { echo "Error: dnsmasq not found; install it or run --relay (without -dns)."; exit 1; }
     # --conf-file=/dev/null + --no-hosts: ignore the system dnsmasq config and /etc/hosts so this
@@ -234,7 +240,7 @@ start_dnsmasq() {
     # /etc/dnsmasq.d/* on the host). --log-queries: show each lookup so failures are visible.
     local args=(
         --no-daemon --conf-file=/dev/null --no-resolv --no-hosts --log-queries
-        --port="$DNSMASQ_PORT" --listen-address=127.0.0.1 --bind-interfaces
+        --port="$port" --listen-address=127.0.0.1 --bind-interfaces
     )
     for ((i=0; i<NUM_VALIDATORS; i++)); do
         local host="v$((i+1)).${RELAY_DNS_DOMAIN}"
@@ -243,16 +249,23 @@ start_dnsmasq() {
         # into node-info (primary listed first, worker second).
         local ids
         mapfile -t ids < <(grep -oE '/p2p/12D3KooW[A-Za-z0-9]+' "$ninfo" | grep -oE '12D3KooW[A-Za-z0-9]+')
-        local dst
-        for dst in "${ids[0]}" "${ids[1]}"; do
+        # ids[0]=primary, ids[1]=worker; their direct ports differ (40000+i / 41000+i).
+        local direct_ports=($((PRIMARY_DIRECT_BASE + i)) $((WORKER_DIRECT_BASE + i)))
+        local j dst
+        for j in 0 1; do
+            dst="${ids[$j]}"
             [[ -n "$dst" ]] || { echo "Error: could not read peer id from $ninfo"; exit 1; }
-            args+=(--txt-record="_dnsaddr.${host},dnsaddr=${RELAY_A_ADDR[$i]}/p2p-circuit/p2p/${dst}")
-            args+=(--txt-record="_dnsaddr.${host},dnsaddr=${RELAY_B_ADDR[$i]}/p2p-circuit/p2p/${dst}")
+            if [[ "$view" == "direct" ]]; then
+                args+=(--txt-record="_dnsaddr.${host},dnsaddr=/ip4/127.0.0.1/udp/${direct_ports[$j]}/quic-v1/p2p/${dst}")
+            else
+                args+=(--txt-record="_dnsaddr.${host},dnsaddr=${RELAY_A_ADDR[$i]}/p2p-circuit/p2p/${dst}")
+                args+=(--txt-record="_dnsaddr.${host},dnsaddr=${RELAY_B_ADDR[$i]}/p2p-circuit/p2p/${dst}")
+            fi
         done
-        echo "dnsmasq: ${host} -> relay ${RELAY_A_ADDR[$i]%%/p2p*}.. + backup ${RELAY_B_ADDR[$i]%%/p2p*}.."
     done
-    dnsmasq "${args[@]}" >> "${ROOTDIR}/dnsmasq.log" 2>&1 &
-    echo $! > "${ROOTDIR}/dnsmasq.pid"
+    dnsmasq "${args[@]}" >> "${ROOTDIR}/dnsmasq-${view}.log" 2>&1 &
+    echo $! > "${ROOTDIR}/dnsmasq-${view}.pid"
+    echo "dnsmasq[${view}] on 127.0.0.1:${port} serving ${NUM_VALIDATORS} validators' /dnsaddr"
     sleep 1
 }
 
@@ -355,9 +368,23 @@ RELAY_BASE_PORT=50000
 # re-reach it via the backup without /dnsaddr advertisement; the network continues on quorum.)
 RELAY_B_BASE_PORT=51000
 # --relay-dns only: validators advertise /dnsaddr/v<i>.${RELAY_DNS_DOMAIN}, resolved by a local
-# dnsmasq on 127.0.0.1:${DNSMASQ_PORT} (high port, no systemd-resolved/NetworkManager conflict).
+# dnsmasq on 127.0.0.1:${DNSMASQ_PRIVATE_PORT} (high port, no systemd-resolved/NetworkManager conflict).
 RELAY_DNS_DOMAIN="rayls.test"
-DNSMASQ_PORT=5353
+DNSMASQ_PRIVATE_PORT=5353
+# MULTI_LISTEN only: the PUBLIC (outside) resolver. Serves the relay-circuit records that an outsider
+# joining later (add-relay-node.sh) resolves, while the inside view (direct records) stays on
+# DNSMASQ_PRIVATE_PORT. Distinct port so both dnsmasq instances can bind 127.0.0.1.
+DNSMASQ_PUBLIC_PORT=5354
+# MULTI_LISTEN=1 (relay/relay-dns only): in addition to the relay reservation, open a DIRECT QUIC
+# listener bound to 0.0.0.0 (all interfaces) so each validator listens on BOTH a direct and a
+# relayed address at once -- the private-direct + public-relay topology. 0.0.0.0 is a bind wildcard,
+# never advertised (the node still advertises its /dnsaddr), so no loopback alias/setup is needed.
+# Direct ports mirror the relay scheme one band lower: primary 40000+i / worker 41000+i, i.e. exactly
+# 10000 below the validator's relay ports (relay A 50000+i / relay B 51000+i). Clear of reth's
+# 8545/9100 range. Each validator needs a unique port since 0.0.0.0:<port> is host-wide.
+MULTI_LISTEN="${MULTI_LISTEN:-0}"
+PRIMARY_DIRECT_BASE=40000
+WORKER_DIRECT_BASE=41000
 RELAY_PEER_IDS=(
     "12D3KooWK99VoVxNE7XzyBwXEzW7xhK7Gpv85r9F3V3fyKSUKPH5" # validator-1 relay @ 127.0.0.1:50000 (seed 0x01*32)
     "12D3KooWJWoaqZhDaoEFshF7Rh1bpY9ohihFhzcW6d69Lr2NASuq" # validator-2 relay @ 127.0.0.1:50001 (seed 0x02*32)
@@ -573,13 +600,27 @@ if [[ -n "$STOP_VALIDATOR" ]]; then
 fi
 
 if [ "$START" = true ]; then
+    # MULTI_LISTEN is only meaningful with a relay mode, where the node otherwise has no direct
+    # listener. The direct listener binds 0.0.0.0, so there's no interface/alias to set up.
+    if [[ "$MULTI_LISTEN" == "1" && "$RELAY_MODE" != "true" && "$RELAY_DNS_MODE" != "true" ]]; then
+        echo "MULTI_LISTEN=1 ignored: only meaningful with --relay/--relay-dns."
+        MULTI_LISTEN=0
+    fi
     # In relay mode, bring the relays up before validators so reservations/dials succeed.
     if [[ "$RELAY_MODE" == "true" ]]; then
         start_relays
     fi
-    # In /dnsaddr mode, start the resolver that maps each validator's /dnsaddr to both its relays.
+    # In /dnsaddr mode, start the resolver(s). With MULTI_LISTEN, run TWO views: the inside/private
+    # view (direct records) on $DNSMASQ_PRIVATE_PORT that the base validators use, and the public
+    # view (relay records) on $DNSMASQ_PUBLIC_PORT that an outsider joining later (add-relay-node.sh)
+    # points at. Without MULTI_LISTEN, a single relay view on $DNSMASQ_PRIVATE_PORT.
     if [[ "$RELAY_DNS_MODE" == "true" ]]; then
-        start_dnsmasq
+        if [[ "$MULTI_LISTEN" == "1" ]]; then
+            start_dnsmasq direct "$DNSMASQ_PRIVATE_PORT"
+            start_dnsmasq relay "$DNSMASQ_PUBLIC_PORT"
+        else
+            start_dnsmasq relay "$DNSMASQ_PRIVATE_PORT"
+        fi
     fi
 
     for ((i=0; i<$NUM_VALIDATORS; i++)); do
@@ -603,7 +644,7 @@ if [ "$START" = true ]; then
             # node-info advertises /dnsaddr (not listened on), so reserve on BOTH relays via env,
             # and resolve /dnsaddr against the local dnsmasq.
             RELAY_ENV=(
-                "RAYLS_DNS_SERVER=127.0.0.1:${DNSMASQ_PORT}"
+                "RAYLS_DNS_SERVER=127.0.0.1:${DNSMASQ_PRIVATE_PORT}"
                 "PRIMARY_RELAY_MULTIADDRS=${RELAY_A_ADDR[$i]},${RELAY_B_ADDR[$i]}"
                 "WORKER_RELAY_MULTIADDRS=${RELAY_A_ADDR[$i]},${RELAY_B_ADDR[$i]}"
             )
@@ -612,6 +653,16 @@ if [ "$START" = true ]; then
                 "PRIMARY_RELAY_MULTIADDRS=${RELAY_B_ADDR[$i]}"
                 "WORKER_RELAY_MULTIADDRS=${RELAY_B_ADDR[$i]}"
             )
+        fi
+        # MULTI_LISTEN: also open a direct QUIC listener bound to 0.0.0.0, so this validator listens
+        # on BOTH a direct address (all interfaces) and its relay reservation(s) at once. The node
+        # appends /p2p itself, so pass the bare base multiaddr.
+        if [[ "$MULTI_LISTEN" == "1" ]]; then
+            RELAY_ENV+=(
+                "PRIMARY_LISTENER_MULTIADDR=/ip4/0.0.0.0/udp/$((PRIMARY_DIRECT_BASE + i))/quic-v1"
+                "WORKER_LISTENER_MULTIADDR=/ip4/0.0.0.0/udp/$((WORKER_DIRECT_BASE + i))/quic-v1"
+            )
+            echo "  MULTI_LISTEN: direct 0.0.0.0:$((PRIMARY_DIRECT_BASE + i)) (primary) / 0.0.0.0:$((WORKER_DIRECT_BASE + i)) (worker), plus relay reservation"
         fi
         # start validator
         env "${RELAY_ENV[@]}" $heaptrackProfiling "$scriptDir/../../target/${BUILD_CONFIG}/rayls-network" node \
@@ -661,7 +712,7 @@ if [ "$START" = true ]; then
             # don't reserve on relays (peers don't dial them), so only the resolver env is needed.
             OBSERVER_ENV=()
             if [[ "$RELAY_DNS_MODE" == "true" ]]; then
-                OBSERVER_ENV=("RAYLS_DNS_SERVER=127.0.0.1:${DNSMASQ_PORT}")
+                OBSERVER_ENV=("RAYLS_DNS_SERVER=127.0.0.1:${DNSMASQ_PRIVATE_PORT}")
             fi
             env "${OBSERVER_ENV[@]}" "$scriptDir/../../target/${BUILD_CONFIG}/rayls-network" node \
                 --datadir "${ROOTDIR}/${OBSERVER}" \
@@ -702,7 +753,7 @@ if [ "$START" = true ]; then
     if [[ "$RELAY_MODE" == "true" ]]; then
         echo "$TOTAL_NODES nodes + $((NUM_VALIDATORS * 2)) relays (primary + backup per validator) started in background."
         if [[ "$RELAY_DNS_MODE" == "true" ]]; then
-            echo "Full-failover test (/dnsaddr via dnsmasq on :${DNSMASQ_PORT}):"
+            echo "Full-failover test (/dnsaddr via dnsmasq on :${DNSMASQ_PRIVATE_PORT}):"
             echo "  kill validator-1's PRIMARY relay: 'kill \$(cat ${ROOTDIR}/relay-1.pid)'"
             echo "  peers re-resolve /dnsaddr and reconnect to ${VALIDATORS[0]} via relay-1-b -- it stays in the committee."
             echo "Bring it all down with 'killall rayls-network rayls-relay dnsmasq'."
