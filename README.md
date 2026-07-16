@@ -1,48 +1,67 @@
-# Rayls Network
+<div align="center">
 
-[![License: BUSL-1.1](https://img.shields.io/badge/License-BUSL--1.1-blue.svg)](./LICENSE)
+<img src="./assets/rayls-logo.svg" alt="Rayls" width="120">
 
-Consensus layer (CL) is an implementation of Narwhal and Bullshark.
-Execution layer (EL) produces EVM blocks compatible with Ethereum.
+# Axyl
 
-Requires Rust 1.91
+**The Rayls Network protocol client — EVM execution built on [reth], DAG-based BFT consensus (Narwhal + Bullshark).**
 
-Crate index: [`doc/crates/index.md`](doc/crates/index.md)
+[![CI][ci-badge]][ci-url]
+[![Nightly E2E][e2e-badge]][e2e-url]
+[![Nightly Fuzz][fuzz-badge]][fuzz-url]
+[![Version][version-badge]][version-url]
+[![MSRV][msrv-badge]][msrv-url]
+[![License: BUSL-1.1][license-badge]][license-url]
 
-### Supported Platforms
+[![Discord][discord-badge]][discord-url]
+[![X][x-badge]][x-url]
+[![LinkedIn][linkedin-badge]][linkedin-url]
+[![YouTube][youtube-badge]][youtube-url]
 
-The Rayls Network protocol client supports Linux and MacOS operating systems. For Windows users, use WSL to run a Linux environment in which the client compiles and runs properly.
+[Run a node](#running-a-node) | [System Overview](doc/index.md) | [Crate Docs](doc/crates/index.md) | [Dev Mode](doc/dev-mode.md)
 
-### Recommended minimum system requirements
+</div>
 
-Target performance: 10 000+ TPS
+## What is Axyl?
 
-**CPU:** 8 x physical CPU cores
+Axyl is the protocol client for the Rayls Network, an EVM-compatible blockchain built on DAG-based consensus. A single binary (`rayls-network`) runs both halves of the protocol:
 
-**RAM:** 16 GiB RAM
+- **Consensus layer** — an implementation of [Narwhal](https://arxiv.org/abs/2105.11827) and [Bullshark](https://arxiv.org/abs/2201.05677), a DAG-based BFT consensus protocol, communicating over libp2p (QUIC).
+- **Execution layer** — an Ethereum-compatible EVM built on [reth] and [alloy]. It produces EVM blocks and serves the standard Ethereum JSON-RPC API, so existing Ethereum tooling works out of the box.
 
-**Storage:** 500 GiB SSD Disk
+Nodes run as **validators**, which participate in consensus, or as **observers**, which follow the chain via state-sync without joining the committee. Chain specs for the public `testnet` and `mainnet` are embedded in the binary. The protocol targets 10,000+ TPS.
 
-**Network:** 10+ Gbps Network Bandwidth
+For the architecture and transaction flow, see the [system overview](doc/index.md); for a map of the workspace, see the [crate index](doc/crates/index.md).
 
-## Quick Start
+## Status
+
+Releases are tagged `v<version>` from `main` — the version badge above tracks the latest tag.
+
+The protocol has been independently audited by [Halborn](https://www.halborn.com/): three assessments performed between February and March 2026, covering the consensus protocol, the network node, and the smart contracts, with remediation reviews completed in April–May 2026. The full reports and their outcomes are in [audits/](./audits/).
+
+## Running a node
+
+### System requirements
+
+|             | Recommended minimum        |
+| ----------- | -------------------------- |
+| CPU         | 8 physical cores           |
+| RAM         | 16 GiB                     |
+| Storage     | 500 GiB SSD                |
+| Network     | 10+ Gbps bandwidth         |
+
+Axyl supports Linux and macOS. On Windows, use WSL to run a Linux environment in which the client compiles and runs properly.
 
 ### Run a local dev chain (one command)
 
-The fastest way to get a working chain for local development — no key/genesis
-ceremony, RPC enabled, well-known accounts pre-funded:
+The fastest way to get a working chain for local development — no key/genesis ceremony, RPC enabled, well-known accounts pre-funded:
 
 ```sh
 cargo build --bin rayls-network --release --features dev-single-node-setup
 target/release/rayls-network dev --datadir /tmp/rayls-dev
 ```
 
-This bootstraps an empty datadir into a single-validator, gasless chain (chain-id
-`2017`) with HTTP RPC on `http://127.0.0.1:8545` and a status/explorer dashboard at
-`http://127.0.0.1:8550`. Dev mode lives behind the `dev-single-node-setup` Cargo feature (off by
-default, so production builds exclude it). See [`doc/dev-mode.md`](doc/dev-mode.md)
-for pre-funded accounts and wallet setup. For local development only — not for
-production.
+This bootstraps an empty datadir into a single-validator, gasless chain (chain-id `2017`) with HTTP RPC on `http://127.0.0.1:8545` and a status/explorer dashboard at `http://127.0.0.1:8550`. Dev mode lives behind the `dev-single-node-setup` Cargo feature (off by default, so production builds exclude it). See [`doc/dev-mode.md`](doc/dev-mode.md) for pre-funded accounts and wallet setup. For local development only — not for production.
 
 ### Run an observer against testnet
 
@@ -61,9 +80,9 @@ target/release/rayls-network keytool generate observer \
     --bls-passphrase-source ask
 ```
 
-This will use DATADIR for storage and set your "execution" address to 0x4444444444444444444444444444444444444444. Note an observer does not recieve credit for execution but this option needs to be set anyway (at time of writing). Use an address you control or a dummy like above. This will also ask for the password for your nodes BLS key, this will need to be entered when started (or it can be put in an ENV var for injection).
+This uses `DATADIR` for storage and sets the node's execution address. Observers do not receive credit for execution, but the option is still required — use an address you control, or a dummy one as above. The command prompts for a passphrase for the node's BLS key; you will need it again on startup (or supply it via the `RL_BLS_PASSPHRASE` environment variable with `--bls-passphrase-source env`).
 
-Start your observer node:
+Start your observer node, with a `DATADIR` and passphrase matching the step above:
 
 ```sh
 target/release/rayls-network node -vvv \
@@ -76,56 +95,22 @@ target/release/rayls-network node -vvv \
 
 The only valid values for `--chain` are `testnet` and `mainnet`; the embedded chain spec is selected from the value.
 
-Make sure DATADIR matches the config command above and use the same password for reading the key.
+### Run a local multi-validator network
 
-### Start a local development network
-
-Run the test network script to start four local validators and begin advancing the chain. The
-script reads `etc/test-network/.env` (copy from `.env.example` first if you have not already)
-for tunable parameters like RPC ports and gas limits:
+The test network script configures four local validators, creates genesis, and starts them in the background:
 
 ```sh
 cp etc/test-network/.env.example etc/test-network/.env  # first time only
 etc/test-network/local-testnet.sh --start --dev-funds 0xADDRESS
 ```
 
-Note: the script will compile a release build, which may take a few minutes.
-This configures and creates genesis for a new network and starts it. See the output for the RPC endpoints.
-0xADDRESS above should be a valid address prepended with 0x. Make sure you have the key for this address,
-it will be funded with 1billion RLS on your test network. After configuration you can run the script with
-just the --start option (--dev-funds is only used when configuring and CAN NOT be used later to fund
-an account). Nodes run in the backgound and should be killed with the `kill` or `killall` commands.
+`0xADDRESS` must be an address you hold the key for; it is funded with 1 billion RLS at genesis (`--dev-funds` only applies during initial configuration and cannot fund accounts later). The script compiles a release build, which may take a few minutes, and prints the RPC endpoints — point your favorite Ethereum tooling at any of them. Tunables (RPC ports, gas limits, block cadence — roughly one block every 10 seconds by default) live in `etc/test-network/.env`.
 
-The best docs for running a test network will currently be this script. It is short and pretty basic,
-it configures each node, brings together the configs to create genesis and then shares this with each node.
-This is the same basic procedure used to create nodes on diffent machines (NOTE- do not use the instance
-option if not running on the same machine, it is to avoid port conflicts).
+After the first run, `--start` alone restarts the network. To reset from scratch: stop the nodes (`killall rayls-network`), delete `etc/test-network/local-validators/`, and rerun the script. The same basic procedure — configure each node, combine the configs into genesis, share it with every node — is used to create networks across machines; the script itself is short and is currently the best reference for it.
 
-Once started you can use the RPC endpoint for any node with your favorate Ethereum tooling to test.
-You will have test funds in your dev funds account set during config. The network can be restarted
-by shutting down, `killall rayls-network` is good for this, deleting ./etc/test-network/local-validators/ and
-rerunning the script.
+For multi-machine setups, `RL_EXTERNAL_PRIMARY_ADDR` and `RL_EXTERNAL_WORKER_ADDRS` (comma-separated) set the [multiaddrs](https://github.com/multiformats/multiaddr) the primary and worker libp2p networks advertise. They default to `/ip4/127.0.0.1/udp/[PORT]/quic-v1` with unused ports; the addresses must use `quic-v1` over UDP.
 
-The defaults should build a block roughly every 10 seconds, see comments on the script if you want to
-speed this up for testing.
-
-## CLI Usage
-
-The CLI is used to create validator information, join a committee, and start the network.
-The following `.env` variables are useful but not required:
-
-- `RL_EXTERNAL_PRIMARY_ADDR`: The multi address of the primary libp2p network.
-- `RL_EXTERNAL_WORKER_ADDRS`: The multi address(es) of the worker libp2p networks. This is a comma seperated list.
-  All of these multi addresses will default to /ip4/127.0.0.1/udp/[PORT]/quic-v1 with an unused port for PORT. This is really only useful for tests (but is very useful for testing).
-  You MUST supply quic-v1 and udp to work with the rayls-network (although if you were setting up your own network other protocols may work but are untested).
-  References for multiaddr:
-  https://github.com/multiformats/multiaddr
-  https://github.com/multiformats/rust-multiaddr
-  These are used with libp2p2 so also see the Rust libp2p docs.
-
-## Example RPC request
-
-### get chain id
+### Example RPC request
 
 ```sh
 curl 127.0.0.1:8545 \
@@ -134,25 +119,72 @@ curl 127.0.0.1:8545 \
     --data '{"method":"eth_chainId","params":[],"id":1,"jsonrpc":"2.0"}'
 ```
 
-## Security Audits
+## For Developers
 
-The protocol has been independently audited by [Halborn](https://www.halborn.com/) —
-three assessments covering the consensus protocol, the network node, and the smart
-contracts. The full reports and their outcomes are in the [audits/](./audits/) directory.
+Build from source:
+
+```sh
+git clone https://github.com/raylsnetwork/axyl
+cd axyl
+cargo build --release
+```
+
+The toolchain is pinned to Rust 1.91 via [`rust-toolchain.toml`](./rust-toolchain.toml). `make pr` runs the same fmt + clippy + test gate as CI (fmt and clippy require a nightly toolchain); `make test` runs the test suite alone.
+
+Documentation lives in [`doc/`](doc/):
+
+- [System overview](doc/index.md) — architecture, transaction flow, database tables, RPC.
+- [Crate index](doc/crates/index.md) — every workspace crate with per-domain overviews.
+- [Dev mode](doc/dev-mode.md), [gasless mode](doc/gasless-mode.md), [node lifecycle](doc/node-lifecycle.md).
+
+Contributions are welcome — see [CONTRIBUTING.md](./CONTRIBUTING.md) and our [Code of Conduct](./CODE_OF_CONDUCT.md).
+
+## Getting Help
+
+- Join the chat on [Discord][discord-url].
+- Found a bug or have a feature request? [Open an issue](https://github.com/raylsnetwork/axyl/issues).
+- Follow Rayls on [X][x-url], [LinkedIn][linkedin-url], and [YouTube][youtube-url] for announcements.
+
+## Security
+
+To report a security vulnerability, see [SECURITY.md](./SECURITY.md) — please do not open a public issue. Completed third-party audits are listed under [Status](#status).
 
 ## Acknowledgements
 
-Rayls Network is an EVM-compatible blockchain built with DAG-based consensus.
-While building the protocol, we studied and explored many different projects to identify what worked well and where we could make improvements.
+Axyl is an EVM-compatible blockchain client built with DAG-based consensus. While building the protocol, we studied and explored many different projects to identify what worked well and where we could make improvements.
 
 We want to extend our sincere appreciation to the following teams:
 
 - [reth](https://github.com/paradigmxyz/reth): Reth stands out for their dedication to implementing the Ethereum protocol with clean, well-written code. Their unwavering commitment to building a strong open-source community has reached far beyond the Ethereum ecosystem. We are truly grateful for their leadership and the inspiration they continue to provide.
-- [sui](https://github.com/MystenLabs/sui): Rayls Network uses a version of Bullshark that was heavily derived from Mysten Lab's Sui codebase under Apache 2.0 license. Because this code was already released under the Apache License, we decided to start with a derivation of their work to iterate more quickly. We thank the Mysten Labs team for pioneering BFT consensus protocols and publishing their libraries.
-- [Telcoin Network](https://github.com/Telcoin-Association/telcoin-network): Rayls' Rust consensus workspace is derived from Telcoin Network — which builds on Sui's Narwhal/Bullshark consensus — and has been substantially reorganized and modified by Rayls. Their work is released under the Apache 2.0 / MIT licenses. We thank the Telcoin Association and its contributors for their open-source work.
+- [sui](https://github.com/MystenLabs/sui): Axyl uses a version of Bullshark that was heavily derived from Mysten Labs' Sui codebase under the Apache 2.0 license. Because this code was already released under the Apache License, we decided to start with a derivation of their work to iterate more quickly. We thank the Mysten Labs team for pioneering BFT consensus protocols and publishing their libraries.
+- [Telcoin Network](https://github.com/Telcoin-Association/telcoin-network): Axyl's Rust consensus workspace is derived from Telcoin Network — which builds on Sui's Narwhal/Bullshark consensus — and has been substantially reorganized and modified by Rayls. Their work is released under the Apache 2.0 / MIT licenses. We thank the Telcoin Association and its contributors for their open-source work.
 
 ## License
 
-Rayls Network is licensed under the **Business Source License 1.1 (BUSL-1.1)** — see [LICENSE](./LICENSE). The Change Date is four years after each version's first public release, with the **Apache License, Version 2.0** as the Change License.
+Axyl is licensed under the **Business Source License 1.1 (BUSL-1.1)** — see [LICENSE](./LICENSE). Production use is permitted for operating nodes — validator, observer, relayer, and RPC — on the Rayls public mainnet and its official test networks; other production use requires a commercial license. The Change Date is four years after each version's first public release, with the **Apache License, Version 2.0** as the Change License.
 
 This repository is a derivative work that incorporates and modifies code from Telcoin Network, Sui, and reth (all permissively licensed), plus the LayerZero OFT interfaces kept under their original MIT license. See [NOTICE](./NOTICE) for full attribution — including the MIT terms for the LayerZero interfaces — alongside the third-party [Apache 2.0 license text](./licenses/Apache-2.0.txt).
+
+[reth]: https://github.com/paradigmxyz/reth
+[alloy]: https://github.com/alloy-rs/alloy
+
+[ci-badge]: https://github.com/raylsnetwork/axyl/actions/workflows/pr.yaml/badge.svg
+[ci-url]: https://github.com/raylsnetwork/axyl/actions/workflows/pr.yaml
+[e2e-badge]: https://github.com/raylsnetwork/axyl/actions/workflows/nightly-e2e.yml/badge.svg
+[e2e-url]: https://github.com/raylsnetwork/axyl/actions/workflows/nightly-e2e.yml
+[fuzz-badge]: https://github.com/raylsnetwork/axyl/actions/workflows/nightly-fuzz.yml/badge.svg
+[fuzz-url]: https://github.com/raylsnetwork/axyl/actions/workflows/nightly-fuzz.yml
+[version-badge]: https://img.shields.io/github/v/tag/raylsnetwork/axyl?label=version
+[version-url]: https://github.com/raylsnetwork/axyl/tags
+[msrv-badge]: https://img.shields.io/badge/MSRV-1.91-orange.svg
+[msrv-url]: ./rust-toolchain.toml
+[license-badge]: https://img.shields.io/badge/License-BUSL--1.1-blue.svg
+[license-url]: ./LICENSE
+[discord-badge]: https://img.shields.io/badge/Discord-join%20chat-5865F2?logo=discord&logoColor=white
+[discord-url]: https://discord.gg/6THZ96357r
+[x-badge]: https://img.shields.io/badge/X-%40RaylsLabs-000000?logo=x&logoColor=white
+[x-url]: https://x.com/RaylsLabs
+[linkedin-badge]: https://img.shields.io/badge/LinkedIn-Rayls-0A66C2?logo=linkedin&logoColor=white
+[linkedin-url]: https://www.linkedin.com/company/rayls/
+[youtube-badge]: https://img.shields.io/badge/YouTube-Rayls-FF0000?logo=youtube&logoColor=white
+[youtube-url]: https://www.youtube.com/@Rayls_blockchain
