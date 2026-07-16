@@ -157,7 +157,7 @@ dependencies = [
  "secp256k1 0.30.0",
  "serde",
  "serde_json",
- "serde_with 3.18.0",
+ "serde_with",
  "thiserror 2.0.18",
 ]
 
@@ -265,7 +265,7 @@ dependencies = [
  "borsh",
  "k256",
  "serde",
- "serde_with 3.18.0",
+ "serde_with",
  "thiserror 2.0.18",
 ]
 
@@ -302,7 +302,7 @@ dependencies = [
  "ethereum_ssz 0.9.1",
  "ethereum_ssz_derive 0.9.1",
  "serde",
- "serde_with 3.18.0",
+ "serde_with",
  "sha2",
 ]
 
@@ -339,7 +339,7 @@ dependencies = [
  "alloy-trie",
  "borsh",
  "serde",
- "serde_with 3.18.0",
+ "serde_with",
 ]
 
 [[package]]
@@ -633,7 +633,7 @@ dependencies = [
  "ethereum_ssz_derive 0.9.1",
  "serde",
  "serde_json",
- "serde_with 3.18.0",
+ "serde_with",
  "thiserror 2.0.18",
  "tree_hash",
  "tree_hash_derive",
@@ -648,7 +648,7 @@ dependencies = [
  "alloy-primitives",
  "derive_more",
  "serde",
- "serde_with 3.18.0",
+ "serde_with",
 ]
 
 [[package]]
@@ -688,7 +688,7 @@ dependencies = [
  "itertools 0.14.0",
  "serde",
  "serde_json",
- "serde_with 3.18.0",
+ "serde_with",
  "thiserror 2.0.18",
 ]
 
@@ -1535,12 +1535,6 @@ dependencies = [
  "const-str",
  "match-lookup",
 ]
-
-[[package]]
-name = "base64"
-version = "0.13.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9e1b586273c5702936fe7b7d6896644d8be71e6314cfe09d3167c95f712589e8"
 
 [[package]]
 name = "base64"
@@ -5754,7 +5748,7 @@ dependencies = [
  "alloy-serde",
  "derive_more",
  "serde",
- "serde_with 3.18.0",
+ "serde_with",
  "thiserror 2.0.18",
 ]
 
@@ -6652,7 +6646,7 @@ dependencies = [
 
 [[package]]
 name = "rayls-infrastructure-types"
-version = "1.2.1"
+version = "1.2.2"
 dependencies = [
  "alloy",
  "async-trait",
@@ -6679,7 +6673,7 @@ dependencies = [
  "secp256k1 0.31.1",
  "serde",
  "serde_repr",
- "serde_with 2.3.3",
+ "serde_with",
  "serde_yaml",
  "thiserror 1.0.69",
  "tokio",
@@ -7380,7 +7374,7 @@ dependencies = [
  "schnellru",
  "secp256k1 0.30.0",
  "serde",
- "serde_with 3.18.0",
+ "serde_with",
  "thiserror 2.0.18",
  "tokio",
  "tokio-stream",
@@ -7824,7 +7818,7 @@ dependencies = [
  "reth-primitives-traits",
  "reth-zstd-compressors",
  "serde",
- "serde_with 3.18.0",
+ "serde_with",
 ]
 
 [[package]]
@@ -7910,7 +7904,7 @@ dependencies = [
  "reth-trie-common",
  "revm",
  "serde",
- "serde_with 3.18.0",
+ "serde_with",
 ]
 
 [[package]]
@@ -7962,7 +7956,7 @@ dependencies = [
  "reth-execution-types",
  "reth-primitives-traits",
  "serde",
- "serde_with 3.18.0",
+ "serde_with",
 ]
 
 [[package]]
@@ -8077,7 +8071,7 @@ dependencies = [
  "futures-util",
  "if-addrs",
  "reqwest 0.12.28",
- "serde_with 3.18.0",
+ "serde_with",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -8195,7 +8189,7 @@ dependencies = [
  "alloy-rlp",
  "enr",
  "secp256k1 0.30.0",
- "serde_with 3.18.0",
+ "serde_with",
  "thiserror 2.0.18",
  "tokio",
  "url",
@@ -8613,7 +8607,7 @@ dependencies = [
  "revm-state",
  "secp256k1 0.30.0",
  "serde",
- "serde_with 3.18.0",
+ "serde_with",
  "thiserror 2.0.18",
 ]
 
@@ -9351,7 +9345,7 @@ dependencies = [
  "reth-primitives-traits",
  "revm-database",
  "serde",
- "serde_with 3.18.0",
+ "serde_with",
 ]
 
 [[package]]
@@ -10264,22 +10258,6 @@ dependencies = [
 
 [[package]]
 name = "serde_with"
-version = "2.3.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "07ff71d2c147a7b57362cead5e22f772cd52f6ab31cfcd9edcd7f6aeb2a0afbe"
-dependencies = [
- "base64 0.13.1",
- "chrono",
- "hex",
- "indexmap 1.9.3",
- "serde",
- "serde_json",
- "serde_with_macros 2.3.3",
- "time",
-]
-
-[[package]]
-name = "serde_with"
 version = "3.18.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dd5414fad8e6907dbdd5bc441a50ae8d6e26151a03b1de04d89a5576de61d01f"
@@ -10293,20 +10271,8 @@ dependencies = [
  "schemars 1.2.1",
  "serde_core",
  "serde_json",
- "serde_with_macros 3.18.0",
+ "serde_with_macros",
  "time",
-]
-
-[[package]]
-name = "serde_with_macros"
-version = "2.3.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "881b6f881b17d13214e5d494c939ebab463d01264ce1811e9d4ac3a882e7695f"
-dependencies = [
- "darling 0.20.11",
- "proc-macro2",
- "quote",
- "syn 2.0.117",
 ]
 
 [[package]]
