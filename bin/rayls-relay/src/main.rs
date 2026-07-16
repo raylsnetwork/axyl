@@ -149,6 +149,9 @@ async fn main() -> eyre::Result<()> {
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
         )
+        // No ANSI colors: the relay's output is redirected to a log file, where escape sequences
+        // would show up as `^[[2m…` noise. Plain text; colorize downstream if desired.
+        .with_ansi(false)
         .try_init();
 
     let key = keypair_from_seed_env()?;
