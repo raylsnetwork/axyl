@@ -3,9 +3,14 @@
 # Add one extra relayed node to an already-running local relay testnet, with its own relay, and
 # let it connect via the genesis bootstrap seeds. No edits to existing nodes' config.
 #
-# The node joins as an OBSERVER: it dials the committee (through their relays) and syncs. Becoming
-# a voting validator additionally requires staking it in the on-chain ConsensusRegistry + an epoch
-# transition -- not done here.
+# The node is not in the genesis committee, so it boots following the committee (dials them through
+# their relays and syncs). It runs WITHOUT --observer, so once it is staked in the on-chain
+# ConsensusRegistry it is promoted to a voting validator (CVV) automatically at the next epoch
+# boundary -- and that mode persists across restarts.
+#
+# Restart-safe: if this node's datadir already exists, keygen + the genesis copy are skipped and only
+# the relay + node processes are (re)started (reusing whichever is still alive). So the same script
+# both adds the node the first time and restarts it later.
 #
 # Usage: ./add-relay-node.sh [INDEX]   (default INDEX=5; must not collide with existing nodes/ports)
 
@@ -58,38 +63,53 @@ for ((c = 0; c < 32; c++)); do SEED="${SEED}${byte}"; done
 [[ "$NODE_NUM" -gt "${NUM_VALIDATORS:-0}" ]] || { echo "Error: INDEX ($NODE_NUM) must be > NUM_VALIDATORS (${NUM_VALIDATORS}) so its relay port ($RELAY_PORT) and identity don't collide with a validator's."; exit 1; }
 [[ -d "${ROOTDIR}/genesis" ]] || { echo "Error: run local-testnet.sh --relay first (no genesis found)."; exit 1; }
 [[ -x "$BIN" ]] || { echo "Error: $BIN not built."; exit 1; }
-[[ -d "$DATADIR" ]] && { echo "Error: $DATADIR already exists -- pick another INDEX or remove it."; exit 1; }
 if [[ ! -x "$RELAY_BIN" ]]; then
     echo "Building rayls-relay..."
     cargo build --bin rayls-relay $([[ "$BUILD_CONFIG" == "release" ]] && echo --release)
 fi
 
-# --- 1. start this node's relay and read back its peer id ---
-echo "Starting relay-${NODE_NUM} on ${RELAY_HOST}:${RELAY_PORT}..."
-RELAY_SEED_HEX="$SEED" RELAY_PORT="$RELAY_PORT" "$RELAY_BIN" >> "$RELAY_LOG" 2>&1 &
-echo $! > "${ROOTDIR}/relay-${NODE_NUM}.pid"
+# Restart-safe: an existing datadir means this node was already added, so skip keygen + genesis and
+# just (re)start its processes.
+RESTART=0
+[[ -d "$DATADIR" ]] && RESTART=1
+RELAY_PID_FILE="${ROOTDIR}/relay-${NODE_NUM}.pid"
+NODE_PID_FILE="${ROOTDIR}/${NODE_NAME}.pid"
+alive() { [[ -f "$1" ]] && kill -0 "$(cat "$1" 2>/dev/null)" 2>/dev/null; }
 
-RELAY_PEER=""
-for _ in $(seq 1 40); do
-    RELAY_PEER=$(grep -ao '12D3KooW[A-Za-z0-9]*' "$RELAY_LOG" 2>/dev/null | head -1 || true)
-    [[ -n "$RELAY_PEER" ]] && break
-    sleep 0.25
-done
-[[ -n "$RELAY_PEER" ]] || { echo "Error: relay did not report a peer id (see $RELAY_LOG)."; exit 1; }
-RELAY_ADDR="/ip4/${RELAY_HOST}/udp/${RELAY_PORT}/quic-v1/p2p/${RELAY_PEER}"
-echo "relay-${NODE_NUM} up: ${RELAY_ADDR}"
+# --- 1. (re)start this node's relay (fixed identity from SEED, so the peer id is stable) ---
+if alive "$RELAY_PID_FILE"; then
+    echo "relay-${NODE_NUM} already running (pid $(cat "$RELAY_PID_FILE")); reusing."
+else
+    echo "Starting relay-${NODE_NUM} on ${RELAY_HOST}:${RELAY_PORT}..."
+    RELAY_SEED_HEX="$SEED" RELAY_PORT="$RELAY_PORT" "$RELAY_BIN" >> "$RELAY_LOG" 2>&1 &
+    echo $! > "$RELAY_PID_FILE"
+fi
 
-# --- 2. generate node keys with a circuit address on that relay ---
-mkdir -p "${DATADIR}/genesis"
-"$BIN" keytool generate observer \
-    --datadir "$DATADIR" \
-    --address "0x0000000000000000000000000000000000000000" \
-    --relay "$RELAY_ADDR"
+if [[ "$RESTART" -eq 0 ]]; then
+    # --- 2. first add: read the relay's peer id and generate node keys with a circuit on it ---
+    RELAY_PEER=""
+    for _ in $(seq 1 40); do
+        RELAY_PEER=$(grep -ao '12D3KooW[A-Za-z0-9]*' "$RELAY_LOG" 2>/dev/null | head -1 || true)
+        [[ -n "$RELAY_PEER" ]] && break
+        sleep 0.25
+    done
+    [[ -n "$RELAY_PEER" ]] || { echo "Error: relay did not report a peer id (see $RELAY_LOG)."; exit 1; }
+    RELAY_ADDR="/ip4/${RELAY_HOST}/udp/${RELAY_PORT}/quic-v1/p2p/${RELAY_PEER}"
+    echo "relay-${NODE_NUM} up: ${RELAY_ADDR}"
 
-# --- 3. give it the genesis + committee so it knows the bootstrap seeds ---
-cp "${ROOTDIR}/genesis/genesis.yaml" "${DATADIR}/genesis/"
-cp "${ROOTDIR}/genesis/committee.yaml" "${DATADIR}/genesis/"
-cp "${ROOTDIR}/parameters.yaml" "${DATADIR}/"
+    mkdir -p "${DATADIR}/genesis"
+    "$BIN" keytool generate validator \
+        --datadir "$DATADIR" \
+        --address "0x0000000000000000000000000000000000000000" \
+        --relay "$RELAY_ADDR"
+
+    # --- 3. give it the genesis + committee so it knows the bootstrap seeds ---
+    cp "${ROOTDIR}/genesis/genesis.yaml" "${DATADIR}/genesis/"
+    cp "${ROOTDIR}/genesis/committee.yaml" "${DATADIR}/genesis/"
+    cp "${ROOTDIR}/parameters.yaml" "${DATADIR}/"
+else
+    echo "Restart: reusing existing datadir ${DATADIR} (skipping keygen + genesis copy)."
+fi
 
 # If the network was started with --relay-dns, committee members are advertised as /dnsaddr and can
 # only be resolved against the local dnsmasq -- otherwise this node queries the system/public
@@ -102,16 +122,49 @@ if grep -q '/dnsaddr/' "${DATADIR}/genesis/committee.yaml"; then
     NODE_ENV=("RAYLS_DNS_SERVER=127.0.0.1:${DNSMASQ_PORT}")
 fi
 
-# --- 4. start the node; it dials the committee (via their relays) and syncs ---
+# Mirror the base validators' txpool / db-growth flags (see local-testnet.sh) so this node behaves
+# identically -- same pool limits and zero min-fee, otherwise it would reject the local zero-fee txs
+# the rest of the committee accepts. Honors the same env toggles: TX_POOL_LARGE_LIMITS=1, DB_GROW_STEP.
+FLAG_TX_POOL_MAX_COUNT="50000"
+FLAG_TX_POOL_MAX_SIZE="1048556000"
+if [[ "${TX_POOL_LARGE_LIMITS:-}" == "1" ]]; then
+    FLAG_TX_POOL_MAX_COUNT="1000000"
+    FLAG_TX_POOL_MAX_SIZE="20971120000"
+fi
+FLAG_DB_GROW=""
+FLAG_CONSENSUS_DB_GROW=""
+if [[ -n "${DB_GROW_STEP:-}" ]]; then
+    FLAG_DB_GROW="--db.growth-step $DB_GROW_STEP"
+    FLAG_CONSENSUS_DB_GROW="--consensus-db.growth-step $DB_GROW_STEP"
+fi
+
+# --- 4. start the node; it follows the committee (via their relays), syncs, and promotes to a
+#        validator once staked. No --observer: that flag pins it out of the committee permanently. ---
+if alive "$NODE_PID_FILE"; then
+    echo "Error: ${NODE_NAME} already running (pid $(cat "$NODE_PID_FILE")). Stop it first."; exit 1
+fi
 echo "Starting ${NODE_NAME} (instance ${INSTANCE}, rpc http://localhost:${HTTP_PORT} ws ws://localhost:${WS_PORT})..."
 env "${NODE_ENV[@]}" "$BIN" node \
     --datadir "$DATADIR" \
-    --observer \
     --instance "$INSTANCE" \
     --metrics "127.0.0.1:${METRICS_PORT}" \
     --log.stdout.format log-fmt \
     --full \
     --storage.v2 \
+    ${FLAG_DB_GROW} \
+    ${FLAG_CONSENSUS_DB_GROW} \
+    --txpool.pending-max-count "$FLAG_TX_POOL_MAX_COUNT" \
+    --txpool.pending-max-size "$FLAG_TX_POOL_MAX_SIZE" \
+    --txpool.basefee-max-count "$FLAG_TX_POOL_MAX_COUNT" \
+    --txpool.basefee-max-size "$FLAG_TX_POOL_MAX_SIZE" \
+    --txpool.queued-max-count "$FLAG_TX_POOL_MAX_COUNT" \
+    --txpool.queued-max-size "$FLAG_TX_POOL_MAX_SIZE" \
+    --txpool.max-pending-txns "$FLAG_TX_POOL_MAX_COUNT" \
+    --txpool.max-new-txns "$FLAG_TX_POOL_MAX_COUNT" \
+    --txpool.minimal-protocol-fee 0 \
+    --txpool.max-tx-input-bytes 999999999999 \
+    --txpool.max-account-slots "$FLAG_TX_POOL_MAX_COUNT" \
+    --gpo.default-suggested-fee 0 \
     -${LOG_LEVEL} \
     --http \
     --http.api all \
