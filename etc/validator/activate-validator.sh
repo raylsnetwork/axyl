@@ -13,7 +13,12 @@ fi
 
 cd "$workingDir/../.."
 
-RL_BLS_PASSPHRASE="local"
+# BLS passphrase: sourced from .env (RL_BLS_PASSPHRASE) so it matches whatever
+# create-validator.sh used. Falls back to "local" for throwaway local nodes.
+if [ -z "$RL_BLS_PASSPHRASE" ]; then
+    RL_BLS_PASSPHRASE="local"
+fi
+export RL_BLS_PASSPHRASE
 
 # PRIVATE KEY
 if [ -z "$PRIVATE_KEY" ]; then
@@ -81,9 +86,11 @@ cast send $REGISTRY_CONTRACT_ADDRESS "activate()" --private-key $PRIVATE_KEY --r
 if [ "$START" = true ]; then
     echo "Starting ${VALIDATOR} in background, rpc endpoint http://localhost:$RPC_PORT"
     # -vvv for INFO, -vvvvv for TRACE, etc
-    # start validator
-    RL_BLS_PASSPHRASE="local" ${workingDir}/../../target/${RELEASE}/rayls-network node \
+    # start validator (RL_BLS_PASSPHRASE is exported above)
+    ${workingDir}/../../target/${RELEASE}/rayls-network node \
         --datadir "${DATADIR}" \
+        --full \
+        --storage.v2 \
         --instance 99 \
         --metrics "127.0.0.1:9109" \
         --log.stdout.format log-fmt \
