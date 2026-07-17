@@ -4,15 +4,22 @@
 # let it connect via the genesis bootstrap seeds. No edits to existing nodes' config.
 #
 # The node is not in the genesis committee, so it boots following the committee (dials them through
-# their relays and syncs). It runs WITHOUT --observer, so once it is staked in the on-chain
-# ConsensusRegistry it is promoted to a voting validator (CVV) automatically at the next epoch
-# boundary -- and that mode persists across restarts.
+# their relays and syncs) as an observer. It runs WITHOUT --observer, so once it is staked in the
+# on-chain ConsensusRegistry it is promoted to a voting validator (CVV) at the next epoch boundary --
+# and that mode persists across restarts.
 #
-# Restart-safe: if this node's datadir already exists, keygen + the genesis copy are skipped and only
-# the relay + node processes are (re)started (reusing whichever is still alive). So the same script
-# both adds the node the first time and restarts it later.
+# Staking is a separate, one-time step -- run stake-relay-node.sh after this. Because the node's
+# proof-of-possession is bound to its operator address at keygen, pass ADDRESS=0x<operator> here on
+# the FIRST run if you intend to stake it later (default is the zero address = pure observer).
 #
-# Usage: ./add-relay-node.sh [INDEX]   (default INDEX=5; must not collide with existing nodes/ports)
+# Restart-safe: if this node's datadir already exists, keygen + genesis copy are skipped and only the
+# relay + node processes are (re)started. So the same script both adds the node the first time and
+# restarts it later.
+#
+# Usage:
+#   ./add-relay-node.sh [INDEX]                            # add as a pure observer (default INDEX=5)
+#   ADDRESS=0x<operator> ./add-relay-node.sh [INDEX]       # add, stakeable later via stake-relay-node.sh
+#   DNSMASQ_PORT=5354 ./add-relay-node.sh [INDEX]          # outsider: resolve committee via the public relay view
 
 set -e
 
@@ -31,8 +38,26 @@ LOG_LEVEL="${LOG_LEVEL:-info}"
 # Relay ip/port convention must match local-testnet.sh.
 RELAY_HOST="127.0.0.1"
 RELAY_BASE_PORT=50000
-# Local dnsmasq port used by --relay-dns (must match local-testnet.sh's DNSMASQ_PORT).
+# Local dnsmasq port used by --relay-dns. A newcomer is an outsider, so point it at the network's
+# PUBLIC view (relay records): DNSMASQ_PORT=5354 when the network was started with MULTI_LISTEN; a
+# plain --relay-dns network serves everything on 5353.
 DNSMASQ_PORT="${DNSMASQ_PORT:-5353}"
+
+# Operator identity for staking, derived deterministically from the index so the node is stakeable
+# later (stake-relay-node.sh ${NODE_NUM}) without tracking keys. OPERATOR_KEY is a small fixed
+# integer (test-only, throwaway; won't collide with the mnemonic-derived genesis accounts); ADDRESS
+# is computed from it with `cast` and baked into the node's proof-of-possession at keygen
+# (blsPubkey||validatorAddress), so it can't change afterward. Without `cast` it falls back to the
+# zero address (pure observer, not stakeable). Override ADDRESS or OPERATOR_KEY to use your own.
+OPERATOR_KEY="${OPERATOR_KEY:-0x$(printf '%064x' $((1000 + NODE_NUM)))}"
+if [[ -z "${ADDRESS:-}" ]]; then
+    if command -v cast >/dev/null 2>&1; then
+        ADDRESS=$(cast wallet address --private-key "$OPERATOR_KEY")
+    else
+        echo "note: Foundry 'cast' not found -> keygen with the zero address (pure observer, not stakeable)."
+        ADDRESS="0x0000000000000000000000000000000000000000"
+    fi
+fi
 
 idx=$((NODE_NUM - 1))
 RELAY_PORT=$((RELAY_BASE_PORT + idx))
@@ -100,7 +125,7 @@ if [[ "$RESTART" -eq 0 ]]; then
     mkdir -p "${DATADIR}/genesis"
     "$BIN" keytool generate validator \
         --datadir "$DATADIR" \
-        --address "0x0000000000000000000000000000000000000000" \
+        --address "$ADDRESS" \
         --relay "$RELAY_ADDR"
 
     # --- 3. give it the genesis + committee so it knows the bootstrap seeds ---
@@ -177,4 +202,10 @@ echo
 echo "Started ${NODE_NAME}. It will dial the committee through their relays and sync."
 echo "  node log:  tail -f ${NODE_LOG}"
 echo "  relay log: tail -f ${RELAY_LOG}"
+if [[ "$ADDRESS" != "0x0000000000000000000000000000000000000000" ]]; then
+    echo "Operator ${ADDRESS} baked in. To promote it to a validator (one-time), run:"
+    echo "  ./stake-relay-node.sh ${NODE_NUM}"
+    echo "  (derives the same operator from the index and uses the default registry-owner admin key;"
+    echo "   override ADMIN_PRIVATE_KEY if your network's owner differs from anvil #0.)"
+fi
 echo "Stop everything with: killall rayls-network rayls-relay"
