@@ -30,10 +30,20 @@ DNSMASQ_PORT=5354 ./etc/test-network/add-relay-node.sh 6
 
 # 3. stake it into the committee (waits for the chain to be ready, then mint→allowlist→approve→stake→activate)
 ADMIN_PRIVATE_KEY="$DEV_FUNDS_KEY" ./etc/test-network/stake-relay-node.sh 6
+
+# --- stopping ---
+
+# stop just the added node (+ its relay):
+./etc/test-network/stop-relay-node.sh 6
+# stop just a base validator (+ its two relays), seq 0-based (1 = validator-2):
+./etc/test-network/local-testnet.sh --stop-validator 1
+# bring the whole network down:
+killall rayls-network rayls-relay dnsmasq
 ```
 
 After step 3, node-6 promotes `Observer → CVV` at the **next epoch boundary**
-(epoch duration is ~60s).
+(epoch duration is ~60s). See [Stopping, restarting & chaos-testing](#stopping-restarting--chaos-testing)
+for restarting a single node and the chaos loop.
 
 ## What each step does (and the gotchas)
 
@@ -65,6 +75,51 @@ After step 3, node-6 promotes `Observer → CVV` at the **next epoch boundary**
   `MINTER_ROLE`) → **allowlist** the operator (owner-only) → operator **approves**
   the registry → **stake** → **activate**.
 - `ADMIN_PRIVATE_KEY` must be the key of the `--dev-funds` account (owner+minter).
+
+## Stopping, restarting & chaos-testing
+
+**Whole network down:** `killall rayls-network rayls-relay dnsmasq` (add
+`rm -rf etc/test-network/local-validators` to wipe state for a fresh genesis).
+
+**Stop / restart a single node.** Two node kinds, two toolchains — but both are
+env-self-contained, so a restart never loses the relay/DNS env (a hand-restarted
+node instead resolves committee `/dnsaddr` via the system/public resolver, gets
+NXDomain, and can't rejoin):
+
+| | base (genesis) validator | dynamically-added node |
+|---|---|---|
+| stop | `local-testnet.sh --stop-validator <SEQ>` | `stop-relay-node.sh <N>` |
+| start | `local-testnet.sh --start-validator <SEQ> [flags]` | `add-relay-node.sh <N>` |
+| index | `SEQ` 0-based (`1`=validator-2) | `N` = the add-relay index (`6`) |
+| scope | validator **+ its two relays** | node **+ its relay** |
+
+- `--stop-validator` / `--start-validator` also **manage that validator's relays**
+  (scrap on stop, revive on start). `--start-validator` rebuilds the *same*
+  `RAYLS_DNS_SERVER` + relay reservations the `--start` loop used — but you must
+  pass the **same mode flags** the network was started with, else the env comes out
+  empty:
+  ```bash
+  MULTI_LISTEN=1 ./etc/test-network/local-testnet.sh --start-validator 1 --relay-dns
+  ```
+- `add-relay-node.sh` is restart-safe (reuses the datadir, revives the relay, no
+  re-keygen/re-stake) and sets its own DNS env; pass `DNSMASQ_PORT=5354` as on the
+  first add.
+- **Shutdown semantics:** a consensus node is stopped with SIGTERM and **waited on
+  indefinitely — no `kill -9`**, so a hung graceful shutdown blocks (and is caught)
+  instead of being silently masked. Relays are stateless, so they get SIGTERM then
+  `kill -9` if they linger.
+
+**Chaos-test rejoin** with `fork_test_configs/bounce-node.sh` — it waits until the
+node reports `is_caught_up`, then loops stop → restart, exercising the
+catch-up/rejoin path:
+```bash
+# base validator (pass the net's mode flags):
+RELAY_DNS=1 MULTI_LISTEN=1 ./fork_test_configs/bounce-node.sh 1
+# dynamically-added node:
+ADDED=1 ./fork_test_configs/bounce-node.sh 6
+```
+If it parks on `still shutting down after Ns…`, that's a real hung shutdown — look
+at the node's log; it won't force-kill.
 
 ## Ports (node N; base validators use 9100+i etc.)
 

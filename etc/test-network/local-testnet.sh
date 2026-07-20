@@ -61,7 +61,9 @@ start_validator() {
 
     echo "Starting ${VALIDATOR} (seq: $seq_num) in background, rpc http://localhost:$RPC_PORT ws ws://localhost:$WS_PORT"
 
-    $heaptrackProfiling "$scriptDir/../../target/${BUILD_CONFIG}/rayls-network" node \
+    # RELAY_ENV is populated by the dispatch above (start_relay_pair + build_relay_env) in relay
+    # mode, empty otherwise. `env` with no assignments just runs the command normally.
+    env "${RELAY_ENV[@]}" $heaptrackProfiling "$scriptDir/../../target/${BUILD_CONFIG}/rayls-network" node \
         --datadir "${DATADIR}" \
         --instance "${INSTANCE}" \
         --metrics "${CONSENSUS_METRICS}" \
@@ -134,19 +136,16 @@ stop_validator() {
     # Send SIGTERM for graceful shutdown
     kill "$PID"
 
-    # Wait for process to terminate (max 10 seconds)
+    # Wait for the process to exit on its own -- indefinitely, NO SIGKILL fallback. A graceful
+    # SIGTERM shutdown that hangs is a real bug worth catching; forcing kill -9 would mask it (and
+    # any shutdown errors would scroll past unnoticed unless you're watching the logs). If a stop
+    # blocks here, inspect ${VALIDATOR}.log to see what shutdown step is stuck.
     local count=0
-    while kill -0 "$PID" 2>/dev/null && [[ $count -lt 10 ]]; do
+    while kill -0 "$PID" 2>/dev/null; do
         sleep 1
         count=$((count+1))
+        (( count % 30 == 0 )) && echo "  ${VALIDATOR} still shutting down after ${count}s (SIGTERM sent; not forcing) -- check ${VALIDATOR}.log"
     done
-
-    # Force kill if still running
-    if kill -0 "$PID" 2>/dev/null; then
-        echo "Process did not terminate gracefully, forcing kill..."
-        kill -9 "$PID"
-        sleep 1
-    fi
 
     rm "$PIDFILE"
     echo "Stopped ${VALIDATOR} (seq: $seq_num)"
@@ -173,53 +172,138 @@ relay_seed_hex() {
     echo "$seed"
 }
 
-# Spawn relays per validator:
-#  - primary relay-(i+1) on ${RELAY_BASE_PORT+i} with the fixed identity for that index (its peer
-#    id matches the validators' baked node-info addresses / RELAY_PEER_IDS);
-#  - backup relay-(i+1)-b on ${RELAY_B_BASE_PORT+i} with a distinct fixed identity. Its address is
-#    read back from the relay's log and exported to the validator via PRIMARY/WORKER_RELAY_MULTIADDRS
-#    so the validator reserves on BOTH relays.
-# Populates the global RELAY_B_ADDR[] with each backup relay's dialable multiaddr.
-start_relays() {
+# True if the pid recorded in <pidfile> names a live process.
+relay_alive() {
+    local pf=$1 pid
+    [[ -f "$pf" ]] || return 1
+    pid=$(cat "$pf" 2>/dev/null) || return 1
+    [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null
+}
+
+# Ensure validator <i>'s primary + backup relays are running (start only if down) and populate
+# RELAY_A_ADDR[i]/RELAY_B_ADDR[i]. Idempotent: a relay already up is reused, not restarted. Relay
+# identities are deterministic (fixed seeds), so a restarted relay keeps the SAME peer id / dialable
+# address -- the /dnsaddr records dnsmasq serves stay valid across relay restarts.
+#  - primary relay-(i+1) on ${RELAY_BASE_PORT+i}: fixed identity matching the validators' baked
+#    node-info addresses / RELAY_PEER_IDS;
+#  - backup relay-(i+1)-b on ${RELAY_B_BASE_PORT+i}: distinct fixed identity, peer id read from log.
+start_relay_pair() {
+    local i=$1
     local ROOTDIR="$scriptDir/local-validators"
-    RELAY_B_ADDR=()
-    RELAY_A_ADDR=()
-    for ((i=0; i<NUM_VALIDATORS; i++)); do
-        # primary relay (identity must match the baked node-info addresses)
-        local port=$((RELAY_BASE_PORT + i))
+
+    # primary relay (identity must match the baked node-info addresses)
+    local port=$((RELAY_BASE_PORT + i))
+    local pidf="${ROOTDIR}/relay-$((i+1)).pid"
+    if relay_alive "$pidf"; then
+        echo "relay-$((i+1)) already running on ${RELAY_HOST}:${port} (peer ${RELAY_PEER_IDS[$i]})"
+    else
         local seed
         seed=$(relay_seed_hex "$i")
         echo "Starting relay-$((i+1)) on ${RELAY_HOST}:${port} (peer ${RELAY_PEER_IDS[$i]})"
         RELAY_SEED_HEX="$seed" RELAY_PORT="$port" \
             "$scriptDir/../../target/${BUILD_CONFIG}/rayls-relay" \
             >> "${ROOTDIR}/relay-$((i+1)).log" 2>&1 &
-        echo $! > "${ROOTDIR}/relay-$((i+1)).pid"
-        # base dialable address of this primary relay (used by the /dnsaddr TXT records + env)
-        RELAY_A_ADDR[$i]="/ip4/${RELAY_HOST}/udp/${port}/quic-v1/p2p/${RELAY_PEER_IDS[$i]}"
+        echo $! > "$pidf"
+    fi
+    # base dialable address of this primary relay (fixed peer id, so always known)
+    RELAY_A_ADDR[$i]="/ip4/${RELAY_HOST}/udp/${port}/quic-v1/p2p/${RELAY_PEER_IDS[$i]}"
 
-        # backup relay (distinct fixed seed byte 0xb0+i; peer id read from its log)
-        local b_port=$((RELAY_B_BASE_PORT + i))
+    # backup relay (distinct fixed seed byte 0xb0+i; peer id read back from its log)
+    local b_port=$((RELAY_B_BASE_PORT + i))
+    local b_pidf="${ROOTDIR}/relay-$((i+1))-b.pid"
+    local b_log="${ROOTDIR}/relay-$((i+1))-b.log"
+    if relay_alive "$b_pidf"; then
+        echo "relay-$((i+1))-b (backup) already running on ${RELAY_HOST}:${b_port}"
+    else
         local b_byte b_seed c
         b_byte=$(printf '%02x' $((0xb0 + i)))
         b_seed=""
         for ((c=0; c<32; c++)); do b_seed="${b_seed}${b_byte}"; done
-        local b_log="${ROOTDIR}/relay-$((i+1))-b.log"
+        echo "Starting relay-$((i+1))-b (backup) on ${RELAY_HOST}:${b_port}"
         RELAY_SEED_HEX="$b_seed" RELAY_PORT="$b_port" \
             "$scriptDir/../../target/${BUILD_CONFIG}/rayls-relay" \
             >> "$b_log" 2>&1 &
-        echo $! > "${ROOTDIR}/relay-$((i+1))-b.pid"
-        local b_peer=""
-        for _ in $(seq 1 40); do
-            b_peer=$(grep -ao '12D3KooW[A-Za-z0-9]*' "$b_log" 2>/dev/null | head -1 || true)
-            [[ -n "$b_peer" ]] && break
-            sleep 0.25
-        done
-        [[ -n "$b_peer" ]] || { echo "Error: backup relay-$((i+1))-b did not report a peer id (see $b_log)."; exit 1; }
-        RELAY_B_ADDR[$i]="/ip4/${RELAY_HOST}/udp/${b_port}/quic-v1/p2p/${b_peer}"
-        echo "Starting relay-$((i+1))-b (backup) on ${RELAY_HOST}:${b_port} (peer ${b_peer})"
+        echo $! > "$b_pidf"
+    fi
+    # backup relay peer id: read from its log. The seed is fixed, so the peer id is stable across
+    # restarts -- head -1 picks the first (possibly older) entry, which is identical either way.
+    local b_peer=""
+    for _ in $(seq 1 40); do
+        b_peer=$(grep -ao '12D3KooW[A-Za-z0-9]*' "$b_log" 2>/dev/null | head -1 || true)
+        [[ -n "$b_peer" ]] && break
+        sleep 0.25
+    done
+    [[ -n "$b_peer" ]] || { echo "Error: backup relay-$((i+1))-b did not report a peer id (see $b_log)."; exit 1; }
+    RELAY_B_ADDR[$i]="/ip4/${RELAY_HOST}/udp/${b_port}/quic-v1/p2p/${b_peer}"
+}
+
+# Stop validator <i>'s primary + backup relays (by pidfile) and clear their pidfiles.
+stop_relay_pair() {
+    local i=$1
+    local ROOTDIR="$scriptDir/local-validators"
+    local pf pid count
+    for pf in "${ROOTDIR}/relay-$((i+1)).pid" "${ROOTDIR}/relay-$((i+1))-b.pid"; do
+        if relay_alive "$pf"; then
+            pid=$(cat "$pf")
+            echo "stopping $(basename "${pf%.pid}") (pid $pid)"
+            kill -TERM "$pid" 2>/dev/null || true
+            # Relays are stateless -- if SIGTERM doesn't take within a few seconds, just rip it with
+            # SIGKILL (unlike validators, there's no shutdown correctness to preserve).
+            count=0
+            while kill -0 "$pid" 2>/dev/null && [[ $count -lt 5 ]]; do sleep 1; count=$((count+1)); done
+            if kill -0 "$pid" 2>/dev/null; then
+                echo "  $(basename "${pf%.pid}") did not exit on SIGTERM, forcing kill -9"
+                kill -9 "$pid" 2>/dev/null || true
+            fi
+        fi
+        rm -f "$pf"
+    done
+}
+
+# Spawn all validators' relays (primary + backup). Populates RELAY_A_ADDR[]/RELAY_B_ADDR[].
+start_relays() {
+    RELAY_B_ADDR=()
+    RELAY_A_ADDR=()
+    for ((i=0; i<NUM_VALIDATORS; i++)); do
+        start_relay_pair "$i"
     done
     # Give relays a moment to bind before validators try to reserve/dial through them.
     sleep 1
+}
+
+# Build the global RELAY_ENV[] for validator <seq>: relay reservations (+ /dnsaddr resolver in
+# --relay-dns mode) and, with MULTI_LISTEN=1, the direct 0.0.0.0 listeners. Requires RELAY_A_ADDR/
+# RELAY_B_ADDR to be populated (by start_relays in --start, or start_relay_pair on restart).
+# Shared by the --start loop and the single-validator (re)start path so both launch with the SAME
+# env -- without RAYLS_DNS_SERVER a restarted node resolves committee /dnsaddr via the system/public
+# resolver, finds no peers, and can't rejoin.
+build_relay_env() {
+    local i=$1
+    RELAY_ENV=()
+    if [[ "$RELAY_DNS_MODE" == "true" ]]; then
+        # node-info advertises /dnsaddr (not listened on), so reserve on BOTH relays via env,
+        # and resolve /dnsaddr against the local dnsmasq.
+        RELAY_ENV=(
+            "RAYLS_DNS_SERVER=127.0.0.1:${DNSMASQ_PRIVATE_PORT}"
+            "PRIMARY_RELAY_MULTIADDRS=${RELAY_A_ADDR[$i]},${RELAY_B_ADDR[$i]}"
+            "WORKER_RELAY_MULTIADDRS=${RELAY_A_ADDR[$i]},${RELAY_B_ADDR[$i]}"
+        )
+    elif [[ "$RELAY_MODE" == "true" ]]; then
+        RELAY_ENV=(
+            "PRIMARY_RELAY_MULTIADDRS=${RELAY_B_ADDR[$i]}"
+            "WORKER_RELAY_MULTIADDRS=${RELAY_B_ADDR[$i]}"
+        )
+    fi
+    # MULTI_LISTEN: also open a direct QUIC listener bound to 0.0.0.0, so this validator listens on
+    # BOTH a direct address (all interfaces) and its relay reservation(s) at once. The node appends
+    # /p2p itself, so pass the bare base multiaddr.
+    if [[ "$MULTI_LISTEN" == "1" ]]; then
+        RELAY_ENV+=(
+            "PRIMARY_LISTENER_MULTIADDR=/ip4/0.0.0.0/udp/$((PRIMARY_DIRECT_BASE + i))/quic-v1"
+            "WORKER_LISTENER_MULTIADDR=/ip4/0.0.0.0/udp/$((WORKER_DIRECT_BASE + i))/quic-v1"
+        )
+        echo "  MULTI_LISTEN: direct 0.0.0.0:$((PRIMARY_DIRECT_BASE + i)) (primary) / 0.0.0.0:$((WORKER_DIRECT_BASE + i)) (worker), plus relay reservation"
+    fi
 }
 
 # Launch a local dnsmasq serving ONE view of the committee /dnsaddr records (high port, no
@@ -590,12 +674,25 @@ fi
 
 # Handle individual validator start/stop commands
 if [[ -n "$START_VALIDATOR" ]]; then
+    # Rebuild the SAME relay/DNS env the --start loop uses, so a single-validator (re)start (e.g.
+    # the chaos-kill loop) doesn't boot with a bare env and fail /dnsaddr resolution. Bring this
+    # validator's relays up if they're down (idempotent) and populate its relay addresses. Requires
+    # the same mode flags on this invocation, e.g.
+    #   MULTI_LISTEN=1 ./local-testnet.sh --start-validator N --relay-dns
+    RELAY_ENV=()
+    if [[ "$RELAY_DNS_MODE" == "true" || "$RELAY_MODE" == "true" ]]; then
+        start_relay_pair "$START_VALIDATOR"
+        build_relay_env "$START_VALIDATOR"
+    fi
     start_validator "$START_VALIDATOR"
     exit $?
 fi
 
 if [[ -n "$STOP_VALIDATOR" ]]; then
     stop_validator "$STOP_VALIDATOR"
+    # Also scrap this validator's relays; a later --start-validator brings them back (identities are
+    # deterministic, so peer ids / dnsmasq records stay valid). Harmless if no relays were running.
+    stop_relay_pair "$STOP_VALIDATOR"
     exit $?
 fi
 
@@ -636,34 +733,10 @@ if [ "$START" = true ]; then
         fi
 
         echo "Starting ${VALIDATOR} in background, rpc http://localhost:$RPC_PORT ws ws://localhost:$WS_PORT"
-        # In relay mode, tell the validator to also reserve on its backup relay (so it survives
-        # losing its primary relay). Passed as env assignments via `env` so the big command below
-        # stays unchanged.
-        RELAY_ENV=()
-        if [[ "$RELAY_DNS_MODE" == "true" ]]; then
-            # node-info advertises /dnsaddr (not listened on), so reserve on BOTH relays via env,
-            # and resolve /dnsaddr against the local dnsmasq.
-            RELAY_ENV=(
-                "RAYLS_DNS_SERVER=127.0.0.1:${DNSMASQ_PRIVATE_PORT}"
-                "PRIMARY_RELAY_MULTIADDRS=${RELAY_A_ADDR[$i]},${RELAY_B_ADDR[$i]}"
-                "WORKER_RELAY_MULTIADDRS=${RELAY_A_ADDR[$i]},${RELAY_B_ADDR[$i]}"
-            )
-        elif [[ "$RELAY_MODE" == "true" ]]; then
-            RELAY_ENV=(
-                "PRIMARY_RELAY_MULTIADDRS=${RELAY_B_ADDR[$i]}"
-                "WORKER_RELAY_MULTIADDRS=${RELAY_B_ADDR[$i]}"
-            )
-        fi
-        # MULTI_LISTEN: also open a direct QUIC listener bound to 0.0.0.0, so this validator listens
-        # on BOTH a direct address (all interfaces) and its relay reservation(s) at once. The node
-        # appends /p2p itself, so pass the bare base multiaddr.
-        if [[ "$MULTI_LISTEN" == "1" ]]; then
-            RELAY_ENV+=(
-                "PRIMARY_LISTENER_MULTIADDR=/ip4/0.0.0.0/udp/$((PRIMARY_DIRECT_BASE + i))/quic-v1"
-                "WORKER_LISTENER_MULTIADDR=/ip4/0.0.0.0/udp/$((WORKER_DIRECT_BASE + i))/quic-v1"
-            )
-            echo "  MULTI_LISTEN: direct 0.0.0.0:$((PRIMARY_DIRECT_BASE + i)) (primary) / 0.0.0.0:$((WORKER_DIRECT_BASE + i)) (worker), plus relay reservation"
-        fi
+        # Build this validator's relay/DNS env (also reserves on the backup relay so it survives
+        # losing its primary). Passed as env assignments via `env` so the big command below stays
+        # unchanged. Shared with the single-validator restart path (see build_relay_env).
+        build_relay_env "$i"
         # start validator
         env "${RELAY_ENV[@]}" $heaptrackProfiling "$scriptDir/../../target/${BUILD_CONFIG}/rayls-network" node \
             --datadir "${DATADIR}" \
