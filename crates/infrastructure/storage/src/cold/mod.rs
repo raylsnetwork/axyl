@@ -10,9 +10,15 @@
 //! addressed by the hot `ColdBatchLocations` index; the digest column keeps each jar
 //! self-describing, so reconcile can rebuild that index from the jars alone).
 
+mod archiver;
 mod jar;
+mod producer;
+mod reconcile;
 
+pub use archiver::ColdArchiver;
 pub use jar::{ColdSegment, ColdStore};
+pub use producer::{archive_below_epoch, ArchiveStats, SealOutcome};
+pub use reconcile::reconcile;
 
 use std::{collections::BTreeMap, path::PathBuf};
 

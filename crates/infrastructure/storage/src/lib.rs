@@ -27,7 +27,9 @@ pub mod redb;
 #[cfg(feature = "cold-storage")]
 pub mod cold;
 #[cfg(feature = "cold-storage")]
-pub use cold::{ColdConfig, ColdSegment, ColdSegmentKind};
+pub use cold::{ColdArchiver, ColdConfig, ColdSegment, ColdSegmentKind, SealOutcome};
+#[cfg(feature = "cold-storage")]
+use tables::{ColdArchiveHighWater, ColdBatchLocations};
 
 pub use rayls_infrastructure_types::{error::StoreError, ReadTimeout};
 
@@ -66,6 +68,10 @@ const EPOCH_TRANSITION_CHECKPOINTS_CF: &str = "epoch_transition_checkpoints";
 const BATCH_SEQ_COUNTER_CF: &str = "batch_seq_counter";
 const NODE_IDENTITY_CF: &str = "node_identity";
 const BATCH_ORDERING_STATE_CF: &str = "batch_ordering_state";
+#[cfg(feature = "cold-storage")]
+const COLD_BATCH_LOCATIONS_CF: &str = "cold_batch_locations";
+#[cfg(feature = "cold-storage")]
+const COLD_ARCHIVE_HIGH_WATER_CF: &str = "cold_archive_high_water";
 
 macro_rules! tables {
     ( $($table:ident;$name:expr;<$K:ty, $V:ty>),*) => {
@@ -84,6 +90,8 @@ macro_rules! tables {
 
 pub mod tables {
     use super::{PayloadToken, ProposerKey};
+    #[cfg(feature = "cold-storage")]
+    use crate::cold::ColdLocation;
     use rayls_infrastructure_types::{
         batch_ordering::BatchOrderingState as TypeBatchOrderingState, AuthorityIdentifier, Batch,
         BlockHash, Certificate, CertificateDigest, ConsensusHeader, Epoch, EpochCertificate,
@@ -125,6 +133,15 @@ pub mod tables {
         NodeIdentity;crate::NODE_IDENTITY_CF;<u8, AuthorityIdentifier>,
         // Batch ordering state for the current epoch.
         BatchOrderingState;crate::BATCH_ORDERING_STATE_CF;<u8, TypeBatchOrderingState>
+    );
+
+    // Cold-tier tables, compiled only with the `cold-storage` feature.
+    #[cfg(feature = "cold-storage")]
+    tables!(
+        // Cold-tier aux index: batch digest -> (epoch jar, row); rebuildable from the jar.
+        ColdBatchLocations;crate::COLD_BATCH_LOCATIONS_CF;<BlockHash, ColdLocation>,
+        // Last fully-archived epoch; the atomicity commit boundary, at most one row.
+        ColdArchiveHighWater;crate::COLD_ARCHIVE_HIGH_WATER_CF;<u8, Epoch>
     );
 }
 
@@ -217,6 +234,11 @@ fn open_default_tables<DB: Database>(db: &mut DB) -> eyre::Result<()> {
     open_one::<BatchSeqCounter>(db)?;
     open_one::<NodeIdentity>(db)?;
     open_one::<BatchOrderingState>(db)?;
+    #[cfg(feature = "cold-storage")]
+    {
+        open_one::<ColdBatchLocations>(db)?;
+        open_one::<ColdArchiveHighWater>(db)?;
+    }
 
     Ok(())
 }
