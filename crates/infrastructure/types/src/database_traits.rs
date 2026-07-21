@@ -69,6 +69,16 @@ pub trait DbTx {
     /// Skips to the first key >= the provided key and iterates from there.
     fn skip_to<T: Table>(&self, key: &T::Key) -> eyre::Result<DBIter<'_, T>>;
 
+    /// Skips to the first key >= the provided key and iterates from there as raw bytes.
+    ///
+    /// The default filters a full [`raw_iter`](Self::raw_iter) scan, correct for any backend
+    /// whose raw iteration is ordered by encoded key; seekable backends override it to position
+    /// a cursor directly, skipping the leading scan entirely.
+    fn raw_skip_to<T: Table>(&self, key: &T::Key) -> eyre::Result<DBRawIter<'_>> {
+        let target = crate::encode_key(key);
+        Ok(Box::new(self.raw_iter::<T>().skip_while(move |(k, _)| k.as_ref() < target.as_slice())))
+    }
+
     /// Returns an iterator over all key-value pairs in reverse order.
     fn reverse_iter<T: Table>(&self) -> DBIter<'_, T>;
 
@@ -94,14 +104,16 @@ pub trait DbTxMut: DbTx {
     /// Removes the entry for the given key from the map.
     fn remove<T: Table>(&mut self, key: &T::Key) -> eyre::Result<()>;
 
-    /// Removes a key from the durable store within this transaction, bypassing any in-memory write
-    /// cache.
+    /// Removes many keys from the durable store as one operation, bypassing any in-memory cache.
     ///
-    /// Layered backends override this to delete from the persistent layer without planting an
-    /// in-memory tombstone, so a cold-storage archiver can drop permanently-removed keys without
-    /// shadowing a read fall-through tier or leaking tombstones. The default delegates to `remove`.
-    fn evict_persistent<T: Table>(&mut self, key: &T::Key) -> eyre::Result<()> {
-        self.remove::<T>(key)
+    /// Layered backends override it to hard-delete (no tombstone, which would shadow a
+    /// fall-through tier) and to hand the set to the writer as one unit; the default is per-key
+    /// removes.
+    fn evict_persistent_batch<T: Table>(&mut self, keys: &[T::Key]) -> eyre::Result<()> {
+        for key in keys {
+            self.remove::<T>(key)?;
+        }
+        Ok(())
     }
 
     /// Removes every key-value pair from the table.

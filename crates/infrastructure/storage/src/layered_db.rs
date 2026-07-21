@@ -6,6 +6,7 @@ use std::{
     iter::Peekable,
     marker::PhantomData,
     sync::{
+        atomic::{AtomicUsize, Ordering as AtomicOrdering},
         mpsc::{self, Receiver, Sender},
         Arc,
     },
@@ -14,7 +15,10 @@ use std::{
 };
 
 use crate::mem_db::{MemDatabase, MemDbTx, MemDbTxMut};
-use rayls_infrastructure_types::{decode_key, DBIter, DBRawIter, Database, DbTx, DbTxMut, Table};
+use prometheus::{default_registry, register_int_gauge_with_registry, IntGauge, Registry};
+use rayls_infrastructure_types::{
+    decode_key, encode, DBIter, DBRawIter, Database, DbTx, DbTxMut, Table,
+};
 use tokio::sync::oneshot::{self, error::TryRecvError};
 
 /// Streaming merge-join iterator for LayeredDB.
@@ -202,6 +206,19 @@ impl<'a, DB: Database> DbTx for LayeredDbTx<'a, DB> {
         }
     }
 
+    fn raw_get<T: Table>(&self, key: &T::Key) -> eyre::Result<Option<Cow<'_, [u8]>>> {
+        if self.mem_db.is_tombstoned::<T>(key) {
+            return Ok(None);
+        }
+        // A mem-overlay hit holds the typed value, so it must re-encode; the common archival path
+        // (old rows already evicted from the overlay) falls through to the inner backend's
+        // zero-copy raw read.
+        if let Some((_, val)) = self.mem_db.get_no_marked_check::<T>(key) {
+            return Ok(Some(Cow::Owned(encode(&val))));
+        }
+        self.db.raw_get::<T>(key)
+    }
+
     fn iter<T: Table>(&self) -> DBIter<'_, T> {
         let db_iter = self.db.iter::<T>();
         let mem_iter = self.mem_db.iter::<T>();
@@ -224,6 +241,14 @@ impl<'a, DB: Database> DbTx for LayeredDbTx<'a, DB> {
         let is_tombstoned: Box<dyn Fn(&T::Key) -> bool + '_> =
             Box::new(|k| self.mem_db.is_tombstoned::<T>(k));
         Ok(Box::new(MergeJoinIter::<T>::forward(db_iter, mem_iter, is_tombstoned)))
+    }
+
+    fn raw_skip_to<T: Table>(&self, key: &T::Key) -> eyre::Result<DBRawIter<'_>> {
+        let db_iter = self.db.raw_skip_to::<T>(key)?;
+        let mem_iter = self.mem_db.raw_skip_to::<T>(key)?;
+        let is_tombstoned: Box<dyn Fn(&T::Key) -> bool + '_> =
+            Box::new(|k| self.mem_db.is_tombstoned::<T>(k));
+        Ok(Box::new(MergeJoinRawIter::<T>::forward(db_iter, mem_iter, is_tombstoned)))
     }
 
     fn reverse_iter<T: Table>(&self) -> DBIter<'_, T> {
@@ -260,7 +285,7 @@ impl<'a, DB: Database> DbTx for LayeredDbTx<'a, DB> {
 pub struct LayeredDbTxMut<'a, DB: Database> {
     mem_db: MemDbTxMut<'a>,
     _db: DB,
-    tx: Sender<DBMessage<DB>>,
+    tx: QueueSender<DB>,
 }
 
 impl<'a, DB: Database> Debug for LayeredDbTxMut<'a, DB> {
@@ -272,6 +297,14 @@ impl<'a, DB: Database> Debug for LayeredDbTxMut<'a, DB> {
 impl<'a, DB: Database> DbTx for LayeredDbTxMut<'a, DB> {
     fn get<T: Table>(&self, _key: &T::Key) -> eyre::Result<Option<T::Value>> {
         panic!("DbTx get() should not be called on a DbTxMut!");
+    }
+
+    fn raw_get<T: Table>(&self, _key: &T::Key) -> eyre::Result<Option<Cow<'_, [u8]>>> {
+        panic!("DbTx raw_get() should not be called on a DbTxMut!");
+    }
+
+    fn raw_skip_to<T: Table>(&self, _key: &T::Key) -> eyre::Result<DBRawIter<'_>> {
+        panic!("DbTx raw_skip_to() should not be called on a DbTxMut!");
     }
 
     fn iter<T: Table>(&self) -> DBIter<'_, T> {
@@ -322,6 +355,20 @@ impl<'a, DB: Database> DbTxMut for LayeredDbTxMut<'a, DB> {
         Ok(())
     }
 
+    fn evict_persistent_batch<T: Table>(&mut self, keys: &[T::Key]) -> eyre::Result<()> {
+        if keys.is_empty() {
+            return Ok(());
+        }
+        // Hard-delete (no tombstone): a tombstone would shadow the cold fall-through. The whole
+        // set is ONE writer message; a per-row message on a whole-epoch prune is pure overhead.
+        for key in keys {
+            self.mem_db.hard_delete::<T>(key);
+        }
+        let rm = Box::new(KeyRemoveBatch::<T> { keys: keys.to_vec() });
+        self.tx.send(DBMessage::Remove(rm)).map_err(|_| eyre::eyre!("DB thread gone, FATAL!"))?;
+        Ok(())
+    }
+
     fn clear_table<T: Table>(&mut self) -> eyre::Result<()> {
         self.mem_db.clear_table::<T>()?;
         let clr = Box::new(ClearTable::<T> { _casper: PhantomData });
@@ -358,9 +405,111 @@ fn evict_committed<DB: Database>(
     committed_inserts.drain(..remove_count);
 }
 
-fn db_run<DB: Database>(db: DB, mem_db: MemDatabase, rx: Receiver<DBMessage<DB>>) {
+/// Depth at which the writer queue is treated as a backlog: `db_run` warns (rate-limited) and
+/// data-plane enqueues start pacing, so the imbalance never surfaces as a multi-minute `persist`
+/// drain at the next epoch boundary.
+const QUEUE_HIGH_WATER: usize = 10_000;
+const QUEUE_LAG_WARN_INTERVAL: Duration = Duration::from_secs(10);
+
+/// Pause paid by each insert/remove/clear enqueue while the queue is above [`QUEUE_HIGH_WATER`].
+///
+/// Soft backpressure: a slow inner DB surfaces as gradual producer slowdown instead of a
+/// network-wide stall at the deterministic boundary `persist`. Pacing can lag the node into
+/// demotion (recoverable; the boundary stall is not), and the sleep may land on an async worker
+/// thread (the `Database` write API is sync) - the accepted cost in an already-degraded regime.
+/// Control messages (txn markers, persist barrier, shutdown) never pace.
+const QUEUE_PACE_SLEEP: Duration = Duration::from_millis(1);
+
+/// Drain time past which a `persist`/`sync_persist` is logged at `warn` rather than `debug`.
+const PERSIST_SLOW_WARN: Duration = Duration::from_secs(1);
+
+/// A [`DBMessage`] sender that tracks the writer queue's depth: every enqueue bumps a shared
+/// counter `db_run` decrements as it drains, feeding the depth gauge and the
+/// [`QUEUE_HIGH_WATER`] pacing.
+struct QueueSender<DB: Database> {
+    tx: Sender<DBMessage<DB>>,
+    depth: Arc<AtomicUsize>,
+}
+
+impl<DB: Database> Clone for QueueSender<DB> {
+    fn clone(&self) -> Self {
+        Self { tx: self.tx.clone(), depth: Arc::clone(&self.depth) }
+    }
+}
+
+impl<DB: Database> Debug for QueueSender<DB> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "QueueSender(depth: {})", self.depth())
+    }
+}
+
+impl<DB: Database> QueueSender<DB> {
+    /// Enqueues a writer message; data-plane messages pace once the depth is past
+    /// [`QUEUE_HIGH_WATER`] (see [`QUEUE_PACE_SLEEP`]).
+    fn send(&self, msg: DBMessage<DB>) -> Result<(), mpsc::SendError<DBMessage<DB>>> {
+        if matches!(msg, DBMessage::Insert(_) | DBMessage::Remove(_) | DBMessage::Clear(_))
+            && self.depth() > QUEUE_HIGH_WATER
+        {
+            std::thread::sleep(QUEUE_PACE_SLEEP);
+        }
+        // Bump before the send so the depth never reads low mid-flight. Relaxed: an advisory
+        // gauge, not a synchronization point.
+        self.depth.fetch_add(1, AtomicOrdering::Relaxed);
+        self.tx.send(msg)
+    }
+
+    /// Returns the writer messages enqueued but not yet applied by the background thread.
+    fn depth(&self) -> usize {
+        self.depth.load(AtomicOrdering::Relaxed)
+    }
+}
+
+/// Registers a metric on the process scrape registry, falling back to a private unscraped one on
+/// double registration (a second stack in one process, as tests build).
+pub(crate) fn register_metric_or_unscraped<T>(
+    register: impl Fn(&Registry) -> Result<T, prometheus::Error>,
+) -> T {
+    register(default_registry())
+        .unwrap_or_else(|_| register(&Registry::new()).expect("metric on a fresh registry"))
+}
+
+/// Returns the writer-queue-depth gauge; `db_run` samples it on every dequeue, so a dashboard
+/// shows the backlog ramp before it crosses the warn threshold.
+fn writer_queue_depth_gauge() -> IntGauge {
+    register_metric_or_unscraped(|registry| {
+        register_int_gauge_with_registry!(
+            "layered_db_writer_queue_depth",
+            "Consensus DB layered writer messages enqueued but not yet applied.",
+            registry,
+        )
+    })
+}
+
+/// Logs a `persist`/`sync_persist` drain: `warn` past [`PERSIST_SLOW_WARN`] (a backlog that stalled
+/// the barrier), `debug` otherwise. `depth` is the queue depth observed when the barrier enqueued.
+fn log_persist_latency(elapsed: Duration, depth: usize) {
+    if elapsed >= PERSIST_SLOW_WARN {
+        tracing::warn!(
+            target: "storage",
+            ?elapsed,
+            depth,
+            "consensus DB persist drained a slow writer backlog"
+        );
+    } else {
+        tracing::debug!(target: "storage", ?elapsed, depth, "consensus DB persist");
+    }
+}
+
+fn db_run<DB: Database>(
+    db: DB,
+    mem_db: MemDatabase,
+    rx: Receiver<DBMessage<DB>>,
+    depth: Arc<AtomicUsize>,
+) {
     let mut txn = None;
     let mut last_compact = Instant::now();
+    let queue_depth_gauge = writer_queue_depth_gauge();
+    let mut last_lag_warn: Option<Instant> = None;
 
     let mut committed_inserts: Vec<(Instant, Box<dyn InsertTrait<DB>>)> = Vec::with_capacity(1000);
     // last write/commit failure since the previous CaughtUp, reported by the next persist
@@ -369,6 +518,15 @@ fn db_run<DB: Database>(db: DB, mem_db: MemDatabase, rx: Receiver<DBMessage<DB>>
         tracing::error!(target: "layered_db_runner", "DB ERROR compacting DB on startup (background): {e}");
     }
     while let Ok(msg) = rx.recv() {
+        // Depth after taking this message off the queue (fetch_sub returns the count including it).
+        let queued = depth.fetch_sub(1, AtomicOrdering::Relaxed).saturating_sub(1);
+        queue_depth_gauge.set(queued as i64);
+        if queued > QUEUE_HIGH_WATER
+            && last_lag_warn.is_none_or(|at| at.elapsed() >= QUEUE_LAG_WARN_INTERVAL)
+        {
+            last_lag_warn = Some(Instant::now());
+            tracing::warn!(target: "storage", depth = queued, "layered DB writer queue backlog");
+        }
         match msg {
             DBMessage::StartTxn => {
                 if let Some((_txn, count)) = &mut txn {
@@ -466,7 +624,7 @@ fn db_run<DB: Database>(db: DB, mem_db: MemDatabase, rx: Receiver<DBMessage<DB>>
 pub struct LayeredDatabase<DB: Database> {
     mem_db: MemDatabase,
     db: DB,
-    tx: Sender<DBMessage<DB>>,
+    tx: QueueSender<DB>,
     thread: Option<Arc<JoinHandle<()>>>,
 }
 
@@ -494,12 +652,26 @@ impl<DB: Database> Drop for LayeredDatabase<DB> {
 impl<DB: Database> LayeredDatabase<DB> {
     pub fn open(db: DB) -> Self {
         let (tx, rx) = mpsc::channel();
+        let depth = Arc::new(AtomicUsize::new(0));
         let db_cloned = db.clone();
         let mem_db = MemDatabase::new();
         let mem_db_clone = mem_db.clone();
-        let thread =
-            Some(Arc::new(std::thread::spawn(move || db_run(db_cloned, mem_db_clone, rx))));
-        Self { mem_db, db, tx, thread }
+        let queue_depth = Arc::clone(&depth);
+        let thread = Some(Arc::new(std::thread::spawn(move || {
+            db_run(db_cloned, mem_db_clone, rx, queue_depth)
+        })));
+        Self { mem_db, db, tx: QueueSender { tx, depth }, thread }
+    }
+
+    /// Returns the wrapped inner database: archival operates beneath the mem cache so its deletes
+    /// leave no tombstones that would shadow the cold store.
+    pub fn inner(&self) -> &DB {
+        &self.db
+    }
+
+    /// Returns the writer messages enqueued but not yet applied (advisory, relaxed load).
+    pub fn queue_depth(&self) -> usize {
+        self.tx.depth()
     }
 }
 
@@ -633,11 +805,16 @@ impl<DB: Database> Database for LayeredDatabase<DB> {
 
     fn persist(&self) -> impl Future<Output = eyre::Result<()>> + Send {
         let (tx, rx) = oneshot::channel();
+        let depth_at_send = self.tx.depth();
+        let started = Instant::now();
         let send_result = self.tx.send(DBMessage::CaughtUp(tx));
         async move {
             match send_result {
                 Ok(()) => match rx.await {
-                    Ok(Ok(())) => Ok(()),
+                    Ok(Ok(())) => {
+                        log_persist_latency(started.elapsed(), depth_at_send);
+                        Ok(())
+                    }
                     Ok(Err(e)) => {
                         tracing::error!(target: "storage", "consensus DB persist: write failed since last flush: {e}");
                         Err(eyre::eyre!("consensus DB persist: {e}"))
@@ -659,6 +836,8 @@ impl<DB: Database> Database for LayeredDatabase<DB> {
     /// on an async runtime worker.
     fn sync_persist(&self) {
         let (tx, mut rx) = oneshot::channel();
+        let depth_at_send = self.tx.depth();
+        let started = Instant::now();
         let r = self
             .tx
             .send(DBMessage::CaughtUp(tx))
@@ -669,7 +848,10 @@ impl<DB: Database> Database for LayeredDatabase<DB> {
                 match rx.try_recv() {
                     Err(TryRecvError::Empty) => std::thread::sleep(Duration::from_millis(100)),
                     Err(TryRecvError::Closed) => break,
-                    Ok(Ok(())) => break,
+                    Ok(Ok(())) => {
+                        log_persist_latency(started.elapsed(), depth_at_send);
+                        break;
+                    }
                     Ok(Err(e)) => {
                         tracing::error!(target: "storage", "consensus DB sync_persist: write failed: {e}");
                         break;
@@ -704,6 +886,10 @@ struct KeyValueInsert<T: Table> {
 
 struct KeyRemove<T: Table> {
     key: T::Key,
+}
+
+struct KeyRemoveBatch<T: Table> {
+    keys: Vec<T::Key>,
 }
 
 struct ClearTable<T: Table> {
@@ -742,6 +928,35 @@ impl<T: Table, DB: Database> RemoveTrait<DB> for KeyRemove<T> {
             return Ok(());
         }
         txn.remove::<T>(&self.key)
+    }
+}
+
+// Batched `KeyRemove`: same per-key re-insert guard, one message for a whole-epoch prune (see
+// [`LayeredDbTxMut::evict_persistent_batch`]).
+impl<T: Table, DB: Database> RemoveTrait<DB> for KeyRemoveBatch<T> {
+    fn remove(&self, db: &DB, mem_db: &MemDatabase) -> eyre::Result<()> {
+        for key in &self.keys {
+            // skip if the key was re-inserted after the remove was queued
+            if mem_db.contains_key::<T>(key)? {
+                continue;
+            }
+            db.remove::<T>(key)?;
+        }
+        Ok(())
+    }
+
+    fn remove_txn(
+        &self,
+        txn: &mut <DB as Database>::TXMut<'_>,
+        mem_db: &MemDatabase,
+    ) -> eyre::Result<()> {
+        for key in &self.keys {
+            if mem_db.contains_key::<T>(key)? {
+                continue;
+            }
+            txn.remove::<T>(key)?;
+        }
+        Ok(())
     }
 }
 
@@ -786,15 +1001,16 @@ impl<DB: Database> Debug for DBMessage<DB> {
 
 #[cfg(test)]
 mod test {
-    use super::LayeredDatabase;
+    use super::{DBMessage, InsertTrait, LayeredDatabase, QUEUE_HIGH_WATER, QUEUE_PACE_SLEEP};
     #[cfg(feature = "redb")]
     use crate::redb::ReDB;
     use crate::{
         mdbx::{MdbxConfig, MdbxDatabase},
+        mem_db::MemDatabase,
         test::*,
     };
     use rayls_infrastructure_types::{Database, DbTxMut};
-    use std::path::Path;
+    use std::{path::Path, time::Instant};
     use tempfile::tempdir;
 
     #[cfg(feature = "redb")]
@@ -812,6 +1028,45 @@ mod test {
         let db = LayeredDatabase::open(db);
         db.open_table::<TestTable>().expect("failed to open table!");
         db
+    }
+
+    /// `evict_persistent_batch` must drop exactly the given keys from the durable layer and leave
+    /// every other key intact, matching a per-key remove loop. Guards the batched
+    /// cold-prune path that collapses a whole epoch's row deletes into one writer message.
+    #[test]
+    fn evict_persistent_batch_removes_exactly_the_given_keys() {
+        let temp_dir = tempdir().expect("failed to create temp dir");
+        let db = open_mdbx(temp_dir.path());
+
+        db.with_write_txn(|txn| {
+            for i in 0..10u64 {
+                txn.insert::<TestTable>(&i, &format!("v{i}"))?;
+            }
+            Ok(())
+        })
+        .expect("seed");
+        db.sync_persist();
+
+        // An empty batch is a no-op: nothing is removed.
+        db.with_write_txn(|txn| txn.evict_persistent_batch::<TestTable>(&[])).expect("empty batch");
+        db.sync_persist();
+        for i in 0..10u64 {
+            assert!(db.contains_key::<TestTable>(&i).unwrap(), "empty batch removed key {i}");
+        }
+
+        let evicted = [1u64, 3, 5, 7];
+        db.with_write_txn(|txn| txn.evict_persistent_batch::<TestTable>(&evicted))
+            .expect("batch evict");
+        db.sync_persist();
+
+        for i in 0..10u64 {
+            let present = db.contains_key::<TestTable>(&i).unwrap();
+            if evicted.contains(&i) {
+                assert!(!present, "evicted key {i} must be gone from the durable layer");
+            } else {
+                assert!(present, "unlisted key {i} must remain");
+            }
+        }
     }
 
     /// A write the backend rejects (MAP_FULL here, as on a full disk) must surface through
@@ -838,6 +1093,70 @@ mod test {
         assert!(
             db.persist().await.is_err(),
             "persist must surface the write failure instead of reporting success"
+        );
+    }
+
+    /// Writer message that parks `db_run` until the paired sender is dropped, so a test can pin a
+    /// real enqueued backlog behind a stalled writer.
+    struct WriterGate(std::sync::mpsc::Receiver<()>);
+
+    impl<DB: Database> InsertTrait<DB> for WriterGate {
+        fn insert(&self, _db: &DB) -> eyre::Result<()> {
+            let _ = self.0.recv();
+            Ok(())
+        }
+        fn insert_txn(&self, _txn: &mut DB::TXMut<'_>) -> eyre::Result<()> {
+            let _ = self.0.recv();
+            Ok(())
+        }
+        fn clear_insert_mem(&self, _mem_db: &MemDatabase) {}
+    }
+
+    /// A producer bursting into a seeded writer backlog must be paced above the high-water mark,
+    /// so the backlog a boundary `persist` drains grows at the pace rate, not the burst rate; the
+    /// same producer below the mark must run unpaced.
+    #[test]
+    fn writer_backlog_paces_producers_above_high_water() {
+        let inner = MemDatabase::new();
+        inner.open_table::<TestTable>().expect("open inner table");
+        let db = LayeredDatabase::open(inner);
+        db.open_table::<TestTable>().expect("open layered table");
+
+        // Park the writer behind a gate so the seeded backlog cannot drain mid-measurement.
+        let (release, gate) = std::sync::mpsc::channel::<()>();
+        db.tx.send(DBMessage::Insert(Box::new(WriterGate(gate)))).expect("gate enqueue");
+
+        // Seed one message past the mark: every enqueue here is at or below it, hence unpaced.
+        let value = "v".to_string();
+        let seed_started = Instant::now();
+        for key in 0..=(QUEUE_HIGH_WATER as u64) {
+            db.insert::<TestTable>(&key, &value).expect("seed insert");
+        }
+        let seed_elapsed = seed_started.elapsed();
+
+        // With the queue pinned above the mark, every further enqueue pays the pace sleep.
+        const PACED: u32 = 50;
+        let paced_started = Instant::now();
+        for key in 0..PACED as u64 {
+            db.insert::<TestTable>(&(u64::MAX - key), &value).expect("paced insert");
+        }
+        let paced_elapsed = paced_started.elapsed();
+
+        // Unblock the writer before asserting so a failure cannot hang the drop-side join.
+        drop(release);
+
+        assert!(
+            paced_elapsed >= QUEUE_PACE_SLEEP * PACED,
+            "{PACED} enqueues above the high-water mark finished in {paced_elapsed:?}: \
+             producers into a writer backlog must be paced",
+        );
+        // Half the would-be pace time is far above any real unpaced burst, so a false failure
+        // needs the machine frozen for seconds, while wrongly-paced seeding deterministically
+        // exceeds it.
+        assert!(
+            seed_elapsed < QUEUE_PACE_SLEEP * (QUEUE_HIGH_WATER as u32 / 2),
+            "seeding below the high-water mark took {seed_elapsed:?}: enqueues under the mark \
+             must not be paced",
         );
     }
 
@@ -1377,6 +1696,58 @@ mod test {
         let db = LayeredDatabase::open(db);
         db.open_table::<TestTable>().expect("open table");
         db
+    }
+
+    /// `raw_get` returns the stored value's canonical bytes across both layers, so the cold
+    /// archiver can relocate a payload without a decode/re-encode round trip.
+    ///
+    /// Covers the disk layer (the path archival actually hits, served zero-copy from the inner
+    /// mdbx), the mem overlay (a typed value re-encoded), and the tombstone/absent `None` cases.
+    #[test]
+    fn test_layereddb_raw_get_matches_encoded_value() {
+        use rayls_infrastructure_types::{encode, DbTx};
+
+        let temp_dir = tempdir().expect("failed to create temp dir");
+        // Key 1 lives only on the persistent layer (mem empty), modelling an evicted/archivable
+        // row.
+        let db = open_mdbx_prepopulated(temp_dir.path(), &[(1, "disk")]);
+        // Key 2 lives in the mem overlay only; key 3 is tombstoned (deleted in mem).
+        db.insert::<TestTable>(&2, &"mem".to_string()).unwrap();
+        db.remove::<TestTable>(&3).unwrap();
+
+        let txn = db.read_txn().unwrap();
+        let owned = |k: &u64| txn.raw_get::<TestTable>(k).unwrap().map(|c| c.into_owned());
+
+        // Both layers yield exactly the bytes the value codec would produce.
+        assert_eq!(owned(&1), Some(encode(&"disk".to_string())), "disk-layer raw bytes");
+        assert_eq!(owned(&2), Some(encode(&"mem".to_string())), "mem-overlay raw bytes");
+        // A tombstoned key and an absent key are both `None`.
+        assert_eq!(owned(&3), None, "tombstoned key must be None");
+        assert_eq!(owned(&9), None, "absent key must be None");
+    }
+
+    /// `raw_skip_to` seeks across both layers with tombstones honored, so a seeked raw walk sees
+    /// exactly what a full merged scan would from that key on.
+    #[test]
+    fn test_layereddb_raw_skip_to_merges_layers() {
+        use rayls_infrastructure_types::{decode_key, DbTx};
+
+        let temp_dir = tempdir().expect("failed to create temp dir");
+        // Keys 1 and 3 on the persistent layer; 2 in the mem overlay; 3 tombstoned in mem.
+        let db = open_mdbx_prepopulated(temp_dir.path(), &[(1, "disk"), (3, "gone")]);
+        db.insert::<TestTable>(&2, &"mem".to_string()).unwrap();
+        db.remove::<TestTable>(&3).unwrap();
+
+        let txn = db.read_txn().unwrap();
+        let keys_from = |k: u64| -> Vec<u64> {
+            txn.raw_skip_to::<TestTable>(&k)
+                .unwrap()
+                .map(|(key, _)| decode_key::<u64>(&key))
+                .collect()
+        };
+        assert_eq!(keys_from(0), vec![1, 2], "merged walk: disk + mem, tombstone hidden");
+        assert_eq!(keys_from(2), vec![2], "seek lands on the mem-overlay row");
+        assert_eq!(keys_from(3), Vec::<u64>::new(), "the tombstoned tail is empty");
     }
 
     /// Prove `disable_long_read_safety` reaches the inner mdbx txn so a walk

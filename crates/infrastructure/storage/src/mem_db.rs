@@ -335,6 +335,19 @@ impl<'a> DbTxMut for MemDbTxMut<'a> {
     }
 }
 
+impl<'a> MemDbTxMut<'a> {
+    /// Hard-removes `key` from the in-memory store, leaving no tombstone.
+    ///
+    /// Persistent eviction archives a row permanently (never re-inserted), so the cache entry is
+    /// dropped outright rather than tombstoned: this frees the cache and lets reads fall through to
+    /// a lower tier, whereas a tombstone would shadow it and never be reclaimed.
+    pub fn hard_delete<T: Table>(&mut self, key: &T::Key) {
+        if let Some(table) = self.store.get_mut(T::NAME) {
+            table.remove(&encode_key(key));
+        }
+    }
+}
+
 /// Implement the Database trait with an in-memory store.
 /// This means no persistance.
 /// This DB also plays loose with transactions, but since it is in-memory and we do not do
