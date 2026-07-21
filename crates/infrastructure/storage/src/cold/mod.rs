@@ -16,6 +16,9 @@ mod jar;
 mod producer;
 mod reconcile;
 
+#[cfg(test)]
+mod tests;
+
 pub use archiver::ColdArchiver;
 pub use database::{ColdDatabase, ColdTx};
 pub use jar::{ColdSegment, ColdStore};

@@ -39,6 +39,11 @@ tempfile = { workspace = true }
 tokio = { workspace = true, features = ["rt", "macros"] }
 criterion = { workspace = true }
 
+[[bench]]
+name = "cold_read_path"
+harness = false
+required-features = ["cold-storage"]
+
 [features]
 redb = []
 reth-libmdbx = ["dep:reth-libmdbx", "dep:page_size"]

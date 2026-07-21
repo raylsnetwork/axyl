@@ -208,3 +208,94 @@ impl<DB: Database> RewardsBackend for ConsensusRewardsCounter<DB> {
 pub fn from_db<DB: Database>(db: DB) -> RewardsCounter {
     RewardsCounter::from_impl(ConsensusRewardsCounter::new(db))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rand::{rngs::StdRng, SeedableRng};
+    use rayls_infrastructure_storage::{cold_archiver_for, open_db, SealOutcome};
+    use rayls_infrastructure_types::{
+        BlsKeypair, Certificate, CommittedSubDag, CommitteeBuilder, ConsensusHeader, DbTxMut,
+        Header, ReputationScores, Round,
+    };
+    use tempfile::TempDir;
+
+    /// Builds a committee of `n` authorities with distinct execution addresses.
+    fn committee_with(n: usize) -> (Committee, Vec<AuthorityIdentifier>) {
+        let mut rng = StdRng::seed_from_u64(7);
+        let mut builder = CommitteeBuilder::new(0);
+        let mut ids = Vec::with_capacity(n);
+        for i in 0..n {
+            let keypair = BlsKeypair::generate(&mut rng);
+            let key = *keypair.public();
+            builder.add_authority(key, 1, Address::repeat_byte(i as u8 + 1));
+            ids.push(AuthorityIdentifier::from(key));
+        }
+        (builder.build(), ids)
+    }
+
+    /// Builds a stored consensus block whose sub-dag leader fixes `(author, round, epoch)`.
+    fn block(
+        number: u64,
+        epoch: Epoch,
+        round: Round,
+        author: AuthorityIdentifier,
+    ) -> ConsensusHeader {
+        let mut leader = Certificate::default();
+        leader.header = Header { author, round, epoch, ..Default::default() };
+        let sub_dag = CommittedSubDag::new(vec![], leader, 0, ReputationScores::default(), None);
+        ConsensusHeader { sub_dag, number, ..Default::default() }
+    }
+
+    /// The closing epoch's tally must survive cold archival advanced to the EL-anchor floor.
+    ///
+    /// The tally walks `ConsensusBlocks` with a hot-only reverse iterator, so the closing epoch
+    /// `C` is readable at tally time only because the archival cutoff is floored by the EL anchor,
+    /// which is still inside `C` while `C`'s boundary block executes. A subscriber racing ahead
+    /// can commit epoch `C + 1` rows before the tally runs, so the consensus tip alone would
+    /// allow sealing `C`: the anchor floor is the single protection. This fails if the floor is
+    /// dropped or off-by-oned so epoch `C` itself seals (the walk sees nothing and the tally
+    /// empties); the cutoff-policy red/green tests live in the storage crate's cold tests.
+    #[test]
+    fn tally_survives_cold_archival_at_anchor_floor() {
+        let (committee, ids) = committee_with(3);
+        let tmp = TempDir::new().unwrap();
+        let db = open_db(tmp.path().join("consensus"));
+
+        // Epoch 0 (sealable), the closing epoch 1, and a first epoch-2 row modeling a subscriber
+        // that raced past the boundary before the epoch-1 tally ran.
+        let blocks = [
+            block(0, 0, 0, ids[0].clone()), // genesis round 0: never counted
+            block(1, 0, 1, ids[1].clone()),
+            block(2, 0, 2, ids[2].clone()),
+            block(3, 1, 3, ids[0].clone()),
+            block(4, 1, 4, ids[1].clone()),
+            block(5, 1, 5, ids[2].clone()),
+            block(6, 1, 6, ids[0].clone()),
+            block(7, 2, 7, ids[1].clone()),
+        ];
+        db.with_write_txn(|txn| {
+            for b in &blocks {
+                txn.insert::<ConsensusBlocks>(&b.number, b)?;
+            }
+            Ok(())
+        })
+        .expect("seed");
+        db.sync_persist();
+
+        let counter = ConsensusRewardsCounter::new(db.clone());
+        counter.set_committee(committee);
+        let before = counter.tally(1, 6).expect("pre-archival tally");
+        assert!(!before.is_empty(), "fixture must produce a non-empty tally");
+
+        // Advance archival to the floor: the EL anchor is still inside the closing epoch 1, so
+        // exactly epoch 0 seals though consensus has committed into epoch 2.
+        let archiver = cold_archiver_for(&db).expect("mdbx stack has a cold tier");
+        assert_eq!(archiver.seal_due(1, || false).expect("seal"), SealOutcome::Sealed(0));
+        assert_eq!(archiver.seal_due(1, || false).expect("drained"), SealOutcome::Drained);
+        db.sync_persist();
+
+        let after = counter.tally(1, 6).expect("post-archival tally");
+        assert_eq!(after, before, "the closing epoch's tally must survive archival at the floor");
+    }
+}
