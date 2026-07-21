@@ -2,7 +2,8 @@
 
 use std::{
     borrow::Cow,
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
+    ffi::CString,
     marker::PhantomData,
     path::Path,
     sync::{
@@ -129,6 +130,14 @@ impl DbTx for MdbxTx {
         get::<T, RO>(&self.inner, self.get_dbi::<T>()?, key)
     }
 
+    fn raw_get<T: Table>(&self, key: &T::Key) -> eyre::Result<Option<Cow<'_, [u8]>>> {
+        // Borrow the value straight out of the read-txn mmap page (zero-copy on a read txn), with
+        // no value decode; the caller copies it owned only if it must outlive the transaction.
+        let key_buf = encode_key(key);
+        let value: Option<Cow<'_, [u8]>> = self.inner.get(self.get_dbi::<T>()?, &key_buf)?;
+        Ok(value)
+    }
+
     fn iter<T: Table>(&self) -> DBIter<'_, T> {
         match self.cursor::<T>() {
             Ok(cursor) => Box::new(MdbxIter::new(cursor)),
@@ -154,6 +163,12 @@ impl DbTx for MdbxTx {
         let key_bytes = encode_key(key);
         let iter = MdbxSeekedIter::new(cursor, &key_bytes)?;
         Ok(Box::new(iter))
+    }
+
+    fn raw_skip_to<T: Table>(&self, key: &T::Key) -> eyre::Result<DBRawIter<'_>> {
+        let cursor = self.cursor::<T>()?;
+        let key_bytes = encode_key(key);
+        Ok(Box::new(MdbxSeekedRawIter::new(cursor, &key_bytes)?))
     }
 
     fn reverse_iter<T: Table>(&self) -> DBIter<'_, T> {
@@ -269,6 +284,12 @@ impl DbTx for MdbxTxMut {
         let key_bytes = encode_key(key);
         let iter = MdbxSeekedIter::new(cursor, &key_bytes)?;
         Ok(Box::new(iter))
+    }
+
+    fn raw_skip_to<T: Table>(&self, key: &T::Key) -> eyre::Result<DBRawIter<'_>> {
+        let cursor = self.cursor::<T>()?;
+        let key_bytes = encode_key(key);
+        Ok(Box::new(MdbxSeekedRawIter::new(cursor, &key_bytes)?))
     }
 
     fn reverse_iter<T: Table>(&self) -> DBIter<'_, T> {
@@ -562,6 +583,107 @@ impl MdbxDatabase {
             dbis: Arc::new(RwLock::new(HashMap::new())),
         })
     }
+
+    /// Copy-compacts the environment into the `dest` file, writing only live pages.
+    ///
+    /// Runs against a consistent read snapshot, so the source may stay open; the copy omits
+    /// freelist pages, shrinking a heavily pruned datafile to its live size. `dest` must not
+    /// already exist.
+    fn compact_to<P: AsRef<Path>>(&self, dest: P) -> eyre::Result<()> {
+        let dest = dest.as_ref();
+        let dest_c = CString::new(
+            dest.to_str().ok_or_else(|| eyre::eyre!("non-UTF-8 destination path: {dest:?}"))?,
+        )?;
+        // SAFETY: `with_raw_env_ptr` keeps the env pointer valid for the closure's duration, and
+        // `dest_c` is a NUL-terminated path that outlives the call.
+        let rc = self.inner.with_raw_env_ptr(|env| unsafe {
+            ffi::mdbx_env_copy(env, dest_c.as_ptr(), ffi::MDBX_CP_COMPACT)
+        });
+        if rc != ffi::MDBX_SUCCESS {
+            eyre::bail!(
+                "mdbx_env_copy to {dest:?} failed: {}",
+                reth_libmdbx::Error::from_err_code(rc)
+            );
+        }
+        Ok(())
+    }
+}
+
+/// The MDBX datafile name inside an environment directory.
+const MDBX_DAT: &str = "mdbx.dat";
+
+/// Datafile sizes measured around an offline [`compact_in_place`] pass.
+#[derive(Debug, Clone, Copy)]
+pub struct CompactionStats {
+    /// Datafile bytes before compaction.
+    pub before_bytes: u64,
+    /// Datafile bytes after compaction.
+    pub after_bytes: u64,
+    /// Named tables whose entry counts were verified identical.
+    pub tables_verified: usize,
+}
+
+/// Compacts an offline MDBX environment in place, reclaiming freelist space.
+///
+/// Copy-compacts into a sibling temp dir, verifies every named table's entry count, then
+/// atomically replaces `mdbx.dat` via `rename(2)`: a crash leaves the old or the new datafile,
+/// never neither. The environment must not be open in any other process NOR by any live handle
+/// in this process (every `MdbxDatabase` clone dropped, including the layered writer's).
+pub fn compact_in_place(store_path: &Path, config: &MdbxConfig) -> eyre::Result<CompactionStats> {
+    let dat = store_path.join(MDBX_DAT);
+    let before_bytes = std::fs::metadata(&dat)?.len();
+
+    // a leftover directory from an interrupted pass is stale; rebuild it
+    let tmp_dir = store_path.join("mdbx.compact.tmp");
+    if tmp_dir.exists() {
+        std::fs::remove_dir_all(&tmp_dir)?;
+    }
+    std::fs::create_dir_all(&tmp_dir)?;
+
+    let source_counts = {
+        let db = MdbxDatabase::open_with_config(store_path, config.clone())?;
+        let counts = table_entry_counts(&db.inner)?;
+        db.compact_to(tmp_dir.join(MDBX_DAT))?;
+        counts
+    };
+    let compacted_counts = {
+        let db = MdbxDatabase::open_with_config(&tmp_dir, config.clone())?;
+        table_entry_counts(&db.inner)?
+    };
+    eyre::ensure!(
+        source_counts == compacted_counts,
+        "compacted copy diverges from source: {source_counts:?} vs {compacted_counts:?}",
+    );
+
+    std::fs::rename(tmp_dir.join(MDBX_DAT), &dat)?;
+    // the reader-lock file belongs to the replaced datafile; a fresh open recreates it
+    let _ = std::fs::remove_file(store_path.join("mdbx.lck"));
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+
+    let after_bytes = std::fs::metadata(&dat)?.len();
+    Ok(CompactionStats { before_bytes, after_bytes, tables_verified: source_counts.len() })
+}
+
+/// Returns every named table's entry count, keyed by table name.
+fn table_entry_counts(env: &Environment) -> eyre::Result<BTreeMap<String, usize>> {
+    let txn = env.begin_ro_txn()?;
+    let main_dbi = txn.open_db(None)?.dbi();
+
+    // the MAIN db's keys are the names of every named sub-database
+    let mut names = Vec::new();
+    let mut cursor = txn.cursor_with_dbi(main_dbi)?;
+    let mut row = cursor.first::<Vec<u8>, Vec<u8>>()?;
+    while let Some((key, _)) = row {
+        names.push(String::from_utf8_lossy(&key).into_owned());
+        row = cursor.next::<Vec<u8>, Vec<u8>>()?;
+    }
+
+    let mut counts = BTreeMap::new();
+    for name in names {
+        let dbi = txn.open_db(Some(&name))?.dbi();
+        counts.insert(name, txn.db_stat(dbi)?.entries());
+    }
+    Ok(counts)
 }
 
 impl Database for MdbxDatabase {
@@ -877,6 +999,50 @@ where
     }
 }
 
+/// Forward raw iterator seeded at the first key >= the given target via MDBX `set_range`.
+///
+/// The raw twin of [`MdbxSeekedIter`]: same seek semantics, but yields the stored bytes without
+/// decoding, borrowed from the read transaction's mmap pages (see [`MdbxRawIter`] for the
+/// lifetime argument).
+#[derive(Debug)]
+pub struct MdbxSeekedRawIter<'i, TK = RO>
+where
+    TK: TransactionKind,
+{
+    cursor: Cursor<TK>,
+    /// First row returned by `set_range`, yielded on the first call to `next`.
+    pending: Option<(Cow<'i, [u8]>, Cow<'i, [u8]>)>,
+    /// True once end-of-table reached; prevents cursor wraparound.
+    exhausted: bool,
+}
+
+impl<'i, TK: TransactionKind> MdbxSeekedRawIter<'i, TK> {
+    fn new(mut cursor: Cursor<TK>, key_bytes: &[u8]) -> eyre::Result<Self> {
+        let pending = cursor.set_range::<Cow<'i, [u8]>, Cow<'i, [u8]>>(key_bytes)?;
+        Ok(Self { exhausted: pending.is_none(), cursor, pending })
+    }
+}
+
+impl<'i, TK: TransactionKind> Iterator for MdbxSeekedRawIter<'i, TK> {
+    type Item = (Cow<'i, [u8]>, Cow<'i, [u8]>);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.exhausted {
+            return None;
+        }
+        if let Some(row) = self.pending.take() {
+            return Some(row);
+        }
+        match self.cursor.next::<Cow<'i, [u8]>, Cow<'i, [u8]>>() {
+            Ok(Some(row)) => Some(row),
+            _ => {
+                self.exhausted = true;
+                None
+            }
+        }
+    }
+}
+
 /// Reverse iterator over MDBX key-value pairs.
 #[derive(Debug)]
 pub struct MdbxRevIter<K, V, TK = RO>
@@ -964,9 +1130,9 @@ where
 
 #[cfg(test)]
 mod test {
-    use super::MdbxDatabase;
-    use crate::test::*;
-    use rayls_infrastructure_types::Database as _;
+    use super::{compact_in_place, MdbxConfig, MdbxDatabase};
+    use crate::{layered_db::LayeredDatabase, test::*};
+    use rayls_infrastructure_types::{Database as _, DbTxMut as _};
     use std::path::Path;
     use tempfile::tempdir;
 
@@ -974,6 +1140,85 @@ mod test {
         let db = MdbxDatabase::open(path).expect("Cannot open database");
         db.open_table::<TestTable>().expect("failed to open table!");
         db
+    }
+
+    /// Seeds a table, prunes most of it, then compacts in place: the survivors must be
+    /// intact through a fresh open and the datafile must shrink to its live size.
+    #[test]
+    fn compact_in_place_preserves_rows_and_shrinks_file() {
+        const ROWS: u64 = 4096;
+        const SURVIVORS: u64 = 96;
+
+        let temp_dir = tempdir().expect("failed to create temp dir");
+        // the compacted datafile is sized in growth_step granules, so shrinkage is only
+        // observable when the step is far below the seeded data volume
+        let cfg = MdbxConfig::default().with_growth_step(super::MEGABYTE);
+        let blob = "x".repeat(4096);
+
+        let open = |path: &Path| {
+            let db = MdbxDatabase::open_with_config(path, cfg.clone()).expect("open database");
+            db.open_table::<TestTable>().expect("open table");
+            db
+        };
+
+        {
+            let db = open(temp_dir.path());
+            db.with_write_txn(|txn| {
+                for n in 0..ROWS {
+                    txn.insert::<TestTable>(&n, &blob)?;
+                }
+                Ok(())
+            })
+            .expect("seed rows");
+            db.with_write_txn(|txn| {
+                for n in 0..ROWS - SURVIVORS {
+                    txn.remove::<TestTable>(&n)?;
+                }
+                Ok(())
+            })
+            .expect("prune rows");
+        }
+
+        let stats = compact_in_place(temp_dir.path(), &cfg).expect("compact in place");
+        assert!(stats.tables_verified >= 1, "no tables verified: {stats:?}");
+        assert!(stats.after_bytes < stats.before_bytes / 4, "datafile did not shrink: {stats:?}",);
+
+        // survivors intact, pruned rows gone, through a fresh open of the swapped file
+        let db = open(temp_dir.path());
+        for n in ROWS - SURVIVORS..ROWS {
+            assert_eq!(db.get::<TestTable>(&n).expect("get survivor"), Some(blob.clone()));
+        }
+        assert_eq!(db.get::<TestTable>(&0).expect("get pruned"), None);
+    }
+
+    /// The offline migrate-then-compact sequence: once every `LayeredDatabase` clone drops (which
+    /// joins the writer thread and closes its env handle), an in-place compaction of the same
+    /// directory must succeed with the rows intact.
+    #[test]
+    fn compact_in_place_after_layered_stack_drop() {
+        let temp_dir = tempdir().expect("failed to create temp dir");
+        let cfg = MdbxConfig::default().with_growth_step(super::MEGABYTE);
+
+        {
+            let db = LayeredDatabase::open(
+                MdbxDatabase::open_with_config(temp_dir.path(), cfg.clone())
+                    .expect("open database"),
+            );
+            db.open_table::<TestTable>().expect("open table");
+            for n in 0..8u64 {
+                db.insert::<TestTable>(&n, &format!("row-{n}")).expect("insert");
+            }
+            db.sync_persist();
+        }
+
+        let stats = compact_in_place(temp_dir.path(), &cfg).expect("compact after stack drop");
+        assert!(stats.tables_verified >= 1, "no tables verified: {stats:?}");
+
+        let db = MdbxDatabase::open_with_config(temp_dir.path(), cfg).expect("reopen");
+        db.open_table::<TestTable>().expect("open table");
+        for n in 0..8u64 {
+            assert_eq!(db.get::<TestTable>(&n).expect("get row"), Some(format!("row-{n}")));
+        }
     }
 
     #[test]
