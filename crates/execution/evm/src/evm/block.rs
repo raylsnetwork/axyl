@@ -16,7 +16,7 @@ use alloy::{
     sol_types::SolCall as _,
 };
 use alloy_evm::{block::StateChangeSource, eth::EthTxResult, tx::RecoveredTx as _, Database, Evm};
-use rand::{rngs::StdRng, seq::IteratorRandom, Rng as _, SeedableRng as _};
+use rand::{rngs::StdRng, Rng as _, SeedableRng as _};
 use rayls_infrastructure_types::{
     rewards::build_withdrawals, Address, Bytes, Encodable2718, ExecHeader, Receipt, SolValue,
     TransactionSigned, Withdrawals, B256, EMPTY_WITHDRAWALS, U256,
@@ -323,17 +323,17 @@ where
                 target: "engine",
                 nonce = self.ctx.nonce,
                 epoch,
-                "concludeEpoch called with EMPTY committee - aborting to prevent contract revert"
+                "conclude epoch: called with EMPTY committee - aborting to prevent contract revert"
             );
             return Err(RaylsRethError::EVMCustom(format!(
-                "concludeEpoch: empty committee at epoch {epoch} - \
+                "conclude epoch: empty committee at epoch {epoch} - \
                  see 'NO ACTIVE VALIDATORS' log for validator statuses"
             )));
         }
 
         // sort addresses in ascending order (0x0...0xf)
         new_committee.sort();
-        info!(target: "engine", committee_size = new_committee.len(), "concludeEpoch committee");
+        info!(target: "engine", committee_size = new_committee.len(), "conclude epoch: committee");
 
         // encode the call to bytes with method selector and args
         let bytes = ConsensusRegistry::concludeEpochCall { newCommittee: new_committee }
@@ -368,22 +368,23 @@ where
 
     /// Read eligible validators from latest state and shuffle the committee deterministically.
     fn shuffle_new_committee(&mut self, randomness: B256) -> RaylsRethResult<Vec<Address>> {
-        let new_committee_size = self.next_committee_size()?;
+        let block_number = self.evm.block().number().saturating_to::<u64>();
+
+        let mut new_committee: Vec<ValidatorInfo> = self.next_committee(block_number)?;
+        let new_committee_size = new_committee.len();
 
         // read all active validators from consensus registry
-        let all_active_validators = self.get_active_validators()?;
+        // let all_active_validators = self.get_active_validators()?;
 
         info!(
             target: "engine",
             new_committee_size,
-            active_validators = all_active_validators.len(),
-            "shuffle_new_committee: read active validators"
+            "shuffle_new_committee: read validators (Active + PendingActivation)"
         );
 
-        if all_active_validators.is_empty() {
+        if new_committee.is_empty() {
             // query ALL validators (Any status) to understand their statuses
             let all_validators = self.get_all_validators()?;
-
             error!(
                 target: "engine",
                 total_validators = all_validators.len(),
@@ -405,80 +406,96 @@ where
 
         // 1) separate active and pending validators
         // 2) check if active length is sufficient
-        // 3) if missing, randomly select from the pending validators
-        let (pending_exit, mut active_validators): (Vec<_>, Vec<_>) = all_active_validators
-            .into_iter()
-            .partition(|v| v.currentStatus == ValidatorStatus::PendingExit);
+        // 3) if missing, randomly select from the pending validators (pre-fork only)
+        // TODO: Why we're getting pending exit from active?!
+        // let (pending_exit, mut active_validators): (Vec<_>, Vec<_>) = new_committee
+        //     .into_iter()
+        //     .partition(|v| v.currentStatus == ValidatorStatus::PendingExit);
 
-        let active_validator_count = active_validators.len();
-        let mut validators_for_shuffle = if active_validator_count >= new_committee_size {
-            // enough active validators for next committee
-            active_validators
-        } else {
-            // NOTE: already checked if active_validator_count >= new_committee_size above
-            let num_missing = new_committee_size - active_validator_count;
+        // let active_validator_count = active_validators.len();
+        // let mut validators_for_shuffle = if active_validator_count >= new_committee_size {
+        //     // enough active validators for next committee
+        //     active_validators
+        // } else if self.spec.is_dynamic_committee_sizing_active_at_block(block_number) {
+        //     // Post-fork: the committee size already equals the eligible count,
+        //     // so this branch should be unreachable. Return a clear error rather
+        //     // than silently pulling from pending-exit validators.
+        //     error!(
+        //         target: "engine",
+        //         active_validator_count,
+        //         new_committee_size,
+        //         "DynamicCommitteeSizing: active count < committee size - state mismatch"
+        //     );
+        //     return Err(RaylsRethError::EVMCustom(
+        //         "DynamicCommitteeSizing invariant violated: \
+        //          active validator count < committee size"
+        //             .to_string(),
+        //     ));
+        // } else {
+        //     // Pre-fork legacy: pull from PendingExit to maintain fixed committee size
+        //     let num_missing = new_committee_size - active_validator_count;
 
-            // randomly take enough pending exit validators to reach new committee size
-            let random_pending = pending_exit.into_iter().choose_multiple(&mut rng, num_missing);
-            active_validators.extend(random_pending);
-            active_validators
-        };
+        //     // randomly take enough pending exit validators to reach new committee size
+        //     let random_pending = pending_exit.into_iter().choose_multiple(&mut rng, num_missing);
+        //     active_validators.extend(random_pending);
+        //     active_validators
+        // };
 
         // simple Fisher-Yates shuffle
-        for i in (1..validators_for_shuffle.len()).rev() {
+        for i in (1..new_committee.len()).rev() {
             let j = rng.random_range(0..=i);
-            validators_for_shuffle.swap(i, j);
+            new_committee.swap(i, j);
         }
 
-        debug!(target: "engine",  "validators post-shuffle {:?}", validators_for_shuffle);
+        debug!(target: "engine",  "validators post-shuffle {:?}", new_committee);
 
-        let mut new_committee =
-            validators_for_shuffle.into_iter().map(|v| v.validatorAddress).collect::<Vec<_>>();
+        let new_committee_addresses =
+            new_committee.into_iter().map(|v| v.validatorAddress).collect::<Vec<_>>();
 
-        // trim the shuffled committee to maintain correct size
-        new_committee.truncate(new_committee_size);
+        // // trim the shuffled committee to maintain correct size
+        // new_committee.truncate(new_committee_size);
 
-        trace!(target: "engine",  ?new_committee_size, ?new_committee, "truncated shuffle for new committee");
+        trace!(target: "engine",  ?new_committee_size, ?new_committee_addresses, "truncated shuffle for new committee");
 
-        Ok(new_committee)
+        Ok(new_committee_addresses)
     }
 
-    /// Return the next committee size.
+    /// Return the next committee.
     ///
-    /// This is isolated into a function and requires a fork to change.
-    fn next_committee_size(&mut self) -> RaylsRethResult<usize> {
+    /// Pre-fork: reuses the current epoch's committee so the size is fixed across epochs
+    /// Post-fork: counts (Active + PendingActivation) validators so the committee dynamically grows/shrinks with the validator set.
+    fn next_committee(&mut self, block_number: u64) -> RaylsRethResult<Vec<ValidatorInfo>> {
         // retrieve the current committee size
         let epoch = self.extract_epoch_from_nonce(self.ctx.nonce);
 
         // query contract's currentEpoch to detect desync
         let contract_epoch: u32 = self.get_current_epoch_number()?;
-        info!(
-            target: "engine",
-            nonce_epoch = epoch,
-            contract_epoch,
-            "next_committee_size: epoch comparison"
-        );
+        info!(target: "engine", nonce_epoch = epoch, contract_epoch, "next_committee: epoch comparison");
 
         if contract_epoch != epoch {
-            error!(
-                target: "engine",
-                nonce_epoch = epoch,
-                contract_epoch,
-                "EPOCH DESYNC: contract currentEpoch != nonce epoch"
-            );
+            error!(target: "engine", nonce_epoch = epoch, contract_epoch, "EPOCH DESYNC: contract currentEpoch != nonce epoch");
         }
 
-        let current_committee: Vec<ValidatorInfo> = self.get_epoch_committee_validators(epoch)?;
+        let new_committee = if self.spec.is_dynamic_committee_sizing_active_at_block(block_number) {
+            // this function returns (SmartContract implementation) Active + PendingActivation + PendingExit
+            let validators = self.get_active_validators()?;
+            validators
+                .into_iter()
+                .filter(|v| v.currentStatus != ValidatorStatus::PendingExit)
+                .collect()
+        } else {
+            self.get_epoch_committee_validators(epoch)?
+        };
 
         info!(
             target: "engine",
-            epoch,
-            committee_size = current_committee.len(),
-            "next_committee_size: read committee for epoch"
+            epoch = epoch + 2,
+            new_committee_size = new_committee.len(),
+            "next_committee: new comittee size"
         );
 
         // this will fail on-chain if incorrect
-        Ok(current_committee.len())
+        Ok(new_committee)
     }
 
     /// Extract the epoch number from a header's nonce.
