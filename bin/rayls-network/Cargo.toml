@@ -22,6 +22,9 @@ tikv-jemallocator = { version = "0.6", features = ["profiling"], optional = true
 
 [features]
 default = ["jemalloc"]
+# The `cold-migrate` command (drain the boot-time cold-storage migration without starting
+# the node). Off by default; enable with `--features cold-storage`.
+cold-storage = ["rayls-network-cli/cold-storage"]
 faucet = ["rayls-execution-faucet"]
 jemalloc = ["tikv-jemallocator"]
 # Local single-node development mode (`dev` subcommand + `node --dev`). NOT FOR

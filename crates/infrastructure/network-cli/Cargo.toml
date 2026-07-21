@@ -41,6 +41,10 @@ ethereum-tx-sign = { version = "6.1.3", optional = true }
 
 [features]
 default = []
+# Exposes the `cold-migrate` command (drain the boot-time cold-storage migration without
+# starting the node) and forwards to the orchestrator's cold wiring. Off by default; enable
+# with `--features cold-storage`.
+cold-storage = ["rayls-middleware-orchestrator/cold-storage"]
 # Local single-node development mode: the `dev` subcommand and `node --dev`
 # (auto-bootstrap, gasless chain, pre-funded well-known keys, embedded dev
 # dashboard). NOT FOR PRODUCTION — excluded from default/release builds; enable

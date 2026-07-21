@@ -160,7 +160,7 @@ impl<Ext: clap::Args + fmt::Debug> NodeCommand<Ext> {
     /// Execute `node` command
     #[instrument(level = "info", skip_all)]
     pub fn execute<L>(
-        mut self,
+        #[cfg_attr(not(feature = "dev-single-node-setup"), allow(unused_mut))] mut self,
         rl_datadir: PathBuf,
         passphrase: String,
         launcher: L,
@@ -168,6 +168,8 @@ impl<Ext: clap::Args + fmt::Debug> NodeCommand<Ext> {
     where
         L: FnOnce(RaylsBuilder, Ext, PathBuf, String) -> eyre::Result<()>,
     {
+        // NOTE: operator forensics count this exact line as a node (re)start; only paths that
+        // actually start a node may emit it (see `execute_maintenance`).
         info!(target: "rl::cli", "rayls-network {} starting", SHORT_VERSION);
 
         // A `dev-single-node-setup` build is single-node-only, so it is always in dev
@@ -178,10 +180,6 @@ impl<Ext: clap::Args + fmt::Debug> NodeCommand<Ext> {
             self.dev = true;
         }
 
-        // Raise the fd limit of the process.
-        // Does not do anything on windows.
-        raise_fd_limit()?;
-
         // Dev auto-bootstrap: on an empty datadir, generate the validator key +
         // single-validator genesis + committee in-process, so the manual
         // `keytool generate` / `genesis` steps aren't required (#590).
@@ -190,6 +188,47 @@ impl<Ext: clap::Args + fmt::Debug> NodeCommand<Ext> {
         if self.dev {
             crate::dev::bootstrap_dev_datadir_if_empty(&rl_datadir, &passphrase)?;
         }
+
+        self.build_and_launch(rl_datadir, passphrase, launcher, true)
+    }
+
+    /// Executes a maintenance command over an existing datadir: the node's config/builder
+    /// wiring, but no start banner (the operator restart marker), no dev bootstrap of an
+    /// uninitialized datadir, and no dev single-validator gate.
+    #[cfg(feature = "cold-storage")]
+    #[instrument(level = "info", skip_all)]
+    pub fn execute_maintenance<L>(
+        self,
+        rl_datadir: PathBuf,
+        passphrase: String,
+        launcher: L,
+    ) -> eyre::Result<()>
+    where
+        L: FnOnce(RaylsBuilder, Ext, PathBuf, String) -> eyre::Result<()>,
+    {
+        info!(target: "rl::cli", "rayls-network {} maintenance run", SHORT_VERSION);
+        self.build_and_launch(rl_datadir, passphrase, launcher, false)
+    }
+
+    /// Loads config, builds the [`RaylsBuilder`], and hands off to `launcher`.
+    ///
+    /// The shared tail of [`execute`](Self::execute) and
+    /// [`execute_maintenance`](Self::execute_maintenance); `enforce_dev_gate` applies the dev
+    /// single-validator gating only on the node path (unused in non-dev builds).
+    fn build_and_launch<L>(
+        mut self,
+        rl_datadir: PathBuf,
+        passphrase: String,
+        launcher: L,
+        #[cfg_attr(not(feature = "dev-single-node-setup"), allow(unused_variables))]
+        enforce_dev_gate: bool,
+    ) -> eyre::Result<()>
+    where
+        L: FnOnce(RaylsBuilder, Ext, PathBuf, String) -> eyre::Result<()>,
+    {
+        // Raise the fd limit of the process.
+        // Does not do anything on windows.
+        raise_fd_limit()?;
 
         // limit global rayon thread pool for batch validator
         //
@@ -232,8 +271,9 @@ impl<Ext: clap::Args + fmt::Debug> NodeCommand<Ext> {
         // single-validator network (the committee-size assert allows n=1) and may never
         // target a production chain-id. Production builds have no such escape hatch — a
         // 1-of-1 committee is refused by the committee-size assert, exactly as before dev mode.
+        // A maintenance run skips the gate: it starts no node, so any committee size is fine.
         #[cfg(feature = "dev-single-node-setup")]
-        {
+        if enforce_dev_gate {
             // Read the committee from the same file `ConsensusConfig` will later load,
             // so the count reflects what consensus runs.
             let committee: Committee =

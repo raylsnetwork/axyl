@@ -84,7 +84,6 @@ pub fn run_cold_migration<P>(
     builder: RaylsBuilder,
     rayls_datadir: P,
     compact: bool,
-    throttle_writes: bool,
 ) -> eyre::Result<()>
 where
     P: RaylsDirs + Clone + 'static,
@@ -114,15 +113,7 @@ where
         .build()?;
 
     let migrated = runtime.block_on(async {
-        // The lock above makes this process the only consensus-DB writer, so the live node's
-        // writer pacing protects nothing here; unpaced is the default, opt back in via the flag.
-        let throttle = if throttle_writes {
-            rayls_infrastructure_storage::Throttle::default()
-        } else {
-            rayls_infrastructure_storage::Throttle::Unpaced
-        };
-        let consensus_db =
-            open_consensus_db(&rayls_datadir, &builder.consensus_db_config, throttle)?;
+        let consensus_db = open_consensus_db(&rayls_datadir, &builder.consensus_db_config)?;
         let archival = epoch_manager::ColdArchival::new(&consensus_db);
         if !archival.is_active() {
             info!(target: "epoch-manager", "database stack has no cold tier; nothing to migrate");
@@ -142,6 +133,7 @@ where
             &task_manager,
             reth_db,
             rayls_middleware_rewards::from_db(consensus_db.clone()),
+            false,
         )
         .await?;
 
