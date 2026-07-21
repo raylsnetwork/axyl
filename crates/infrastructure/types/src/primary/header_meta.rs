@@ -1,11 +1,9 @@
 //! Lightweight metadata projections over a stored `ConsensusHeader`.
 
-use std::collections::BTreeSet;
-
 use crate::{
-    bcs_layout::{skip_bytes, BcsCursor, BcsLayoutError},
-    crypto, AuthorityIdentifier, BlockHash, BlockNumHash, Certificate, CertificateDigest, Epoch,
-    ReputationScores, Round, SignatureVerificationState, TimestampSec, WorkerId, B256,
+    bcs_layout::{BcsCursor, BcsLayoutError},
+    crypto, AuthorityIdentifier, BlockHash, Certificate, Epoch, ReputationScores, Round,
+    TimestampSec, WorkerId, B256,
 };
 
 /// Leader projection of a stored `ConsensusHeader`: who led the sub-dag and at
@@ -124,29 +122,29 @@ pub fn leader_epoch_and_batch_digests(
 
 /// Walks one BCS-encoded `Certificate`, pushing its header `payload` digests onto `out`.
 ///
-/// Mirrors `Certificate::skip` and `Header::skip`: read the payload keys, skip every other field.
+/// Reuses [`Certificate::skip_with_header_span`] to advance past the whole certificate and
+/// recover its `Header` bytes, so only the header prefix is walked here to reach the payload; the
+/// certificate and header tails are skipped by the canonical impl rather than re-mirrored.
 fn read_certificate_payload_digests(
     c: &mut BcsCursor<'_>,
     out: &mut Vec<BlockHash>,
 ) -> Result<(), BcsLayoutError> {
+    let header = Certificate::skip_with_header_span(c)?;
+    let mut h = BcsCursor::new(header);
+
     // Header prefix: author, round, epoch, created_at.
-    c.skip::<AuthorityIdentifier>()?.skip::<Round>()?.skip::<Epoch>()?.skip::<TimestampSec>()?;
+    h.skip::<AuthorityIdentifier>()?.skip::<Round>()?.skip::<Epoch>()?.skip::<TimestampSec>()?;
 
     // Header.payload: IndexMap<BlockHash, WorkerId>, on the wire as a length-prefixed sequence of
-    // (digest, worker) pairs in insertion order. Keep the keys, skip the worker ids.
-    let entries = c.read_len()?;
-    out.reserve(entries);
+    // (digest, worker) pairs in insertion order. Keep the keys, skip the worker ids. Clamp the
+    // pre-allocation to the remaining bytes so a corrupt length prefix cannot capacity-overflow and
+    // abort the node (each pair is at least 33 bytes: a length-prefixed 32-byte digest).
+    let entries = h.read_len()?;
+    out.reserve(entries.min(h.len() / 33));
     for _ in 0..entries {
-        out.push(c.read::<BlockHash>()?);
-        c.skip::<WorkerId>()?;
+        out.push(h.read::<BlockHash>()?);
+        h.skip::<WorkerId>()?;
     }
-
-    // Header tail: parents, latest_execution_block.
-    c.skip::<BTreeSet<CertificateDigest>>()?.skip::<BlockNumHash>()?;
-    // Certificate tail: signature_verification_state, signed_authorities (roaring bitmap), created.
-    c.skip::<SignatureVerificationState>()?;
-    skip_bytes(c)?;
-    c.skip::<TimestampSec>()?;
     Ok(())
 }
 
@@ -319,5 +317,105 @@ mod tests {
             .collect();
         assert_eq!(epoch, h.sub_dag.leader_epoch(), "projected leader epoch");
         assert_eq!(digests, expected, "projected digests must match the full-decode walk");
+    }
+
+    /// A torn/corrupt header (the consensus env runs SafeNoSync) must surface as an `Err`, never a
+    /// panic. In particular the payload-count pre-allocation must be bounded by the remaining
+    /// bytes, so a bogus length prefix cannot capacity-overflow and abort the node.
+    #[test]
+    fn projection_rejects_corrupt_header_without_panicking() {
+        let leader = make_cert(0xEE, 14, 7, vec![(BlockHash::repeat_byte(9), 0)], 2);
+        let certs = vec![
+            make_cert(
+                0x01,
+                13,
+                7,
+                vec![(BlockHash::repeat_byte(2), 1), (BlockHash::repeat_byte(5), 3)],
+                1,
+            ),
+            make_cert(0x02, 13, 7, vec![(BlockHash::repeat_byte(8), 2)], 1),
+        ];
+        let bytes = crate::encode(&make_header(leader, certs));
+
+        // Every cut inside the certificate region (the leader epoch the projection returns is read
+        // last, near the end) must error rather than panic, whatever the truncation exposes as a
+        // length prefix.
+        for len in 1..bytes.len() / 2 {
+            assert!(
+                leader_epoch_and_batch_digests(&bytes[..len]).is_err(),
+                "header truncated to {len} bytes must error, not panic",
+            );
+        }
+        // The intact header still projects.
+        assert!(leader_epoch_and_batch_digests(&bytes).is_ok());
+    }
+
+    /// Asserts the projection equals a full decode's `certificates -> payload keys` walk and
+    /// recovers the leader epoch, for `h`.
+    fn assert_projection_matches(h: &ConsensusHeader) {
+        let bytes = crate::encode(h);
+        let (epoch, digests) = leader_epoch_and_batch_digests(&bytes).unwrap();
+        let expected: Vec<BlockHash> = h
+            .sub_dag
+            .certificates
+            .iter()
+            .flat_map(|c| c.header().payload().keys().copied())
+            .collect();
+        assert_eq!(epoch, h.sub_dag.leader_epoch(), "projected leader epoch");
+        assert_eq!(digests, expected, "projected digests must match the full-decode walk");
+    }
+
+    /// The projection equivalence holds across header shapes, not just one handcrafted fixture:
+    /// no certificates, an empty payload, a wide payload, a deep parent set, and a digest shared
+    /// across certificates (which the walk must yield twice).
+    #[test]
+    fn projection_matches_full_decode_across_shapes() {
+        let leader = || make_cert(0xEE, 14, 7, vec![(BlockHash::repeat_byte(9), 0)], 2);
+        let wide: Vec<(BlockHash, WorkerId)> =
+            (0..33u8).map(|i| (BlockHash::repeat_byte(i + 1), i as WorkerId)).collect();
+        let shapes: Vec<Vec<Certificate>> = vec![
+            vec![],
+            vec![make_cert(1, 13, 7, vec![], 0)],
+            vec![make_cert(1, 13, 7, wide, 0)],
+            vec![make_cert(1, 13, 7, vec![(BlockHash::repeat_byte(2), 1)], 8)],
+            vec![
+                make_cert(1, 13, 7, vec![(BlockHash::repeat_byte(2), 1)], 1),
+                make_cert(2, 13, 7, vec![(BlockHash::repeat_byte(2), 3)], 0),
+            ],
+        ];
+        for certs in shapes {
+            assert_projection_matches(&make_header(leader(), certs));
+        }
+    }
+
+    /// Any single-byte corruption of a stored header must project to `Ok` or `Err`, never a
+    /// panic: the consensus env runs SafeNoSync so a torn write can surface arbitrary bytes, and
+    /// with panic=abort a projection panic is a node abort at boot or on a cold serve.
+    #[test]
+    fn projection_survives_single_byte_corruption() {
+        let leader = make_cert(0xEE, 14, 7, vec![(BlockHash::repeat_byte(9), 0)], 2);
+        let certs = vec![
+            make_cert(
+                0x01,
+                13,
+                7,
+                vec![(BlockHash::repeat_byte(2), 1), (BlockHash::repeat_byte(5), 3)],
+                1,
+            ),
+            make_cert(0x02, 13, 7, vec![(BlockHash::repeat_byte(8), 2)], 1),
+        ];
+        let bytes = crate::encode(&make_header(leader, certs));
+
+        let mut mutated = bytes.clone();
+        for pos in 0..bytes.len() {
+            for flip in [0x01u8, 0x80, 0xFF] {
+                mutated[pos] = bytes[pos] ^ flip;
+                // Any outcome but a panic is acceptable; a flip may still parse validly.
+                let _ = leader_epoch_and_batch_digests(&mutated);
+                let _ = ConsensusHeaderMeta::from_bytes(&mutated);
+                let _ = ConsensusHeaderChainMeta::from_bytes(&mutated);
+            }
+            mutated[pos] = bytes[pos];
+        }
     }
 }
