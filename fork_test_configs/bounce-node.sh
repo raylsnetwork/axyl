@@ -12,13 +12,22 @@
 #                               INDEX = the add-relay-node.sh index (e.g. 6). Restart goes through
 #                               stop-relay-node.sh + add-relay-node.sh, which carry their own
 #                               relay/DNS env. DNSMASQ_PORT selects the resolver view the node uses
-#                               to reach the committee (default 5354, the public/outsider view).
+#                               to reach the committee (default 5353, the private/direct view;
+#                               set DNSMASQ_PORT=5354 for the public/relay view). Matches
+#                               add-relay-node.sh's default so add + bounce stay consistent.
 #
 # stop is graceful and waits INDEFINITELY for a clean shutdown (no kill -9), so a hung shutdown
 # blocks the loop here on purpose -- inspect the node's log instead of losing the failure.
 
 ADDED="${ADDED:-0}"
 IDX="${1:-1}"
+
+# Keep the node DOWN this long before restarting. Default 0 = restart immediately (tests a quick
+# bounce, which usually rejoins via normal gossip). Set it above ~2 epoch durations to make the
+# node fall behind across epoch boundaries: it comes back with a stale committee view, its
+# consensus-output gossip mesh stays empty, and the forward streamer's proactive idle-probe
+# catch-up path is exercised.
+DOWN_SECS="${DOWN_SECS:-0}"
 
 LOCAL_TESTNET_SCRIPT="./etc/test-network/local-testnet.sh"
 ADD_RELAY_NODE_SCRIPT="./etc/test-network/add-relay-node.sh"
@@ -31,7 +40,7 @@ if [[ "$ADDED" == "1" ]]; then
     # down by (instance-1) from 8545. Keep in sync with add-relay-node.sh if that formula changes.
     INSTANCE=$((100 + NODE_NUM))
     RPC_PORT=$((8545 - (INSTANCE - 1)))
-    DNSMASQ_PORT="${DNSMASQ_PORT:-5354}"
+    DNSMASQ_PORT="${DNSMASQ_PORT:-5353}"
     stop_node()  { bash "$STOP_RELAY_NODE_SCRIPT" "$NODE_NUM"; }
     start_node() { DNSMASQ_PORT="$DNSMASQ_PORT" bash "$ADD_RELAY_NODE_SCRIPT" "$NODE_NUM"; }
 else
@@ -71,6 +80,11 @@ while true; do
 
   echo "stopping ${LABEL}..."
   stop_node
+
+  if [[ "$DOWN_SECS" -gt 0 ]]; then
+    echo "keeping ${LABEL} down ${DOWN_SECS}s (to fall behind across epoch boundaries)..."
+    sleep "$DOWN_SECS"
+  fi
 
   echo "restarting ${LABEL}..."
   start_node
