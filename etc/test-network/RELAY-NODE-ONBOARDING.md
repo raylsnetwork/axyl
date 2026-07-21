@@ -113,10 +113,16 @@ NXDomain, and can't rejoin):
 node reports `is_caught_up`, then loops stop → restart, exercising the
 catch-up/rejoin path:
 ```bash
-# base validator (pass the net's mode flags):
+# base validator (pass the net's mode flags). Always resolves the committee via the private/direct
+# view (5353) -- build_relay_env pins it, so DNSMASQ_PORT is NOT honored here; base always meshes direct.
 RELAY_DNS=1 MULTI_LISTEN=1 ./fork_test_configs/bounce-node.sh 1
-# dynamically-added node:
-ADDED=1 ./fork_test_configs/bounce-node.sh 6
+# dynamically-added node — always set DNSMASQ_PORT explicitly, it decides the transport on restart:
+#   DNSMASQ_PORT=5353 -> the bounced node resolves the committee to DIRECT addresses and connects
+#                        directly (the goal when testing the direct path);
+#   DNSMASQ_PORT=5354 -> it resolves to relay circuits and MUST reach the committee THROUGH their
+#                        relays (the goal when testing the relay path).
+# Use the SAME view you added it with, or the node silently switches transport across the bounce.
+ADDED=1 DNSMASQ_PORT=5354 ./fork_test_configs/bounce-node.sh 6
 ```
 If it parks on `still shutting down after Ns…`, that's a real hung shutdown — look
 at the node's log; it won't force-kill.
