@@ -23,7 +23,7 @@ use reth_libmdbx::{
     HandleSlowReadersReturnCode, MaxReadTransactionDuration, Mode, PageSize, SyncMode, Transaction,
     TransactionKind, WriteFlags, RO, RW,
 };
-use tracing::warn;
+use tracing::debug;
 
 /// Maximum space (in bytes) that a slow reader can hold before triggering a warning.
 /// 50MB threshold for investigation purposes.
@@ -207,7 +207,7 @@ impl DbTx for MdbxTx {
     }
 
     fn disable_long_read_safety(&self) {
-        warn!(target: "storage::mdbx", "Disabling long read safety for database transaction");
+        debug!(target: "storage::mdbx", "disabling long read safety for database transaction");
         self.inner.disable_timeout();
     }
 }
@@ -322,7 +322,7 @@ impl DbTx for MdbxTxMut {
     }
 
     fn disable_long_read_safety(&self) {
-        warn!(target: "storage::mdbx", "Disabling long read safety for database transaction");
+        debug!(target: "storage::mdbx", "disabling long read safety for database transaction");
 
         self.inner.disable_timeout();
     }

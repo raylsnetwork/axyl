@@ -655,7 +655,8 @@ impl<DB: Database> Database for LayeredDatabase<DB> {
         }
     }
 
-    /// Panic if called within an async context.
+    /// Blocks the calling thread until the writer has applied all queued messages; never call it
+    /// on an async runtime worker.
     fn sync_persist(&self) {
         let (tx, mut rx) = oneshot::channel();
         let r = self

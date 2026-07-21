@@ -182,50 +182,36 @@ fn _open_redb<P: AsRef<std::path::Path> + Send>(store_path: P) -> LayeredDatabas
     db
 }
 
+/// Opens one table on `db`, folding [`rayls_infrastructure_types::Table::NAME`] into the error so
+/// the message cannot drift from the type.
+fn open_one<T: rayls_infrastructure_types::Table>(db: &mut impl Database) -> eyre::Result<()> {
+    db.open_table::<T>().map_err(|e| eyre::eyre!("failed to open {} table: {e}", T::NAME))
+}
+
 fn open_default_tables<DB: Database>(db: &mut DB) -> eyre::Result<()> {
-    db.open_table::<LastProposed>()
-        .map_err(|e| eyre::eyre!("failed to open LastProposed table: {e}"))?;
-    db.open_table::<LastProposedByAuthority>()
-        .map_err(|e| eyre::eyre!("failed to open LastProposedByAuthority table: {e}"))?;
-    db.open_table::<Votes>().map_err(|e| eyre::eyre!("failed to open Votes table: {e}"))?;
-    db.open_table::<Certificates>()
-        .map_err(|e| eyre::eyre!("failed to open Certificates table: {e}"))?;
-    db.open_table::<CertificateDigestByRound>()
-        .map_err(|e| eyre::eyre!("failed to open CertificateDigestByRound table: {e}"))?;
-    db.open_table::<CertificateDigestByOrigin>()
-        .map_err(|e| eyre::eyre!("failed to open CertificateDigestByOrigin table: {e}"))?;
-    db.open_table::<Payload>().map_err(|e| eyre::eyre!("failed to open Payload table: {e}"))?;
-    db.open_table::<Batches>().map_err(|e| eyre::eyre!("failed to open Batches table: {e}"))?;
-    db.open_table::<ConsensusBlocks>()
-        .map_err(|e| eyre::eyre!("failed to open ConsensusBlocks table: {e}"))?;
-    db.open_table::<ConsensusBlockNumbersByDigest>()
-        .map_err(|e| eyre::eyre!("failed to open ConsensusBlockNumbersByDigest table: {e}"))?;
-    db.open_table::<ConsensusBlocksCache>()
-        .map_err(|e| eyre::eyre!("failed to open ConsensusBlocksCache table: {e}"))?;
-    db.open_table::<NodeBatchesCache>()
-        .map_err(|e| eyre::eyre!("failed to open NodeBatchesCache table: {e}"))?;
-    db.open_table::<EpochRecords>()
-        .map_err(|e| eyre::eyre!("failed to open EpochRecords table: {e}"))?;
-    db.open_table::<EpochCerts>()
-        .map_err(|e| eyre::eyre!("failed to open EpochCerts table: {e}"))?;
-    db.open_table::<EpochRecordsIndex>()
-        .map_err(|e| eyre::eyre!("failed to open EpochRecordsIndex table: {e}"))?;
-    db.open_table::<EpochTransitionCheckpoints>()
-        .map_err(|e| eyre::eyre!("failed to open EpochTransitionCheckpoints table: {e}"))?;
-    db.open_table::<KadRecords>()
-        .map_err(|e| eyre::eyre!("failed to open KadRecords table: {e}"))?;
-    db.open_table::<KadProviderRecords>()
-        .map_err(|e| eyre::eyre!("failed to open KadProviderRecords table: {e}"))?;
-    db.open_table::<KadWorkerRecords>()
-        .map_err(|e| eyre::eyre!("failed to open KadWorkerRecords table: {e}"))?;
-    db.open_table::<KadWorkerProviderRecords>()
-        .map_err(|e| eyre::eyre!("failed to open KadWorkerProviderRecords table: {e}"))?;
-    db.open_table::<BatchSeqCounter>()
-        .map_err(|e| eyre::eyre!("failed to open BatchSeqCounter table: {e}"))?;
-    db.open_table::<NodeIdentity>()
-        .map_err(|e| eyre::eyre!("failed to open NodeIdentity table: {e}"))?;
-    db.open_table::<BatchOrderingState>()
-        .map_err(|e| eyre::eyre!("failed to open BatchOrdering table: {e}"))?;
+    open_one::<LastProposed>(db)?;
+    open_one::<LastProposedByAuthority>(db)?;
+    open_one::<Votes>(db)?;
+    open_one::<Certificates>(db)?;
+    open_one::<CertificateDigestByRound>(db)?;
+    open_one::<CertificateDigestByOrigin>(db)?;
+    open_one::<Payload>(db)?;
+    open_one::<Batches>(db)?;
+    open_one::<ConsensusBlocks>(db)?;
+    open_one::<ConsensusBlockNumbersByDigest>(db)?;
+    open_one::<ConsensusBlocksCache>(db)?;
+    open_one::<NodeBatchesCache>(db)?;
+    open_one::<EpochRecords>(db)?;
+    open_one::<EpochCerts>(db)?;
+    open_one::<EpochRecordsIndex>(db)?;
+    open_one::<EpochTransitionCheckpoints>(db)?;
+    open_one::<KadRecords>(db)?;
+    open_one::<KadProviderRecords>(db)?;
+    open_one::<KadWorkerRecords>(db)?;
+    open_one::<KadWorkerProviderRecords>(db)?;
+    open_one::<BatchSeqCounter>(db)?;
+    open_one::<NodeIdentity>(db)?;
+    open_one::<BatchOrderingState>(db)?;
 
     Ok(())
 }
