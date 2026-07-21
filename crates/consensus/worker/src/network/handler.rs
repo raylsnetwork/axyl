@@ -197,9 +197,13 @@ fn collect_requested_batches_blocking<DB: Database>(
 
     let store = consensus_config.node_storage();
 
+    // Serve from one cold-aware read txn: `tx.get` resolves each digest hot-first and falls through
+    // to cold within the same txn (see `ColdTx`), so a lagging peer's archived batches are served
+    // without opening a fresh read txn per digest.
+    //
     // Stop at the response budget: requesters rely on responders truncating below the requested
     // set, so reading further would only decode (often large) batches to discard them.
-    let batches = store
+    store
         .with_read_txn(|tx| {
             let mut batches = Vec::new();
             let mut total_size = 0usize;
@@ -216,9 +220,7 @@ fn collect_requested_batches_blocking<DB: Database>(
         })
         .map_err(|e| {
             WorkerNetworkError::Internal(format!("failed to read from batch store: {e:?}"))
-        })?;
-
-    Ok(batches)
+        })
 }
 
 // support IT tests
@@ -293,6 +295,68 @@ mod tests {
         assert!(
             batches.iter().map(Batch::size).sum::<usize>() <= budget,
             "returned batches must fit within the budget",
+        );
+    }
+
+    /// A batch present only in the cold tier (archived and pruned from hot) is still served: the
+    /// responder's read txn falls through to cold, so a lagging peer can fetch history past the
+    /// hot window.
+    #[test]
+    fn responder_serves_cold_archived_batches() {
+        use rayls_infrastructure_storage::{
+            cold::{ColdConfig, ColdDatabase, ColdLocation},
+            layered_db::LayeredDatabase,
+            mdbx::MdbxDatabase,
+            tables::ColdBatchLocations,
+        };
+        use rayls_infrastructure_types::encode;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let next = AtomicUsize::new(0);
+        // The node's cold-tiered mdbx stack, one subdir per authority. Built explicitly (not via
+        // `open_db`) so an `--all-features` build, where the redb backend takes over the
+        // `DatabaseType` alias, still tests the cold composition.
+        let fixture = CommitteeFixture::builder(|| {
+            let dir = tmp.path().join(format!("authority-{}", next.fetch_add(1, Ordering::SeqCst)));
+            std::fs::create_dir_all(dir.join("hot")).expect("create db dir");
+            let layered =
+                LayeredDatabase::open(MdbxDatabase::open(dir.join("hot")).expect("open mdbx"));
+            let db = ColdDatabase::open(layered, &ColdConfig { dir: dir.join("cold") })
+                .expect("open cold store");
+            db.open_table::<Batches>().expect("open Batches");
+            db.open_table::<ColdBatchLocations>().expect("open ColdBatchLocations");
+            db
+        })
+        .build();
+        let config = fixture.first_authority().consensus_config();
+        let store = config.node_storage().clone();
+
+        let hot_digest = B256::repeat_byte(0x11);
+        let hot_batch = Batch { transactions: vec![vec![1u8; 64]], ..Default::default() };
+        store.insert::<Batches>(&hot_digest, &hot_batch).expect("insert hot batch");
+
+        // The cold batch exists only as a jar row plus its auxiliary-index entry, never hot.
+        let cold_digest = B256::repeat_byte(0x22);
+        let cold_batch = Batch { transactions: vec![vec![2u8; 64]], ..Default::default() };
+        let cold = store.cold();
+        cold.batches().begin_epoch(1, 0).expect("begin epoch");
+        cold.batches()
+            .append_row(&[cold_digest.as_slice(), &encode(&cold_batch)])
+            .expect("append row");
+        cold.batches().commit().expect("commit");
+        store
+            .insert::<ColdBatchLocations>(&cold_digest, &ColdLocation { epoch: 1, row: 0 })
+            .expect("insert cold location");
+
+        // Request hot + cold + absent: both stored batches serve, the absent digest is skipped.
+        let digests = vec![hot_digest, cold_digest, B256::repeat_byte(0x33)];
+        let batches =
+            collect_requested_batches_blocking(digests, usize::MAX, config).expect("collect");
+        assert_eq!(batches.len(), 2, "hot and cold batches must both serve");
+        assert!(
+            batches.iter().any(|b| encode(b) == encode(&cold_batch)),
+            "the cold-archived batch must serve through the fall-through"
         );
     }
 }
