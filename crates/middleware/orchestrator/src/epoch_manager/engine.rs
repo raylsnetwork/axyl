@@ -1,12 +1,48 @@
-use crate::{engine::ExecutionNode, epoch_manager::types::EpochManager};
-use rayls_execution_evm::{reth_env::RethEnv, CanonStateNotificationStream};
+use crate::{
+    engine::{ExecutionNode, RaylsBuilder},
+    epoch_manager::types::EpochManager,
+};
+use rayls_execution_evm::{
+    reth_env::{RethDb, RethEnv},
+    CanonStateNotificationStream,
+};
 use rayls_infrastructure_config::RaylsDirs;
 use rayls_infrastructure_types::{
     gas_accumulator::GasAccumulator, Database as ReDatabase, Noticer, TaskManager,
 };
+use rayls_middleware_rewards::RewardsCounter;
 use std::time::Duration;
 use tokio_stream::StreamExt;
 use tracing::{error, info};
+
+/// Opens the boot EL environment with the exact wiring node boot uses (consistency check and
+/// unwind included).
+///
+/// The single construction point for the boot `RethEnv`: node boot (`create_engine`) and the
+/// offline cold migration both route through it, so the migration's EL anchor is computed against
+/// the same environment a real boot would open. A hand-copied open could silently drift and floor
+/// cold archival differently than boot.
+pub(crate) async fn open_boot_reth_env(
+    builder: &RaylsBuilder,
+    task_manager: &TaskManager,
+    reth_db: RethDb,
+    rewards_counter: RewardsCounter,
+    allow_v1: bool,
+) -> eyre::Result<RethEnv> {
+    let parameters = &builder.rayls_infrastructure_config.parameters;
+    RethEnv::new(
+        &builder.node_config,
+        task_manager,
+        reth_db,
+        parameters.basefee_address,
+        rewards_counter,
+        &builder.build_metadata,
+        Some(parameters.network),
+        Some(parameters.min_base_fee),
+        allow_v1,
+    )
+    .await
+}
 
 impl<P, DB> EpochManager<P, DB>
 where
@@ -19,19 +55,11 @@ where
         engine_task_manager: &TaskManager,
         gas_accumulator: &GasAccumulator,
     ) -> eyre::Result<ExecutionNode> {
-        // create execution components (ie - reth env)
-        let basefee_address = self.builder.rayls_infrastructure_config.parameters.basefee_address;
-        let network = self.builder.rayls_infrastructure_config.parameters.network;
-        let min_base_fee = self.builder.rayls_infrastructure_config.parameters.min_base_fee;
-        let reth_env = RethEnv::new(
-            &self.builder.node_config,
+        let reth_env = open_boot_reth_env(
+            &self.builder,
             engine_task_manager,
             self.reth_db.clone(),
-            basefee_address,
             gas_accumulator.rewards_counter(),
-            &self.builder.build_metadata,
-            Some(network),
-            Some(min_base_fee),
             false,
         )
         .await?;

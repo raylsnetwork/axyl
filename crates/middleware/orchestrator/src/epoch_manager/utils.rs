@@ -1,18 +1,45 @@
 use crate::epoch_manager::types::EpochManager;
+use rayls_consensus_state_sync::{highest_executed_anchor, last_executed_consensus_from_anchor};
 use rayls_execution_evm::reth_env::RethEnv;
 use rayls_infrastructure_config::RaylsDirs;
 use rayls_infrastructure_storage::{
     mdbx::MdbxConfig, open_db_with_consensus_config, tables::ConsensusBlocks, DatabaseType,
 };
 use rayls_infrastructure_types::{
-    gas_accumulator::GasAccumulator, AuthorityIdentifier, BlsPublicKey, ConsensusHeaderMeta,
-    Database, DbTx, EpochVote, B256, WALK_PROGRESS_LOG_EVERY,
+    gas_accumulator::GasAccumulator, AuthorityIdentifier, BlsPublicKey, ConsensusHeader,
+    ConsensusHeaderMeta, Database, DbTx, EpochVote, B256, WALK_PROGRESS_LOG_EVERY,
 };
 // production-only: the hardcoded protocol base-fee floor used to seed the accumulator
 #[cfg(not(feature = "dev-single-node-setup"))]
 use rayls_infrastructure_types::MIN_RAYLS_PROTOCOL_BASE_FEE;
 use std::collections::BTreeMap;
 use tracing::info;
+
+/// Number of recent EVM blocks scanned to recover the restart execution anchor.
+///
+/// A drained parked (out-of-order seq) batch's block carries its ORIGIN output's lower nonce and
+/// that output's digest as `parent_beacon_block_root`, yet lands after the in-order filler and
+/// becomes the canonical tip, so the tip can anchor to a PREVIOUS output. Scanning this window and
+/// taking the max-nonce block recovers the true highest executed output's consensus-header digest.
+/// Sized well above any plausible reorder/park run.
+const LAST_EXECUTED_SCAN_DEPTH: u64 = 200;
+
+/// Recovers the EL execution anchor at boot: the consensus header committed by the highest-nonce
+/// EVM block in the recent window, or `None` when no executed block anchors to a known header.
+///
+/// The literal canonical tip is not a reliable anchor (see [`LAST_EXECUTED_SCAN_DEPTH`]); the
+/// max-nonce block in the window identifies the true highest executed output. Callers must run
+/// this before the engine starts, while the tip is frozen.
+pub(crate) fn recover_executed_anchor<DB: Database>(
+    reth_env: &RethEnv,
+    db: &DB,
+) -> eyre::Result<Option<ConsensusHeader>> {
+    let tip = reth_env.canonical_tip();
+    let start = tip.number.saturating_sub(LAST_EXECUTED_SCAN_DEPTH);
+    let window = reth_env.blocks_for_range(start..=tip.number)?;
+    let anchor = highest_executed_anchor(&window).or(tip.header().parent_beacon_block_root);
+    Ok(last_executed_consensus_from_anchor(anchor, db))
+}
 
 /// Seed per-worker gas/block totals and the in-memory leader-count mirror from
 /// executed blocks in the current epoch.
