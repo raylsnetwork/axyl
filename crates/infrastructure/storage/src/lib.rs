@@ -24,6 +24,11 @@ pub mod mdbx;
 pub mod mem_db;
 pub mod redb;
 
+#[cfg(feature = "cold-storage")]
+pub mod cold;
+#[cfg(feature = "cold-storage")]
+pub use cold::{ColdConfig, ColdSegment, ColdSegmentKind};
+
 pub use rayls_infrastructure_types::{error::StoreError, ReadTimeout};
 
 use crate::mdbx::MdbxConfig;

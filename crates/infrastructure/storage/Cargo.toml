@@ -15,6 +15,8 @@ eyre = { workspace = true }
 prometheus = { workspace = true }
 ouroboros = { workspace = true }
 parking_lot = { workspace = true }
+serde = { workspace = true, optional = true }
+thiserror = { workspace = true, optional = true }
 # For the persist async implemetation.
 tokio = { workspace = true, features = [ "sync" ] }
 
@@ -28,14 +30,22 @@ reth-libmdbx = { workspace = true, optional = true, features = [
 ] }
 page_size = { version = "0.6.0", optional = true }
 
+# consensus cold-storage: reused as the immutable nippy-jar file format only (not reth StaticFile*)
+reth-nippy-jar = { workspace = true, optional = true }
+lru = { workspace = true, optional = true }
+
 [dev-dependencies]
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["rt", "macros"] }
+criterion = { workspace = true }
 
 [features]
 redb = []
 reth-libmdbx = ["dep:reth-libmdbx", "dep:page_size"]
-default = ["reth-libmdbx"]
+# Consensus DB cold tier (append-only nippy-jar archive). On by default; disable to compile out all
+# cold-storage code and ship the hot-only mdbx stack.
+cold-storage = ["dep:reth-nippy-jar", "dep:thiserror", "dep:serde", "dep:lru"]
+default = ["reth-libmdbx", "cold-storage"]
 archive-replay = []
 
 [lints]
