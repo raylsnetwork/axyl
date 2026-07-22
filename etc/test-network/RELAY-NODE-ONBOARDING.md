@@ -38,7 +38,10 @@ DNSMASQ_BIND=127.0.0.1 RELAY_PUBLIC_HOST=127.0.0.1 MULTI_LISTEN=1 MULTI_LISTEN_B
 DNSMASQ_HOST=127.0.0.1 DNSMASQ_PORT=5354 ./etc/test-network/add-relay-node.sh 6
 
 # 3. stake it into the committee (waits for the chain to be ready, then mint→allowlist→approve→stake→activate)
-ADMIN_PRIVATE_KEY="$DEV_FUNDS_KEY" ./etc/test-network/stake-relay-node.sh 6
+#    RPC_URL must point at a synced node's RPC. Use node-6's own port so it works on either host:
+#    INSTANCE=100+N, so RPC = 8545-(INSTANCE-1) = 8440 for N=6. (The script's default 8545 is only a
+#    base committee member — absent on a machine that runs only the joined node.)
+RPC_URL=http://localhost:8440 ADMIN_PRIVATE_KEY="$DEV_FUNDS_KEY" ./etc/test-network/stake-relay-node.sh 6
 
 # --- stopping ---
 
