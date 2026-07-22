@@ -314,7 +314,7 @@ where
 
     /// Generate calldata for updating the ConsensusRegistry to conclude the epoch.
     fn generate_conclude_epoch_calldata(&mut self, randomness: B256) -> RaylsRethResult<Bytes> {
-        // shuffle all validators for new committee
+        // build committee for next epoch (pre-fork: shuffled; post-fork: sorted, no shuffle)
         let mut new_committee = self.new_committee(randomness)?;
 
         if new_committee.is_empty() {
@@ -399,7 +399,7 @@ where
         let new_committee_addresses =
             new_committee.into_iter().map(|v| v.validatorAddress).collect::<Vec<_>>();
 
-        trace!(target: "engine",  ?new_committee_size, ?new_committee_addresses, "new committee");
+        trace!(target: "engine", ?new_committee_size, ?new_committee_addresses, "new committee");
 
         Ok(new_committee_addresses)
     }

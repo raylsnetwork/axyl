@@ -1150,8 +1150,7 @@ async fn test_close_epochs_with_dynamic_committee() -> eyre::Result<()> {
     let future_epoch_info = reth_env
         .call_consensus_registry::<_, ConsensusRegistry::EpochInfo>(&mut rayls_evm, calldata)?;
     assert_eq!(
-        future_epoch_info.committee.len(),
-        6,
+        future_epoch_info.committee, expected_sorted_6,
         "future epoch (epoch 3) must have 6 validators"
     );
 
@@ -1191,8 +1190,7 @@ async fn test_close_epochs_with_dynamic_committee() -> eyre::Result<()> {
     expected_epoch += 1;
     let consensus_output = consensus_output_for_tests(2, expected_epoch, 7);
     let payload = RLPayload::new_for_test(canonical_header.clone(), &consensus_output);
-    let block7 = execute_payload_and_update_canonical_chain(&reth_env, payload, vec![]).await?;
-    let _ = block7;
+    execute_payload_and_update_canonical_chain(&reth_env, payload, vec![]).await?;
 
     // validator 2 should now be Exited
     let state = StateProviderDatabase::new(reth_env.latest()?);
