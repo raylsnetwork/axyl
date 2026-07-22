@@ -16,6 +16,7 @@ use alloy::{
     sol_types::SolCall as _,
 };
 use alloy_evm::{block::StateChangeSource, eth::EthTxResult, tx::RecoveredTx as _, Database, Evm};
+use rand::{rngs::StdRng, seq::IteratorRandom, Rng as _, SeedableRng as _};
 use rayls_infrastructure_types::{
     rewards::build_withdrawals, Address, Bytes, Encodable2718, ExecHeader, Receipt, SolValue,
     TransactionSigned, Withdrawals, B256, EMPTY_WITHDRAWALS, U256,
@@ -226,9 +227,9 @@ where
     }
 
     /// Apply the closing epoch call to ConsensusRegistry.
-    fn apply_closing_epoch_contract_call(&mut self) -> RaylsRethResult<()> {
-        debug!(target: "engine", "applying closing contract call");
-        let calldata = self.generate_conclude_epoch_calldata()?;
+    fn apply_closing_epoch_contract_call(&mut self, randomness: B256) -> RaylsRethResult<()> {
+        debug!(target: "engine", ?randomness, "applying closing contract call");
+        let calldata = self.generate_conclude_epoch_calldata(randomness)?;
         trace!(target: "engine", ?calldata, "close epoch calldata");
 
         // execute system call to consensus registry
@@ -312,9 +313,9 @@ where
     }
 
     /// Generate calldata for updating the ConsensusRegistry to conclude the epoch.
-    fn generate_conclude_epoch_calldata(&mut self) -> RaylsRethResult<Bytes> {
+    fn generate_conclude_epoch_calldata(&mut self, randomness: B256) -> RaylsRethResult<Bytes> {
         // shuffle all validators for new committee
-        let mut new_committee = self.new_committee()?;
+        let mut new_committee = self.new_committee(randomness)?;
 
         if new_committee.is_empty() {
             let epoch = self.extract_epoch_from_nonce(self.ctx.nonce);
@@ -365,17 +366,20 @@ where
         Ok(bytes)
     }
 
-    /// Read eligible validators from latest state
-    fn new_committee(&mut self) -> RaylsRethResult<Vec<Address>> {
+    /// Read eligible validators from latest state and shuffle the committee deterministically.
+    fn new_committee(&mut self, randomness: B256) -> RaylsRethResult<Vec<Address>> {
         let block_number = self.evm.block().number().saturating_to::<u64>();
+        if !self.spec.is_dynamic_committee_sizing_active_at_block(block_number) {
+            return self.shuffle_new_committee(randomness);
+        }
 
-        let new_committee: Vec<ValidatorInfo> = self.next_committee(block_number)?;
+        let new_committee: Vec<ValidatorInfo> = self.next_committee(true)?;
         let new_committee_size = new_committee.len();
 
         info!(
             target: "engine",
             new_committee_size,
-            "shuffle_new_committee: read validators (Active + PendingActivation)"
+            "new_committee: read validators (Active + PendingActivation)"
         );
 
         if new_committee.is_empty() {
@@ -400,11 +404,91 @@ where
         Ok(new_committee_addresses)
     }
 
+    fn shuffle_new_committee(&mut self, randomness: B256) -> RaylsRethResult<Vec<Address>> {
+        let next_committee = self.next_committee(false)?;
+        let new_committee_size = next_committee.len();
+
+        // read all active validators from consensus registry
+        let all_active_validators = self.get_active_validators()?;
+
+        info!(
+            target: "engine",
+            new_committee_size,
+            active_validators = all_active_validators.len(),
+            "shuffle_new_committee: read active validators"
+        );
+
+        if all_active_validators.is_empty() {
+            // query ALL validators (Any status) to understand their statuses
+            let all_validators = self.get_all_validators()?;
+
+            error!(
+                target: "engine",
+                total_validators = all_validators.len(),
+                statuses = ?all_validators
+                    .iter()
+                    .map(|v| (v.validatorAddress, v.currentStatus))
+                    .collect::<Vec<_>>(),
+                "NO ACTIVE VALIDATORS - dumping all validator statuses"
+            );
+        }
+
+        // create seed from hashed bls agg signature
+        let mut seed = [0; 32];
+        seed.copy_from_slice(randomness.as_slice());
+        trace!(target: "engine", ?seed, "seed after");
+
+        // used as deterministic randomness
+        let mut rng = StdRng::from_seed(seed);
+
+        // 1) separate active and pending validators
+        // 2) check if active length is sufficient
+        // 3) if missing, randomly select from the pending validators
+        let (pending_exit, mut active_validators): (Vec<_>, Vec<_>) = all_active_validators
+            .into_iter()
+            .partition(|v| v.currentStatus == ValidatorStatus::PendingExit);
+
+        let active_validator_count = active_validators.len();
+        let mut validators_for_shuffle = if active_validator_count >= new_committee_size {
+            // enough active validators for next committee
+            active_validators
+        } else {
+            // NOTE: already checked if active_validator_count >= new_committee_size above
+            let num_missing = new_committee_size - active_validator_count;
+
+            // randomly take enough pending exit validators to reach new committee size
+            let random_pending = pending_exit.into_iter().choose_multiple(&mut rng, num_missing);
+            active_validators.extend(random_pending);
+            active_validators
+        };
+
+        // simple Fisher-Yates shuffle
+        for i in (1..validators_for_shuffle.len()).rev() {
+            let j = rng.random_range(0..=i);
+            validators_for_shuffle.swap(i, j);
+        }
+
+        debug!(target: "engine",  "validators post-shuffle {:?}", validators_for_shuffle);
+
+        let mut new_committee =
+            validators_for_shuffle.into_iter().map(|v| v.validatorAddress).collect::<Vec<_>>();
+
+        // trim the shuffled committee to maintain correct size
+        new_committee.truncate(new_committee_size);
+
+        trace!(target: "engine",  ?new_committee_size, ?new_committee, "truncated shuffle for new committee");
+
+        Ok(new_committee)
+    }
+
     /// Return the next committee.
     ///
     /// Pre-fork: reuses the current epoch's committee so the size is fixed across epochs
     /// Post-fork: counts (Active + PendingActivation) validators so the committee dynamically grows/shrinks with the validator set.
-    fn next_committee(&mut self, block_number: u64) -> RaylsRethResult<Vec<ValidatorInfo>> {
+    fn next_committee(
+        &mut self,
+        is_dynamic_committee_sizing_active: bool,
+    ) -> RaylsRethResult<Vec<ValidatorInfo>> {
         // retrieve the current committee size
         let epoch = self.extract_epoch_from_nonce(self.ctx.nonce);
 
@@ -416,7 +500,7 @@ where
             error!(target: "engine", nonce_epoch = epoch, contract_epoch, "EPOCH DESYNC: contract currentEpoch != nonce epoch");
         }
 
-        let new_committee = if self.spec.is_dynamic_committee_sizing_active_at_block(block_number) {
+        let new_committee = if is_dynamic_committee_sizing_active {
             // this function returns (SmartContract implementation) Active + PendingActivation + PendingExit
             let validators = self.get_active_validators()?;
             validators
@@ -764,14 +848,14 @@ where
         let requests = Requests::default();
 
         // potentially close epoch boundary (current we don't need the randomness data because validator set it not shuffled)
-        if let Some(_randomness) = self.ctx.close_epoch {
+        if let Some(randomness) = self.ctx.close_epoch {
             debug!(target: "engine", "ctx indicates close epoch");
             let tally = self.ctx.close_epoch_tally.clone().unwrap_or_default();
             self.apply_consensus_block_rewards(tally).map_err(|e| {
                 BlockExecutionError::Internal(InternalBlockExecutionError::Other(e.into()))
             })?;
 
-            self.apply_closing_epoch_contract_call().map_err(|e| {
+            self.apply_closing_epoch_contract_call(randomness).map_err(|e| {
                 BlockExecutionError::Internal(InternalBlockExecutionError::Other(e.into()))
             })?;
 
