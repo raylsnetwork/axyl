@@ -764,36 +764,36 @@ where
         let requests = Requests::default();
 
         // potentially close epoch boundary (current we don't need the randomness data because validator set it not shuffled)
-        // if let Some(randomness) = self.ctx.close_epoch {
-        debug!(target: "engine", "ctx indicates close epoch");
-        let tally = self.ctx.close_epoch_tally.clone().unwrap_or_default();
-        self.apply_consensus_block_rewards(tally).map_err(|e| {
-            BlockExecutionError::Internal(InternalBlockExecutionError::Other(e.into()))
-        })?;
+        if let Some(_randomness) = self.ctx.close_epoch {
+            debug!(target: "engine", "ctx indicates close epoch");
+            let tally = self.ctx.close_epoch_tally.clone().unwrap_or_default();
+            self.apply_consensus_block_rewards(tally).map_err(|e| {
+                BlockExecutionError::Internal(InternalBlockExecutionError::Other(e.into()))
+            })?;
 
-        self.apply_closing_epoch_contract_call().map_err(|e| {
-            BlockExecutionError::Internal(InternalBlockExecutionError::Other(e.into()))
-        })?;
+            self.apply_closing_epoch_contract_call().map_err(|e| {
+                BlockExecutionError::Internal(InternalBlockExecutionError::Other(e.into()))
+            })?;
 
-        // best-effort, never blocks epoch close; testnet archive replay skips the
-        // historical reward-distribution outage window to match canonical state
-        #[cfg(feature = "archive-replay")]
-        let skip_distribution =
-            self.spec.is_tokenomics_outage_block(self.evm.block().number().saturating_to());
-        #[cfg(not(feature = "archive-replay"))]
-        let skip_distribution = false;
-        if !skip_distribution {
-            match self.apply_reward_distribution() {
-                Ok(()) => {}
-                Err(e) => {
-                    error!(target: "engine", "reward distribution failed (non-fatal): {:?}", e);
+            // best-effort, never blocks epoch close; testnet archive replay skips the
+            // historical reward-distribution outage window to match canonical state
+            #[cfg(feature = "archive-replay")]
+            let skip_distribution =
+                self.spec.is_tokenomics_outage_block(self.evm.block().number().saturating_to());
+            #[cfg(not(feature = "archive-replay"))]
+            let skip_distribution = false;
+            if !skip_distribution {
+                match self.apply_reward_distribution() {
+                    Ok(()) => {}
+                    Err(e) => {
+                        error!(target: "engine", "reward distribution failed (non-fatal): {:?}", e);
+                    }
                 }
             }
-        }
 
-        // merge transitions into bundle state
-        self.evm.db_mut().merge_transitions(BundleRetention::Reverts);
-        // }
+            // merge transitions into bundle state
+            self.evm.db_mut().merge_transitions(BundleRetention::Reverts);
+        }
 
         Ok((
             self.evm,
