@@ -484,7 +484,8 @@ where
     /// Return the next committee.
     ///
     /// Pre-fork: reuses the current epoch's committee so the size is fixed across epochs
-    /// Post-fork: counts (Active + PendingActivation) validators so the committee dynamically grows/shrinks with the validator set.
+    /// Post-fork: counts (Active + PendingActivation) validators so the committee dynamically
+    /// grows/shrinks with the validator set.
     fn next_committee(
         &mut self,
         is_dynamic_committee_sizing_active: bool,
@@ -501,7 +502,8 @@ where
         }
 
         let new_committee = if is_dynamic_committee_sizing_active {
-            // this function returns (SmartContract implementation) Active + PendingActivation + PendingExit
+            // this function returns (SmartContract implementation) Active + PendingActivation +
+            // PendingExit
             let validators = self.get_active_validators()?;
             validators
                 .into_iter()
@@ -847,7 +849,8 @@ where
         // don't support prague deposit requests
         let requests = Requests::default();
 
-        // potentially close epoch boundary (current we don't need the randomness data because validator set it not shuffled)
+        // potentially close epoch boundary (current we don't need the randomness data because
+        // validator set it not shuffled)
         if let Some(randomness) = self.ctx.close_epoch {
             debug!(target: "engine", "ctx indicates close epoch");
             let tally = self.ctx.close_epoch_tally.clone().unwrap_or_default();

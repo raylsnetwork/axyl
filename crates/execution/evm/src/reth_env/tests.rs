@@ -930,10 +930,7 @@ async fn test_close_epochs_with_dynamic_committee() -> eyre::Result<()> {
         TransactionFactory::new_random_from_seed(&mut StdRng::seed_from_u64(33));
     let governance = governance_multisig.address();
     let tmp_genesis = rayls_infrastructure_types::test_genesis().extend_accounts([
-        (
-            governance,
-            GenesisAccount::default().with_balance(U256::from((50_000_000 * 10) ^ 18)),
-        ),
+        (governance, GenesisAccount::default().with_balance(U256::from((50_000_000 * 10) ^ 18))),
         (
             new_validator_eoa.address(),
             GenesisAccount::default()
@@ -960,11 +957,8 @@ async fn test_close_epochs_with_dynamic_committee() -> eyre::Result<()> {
     let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
 
     // Build a RaylsChainSpec with DynamicCommitteeSizing active from block 0
-    let rayls_chain_spec: Arc<RaylsChainSpec> = Arc::new(
-        RaylsChainSpec::builder(chain.clone())
-            .dynamic_committee_sizing(0)
-            .build(),
-    );
+    let rayls_chain_spec: Arc<RaylsChainSpec> =
+        Arc::new(RaylsChainSpec::builder(chain.clone()).dynamic_committee_sizing(0).build());
 
     // governance allowlists the new validator
     let calldata =
@@ -1041,15 +1035,14 @@ async fn test_close_epochs_with_dynamic_committee() -> eyre::Result<()> {
     // create env with custom RaylsChainSpec
     let tmp_dir = TempDir::new()?;
     let task_manager = TaskManager::new("Test Task Manager");
-    let reth_env =
-        RethEnv::new_for_temp_chain_with_rayls_spec(
-            chain.clone(),
-            rayls_chain_spec.clone(),
-            tmp_dir.path(),
-            &task_manager,
-            None,
-        )
-        .await?;
+    let reth_env = RethEnv::new_for_temp_chain_with_rayls_spec(
+        chain.clone(),
+        rayls_chain_spec.clone(),
+        tmp_dir.path(),
+        &task_manager,
+        None,
+    )
+    .await?;
 
     // verify fork is active
     assert!(
@@ -1108,9 +1101,8 @@ async fn test_close_epochs_with_dynamic_committee() -> eyre::Result<()> {
         .evm_factory()
         .create_evm(&mut db, reth_env.evm_config.evm_env(canonical_header.header())?);
 
-    let calldata = ConsensusRegistry::getEpochInfoCall { epoch: expected_epoch + 2 }
-        .abi_encode()
-        .into();
+    let calldata =
+        ConsensusRegistry::getEpochInfoCall { epoch: expected_epoch + 2 }.abi_encode().into();
     let future_epoch_info = reth_env
         .call_consensus_registry::<_, ConsensusRegistry::EpochInfo>(&mut rayls_evm, calldata)?;
 
@@ -1135,9 +1127,9 @@ async fn test_close_epochs_with_dynamic_committee() -> eyre::Result<()> {
     let block3 = execute_payload_and_update_canonical_chain(&reth_env, payload, vec![]).await?;
     let canonical_header = block3.recovered_block.clone_sealed_header();
 
-    // Current epoch committee should now be 6 (the 6-validator committee becomes current at epoch 3)
-    let EpochState { epoch: current_epoch, .. } =
-        reth_env.epoch_state_from_canonical_tip()?;
+    // Current epoch committee should now be 6 (the 6-validator committee becomes current at epoch
+    // 3)
+    let EpochState { epoch: current_epoch, .. } = reth_env.epoch_state_from_canonical_tip()?;
     assert_eq!(current_epoch, expected_epoch);
     // The 6-validator committee is stored for epoch 3 (two epochs ahead at block 2).
     // We need to wait until block 5 (close epoch 2) for it to become current.
@@ -1153,12 +1145,15 @@ async fn test_close_epochs_with_dynamic_committee() -> eyre::Result<()> {
         .evm_config
         .evm_factory()
         .create_evm(&mut db, reth_env.evm_config.evm_env(canonical_header.header())?);
-    let calldata = ConsensusRegistry::getEpochInfoCall { epoch: current_epoch + 1 }
-        .abi_encode()
-        .into();
+    let calldata =
+        ConsensusRegistry::getEpochInfoCall { epoch: current_epoch + 1 }.abi_encode().into();
     let future_epoch_info = reth_env
         .call_consensus_registry::<_, ConsensusRegistry::EpochInfo>(&mut rayls_evm, calldata)?;
-    assert_eq!(future_epoch_info.committee.len(), 6, "future epoch (epoch 3) must have 6 validators");
+    assert_eq!(
+        future_epoch_info.committee.len(),
+        6,
+        "future epoch (epoch 3) must have 6 validators"
+    );
 
     // ── Block 4: no epoch close, validator 2 begins exit ──
     let calldata = ConsensusRegistry::beginExitCall {}.abi_encode().into();
@@ -1220,19 +1215,13 @@ async fn test_close_epochs_with_dynamic_committee() -> eyre::Result<()> {
     assert_eq!(validator_2_info.currentStatus, ValidatorStatus::Exited);
 
     // Future committee should have shrunk to 5 (validator 2 excluded)
-    let calldata = ConsensusRegistry::getEpochInfoCall { epoch: expected_epoch + 1 }
-        .abi_encode()
-        .into();
+    let calldata =
+        ConsensusRegistry::getEpochInfoCall { epoch: expected_epoch + 1 }.abi_encode().into();
     let shrunken_epoch_info = reth_env
         .call_consensus_registry::<_, ConsensusRegistry::EpochInfo>(&mut rayls_evm, calldata)?;
 
-    let expected_sorted_5 = vec![
-        validator_1,
-        validator_3,
-        validator_4,
-        validator_5,
-        new_validator.execution_address,
-    ];
+    let expected_sorted_5 =
+        vec![validator_1, validator_3, validator_4, validator_5, new_validator.execution_address];
     assert_eq!(
         shrunken_epoch_info.committee, expected_sorted_5,
         "dynamic committee must shrink to 5 after validator 2 exits"
