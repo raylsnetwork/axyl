@@ -366,7 +366,7 @@ where
         Ok(bytes)
     }
 
-    /// Read eligible validators from latest state and shuffle the committee deterministically.
+    /// Prepares the next committee from the latest state
     fn new_committee(&mut self, randomness: B256) -> RaylsRethResult<Vec<Address>> {
         let block_number = self.evm.block().number().saturating_to::<u64>();
         if !self.spec.is_dynamic_committee_sizing_active_at_block(block_number) {
@@ -502,8 +502,8 @@ where
         }
 
         let new_committee = if is_dynamic_committee_sizing_active {
-            // this function returns (SmartContract implementation) Active + PendingActivation +
-            // PendingExit
+            // get_active_validators() returns Active + PendingActivation + PendingExit;
+            // we exclude PendingExit to get only the eligible validators.
             let validators = self.get_active_validators()?;
             validators
                 .into_iter()

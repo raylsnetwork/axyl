@@ -1107,7 +1107,7 @@ async fn test_close_epochs_with_dynamic_committee() -> eyre::Result<()> {
     expected_epoch += 1;
 
     // Dynamic committee: 6 validators sorted by address (no truncate)
-    let expected_sorted_6 = vec![
+    let mut expected_sorted_6 = vec![
         validator_1,
         validator_3,
         validator_4,
@@ -1115,6 +1115,7 @@ async fn test_close_epochs_with_dynamic_committee() -> eyre::Result<()> {
         validator_2_address,
         new_validator.execution_address,
     ];
+    expected_sorted_6.sort();
     assert_eq!(
         future_epoch_info.committee, expected_sorted_6,
         "dynamic committee must include all 6 active validators sorted by address (no truncate)"
@@ -1215,8 +1216,9 @@ async fn test_close_epochs_with_dynamic_committee() -> eyre::Result<()> {
     let shrunken_epoch_info = reth_env
         .call_consensus_registry::<_, ConsensusRegistry::EpochInfo>(&mut rayls_evm, calldata)?;
 
-    let expected_sorted_5 =
+    let mut expected_sorted_5 =
         vec![validator_1, validator_3, validator_4, validator_5, new_validator.execution_address];
+    expected_sorted_5.sort();
     assert_eq!(
         shrunken_epoch_info.committee, expected_sorted_5,
         "dynamic committee must shrink to 5 after validator 2 exits"
