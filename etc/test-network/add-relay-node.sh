@@ -21,6 +21,8 @@
 #   ADDRESS=0x<operator> ./add-relay-node.sh [INDEX]       # add, stakeable later via stake-relay-node.sh
 #   DNSMASQ_PORT=5354 ./add-relay-node.sh [INDEX]          # outsider: resolve committee via the public relay view
 #   DNSMASQ_HOST=10.0.0.5 ./add-relay-node.sh [INDEX]      # join from another host: point at that resolver's address
+#   RELAY_HOST=10.0.0.6 ./add-relay-node.sh [INDEX]        # join from another host: advertise this node's relay at
+#                                                          # this host's IP so the committee can dial it back
 
 set -e
 
@@ -36,8 +38,13 @@ cd "$scriptDir/../.."
 NODE_NUM="${1:-5}"
 BUILD_CONFIG="${BUILD_CONFIG:-release}"
 LOG_LEVEL="${LOG_LEVEL:-info}"
-# Relay ip/port convention must match local-testnet.sh.
-RELAY_HOST="127.0.0.1"
+# Relay ip/port convention must match local-testnet.sh. RELAY_HOST is the IP baked into this node's
+# advertised relay-circuit address (what other nodes dial to reach it through its relay). Default
+# 127.0.0.1 (single host). When joining from ANOTHER machine, set RELAY_HOST to THIS host's
+# LAN/public IP so the committee can dial this node back through its relay -- the relay server
+# already listens on all interfaces, so it's reachable there. Must be set at first add (the relay
+# address is baked into the node at keygen and does not change on restart).
+RELAY_HOST="${RELAY_HOST:-127.0.0.1}"
 RELAY_BASE_PORT=50000
 # Local dnsmasq port used by --relay-dns. A newcomer is an outsider, so point it at the network's
 # PUBLIC view (relay records): DNSMASQ_PORT=5354 when the network was started with MULTI_LISTEN; a

@@ -34,8 +34,11 @@ DNSMASQ_BIND=127.0.0.1 RELAY_PUBLIC_HOST=127.0.0.1 MULTI_LISTEN=1 MULTI_LISTEN_B
 ./etc/test-network/local-testnet.sh --export-join-bundle
 
 # 2. add node 6 as a relayed OUTSIDER (resolves the committee via the public/relay DNS view).
-#    DNSMASQ_HOST shown at its single-host default; from ANOTHER machine set DNSMASQ_HOST=<this-host-IP>.
-DNSMASQ_HOST=127.0.0.1 DNSMASQ_PORT=5354 ./etc/test-network/add-relay-node.sh 6
+#    Hosts shown at single-host defaults. From ANOTHER machine set BOTH: DNSMASQ_HOST=<committee-host-IP>
+#    (resolver to reach the committee) and RELAY_HOST=<this-host-IP> (advertise THIS node's relay at a
+#    reachable IP so the committee can dial it back). RELAY_HOST must be set on the FIRST add — the
+#    relay address is baked at keygen and won't change on restart.
+DNSMASQ_HOST=127.0.0.1 RELAY_HOST=127.0.0.1 DNSMASQ_PORT=5354 ./etc/test-network/add-relay-node.sh 6
 
 # 3. stake it into the committee (waits for the chain to be ready, then mint→allowlist→approve→stake→activate)
 #    RPC_URL must point at a synced node's RPC. Use node-6's own port so it works on either host:
