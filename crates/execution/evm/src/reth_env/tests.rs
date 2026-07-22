@@ -1082,13 +1082,12 @@ async fn test_close_epochs_with_dynamic_committee() -> eyre::Result<()> {
     // With DynamicCommitteeSizing the future committee is deterministic (sorted, no shuffle).
     // new_validator is PendingActivation at this point, so it is included.
     // Future committee = 6 validators sorted by address.
-    expected_epoch += 1;
     let consensus_output = consensus_output_for_tests(2, expected_epoch, 2);
     let payload = RLPayload::new_for_test(canonical_header, &consensus_output);
     let block2 = execute_payload_and_update_canonical_chain(&reth_env, payload, vec![]).await?;
     let canonical_header = block2.recovered_block.clone_sealed_header();
 
-    // Read future committee (2 epochs ahead)
+    // Read future committee (3 epochs ahead of the one that is closing)
     let state = StateProviderDatabase::new(reth_env.latest()?);
     let mut cached_reads = CachedReads::default();
     let mut db = State::builder()
@@ -1102,9 +1101,10 @@ async fn test_close_epochs_with_dynamic_committee() -> eyre::Result<()> {
         .create_evm(&mut db, reth_env.evm_config.evm_env(canonical_header.header())?);
 
     let calldata =
-        ConsensusRegistry::getEpochInfoCall { epoch: expected_epoch + 2 }.abi_encode().into();
+        ConsensusRegistry::getEpochInfoCall { epoch: expected_epoch + 3 }.abi_encode().into();
     let future_epoch_info = reth_env
         .call_consensus_registry::<_, ConsensusRegistry::EpochInfo>(&mut rayls_evm, calldata)?;
+    expected_epoch += 1;
 
     // Dynamic committee: 6 validators sorted by address (no truncate)
     let expected_sorted_6 = vec![
@@ -1121,18 +1121,15 @@ async fn test_close_epochs_with_dynamic_committee() -> eyre::Result<()> {
     );
 
     // ── Block 3: close epoch 1 ──
-    expected_epoch += 1;
     let consensus_output = consensus_output_for_tests(2, expected_epoch, 3);
     let payload = RLPayload::new_for_test(canonical_header, &consensus_output);
     let block3 = execute_payload_and_update_canonical_chain(&reth_env, payload, vec![]).await?;
     let canonical_header = block3.recovered_block.clone_sealed_header();
 
-    // Current epoch committee should now be 6 (the 6-validator committee becomes current at epoch
-    // 3)
-    let EpochState { epoch: current_epoch, .. } = reth_env.epoch_state_from_canonical_tip()?;
-    assert_eq!(current_epoch, expected_epoch);
     // The 6-validator committee is stored for epoch 3 (two epochs ahead at block 2).
-    // We need to wait until block 5 (close epoch 2) for it to become current.
+    // It becomes current at epoch 3, which is after block 5 closes epoch 2.
+    let EpochState { epoch: current_epoch, .. } = reth_env.epoch_state_from_canonical_tip()?;
+    assert_eq!(current_epoch, expected_epoch + 1);
     // For now, check the future epoch (epoch 3) which has the 6-validator committee.
     let state = StateProviderDatabase::new(reth_env.latest()?);
     let mut cached_reads = CachedReads::default();
@@ -1153,6 +1150,7 @@ async fn test_close_epochs_with_dynamic_committee() -> eyre::Result<()> {
         future_epoch_info.committee, expected_sorted_6,
         "future epoch (epoch 3) must have 6 validators"
     );
+    expected_epoch += 1;
 
     // ── Block 4: no epoch close, validator 2 begins exit ──
     let calldata = ConsensusRegistry::beginExitCall {}.abi_encode().into();
@@ -1164,7 +1162,6 @@ async fn test_close_epochs_with_dynamic_committee() -> eyre::Result<()> {
         U256::ZERO,
         calldata,
     );
-    expected_epoch += 1;
     let mut consensus_output = consensus_output_for_tests(2, expected_epoch, 4);
     consensus_output.close_epoch = false;
     let payload = RLPayload::new_for_test(canonical_header, &consensus_output);
@@ -1173,24 +1170,24 @@ async fn test_close_epochs_with_dynamic_committee() -> eyre::Result<()> {
     let canonical_header = block4.recovered_block.clone_sealed_header();
 
     // ── Block 5: close epoch 2 ──
-    expected_epoch += 1;
     let consensus_output = consensus_output_for_tests(2, expected_epoch, 5);
     let payload = RLPayload::new_for_test(canonical_header, &consensus_output);
     let block5 = execute_payload_and_update_canonical_chain(&reth_env, payload, vec![]).await?;
+    expected_epoch += 1;
     let canonical_header = block5.recovered_block.clone_sealed_header();
 
     // ── Block 6: close epoch 3 ──
-    expected_epoch += 1;
     let consensus_output = consensus_output_for_tests(2, expected_epoch, 6);
     let payload = RLPayload::new_for_test(canonical_header, &consensus_output);
     let block6 = execute_payload_and_update_canonical_chain(&reth_env, payload, vec![]).await?;
+    expected_epoch += 1;
     let canonical_header = block6.recovered_block.clone_sealed_header();
 
     // ── Block 7: close epoch 4 ──
-    expected_epoch += 1;
     let consensus_output = consensus_output_for_tests(2, expected_epoch, 7);
     let payload = RLPayload::new_for_test(canonical_header.clone(), &consensus_output);
     execute_payload_and_update_canonical_chain(&reth_env, payload, vec![]).await?;
+    expected_epoch += 1;
 
     // validator 2 should now be Exited
     let state = StateProviderDatabase::new(reth_env.latest()?);
