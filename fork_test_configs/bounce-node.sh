@@ -15,6 +15,9 @@
 #                               to reach the committee (default 5353, the private/direct view;
 #                               set DNSMASQ_PORT=5354 for the public/relay view). Matches
 #                               add-relay-node.sh's default so add + bounce stay consistent.
+#                               DNSMASQ_HOST selects the resolver's address (default 127.0.0.1); set
+#                               it to the committee host's IP to bounce a node that joined from
+#                               another machine.
 #
 # stop is graceful and waits INDEFINITELY for a clean shutdown (no kill -9), so a hung shutdown
 # blocks the loop here on purpose -- inspect the node's log instead of losing the failure.
@@ -41,8 +44,12 @@ if [[ "$ADDED" == "1" ]]; then
     INSTANCE=$((100 + NODE_NUM))
     RPC_PORT=$((8545 - (INSTANCE - 1)))
     DNSMASQ_PORT="${DNSMASQ_PORT:-5353}"
+    # Resolver host the respawned node points RAYLS_DNS_SERVER at (add-relay-node.sh sets it on
+    # every start, not just the first). Default loopback (single-host); set DNSMASQ_HOST=<committee-IP>
+    # to bounce a node that joined from another machine, or it won't re-resolve the committee.
+    DNSMASQ_HOST="${DNSMASQ_HOST:-127.0.0.1}"
     stop_node()  { bash "$STOP_RELAY_NODE_SCRIPT" "$NODE_NUM"; }
-    start_node() { DNSMASQ_PORT="$DNSMASQ_PORT" bash "$ADD_RELAY_NODE_SCRIPT" "$NODE_NUM"; }
+    start_node() { DNSMASQ_HOST="$DNSMASQ_HOST" DNSMASQ_PORT="$DNSMASQ_PORT" bash "$ADD_RELAY_NODE_SCRIPT" "$NODE_NUM"; }
 else
     SEQ="$IDX"
     LABEL="validator-$((SEQ + 1))"
