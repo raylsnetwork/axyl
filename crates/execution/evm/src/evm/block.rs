@@ -399,7 +399,7 @@ where
         let new_committee_addresses =
             new_committee.into_iter().map(|v| v.validatorAddress).collect::<Vec<_>>();
 
-        trace!(target: "engine",  ?new_committee_size, ?new_committee_addresses, "truncated shuffle for new committee");
+        trace!(target: "engine",  ?new_committee_size, ?new_committee_addresses, "new committee");
 
         Ok(new_committee_addresses)
     }
@@ -517,7 +517,7 @@ where
             target: "engine",
             for_epoch = epoch + 3,
             new_committee_size = new_committee.len(),
-            "next_committee: new comittee size"
+            "next_committee: new committee size"
         );
 
         // this will fail on-chain if incorrect
@@ -849,8 +849,7 @@ where
         // don't support prague deposit requests
         let requests = Requests::default();
 
-        // potentially close epoch boundary (current we don't need the randomness data because
-        // validator set it not shuffled)
+        // potentially close epoch boundary
         if let Some(randomness) = self.ctx.close_epoch {
             debug!(target: "engine", "ctx indicates close epoch");
             let tally = self.ctx.close_epoch_tally.clone().unwrap_or_default();

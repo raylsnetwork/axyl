@@ -170,13 +170,13 @@ pub const MAINNET_EMPTY_OUTPUT_BLOCK_BLOCK: u64 = 3_569_194;
 pub const LOCAL_EMPTY_OUTPUT_BLOCK_BLOCK: u64 = 0;
 
 /// DynamicCommitteeSizing activation block on the Rayls devnet
-pub const DEVNET_DYNAMIC_COMMITTEE_SIZING_BLOCK: u64 = 0;
+pub const DEVNET_DYNAMIC_COMMITTEE_SIZING_BLOCK: u64 = u64::MAX;
 
 /// DynamicCommitteeSizing activation block on the Rayls testnet
-pub const TESTNET_DYNAMIC_COMMITTEE_SIZING_BLOCK: u64 = 0;
+pub const TESTNET_DYNAMIC_COMMITTEE_SIZING_BLOCK: u64 = u64::MAX;
 
 /// DynamicCommitteeSizing activation block on the Rayls mainnet
-pub const MAINNET_DYNAMIC_COMMITTEE_SIZING_BLOCK: u64 = 0;
+pub const MAINNET_DYNAMIC_COMMITTEE_SIZING_BLOCK: u64 = u64::MAX;
 
 /// DynamicCommitteeSizing activation block on the local sandbox network.
 pub const LOCAL_DYNAMIC_COMMITTEE_SIZING_BLOCK: u64 = 0;
@@ -217,7 +217,10 @@ impl RaylsHardFork {
             (Self::TransactionLoadBalancing, ForkCondition::Block(DEVNET_LOAD_BALANCING_BLOCK)),
             (Self::UsdrSupplyCorrection, ForkCondition::Never),
             (Self::EmptyOutputBlock, ForkCondition::Block(DEVNET_EMPTY_OUTPUT_BLOCK_BLOCK)),
-            (Self::DynamicCommitteeSizing, ForkCondition::Never),
+            (
+                Self::DynamicCommitteeSizing,
+                ForkCondition::Block(DEVNET_DYNAMIC_COMMITTEE_SIZING_BLOCK),
+            ),
         ]
     }
 
@@ -236,7 +239,10 @@ impl RaylsHardFork {
             (Self::TransactionLoadBalancing, ForkCondition::Block(TESTNET_LOAD_BALANCING_BLOCK)),
             (Self::UsdrSupplyCorrection, ForkCondition::Never),
             (Self::EmptyOutputBlock, ForkCondition::Block(TESTNET_EMPTY_OUTPUT_BLOCK_BLOCK)),
-            (Self::DynamicCommitteeSizing, ForkCondition::Never),
+            (
+                Self::DynamicCommitteeSizing,
+                ForkCondition::Block(TESTNET_DYNAMIC_COMMITTEE_SIZING_BLOCK),
+            ),
         ]
     }
 
@@ -260,7 +266,10 @@ impl RaylsHardFork {
                 ForkCondition::Block(MAINNET_USDR_SUPPLY_CORRECTION_BLOCK),
             ),
             (Self::EmptyOutputBlock, ForkCondition::Block(MAINNET_EMPTY_OUTPUT_BLOCK_BLOCK)),
-            (Self::DynamicCommitteeSizing, ForkCondition::Never),
+            (
+                Self::DynamicCommitteeSizing,
+                ForkCondition::Block(MAINNET_DYNAMIC_COMMITTEE_SIZING_BLOCK),
+            ),
         ]
     }
 
