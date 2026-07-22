@@ -324,7 +324,7 @@ start_dnsmasq() {
     # /etc/dnsmasq.d/* on the host). --log-queries: show each lookup so failures are visible.
     local args=(
         --no-daemon --conf-file=/dev/null --no-resolv --no-hosts --log-queries
-        --port="$port" --listen-address=127.0.0.1 --bind-interfaces
+        --port="$port" --listen-address="$DNSMASQ_BIND" --bind-interfaces
     )
     for ((i=0; i<NUM_VALIDATORS; i++)); do
         local host="v$((i+1)).${RELAY_DNS_DOMAIN}"
@@ -342,15 +342,40 @@ start_dnsmasq() {
             if [[ "$view" == "direct" ]]; then
                 args+=(--txt-record="_dnsaddr.${host},dnsaddr=/ip4/127.0.0.1/udp/${direct_ports[$j]}/quic-v1/p2p/${dst}")
             else
-                args+=(--txt-record="_dnsaddr.${host},dnsaddr=${RELAY_A_ADDR[$i]}/p2p-circuit/p2p/${dst}")
-                args+=(--txt-record="_dnsaddr.${host},dnsaddr=${RELAY_B_ADDR[$i]}/p2p-circuit/p2p/${dst}")
+                # Advertise the relay at RELAY_PUBLIC_HOST (default RELAY_HOST) so a cross-host
+                # joiner resolves a reachable relay IP, not loopback. RELAY_{A,B}_ADDR bake in
+                # RELAY_HOST for the validators' own (co-located) reservations; rewrite just the ip4
+                # host for the public record.
+                local relay_a="${RELAY_A_ADDR[$i]/\/ip4\/${RELAY_HOST}\//\/ip4\/${RELAY_PUBLIC_HOST}\/}"
+                local relay_b="${RELAY_B_ADDR[$i]/\/ip4\/${RELAY_HOST}\//\/ip4\/${RELAY_PUBLIC_HOST}\/}"
+                args+=(--txt-record="_dnsaddr.${host},dnsaddr=${relay_a}/p2p-circuit/p2p/${dst}")
+                args+=(--txt-record="_dnsaddr.${host},dnsaddr=${relay_b}/p2p-circuit/p2p/${dst}")
             fi
         done
     done
     dnsmasq "${args[@]}" >> "${ROOTDIR}/dnsmasq-${view}.log" 2>&1 &
     echo $! > "${ROOTDIR}/dnsmasq-${view}.pid"
-    echo "dnsmasq[${view}] on 127.0.0.1:${port} serving ${NUM_VALIDATORS} validators' /dnsaddr"
+    echo "dnsmasq[${view}] on ${DNSMASQ_BIND}:${port} serving ${NUM_VALIDATORS} validators' /dnsaddr"
     sleep 1
+}
+
+# Bundle the three files a follower needs (genesis.yaml + committee.yaml + parameters.yaml) so they
+# can be shipped to another host and dropped in where add-relay-node.sh expects them. Archiving with
+# `-C local-validators` stores them as genesis/... + parameters.yaml, so extracting with the same
+# `-C` on the other host restores the exact tree -- no path munging. Arg: optional output file.
+export_join_bundle() {
+    local ROOTDIR="$scriptDir/local-validators"
+    local out="${1:-join-bundle.tgz}"
+    local missing=0
+    for f in genesis/genesis.yaml genesis/committee.yaml parameters.yaml; do
+        [[ -f "${ROOTDIR}/${f}" ]] || { echo "Error: missing ${ROOTDIR}/${f}"; missing=1; }
+    done
+    [[ "$missing" == 0 ]] || { echo "Start the network first (--start) so the genesis exists."; exit 1; }
+    tar -czf "$out" -C "$ROOTDIR" genesis/genesis.yaml genesis/committee.yaml parameters.yaml
+    echo "wrote ${out} (genesis.yaml + committee.yaml + parameters.yaml)"
+    echo "on the joining host, from the repo root:"
+    echo "  mkdir -p etc/test-network/local-validators"
+    echo "  tar -xzf $(basename "$out") -C etc/test-network/local-validators"
 }
 
 while [ "$1" != "" ]; do
@@ -365,6 +390,14 @@ while [ "$1" != "" ]; do
         --stop-validator )
                 shift
                 STOP_VALIDATOR="$1"
+                ;;
+        --export-join-bundle )
+                EXPORT_JOIN_BUNDLE=1
+                # optional output filename follows
+                if [[ -n "$2" && "$2" != --* ]]; then
+                    JOIN_BUNDLE_FILE="$2"
+                    shift
+                fi
                 ;;
         --dev-funds )
                 shift
@@ -445,6 +478,13 @@ ANVIL_VALIDATOR_ADDRESSES=(
 # the identity is ed25519 with a 32-byte seed equal to the byte (validator index + 1) repeated 32x
 # (i.e. 0x01*32 for validator-1, 0x02*32 for validator-2, ...). See RELAY_KEYS.md for the secrets.
 RELAY_HOST="127.0.0.1"
+# The IP advertised for the relays in the PUBLIC (relay-circuit) dnsaddr records that outsiders
+# resolve -- as opposed to RELAY_HOST, which is how co-located validators dial their own relay to
+# reserve. Default RELAY_HOST (loopback, single-host testnet). To let a node on ANOTHER machine join,
+# set RELAY_PUBLIC_HOST to this host's LAN/public IP: the relay server already listens on all
+# interfaces, so it is reachable there, and the joiner then dials the relay at a real address instead
+# of 127.0.0.1. Only rewrites the public-view records; the direct/inside view stays loopback.
+RELAY_PUBLIC_HOST="${RELAY_PUBLIC_HOST:-$RELAY_HOST}"
 RELAY_BASE_PORT=50000
 # Each validator also gets a second "backup" relay (ports 51000+i) so it reserves on two relays.
 # Kill a validator's primary relay (relay-N) and the validator should stay up on its backup
@@ -452,13 +492,17 @@ RELAY_BASE_PORT=50000
 # re-reach it via the backup without /dnsaddr advertisement; the network continues on quorum.)
 RELAY_B_BASE_PORT=51000
 # --relay-dns only: validators advertise /dnsaddr/v<i>.${RELAY_DNS_DOMAIN}, resolved by a local
-# dnsmasq on 127.0.0.1:${DNSMASQ_PRIVATE_PORT} (high port, no systemd-resolved/NetworkManager conflict).
+# dnsmasq on ${DNSMASQ_BIND}:${DNSMASQ_PRIVATE_PORT} (high port, no systemd-resolved/NetworkManager conflict).
 RELAY_DNS_DOMAIN="rayls.test"
 DNSMASQ_PRIVATE_PORT=5353
 # MULTI_LISTEN only: the PUBLIC (outside) resolver. Serves the relay-circuit records that an outsider
 # joining later (add-relay-node.sh) resolves, while the inside view (direct records) stays on
-# DNSMASQ_PRIVATE_PORT. Distinct port so both dnsmasq instances can bind 127.0.0.1.
+# DNSMASQ_PRIVATE_PORT. Distinct port so both dnsmasq instances can bind the same address.
 DNSMASQ_PUBLIC_PORT=5354
+# The interface the local dnsmasq resolver(s) bind. Default 127.0.0.1 (loopback only) keeps the
+# resolver private to this host; set DNSMASQ_BIND=0.0.0.0 to serve the /dnsaddr records to other
+# hosts (e.g. an outsider joining from another machine that points RAYLS_DNS_SERVER here).
+DNSMASQ_BIND="${DNSMASQ_BIND:-127.0.0.1}"
 # MULTI_LISTEN=1 (relay/relay-dns only): in addition to the relay reservation, open a DIRECT QUIC
 # listener so each validator listens on BOTH a direct and a relayed address at once -- the
 # private-direct + public-relay topology. The listener binds MULTI_LISTEN_BIND (default 127.0.0.1,
@@ -676,6 +720,11 @@ else
 fi
 
 # Handle individual validator start/stop commands
+if [[ -n "$EXPORT_JOIN_BUNDLE" ]]; then
+    export_join_bundle "$JOIN_BUNDLE_FILE"
+    exit $?
+fi
+
 if [[ -n "$START_VALIDATOR" ]]; then
     # Rebuild the SAME relay/DNS env the --start loop uses, so a single-validator (re)start (e.g.
     # the chaos-kill loop) doesn't boot with a bare env and fail /dnsaddr resolution. Bring this

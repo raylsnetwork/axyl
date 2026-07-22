@@ -23,12 +23,19 @@ DEV_FUNDS=0x57b9D26eF4a6d4738E17932AC4d0191EfE6dBc88   # owner+minter; YOU must 
 DEV_FUNDS_KEY=0x<private-key-of-DEV_FUNDS>
 
 # 1. bring up the relay-fronted 4-validator mesh (inside=direct, outside=relay)
-#    MULTI_LISTEN_BIND=127.0.0.1 (the default) binds the direct listeners to loopback only;
-#    set it to 0.0.0.0 to expose them on all interfaces.
-MULTI_LISTEN=1 MULTI_LISTEN_BIND=127.0.0.1 ./etc/test-network/local-testnet.sh --start --dev-funds "$DEV_FUNDS" --relay-dns
+#    Knobs shown at their single-host defaults (loopback). To let a node join from ANOTHER machine,
+#    set DNSMASQ_BIND=0.0.0.0 (serve DNS off-host) and RELAY_PUBLIC_HOST=<this-host-IP> (advertise
+#    the relays at a reachable IP in the public :5354 records). MULTI_LISTEN_BIND stays loopback.
+DNSMASQ_BIND=127.0.0.1 RELAY_PUBLIC_HOST=127.0.0.1 MULTI_LISTEN=1 MULTI_LISTEN_BIND=127.0.0.1 \
+  ./etc/test-network/local-testnet.sh --start --dev-funds "$DEV_FUNDS" --relay-dns
 
-# 2. add node 6 as a relayed OUTSIDER (resolves the committee via the public/relay DNS view)
-DNSMASQ_PORT=5354 ./etc/test-network/add-relay-node.sh 6
+# 1b. (cross-host only) bundle the genesis a joiner needs; scp the .tgz to the other machine and
+#     run the extract command it prints there.
+./etc/test-network/local-testnet.sh --export-join-bundle
+
+# 2. add node 6 as a relayed OUTSIDER (resolves the committee via the public/relay DNS view).
+#    DNSMASQ_HOST shown at its single-host default; from ANOTHER machine set DNSMASQ_HOST=<this-host-IP>.
+DNSMASQ_HOST=127.0.0.1 DNSMASQ_PORT=5354 ./etc/test-network/add-relay-node.sh 6
 
 # 3. stake it into the committee (waits for the chain to be ready, then mint→allowlist→approve→stake→activate)
 ADMIN_PRIVATE_KEY="$DEV_FUNDS_KEY" ./etc/test-network/stake-relay-node.sh 6
@@ -54,6 +61,9 @@ for restarting a single node and the chaos loop.
   per-validator relay (primary + backup), and a split-horizon dnsmasq:
   - **inside/private view** on `:5353` → **direct** `127.0.0.1` records (base validators mesh directly)
   - **public view** on `:5354` → **relay circuit** records (how an outsider reaches the committee)
+  - both resolvers bind **`DNSMASQ_BIND` (default `127.0.0.1`, loopback only)**; set
+    `DNSMASQ_BIND=0.0.0.0` to serve the `/dnsaddr` records to another machine that points its
+    `RAYLS_DNS_SERVER` here.
 - `MULTI_LISTEN=1` makes each validator additionally open a **direct listener**
   (primary `40000+i`, worker `41000+i`) alongside its relay reservation. It binds
   **`MULTI_LISTEN_BIND` (default `127.0.0.1`, loopback only)** — matching the direct

@@ -20,6 +20,7 @@
 #   ./add-relay-node.sh [INDEX]                            # add as a pure observer (default INDEX=5)
 #   ADDRESS=0x<operator> ./add-relay-node.sh [INDEX]       # add, stakeable later via stake-relay-node.sh
 #   DNSMASQ_PORT=5354 ./add-relay-node.sh [INDEX]          # outsider: resolve committee via the public relay view
+#   DNSMASQ_HOST=10.0.0.5 ./add-relay-node.sh [INDEX]      # join from another host: point at that resolver's address
 
 set -e
 
@@ -42,6 +43,10 @@ RELAY_BASE_PORT=50000
 # PUBLIC view (relay records): DNSMASQ_PORT=5354 when the network was started with MULTI_LISTEN; a
 # plain --relay-dns network serves everything on 5353.
 DNSMASQ_PORT="${DNSMASQ_PORT:-5353}"
+# Host of the dnsmasq resolver this node points RAYLS_DNS_SERVER at. Default 127.0.0.1 (co-located
+# with the committee, as in the single-host testnet). Set DNSMASQ_HOST to the resolver's address
+# when joining from another machine (the network must have started dnsmasq with DNSMASQ_BIND=0.0.0.0).
+DNSMASQ_HOST="${DNSMASQ_HOST:-127.0.0.1}"
 
 # Operator identity for staking, derived deterministically from the index so the node is stakeable
 # later (stake-relay-node.sh ${NODE_NUM}) without tracking keys. OPERATOR_KEY is a small fixed
@@ -139,12 +144,12 @@ fi
 # If the network was started with --relay-dns, committee members are advertised as /dnsaddr and can
 # only be resolved against the local dnsmasq -- otherwise this node queries the system/public
 # resolver, gets NXDomain for *.rayls.test, resolves no circuit addresses, and never connects. Point
-# it at 127.0.0.1:$DNSMASQ_PORT like the base validators/observer do. This node's own address is a
+# it at $DNSMASQ_HOST:$DNSMASQ_PORT like the base validators/observer do. This node's own address is a
 # concrete circuit (--relay above), so no DNS records are needed for it.
 NODE_ENV=()
 if grep -q '/dnsaddr/' "${DATADIR}/genesis/committee.yaml"; then
-    echo "committee uses /dnsaddr -> resolving via local dnsmasq at 127.0.0.1:${DNSMASQ_PORT}"
-    NODE_ENV=("RAYLS_DNS_SERVER=127.0.0.1:${DNSMASQ_PORT}")
+    echo "committee uses /dnsaddr -> resolving via dnsmasq at ${DNSMASQ_HOST}:${DNSMASQ_PORT}"
+    NODE_ENV=("RAYLS_DNS_SERVER=${DNSMASQ_HOST}:${DNSMASQ_PORT}")
 fi
 
 # Mirror the base validators' txpool / db-growth flags (see local-testnet.sh) so this node behaves
