@@ -23,7 +23,9 @@ DEV_FUNDS=0x57b9D26eF4a6d4738E17932AC4d0191EfE6dBc88   # owner+minter; YOU must 
 DEV_FUNDS_KEY=0x<private-key-of-DEV_FUNDS>
 
 # 1. bring up the relay-fronted 4-validator mesh (inside=direct, outside=relay)
-MULTI_LISTEN=1 ./etc/test-network/local-testnet.sh --start --dev-funds "$DEV_FUNDS" --relay-dns
+#    MULTI_LISTEN_BIND=127.0.0.1 (the default) binds the direct listeners to loopback only;
+#    set it to 0.0.0.0 to expose them on all interfaces.
+MULTI_LISTEN=1 MULTI_LISTEN_BIND=127.0.0.1 ./etc/test-network/local-testnet.sh --start --dev-funds "$DEV_FUNDS" --relay-dns
 
 # 2. add node 6 as a relayed OUTSIDER (resolves the committee via the public/relay DNS view)
 DNSMASQ_PORT=5354 ./etc/test-network/add-relay-node.sh 6
@@ -52,8 +54,12 @@ for restarting a single node and the chaos loop.
   per-validator relay (primary + backup), and a split-horizon dnsmasq:
   - **inside/private view** on `:5353` → **direct** `127.0.0.1` records (base validators mesh directly)
   - **public view** on `:5354` → **relay circuit** records (how an outsider reaches the committee)
-- `MULTI_LISTEN=1` makes each validator additionally open a **direct listener on
-  `0.0.0.0`** (primary `40000+i`, worker `41000+i`) alongside its relay reservation.
+- `MULTI_LISTEN=1` makes each validator additionally open a **direct listener**
+  (primary `40000+i`, worker `41000+i`) alongside its relay reservation. It binds
+  **`MULTI_LISTEN_BIND` (default `127.0.0.1`, loopback only)** — matching the direct
+  `127.0.0.1` dnsaddr records, so co-located nodes mesh directly while the listener is
+  never exposed on an external interface (cross-host reach must go via a relay). Set
+  `MULTI_LISTEN_BIND=0.0.0.0` to bind all interfaces instead.
 - **Gotcha — genesis is created only once.** If `local-validators/` already
   exists the script *skips* config and **ignores `--dev-funds`**, reusing the old
   owner. To change owner/regenerate: `killall rayls-network rayls-relay dnsmasq;

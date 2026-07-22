@@ -294,15 +294,15 @@ build_relay_env() {
             "WORKER_RELAY_MULTIADDRS=${RELAY_B_ADDR[$i]}"
         )
     fi
-    # MULTI_LISTEN: also open a direct QUIC listener bound to 0.0.0.0, so this validator listens on
-    # BOTH a direct address (all interfaces) and its relay reservation(s) at once. The node appends
-    # /p2p itself, so pass the bare base multiaddr.
+    # MULTI_LISTEN: also open a direct QUIC listener bound to MULTI_LISTEN_BIND (default 127.0.0.1),
+    # so this validator listens on BOTH a direct address and its relay reservation(s) at once. The
+    # node appends /p2p itself, so pass the bare base multiaddr.
     if [[ "$MULTI_LISTEN" == "1" ]]; then
         RELAY_ENV+=(
-            "PRIMARY_LISTENER_MULTIADDR=/ip4/0.0.0.0/udp/$((PRIMARY_DIRECT_BASE + i))/quic-v1"
-            "WORKER_LISTENER_MULTIADDR=/ip4/0.0.0.0/udp/$((WORKER_DIRECT_BASE + i))/quic-v1"
+            "PRIMARY_LISTENER_MULTIADDR=/ip4/${MULTI_LISTEN_BIND}/udp/$((PRIMARY_DIRECT_BASE + i))/quic-v1"
+            "WORKER_LISTENER_MULTIADDR=/ip4/${MULTI_LISTEN_BIND}/udp/$((WORKER_DIRECT_BASE + i))/quic-v1"
         )
-        echo "  MULTI_LISTEN: direct 0.0.0.0:$((PRIMARY_DIRECT_BASE + i)) (primary) / 0.0.0.0:$((WORKER_DIRECT_BASE + i)) (worker), plus relay reservation"
+        echo "  MULTI_LISTEN: direct ${MULTI_LISTEN_BIND}:$((PRIMARY_DIRECT_BASE + i)) (primary) / ${MULTI_LISTEN_BIND}:$((WORKER_DIRECT_BASE + i)) (worker), plus relay reservation"
     fi
 }
 
@@ -460,13 +460,16 @@ DNSMASQ_PRIVATE_PORT=5353
 # DNSMASQ_PRIVATE_PORT. Distinct port so both dnsmasq instances can bind 127.0.0.1.
 DNSMASQ_PUBLIC_PORT=5354
 # MULTI_LISTEN=1 (relay/relay-dns only): in addition to the relay reservation, open a DIRECT QUIC
-# listener bound to 0.0.0.0 (all interfaces) so each validator listens on BOTH a direct and a
-# relayed address at once -- the private-direct + public-relay topology. 0.0.0.0 is a bind wildcard,
-# never advertised (the node still advertises its /dnsaddr), so no loopback alias/setup is needed.
+# listener so each validator listens on BOTH a direct and a relayed address at once -- the
+# private-direct + public-relay topology. The listener binds MULTI_LISTEN_BIND (default 127.0.0.1,
+# loopback only): co-located nodes reach it directly (matching the direct dnsaddr records, which
+# advertise 127.0.0.1) while it is never exposed on an external interface, so any cross-host reach
+# must go through a relay. Set MULTI_LISTEN_BIND=0.0.0.0 to bind all interfaces instead.
 # Direct ports mirror the relay scheme one band lower: primary 40000+i / worker 41000+i, i.e. exactly
 # 10000 below the validator's relay ports (relay A 50000+i / relay B 51000+i). Clear of reth's
-# 8545/9100 range. Each validator needs a unique port since 0.0.0.0:<port> is host-wide.
+# 8545/9100 range. Each validator needs a unique port since <bind>:<port> is host-wide.
 MULTI_LISTEN="${MULTI_LISTEN:-0}"
+MULTI_LISTEN_BIND="${MULTI_LISTEN_BIND:-127.0.0.1}"
 PRIMARY_DIRECT_BASE=40000
 WORKER_DIRECT_BASE=41000
 RELAY_PEER_IDS=(
