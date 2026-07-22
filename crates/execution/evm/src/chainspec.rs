@@ -49,6 +49,9 @@ hardfork!(
         /// Produce a fallback empty block for any consensus output that contributed no block
         /// (no batches, all deduped, or all parked), so every output maps to a block.
         EmptyOutputBlock,
+        /// Re-key genesis storage history from plaintext slot keys to hashed keys
+        /// so v2 archive reads reconstruct genesis-seeded storage (e.g. versions[0]).
+        GenesisStorageRekey,
     }
 );
 
@@ -166,6 +169,15 @@ pub const MAINNET_EMPTY_OUTPUT_BLOCK_BLOCK: u64 = 3_569_194;
 /// UsdrSupplyCorrection activation block on the Rayls mainnet.
 pub const MAINNET_USDR_SUPPLY_CORRECTION_BLOCK: u64 = 3_569_194;
 
+/// GenesisStorageRekey activation block on the Rayls devnet.
+pub const DEVNET_GENESIS_STORAGE_REKEY_BLOCK: u64 = u64::MAX;
+/// GenesisStorageRekey activation block on the Rayls testnet.
+pub const TESTNET_GENESIS_STORAGE_REKEY_BLOCK: u64 = u64::MAX;
+/// GenesisStorageRekey activation block on the Rayls mainnet.
+pub const MAINNET_GENESIS_STORAGE_REKEY_BLOCK: u64 = u64::MAX;
+/// GenesisStorageRekey activation block on the Rayls local network.
+pub const LOCAL_GENESIS_STORAGE_REKEY_BLOCK: u64 = 1;
+
 impl RaylsHardFork {
     /// Return the protocol version byte for this hardfork.
     pub const fn version_byte(self) -> u8 {
@@ -181,11 +193,12 @@ impl RaylsHardFork {
             Self::TransactionLoadBalancing => 0x09,
             Self::UsdrSupplyCorrection => 0x0a,
             Self::EmptyOutputBlock => 0x0b,
+            Self::GenesisStorageRekey => 0x0c,
         }
     }
 
     /// Devnet hardfork schedule.
-    pub const fn devnet() -> [(Self, ForkCondition); 11] {
+    pub const fn devnet() -> [(Self, ForkCondition); 12] {
         [
             (Self::Eip1559, ForkCondition::Block(DEVNET_EIP1559_BLOCK)),
             (Self::BatchDigestV2, ForkCondition::Block(DEVNET_BATCH_DIGEST_V2_BLOCK)),
@@ -201,11 +214,12 @@ impl RaylsHardFork {
             (Self::TransactionLoadBalancing, ForkCondition::Block(DEVNET_LOAD_BALANCING_BLOCK)),
             (Self::UsdrSupplyCorrection, ForkCondition::Never),
             (Self::EmptyOutputBlock, ForkCondition::Block(DEVNET_EMPTY_OUTPUT_BLOCK_BLOCK)),
+            (Self::GenesisStorageRekey, ForkCondition::Block(DEVNET_GENESIS_STORAGE_REKEY_BLOCK)),
         ]
     }
 
     /// Testnet hardfork schedule.
-    pub const fn testnet() -> [(Self, ForkCondition); 11] {
+    pub const fn testnet() -> [(Self, ForkCondition); 12] {
         [
             (Self::Eip1559, ForkCondition::Block(TESTNET_EIP1559_BLOCK)),
             (Self::BatchDigestV2, ForkCondition::Block(TESTNET_BATCH_DIGEST_V2_BLOCK)),
@@ -219,11 +233,12 @@ impl RaylsHardFork {
             (Self::TransactionLoadBalancing, ForkCondition::Block(TESTNET_LOAD_BALANCING_BLOCK)),
             (Self::UsdrSupplyCorrection, ForkCondition::Never),
             (Self::EmptyOutputBlock, ForkCondition::Block(TESTNET_EMPTY_OUTPUT_BLOCK_BLOCK)),
+            (Self::GenesisStorageRekey, ForkCondition::Block(TESTNET_GENESIS_STORAGE_REKEY_BLOCK)),
         ]
     }
 
     /// Mainnet hardfork schedule.
-    pub const fn mainnet() -> [(Self, ForkCondition); 11] {
+    pub const fn mainnet() -> [(Self, ForkCondition); 12] {
         [
             (Self::Eip1559, ForkCondition::Block(MAINNET_EIP1559_BLOCK)),
             (Self::BatchDigestV2, ForkCondition::Block(MAINNET_BATCH_DIGEST_V2_BLOCK)),
@@ -242,11 +257,12 @@ impl RaylsHardFork {
                 ForkCondition::Block(MAINNET_USDR_SUPPLY_CORRECTION_BLOCK),
             ),
             (Self::EmptyOutputBlock, ForkCondition::Block(MAINNET_EMPTY_OUTPUT_BLOCK_BLOCK)),
+            (Self::GenesisStorageRekey, ForkCondition::Block(MAINNET_GENESIS_STORAGE_REKEY_BLOCK)),
         ]
     }
 
     /// Local network hardfork schedule (first four hardforks active at genesis).
-    pub const fn local() -> [(Self, ForkCondition); 11] {
+    pub const fn local() -> [(Self, ForkCondition); 12] {
         [
             (Self::Eip1559, ForkCondition::Block(LOCAL_EIP1559_BLOCK)),
             (Self::BatchDigestV2, ForkCondition::Block(LOCAL_BATCH_DIGEST_V2_BLOCK)),
@@ -262,11 +278,12 @@ impl RaylsHardFork {
             (Self::TransactionLoadBalancing, ForkCondition::Block(LOCAL_LOAD_BALANCING_BLOCK)),
             (Self::UsdrSupplyCorrection, ForkCondition::Block(LOCAL_USDR_SUPPLY_CORRECTION_BLOCK)),
             (Self::EmptyOutputBlock, ForkCondition::Block(LOCAL_EMPTY_OUTPUT_BLOCK_BLOCK)),
+            (Self::GenesisStorageRekey, ForkCondition::Block(LOCAL_GENESIS_STORAGE_REKEY_BLOCK)),
         ]
     }
 
     /// Return the hardfork schedule for the given network.
-    pub const fn for_network(network: RaylsNetwork) -> [(Self, ForkCondition); 11] {
+    pub const fn for_network(network: RaylsNetwork) -> [(Self, ForkCondition); 12] {
         match network {
             RaylsNetwork::Devnet => Self::devnet(),
             RaylsNetwork::Testnet => Self::testnet(),
@@ -389,6 +406,11 @@ pub trait RaylsHardforks {
     /// Return true if the EmptyOutputBlock fork is active at `block`.
     fn is_empty_output_block_active_at_block(&self, block: u64) -> bool {
         self.is_rayls_fork_active_at_block(RaylsHardFork::EmptyOutputBlock, block)
+    }
+
+    /// Return true if the GenesisStorageRekey fork is active at `block`.
+    fn is_genesis_storage_rekey_active_at_block(&self, block: u64) -> bool {
+        self.is_rayls_fork_active_at_block(RaylsHardFork::GenesisStorageRekey, block)
     }
 
     /// Return the active version byte at `block`, if any.
@@ -552,6 +574,14 @@ impl RaylsChainSpecBuilder {
         self.inner
             .hardforks
             .insert(RaylsHardFork::Erc20PrecompileBytecode, ForkCondition::Block(block));
+        self
+    }
+
+    /// Activate GenesisStorageRekey at `block`.
+    pub fn genesis_storage_rekey(mut self, block: u64) -> Self {
+        self.inner
+            .hardforks
+            .insert(RaylsHardFork::GenesisStorageRekey, ForkCondition::Block(block));
         self
     }
 
@@ -813,7 +843,7 @@ mod tests {
             RaylsNetwork::Local,
         ] {
             let schedule = RaylsHardFork::for_network(network);
-            assert_eq!(schedule.len(), 11, "expected 11 hardforks for {network}");
+            assert_eq!(schedule.len(), 12, "expected 12 hardforks for {network}");
             assert_eq!(schedule[0].0, RaylsHardFork::Eip1559);
             assert_eq!(schedule[1].0, RaylsHardFork::BatchDigestV2);
             assert_eq!(schedule[2].0, RaylsHardFork::AdminTransfer);
@@ -825,6 +855,7 @@ mod tests {
             assert_eq!(schedule[8].0, RaylsHardFork::TransactionLoadBalancing);
             assert_eq!(schedule[9].0, RaylsHardFork::UsdrSupplyCorrection);
             assert_eq!(schedule[10].0, RaylsHardFork::EmptyOutputBlock);
+            assert_eq!(schedule[11].0, RaylsHardFork::GenesisStorageRekey);
         }
     }
 

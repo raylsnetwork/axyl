@@ -29,7 +29,6 @@ pub struct RethEnv {
     /// Type that fetches data from the database.
     pub(crate) blockchain_provider: BlockchainProvider<RaylsNode>,
     /// Provider factory for direct storage operations such as pipeline unwind.
-    #[cfg(feature = "archive-replay")]
     pub(crate) provider_factory: ProviderFactory<RaylsNode>,
     /// The type to configure the EVM for execution.
     pub(crate) evm_config: RaylsEvmConfig,

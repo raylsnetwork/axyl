@@ -379,7 +379,7 @@ impl EvmFactory for RaylsEvmFactory {
 }
 
 /// Ethereum block executor factory.
-#[derive(Debug, Clone, Default, Copy)]
+#[derive(Debug, Clone)]
 pub struct RaylsBlockExecutorFactory<
     R = AlloyReceiptBuilder,
     Spec = EthSpec,
@@ -391,14 +391,26 @@ pub struct RaylsBlockExecutorFactory<
     spec: Spec,
     /// EVM factory.
     evm_factory: EvmFactory,
+    /// Provider factory for RocksDB access (needed by genesis storage migration).
+    pub(crate) provider_factory: Option<Arc<reth_provider::ProviderFactory<crate::traits::RaylsNode>>>,
 }
 
 // alloy-evm
 impl<R, Spec, EvmFactory> RaylsBlockExecutorFactory<R, Spec, EvmFactory> {
     /// Creates a new [`RaylsBlockExecutorFactory`] with the given spec, [`EvmFactory`], and
     /// [`ReceiptBuilder`].
-    pub const fn new(receipt_builder: R, spec: Spec, evm_factory: EvmFactory) -> Self {
-        Self { receipt_builder, spec, evm_factory }
+    pub fn new(receipt_builder: R, spec: Spec, evm_factory: EvmFactory) -> Self {
+        Self { receipt_builder, spec, evm_factory, provider_factory: None }
+    }
+
+    /// Creates a new [`RaylsBlockExecutorFactory`] with a provider factory for RocksDB access.
+    pub fn new_with_provider_factory(
+        receipt_builder: R,
+        spec: Spec,
+        evm_factory: EvmFactory,
+        provider_factory: Option<Arc<reth_provider::ProviderFactory<crate::traits::RaylsNode>>>,
+    ) -> Self {
+        Self { receipt_builder, spec, evm_factory, provider_factory }
     }
 
     /// Exposes the receipt builder.
@@ -443,6 +455,9 @@ where
         DB: Database + 'a,
         I: Inspector<EvmF::Context<&'a mut State<DB>>> + 'a,
     {
-        RaylsBlockExecutor::new(evm, ctx, &self.spec, &self.receipt_builder)
+        RaylsBlockExecutor::new_with_provider_factory(
+            evm, ctx, &self.spec, &self.receipt_builder,
+            self.provider_factory.clone(),
+        )
     }
 }

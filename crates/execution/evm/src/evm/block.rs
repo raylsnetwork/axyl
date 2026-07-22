@@ -128,6 +128,8 @@ pub(crate) struct RaylsBlockExecutor<Evm, Spec, R: ReceiptBuilder> {
     gas_used: u64,
     /// Hook for per-transaction state change notifications
     state_hook: Option<Box<dyn OnStateHook>>,
+    /// Provider factory for RocksDB access (needed by genesis storage migration).
+    provider_factory: Option<Arc<reth_provider::ProviderFactory<crate::traits::RaylsNode>>>,
 }
 
 impl<Evm: std::fmt::Debug, Spec: std::fmt::Debug, R: ReceiptBuilder> std::fmt::Debug
@@ -165,6 +167,17 @@ where
         spec: Spec,
         receipt_builder: R,
     ) -> Self {
+        Self::new_with_provider_factory(evm, ctx, spec, receipt_builder, None)
+    }
+
+    /// Creates a new [`RaylsBlockExecutor`] with a provider factory for RocksDB access.
+    pub(crate) fn new_with_provider_factory(
+        evm: Evm,
+        ctx: RaylsBlockExecutionCtx,
+        spec: Spec,
+        receipt_builder: R,
+        provider_factory: Option<Arc<reth_provider::ProviderFactory<crate::traits::RaylsNode>>>,
+    ) -> Self {
         Self {
             evm,
             ctx,
@@ -173,6 +186,7 @@ where
             spec,
             receipt_builder,
             state_hook: None,
+            provider_factory,
         }
     }
 
@@ -730,6 +744,7 @@ where
                 self.receipts.len(),
                 parent_number,
                 block_number,
+                self.provider_factory.as_ref().map(|v| &**v),
             )?;
         }
 

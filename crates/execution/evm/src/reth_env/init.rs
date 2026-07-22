@@ -69,18 +69,22 @@ impl RethEnv {
             builder = builder.min_base_fee(min_fee);
         }
         let chain_spec = Arc::new(builder.build());
-        let evm_config = RaylsEvmConfig::new(chain_spec.clone(), rewards_counter.clone());
         let task_spawner = task_manager.get_spawner();
         let runtime = reth_tasks::Runtime::with_existing_handle(tokio::runtime::Handle::current())?;
         let provider_factory = Self::init_provider_factory(
             &node_config,
-            chain_spec,
+            chain_spec.clone(),
             database.clone(),
             &task_spawner,
             runtime.clone(),
-            rewards_counter,
+            rewards_counter.clone(),
         )
         .await?;
+        let evm_config = RaylsEvmConfig::new_with_provider_factory(
+            chain_spec,
+            rewards_counter,
+            Some(Arc::new(provider_factory.clone())),
+        );
         let blockchain_provider = BlockchainProvider::new(provider_factory.clone())?;
         set_basefee_address(basefee_address);
 
@@ -133,7 +137,6 @@ impl RethEnv {
         Ok(Self {
             node_config,
             blockchain_provider,
-            #[cfg(feature = "archive-replay")]
             provider_factory,
             evm_config,
             task_spawner,
@@ -490,7 +493,6 @@ impl RethEnv {
     /// block-0 entry. This is a non-issue for replay-built archives, where that
     /// stage never runs; account history is written once by genesis init and only
     /// appended to.
-    #[cfg(feature = "archive-replay")]
     pub fn fix_genesis_account_history(&self) -> eyre::Result<()> {
         Self::fix_genesis_account_history_with(
             &self.provider_factory,
@@ -501,7 +503,6 @@ impl RethEnv {
 
     /// Testable core of [`Self::fix_genesis_account_history`]. Returns the number
     /// of accounts seeded.
-    #[cfg(feature = "archive-replay")]
     pub(crate) fn fix_genesis_account_history_with(
         provider_factory: &ProviderFactory<RaylsNode>,
         use_hashed_state: bool,
@@ -623,7 +624,6 @@ impl RethEnv {
     /// written by genesis init is intentionally left in place. It's never read by
     /// v2 (which looks up the hashed key) and deleting it is avoidable risk for no
     /// functional gain, so it's kept as harmless dead weight rather than removed.
-    #[cfg(feature = "archive-replay")]
     pub fn fix_genesis_history(&self) -> eyre::Result<()> {
         Self::fix_genesis_history_with(
             &self.provider_factory,
@@ -634,7 +634,6 @@ impl RethEnv {
 
     /// Testable core of [`Self::fix_genesis_history`]. Returns the number of
     /// storage slots re-keyed (0 when everything is already correct).
-    #[cfg(feature = "archive-replay")]
     pub(crate) fn fix_genesis_history_with(
         provider_factory: &ProviderFactory<RaylsNode>,
         use_hashed_state: bool,

@@ -19,6 +19,7 @@ use reth_evm::OnStateHook;
 use reth_revm::{
     bytecode::Bytecode,
     db::StorageWithOriginalValues,
+    primitives::HashMap,
     state::{Account as RevmAccount, AccountInfo, AccountStatus},
     State,
 };
@@ -54,6 +55,7 @@ pub(crate) fn apply_activated_migrations<DB: alloy_evm::Database>(
     receipt_count: usize,
     parent_number: u64,
     block_number: u64,
+    provider_factory: Option<&reth_provider::ProviderFactory<crate::traits::RaylsNode>>,
 ) -> Result<(), BlockExecutionError>
 where
     DB::Error: core::fmt::Display,
@@ -114,6 +116,32 @@ where
                 // Corrective migration: needs db read access to compute
                 // `slot + correction` at activation. See module docs.
                 usdr_supply_correction::usdr_supply_correction_state(db)?
+            }
+            RaylsHardFork::GenesisStorageRekey => {
+                let pf = provider_factory.expect("GenesisStorageRekey requires a provider factory");
+                info!(
+                    target: "engine",
+                    block_number,
+                    "Applying GenesisStorageRekey hardfork: re-keying genesis storage history"
+                );
+                crate::reth_env::RethEnv::fix_genesis_history_with(pf, true).map_err(|e| {
+                    BlockExecutionError::msg(format!(
+                        "GenesisStorageRekey: failed to re-key genesis storage: {e}"
+                    ))
+                })?;
+                info!(
+                    target: "engine",
+                    block_number,
+                    "Applying GenesisStorageRekey hardfork: seeding genesis account history"
+                );
+                crate::reth_env::RethEnv::fix_genesis_account_history_with(pf, true).map_err(
+                    |e| {
+                        BlockExecutionError::msg(format!(
+                            "GenesisStorageRekey: failed to seed genesis account history: {e}"
+                        ))
+                    },
+                )?;
+                HashMap::default()
             }
             // Continuous behavioral forks -- not one-shot migrations.
             RaylsHardFork::Eip1559
@@ -233,6 +261,7 @@ mod tests {
             0,
             TESTNET_ADMIN_TRANSFER_BLOCK - 1,
             TESTNET_ADMIN_TRANSFER_BLOCK,
+            None,
         )
         .expect("migration should succeed");
 
@@ -285,6 +314,7 @@ mod tests {
             0,
             crate::chainspec::TESTNET_ADMIN_TRANSFER_BLOCK - 2,
             crate::chainspec::TESTNET_ADMIN_TRANSFER_BLOCK - 1,
+            None,
         )
         .expect("migration should succeed");
 
@@ -306,6 +336,7 @@ mod tests {
             0,
             crate::chainspec::TESTNET_ADMIN_TRANSFER_BLOCK,
             crate::chainspec::TESTNET_ADMIN_TRANSFER_BLOCK + 1,
+            None,
         )
         .expect("should succeed");
 
@@ -329,6 +360,7 @@ mod tests {
             0,
             TESTNET_ADMIN_TRANSFER_BLOCK - 1,
             TESTNET_ADMIN_TRANSFER_BLOCK,
+            None,
         )
         .expect("migration should succeed");
 
@@ -378,6 +410,7 @@ mod tests {
             0,
             crate::chainspec::TESTNET_EIP1559_BLOCK - 1,
             crate::chainspec::TESTNET_EIP1559_BLOCK,
+            None,
         )
         .expect("should succeed");
 
@@ -400,6 +433,7 @@ mod tests {
             0,
             crate::chainspec::TESTNET_ADMIN_TRANSFER_BLOCK - 1,
             crate::chainspec::TESTNET_ADMIN_TRANSFER_BLOCK,
+            None,
         )
         .expect("should succeed");
 
@@ -436,6 +470,7 @@ mod tests {
             0,
             ACTIVATION_BLOCK - 1,
             ACTIVATION_BLOCK,
+            None,
         )
         .expect("migration should succeed");
 
@@ -467,6 +502,7 @@ mod tests {
             0,
             ACTIVATION_BLOCK - 2,
             ACTIVATION_BLOCK - 1,
+            None,
         )
         .expect("should succeed");
 
@@ -489,6 +525,7 @@ mod tests {
             0,
             ACTIVATION_BLOCK,
             ACTIVATION_BLOCK + 1,
+            None,
         )
         .expect("should succeed");
 

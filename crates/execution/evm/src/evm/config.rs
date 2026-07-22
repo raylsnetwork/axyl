@@ -37,21 +37,36 @@ pub struct RaylsEvmConfig<ChainSpec = RaylsChainSpec> {
     pub block_assembler: RaylsBlockAssembler<ChainSpec>,
     /// Counter that resolves epoch leader counts from the consensus DB.
     pub rewards_counter: RewardsCounter,
+    /// Provider factory for RocksDB access (needed by genesis storage migration).
+    /// `None` for test/temp chains that don't have a real provider factory.
+    pub provider_factory: Option<Arc<reth_provider::ProviderFactory<crate::traits::RaylsNode>>>,
 }
 
 impl RaylsEvmConfig {
     /// Creates a new Rayls EVM configuration with the given chain spec.
+    /// Use `new_with_provider_factory` when you have a real provider factory (production).
     pub fn new(chain_spec: Arc<RaylsChainSpec>, rewards_counter: RewardsCounter) -> Self {
+        Self::new_with_provider_factory(chain_spec, rewards_counter, None)
+    }
+
+    /// Creates a new Rayls EVM configuration with a provider factory for RocksDB access.
+    pub fn new_with_provider_factory(
+        chain_spec: Arc<RaylsChainSpec>,
+        rewards_counter: RewardsCounter,
+        provider_factory: Option<Arc<reth_provider::ProviderFactory<crate::traits::RaylsNode>>>,
+    ) -> Self {
         let evm_factory = RaylsEvmFactory::default();
         Self {
             block_assembler: RaylsBlockAssembler::new(chain_spec.clone()),
-            executor_factory: RaylsBlockExecutorFactory::new(
+            executor_factory: RaylsBlockExecutorFactory::new_with_provider_factory(
                 RethReceiptBuilder::default(),
                 chain_spec,
                 evm_factory,
+                provider_factory.clone(),
             ),
             evm_factory,
             rewards_counter,
+            provider_factory,
         }
     }
 
