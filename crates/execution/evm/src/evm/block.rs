@@ -16,7 +16,6 @@ use alloy::{
     sol_types::SolCall as _,
 };
 use alloy_evm::{block::StateChangeSource, eth::EthTxResult, tx::RecoveredTx as _, Database, Evm};
-use rand::{rngs::StdRng, Rng as _, SeedableRng as _};
 use rayls_infrastructure_types::{
     rewards::build_withdrawals, Address, Bytes, Encodable2718, ExecHeader, Receipt, SolValue,
     TransactionSigned, Withdrawals, B256, EMPTY_WITHDRAWALS, U256,
@@ -227,9 +226,9 @@ where
     }
 
     /// Apply the closing epoch call to ConsensusRegistry.
-    fn apply_closing_epoch_contract_call(&mut self, randomness: B256) -> RaylsRethResult<()> {
-        debug!(target: "engine", ?randomness, "applying closing contract call");
-        let calldata = self.generate_conclude_epoch_calldata(randomness)?;
+    fn apply_closing_epoch_contract_call(&mut self) -> RaylsRethResult<()> {
+        debug!(target: "engine", "applying closing contract call");
+        let calldata = self.generate_conclude_epoch_calldata()?;
         trace!(target: "engine", ?calldata, "close epoch calldata");
 
         // execute system call to consensus registry
@@ -313,9 +312,9 @@ where
     }
 
     /// Generate calldata for updating the ConsensusRegistry to conclude the epoch.
-    fn generate_conclude_epoch_calldata(&mut self, randomness: B256) -> RaylsRethResult<Bytes> {
+    fn generate_conclude_epoch_calldata(&mut self) -> RaylsRethResult<Bytes> {
         // shuffle all validators for new committee
-        let mut new_committee = self.shuffle_new_committee(randomness)?;
+        let mut new_committee = self.new_committee()?;
 
         if new_committee.is_empty() {
             let epoch = self.extract_epoch_from_nonce(self.ctx.nonce);
@@ -366,15 +365,12 @@ where
         Ok(bytes)
     }
 
-    /// Read eligible validators from latest state and shuffle the committee deterministically.
-    fn shuffle_new_committee(&mut self, randomness: B256) -> RaylsRethResult<Vec<Address>> {
+    /// Read eligible validators from latest state
+    fn new_committee(&mut self) -> RaylsRethResult<Vec<Address>> {
         let block_number = self.evm.block().number().saturating_to::<u64>();
 
-        let mut new_committee: Vec<ValidatorInfo> = self.next_committee(block_number)?;
+        let new_committee: Vec<ValidatorInfo> = self.next_committee(block_number)?;
         let new_committee_size = new_committee.len();
-
-        // read all active validators from consensus registry
-        // let all_active_validators = self.get_active_validators()?;
 
         info!(
             target: "engine",
@@ -396,64 +392,8 @@ where
             );
         }
 
-        // create seed from hashed bls agg signature
-        let mut seed = [0; 32];
-        seed.copy_from_slice(randomness.as_slice());
-        trace!(target: "engine", ?seed, "seed after");
-
-        // used as deterministic randomness
-        let mut rng = StdRng::from_seed(seed);
-
-        // 1) separate active and pending validators
-        // 2) check if active length is sufficient
-        // 3) if missing, randomly select from the pending validators (pre-fork only)
-        // TODO: Why we're getting pending exit from active?!
-        // let (pending_exit, mut active_validators): (Vec<_>, Vec<_>) = new_committee
-        //     .into_iter()
-        //     .partition(|v| v.currentStatus == ValidatorStatus::PendingExit);
-
-        // let active_validator_count = active_validators.len();
-        // let mut validators_for_shuffle = if active_validator_count >= new_committee_size {
-        //     // enough active validators for next committee
-        //     active_validators
-        // } else if self.spec.is_dynamic_committee_sizing_active_at_block(block_number) {
-        //     // Post-fork: the committee size already equals the eligible count,
-        //     // so this branch should be unreachable. Return a clear error rather
-        //     // than silently pulling from pending-exit validators.
-        //     error!(
-        //         target: "engine",
-        //         active_validator_count,
-        //         new_committee_size,
-        //         "DynamicCommitteeSizing: active count < committee size - state mismatch"
-        //     );
-        //     return Err(RaylsRethError::EVMCustom(
-        //         "DynamicCommitteeSizing invariant violated: \
-        //          active validator count < committee size"
-        //             .to_string(),
-        //     ));
-        // } else {
-        //     // Pre-fork legacy: pull from PendingExit to maintain fixed committee size
-        //     let num_missing = new_committee_size - active_validator_count;
-
-        //     // randomly take enough pending exit validators to reach new committee size
-        //     let random_pending = pending_exit.into_iter().choose_multiple(&mut rng, num_missing);
-        //     active_validators.extend(random_pending);
-        //     active_validators
-        // };
-
-        // simple Fisher-Yates shuffle
-        for i in (1..new_committee.len()).rev() {
-            let j = rng.random_range(0..=i);
-            new_committee.swap(i, j);
-        }
-
-        debug!(target: "engine",  "validators post-shuffle {:?}", new_committee);
-
         let new_committee_addresses =
             new_committee.into_iter().map(|v| v.validatorAddress).collect::<Vec<_>>();
-
-        // // trim the shuffled committee to maintain correct size
-        // new_committee.truncate(new_committee_size);
 
         trace!(target: "engine",  ?new_committee_size, ?new_committee_addresses, "truncated shuffle for new committee");
 
@@ -489,7 +429,7 @@ where
 
         info!(
             target: "engine",
-            epoch = epoch + 2,
+            for_epoch = epoch + 3,
             new_committee_size = new_committee.len(),
             "next_committee: new comittee size"
         );
@@ -823,37 +763,37 @@ where
         // don't support prague deposit requests
         let requests = Requests::default();
 
-        // potentially close epoch boundary
-        if let Some(randomness) = self.ctx.close_epoch {
-            debug!(target: "engine", ?randomness, "ctx indicates close epoch");
-            let tally = self.ctx.close_epoch_tally.clone().unwrap_or_default();
-            self.apply_consensus_block_rewards(tally).map_err(|e| {
-                BlockExecutionError::Internal(InternalBlockExecutionError::Other(e.into()))
-            })?;
+        // potentially close epoch boundary (current we don't need the randomness data because validator set it not shuffled)
+        // if let Some(randomness) = self.ctx.close_epoch {
+        debug!(target: "engine", "ctx indicates close epoch");
+        let tally = self.ctx.close_epoch_tally.clone().unwrap_or_default();
+        self.apply_consensus_block_rewards(tally).map_err(|e| {
+            BlockExecutionError::Internal(InternalBlockExecutionError::Other(e.into()))
+        })?;
 
-            self.apply_closing_epoch_contract_call(randomness).map_err(|e| {
-                BlockExecutionError::Internal(InternalBlockExecutionError::Other(e.into()))
-            })?;
+        self.apply_closing_epoch_contract_call().map_err(|e| {
+            BlockExecutionError::Internal(InternalBlockExecutionError::Other(e.into()))
+        })?;
 
-            // best-effort, never blocks epoch close; testnet archive replay skips the
-            // historical reward-distribution outage window to match canonical state
-            #[cfg(feature = "archive-replay")]
-            let skip_distribution =
-                self.spec.is_tokenomics_outage_block(self.evm.block().number().saturating_to());
-            #[cfg(not(feature = "archive-replay"))]
-            let skip_distribution = false;
-            if !skip_distribution {
-                match self.apply_reward_distribution() {
-                    Ok(()) => {}
-                    Err(e) => {
-                        error!(target: "engine", "reward distribution failed (non-fatal): {:?}", e);
-                    }
+        // best-effort, never blocks epoch close; testnet archive replay skips the
+        // historical reward-distribution outage window to match canonical state
+        #[cfg(feature = "archive-replay")]
+        let skip_distribution =
+            self.spec.is_tokenomics_outage_block(self.evm.block().number().saturating_to());
+        #[cfg(not(feature = "archive-replay"))]
+        let skip_distribution = false;
+        if !skip_distribution {
+            match self.apply_reward_distribution() {
+                Ok(()) => {}
+                Err(e) => {
+                    error!(target: "engine", "reward distribution failed (non-fatal): {:?}", e);
                 }
             }
-
-            // merge transitions into bundle state
-            self.evm.db_mut().merge_transitions(BundleRetention::Reverts);
         }
+
+        // merge transitions into bundle state
+        self.evm.db_mut().merge_transitions(BundleRetention::Reverts);
+        // }
 
         Ok((
             self.evm,
