@@ -583,6 +583,14 @@ impl RaylsChainSpecBuilder {
         self
     }
 
+    /// Activate DynamicCommitteeSizing at `block`.
+    pub fn dynamic_committee_sizing(mut self, block: u64) -> Self {
+        self.inner
+            .hardforks
+            .insert(RaylsHardFork::DynamicCommitteeSizing, ForkCondition::Block(block));
+        self
+    }
+
     /// Set the minimum EIP-1559 base fee floor.
     pub fn min_base_fee(mut self, min_base_fee: u64) -> Self {
         self.min_base_fee = min_base_fee;

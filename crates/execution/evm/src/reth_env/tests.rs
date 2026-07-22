@@ -871,6 +871,376 @@ async fn test_close_epochs() -> eyre::Result<()> {
     Ok(())
 }
 
+/// Same lifecycle as `test_close_epochs` but with `DynamicCommitteeSizing` active from genesis.
+/// Verifies three key differences from the pre-fork behaviour:
+///   1. Committee is deterministic (sorted, no shuffle).
+///   2. Committee grows when a new validator joins (no truncate).
+///   3. Committee shrinks when a validator exits.
+#[tokio::test]
+async fn test_close_epochs_with_dynamic_committee() -> eyre::Result<()> {
+    use crate::chainspec::{RaylsChainSpec, RaylsHardforks};
+
+    let validator_1 = Address::from_slice(&[0x11; 20]);
+    let validator_3 = Address::from_slice(&[0x33; 20]);
+    let validator_4 = Address::from_slice(&[0x44; 20]);
+    let validator_5 = Address::from_slice(&[0x55; 20]);
+
+    let mut new_validator_eoa =
+        TransactionFactory::new_random_from_seed(&mut StdRng::seed_from_u64(6));
+
+    let mut validator_2_eoa =
+        TransactionFactory::new_random_from_seed(&mut StdRng::seed_from_u64(2));
+    let validator_2_address = validator_2_eoa.address();
+
+    let all_validators = [
+        validator_1,
+        validator_2_address,
+        validator_3,
+        validator_4,
+        validator_5,
+        new_validator_eoa.address(),
+    ];
+
+    let mut validators: Vec<_> = all_validators
+        .iter()
+        .enumerate()
+        .map(|(i, addr)| {
+            let mut rng = StdRng::seed_from_u64(i as u64);
+            let bls = BlsKeypair::generate(&mut rng);
+            let bls_pubkey = bls.public();
+            let pop = generate_proof_of_possession_bls(&bls, addr).expect("pop generation failed");
+            NodeInfo {
+                name: format!("validator-{i}"),
+                bls_public_key: *bls_pubkey,
+                p2p_info: NodeP2pInfo::default(),
+                execution_address: *addr,
+                proof_of_possession: pop,
+            }
+        })
+        .collect();
+
+    let epoch_duration = 60 * 60 * 24;
+    let initial_stake_config = ConsensusRegistry::StakeConfig {
+        stakeAmount: U256::from(parse_ether("1_000_000").unwrap()),
+        minWithdrawAmount: U256::from(parse_ether("1_000").unwrap()),
+        epochDuration: epoch_duration,
+    };
+
+    let mut governance_multisig =
+        TransactionFactory::new_random_from_seed(&mut StdRng::seed_from_u64(33));
+    let governance = governance_multisig.address();
+    let tmp_genesis = rayls_infrastructure_types::test_genesis().extend_accounts([
+        (
+            governance,
+            GenesisAccount::default().with_balance(U256::from((50_000_000 * 10) ^ 18)),
+        ),
+        (
+            new_validator_eoa.address(),
+            GenesisAccount::default()
+                .with_balance(initial_stake_config.stakeAmount.saturating_mul(U256::from(2))),
+        ),
+        (
+            validator_2_address,
+            GenesisAccount::default()
+                .with_balance(initial_stake_config.stakeAmount.saturating_mul(U256::from(2))),
+        ),
+    ]);
+
+    let new_validator = validators.pop().expect("six validators");
+
+    let genesis = RethEnv::create_consensus_registry_genesis_accounts(
+        validators.clone(),
+        tmp_genesis,
+        initial_stake_config.clone(),
+        governance,
+        governance,
+        vec![(governance, initial_stake_config.stakeAmount)],
+    )?;
+
+    let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+
+    // Build a RaylsChainSpec with DynamicCommitteeSizing active from block 0
+    let rayls_chain_spec: Arc<RaylsChainSpec> = Arc::new(
+        RaylsChainSpec::builder(chain.clone())
+            .dynamic_committee_sizing(0)
+            .build(),
+    );
+
+    // governance allowlists the new validator
+    let calldata =
+        ConsensusRegistry::allowlistValidatorCall { validatorAddress: new_validator_eoa.address() }
+            .abi_encode()
+            .into();
+    let allowlist_tx = governance_multisig.create_eip1559_encoded(
+        chain.clone(),
+        None,
+        100,
+        Some(CONSENSUS_REGISTRY_ADDRESS),
+        U256::ZERO,
+        calldata,
+    );
+
+    let calldata = RLSToken::transferCall {
+        to: new_validator_eoa.address(),
+        amount: initial_stake_config.stakeAmount,
+    }
+    .abi_encode()
+    .into();
+    let rls_transfer_tx = governance_multisig.create_eip1559_encoded(
+        chain.clone(),
+        None,
+        100,
+        Some(RLS_ADDRESS),
+        U256::ZERO,
+        calldata,
+    );
+
+    let calldata = RLSToken::approveCall {
+        spender: CONSENSUS_REGISTRY_ADDRESS,
+        amount: initial_stake_config.stakeAmount,
+    }
+    .abi_encode()
+    .into();
+    let rls_approve_tx = new_validator_eoa.create_eip1559_encoded(
+        chain.clone(),
+        None,
+        100,
+        Some(RLS_ADDRESS),
+        U256::ZERO,
+        calldata,
+    );
+
+    let proof = ConsensusRegistry::ProofOfPossession {
+        uncompressedPubkey: new_validator.bls_public_key.serialize().into(),
+        uncompressedSignature: new_validator.proof_of_possession.serialize().into(),
+    };
+    let calldata = ConsensusRegistry::stakeCall {
+        blsPubkey: new_validator.bls_public_key.to_bytes().into(),
+        proofOfPossession: proof,
+    }
+    .abi_encode()
+    .into();
+    let stake_tx = new_validator_eoa.create_eip1559_encoded(
+        chain.clone(),
+        None,
+        100,
+        Some(CONSENSUS_REGISTRY_ADDRESS),
+        U256::ZERO,
+        calldata,
+    );
+    let calldata = ConsensusRegistry::activateCall {}.abi_encode().into();
+    let activate_tx = new_validator_eoa.create_eip1559_encoded(
+        chain.clone(),
+        None,
+        100,
+        Some(CONSENSUS_REGISTRY_ADDRESS),
+        U256::ZERO,
+        calldata,
+    );
+
+    // create env with custom RaylsChainSpec
+    let tmp_dir = TempDir::new()?;
+    let task_manager = TaskManager::new("Test Task Manager");
+    let reth_env =
+        RethEnv::new_for_temp_chain_with_rayls_spec(
+            chain.clone(),
+            rayls_chain_spec.clone(),
+            tmp_dir.path(),
+            &task_manager,
+            None,
+        )
+        .await?;
+
+    // verify fork is active
+    assert!(
+        rayls_chain_spec.is_dynamic_committee_sizing_active_at_block(0),
+        "DynamicCommitteeSizing must be active at block 0"
+    );
+
+    let mut expected_epoch = 0;
+    let expected_committee = validators.iter().map(|v| v.execution_address).collect();
+    let expected_epoch_info = ConsensusRegistry::EpochInfo {
+        committee: expected_committee,
+        blockHeight: 0,
+        epochDuration: epoch_duration,
+        stakeVersion: 0,
+    };
+
+    // assert genesis epoch state
+    let EpochState { epoch, epoch_info, epoch_start, .. } =
+        reth_env.epoch_state_from_canonical_tip()?;
+    assert_eq!(epoch, expected_epoch);
+    assert_eq!(epoch_start, chain.genesis_timestamp());
+    assert_eq!(epoch_info, expected_epoch_info);
+
+    // ── Block 1: no epoch close, new validator stakes + activates ──
+    let mut consensus_output = consensus_output_for_tests(2, expected_epoch, 1);
+    consensus_output.close_epoch = false;
+    let payload = RLPayload::new_for_test(chain.sealed_genesis_header(), &consensus_output);
+    let block1 = execute_payload_and_update_canonical_chain(
+        &reth_env,
+        payload,
+        vec![allowlist_tx, rls_transfer_tx, rls_approve_tx, stake_tx, activate_tx],
+    )
+    .await?;
+    let canonical_header = block1.recovered_block.clone_sealed_header();
+
+    // ── Block 2: close epoch 0 ──
+    // With DynamicCommitteeSizing the future committee is deterministic (sorted, no shuffle).
+    // new_validator is PendingActivation at this point, so it is included.
+    // Future committee = 6 validators sorted by address.
+    expected_epoch += 1;
+    let consensus_output = consensus_output_for_tests(2, expected_epoch, 2);
+    let payload = RLPayload::new_for_test(canonical_header, &consensus_output);
+    let block2 = execute_payload_and_update_canonical_chain(&reth_env, payload, vec![]).await?;
+    let canonical_header = block2.recovered_block.clone_sealed_header();
+
+    // Read future committee (2 epochs ahead)
+    let state = StateProviderDatabase::new(reth_env.latest()?);
+    let mut cached_reads = CachedReads::default();
+    let mut db = State::builder()
+        .with_database(cached_reads.as_db_mut(state))
+        .with_bundle_update()
+        .without_state_clear()
+        .build();
+    let mut rayls_evm = reth_env
+        .evm_config
+        .evm_factory()
+        .create_evm(&mut db, reth_env.evm_config.evm_env(canonical_header.header())?);
+
+    let calldata = ConsensusRegistry::getEpochInfoCall { epoch: expected_epoch + 2 }
+        .abi_encode()
+        .into();
+    let future_epoch_info = reth_env
+        .call_consensus_registry::<_, ConsensusRegistry::EpochInfo>(&mut rayls_evm, calldata)?;
+
+    // Dynamic committee: 6 validators sorted by address (no truncate)
+    let expected_sorted_6 = vec![
+        validator_1,
+        validator_3,
+        validator_4,
+        validator_5,
+        validator_2_address,
+        new_validator.execution_address,
+    ];
+    assert_eq!(
+        future_epoch_info.committee, expected_sorted_6,
+        "dynamic committee must include all 6 active validators sorted by address (no truncate)"
+    );
+
+    // ── Block 3: close epoch 1 ──
+    expected_epoch += 1;
+    let consensus_output = consensus_output_for_tests(2, expected_epoch, 3);
+    let payload = RLPayload::new_for_test(canonical_header, &consensus_output);
+    let block3 = execute_payload_and_update_canonical_chain(&reth_env, payload, vec![]).await?;
+    let canonical_header = block3.recovered_block.clone_sealed_header();
+
+    // Current epoch committee should now be 6 (the 6-validator committee becomes current at epoch 3)
+    let EpochState { epoch: current_epoch, .. } =
+        reth_env.epoch_state_from_canonical_tip()?;
+    assert_eq!(current_epoch, expected_epoch);
+    // The 6-validator committee is stored for epoch 3 (two epochs ahead at block 2).
+    // We need to wait until block 5 (close epoch 2) for it to become current.
+    // For now, check the future epoch (epoch 3) which has the 6-validator committee.
+    let state = StateProviderDatabase::new(reth_env.latest()?);
+    let mut cached_reads = CachedReads::default();
+    let mut db = State::builder()
+        .with_database(cached_reads.as_db_mut(state))
+        .with_bundle_update()
+        .without_state_clear()
+        .build();
+    let mut rayls_evm = reth_env
+        .evm_config
+        .evm_factory()
+        .create_evm(&mut db, reth_env.evm_config.evm_env(canonical_header.header())?);
+    let calldata = ConsensusRegistry::getEpochInfoCall { epoch: current_epoch + 1 }
+        .abi_encode()
+        .into();
+    let future_epoch_info = reth_env
+        .call_consensus_registry::<_, ConsensusRegistry::EpochInfo>(&mut rayls_evm, calldata)?;
+    assert_eq!(future_epoch_info.committee.len(), 6, "future epoch (epoch 3) must have 6 validators");
+
+    // ── Block 4: no epoch close, validator 2 begins exit ──
+    let calldata = ConsensusRegistry::beginExitCall {}.abi_encode().into();
+    let begin_exit_tx = validator_2_eoa.create_eip1559_encoded(
+        chain.clone(),
+        None,
+        100,
+        Some(CONSENSUS_REGISTRY_ADDRESS),
+        U256::ZERO,
+        calldata,
+    );
+    expected_epoch += 1;
+    let mut consensus_output = consensus_output_for_tests(2, expected_epoch, 4);
+    consensus_output.close_epoch = false;
+    let payload = RLPayload::new_for_test(canonical_header, &consensus_output);
+    let block4 =
+        execute_payload_and_update_canonical_chain(&reth_env, payload, vec![begin_exit_tx]).await?;
+    let canonical_header = block4.recovered_block.clone_sealed_header();
+
+    // ── Block 5: close epoch 2 ──
+    expected_epoch += 1;
+    let consensus_output = consensus_output_for_tests(2, expected_epoch, 5);
+    let payload = RLPayload::new_for_test(canonical_header, &consensus_output);
+    let block5 = execute_payload_and_update_canonical_chain(&reth_env, payload, vec![]).await?;
+    let canonical_header = block5.recovered_block.clone_sealed_header();
+
+    // ── Block 6: close epoch 3 ──
+    expected_epoch += 1;
+    let consensus_output = consensus_output_for_tests(2, expected_epoch, 6);
+    let payload = RLPayload::new_for_test(canonical_header, &consensus_output);
+    let block6 = execute_payload_and_update_canonical_chain(&reth_env, payload, vec![]).await?;
+    let canonical_header = block6.recovered_block.clone_sealed_header();
+
+    // ── Block 7: close epoch 4 ──
+    expected_epoch += 1;
+    let consensus_output = consensus_output_for_tests(2, expected_epoch, 7);
+    let payload = RLPayload::new_for_test(canonical_header.clone(), &consensus_output);
+    let block7 = execute_payload_and_update_canonical_chain(&reth_env, payload, vec![]).await?;
+    let _ = block7;
+
+    // validator 2 should now be Exited
+    let state = StateProviderDatabase::new(reth_env.latest()?);
+    let mut cached_reads = CachedReads::default();
+    let mut db = State::builder()
+        .with_database(cached_reads.as_db_mut(state))
+        .with_bundle_update()
+        .without_state_clear()
+        .build();
+    let mut rayls_evm = reth_env
+        .evm_config
+        .evm_factory()
+        .create_evm(&mut db, reth_env.evm_config.evm_env(canonical_header.header())?);
+
+    let calldata = ConsensusRegistry::getValidatorCall { validatorAddress: validator_2_address }
+        .abi_encode()
+        .into();
+    let validator_2_info = reth_env
+        .call_consensus_registry::<_, ConsensusRegistry::ValidatorInfo>(&mut rayls_evm, calldata)?;
+    assert_eq!(validator_2_info.currentStatus, ValidatorStatus::Exited);
+
+    // Future committee should have shrunk to 5 (validator 2 excluded)
+    let calldata = ConsensusRegistry::getEpochInfoCall { epoch: expected_epoch + 1 }
+        .abi_encode()
+        .into();
+    let shrunken_epoch_info = reth_env
+        .call_consensus_registry::<_, ConsensusRegistry::EpochInfo>(&mut rayls_evm, calldata)?;
+
+    let expected_sorted_5 = vec![
+        validator_1,
+        validator_3,
+        validator_4,
+        validator_5,
+        new_validator.execution_address,
+    ];
+    assert_eq!(
+        shrunken_epoch_info.committee, expected_sorted_5,
+        "dynamic committee must shrink to 5 after validator 2 exits"
+    );
+
+    Ok(())
+}
+
 #[test]
 fn test_rpc_validator() {
     let mut mods: Option<RpcModuleSelection> = None;
