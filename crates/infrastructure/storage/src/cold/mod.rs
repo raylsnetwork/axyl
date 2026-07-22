@@ -1,14 +1,9 @@
 //! Append-only compressed cold tier for the consensus DB, backed by the nippy-jar file format.
 //!
-//! Whole epochs of `Batches` and `ConsensusBlocks` move into per-epoch nippy jars, bounding those
-//! two hot tables (the hot `ConsensusBlockNumbersByDigest` index stays and still grows with chain
-//! length). All history remains queryable back to genesis through the [`ColdDatabase`] read
-//! fall-through; nothing here ever drops data, it only relocates it.
-//!
-//! Two segments, one jar per archived epoch: consensus_blocks (one `bcs(ConsensusHeader)` column,
-//! arithmetic addressing over dense numbers) and batches (digest + `bcs(Batch)` columns,
-//! addressed by the hot `ColdBatchLocations` index; the digest column keeps each jar
-//! self-describing, so reconcile can rebuild that index from the jars alone).
+//! Whole epochs of `Batches` and `ConsensusBlocks` move into per-epoch jars, one jar per segment.
+//! Nothing here drops data: all history stays queryable through the [`ColdDatabase`]
+//! fall-through, and the batches jar carries its digest column so the auxiliary index that
+//! addresses it can be rebuilt from the jars alone.
 
 mod archiver;
 mod database;
@@ -107,10 +102,19 @@ pub struct SealedJar {
 }
 
 impl SealedJar {
-    /// Returns the last key the jar covers, derived from the dense ascending numbering the
-    /// consensus_blocks segment appends with (meaningless for batches, whose start is a sentinel).
+    /// Returns the last key the jar covers, or `None` if `start_key` cannot address its rows.
+    ///
+    /// `start_key` comes from the jar's `.conf` unvalidated, so the addition is checked: an
+    /// overflow would abort the process under `overflow-checks`.
+    pub fn checked_end_key(&self) -> Option<u64> {
+        self.start_key.checked_add(self.rows.saturating_sub(1))
+    }
+
+    /// Returns the last key the jar covers, saturating on a start key that cannot address its rows.
+    ///
+    /// Index admission refuses such a jar, so a saturated value never describes an indexed one.
     pub fn end_key(&self) -> u64 {
-        self.start_key + self.rows.saturating_sub(1)
+        self.checked_end_key().unwrap_or(u64::MAX)
     }
 }
 
@@ -130,5 +134,8 @@ pub(crate) type JarIndex = BTreeMap<u64, SealedJar>;
 /// Convenience result alias for cold-tier internal APIs.
 pub type ColdResult<T> = Result<T, ColdError>;
 
-/// Sentinel key for the single `ColdArchiveHighWater` row (the table holds at most one entry).
-pub const ARCHIVE_HIGH_WATER_KEY: u8 = 0;
+/// Sentinel key for the single `ColdArchiveHighWaterMark` row (the table holds at most one entry).
+pub const ARCHIVE_HIGH_WATER_MARK_KEY: u8 = 0;
+
+#[cfg(test)]
+pub(crate) mod probe;

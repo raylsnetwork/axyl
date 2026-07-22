@@ -408,10 +408,11 @@ fn evict_committed<DB: Database>(
 /// Depth at which the writer queue is treated as a backlog: `db_run` warns (rate-limited) and
 /// data-plane enqueues start pacing, so the imbalance never surfaces as a multi-minute `persist`
 /// drain at the next epoch boundary.
-const QUEUE_HIGH_WATER: usize = 10_000;
+const QUEUE_HIGH_WATER_MARK: usize = 10_000;
 const QUEUE_LAG_WARN_INTERVAL: Duration = Duration::from_secs(10);
 
-/// Pause paid by each insert/remove/clear enqueue while the queue is above [`QUEUE_HIGH_WATER`].
+/// Pause paid by each insert/remove/clear enqueue while the queue is above
+/// [`QUEUE_HIGH_WATER_MARK`].
 ///
 /// Soft backpressure: a slow inner DB surfaces as gradual producer slowdown instead of a
 /// network-wide stall at the deterministic boundary `persist`. Pacing can lag the node into
@@ -425,7 +426,7 @@ const PERSIST_SLOW_WARN: Duration = Duration::from_secs(1);
 
 /// A [`DBMessage`] sender that tracks the writer queue's depth: every enqueue bumps a shared
 /// counter `db_run` decrements as it drains, feeding the depth gauge and the
-/// [`QUEUE_HIGH_WATER`] pacing.
+/// [`QUEUE_HIGH_WATER_MARK`] pacing.
 struct QueueSender<DB: Database> {
     tx: Sender<DBMessage<DB>>,
     depth: Arc<AtomicUsize>,
@@ -445,10 +446,10 @@ impl<DB: Database> Debug for QueueSender<DB> {
 
 impl<DB: Database> QueueSender<DB> {
     /// Enqueues a writer message; data-plane messages pace once the depth is past
-    /// [`QUEUE_HIGH_WATER`] (see [`QUEUE_PACE_SLEEP`]).
+    /// [`QUEUE_HIGH_WATER_MARK`] (see [`QUEUE_PACE_SLEEP`]).
     fn send(&self, msg: DBMessage<DB>) -> Result<(), mpsc::SendError<DBMessage<DB>>> {
         if matches!(msg, DBMessage::Insert(_) | DBMessage::Remove(_) | DBMessage::Clear(_))
-            && self.depth() > QUEUE_HIGH_WATER
+            && self.depth() > QUEUE_HIGH_WATER_MARK
         {
             std::thread::sleep(QUEUE_PACE_SLEEP);
         }
@@ -521,7 +522,7 @@ fn db_run<DB: Database>(
         // Depth after taking this message off the queue (fetch_sub returns the count including it).
         let queued = depth.fetch_sub(1, AtomicOrdering::Relaxed).saturating_sub(1);
         queue_depth_gauge.set(queued as i64);
-        if queued > QUEUE_HIGH_WATER
+        if queued > QUEUE_HIGH_WATER_MARK
             && last_lag_warn.is_none_or(|at| at.elapsed() >= QUEUE_LAG_WARN_INTERVAL)
         {
             last_lag_warn = Some(Instant::now());
@@ -1001,7 +1002,7 @@ impl<DB: Database> Debug for DBMessage<DB> {
 
 #[cfg(test)]
 mod test {
-    use super::{DBMessage, InsertTrait, LayeredDatabase, QUEUE_HIGH_WATER, QUEUE_PACE_SLEEP};
+    use super::{DBMessage, InsertTrait, LayeredDatabase, QUEUE_HIGH_WATER_MARK, QUEUE_PACE_SLEEP};
     #[cfg(feature = "redb")]
     use crate::redb::ReDB;
     use crate::{
@@ -1116,7 +1117,7 @@ mod test {
     /// so the backlog a boundary `persist` drains grows at the pace rate, not the burst rate; the
     /// same producer below the mark must run unpaced.
     #[test]
-    fn writer_backlog_paces_producers_above_high_water() {
+    fn writer_backlog_paces_producers_above_the_high_water_mark() {
         let inner = MemDatabase::new();
         inner.open_table::<TestTable>().expect("open inner table");
         let db = LayeredDatabase::open(inner);
@@ -1129,7 +1130,7 @@ mod test {
         // Seed one message past the mark: every enqueue here is at or below it, hence unpaced.
         let value = "v".to_string();
         let seed_started = Instant::now();
-        for key in 0..=(QUEUE_HIGH_WATER as u64) {
+        for key in 0..=(QUEUE_HIGH_WATER_MARK as u64) {
             db.insert::<TestTable>(&key, &value).expect("seed insert");
         }
         let seed_elapsed = seed_started.elapsed();
@@ -1154,8 +1155,8 @@ mod test {
         // needs the machine frozen for seconds, while wrongly-paced seeding deterministically
         // exceeds it.
         assert!(
-            seed_elapsed < QUEUE_PACE_SLEEP * (QUEUE_HIGH_WATER as u32 / 2),
-            "seeding below the high-water mark took {seed_elapsed:?}: enqueues under the mark \
+            seed_elapsed < QUEUE_PACE_SLEEP * (QUEUE_HIGH_WATER_MARK as u32 / 2),
+            "seeding below the high-water mark took {seed_elapsed:?}: enqueues under the high-water mark \
              must not be paced",
         );
     }

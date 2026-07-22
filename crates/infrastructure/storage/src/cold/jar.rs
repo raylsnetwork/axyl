@@ -1,12 +1,8 @@
 //! Per-segment nippy-jar handles and the two-segment cold store.
 //!
-//! A [`ColdSegment`] owns one nippy jar per archived epoch plus an in-memory index rebuilt at boot
-//! from the jars' `.conf` headers. The consensus_blocks segment is addressed arithmetically by
-//! block number minus the jar start key; the batches segment is addressed by an explicit
-//! [`ColdLocation`] resolved from the hot auxiliary index. The digest column of a batches jar keeps
-//! it self-describing, so the auxiliary index is never the sole source of truth (reconcile rebuilds
-//! it from the consensus_blocks projection).
-
+//! A [`ColdSegment`] owns one jar per archived epoch plus an index rebuilt at boot from the jars'
+//! `.conf` headers. consensus_blocks is addressed arithmetically by block number minus the jar
+//! start key; batches is addressed by a [`ColdLocation`] resolved from the hot auxiliary index.
 use std::{
     collections::BTreeSet,
     fs,
@@ -29,11 +25,7 @@ use super::{
     SealedJar,
 };
 
-/// Zstd level for cold jars, set to the measured knee of the speed/ratio curve on real batch data.
-///
-/// Batch payloads are RLP-encoded txs (signatures + calldata), so they are near-incompressible: on
-/// an 8 GB sample level 3 reaches 1.58x at near-lz4 speed, while level 19 spends ~16x the CPU for
-/// only 1.61x. Decompression speed is level-independent, so serving reads are unaffected.
+/// Zstd level for cold jars: the measured knee, past which CPU climbs and the ratio does not.
 const COLD_ZSTD_LEVEL: i32 = 3;
 
 /// Number of columns in the consensus_blocks segment: `[bcs(ConsensusHeader)]`.
@@ -45,18 +37,15 @@ pub(crate) const BATCHES_COLUMNS: usize = 2;
 /// Column index of the batch payload within a batches jar row.
 const BATCH_PAYLOAD_COLUMN: usize = 1;
 
-/// Number of open jars a segment keeps mmapped for reuse across reads.
+/// Number of open jars a segment keeps mmapped.
 ///
-/// Each cached [`LoadedJar`] pins two file descriptors and two mmaps (see [`DataReader`]), so the
-/// cache is bounded: reth's static-file cache is unbounded, but cold epochs grow without limit, so
-/// a small LRU caps the descriptor and address-space cost while still serving read bursts that
-/// cluster on a few recent epochs from the open handles.
+/// Each entry pins two file descriptors and two mmaps, and cold epochs grow without limit, so the
+/// cache is bounded rather than unbounded like reth's.
 const JAR_CACHE_CAPACITY: usize = 16;
 
 /// An open writer plus the header it is accumulating for the in-progress epoch jar.
 ///
-/// Held behind a [`Mutex`] so the producer can drive `append_row`/`commit` through `&self` without
-/// promoting the receiver to `&mut self`, which would break sharing the store via `Arc`.
+/// Behind a [`Mutex`] so appends drive through `&self`, keeping the store shareable via `Arc`.
 #[derive(Debug)]
 struct OpenJar {
     /// Active nippy-jar writer for the epoch being sealed.
@@ -65,8 +54,7 @@ struct OpenJar {
     header: ColdJarHeader,
 }
 
-/// A jar opened for reading: its config plus an `Arc` data reader so cursors share one open mmap
-/// instead of re-opening the file per row (mirrors reth-provider's `LoadedJar`).
+/// A jar opened for reading, whose cursors share one open mmap rather than reopening per row.
 struct LoadedJar {
     /// Jar config and header, the borrow target for a cursor.
     jar: NippyJar<ColdJarHeader>,
@@ -77,9 +65,10 @@ struct LoadedJar {
 impl LoadedJar {
     /// Opens the jar at `path`, mmapping its data and offset files once.
     ///
-    /// Validates the offsets' claimed data end against the mmapped file: a truncated data file
-    /// would otherwise panic the unchecked slice on first read, and panic=abort makes that a node
-    /// abort rather than a surfaced corruption.
+    /// Checks the offsets' claimed data end against the file: a truncated jar would otherwise
+    /// panic an unchecked slice, which `panic=abort` turns into a node abort. The `.conf`'s
+    /// declared max row size stays unchecked because only `NippyJarWriter` exposes it, and
+    /// opening a writer here would run nippy's consistency heal.
     fn load(path: &Path) -> ColdResult<Self> {
         let jar = NippyJar::<ColdJarHeader>::load(path)?;
         let reader = Arc::new(jar.open_data_reader()?);
@@ -99,11 +88,10 @@ impl LoadedJar {
     }
 }
 
-/// One nippy-jar-backed cold segment (a kind, its directory, and an in-memory jar index).
+/// One nippy-jar-backed cold segment: a kind, its directory, and an in-memory jar index.
 ///
-/// A segment owns the single writer for its kind and serves arithmetic (consensus_blocks) or
-/// location-addressed (batches) row reads. The index maps each sealed jar's end key to its
-/// [`SealedJar`] entry and is rebuilt from the on-disk jars at [`ColdSegment::open`].
+/// Owns the single writer for its kind. The index is rebuilt from the on-disk jars at
+/// [`ColdSegment::open`].
 #[derive(Debug)]
 pub struct ColdSegment {
     /// Segment kind, fixing column layout and addressing scheme.
@@ -121,10 +109,9 @@ pub struct ColdSegment {
 }
 
 impl ColdSegment {
-    /// Opens the segment at `dir`, rebuilding the in-memory index from each jar's `.conf` header.
+    /// Opens the segment at `dir`, rebuilding the index from each jar's `.conf` header.
     ///
-    /// A missing directory is created and treated as an empty segment, mirroring reth's
-    /// `iter_static_files` -> `initialize_index` boot scan.
+    /// A missing directory is created and treated as an empty segment.
     pub fn open(dir: impl AsRef<Path>, kind: ColdSegmentKind) -> ColdResult<Self> {
         let dir = dir.as_ref().to_path_buf();
         fs::create_dir_all(&dir)?;
@@ -155,6 +142,15 @@ impl ColdSegment {
             // nippy addresses satellites off the data-file stem (no extension), so strip `.conf`.
             let data_path = path.with_extension("");
             let jar = NippyJar::<ColdJarHeader>::load(&data_path)?;
+            // A jar records its own kind so that a restored, renamed, or mis-filed file cannot be
+            // served under the other segment's column count and addressing scheme.
+            let header = jar.user_header();
+            if header.kind != kind {
+                return Err(ColdError::Corruption(format!(
+                    "jar {data_path:?} is a {:?} jar in a {kind:?} segment",
+                    header.kind
+                )));
+            }
             // The row count comes from the jar itself, never a persisted copy (see
             // [`SealedJar`]). The writer freezes a zero-row `.conf` at jar creation, before any
             // row is committed; such a jar marks an aborted or in-progress seal, not a durable
@@ -162,9 +158,8 @@ impl ColdSegment {
             // on the next reopen.
             let rows = jar.rows() as u64;
             if rows > 0 {
-                let header = jar.user_header();
                 let sealed = SealedJar { epoch: header.epoch, start_key: header.start_key, rows };
-                index.insert(Self::index_key(kind, &sealed), sealed);
+                index.insert(Self::index_key(kind, &sealed)?, sealed);
             }
         }
         Ok(index)
@@ -187,8 +182,9 @@ impl ColdSegment {
 
     /// Opens a fresh jar for `epoch` rooted at `start_key`, making it the active append target.
     ///
-    /// `start_key` is the first block number for consensus_blocks and an unused sentinel for
-    /// batches. Public so out-of-crate harnesses (benches) can author fixture jars.
+    /// Truncates any existing jar for `epoch` back to empty rather than appending, which is how a
+    /// half-written or orphaned jar is re-archived whole. Callers must not begin an epoch whose
+    /// jar is the only remaining copy of its rows. `start_key` is a sentinel for batches.
     pub fn begin_epoch(&self, epoch: Epoch, start_key: u64) -> ColdResult<()> {
         // Release any half-built writer from a failed seal first: two live writers over the same
         // jar file would collide, and the fresh writer's consistency check heals the leftovers.
@@ -202,9 +198,8 @@ impl ColdSegment {
 
     /// Creates `header`'s epoch jar with the [`COLD_ZSTD_LEVEL`] compressor swapped in.
     ///
-    /// Cold jars are written once by a background task (off the consensus path) and read for the
-    /// chain's lifetime. nippy's `with_zstd` builds the compressor at zstd's default level and
-    /// its level field is private, so the level-set compressor goes in through the public handle.
+    /// nippy leaves the level at zstd's default, which equals [`COLD_ZSTD_LEVEL`] today, so the
+    /// swap pins it: a zstd default change would otherwise re-tune every cold jar silently.
     fn cold_zstd_jar(&self, header: ColdJarHeader) -> NippyJar<ColdJarHeader> {
         let path = self.jar_data_path(header.epoch);
         let mut jar = NippyJar::new(self.column_count(), &path, header).with_zstd(false, 0);
@@ -243,9 +238,8 @@ impl ColdSegment {
 
     /// Commits the open jar: fsyncs data + offsets, freezes the `.conf` boundary, indexes it.
     ///
-    /// The `.conf` write is nippy's atomic durability boundary; only after it returns is the epoch
-    /// safe to remove from the hot tier. Sealing the same epoch twice without an intervening
-    /// `begin_epoch` is a no-op.
+    /// The `.conf` write is the durability boundary, so only after it returns is the epoch safe to
+    /// remove from the hot tier. A second commit without an intervening `begin_epoch` is a no-op.
     pub fn commit(&self) -> ColdResult<()> {
         let mut guard = self.open.lock();
         let Some(mut open) = guard.take() else {
@@ -268,7 +262,7 @@ impl ColdSegment {
         if rows > 0 {
             let sealed =
                 SealedJar { epoch: open.header.epoch, start_key: open.header.start_key, rows };
-            self.index.write().insert(Self::index_key(self.kind, &sealed), sealed);
+            self.index.write().insert(Self::index_key(self.kind, &sealed)?, sealed);
         }
         Ok(())
     }
@@ -291,8 +285,8 @@ impl ColdSegment {
         self.covering_jar(number).is_some()
     }
 
-    /// Visits every row of `epoch`'s jar in ascending order, reusing one cursor for the whole
-    /// scan: peak memory stays one borrowed row and a rebuild costs O(that epoch).
+    /// Visits every row of `epoch`'s jar in ascending row order as `(row index, first column)`,
+    /// reusing one cursor so peak memory stays one borrowed row.
     pub(crate) fn for_each_row_in_epoch(
         &self,
         epoch: Epoch,
@@ -304,15 +298,13 @@ impl ColdSegment {
         let loaded = self.load_jar(epoch)?;
         let mut cursor = loaded.cursor()?;
         for row in 0..jar.rows {
-            // consensus_blocks numbers are arithmetic: jar start key plus the row offset.
-            let number = jar.start_key + row;
             let columns = cursor.row_by_number(row as usize)?.ok_or_else(|| {
                 ColdError::Corruption(format!("cold row {row} missing from epoch {epoch} jar"))
             })?;
             let value = columns.first().copied().ok_or_else(|| {
-                ColdError::Corruption(format!("consensus_blocks row {number} has no columns"))
+                ColdError::Corruption(format!("epoch {epoch} jar row {row} has no columns"))
             })?;
-            visit(number, value)?;
+            visit(row, value)?;
         }
         Ok(())
     }
@@ -380,13 +372,22 @@ impl ColdSegment {
         }
     }
 
-    /// Returns the [`JarIndex`] key for a sealed jar of `kind`: end key for range-addressed
-    /// consensus_blocks, epoch for batches (whose sentinel start key would collide end keys
-    /// across epochs and drop all but the last jar).
-    fn index_key(kind: ColdSegmentKind, jar: &SealedJar) -> u64 {
+    /// Returns the [`JarIndex`] key for a sealed jar: end key for consensus_blocks, epoch for
+    /// batches, whose sentinel start key would otherwise collide every epoch onto one key.
+    ///
+    /// # Errors
+    ///
+    /// [`ColdError::Corruption`] if a start key cannot address its own rows. This is the only
+    /// place that bound is applied, so it keeps every later `start_key + row` in range.
+    fn index_key(kind: ColdSegmentKind, jar: &SealedJar) -> ColdResult<u64> {
         match kind {
-            ColdSegmentKind::ConsensusBlocks => jar.end_key(),
-            ColdSegmentKind::Batches => Self::index_key_for_epoch(jar.epoch),
+            ColdSegmentKind::ConsensusBlocks => jar.checked_end_key().ok_or_else(|| {
+                ColdError::Corruption(format!(
+                    "jar epoch-{:010} start key {} cannot address {} rows",
+                    jar.epoch, jar.start_key, jar.rows
+                ))
+            }),
+            ColdSegmentKind::Batches => Ok(Self::index_key_for_epoch(jar.epoch)),
         }
     }
 
@@ -428,13 +429,12 @@ impl ColdStore {
         &self.batches
     }
 
-    /// Reads the raw `ConsensusHeader` bytes for `number`, cross-checking the stored header's own
-    /// number so a misaligned jar surfaces as corruption instead of a silent wrong-header serve
-    /// (which would feed a forked `mix_hash` / `parent_beacon_block_root`).
+    /// Reads the raw `ConsensusHeader` bytes for `number`.
     ///
     /// # Errors
     ///
-    /// Returns [`ColdError::Corruption`] if the stored header's number differs from `number`.
+    /// [`ColdError::Corruption`] if the stored header's own number differs, since a misaligned jar
+    /// would otherwise serve a wrong header into `mix_hash` / `parent_beacon_block_root`.
     pub fn read_consensus_block_checked(&self, number: u64) -> ColdResult<Option<Vec<u8>>> {
         let Some(bytes) = self.consensus_blocks.read_by_number(number)? else {
             return Ok(None);
@@ -450,13 +450,12 @@ impl ColdStore {
         Ok(Some(bytes))
     }
 
-    /// Reads the raw `Batch` bytes at `loc`, cross-checking the stored digest column so a
-    /// mis-pointing auxiliary index surfaces as corruption instead of a silent mis-serve.
-    /// Returns `None` if the epoch jar or row is absent.
+    /// Reads the raw `Batch` bytes at `loc`, or `None` if the epoch jar or row is absent.
     ///
     /// # Errors
     ///
-    /// Returns [`ColdError::Corruption`] if the stored digest at `loc` differs from `digest`.
+    /// [`ColdError::Corruption`] if the stored digest column differs, since a mis-pointing
+    /// auxiliary index would otherwise serve the wrong batch.
     pub fn read_batch_checked(
         &self,
         digest: BlockHash,
@@ -486,14 +485,27 @@ impl ColdStore {
             .then(|| columns.swap_remove(BATCH_PAYLOAD_COLUMN)))
     }
 
-    /// Visits a single epoch's archived consensus blocks in ascending order, reusing one cursor
-    /// (see [`ColdSegment::for_each_row_in_epoch`]).
-    pub(crate) fn for_each_consensus_block_in_epoch(
+    /// Visits a single epoch's archived batches as `(row, digest)`, `row` being exactly the
+    /// [`ColdLocation::row`] the batch is served from, so the auxiliary index can be rebuilt from
+    /// the jar itself rather than re-derived from another segment.
+    ///
+    /// # Errors
+    ///
+    /// [`ColdError::Corruption`] if a row's digest column is not a 32-byte hash.
+    pub(crate) fn for_each_batch_digest_in_epoch(
         &self,
         epoch: Epoch,
-        visit: impl FnMut(u64, &[u8]) -> ColdResult<()>,
+        mut visit: impl FnMut(u64, BlockHash) -> ColdResult<()>,
     ) -> ColdResult<()> {
-        self.consensus_blocks.for_each_row_in_epoch(epoch, visit)
+        self.batches.for_each_row_in_epoch(epoch, |row, column| {
+            let digest = BlockHash::try_from(column).map_err(|_| {
+                ColdError::Corruption(format!(
+                    "batches epoch {epoch} row {row} digest column is {} bytes",
+                    column.len()
+                ))
+            })?;
+            visit(row, digest)
+        })
     }
 }
 

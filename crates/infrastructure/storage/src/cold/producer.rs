@@ -1,14 +1,8 @@
 //! The cold archiver: chunked seal pass plus the index-and-prune finalize tail.
 //!
-//! [`archive_below_epoch`] migrates whole epochs of `Batches` and `ConsensusBlocks` out of the
-//! hot MDBX into per-epoch nippy jars; [`reconcile`](super::reconcile()) heals an interrupted
-//! migration. The ordering is crash-atomic so a row is never absent from both tiers (the serve
-//! floor is genesis, so a missing row is a fatal protocol violation): jars are made durable, then
-//! the hot auxiliary index and high-water are synced, and only then are the hot rows removed.
-//!
-//! Every MDBX access here is scoped in an explicit `with_read_txn` / `with_write_txn` closure; jar
-//! file I/O happens outside those closures so a read txn never spans disk writes.
-
+//! Ordering is crash-atomic so a row is never absent from both tiers: jars are made durable, then
+//! the hot auxiliary index and high-water mark are synced, and only then are the hot rows removed.
+//! Every MDBX access is scoped in an explicit txn closure, so a read txn never spans jar writes.
 use std::{
     collections::BTreeMap,
     ops::RangeInclusive,
@@ -22,8 +16,8 @@ use rayls_infrastructure_types::{
 };
 use tracing::info;
 
-use super::{ColdError, ColdLocation, ColdResult, ColdStore, ARCHIVE_HIGH_WATER_KEY};
-use crate::tables::{Batches, ColdArchiveHighWater, ColdBatchLocations, ConsensusBlocks};
+use super::{ColdError, ColdLocation, ColdResult, ColdStore, ARCHIVE_HIGH_WATER_MARK_KEY};
+use crate::tables::{Batches, ColdArchiveHighWaterMark, ColdBatchLocations, ConsensusBlocks};
 
 /// A header plus its archivable batch rows, captured under a read txn for the later jar phase.
 type PendingBlock = (Vec<u8>, Vec<(BlockHash, Vec<u8>)>);
@@ -40,13 +34,14 @@ const MAX_CHUNK_DIGESTS: usize = 64;
 /// at a handful of lines per epoch.
 const SEAL_PROGRESS_LOG_BLOCKS: u64 = 50_000;
 
-/// Returns the process-wide high-water gauge (last fully-archived epoch), registered on first use.
-fn high_water_gauge() -> &'static IntGauge {
+/// Returns the process-wide high-water mark gauge (last fully-archived epoch), registered on first
+/// use.
+fn high_water_mark_gauge() -> &'static IntGauge {
     static GAUGE: OnceLock<IntGauge> = OnceLock::new();
     GAUGE.get_or_init(|| {
         crate::layered_db::register_metric_or_unscraped(|registry| {
             register_int_gauge_with_registry!(
-                "cold_archive_high_water_epoch",
+                "cold_archive_high_water_mark_epoch",
                 "Last fully-archived (sealed and indexed) cold epoch.",
                 registry,
             )
@@ -62,8 +57,10 @@ pub enum SealOutcome {
     Sealed(Epoch),
     /// Every epoch below the cutoff is already sealed; nothing to do.
     Drained,
-    /// The cancel flag tripped at a chunk seam; the jars are uncommitted and the next
-    /// `begin_epoch` heals them, so the epoch re-seals whole on retry.
+    /// The cancel flag tripped, leaving the epoch NOT archived. At a seal chunk seam the jars are
+    /// uncommitted and the next `begin_epoch` heals them, so the epoch re-seals whole; at a prune
+    /// batch seam the jars and index are durable and only leftover hot rows remain, which the
+    /// next [`reconcile`](super::reconcile()) sweeps. Either way the caller must retry the epoch.
     Cancelled,
 }
 
@@ -129,19 +126,24 @@ pub(super) fn seal_next_epoch<DB: Database>(
         JarSeal::Sealed(sealed) => {
             let seal = seal_started.elapsed();
             let finalize_started = Instant::now();
-            let stats = finalize_sealed(db, &sealed, &|| false, Duration::ZERO)?;
-            // The fused path's per-epoch progress, mirroring the live actor's "cold pass phases";
-            // `remaining` counts the epochs still due below the cutoff, so a long boot or
-            // migration drain shows its distance to done.
-            info!(
-                target: "cold-archive",
-                epoch = sealed.epoch,
-                remaining = cutoff_epoch - sealed.epoch - 1,
-                seal = ?seal,
-                finalize = ?finalize_started.elapsed(),
-                "cold backlog epoch archived",
-            );
-            Ok(Some(stats))
+            match finalize_sealed(db, &sealed, &|| false, Duration::ZERO)? {
+                Finalized::Complete(stats) => {
+                    // The fused path's per-epoch progress, mirroring the live actor's "cold pass
+                    // phases"; `remaining` counts the epochs still due below the cutoff, so a long
+                    // boot or migration drain shows its distance to done.
+                    info!(
+                        target: "cold-archive",
+                        epoch = sealed.epoch,
+                        remaining = cutoff_epoch - sealed.epoch - 1,
+                        seal = ?seal,
+                        finalize = ?finalize_started.elapsed(),
+                        "cold backlog epoch archived",
+                    );
+                    Ok(Some(stats))
+                }
+                // The flag above never trips, so this is unreachable alongside JarSeal::Cancelled.
+                Finalized::Cancelled => Ok(None),
+            }
         }
         // The flag above never trips, so Cancelled is unreachable and folds into "nothing sealed".
         JarSeal::Drained | JarSeal::Cancelled => Ok(None),
@@ -169,37 +171,53 @@ pub(super) enum JarSeal {
     Cancelled,
 }
 
-/// Finalizes one sealed epoch from its carried metadata: index + high-water in one synced txn,
-/// then the hot prune in bounded batches. The tail of the crash-atomic ordering; the jars are
-/// already durable. The live archiver passes its cancel flag and [`PRUNE_YIELD`]; the fused
+/// Outcome of [`finalize_sealed`].
+///
+/// `#[must_use]` because dropping it silently reports a cancelled pass as a completed archive.
+#[must_use]
+pub(super) enum Finalized {
+    /// The index, the high-water mark and the whole hot prune landed; carries the pass counts.
+    Complete(ArchiveStats),
+    /// `should_cancel` tripped mid-prune: the jars and the index are durable, so every row is in
+    /// cold, and the leftover hot rows are swept by the next
+    /// [`reconcile`](super::reconcile())'s last-block probe. The epoch is NOT fully archived.
+    Cancelled,
+}
+
+/// Finalizes one sealed epoch from its carried metadata: index + high-water mark in bounded synced
+/// txns, then the hot prune in bounded batches. The tail of the crash-atomic ordering; the jars
+/// are already durable. The live archiver passes its cancel flag and [`PRUNE_YIELD`]; the fused
 /// boot/offline paths pass no-cancel and zero yield (nothing shares the hot writer yet).
 pub(super) fn finalize_sealed<DB: Database>(
     db: &DB,
     sealed: &SealedJars,
     should_cancel: &(impl Fn() -> bool + ?Sized),
     yield_between: Duration,
-) -> ColdResult<ArchiveStats> {
-    commit_index_and_high_water(db, sealed.epoch, &sealed.locations)?;
-    let blocks_archived = delete_archived_rows(
+) -> ColdResult<Finalized> {
+    commit_index(db, &sealed.locations)?;
+    let Some(blocks_archived) = delete_archived_rows(
         db,
         sealed.numbers.clone(),
         &sealed.locations,
         should_cancel,
         yield_between,
-    )?;
-    Ok(ArchiveStats {
+    )?
+    else {
+        return Ok(Finalized::Cancelled);
+    };
+    advance_high_water_mark(db, sealed.epoch)?;
+    Ok(Finalized::Complete(ArchiveStats {
         batches_archived: sealed.locations.len() as u64,
         blocks_archived,
         epochs_sealed: 1,
-    })
+    }))
 }
 
 /// Seals the lowest unsealed epoch below `cutoff_epoch` into committed jars, without the
-/// index+prune tail (a later [`reconcile`](super::reconcile()) finalizes, or
-/// [`seal_next_epoch`] fuses both).
+/// index+prune tail that [`reconcile`](super::reconcile()) or [`seal_next_epoch`] adds.
 ///
-/// `should_cancel` is polled at each chunk seam; a cancelled pass leaves the jars uncommitted and
-/// hot rows intact, so the next `begin_epoch` heals and re-seals whole.
+/// A cancel at a chunk seam leaves the jars uncommitted and hot rows intact, so the next
+/// `begin_epoch` re-seals the epoch whole.
 pub(super) fn seal_next_epoch_jars<DB: Database>(
     db: &DB,
     cold: &ColdStore,
@@ -207,19 +225,31 @@ pub(super) fn seal_next_epoch_jars<DB: Database>(
     chunk_bytes: usize,
     should_cancel: &(impl Fn() -> bool + ?Sized),
 ) -> ColdResult<JarSeal> {
-    // Resume past the last SEALED jar's tip, not the high-water: a sealed epoch can still await
-    // its finalize prune, and a high-water resume would re-open (truncate) a committed jar.
+    // Resume past the last SEALED jar's tip, not the high-water mark: a sealed epoch can still
+    // await its finalize prune, and a high-water mark resume would re-open (truncate) a
+    // committed jar.
     let resume_number =
         cold.consensus_blocks().last_sealed().map(|jar| jar.end_key() + 1).unwrap_or(0);
 
-    // A torn epoch (jar durable, high-water not advanced) still owns its hot rows, so it is
-    // rediscovered and re-sealed whole.
+    // An epoch whose consensus_blocks jar never committed is absent from the index, so the resume
+    // above does not skip it and it is re-sealed whole. One whose jar did commit is past the
+    // resume point and is finished by reconcile instead.
     let Some((start_number, epoch)) = first_unsealed_block(db, resume_number)? else {
         return Ok(JarSeal::Drained);
     };
     if epoch >= cutoff_epoch {
         // A partially-filled current epoch is never sealed.
         return Ok(JarSeal::Drained);
+    }
+    // `begin_epoch` hands nippy a fresh zero-row config for the epoch's file, whose consistency
+    // heal truncates whatever that file already holds. An epoch that is already sealed yet still
+    // owns hot rows past its jar was sealed short by an earlier pass, so re-opening it would
+    // destroy the only copy of the rows that pass archived and pruned.
+    if cold.consensus_blocks().is_epoch_sealed(epoch) {
+        return Err(ColdError::Corruption(format!(
+            "epoch {epoch} is already sealed yet still holds hot block {start_number}: its jar \
+             covers only part of the epoch"
+        )));
     }
 
     cold.consensus_blocks().begin_epoch(epoch, start_number)?;
@@ -276,6 +306,26 @@ pub(super) fn seal_next_epoch_jars<DB: Database>(
         epoch_open = !closed;
     }
 
+    // The peek and the walk run in separate read txns, so a row the peek saw can be gone or carry
+    // another epoch by the time the walk reads it; an empty capture would build an inverted range.
+    if next_number == start_number {
+        return Err(ColdError::Corruption(format!(
+            "epoch {epoch} seal captured no block at {start_number}"
+        )));
+    }
+    // A mid-walk cursor error is indistinguishable from end-of-table (the raw iterator yields
+    // `None` for both), and committing a short jar is unrecoverable: the finalize prunes the rows
+    // that jar holds, and the epoch's remaining hot rows then look like a fresh epoch to seal.
+    // Nothing is committed yet, so confirming the walk really reached the epoch end is free.
+    if let Some((number, block_epoch)) = first_unsealed_block(db, next_number)? {
+        if block_epoch == epoch {
+            return Err(ColdError::Corruption(format!(
+                "epoch {epoch} seal walk stopped at block {next_number} but block {number} still \
+                 belongs to it"
+            )));
+        }
+    }
+
     // Commit both jars so the `.conf` durability boundary is on disk before any hot delete.
     // NOTE: batches commits before consensus_blocks, and reconcile/archive gate "sealed" on the
     // consensus_blocks jar alone. So a crash between these commits leaves the epoch un-sealed
@@ -284,17 +334,14 @@ pub(super) fn seal_next_epoch_jars<DB: Database>(
     cold.batches().commit()?;
     cold.consensus_blocks().commit()?;
 
-    // The peek found at least one block, so the walk captured at least one and the range is
-    // never empty.
+    // The empty-capture check above makes the range non-empty by construction.
     Ok(JarSeal::Sealed(SealedJars { epoch, numbers: start_number..=next_number - 1, locations }))
 }
 
-/// Reads one seal chunk under `tx`: whole blocks from `start_from` until the byte budget or
-/// digest cap is crossed, plus their fresh batch payloads, assembled in append order; returns
-/// whether the walk closed the epoch.
+/// Reads one seal chunk under `tx`: whole blocks from `start_from` until the byte budget or digest
+/// cap is crossed, plus their fresh batch payloads in append order, and whether the epoch closed.
 ///
-/// Batches are read in sorted-digest order (b-tree key order, not random probes); `archived`
-/// carries the epoch's captured digests across chunks so a shared digest still dedups.
+/// `archived` carries the epoch's captured digests across chunks so a shared digest still dedups.
 fn read_seal_chunk<TX: DbTx>(
     tx: &TX,
     epoch: Epoch,
@@ -348,7 +395,9 @@ fn read_seal_chunk<TX: DbTx>(
         }
     }
 
-    // `fresh_count` was tallied during selection, so the buffer is sized exactly once.
+    // `fresh_count` was tallied during selection, so the buffer is sized exactly once. Sorted
+    // because the fetch below walks `Batches` in b-tree key order rather than probing at random,
+    // which is what keeps a chunk's payload reads sequential across a multi-gigabyte table.
     let mut wanted: Vec<BlockHash> = Vec::with_capacity(fresh_count);
     wanted.extend(selected.iter().flat_map(|(_, fresh)| fresh.iter().copied()));
     wanted.sort_unstable();
@@ -400,54 +449,71 @@ fn first_unsealed_block<DB: Database>(
     .map_err(to_cold)
 }
 
-/// Inserts the staged batch locations and advances the high-water to `epoch` in one hot txn,
-/// drained via `sync_persist` so it is applied before any hot row is removed.
+/// Inserts the staged batch locations in bounded hot txns and drains them.
 ///
-/// `sync_persist` orders, it does not fsync (SafeNoSync env). That suffices: MDBX commits
-/// monotonically, so the later delete commit can never be durable while this one is not, and the
-/// independently fsynced jars let boot [`reconcile`](super::reconcile()) rebuild the rest.
-pub(super) fn commit_index_and_high_water<DB: Database>(
+/// The drain orders, it does not fsync (SafeNoSync env): MDBX commits monotonically, so a later
+/// delete can never be durable while this is not, and the fsynced jars let boot reconcile rebuild.
+pub(super) fn commit_index<DB: Database>(
     db: &DB,
-    epoch: Epoch,
     locations: &[(BlockHash, ColdLocation)],
 ) -> ColdResult<()> {
-    db.with_write_txn(|txn| {
-        for (digest, loc) in locations {
-            txn.insert::<ColdBatchLocations>(digest, loc)?;
-        }
-        txn.insert::<ColdArchiveHighWater>(&ARCHIVE_HIGH_WATER_KEY, &epoch)?;
-        Ok(())
-    })
-    .map_err(to_cold)?;
-    // Drain the write queue so the high-water commit is applied before the hot delete (ordering,
-    // not an fsync; see the doc above).
+    for chunk in locations.chunks(WRITE_BATCH_ROWS) {
+        db.with_write_txn(|txn| {
+            for (digest, loc) in chunk {
+                txn.insert::<ColdBatchLocations>(digest, loc)?;
+            }
+            Ok(())
+        })
+        .map_err(to_cold)?;
+    }
+    // Every location must be applied before the prune removes the rows they address.
     db.sync_persist();
-    high_water_gauge().set(epoch as i64);
     Ok(())
 }
 
-/// Rows evicted per prune commit: a whole-epoch prune in one txn would hold the single hot
-/// writer (shared with live consensus) for tens of seconds; bounded batches with a yield hand it
-/// back, so consensus writes never wait more than one batch.
-const PRUNE_BATCH_ROWS: usize = 4096;
+/// Marks `epoch` fully archived, after its index and its whole hot prune have landed.
+///
+/// NOTE: this is the LAST step of a finalize, never an earlier one. The high-water mark's only
+/// meaning is "archived through here", which is what lets reconcile skip an epoch without probing
+/// it. An interruption anywhere before this leaves it un-advanced, so reconcile re-runs the whole
+/// finalize for that epoch, which is idempotent. Advancing it earlier would mark an epoch done
+/// while its rows were still hot, and nothing would ever sweep them.
+pub(super) fn advance_high_water_mark<DB: Database>(db: &DB, epoch: Epoch) -> ColdResult<()> {
+    db.with_write_txn(|txn| {
+        txn.insert::<ColdArchiveHighWaterMark>(&ARCHIVE_HIGH_WATER_MARK_KEY, &epoch)
+    })
+    .map_err(to_cold)?;
+    db.sync_persist();
+    high_water_mark_gauge().set(epoch as i64);
+    Ok(())
+}
+
+/// Rows written per hot commit, indexing and pruning alike: a whole epoch in one txn holds the
+/// single hot writer (shared with live consensus) for tens of seconds, and the writer queue's
+/// over-mark pacing sleeps under it.
+///
+/// NOTE: this bounds the transaction, it does not isolate it. The layered writer refcounts
+/// overlapping transactions, so a consensus write spanning a chunk boundary merges that chunk into
+/// its transaction and the archiver's commit only decrements the count. The delay is one consensus
+/// transaction, which is short, but a chunk boundary is not a guaranteed commit point.
+const WRITE_BATCH_ROWS: usize = 4096;
 
 /// A yield between live prune batches: long enough for consensus writes queued during the batch
 /// to reach the writer before the next one, and well under a consensus round.
 pub(super) const PRUNE_YIELD: Duration = Duration::from_millis(5);
 
-/// Removes an archived epoch's hot rows in bounded per-txn batches (addressed from the sealed
-/// jar's metadata, no hot scan), returning the epoch's block count.
+/// Removes an archived epoch's hot rows in bounded per-txn batches addressed from the sealed jar,
+/// returning the block count, or `None` if `should_cancel` tripped mid-prune.
 ///
-/// Only invoked after the jars are durable and the high-water synced. A cancelled or crashed
-/// partial delete is safe: every row is already in cold, the epoch's LAST block is deleted last,
-/// and [`reconcile`](super::reconcile()) probes it to sweep leftovers.
+/// Only safe after the jars are durable and the high-water mark synced. A partial delete strands
+/// nothing: the epoch's LAST block is deleted last, which is what reconcile probes to sweep it.
 pub(super) fn delete_archived_rows<DB: Database>(
     db: &DB,
     numbers: RangeInclusive<u64>,
     locations: &[(BlockHash, ColdLocation)],
     should_cancel: &(impl Fn() -> bool + ?Sized),
     yield_between: Duration,
-) -> ColdResult<u64> {
+) -> ColdResult<Option<u64>> {
     let count = numbers.end() - numbers.start() + 1;
     let digests: Vec<BlockHash> = locations.iter().map(|(digest, _)| *digest).collect();
     let block_numbers: Vec<u64> = numbers.collect();
@@ -461,22 +527,22 @@ pub(super) fn delete_archived_rows<DB: Database>(
             std::thread::sleep(yield_between);
         }
     };
-    for chunk in digests.chunks(PRUNE_BATCH_ROWS) {
+    for chunk in digests.chunks(WRITE_BATCH_ROWS) {
         if should_cancel() {
-            return Ok(count);
+            return Ok(None);
         }
         db.with_write_txn(|txn| txn.evict_persistent_batch::<Batches>(chunk)).map_err(to_cold)?;
         pace(db);
     }
-    for chunk in block_numbers.chunks(PRUNE_BATCH_ROWS) {
+    for chunk in block_numbers.chunks(WRITE_BATCH_ROWS) {
         if should_cancel() {
-            return Ok(count);
+            return Ok(None);
         }
         db.with_write_txn(|txn| txn.evict_persistent_batch::<ConsensusBlocks>(chunk))
             .map_err(to_cold)?;
         pace(db);
     }
-    Ok(count)
+    Ok(Some(count))
 }
 
 /// Converts an `eyre` error from the `Database`/`DbTx` trait boundary into a [`ColdError`].

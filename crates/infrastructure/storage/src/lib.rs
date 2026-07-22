@@ -21,7 +21,7 @@ use tables::{
     LastProposedByAuthority, NodeBatchesCache, NodeIdentity, Payload, Votes,
 };
 #[cfg(feature = "cold-storage")]
-use tables::{ColdArchiveHighWater, ColdBatchLocations};
+use tables::{ColdArchiveHighWaterMark, ColdBatchLocations};
 
 // Always build redb, we use it as the default for persistant consensus data.
 pub mod layered_db;
@@ -70,7 +70,7 @@ const BATCH_ORDERING_STATE_CF: &str = "batch_ordering_state";
 #[cfg(feature = "cold-storage")]
 const COLD_BATCH_LOCATIONS_CF: &str = "cold_batch_locations";
 #[cfg(feature = "cold-storage")]
-const COLD_ARCHIVE_HIGH_WATER_CF: &str = "cold_archive_high_water";
+const COLD_ARCHIVE_HIGH_WATER_MARK_CF: &str = "cold_archive_high_water_mark";
 
 macro_rules! tables {
     ( $($table:ident;$name:expr;<$K:ty, $V:ty>),*) => {
@@ -140,7 +140,7 @@ pub mod tables {
         // Cold-tier aux index: batch digest -> (epoch jar, row); rebuildable from the jar.
         ColdBatchLocations;crate::COLD_BATCH_LOCATIONS_CF;<BlockHash, ColdLocation>,
         // Last fully-archived epoch; the atomicity commit boundary, at most one row.
-        ColdArchiveHighWater;crate::COLD_ARCHIVE_HIGH_WATER_CF;<u8, Epoch>
+        ColdArchiveHighWaterMark;crate::COLD_ARCHIVE_HIGH_WATER_MARK_CF;<u8, Epoch>
     );
 }
 
@@ -294,7 +294,7 @@ fn open_default_tables<DB: Database>(db: &mut DB) -> eyre::Result<()> {
     #[cfg(feature = "cold-storage")]
     {
         open_one::<ColdBatchLocations>(db)?;
-        open_one::<ColdArchiveHighWater>(db)?;
+        open_one::<ColdArchiveHighWaterMark>(db)?;
     }
 
     Ok(())

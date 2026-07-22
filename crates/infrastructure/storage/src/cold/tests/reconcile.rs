@@ -15,9 +15,9 @@ fn test_reconcile_heals_interrupted_archive() {
         fixtures.iter().filter(|f| archived(f.epoch)).map(|f| f.digest).collect();
 
     // Phase 1: seed hot, archive into durable jars, then simulate a crash AFTER the jar `.conf` is
-    // durable but BEFORE the hot delete + auxiliary-index/high-water commit. The dangerous ordering
-    // (hot delete before jar durable) is impossible by construction; this is the surviving
-    // crash window.
+    // durable but BEFORE the hot delete + auxiliary-index/high-water mark commit. The dangerous
+    // ordering (hot delete before jar durable) is impossible by construction; this is the
+    // surviving crash window.
     {
         let (db, hot) = open_test_db(&tmp);
         seed_hot(&hot, &fixtures);
@@ -25,14 +25,15 @@ fn test_reconcile_heals_interrupted_archive() {
         archive_below_epoch(&hot, db.cold(), cutoff, None).expect("archive");
 
         // Re-create the partial state: jars sealed (kept on disk), hot rows still present,
-        // auxiliary index and high-water rolled back as if the post-jar hot txn never committed.
+        // auxiliary index and high-water mark rolled back as if the post-jar hot txn never
+        // committed.
         hot.with_write_txn(|txn| {
             for f in fixtures.iter().filter(|f| archived(f.epoch)) {
                 txn.insert::<Batches>(&f.digest, &f.batch)?;
                 txn.insert::<ConsensusBlocks>(&f.number, &f.header)?;
                 txn.remove::<ColdBatchLocations>(&f.digest)?;
             }
-            txn.remove::<ColdArchiveHighWater>(&ARCHIVE_HIGH_WATER_KEY)?;
+            txn.remove::<ColdArchiveHighWaterMark>(&ARCHIVE_HIGH_WATER_MARK_KEY)?;
             Ok(())
         })
         .expect("simulate crash window");
@@ -53,12 +54,12 @@ fn test_reconcile_heals_interrupted_archive() {
     // Flush so any reconcile hot deletes land in the bare MDBX we probe for boundedness.
     hot.sync_persist();
 
-    // The auxiliary index and high-water are rebuilt from the self-describing jars.
-    let high_water = db
-        .get::<ColdArchiveHighWater>(&ARCHIVE_HIGH_WATER_KEY)
-        .expect("read high water")
-        .expect("reconcile must restore the high water from the durable jars");
-    assert_eq!(high_water, cutoff - 1);
+    // The auxiliary index and high-water mark are rebuilt from the self-describing jars.
+    let high_water_mark = db
+        .get::<ColdArchiveHighWaterMark>(&ARCHIVE_HIGH_WATER_MARK_KEY)
+        .expect("read high-water mark")
+        .expect("reconcile must restore the high-water mark from the durable jars");
+    assert_eq!(high_water_mark, cutoff - 1);
 
     // The redundant hot rows are re-deleted so the table stays bounded.
     let mdbx = hot.inner();
@@ -102,16 +103,12 @@ fn delete_segment_epoch_files(tmp: &TempDir, segment: &str, epoch: Epoch) {
     }
 }
 
-/// A crash BETWEEN the two jar commits (batches sealed, consensus_blocks not) must not destroy the
-/// torn epoch's only surviving copy.
+/// A crash between the two jar commits must leave the torn epoch re-sealable.
 ///
-/// `seal_epoch` commits batches before consensus_blocks, so a crash in that window leaves the
-/// batches jar durable but the consensus_blocks jar un-sealed (it drops from the boot index),
-/// the high-water un-advanced, and the epoch's hot rows present. Reconcile must gate on the
-/// consensus_blocks segment (the last commit) and leave the hot rows for the next archive pass.
-/// Against the bug it gates on the union, so it rebuilds an empty index from the missing jar,
-/// advances the high-water over it, and evicts the hot rows: both reads then return None because
-/// the rows live in neither tier (and the batches rows have no index entry).
+/// Batches commits before consensus_blocks, so that window leaves a durable batches jar, no
+/// consensus_blocks jar, and the hot rows present. Reconcile must gate on consensus_blocks, the
+/// last commit: gating on the union instead advances the high-water mark over a missing jar and
+/// evicts rows that are then in neither tier.
 #[test]
 fn reconcile_preserves_epoch_torn_between_jar_commits() {
     let tmp = TempDir::new().unwrap();
@@ -133,15 +130,18 @@ fn reconcile_preserves_epoch_torn_between_jar_commits() {
         delete_segment_epoch_files(&tmp, "consensus_blocks", torn_epoch);
 
         // Roll the rest back to that instant: the post-jar hot txn never ran, so the torn epoch's
-        // hot rows are still present, its auxiliary-index entries absent, and the high-water still
-        // points at the last fully sealed epoch below it.
+        // hot rows are still present, its auxiliary-index entries absent, and the high-water mark
+        // still points at the last fully sealed epoch below it.
         hot.with_write_txn(|txn| {
             for f in fixtures.iter().filter(|f| f.epoch == torn_epoch) {
                 txn.insert::<Batches>(&f.digest, &f.batch)?;
                 txn.insert::<ConsensusBlocks>(&f.number, &f.header)?;
                 txn.remove::<ColdBatchLocations>(&f.digest)?;
             }
-            txn.insert::<ColdArchiveHighWater>(&ARCHIVE_HIGH_WATER_KEY, &(torn_epoch - 1))?;
+            txn.insert::<ColdArchiveHighWaterMark>(
+                &ARCHIVE_HIGH_WATER_MARK_KEY,
+                &(torn_epoch - 1),
+            )?;
             Ok(())
         })
         .expect("carve crash window");
@@ -182,12 +182,11 @@ fn reconcile_preserves_epoch_torn_between_jar_commits() {
     }
 }
 
-/// A batch digest referenced by several blocks in one epoch is stored once, and a boot reconcile
-/// must rebuild its auxiliary-index row to match that single jar row.
+/// A digest several blocks in one epoch share is stored once, and reconcile must rebuild its
+/// index row to match that single jar row.
 ///
-/// `seal_epoch` dedups a shared digest (appends it once); the rebuild must apply the same dedup or
-/// the row counter drifts, mapping the shared digest (and every later one) to the wrong jar row.
-/// Regression for that append-vs-rebuild asymmetry.
+/// The seal appends it once, so a rebuild that does not dedup identically drifts the row counter
+/// and mis-maps that digest and every later one.
 #[test]
 fn reconcile_rebuilds_shared_digest_to_correct_row() {
     let tmp = TempDir::new().unwrap();
@@ -219,7 +218,7 @@ fn reconcile_rebuilds_shared_digest_to_correct_row() {
     };
 
     // Phase 1: archive into durable jars, then roll back the post-jar hot txn to model a crash
-    // after the jars are durable but before the index/high-water commit and hot delete.
+    // after the jars are durable but before the index/high-water mark commit and hot delete.
     {
         let (db, hot) = open_test_db(&tmp);
         seed(&hot);
@@ -232,7 +231,7 @@ fn reconcile_rebuilds_shared_digest_to_correct_row() {
             }
             txn.remove::<ColdBatchLocations>(&shared)?;
             txn.remove::<ColdBatchLocations>(&other)?;
-            txn.remove::<ColdArchiveHighWater>(&ARCHIVE_HIGH_WATER_KEY)?;
+            txn.remove::<ColdArchiveHighWaterMark>(&ARCHIVE_HIGH_WATER_MARK_KEY)?;
             Ok(())
         })
         .expect("simulate crash window");
@@ -257,10 +256,169 @@ fn reconcile_rebuilds_shared_digest_to_correct_row() {
     assert_eq!(encode(&got_other), encode(&batch_other), "row drift must not mis-serve later rows");
 }
 
+/// A digest an earlier epoch already archived gets NO new jar row when a later epoch's blocks
+/// reference it again, so replaying the block projection to rebuild the index numbers one row too
+/// many and shifts that digest and every later one in the epoch. Walking the batches jar cannot
+/// drift: row `i` stores the digest the seal appended at row `i`.
+#[test]
+fn reconcile_rebuilds_cross_epoch_shared_digest_from_the_jar() {
+    let tmp = TempDir::new().unwrap();
+
+    // Epoch 0 archives `shared`; epoch 1 references it again (already in cold, so no new row) and
+    // adds `only_later` at its jar's row 0. Block 3 keeps epoch 2 as the live epoch.
+    let shared = BlockHash::repeat_byte(0xD1);
+    let only_later = BlockHash::repeat_byte(0xE2);
+    let live = BlockHash::repeat_byte(0xF3);
+    let batch_shared = batch_for(100, 0);
+    let batch_only_later = batch_for(200, 1);
+    let blocks = [
+        (0u64, header_for(0, 0, shared)),
+        (1u64, header_for(1, 1, shared)),
+        (2u64, header_for(2, 1, only_later)),
+        (3u64, header_for(3, 2, live)),
+    ];
+
+    {
+        let (db, hot) = open_test_db(&tmp);
+        hot.with_write_txn(|txn| {
+            txn.insert::<Batches>(&shared, &batch_shared)?;
+            txn.insert::<Batches>(&only_later, &batch_only_later)?;
+            txn.insert::<Batches>(&live, &batch_for(300, 2))?;
+            for (number, header) in &blocks {
+                txn.insert::<ConsensusBlocks>(number, header)?;
+            }
+            Ok(())
+        })
+        .expect("seed hot");
+        hot.sync_persist();
+
+        // Archive one epoch at a time, flushing between: epoch 1's seal must observe `shared`
+        // already gone from hot, which is what makes it skip the row.
+        for cutoff in 1..=2 {
+            crate::cold::producer::seal_next_epoch(&hot, db.cold(), cutoff, usize::MAX)
+                .expect("seal")
+                .expect("one epoch below the cutoff");
+            hot.sync_persist();
+        }
+
+        // Roll back the index and high-water mark, the crash window boot reconcile rebuilds from.
+        hot.with_write_txn(|txn| {
+            txn.remove::<ColdBatchLocations>(&shared)?;
+            txn.remove::<ColdBatchLocations>(&only_later)?;
+            txn.remove::<ColdArchiveHighWaterMark>(&ARCHIVE_HIGH_WATER_MARK_KEY)?;
+            Ok(())
+        })
+        .expect("simulate crash window");
+        hot.sync_persist();
+    }
+
+    let (db, hot) = open_test_db(&tmp);
+    reconcile(&hot, db.cold()).expect("reconcile");
+    hot.sync_persist();
+
+    // Against the drift, `shared` is re-pointed at epoch 1 row 0 (which holds `only_later`) and
+    // `only_later` at a row epoch 1's jar does not have.
+    assert_eq!(
+        db.get::<ColdBatchLocations>(&shared).expect("read index"),
+        Some(ColdLocation { epoch: 0, row: 0 }),
+        "a digest archived by an earlier epoch keeps that epoch's row"
+    );
+    let got_shared = db
+        .get::<Batches>(&shared)
+        .expect("read shared")
+        .expect("shared digest must resolve after reconcile");
+    assert_eq!(encode(&got_shared), encode(&batch_shared));
+    let got_only_later = db
+        .get::<Batches>(&only_later)
+        .expect("read only_later")
+        .expect("later digest must resolve after reconcile");
+    assert_eq!(encode(&got_only_later), encode(&batch_only_later));
+}
+
+/// A batches jar's start key is an unused sentinel, so the rebuilt [`ColdLocation::row`] must be
+/// the row index alone. Sealing one at a non-zero start key pins that: any `start_key + row`
+/// mapping leaking into the rebuild is invisible while the seal happens to root batches jars at 0.
+#[test]
+fn reconcile_rebuilds_rows_independently_of_the_batches_start_key() {
+    let tmp = TempDir::new().unwrap();
+    let (db, hot) = open_test_db(&tmp);
+
+    let digests = [BlockHash::repeat_byte(0xA7), BlockHash::repeat_byte(0xB8)];
+    let batches: Vec<Batch> = (0..2).map(|n| batch_for(100 + n, 0)).collect();
+    hot.with_write_txn(|txn| {
+        for (digest, batch) in digests.iter().zip(&batches) {
+            txn.insert::<Batches>(digest, batch)?;
+        }
+        txn.insert::<ConsensusBlocks>(&0, &header_for(0, 0, digests[0]))?;
+        Ok(())
+    })
+    .expect("seed hot");
+    hot.sync_persist();
+
+    // Seal epoch 0 by hand so the batches jar is rooted at a non-zero sentinel; the seal path
+    // always passes 0, which is exactly what would hide a start-key-based row mapping.
+    db.cold().batches().begin_epoch(0, 500).expect("begin batches");
+    for (digest, batch) in digests.iter().zip(&batches) {
+        db.cold().batches().append_row(&[digest.as_slice(), &encode(batch)]).expect("append batch");
+    }
+    db.cold().batches().commit().expect("commit batches");
+    db.cold().consensus_blocks().begin_epoch(0, 0).expect("begin blocks");
+    db.cold()
+        .consensus_blocks()
+        .append_row(&[&encode(&header_for(0, 0, digests[0]))])
+        .expect("append block");
+    db.cold().consensus_blocks().commit().expect("commit blocks");
+
+    reconcile(&hot, db.cold()).expect("reconcile");
+    hot.sync_persist();
+
+    for (row, (digest, batch)) in digests.iter().zip(&batches).enumerate() {
+        assert_eq!(
+            db.get::<ColdBatchLocations>(digest).expect("read index"),
+            Some(ColdLocation { epoch: 0, row: row as u64 }),
+            "row must be the jar row index, not the jar start key plus it"
+        );
+        let served = db.get::<Batches>(digest).expect("read batch").expect("batch must serve");
+        assert_eq!(encode(&served), encode(batch));
+    }
+}
+
+/// A consensus DB restored without its `cold/` directory keeps a high-water mark and a fully
+/// populated auxiliary index while every jar is gone, so each archived read resolves to neither
+/// tier. Boot reconcile drives off the sealed jars, so it finds nothing to do; it must assert
+/// coverage and refuse to boot rather than serve the hole.
+#[test]
+fn reconcile_rejects_a_high_water_mark_the_jars_do_not_cover() {
+    let tmp = TempDir::new().unwrap();
+    let fixtures = build_fixtures();
+    let cutoff: Epoch = EPOCHS - 1;
+
+    {
+        let (db, hot) = open_test_db(&tmp);
+        seed_hot(&hot, &fixtures);
+        archive_below_epoch(&hot, db.cold(), cutoff, None).expect("archive");
+        hot.sync_persist();
+    }
+    std::fs::remove_dir_all(tmp.path().join("cold")).expect("restore without the cold directory");
+
+    let (db, hot) = open_test_db(&tmp);
+    assert!(db.cold().consensus_blocks().sealed_epochs().is_empty(), "no jar may survive");
+    assert!(
+        db.get::<ConsensusBlocks>(&0).expect("read block").is_none(),
+        "the archived rows really are absent from both tiers"
+    );
+
+    let healed = reconcile(&hot, db.cold());
+    assert!(
+        matches!(healed, Err(ColdError::Corruption(_))),
+        "reconcile must fail closed on a high-water mark no jar covers, got {healed:?}"
+    );
+}
+
 /// The durable residue of a seal whose index txn was lost while its hot prune landed (the layered
 /// writer surfaces a failed commit only through `sync_persist`, which logs and continues): jars
-/// durable, hot rows pruned, auxiliary index and high-water absent. Boot reconcile must rebuild
-/// the index from the jars so every archived row still serves.
+/// durable, hot rows pruned, auxiliary index and high-water mark absent. Boot reconcile must
+/// rebuild the index from the jars so every archived row still serves.
 #[test]
 fn reconcile_restores_pruned_but_unindexed_epochs() {
     let tmp = TempDir::new().unwrap();
@@ -272,12 +430,13 @@ fn reconcile_restores_pruned_but_unindexed_epochs() {
         let (db, hot) = open_test_db(&tmp);
         seed_hot(&hot, &fixtures);
         archive_below_epoch(&hot, db.cold(), cutoff, None).expect("archive");
-        // Carve the residue: the index/high-water txn rolls back while the (later) prune stays.
+        // Carve the residue: the index/high-water mark txn rolls back while the (later) prune
+        // stays.
         hot.with_write_txn(|txn| {
             for f in fixtures.iter().filter(|f| archived(f.epoch)) {
                 txn.remove::<ColdBatchLocations>(&f.digest)?;
             }
-            txn.remove::<ColdArchiveHighWater>(&ARCHIVE_HIGH_WATER_KEY)?;
+            txn.remove::<ColdArchiveHighWaterMark>(&ARCHIVE_HIGH_WATER_MARK_KEY)?;
             Ok(())
         })
         .expect("carve residue");
@@ -288,11 +447,11 @@ fn reconcile_restores_pruned_but_unindexed_epochs() {
     reconcile(&hot, db.cold()).expect("reconcile");
     hot.sync_persist();
 
-    let high_water = db
-        .get::<ColdArchiveHighWater>(&ARCHIVE_HIGH_WATER_KEY)
-        .expect("read high water")
-        .expect("reconcile must restore the high water");
-    assert_eq!(high_water, cutoff - 1);
+    let high_water_mark = db
+        .get::<ColdArchiveHighWaterMark>(&ARCHIVE_HIGH_WATER_MARK_KEY)
+        .expect("read high-water mark")
+        .expect("reconcile must restore the high-water mark");
+    assert_eq!(high_water_mark, cutoff - 1);
     for f in fixtures.iter().filter(|f| archived(f.epoch)) {
         let batch = db
             .get::<Batches>(&f.digest)
@@ -303,24 +462,29 @@ fn reconcile_restores_pruned_but_unindexed_epochs() {
     }
 }
 
-/// A crash between advancing the high-water and the hot delete leaves the high-water epoch's rows
-/// in both tiers; reconcile must re-delete them (boundedness) while they keep serving via cold.
+/// An epoch at or below the high-water mark is skipped outright, with no probe and no work.
+///
+/// That skip is what keeps boot O(sealed epochs) instead of a hot read per archived epoch, and it
+/// is sound only because the high-water mark advances after a completed prune. Pinning it also pins
+/// the trade: rows reappearing below the high-water mark are never swept, which no production path
+/// does.
 #[test]
-fn reconcile_redeletes_hot_rows_left_at_the_high_water_epoch() {
+fn reconcile_skips_epochs_at_or_below_the_high_water_mark() {
     let tmp = TempDir::new().unwrap();
     let fixtures = build_fixtures();
     let cutoff: Epoch = EPOCHS - 1;
-    // The last archived epoch is the persisted high-water.
-    let high_water_epoch = cutoff - 1;
+    // The last archived epoch is the persisted high-water mark.
+    let high_water_mark_epoch = cutoff - 1;
 
     {
         let (db, hot) = open_test_db(&tmp);
         seed_hot(&hot, &fixtures);
         archive_below_epoch(&hot, db.cold(), cutoff, None).expect("archive");
-        // Re-insert only the high-water epoch's rows: the index and high-water stay committed, so
-        // the state is exactly the crash window between the high-water txn and the delete.
+        // Re-insert only the high-water mark epoch's rows: the index and high-water mark stay
+        // committed, so the state is exactly the crash window between the high-water mark
+        // txn and the delete.
         hot.with_write_txn(|txn| {
-            for f in fixtures.iter().filter(|f| f.epoch == high_water_epoch) {
+            for f in fixtures.iter().filter(|f| f.epoch == high_water_mark_epoch) {
                 txn.insert::<Batches>(&f.digest, &f.batch)?;
                 txn.insert::<ConsensusBlocks>(&f.number, &f.header)?;
             }
@@ -336,24 +500,21 @@ fn reconcile_redeletes_hot_rows_left_at_the_high_water_epoch() {
 
     let mdbx = hot.inner();
     let numbers: BTreeSet<u64> =
-        fixtures.iter().filter(|f| f.epoch == high_water_epoch).map(|f| f.number).collect();
+        fixtures.iter().filter(|f| f.epoch == high_water_mark_epoch).map(|f| f.number).collect();
     let digests: BTreeSet<BlockHash> =
-        fixtures.iter().filter(|f| f.epoch == high_water_epoch).map(|f| f.digest).collect();
+        fixtures.iter().filter(|f| f.epoch == high_water_mark_epoch).map(|f| f.digest).collect();
     assert_eq!(
         count_hot_rows::<ConsensusBlocks, _>(mdbx, |n| numbers.contains(n)),
-        0,
-        "reconcile must re-delete the high-water epoch's hot consensus blocks"
+        numbers.len(),
+        "an epoch at the high-water mark is skipped, so reconcile leaves its rows untouched"
     );
     assert_eq!(
         count_hot_rows::<Batches, _>(mdbx, |d| digests.contains(d)),
-        0,
-        "reconcile must re-delete the high-water epoch's hot batches"
+        digests.len(),
+        "an epoch at the high-water mark is skipped, so reconcile leaves its batches untouched"
     );
-    for f in fixtures.iter().filter(|f| f.epoch == high_water_epoch) {
-        let batch = db
-            .get::<Batches>(&f.digest)
-            .expect("read batch")
-            .expect("re-deleted rows must keep serving via cold");
+    for f in fixtures.iter().filter(|f| f.epoch == high_water_mark_epoch) {
+        let batch = db.get::<Batches>(&f.digest).expect("read batch").expect("row must serve");
         assert_eq!(encode(&batch), encode(&f.batch));
         assert!(db.get::<ConsensusBlocks>(&f.number).expect("read block").is_some());
     }
@@ -361,8 +522,8 @@ fn reconcile_redeletes_hot_rows_left_at_the_high_water_epoch() {
 
 /// The boundary finalize (reconcile) must never open a serve gap: while it migrates a sealed
 /// epoch from hot rows to the cold index, a reader hammering the fall-through finds every
-/// archived row in at least one tier (the index+high-water commit lands strictly before the hot
-/// prune).
+/// archived row in at least one tier (the index+high-water mark commit lands strictly before the
+/// hot prune).
 #[test]
 fn finalize_never_gaps_reads_through_fall_through() {
     let tmp = TempDir::new().unwrap();
@@ -415,9 +576,11 @@ fn finalize_never_gaps_reads_through_fall_through() {
     }
 }
 
-/// A prune cancelled mid-archive (a shutdown between the high-water commit and the last prune
-/// batch) must leave every row in at least one tier - the high-water is committed, so the rows
-/// are in cold - and a later reconcile must sweep the leftover hot rows.
+/// A prune cancelled after the high-water mark commit leaves every row in cold, and a later
+/// reconcile must sweep the hot leftovers.
+///
+/// The pass must also report cancelled rather than archived: a `Sealed` outcome counts as
+/// progress and schedules the next pass, which is the teardown the cancel is stopping.
 #[test]
 fn paced_prune_cancelled_after_seal_heals_on_reconcile() {
     let tmp = TempDir::new().unwrap();
@@ -437,21 +600,24 @@ fn paced_prune_cancelled_after_seal_heals_on_reconcile() {
     hot.sync_persist();
 
     let archiver = ColdArchiver::new(hot.clone(), db.cold().clone());
-    // Cancel the instant epoch 0's jar is committed: the seal completes and the high-water commits,
-    // but the prune is skipped at its first batch - the partial-archive state a shutdown leaves.
+    // Cancel the instant epoch 0's jar is committed: the seal completes and the high-water mark
+    // commits, but the prune is skipped at its first batch - the partial-archive state a
+    // shutdown leaves.
     let cold = db.cold().clone();
     let cancel_once_sealed = move || cold.consensus_blocks().sealed_epochs().contains(&0);
-    assert!(matches!(
+    assert_eq!(
         archiver.seal_due(Epoch::MAX, cancel_once_sealed).expect("archive"),
-        SealOutcome::Sealed(0)
-    ));
+        SealOutcome::Cancelled,
+        "a pass whose prune was cancelled has not archived the epoch"
+    );
     hot.sync_persist();
 
-    // High-water advanced (epoch archived, rows in cold), but the hot rows were NOT pruned.
-    let high_water = hot
-        .with_read_txn(|tx| tx.get::<ColdArchiveHighWater>(&ARCHIVE_HIGH_WATER_KEY))
-        .expect("read high-water");
-    assert_eq!(high_water, Some(0), "high-water advanced before the prune");
+    // The high-water mark did NOT advance, so the epoch stays above it and reconcile revisits it;
+    // its rows are in cold either way, so serving is unaffected.
+    let high_water_mark = hot
+        .with_read_txn(|tx| tx.get::<ColdArchiveHighWaterMark>(&ARCHIVE_HIGH_WATER_MARK_KEY))
+        .expect("read high-water mark");
+    assert_eq!(high_water_mark, None, "a cancelled prune must not mark the epoch archived");
     assert!(
         count_hot_rows::<ConsensusBlocks, _>(hot.inner(), |n| *n <= 2) > 0,
         "the cancelled prune left hot rows (they are in both tiers, which is safe)"
@@ -471,13 +637,13 @@ fn paced_prune_cancelled_after_seal_heals_on_reconcile() {
 }
 
 /// A prune cancelled MID-delete (some block chunks committed, the tail not) must still be swept
-/// by reconcile. The paced prune deletes ascending in per-txn chunks, so the epoch's first block
-/// can be gone while its last is still hot: a torn-epoch probe on the FIRST block reads "clean"
-/// and strands the tail hot forever once the high-water advances past the epoch. The probe must
-/// target the epoch's LAST block, which both delete paths remove last.
+/// by reconcile: the epoch stays above the high-water mark, so the whole finalize re-runs and the
+/// re-prune is addressed from the jar rather than from what the hot tier still happens to hold.
 #[test]
 fn reconcile_sweeps_partially_paced_pruned_epoch() {
-    use crate::cold::producer::{finalize_sealed, seal_next_epoch_jars, JarSeal, SEAL_CHUNK_BYTES};
+    use crate::cold::producer::{
+        finalize_sealed, seal_next_epoch_jars, Finalized, JarSeal, SEAL_CHUNK_BYTES,
+    };
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     let tmp = TempDir::new().unwrap();
@@ -501,21 +667,25 @@ fn reconcile_sweeps_partially_paced_pruned_epoch() {
     let seal = seal_next_epoch_jars(&hot, db.cold(), 1, SEAL_CHUNK_BYTES, &|| false).expect("seal");
     let JarSeal::Sealed(sealed) = seal else { panic!("epoch 0 must seal") };
     let polls = AtomicUsize::new(0);
-    finalize_sealed(
+    let finalized = finalize_sealed(
         &hot,
         &sealed,
         &|| polls.fetch_add(1, Ordering::Relaxed) + 1 >= 4,
         Duration::ZERO,
     )
     .expect("paced finalize");
+    assert!(
+        matches!(finalized, Finalized::Cancelled),
+        "a prune stopped before its last batch has not finished archiving the epoch"
+    );
     hot.sync_persist();
 
-    // The partial-archive state a shutdown leaves: high-water committed, first block gone, last
-    // block still hot (every row is in cold, so this is safe but must not persist).
-    let high_water = hot
-        .with_read_txn(|tx| tx.get::<ColdArchiveHighWater>(&ARCHIVE_HIGH_WATER_KEY))
-        .expect("read high-water");
-    assert_eq!(high_water, Some(0), "high-water advanced before the cancelled prune");
+    // The partial-archive state a shutdown leaves: index committed, first block gone, last block
+    // still hot, and the high-water mark un-advanced so the epoch is still due.
+    let high_water_mark = hot
+        .with_read_txn(|tx| tx.get::<ColdArchiveHighWaterMark>(&ARCHIVE_HIGH_WATER_MARK_KEY))
+        .expect("read high-water mark");
+    assert_eq!(high_water_mark, None, "a cancelled prune must not mark the epoch archived");
     assert_eq!(count_hot_rows::<ConsensusBlocks, _>(hot.inner(), |n| *n == 0), 0);
     assert_eq!(count_hot_rows::<ConsensusBlocks, _>(hot.inner(), |n| *n == BLOCKS - 1), 1);
 

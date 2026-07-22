@@ -80,12 +80,12 @@ fn test_archive_keeps_hot_bounded_and_serves_cold() {
         );
     }
 
-    // (c) The auxiliary index and high-water reflect the archive.
-    let high_water = db
-        .get::<ColdArchiveHighWater>(&ARCHIVE_HIGH_WATER_KEY)
-        .expect("read high water")
-        .expect("high water must advance after archive");
-    assert_eq!(high_water, cutoff - 1, "high water is the last fully-archived epoch");
+    // (c) The auxiliary index and high-water mark reflect the archive.
+    let high_water_mark = db
+        .get::<ColdArchiveHighWaterMark>(&ARCHIVE_HIGH_WATER_MARK_KEY)
+        .expect("read high-water mark")
+        .expect("high-water mark must advance after archive");
+    assert_eq!(high_water_mark, cutoff - 1, "high-water mark is the last fully-archived epoch");
 
     for f in fixtures.iter().filter(|f| archived(f.epoch)) {
         let loc: ColdLocation = db
@@ -224,8 +224,8 @@ fn seal_due_seals_prior_epoch_during_live_epoch() {
     }
 }
 
-/// `max_epochs` caps how many epochs one pass seals; the resumable high-water drains the rest over
-/// later passes, converging to one uncapped pass. This bounds the boundary archival pause.
+/// `max_epochs` caps how many epochs one pass seals; the resumable high-water mark drains the rest
+/// over later passes, converging to one uncapped pass. This bounds the boundary archival pause.
 #[test]
 fn archive_below_epoch_caps_epochs_per_pass() {
     let tmp = TempDir::new().unwrap();
@@ -241,10 +241,10 @@ fn archive_below_epoch_caps_epochs_per_pass() {
     hot.sync_persist();
     assert_eq!(first.epochs_sealed, 1, "a cap of one seals exactly one epoch");
 
-    // The next pass resumes past the high-water and seals the next eligible epoch.
+    // The next pass resumes past the high-water mark and seals the next eligible epoch.
     let second = archive_below_epoch(&hot, db.cold(), cutoff, Some(1)).expect("second capped pass");
     hot.sync_persist();
-    assert_eq!(second.epochs_sealed, 1, "the resumable high-water advances the capped passes");
+    assert_eq!(second.epochs_sealed, 1, "the resumable high-water mark advances the capped passes");
 
     // The backlog is now drained; a further (uncapped) pass seals nothing.
     let third = archive_below_epoch(&hot, db.cold(), cutoff, None).expect("drained pass");

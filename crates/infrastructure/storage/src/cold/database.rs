@@ -94,13 +94,19 @@ impl<DB: Database> ColdTx<'_, DB> {
         self.cold_raw::<T>(key)?.map(|bytes| decode_cold::<T>(&bytes)).transpose()
     }
 
-    /// Returns true if the cold tier holds `key`, without reading the payload.
+    /// Returns true if the cold tier holds `key`.
     fn cold_has<T: Table>(&self, key: &T::Key) -> ColdResult<bool> {
         match cold_kind::<T>() {
             Some(ColdKind::ConsensusBlocks) => {
                 Ok(self.cold.consensus_blocks().contains_number(archived_number::<T>(key)?))
             }
-            Some(ColdKind::Batches) => Ok(self.archived_location::<T>(key)?.is_some()),
+            // Answered from the jar, not the auxiliary index alone: an index entry can name a row
+            // that is not readable (an epoch whose jar is not sealed yet, a digest the jar does not
+            // hold), and a `contains_key` that promises a value `get` cannot produce turns any
+            // availability check that gates on it into a lie. The price is a full row read (mmap
+            // plus decompress, sized to the widest archived batch), so this is the exact answer and
+            // not a cheap one: resolve a set of digests with `get`, never with this in a loop.
+            Some(ColdKind::Batches) => Ok(self.cold_raw::<T>(key)?.is_some()),
             None => Ok(false),
         }
     }
@@ -244,12 +250,28 @@ impl<DB: Database> Database for ColdDatabase<DB> {
         self.inner.write_txn()
     }
 
+    // Point reads answer from the hot tier first: opening a transaction up front would cost one
+    // per read for every table in the workspace, including those whose fall-through can never
+    // fire. The cold resolve then skips `ColdTx`'s own hot-first probe, which has already missed
+    // here and would otherwise run a second time under the transaction it opens.
     fn contains_key<T: Table>(&self, key: &T::Key) -> eyre::Result<bool> {
-        self.with_read_txn(|tx| tx.contains_key::<T>(key))
+        if self.inner.contains_key::<T>(key)? {
+            return Ok(true);
+        }
+        if cold_kind::<T>().is_none() {
+            return Ok(false);
+        }
+        self.read_txn()?.cold_has::<T>(key).map_err(cold_to_eyre)
     }
 
     fn get<T: Table>(&self, key: &T::Key) -> eyre::Result<Option<T::Value>> {
-        self.with_read_txn(|tx| tx.get::<T>(key))
+        if let Some(value) = self.inner.get::<T>(key)? {
+            return Ok(Some(value));
+        }
+        if cold_kind::<T>().is_none() {
+            return Ok(None);
+        }
+        self.read_txn()?.cold_get::<T>(key).map_err(cold_to_eyre)
     }
 
     fn insert<T: Table>(&self, key: &T::Key, value: &T::Value) -> eyre::Result<()> {
@@ -309,5 +331,76 @@ impl<DB: Database> Database for ColdDatabase<DB> {
 
     fn sync_persist(&self) {
         self.inner.sync_persist()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use rayls_infrastructure_types::{encode, Batch};
+    use tempfile::TempDir;
+
+    use super::*;
+    use crate::cold::probe::ProbeDb;
+
+    /// Returns a cold-tiered database whose hot tier counts the read transactions opened on it.
+    fn probe_cold_db(tmp: &TempDir) -> ColdDatabase<ProbeDb> {
+        let db = ColdDatabase::open(ProbeDb::new(), &ColdConfig { dir: tmp.path().join("cold") })
+            .expect("open cold store");
+        db.open_table::<Batches>().expect("open Batches");
+        db
+    }
+
+    /// A point read the hot tier can answer opens no read transaction, and neither does a miss on
+    /// a table with no cold tier; only a hot miss that can actually fall through pays for one.
+    #[test]
+    fn point_reads_reach_for_a_txn_only_to_fall_through() {
+        let tmp = TempDir::new().expect("tempdir");
+        let db = probe_cold_db(&tmp);
+
+        let hot_digest = BlockHash::repeat_byte(0x11);
+        let hot_batch = Batch { transactions: vec![vec![1u8; 64]], ..Default::default() };
+        db.insert::<Batches>(&hot_digest, &hot_batch).expect("insert hot batch");
+        let before = db.inner().read_txns();
+
+        assert!(db.get::<Batches>(&hot_digest).expect("get").is_some(), "hot hit must serve");
+        assert!(db.contains_key::<Batches>(&hot_digest).expect("contains"), "hot hit must serve");
+        // `ColdBatchLocations` has no cold tier, so a miss on it can never find more.
+        let absent = BlockHash::repeat_byte(0x99);
+        assert!(db.get::<ColdBatchLocations>(&absent).expect("get").is_none());
+        assert_eq!(db.inner().read_txns(), before, "hot answers must not open a read txn");
+
+        // The fall-through itself is unchanged: a batch that lives only in cold still resolves.
+        let cold_digest = BlockHash::repeat_byte(0x22);
+        let cold_batch = Batch { transactions: vec![vec![2u8; 64]], ..Default::default() };
+        db.cold().batches().begin_epoch(1, 0).expect("begin epoch");
+        db.cold()
+            .batches()
+            .append_row(&[cold_digest.as_slice(), &encode(&cold_batch)])
+            .expect("append row");
+        db.cold().batches().commit().expect("commit");
+        db.insert::<ColdBatchLocations>(&cold_digest, &ColdLocation { epoch: 1, row: 0 })
+            .expect("insert cold location");
+
+        let served = db.get::<Batches>(&cold_digest).expect("get").expect("cold batch must serve");
+        assert_eq!(encode(&served), encode(&cold_batch), "the cold row must round-trip");
+        assert!(db.inner().read_txns() > before, "a cold fall-through does open a read txn");
+    }
+
+    /// `contains_key` never claims a batch that `get` cannot produce: an auxiliary-index entry
+    /// naming an unsealed epoch has no readable row, and both reads must say so.
+    #[test]
+    fn cold_contains_key_agrees_with_get_for_batches() {
+        let tmp = TempDir::new().expect("tempdir");
+        let db = probe_cold_db(&tmp);
+
+        let digest = BlockHash::repeat_byte(0x33);
+        db.insert::<ColdBatchLocations>(&digest, &ColdLocation { epoch: 7, row: 0 })
+            .expect("insert cold location");
+
+        assert!(db.get::<Batches>(&digest).expect("get").is_none(), "no jar holds the row");
+        assert!(
+            !db.contains_key::<Batches>(&digest).expect("contains"),
+            "contains_key must not promise a batch the serve path cannot produce",
+        );
     }
 }

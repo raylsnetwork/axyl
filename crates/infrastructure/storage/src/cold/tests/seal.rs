@@ -47,13 +47,9 @@ fn seal_layout(layout: &[(u64, BlockHash)], chunk_bytes: usize) -> (TempDir, Tes
     (tmp, db)
 }
 
-/// A chunked seal must be indistinguishable from a single-chunk seal across digest-sharing
-/// layouts and chunk budgets: identical jar files on disk, identical auxiliary-index locations,
-/// and byte-identical serves. Only peak memory may differ.
-///
-/// The layouts cover no sharing, full sharing, sharing across chunk boundaries (a zero budget
-/// puts every block in its own chunk), and a single block; the mid-size budget splits chunks at
-/// layout-dependent points.
+/// A chunked seal must be indistinguishable from a single-chunk one: identical jar files, index
+/// locations and serves, whatever the digest-sharing layout and chunk budget. Only peak memory
+/// may differ.
 #[test]
 fn chunked_seal_matches_single_chunk_across_layouts_and_budgets() {
     let layouts: &[&[(u64, BlockHash)]] = &[
@@ -190,8 +186,8 @@ fn cancelled_seal_leaves_jars_uncommitted_and_reseals_whole() {
 }
 
 /// The background `seal_due` (seal + finalize + yielding prune, in one pass) must produce exactly
-/// the fused `archive_due` outcome: byte-identical jars, equal auxiliary index and high-water, and
-/// equally pruned hot tiers. Proves the yielding prune does not change the archived state.
+/// the fused `archive_due` outcome: byte-identical jars, equal auxiliary index and high-water mark,
+/// and equally pruned hot tiers. Proves the yielding prune does not change the archived state.
 #[test]
 fn seal_due_fully_archives_and_matches_fused() {
     let fixtures = build_fixtures();
@@ -219,11 +215,11 @@ fn seal_due_fully_archives_and_matches_fused() {
         dir_files(&tmp_fused.path().join("cold")),
         "background jars must match fused jars byte-for-byte"
     );
-    let high_water = |hot: &HotDb| {
-        hot.with_read_txn(|tx| tx.get::<ColdArchiveHighWater>(&ARCHIVE_HIGH_WATER_KEY))
-            .expect("read high-water")
+    let high_water_mark = |hot: &HotDb| {
+        hot.with_read_txn(|tx| tx.get::<ColdArchiveHighWaterMark>(&ARCHIVE_HIGH_WATER_MARK_KEY))
+            .expect("read high-water mark")
     };
-    assert_eq!(high_water(&hot_bg), high_water(&hot_fused), "high-water must agree");
+    assert_eq!(high_water_mark(&hot_bg), high_water_mark(&hot_fused), "high-water mark must agree");
     for f in &fixtures {
         assert_eq!(
             db_bg.get::<ColdBatchLocations>(&f.digest).expect("bg index"),
@@ -242,6 +238,94 @@ fn seal_due_fully_archives_and_matches_fused() {
         0,
         "fused pruned"
     );
+}
+
+/// A jar sealed over only part of an epoch must never be re-opened by a later pass: `begin_epoch`
+/// hands nippy a fresh zero-row config, whose consistency heal truncates the committed jar away,
+/// putting its already-pruned rows in neither tier.
+#[test]
+fn short_jar_is_never_reopened_by_a_later_pass() {
+    // Blocks the short jar covers; the epoch actually spans 0..=5.
+    const SHORT: u64 = 3;
+
+    let tmp = TempDir::new().unwrap();
+    let (db, hot) = open_test_db(&tmp);
+
+    // Epoch 0 over blocks 0..=5, plus one epoch-1 block so epoch 0 sits below the cutoff.
+    let epoch_of = |number: u64| if number < 6 { 0 } else { 1 };
+    let digests: Vec<BlockHash> =
+        (0..=6).map(|number| BlockHash::from(digest_seed(number, epoch_of(number)))).collect();
+    hot.with_write_txn(|txn| {
+        for (number, digest) in digests.iter().enumerate() {
+            let number = number as u64;
+            txn.insert::<Batches>(digest, &batch_for(number, epoch_of(number)))?;
+            txn.insert::<ConsensusBlocks>(&number, &header_for(number, epoch_of(number), *digest))?;
+        }
+        Ok(())
+    })
+    .expect("seed hot");
+    hot.sync_persist();
+
+    // Seal a jar covering only the first SHORT blocks of epoch 0.
+    db.cold().consensus_blocks().begin_epoch(0, 0).expect("begin blocks");
+    db.cold().batches().begin_epoch(0, 0).expect("begin batches");
+    for number in 0..SHORT {
+        let digest = digests[number as usize];
+        db.cold()
+            .batches()
+            .append_row(&[digest.as_slice(), &encode(&batch_for(number, 0))])
+            .expect("append batch");
+        db.cold()
+            .consensus_blocks()
+            .append_row(&[&encode(&header_for(number, 0, digest))])
+            .expect("append block");
+    }
+    db.cold().batches().commit().expect("commit batches");
+    db.cold().consensus_blocks().commit().expect("commit blocks");
+
+    // Finalize exactly what the short jar holds: index it, advance the high-water mark, prune its
+    // rows.
+    hot.with_write_txn(|txn| {
+        for (row, digest) in digests.iter().take(SHORT as usize).enumerate() {
+            txn.insert::<ColdBatchLocations>(digest, &ColdLocation { epoch: 0, row: row as u64 })?;
+        }
+        txn.insert::<ColdArchiveHighWaterMark>(&ARCHIVE_HIGH_WATER_MARK_KEY, &0)?;
+        txn.evict_persistent_batch::<ConsensusBlocks>(&(0..SHORT).collect::<Vec<_>>())?;
+        txn.evict_persistent_batch::<Batches>(&digests[..SHORT as usize])?;
+        Ok(())
+    })
+    .expect("finalize the short jar");
+    hot.sync_persist();
+    assert!(
+        db.get::<ConsensusBlocks>(&0).expect("read").is_some(),
+        "cold must serve before the pass"
+    );
+
+    // The next pass resumes at block 3, which still belongs to epoch 0, so it would re-open (and
+    // truncate) that epoch's jars. It must fail closed instead.
+    let sealed = crate::cold::producer::seal_next_epoch_jars(
+        &hot,
+        db.cold(),
+        1,
+        crate::cold::producer::SEAL_CHUNK_BYTES,
+        &|| false,
+    );
+    assert!(
+        matches!(sealed, Err(ColdError::Corruption(_))),
+        "re-sealing an already-sealed epoch must fail closed"
+    );
+
+    // Nothing the short jar held may have been destroyed: it is the only copy.
+    for number in 0..SHORT {
+        assert!(
+            db.get::<ConsensusBlocks>(&number).expect("read block").is_some(),
+            "block {number} must still serve from the short jar"
+        );
+        assert!(
+            matches!(db.get::<Batches>(&digests[number as usize]), Ok(Some(_))),
+            "batch {number} must still serve from the short jar"
+        );
+    }
 }
 
 /// A numbering gap within an epoch must be caught at archival (rows still hot and recoverable), not

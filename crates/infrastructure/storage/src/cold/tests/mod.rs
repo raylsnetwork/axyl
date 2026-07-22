@@ -1,14 +1,5 @@
-//! Cold-tier proof-gate regression tests.
-//!
-//! Two failing-first tests pin the design invariants:
-//! - [`test_archive_keeps_hot_bounded_and_serves_cold`]: archived epochs leave the hot tables, yet
-//!   every archived row reads byte-identically through the fall-through, and the auxiliary index
-//!   plus high-water reflect the cut.
-//! - [`test_reconcile_heals_interrupted_archive`]: with jars durable but the hot delete and
-//!   index/high-water commit skipped, boot reconciliation heals the tiers so no row is absent from
-//!   both.
-//!
-//! MDBX-only; built against the node's `ColdDatabase<LayeredDatabase<MdbxDatabase>>` shape.
+//! Cold-tier regression tests, built against the node's
+//! `ColdDatabase<LayeredDatabase<MdbxDatabase>>` shape and so MDBX-only.
 
 #![cfg(feature = "reth-libmdbx")]
 
@@ -32,15 +23,16 @@ use tempfile::TempDir;
 use crate::{
     cold::{
         archive_below_epoch, reconcile::reconcile, ArchiveStats, ColdArchiver, ColdConfig,
-        ColdDatabase, ColdError, ColdLocation, ColdStore, SealOutcome, ARCHIVE_HIGH_WATER_KEY,
+        ColdDatabase, ColdError, ColdLocation, ColdStore, SealOutcome, ARCHIVE_HIGH_WATER_MARK_KEY,
     },
     layered_db::LayeredDatabase,
     mdbx::MdbxDatabase,
     open_default_tables,
-    tables::{Batches, ColdArchiveHighWater, ColdBatchLocations, ConsensusBlocks},
+    tables::{Batches, ColdArchiveHighWaterMark, ColdBatchLocations, ConsensusBlocks},
 };
 
 mod archive;
+mod finalize;
 mod reconcile;
 mod seal;
 

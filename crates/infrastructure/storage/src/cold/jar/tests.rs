@@ -336,7 +336,7 @@ fn for_each_row_in_epoch_reads_only_the_target_jar() {
             Ok(())
         })
         .unwrap();
-    assert_eq!(rows, vec![(3, vec![3u8]), (4, vec![4u8]), (5, vec![5u8])]);
+    assert_eq!(rows, vec![(0, vec![3u8]), (1, vec![4u8]), (2, vec![5u8])]);
 
     // The deleted epoch-1 jar errors only when its own rows are read.
     assert!(segment.for_each_row_in_epoch(1, |_, _| Ok(())).is_err());
@@ -350,6 +350,95 @@ fn for_each_row_in_epoch_reads_only_the_target_jar() {
         })
         .unwrap();
     assert!(!visited, "an absent epoch must visit no rows");
+}
+
+/// The batches walk yields every archived row as `(row, digest)` in ascending row order, with the
+/// row equal to the [`ColdLocation`] a serve resolves through, so the auxiliary digest index can be
+/// rebuilt from the jar alone.
+#[test]
+fn batch_digest_walk_yields_serveable_locations() {
+    let tmp = TempDir::new().unwrap();
+    let store = ColdStore::open(&ColdConfig { dir: tmp.path().to_path_buf() }).unwrap();
+    let digests: Vec<BlockHash> = (0..4u8).map(|i| BlockHash::repeat_byte(i + 1)).collect();
+
+    store.batches().begin_epoch(6, 0).unwrap();
+    for (i, digest) in digests.iter().enumerate() {
+        store.batches().append_row(&[digest.as_slice(), &[i as u8; 3]]).unwrap();
+    }
+    store.batches().commit().unwrap();
+
+    let mut walked = Vec::new();
+    store
+        .for_each_batch_digest_in_epoch(6, |row, digest| {
+            walked.push((digest, ColdLocation { epoch: 6, row }));
+            Ok(())
+        })
+        .unwrap();
+    let expected: Vec<_> = digests
+        .iter()
+        .enumerate()
+        .map(|(row, digest)| (*digest, ColdLocation { epoch: 6, row: row as u64 }))
+        .collect();
+    assert_eq!(walked, expected);
+
+    // Each walked pair addresses the row it was read from, so an index rebuilt from the walk
+    // serves the right payload rather than tripping the digest cross-check.
+    for (digest, loc) in walked {
+        assert_eq!(store.read_batch_checked(digest, loc).unwrap().unwrap().len(), 3);
+    }
+
+    // An epoch with no sealed batches jar is an empty walk, not an error.
+    let mut visited = false;
+    store
+        .for_each_batch_digest_in_epoch(9, |_, _| {
+            visited = true;
+            Ok(())
+        })
+        .unwrap();
+    assert!(!visited, "an absent epoch must visit no rows");
+}
+
+/// A `.conf` start key that cannot address the jar's own rows must surface as corruption on both
+/// the live seal and the boot rebuild. The header is deserialized from disk without validation, so
+/// the range arithmetic must never be what notices: it aborts the process under overflow-checks,
+/// on every restart, before the node serves anything.
+#[test]
+fn incoherent_start_key_is_rejected_not_aborted() {
+    let tmp = TempDir::new().unwrap();
+    let segment = open_consensus_blocks(tmp.path());
+    // Two rows rooted at the last addressable key: the jar's end key would wrap.
+    segment.begin_epoch(1, u64::MAX).unwrap();
+    segment.append_row(&[&[1u8]]).unwrap();
+    segment.append_row(&[&[2u8]]).unwrap();
+    assert!(
+        matches!(segment.commit(), Err(ColdError::Corruption(_))),
+        "live seal must fail closed"
+    );
+
+    // The jar is durable by now (nippy commits before the index insert), so the boot rebuild has
+    // to reject it too rather than fault inside `ColdSegment::open`.
+    let reopened = ColdSegment::open(tmp.path(), ColdSegmentKind::ConsensusBlocks);
+    assert!(matches!(reopened, Err(ColdError::Corruption(_))), "boot rebuild must fail closed");
+}
+
+/// A jar whose own `kind` disagrees with the segment holding it must fail the boot rebuild. The
+/// two kinds carry different column counts and different addressing, so indexing a foreign jar
+/// would serve batch rows as `ConsensusHeader` bytes at arithmetic block numbers.
+#[test]
+fn foreign_kind_jar_is_rejected_at_boot() {
+    let tmp = TempDir::new().unwrap();
+    {
+        let segment = open_batches(tmp.path());
+        segment.begin_epoch(3, 0).unwrap();
+        segment.append_row(&[BlockHash::repeat_byte(1).as_slice(), &[0xAAu8]]).unwrap();
+        segment.commit().unwrap();
+    }
+
+    let opened = ColdSegment::open(tmp.path(), ColdSegmentKind::ConsensusBlocks);
+    assert!(matches!(opened, Err(ColdError::Corruption(_))), "a foreign-kind jar must not index");
+
+    // The jar is still coherent for the segment it was written for.
+    assert!(open_batches(tmp.path()).is_epoch_sealed(3));
 }
 
 #[test]
