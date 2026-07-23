@@ -181,7 +181,6 @@ async fn run(cli: Cli) -> eyre::Result<()> {
         cli.chain,
         basefee_address,
         Some(min_base_fee),
-        cli.storage_v2,
         Some(cli.persistence_threshold),
         archive_rewards.clone(),
     )
@@ -229,7 +228,6 @@ async fn run(cli: Cli) -> eyre::Result<()> {
         cli.chain,
         basefee_address,
         Some(min_base_fee),
-        cli.storage_v2,
         None,
         RewardsCounter::default(),
     )
