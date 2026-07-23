@@ -59,6 +59,7 @@ impl RethEnv {
         build_metadata: &BuildMetadata,
         network: Option<RaylsNetwork>,
         min_base_fee: Option<u64>,
+        allow_v1: bool,
     ) -> eyre::Result<Self> {
         let node_config = reth_config.0.clone();
         let mut builder = RaylsChainSpec::builder(Arc::clone(&node_config.chain));
@@ -79,6 +80,7 @@ impl RethEnv {
             &task_spawner,
             runtime.clone(),
             rewards_counter,
+            allow_v1,
         )
         .await?;
         let blockchain_provider = BlockchainProvider::new(provider_factory.clone())?;
@@ -180,6 +182,7 @@ impl RethEnv {
             &BuildMetadata::default(),
             None,
             None,
+            false,
         )
         .await
     }
@@ -239,6 +242,7 @@ impl RethEnv {
             &BuildMetadata::default(),
             Some(network),
             min_base_fee,
+            true,
         )
         .await
     }
@@ -251,10 +255,11 @@ impl RethEnv {
         task_spawner: &TaskSpawner,
         runtime: reth_tasks::Runtime,
         rewards_counter: RewardsCounter,
+        allow_v1: bool,
     ) -> eyre::Result<ProviderFactory<RaylsNode>> {
         // V1 (plain) storage is no longer supported — forbid it at startup.
         let storage_settings = node_config.storage_settings();
-        if !storage_settings.storage_v2 {
+        if !storage_settings.storage_v2 && !allow_v1 {
             panic!(
                 "V1 (plain) storage is no longer supported. \
                  Restart with `--storage.v2`."

@@ -107,6 +107,7 @@ impl RethEnv {
             &task_spawner,
             runtime.clone(),
             rewards_counter,
+            false,
         )
         .await?;
         let blockchain_provider = BlockchainProvider::new(provider_factory.clone())?;

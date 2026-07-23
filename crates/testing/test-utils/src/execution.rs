@@ -168,6 +168,7 @@ pub async fn faucet_test_execution_node(
             &BuildMetadata::default(),
             None,
             None,
+            false,
         )
         .await?,
     )?;

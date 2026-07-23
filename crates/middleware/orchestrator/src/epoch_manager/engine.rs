@@ -32,6 +32,7 @@ where
             &self.builder.build_metadata,
             Some(network),
             Some(min_base_fee),
+            false,
         )
         .await?;
         let engine = ExecutionNode::new(&self.builder, reth_env)?;
