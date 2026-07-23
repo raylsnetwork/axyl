@@ -74,8 +74,10 @@ impl RethEnv {
             persistence,
             reth_env::RethConfig,
         };
-        use reth_node_core::args::{DatadirArgs, StorageArgs};
-        use reth_node_core::node_config::NodeConfig;
+        use reth_node_core::{
+            args::{DatadirArgs, StorageArgs},
+            node_config::NodeConfig,
+        };
         use reth_provider::providers::BlockchainProvider;
         use reth_storage_api::{BlockNumReader, DatabaseProviderFactory};
 
