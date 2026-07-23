@@ -253,8 +253,8 @@ impl RethEnv {
         rewards_counter: RewardsCounter,
     ) -> eyre::Result<ProviderFactory<RaylsNode>> {
         // V1 (plain) storage is no longer supported — forbid it at startup.
-        let requested = node_config.storage_settings();
-        if !requested.storage_v2 {
+        let storage_settings = node_config.storage_settings();
+        if !storage_settings.storage_v2 {
             panic!(
                 "V1 (plain) storage is no longer supported. \
                  Restart with `--storage.v2`."
@@ -276,7 +276,7 @@ impl RethEnv {
             runtime,
         )?;
 
-        provider_factory.set_storage_settings_cache(node_config.storage_settings());
+        provider_factory.set_storage_settings_cache(storage_settings);
 
         if let Some(prune_config) = node_config.prune_config() {
             provider_factory = provider_factory.with_prune_modes(prune_config.segments);
@@ -313,9 +313,8 @@ impl RethEnv {
 
         // init_genesis_with_settings writes HashedAccounts/HashedStorages via
         // insert_genesis_hashes and derives the trie via compute_state_root,
-        // so no post-init rehashing is needed for v1 or v2.
-        let genesis_hash =
-            init_genesis_with_settings(&provider_factory, node_config.storage_settings())?;
+        // so no post-init rehashing is needed for v2.
+        let genesis_hash = init_genesis_with_settings(&provider_factory, storage_settings)?;
         debug!(target: "rayls::execution", chain=%node_config.chain.chain, ?genesis_hash, "Initialized genesis");
 
         Ok(provider_factory)
