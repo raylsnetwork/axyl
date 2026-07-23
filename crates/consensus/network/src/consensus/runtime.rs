@@ -125,7 +125,7 @@ where
             // NOTE: only relay reservations are retried. A node mixing a direct listener with
             // relay reservations keeps running but never re-establishes the direct listener
             // (pre-existing behavior restored it via fatal-exit-and-restart); no shipped
-            // topology mixes them today - see TODO-CRv2-NETWORKING.md finding 6.
+            // topology mixes them today.
             if self.relay_reservations.is_empty() {
                 error!(target: "network", ?addresses, "no listeners for swarm - network shutting down");
                 return Err(NetworkError::AllListenersClosed);

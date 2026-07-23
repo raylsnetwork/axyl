@@ -24,8 +24,7 @@ listeners but a desired reservation is a retried state, not a shutdown. Nodes ru
 `RAYLS_NETWORK=local` (all mainnet hardforks active).
 
 The full rationale for every design choice in this harness - and the bugs that forced them - is
-in [`DESIGN-DECISIONS.md`](DESIGN-DECISIONS.md); branch-level findings are recorded in
-`TODO-CRv2-NETWORKING.md` at the repo root.
+in [`DESIGN-DECISIONS.md`](DESIGN-DECISIONS.md); branch-level findings are tracked as GitHub issues.
 
 ## Topology
 
@@ -226,4 +225,4 @@ heartbeat, without waiting for the epoch boundary), restoring 4/4 - watch
 This is a POC harness for the relay topology, not a production deployment recipe: the relays
 grant reservations to **anyone** (no ACL), and all relayed traffic hairpins through the relay
 forever (the only-own-relay isolation is the point - there is no direct-link upgrade path). See
-`etc/test-network/RELAY_DESIGN.md` and `TODO-CRv2-NETWORKING.md`.
+`etc/test-network/RELAY_DESIGN.md`.

@@ -138,10 +138,10 @@ chain through the relays only, and RPC calls through the round-robin name answer
 
 ## Branch-level findings (not harness issues)
 
-Recorded in `TODO-CRv2-NETWORKING.md`: the relay-client reservation/dial arbitration limitation,
-the fatal `AllListenersClosed` at boot when all relay listeners fail transiently (the retry loop
-could recover but never gets the chance), the fire-and-forget tx disbursement, and the observer
-loopback-listener dial trap. Fixes belong on the branch with failing-first tests, per repo
+Tracked as branch follow-ups (GitHub issues): the relay-client reservation/dial arbitration
+limitation, the fatal `AllListenersClosed` at boot when all relay listeners fail transiently (the
+retry loop could recover but never gets the chance), the fire-and-forget tx disbursement, and the
+observer loopback-listener dial trap. Fixes belong on the branch with failing-first tests, per repo
 discipline.
 
 ### 11. The relay is the validator's only network neighbor (gateway), kernel-enforced
