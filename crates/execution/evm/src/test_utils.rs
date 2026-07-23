@@ -74,7 +74,8 @@ impl RethEnv {
             persistence,
             reth_env::RethConfig,
         };
-        use reth_node_core::{args::DatadirArgs, node_config::NodeConfig};
+        use reth_node_core::args::{DatadirArgs, StorageArgs};
+        use reth_node_core::node_config::NodeConfig;
         use reth_provider::providers::BlockchainProvider;
         use reth_storage_api::{BlockNumReader, DatabaseProviderFactory};
 
@@ -88,6 +89,7 @@ impl RethEnv {
                 pprof_dumps_path: None,
             },
             chain,
+            storage: StorageArgs { v2: true },
             ..NodeConfig::default()
         };
         let reth_config = RethConfig(node_config.clone());
