@@ -492,7 +492,7 @@ impl RethEnv {
     /// from `AccountChangeSets` by `IndexAccountHistoryStage` (a normally-synced
     /// node — not `rayls-replay`), a *multi-shard* genesis account is skipped here
     /// and genesis has no changeset to rebuild from, so it never regains its
-    /// block-0 entry. This is a non-issue for replay-built, where that
+    /// block-0 entry. This is a non-issue for replay-built nodes, where that
     /// stage never runs; account history is written once by genesis init and only
     /// appended to.
     pub fn fix_genesis_account_history(&self) -> eyre::Result<()> {
@@ -522,10 +522,11 @@ impl RethEnv {
         let genesis = chain_spec.genesis();
         let block = chain_spec.genesis_header().number;
 
+        let rocksdb = provider_factory.rocksdb_provider();
+
         // Per-account prefix scan — mirrors fix_genesis_history_with pattern.
         // Only scans shards for genesis accounts, not the entire table.
         let (already_fixed, shard_counts): (HashSet<Address>, HashMap<Address, usize>) = {
-            let rocksdb = provider_factory.rocksdb_provider();
             let mut fixed = HashSet::new();
             let mut counts: HashMap<Address, usize> = HashMap::new();
             for addr in genesis.alloc.keys() {
@@ -579,7 +580,6 @@ impl RethEnv {
             return Ok(0);
         }
 
-        let rocksdb = provider_factory.rocksdb_provider();
         let mut batch = rocksdb.batch();
         for addr in &to_fix {
             let key = ShardedKey::last(*addr);
