@@ -49,8 +49,18 @@ impl<'de> DeserializeAs<'de, roaring::RoaringBitmap> for RoaringBitmapSerde {
             where
                 E: Error,
             {
-                roaring::RoaringBitmap::deserialize_from(v).map_err(|e| {
+                let raw = roaring::RoaringBitmap::deserialize_from(v).map_err(|e| {
                     Error::custom(format!("roaring bitmap deserialization failed: {e:?}"))
+                })?;
+                // Normalize by rebuilding from the (already-sorted) values.
+                // `roaring`'s checked deserializer accepts a run-container with
+                // zero runs, producing an empty container that later panics on
+                // re-serialization (`(container.len() - 1)` underflows under
+                // overflow-checks). Rebuilding drops any empty container while
+                // preserving every value, so a malformed wire bitmap can't crash
+                // the node when the certificate is re-encoded. See issue #55.
+                roaring::RoaringBitmap::from_sorted_iter(raw).map_err(|e| {
+                    Error::custom(format!("roaring bitmap normalization failed: {e:?}"))
                 })
             }
 
@@ -70,5 +80,36 @@ impl<'de> DeserializeAs<'de, roaring::RoaringBitmap> for RoaringBitmapSerde {
         } else {
             deserializer.deserialize_bytes(RBVisitor)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::Certificate;
+
+    /// Regression for issue #55. This byte sequence — found by the
+    /// `bcs_roundtrip` fuzz target — decodes into a `Certificate` whose
+    /// `signed_authorities` roaring bitmap contains an empty container (via
+    /// roaring's checked deserializer accepting a run-container with zero runs).
+    /// Before the normalize-on-deserialize fix in `RoaringBitmapSerde`,
+    /// re-encoding this certificate panicked with "attempt to subtract with
+    /// overflow" in roaring's serializer.
+    const ROARING_EMPTY_CONTAINER_CRASH: &[u8] =
+        include_bytes!("testdata/roaring_empty_container_crash.bin");
+
+    #[test]
+    fn certificate_with_empty_roaring_container_reencodes_without_panic() {
+        // Guard that the input still decodes as a Certificate, so a future
+        // layout change can't silently turn this regression test into a no-op.
+        let cert: Certificate = bcs::from_bytes(ROARING_EMPTY_CONTAINER_CRASH)
+            .expect("crash input should decode as a Certificate");
+
+        // This re-encode is exactly what panicked before the fix.
+        let encoded = bcs::to_bytes(&cert).expect("re-encode must not panic");
+
+        // And the normalized certificate must round-trip stably.
+        let decoded: Certificate = bcs::from_bytes(&encoded).expect("re-decode must succeed");
+        let re_encoded = bcs::to_bytes(&decoded).expect("second re-encode must succeed");
+        assert_eq!(encoded, re_encoded, "normalized certificate must round-trip stably");
     }
 }
