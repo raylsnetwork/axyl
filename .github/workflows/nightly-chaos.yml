@@ -54,25 +54,25 @@ jobs:
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
-          shared-key: nightly-chaos
+          shared-key: nightly-chaos-2
           cache-on-failure: true
 
       - name: Ensure tc / iptables are available
         run: sudo apt-get update && sudo apt-get install -y iproute2 iptables
 
-      # The network-fault scenarios shell out to `tc`/`iptables` (no sudo of
-      # their own), so the test process itself must be root. `rustup which cargo`
-      # resolves the real toolchain binary as the runner user, but sudo applies
-      # its `secure_path`, which overrides PATH (even with -E) and drops
-      # ~/.cargo/bin — so the invoked cargo can't find `rustc` and aborts with
-      # "could not execute process `rustc -vV`". Re-inject the runner's PATH via
-      # `env` (which sudo finds on secure_path) so the toolchain resolves inside
-      # the sudo'd process.
+      # The network-fault scenarios shell out to `tc`/`iptables`, so the test
+      # process must run as root. Do NOT run cargo under sudo: sudo's secure_path
+      # and root's HOME make the rustup shim resolve the wrong toolchain (the
+      # runner image default, not the repo-pinned 1.91.0) and leave target/ owned
+      # by root. Instead build the test binary as the normal runner user (correct
+      # toolchain, clean ownership), then run only the prebuilt binary under sudo.
       # Pass the dispatch input via env (not templated into the script) so it's
       # treated as data, not shell code. Left unquoted so empty = run all.
       - name: Run chaos scenarios
         env:
           TEST: ${{ github.event.inputs.test }}
         run: |
-          sudo -E env "PATH=$PATH" "$(rustup which cargo)" test -p chaos-framework --test chaos_scenarios \
-            -- --ignored --exact --test-threads 1 $TEST
+          bin=$(cargo test -p chaos-framework --test chaos_scenarios --no-run --message-format=json \
+            | jq -r 'select(.reason == "compiler-artifact" and .target.name == "chaos_scenarios" and .executable != null) | .executable')
+          if [ -z "$bin" ]; then echo "could not locate chaos_scenarios test binary" >&2; exit 1; fi
+          sudo -E "$bin" --ignored --exact --test-threads 1 $TEST
