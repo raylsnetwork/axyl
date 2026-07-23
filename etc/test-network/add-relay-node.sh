@@ -124,13 +124,20 @@ fi
 
 if [[ "$RESTART" -eq 0 ]]; then
     # --- 2. first add: read the relay's peer id and generate node keys with a circuit on it ---
+    # A libp2p ed25519 peer id is exactly 52 chars ("12D3KooW" + 44 base58). The grep already
+    # anchors the prefix, so only accept a match of that exact length: a partial log write (grep
+    # racing the relay's startup flush) yields a shorter match, which we reject and keep polling
+    # for the full id. Length test only -- portable across GNU/BSD grep and bash 3.2 (macOS).
     RELAY_PEER=""
     for _ in $(seq 1 40); do
-        RELAY_PEER=$(grep -ao '12D3KooW[A-Za-z0-9]*' "$RELAY_LOG" 2>/dev/null | head -1 || true)
-        [[ -n "$RELAY_PEER" ]] && break
+        candidate=$(grep -ao '12D3KooW[A-Za-z0-9]*' "$RELAY_LOG" 2>/dev/null | head -1 || true)
+        if [[ ${#candidate} -eq 52 ]]; then
+            RELAY_PEER="$candidate"
+            break
+        fi
         sleep 0.25
     done
-    [[ -n "$RELAY_PEER" ]] || { echo "Error: relay did not report a peer id (see $RELAY_LOG)."; exit 1; }
+    [[ -n "$RELAY_PEER" ]] || { echo "Error: relay did not report a valid peer id (see $RELAY_LOG)."; exit 1; }
     RELAY_ADDR="/ip4/${RELAY_HOST}/udp/${RELAY_PORT}/quic-v1/p2p/${RELAY_PEER}"
     echo "relay-${NODE_NUM} up: ${RELAY_ADDR}"
 
