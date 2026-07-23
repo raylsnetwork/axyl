@@ -442,7 +442,7 @@ async fn resolve_relay_circuits(
                 }
             }
             Err(e) => {
-                warn!(target: "network-kad", %name, ?e, "failed to resolve /dnsaddr for relay discovery");
+                warn!(target: "network", %name, ?e, "failed to resolve /dnsaddr for relay discovery");
             }
         }
     }

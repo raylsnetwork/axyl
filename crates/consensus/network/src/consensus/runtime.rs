@@ -162,12 +162,19 @@ where
                     .connections_by_path
                     .with_label_values(&[path.metric_label(), self.network_label])
                     .inc();
-                // A node holding circuit reservations is a relayed node: its only legitimate
-                // connections are relay legs and circuits, so a direct connection to a non-relay
-                // peer breaks the relayed-only topology. On a direct (no-reservation) node the
-                // same classification is the normal case and stays at debug.
+                // A node holding an *established* circuit reservation is a relayed node: its only
+                // legitimate connections are relay legs and circuits, so a direct connection to a
+                // non-relay peer breaks the relayed-only topology. On a direct (no-reservation)
+                // node the same classification is the normal case and stays at
+                // debug.
+                //
+                // Test for an active reservation (`Some` value), not a merely-requested one:
+                // entries are inserted when the reservation is requested (value
+                // `None`) before the RESERVE handshake completes, so `!is_empty()`
+                // is true during the boot window while nothing is reserved yet --
+                // direct dials completing then would false-positive.
                 if matches!(path, ConnectionPath::DirectNonRelay { .. })
-                    && !self.relay_reservations.is_empty()
+                    && self.relay_reservations.values().any(Option::is_some)
                 {
                     warn!(
                         target: "network",
