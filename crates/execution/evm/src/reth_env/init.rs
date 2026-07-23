@@ -203,6 +203,7 @@ impl RethEnv {
         network: RaylsNetwork,
         basefee_address: Option<Address>,
         min_base_fee: Option<u64>,
+        storage_v2: bool,
         persistence_threshold: Option<u64>,
         rewards_counter: RewardsCounter,
     ) -> eyre::Result<Self> {
@@ -216,7 +217,7 @@ impl RethEnv {
                 pprof_dumps_path: None,
             },
             chain,
-            storage: StorageArgs { v2: true },
+            storage: StorageArgs { v2: storage_v2 },
             engine: EngineArgs {
                 persistence_threshold: persistence_threshold
                     .unwrap_or(DEFAULT_PERSISTENCE_THRESHOLD),
