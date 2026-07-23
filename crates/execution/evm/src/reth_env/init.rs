@@ -252,6 +252,15 @@ impl RethEnv {
         runtime: reth_tasks::Runtime,
         rewards_counter: RewardsCounter,
     ) -> eyre::Result<ProviderFactory<RaylsNode>> {
+        // V1 (plain) storage is no longer supported — forbid it at startup.
+        let requested = node_config.storage_settings();
+        if !requested.storage_v2 {
+            panic!(
+                "V1 (plain) storage is no longer supported. \
+                 Restart with `--storage.v2`."
+            );
+        }
+
         let datadir = node_config.datadir();
         // Wrap ChainSpec in RaylsChainSpec for static base fee
         let rocksdb_provider = RocksDBBuilder::new(datadir.rocksdb())
@@ -308,15 +317,6 @@ impl RethEnv {
         let genesis_hash =
             init_genesis_with_settings(&provider_factory, node_config.storage_settings())?;
         debug!(target: "rayls::execution", chain=%node_config.chain.chain, ?genesis_hash, "Initialized genesis");
-
-        // V1 (plain) storage is no longer supported — forbid it at startup.
-        let requested = node_config.storage_settings();
-        if !requested.storage_v2 {
-            panic!(
-                "V1 (plain) storage is no longer supported. \
-                 Restart with `--storage.v2`."
-            );
-        }
 
         Ok(provider_factory)
     }
