@@ -588,6 +588,10 @@ impl RethEnv {
                 Some(existing_list) => {
                     let blocks: Vec<u64> =
                         core::iter::once(block).chain(existing_list.iter()).collect();
+                    debug_assert!(
+                        blocks.windows(2).all(|w| w[0] < w[1]),
+                        "merged genesis account history must be strictly ascending"
+                    );
                     BlockNumberList::new(blocks)
                         .map_err(|e| eyre::eyre!("failed to build block number list: {e}"))?
                 }
