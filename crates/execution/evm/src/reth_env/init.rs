@@ -260,10 +260,7 @@ impl RethEnv {
         // V1 (plain) storage is no longer supported — forbid it at startup.
         let storage_settings = node_config.storage_settings();
         if !storage_settings.storage_v2 && !allow_v1 {
-            panic!(
-                "V1 (plain) storage is no longer supported. \
-                 Restart with `--storage.v2`."
-            );
+            eyre::bail!("V1 (plain) storage is no longer supported. Restart with `--storage.v2`.");
         }
 
         let datadir = node_config.datadir();
