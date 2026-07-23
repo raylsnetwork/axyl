@@ -22,8 +22,8 @@ use reth_engine_tree::tree::{precompile_cache::PrecompileCacheMap, PayloadProces
 use reth_node_core::args::{EngineArgs, StorageArgs};
 use reth_provider::{
     providers::{BlockchainProvider, RocksDBBuilder, StaticFileProvider},
-    BlockNumReader, ChainSpecProvider, DatabaseProviderFactory, ProviderFactory,
-    RocksDBProviderFactory, StorageSettingsCache,
+    BlockNumReader, ChainSpecProvider, DatabaseProviderFactory, MetadataProvider, ProviderFactory,
+    RocksDBProviderFactory, StorageSettings, StorageSettingsCache,
 };
 use reth_prune_types::PruneModes;
 use reth_stages::{sets::DefaultStages, PipelineBuilder, PipelineTarget};
@@ -307,6 +307,19 @@ impl RethEnv {
         let genesis_hash =
             init_genesis_with_settings(&provider_factory, node_config.storage_settings())?;
         debug!(target: "rayls::execution", chain=%node_config.chain.chain, ?genesis_hash, "Initialized genesis");
+
+        // Hard check: panic if the DB is V2 but the node is started as V1.
+        // A V1 node cannot read V2 hashed state — this is the only dangerous mismatch.
+        // V1→V2 upgrades are the intended migration path, so we allow that direction.
+        let stored = provider_factory.storage_settings()?.unwrap_or_else(StorageSettings::v1);
+        let requested = node_config.storage_settings();
+        if stored.storage_v2 && !requested.storage_v2 {
+            panic!(
+                "Database is V2 (hashed state) but the node was started as V1. \
+                 A V1 node cannot read V2 storage — point the node to the \
+                 correct datadir or rebuild with `--storage.v2`."
+            );
+        }
 
         Ok(provider_factory)
     }
