@@ -25,6 +25,8 @@
 //!   infrastructure. Circuit *sources* stay unrestricted -- other validators must still dial
 //!   through to reach a fronted one. Unset = any peer may reserve (the default the local testnet
 //!   relies on).
+//!
+//! No per-source rate limiting is configured (see `relay_config`).
 
 use futures::StreamExt as _;
 use libp2p::{
@@ -40,7 +42,7 @@ use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr},
     time::Duration,
 };
-use tracing::info;
+use tracing::{info, warn};
 
 /// Render a peer's direct-connection endpoint (`ip:port/proto`, e.g. `127.0.0.1:54321/quic-v1`) for
 /// log annotation. The relay's events are peer-id-only and the swarm exposes no per-peer address
@@ -150,14 +152,14 @@ fn relay_config() -> eyre::Result<relay::Config> {
     cfg.max_reservations_per_peer = 64;
     cfg.max_circuits = 1024;
     cfg.max_circuits_per_peer = 64;
-    // Drop the default per-peer/per-IP rate limiters. They cap circuits/reservations to
-    // 30 per 2 min per source peer and 60 per hour per source IP -- fine for a public relay, but
-    // this is a dedicated test relay that all validators hairpin through, often from the SAME IP
-    // (127.0.0.1 locally). Reconnect churn (killing/reviving relays, re-reservation retries) then
-    // trips the per-IP limiter and the relay denies circuits with ResourceLimitExceeded. Empty
-    // vecs = no rate limiting.
+    // No per-source rate limiters: libp2p's defaults (30/2min per peer, 60/hr per IP) trip on the
+    // local testnet, where every validator hairpins from 127.0.0.1 and reconnect churn exceeds the
+    // per-IP cap. Per-source limiters also can't meaningfully protect a shared relay here anyway
+    // (the only slot-reclaiming knob, a finite `max_circuit_duration`, would force-close live
+    // consensus links), so the relay relies on network-edge protection instead.
     cfg.reservation_rate_limiters = Vec::new();
     cfg.circuit_src_rate_limiters = Vec::new();
+    warn!("relay rate limiting is disabled");
 
     if let Some(secs) = env_parse::<u64>("RELAY_MAX_CIRCUIT_DURATION_SECS")? {
         cfg.max_circuit_duration = Duration::from_secs(secs);
