@@ -152,6 +152,7 @@ pub fn spawn_local_testnet(
         let command = NodeCommand::<rayls_execution_faucet::FaucetArgs>::parse_from([
             "rl",
             "--http",
+            "--storage.v2",
             "--instance",
             &instance,
             "--google-kms",
@@ -159,7 +160,8 @@ pub fn spawn_local_testnet(
             faucet_contract_address,
         ]);
         #[cfg(not(feature = "faucet"))]
-        let command = NodeCommand::parse_from(["rl", "--http", "--instance", &instance]);
+        let command =
+            NodeCommand::parse_from(["rl", "--http", "--storage.v2", "--instance", &instance]);
 
         std::thread::spawn(|| {
             let err = command.execute(

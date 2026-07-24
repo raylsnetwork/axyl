@@ -97,6 +97,31 @@ else
     echo "Adding validator to whitelist"
     cast send $REGISTRY_CONTRACT_ADDRESS "allowlistValidator(address)" $ADDRESS --private-key $ADMIN_PRIVATE_KEY --rpc-url $RPC_URL
 
+    # Get RLS token contract address from registry
+    RLS_TOKEN=$(cast call --rpc-url $RPC_URL $REGISTRY_CONTRACT_ADDRESS "rlsToken()(address)" 2>&1)
+    echo "RLS token contract: $RLS_TOKEN"
+
+    # Get the required stake amount from the current stake config
+    STAKE_CONFIG=$(cast call --rpc-url $RPC_URL $REGISTRY_CONTRACT_ADDRESS "getCurrentStakeConfig()(uint256,uint256,uint32)" 2>&1)
+    REQUIRED_STAKE=$(echo "$STAKE_CONFIG" | head -1 | sed 's/\[.*\]//;s/ //g')
+    echo "Required stake amount: $REQUIRED_STAKE"
+
+    # Mint RLS tokens to validator address (admin has MINTER_ROLE)
+    echo "Minting $REQUIRED_STAKE RLS tokens to validator address ${ADDRESS}"
+    cast send $RLS_TOKEN \
+      "mint(address,uint256)" \
+      $ADDRESS \
+      $REQUIRED_STAKE \
+      --private-key $ADMIN_PRIVATE_KEY --rpc-url $RPC_URL
+
+    # Approve the registry to spend the RLS tokens
+    echo "Approving registry to spend $REQUIRED_STAKE RLS tokens"
+    cast send $RLS_TOKEN \
+      "approve(address,uint256)(bool)" \
+      $REGISTRY_CONTRACT_ADDRESS \
+      $REQUIRED_STAKE \
+      --private-key $PRIVATE_KEY --rpc-url $RPC_URL
+
     # extract stake calldata from output
     echo "Submitting stake transaction to registry contract at address ${REGISTRY_CONTRACT_ADDRESS}"
     CALLDATA_RES=$(RL_BLS_PASSPHRASE="local" ${workingDir}/../../target/${RELEASE}/rayls-network keytool stake-calldata \
@@ -104,7 +129,7 @@ else
 
     CALLDATA=$(echo "$CALLDATA_RES" | grep 'Calldata:' | awk '{print $2}')
 
-    echo "Stake: $STAKE_AMOUNT, CallData: $CALLDATA"
+    echo "Stake: $REQUIRED_STAKE, CallData: $CALLDATA"
 
     # send stake transaction
     cast send $REGISTRY_CONTRACT_ADDRESS $CALLDATA --private-key $PRIVATE_KEY --rpc-url $RPC_URL -vvvv
