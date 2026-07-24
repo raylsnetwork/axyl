@@ -323,17 +323,17 @@ where
                 target: "engine",
                 nonce = self.ctx.nonce,
                 epoch,
-                "conclude epoch: called with EMPTY committee - aborting to prevent contract revert"
+                "concludeEpoch: called with EMPTY committee - aborting to prevent contract revert"
             );
             return Err(RaylsRethError::EVMCustom(format!(
-                "conclude epoch: empty committee at epoch {epoch} - \
+                "concludeEpoch: empty committee at epoch {epoch} - \
                  see 'NO ACTIVE VALIDATORS' log for validator statuses"
             )));
         }
 
         // sort addresses in ascending order (0x0...0xf)
         new_committee.sort();
-        info!(target: "engine", committee_size = new_committee.len(), "conclude epoch: committee");
+        info!(target: "engine", committee_size = new_committee.len(), "concludeEpoch: committee");
 
         // encode the call to bytes with method selector and args
         let bytes = ConsensusRegistry::concludeEpochCall { newCommittee: new_committee }
