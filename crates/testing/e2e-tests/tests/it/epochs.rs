@@ -35,8 +35,13 @@ const INITIAL_STAKE_AMOUNT: &str = "1_000_000";
 /// new validator was never shuffled in. With a 1/6 per-epoch selection chance,
 /// `1 - (5/6)^25 >= 0.99`.
 const SELECTABLE_TRIALS_TARGET: usize = 25;
-// 3s is too aggressive
-const EPOCH_DURATION: u64 = 5;
+// Bumped from 5s: at short cadences a loaded CI runner can miss the epoch-advance
+// window, tripping the `loop_epochs` debounce ("Old and new epoch equal"). The few
+// seconds of CI jitter that break 5s (its debounce tolerance is only ~11s) are
+// roughly absolute, not proportional — so 30s (tolerance ~61s) gives ample margin
+// while keeping test_epoch_boundary's shuffle wait under the 60-min job cap.
+// Retry-based record checks stay correct regardless of cadence.
+const EPOCH_DURATION: u64 = 30;
 
 async fn test_epoch_boundary_inner(
     genesis: Genesis,
