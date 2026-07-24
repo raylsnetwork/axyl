@@ -36,6 +36,9 @@ Start with one of the pages below depending on what you are trying to do.
 - [`index.md`](index.md) — system overview: end-to-end transaction flow,
   architecture diagram, custom database tables, header-field encoding,
   RPC interface.
+- [`node-types.md`](node-types.md) — Validator, Observer, and Archive: what
+  each one is, why it matters, and how consensus participation, state
+  pruning, and RPC exposure differ between them.
 - [`glossary.md`](glossary.md) — terms that mean different things in
   different parts of Axyl (e.g. "network", "whitelist"). Check here before
   using an overloaded term in a design doc or PR description.

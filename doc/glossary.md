@@ -71,6 +71,10 @@ different software:
 below) is still a Validator — it's just not currently signing/voting. It is not an Observer; the
 role (admitted to the committee) hasn't changed, only its current sync/voting state.
 
+See [`node-types.md`](node-types.md) for the full role/config comparison across
+Validator, Observer, and Archive (a third, purely operator-configured variant of
+Observer — never-pruned — not a distinct code concept).
+
 ### Round
 
 `pub type Round = u32` — the DAG round number that Primary/Bullshark consensus advances through.
