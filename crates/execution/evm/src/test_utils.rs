@@ -129,7 +129,6 @@ impl RethEnv {
         Ok(Self {
             node_config,
             blockchain_provider,
-            #[cfg(feature = "archive-replay")]
             provider_factory,
             evm_config,
             task_spawner,
