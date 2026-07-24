@@ -87,6 +87,7 @@ if [ "$START" = true ]; then
         --instance 99 \
         --metrics "127.0.0.1:9109" \
         --log.stdout.format log-fmt \
+        --storage.v2 \
         --txpool.pending-max-count 1000000 \
         --txpool.pending-max-size 1242880000 \
         --txpool.basefee-max-count 1000000 \
