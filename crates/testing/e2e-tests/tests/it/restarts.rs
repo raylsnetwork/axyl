@@ -19,7 +19,13 @@ use rayls_infrastructure_types::{
 };
 use secp256k1::{Keypair, Secp256k1, SecretKey};
 use serde_json::Value;
-use std::{collections::HashMap, fmt::Debug, path::Path, process::Child, time::Duration};
+use std::{
+    collections::HashMap,
+    fmt::Debug,
+    path::Path,
+    process::Child,
+    time::{Duration, Instant},
+};
 use tokio::runtime::Builder;
 use tracing::{error, info};
 
@@ -104,6 +110,27 @@ fn send_and_confirm(
     if fee_index > 0 && new_basefee <= current_basefee {
         error!(target: "restart-test", "basefee collector did not increase: {current_basefee} -> {new_basefee}");
         return Err(Report::msg("Expected a basefee increment!".to_string()));
+    }
+
+    // The transfer was confirmed on `node_test`, but the sender `node` (e.g. an
+    // observer) can lag the confirming node and still show a stale nonce. Wait for
+    // `node` to actually execute this tx before returning, so the next
+    // `send_and_confirm` that reads the nonce from this node doesn't reuse a
+    // consumed nonce ("nonce too low: next nonce N, tx nonce N-1"). Poll the
+    // "latest" (executed) nonce, which is monotonic — unlike "pending" it won't
+    // momentarily drop back when the tx leaves the mempool. See #57.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let executed = get_executed_nonce(node, &from_account)?;
+        if executed > nonce {
+            break;
+        }
+        if Instant::now() >= deadline {
+            return Err(Report::msg(format!(
+                "sender node {node} did not execute nonce {nonce} within 30s (executed nonce still {executed})"
+            )));
+        }
+        std::thread::sleep(Duration::from_millis(200));
     }
     Ok(())
 }
@@ -853,6 +880,17 @@ fn get_block_number(node: &str) -> eyre::Result<u64> {
 fn get_transaction_count(node: &str, address: &str) -> eyre::Result<u128> {
     let res_str: String =
         call_rpc(node, "eth_getTransactionCount", rpc_params!(address, "pending"), 5)?;
+    Ok(u128::from_str_radix(res_str.strip_prefix("0x").unwrap_or(&res_str), 16)?)
+}
+
+/// Get the latest *executed* nonce for an address (via the "latest" tag).
+///
+/// Unlike the "pending" count this reflects only transactions already included in
+/// a block, so it is monotonic — it never drops back when a tx leaves the mempool.
+/// Use it to wait until a node has actually caught up to a submitted transaction.
+fn get_executed_nonce(node: &str, address: &str) -> eyre::Result<u128> {
+    let res_str: String =
+        call_rpc(node, "eth_getTransactionCount", rpc_params!(address, "latest"), 5)?;
     Ok(u128::from_str_radix(res_str.strip_prefix("0x").unwrap_or(&res_str), 16)?)
 }
 
