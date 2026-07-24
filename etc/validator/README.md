@@ -75,8 +75,8 @@ What it does:
    `local-validator/genesis/` and `${GENESISDIR}/../parameters.yaml` into
    `local-validator/`.
 4. **Funding** — `cast send` from `ADMIN_PRIVATE_KEY` transfers
-   `${STAKE_AMOUNT}` wei to `${ADDRESS}` so the operator has enough RLS to
-   stake.
+    `${STAKE_AMOUNT}` wei (native tokens) to `${ADDRESS}` to cover gas for
+    subsequent on-chain calls. RLS tokens are minted separately.
 5. **Allowlisting** — `cast send` calls
    `ConsensusRegistry.allowlistValidator(address)` from
    `ADMIN_PRIVATE_KEY` to add the new operator address to the registry's

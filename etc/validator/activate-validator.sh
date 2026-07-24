@@ -81,7 +81,7 @@ RUSTFLAGS="-C target-cpu=native" cargo build "${BUILD_ARGS[@]}"
 
 # send activate transaction
 
-echo "Stake transaction sent, sending activate transaction"
+echo "Activate transaction sent, sending activate transaction"
 
 cast send "$REGISTRY_CONTRACT_ADDRESS" "activate()" --private-key "$PRIVATE_KEY" --rpc-url "$RPC_URL" -vvvv
 
@@ -99,7 +99,7 @@ if [ "$START" = true ]; then
         --full \
         --storage.v2 \
         --db.growth-step 1MB \
-        --consensus-db.growth-step  1MB \
+        --consensus-db.growth-step 1MB \
         --txpool.pending-max-count 1000000 \
         --txpool.pending-max-size 1242880000 \
         --txpool.basefee-max-count 1000000 \
