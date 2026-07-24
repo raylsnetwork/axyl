@@ -58,4 +58,4 @@ USER $USER_NAME
 COPY --from=builder /tmp/rayls-network /usr/local/bin/rayls
 
 # default
-CMD ["rayls", "node"]
+CMD ["rayls", "node", "--storage.v2"]
