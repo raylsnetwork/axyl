@@ -787,28 +787,31 @@ fn assert_nonce_monotonicity(node: &str, latest_block: u64) -> eyre::Result<()> 
 }
 
 fn test_blocks_same(client_urls: &[String; 4]) -> eyre::Result<()> {
-    info!(target: "restart-test", "calling get_block for {:?}", &client_urls[0]);
-    let block0 = get_block(&client_urls[0], None)?;
-    let number = u64::from_str_radix(&block0["number"].as_str().unwrap_or("0x100_000")[2..], 16)?;
-    info!(target: "restart-test", ?number, "success - now calling get_block for {:?}", &client_urls[1]);
-    let block = get_block(&client_urls[1], Some(number))?;
-    if block0["hash"] != block["hash"] {
-        return Err(Report::msg("Blocks between validators not the same!".to_string()));
+    // Compare a block height every node is guaranteed to have reached, rather than
+    // one node's tip. Taking a single node's `latest` and demanding that exact block
+    // on the others races their sync: a node still catching up (e.g. just restarted)
+    // returns `null` for a block it hasn't reached, which `get_block` surfaces as a
+    // cryptic "invalid type: null, expected a map" parse error. The min of all nodes'
+    // latest heights is the highest block they all definitely have (blocks are
+    // append-only, so a node only ever advances past it). See #57.
+    let mut min_number = u64::MAX;
+    for url in client_urls {
+        min_number = min_number.min(get_block_number(url)?);
     }
-    info!(target: "restart-test", ?number, "success - now calling get_block for {:?}", &client_urls[2]);
-    let block = get_block(&client_urls[2], Some(number))?;
-    if block0["hash"] != block["hash"] {
-        return Err(Report::msg(format!(
-            "Blocks between validators not the same! block0: {:?} - block: {:?}",
-            block0["hash"], block["hash"]
-        )));
+    info!(target: "restart-test", number = min_number, "comparing block across all nodes at common height");
+
+    let reference = get_block(&client_urls[0], Some(min_number))?;
+    let reference_hash = &reference["hash"];
+    for url in &client_urls[1..] {
+        let block = get_block(url, Some(min_number))?;
+        if reference_hash != &block["hash"] {
+            return Err(Report::msg(format!(
+                "Blocks between validators not the same at block {min_number}! {} has {:?}, {url} has {:?}",
+                &client_urls[0], reference_hash, block["hash"]
+            )));
+        }
     }
-    info!(target: "restart-test", ?number, "success - now calling get_block for {:?}", &client_urls[3]);
-    let block = get_block(&client_urls[3], Some(number))?;
-    if block0["hash"] != block["hash"] {
-        return Err(Report::msg("Blocks between validators not the same!".to_string()));
-    }
-    info!(target: "restart-test", "all rpcs returned same block hash");
+    info!(target: "restart-test", "all rpcs returned same block hash at block {min_number}");
     Ok(())
 }
 
