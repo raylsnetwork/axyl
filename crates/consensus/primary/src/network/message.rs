@@ -170,10 +170,16 @@ impl MissingCertificatesRequest {
             .skip_rounds
             .iter()
             .map(|(k, serialized)| {
-                let rounds = RoaringBitmap::deserialize_from(&serialized[..])?
-                    .into_iter()
-                    .map(|r| self.exclusive_lower_bound + r as Round)
-                    .collect::<BTreeSet<Round>>();
+                // Normalize on read: this bitmap comes from a peer request. It is
+                // only iterated today (so the empty-container re-serialize panic
+                // can't fire here), but routing every untrusted roaring
+                // deserialization through the shared helper keeps that invariant
+                // if this call site ever grows to re-encode the bitmap. See #55.
+                let rounds =
+                    rayls_infrastructure_types::serde::deserialize_normalized(&serialized[..])?
+                        .into_iter()
+                        .map(|r| self.exclusive_lower_bound + r as Round)
+                        .collect::<BTreeSet<Round>>();
                 Ok((k.clone(), rounds))
             })
             .collect::<PrimaryNetworkResult<BTreeMap<_, _>>>()?;
