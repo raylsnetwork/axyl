@@ -518,11 +518,41 @@ MULTI_LISTEN="${MULTI_LISTEN:-0}"
 MULTI_LISTEN_BIND="${MULTI_LISTEN_BIND:-127.0.0.1}"
 PRIMARY_DIRECT_BASE=40000
 WORKER_DIRECT_BASE=41000
+# Precomputed for up to 32 validators (seed = byte (index+1) repeated 32x; peer id derived by
+# rayls-relay). Extend by running the relay with the next seed and reading its logged peer id.
 RELAY_PEER_IDS=(
-    "12D3KooWK99VoVxNE7XzyBwXEzW7xhK7Gpv85r9F3V3fyKSUKPH5" # validator-1 relay @ 127.0.0.1:50000 (seed 0x01*32)
-    "12D3KooWJWoaqZhDaoEFshF7Rh1bpY9ohihFhzcW6d69Lr2NASuq" # validator-2 relay @ 127.0.0.1:50001 (seed 0x02*32)
-    "12D3KooWRndVhVZPCiQwHBBBdg769GyrPUW13zxwqQyf9r3ANaba" # validator-3 relay @ 127.0.0.1:50002 (seed 0x03*32)
-    "12D3KooWPT98FXMfDQYavZm66EeVjTqP9Nnehn1gyaydqV8L8BQw" # validator-4 relay @ 127.0.0.1:50003 (seed 0x04*32)
+    "12D3KooWK99VoVxNE7XzyBwXEzW7xhK7Gpv85r9F3V3fyKSUKPH5" # validator-1  relay @ 127.0.0.1:50000 (seed 0x01*32)
+    "12D3KooWJWoaqZhDaoEFshF7Rh1bpY9ohihFhzcW6d69Lr2NASuq" # validator-2  relay @ 127.0.0.1:50001 (seed 0x02*32)
+    "12D3KooWRndVhVZPCiQwHBBBdg769GyrPUW13zxwqQyf9r3ANaba" # validator-3  relay @ 127.0.0.1:50002 (seed 0x03*32)
+    "12D3KooWPT98FXMfDQYavZm66EeVjTqP9Nnehn1gyaydqV8L8BQw" # validator-4  relay @ 127.0.0.1:50003 (seed 0x04*32)
+    "12D3KooWHFd1gyNYFqxt7ke9FY2VoVVWY2XSPhvL9vg2pB6wQGfa" # validator-5  relay @ 127.0.0.1:50004 (seed 0x05*32)
+    "12D3KooWK98A5qKRAA9qZccvoJLvcLu68PCFZLNfdd81iQLvHj6W" # validator-6  relay @ 127.0.0.1:50005 (seed 0x06*32)
+    "12D3KooWRawPbxPtP1eZaJpumGnyWX2DcUyd3RQnydr3eAto4Az7" # validator-7  relay @ 127.0.0.1:50006 (seed 0x07*32)
+    "12D3KooWB8sCGZCrwr79HtabLAn95qyPQx6RYHXjEbiD6QKou7ww" # validator-8  relay @ 127.0.0.1:50007 (seed 0x08*32)
+    "12D3KooWSrKnMZUcSxK8G7wmBbXdU8nFEfWGhLu6H8xjn8LmCSJb" # validator-9  relay @ 127.0.0.1:50008 (seed 0x09*32)
+    "12D3KooWENTLiCwwoVwYNbKFEfmNdyHG1jxNn9oPB29JeeZXWjAb" # validator-10 relay @ 127.0.0.1:50009 (seed 0x0a*32)
+    "12D3KooWGjSE7eCu5f1Pa8pGxscmoEcdQ5BRMGqbyMvL2dhrPCS5" # validator-11 relay @ 127.0.0.1:50010 (seed 0x0b*32)
+    "12D3KooWAaYVakMyznsMrUbM1TPKUnduj2tCfQiM6zujqQmepeqr" # validator-12 relay @ 127.0.0.1:50011 (seed 0x0c*32)
+    "12D3KooWKcs31iJqYLZbNpqPHri8vWeLmNhRDpVuR7gJQf6v95Xo" # validator-13 relay @ 127.0.0.1:50012 (seed 0x0d*32)
+    "12D3KooWAcwzQbKqSAJHDuRsRruiXPoa13SoqydqCmLupcMhUpb5" # validator-14 relay @ 127.0.0.1:50013 (seed 0x0e*32)
+    "12D3KooWQUMg8tdBR9qZCUkXiooRFqmWdycdj939teFVcRAAjzWw" # validator-15 relay @ 127.0.0.1:50014 (seed 0x0f*32)
+    "12D3KooWG3t2M63pjiZP7UHsWruK1tQomm9kMsTm4FS3YMTfE6ao" # validator-16 relay @ 127.0.0.1:50015 (seed 0x10*32)
+    "12D3KooWPqT2nMDSiXUSx5D7fasaxhxKigVhcqfkKqrLghCq9jxz" # validator-17 relay @ 127.0.0.1:50016 (seed 0x11*32)
+    "12D3KooWBzG3Lxj5G8qh233wQRxNdGaV7r7Truibfa77gS8QKQaC" # validator-18 relay @ 127.0.0.1:50017 (seed 0x12*32)
+    "12D3KooWGjfPc5wmHm33wCgL8afNLDHCuh24ojhW2mSQQou9Wsai" # validator-19 relay @ 127.0.0.1:50018 (seed 0x13*32)
+    "12D3KooWC1GftZzo5AMyfCZnQM9joxpyHJ3x3BzZSaUkF7KTymfC" # validator-20 relay @ 127.0.0.1:50019 (seed 0x14*32)
+    "12D3KooWQAqQX2YQexMmQapfgrFV88PTtqkyiRo1LjpZoVbkjQYR" # validator-21 relay @ 127.0.0.1:50020 (seed 0x15*32)
+    "12D3KooWFGz8vnyLNnHF9mReBwk6x3sjquP9k9eeqenkrqJP42G9" # validator-22 relay @ 127.0.0.1:50021 (seed 0x16*32)
+    "12D3KooWDB39ABqkZQvyq72DjK7W41GQKqQKyFbaCyFPDDewU62P" # validator-23 relay @ 127.0.0.1:50022 (seed 0x17*32)
+    "12D3KooWFRSqG9C2jAgrnVKRMpNpcpwvQzXYThbwgUFnwdQveWG2" # validator-24 relay @ 127.0.0.1:50023 (seed 0x18*32)
+    "12D3KooWDBMEHEJEp5tf1GsLkhotHBm7X91jS1EumWiuQoXokdpa" # validator-25 relay @ 127.0.0.1:50024 (seed 0x19*32)
+    "12D3KooWGbhRdffguKKgygFbjCHhfV8S5VqWAurjfV3kfFzW6f9i" # validator-26 relay @ 127.0.0.1:50025 (seed 0x1a*32)
+    "12D3KooWBr7cTGxmMhdiGNcbesEusWMR1VG26jEQQgFr6wwZkNNf" # validator-27 relay @ 127.0.0.1:50026 (seed 0x1b*32)
+    "12D3KooWMw97h2fpqxGKnFymaiVZuJJ33Sm4vYcWLCkBy8Pbcz1D" # validator-28 relay @ 127.0.0.1:50027 (seed 0x1c*32)
+    "12D3KooWRVKu7FRt7eyURWw3PLSgHdQTxj8sNpYRdnS4pdHU6kxq" # validator-29 relay @ 127.0.0.1:50028 (seed 0x1d*32)
+    "12D3KooWMT82VGUcv9obBMUhZrRfbagYkw4LsabgmGNsJTnD4ap9" # validator-30 relay @ 127.0.0.1:50029 (seed 0x1e*32)
+    "12D3KooWEKyPsvgm7g8vyRA59466ph3t9VLxEUFzNqTXHJdfY2Wq" # validator-31 relay @ 127.0.0.1:50030 (seed 0x1f*32)
+    "12D3KooWF84k1mETNdjWqZDy93UtQCFZ6H6yh8jwKqbfjTSgNSi3" # validator-32 relay @ 127.0.0.1:50031 (seed 0x20*32)
 )
 
 declare -a VALIDATORS
