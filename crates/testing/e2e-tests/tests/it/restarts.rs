@@ -19,7 +19,13 @@ use rayls_infrastructure_types::{
 };
 use secp256k1::{Keypair, Secp256k1, SecretKey};
 use serde_json::Value;
-use std::{collections::HashMap, fmt::Debug, path::Path, process::Child, time::Duration};
+use std::{
+    collections::HashMap,
+    fmt::Debug,
+    path::Path,
+    process::Child,
+    time::{Duration, Instant},
+};
 use tokio::runtime::Builder;
 use tracing::{error, info};
 
@@ -104,6 +110,27 @@ fn send_and_confirm(
     if fee_index > 0 && new_basefee <= current_basefee {
         error!(target: "restart-test", "basefee collector did not increase: {current_basefee} -> {new_basefee}");
         return Err(Report::msg("Expected a basefee increment!".to_string()));
+    }
+
+    // The transfer was confirmed on `node_test`, but the sender `node` (e.g. an
+    // observer) can lag the confirming node and still show a stale nonce. Wait for
+    // `node` to actually execute this tx before returning, so the next
+    // `send_and_confirm` that reads the nonce from this node doesn't reuse a
+    // consumed nonce ("nonce too low: next nonce N, tx nonce N-1"). Poll the
+    // "latest" (executed) nonce, which is monotonic — unlike "pending" it won't
+    // momentarily drop back when the tx leaves the mempool. See #57.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let executed = get_executed_nonce(node, &from_account)?;
+        if executed > nonce {
+            break;
+        }
+        if Instant::now() >= deadline {
+            return Err(Report::msg(format!(
+                "sender node {node} did not execute nonce {nonce} within 30s (executed nonce still {executed})"
+            )));
+        }
+        std::thread::sleep(Duration::from_millis(200));
     }
     Ok(())
 }
@@ -760,28 +787,31 @@ fn assert_nonce_monotonicity(node: &str, latest_block: u64) -> eyre::Result<()> 
 }
 
 fn test_blocks_same(client_urls: &[String; 4]) -> eyre::Result<()> {
-    info!(target: "restart-test", "calling get_block for {:?}", &client_urls[0]);
-    let block0 = get_block(&client_urls[0], None)?;
-    let number = u64::from_str_radix(&block0["number"].as_str().unwrap_or("0x100_000")[2..], 16)?;
-    info!(target: "restart-test", ?number, "success - now calling get_block for {:?}", &client_urls[1]);
-    let block = get_block(&client_urls[1], Some(number))?;
-    if block0["hash"] != block["hash"] {
-        return Err(Report::msg("Blocks between validators not the same!".to_string()));
+    // Compare a block height every node is guaranteed to have reached, rather than
+    // one node's tip. Taking a single node's `latest` and demanding that exact block
+    // on the others races their sync: a node still catching up (e.g. just restarted)
+    // returns `null` for a block it hasn't reached, which `get_block` surfaces as a
+    // cryptic "invalid type: null, expected a map" parse error. The min of all nodes'
+    // latest heights is the highest block they all definitely have (blocks are
+    // append-only, so a node only ever advances past it). See #57.
+    let mut min_number = u64::MAX;
+    for url in client_urls {
+        min_number = min_number.min(get_block_number(url)?);
     }
-    info!(target: "restart-test", ?number, "success - now calling get_block for {:?}", &client_urls[2]);
-    let block = get_block(&client_urls[2], Some(number))?;
-    if block0["hash"] != block["hash"] {
-        return Err(Report::msg(format!(
-            "Blocks between validators not the same! block0: {:?} - block: {:?}",
-            block0["hash"], block["hash"]
-        )));
+    info!(target: "restart-test", number = min_number, "comparing block across all nodes at common height");
+
+    let reference = get_block(&client_urls[0], Some(min_number))?;
+    let reference_hash = &reference["hash"];
+    for url in &client_urls[1..] {
+        let block = get_block(url, Some(min_number))?;
+        if reference_hash != &block["hash"] {
+            return Err(Report::msg(format!(
+                "Blocks between validators not the same at block {min_number}! {} has {:?}, {url} has {:?}",
+                &client_urls[0], reference_hash, block["hash"]
+            )));
+        }
     }
-    info!(target: "restart-test", ?number, "success - now calling get_block for {:?}", &client_urls[3]);
-    let block = get_block(&client_urls[3], Some(number))?;
-    if block0["hash"] != block["hash"] {
-        return Err(Report::msg("Blocks between validators not the same!".to_string()));
-    }
-    info!(target: "restart-test", "all rpcs returned same block hash");
+    info!(target: "restart-test", "all rpcs returned same block hash at block {min_number}");
     Ok(())
 }
 
@@ -853,6 +883,17 @@ fn get_block_number(node: &str) -> eyre::Result<u64> {
 fn get_transaction_count(node: &str, address: &str) -> eyre::Result<u128> {
     let res_str: String =
         call_rpc(node, "eth_getTransactionCount", rpc_params!(address, "pending"), 5)?;
+    Ok(u128::from_str_radix(res_str.strip_prefix("0x").unwrap_or(&res_str), 16)?)
+}
+
+/// Get the latest *executed* nonce for an address (via the "latest" tag).
+///
+/// Unlike the "pending" count this reflects only transactions already included in
+/// a block, so it is monotonic — it never drops back when a tx leaves the mempool.
+/// Use it to wait until a node has actually caught up to a submitted transaction.
+fn get_executed_nonce(node: &str, address: &str) -> eyre::Result<u128> {
+    let res_str: String =
+        call_rpc(node, "eth_getTransactionCount", rpc_params!(address, "latest"), 5)?;
     Ok(u128::from_str_radix(res_str.strip_prefix("0x").unwrap_or(&res_str), 16)?)
 }
 

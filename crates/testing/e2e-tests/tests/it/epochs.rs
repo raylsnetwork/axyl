@@ -6,7 +6,7 @@ use alloy::{
     sol_types::SolCall,
 };
 use clap::Parser as _;
-use e2e_tests::{create_validator_info, IT_TEST_MUTEX};
+use e2e_tests::{create_validator_info, retry_until, IT_TEST_MUTEX};
 use nix::{
     sys::signal::{self, Signal},
     unistd::Pid,
@@ -35,8 +35,13 @@ const INITIAL_STAKE_AMOUNT: &str = "1_000_000";
 /// new validator was never shuffled in. With a 1/6 per-epoch selection chance,
 /// `1 - (5/6)^25 >= 0.99`.
 const SELECTABLE_TRIALS_TARGET: usize = 25;
-// 3s is too aggressive
-const EPOCH_DURATION: u64 = 5;
+// Bumped from 5s: at short cadences a loaded CI runner can miss the epoch-advance
+// window, tripping the `loop_epochs` debounce ("Old and new epoch equal"). The few
+// seconds of CI jitter that break 5s (its debounce tolerance is only ~11s) are
+// roughly absolute, not proportional — so 30s (tolerance ~61s) gives ample margin
+// while keeping test_epoch_boundary's shuffle wait under the 60-min job cap.
+// Retry-based record checks stay correct regardless of cadence.
+const EPOCH_DURATION: u64 = 30;
 
 async fn test_epoch_boundary_inner(
     genesis: Genesis,
@@ -184,13 +189,12 @@ async fn test_epoch_boundary_inner(
         // Check that all nodes have valid (certified) Epoch Records. `latest_epoch`
         // is the current, in-progress epoch — its record isn't certified until it
         // concludes — so verify only epochs strictly before it (all concluded).
-        for p in 8540..=8545 {
+        for p in 8540..=8545u16 {
             let rpc_url = format!("http://127.0.0.1:{p}");
             let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
             for epoch in 0..latest_epoch {
-                let (epoch_rec, cert): (EpochRecord, EpochCertificate) =
-                    provider.raw_request("rayls_epochRecord".into(), (epoch,)).await?;
-                assert!(epoch_rec.verify_with_cert(&cert), "invalid epoch record!");
+                wait_for_verified_epoch_record(&provider, p, epoch, Duration::from_secs(60))
+                    .await?;
             }
         }
 
@@ -275,29 +279,62 @@ async fn test_epoch_sync_inner(
     *child.lock().expect("poison") = new_child;
     loop_epochs(10, 5).await?;
 
-    tokio::time::sleep(std::time::Duration::from_secs(EPOCH_DURATION * 2)).await;
-
     // Do a check to make sure all the nodes have valid (certified) Epoch Records.
     // The node that was down should also have all these records after syncing.
     // Verify only concluded epochs: the current (in-progress) epoch has no certified
-    // record yet, so `rayls_epochRecord` would return NotFound (401) for it.
-    let latest_epoch = 15;
-    for p in 8540..=8545 {
+    // record yet, so `rayls_epochRecord` would return NotFound (401) for it. The
+    // just-restarted node is still catching up, so poll (bounded) rather than
+    // requiring every record to be present on the first try.
+    let latest_epoch: u32 = 15;
+    for p in 8540..=8545u16 {
         let rpc_url = format!("http://127.0.0.1:{p}");
         let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
         for epoch in 0..latest_epoch {
-            let (epoch_rec, cert): (EpochRecord, EpochCertificate) =
-                provider.raw_request("rayls_epochRecord".into(), (epoch,)).await?;
-            assert!(
-                epoch_rec.verify_with_cert(&cert),
-                "invalid epoch record: {p} {}/{} {}!",
-                epoch_rec.epoch,
-                epoch_rec.digest(),
-                cert.epoch_hash
-            );
+            wait_for_verified_epoch_record(&provider, p, epoch, Duration::from_secs(60)).await?;
         }
     }
 
+    Ok(())
+}
+
+/// Poll `rayls_epochRecord(epoch)` on one node until it returns a record, then
+/// verify it against its certificate.
+///
+/// A node that is still catching up returns `NotFound` (401) for a not-yet-synced
+/// epoch, so a transient error is retried up to `deadline` — this is what makes
+/// the completeness check tolerant of a legitimately-lagging node. A record that
+/// IS returned but fails cert verification is a real correctness bug and fails
+/// immediately (no retry). A node that never produces the record fails once the
+/// deadline is exceeded, with a message naming the node and epoch.
+async fn wait_for_verified_epoch_record<P: Provider>(
+    provider: &P,
+    port: u16,
+    epoch: u32,
+    deadline: Duration,
+) -> eyre::Result<()> {
+    let (record, cert): (EpochRecord, EpochCertificate) =
+        retry_until(deadline, Duration::from_secs(1), move || async move {
+            provider
+                .raw_request::<_, (EpochRecord, EpochCertificate)>(
+                    "rayls_epochRecord".into(),
+                    (epoch,),
+                )
+                .await
+        })
+        .await
+        .map_err(|e| {
+            eyre::eyre!(
+                "node on port {port}: epoch {epoch} record unavailable after {deadline:?}: {e}"
+            )
+        })?;
+
+    eyre::ensure!(
+        record.verify_with_cert(&cert),
+        "node on port {port}: epoch {epoch} record present but failed cert verification: {}/{} {}",
+        record.epoch,
+        record.digest(),
+        cert.epoch_hash
+    );
     Ok(())
 }
 

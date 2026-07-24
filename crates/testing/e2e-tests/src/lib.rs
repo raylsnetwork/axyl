@@ -10,8 +10,10 @@ use rayls_infrastructure_types::{test_utils::CommandParser, Address, Genesis, Ge
 use rayls_middleware_orchestrator::launch_node;
 use rayls_network_cli::{genesis::GenesisArgs, keytool::KeyArgs, node::NodeCommand};
 use std::{
+    future::Future,
     path::{Path, PathBuf},
     sync::OnceLock,
+    time::{Duration, Instant},
 };
 use tracing::{error, info};
 // unused deps warnings
@@ -234,4 +236,88 @@ pub async fn ensure_account_balance_infinite_loop(
     }
 
     Ok(U256::ZERO)
+}
+
+/// Retry an async fallible operation until it succeeds or `deadline` elapses.
+///
+/// Runs `op` immediately, then re-runs it every `interval` while it returns
+/// `Err`, until `deadline` since the first attempt has passed; returns the first
+/// `Ok`, or the most recent `Err` once the deadline is exceeded.
+///
+/// Used by the epoch e2e tests to tolerate a node that is still catching up —
+/// its epoch records are only eventually consistent — without masking a genuine,
+/// persistent failure (which still surfaces as the returned `Err`).
+pub async fn retry_until<T, E, F, Fut>(
+    deadline: Duration,
+    interval: Duration,
+    mut op: F,
+) -> Result<T, E>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<T, E>>,
+{
+    let start = Instant::now();
+    loop {
+        match op().await {
+            Ok(value) => return Ok(value),
+            Err(err) => {
+                if start.elapsed() >= deadline {
+                    return Err(err);
+                }
+                tokio::time::sleep(interval).await;
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::retry_until;
+    use std::{
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        },
+        time::Duration,
+    };
+
+    #[tokio::test]
+    async fn retry_until_returns_ok_after_transient_errors() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let c = calls.clone();
+        let result: Result<u32, &'static str> =
+            retry_until(Duration::from_secs(5), Duration::from_millis(5), move || {
+                let c = c.clone();
+                async move {
+                    if c.fetch_add(1, Ordering::SeqCst) < 2 {
+                        Err("not ready")
+                    } else {
+                        Ok(42)
+                    }
+                }
+            })
+            .await;
+        assert_eq!(result.unwrap(), 42);
+        assert_eq!(calls.load(Ordering::SeqCst), 3, "expected two transient errors then success");
+    }
+
+    #[tokio::test]
+    async fn retry_until_times_out_and_returns_last_error() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let c = calls.clone();
+        let result: Result<u32, &'static str> =
+            retry_until(Duration::from_millis(25), Duration::from_millis(5), move || {
+                let c = c.clone();
+                async move {
+                    c.fetch_add(1, Ordering::SeqCst);
+                    Err("still failing")
+                }
+            })
+            .await;
+        assert_eq!(result.unwrap_err(), "still failing");
+        assert!(
+            calls.load(Ordering::SeqCst) >= 2,
+            "expected at least one retry before the deadline"
+        );
+    }
 }
