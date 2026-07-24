@@ -8,6 +8,22 @@ use serde::{
 };
 use serde_with::{DeserializeAs, SerializeAs};
 
+/// Deserialize a roaring bitmap from its on-disk bytes and normalize it by
+/// rebuilding from its (already-sorted) values.
+///
+/// `roaring`'s checked deserializer accepts a run-container with zero runs, which
+/// yields an *empty container*. That container panics on the next
+/// re-serialization — `(container.len() - 1)` underflows under overflow-checks.
+/// Rebuilding drops any empty container while preserving every value. Call this
+/// at every roaring deserialization boundary that reads untrusted (peer or disk)
+/// bytes so a malformed bitmap can't crash the node when it is later re-encoded.
+/// See issue #55.
+pub fn deserialize_normalized(bytes: &[u8]) -> std::io::Result<roaring::RoaringBitmap> {
+    let raw = roaring::RoaringBitmap::deserialize_from(bytes)?;
+    roaring::RoaringBitmap::from_sorted_iter(raw)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+}
+
 /// Serde interface to RoaringBitmap according to the roaring bitmap on-disk standard.
 pub(crate) struct RoaringBitmapSerde;
 
@@ -49,18 +65,10 @@ impl<'de> DeserializeAs<'de, roaring::RoaringBitmap> for RoaringBitmapSerde {
             where
                 E: Error,
             {
-                let raw = roaring::RoaringBitmap::deserialize_from(v).map_err(|e| {
+                // Normalize on read so a malformed wire bitmap (empty container)
+                // can't panic when the certificate is later re-encoded. See #55.
+                deserialize_normalized(v).map_err(|e| {
                     Error::custom(format!("roaring bitmap deserialization failed: {e:?}"))
-                })?;
-                // Normalize by rebuilding from the (already-sorted) values.
-                // `roaring`'s checked deserializer accepts a run-container with
-                // zero runs, producing an empty container that later panics on
-                // re-serialization (`(container.len() - 1)` underflows under
-                // overflow-checks). Rebuilding drops any empty container while
-                // preserving every value, so a malformed wire bitmap can't crash
-                // the node when the certificate is re-encoded. See issue #55.
-                roaring::RoaringBitmap::from_sorted_iter(raw).map_err(|e| {
-                    Error::custom(format!("roaring bitmap normalization failed: {e:?}"))
                 })
             }
 
