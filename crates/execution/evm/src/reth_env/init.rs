@@ -83,6 +83,12 @@ impl RethEnv {
             allow_v1,
         )
         .await?;
+
+        // Apply genesis history fixes (idempotent, no-op on v1 storage).
+        let use_hashed_state = node_config.storage_settings().use_hashed_state();
+        Self::fix_genesis_history_with(&provider_factory, use_hashed_state)?;
+        Self::fix_genesis_account_history_with(&provider_factory, use_hashed_state)?;
+
         let blockchain_provider = BlockchainProvider::new(provider_factory.clone())?;
         set_basefee_address(basefee_address);
 
@@ -135,7 +141,6 @@ impl RethEnv {
         Ok(Self {
             node_config,
             blockchain_provider,
-            #[cfg(feature = "archive-replay")]
             provider_factory,
             evm_config,
             task_spawner,
@@ -492,16 +497,15 @@ impl RethEnv {
     /// This re-inserts a genesis block-0 entry for every such account via a
     /// read-merge-write so existing post-genesis shards are preserved. Accounts
     /// with more than one shard already carry post-genesis changesets and are
-    /// left untouched. Only applicable to v2 (RocksDB) archives. Idempotent.
+    /// left untouched. Only applicable to v2 (RocksDB). Idempotent.
     ///
-    /// Limitation: on an archive whose `AccountsHistory` was cleared and rebuilt
+    /// Limitation: on a node whose `AccountsHistory` was cleared and rebuilt
     /// from `AccountChangeSets` by `IndexAccountHistoryStage` (a normally-synced
     /// node — not `rayls-replay`), a *multi-shard* genesis account is skipped here
     /// and genesis has no changeset to rebuild from, so it never regains its
-    /// block-0 entry. This is a non-issue for replay-built archives, where that
+    /// block-0 entry. This is a non-issue for replay-built nodes, where that
     /// stage never runs; account history is written once by genesis init and only
     /// appended to.
-    #[cfg(feature = "archive-replay")]
     pub fn fix_genesis_account_history(&self) -> eyre::Result<()> {
         Self::fix_genesis_account_history_with(
             &self.provider_factory,
@@ -512,7 +516,6 @@ impl RethEnv {
 
     /// Testable core of [`Self::fix_genesis_account_history`]. Returns the number
     /// of accounts seeded.
-    #[cfg(feature = "archive-replay")]
     pub(crate) fn fix_genesis_account_history_with(
         provider_factory: &ProviderFactory<RaylsNode>,
         use_hashed_state: bool,
@@ -530,17 +533,21 @@ impl RethEnv {
         let genesis = chain_spec.genesis();
         let block = chain_spec.genesis_header().number;
 
-        // Single pass: collect which addresses already have a block-0 entry
-        // (idempotency guard) and how many shards each address has (safety guard).
+        let rocksdb = provider_factory.rocksdb_provider();
+
+        // Per-account prefix scan — mirrors fix_genesis_history_with pattern.
+        // Only scans shards for genesis accounts, not the entire table.
         let (already_fixed, shard_counts): (HashSet<Address>, HashMap<Address, usize>) = {
-            let rocksdb = provider_factory.rocksdb_provider();
             let mut fixed = HashSet::new();
             let mut counts: HashMap<Address, usize> = HashMap::new();
-            for entry in rocksdb.iter::<reth_db::tables::AccountsHistory>()? {
-                let (key, value) = entry?;
-                *counts.entry(key.key).or_insert(0) += 1;
-                if value.contains(block) {
-                    fixed.insert(key.key);
+            for addr in genesis.alloc.keys() {
+                let shards = rocksdb.account_history_shards(*addr)?;
+                if shards.is_empty() {
+                    continue;
+                }
+                counts.insert(*addr, shards.len());
+                if shards.iter().any(|(_, list)| list.contains(block)) {
+                    fixed.insert(*addr);
                 }
             }
             (fixed, counts)
@@ -584,7 +591,6 @@ impl RethEnv {
             return Ok(0);
         }
 
-        let rocksdb = provider_factory.rocksdb_provider();
         let mut batch = rocksdb.batch();
         for addr in &to_fix {
             let key = ShardedKey::last(*addr);
@@ -593,6 +599,10 @@ impl RethEnv {
                 Some(existing_list) => {
                     let blocks: Vec<u64> =
                         core::iter::once(block).chain(existing_list.iter()).collect();
+                    debug_assert!(
+                        blocks.windows(2).all(|w| w[0] < w[1]),
+                        "merged genesis account history must be strictly ascending"
+                    );
                     BlockNumberList::new(blocks)
                         .map_err(|e| eyre::eyre!("failed to build block number list: {e}"))?
                 }
@@ -606,12 +616,12 @@ impl RethEnv {
             target: "rayls::reth",
             accounts = to_fix.len(),
             block,
-            "seeded genesis account history for v2 archive"
+            "seeded genesis account history for v2"
         );
         Ok(to_fix.len())
     }
 
-    /// Re-key the genesis storage history to hashed keys so v2 archive reads
+    /// Re-key the genesis storage history to hashed keys so v2 reads
     /// reconstruct genesis-seeded storage instead of returning 0x0.
     ///
     /// reth's genesis writer (`insert_storage_history`) keys `StoragesHistory`
@@ -628,13 +638,12 @@ impl RethEnv {
     /// blocks. When prepending would push the earliest shard past
     /// `NUM_OF_INDICES_IN_SHARD` (a hot genesis slot with >= that many
     /// post-genesis changes), the slot's shards are re-chunked so none exceeds
-    /// the limit. Only applicable to v2 (RocksDB) archives. Idempotent.
+    /// the limit. Only applicable to v2 (RocksDB). Idempotent.
     ///
     /// This adds the entry under the hashed key; the original plain-slot entry
     /// written by genesis init is intentionally left in place. It's never read by
     /// v2 (which looks up the hashed key) and deleting it is avoidable risk for no
     /// functional gain, so it's kept as harmless dead weight rather than removed.
-    #[cfg(feature = "archive-replay")]
     pub fn fix_genesis_history(&self) -> eyre::Result<()> {
         Self::fix_genesis_history_with(
             &self.provider_factory,
@@ -645,7 +654,6 @@ impl RethEnv {
 
     /// Testable core of [`Self::fix_genesis_history`]. Returns the number of
     /// storage slots re-keyed (0 when everything is already correct).
-    #[cfg(feature = "archive-replay")]
     pub(crate) fn fix_genesis_history_with(
         provider_factory: &ProviderFactory<RaylsNode>,
         use_hashed_state: bool,
