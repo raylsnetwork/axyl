@@ -3,8 +3,9 @@
 Measures how much routing all consensus p2p through circuit-relay-v2 relays costs, versus a direct
 (no-relay) network — under sustained load, at two committee sizes.
 
-**TL;DR:** on this setup the relays are essentially free — relay vs no-relay finality and throughput
-are within noise at both sizes. The real cost is committee size (4→6 roughly doubles finality
+**TL;DR:** on this setup the relays add little — at 4+1 relay vs no-relay is within noise; at 6+1 one
+relay run was slightly faster than direct and the other slightly slower, so the gap is run-to-run
+noise rather than a real relay cost. The real cost is committee size (4→6 roughly doubles finality
 latency). See the [caveat](#caveat) — everything runs on one host, so this is a *lower bound* on
 relay cost.
 
@@ -106,31 +107,33 @@ All runs: 10k target TPS, 300s, release build, generator remote, nodes on `172.1
 
 ### 6 validators + 1 observer
 
-| Metric | No relay | Relay |
-|---|---|---|
-| Send/Confirm TPS | 9873 (98.7%) | 9854 (98.5%) |
-| Confirm rate | 100% | 100% |
-| **Finality p50** | 3128ms | 2899ms |
-| **Finality p95** | 6033ms | 5767ms |
-| **Finality p99** | 7133ms | 6800ms |
-| Finality mean | 3113ms | 3274ms |
-| Confirm p99 (incl. poll) | 8431ms | 9749ms |
-| Blocks / rate | 736 · 2.43/s | 708 · 2.33/s |
-| Grade · RPC stress | C · CRITICAL | C · CRITICAL |
-| Production gaps | 1 (3s) | 4 (≤4s) |
+| Metric | No relay | Relay run 1 | Relay run 2 |
+|---|---|---|---|
+| Send/Confirm TPS | 9873 (98.7%) | 9854 (98.5%) | 9837 (98.4%) |
+| Confirm rate | 100% | 100% | 100% |
+| **Finality p50** | 3128ms | 2899ms | 3163ms |
+| **Finality p95** | 6033ms | 5767ms | 6152ms |
+| **Finality p99** | 7133ms | 6800ms | 8107ms |
+| Finality mean | 3113ms | 3274ms | 3655ms |
+| Confirm p99 (incl. poll) | 8431ms | 9749ms | 10023ms |
+| Blocks / rate | 736 · 2.43/s | 708 · 2.33/s | 669 · 2.21/s |
+| Grade · RPC stress | C · CRITICAL | C · CRITICAL | C · CRITICAL |
+| Production gaps | 1 (3s) | 4 (≤4s) | 1 (4s) |
 
 ## Findings
 
-1. **Relays are essentially free here.** At both committee sizes, relay vs no-relay finality and TPS
-   are within noise — finality percentiles differ by <10%, and the relay is sometimes *faster*
-   (6+1: p50 2899 vs 3128, p99 6800 vs 7133). Throughput held ~99% of 10k and confirm rate was 100%
-   (zero dropped txns) in every run.
+1. **Relays add little.** At 4+1, relay vs no-relay is within noise — finality percentiles <10%
+   apart, sometimes relay *faster*. At 6+1 the result is just noisier: relay p99 was 6.8s in one run
+   and 8.1s in the other, with no-relay at 7.1s in between — i.e. one relay run beat direct and one
+   was slower, so there's no consistent relay penalty, only run-to-run variance. Throughput held
+   ~98–99% of 10k and confirm rate was 100% (zero dropped txns) in every run.
 2. **The real cost is committee size, not relays.** Going 4+1 → 6+1 roughly **doubles** finality
-   (p50 ~1.4s → ~3s, p99 ~4.3s → ~7s), drops the grade **B → C**, pushes RPC stress
-   **HIGH → CRITICAL**, and lowers block rate ~2.6 → ~2.4/s. Both topologies degrade together.
-3. **Minor relay tail jitter under the heavier load.** At 6+1 the relay run had more/larger
-   production gaps (4 vs 1, up to 4s) and a worse *confirm* p99 (9.7s vs 8.4s) — a bit more tail
-   variance, though median finality was marginally better.
+   (p50 ~1.4s → ~3s, p99 ~4.3s → ~7–8s), drops the grade **B → C**, pushes RPC stress
+   **HIGH → CRITICAL**, and lowers block rate ~2.6 → ~2.2–2.4/s. Both topologies degrade together.
+3. **Relay tail is a touch noisier under heavy load.** At 6+1 the relay runs show a slightly worse
+   *confirm* p99 (9.7–10.0s vs 8.4s) and higher mean finality (3.3–3.7s vs 3.1s). Differences are
+   small and run-to-run variance is high at this size — average more runs (3+ per config) before
+   drawing a firm 6+1 conclusion.
 
 ## Caveat
 
