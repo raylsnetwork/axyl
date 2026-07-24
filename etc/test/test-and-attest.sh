@@ -29,8 +29,8 @@ COMMIT_HASH=$(git rev-parse HEAD)
 echo "attesting git hash: ${COMMIT_HASH}"
 
 # Use cast to call the contract and return early if current HEAD attestation present
-ALREADY_ATTESTED=$(cast call --rpc-url ${RPC_ENDPOINT} \
-    ${CONTRACT_ADDRESS} "${VERIFY_CALL}" "${COMMIT_HASH}" )
+ALREADY_ATTESTED=$(cast call --rpc-url "${RPC_ENDPOINT}" \
+    "${CONTRACT_ADDRESS}" "${VERIFY_CALL}" "${COMMIT_HASH}" )
 
 # Check if the result is true (1) or false (0)
 if [[ "${ALREADY_ATTESTED: -1}" == "1" ]]; then
@@ -97,11 +97,11 @@ echo "default tests and specific faucet it test passing"
 # create and submit transaction
 #
 # Send the transaction using cast
-output=$(cast send --private-key ${PRIVATE_KEY} \
-    --rpc-url ${RPC_ENDPOINT} \
+output=$(cast send --private-key "${PRIVATE_KEY}" \
+    --rpc-url "${RPC_ENDPOINT}" \
     --chain "2017" \
     --gas-limit 1000000 \
-    ${CONTRACT_ADDRESS} \
+    "${CONTRACT_ADDRESS}" \
     "${ATTEST_CALL}" "${COMMIT_HASH}" "true")
 
 # Check if the cast command was successful

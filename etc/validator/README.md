@@ -53,7 +53,7 @@ Populate `.env` with:
 | `REGISTRY_CONTRACT_ADDRESS` | *(Optional)* Defaults to the canonical address `0x07E17e17E17e17E17e17E17E17E17e17e17E17e1`. Override only if the network operator has deployed `ConsensusRegistry` elsewhere. |
 | `RPC_PORT` | *(Optional)* Only used in a log line printed by `activate-validator.sh --start`; the node itself starts on its default HTTP port regardless. |
 | `VALIDATOR` | *(Optional)* Human-readable label used in log lines for this validator (e.g. `val1`). |
-| `BUILD_CONFIG` | Build configuration passed to `rayls-network` compilation (e.g. `debug` or `release`). Defaults to `release` if unset. |
+| `BUILD_CONFIG` | Build configuration passed to `rayls-network` compilation (e.g. `debug` or `release`). Defaults to `debug` if unset. |
 | `RAYLS_NETWORK` | *(Optional)* Network identifier for the `rayls-network` binary (e.g. `local`). |
 
 The same `.env` is read by all three scripts.

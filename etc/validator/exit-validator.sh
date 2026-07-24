@@ -43,5 +43,5 @@ fi
 echo "Submitting beginExit transaction to registry contract at address ${REGISTRY_CONTRACT_ADDRESS}"
 
 # send beginExit transaction
-cast send $REGISTRY_CONTRACT_ADDRESS "beginExit()" --private-key $PRIVATE_KEY --rpc-url $RPC_URL
+cast send "$REGISTRY_CONTRACT_ADDRESS" "beginExit()" --private-key "$PRIVATE_KEY" --rpc-url "$RPC_URL"
 

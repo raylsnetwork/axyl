@@ -83,7 +83,7 @@ RUSTFLAGS="-C target-cpu=native" cargo build "${BUILD_ARGS[@]}"
 
 echo "Stake transaction sent, sending activate transaction"
 
-cast send $REGISTRY_CONTRACT_ADDRESS "activate()" --private-key $PRIVATE_KEY --rpc-url $RPC_URL -vvvv
+cast send "$REGISTRY_CONTRACT_ADDRESS" "activate()" --private-key "$PRIVATE_KEY" --rpc-url "$RPC_URL" -vvvv
 
 
 if [ "$START" = true ]; then
