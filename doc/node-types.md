@@ -30,10 +30,10 @@ detail.
 flowchart TD
     CR["ConsensusRegistry (on-chain)<br/>allowlist -> stake -> activate"]
     CR -->|"key in committee?"| Q{ }
-    Q -->|yes| V["Validator<br/>NodeMode::CvvActive / CvvInactive<br/>proposes, votes, commits"]
-    Q -->|no| O["Observer<br/>NodeMode::Observer<br/>streams committed output, never votes"]
+    Q -->|yes| V["Validator<br/>NodeMode::CvvActive / CvvInactive<br/>proposes, votes, commits<br/>RPC: loopback only — not public"]
+    Q -->|no| O["Observer<br/>NodeMode::Observer<br/>streams committed output, never votes<br/>RPC: public — accepts tx submission"]
     V -->|"streams committed ConsensusOutput"| O
-    O -->|"run without --full / --minimal"| A["Archive<br/>Observer + pruning disabled<br/>full tx/log history"]
+    O -->|"run without --full / --minimal"| A["Archive<br/>Observer + pruning disabled<br/>full tx/log history<br/>RPC: public — plus full history queries"]
 ```
 
 ## Validator
