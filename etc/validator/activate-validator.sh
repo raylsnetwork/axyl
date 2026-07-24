@@ -77,7 +77,7 @@ cast send "$REGISTRY_CONTRACT_ADDRESS" "activate()" --private-key "$PRIVATE_KEY"
 
 if [ "$START" = true ]; then
     export RAYLS_NETWORK="$RAYLS_NETWORK"
-    echo "Starting ${VALIDATOR} in background, rpc endpoint http://localhost:$RPC_PORT"
+    echo "Starting ${VALIDATOR}, rpc endpoint http://localhost:$RPC_PORT"
     # -vvv for INFO, -vvvvv for TRACE, etc
     # start validator
     RL_BLS_PASSPHRASE="local" ${workingDir}/../../target/${BUILD_CONFIG}/rayls-network node \
