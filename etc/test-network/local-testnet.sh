@@ -87,8 +87,10 @@ start_validator() {
         --gpo.default-suggested-fee 0 \
         -${LOG_LEVEL} \
         --http \
+        --http.addr 0.0.0.0 \
         --http.api all \
         ${FLAG_WS_API} \
+        --ws.addr 0.0.0.0 \
         --ws.port "${WS_PORT}" \
         --ws.api all \
         >> "${ROOTDIR}/${VALIDATOR}.log" &
@@ -813,8 +815,10 @@ if [ "$START" = true ]; then
             --gpo.default-suggested-fee 0 \
             -${LOG_LEVEL} \
             --http \
+            --http.addr 0.0.0.0 \
             --http.api all \
             ${FLAG_WS_API} \
+            --ws.addr 0.0.0.0 \
             --ws.port "${WS_PORT}" \
             --ws.api all \
              >> "${ROOTDIR}/${VALIDATOR}.log" &
@@ -863,8 +867,10 @@ if [ "$START" = true ]; then
                 --gpo.default-suggested-fee 0 \
                 -${LOG_LEVEL} \
                 --http \
+                --http.addr 0.0.0.0 \
                 --http.api all \
                 ${FLAG_WS_API} \
+                --ws.addr 0.0.0.0 \
                 --ws.port "${OBSERVER_WS_PORT}" \
                 --ws.api all \
                 >> "${ROOTDIR}/${OBSERVER}.log" &

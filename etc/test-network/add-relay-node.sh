@@ -211,7 +211,9 @@ env "${NODE_ENV[@]}" "$BIN" node \
     --gpo.default-suggested-fee 0 \
     -${LOG_LEVEL} \
     --http \
+    --http.addr 0.0.0.0 \
     --http.api all \
+    --ws.addr 0.0.0.0 \
     --ws.port "$WS_PORT" \
     --ws.api all \
     >> "$NODE_LOG" 2>&1 &
