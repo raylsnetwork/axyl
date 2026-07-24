@@ -35,17 +35,6 @@ if [ -z "$RPC_URL" ]; then
     fi
 fi
 
-
-# STAKE_AMOUNT
-if [ -z "$STAKE_AMOUNT" ]; then
-    echo "Enter stake amount:"
-    read STAKE_AMOUNT
-    if [ -z "$STAKE_AMOUNT" ]; then
-        echo "Error: Stake amount is required."
-        exit 1
-    fi
-fi
-
 # registry contract address - if not supplied, use default value
 if [ -z "$REGISTRY_CONTRACT_ADDRESS" ]; then
     REGISTRY_CONTRACT_ADDRESS="0x07E17e17E17e17E17e17E17E17E17e17e17E17e1"
