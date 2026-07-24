@@ -59,6 +59,7 @@ impl RethEnv {
         build_metadata: &BuildMetadata,
         network: Option<RaylsNetwork>,
         min_base_fee: Option<u64>,
+        allow_v1: bool,
     ) -> eyre::Result<Self> {
         let node_config = reth_config.0.clone();
         let mut builder = RaylsChainSpec::builder(Arc::clone(&node_config.chain));
@@ -79,6 +80,7 @@ impl RethEnv {
             &task_spawner,
             runtime.clone(),
             rewards_counter,
+            allow_v1,
         )
         .await?;
 
@@ -171,6 +173,7 @@ impl RethEnv {
                 pprof_dumps_path: None,
             },
             chain,
+            storage: StorageArgs { v2: true },
             ..NodeConfig::default()
         };
         let reth_config = RethConfig(node_config);
@@ -184,6 +187,7 @@ impl RethEnv {
             &BuildMetadata::default(),
             None,
             None,
+            false,
         )
         .await
     }
@@ -243,6 +247,7 @@ impl RethEnv {
             &BuildMetadata::default(),
             Some(network),
             min_base_fee,
+            true,
         )
         .await
     }
@@ -255,7 +260,14 @@ impl RethEnv {
         task_spawner: &TaskSpawner,
         runtime: reth_tasks::Runtime,
         rewards_counter: RewardsCounter,
+        allow_v1: bool,
     ) -> eyre::Result<ProviderFactory<RaylsNode>> {
+        // V1 (plain) storage is no longer supported — forbid it at startup.
+        let storage_settings = node_config.storage_settings();
+        if !storage_settings.storage_v2 && !allow_v1 {
+            eyre::bail!("V1 (plain) storage is no longer supported. Restart with `--storage.v2`.");
+        }
+
         let datadir = node_config.datadir();
         // Wrap ChainSpec in RaylsChainSpec for static base fee
         let rocksdb_provider = RocksDBBuilder::new(datadir.rocksdb())
@@ -271,7 +283,7 @@ impl RethEnv {
             runtime,
         )?;
 
-        provider_factory.set_storage_settings_cache(node_config.storage_settings());
+        provider_factory.set_storage_settings_cache(storage_settings);
 
         if let Some(prune_config) = node_config.prune_config() {
             provider_factory = provider_factory.with_prune_modes(prune_config.segments);
@@ -308,9 +320,8 @@ impl RethEnv {
 
         // init_genesis_with_settings writes HashedAccounts/HashedStorages via
         // insert_genesis_hashes and derives the trie via compute_state_root,
-        // so no post-init rehashing is needed for v1 or v2.
-        let genesis_hash =
-            init_genesis_with_settings(&provider_factory, node_config.storage_settings())?;
+        // so no post-init rehashing is needed for v2.
+        let genesis_hash = init_genesis_with_settings(&provider_factory, storage_settings)?;
         debug!(target: "rayls::execution", chain=%node_config.chain.chain, ?genesis_hash, "Initialized genesis");
 
         Ok(provider_factory)
