@@ -628,7 +628,9 @@ fn start_nodes(temp_path: &Path, validators: &[(&str, Address)]) -> eyre::Result
             .arg(&*dir.to_string_lossy())
             .arg("--instance")
             .arg(&instance)
-            .arg("--http");
+            .arg("--http")
+            // v1 (plain) storage is no longer supported -- the node refuses to start without this
+            .arg("--storage.v2");
 
         #[cfg(feature = "faucet")]
         command
