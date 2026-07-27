@@ -149,6 +149,20 @@ ADDED=1 DNSMASQ_PORT=5354 ./fork_test_configs/bounce-node.sh 6
 If it parks on `still shutting down after Ns…`, that's a real hung shutdown — look
 at the node's log; it won't force-kill.
 
+**Bounce a single *relay* (not the node)** with `relay-ctl.sh` — the quickest way to test relay
+failure/recovery. It keeps the relay's peer id stable, so the fronted validator re-reserves on its
+own (`retry_relay_reservations`, ~15s) with no node restart:
+```bash
+./etc/test-network/relay-ctl.sh stop 6        # kill relay-node-6's relay (or validator-6's primary)
+./etc/test-network/relay-ctl.sh start 6       # respawn it — watch relay-6.log for "reservation accepted … renewed"
+./etc/test-network/relay-ctl.sh restart 6     # stop + start
+./etc/test-network/relay-ctl.sh restart 1 --backup   # a base validator's *backup* relay (port 51000+i)
+```
+`N` = the validator/added-node index. Primary relay: port `50000+(N-1)`, seed byte `N`; `--backup`:
+port `51000+(N-1)`, seed byte `0xb0+(N-1)`. While a relay is down, a base validator fails over to
+its backup; an added node (single relay) stays reachable only via its own outbound links until the
+relay returns.
+
 ## Ports (node N; base validators use 9100+i etc.)
 
 `INSTANCE = 100+N`; RPC `= 8545-(INSTANCE-1)`, WS `= 18556-(N-1)`, consensus
