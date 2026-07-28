@@ -750,6 +750,65 @@ async fn test_admitted_connection_is_registered_under_the_same_ban_predicate() {
     );
 }
 
+/// A peer recorded as a relay via `mark_relay_peer` (the `GossipsubNotSupported` path) must be
+/// exempt from consensus-layer penalties: a `Fatal` penalty must neither ban nor disconnect it.
+/// Regression for relayed nodes banning the very relays their circuits ride on.
+#[tokio::test]
+async fn test_mark_relay_peer_exempts_from_ban() {
+    let mut peer_manager = create_test_peer_manager(None);
+    let relay = register_peer(&mut peer_manager, None); // random peer id -> not a validator
+
+    // record it as relay infrastructure, as the GossipsubNotSupported handler does
+    assert!(
+        peer_manager.mark_relay_peer(relay),
+        "a non-validator peer must be recordable as relay"
+    );
+    assert!(peer_manager.is_relay(&relay));
+
+    // a fatal penalty must now be a no-op: no ban, no disconnect
+    peer_manager.process_penalty(relay, Penalty::Fatal);
+    let events = collect_all_events(&mut peer_manager);
+    assert!(
+        extract_events(&events, |e| matches!(
+            e,
+            PeerEvent::Banned(_) | PeerEvent::DisconnectPeer(_) | PeerEvent::DisconnectPeerX(_, _)
+        ))
+        .is_empty(),
+        "a relay peer must not be banned or disconnected by a consensus-layer penalty"
+    );
+    assert!(!peer_manager.peer_banned(&relay), "relay peer must not be banned");
+}
+
+/// `mark_relay_peer` must refuse to record a committee validator as a relay: a validator that
+/// fails gossipsub negotiation is a real protocol/version fault, not infrastructure to exempt.
+#[tokio::test]
+async fn test_mark_relay_peer_refuses_validator() {
+    let all_nodes = CommitteeFixture::builder(MemDatabase::default).build();
+    let mut authorities = all_nodes.authorities();
+    let authority_1 = authorities.next().expect("first authority");
+    let config = authority_1.consensus_config();
+    let mut peer_manager =
+        PeerManager::new(config.network_config().peer_config(), PeerId::random());
+
+    let validator_bls = *authority_1.authority().protocol_key();
+    let netkey = config.key_config().primary_network_public_key();
+    let validator_peer_id: PeerId = netkey.clone().into();
+    let info = NetworkInfo {
+        pubkey: netkey,
+        multiaddrs: vec![config.primary_address()],
+        timestamp: now(),
+    };
+    peer_manager.add_known_peer(validator_bls, info);
+    peer_manager.new_epoch(config.committee_pub_keys());
+
+    // sanity: the derived peer id is recognized as a committee validator
+    assert!(peer_manager.is_peer_validator(&validator_peer_id));
+
+    // the guard: a validator is never recorded as a relay
+    assert!(!peer_manager.mark_relay_peer(validator_peer_id));
+    assert!(!peer_manager.is_relay(&validator_peer_id));
+}
+
 #[tokio::test]
 async fn test_register_outgoing_connection() {
     let mut peer_manager = create_test_peer_manager(None);

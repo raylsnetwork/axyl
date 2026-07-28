@@ -493,6 +493,27 @@ impl PeerManager {
         self.relay_peers.contains(peer_id)
     }
 
+    /// Record a peer that completed connection setup but does not speak a consensus protocol
+    /// (learned authoritatively, e.g. gossipsub's `GossipsubNotSupported`) as protected
+    /// infrastructure. In this network a peer that runs none of our consensus protocols is a
+    /// circuit relay, so record it the same way as a relay named in a `/p2p-circuit` address:
+    /// exempt from penalties and kept out of the kademlia DHT. This is the discovery-independent
+    /// counterpart to [`Self::register_relays_from_addrs`]; it catches relays we only ever saw via
+    /// a bare direct address (a kad/identify leak), which the address-based path cannot.
+    ///
+    /// Returns `false` without recording when `peer_id` is a known committee validator: a
+    /// validator that fails consensus-protocol negotiation is a real protocol/version fault the
+    /// caller must surface, never silently exempt.
+    pub(crate) fn mark_relay_peer(&mut self, peer_id: PeerId) -> bool {
+        if self.is_peer_validator(&peer_id) {
+            return false;
+        }
+        if self.relay_peers.insert(peer_id) {
+            debug!(target: "peer-manager", ?peer_id, "recorded non-consensus peer as relay (exempt from penalties)");
+        }
+        true
+    }
+
     /// Record the relay servers referenced by any `/p2p-circuit` addresses so they are treated as
     /// protected infrastructure (never penalized or pruned).
     pub(crate) fn register_relays_from_addrs(&mut self, addrs: &[Multiaddr]) {
