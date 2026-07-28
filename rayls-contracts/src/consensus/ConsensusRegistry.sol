@@ -43,6 +43,20 @@ contract ConsensusRegistry is
     uint256 private constant ANCHOR_BPS = 1_000;
     uint256 private constant STAKE_BPS = 1_000;
 
+    /// @dev Fixed-point scale applied to every weight component before the
+    /// truncating integer division that normalizes it. Each component is at most
+    /// its `*_BPS` share (<= `MAX_BPS`), so with a large committee splitting that
+    /// share, a per-validator numerator like `PARTICIPATION_BPS * rounds` can round
+    /// down to 0 (e.g. one round out of a >8000-round submitted sum), silently
+    /// dropping a validator that did contribute. Scaling the numerator by
+    /// `WEIGHT_PRECISION` preserves sub-bps resolution; because RewardDistributor
+    /// consumes weights purely as ratios (`weight / totalWeight`), scaling every
+    /// weight by the same constant leaves the distribution unchanged. `1e18` keeps
+    /// the largest possible weight (`MAX_BPS * WEIGHT_PRECISION`, times per-epoch
+    /// round counts) far inside uint256 - and well below the pre-hybrid
+    /// `stake * headerCount` weights this contract already stored without overflow.
+    uint256 private constant WEIGHT_PRECISION = 1e18;
+
     /// @dev Stake-tier bonus: own required stake (`getBalanceBreakdown` position 1,
     /// not position 0 which is contaminated by accrued rewards) plus delegated
     /// stake, tiered every `STAKE_TIER_STEP` above `STAKE_TIER_MIN`, capped at
@@ -134,7 +148,10 @@ contract ConsensusRegistry is
     /// anchor/leader-round share of `totalRounds` (a true committee-wide share,
     /// since exactly one leader commits per round), and `STAKE_BPS` by stake-tier
     /// share. Mirrors `RewardDistributor.sol`'s own "sum totals, then proportional
-    /// split" idiom one level deeper.
+    /// split" idiom one level deeper. Each share is scaled by `WEIGHT_PRECISION`
+    /// before its truncating division so a contributing validator's weight can't
+    /// round to 0 in a large committee (ratios, and thus the distribution, are
+    /// unchanged - see `WEIGHT_PRECISION`).
     function applyIncentives(
         RewardInfo[] calldata rewardInfos,
         uint256 totalRounds
@@ -190,14 +207,22 @@ contract ConsensusRegistry is
             if (stakeWeight[i] == 0) continue;
             RewardInfo calldata reward = rewardInfos[i];
 
+            // Numerators are scaled by WEIGHT_PRECISION so an eligible validator's
+            // share can't truncate to 0 under a large committee (see the constant's
+            // doc). Distribution is unaffected - RewardDistributor uses weight/totalWeight.
             uint256 weight;
             if (totalParticipationRounds > 0) {
-                weight += (PARTICIPATION_BPS * reward.participationRounds) / totalParticipationRounds;
+                weight +=
+                    (PARTICIPATION_BPS * WEIGHT_PRECISION * reward.participationRounds) /
+                    totalParticipationRounds;
             }
             if (totalRounds > 0) {
-                weight += (ANCHOR_BPS * reward.anchorRounds) / totalRounds;
+                weight += (ANCHOR_BPS * WEIGHT_PRECISION * reward.anchorRounds) / totalRounds;
             }
-            weight += (STAKE_BPS * stakeWeight[i]) / totalStakeWeight;
+            weight += (STAKE_BPS * WEIGHT_PRECISION * stakeWeight[i]) / totalStakeWeight;
+            // Defensive only: with WEIGHT_PRECISION scaling and stakeWeight[i] > 0
+            // (guaranteed for every Pass-1-eligible validator), the stake term alone is
+            // already > 0, so an eligible validator can no longer be silently dropped here.
             if (weight == 0) continue;
 
             tmpValidators[validatorCount] = reward.validatorAddress;
@@ -249,6 +274,15 @@ contract ConsensusRegistry is
 
     /// @notice Governance sets the minimum participation share (bps) required for
     /// eligibility; `0` disables the floor.
+    /// @dev The floor is a *minimum-attendance* gate measured against `totalRounds`
+    /// (committed rounds): a validator is excluded when
+    /// `participationRounds * MAX_BPS / totalRounds < newFloorBps`. This denominator
+    /// is deliberately different from the one used to size the participation *weight*
+    /// (`totalParticipationRounds`, the committee-wide submitted sum). So passing the
+    /// floor does not imply a participation weight of at least `newFloorBps` bps: the
+    /// floor answers "was this validator present enough to be eligible?", the weight
+    /// answers "how large is its slice of the committee's total contribution?". The
+    /// two are distinct by design and must not be read as the same threshold.
     /// @param newFloorBps New floor, in bps of `totalRounds`. Must be `<= MAX_BPS`.
     function setParticipationFloorBps(uint256 newFloorBps) external onlyOwner {
         if (newFloorBps > MAX_BPS) revert InvalidParticipationFloor(newFloorBps);

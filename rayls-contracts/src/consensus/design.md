@@ -54,6 +54,14 @@ starved latency-distant validators and pushed operators to cluster nodes) to a h
   the tally → calldata → contract path). `applyIncentives` runs as an EVM system call whose
   result feeds both `state_root` and `withdrawals_root`, so it must be bit-for-bit identical on
   every node.
+- **Weight precision.** Each of the three normalized shares is scaled by `WEIGHT_PRECISION`
+  (`1e18`) before its truncating integer division. Without it, a per-validator numerator such as
+  `PARTICIPATION_BPS * participationRounds` can round down to zero once a large committee splits
+  the ~10 000-bps pool (one round out of a >8 000-round submitted sum), silently dropping a
+  validator that did contribute. Scaling preserves sub-bps resolution; because `RewardDistributor`
+  consumes weights purely as ratios (`weight / totalWeight`), scaling every weight by the same
+  constant leaves the distribution unchanged — and the scaled weights stay well below the
+  pre-hybrid `stake × headerCount` magnitudes this contract already stored.
 - **Anchor Commit Share (10%, capped)** preserves the incentive to run competitive
   infrastructure — a validator that wins the latency-sensitive fast path still earns more —
   without letting geography dominate rewards.

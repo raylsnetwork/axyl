@@ -224,16 +224,21 @@ contract ConsensusRegistryTestFuzz is ConsensusRegistryTestUtils {
             else if (perf.validators[i] == third) weightOf[2] = perf.weights[i];
         }
 
-        // Participation share is equal across all three (each submitted totalRounds
-        // participationRounds out of a 3*totalRounds submitted sum) -> 8_000/3 bps each.
-        // Anchor share: usLeader gets the full 1_000 bps (100% of totalRounds); the
-        // other two get 0. Stake share splits evenly at baseline -> 1_000/3 bps each.
-        // Cast forces normal truncating integer division; bare literal/literal
-        // division is exact-rational at compile time in Solidity and rejects
-        // non-whole results (e.g. plain `8_000 / 3` fails to compile).
-        uint256 participationShare = uint256(8_000) / 3;
-        uint256 stakeShare = uint256(1_000) / 3;
-        uint256 expectedUsLeader = participationShare + 1_000 + stakeShare;
+        // Each share mirrors the contract's WEIGHT_PRECISION-scaled truncating
+        // division exactly - scale THEN divide (not divide-then-scale), so the
+        // retained sub-bps resolution matches. Participation: each of the 3 validators
+        // submitted `totalRounds` out of a `3*totalRounds` submitted sum. Anchor:
+        // usLeader led every round (full 1_000-bps share of `totalRounds`), the other
+        // two led none. Stake: equal baseline stake weight -> 1/3 each. Casts force
+        // runtime truncating division (bare literal/literal is exact-rational at
+        // compile time and rejects non-whole results).
+        uint256 precision = 1e18; // WEIGHT_PRECISION mirror
+        uint256 baselineStakeWeight = 10_000; // MAX_BPS baseline, no delegation
+        uint256 participationShare = (uint256(8_000) * precision * totalRounds) / (3 * totalRounds);
+        uint256 anchorFull = (uint256(1_000) * precision * totalRounds) / totalRounds;
+        uint256 stakeShare =
+            (uint256(1_000) * precision * baselineStakeWeight) / (3 * baselineStakeWeight);
+        uint256 expectedUsLeader = participationShare + anchorFull + stakeShare;
         uint256 expectedTokyo = participationShare + stakeShare;
         uint256 expectedThird = participationShare + stakeShare;
 

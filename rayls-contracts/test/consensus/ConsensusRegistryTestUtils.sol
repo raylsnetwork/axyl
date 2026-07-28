@@ -277,9 +277,14 @@ contract ConsensusRegistryTestUtils is ConsensusRegistry, BlsG1Harness, GenesisP
     /// sums (e.g. anchor rounds summing to exactly `totalRounds`) - the blended
     /// weight formula doesn't require that invariant to hold to compute a result,
     /// and per-validator round counts are exactly what `applyIncentives` trusts.
+    /// It does enforce the one *per-validator* invariant production always upholds:
+    /// `anchorRounds <= participationRounds` (a leader's own certificate is always in
+    /// the sub-dag it commits, so `order_dag` yields `participationRounds >=
+    /// anchorRounds`). Drawing them independently would routinely produce impossible
+    /// `anchorRounds > participationRounds` inputs, so anchor is clamped below.
     function _fuzz_createRewardInfos(
         uint24 numRewardees
-    ) internal view returns (RewardInfo[] memory, uint256 totalRounds) {
+    ) internal pure returns (RewardInfo[] memory, uint256 totalRounds) {
         totalRounds = 10_000;
         RewardInfo[] memory rewardInfos = new RewardInfo[](numRewardees);
         for (uint256 i; i < numRewardees; ++i) {
@@ -288,9 +293,11 @@ contract ConsensusRegistryTestUtils is ConsensusRegistry, BlsG1Harness, GenesisP
             uint256 participationRounds = uint256(
                 keccak256(abi.encode(uniqueSeed, "participation"))
             ) % (totalRounds + 1);
-            uint256 anchorRounds = uint256(
-                keccak256(abi.encode(uniqueSeed, "anchor"))
-            ) % (totalRounds + 1);
+            // Clamp anchor to the per-validator invariant `anchorRounds <=
+            // participationRounds` (0 when a validator participated in no round).
+            uint256 anchorRounds = participationRounds == 0
+                ? 0
+                : uint256(keccak256(abi.encode(uniqueSeed, "anchor"))) % (participationRounds + 1);
 
             rewardInfos[i] = RewardInfo(rewardee, participationRounds, anchorRounds);
         }

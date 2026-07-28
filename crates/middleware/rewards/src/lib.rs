@@ -183,6 +183,9 @@ impl<DB: Database> RewardsBackend for ConsensusRewardsCounter<DB> {
                 let mut per_address: BTreeMap<Address, ValidatorRoundTally> = BTreeMap::new();
                 let mut total_rounds: u32 = 0;
                 let mut walked: u64 = 0;
+                // Reused across rounds (cleared each round) to avoid a per-round heap
+                // allocation in this once-per-epoch-close walk.
+                let mut seen: BTreeSet<Address> = BTreeSet::new();
                 for (_key_bytes, value_bytes) in txn.reverse_raw_iter::<ConsensusBlocks>() {
                     walked += 1;
                     let meta = ConsensusHeaderParticipation::from_bytes(&value_bytes)?;
@@ -217,13 +220,11 @@ impl<DB: Database> RewardsBackend for ConsensusRewardsCounter<DB> {
                         continue;
                     }
 
-                    total_rounds += 1;
+                    total_rounds = total_rounds.saturating_add(1);
 
                     if let Some(authority) = committee.authority(&meta.leader_author) {
-                        per_address
-                            .entry(authority.execution_address())
-                            .or_default()
-                            .leader_rounds += 1;
+                        let tally = per_address.entry(authority.execution_address()).or_default();
+                        tally.leader_rounds = tally.leader_rounds.saturating_add(1);
                     }
 
                     // Dedup on the resolved execution address, not the pre-resolution
@@ -231,12 +232,14 @@ impl<DB: Database> RewardsBackend for ConsensusRewardsCounter<DB> {
                     // distinct authority ids that resolve to the same execution address
                     // (invariant-precluded, but defended for symmetry with the legacy
                     // `get_address_counts` merge) can't double-count within one sub-dag.
-                    let mut seen = BTreeSet::new();
+                    seen.clear();
                     for author in &meta.participants {
                         if let Some(authority) = committee.authority(author) {
                             let address = authority.execution_address();
                             if seen.insert(address) {
-                                per_address.entry(address).or_default().participation_rounds += 1;
+                                let tally = per_address.entry(address).or_default();
+                                tally.participation_rounds =
+                                    tally.participation_rounds.saturating_add(1);
                             }
                         }
                     }
