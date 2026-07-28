@@ -1008,8 +1008,25 @@ impl PeerManager {
             if !skip_dial && discovery_peers.is_empty() {
                 for (_bls, info) in &self.known_peers {
                     let peer_id: PeerId = info.pubkey.clone().into();
-                    if !self.peer_banned(&peer_id) {
-                        discovery_peers.insert(peer_id, info.multiaddrs.clone());
+                    if self.peer_banned(&peer_id) {
+                        continue;
+                    }
+                    // A `/dnsaddr` member MUST be reached through the resolving `DialBls` path,
+                    // which resolves it to a concrete `/p2p-circuit` before dialing. Raw-dialing
+                    // the unresolved `/dnsaddr` here opens a non-circuit connection that
+                    // `sanitize_ip_addr` denies ("no valid unbanned IP"); the resulting
+                    // `on_dial_failure` then `register_disconnected`s the peer, racing with and
+                    // tearing down the circuit the proper path just established. Committee members
+                    // are re-dialed via `redial_missing_committee`, so seed only concrete
+                    // (already-dialable) addresses and drop `/dnsaddr` ones.
+                    let dialable: Vec<Multiaddr> = info
+                        .multiaddrs
+                        .iter()
+                        .filter(|a| !crate::types::is_dnsaddr(a))
+                        .cloned()
+                        .collect();
+                    if !dialable.is_empty() {
+                        discovery_peers.insert(peer_id, dialable);
                     }
                 }
                 if !discovery_peers.is_empty() {
