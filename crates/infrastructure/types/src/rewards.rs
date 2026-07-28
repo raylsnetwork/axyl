@@ -173,9 +173,9 @@ impl RewardsBackend for NoopRewardsBackend {
         let mut guard = self.leader_counts.lock();
         *guard = leader_counts;
     }
-    fn inc_leader_count(&self, _leader: &AuthorityIdentifier) {
+    fn inc_leader_count(&self, leader: &AuthorityIdentifier) {
         let mut guard = self.leader_counts.lock();
-        *guard.entry(_leader.clone()).or_insert(0) += 1;
+        *guard.entry(leader.clone()).or_insert(0) += 1;
     }
 
     fn clear(&self) {

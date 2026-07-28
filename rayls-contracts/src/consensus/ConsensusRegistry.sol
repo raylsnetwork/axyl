@@ -155,7 +155,7 @@ contract ConsensusRegistry is
     function applyIncentives(
         RewardInfo[] calldata rewardInfos,
         uint256 totalRounds
-    ) public override onlySystemCall {
+    ) external override onlySystemCall {
         // clear previous epoch's performance weights
         delete _performanceWeights;
 
