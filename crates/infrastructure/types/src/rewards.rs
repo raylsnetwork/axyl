@@ -5,6 +5,28 @@ use alloy::rpc::types::{Withdrawal, Withdrawals};
 use parking_lot::{Mutex, RwLock};
 use std::{collections::BTreeMap, fmt::Debug, sync::Arc};
 
+/// Per-validator round counts feeding the hybrid (participation + anchor) reward tally.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ValidatorRoundTally {
+    /// Distinct committed rounds whose sub-dag included this validator's certificate.
+    pub participation_rounds: u32,
+    /// Committed rounds this validator led ("Anchor Commit Share" component;
+    /// identical signal to what [`RewardsBackend::tally`] counts today).
+    pub leader_rounds: u32,
+}
+
+/// Per-epoch hybrid reward tally: every validator's round counts plus the
+/// epoch-wide committed-round count (the anchor-share/floor denominator).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HybridEpochTally {
+    /// Per-validator counts, keyed by execution address.
+    pub per_address: BTreeMap<Address, ValidatorRoundTally>,
+    /// Total committed rounds walked for the epoch (same denominator for
+    /// every validator; exactly one leader per round, so `leader_rounds`
+    /// summed across `per_address` equals this).
+    pub total_rounds: u32,
+}
+
 /// Compute per-address leader-execution counts for closing-epoch withdrawals.
 pub trait RewardsBackend: Debug + Send + Sync + 'static {
     /// Tally leader counts for `epoch` over rounds `1..=last_executed_round`,
@@ -17,6 +39,17 @@ pub trait RewardsBackend: Debug + Send + Sync + 'static {
         epoch: Epoch,
         last_executed_round: u32,
     ) -> Result<BTreeMap<Address, u32>, RewardsError>;
+
+    /// Tally participation + leader rounds for `epoch` over rounds
+    /// `1..=last_executed_round`, in one walk. This is the input for the hybrid
+    /// reward blend; `tally` above remains the leader-only tally and is untouched
+    /// by this method's existence. (Wiring this into block execution — deciding
+    /// when a block uses the hybrid vs. leader-only path — is a separate change.)
+    fn tally_hybrid(
+        &self,
+        epoch: Epoch,
+        last_executed_round: u32,
+    ) -> Result<HybridEpochTally, RewardsError>;
 
     /// Resolve an authority identifier to its execution address using the
     /// current committee. Used for empty-block beneficiary assignment.
@@ -46,6 +79,14 @@ pub enum RewardsError {
         /// Epoch the caller requested.
         epoch: Epoch,
     },
+
+    /// The requested tally is a known, permanent capability gap (not a
+    /// transient failure) - e.g. `SnapshotRewardsBackend::tally_hybrid` can't
+    /// recover per-validator participation rounds from a plain withdrawals
+    /// snapshot. Retrying will never succeed; distinct from [`Self::Database`]
+    /// specifically so callers don't loop retrying something that can't work.
+    #[error("unsupported: {0}")]
+    Unsupported(String),
 }
 
 impl RewardsError {
@@ -90,6 +131,14 @@ impl RewardsBackend for NoopRewardsBackend {
         _last_executed_round: u32,
     ) -> Result<BTreeMap<Address, u32>, RewardsError> {
         Ok(BTreeMap::new())
+    }
+
+    fn tally_hybrid(
+        &self,
+        _epoch: Epoch,
+        _last_executed_round: u32,
+    ) -> Result<HybridEpochTally, RewardsError> {
+        Ok(HybridEpochTally::default())
     }
 
     fn get_authority_address(&self, id: &AuthorityIdentifier) -> Option<Address> {
@@ -161,6 +210,15 @@ impl RewardsCounter {
         last_executed_round: u32,
     ) -> Result<BTreeMap<Address, u32>, RewardsError> {
         self.0.tally(epoch, last_executed_round)
+    }
+
+    /// Compute the close-epoch hybrid (participation + anchor) tally.
+    pub fn tally_hybrid(
+        &self,
+        epoch: Epoch,
+        last_executed_round: u32,
+    ) -> Result<HybridEpochTally, RewardsError> {
+        self.0.tally_hybrid(epoch, last_executed_round)
     }
 
     /// Resolve an authority identifier to its execution address.

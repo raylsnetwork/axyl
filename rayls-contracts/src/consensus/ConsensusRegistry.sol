@@ -32,6 +32,28 @@ contract ConsensusRegistry is
     using BlsG1 for bytes;
     using SafeERC20 for IERC20;
 
+    /// @dev Basis-points denominator (1 bps = 0.01%), mirrors the `MAX_BPS` idiom
+    /// used elsewhere in this contract family (e.g. `FeeAggregator.MAX_BPS`)
+    uint256 private constant MAX_BPS = 10_000;
+
+    /// @dev Hybrid weight split between participation, anchor (leader), and stake -
+    /// must sum to `MAX_BPS`. Fixed for this deployment; retuning requires a new
+    /// hardfork-gated bytecode swap, same as any other change to this contract.
+    uint256 private constant PARTICIPATION_BPS = 8_000;
+    uint256 private constant ANCHOR_BPS = 1_000;
+    uint256 private constant STAKE_BPS = 1_000;
+
+    /// @dev Stake-tier bonus: own required stake (`getBalanceBreakdown` position 1,
+    /// not position 0 which is contaminated by accrued rewards) plus delegated
+    /// stake, tiered every `STAKE_TIER_STEP` above `STAKE_TIER_MIN`, capped at
+    /// `STAKE_TIER_MAX_TIERS` tiers. With the current 5M-RLS minimum this is a 5M
+    /// baseline (everyone) plus up to 25M delegated (5 tiers), capping combined
+    /// stake consideration at 30M.
+    uint256 private constant STAKE_TIER_MIN = 5_000_000e18;
+    uint256 private constant STAKE_TIER_STEP = 5_000_000e18;
+    uint256 private constant STAKE_TIER_MAX_TIERS = 5;
+    uint256 private constant STAKE_TIER_BONUS_BPS = 200;
+
     uint32 internal currentEpoch;
     uint8 internal epochPointer;
     EpochInfo[4] public epochInfo;
@@ -47,6 +69,17 @@ contract ConsensusRegistry is
 
     /// @dev Performance weights recorded by applyIncentives for fee-based reward distribution
     PerformanceWeights internal _performanceWeights;
+
+    /// @notice Minimum participation share (in bps of `totalRounds`) a validator must
+    /// meet to be eligible for any reward this epoch; `0` disables the floor.
+    /// @dev Governance-settable without a new hardfork, unlike the reward-split
+    /// constants above - starts disabled pending real post-activation participation
+    /// data to tune it. MUST stay at the end of storage (appended after the prior
+    /// last var `_performanceWeights`): the `HybridRewards` hardfork installs this
+    /// contract's bytecode over an EXISTING `ConsensusRegistry`'s storage via a
+    /// bytecode swap, so every pre-existing slot must keep its offset and new state
+    /// may only be appended, never inserted.
+    uint256 public participationFloorBps;
 
     /// @dev Signals a validator's pending status until activation/exit to correctly apply incentives
     uint32 internal constant PENDING_EPOCH = type(uint32).max;
@@ -95,29 +128,77 @@ contract ConsensusRegistry is
     }
 
     /// @inheritdoc IConsensusRegistry
+    /// @dev Blends three normalized per-validator shares into one weight:
+    /// `PARTICIPATION_BPS` of the pool by participation-round share (of the
+    /// *submitted* total, not `totalRounds` - see note below), `ANCHOR_BPS` by
+    /// anchor/leader-round share of `totalRounds` (a true committee-wide share,
+    /// since exactly one leader commits per round), and `STAKE_BPS` by stake-tier
+    /// share. Mirrors `RewardDistributor.sol`'s own "sum totals, then proportional
+    /// split" idiom one level deeper.
     function applyIncentives(
-        RewardInfo[] calldata rewardInfos
+        RewardInfo[] calldata rewardInfos,
+        uint256 totalRounds
     ) public override onlySystemCall {
         // clear previous epoch's performance weights
         delete _performanceWeights;
 
-        // compute performance weights: stake × consensusHeaderCount per validator
+        uint256 n = rewardInfos.length;
+        // `stakeWeight[i] == 0` doubles as "ineligible" - `_stakeTierWeightOf`
+        // never returns 0 for an eligible validator, since it floors at `MAX_BPS`.
+        uint256[] memory stakeWeight = new uint256[](n);
+        uint256 totalParticipationRounds;
+        uint256 totalStakeWeight;
+        uint256 eligibleCount;
+
+        // Pass 1: eligibility (absent / retired / below the participation floor) + totals.
+        for (uint256 i; i < n; ++i) {
+            RewardInfo calldata reward = rewardInfos[i];
+            if (isRetired(reward.validatorAddress)) continue;
+            // Absent -> 0: a validator that contributed no certificate to any
+            // committed sub-dag this epoch earns nothing from any component,
+            // independent of the floor. `order_dag` always includes a leader's own
+            // certificate in the sub-dag it commits, so `participationRounds >=
+            // anchorRounds`; `participationRounds == 0` therefore also implies
+            // `anchorRounds == 0` - the validator neither participated nor led.
+            if (reward.participationRounds == 0) continue;
+            if (
+                participationFloorBps > 0 &&
+                totalRounds > 0 &&
+                (reward.participationRounds * MAX_BPS) / totalRounds < participationFloorBps
+            ) continue;
+
+            stakeWeight[i] = _stakeTierWeightOf(reward.validatorAddress);
+            totalParticipationRounds += reward.participationRounds;
+            totalStakeWeight += stakeWeight[i];
+            eligibleCount++;
+        }
+
+        if (eligibleCount == 0) return;
+
+        // Pass 2: blend each eligible validator's normalized shares into one weight.
+        // Note: participation normalizes against `totalParticipationRounds` (the
+        // *submitted* sum), not `totalRounds` - unlike anchor rounds, participation
+        // rounds don't sum to `totalRounds` across the committee (every live
+        // validator can participate in every round simultaneously), so submitted-sum
+        // normalization is what turns it into a true "slice of the 80% pool".
+        address[] memory tmpValidators = new address[](eligibleCount);
+        uint256[] memory tmpWeights = new uint256[](eligibleCount);
         uint256 totalWeight;
         uint256 validatorCount;
-        address[] memory tmpValidators = new address[](rewardInfos.length);
-        uint256[] memory tmpWeights = new uint256[](rewardInfos.length);
 
-        for (uint256 i; i < rewardInfos.length; ++i) {
+        for (uint256 i; i < n; ++i) {
+            if (stakeWeight[i] == 0) continue;
             RewardInfo calldata reward = rewardInfos[i];
-            if (reward.consensusHeaderCount == 0) continue;
 
-            // skip forcibly retired validators
-            if (isRetired(reward.validatorAddress)) continue;
-
-            uint8 rewardeeVersion = validators[reward.validatorAddress]
-                .stakeVersion;
-            uint256 stakeAmount = versions[rewardeeVersion].stakeAmount;
-            uint256 weight = stakeAmount * reward.consensusHeaderCount;
+            uint256 weight;
+            if (totalParticipationRounds > 0) {
+                weight += (PARTICIPATION_BPS * reward.participationRounds) / totalParticipationRounds;
+            }
+            if (totalRounds > 0) {
+                weight += (ANCHOR_BPS * reward.anchorRounds) / totalRounds;
+            }
+            weight += (STAKE_BPS * stakeWeight[i]) / totalStakeWeight;
+            if (weight == 0) continue;
 
             tmpValidators[validatorCount] = reward.validatorAddress;
             tmpWeights[validatorCount] = weight;
@@ -140,6 +221,40 @@ contract ConsensusRegistry is
             weights: finalWeights,
             totalWeight: totalWeight
         });
+    }
+
+    /// @dev Stake-tier weight multiplier (in bps, `MAX_BPS` baseline) for
+    /// `validatorAddress`: own required stake (`getBalanceBreakdown` position 1 -
+    /// see `RewardDistributor.sol`'s identical destructuring - not position 0,
+    /// which is contaminated by accrued rewards) plus delegated stake, tiered
+    /// above `STAKE_TIER_MIN` and capped at `STAKE_TIER_MAX_TIERS` tiers.
+    function _stakeTierWeightOf(address validatorAddress) internal view returns (uint256) {
+        (, uint256 requiredStake, ) = getBalanceBreakdown(validatorAddress);
+        address pool = delegationPool;
+        uint256 delegated = pool != address(0)
+            ? IDelegationPool(pool).getTotalDelegatedStake(validatorAddress)
+            : 0;
+        uint256 totalStake = requiredStake + delegated;
+
+        if (totalStake <= STAKE_TIER_MIN) {
+            return MAX_BPS;
+        }
+        uint256 maxStake = STAKE_TIER_MIN + STAKE_TIER_STEP * STAKE_TIER_MAX_TIERS;
+        if (totalStake > maxStake) {
+            totalStake = maxStake;
+        }
+        uint256 tiers = (totalStake - STAKE_TIER_MIN) / STAKE_TIER_STEP;
+        return MAX_BPS + tiers * STAKE_TIER_BONUS_BPS;
+    }
+
+    /// @notice Governance sets the minimum participation share (bps) required for
+    /// eligibility; `0` disables the floor.
+    /// @param newFloorBps New floor, in bps of `totalRounds`. Must be `<= MAX_BPS`.
+    function setParticipationFloorBps(uint256 newFloorBps) external onlyOwner {
+        if (newFloorBps > MAX_BPS) revert InvalidParticipationFloor(newFloorBps);
+        uint256 oldFloorBps = participationFloorBps;
+        participationFloorBps = newFloorBps;
+        emit ParticipationFloorUpdated(oldFloorBps, newFloorBps);
     }
 
     /// @inheritdoc IConsensusRegistry

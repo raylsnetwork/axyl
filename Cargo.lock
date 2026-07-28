@@ -8204,6 +8204,7 @@ dependencies = [
 name = "rayls-middleware-rewards"
 version = "1.2.2"
 dependencies = [
+ "alloy",
  "eyre",
  "indexmap 2.13.0",
  "parking_lot",
