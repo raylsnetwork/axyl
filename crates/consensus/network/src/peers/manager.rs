@@ -483,6 +483,12 @@ impl PeerManager {
 
         let action = self.peers.process_penalty(&peer_id, penalty);
 
+        // Surface the penalty that tipped a peer into a ban. Emitted at warn (not trace, like the
+        // step below) because a ban severs connectivity and the bare "peer banned" event otherwise
+        // records no cause -- leaving the trigger to be guessed from surrounding logs.
+        if matches!(action, PeerAction::Ban(_)) {
+            warn!(target: "peer-manager", ?peer_id, ?penalty, "penalty resulted in ban");
+        }
         trace!(target: "peer-manager", ?peer_id, ?action, "processed penalty");
         self.apply_peer_action(peer_id, action);
     }

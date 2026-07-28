@@ -187,8 +187,28 @@ where
                 }
                 self.connection_paths.insert(connection_id, path);
             }
-            SwarmEvent::ConnectionClosed { connection_id, .. } => {
-                self.connection_paths.remove(&connection_id);
+            SwarmEvent::ConnectionClosed {
+                peer_id,
+                connection_id,
+                endpoint,
+                num_established,
+                cause,
+            } => {
+                let path = self.connection_paths.remove(&connection_id);
+                // Diagnostic: the bare swarm event records no cause, which left the duplicate-
+                // connection churn (a peer with both a dialed and an inbound relayed connection
+                // has one dropped ~seconds later) impossible to attribute. Log the transport path,
+                // how many connections to this peer remain, and the `ConnectionError` cause so the
+                // teardown reason is explicit in the file log.
+                info!(
+                    target: "network",
+                    ?peer_id,
+                    ?path,
+                    num_established,
+                    ?cause,
+                    addr = ?endpoint.get_remote_address(),
+                    "connection closed"
+                );
             }
             SwarmEvent::ExternalAddrConfirmed { address: _ } => {
                 // New confirmed address so lets publish/update or kademlia address rocord.
