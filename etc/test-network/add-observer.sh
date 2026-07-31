@@ -28,6 +28,7 @@
 #   ./add-observer.sh <INDEX>                        # INDEX is required, must be unique across nodes
 #   DNSMASQ_PORT=5354 ./add-observer.sh <INDEX>      # resolve committee via the PUBLIC relay view (MULTI_LISTEN)
 #   DNSMASQ_HOST=10.0.0.5 ./add-observer.sh <INDEX>  # join from another host: point at that resolver's address
+#   LISTEN_HOST=10.0.0.10 ./add-observer.sh <INDEX>  # bind p2p to this IP instead of 0.0.0.0 (default binds all ifaces)
 #   DISABLE_PRUNING=1 ./add-observer.sh <INDEX>      # run as a full archive (no --full)
 
 set -e
@@ -70,6 +71,16 @@ METRICS_PORT=$((9100 + NODE_NUM))
 HTTP_PORT=$((8545 - (NODE_NUM - 1)))
 WS_PORT=$((8546 - (NODE_NUM - 1)))
 NODE_NAME="observer-${NODE_NUM}"
+
+# p2p listener bind address. Default 0.0.0.0 (all interfaces) -- REQUIRED for a remote observer: a
+# socket bound to keygen's node-info default (127.0.0.1) can't reach external peers, so outbound QUIC
+# to the committee's relays fails and no dial ever completes. Binding 0.0.0.0 makes libp2p announce
+# the concrete per-interface addresses, so committee peers can also reach it back. This matches how
+# base observers run on main. Override the bind IP with LISTEN_HOST=<ip>, or replace the whole
+# multiaddr with PRIMARY_LISTENER_MULTIADDR / WORKER_LISTENER_MULTIADDR (the env vars the node reads).
+LISTEN_HOST="${LISTEN_HOST:-0.0.0.0}"
+export PRIMARY_LISTENER_MULTIADDR="${PRIMARY_LISTENER_MULTIADDR:-/ip4/${LISTEN_HOST}/udp/$((49000 + NODE_NUM))/quic-v1}"
+export WORKER_LISTENER_MULTIADDR="${WORKER_LISTENER_MULTIADDR:-/ip4/${LISTEN_HOST}/udp/$((49100 + NODE_NUM))/quic-v1}"
 
 ROOTDIR="$scriptDir/local-validators"
 BIN="$scriptDir/../../target/${BUILD_CONFIG}/rayls-network"
@@ -128,6 +139,7 @@ fi
 # --- 3. start the observer (args mirror start-local-observer.sh). --observer pins it out of the
 #        committee (never counted toward quorum). Backgrounded + pid file so it is restartable. ---
 echo "Starting ${NODE_NAME} (instance ${INSTANCE}, rpc http://localhost:${HTTP_PORT} ws ws://localhost:${WS_PORT}, metrics 127.0.0.1:${METRICS_PORT})..."
+echo "  p2p listeners: primary ${PRIMARY_LISTENER_MULTIADDR}, worker ${WORKER_LISTENER_MULTIADDR}"
 env "${NODE_ENV[@]}" "$BIN" node \
     --observer \
     --datadir "$DATADIR" \
