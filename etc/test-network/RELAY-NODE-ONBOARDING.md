@@ -98,6 +98,23 @@ for restarting a single node and the chaos loop.
   the registry → **stake** → **activate**.
 - `ADMIN_PRIVATE_KEY` must be the key of the `--dev-funds` account (owner+minter).
 
+## Onboarding an observer (no staking)
+
+A pure follower — **never in the committee, never counted toward quorum**, so safe to inject into a
+live chain. No relay in front: it dials the committee directly, or — if the committee is advertised
+via `/dnsaddr` — through their relays, making no reservation of its own. First fetch the network
+files (`genesis.yaml`, `committee.yaml` → `<datadir>/genesis/`, `parameters.yaml` → `<datadir>/`)
+from a committee member — the script bails with the exact paths if they're missing (cross-host: use
+the `--export-join-bundle` tarball).
+
+```bash
+# add/start observer 7. The DNSMASQ_* env is used only if committee.yaml uses /dnsaddr (then it
+# points at the public relay view; from another machine set DNSMASQ_HOST=<committee-host-IP>).
+# Re-run the same command after a kill to restart.
+DNSMASQ_HOST=127.0.0.1 DNSMASQ_PORT=5354 ./etc/test-network/add-observer.sh 7
+# stop it: kill $(cat etc/test-network/local-validators/observer-7.pid)
+```
+
 ## Stopping, restarting & chaos-testing
 
 **Whole network down:** `killall rayls-network rayls-relay dnsmasq` (add
