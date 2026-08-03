@@ -194,6 +194,34 @@ sol!(
 
 );
 
+// ConsensusRegistry hybrid-reward ABI (active from the HybridRewards fork).
+//
+// A separate Rust-side binding, not an edit of `ConsensusRegistry` above: it keeps the
+// pre-fork 1-arg `applyIncentives` encoding byte-for-byte unchanged for archive replay,
+// and avoids a `RewardInfo` symbol collision between the two ABIs. Only the members the
+// hybrid close-epoch path encodes are declared here.
+sol!(
+    /// Consensus registry, hybrid-reward ABI.
+    #[sol(rpc)]
+    contract ConsensusRegistryV2 {
+        /// Per-validator inputs for the hybrid (participation + anchor + stake) blend.
+        /// Mirrors `IStakeManager.RewardInfo` in the hybrid contract.
+        #[derive(Debug)]
+        struct RewardInfo {
+            /// The validator to receive rewards.
+            address validatorAddress;
+            /// Distinct committed rounds this validator's certificate was included in.
+            uint256 participationRounds;
+            /// Committed rounds this validator led (the Anchor Commit Share signal).
+            uint256 anchorRounds;
+        }
+
+        /// Apply hybrid incentives for the epoch. Must be called before `concludeEpoch`.
+        /// `totalRounds` is the epoch-wide committed-round count (anchor/floor denominator).
+        function applyIncentives(RewardInfo[] calldata rewardInfos, uint256 totalRounds) external;
+    }
+);
+
 // FeeAggregator interface. See rayls-contracts submodule.
 // Unified contract for fee collection, swapping (USDr → RLS), and distribution.
 sol!(

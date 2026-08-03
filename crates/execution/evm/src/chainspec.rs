@@ -52,6 +52,9 @@ hardfork!(
         /// Size the next epoch's committee based on Active validators (Active + PendingActivation)
         /// instead of reusing the current epoch's fixed committee size.
         DynamicCommitteeSizing,
+        /// Swap ConsensusRegistry to the hybrid-reward (participation + anchor + stake) bytecode
+        /// and switch epoch-close reward distribution to the 2-arg `applyIncentives` ABI.
+        HybridRewards,
     }
 );
 
@@ -181,6 +184,11 @@ pub const MAINNET_DYNAMIC_COMMITTEE_SIZING_BLOCK: u64 = u64::MAX;
 /// DynamicCommitteeSizing activation block on the local sandbox network.
 pub const LOCAL_DYNAMIC_COMMITTEE_SIZING_BLOCK: u64 = 0;
 
+/// HybridRewards activation block on the local sandbox network. Block 1 (not 0): genesis
+/// deploys the pre-hybrid ConsensusRegistry, and the in-place bytecode-swap migration runs at
+/// the first post-genesis block, after which epoch closes use the hybrid `applyIncentives` ABI.
+pub const LOCAL_HYBRID_REWARDS_BLOCK: u64 = 1;
+
 impl RaylsHardFork {
     /// Return the protocol version byte for this hardfork.
     pub const fn version_byte(self) -> u8 {
@@ -197,11 +205,12 @@ impl RaylsHardFork {
             Self::UsdrSupplyCorrection => 0x0a,
             Self::EmptyOutputBlock => 0x0b,
             Self::DynamicCommitteeSizing => 0x0c,
+            Self::HybridRewards => 0x0d,
         }
     }
 
     /// Devnet hardfork schedule.
-    pub const fn devnet() -> [(Self, ForkCondition); 12] {
+    pub const fn devnet() -> [(Self, ForkCondition); 13] {
         [
             (Self::Eip1559, ForkCondition::Block(DEVNET_EIP1559_BLOCK)),
             (Self::BatchDigestV2, ForkCondition::Block(DEVNET_BATCH_DIGEST_V2_BLOCK)),
@@ -221,11 +230,13 @@ impl RaylsHardFork {
                 Self::DynamicCommitteeSizing,
                 ForkCondition::Block(DEVNET_DYNAMIC_COMMITTEE_SIZING_BLOCK),
             ),
+            // Never until SRE schedules a concrete devnet activation block.
+            (Self::HybridRewards, ForkCondition::Never),
         ]
     }
 
     /// Testnet hardfork schedule.
-    pub const fn testnet() -> [(Self, ForkCondition); 12] {
+    pub const fn testnet() -> [(Self, ForkCondition); 13] {
         [
             (Self::Eip1559, ForkCondition::Block(TESTNET_EIP1559_BLOCK)),
             (Self::BatchDigestV2, ForkCondition::Block(TESTNET_BATCH_DIGEST_V2_BLOCK)),
@@ -243,11 +254,13 @@ impl RaylsHardFork {
                 Self::DynamicCommitteeSizing,
                 ForkCondition::Block(TESTNET_DYNAMIC_COMMITTEE_SIZING_BLOCK),
             ),
+            // Never until SRE schedules a concrete testnet activation block.
+            (Self::HybridRewards, ForkCondition::Never),
         ]
     }
 
     /// Mainnet hardfork schedule.
-    pub const fn mainnet() -> [(Self, ForkCondition); 12] {
+    pub const fn mainnet() -> [(Self, ForkCondition); 13] {
         [
             (Self::Eip1559, ForkCondition::Block(MAINNET_EIP1559_BLOCK)),
             (Self::BatchDigestV2, ForkCondition::Block(MAINNET_BATCH_DIGEST_V2_BLOCK)),
@@ -270,11 +283,14 @@ impl RaylsHardFork {
                 Self::DynamicCommitteeSizing,
                 ForkCondition::Block(MAINNET_DYNAMIC_COMMITTEE_SIZING_BLOCK),
             ),
+            // Never until SRE schedules a concrete mainnet activation block (the reward-fairness
+            // rollout for #633); the in-place migration re-links BlsG1 from the live contract.
+            (Self::HybridRewards, ForkCondition::Never),
         ]
     }
 
     /// Local network hardfork schedule (first four hardforks active at genesis).
-    pub const fn local() -> [(Self, ForkCondition); 12] {
+    pub const fn local() -> [(Self, ForkCondition); 13] {
         [
             (Self::Eip1559, ForkCondition::Block(LOCAL_EIP1559_BLOCK)),
             (Self::BatchDigestV2, ForkCondition::Block(LOCAL_BATCH_DIGEST_V2_BLOCK)),
@@ -294,11 +310,12 @@ impl RaylsHardFork {
                 Self::DynamicCommitteeSizing,
                 ForkCondition::Block(LOCAL_DYNAMIC_COMMITTEE_SIZING_BLOCK),
             ),
+            (Self::HybridRewards, ForkCondition::Block(LOCAL_HYBRID_REWARDS_BLOCK)),
         ]
     }
 
     /// Return the hardfork schedule for the given network.
-    pub const fn for_network(network: RaylsNetwork) -> [(Self, ForkCondition); 12] {
+    pub const fn for_network(network: RaylsNetwork) -> [(Self, ForkCondition); 13] {
         match network {
             RaylsNetwork::Devnet => Self::devnet(),
             RaylsNetwork::Testnet => Self::testnet(),
@@ -426,6 +443,15 @@ pub trait RaylsHardforks {
     /// Return true if the DynamicCommitteeSizing fork is active at `block`.
     fn is_dynamic_committee_sizing_active_at_block(&self, block: u64) -> bool {
         self.is_rayls_fork_active_at_block(RaylsHardFork::DynamicCommitteeSizing, block)
+    }
+
+    /// Return true if the HybridRewards fork is active at `block`.
+    ///
+    /// Gates both the ConsensusRegistry bytecode swap (the migration) and the epoch-close
+    /// reward ABI: an epoch whose close block satisfies this uses the 2-arg hybrid
+    /// `applyIncentives`; earlier closes use the 1-arg leader-only path.
+    fn is_hybrid_rewards_active_at_block(&self, block: u64) -> bool {
+        self.is_rayls_fork_active_at_block(RaylsHardFork::HybridRewards, block)
     }
 
     /// Return the active version byte at `block`, if any.
@@ -597,6 +623,12 @@ impl RaylsChainSpecBuilder {
         self.inner
             .hardforks
             .insert(RaylsHardFork::DynamicCommitteeSizing, ForkCondition::Block(block));
+        self
+    }
+
+    /// Activate HybridRewards at `block` (synthetic schedules / fork-boundary tests).
+    pub fn hybrid_rewards(mut self, block: u64) -> Self {
+        self.inner.hardforks.insert(RaylsHardFork::HybridRewards, ForkCondition::Block(block));
         self
     }
 
@@ -858,7 +890,7 @@ mod tests {
             RaylsNetwork::Local,
         ] {
             let schedule = RaylsHardFork::for_network(network);
-            assert_eq!(schedule.len(), 12, "expected 12 hardforks for {network}");
+            assert_eq!(schedule.len(), 13, "expected 13 hardforks for {network}");
             assert_eq!(schedule[0].0, RaylsHardFork::Eip1559);
             assert_eq!(schedule[1].0, RaylsHardFork::BatchDigestV2);
             assert_eq!(schedule[2].0, RaylsHardFork::AdminTransfer);
@@ -871,6 +903,7 @@ mod tests {
             assert_eq!(schedule[9].0, RaylsHardFork::UsdrSupplyCorrection);
             assert_eq!(schedule[10].0, RaylsHardFork::EmptyOutputBlock);
             assert_eq!(schedule[11].0, RaylsHardFork::DynamicCommitteeSizing);
+            assert_eq!(schedule[12].0, RaylsHardFork::HybridRewards);
         }
     }
 

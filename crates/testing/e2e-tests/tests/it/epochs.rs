@@ -630,7 +630,12 @@ fn start_nodes(temp_path: &Path, validators: &[(&str, Address)]) -> eyre::Result
             .arg(&instance)
             .arg("--http")
             // v1 (plain) storage is no longer supported -- the node refuses to start without this
-            .arg("--storage.v2");
+            .arg("--storage.v2")
+            // Use the Local hardfork schedule so HybridRewards activates at block 1: genesis
+            // deploys the pre-hybrid ConsensusRegistry and the in-place migration swaps it to the
+            // hybrid contract at the first block, exercising the full rollout end-to-end.
+            .arg("--network")
+            .arg("local");
 
         #[cfg(feature = "faucet")]
         command
