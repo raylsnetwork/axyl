@@ -326,6 +326,16 @@ impl ColdSegment {
         self.index.read().values().find(|j| j.epoch == epoch).map(|j| j.start_key..=j.end_key())
     }
 
+    /// Returns the dense `[first, last]` key range the sealed jars cover as one span, or `None`
+    /// for an empty segment; reads the in-memory index only (epochs seal contiguously, so the
+    /// span has no interior gaps).
+    pub fn key_span(&self) -> Option<RangeInclusive<u64>> {
+        let index = self.index.read();
+        let first = index.values().next()?.start_key;
+        let last = index.values().next_back()?.end_key();
+        Some(first..=last)
+    }
+
     /// Returns the entry of the jar whose `[start_key, end_key]` range covers `number`.
     fn covering_jar(&self, number: u64) -> Option<SealedJar> {
         self.index

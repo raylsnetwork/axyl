@@ -36,6 +36,8 @@ pub(crate) struct ProbeDb {
     read_fault: bool,
     /// Read transactions opened so far, shared across clones.
     read_txns: Arc<AtomicUsize>,
+    /// Full reverse scans requested so far, shared across clones.
+    reverse_iters: Arc<AtomicUsize>,
     /// One snapshot per write transaction, taken when it opens rather than when it commits.
     write_starts: Arc<Mutex<Vec<TxnStart>>>,
 }
@@ -47,6 +49,7 @@ impl ProbeDb {
             inner: MemDatabase::new(),
             read_fault: false,
             read_txns: Arc::new(AtomicUsize::new(0)),
+            reverse_iters: Arc::new(AtomicUsize::new(0)),
             write_starts: Arc::new(Mutex::new(Vec::new())),
         };
         // Opened through the node's own table list so a table added later is not missed here.
@@ -62,6 +65,11 @@ impl ProbeDb {
     /// Returns how many read transactions have been opened.
     pub(crate) fn read_txns(&self) -> usize {
         self.read_txns.load(Ordering::SeqCst)
+    }
+
+    /// Returns how many full reverse scans have been requested.
+    pub(crate) fn reverse_iters(&self) -> usize {
+        self.reverse_iters.load(Ordering::SeqCst)
     }
 
     /// Returns one entry per write transaction, in the order they were opened.
@@ -131,6 +139,7 @@ impl Database for ProbeDb {
         self.inner.skip_to::<T>(key)
     }
     fn reverse_iter<T: Table>(&self) -> DBIter<'_, T> {
+        self.reverse_iters.fetch_add(1, Ordering::SeqCst);
         self.inner.reverse_iter::<T>()
     }
     fn reverse_raw_iter<T: Table>(&self) -> DBRawIter<'_> {

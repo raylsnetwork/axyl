@@ -16,7 +16,7 @@ use std::{
 
 #[cfg(feature = "cold-storage")]
 use crate::{
-    cold::{cold_to_eyre, ColdStore},
+    cold::{ColdStore, ColdTx},
     tables::ColdBatchLocations,
 };
 
@@ -186,6 +186,51 @@ impl<'a, T: Table> Iterator for MergeJoinRawIter<'a, T> {
     }
 }
 
+/// Merges the cold-ordered stream for `T` beneath `hot`; hot wins on an equal key, so a
+/// sealed-but-unpruned row surfaces once. A passthrough when no cold layer is attached or `T`
+/// has no cold key order. A hot tombstone does not hide the cold copy, matching `get`.
+///
+/// A cold fault ends the whole merged stream, not just the cold side: draining the hot tail past
+/// a corrupt jar would present the fault as a gap in history instead of a truncation at it.
+#[cfg(feature = "cold-storage")]
+fn merge_cold<'i, T: Table>(
+    cold: Option<ColdTx<'i>>,
+    hot: DBIter<'i, T>,
+    from: Option<&T::Key>,
+    reverse: bool,
+) -> DBIter<'i, T> {
+    let Some(tx) = cold else { return hot };
+    let Some(cold_side) = tx.scan::<T>(from, reverse) else { return hot };
+    let faulted = tx.faulted();
+    let never: Box<dyn Fn(&T::Key) -> bool + 'i> = Box::new(|_| false);
+    let merged: DBIter<'i, T> = if reverse {
+        Box::new(MergeJoinIter::<T>::reverse(cold_side, hot, never))
+    } else {
+        Box::new(MergeJoinIter::<T>::forward(cold_side, hot, never))
+    };
+    Box::new(merged.take_while(move |_| !faulted.get()))
+}
+
+/// Raw-bytes twin of [`merge_cold`].
+#[cfg(feature = "cold-storage")]
+fn merge_cold_raw<'i, T: Table>(
+    cold: Option<ColdTx<'i>>,
+    hot: DBRawIter<'i>,
+    from: Option<&T::Key>,
+    reverse: bool,
+) -> DBRawIter<'i> {
+    let Some(tx) = cold else { return hot };
+    let Some(cold_side) = tx.raw_scan::<T>(from, reverse) else { return hot };
+    let faulted = tx.faulted();
+    let never: Box<dyn Fn(&T::Key) -> bool + 'i> = Box::new(|_| false);
+    let merged: DBRawIter<'i> = if reverse {
+        Box::new(MergeJoinRawIter::<T>::reverse(cold_side, hot, never))
+    } else {
+        Box::new(MergeJoinRawIter::<T>::forward(cold_side, hot, never))
+    };
+    Box::new(merged.take_while(move |_| !faulted.get()))
+}
+
 const CACHE_KEEP_TIME_SECS: u64 = 60;
 const MAX_CACHE_SIZE: usize = 10000;
 
@@ -198,12 +243,21 @@ pub struct LayeredDbTx<'a, DB: Database> {
 }
 
 impl<'a, DB: Database> LayeredDbTx<'a, DB> {
+    /// Opens a cold read transaction over the attached tier, resolving the auxiliary index on
+    /// this transaction's own hot snapshot.
+    #[cfg(feature = "cold-storage")]
+    fn cold_tx(&self) -> Option<ColdTx<'_>> {
+        let cold = self.cold?;
+        Some(ColdTx::new(cold, |digest| self.get::<ColdBatchLocations>(digest)))
+    }
+
     /// Serves `key` from the cold tier after a hot miss; `None` when no cold layer is attached.
     #[cfg(feature = "cold-storage")]
     fn cold_get<T: Table>(&self, key: &T::Key) -> eyre::Result<Option<T::Value>> {
-        let Some(cold) = self.cold else { return Ok(None) };
-        crate::cold::cold_get::<T>(cold, key, |digest| self.get::<ColdBatchLocations>(digest))
-            .map_err(cold_to_eyre)
+        match self.cold_tx() {
+            Some(tx) => tx.get::<T>(key),
+            None => Ok(None),
+        }
     }
 
     /// Cold storage compiled out: a hot miss is final.
@@ -215,16 +269,93 @@ impl<'a, DB: Database> LayeredDbTx<'a, DB> {
     /// Serves `key`'s raw jar bytes from the cold tier after a hot miss.
     #[cfg(feature = "cold-storage")]
     fn cold_raw_get<T: Table>(&self, key: &T::Key) -> eyre::Result<Option<Cow<'_, [u8]>>> {
-        let Some(cold) = self.cold else { return Ok(None) };
-        crate::cold::cold_raw::<T>(cold, key, |digest| self.get::<ColdBatchLocations>(digest))
-            .map(|bytes| bytes.map(Cow::Owned))
-            .map_err(cold_to_eyre)
+        match self.cold_tx() {
+            Some(tx) => Ok(tx.raw_get::<T>(key)?.map(|bytes| Cow::Owned(bytes.into_owned()))),
+            None => Ok(None),
+        }
     }
 
     /// Cold storage compiled out: a hot miss is final.
     #[cfg(not(feature = "cold-storage"))]
     fn cold_raw_get<T: Table>(&self, _key: &T::Key) -> eyre::Result<Option<Cow<'_, [u8]>>> {
         Ok(None)
+    }
+
+    /// Iterates key-descending from the largest key at or below `key` (the reverse of
+    /// `skip_to`), merging the cold span beneath the hot tiers.
+    ///
+    /// Inherent rather than a `DbTx` method: the transaction contract deliberately stays fixed,
+    /// so walk-back lives on the concrete layered types that can serve it efficiently. Each hot
+    /// side starts at the floor by positioned lookup and steps backwards one seek per row
+    /// (`record_prior_to`), so a deep floor never pays for the rows above it.
+    pub fn reverse_skip_to<T: Table>(&self, key: &T::Key) -> eyre::Result<DBIter<'_, T>> {
+        let db = &self.db;
+        let db_first = db
+            .get::<T>(key)?
+            .map(|value| (key.clone(), value))
+            .or_else(|| db.record_prior_to::<T>(key));
+        let db_iter: DBIter<'_, T> =
+            Box::new(std::iter::successors(db_first, move |(k, _)| db.record_prior_to::<T>(k)));
+
+        let mem = &self.mem_db;
+        let mem_first = if mem.is_tombstoned::<T>(key) {
+            None
+        } else {
+            mem.get_no_marked_check::<T>(key).map(|(_, value)| (key.clone(), value))
+        }
+        .or_else(|| mem.record_prior_to::<T>(key));
+        let mem_iter: DBIter<'_, T> =
+            Box::new(std::iter::successors(mem_first, move |(k, _)| mem.record_prior_to::<T>(k)));
+
+        let is_tombstoned: Box<dyn Fn(&T::Key) -> bool + '_> =
+            Box::new(|k| self.mem_db.is_tombstoned::<T>(k));
+        let hot: DBIter<'_, T> =
+            Box::new(MergeJoinIter::<T>::reverse(db_iter, mem_iter, is_tombstoned));
+        Ok(self.chain_cold::<T>(hot, Some(key), true))
+    }
+
+    /// Chains the cold-ordered stream for `T` beneath `hot` (see [`merge_cold`]).
+    #[cfg(feature = "cold-storage")]
+    fn chain_cold<'i, T: Table>(
+        &'i self,
+        hot: DBIter<'i, T>,
+        from: Option<&T::Key>,
+        reverse: bool,
+    ) -> DBIter<'i, T> {
+        merge_cold::<T>(self.cold_tx(), hot, from, reverse)
+    }
+
+    /// Cold storage compiled out: iteration is hot-only.
+    #[cfg(not(feature = "cold-storage"))]
+    fn chain_cold<'i, T: Table>(
+        &'i self,
+        hot: DBIter<'i, T>,
+        _from: Option<&T::Key>,
+        _reverse: bool,
+    ) -> DBIter<'i, T> {
+        hot
+    }
+
+    /// Chains the cold-ordered raw stream for `T` beneath `hot` (see [`merge_cold_raw`]).
+    #[cfg(feature = "cold-storage")]
+    fn chain_cold_raw<'i, T: Table>(
+        &'i self,
+        hot: DBRawIter<'i>,
+        from: Option<&T::Key>,
+        reverse: bool,
+    ) -> DBRawIter<'i> {
+        merge_cold_raw::<T>(self.cold_tx(), hot, from, reverse)
+    }
+
+    /// Cold storage compiled out: iteration is hot-only.
+    #[cfg(not(feature = "cold-storage"))]
+    fn chain_cold_raw<'i, T: Table>(
+        &'i self,
+        hot: DBRawIter<'i>,
+        _from: Option<&T::Key>,
+        _reverse: bool,
+    ) -> DBRawIter<'i> {
+        hot
     }
 }
 
@@ -273,7 +404,9 @@ impl<'a, DB: Database> DbTx for LayeredDbTx<'a, DB> {
         let mem_iter = self.mem_db.iter::<T>();
         let is_tombstoned: Box<dyn Fn(&T::Key) -> bool + '_> =
             Box::new(|k| self.mem_db.is_tombstoned::<T>(k));
-        Box::new(MergeJoinIter::<T>::forward(db_iter, mem_iter, is_tombstoned))
+        let hot: DBIter<'_, T> =
+            Box::new(MergeJoinIter::<T>::forward(db_iter, mem_iter, is_tombstoned));
+        self.chain_cold::<T>(hot, None, false)
     }
 
     fn raw_iter<T: Table>(&self) -> DBRawIter<'_> {
@@ -281,7 +414,9 @@ impl<'a, DB: Database> DbTx for LayeredDbTx<'a, DB> {
         let mem_iter = self.mem_db.raw_iter::<T>();
         let is_tombstoned: Box<dyn Fn(&T::Key) -> bool + '_> =
             Box::new(|k| self.mem_db.is_tombstoned::<T>(k));
-        Box::new(MergeJoinRawIter::<T>::forward(db_iter, mem_iter, is_tombstoned))
+        let hot: DBRawIter<'_> =
+            Box::new(MergeJoinRawIter::<T>::forward(db_iter, mem_iter, is_tombstoned));
+        self.chain_cold_raw::<T>(hot, None, false)
     }
 
     fn skip_to<T: Table>(&self, key: &T::Key) -> eyre::Result<DBIter<'_, T>> {
@@ -289,7 +424,9 @@ impl<'a, DB: Database> DbTx for LayeredDbTx<'a, DB> {
         let mem_iter = self.mem_db.skip_to::<T>(key)?;
         let is_tombstoned: Box<dyn Fn(&T::Key) -> bool + '_> =
             Box::new(|k| self.mem_db.is_tombstoned::<T>(k));
-        Ok(Box::new(MergeJoinIter::<T>::forward(db_iter, mem_iter, is_tombstoned)))
+        let hot: DBIter<'_, T> =
+            Box::new(MergeJoinIter::<T>::forward(db_iter, mem_iter, is_tombstoned));
+        Ok(self.chain_cold::<T>(hot, Some(key), false))
     }
 
     fn raw_skip_to<T: Table>(&self, key: &T::Key) -> eyre::Result<DBRawIter<'_>> {
@@ -297,7 +434,9 @@ impl<'a, DB: Database> DbTx for LayeredDbTx<'a, DB> {
         let mem_iter = self.mem_db.raw_skip_to::<T>(key)?;
         let is_tombstoned: Box<dyn Fn(&T::Key) -> bool + '_> =
             Box::new(|k| self.mem_db.is_tombstoned::<T>(k));
-        Ok(Box::new(MergeJoinRawIter::<T>::forward(db_iter, mem_iter, is_tombstoned)))
+        let hot: DBRawIter<'_> =
+            Box::new(MergeJoinRawIter::<T>::forward(db_iter, mem_iter, is_tombstoned));
+        Ok(self.chain_cold_raw::<T>(hot, Some(key), false))
     }
 
     fn reverse_iter<T: Table>(&self) -> DBIter<'_, T> {
@@ -305,7 +444,9 @@ impl<'a, DB: Database> DbTx for LayeredDbTx<'a, DB> {
         let mem_iter = self.mem_db.reverse_iter::<T>();
         let is_tombstoned: Box<dyn Fn(&T::Key) -> bool + '_> =
             Box::new(|k| self.mem_db.is_tombstoned::<T>(k));
-        Box::new(MergeJoinIter::<T>::reverse(db_iter, mem_iter, is_tombstoned))
+        let hot: DBIter<'_, T> =
+            Box::new(MergeJoinIter::<T>::reverse(db_iter, mem_iter, is_tombstoned));
+        self.chain_cold::<T>(hot, None, true)
     }
 
     fn reverse_raw_iter<T: Table>(&self) -> DBRawIter<'_> {
@@ -313,7 +454,9 @@ impl<'a, DB: Database> DbTx for LayeredDbTx<'a, DB> {
         let mem_iter = self.mem_db.reverse_raw_iter::<T>();
         let is_tombstoned: Box<dyn Fn(&T::Key) -> bool + '_> =
             Box::new(|k| self.mem_db.is_tombstoned::<T>(k));
-        Box::new(MergeJoinRawIter::<T>::reverse(db_iter, mem_iter, is_tombstoned))
+        let hot: DBRawIter<'_> =
+            Box::new(MergeJoinRawIter::<T>::reverse(db_iter, mem_iter, is_tombstoned));
+        self.chain_cold_raw::<T>(hot, None, true)
     }
 
     fn last_record<T: Table>(&self) -> Option<(T::Key, T::Value)> {
@@ -749,12 +892,21 @@ impl<DB: Database> LayeredDatabase<DB> {
         self.cold.as_ref()
     }
 
+    /// Opens a cold read transaction over the attached tier, resolving the auxiliary index on
+    /// this handle's own hot view.
+    #[cfg(feature = "cold-storage")]
+    fn cold_tx(&self) -> Option<ColdTx<'_>> {
+        let cold = self.cold.as_deref()?;
+        Some(ColdTx::new(cold, |digest| self.get::<ColdBatchLocations>(digest)))
+    }
+
     /// Serves `key` from the cold tier after a hot miss; `None` when no cold layer is attached.
     #[cfg(feature = "cold-storage")]
     fn cold_get<T: Table>(&self, key: &T::Key) -> eyre::Result<Option<T::Value>> {
-        let Some(cold) = &self.cold else { return Ok(None) };
-        crate::cold::cold_get::<T>(cold, key, |digest| self.get::<ColdBatchLocations>(digest))
-            .map_err(cold_to_eyre)
+        match self.cold_tx() {
+            Some(tx) => tx.get::<T>(key),
+            None => Ok(None),
+        }
     }
 
     /// Cold storage compiled out: a hot miss is final.
@@ -767,15 +919,93 @@ impl<DB: Database> LayeredDatabase<DB> {
     /// attached.
     #[cfg(feature = "cold-storage")]
     fn cold_has<T: Table>(&self, key: &T::Key) -> eyre::Result<bool> {
-        let Some(cold) = &self.cold else { return Ok(false) };
-        crate::cold::cold_has::<T>(cold, key, |digest| self.get::<ColdBatchLocations>(digest))
-            .map_err(cold_to_eyre)
+        match self.cold_tx() {
+            Some(tx) => tx.contains_key::<T>(key),
+            None => Ok(false),
+        }
     }
 
     /// Cold storage compiled out: a hot miss is final.
     #[cfg(not(feature = "cold-storage"))]
     fn cold_has<T: Table>(&self, _key: &T::Key) -> eyre::Result<bool> {
         Ok(false)
+    }
+
+    /// Iterates key-descending from the largest key at or below `key` (the reverse of
+    /// `skip_to`), merging the cold span beneath the hot tiers.
+    ///
+    /// Inherent rather than a `Database` method: the storage contract deliberately stays fixed,
+    /// so walk-back lives on the concrete layered types that can serve it efficiently. Each hot
+    /// side starts at the floor by positioned lookup and steps backwards one seek per row
+    /// (`record_prior_to`), so a deep floor never pays for the rows above it.
+    pub fn reverse_skip_to<T: Table>(&self, key: &T::Key) -> eyre::Result<DBIter<'_, T>> {
+        let db = &self.db;
+        let db_first = db
+            .get::<T>(key)?
+            .map(|value| (key.clone(), value))
+            .or_else(|| db.record_prior_to::<T>(key));
+        let db_iter: DBIter<'_, T> =
+            Box::new(std::iter::successors(db_first, move |(k, _)| db.record_prior_to::<T>(k)));
+
+        let mem = &self.mem_db;
+        let mem_first = if mem.is_tombstoned::<T>(key) {
+            None
+        } else {
+            mem.get_marked::<T>(key)?.map(|(_, value)| (key.clone(), value))
+        }
+        .or_else(|| mem.record_prior_to::<T>(key));
+        let mem_iter: DBIter<'_, T> =
+            Box::new(std::iter::successors(mem_first, move |(k, _)| mem.record_prior_to::<T>(k)));
+
+        let is_tombstoned: Box<dyn Fn(&T::Key) -> bool + '_> =
+            Box::new(|k| self.mem_db.is_tombstoned::<T>(k));
+        let hot: DBIter<'_, T> =
+            Box::new(MergeJoinIter::<T>::reverse(db_iter, mem_iter, is_tombstoned));
+        Ok(self.chain_cold::<T>(hot, Some(key), true))
+    }
+
+    /// Chains the cold-ordered stream for `T` beneath `hot` (see [`merge_cold`]).
+    #[cfg(feature = "cold-storage")]
+    fn chain_cold<'i, T: Table>(
+        &'i self,
+        hot: DBIter<'i, T>,
+        from: Option<&T::Key>,
+        reverse: bool,
+    ) -> DBIter<'i, T> {
+        merge_cold::<T>(self.cold_tx(), hot, from, reverse)
+    }
+
+    /// Cold storage compiled out: iteration is hot-only.
+    #[cfg(not(feature = "cold-storage"))]
+    fn chain_cold<'i, T: Table>(
+        &'i self,
+        hot: DBIter<'i, T>,
+        _from: Option<&T::Key>,
+        _reverse: bool,
+    ) -> DBIter<'i, T> {
+        hot
+    }
+
+    /// Chains the cold-ordered raw stream for `T` beneath `hot` (see [`merge_cold_raw`]).
+    #[cfg(feature = "cold-storage")]
+    fn chain_cold_raw<'i, T: Table>(
+        &'i self,
+        hot: DBRawIter<'i>,
+        from: Option<&T::Key>,
+        reverse: bool,
+    ) -> DBRawIter<'i> {
+        merge_cold_raw::<T>(self.cold_tx(), hot, from, reverse)
+    }
+
+    /// Cold storage compiled out: iteration is hot-only.
+    #[cfg(not(feature = "cold-storage"))]
+    fn chain_cold_raw<'i, T: Table>(
+        &'i self,
+        hot: DBRawIter<'i>,
+        _from: Option<&T::Key>,
+        _reverse: bool,
+    ) -> DBRawIter<'i> {
+        hot
     }
 
     /// Returns the wrapped inner database: archival operates beneath the mem cache so its deletes
@@ -888,7 +1118,9 @@ impl<DB: Database> Database for LayeredDatabase<DB> {
         let mem_iter = self.mem_db.iter::<T>();
         let is_tombstoned: Box<dyn Fn(&T::Key) -> bool + '_> =
             Box::new(|k| self.mem_db.is_tombstoned::<T>(k));
-        Box::new(MergeJoinIter::<T>::forward(db_iter, mem_iter, is_tombstoned))
+        let hot: DBIter<'_, T> =
+            Box::new(MergeJoinIter::<T>::forward(db_iter, mem_iter, is_tombstoned));
+        self.chain_cold::<T>(hot, None, false)
     }
 
     fn raw_iter<T: Table>(&self) -> DBRawIter<'_> {
@@ -896,7 +1128,9 @@ impl<DB: Database> Database for LayeredDatabase<DB> {
         let mem_iter = self.mem_db.raw_iter::<T>();
         let is_tombstoned: Box<dyn Fn(&T::Key) -> bool + '_> =
             Box::new(|k| self.mem_db.is_tombstoned::<T>(k));
-        Box::new(MergeJoinRawIter::<T>::forward(db_iter, mem_iter, is_tombstoned))
+        let hot: DBRawIter<'_> =
+            Box::new(MergeJoinRawIter::<T>::forward(db_iter, mem_iter, is_tombstoned));
+        self.chain_cold_raw::<T>(hot, None, false)
     }
 
     fn skip_to<T: Table>(&self, key: &T::Key) -> eyre::Result<DBIter<'_, T>> {
@@ -904,7 +1138,9 @@ impl<DB: Database> Database for LayeredDatabase<DB> {
         let mem_iter = self.mem_db.skip_to::<T>(key)?;
         let is_tombstoned: Box<dyn Fn(&T::Key) -> bool + '_> =
             Box::new(|k| self.mem_db.is_tombstoned::<T>(k));
-        Ok(Box::new(MergeJoinIter::<T>::forward(db_iter, mem_iter, is_tombstoned)))
+        let hot: DBIter<'_, T> =
+            Box::new(MergeJoinIter::<T>::forward(db_iter, mem_iter, is_tombstoned));
+        Ok(self.chain_cold::<T>(hot, Some(key), false))
     }
 
     fn reverse_iter<T: Table>(&self) -> DBIter<'_, T> {
@@ -912,7 +1148,9 @@ impl<DB: Database> Database for LayeredDatabase<DB> {
         let mem_iter = self.mem_db.reverse_iter::<T>();
         let is_tombstoned: Box<dyn Fn(&T::Key) -> bool + '_> =
             Box::new(|k| self.mem_db.is_tombstoned::<T>(k));
-        Box::new(MergeJoinIter::<T>::reverse(db_iter, mem_iter, is_tombstoned))
+        let hot: DBIter<'_, T> =
+            Box::new(MergeJoinIter::<T>::reverse(db_iter, mem_iter, is_tombstoned));
+        self.chain_cold::<T>(hot, None, true)
     }
 
     fn reverse_raw_iter<T: Table>(&self) -> DBRawIter<'_> {
@@ -920,7 +1158,9 @@ impl<DB: Database> Database for LayeredDatabase<DB> {
         let mem_iter = self.mem_db.reverse_raw_iter::<T>();
         let is_tombstoned: Box<dyn Fn(&T::Key) -> bool + '_> =
             Box::new(|k| self.mem_db.is_tombstoned::<T>(k));
-        Box::new(MergeJoinRawIter::<T>::reverse(db_iter, mem_iter, is_tombstoned))
+        let hot: DBRawIter<'_> =
+            Box::new(MergeJoinRawIter::<T>::reverse(db_iter, mem_iter, is_tombstoned));
+        self.chain_cold_raw::<T>(hot, None, true)
     }
 
     fn record_prior_to<T: Table>(&self, key: &T::Key) -> Option<(T::Key, T::Value)> {

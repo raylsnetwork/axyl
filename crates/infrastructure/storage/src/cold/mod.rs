@@ -6,19 +6,19 @@
 //! addresses it can be rebuilt from the jars alone.
 
 mod archiver;
-mod fallthrough;
 mod jar;
 mod producer;
 mod reconcile;
+mod tx;
 
 #[cfg(test)]
 mod tests;
 
 pub use archiver::ColdArchiver;
-pub(crate) use fallthrough::{cold_get, cold_has, cold_raw, cold_to_eyre};
 pub use jar::{ColdSegment, ColdStore};
 pub use producer::{archive_below_epoch, ArchiveStats, SealOutcome};
 pub use reconcile::reconcile;
+pub use tx::{ColdTx, ColdTxMut};
 
 use std::{collections::BTreeMap, path::PathBuf};
 

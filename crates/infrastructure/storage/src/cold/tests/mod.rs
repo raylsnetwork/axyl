@@ -36,6 +36,7 @@ mod finalize;
 mod layered;
 mod reconcile;
 mod seal;
+mod tx;
 
 /// Number of epochs the fixture spans, including the recent epoch that must stay hot.
 const EPOCHS: Epoch = 4;

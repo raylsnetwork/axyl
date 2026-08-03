@@ -162,16 +162,11 @@ impl<'a> DbTx for MemDbTx<'a> {
     fn record_prior_to<T: Table>(&self, key: &T::Key) -> Option<(T::Key, T::Value)> {
         if let Some(table) = self.store.get(T::NAME) {
             let key_bytes = encode_key(key);
-            let mut last = None;
-            for (k, (removed, v)) in table.iter() {
-                if k >= &key_bytes {
-                    break;
-                }
-                if !*removed {
-                    last = Some((decode_key(k), decode(v)));
-                }
-            }
-            last
+            table
+                .range(..key_bytes)
+                .rev()
+                .find(|(_, (removed, _))| !*removed)
+                .map(|(k, (_, v))| (decode_key(k), decode(v)))
         } else {
             None
         }
@@ -272,16 +267,11 @@ impl<'a> DbTx for MemDbTxMut<'a> {
     fn record_prior_to<T: Table>(&self, key: &T::Key) -> Option<(T::Key, T::Value)> {
         if let Some(table) = self.store.get(T::NAME) {
             let key_bytes = encode_key(key);
-            let mut last = None;
-            for (k, (removed, v)) in table.iter() {
-                if k >= &key_bytes {
-                    break;
-                }
-                if !*removed {
-                    last = Some((decode_key(k), decode(v)));
-                }
-            }
-            last
+            table
+                .range(..key_bytes)
+                .rev()
+                .find(|(_, (removed, _))| !*removed)
+                .map(|(k, (_, v))| (decode_key(k), decode(v)))
         } else {
             None
         }
@@ -635,21 +625,11 @@ impl Database for MemDatabase {
     fn record_prior_to<T: Table>(&self, key: &T::Key) -> Option<(T::Key, T::Value)> {
         if let Some(table) = self.store.read().get(T::NAME) {
             let key_bytes = encode_key(key);
-            let mut last = None;
-            let guard = table;
-            for (k, v) in guard.iter() {
-                if k >= &key_bytes {
-                    break;
-                }
-                if !v.0 {
-                    last = Some((k, v));
-                }
-            }
-            last.map(|(key_bytes, marked_value_bytes)| {
-                let key = decode_key(key_bytes);
-                let value = decode(&marked_value_bytes.1);
-                (key, value)
-            })
+            table
+                .range(..key_bytes)
+                .rev()
+                .find(|(_, v)| !v.0)
+                .map(|(k, v)| (decode_key(k), decode(&v.1)))
         } else {
             None
         }

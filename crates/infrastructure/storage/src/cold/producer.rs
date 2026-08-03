@@ -16,7 +16,9 @@ use rayls_infrastructure_types::{
 };
 use tracing::info;
 
-use super::{ColdError, ColdLocation, ColdResult, ColdStore, ARCHIVE_HIGH_WATER_MARK_KEY};
+use super::{
+    ColdError, ColdLocation, ColdResult, ColdStore, ColdTxMut, ARCHIVE_HIGH_WATER_MARK_KEY,
+};
 use crate::tables::{Batches, ColdArchiveHighWaterMark, ColdBatchLocations, ConsensusBlocks};
 
 /// A header plus its archivable batch rows, captured under a read txn for the later jar phase.
@@ -252,8 +254,7 @@ pub(super) fn seal_next_epoch_jars<DB: Database>(
         )));
     }
 
-    cold.consensus_blocks().begin_epoch(epoch, start_number)?;
-    cold.batches().begin_epoch(epoch, 0)?;
+    let mut jar_txn = ColdTxMut::begin(cold, epoch, start_number)?;
     info!(target: "cold-archive", epoch, start_number, "cold seal started");
     let pass_started = Instant::now();
     let mut next_progress = SEAL_PROGRESS_LOG_BLOCKS;
@@ -263,15 +264,16 @@ pub(super) fn seal_next_epoch_jars<DB: Database>(
     let mut archived = B256Set::default();
 
     // Alternate read and append in bounded chunks; the rows are immutable history, so per-chunk
-    // snapshots read what an epoch-wide snapshot would. A failed chunk aborts with the jars
-    // uncommitted; the retry's `begin_epoch` heals the leftovers.
+    // snapshots read what an epoch-wide snapshot would. A failed chunk aborts with the jar txn
+    // uncommitted; the retry's begin heals the leftovers.
     let mut locations: Vec<(BlockHash, ColdLocation)> = Vec::new();
     let mut next_batch_row: u64 = 0;
     let mut next_number = start_number;
     let mut epoch_open = true;
     while epoch_open {
         // The chunk seam is the cancellation point: between chunks nothing is committed, so
-        // stopping here leaves only uncommitted appends for the next `begin_epoch` to heal.
+        // stopping here drops the jar txn and leaves only uncommitted appends for the next begin
+        // to heal.
         if should_cancel() {
             return Ok(JarSeal::Cancelled);
         }
@@ -281,13 +283,13 @@ pub(super) fn seal_next_epoch_jars<DB: Database>(
 
         // Jar phase (no MDBX): append rows in the captured order; the batches jar row index is the
         // append position, captured per digest so the auxiliary index points at the exact row.
-        for (header, rows) in &pending {
+        for (offset, (header, rows)) in pending.iter().enumerate() {
             for (digest, batch_bytes) in rows {
-                cold.batches().append_row(&[digest.as_slice(), batch_bytes])?;
+                jar_txn.append_raw::<Batches>(digest, batch_bytes)?;
                 locations.push((*digest, ColdLocation { epoch, row: next_batch_row }));
                 next_batch_row += 1;
             }
-            cold.consensus_blocks().append_row(&[header])?;
+            jar_txn.append_raw::<ConsensusBlocks>(&(next_number + offset as u64), header)?;
         }
         // One `pending` entry per captured block, so its length advances the walk.
         next_number += pending.len() as u64;
@@ -326,13 +328,9 @@ pub(super) fn seal_next_epoch_jars<DB: Database>(
         }
     }
 
-    // Commit both jars so the `.conf` durability boundary is on disk before any hot delete.
-    // NOTE: batches commits before consensus_blocks, and reconcile/archive gate "sealed" on the
-    // consensus_blocks jar alone. So a crash between these commits leaves the epoch un-sealed
-    // (batches jar durable but orphaned), and the next pass re-archives it whole rather than
-    // stranding a half-sealed epoch whose hot rows reconcile would evict with no cold copy.
-    cold.batches().commit()?;
-    cold.consensus_blocks().commit()?;
+    // Commit both jars so the `.conf` durability boundary is on disk before any hot delete; the
+    // crash-window ordering argument lives on `ColdTxMut::seal`.
+    jar_txn.seal()?;
 
     // The empty-capture check above makes the range non-empty by construction.
     Ok(JarSeal::Sealed(SealedJars { epoch, numbers: start_number..=next_number - 1, locations }))
