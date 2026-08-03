@@ -5,7 +5,7 @@
 pub mod cold;
 mod stores;
 #[cfg(feature = "cold-storage")]
-pub use cold::{ColdArchiver, ColdConfig, ColdDatabase, ColdSegment, ColdSegmentKind, SealOutcome};
+pub use cold::{ColdArchiver, ColdConfig, ColdSegment, ColdSegmentKind, ColdStore, SealOutcome};
 use layered_db::LayeredDatabase;
 #[cfg(feature = "reth-libmdbx")]
 use mdbx::MdbxDatabase;
@@ -145,12 +145,10 @@ pub mod tables {
 }
 
 // mdbx is  the default, if redb is set then is used (so priority is mdbx -> redb)
-// The mdbx stack puts `ColdDatabase` OUTERMOST, above the in-memory write cache: every read funnels
-// through its hot -> cold fall-through, and archival writes go through the single layered writer
-// beneath it (no second MDBX writer). redb has no cold tier.
-#[cfg(all(feature = "reth-libmdbx", not(feature = "redb"), feature = "cold-storage"))]
-pub type DatabaseType = ColdDatabase<LayeredDatabase<MdbxDatabase>>;
-#[cfg(all(feature = "reth-libmdbx", not(feature = "redb"), not(feature = "cold-storage")))]
+// The cold tier is a layer inside `LayeredDatabase`: point reads resolve mem -> mdbx -> cold, and
+// archival writes go through the single layered writer (no second MDBX writer). The alias is the
+// same with or without the `cold-storage` feature; redb never attaches a cold layer.
+#[cfg(all(feature = "reth-libmdbx", not(feature = "redb")))]
 pub type DatabaseType = LayeredDatabase<MdbxDatabase>;
 #[cfg(feature = "redb")]
 pub type DatabaseType = LayeredDatabase<ReDB>;
@@ -180,8 +178,8 @@ pub fn open_db_with_consensus_config<Path: AsRef<std::path::Path> + Send>(
 
 /// Concrete cold archiver for the active backend, cfg-selected like [`DatabaseType`].
 ///
-/// The mdbx stack tiers through [`ColdDatabase`], so the archiver drives its inner
-/// `LayeredDatabase<MdbxDatabase>` hot tier.
+/// The archiver drives the hot-only view of the layered database
+/// ([`LayeredDatabase::without_cold`]), so its reads and deletes never fall through to cold.
 #[cfg(all(feature = "cold-storage", feature = "reth-libmdbx", not(feature = "redb")))]
 pub type ColdArchiverType = Option<std::sync::Arc<ColdArchiver<LayeredDatabase<MdbxDatabase>>>>;
 /// Concrete cold archiver for the active backend, cfg-selected like [`DatabaseType`].
@@ -196,9 +194,9 @@ pub type ColdArchiverType = Option<std::sync::Arc<ColdArchiver<LayeredDatabase<R
 #[cfg(all(feature = "cold-storage", feature = "reth-libmdbx", not(feature = "redb")))]
 pub fn cold_archiver_for(db: &DatabaseType) -> ColdArchiverType {
     use std::sync::Arc;
-    // The inner layered DB, so archival reads, index writes and evictions all go through the
-    // single db_run writer (no second MDBX write txn).
-    Some(Arc::new(ColdArchiver::new(db.inner().clone(), Arc::clone(db.cold()))))
+    // The hot-only view, so the producer's "is this row still hot?" reads are never answered by
+    // the cold copy; index writes and evictions still route through the shared db_run writer.
+    db.cold().map(|cold| Arc::new(ColdArchiver::new(db.without_cold(), Arc::clone(cold))))
 }
 /// Builds the background cold archiver for the current database stack.
 ///
@@ -211,38 +209,26 @@ pub fn cold_archiver_for(db: &DatabaseType) -> ColdArchiverType {
 
 // The open functions below are the way they are so we can use if cfg!... on open_db.
 
-/// Open or reopen all the storage of the node backed by MDBX, tiered through the cold archive.
-#[cfg(all(feature = "reth-libmdbx", feature = "cold-storage"))]
-fn _open_mdbx<P: AsRef<std::path::Path> + Send>(
-    store_path: P,
-    consensus_db_config: &MdbxConfig,
-) -> ColdDatabase<LayeredDatabase<MdbxDatabase>> {
-    // Cold jars live in a `cold/` subdir of the consensus DB dir. NOTE: an operator wiping the
-    // consensus DB to shrink it must preserve this subdir, or the node loses the only copy of
-    // archived history and can no longer serve it to lagging peers.
-    let cold_dir = store_path.as_ref().join("cold");
-    let persistent_db = MdbxDatabase::open_with_config(store_path, consensus_db_config.clone())
-        .expect("Cannot open database");
-    // Layered (mem cache + db_run writer) wraps the raw MDBX; ColdDatabase wraps that, so cold sits
-    // above the mem cache and the single writer serializes all MDBX writes.
-    let layered = LayeredDatabase::open(persistent_db);
-    let mut db =
-        ColdDatabase::open(layered, &ColdConfig { dir: cold_dir }).expect("Cannot open cold store");
-
-    open_default_tables(&mut db).expect("failed to open table!");
-
-    db
-}
-
-/// Open or reopen all the storage of the node backed by MDBX, without the cold tier.
-#[cfg(all(feature = "reth-libmdbx", not(feature = "cold-storage")))]
+/// Open or reopen all the storage of the node backed by MDBX, with the cold layer attached when
+/// the `cold-storage` feature is on.
+#[cfg(feature = "reth-libmdbx")]
 fn _open_mdbx<P: AsRef<std::path::Path> + Send>(
     store_path: P,
     consensus_db_config: &MdbxConfig,
 ) -> LayeredDatabase<MdbxDatabase> {
+    // Cold jars live in a `cold/` subdir of the consensus DB dir. NOTE: an operator wiping the
+    // consensus DB to shrink it must preserve this subdir, or the node loses the only copy of
+    // archived history and can no longer serve it to lagging peers.
+    #[cfg(feature = "cold-storage")]
+    let cold_dir = store_path.as_ref().join("cold");
     let persistent_db = MdbxDatabase::open_with_config(store_path, consensus_db_config.clone())
         .expect("Cannot open database");
     let mut db = LayeredDatabase::open(persistent_db);
+    #[cfg(feature = "cold-storage")]
+    {
+        let cold = ColdStore::open(&ColdConfig { dir: cold_dir }).expect("Cannot open cold store");
+        db = db.with_cold(std::sync::Arc::new(cold));
+    }
 
     open_default_tables(&mut db).expect("failed to open table!");
 

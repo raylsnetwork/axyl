@@ -22,10 +22,11 @@ use crate::tables::ConsensusBlocks;
 #[cfg(test)]
 mod tests;
 
-/// Drives cold archival against a raw hot database and its cold store.
+/// Drives cold archival against a hot-only database view and its cold store.
 ///
-/// `hot` must be the raw hot database, never a [`ColdDatabase`](super::ColdDatabase) wrapper, so
-/// the producer's reads and deletes stay on the hot tier (see [`archive_below_epoch`]).
+/// `hot` must never fall through to cold (`LayeredDatabase::without_cold` in production), so the
+/// producer's reads and deletes stay on the hot tier (see [`archive_below_epoch`]): a tiered view
+/// would answer "is this row still hot?" from the very cold copy archival is creating.
 pub struct ColdArchiver<DB: Database> {
     hot: DB,
     cold: Arc<ColdStore>,
@@ -40,8 +41,11 @@ impl<DB: Database> std::fmt::Debug for ColdArchiver<DB> {
 }
 
 impl<DB: Database> ColdArchiver<DB> {
-    /// Builds an archiver over a raw hot database and its shared cold store.
-    pub fn new(hot: DB, cold: Arc<ColdStore>) -> Self {
+    /// Builds an archiver over a hot-only database view and its shared cold store.
+    ///
+    /// Crate-private so external code cannot hand the archiver a cold-attached handle; production
+    /// wiring goes through `cold_archiver_for`, which strips the cold layer first.
+    pub(crate) fn new(hot: DB, cold: Arc<ColdStore>) -> Self {
         Self { hot, cold }
     }
 

@@ -14,6 +14,12 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[cfg(feature = "cold-storage")]
+use crate::{
+    cold::{cold_to_eyre, ColdStore},
+    tables::ColdBatchLocations,
+};
+
 use crate::mem_db::{MemDatabase, MemDbTx, MemDbTxMut};
 use prometheus::{default_registry, register_int_gauge_with_registry, IntGauge, Registry};
 use rayls_infrastructure_types::{
@@ -186,6 +192,40 @@ const MAX_CACHE_SIZE: usize = 10000;
 pub struct LayeredDbTx<'a, DB: Database> {
     mem_db: MemDbTx<'a>,
     db: DB::TX<'a>,
+    /// The cold tier reads fall through to on a hot miss, when attached.
+    #[cfg(feature = "cold-storage")]
+    cold: Option<&'a ColdStore>,
+}
+
+impl<'a, DB: Database> LayeredDbTx<'a, DB> {
+    /// Serves `key` from the cold tier after a hot miss; `None` when no cold layer is attached.
+    #[cfg(feature = "cold-storage")]
+    fn cold_get<T: Table>(&self, key: &T::Key) -> eyre::Result<Option<T::Value>> {
+        let Some(cold) = self.cold else { return Ok(None) };
+        crate::cold::cold_get::<T>(cold, key, |digest| self.get::<ColdBatchLocations>(digest))
+            .map_err(cold_to_eyre)
+    }
+
+    /// Cold storage compiled out: a hot miss is final.
+    #[cfg(not(feature = "cold-storage"))]
+    fn cold_get<T: Table>(&self, _key: &T::Key) -> eyre::Result<Option<T::Value>> {
+        Ok(None)
+    }
+
+    /// Serves `key`'s raw jar bytes from the cold tier after a hot miss.
+    #[cfg(feature = "cold-storage")]
+    fn cold_raw_get<T: Table>(&self, key: &T::Key) -> eyre::Result<Option<Cow<'_, [u8]>>> {
+        let Some(cold) = self.cold else { return Ok(None) };
+        crate::cold::cold_raw::<T>(cold, key, |digest| self.get::<ColdBatchLocations>(digest))
+            .map(|bytes| bytes.map(Cow::Owned))
+            .map_err(cold_to_eyre)
+    }
+
+    /// Cold storage compiled out: a hot miss is final.
+    #[cfg(not(feature = "cold-storage"))]
+    fn cold_raw_get<T: Table>(&self, _key: &T::Key) -> eyre::Result<Option<Cow<'_, [u8]>>> {
+        Ok(None)
+    }
 }
 
 impl<'a, DB: Database> Debug for LayeredDbTx<'a, DB> {
@@ -196,19 +236,25 @@ impl<'a, DB: Database> Debug for LayeredDbTx<'a, DB> {
 
 impl<'a, DB: Database> DbTx for LayeredDbTx<'a, DB> {
     fn get<T: Table>(&self, key: &T::Key) -> eyre::Result<Option<T::Value>> {
-        if self.mem_db.is_tombstoned::<T>(key) {
-            return Ok(None);
-        }
-        if let Some((_, val)) = self.mem_db.get_no_marked_check::<T>(key) {
-            Ok(Some(val))
+        // The hot answer (tombstone-aware mem snapshot, then the persistent tier) wins; only a
+        // full hot miss consults the cold tier, so a row removed from hot still serves its
+        // archived copy.
+        let hot = if self.mem_db.is_tombstoned::<T>(key) {
+            None
+        } else if let Some((_, val)) = self.mem_db.get_no_marked_check::<T>(key) {
+            Some(val)
         } else {
-            self.db.get::<T>(key)
+            self.db.get::<T>(key)?
+        };
+        match hot {
+            Some(val) => Ok(Some(val)),
+            None => self.cold_get::<T>(key),
         }
     }
 
     fn raw_get<T: Table>(&self, key: &T::Key) -> eyre::Result<Option<Cow<'_, [u8]>>> {
         if self.mem_db.is_tombstoned::<T>(key) {
-            return Ok(None);
+            return self.cold_raw_get::<T>(key);
         }
         // A mem-overlay hit holds the typed value, so it must re-encode; the common archival path
         // (old rows already evicted from the overlay) falls through to the inner backend's
@@ -216,7 +262,10 @@ impl<'a, DB: Database> DbTx for LayeredDbTx<'a, DB> {
         if let Some((_, val)) = self.mem_db.get_no_marked_check::<T>(key) {
             return Ok(Some(Cow::Owned(encode(&val))));
         }
-        self.db.raw_get::<T>(key)
+        match self.db.raw_get::<T>(key)? {
+            Some(bytes) => Ok(Some(bytes)),
+            None => self.cold_raw_get::<T>(key),
+        }
     }
 
     fn iter<T: Table>(&self) -> DBIter<'_, T> {
@@ -627,6 +676,9 @@ pub struct LayeredDatabase<DB: Database> {
     db: DB,
     tx: QueueSender<DB>,
     thread: Option<Arc<JoinHandle<()>>>,
+    /// The cold tier point reads fall through to on a hot miss, when attached.
+    #[cfg(feature = "cold-storage")]
+    cold: Option<Arc<ColdStore>>,
 }
 
 impl<DB: Database> Drop for LayeredDatabase<DB> {
@@ -661,7 +713,69 @@ impl<DB: Database> LayeredDatabase<DB> {
         let thread = Some(Arc::new(std::thread::spawn(move || {
             db_run(db_cloned, mem_db_clone, rx, queue_depth)
         })));
-        Self { mem_db, db, tx: QueueSender { tx, depth }, thread }
+        Self {
+            mem_db,
+            db,
+            tx: QueueSender { tx, depth },
+            thread,
+            #[cfg(feature = "cold-storage")]
+            cold: None,
+        }
+    }
+
+    /// Attaches the cold tier point reads fall through to on a hot miss.
+    ///
+    /// Reads resolve mem -> db -> cold; writes and iteration never touch the cold tier.
+    #[cfg(feature = "cold-storage")]
+    pub fn with_cold(mut self, cold: Arc<ColdStore>) -> Self {
+        self.cold = Some(cold);
+        self
+    }
+
+    /// Returns a hot-only view of this database: the same mem cache and writer, no cold layer.
+    ///
+    /// The archival producer reads and deletes through this view, so "is this row still hot?" is
+    /// answered by the hot tier alone and never by the cold copy it is about to create.
+    #[cfg(feature = "cold-storage")]
+    pub fn without_cold(&self) -> Self {
+        let mut view = self.clone();
+        view.cold = None;
+        view
+    }
+
+    /// Returns the attached cold tier, or `None` for a hot-only handle.
+    #[cfg(feature = "cold-storage")]
+    pub fn cold(&self) -> Option<&Arc<ColdStore>> {
+        self.cold.as_ref()
+    }
+
+    /// Serves `key` from the cold tier after a hot miss; `None` when no cold layer is attached.
+    #[cfg(feature = "cold-storage")]
+    fn cold_get<T: Table>(&self, key: &T::Key) -> eyre::Result<Option<T::Value>> {
+        let Some(cold) = &self.cold else { return Ok(None) };
+        crate::cold::cold_get::<T>(cold, key, |digest| self.get::<ColdBatchLocations>(digest))
+            .map_err(cold_to_eyre)
+    }
+
+    /// Cold storage compiled out: a hot miss is final.
+    #[cfg(not(feature = "cold-storage"))]
+    fn cold_get<T: Table>(&self, _key: &T::Key) -> eyre::Result<Option<T::Value>> {
+        Ok(None)
+    }
+
+    /// Answers `contains_key` from the cold tier after a hot miss; false when no cold layer is
+    /// attached.
+    #[cfg(feature = "cold-storage")]
+    fn cold_has<T: Table>(&self, key: &T::Key) -> eyre::Result<bool> {
+        let Some(cold) = &self.cold else { return Ok(false) };
+        crate::cold::cold_has::<T>(cold, key, |digest| self.get::<ColdBatchLocations>(digest))
+            .map_err(cold_to_eyre)
+    }
+
+    /// Cold storage compiled out: a hot miss is final.
+    #[cfg(not(feature = "cold-storage"))]
+    fn cold_has<T: Table>(&self, _key: &T::Key) -> eyre::Result<bool> {
+        Ok(false)
     }
 
     /// Returns the wrapped inner database: archival operates beneath the mem cache so its deletes
@@ -693,7 +807,12 @@ impl<DB: Database> Database for LayeredDatabase<DB> {
     }
 
     fn read_txn(&self) -> eyre::Result<Self::TX<'_>> {
-        Ok(LayeredDbTx { mem_db: self.mem_db.read_txn()?, db: self.db.read_txn()? })
+        Ok(LayeredDbTx {
+            mem_db: self.mem_db.read_txn()?,
+            db: self.db.read_txn()?,
+            #[cfg(feature = "cold-storage")]
+            cold: self.cold.as_deref(),
+        })
     }
 
     /// Write transactions overlap and commit when the last one completes.
@@ -707,23 +826,31 @@ impl<DB: Database> Database for LayeredDatabase<DB> {
     }
 
     fn contains_key<T: Table>(&self, key: &T::Key) -> eyre::Result<bool> {
-        if self.mem_db.is_tombstoned::<T>(key) {
-            return Ok(false);
-        }
-        if self.mem_db.contains_key::<T>(key)? {
+        let hot = if self.mem_db.is_tombstoned::<T>(key) {
+            false
+        } else {
+            self.mem_db.contains_key::<T>(key)? || self.db.contains_key::<T>(key)?
+        };
+        if hot {
             return Ok(true);
         }
-        self.db.contains_key::<T>(key)
+        self.cold_has::<T>(key)
     }
 
     fn get<T: Table>(&self, key: &T::Key) -> eyre::Result<Option<T::Value>> {
-        if self.mem_db.is_tombstoned::<T>(key) {
-            return Ok(None);
-        }
-        if let Some((_, val)) = self.mem_db.get_marked::<T>(key)? {
-            Ok(Some(val))
+        // The hot answer (tombstone-aware mem overlay, then the persistent tier) wins; only a
+        // full hot miss consults the cold tier, so a row removed from hot still serves its
+        // archived copy.
+        let hot = if self.mem_db.is_tombstoned::<T>(key) {
+            None
+        } else if let Some((_, val)) = self.mem_db.get_marked::<T>(key)? {
+            Some(val)
         } else {
-            self.db.get::<T>(key)
+            self.db.get::<T>(key)?
+        };
+        match hot {
+            Some(val) => Ok(Some(val)),
+            None => self.cold_get::<T>(key),
         }
     }
 

@@ -1,12 +1,12 @@
 //! Append-only compressed cold tier for the consensus DB, backed by the nippy-jar file format.
 //!
 //! Whole epochs of `Batches` and `ConsensusBlocks` move into per-epoch jars, one jar per segment.
-//! Nothing here drops data: all history stays queryable through the [`ColdDatabase`]
+//! Nothing here drops data: all history stays queryable through the layered database's cold
 //! fall-through, and the batches jar carries its digest column so the auxiliary index that
 //! addresses it can be rebuilt from the jars alone.
 
 mod archiver;
-mod database;
+mod fallthrough;
 mod jar;
 mod producer;
 mod reconcile;
@@ -15,7 +15,7 @@ mod reconcile;
 mod tests;
 
 pub use archiver::ColdArchiver;
-pub use database::{ColdDatabase, ColdTx};
+pub(crate) use fallthrough::{cold_get, cold_has, cold_raw, cold_to_eyre};
 pub use jar::{ColdSegment, ColdStore};
 pub use producer::{archive_below_epoch, ArchiveStats, SealOutcome};
 pub use reconcile::reconcile;

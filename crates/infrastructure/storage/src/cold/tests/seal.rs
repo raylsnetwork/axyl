@@ -40,7 +40,7 @@ fn seal_layout(layout: &[(u64, BlockHash)], chunk_bytes: usize) -> (TempDir, Tes
     let tmp = TempDir::new().unwrap();
     let (db, hot) = open_test_db(&tmp);
     seed_chunk_blocks(&hot, &blocks, &batches);
-    crate::cold::producer::seal_next_epoch(&hot, db.cold(), 1, chunk_bytes)
+    crate::cold::producer::seal_next_epoch(&hot, db.cold().expect("cold attached"), 1, chunk_bytes)
         .expect("seal epoch")
         .expect("one epoch below the cutoff");
     hot.sync_persist();
@@ -112,20 +112,25 @@ fn chunked_seal_retry_after_late_chunk_failure_reseals_cleanly() {
     // chunk finds C absent from both tiers and aborts with the jars uncommitted.
     seed_chunk_blocks(&hot, &blocks, &[(DIGEST_A, 0), (DIGEST_B, 1)]);
 
-    let result = crate::cold::producer::seal_next_epoch(&hot, db.cold(), 1, 0);
+    let result =
+        crate::cold::producer::seal_next_epoch(&hot, db.cold().expect("cold attached"), 1, 0);
     assert!(
         matches!(result, Err(ColdError::Corruption(_))),
         "missing batch must abort the seal, got {result:?}"
     );
-    assert!(!db.cold().consensus_blocks().is_epoch_sealed(0), "aborted seal must not be indexed");
+    assert!(
+        !db.cold().expect("cold attached").consensus_blocks().is_epoch_sealed(0),
+        "aborted seal must not be indexed"
+    );
 
     // Heal the cause and retry: begin_epoch must recover the partially-appended jars.
     hot.with_write_txn(|txn| txn.insert::<Batches>(&DIGEST_C, &batch_for(2, 0)))
         .expect("insert missing batch");
     hot.sync_persist();
-    let stats = crate::cold::producer::seal_next_epoch(&hot, db.cold(), 1, 0)
-        .expect("retried seal")
-        .expect("epoch sealed on retry");
+    let stats =
+        crate::cold::producer::seal_next_epoch(&hot, db.cold().expect("cold attached"), 1, 0)
+            .expect("retried seal")
+            .expect("epoch sealed on retry");
     hot.sync_persist();
     assert_eq!((stats.blocks_archived, stats.batches_archived, stats.epochs_sealed), (3, 3, 1));
 
@@ -155,24 +160,34 @@ fn cancelled_seal_leaves_jars_uncommitted_and_reseals_whole() {
     // Zero budget = one block per chunk; cancel at the second chunk seam, after the first chunk's
     // rows were already appended (the leftover state the retry's `begin_epoch` must heal).
     let seams = std::cell::Cell::new(0u32);
-    let outcome = crate::cold::producer::seal_next_epoch_jars(&hot, db.cold(), 1, 0, &|| {
-        seams.set(seams.get() + 1);
-        seams.get() > 1
-    })
+    let outcome = crate::cold::producer::seal_next_epoch_jars(
+        &hot,
+        db.cold().expect("cold attached"),
+        1,
+        0,
+        &|| {
+            seams.set(seams.get() + 1);
+            seams.get() > 1
+        },
+    )
     .expect("a cancelled pass is not an error");
     assert!(
         matches!(outcome, crate::cold::producer::JarSeal::Cancelled),
         "flag must cancel the pass"
     );
-    assert!(db.cold().consensus_blocks().sealed_epochs().is_empty(), "nothing may be sealed");
+    assert!(
+        db.cold().expect("cold attached").consensus_blocks().sealed_epochs().is_empty(),
+        "nothing may be sealed"
+    );
     let mdbx = hot.inner();
     assert_eq!(count_hot_rows::<ConsensusBlocks, _>(mdbx, |_| true), 3, "hot rows intact");
     assert_eq!(count_hot_rows::<Batches, _>(mdbx, |_| true), 3, "hot batches intact");
 
     // Retry without cancelling: the epoch seals whole...
-    let stats = crate::cold::producer::seal_next_epoch(&hot, db.cold(), 1, 0)
-        .expect("retried seal")
-        .expect("epoch sealed on retry");
+    let stats =
+        crate::cold::producer::seal_next_epoch(&hot, db.cold().expect("cold attached"), 1, 0)
+            .expect("retried seal")
+            .expect("epoch sealed on retry");
     hot.sync_persist();
     assert_eq!((stats.blocks_archived, stats.batches_archived, stats.epochs_sealed), (3, 3, 1));
 
@@ -195,7 +210,8 @@ fn seal_due_fully_archives_and_matches_fused() {
     let tmp_bg = TempDir::new().unwrap();
     let (db_bg, hot_bg) = open_test_db(&tmp_bg);
     seed_hot(&hot_bg, &fixtures);
-    let background = ColdArchiver::new(hot_bg.clone(), db_bg.cold().clone());
+    let background =
+        ColdArchiver::new(hot_bg.clone(), db_bg.cold().expect("cold attached").clone());
     while matches!(
         background.seal_due(Epoch::MAX, || false).expect("archive pass"),
         SealOutcome::Sealed(_)
@@ -205,7 +221,8 @@ fn seal_due_fully_archives_and_matches_fused() {
     let tmp_fused = TempDir::new().unwrap();
     let (db_fused, hot_fused) = open_test_db(&tmp_fused);
     seed_hot(&hot_fused, &fixtures);
-    let fused = ColdArchiver::new(hot_fused.clone(), db_fused.cold().clone());
+    let fused =
+        ColdArchiver::new(hot_fused.clone(), db_fused.cold().expect("cold attached").clone());
     let stats = fused.archive_due(Epoch::MAX, None).expect("fused archive");
     assert_eq!(stats.epochs_sealed, 3);
     hot_fused.sync_persist();
@@ -267,21 +284,23 @@ fn short_jar_is_never_reopened_by_a_later_pass() {
     hot.sync_persist();
 
     // Seal a jar covering only the first SHORT blocks of epoch 0.
-    db.cold().consensus_blocks().begin_epoch(0, 0).expect("begin blocks");
-    db.cold().batches().begin_epoch(0, 0).expect("begin batches");
+    db.cold().expect("cold attached").consensus_blocks().begin_epoch(0, 0).expect("begin blocks");
+    db.cold().expect("cold attached").batches().begin_epoch(0, 0).expect("begin batches");
     for number in 0..SHORT {
         let digest = digests[number as usize];
         db.cold()
+            .expect("cold attached")
             .batches()
             .append_row(&[digest.as_slice(), &encode(&batch_for(number, 0))])
             .expect("append batch");
         db.cold()
+            .expect("cold attached")
             .consensus_blocks()
             .append_row(&[&encode(&header_for(number, 0, digest))])
             .expect("append block");
     }
-    db.cold().batches().commit().expect("commit batches");
-    db.cold().consensus_blocks().commit().expect("commit blocks");
+    db.cold().expect("cold attached").batches().commit().expect("commit batches");
+    db.cold().expect("cold attached").consensus_blocks().commit().expect("commit blocks");
 
     // Finalize exactly what the short jar holds: index it, advance the high-water mark, prune its
     // rows.
@@ -305,7 +324,7 @@ fn short_jar_is_never_reopened_by_a_later_pass() {
     // truncate) that epoch's jars. It must fail closed instead.
     let sealed = crate::cold::producer::seal_next_epoch_jars(
         &hot,
-        db.cold(),
+        db.cold().expect("cold attached"),
         1,
         crate::cold::producer::SEAL_CHUNK_BYTES,
         &|| false,
@@ -351,7 +370,7 @@ fn archive_rejects_non_contiguous_consensus_blocks() {
     hot.sync_persist();
 
     // Archiving epoch 0 (cutoff 1) must reject the gap rather than seal a misaligned jar.
-    let result = archive_below_epoch(&hot, db.cold(), 1, None);
+    let result = archive_below_epoch(&hot, db.cold().expect("cold attached"), 1, None);
     assert!(
         matches!(result, Err(ColdError::Corruption(_))),
         "non-contiguous epoch must surface as corruption, got {result:?}"

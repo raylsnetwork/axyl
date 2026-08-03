@@ -400,8 +400,8 @@ impl ColdSegment {
 
 /// The two-segment cold store: a consensus_blocks segment plus a batches segment.
 ///
-/// Wraps both [`ColdSegment`]s behind the read APIs [`ColdDatabase`](super::ColdDatabase) routes to
-/// on a hot miss.
+/// Wraps both [`ColdSegment`]s behind the read APIs the layered database's cold fall-through
+/// routes to on a hot miss.
 #[derive(Debug)]
 pub struct ColdStore {
     /// Consensus-blocks segment (block number -> ConsensusHeader bytes).

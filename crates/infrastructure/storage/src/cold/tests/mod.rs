@@ -1,9 +1,9 @@
-//! Cold-tier regression tests, built against the node's
-//! `ColdDatabase<LayeredDatabase<MdbxDatabase>>` shape and so MDBX-only.
+//! Cold-tier regression tests, built against the node's `LayeredDatabase<MdbxDatabase>` shape
+//! (cold layer attached) and so MDBX-only.
 
 #![cfg(feature = "reth-libmdbx")]
 
-use std::collections::BTreeSet;
+use std::{collections::BTreeSet, sync::Arc};
 
 use rayls_infrastructure_types::{
     encode, Batch, BlockHash, Certificate, CommittedSubDag, ConsensusHeader, Database, DbTx,
@@ -23,7 +23,7 @@ use tempfile::TempDir;
 use crate::{
     cold::{
         archive_below_epoch, reconcile::reconcile, ArchiveStats, ColdArchiver, ColdConfig,
-        ColdDatabase, ColdError, ColdLocation, ColdStore, SealOutcome, ARCHIVE_HIGH_WATER_MARK_KEY,
+        ColdError, ColdLocation, ColdStore, SealOutcome, ARCHIVE_HIGH_WATER_MARK_KEY,
     },
     layered_db::LayeredDatabase,
     mdbx::MdbxDatabase,
@@ -33,6 +33,7 @@ use crate::{
 
 mod archive;
 mod finalize;
+mod layered;
 mod reconcile;
 mod seal;
 
@@ -42,10 +43,10 @@ const EPOCHS: Epoch = 4;
 /// Number of consensus blocks (and one batch each) per epoch.
 const BLOCKS_PER_EPOCH: u64 = 6;
 
-/// Full hot+cold composition matching the node's `DatabaseType` shape (cold outermost).
-type TestDb = ColdDatabase<LayeredDatabase<MdbxDatabase>>;
+/// The node's `DatabaseType` shape: the layered database with the cold layer attached.
+type TestDb = LayeredDatabase<MdbxDatabase>;
 
-/// The layered hot tier beneath the cold wrapper (what the producer writes through).
+/// The hot-only view of [`TestDb`] (what the producer reads and writes through).
 type HotDb = LayeredDatabase<MdbxDatabase>;
 
 /// One synthetic consensus block plus the single batch its sub-dag references.
@@ -121,19 +122,18 @@ fn digest_seed(number: u64, epoch: Epoch) -> [u8; 32] {
     seed
 }
 
-/// Opens a fresh `ColdDatabase<LayeredDatabase<MdbxDatabase>>` rooted under `tmp`.
+/// Opens a fresh cold-attached `LayeredDatabase<MdbxDatabase>` rooted under `tmp`.
 ///
-/// Returns the full stack (cold outermost, what the node reads through) alongside a clone of the
-/// inner layered hot DB. The producer writes through the layered DB so its writes go via the single
-/// `db_run` writer; both handles share the same `Arc<ColdStore>` so newly sealed jars are visible
-/// through the cold fall-through within the process.
+/// Returns the tiered handle (what the node reads through) alongside its hot-only view. The
+/// producer reads and writes through the hot view so its reads never fall through to cold; both
+/// handles share the same `Arc<ColdStore>` and the single `db_run` writer, so newly sealed jars
+/// are visible through the cold fall-through within the process.
 fn open_test_db(tmp: &TempDir) -> (TestDb, HotDb) {
     let mdbx = MdbxDatabase::open(tmp.path().join("hot")).expect("open mdbx");
-    let layered = LayeredDatabase::open(mdbx);
-    let cfg = ColdConfig { dir: tmp.path().join("cold") };
-    let mut db = ColdDatabase::open(layered, &cfg).expect("open cold");
+    let cold = ColdStore::open(&ColdConfig { dir: tmp.path().join("cold") }).expect("open cold");
+    let mut db = LayeredDatabase::open(mdbx).with_cold(Arc::new(cold));
     open_default_tables(&mut db).expect("open tables");
-    let hot = db.inner().clone();
+    let hot = db.without_cold();
     (db, hot)
 }
 

@@ -32,7 +32,7 @@ fn test_archive_keeps_hot_bounded_and_serves_cold() {
     // The producer runs against the layered hot DB (beneath the cold fall-through), so its reads
     // and deletes stay on the hot tier and route through the single db_run writer. Serving reads go
     // through the full stack (cold outermost).
-    archive_below_epoch(&hot, db.cold(), cutoff, None).expect("archive");
+    archive_below_epoch(&hot, db.cold().expect("cold attached"), cutoff, None).expect("archive");
     // Flush the layered write queue so the archive's deletes land in the bare MDBX we probe.
     hot.sync_persist();
 
@@ -94,14 +94,18 @@ fn test_archive_keeps_hot_bounded_and_serves_cold() {
             .expect("auxiliary index entry must exist for archived batch");
         assert_eq!(loc.epoch, f.epoch, "auxiliary index epoch must match the batch epoch");
         // The located batch reads byte-identically straight from the jar.
-        let raw =
-            db.cold().read_batch_checked(f.digest, loc).expect("cold read").expect("jar present");
+        let raw = db
+            .cold()
+            .expect("cold attached")
+            .read_batch_checked(f.digest, loc)
+            .expect("cold read")
+            .expect("jar present");
         assert_eq!(raw, encode(&f.batch), "jar batch bytes must match the inserted batch");
     }
 }
 
 /// A batch archived to cold and pruned from hot is served by both a `Database`-level `get` and a
-/// held read txn, because `ColdTx` makes the transaction cold-aware (mem -> hot -> cold).
+/// held read txn, because the layered read txn is cold-aware (mem -> hot -> cold).
 ///
 /// Pins the invariant the batch responder relies on: a single `with_read_txn(|tx| tx.get())`
 /// resolves the historical batches a lagging peer requests, even though after archival those rows
@@ -114,14 +118,14 @@ fn archived_batch_serves_via_read_txn_and_get() {
     seed_hot(&hot, &fixtures);
 
     let cutoff: Epoch = EPOCHS - 1;
-    archive_below_epoch(&hot, db.cold(), cutoff, None).expect("archive");
+    archive_below_epoch(&hot, db.cold().expect("cold attached"), cutoff, None).expect("archive");
     // Flush the layered write queue so the archive's deletes land in the bare hot tier.
     hot.sync_persist();
 
     // An archived (below-cutoff) batch: pruned from hot, present only in cold.
     let archived = fixtures.iter().find(|f| f.epoch < cutoff).expect("an archived fixture");
 
-    // The cold-aware read txn serves it: `ColdTx` falls through to cold within the txn.
+    // The cold-aware read txn serves it: the layered txn falls through to cold within the txn.
     let via_txn = db
         .with_read_txn(|tx| tx.get::<Batches>(&archived.digest))
         .expect("read txn succeeds")
@@ -144,7 +148,7 @@ fn archive_due_floors_cutoff_by_el_anchor() {
     let fixtures = build_fixtures();
     let (db, hot) = open_test_db(&tmp);
     seed_hot(&hot, &fixtures);
-    let archiver = ColdArchiver::new(hot.clone(), db.cold().clone());
+    let archiver = ColdArchiver::new(hot.clone(), db.cold().expect("cold attached").clone());
 
     // An EL still at genesis floors the cutoff to zero: nothing seals.
     let stats = archiver.archive_due(0, None).expect("floored pass");
@@ -202,7 +206,7 @@ fn seal_due_seals_prior_epoch_during_live_epoch() {
         .collect();
     seed_hot(&hot, &seeded);
 
-    let archiver = ColdArchiver::new(hot.clone(), db.cold().clone());
+    let archiver = ColdArchiver::new(hot.clone(), db.cold().expect("cold attached").clone());
     let outcome = archiver.seal_due(1, || false).expect("seal pass");
     assert_eq!(outcome, SealOutcome::Sealed(0), "epoch 0 must seal during epoch 1");
 
@@ -237,17 +241,20 @@ fn archive_below_epoch_caps_epochs_per_pass() {
     let cutoff = EPOCHS - 2;
 
     // A cap of one seals exactly one epoch; without the cap this single pass would seal both.
-    let first = archive_below_epoch(&hot, db.cold(), cutoff, Some(1)).expect("first capped pass");
+    let first = archive_below_epoch(&hot, db.cold().expect("cold attached"), cutoff, Some(1))
+        .expect("first capped pass");
     hot.sync_persist();
     assert_eq!(first.epochs_sealed, 1, "a cap of one seals exactly one epoch");
 
     // The next pass resumes past the high-water mark and seals the next eligible epoch.
-    let second = archive_below_epoch(&hot, db.cold(), cutoff, Some(1)).expect("second capped pass");
+    let second = archive_below_epoch(&hot, db.cold().expect("cold attached"), cutoff, Some(1))
+        .expect("second capped pass");
     hot.sync_persist();
     assert_eq!(second.epochs_sealed, 1, "the resumable high-water mark advances the capped passes");
 
     // The backlog is now drained; a further (uncapped) pass seals nothing.
-    let third = archive_below_epoch(&hot, db.cold(), cutoff, None).expect("drained pass");
+    let third = archive_below_epoch(&hot, db.cold().expect("cold attached"), cutoff, None)
+        .expect("drained pass");
     hot.sync_persist();
     assert_eq!(third.epochs_sealed, 0, "nothing remains after the backlog drained");
 
@@ -306,13 +313,13 @@ fn time_per_epoch_archive() {
         .unwrap_or(u64::MAX);
 
     let mdbx = MdbxDatabase::open(&hot_dir).expect("open hot copy");
-    let layered = LayeredDatabase::open(mdbx);
     let cfg = ColdConfig { dir: hot_dir.join("cold") };
-    let mut db = ColdDatabase::open(layered, &cfg).expect("open cold");
+    let cold = ColdStore::open(&cfg).expect("open cold");
+    let mut db = LayeredDatabase::open(mdbx).with_cold(Arc::new(cold));
     open_default_tables(&mut db).expect("open tables");
-    let hot = db.inner().clone();
+    let hot = db.without_cold();
 
-    let archiver = ColdArchiver::new(hot.clone(), db.cold().clone());
+    let archiver = ColdArchiver::new(hot.clone(), db.cold().expect("cold attached").clone());
     println!("pass,epoch,blocks,archive_seconds");
     for pass in 0..passes_cap {
         let started = Instant::now();
@@ -326,6 +333,7 @@ fn time_per_epoch_archive() {
         };
         let blocks = db
             .cold()
+            .expect("cold attached")
             .consensus_blocks()
             .key_range_for_epoch(epoch)
             .map(|range| range.end() - range.start() + 1)
@@ -354,11 +362,11 @@ fn validate_real_db_archive() {
         std::env::var("RAYLS_COLD_VALIDATE_EPOCHS").ok().and_then(|s| s.parse().ok()).unwrap_or(50);
 
     let mdbx = MdbxDatabase::open(&hot_dir).expect("open hot copy");
-    let layered = LayeredDatabase::open(mdbx);
     let cfg = ColdConfig { dir: cold_dir.clone() };
-    let mut db = ColdDatabase::open(layered, &cfg).expect("open cold");
+    let cold = ColdStore::open(&cfg).expect("open cold");
+    let mut db = LayeredDatabase::open(mdbx).with_cold(Arc::new(cold));
     open_default_tables(&mut db).expect("open tables");
-    let hot = db.inner().clone();
+    let hot = db.without_cold();
 
     // Survey via the ConsensusBlocks table only. It is small enough to scan inside the MDBX
     // read-transaction window; the multi-GB Batches table is not, so a full scan there trips the
@@ -420,7 +428,7 @@ fn validate_real_db_archive() {
 
     // Run the archiver against the layered hot DB and time it.
     let started = Instant::now();
-    let stats = match archive_below_epoch(&hot, db.cold(), cutoff, None) {
+    let stats = match archive_below_epoch(&hot, db.cold().expect("cold attached"), cutoff, None) {
         Ok(stats) => stats,
         Err(e) => panic!("archive failed (finding, not a test bug): {e}"),
     };

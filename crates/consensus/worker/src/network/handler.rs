@@ -219,8 +219,8 @@ fn collect_requested_batches_blocking<DB: Database>(
     }
 
     // Serve from one cold-aware read txn: `tx.get` resolves each digest hot-first and falls through
-    // to cold within the same txn (see `ColdTx`), so a lagging peer's archived batches are served
-    // without opening a fresh read txn per digest.
+    // to cold within the same txn (the layered read txn is cold-aware), so a lagging peer's
+    // archived batches are served without opening a fresh read txn per digest.
     //
     // Stop at the response budget: requesters rely on responders truncating below the requested
     // set, so reading further would only decode (often large) batches to discard them.
@@ -297,7 +297,7 @@ where
 mod tests {
     use super::*;
     use rayls_infrastructure_storage::{
-        cold::{ColdConfig, ColdDatabase, ColdLocation},
+        cold::{ColdConfig, ColdLocation, ColdStore},
         layered_db::LayeredDatabase,
         mdbx::MdbxDatabase,
         mem_db::MemDatabase,
@@ -305,11 +305,14 @@ mod tests {
     };
     use rayls_infrastructure_types::B256;
     use rayls_testing_test_utils::CommitteeFixture;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
     use tempfile::TempDir;
 
     /// The node storage stack under test for the cold cases: mem overlay -> mdbx -> cold jars.
-    type ColdTieredDb = ColdDatabase<LayeredDatabase<MdbxDatabase>>;
+    type ColdTieredDb = LayeredDatabase<MdbxDatabase>;
 
     /// Returns the first authority's config, backed by the cold-tiered stack rooted under `tmp`.
     ///
@@ -322,8 +325,9 @@ mod tests {
             std::fs::create_dir_all(dir.join("hot")).expect("create db dir");
             let layered =
                 LayeredDatabase::open(MdbxDatabase::open(dir.join("hot")).expect("open mdbx"));
-            let db = ColdDatabase::open(layered, &ColdConfig { dir: dir.join("cold") })
-                .expect("open cold store");
+            let cold =
+                ColdStore::open(&ColdConfig { dir: dir.join("cold") }).expect("open cold store");
+            let db = layered.with_cold(Arc::new(cold));
             db.open_table::<Batches>().expect("open Batches");
             db.open_table::<ColdBatchLocations>().expect("open ColdBatchLocations");
             db
@@ -383,7 +387,7 @@ mod tests {
         // The cold batch exists only as a jar row plus its auxiliary-index entry, never hot.
         let cold_digest = B256::repeat_byte(0x22);
         let cold_batch = Batch { transactions: vec![vec![2u8; 64]], ..Default::default() };
-        let cold = store.cold();
+        let cold = store.cold().expect("cold attached");
         cold.batches().begin_epoch(1, 0).expect("begin epoch");
         cold.batches()
             .append_row(&[cold_digest.as_slice(), &encode(&cold_batch)])
@@ -422,7 +426,7 @@ mod tests {
         // that makes `read_batch_checked` fail reaches the responder the same way; the digest
         // cross-check is simply the cheapest one to stage.
         let archived = B256::repeat_byte(0x33);
-        let cold = store.cold();
+        let cold = store.cold().expect("cold attached");
         cold.batches().begin_epoch(1, 0).expect("begin epoch");
         cold.batches().append_row(&[archived.as_slice(), &encode(&hot_batch)]).expect("append row");
         cold.batches().commit().expect("commit");

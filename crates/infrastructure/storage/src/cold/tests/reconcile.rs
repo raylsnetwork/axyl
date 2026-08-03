@@ -22,7 +22,8 @@ fn test_reconcile_heals_interrupted_archive() {
         let (db, hot) = open_test_db(&tmp);
         seed_hot(&hot, &fixtures);
 
-        archive_below_epoch(&hot, db.cold(), cutoff, None).expect("archive");
+        archive_below_epoch(&hot, db.cold().expect("cold attached"), cutoff, None)
+            .expect("archive");
 
         // Re-create the partial state: jars sealed (kept on disk), hot rows still present,
         // auxiliary index and high-water mark rolled back as if the post-jar hot txn never
@@ -40,7 +41,8 @@ fn test_reconcile_heals_interrupted_archive() {
         hot.sync_persist();
 
         // Sanity: the jars are durable, so no row is absent from both tiers even pre-reconcile.
-        let sealed: BTreeSet<Epoch> = db.cold().consensus_blocks().sealed_epochs();
+        let sealed: BTreeSet<Epoch> =
+            db.cold().expect("cold attached").consensus_blocks().sealed_epochs();
         for epoch in 0..cutoff {
             assert!(sealed.contains(&epoch), "epoch {epoch} jar must be durable after commit");
         }
@@ -50,7 +52,7 @@ fn test_reconcile_heals_interrupted_archive() {
     // Phase 2: reopen (boot), rebuilding the cold index from the on-disk `.conf` headers, then run
     // reconciliation and assert the tiers are healed.
     let (db, hot) = open_test_db(&tmp);
-    reconcile(&hot, db.cold()).expect("reconcile");
+    reconcile(&hot, db.cold().expect("cold attached")).expect("reconcile");
     // Flush so any reconcile hot deletes land in the bare MDBX we probe for boundedness.
     hot.sync_persist();
 
@@ -122,7 +124,8 @@ fn reconcile_preserves_epoch_torn_between_jar_commits() {
     {
         let (db, hot) = open_test_db(&tmp);
         seed_hot(&hot, &fixtures);
-        archive_below_epoch(&hot, db.cold(), cutoff, None).expect("archive");
+        archive_below_epoch(&hot, db.cold().expect("cold attached"), cutoff, None)
+            .expect("archive");
 
         // Model the crash between `cold.batches().commit()` and `cold.consensus_blocks().commit()`
         // for `torn_epoch`: the consensus_blocks jar never reached its durable `.conf`, so delete
@@ -155,13 +158,16 @@ fn reconcile_preserves_epoch_torn_between_jar_commits() {
     // The boot scan rebuilt the index from disk: the batches jar survived but the consensus_blocks
     // jar did not, so only the union of both segments still claims the torn epoch as sealed (the
     // trap reconcile must not fall into).
-    assert!(db.cold().batches().is_epoch_sealed(torn_epoch), "batches jar must survive reboot");
     assert!(
-        !db.cold().consensus_blocks().is_epoch_sealed(torn_epoch),
+        db.cold().expect("cold attached").batches().is_epoch_sealed(torn_epoch),
+        "batches jar must survive reboot"
+    );
+    assert!(
+        !db.cold().expect("cold attached").consensus_blocks().is_epoch_sealed(torn_epoch),
         "consensus_blocks jar must be absent after reboot"
     );
 
-    reconcile(&hot, db.cold()).expect("reconcile");
+    reconcile(&hot, db.cold().expect("cold attached")).expect("reconcile");
     hot.sync_persist();
 
     // The torn epoch's rows must still resolve. With the fix they stay hot (reconcile skips the
@@ -222,7 +228,8 @@ fn reconcile_rebuilds_shared_digest_to_correct_row() {
     {
         let (db, hot) = open_test_db(&tmp);
         seed(&hot);
-        archive_below_epoch(&hot, db.cold(), cutoff, None).expect("archive");
+        archive_below_epoch(&hot, db.cold().expect("cold attached"), cutoff, None)
+            .expect("archive");
         hot.with_write_txn(|txn| {
             txn.insert::<Batches>(&shared, &batch_shared)?;
             txn.insert::<Batches>(&other, &batch_other)?;
@@ -240,7 +247,7 @@ fn reconcile_rebuilds_shared_digest_to_correct_row() {
 
     // Phase 2: reopen and reconcile, then both batches must read back through cold.
     let (db, hot) = open_test_db(&tmp);
-    reconcile(&hot, db.cold()).expect("reconcile");
+    reconcile(&hot, db.cold().expect("cold attached")).expect("reconcile");
     hot.sync_persist();
 
     let got_shared = db
@@ -295,9 +302,14 @@ fn reconcile_rebuilds_cross_epoch_shared_digest_from_the_jar() {
         // Archive one epoch at a time, flushing between: epoch 1's seal must observe `shared`
         // already gone from hot, which is what makes it skip the row.
         for cutoff in 1..=2 {
-            crate::cold::producer::seal_next_epoch(&hot, db.cold(), cutoff, usize::MAX)
-                .expect("seal")
-                .expect("one epoch below the cutoff");
+            crate::cold::producer::seal_next_epoch(
+                &hot,
+                db.cold().expect("cold attached"),
+                cutoff,
+                usize::MAX,
+            )
+            .expect("seal")
+            .expect("one epoch below the cutoff");
             hot.sync_persist();
         }
 
@@ -313,7 +325,7 @@ fn reconcile_rebuilds_cross_epoch_shared_digest_from_the_jar() {
     }
 
     let (db, hot) = open_test_db(&tmp);
-    reconcile(&hot, db.cold()).expect("reconcile");
+    reconcile(&hot, db.cold().expect("cold attached")).expect("reconcile");
     hot.sync_persist();
 
     // Against the drift, `shared` is re-pointed at epoch 1 row 0 (which holds `only_later`) and
@@ -357,19 +369,24 @@ fn reconcile_rebuilds_rows_independently_of_the_batches_start_key() {
 
     // Seal epoch 0 by hand so the batches jar is rooted at a non-zero sentinel; the seal path
     // always passes 0, which is exactly what would hide a start-key-based row mapping.
-    db.cold().batches().begin_epoch(0, 500).expect("begin batches");
+    db.cold().expect("cold attached").batches().begin_epoch(0, 500).expect("begin batches");
     for (digest, batch) in digests.iter().zip(&batches) {
-        db.cold().batches().append_row(&[digest.as_slice(), &encode(batch)]).expect("append batch");
+        db.cold()
+            .expect("cold attached")
+            .batches()
+            .append_row(&[digest.as_slice(), &encode(batch)])
+            .expect("append batch");
     }
-    db.cold().batches().commit().expect("commit batches");
-    db.cold().consensus_blocks().begin_epoch(0, 0).expect("begin blocks");
+    db.cold().expect("cold attached").batches().commit().expect("commit batches");
+    db.cold().expect("cold attached").consensus_blocks().begin_epoch(0, 0).expect("begin blocks");
     db.cold()
+        .expect("cold attached")
         .consensus_blocks()
         .append_row(&[&encode(&header_for(0, 0, digests[0]))])
         .expect("append block");
-    db.cold().consensus_blocks().commit().expect("commit blocks");
+    db.cold().expect("cold attached").consensus_blocks().commit().expect("commit blocks");
 
-    reconcile(&hot, db.cold()).expect("reconcile");
+    reconcile(&hot, db.cold().expect("cold attached")).expect("reconcile");
     hot.sync_persist();
 
     for (row, (digest, batch)) in digests.iter().zip(&batches).enumerate() {
@@ -396,19 +413,23 @@ fn reconcile_rejects_a_high_water_mark_the_jars_do_not_cover() {
     {
         let (db, hot) = open_test_db(&tmp);
         seed_hot(&hot, &fixtures);
-        archive_below_epoch(&hot, db.cold(), cutoff, None).expect("archive");
+        archive_below_epoch(&hot, db.cold().expect("cold attached"), cutoff, None)
+            .expect("archive");
         hot.sync_persist();
     }
     std::fs::remove_dir_all(tmp.path().join("cold")).expect("restore without the cold directory");
 
     let (db, hot) = open_test_db(&tmp);
-    assert!(db.cold().consensus_blocks().sealed_epochs().is_empty(), "no jar may survive");
+    assert!(
+        db.cold().expect("cold attached").consensus_blocks().sealed_epochs().is_empty(),
+        "no jar may survive"
+    );
     assert!(
         db.get::<ConsensusBlocks>(&0).expect("read block").is_none(),
         "the archived rows really are absent from both tiers"
     );
 
-    let healed = reconcile(&hot, db.cold());
+    let healed = reconcile(&hot, db.cold().expect("cold attached"));
     assert!(
         matches!(healed, Err(ColdError::Corruption(_))),
         "reconcile must fail closed on a high-water mark no jar covers, got {healed:?}"
@@ -429,7 +450,8 @@ fn reconcile_restores_pruned_but_unindexed_epochs() {
     {
         let (db, hot) = open_test_db(&tmp);
         seed_hot(&hot, &fixtures);
-        archive_below_epoch(&hot, db.cold(), cutoff, None).expect("archive");
+        archive_below_epoch(&hot, db.cold().expect("cold attached"), cutoff, None)
+            .expect("archive");
         // Carve the residue: the index/high-water mark txn rolls back while the (later) prune
         // stays.
         hot.with_write_txn(|txn| {
@@ -444,7 +466,7 @@ fn reconcile_restores_pruned_but_unindexed_epochs() {
     }
 
     let (db, hot) = open_test_db(&tmp);
-    reconcile(&hot, db.cold()).expect("reconcile");
+    reconcile(&hot, db.cold().expect("cold attached")).expect("reconcile");
     hot.sync_persist();
 
     let high_water_mark = db
@@ -479,7 +501,8 @@ fn reconcile_skips_epochs_at_or_below_the_high_water_mark() {
     {
         let (db, hot) = open_test_db(&tmp);
         seed_hot(&hot, &fixtures);
-        archive_below_epoch(&hot, db.cold(), cutoff, None).expect("archive");
+        archive_below_epoch(&hot, db.cold().expect("cold attached"), cutoff, None)
+            .expect("archive");
         // Re-insert only the high-water mark epoch's rows: the index and high-water mark stay
         // committed, so the state is exactly the crash window between the high-water mark
         // txn and the delete.
@@ -495,7 +518,7 @@ fn reconcile_skips_epochs_at_or_below_the_high_water_mark() {
     }
 
     let (db, hot) = open_test_db(&tmp);
-    reconcile(&hot, db.cold()).expect("reconcile");
+    reconcile(&hot, db.cold().expect("cold attached")).expect("reconcile");
     hot.sync_persist();
 
     let mdbx = hot.inner();
@@ -535,9 +558,14 @@ fn finalize_never_gaps_reads_through_fall_through() {
         (0..200).map(|n| (n, vec![BlockHash::from(digest_seed(n, 0))])).collect();
     let batches: Vec<(BlockHash, u64)> = blocks.iter().map(|(n, d)| (d[0], *n)).collect();
     seed_chunk_blocks(&hot, &blocks, &batches);
-    let outcome =
-        crate::cold::producer::seal_next_epoch_jars(&hot, db.cold(), 1, usize::MAX, &|| false)
-            .expect("seal jars");
+    let outcome = crate::cold::producer::seal_next_epoch_jars(
+        &hot,
+        db.cold().expect("cold attached"),
+        1,
+        usize::MAX,
+        &|| false,
+    )
+    .expect("seal jars");
     assert!(matches!(outcome, crate::cold::producer::JarSeal::Sealed { .. }), "epoch must seal");
 
     // Reader thread: every row must resolve through mem -> hot -> cold at every instant.
@@ -562,7 +590,7 @@ fn finalize_never_gaps_reads_through_fall_through() {
         })
     };
 
-    reconcile(&hot, db.cold()).expect("finalize");
+    reconcile(&hot, db.cold().expect("cold attached")).expect("finalize");
     stop.store(true, std::sync::atomic::Ordering::Relaxed);
     let gaps = reader.join().expect("reader thread");
     assert_eq!(gaps, 0, "finalize must never let an archived row vanish from both tiers");
@@ -599,11 +627,11 @@ fn paced_prune_cancelled_after_seal_heals_on_reconcile() {
     .expect("seed markers");
     hot.sync_persist();
 
-    let archiver = ColdArchiver::new(hot.clone(), db.cold().clone());
+    let archiver = ColdArchiver::new(hot.clone(), db.cold().expect("cold attached").clone());
     // Cancel the instant epoch 0's jar is committed: the seal completes and the high-water mark
     // commits, but the prune is skipped at its first batch - the partial-archive state a
     // shutdown leaves.
-    let cold = db.cold().clone();
+    let cold = db.cold().expect("cold attached").clone();
     let cancel_once_sealed = move || cold.consensus_blocks().sealed_epochs().contains(&0);
     assert_eq!(
         archiver.seal_due(Epoch::MAX, cancel_once_sealed).expect("archive"),
@@ -664,7 +692,11 @@ fn reconcile_sweeps_partially_paced_pruned_epoch() {
 
     // Seal + index, then cancel the paced prune right before its SECOND block chunk: the digests
     // and blocks 0..=4095 are deleted and committed, block 4096 (the epoch's last) stays hot.
-    let seal = seal_next_epoch_jars(&hot, db.cold(), 1, SEAL_CHUNK_BYTES, &|| false).expect("seal");
+    let seal =
+        seal_next_epoch_jars(&hot, db.cold().expect("cold attached"), 1, SEAL_CHUNK_BYTES, &|| {
+            false
+        })
+        .expect("seal");
     let JarSeal::Sealed(sealed) = seal else { panic!("epoch 0 must seal") };
     let polls = AtomicUsize::new(0);
     let finalized = finalize_sealed(
@@ -690,7 +722,7 @@ fn reconcile_sweeps_partially_paced_pruned_epoch() {
     assert_eq!(count_hot_rows::<ConsensusBlocks, _>(hot.inner(), |n| *n == BLOCKS - 1), 1);
 
     // Reconcile must sweep the leftover tail; probing only the first block would skip it.
-    reconcile(&hot, db.cold()).expect("heal");
+    reconcile(&hot, db.cold().expect("cold attached")).expect("heal");
     hot.sync_persist();
     assert_eq!(
         count_hot_rows::<ConsensusBlocks, _>(hot.inner(), |n| *n < BLOCKS),
