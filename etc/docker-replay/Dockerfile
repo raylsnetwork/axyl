@@ -39,8 +39,9 @@ COPY crates/ ./crates/
 COPY chain-configs/ ./chain-configs/
 COPY rayls-contracts/ ./rayls-contracts/
 
+# Must never expand to the empty string -- see etc/docker-network/Dockerfile.
 ARG VERGEN_GIT_SHA
-ENV VERGEN_GIT_SHA=${VERGEN_GIT_SHA}
+ENV VERGEN_GIT_SHA=${VERGEN_GIT_SHA:-0000000000000000000000000000000000000000}
 
 # build the replay binary; the archive-replay feature is selected by
 # bin/rayls-replay/Cargo.toml, so no extra --features flag is required

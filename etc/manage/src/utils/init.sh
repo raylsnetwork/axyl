@@ -15,6 +15,13 @@ DOCKER_TAG_RAYLS_NODE_CLIENT="$DOCKER_RAYLS_STACK-node-client"
 
 USE_DOCKER_FOR_HOST_NODES="0"
 
+# Commit the client image is built from. The builder image has no git and the
+# source tarball carries no .git directory, so the sha has to be passed in as a
+# docker build arg to end up in `rayls version`.
+RAYLS_GIT_SHA=""
+
 function init() {
     mkdir -p "$DIST_DIR"
+
+    RAYLS_GIT_SHA=$(git -C "$SCRIPT_DIR/../.." rev-parse HEAD 2>/dev/null)
 }

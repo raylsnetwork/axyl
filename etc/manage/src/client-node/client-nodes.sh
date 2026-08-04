@@ -27,10 +27,17 @@ function makeClientNodeByComputerIndex() {
 
     if [ -z "$imageId" ]; then
         local sourceTar="/usr/src/rayls-network/source.tar.gz"
+        local dockerBuildArgGitSha=""
+        if [[ "$RAYLS_GIT_SHA" != "" ]]; then
+            dockerBuildArgGitSha="--build-arg VERGEN_GIT_SHA=$RAYLS_GIT_SHA"
+        fi
 
         _=$(executeOnNodeClient $computerIndex "cd /usr/src/rayls-network && sudo tar -xzf $sourceTar && rm -rf $sourceTar")
-        _=$(executeOnNodeClient $computerIndex "cd /usr/src/rayls-network && sudo docker build $dockerBuildArgNoCache -t "$DOCKER_TAG_RAYLS_NODE_CLIENT" --file "./etc/docker-network/Dockerfile" ./ 2>&1")
+
+        local buildResult
+        buildResult=$(executeOnNodeClient $computerIndex "cd /usr/src/rayls-network && sudo docker build $dockerBuildArgNoCache $dockerBuildArgGitSha -t "$DOCKER_TAG_RAYLS_NODE_CLIENT" --file "./etc/docker-network/Dockerfile" ./ 2>&1")
         if [ "$?" != 0 ]; then
+            echo "$buildResult" > "$DIST_DIR/build-$computerIndex.log"
             exit 2
         fi
     fi
@@ -110,7 +117,7 @@ function makeClientNodes() {
                 echo -e "${STYLE_RED}Error:${STYLE_DEFAULT} Unable to check for available docker image at computer[$i]";
                 exit 1;
             elif [[ "$exitCode" == 2 ]]; then
-                echo -e "${STYLE_RED}Error:${STYLE_DEFAULT} Unable to build client docker on computer[$i]";
+                echo -e "${STYLE_RED}Error:${STYLE_DEFAULT} Unable to build client docker on computer[$i]. Build output: $DIST_DIR/build-$i.log";
                 exit 1;
             elif [[ "$exitCode" == 3 ]]; then
                 echo -e "${STYLE_RED}Error:${STYLE_DEFAULT} Unable to start client on computer[$i]";

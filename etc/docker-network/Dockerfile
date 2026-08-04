@@ -20,8 +20,13 @@ COPY crates/ ./crates/
 COPY chain-configs/ ./chain-configs/
 COPY rayls-contracts/ ./rayls-contracts/
 
+# The builder image has no `git` and no `.git` directory, so vergen cannot derive
+# the commit itself and reads this variable instead. Never let it expand to the
+# empty string: reth's own build script reads the same variable and slices the
+# first 7 bytes off it, panicking on "". Fall back to an all-zero sha so a build
+# without --build-arg still works (with an obviously-unstamped version).
 ARG VERGEN_GIT_SHA
-ENV VERGEN_GIT_SHA=${VERGEN_GIT_SHA}
+ENV VERGEN_GIT_SHA=${VERGEN_GIT_SHA:-0000000000000000000000000000000000000000}
 
 # Optional cargo features compiled into the binary, e.g. `dev-single-node-setup` for single-validator local
 # `node --dev` chains. Empty (default) -> a production build with no extra features.
