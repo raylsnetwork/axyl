@@ -6,6 +6,7 @@ use crate::{
     traits::RaylsNode,
     RaylsChainSpec,
 };
+use rayls_infrastructure_config::Parameters;
 use rayls_infrastructure_types::{
     Address, BuildMetadata, RaylsNetwork, TaskManager, TaskSpawner, B256,
 };
@@ -44,6 +45,36 @@ impl RethEnv {
         let db_path = db_path.as_ref();
         info!(target: "rayls::reth", path = ?db_path, "opening database");
         Ok(Arc::new(init_db(db_path, reth_config.0.db.database_args())?))
+    }
+
+    /// Produce a new wrapped Reth environment with the network-specific settings (basefee
+    /// address, hardforks, minimum base fee) derived from the node's [`Parameters`].
+    ///
+    /// The single production construction point: node boot and the offline cold migration both
+    /// route through it, so both open the EL with identical wiring (consistency check and unwind
+    /// included). A hand-copied open could silently drift and floor cold archival differently
+    /// than boot.
+    pub async fn new_from_parameters(
+        reth_config: &RethConfig,
+        parameters: &Parameters,
+        task_manager: &TaskManager,
+        database: RethDb,
+        rewards_counter: RewardsCounter,
+        build_metadata: &BuildMetadata,
+        allow_v1: bool,
+    ) -> eyre::Result<Self> {
+        Self::new(
+            reth_config,
+            task_manager,
+            database,
+            parameters.basefee_address,
+            rewards_counter,
+            build_metadata,
+            Some(parameters.network),
+            Some(parameters.min_base_fee),
+            allow_v1,
+        )
+        .await
     }
 
     /// Produce a new wrapped Reth environment from a config, DB path and task manager.

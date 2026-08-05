@@ -220,6 +220,11 @@ impl ColdArchiveMetrics {
         static METRICS: OnceLock<ColdArchiveMetrics> = OnceLock::new();
         METRICS.get_or_init(|| {
             Self::try_new(default_registry()).unwrap_or_else(|_| {
+                warn!(
+                    target: "epoch-manager",
+                    "cold archive metrics already registered; falling back to a private registry \
+                     that no endpoint scrapes"
+                );
                 Self::try_new(&Registry::new()).expect("cold archive metrics on a fresh registry")
             })
         })
@@ -542,12 +547,17 @@ mod tests {
         // exactly `pid\nstart_time`, and liveness matches both.
         let own = std::process::id();
         let system = sysinfo::System::new_all();
-        let (pid, start_time) = system
+        // Minimal container environments can hide every other process from sysinfo; the test's
+        // premise is gone, so skip rather than abort.
+        let Some((pid, start_time)) = system
             .processes()
             .iter()
             .find(|(pid, _)| pid.as_u32() != own)
             .map(|(pid, process)| (pid.as_u32(), process.start_time()))
-            .expect("another live process exists");
+        else {
+            eprintln!("skipping: no other live process visible");
+            return;
+        };
         std::fs::write(tmp.path().join("lock"), format!("{pid}\n{start_time}")).unwrap();
         assert!(
             acquire_consensus_db_lock(tmp.path()).is_err(),

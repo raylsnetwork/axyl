@@ -122,17 +122,19 @@ where
 
         archival.reconcile_at_boot().await?;
 
-        // Open the EL through the same helper node boot uses (consistency check and unwind
+        // Open the EL through the same constructor node boot uses (consistency check and unwind
         // included), so the anchor floor below can never exceed what a real boot would compute.
         // The task manager only hosts reth's idle background tasks (no block is ever executed
         // here); dropping the runtime on return reaps them.
         let task_manager = TaskManager::new("Cold Migration Task Manager");
         let reth_db = RethEnv::new_database(&builder.node_config, rayls_datadir.reth_db_path())?;
-        let reth_env = epoch_manager::open_boot_reth_env(
-            &builder,
+        let reth_env = RethEnv::new_from_parameters(
+            &builder.node_config,
+            &builder.rayls_infrastructure_config.parameters,
             &task_manager,
             reth_db,
             rayls_middleware_rewards::from_db(consensus_db.clone()),
+            &builder.build_metadata,
             false,
         )
         .await?;

@@ -514,7 +514,6 @@ pub(super) fn delete_archived_rows<DB: Database>(
 ) -> ColdResult<Option<u64>> {
     let count = numbers.end() - numbers.start() + 1;
     let digests: Vec<BlockHash> = locations.iter().map(|(digest, _)| *digest).collect();
-    let block_numbers: Vec<u64> = numbers.collect();
     // The between-chunk drain and yield hand the shared hot writer back to live consensus; with
     // zero yield (boot, migration, reconcile) nothing shares the writer, and every `sync_persist`
     // would cost its full polling quantum per chunk for nothing. Deletes queued at a crash just
@@ -532,13 +531,22 @@ pub(super) fn delete_archived_rows<DB: Database>(
         db.with_write_txn(|txn| txn.evict_persistent_batch::<Batches>(chunk)).map_err(to_cold)?;
         pace(db);
     }
-    for chunk in block_numbers.chunks(WRITE_BATCH_ROWS) {
+    // Chunk the dense range directly instead of materializing every block number up front; only
+    // one chunk's numbers are ever held at a time.
+    let mut chunk_start = *numbers.start();
+    loop {
         if should_cancel() {
             return Ok(None);
         }
-        db.with_write_txn(|txn| txn.evict_persistent_batch::<ConsensusBlocks>(chunk))
+        let chunk_end = chunk_start.saturating_add(WRITE_BATCH_ROWS as u64 - 1).min(*numbers.end());
+        let chunk: Vec<u64> = (chunk_start..=chunk_end).collect();
+        db.with_write_txn(|txn| txn.evict_persistent_batch::<ConsensusBlocks>(&chunk))
             .map_err(to_cold)?;
         pace(db);
+        match chunk_end.checked_add(1) {
+            Some(next) if next <= *numbers.end() => chunk_start = next,
+            _ => break,
+        }
     }
     Ok(Some(count))
 }

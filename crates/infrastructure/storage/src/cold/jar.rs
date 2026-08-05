@@ -4,7 +4,7 @@
 //! `.conf` headers. consensus_blocks is addressed arithmetically by block number minus the jar
 //! start key; batches is addressed by a [`ColdLocation`] resolved from the hot auxiliary index.
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     fs,
     num::NonZeroUsize,
     ops::RangeInclusive,
@@ -88,6 +88,35 @@ impl LoadedJar {
     }
 }
 
+/// The in-memory index of a segment's sealed jars, addressable by primary key and by epoch.
+///
+/// `by_key` orders jars by their primary key (end key for consensus_blocks, epoch for batches)
+/// for range-addressed reads; `by_epoch` maps every epoch to that key so epoch-addressed lookups
+/// (seal idempotence, reconcile) stay O(log n) on either keying.
+#[derive(Debug, Default)]
+struct SegmentIndex {
+    by_key: JarIndex,
+    by_epoch: BTreeMap<Epoch, u64>,
+}
+
+impl SegmentIndex {
+    /// Inserts a sealed jar under `key`, evicting any prior entry for the same epoch so a
+    /// re-sealed epoch with a different end key cannot leave a stale duplicate behind.
+    fn insert(&mut self, key: u64, jar: SealedJar) {
+        if let Some(old_key) = self.by_epoch.insert(jar.epoch, key) {
+            if old_key != key {
+                self.by_key.remove(&old_key);
+            }
+        }
+        self.by_key.insert(key, jar);
+    }
+
+    /// Returns the sealed jar for `epoch`, if any.
+    fn jar_for_epoch(&self, epoch: Epoch) -> Option<&SealedJar> {
+        self.by_epoch.get(&epoch).and_then(|key| self.by_key.get(key))
+    }
+}
+
 /// One nippy-jar-backed cold segment: a kind, its directory, and an in-memory jar index.
 ///
 /// Owns the single writer for its kind. The index is rebuilt from the on-disk jars at
@@ -98,8 +127,8 @@ pub struct ColdSegment {
     kind: ColdSegmentKind,
     /// Directory holding this segment's jars and satellite files.
     dir: PathBuf,
-    /// End-key -> sealed-jar index, rebuilt at boot from the on-disk jars.
-    index: RwLock<JarIndex>,
+    /// Sealed-jar index, rebuilt at boot from the on-disk jars.
+    index: RwLock<SegmentIndex>,
     /// Writer for the epoch currently being sealed, if any.
     open: Mutex<Option<OpenJar>>,
     /// Bounded LRU of open jars, so read bursts on the same epoch reuse one mmap.
@@ -130,8 +159,8 @@ impl ColdSegment {
     }
 
     /// Rebuilds the in-memory index by loading every sealed jar `.conf` under `dir`.
-    fn rebuild_index(dir: &Path, kind: ColdSegmentKind) -> ColdResult<JarIndex> {
-        let mut index = JarIndex::new();
+    fn rebuild_index(dir: &Path, kind: ColdSegmentKind) -> ColdResult<SegmentIndex> {
+        let mut index = SegmentIndex::default();
         for entry in fs::read_dir(dir)? {
             let path = entry?.path();
             // The `.conf` is the durable commit boundary; a jar without one was never sealed and is
@@ -166,18 +195,10 @@ impl ColdSegment {
     }
 
     /// Returns true if the given epoch already has a sealed jar in the index (idempotent re-run).
+    ///
+    /// On the served-batch read path (`read_batch_checked`), so it must not scan every jar.
     pub fn is_epoch_sealed(&self, epoch: Epoch) -> bool {
-        match self.kind {
-            // Batches jars are epoch-keyed, so presence is an O(log n) lookup. This is on the
-            // served-batch read path (`read_batch_checked`), so it must not scan every jar.
-            ColdSegmentKind::Batches => {
-                self.index.read().contains_key(&Self::index_key_for_epoch(epoch))
-            }
-            // Consensus-blocks jars are end-key-keyed, so presence requires a scan by epoch.
-            ColdSegmentKind::ConsensusBlocks => {
-                self.index.read().values().any(|h| h.epoch == epoch)
-            }
-        }
+        self.index.read().jar_for_epoch(epoch).is_some()
     }
 
     /// Opens a fresh jar for `epoch` rooted at `start_key`, making it the active append target.
@@ -292,7 +313,7 @@ impl ColdSegment {
         epoch: Epoch,
         mut visit: impl FnMut(u64, &[u8]) -> ColdResult<()>,
     ) -> ColdResult<()> {
-        let Some(jar) = self.index.read().values().find(|j| j.epoch == epoch).cloned() else {
+        let Some(jar) = self.index.read().jar_for_epoch(epoch).cloned() else {
             return Ok(());
         };
         let loaded = self.load_jar(epoch)?;
@@ -311,19 +332,19 @@ impl ColdSegment {
 
     /// Returns the set of epochs that have a sealed jar in this segment.
     pub fn sealed_epochs(&self) -> BTreeSet<Epoch> {
-        self.index.read().values().map(|h| h.epoch).collect()
+        self.index.read().by_epoch.keys().copied().collect()
     }
 
     /// Returns the newest sealed jar's index entry, or `None` if the segment has no jar (the
     /// index is keyed by end key and epochs are monotonic, so the last entry is the newest).
     pub fn last_sealed(&self) -> Option<SealedJar> {
-        self.index.read().values().next_back().cloned()
+        self.index.read().by_key.values().next_back().cloned()
     }
 
     /// Returns the dense `[start_key, end_key]` range archived for `epoch`, or `None` if it has
     /// no jar; reads the in-memory index only.
     pub fn key_range_for_epoch(&self, epoch: Epoch) -> Option<RangeInclusive<u64>> {
-        self.index.read().values().find(|j| j.epoch == epoch).map(|j| j.start_key..=j.end_key())
+        self.index.read().jar_for_epoch(epoch).map(|j| j.start_key..=j.end_key())
     }
 
     /// Returns the dense `[first, last]` key range the sealed jars cover as one span, or `None`
@@ -331,8 +352,8 @@ impl ColdSegment {
     /// span has no interior gaps).
     pub fn key_span(&self) -> Option<RangeInclusive<u64>> {
         let index = self.index.read();
-        let first = index.values().next()?.start_key;
-        let last = index.values().next_back()?.end_key();
+        let first = index.by_key.values().next()?.start_key;
+        let last = index.by_key.values().next_back()?.end_key();
         Some(first..=last)
     }
 
@@ -340,6 +361,7 @@ impl ColdSegment {
     fn covering_jar(&self, number: u64) -> Option<SealedJar> {
         self.index
             .read()
+            .by_key
             .range(number..)
             .next()
             .map(|(_, j)| j.clone())
