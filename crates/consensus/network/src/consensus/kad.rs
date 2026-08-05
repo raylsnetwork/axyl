@@ -115,12 +115,16 @@ where
                         } else {
                             trace!(target: "network-kad", "Received invalid peer record!");
 
-                            // assess penalty for invalid peer record
+                            // assess penalty against the record's author, not the responder that
+                            // relayed it (see `kad_record_fault_penalty`)
                             if let Some(peer_id) = peer {
-                                self.swarm
-                                    .behaviour_mut()
-                                    .peer_manager
-                                    .process_penalty(peer_id, Penalty::Fatal);
+                                self.apply_invalid_kad_request_penalty(
+                                    &peer_id,
+                                    record.publisher,
+                                    &RecordInvalidReason::InvalidPeerRecord(
+                                        "get record failed validation".to_string(),
+                                    ),
+                                );
                             }
 
                             // ensure query cleaned up
@@ -233,6 +237,7 @@ where
             error!(target: "network-kad", ?source, "failed to decode record value - rejecting put request");
             self.apply_invalid_kad_request_penalty(
                 &source,
+                record.publisher,
                 &RecordInvalidReason::InvalidPeerRecord("decoding failed".to_string()),
             );
             return;
@@ -240,7 +245,11 @@ where
 
         let Ok(key) = BlsPublicKey::from_literal_bytes(record.key.as_ref()) else {
             error!(target: "network-kad", ?source, "invalid record key format - rejecting put request");
-            self.apply_invalid_kad_request_penalty(&source, &RecordInvalidReason::InvalidKeyFormat);
+            self.apply_invalid_kad_request_penalty(
+                &source,
+                record.publisher,
+                &RecordInvalidReason::InvalidKeyFormat,
+            );
             return;
         };
 
@@ -257,7 +266,7 @@ where
                 // handle race condition with PM
                 self.swarm.behaviour_mut().kademlia.remove_record(&record.key);
             }
-            self.apply_invalid_kad_request_penalty(&source, &reason);
+            self.apply_invalid_kad_request_penalty(&source, record.publisher, &reason);
             error!(target: "network-kad", ?source, ?reason, "failed to process kad put request");
             return;
         }
@@ -282,22 +291,19 @@ where
     }
 
     /// Process on inbound add provider request.
+    ///
+    /// Discovery here runs on `get_record` against the BLS key; `get_providers` is never called, so
+    /// a stored provider record is never read. Persisting one only grows a never-queried table that
+    /// takes unsigned writes from any non-banned peer, so foreign provider records are dropped.
+    /// Sending an ADD_PROVIDER is ordinary libp2p traffic, not misbehavior, so the sender is not
+    /// penalized.
     fn process_add_provider_request(&mut self, record: Option<ProviderRecord>) {
         if let Some(record) = record {
-            let peer_id = record.provider;
-
-            if self.swarm.behaviour().peer_manager.peer_banned(&peer_id) {
-                warn!(target: "network-kad", ?peer_id, "rejecting add provider from banned peer");
-                self.apply_invalid_kad_request_penalty(
-                    &peer_id,
-                    &RecordInvalidReason::SourceBanned,
-                );
-                return;
-            }
-
-            if let Err(err) = self.swarm.behaviour_mut().kademlia.store_mut().add_provider(record) {
-                self.handle_kad_store_error(&peer_id, err);
-            }
+            trace!(
+                target: "network-kad",
+                provider = ?record.provider,
+                "dropping unused inbound provider record"
+            );
         }
     }
 
@@ -327,56 +333,43 @@ where
             .map_err(RecordInvalidReason::InvalidPeerRecord)
     }
 
-    /// Handle a store error from `add_provider()` or `put()`.
+    /// Handle a store error from `put()`.
     ///
-    /// Map the store error to a penalty reason and penalize the source peer.
+    /// A full store or oversize value is this node's local condition, not the deliverer's fault;
+    /// the penalty here is provisional, pending a separate local-vs-remote cause split.
     fn handle_kad_store_error(&mut self, peer_id: &PeerId, err: Error) {
-        let reason = match err {
-            Error::MaxRecords => {
-                warn!(target: "network-kad", ?peer_id, "kad store at record capacity");
-                RecordInvalidReason::MaxRecordSizeExceeded
-            }
-            Error::MaxProvidedKeys => {
-                warn!(target: "network-kad", ?peer_id, "kad store at provider key capacity");
-                RecordInvalidReason::MaxProvidedKeysExceeded
-            }
-            Error::ValueTooLarge => {
-                warn!(target: "network-kad", ?peer_id, "kad record value too large");
-                RecordInvalidReason::InvalidPeerRecord("value too large".to_string())
-            }
+        let (reason, penalty) = match err {
+            Error::MaxRecords => (RecordInvalidReason::MaxRecordSizeExceeded, Penalty::Mild),
+            Error::MaxProvidedKeys => (RecordInvalidReason::MaxProvidedKeysExceeded, Penalty::Mild),
+            Error::ValueTooLarge => (
+                RecordInvalidReason::InvalidPeerRecord("value too large".to_string()),
+                Penalty::Fatal,
+            ),
         };
-        self.apply_invalid_kad_request_penalty(peer_id, &reason);
+        warn!(target: "network-kad", ?peer_id, ?reason, "kad store rejected record");
+        self.swarm.behaviour_mut().peer_manager.process_penalty(*peer_id, penalty);
     }
 
+    /// Apply the penalty owed for an invalid KAD record delivered by `deliverer`.
+    ///
+    /// The record's fault may belong to its `publisher` rather than the deliverer; the decision is
+    /// made by [`kad_record_fault_penalty`], and no penalty is applied when the deliverer is only
+    /// an honest relayer of someone else's bad record.
     fn apply_invalid_kad_request_penalty(
         &mut self,
-        peer_id: &PeerId,
+        deliverer: &PeerId,
+        publisher: Option<PeerId>,
         reason: &RecordInvalidReason,
     ) {
-        match reason {
-            RecordInvalidReason::MissingPublisher
-            | RecordInvalidReason::PublisherBanned
-            | RecordInvalidReason::SourceBanned
-            | RecordInvalidReason::InvalidKeyFormat
-            | RecordInvalidReason::InvalidPeerRecord(_) => {
-                self.process_fatal_penalty(peer_id, reason);
+        match kad_record_fault_penalty(deliverer, publisher, reason) {
+            Some(penalty) => {
+                trace!(target: "network-kad", ?deliverer, ?reason, ?penalty, "penalizing invalid kad record");
+                self.swarm.behaviour_mut().peer_manager.process_penalty(*deliverer, penalty);
             }
-            RecordInvalidReason::TimestampTooFarInFuture
-            | RecordInvalidReason::MaxRecordSizeExceeded
-            | RecordInvalidReason::MaxProvidedKeysExceeded => {
-                self.process_mild_penalty(peer_id, reason);
+            None => {
+                trace!(target: "network-kad", ?deliverer, ?publisher, ?reason, "no penalty: kad record fault belongs to its author, not the deliverer");
             }
         }
-    }
-
-    fn process_mild_penalty(&mut self, peer_id: &PeerId, reason: &RecordInvalidReason) {
-        trace!(target: "network-kad", ?peer_id, "processing mild penalty for {:?}", reason);
-        self.swarm.behaviour_mut().peer_manager.process_penalty(*peer_id, Penalty::Mild);
-    }
-
-    fn process_fatal_penalty(&mut self, peer_id: &PeerId, reason: &RecordInvalidReason) {
-        trace!(target: "network-kad", ?peer_id, "processing fatal penalty for {:?}", reason);
-        self.swarm.behaviour_mut().peer_manager.process_penalty(*peer_id, Penalty::Fatal);
     }
 
     /// Check the local kad store to compare record timestamps.
@@ -443,9 +436,15 @@ where
             // record signature invalid
             warn!(target: "network-kad", "Received invalid peer record!");
 
-            // assess penalty for invalid peer record
+            // assess penalty against the record's author, not the responder that relayed it
             if let Some(peer_id) = peer {
-                self.swarm.behaviour_mut().peer_manager.process_penalty(peer_id, Penalty::Fatal);
+                self.apply_invalid_kad_request_penalty(
+                    &peer_id,
+                    record.publisher,
+                    &RecordInvalidReason::InvalidPeerRecord(
+                        "query record failed validation".to_string(),
+                    ),
+                );
             }
         }
 
@@ -567,5 +566,130 @@ where
         if let Err(err) = self.swarm.behaviour_mut().kademlia.put_record(record, kad::Quorum::One) {
             error!(target: "network-kad", "Failed to publish record: {err}");
         }
+    }
+}
+
+/// Classifies a KAD record fault into the penalty owed the delivering peer.
+///
+/// A record travels the DHT by replication, so its deliverer is not necessarily its author. A
+/// content-integrity fault (undecodable value, malformed key, absent publisher) could never pass
+/// an honest peer's validation, so no honest peer relays it: the deliverer is the origin and its
+/// `publisher` is unauthenticated (bound only once the signature verifies), so it cannot excuse
+/// the deliverer, which always pays. An author-attributed fault on a well-formed record (banned
+/// publisher, future timestamp) can be carried by an honest relayer, so charge only the named
+/// author, else one banned author becomes a ban cascade. `SourceBanned` names the deliverer
+/// itself; store-capacity faults go through `handle_kad_store_error` and never reach here.
+fn kad_record_fault_penalty(
+    deliverer: &PeerId,
+    publisher: Option<PeerId>,
+    reason: &RecordInvalidReason,
+) -> Option<Penalty> {
+    let authored_by_deliverer = publisher == Some(*deliverer);
+    match reason {
+        // Content-integrity fault: never legitimately relayed, and `publisher` is unauthenticated,
+        // so the deliverer is the origin and always pays regardless of the publisher field.
+        RecordInvalidReason::InvalidPeerRecord(_)
+        | RecordInvalidReason::InvalidKeyFormat
+        | RecordInvalidReason::MissingPublisher => Some(Penalty::Fatal),
+        // Author-attributed fault on a well-formed record: an honest relayer forwarding someone
+        // else's record earns nothing; only the named author pays.
+        RecordInvalidReason::PublisherBanned => authored_by_deliverer.then_some(Penalty::Fatal),
+        RecordInvalidReason::TimestampTooFarInFuture => {
+            authored_by_deliverer.then_some(Penalty::Mild)
+        }
+        // The source itself is banned - the deliverer is the offender, independent of authorship.
+        RecordInvalidReason::SourceBanned => Some(Penalty::Fatal),
+        // Local store capacity, not the peer's fault. Kept for exhaustiveness; the store path
+        // penalizes directly (Class B) and does not reach here.
+        RecordInvalidReason::MaxRecordSizeExceeded
+        | RecordInvalidReason::MaxProvidedKeysExceeded => Some(Penalty::Mild),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // INVARIANT: penalty attribution splits by fault class. A content-integrity fault (undecodable
+    // value, malformed key, absent publisher) is never legitimately relayed and carries an
+    // unauthenticated publisher, so the deliverer always pays. An author-attributed fault on a
+    // well-formed record (banned publisher, future timestamp) can be honestly relayed, so only the
+    // named author pays.
+
+    /// A content-integrity fault always charges the deliverer, no matter what the (unauthenticated)
+    /// publisher field says. Guards the regression where an attacker escaped by setting
+    /// `publisher = None` or a stranger's id on a record that no honest peer would ever relay.
+    #[test]
+    fn content_integrity_fault_always_penalizes_deliverer() {
+        let deliverer = PeerId::random();
+        let stranger = PeerId::random();
+        for reason in [
+            RecordInvalidReason::InvalidPeerRecord("decoding failed".to_string()),
+            RecordInvalidReason::InvalidPeerRecord("bad signature".to_string()),
+            RecordInvalidReason::InvalidKeyFormat,
+            RecordInvalidReason::MissingPublisher,
+        ] {
+            for publisher in [None, Some(stranger), Some(deliverer)] {
+                assert!(
+                    matches!(
+                        kad_record_fault_penalty(&deliverer, publisher, &reason),
+                        Some(Penalty::Fatal)
+                    ),
+                    "content-integrity fault must charge the deliverer Fatal for \
+                     publisher={publisher:?}, reason={reason:?}"
+                );
+            }
+        }
+    }
+
+    /// An honest relayer forwarding another author's banned or future-dated record must not move
+    /// toward a ban: the author is named and authenticated, and the deliverer is a relayer.
+    #[test]
+    fn honest_relayer_of_author_faulted_record_is_not_penalized() {
+        let deliverer = PeerId::random();
+        let author = PeerId::random();
+        for reason in
+            [RecordInvalidReason::PublisherBanned, RecordInvalidReason::TimestampTooFarInFuture]
+        {
+            assert!(
+                kad_record_fault_penalty(&deliverer, Some(author), &reason).is_none(),
+                "relayer must not be penalized for author fault: {reason:?}"
+            );
+        }
+    }
+
+    /// The named author of a banned-publisher or future-timestamp record still pays, at the
+    /// severity the fault carried before the authorship split.
+    #[test]
+    fn author_pays_for_its_own_attributed_fault() {
+        let author = PeerId::random();
+        assert!(matches!(
+            kad_record_fault_penalty(&author, Some(author), &RecordInvalidReason::PublisherBanned),
+            Some(Penalty::Fatal)
+        ));
+        assert!(matches!(
+            kad_record_fault_penalty(
+                &author,
+                Some(author),
+                &RecordInvalidReason::TimestampTooFarInFuture
+            ),
+            Some(Penalty::Mild)
+        ));
+    }
+
+    /// `SourceBanned` names the deliverer itself as the offender, so it applies regardless of who
+    /// authored the record (or whether a publisher is set at all).
+    #[test]
+    fn source_banned_always_penalizes_the_deliverer() {
+        let source = PeerId::random();
+        let publisher = PeerId::random();
+        assert!(matches!(
+            kad_record_fault_penalty(&source, Some(publisher), &RecordInvalidReason::SourceBanned),
+            Some(Penalty::Fatal)
+        ));
+        assert!(matches!(
+            kad_record_fault_penalty(&source, None, &RecordInvalidReason::SourceBanned),
+            Some(Penalty::Fatal)
+        ));
     }
 }

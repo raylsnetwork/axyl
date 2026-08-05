@@ -889,6 +889,22 @@ impl AllPeers {
 
     /// Prune excess number of disconnected peers to prevent exhausting memory.
     fn prune_disconnected_peers(&mut self) {
+        // `disconnected_peers` is hand-maintained across every status transition, unlike
+        // `banned_peers.total()` which derives from a length. Reconcile it against the real
+        // Disconnected count here (the one hot path this cap gates on) so a future transition arm
+        // that forgets to adjust it fails a test instead of silently defeating the cap in prod.
+        debug_assert_eq!(
+            self.disconnected_peers,
+            self.peers
+                .values()
+                .filter(|peer| matches!(
+                    peer.connection_status(),
+                    ConnectionStatus::Disconnected { .. }
+                ))
+                .count(),
+            "disconnected_peers counter drifted from actual Disconnected-status count"
+        );
+
         let excess = self.disconnected_peers.saturating_sub(self.max_disconnected_peers);
 
         if excess > 0 {

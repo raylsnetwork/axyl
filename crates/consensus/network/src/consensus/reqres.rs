@@ -106,6 +106,10 @@ where
                 // this node disconnects after a px timeout
                 if self.pending_px_disconnects.remove(&request_id).is_some() {
                     debug!(target: "network", "outbound failure expected because of px disconnect");
+                    // a px request is tracked in outbound_requests too; the common cleanup below is
+                    // skipped by this early return, so drop the ack here. Dropping the sender also
+                    // resolves the px task's wait immediately instead of holding it to the timeout.
+                    self.outbound_requests.remove(&(peer, request_id));
                     return Ok(());
                 }
 
