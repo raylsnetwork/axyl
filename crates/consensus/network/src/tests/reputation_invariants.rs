@@ -654,3 +654,40 @@ fn the_heartbeat_acts_on_a_disconnect_verdict() {
         "heartbeat reached a disconnect verdict but returned no action: {actions:?}"
     );
 }
+
+// Provenance: what an IP charge is allowed to be derived from
+
+/// The IP ban table is a Sybil defense keyed on where a peer actually connected from. Charging it
+/// with addresses a peer merely claims lets that peer blocklist an address it does not control.
+#[test]
+fn only_observed_addresses_charge_the_ip_ban_table() {
+    let mut peers = all_peers();
+    let victim = ip(50);
+
+    // two throwaway identities, each connecting from its own address and then advertising the
+    // victim's address as one of its own in a peer record
+    for seed in 0..2u8 {
+        let (bls, network_key) = random_keys(seed);
+        let peer_id: PeerId = network_key.clone().into();
+        peers.update_connection_status(
+            &peer_id,
+            NewConnectionStatus::Connected {
+                multiaddr: create_multiaddr(Some(ip(51 + seed))),
+                direction: ConnectionDirection::Incoming,
+            },
+        );
+        peers.upsert_peer(bls, network_key, vec![create_multiaddr(Some(victim))]);
+
+        // each identity earns its own ban
+        peers.process_penalty(&peer_id, Penalty::Fatal);
+        peers.update_connection_status(&peer_id, NewConnectionStatus::Disconnected);
+    }
+
+    // INVARIANT: only the address this node observed the connection on is charged.
+    // CURRENT: `Peer::known_ip_addresses` reads `multiaddrs`, which `update_net` extends from the
+    // peer's own record, so two peers can blocklist any address they name.
+    assert!(
+        !peers.ip_banned(&victim),
+        "two peers blocklisted an address neither of them ever connected from"
+    );
+}

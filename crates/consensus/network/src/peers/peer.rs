@@ -116,6 +116,10 @@ impl Peer {
     }
 
     /// Update keys and network address.
+    ///
+    /// The addresses come from the peer's own record, so they are recorded as advertised rather
+    /// than witnessed. `multiaddrs` drives ban accounting and peer exchange, and a peer must be
+    /// able to neither charge nor advertise an address this node has not seen it connect from.
     pub(super) fn update_net(
         &mut self,
         bls_public_key: BlsPublicKey,
@@ -124,8 +128,7 @@ impl Peer {
     ) {
         self.bls_public_key = Some(bls_public_key);
         self.network_key = Some(network_key);
-        self.multiaddrs.extend(multiaddrs);
-        self.prune_multiaddrs();
+        self.update_listening_addrs(multiaddrs);
     }
 
     /// Rayls: Remove excess multiaddrs when exceeding limit.
@@ -348,6 +351,10 @@ impl Peer {
     pub(super) fn update_listening_addrs(&mut self, multiaddrs: Vec<Multiaddr>) -> bool {
         let mut res = false;
         for multiaddr in multiaddrs {
+            // these are peer-supplied, so the set needs the same bound `multiaddrs` carries
+            if self.listening_addrs.len() >= MAX_MULTIADDRS_PER_PEER {
+                break;
+            }
             if !self.listening_addrs.contains(&multiaddr) {
                 self.listening_addrs.push(multiaddr);
                 res = true;
