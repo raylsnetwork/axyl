@@ -615,3 +615,42 @@ fn decay_depends_on_elapsed_time_not_on_heartbeat_frequency() {
         score_of(&peers, &peer_id)
     );
 }
+
+// Heartbeat verdicts
+
+/// Every verdict the heartbeat reaches must be acted on. A verdict that is computed and then
+/// dropped is a control that reads as present and is not.
+#[test]
+fn the_heartbeat_acts_on_a_disconnect_verdict() {
+    let mut peers = all_peers();
+    let peer_id = connect_from(&mut peers, ip(60));
+
+    // drive the peer clearly below the disconnect threshold, then let it reconnect with its score
+    // intact. One more penalty past the threshold keeps the verdict stable across the sub-second
+    // decay the heartbeat applies before reading the reputation back.
+    penalize_to_disconnect_threshold(&mut peers, &peer_id);
+    peers.process_penalty(&peer_id, Penalty::Medium);
+    peers.update_connection_status(&peer_id, NewConnectionStatus::Disconnected);
+    peers.update_connection_status(
+        &peer_id,
+        NewConnectionStatus::Connected {
+            multiaddr: create_multiaddr(Some(ip(60))),
+            direction: ConnectionDirection::Incoming,
+        },
+    );
+    assert_eq!(
+        peers.get_peer(&peer_id).expect("known").reputation(),
+        Reputation::Disconnected,
+        "precondition: a connected peer sitting below the disconnect threshold"
+    );
+
+    let actions = peers.heartbeat_maintenance();
+
+    // a verdict the heartbeat computes and drops is a control that reads as present and is not,
+    // and it restates itself at error level on every beat for as long as the score stays down
+    assert!(
+        actions.iter().any(|(id, action)| *id == peer_id
+            && matches!(action, PeerAction::Disconnect | PeerAction::DisconnectWithPX)),
+        "heartbeat reached a disconnect verdict but returned no action: {actions:?}"
+    );
+}

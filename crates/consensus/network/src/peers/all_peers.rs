@@ -255,25 +255,28 @@ impl AllPeers {
     /// Update scores for heartbeat interval.
     ///
     /// Returns any subsequent actions the peer manager should take after the peer's score is
-    /// updated. Peers are possibly unbanned, but penalties are not applied with this method.
-    /// It's impossible for a peer to become banned during heartbeat maintenance.
+    /// updated. Penalties are not applied here: decay moves a score toward zero, so the heartbeat
+    /// can lift a peer out of a ban but never push one into it.
     ///
-    /// See [Self::apply_penalty] for ban logic.
+    /// See [Self::process_penalty] for ban logic.
     fn update_peer_scores(&mut self) -> Vec<(PeerId, PeerAction)> {
-        // filter peers that are eligible to become unbanned
-        let unbanned_peers = self.peers.iter_mut().filter_map(|(id, peer)| {
+        let transitions = self.peers.iter_mut().filter_map(|(id, peer)| {
             let update = peer.heartbeat();
             match update {
-                ReputationUpdate::Unbanned => {
-                    Some(*id)
-                },
-                // filter other results and log error
-                ReputationUpdate::Banned | ReputationUpdate::Disconnect => {
+                ReputationUpdate::Unbanned => Some((*id, NewConnectionStatus::Unbanned)),
+                // a connected peer below the disconnect threshold. Decay alone will not lift it
+                // before the next beat, so shed the connection rather than restating the verdict
+                // every heartbeat for as long as the score stays down.
+                ReputationUpdate::Disconnect => Some((
+                    *id,
+                    NewConnectionStatus::Disconnecting { reason: DisconnectReason::Penalized },
+                )),
+                ReputationUpdate::Banned => {
                     error!(
                         target: "peer-manager",
                         ?update,
                         ?id,
-                        "peer reputation penalized during heartbeat - penalties only expected to decay"
+                        "peer reached the ban threshold during heartbeat - decay cannot lower a score"
                     );
                     None
                 },
@@ -282,11 +285,11 @@ impl AllPeers {
         }).collect::<Vec<_>>();
 
         // update peer connection status and return actions for manager
-        unbanned_peers
-            .iter()
-            .map(|id| {
-                let action = self.update_connection_status(id, NewConnectionStatus::Unbanned);
-                (*id, action)
+        transitions
+            .into_iter()
+            .map(|(id, status)| {
+                let action = self.update_connection_status(&id, status);
+                (id, action)
             })
             .collect()
     }
