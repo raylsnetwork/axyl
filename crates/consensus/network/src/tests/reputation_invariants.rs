@@ -13,7 +13,7 @@ use crate::common::{create_multiaddr, ensure_score_config};
 use libp2p::PeerId;
 use rand::{rngs::StdRng, SeedableRng as _};
 use rayls_infrastructure_config::{PeerConfig, ScoreConfig};
-use rayls_infrastructure_types::{BlsKeypair, NetworkKeypair};
+use rayls_infrastructure_types::{now, BlsKeypair, NetworkKeypair};
 use std::net::{IpAddr, Ipv4Addr};
 
 /// Build an `AllPeers` from an operator config, installing its `ScoreConfig` for this test.
@@ -797,5 +797,54 @@ fn operator_configured_thresholds_are_enforced() {
         peers.get_peer(&peer_id).expect("known").reputation(),
         Reputation::Trusted,
         "the disconnect threshold was configured to -60 but a peer at -20 was disconnected"
+    );
+}
+
+// Committee handover
+
+/// A validator applies an epoch boundary on its own schedule, so between this node installing the
+/// new committee and that peer installing it, the peer is still publishing as a member. Its gossip
+/// must keep passing the authorization fallback for that window, because the rejection is Fatal.
+///
+/// The grace covers importance only. A departing member stays penalizable, so a validator rotated
+/// out for misbehaving is not handed an extra epoch of immunity.
+#[test]
+fn a_departing_committee_member_stays_important_for_one_epoch() {
+    let mut peers = all_peers();
+    let (bls_stays, net_stays) = random_keys(50);
+    let (bls_leaves, net_leaves) = random_keys(51);
+    let leaving: PeerId = net_leaves.clone().into();
+
+    let seated = |bls, net: &NetworkPublicKey| {
+        (bls, Some(NetworkInfo { pubkey: net.clone(), multiaddrs: Vec::new(), timestamp: now() }))
+    };
+
+    // epoch N seats both
+    peers.new_epoch(vec![seated(bls_stays, &net_stays), seated(bls_leaves, &net_leaves)]);
+    assert!(peers.is_peer_validator(&leaving), "precondition: seated in epoch N");
+
+    // epoch N+1 drops one of them
+    peers.new_epoch(vec![seated(bls_stays, &net_stays)]);
+    assert!(
+        !peers.is_peer_validator(&leaving),
+        "a departing member is not a validator, so penalties still apply to it"
+    );
+    assert!(
+        peers.is_peer_recently_validator(&leaving),
+        "a departing member lost gossip authorization in the epoch it is still publishing into"
+    );
+
+    // the seat is gone, so the handover grace must not carry penalty immunity with it
+    let action = peers.process_penalty(&leaving, Penalty::Fatal);
+    assert!(
+        !matches!(action, PeerAction::NoAction),
+        "a departing member kept the penalty immunity that belongs to a seat"
+    );
+
+    // epoch N+2: the handover window has passed
+    peers.new_epoch(vec![seated(bls_stays, &net_stays)]);
+    assert!(
+        !peers.is_peer_recently_validator(&leaving),
+        "the grace outlived the handover it exists for"
     );
 }

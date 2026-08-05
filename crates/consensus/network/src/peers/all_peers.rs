@@ -43,6 +43,15 @@ pub(super) struct AllPeers {
     peers: HashMap<PeerId, Peer>,
     /// The collection of staked current_committee at the beginning of each epoch.
     current_committee: HashSet<PeerId>,
+    /// Committee members seated in the previous epoch that are not seated in this one.
+    ///
+    /// A validator applies an epoch boundary on its own schedule, so a departing member is still
+    /// publishing as a member while this node has already stopped treating it as one. It stays
+    /// important for one epoch so that its in-flight gossip keeps passing the authorization
+    /// fallback, whose rejection is fatal. It is deliberately not counted as a validator: the
+    /// penalty absolution and the ban exemption both end at the boundary, so a member rotated out
+    /// for misbehaving gains no extra immunity.
+    departing_committee: HashSet<PeerId>,
     /// The collection of staked current_committee pub key to peerid at the beginning of each
     /// epoch.
     current_committee_keys: HashMap<BlsPublicKey, Option<PeerId>>,
@@ -70,6 +79,7 @@ impl AllPeers {
         Self {
             peers: Default::default(),
             current_committee: Default::default(),
+            departing_committee: Default::default(),
             current_committee_keys: Default::default(),
             banned_peers: Default::default(),
             disconnected_peers: 0,
@@ -701,6 +711,14 @@ impl AllPeers {
         self.current_committee.contains(peer_id)
     }
 
+    /// Boolean indicating this peer is seated now or was seated in the previous epoch.
+    ///
+    /// Used for gossip authorization and connection priority during a committee handover. This is
+    /// not the penalty exemption: see [`Self::is_peer_validator`].
+    pub(super) fn is_peer_recently_validator(&self, peer_id: &PeerId) -> bool {
+        self.is_peer_validator(peer_id) || self.departing_committee.contains(peer_id)
+    }
+
     /// Boolean indicating if the address is associated with a banned peer.
     pub(super) fn ip_banned(&self, ip: &IpAddr) -> bool {
         self.banned_peers.ip_banned(ip)
@@ -958,12 +976,14 @@ impl AllPeers {
             }
         }
 
-        // make peers not in old committeee that are not in the new committee untrusted
-        committee_delta.into_iter().for_each(|peer_id| {
-            if let Some(peer) = self.peers.get_mut(&peer_id) {
+        // drop trust for members that left at this boundary: their penalty absolution and ban
+        // exemption end with the seat. Only importance carries over (see `departing_committee`).
+        for peer_id in &committee_delta {
+            if let Some(peer) = self.peers.get_mut(peer_id) {
                 peer.make_untrusted();
             }
-        });
+        }
+        self.departing_committee = committee_delta;
 
         // return any unban actions for committee peers
         actions
