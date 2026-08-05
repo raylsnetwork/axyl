@@ -364,7 +364,7 @@ fn test_ip_and_peer_banned() {
     );
     let action = all_peers.update_connection_status(&peer_id, NewConnectionStatus::Disconnected);
     assert!(matches!(action, PeerAction::Ban(_)));
-    let banned = all_peers.peer_banned(&peer_id);
+    let banned = all_peers.score_or_ip_banned(&peer_id);
     assert!(!banned);
 
     // check if IP is banned
@@ -387,12 +387,12 @@ fn test_ip_and_peer_banned() {
     );
     let action = all_peers.update_connection_status(&new_peer, NewConnectionStatus::Disconnected);
     assert!(matches!(action, PeerAction::Ban(_)));
-    let banned = all_peers.peer_banned(&new_peer);
+    let banned = all_peers.score_or_ip_banned(&new_peer);
     assert!(banned);
 
     // Check if peer is banned
-    assert!(all_peers.peer_banned(&peer_id));
-    assert!(!all_peers.peer_banned(&PeerId::random()));
+    assert!(all_peers.score_or_ip_banned(&peer_id));
+    assert!(!all_peers.score_or_ip_banned(&PeerId::random()));
 }
 
 #[test]

@@ -563,6 +563,74 @@ async fn test_is_validator() {
     assert!(!peer_manager.is_peer_validator(&random_peer_id));
 }
 
+/// The admission check and the registration check must use the same ban predicate. If the swarm
+/// admits a connection that `register_peer_connection` then refuses, the node holds an open
+/// connection it does not track.
+///
+/// This is the path that emits `error ... "connected with banned peer"` in production.
+#[tokio::test]
+async fn test_admitted_connection_is_registered_under_the_same_ban_predicate() {
+    let all_nodes = CommitteeFixture::builder(MemDatabase::default).build();
+    let mut authorities = all_nodes.authorities();
+    let authority_1 = authorities.next().expect("first authority");
+    let config = authority_1.consensus_config();
+    let mut peer_manager = PeerManager::new(config.network_config().peer_config());
+
+    let blocklisted = create_multiaddr(Some(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 200))));
+    let clean = create_multiaddr(Some(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 201))));
+
+    // the validator is connected, so its record exists and `upsert_peer` will take the
+    // `update_net` branch rather than filing addresses under `listening_addrs`
+    let validator: PeerId = config.key_config().primary_network_public_key().into();
+    assert!(peer_manager.register_peer_connection(
+        &validator,
+        ConnectionType::IncomingConnection { multiaddr: clean.clone() }
+    ));
+
+    // the validator advertises a second address in its record, and joins the committee
+    peer_manager.add_known_peer(
+        *authority_1.authority().protocol_key(),
+        NetworkInfo {
+            pubkey: config.key_config().primary_network_public_key(),
+            multiaddrs: vec![blocklisted.clone()],
+            timestamp: now(),
+        },
+    );
+    peer_manager.new_epoch(config.committee_pub_keys());
+    assert!(peer_manager.is_peer_validator(&validator), "precondition: validator is in committee");
+
+    // two unrelated peers are banned at the advertised address, blocklisting it
+    for _ in 0..2 {
+        let other = PeerId::random();
+        assert!(peer_manager.register_peer_connection(
+            &other,
+            ConnectionType::IncomingConnection { multiaddr: blocklisted.clone() }
+        ));
+        peer_manager.process_penalty(other, Penalty::Fatal);
+        peer_manager.register_disconnected(&other);
+    }
+
+    // the validator reconnects from its clean address. `sanitize_ip_addr` passes (that address is
+    // not blocklisted) and `PeerManager::peer_banned` exempts it as a committee member, so the
+    // swarm admits the connection.
+    assert!(
+        !peer_manager.peer_banned(&validator),
+        "precondition: the swarm admits this connection"
+    );
+
+    // INVARIANT: a connection the admission checks accepted is registered.
+    // CURRENT: `register_peer_connection` gates on `AllPeers::peer_banned`, which has no committee
+    // exemption, so it refuses and logs `error "connected with banned peer"` - while
+    // `on_connection_established` discards the `false` and still emits `PeerEvent::PeerConnected`.
+    assert!(
+        peer_manager.register_peer_connection(
+            &validator,
+            ConnectionType::IncomingConnection { multiaddr: clean }
+        ),
+        "the swarm admitted this connection but the peer manager refused to register it"
+    );
+}
+
 #[tokio::test]
 async fn test_register_outgoing_connection() {
     let mut peer_manager = create_test_peer_manager(None);

@@ -676,10 +676,15 @@ impl AllPeers {
         self.banned_peers.ip_banned(ip)
     }
 
-    /// Boolean indicating if a peer id is banned or associated with any ip addresses.
+    /// Boolean indicating the peer's own score or one of its ip addresses is banned.
+    ///
+    /// This is one ingredient of the admission verdict, not the verdict itself:
+    /// [`super::PeerManager::peer_banned`] is the only caller, and it owns the committee exemption
+    /// and the temporary-ban cache. Calling this directly from a connection gate skips both.
+    ///
     /// NOTE: the peer can still be in a connected status but pending a ban, so the connection
     /// status is not used.
-    pub(super) fn peer_banned(&self, peer_id: &PeerId) -> bool {
+    pub(super) fn score_or_ip_banned(&self, peer_id: &PeerId) -> bool {
         self.peers.get(peer_id).is_some_and(|peer| {
             peer.reputation().banned() || peer.known_ip_addresses().any(|ip| self.ip_banned(&ip))
         })

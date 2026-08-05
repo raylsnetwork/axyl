@@ -379,7 +379,7 @@ impl PeerManager {
             ?peer_id,
             "checking if peer banned"
         );
-        temp_banned || self.peers.peer_banned(peer_id)
+        temp_banned || self.peers.score_or_ip_banned(peer_id)
     }
 
     #[cfg(test)]
@@ -478,7 +478,7 @@ impl PeerManager {
         peer_id: &PeerId,
         connection: ConnectionType,
     ) -> bool {
-        if self.peers.peer_banned(peer_id) {
+        if self.peer_banned(peer_id) {
             // log error if the peer is banned
             error!(target: "peer-manager", ?peer_id, "connected with banned peer");
             return false;
