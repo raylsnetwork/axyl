@@ -704,6 +704,18 @@ impl PeerManager {
             "add_known_peer",
         );
         self.peers.upsert_peer(bls_key, info.pubkey.clone(), info.multiaddrs.clone());
+
+        // A member banned before discovery resolved it still carries its ban after `upsert_peer`
+        // trusts it; release it so the unban action repairs the gossipsub blacklist and kad routing
+        // entry. Not in `upsert_peer`: `new_epoch` also calls it and does its own boundary unban.
+        if self.peers.is_peer_validator(&peer_id)
+            && self.peers.get_peer(&peer_id).is_some_and(|p| p.connection_status().is_banned())
+        {
+            let action =
+                self.peers.update_connection_status(&peer_id, NewConnectionStatus::Unbanned);
+            self.apply_peer_action(peer_id, action);
+        }
+
         self.known_peers.insert(bls_key, info.clone());
         self.known_peers_time_added.insert(bls_key, now());
         self.known_peerids.insert(peer_id, bls_key);

@@ -624,6 +624,63 @@ async fn test_committee_member_resolved_mid_epoch_is_absolved_immediately() {
     assert!(!peer_manager.peer_banned(&unresolved), "a committee member was banned by a penalty");
 }
 
+/// A ban charged against a committee member before its record resolved is released when discovery
+/// trusts it. A lingering charge can evict an innocent peer under the cap or push a shared IP over
+/// the block threshold.
+#[tokio::test]
+async fn resolving_a_banned_committee_member_releases_its_ban() {
+    let all_nodes = CommitteeFixture::builder(MemDatabase::default).build();
+    let mut authorities = all_nodes.authorities();
+    let authority_1 = authorities.next().expect("first authority");
+    let authority_2 = authorities.next().expect("second authority");
+    let config = authority_1.consensus_config();
+    let mut peer_manager = PeerManager::new(config.network_config().peer_config());
+
+    // this node resolves itself, then installs a committee whose second member it cannot yet
+    // resolve
+    peer_manager.add_known_peer(
+        *authority_1.authority().protocol_key(),
+        NetworkInfo {
+            pubkey: config.key_config().primary_network_public_key(),
+            multiaddrs: vec![config.primary_address()],
+            timestamp: now(),
+        },
+    );
+    peer_manager.new_epoch(config.committee_pub_keys());
+
+    // authority_2 connects and is banned while still an ordinary, unresolved peer
+    let config_2 = authority_2.consensus_config();
+    let unresolved: PeerId = config_2.key_config().primary_network_public_key().into();
+    assert!(peer_manager.register_peer_connection(
+        &unresolved,
+        ConnectionType::IncomingConnection { multiaddr: create_multiaddr(None) }
+    ));
+    peer_manager.process_penalty(unresolved, Penalty::Fatal);
+    peer_manager.register_disconnected(&unresolved);
+    assert!(peer_manager.peer_banned(&unresolved), "precondition: banned before resolution");
+    let _ = collect_all_events(&mut peer_manager);
+
+    // discovery resolves the record mid-epoch and trusts the member
+    peer_manager.add_known_peer(
+        *authority_2.authority().protocol_key(),
+        NetworkInfo {
+            pubkey: config_2.key_config().primary_network_public_key(),
+            multiaddrs: vec![config_2.primary_address()],
+            timestamp: now(),
+        },
+    );
+
+    // INVARIANT: resolution releases the ban, surfacing an unban that repairs the gossipsub
+    // blacklist and the kad routing entry.
+    // PRE-FIX: `upsert_peer` only trusts the resolved member; the `Banned` status and IP charge
+    // survive discovery.
+    let events = collect_all_events(&mut peer_manager);
+    assert!(
+        events.iter().any(|e| matches!(e, PeerEvent::Unbanned(p) if *p == unresolved)),
+        "resolving a banned committee member must release its ban"
+    );
+}
+
 /// The admission check and the registration check must use the same ban predicate. If the swarm
 /// admits a connection that `register_peer_connection` then refuses, the node holds an open
 /// connection it does not track.
