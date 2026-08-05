@@ -13,13 +13,13 @@ use crate::common::{create_multiaddr, ensure_score_config};
 use libp2p::PeerId;
 use rand::{rngs::StdRng, SeedableRng as _};
 use rayls_infrastructure_config::{PeerConfig, ScoreConfig};
-use rayls_infrastructure_types::{now, BlsKeypair, NetworkKeypair};
+use rayls_infrastructure_types::{BlsKeypair, NetworkKeypair};
 use std::net::{IpAddr, Ipv4Addr};
 
-/// Build an `AllPeers` from an operator config, installing its `ScoreConfig` globally.
+/// Build an `AllPeers` from an operator config, installing its `ScoreConfig` for this test.
 ///
-/// `ScoreConfig` lands in a process-wide `OnceLock`; nextest runs one process per test, so each
-/// test gets its own. Under `cargo test` this would be order-dependent.
+/// The configuration is process-global but overwritten per test, so under `cargo test
+/// --test-threads 1` each case runs against the config it installs here.
 fn all_peers_with(config: PeerConfig) -> AllPeers {
     ensure_score_config(Some(config.score_config));
     AllPeers::new(Duration::from_secs(5), config.max_banned_peers, config.max_disconnected_peers)
@@ -582,4 +582,36 @@ fn promoting_an_unrelated_peer_to_trusted_leaves_the_ban_total_alone() {
     // CURRENT: `add_trusted_peer` calls `remove_banned_peer`, whose unconditional
     // `total.saturating_sub(1)` runs even though the IP iterator it is handed is always empty.
     assert_ban_accounting_conserved(&peers, "after promoting an unrelated peer to trusted");
+}
+
+// Absolution
+
+/// Decay is a function of elapsed wall time. Running the heartbeat more often must not slow it
+/// down, or a node with a fast heartbeat never forgives anything.
+#[test]
+fn decay_depends_on_elapsed_time_not_on_heartbeat_frequency() {
+    let config = PeerConfig {
+        score_config: ScoreConfig { score_halflife: 1.0, ..Default::default() },
+        ..Default::default()
+    };
+    let mut peers = all_peers_with(config);
+
+    let peer_id = connect_from(&mut peers, ip(40));
+    peers.process_penalty(&peer_id, Penalty::Medium);
+    let after_penalty = score_of(&peers, &peer_id);
+
+    // one halflife of wall time, sampled every 100ms
+    for _ in 0..10 {
+        std::thread::sleep(Duration::from_millis(100));
+        peers.heartbeat_maintenance();
+    }
+
+    // INVARIANT: after one halflife the score has moved roughly halfway back to zero.
+    // CURRENT: `Score::update_at` truncates elapsed to whole seconds but advances `last_updated`
+    // unconditionally, so a sub-second sampling cadence discards every remainder.
+    assert!(
+        score_of(&peers, &peer_id) > after_penalty / 2.0,
+        "score did not decay across one halflife sampled at 100ms: {} vs {after_penalty}",
+        score_of(&peers, &peer_id)
+    );
 }

@@ -4,7 +4,7 @@ use crate::{ConfigFmt, ConfigTrait, RaylsDirs};
 use libp2p::{kad::K_VALUE, request_response::ProtocolSupport, StreamProtocol};
 use rayls_infrastructure_types::Round;
 use serde::{Deserialize, Serialize};
-use std::{num::NonZeroUsize, sync::OnceLock, time::Duration};
+use std::{num::NonZeroUsize, time::Duration};
 
 /// topic to be sent with the transactions batch gossip
 pub const GOSSIP_TOPIC_TXN: &str = "rayls-batch";
@@ -443,14 +443,12 @@ impl ScoreConfig {
         Duration::from_secs(self.banned_before_decay_secs)
     }
 
-    /// Calculate the halflife decay constant =
-    /// -(2.0f64.ln()) / self.score_halflife
+    /// Calculate the halflife decay constant, `-ln(2) / score_halflife`.
+    ///
+    /// Computed from `self` on every call: a process-wide cache would freeze the constant at the
+    /// first configuration it ever saw and ignore every later one.
     pub fn halflife_decay(&self) -> f64 {
-        // static cache that persists
-        static CACHE: OnceLock<f64> = OnceLock::new();
-
-        // return the cached value if it exists
-        *CACHE.get_or_init(|| -(2.0f64.ln()) / self.score_halflife)
+        -(2.0f64.ln()) / self.score_halflife
     }
 }
 
