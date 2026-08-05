@@ -1,13 +1,12 @@
 //! Information shared between peers.
 
 use super::{
-    score::{Reputation, ReputationUpdate, Score},
+    score::{global_score_config, Reputation, ReputationUpdate, Score},
     status::ConnectionStatus,
     types::ConnectionDirection,
     Penalty,
 };
 use libp2p::{core::multiaddr::Multiaddr, PeerId};
-use rayls_infrastructure_config::PeerConfig;
 use rayls_infrastructure_types::{BlsPublicKey, NetworkPublicKey, Protocol};
 use std::{collections::HashSet, net::IpAddr, time::Instant};
 use tracing::error;
@@ -26,8 +25,6 @@ pub(super) struct Peer {
     bls_public_key: Option<BlsPublicKey>,
     /// The peers network public key (libp2p public key).
     network_key: Option<NetworkPublicKey>,
-    /// The config
-    config: PeerConfig,
     /// The peer's score - used to derive [Reputation].
     score: Score,
     /// The multiaddrs this node has witnessed the peer using.
@@ -65,7 +62,6 @@ impl Peer {
             listening_addrs,
             score: Score::new_max(),
             is_trusted: true,
-            config: Default::default(),
             multiaddrs: Default::default(),
             connection_status: Default::default(),
             connection_direction: Default::default(),
@@ -85,7 +81,6 @@ impl Peer {
             listening_addrs,
             score: Score::default(),
             is_trusted: false,
-            config: Default::default(),
             multiaddrs: Default::default(),
             connection_status: Default::default(),
             connection_direction: Default::default(),
@@ -107,7 +102,6 @@ impl Peer {
             listening_addrs,
             score: Score::new_max(),
             is_trusted: false,
-            config: Default::default(),
             multiaddrs: Default::default(),
             connection_status: Default::default(),
             connection_direction: Default::default(),
@@ -148,10 +142,15 @@ impl Peer {
     }
 
     /// Return a peer's reputation based on the aggregate score.
+    ///
+    /// The thresholds come from the score config, the same source [`Score::is_banned`] reads to arm
+    /// the decay freeze. A second pair of thresholds would have to agree with these for the freeze
+    /// and the verdict to describe the same peers, and nothing could enforce that.
     pub(super) fn reputation(&self) -> Reputation {
+        let config = global_score_config();
         match self.score.aggregate_score() {
-            score if score <= self.config.min_score_for_ban => Reputation::Banned,
-            score if score <= self.config.min_score_for_disconnect => Reputation::Disconnected,
+            score if score <= config.min_score_before_ban => Reputation::Banned,
+            score if score <= config.min_score_before_disconnect => Reputation::Disconnected,
             _ => Reputation::Trusted,
         }
     }

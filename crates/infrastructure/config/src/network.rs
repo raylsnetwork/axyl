@@ -299,10 +299,6 @@ pub struct PeerConfig {
     pub target_num_peers: usize,
     /// The timeout for dialing a peer.
     pub dial_timeout: Duration,
-    /// The threshold before a peer is disconnected
-    pub min_score_for_disconnect: f64,
-    /// The threshold before a peer is banned.
-    pub min_score_for_ban: f64,
     /// A fraction of `Self::target_num_peers` that is allowed to connect to this node in excess of
     /// `PeerManager::target_num_peers`.
     ///
@@ -346,8 +342,6 @@ impl Default for PeerConfig {
             heartbeat_interval: 30,
             target_num_peers,
             dial_timeout: Duration::from_secs(15),
-            min_score_for_disconnect: -20.0,
-            min_score_for_ban: -50.0,
             peer_excess_factor: 0.3,
             priority_peer_excess: 0.2,
             target_outbound_only_factor: 0.3,

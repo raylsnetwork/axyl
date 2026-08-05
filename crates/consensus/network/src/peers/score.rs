@@ -36,7 +36,7 @@ pub(super) fn init_peer_score_config(config: ScoreConfig) {
 /// Get a clone of the global peer score configuration.
 ///
 /// Panics if the configuration has not been installed.
-fn global_score_config() -> Arc<ScoreConfig> {
+pub(super) fn global_score_config() -> Arc<ScoreConfig> {
     let config = GLOBAL_SCORE_CONFIG.read().expect("score config lock poisoned").clone();
     config.expect("Peer score configuration not initialized")
 }
