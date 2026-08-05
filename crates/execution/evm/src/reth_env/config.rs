@@ -29,6 +29,8 @@ use tracing::warn;
 #[derive(Debug, Clone, Default, Parser)]
 pub struct RethMetricArgs {
     /// Enable Prometheus metrics for reth execution-layer components.
+    ///
+    /// Overrides `reth_metrics_address` in parameters.yaml when passed.
     #[arg(long = "reth-metrics", value_name = "SOCKET", value_parser = parse_socket_address, help_heading = "Reth Metrics"
     )]
     pub prometheus: Option<SocketAddr>,
