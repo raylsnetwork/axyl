@@ -294,13 +294,16 @@ impl PeerManager {
     ///
     /// Actions on peers happen when their reputation or connection status changes.
     fn apply_peer_action(&mut self, peer_id: PeerId, action: PeerAction) {
+        // this is the single point every reputation-driven action passes through, and each arm
+        // fires only on an actual change, so the ban lifecycle is legible at warn/info without the
+        // per-penalty decay noise that sits at debug
         match action {
             PeerAction::Ban(ip_addrs) => {
-                debug!(target: "peer-manager", ?peer_id, ?ip_addrs, "reputation update results in ban");
+                warn!(target: "peer-manager", ?peer_id, score = ?self.peer_score(&peer_id), ?ip_addrs, "peer banned");
                 self.process_ban(&peer_id);
             }
             PeerAction::Disconnect => {
-                debug!(target: "peer-manager", ?peer_id, "reputation update results in disconnect");
+                info!(target: "peer-manager", ?peer_id, score = ?self.peer_score(&peer_id), "peer disconnected for reputation");
                 self.temporarily_banned.insert(peer_id);
                 self.push_event(PeerEvent::DisconnectPeer(peer_id));
             }
@@ -312,7 +315,7 @@ impl PeerManager {
                 self.events.push_back(PeerEvent::DisconnectPeerX(peer_id, exchange));
             }
             PeerAction::Unban(ip_addrs) => {
-                debug!(target: "peer-manager", ?peer_id, ?ip_addrs, "reputation update results in unban");
+                info!(target: "peer-manager", ?peer_id, ?ip_addrs, "peer unbanned");
                 self.push_event(PeerEvent::Unbanned(peer_id));
             }
 
