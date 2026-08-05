@@ -126,29 +126,9 @@ where
             }
             ReqResEvent::InboundFailure { peer, request_id, error, connection_id: _ } => {
                 debug!(target: "network", ?peer, ?error, pending=?self.inbound_requests, "Inbound failure for req/res");
-                debug!(target: "network", my_id=?self.swarm.local_peer_id(), "this node");
-                match error {
-                    ReqResInboundFailure::Io(e) => {
-                        // penalize peer since this is an attack surface
-                        warn!(target: "network", ?e, ?peer, ?request_id, "inbound IO failure");
-                        self.swarm
-                            .behaviour_mut()
-                            .peer_manager
-                            .process_penalty(peer, Penalty::Medium);
-                    }
-                    ReqResInboundFailure::UnsupportedProtocols => {
-                        warn!(target: "network", ?peer, ?request_id, ?error, "inbound failure: unsupported protocol");
-
-                        // the local peer supports none of the protocols requested by the remote
-                        self.swarm
-                            .behaviour_mut()
-                            .peer_manager
-                            .process_penalty(peer, Penalty::Fatal);
-                    }
-                    ReqResInboundFailure::Timeout | ReqResInboundFailure::ConnectionClosed => {
-                        // no penalty for connection-level failures
-                    }
-                    ReqResInboundFailure::ResponseOmission => { /* ignore local error */ }
+                if let Some(penalty) = inbound_failure_penalty(&error) {
+                    warn!(target: "network", ?peer, ?request_id, ?error, ?penalty, "penalizing inbound failure");
+                    self.swarm.behaviour_mut().peer_manager.process_penalty(peer, penalty);
                 }
 
                 // forward cancelation to handler and ignore errors
@@ -186,10 +166,49 @@ fn outbound_failure_penalty(error: &OutboundFailure) -> Option<Penalty> {
     }
 }
 
+/// Classifies an inbound request-response failure into the penalty owed the requesting peer.
+///
+/// Returns `None` for failures not the requester's fault. libp2p reports an unreadable request
+/// and a failed response write as the same `Io` variant, so charging it would ban an innocent
+/// requester for this node's own write failure.
+fn inbound_failure_penalty(error: &ReqResInboundFailure) -> Option<Penalty> {
+    match error {
+        // The requester spoke a protocol set this node does not accept.
+        ReqResInboundFailure::UnsupportedProtocols => Some(Penalty::Fatal),
+        ReqResInboundFailure::Io(_)
+        | ReqResInboundFailure::Timeout
+        | ReqResInboundFailure::ConnectionClosed
+        | ReqResInboundFailure::ResponseOmission => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::io;
+
+    /// An inbound `Io` failure is ambiguous between an unreadable request and this node's own
+    /// failure to write the response, so it must never charge the requester.
+    #[test]
+    fn inbound_io_failure_is_not_penalized() {
+        let error = ReqResInboundFailure::Io(io::Error::other("failed to write response"));
+        assert!(
+            inbound_failure_penalty(&error).is_none(),
+            "an inbound Io failure may be our own write failure and must not ban the requester"
+        );
+    }
+
+    /// Connection-level and local inbound failures earn nothing; only a protocol mismatch does.
+    #[test]
+    fn inbound_failure_penalties_match_fault() {
+        assert!(inbound_failure_penalty(&ReqResInboundFailure::Timeout).is_none());
+        assert!(inbound_failure_penalty(&ReqResInboundFailure::ConnectionClosed).is_none());
+        assert!(inbound_failure_penalty(&ReqResInboundFailure::ResponseOmission).is_none());
+        assert!(matches!(
+            inbound_failure_penalty(&ReqResInboundFailure::UnsupportedProtocols),
+            Some(Penalty::Fatal)
+        ));
+    }
 
     /// A local outbound substream exhaustion must not penalize the (innocent) target peer.
     #[test]
