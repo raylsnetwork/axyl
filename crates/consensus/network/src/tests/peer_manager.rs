@@ -561,6 +561,67 @@ async fn test_is_validator() {
 
     // Verify random peer is not a validator
     assert!(!peer_manager.is_peer_validator(&random_peer_id));
+
+    // Verify the committee member this node had already resolved IS a validator. Without this the
+    // test passes even if `new_epoch` recognizes nobody at all.
+    let resolved: PeerId = config.key_config().primary_network_public_key().into();
+    assert!(peer_manager.is_peer_validator(&resolved));
+}
+
+/// A committee member this node resolves after the epoch boundary must be absolved from that
+/// moment, not from the next boundary. Committee membership is decided by stake; whether local
+/// discovery has caught up is this node's problem, not the validator's.
+///
+/// The node genuinely cannot exempt a peer before it resolves the key-to-peer mapping, so the
+/// invariant starts at resolution.
+#[tokio::test]
+async fn test_committee_member_resolved_mid_epoch_is_absolved_immediately() {
+    let all_nodes = CommitteeFixture::builder(MemDatabase::default).build();
+    let mut authorities = all_nodes.authorities();
+    let authority_1 = authorities.next().expect("first authority");
+    let authority_2 = authorities.next().expect("second authority");
+    let config = authority_1.consensus_config();
+    let mut peer_manager = PeerManager::new(config.network_config().peer_config());
+
+    // this node resolved itself but not authority_2, the ordinary state on a fresh start or a
+    // restart before discovery has caught up
+    peer_manager.add_known_peer(
+        *authority_1.authority().protocol_key(),
+        NetworkInfo {
+            pubkey: config.key_config().primary_network_public_key(),
+            multiaddrs: vec![config.primary_address()],
+            timestamp: now(),
+        },
+    );
+    peer_manager.new_epoch(config.committee_pub_keys());
+
+    // authority_2 connects before its record arrives, so it is tracked as an ordinary peer
+    let config_2 = authority_2.consensus_config();
+    let unresolved: PeerId = config_2.key_config().primary_network_public_key().into();
+    assert!(peer_manager.register_peer_connection(
+        &unresolved,
+        ConnectionType::IncomingConnection { multiaddr: create_multiaddr(None) }
+    ));
+
+    // discovery completes and the record resolves mid-epoch
+    peer_manager.add_known_peer(
+        *authority_2.authority().protocol_key(),
+        NetworkInfo {
+            pubkey: config_2.key_config().primary_network_public_key(),
+            multiaddrs: vec![config_2.primary_address()],
+            timestamp: now(),
+        },
+    );
+
+    // INVARIANT: resolution grants the exemption, so penalties from this point are absolved.
+    // CURRENT: `new_epoch` rebuilds `current_committee_keys` only from members it could already
+    // resolve, so `upsert_peer` sees an unknown key and leaves the peer untrusted for the epoch.
+    assert!(
+        peer_manager.is_peer_validator(&unresolved),
+        "a committee member resolved mid-epoch was not recognized as a validator"
+    );
+    peer_manager.process_penalty(unresolved, Penalty::Fatal);
+    assert!(!peer_manager.peer_banned(&unresolved), "a committee member was banned by a penalty");
 }
 
 /// The admission check and the registration check must use the same ban predicate. If the swarm

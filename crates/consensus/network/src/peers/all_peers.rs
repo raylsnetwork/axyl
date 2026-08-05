@@ -103,21 +103,30 @@ impl AllPeers {
         addrs: Vec<Multiaddr>,
     ) {
         let peer_id: PeerId = network_key.clone().into();
+
+        // Check if this peer is a committee member - only committee members get trusted status
+        let is_committee_member = self.current_committee_keys.contains_key(&bls_public_key);
+        if is_committee_member {
+            // this call is the only place the key-to-peer mapping becomes known for a member the
+            // epoch boundary could not resolve, so record it here or the exemption waits an epoch
+            self.current_committee_keys.insert(bls_public_key, Some(peer_id));
+            self.current_committee.insert(peer_id);
+        }
+
         if let Some(peer) = self.peers.get_mut(&peer_id) {
             debug!(target: "peer-manager", peer=?peer, "peer already exists, overwriting");
             peer.update_net(bls_public_key, network_key, addrs);
-        } else {
-            // Check if this peer is a committee member - only committee members get trusted status
-            let is_committee_member = self.current_committee_keys.contains_key(&bls_public_key);
-            let peer;
+
+            // a committee member that connected before its record arrived was created untrusted
             if is_committee_member {
-                debug!(target: "peer-manager", ?peer_id, "committee member peer does not exist, creating trusted");
-                peer = Peer::new_trusted(bls_public_key, network_key, addrs);
-            } else {
-                debug!(target: "peer-manager", ?peer_id, "peer does not exist, creating new peer");
-                peer = Peer::new(bls_public_key, network_key, addrs);
+                peer.make_trusted();
             }
-            self.peers.insert(peer_id, peer);
+        } else if is_committee_member {
+            debug!(target: "peer-manager", ?peer_id, "committee member peer does not exist, creating trusted");
+            self.peers.insert(peer_id, Peer::new_trusted(bls_public_key, network_key, addrs));
+        } else {
+            debug!(target: "peer-manager", ?peer_id, "peer does not exist, creating new peer");
+            self.peers.insert(peer_id, Peer::new(bls_public_key, network_key, addrs));
         }
     }
 
@@ -870,9 +879,11 @@ impl AllPeers {
     /// associated with the committee node are reset. The advertised
     /// listening addresses are updated and the peer is marked `trusted`
     /// so it won't incur any additional penalties.
+    /// Members whose [`NetworkInfo`] is not yet resolved are passed as `None`. Their keys are still
+    /// recorded, so [`Self::upsert_peer`] recognizes them as soon as discovery resolves the record.
     pub(super) fn new_epoch(
         &mut self,
-        committee: Vec<(BlsPublicKey, NetworkInfo)>,
+        committee: Vec<(BlsPublicKey, Option<NetworkInfo>)>,
     ) -> Vec<(PeerId, PeerAction)> {
         // clear self.current_committee and store the peers as old committee to then produce delta
         // from
@@ -881,7 +892,13 @@ impl AllPeers {
         self.current_committee_keys.clear();
 
         let mut actions = Vec::with_capacity(committee.len());
-        for (bls_key, NetworkInfo { pubkey, multiaddrs: addr, .. }) in committee {
+        for (bls_key, network_info) in committee {
+            let Some(NetworkInfo { pubkey, multiaddrs: addr, .. }) = network_info else {
+                // record the key so a later resolution is recognized within this epoch
+                self.current_committee_keys.insert(bls_key, None);
+                continue;
+            };
+
             let peer_id: PeerId = pubkey.clone().into();
             self.current_committee.insert(peer_id);
             self.current_committee_keys.insert(bls_key, Some(peer_id));

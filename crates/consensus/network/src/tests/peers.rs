@@ -66,13 +66,16 @@ fn test_poc_stale_trust_persists_for_rotated_out_committee_member() {
     all_peers.new_epoch(vec![
         (
             bls_c,
-            NetworkInfo {
+            Some(NetworkInfo {
                 pubkey: net_c.clone(),
                 multiaddrs: vec![addr_c.clone()],
                 timestamp: now(),
-            },
+            }),
         ),
-        (bls_b, NetworkInfo { pubkey: net_b, multiaddrs: vec![addr_b.clone()], timestamp: now() }),
+        (
+            bls_b,
+            Some(NetworkInfo { pubkey: net_b, multiaddrs: vec![addr_b.clone()], timestamp: now() }),
+        ),
     ]);
 
     assert!(all_peers.is_peer_validator(&peer_id_b), "B must be a validator");
@@ -80,7 +83,7 @@ fn test_poc_stale_trust_persists_for_rotated_out_committee_member() {
     // Rotate to epoch N+1 committee (excluding B).
     all_peers.new_epoch(vec![(
         bls_c,
-        NetworkInfo { pubkey: net_c, multiaddrs: vec![addr_c], timestamp: now() },
+        Some(NetworkInfo { pubkey: net_c, multiaddrs: vec![addr_c], timestamp: now() }),
     )]);
 
     assert!(!all_peers.is_peer_validator(&peer_id_b), "B must not be a validator after rotation");

@@ -651,27 +651,33 @@ impl PeerManager {
     /// Update the committee for the new epoch.
     pub(crate) fn new_epoch(&mut self, committee: HashSet<BlsPublicKey>) {
         // remove from temporary banned and warn if validator was banned
-        let mut exp_committee = Vec::default();
+        //
+        // every committee key is forwarded, resolved or not: membership is decided by stake, so a
+        // member this node has not discovered yet must still be recognized the moment its record
+        // arrives rather than at the next boundary
+        let mut exp_committee = Vec::with_capacity(committee.len());
         for bls_key in &committee {
-            if let Some(NetworkInfo { pubkey, multiaddrs: multiaddr, timestamp }) =
+            let Some(NetworkInfo { pubkey, multiaddrs: multiaddr, timestamp }) =
                 self.known_peers.get(bls_key)
-            {
-                let peer_id: PeerId = pubkey.clone().into();
-                info!(target: "peer-manager", "adding committee member {bls_key}/{peer_id}");
-                if self.temporarily_banned.remove(&peer_id) {
-                    warn!(target: "peer-manager", ?peer_id, "removed committee member from temporarily banned list");
-                }
-                exp_committee.push((
-                    *bls_key,
-                    NetworkInfo {
-                        pubkey: pubkey.clone(),
-                        multiaddrs: multiaddr.clone(),
-                        timestamp: *timestamp,
-                    },
-                ));
-            } else {
+            else {
                 warn!(target: "peer-manager", "unknown committee member with key {bls_key}");
+                exp_committee.push((*bls_key, None));
+                continue;
+            };
+
+            let peer_id: PeerId = pubkey.clone().into();
+            info!(target: "peer-manager", "adding committee member {bls_key}/{peer_id}");
+            if self.temporarily_banned.remove(&peer_id) {
+                warn!(target: "peer-manager", ?peer_id, "removed committee member from temporarily banned list");
             }
+            exp_committee.push((
+                *bls_key,
+                Some(NetworkInfo {
+                    pubkey: pubkey.clone(),
+                    multiaddrs: multiaddr.clone(),
+                    timestamp: *timestamp,
+                }),
+            ));
         }
 
         // add trusted peer record
