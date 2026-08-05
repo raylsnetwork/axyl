@@ -2,11 +2,11 @@
 
 use super::*;
 use crate::common::{ensure_score_config, random_ip_addr};
-use libp2p::{multiaddr::Protocol, Multiaddr};
+use libp2p::{multiaddr::Protocol, Multiaddr, PeerId};
 use std::net::Ipv4Addr;
 
-/// Helper function to create a peer with specific IP addresses.
-fn create_peer_with_ips(ips: Vec<IpAddr>) -> Peer {
+/// Helper function to create a distinctly-identified peer with specific IP addresses.
+fn create_peer_with_ips(ips: Vec<IpAddr>) -> (PeerId, Peer) {
     ensure_score_config(None);
 
     let mut peer = Peer::default_for_test();
@@ -24,7 +24,7 @@ fn create_peer_with_ips(ips: Vec<IpAddr>) -> Peer {
         peer.register_outgoing(multiaddr);
     }
 
-    peer
+    (PeerId::random(), peer)
 }
 
 #[test]
@@ -40,12 +40,12 @@ fn test_remove_banned_peer() {
     let ip1 = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
     let ip2 = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1));
 
-    let peer = create_peer_with_ips(vec![ip1, ip2]);
+    let (peer_id, peer) = create_peer_with_ips(vec![ip1, ip2]);
 
-    banned_peers.add_banned_peer(&peer);
+    banned_peers.add_banned_peer(&peer_id, &peer);
     assert_eq!(banned_peers.total(), 1);
 
-    let unbanned_ips = banned_peers.remove_banned_peer(vec![ip1, ip2].into_iter());
+    let unbanned_ips = banned_peers.remove_banned_peer(&peer_id);
 
     assert_eq!(banned_peers.total(), 0);
     assert_eq!(unbanned_ips.len(), 2);
@@ -63,8 +63,8 @@ fn test_add_multiple_peers_same_ip() {
 
     // add multiple peers with the same IP
     for i in 0..BANNED_PEERS_PER_IP_THRESHOLD {
-        let peer = create_peer_with_ips(vec![ip]);
-        banned_peers.add_banned_peer(&peer);
+        let (peer_id, peer) = create_peer_with_ips(vec![ip]);
+        banned_peers.add_banned_peer(&peer_id, &peer);
 
         // check the total is incrementing
         assert_eq!(banned_peers.total(), i + 1);
@@ -80,8 +80,8 @@ fn test_add_multiple_peers_same_ip() {
     }
 
     // add one more peer to exceed threshold
-    let peer = create_peer_with_ips(vec![ip]);
-    banned_peers.add_banned_peer(&peer);
+    let (peer_id, peer) = create_peer_with_ips(vec![ip]);
+    banned_peers.add_banned_peer(&peer_id, &peer);
 
     // assert IP is now banned
     assert!(banned_peers.ip_banned(&ip));
@@ -95,7 +95,7 @@ fn test_add_peer_no_ip() {
 
     // Create a peer with no IP addresses
     let peer = Peer::default_for_test();
-    banned_peers.add_banned_peer(&peer);
+    banned_peers.add_banned_peer(&PeerId::random(), &peer);
 
     // total should increment but no IPs should be banned
     assert_eq!(banned_peers.total(), 1);
@@ -103,20 +103,21 @@ fn test_add_peer_no_ip() {
 }
 
 #[test]
-fn test_remove_nonexistent_ip() {
+fn test_remove_peer_that_was_never_banned() {
     let mut banned_peers = BannedPeers::default();
     let ip1 = random_ip_addr();
     let ip2 = random_ip_addr();
 
     // Add a peer with ip1
-    let peer = create_peer_with_ips(vec![ip1]);
-    banned_peers.add_banned_peer(&peer);
+    let (peer_id, peer) = create_peer_with_ips(vec![ip1]);
+    banned_peers.add_banned_peer(&peer_id, &peer);
 
-    // Remove a peer with ip2, which doesn't exist in the collection
-    let unbanned_ips = banned_peers.remove_banned_peer(vec![ip2].into_iter());
+    // Release a different peer, which holds no charge
+    let (other_id, _) = create_peer_with_ips(vec![ip2]);
+    let unbanned_ips = banned_peers.remove_banned_peer(&other_id);
 
-    // Total should decrease but no IPs should be unbanned
-    assert_eq!(banned_peers.total(), 0);
+    // the charged peer is untouched, so the total cannot drift below the peers actually banned
+    assert_eq!(banned_peers.total(), 1);
     assert!(unbanned_ips.is_empty());
 }
 
@@ -131,21 +132,21 @@ fn test_remove_banned_peer_partial() {
 
     // add enough peers so ip is banned after removal
     for _ in 0..banned_peers_threshold {
-        let peer = create_peer_with_ips(vec![ip1]);
-        banned_peers.add_banned_peer(&peer);
+        let (peer_id, peer) = create_peer_with_ips(vec![ip1]);
+        banned_peers.add_banned_peer(&peer_id, &peer);
     }
 
     // add one peer with both ips
     // this puts ip1 at threshold + 1 so removing the peer won't unban the IP
     let peer3_ips = vec![ip1, ip2];
-    let peer3 = create_peer_with_ips(peer3_ips.clone());
-    banned_peers.add_banned_peer(&peer3);
+    let (peer3_id, peer3) = create_peer_with_ips(peer3_ips.clone());
+    banned_peers.add_banned_peer(&peer3_id, &peer3);
 
     // assert 1 extra peer past threshold
     assert_eq!(banned_peers.total(), banned_peers_threshold + 1);
 
     // remove one peer with both ip addresses
-    let unbanned_ips = banned_peers.remove_banned_peer(peer3_ips.into_iter());
+    let unbanned_ips = banned_peers.remove_banned_peer(&peer3_id);
 
     // assert total decreased by 1
     assert_eq!(banned_peers.total(), banned_peers_threshold);
@@ -171,19 +172,19 @@ fn test_multiple_ips_different_ban_status() {
 
     // Add BANNED_PEERS_PER_IP_THRESHOLD+1 peers with ip1 (will be banned)
     for _ in 0..banned_peers_threshold {
-        let peer = create_peer_with_ips(vec![ip1]);
-        banned_peers.add_banned_peer(&peer);
+        let (peer_id, peer) = create_peer_with_ips(vec![ip1]);
+        banned_peers.add_banned_peer(&peer_id, &peer);
     }
 
     // add just enough so at threshold, but not banned
     for _ in 0..banned_peers_threshold - 1 {
-        let peer = create_peer_with_ips(vec![ip2]);
-        banned_peers.add_banned_peer(&peer);
+        let (peer_id, peer) = create_peer_with_ips(vec![ip2]);
+        banned_peers.add_banned_peer(&peer_id, &peer);
     }
 
     // add 1 peer with ip3 (below threshold)
-    let peer = create_peer_with_ips(vec![ip3]);
-    banned_peers.add_banned_peer(&peer);
+    let (peer_id, peer) = create_peer_with_ips(vec![ip3]);
+    banned_peers.add_banned_peer(&peer_id, &peer);
 
     // assert banned ips
     assert!(banned_peers.ip_banned(&ip1));
@@ -204,13 +205,13 @@ fn test_remove_all_ips_for_peer() {
     let ips: Vec<IpAddr> = (0..10).map(|_| random_ip_addr()).collect();
 
     // add a peer with all IPs
-    let peer = create_peer_with_ips(ips.clone());
-    banned_peers.add_banned_peer(&peer);
+    let (peer_id, peer) = create_peer_with_ips(ips.clone());
+    banned_peers.add_banned_peer(&peer_id, &peer);
 
     assert_eq!(banned_peers.total(), 1);
 
     // remove the peer
-    let unbanned_ips = banned_peers.remove_banned_peer(ips.iter().cloned());
+    let unbanned_ips = banned_peers.remove_banned_peer(&peer_id);
 
     // check all IPs were unbanned
     assert_eq!(unbanned_ips.len(), ips.len());
@@ -224,7 +225,7 @@ fn test_saturating_operations() {
     let mut banned_peers = BannedPeers::default();
 
     // assert total doesn't underflow
-    let unbanned_ips = banned_peers.remove_banned_peer(vec![].into_iter());
+    let unbanned_ips = banned_peers.remove_banned_peer(&PeerId::random());
     assert_eq!(banned_peers.total(), 0);
     assert!(unbanned_ips.is_empty());
 
@@ -232,17 +233,19 @@ fn test_saturating_operations() {
 
     // add a large number of peers with the same IP
     let ip = random_ip_addr();
+    let mut ids = Vec::new();
     for _ in 0..(banned_peers_threshold * 2) {
-        let peer = create_peer_with_ips(vec![ip]);
-        banned_peers.add_banned_peer(&peer);
+        let (peer_id, peer) = create_peer_with_ips(vec![ip]);
+        banned_peers.add_banned_peer(&peer_id, &peer);
+        ids.push(peer_id);
     }
 
     // verify the IP is banned
     assert!(banned_peers.ip_banned(&ip));
 
-    // remove more peers than added
-    for _ in 0..(banned_peers_threshold * 3) {
-        banned_peers.remove_banned_peer(vec![ip].into_iter());
+    // release every charged peer, then release each one again
+    for peer_id in ids.iter().chain(ids.iter()) {
+        banned_peers.remove_banned_peer(peer_id);
     }
 
     // assert total does not underflow

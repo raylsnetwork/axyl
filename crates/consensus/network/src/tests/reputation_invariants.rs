@@ -434,3 +434,152 @@ fn disconnected_peer_eviction_retires_the_oldest_record() {
     );
     assert!(peers.get_peer(&first).is_none(), "the oldest disconnected record survived eviction");
 }
+
+// Leaving the Banned state: every exit settles the accounting
+
+/// Promoting a peer to trusted is documented to unban its IPs. It must actually release every
+/// charge that peer holds, or the charge outlives the peer record entirely.
+#[test]
+fn promoting_a_banned_peer_to_trusted_releases_its_ip_charges() {
+    let mut peers = all_peers();
+    let shared = ip(72);
+
+    let mut identities = Vec::new();
+    for seed in 10..12u8 {
+        let (bls, network_key) = random_keys(seed);
+        let peer_id: PeerId = network_key.clone().into();
+        peers.update_connection_status(
+            &peer_id,
+            NewConnectionStatus::Connected {
+                multiaddr: create_multiaddr(Some(shared)),
+                direction: ConnectionDirection::Incoming,
+            },
+        );
+        peers.process_penalty(&peer_id, Penalty::Fatal);
+        peers.update_connection_status(&peer_id, NewConnectionStatus::Disconnected);
+        identities.push((bls, network_key));
+    }
+    assert!(peers.ip_banned(&shared), "precondition: the shared IP is blocklisted");
+
+    for (bls, network_key) in identities {
+        peers.add_trusted_peer(bls, network_key, vec![create_multiaddr(Some(shared))]);
+    }
+
+    // INVARIANT: after both peers are trusted, nothing is still charged against their IP.
+    // CURRENT: `Peer::new_trusted` files the address under `listening_addrs`, so
+    // `known_ip_addresses()` on the fresh value is empty and `remove_banned_peer` cleans nothing.
+    assert!(!peers.ip_banned(&shared), "IP stayed blocklisted after every holder became trusted");
+}
+
+/// Disconnecting a peer that is already banned must not lose its ban accounting. If the counters
+/// stay charged while no peer is in `ConnectionStatus::Banned`, the next ban double-charges.
+#[test]
+fn disconnecting_an_already_banned_peer_settles_the_accounting() {
+    let mut peers = all_peers();
+    let peer_id = connect_from(&mut peers, ip(90));
+
+    peers.process_penalty(&peer_id, Penalty::Fatal);
+    peers.update_connection_status(&peer_id, NewConnectionStatus::Disconnected);
+    assert_ban_accounting_conserved(&peers, "after the ban");
+
+    // the manager disconnects a peer it already banned; `disconnect_peer` hardcodes `banned: false`
+    peers.update_connection_status(
+        &peer_id,
+        NewConnectionStatus::Disconnecting { reason: DisconnectReason::ExcessPeers },
+    );
+    peers.update_connection_status(&peer_id, NewConnectionStatus::Disconnected);
+
+    // INVARIANT: the peer is no longer banned, so nothing is still charged for it.
+    // CURRENT: `handle_disconnecting_transition` sets the new status before inspecting the old
+    // one, and its `Banned` arm only logs - `remove_banned_peer` is never called.
+    assert_ban_accounting_conserved(&peers, "after disconnecting an already-banned peer");
+}
+/// Re-banning a peer whose earlier ban was never settled must not charge it twice, or the ban
+/// table grows a permanent surplus for a single peer.
+#[test]
+fn re_banning_a_peer_does_not_double_charge_it() {
+    let mut peers = all_peers();
+    let peer_id = connect_from(&mut peers, ip(91));
+
+    peers.process_penalty(&peer_id, Penalty::Fatal);
+    peers.update_connection_status(&peer_id, NewConnectionStatus::Disconnected);
+    peers.update_connection_status(
+        &peer_id,
+        NewConnectionStatus::Disconnecting { reason: DisconnectReason::ExcessPeers },
+    );
+    peers.update_connection_status(&peer_id, NewConnectionStatus::Disconnected);
+
+    // the same peer is banned again from the Disconnected state
+    peers.update_connection_status(&peer_id, NewConnectionStatus::Banned);
+
+    // INVARIANT: one banned peer is worth exactly one charge.
+    // CURRENT: the first charge was never released, so `add_banned_peer` takes the total to 2.
+    assert_ban_accounting_conserved(&peers, "after re-banning the same peer");
+}
+/// A peer's ban must charge only its own IPs. If the charge is released against whatever addresses
+/// the peer holds at release time, one peer's unban can cancel another peer's ban.
+#[test]
+fn releasing_a_ban_cannot_cancel_another_peers_ban() {
+    let mut peers = all_peers();
+    let shared = ip(93);
+
+    // two peers banned from the shared address, enough to blocklist it
+    for seed in 30..32u8 {
+        let (bls, network_key) = random_keys(seed);
+        let peer_id: PeerId = network_key.clone().into();
+        peers.update_connection_status(
+            &peer_id,
+            NewConnectionStatus::Connected {
+                multiaddr: create_multiaddr(Some(shared)),
+                direction: ConnectionDirection::Incoming,
+            },
+        );
+        peers.upsert_peer(bls, network_key, vec![create_multiaddr(Some(shared))]);
+        peers.process_penalty(&peer_id, Penalty::Fatal);
+        peers.update_connection_status(&peer_id, NewConnectionStatus::Disconnected);
+    }
+    assert!(peers.ip_banned(&shared), "precondition: the shared address is blocklisted");
+
+    // an unrelated peer is banned from its own address, then learns the shared one from a record
+    let (bls, network_key) = random_keys(32);
+    let outsider: PeerId = network_key.clone().into();
+    peers.update_connection_status(
+        &outsider,
+        NewConnectionStatus::Connected {
+            multiaddr: create_multiaddr(Some(ip(94))),
+            direction: ConnectionDirection::Incoming,
+        },
+    );
+    peers.process_penalty(&outsider, Penalty::Fatal);
+    peers.update_connection_status(&outsider, NewConnectionStatus::Disconnected);
+    peers.upsert_peer(bls, network_key, vec![create_multiaddr(Some(shared))]);
+
+    // releasing the outsider's own ban
+    peers.update_connection_status(&outsider, NewConnectionStatus::Unbanned);
+
+    // INVARIANT: two peers are still banned at the shared address, so it stays blocklisted.
+    // CURRENT: `remove_banned_peer` decrements every IP the peer holds *at release time*, which
+    // now includes an address it never charged.
+    assert!(
+        peers.ip_banned(&shared),
+        "one peer's unban cancelled a charge belonging to two other banned peers"
+    );
+}
+/// Promoting an unrelated peer to trusted must not touch the ban accounting at all.
+#[test]
+fn promoting_an_unrelated_peer_to_trusted_leaves_the_ban_total_alone() {
+    let mut peers = all_peers();
+
+    let banned = connect_from(&mut peers, ip(97));
+    peers.process_penalty(&banned, Penalty::Fatal);
+    peers.update_connection_status(&banned, NewConnectionStatus::Disconnected);
+    assert_eq!(peers.banned_peers.total(), 1, "precondition: exactly one banned peer");
+
+    let (bls, network_key) = random_keys(40);
+    peers.add_trusted_peer(bls, network_key, vec![create_multiaddr(Some(ip(98)))]);
+
+    // INVARIANT: adding a trusted peer that was never banned changes nothing.
+    // CURRENT: `add_trusted_peer` calls `remove_banned_peer`, whose unconditional
+    // `total.saturating_sub(1)` runs even though the IP iterator it is handed is always empty.
+    assert_ban_accounting_conserved(&peers, "after promoting an unrelated peer to trusted");
+}
