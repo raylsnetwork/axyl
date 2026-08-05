@@ -1142,3 +1142,34 @@ async fn test_discovery_heartbeat_removes_banned_ip_peers() {
     // discovery peer with banned ip should be removed
     assert!(!peer_manager.discovery_peers.contains_key(&discovery_peer));
 }
+
+/// A connection this node refuses to track must be closed, not announced upward. Announcing it
+/// leaves the application routing consensus traffic to a peer the manager does not manage.
+#[tokio::test]
+async fn test_refused_registration_disconnects_instead_of_announcing_the_peer() {
+    let mut peer_manager = create_test_peer_manager(None);
+    let peer_id = register_peer(&mut peer_manager, None);
+
+    peer_manager.process_penalty(peer_id, Penalty::Fatal);
+    peer_manager.register_disconnected(&peer_id);
+    collect_all_events(&mut peer_manager);
+    assert!(peer_manager.peer_banned(&peer_id), "precondition: the peer is banned");
+
+    // the ban landed between the admission hook and this callback, which is the only way a banned
+    // peer reaches registration now that both gates share one predicate
+    let registered = peer_manager.register_peer_connection(
+        &peer_id,
+        ConnectionType::IncomingConnection { multiaddr: create_multiaddr(None) },
+    );
+    assert!(!registered, "precondition: registration refuses a banned peer");
+
+    let events = collect_all_events(&mut peer_manager);
+    assert!(
+        !events.iter().any(|e| matches!(e, PeerEvent::PeerConnected(id, _) if *id == peer_id)),
+        "announced a peer it refused to track"
+    );
+    assert!(
+        events.iter().any(|e| matches!(e, PeerEvent::DisconnectPeer(id) if *id == peer_id)),
+        "refused registration left the connection open"
+    );
+}

@@ -473,14 +473,18 @@ impl PeerManager {
     ///
     /// Returns a boolean if the peer was successfully registered. This is the initial
     /// method to call for registering a new peer through dialing or incoming connections.
+    ///
+    /// A refusal closes the connection: the admission gates share this method's predicate, so a
+    /// peer reaching here banned means the ban landed mid-handshake, and leaving that connection
+    /// open would route application traffic to a peer this manager does not track.
     pub(super) fn register_peer_connection(
         &mut self,
         peer_id: &PeerId,
         connection: ConnectionType,
     ) -> bool {
         if self.peer_banned(peer_id) {
-            // log error if the peer is banned
             error!(target: "peer-manager", ?peer_id, "connected with banned peer");
+            self.push_event(PeerEvent::DisconnectPeer(*peer_id));
             return false;
         }
 
