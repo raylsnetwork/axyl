@@ -23,7 +23,7 @@ use tracing::info;
 /// No connection limits or rate limiting are implemented.
 /// Connections are immediately closed after sending response.
 ///
-/// To enable on node startup, use `rayls-network node --enable-healthcheck`.
+/// To enable on node startup, use `rayls-network node --healthcheck <PORT>`.
 /// See `rayls-network-cli::node` for more info.
 #[derive(Debug)]
 pub(crate) struct HealthcheckServer;

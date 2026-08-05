@@ -1,0 +1,39 @@
+# Prometheus scrape config for a Rayls node.
+#
+# Rayls exposes metrics on TWO separate endpoints, in two separate registries (see
+# doc/design/network-observability-research.md):
+#   - consensus / Narwhal suite  — enabled via `metrics_address` in parameters.yaml (or --metrics)
+#   - reth execution layer       — enabled via `reth_metrics_address` in parameters.yaml (or --reth-metrics)
+# Because they are distinct registries, scrape BOTH as separate targets per node; the `layer`
+# label lets dashboards/queries tell them apart. Host metrics come from node_exporter.
+#
+# Point the `targets` below at each node's configured endpoints (defaults shown are the ports
+# used by etc/monitoring/docker-compose.yml against a node running on the docker host).
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  # Consensus / Narwhal metrics — ConsensusMetrics, PrimaryMetrics, WorkerMetrics, NetworkMetrics,
+  # ExecutorMetrics, plus storage gauges. Set `metrics_address` in the node's parameters.yaml.
+  - job_name: rayls-consensus
+    static_configs:
+      - targets: ["host.docker.internal:9184"]
+        labels:
+          layer: consensus
+
+  # Reth execution-layer metrics — block processing, txpool, DB/static-file, process.
+  # Set `reth_metrics_address` in the node's parameters.yaml.
+  - job_name: rayls-execution
+    static_configs:
+      - targets: ["host.docker.internal:9001"]
+        labels:
+          layer: execution
+
+  # Host RSS / CPU / disk / network. Run node_exporter alongside the node.
+  - job_name: node-exporter
+    static_configs:
+      - targets: ["node-exporter:9100"]
+        labels:
+          layer: host

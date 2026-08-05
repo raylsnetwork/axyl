@@ -74,9 +74,10 @@ pub struct NodeCommand<Ext: clap::Args + fmt::Debug = NoArgs> {
     #[arg(long, value_name = "NAMED_RL_NETWORK", verbatim_doc_comment)]
     pub chain: Option<NamedChain>,
 
-    /// Enable Prometheus consensus metrics.
+    /// Enable Prometheus consensus metrics, served at the given interface and port.
     ///
-    /// The metrics will be served at the given interface and port.
+    /// Overrides `metrics_address` in parameters.yaml when passed. If neither is set,
+    /// consensus metrics stay off.
     #[arg(long, value_name = "SOCKET", value_parser = parse_socket_address, help_heading = "Consensus Metrics")]
     pub metrics: Option<SocketAddr>,
 
@@ -304,6 +305,22 @@ impl<Ext: clap::Args + fmt::Debug> NodeCommand<Ext> {
             ext,
             consensus_db,
         } = self;
+
+        // Both metrics endpoints can also be enabled from parameters.yaml — `metrics_address` for
+        // the consensus/Narwhal suite and `reth_metrics_address` for the execution layer. The
+        // `--metrics` / `--reth-metrics` CLI flags override the config values when passed.
+        let metrics = metrics.or(rayls_infrastructure_config.parameters.metrics_address);
+        if let Some(addr) = metrics {
+            info!(target: "cli", %addr, "consensus Prometheus metrics enabled");
+        }
+        let mut reth = reth;
+        reth.reth_metrics.prometheus = reth
+            .reth_metrics
+            .prometheus
+            .or(rayls_infrastructure_config.parameters.reth_metrics_address);
+        if let Some(addr) = reth.reth_metrics.prometheus {
+            info!(target: "cli", %addr, "reth execution-layer Prometheus metrics enabled");
+        }
 
         debug!(target: "cli", "node command genesis: {:#?}", rayls_infrastructure_config.genesis());
 

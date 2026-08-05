@@ -1,0 +1,61 @@
+# One-command Prometheus + Grafana + node_exporter stack for monitoring a Rayls node.
+#
+# Quick start (see README.md for the full walkthrough):
+#   1. Enable the node's metrics endpoints in its parameters.yaml:
+#        metrics_address: "0.0.0.0:9184"        # consensus / Narwhal suite
+#        reth_metrics_address: "0.0.0.0:9001"   # reth execution layer
+#      (or pass --metrics / --reth-metrics on the CLI). Restart the node.
+#   2. Adjust the targets in prometheus.yml if the node isn't on the docker host.
+#   3. `docker compose -f etc/monitoring/docker-compose.yml up -d`
+#   4. Open Grafana at http://localhost:3000 (admin / admin) and import the reth dashboard
+#      (Grafana.com dashboard ID 20638) against the "Prometheus" datasource.
+#
+# This is a local/operator convenience, not a production monitoring stack.
+
+services:
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: rayls-prometheus
+    restart: unless-stopped
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    ports:
+      - "9090:9090"
+    extra_hosts:
+      # lets the scrape targets reach a node running on the docker host
+      - "host.docker.internal:host-gateway"
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: rayls-grafana
+    restart: unless-stopped
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_AUTH_ANONYMOUS_ENABLED=false
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - grafana-data:/var/lib/grafana
+    ports:
+      - "3000:3000"
+    depends_on:
+      - prometheus
+
+  node-exporter:
+    image: prom/node-exporter:latest
+    container_name: rayls-node-exporter
+    restart: unless-stopped
+    command:
+      - --path.rootfs=/host
+    pid: host
+    volumes:
+      - /:/host:ro,rslave
+    ports:
+      - "9100:9100"
+
+volumes:
+  prometheus-data:
+  grafana-data:
