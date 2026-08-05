@@ -5,8 +5,8 @@
 //! `update_connection_status` and `heartbeat_maintenance` - never against a hand-set internal
 //! state, so that a refactor of the transition table cannot make them vacuous.
 //!
-//! Where a test currently fails, the invariant it states is the intended behavior and the failure
-//! is the bug. Such tests carry an `INVARIANT`/`CURRENT` comment pair naming both.
+//! Tests that pinned a live bug carry an `INVARIANT` line stating the property and a `PRE-FIX`
+//! line naming the violation; the fixes have landed, so they now pass as regression guards.
 
 use super::*;
 use crate::common::{create_multiaddr, ensure_score_config};
@@ -258,7 +258,7 @@ fn unbanning_a_never_banned_peer_does_not_decrement_the_total() {
     peers.update_connection_status(&healthy, NewConnectionStatus::Unbanned);
 
     // INVARIANT: only a banned peer's release may decrement the total.
-    // CURRENT: `BannedPeers::remove_banned_peer` decrements unconditionally.
+    // PRE-FIX: `BannedPeers::remove_banned_peer` decrements unconditionally.
     assert_eq!(
         peers.banned_peers.total(),
         peers_in_banned_status(&peers),
@@ -426,7 +426,7 @@ fn disconnected_peer_eviction_retires_the_oldest_record() {
     peers.register_disconnected(&second);
 
     // INVARIANT: the older record is the one evicted.
-    // CURRENT: `collect_excess_peers` converges on the newest entries, so the record just created
+    // PRE-FIX: `collect_excess_peers` converges on the newest entries, so the record just created
     // is dropped and the stale one is retained.
     assert!(
         peers.get_peer(&second).is_some(),
@@ -466,7 +466,7 @@ fn promoting_a_banned_peer_to_trusted_releases_its_ip_charges() {
     }
 
     // INVARIANT: after both peers are trusted, nothing is still charged against their IP.
-    // CURRENT: `Peer::new_trusted` files the address under `listening_addrs`, so
+    // PRE-FIX: `Peer::new_trusted` files the address under `listening_addrs`, so
     // `known_ip_addresses()` on the fresh value is empty and `remove_banned_peer` cleans nothing.
     assert!(!peers.ip_banned(&shared), "IP stayed blocklisted after every holder became trusted");
 }
@@ -490,7 +490,7 @@ fn disconnecting_an_already_banned_peer_settles_the_accounting() {
     peers.update_connection_status(&peer_id, NewConnectionStatus::Disconnected);
 
     // INVARIANT: the peer is no longer banned, so nothing is still charged for it.
-    // CURRENT: `handle_disconnecting_transition` sets the new status before inspecting the old
+    // PRE-FIX: `handle_disconnecting_transition` sets the new status before inspecting the old
     // one, and its `Banned` arm only logs - `remove_banned_peer` is never called.
     assert_ban_accounting_conserved(&peers, "after disconnecting an already-banned peer");
 }
@@ -513,7 +513,7 @@ fn re_banning_a_peer_does_not_double_charge_it() {
     peers.update_connection_status(&peer_id, NewConnectionStatus::Banned);
 
     // INVARIANT: one banned peer is worth exactly one charge.
-    // CURRENT: the first charge was never released, so `add_banned_peer` takes the total to 2.
+    // PRE-FIX: the first charge was never released, so `add_banned_peer` takes the total to 2.
     assert_ban_accounting_conserved(&peers, "after re-banning the same peer");
 }
 /// A peer's ban must charge only its own IPs. If the charge is released against whatever addresses
@@ -558,7 +558,7 @@ fn releasing_a_ban_cannot_cancel_another_peers_ban() {
     peers.update_connection_status(&outsider, NewConnectionStatus::Unbanned);
 
     // INVARIANT: two peers are still banned at the shared address, so it stays blocklisted.
-    // CURRENT: `remove_banned_peer` decrements every IP the peer holds *at release time*, which
+    // PRE-FIX: `remove_banned_peer` decrements every IP the peer holds *at release time*, which
     // now includes an address it never charged.
     assert!(
         peers.ip_banned(&shared),
@@ -579,7 +579,7 @@ fn promoting_an_unrelated_peer_to_trusted_leaves_the_ban_total_alone() {
     peers.add_trusted_peer(bls, network_key, vec![create_multiaddr(Some(ip(98)))]);
 
     // INVARIANT: adding a trusted peer that was never banned changes nothing.
-    // CURRENT: `add_trusted_peer` calls `remove_banned_peer`, whose unconditional
+    // PRE-FIX: `add_trusted_peer` calls `remove_banned_peer`, whose unconditional
     // `total.saturating_sub(1)` runs even though the IP iterator it is handed is always empty.
     assert_ban_accounting_conserved(&peers, "after promoting an unrelated peer to trusted");
 }
@@ -607,7 +607,7 @@ fn decay_depends_on_elapsed_time_not_on_heartbeat_frequency() {
     }
 
     // INVARIANT: after one halflife the score has moved roughly halfway back to zero.
-    // CURRENT: `Score::update_at` truncates elapsed to whole seconds but advances `last_updated`
+    // PRE-FIX: `Score::update_at` truncates elapsed to whole seconds but advances `last_updated`
     // unconditionally, so a sub-second sampling cadence discards every remainder.
     assert!(
         score_of(&peers, &peer_id) > after_penalty / 2.0,
@@ -684,7 +684,7 @@ fn only_observed_addresses_charge_the_ip_ban_table() {
     }
 
     // INVARIANT: only the address this node observed the connection on is charged.
-    // CURRENT: `Peer::known_ip_addresses` reads `multiaddrs`, which `update_net` extends from the
+    // PRE-FIX: `Peer::known_ip_addresses` reads `multiaddrs`, which `update_net` extends from the
     // peer's own record, so two peers can blocklist any address they name.
     assert!(
         !peers.ip_banned(&victim),
@@ -706,7 +706,7 @@ fn clearing_a_ban_on_dial_emits_an_unban_action() {
     let action = peers.update_connection_status(&peer_id, NewConnectionStatus::Dialing);
 
     // INVARIANT: a transition that clears the ban stores announces it.
-    // CURRENT: `handle_dialing_transition`'s `Banned` arm calls `remove_banned_peer` and then
+    // PRE-FIX: `handle_dialing_transition`'s `Banned` arm calls `remove_banned_peer` and then
     // returns `NoAction`, so the peer is silently un-charged while the gossipsub blacklist and the
     // kad routing entry stay as the ban left them.
     assert!(

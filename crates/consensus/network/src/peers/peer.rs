@@ -112,8 +112,8 @@ impl Peer {
     /// Update keys and network address.
     ///
     /// The addresses come from the peer's own record, so they are recorded as advertised rather
-    /// than witnessed. `multiaddrs` drives ban accounting and peer exchange, and a peer must be
-    /// able to neither charge nor advertise an address this node has not seen it connect from.
+    /// than witnessed. `multiaddrs` drives ban accounting and peer exchange, so a peer must not be
+    /// able to charge or advertise an address this node has not observed it connecting from.
     pub(super) fn update_net(
         &mut self,
         bls_public_key: BlsPublicKey,

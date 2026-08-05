@@ -614,7 +614,7 @@ async fn test_committee_member_resolved_mid_epoch_is_absolved_immediately() {
     );
 
     // INVARIANT: resolution grants the exemption, so penalties from this point are absolved.
-    // CURRENT: `new_epoch` rebuilds `current_committee_keys` only from members it could already
+    // PRE-FIX: `new_epoch` rebuilds `current_committee_keys` only from members it could already
     // resolve, so `upsert_peer` sees an unknown key and leaves the peer untrusted for the epoch.
     assert!(
         peer_manager.is_peer_validator(&unresolved),
@@ -737,7 +737,7 @@ async fn test_admitted_connection_is_registered_under_the_same_ban_predicate() {
     );
 
     // INVARIANT: a connection the admission checks accepted is registered.
-    // CURRENT: `register_peer_connection` gates on `AllPeers::peer_banned`, which has no committee
+    // PRE-FIX: `register_peer_connection` gates on `AllPeers::peer_banned`, which has no committee
     // exemption, so it refuses and logs `error "connected with banned peer"` - while
     // `on_connection_established` discards the `false` and still emits `PeerEvent::PeerConnected`.
     assert!(
