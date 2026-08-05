@@ -371,3 +371,66 @@ fn committee_members_are_immune_to_penalties() {
     assert!(matches!(action, PeerAction::NoAction));
     assert_eq!(score_of(&peers, &peer_id), before, "a committee member's score was penalized");
 }
+
+// Ban-table capacity and trust promotion
+
+/// The ban table is bounded for memory, not for amnesty. Eviction ages out the oldest bans, so a
+/// flood of new identities cannot flush the bans this node most recently earned.
+///
+/// Three bans against a bound of one forces `excess == 2`. A selection that is correct only for a
+/// single eviction passes the one-peer case and still picks the wrong pair here.
+#[test]
+fn ban_table_overflow_retires_the_oldest_bans() {
+    let mut peers = all_peers_with(PeerConfig { max_banned_peers: 1, ..Default::default() });
+
+    // ban three peers without pruning in between, so the bound is exceeded by two at once
+    let banned: Vec<_> = (70..73u8)
+        .map(|octet| {
+            let peer_id = connect_from(&mut peers, ip(octet));
+            peers.process_penalty(&peer_id, Penalty::Fatal);
+            peers.update_connection_status(&peer_id, NewConnectionStatus::Disconnected);
+            std::thread::sleep(Duration::from_millis(2));
+            peer_id
+        })
+        .collect();
+    assert_eq!(peers.banned_peers.total(), 3, "precondition: three bans, bound of one");
+
+    // any disconnect registration triggers the capacity sweep
+    let (_, pruned) = peers.register_disconnected(&banned[2]);
+    let retired: Vec<_> = pruned.iter().map(|(id, _)| *id).collect();
+
+    assert_eq!(retired.len(), 2, "a bound of one against three bans retires two");
+    assert!(retired.contains(&banned[0]), "the oldest ban survived eviction");
+    assert!(retired.contains(&banned[1]), "the second-oldest ban survived eviction");
+    assert!(!retired.contains(&banned[2]), "eviction retired the ban applied most recently");
+}
+
+/// Disconnected-peer eviction ages out the oldest records, like ban eviction. Both callers share
+/// `collect_excess_peers`, so both inherit whichever ordering it implements.
+#[test]
+fn disconnected_peer_eviction_retires_the_oldest_record() {
+    let mut peers = all_peers_with(PeerConfig { max_disconnected_peers: 1, ..Default::default() });
+
+    let first = connect_from(&mut peers, ip(95));
+    peers.update_connection_status(
+        &first,
+        NewConnectionStatus::Disconnecting { reason: DisconnectReason::ExcessPeers },
+    );
+    peers.register_disconnected(&first);
+
+    let second = connect_from(&mut peers, ip(96));
+    peers.update_connection_status(
+        &second,
+        NewConnectionStatus::Disconnecting { reason: DisconnectReason::ExcessPeers },
+    );
+    peers.register_disconnected(&second);
+
+    // INVARIANT: the older record is the one evicted.
+    // CURRENT: `collect_excess_peers` converges on the newest entries, so the record just created
+    // is dropped and the stale one is retained.
+    assert!(
+        peers.get_peer(&second).is_some(),
+        "eviction dropped the newest disconnected record instead of the oldest"
+    );
+    assert!(peers.get_peer(&first).is_none(), "the oldest disconnected record survived eviction");
+}

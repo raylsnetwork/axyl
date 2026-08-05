@@ -21,7 +21,6 @@ use libp2p::{Multiaddr, PeerId};
 use rand::seq::SliceRandom as _;
 use rayls_infrastructure_types::{BlsPublicKey, NetworkPublicKey};
 use std::{
-    cmp::Reverse,
     collections::{BinaryHeap, HashMap, HashSet},
     net::IpAddr,
     time::{Duration, Instant},
@@ -777,15 +776,18 @@ impl AllPeers {
         (action, pruned_peers)
     }
 
-    /// Filter peers based on connection status.
+    /// Select the `excess` oldest peers whose status `filter` accepts.
     ///
-    /// This creates a min-heap with the excess number of peers.
-    /// Used by Self::prune_banned_peers and Self::prune_disconnected_peers.
+    /// Used by [`Self::prune_banned_peers`] and [`Self::prune_disconnected_peers`] to age out the
+    /// longest-standing records when a capacity bound is exceeded.
+    ///
+    /// The heap is a max-heap on the instant, so `peek` is the newest selected peer; replacing it
+    /// whenever an older candidate arrives converges the heap on the `excess` oldest.
     fn collect_excess_peers<F>(
         &self,
         excess: usize,
         filter: F,
-    ) -> BinaryHeap<(Reverse<Instant>, PeerId, Vec<IpAddr>)>
+    ) -> BinaryHeap<(Instant, PeerId, Vec<IpAddr>)>
     where
         F: Fn(&ConnectionStatus) -> Option<Instant>,
     {
@@ -794,16 +796,13 @@ impl AllPeers {
 
         for (peer_id, peer) in &self.peers {
             if let Some(instant) = filter(peer.connection_status()) {
-                // min-heap sorted by instant (oldest first)
-                let entry =
-                    (Reverse(instant), *peer_id, peer.known_ip_addresses().collect::<Vec<_>>());
+                let entry = (instant, *peer_id, peer.known_ip_addresses().collect::<Vec<_>>());
 
                 if excess_peers.len() < excess {
                     // fill the heap until `excess` elements
                     excess_peers.push(entry);
-                } else if let Some(current_max) = excess_peers.peek() {
-                    // if peer's banned instant is older, replace it
-                    if entry.0 < current_max.0 {
+                } else if let Some(newest) = excess_peers.peek() {
+                    if entry.0 < newest.0 {
                         excess_peers.pop();
                         excess_peers.push(entry);
                     }
