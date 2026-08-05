@@ -19,9 +19,9 @@ use alloy::{
 use alloy_evm::{block::StateChangeSource, eth::EthTxResult, tx::RecoveredTx as _, Database, Evm};
 use rand::{rngs::StdRng, seq::IteratorRandom, Rng as _, SeedableRng as _};
 use rayls_infrastructure_types::{
-    rewards::{build_withdrawals, HybridEpochTally}, Address, Bytes, Encodable2718, ExecHeader,
-    Receipt, SolValue,
-    TransactionSigned, Withdrawals, B256, EMPTY_WITHDRAWALS, U256,
+    rewards::{build_withdrawals, HybridEpochTally},
+    Address, Bytes, Encodable2718, ExecHeader, Receipt, SolValue, TransactionSigned, Withdrawals,
+    B256, EMPTY_WITHDRAWALS, U256,
 };
 use rayls_middleware_rewards::RewardsCounter;
 use reth_chainspec::{EthChainSpec, EthereumHardforks};

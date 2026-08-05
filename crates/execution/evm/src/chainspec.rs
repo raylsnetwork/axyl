@@ -879,6 +879,22 @@ mod tests {
         assert_eq!(version, Some(0x0c));
     }
 
+    #[test]
+    fn local_network_version_byte_advances_at_hybrid_rewards() {
+        let hardforks = RaylsChainHardforks::local();
+        assert_eq!(
+            hardforks.version_byte_at_block(LOCAL_HYBRID_REWARDS_BLOCK - 1),
+            Some(0x0c),
+            "the block before HybridRewards must still report DynamicCommitteeSizing"
+        );
+        assert_eq!(
+            hardforks.version_byte_at_block(LOCAL_HYBRID_REWARDS_BLOCK),
+            Some(0x0d),
+            "HybridRewards must own the version byte from its activation block"
+        );
+        assert_eq!(hardforks.version_byte_at_block(1_000_000), Some(0x0d));
+    }
+
     // ── Schedule and version tests ──────────────────────────────────────
 
     #[test]

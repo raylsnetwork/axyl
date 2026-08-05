@@ -1327,7 +1327,11 @@ async fn test_hybrid_rewards_fork_boundary() -> eyre::Result<()> {
     };
 
     // Genesis deploys the pre-hybrid ConsensusRegistry.
-    assert_eq!(registry_code_len(&reth_env)?, OLD_REGISTRY_LEN, "genesis must be the pre-hybrid contract");
+    assert_eq!(
+        registry_code_len(&reth_env)?,
+        OLD_REGISTRY_LEN,
+        "genesis must be the pre-hybrid contract"
+    );
 
     let mut epoch = 0u32;
 

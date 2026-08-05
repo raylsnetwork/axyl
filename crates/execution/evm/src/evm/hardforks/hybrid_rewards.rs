@@ -19,12 +19,12 @@
 //! - **BlsG1 library address** (8 link sites) — identical at every site.
 //! - **`_rls` immutable** (the RLS proxy address) — identical at every site.
 //! - **The 5 Solady EIP-712 cached immutables.** Their Solady AST ids are stable across the
-//!   pre-hybrid and hybrid compilations (only `ConsensusRegistry`'s own `_rls` AST id shifted),
-//!   so they map 1:1 by index. `_cachedNameHash`/`_cachedVersionHash` are constants of the
-//!   (unchanged) EIP-712 domain, so the live value is already correct; `_cachedThis` /
-//!   `_cachedChainId` / `_cachedDomainSeparator` self-heal at call time (Solady recomputes the
-//!   separator whenever `address(this)`/`block.chainid` disagree with the cached values, which
-//!   they always do because the cached `_cachedThis` was the genesis CREATE address).
+//!   pre-hybrid and hybrid compilations (only `ConsensusRegistry`'s own `_rls` AST id shifted), so
+//!   they map 1:1 by index. `_cachedNameHash`/`_cachedVersionHash` are constants of the (unchanged)
+//!   EIP-712 domain, so the live value is already correct; `_cachedThis` / `_cachedChainId` /
+//!   `_cachedDomainSeparator` self-heal at call time (Solady recomputes the separator whenever
+//!   `address(this)`/`block.chainid` disagree with the cached values, which they always do because
+//!   the cached `_cachedThis` was the genesis CREATE address).
 //!
 //! Everything else in the runtime — the actual hybrid `applyIncentives` logic — comes from the
 //! checked-in fixture. Storage, nonce and balance are untouched (the dispatcher carries them
@@ -69,6 +69,9 @@ const NEW_RLS_OFFSETS: [usize; 7] = [801, 1489, 5228, 9208, 10635, 13787, 17247]
 const OLD_EIP712_OFFSETS: [usize; 5] = [14651, 14686, 14766, 14804, 14618];
 /// Same immutables in the hybrid runtime code, in the same AST-id order.
 const NEW_EIP712_OFFSETS: [usize; 5] = [15652, 15687, 15767, 15805, 15619];
+
+/// The EIP-712 offsets are paired positionally, so the two arrays must stay the same length.
+const _: () = assert!(OLD_EIP712_OFFSETS.len() == NEW_EIP712_OFFSETS.len());
 
 /// Hybrid `ConsensusRegistry` runtime code with BlsG1 link sites and all immutables zeroed;
 /// the per-network values are spliced in from the live contract at activation.
@@ -125,10 +128,8 @@ fn splice_hybrid_registry_code(live: &[u8]) -> Result<Vec<u8>, BlockExecutionErr
     for &o in &NEW_RLS_OFFSETS {
         code[o..o + IMM_LEN].copy_from_slice(rls);
     }
-    for i in 0..OLD_EIP712_OFFSETS.len() {
-        let v = &live[OLD_EIP712_OFFSETS[i]..OLD_EIP712_OFFSETS[i] + IMM_LEN];
-        let o = NEW_EIP712_OFFSETS[i];
-        code[o..o + IMM_LEN].copy_from_slice(v);
+    for (&old_o, &new_o) in OLD_EIP712_OFFSETS.iter().zip(&NEW_EIP712_OFFSETS) {
+        code[new_o..new_o + IMM_LEN].copy_from_slice(&live[old_o..old_o + IMM_LEN]);
     }
 
     Ok(code)
@@ -150,7 +151,9 @@ where
             BlockExecutionError::msg(format!("HybridRewards: read ConsensusRegistry account: {e}"))
         })?
         .ok_or_else(|| {
-            BlockExecutionError::msg("HybridRewards: ConsensusRegistry account is missing".to_string())
+            BlockExecutionError::msg(
+                "HybridRewards: ConsensusRegistry account is missing".to_string(),
+            )
         })?;
 
     let live_code: Bytecode = match info.code {
@@ -185,14 +188,33 @@ mod tests {
         c
     }
 
+    /// Every site the splice writes to must be zeroed in the fixture. A non-zero site would
+    /// mean the fixture's offsets drifted from the hybrid artifact (the hybrid artifact is a
+    /// forge build product and is not checked in, so this is the only guard on the `NEW_*`
+    /// constants): the splice would then be partially overwriting live logic bytes instead of
+    /// cleanly filling a placeholder.
     #[test]
-    fn fixture_has_expected_length_and_zeroed_link_sites() {
+    fn fixture_has_expected_length_and_zeroed_splice_sites() {
         assert_eq!(NEW_DEPLOYED_BYTECODE.len(), NEW_DEPLOYED_LEN);
         for &o in &NEW_BLSG1_OFFSETS {
             assert_eq!(
                 &NEW_DEPLOYED_BYTECODE[o..o + LINK_LEN],
                 &[0u8; LINK_LEN],
-                "fixture link site {o} must be zeroed so splicing fully overwrites it"
+                "fixture BlsG1 link site {o} must be zeroed so splicing fully overwrites it"
+            );
+        }
+        for &o in &NEW_RLS_OFFSETS {
+            assert_eq!(
+                &NEW_DEPLOYED_BYTECODE[o..o + IMM_LEN],
+                &[0u8; IMM_LEN],
+                "fixture `_rls` immutable site {o} must be zeroed so splicing fully overwrites it"
+            );
+        }
+        for &o in &NEW_EIP712_OFFSETS {
+            assert_eq!(
+                &NEW_DEPLOYED_BYTECODE[o..o + IMM_LEN],
+                &[0u8; IMM_LEN],
+                "fixture EIP-712 immutable site {o} must be zeroed so splicing fully overwrites it"
             );
         }
     }
@@ -268,8 +290,22 @@ mod tests {
         expected.sort_unstable();
         assert_eq!(links, expected, "pre-hybrid BlsG1 link offsets drifted from artifact");
 
-        // `_rls` is the one immutable whose site count is 7 (the EIP-712 cached values are single-site).
+        // `_rls` is the one immutable whose site count is 7 (the EIP-712 cached values are
+        // single-site).
         let imms = db["immutableReferences"].as_object().expect("immutable refs");
+
+        // The splice carries exactly two kinds of immutable: `_rls` and the 5 EIP-712 cached
+        // values. A new immutable in the contract would be left zeroed in the migrated code, so
+        // pin the total — a recompile that adds one must revisit this migration.
+        assert_eq!(
+            imms.len(),
+            1 + OLD_EIP712_OFFSETS.len(),
+            "pre-hybrid artifact has {} immutables, expected `_rls` + {} EIP-712 cached values; \
+             a new immutable would be left zeroed by the splice",
+            imms.len(),
+            OLD_EIP712_OFFSETS.len()
+        );
+
         let mut rls: Vec<usize> = imms
             .values()
             .find(|sites| sites.as_array().map(|a| a.len()) == Some(OLD_RLS_OFFSETS.len()))
@@ -283,5 +319,26 @@ mod tests {
         let mut expected_rls = OLD_RLS_OFFSETS.to_vec();
         expected_rls.sort_unstable();
         assert_eq!(rls, expected_rls, "pre-hybrid _rls immutable offsets drifted from artifact");
+
+        // The 5 Solady EIP-712 cached immutables are the single-site entries. The splice pairs
+        // them with `NEW_EIP712_OFFSETS` positionally, and that pairing is "ascending AST id" —
+        // so compare in AST-id order rather than sorted by offset, which pins the ordering the
+        // splice relies on as well as the offsets themselves. (`OLD_EIP712_OFFSETS` is
+        // deliberately not ascending: AST id 55789 sits at the lowest offset.)
+        let mut eip712: Vec<(u64, usize)> = imms
+            .iter()
+            .filter(|(_, sites)| sites.as_array().map(|a| a.len()) == Some(1))
+            .map(|(ast_id, sites)| {
+                let start = sites[0]["start"].as_u64().expect("immutable site start") as usize;
+                (ast_id.parse::<u64>().expect("numeric AST id key"), start)
+            })
+            .collect();
+        eip712.sort_unstable_by_key(|&(ast_id, _)| ast_id);
+        let eip712_starts: Vec<usize> = eip712.iter().map(|&(_, start)| start).collect();
+        assert_eq!(
+            eip712_starts,
+            OLD_EIP712_OFFSETS.to_vec(),
+            "pre-hybrid EIP-712 immutable offsets (ascending AST id) drifted from artifact"
+        );
     }
 }
