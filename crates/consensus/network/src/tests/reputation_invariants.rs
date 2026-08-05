@@ -691,3 +691,51 @@ fn only_observed_addresses_charge_the_ip_ban_table() {
         "two peers blocklisted an address neither of them ever connected from"
     );
 }
+
+/// Clearing a peer's ban is a decision other stores must hear about - the gossipsub blacklist and
+/// the kad routing table are repaired only by `PeerAction::Unban`.
+#[test]
+fn clearing_a_ban_on_dial_emits_an_unban_action() {
+    let mut peers = all_peers();
+    let peer_id = connect_from(&mut peers, ip(92));
+
+    peers.process_penalty(&peer_id, Penalty::Fatal);
+    peers.update_connection_status(&peer_id, NewConnectionStatus::Disconnected);
+    assert_eq!(peers.banned_peers.total(), 1, "precondition: the peer is banned and charged");
+
+    let action = peers.update_connection_status(&peer_id, NewConnectionStatus::Dialing);
+
+    // INVARIANT: a transition that clears the ban stores announces it.
+    // CURRENT: `handle_dialing_transition`'s `Banned` arm calls `remove_banned_peer` and then
+    // returns `NoAction`, so the peer is silently un-charged while the gossipsub blacklist and the
+    // kad routing entry stay as the ban left them.
+    assert!(
+        matches!(action, PeerAction::Unban(_)),
+        "ban cleared on dial without an Unban action: {action:?}"
+    );
+}
+
+/// The same law on the connect path. Accepting a connection from a banned peer releases the ban,
+/// so it carries the same obligation to announce it.
+#[test]
+fn clearing_a_ban_on_connect_emits_an_unban_action() {
+    let mut peers = all_peers();
+    let peer_id = connect_from(&mut peers, ip(99));
+
+    peers.process_penalty(&peer_id, Penalty::Fatal);
+    peers.update_connection_status(&peer_id, NewConnectionStatus::Disconnected);
+    assert_eq!(peers.banned_peers.total(), 1, "precondition: the peer is banned and charged");
+
+    let action = peers.update_connection_status(
+        &peer_id,
+        NewConnectionStatus::Connected {
+            multiaddr: create_multiaddr(Some(ip(99))),
+            direction: ConnectionDirection::Incoming,
+        },
+    );
+
+    assert!(
+        matches!(action, PeerAction::Unban(_)),
+        "ban cleared on connect without an Unban action: {action:?}"
+    );
+}

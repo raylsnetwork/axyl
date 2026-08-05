@@ -390,6 +390,11 @@ impl AllPeers {
         multiaddr: Multiaddr,
         direction: ConnectionDirection,
     ) -> PeerAction {
+        // a ban cleared here has to be announced: the gossipsub blacklist and the kad routing
+        // entry are repaired only by `PeerAction::Unban`, so releasing the counters silently
+        // leaves the peer blocked in stores this method does not own
+        let mut unbanned_ips = None;
+
         if let Some(peer) = self.peers.get_mut(peer_id) {
             // update counters based on previous state
             match current_status {
@@ -398,7 +403,7 @@ impl AllPeers {
                 }
                 ConnectionStatus::Banned { .. } => {
                     error!(target: "peer-manager", ?peer_id, "accepted a connection from a banned peer");
-                    self.banned_peers.remove_banned_peer(peer_id);
+                    unbanned_ips = Some(self.banned_peers.remove_banned_peer(peer_id));
                 }
                 ConnectionStatus::Disconnecting { .. } => {
                     warn!(target: "peer-manager", ?peer_id, "connected to a disconnecting peer")
@@ -415,7 +420,10 @@ impl AllPeers {
             }
         }
 
-        PeerAction::NoAction
+        match unbanned_ips {
+            Some(ip_addrs) => PeerAction::Unban(ip_addrs),
+            None => PeerAction::NoAction,
+        }
     }
 
     /// Handle transition to Dialing state
@@ -424,11 +432,15 @@ impl AllPeers {
         peer_id: &PeerId,
         current_status: ConnectionStatus,
     ) -> PeerAction {
+        // see `handle_connected_transition`: clearing a ban without announcing it strands the
+        // gossipsub blacklist and the kad routing entry the ban removed
+        let mut unbanned_ips = None;
+
         if let Some(peer) = self.peers.get_mut(peer_id) {
             match current_status {
                 ConnectionStatus::Banned { .. } => {
                     warn!(target: "peer-manager", ?peer_id, "dialing a banned peer");
-                    self.banned_peers.remove_banned_peer(peer_id);
+                    unbanned_ips = Some(self.banned_peers.remove_banned_peer(peer_id));
                 }
                 ConnectionStatus::Disconnected { .. } => {
                     self.disconnected_peers = self.disconnected_peers.saturating_sub(1);
@@ -450,7 +462,10 @@ impl AllPeers {
             }
         }
 
-        PeerAction::NoAction
+        match unbanned_ips {
+            Some(ip_addrs) => PeerAction::Unban(ip_addrs),
+            None => PeerAction::NoAction,
+        }
     }
 
     /// Handle transition to Disconnected state
