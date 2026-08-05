@@ -281,8 +281,9 @@ where
 
         // Fresh record: store it first. add_known_peer only on success so a full
         // store cannot be used as a side-channel to populate known_peers (PR #280).
+        let publisher = record.publisher;
         if let Err(err) = self.swarm.behaviour_mut().kademlia.store_mut().put(record) {
-            self.handle_kad_store_error(&source, err);
+            self.handle_kad_store_error(&source, publisher, err);
             return;
         }
 
@@ -333,21 +334,30 @@ where
             .map_err(RecordInvalidReason::InvalidPeerRecord)
     }
 
-    /// Handle a store error from `put()`.
+    /// Handle a store error from `put()`, charging the peer at fault, if any.
     ///
-    /// A full store or oversize value is this node's local condition, not the deliverer's fault;
-    /// the penalty here is provisional, pending a separate local-vs-remote cause split.
-    fn handle_kad_store_error(&mut self, peer_id: &PeerId, err: Error) {
-        let (reason, penalty) = match err {
-            Error::MaxRecords => (RecordInvalidReason::MaxRecordSizeExceeded, Penalty::Mild),
-            Error::MaxProvidedKeys => (RecordInvalidReason::MaxProvidedKeysExceeded, Penalty::Mild),
-            Error::ValueTooLarge => (
-                RecordInvalidReason::InvalidPeerRecord("value too large".to_string()),
-                Penalty::Fatal,
-            ),
+    /// Runs after `verify_kad_put_authenticity`, so `publisher` is authenticated: an oversize
+    /// value charges only its author, never an honest relayer, matching
+    /// [`kad_record_fault_penalty`]. A full store is a local capacity condition, so the deliverer
+    /// is charged only `Penalty::Mild`.
+    fn handle_kad_store_error(
+        &mut self,
+        deliverer: &PeerId,
+        publisher: Option<PeerId>,
+        err: Error,
+    ) {
+        let penalty = match err {
+            Error::MaxRecords => Some(Penalty::Mild),
+            Error::ValueTooLarge => (publisher == Some(*deliverer)).then_some(Penalty::Fatal),
+            // `process_add_provider_request` drops provider records, so `add_provider` never runs.
+            Error::MaxProvidedKeys => {
+                unreachable!("provider records are dropped, so the store holds no provider keys")
+            }
         };
-        warn!(target: "network-kad", ?peer_id, ?reason, "kad store rejected record");
-        self.swarm.behaviour_mut().peer_manager.process_penalty(*peer_id, penalty);
+        if let Some(penalty) = penalty {
+            warn!(target: "network-kad", ?deliverer, ?err, ?penalty, "kad store rejected record");
+            self.swarm.behaviour_mut().peer_manager.process_penalty(*deliverer, penalty);
+        }
     }
 
     /// Apply the penalty owed for an invalid KAD record delivered by `deliverer`.
@@ -599,10 +609,6 @@ fn kad_record_fault_penalty(
         }
         // The source itself is banned - the deliverer is the offender, independent of authorship.
         RecordInvalidReason::SourceBanned => Some(Penalty::Fatal),
-        // Local store capacity, not the peer's fault. Kept for exhaustiveness; the store path
-        // penalizes directly (Class B) and does not reach here.
-        RecordInvalidReason::MaxRecordSizeExceeded
-        | RecordInvalidReason::MaxProvidedKeysExceeded => Some(Penalty::Mild),
     }
 }
 
