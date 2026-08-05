@@ -4,7 +4,7 @@ use super::{
     all_peers::AllPeers,
     cache::BannedPeerCache,
     score::init_peer_score_config,
-    status::NewConnectionStatus,
+    status::{DisconnectReason, NewConnectionStatus},
     types::{ConnectionDirection, ConnectionType, DialRequest, PeerAction},
     PeerEvent, PeerExchangeMap, Penalty,
 };
@@ -462,7 +462,7 @@ impl PeerManager {
         self.events.push_back(event);
         let action = self.peers.update_connection_status(
             &peer_id,
-            NewConnectionStatus::Disconnecting { banned: false },
+            NewConnectionStatus::Disconnecting { reason: DisconnectReason::ExcessPeers },
         );
 
         debug!(target: "peer-manager", ?action, "disconnect peer results in:");

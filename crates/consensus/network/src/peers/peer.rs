@@ -264,7 +264,7 @@ impl Peer {
     /// of being banned (connected/disconnecting).
     pub(super) fn can_dial(&self) -> bool {
         match self.connection_status {
-            ConnectionStatus::Disconnecting { banned } => !banned,
+            ConnectionStatus::Disconnecting { reason } => !reason.bans_peer(),
             ConnectionStatus::Connected { .. }
             | ConnectionStatus::Dialing { .. }
             | ConnectionStatus::Banned { .. } => false,

@@ -4,8 +4,12 @@
 //! manager to take. Some actions are propagated up to the swarm level and affect other behaviors.
 
 use super::{
-    banned::BannedPeers, peer::Peer, score::ReputationUpdate, status::ConnectionStatus,
-    types::ConnectionDirection, PeerExchangeMap, Penalty,
+    banned::BannedPeers,
+    peer::Peer,
+    score::ReputationUpdate,
+    status::{ConnectionStatus, DisconnectReason},
+    types::ConnectionDirection,
+    PeerExchangeMap, Penalty,
 };
 use crate::{
     error::NetworkError,
@@ -27,6 +31,9 @@ use tracing::{debug, error, trace, warn};
 #[cfg(test)]
 #[path = "../tests/peers.rs"]
 mod peers;
+#[cfg(test)]
+#[path = "../tests/reputation_invariants.rs"]
+mod reputation_invariants;
 
 /// State for known peers.
 ///
@@ -354,8 +361,8 @@ impl AllPeers {
             NewConnectionStatus::Disconnected => {
                 self.handle_disconnected_transition(peer_id, current_status)
             }
-            NewConnectionStatus::Disconnecting { banned } => {
-                self.handle_disconnecting_transition(peer_id, current_status, banned)
+            NewConnectionStatus::Disconnecting { reason } => {
+                self.handle_disconnecting_transition(peer_id, current_status, reason)
             }
             NewConnectionStatus::Banned => self.handle_banned_transition(peer_id, current_status),
             NewConnectionStatus::Unbanned => {
@@ -444,7 +451,7 @@ impl AllPeers {
         match current_status {
             ConnectionStatus::Banned { .. } => {}
             ConnectionStatus::Disconnected { .. } => {}
-            ConnectionStatus::Disconnecting { banned } if banned => {
+            ConnectionStatus::Disconnecting { reason } if reason.bans_peer() => {
                 return self.handle_disconnected_and_banned(peer_id);
             }
             ConnectionStatus::Disconnecting { .. } => {
@@ -509,11 +516,11 @@ impl AllPeers {
         &mut self,
         peer_id: &PeerId,
         current_state: ConnectionStatus,
-        banned: bool,
+        reason: DisconnectReason,
     ) -> PeerAction {
         // set the peer to disconnecting state
         if let Some(peer) = self.peers.get_mut(peer_id) {
-            peer.set_connection_status(ConnectionStatus::Disconnecting { banned });
+            peer.set_connection_status(ConnectionStatus::Disconnecting { reason });
         }
 
         match current_state {
@@ -527,9 +534,13 @@ impl AllPeers {
                 error!(target: "peer-manager", ?peer_id, "disconnecting from a banned peer - banned peer should already be disconnected");
             }
             ConnectionStatus::Connected { .. } | ConnectionStatus::Dialing { .. } => {
-                // support discovery with peer exchange if the target number of peers is reached
-                let action =
-                    if banned { PeerAction::Disconnect } else { PeerAction::DisconnectWithPX };
+                // only a healthy peer evicted for connection limits is worth helping find
+                // replacements; a peer this node penalized does not receive its peer table
+                let action = if reason.shares_peers() {
+                    PeerAction::DisconnectWithPX
+                } else {
+                    PeerAction::Disconnect
+                };
                 return action;
             }
             _ => {}
@@ -563,7 +574,9 @@ impl AllPeers {
                 ConnectionStatus::Disconnecting { .. } => {
                     // ban the peer once the disconnection process completes
                     debug!(target: "peer-manager", ?peer_id, "banning peer that is currently disconnecting");
-                    peer.set_connection_status(ConnectionStatus::Disconnecting { banned: true });
+                    peer.set_connection_status(ConnectionStatus::Disconnecting {
+                        reason: DisconnectReason::Banned,
+                    });
                     PeerAction::NoAction
                 }
                 ConnectionStatus::Banned { .. } => {
@@ -572,7 +585,9 @@ impl AllPeers {
                     PeerAction::Ban(peer.filter_new_ips_to_ban(&already_banned_ips))
                 }
                 ConnectionStatus::Connected { .. } | ConnectionStatus::Dialing { .. } => {
-                    peer.set_connection_status(ConnectionStatus::Disconnecting { banned: true });
+                    peer.set_connection_status(ConnectionStatus::Disconnecting {
+                        reason: DisconnectReason::Banned,
+                    });
                     PeerAction::Disconnect
                 }
                 ConnectionStatus::Unknown => {
@@ -615,12 +630,12 @@ impl AllPeers {
 
                     return PeerAction::Unban(peer.known_ip_addresses().collect());
                 }
-                ConnectionStatus::Disconnecting { banned } => {
+                ConnectionStatus::Disconnecting { reason } => {
                     debug!(target: "peer-manager", ?peer_id, "unbanning disconnecting peer");
-                    if banned {
-                        // set disconnecting status false
+                    if reason.bans_peer() {
+                        // the disconnect still completes, but no longer as a ban
                         peer.set_connection_status(ConnectionStatus::Disconnecting {
-                            banned: false,
+                            reason: DisconnectReason::Penalized,
                         });
                     }
                 }
@@ -868,9 +883,9 @@ impl AllPeers {
             self.upsert_peer(bls_key, pubkey, addr.clone());
 
             match status {
-                ConnectionStatus::Disconnecting { banned } => {
+                ConnectionStatus::Disconnecting { reason } => {
                     // unban peer
-                    if banned {
+                    if reason.bans_peer() {
                         warn!(target: "peer-manager", ?peer_id, "unbanning committee member that was disconnecting pending ban");
                         let action =
                             self.update_connection_status(&peer_id, NewConnectionStatus::Unbanned);
@@ -941,7 +956,9 @@ fn new_reputation_status(
         }
         Reputation::Disconnected => {
             if peer.connection_status().is_connected_or_dialing() {
-                Some(NewConnectionStatus::Disconnecting { banned: true })
+                // the score crossed the disconnect threshold, not the ban threshold, so the
+                // disconnect must not complete into a ban
+                Some(NewConnectionStatus::Disconnecting { reason: DisconnectReason::Penalized })
             } else {
                 warn!(target: "peer-manager", ?peer_id, ?prior_reputation, "process_penalty for disconnected peer");
                 Some(NewConnectionStatus::Disconnected)

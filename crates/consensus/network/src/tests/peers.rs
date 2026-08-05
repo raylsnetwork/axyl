@@ -305,7 +305,7 @@ fn test_pruning_logic() {
         // Need to go through disconnecting first
         all_peers.update_connection_status(
             &peer_id,
-            NewConnectionStatus::Disconnecting { banned: true },
+            NewConnectionStatus::Disconnecting { reason: DisconnectReason::Banned },
         );
         all_peers.update_connection_status(&peer_id, NewConnectionStatus::Disconnected);
         all_peers.update_connection_status(&peer_id, NewConnectionStatus::Banned);
@@ -358,8 +358,10 @@ fn test_ip_and_peer_banned() {
             direction: ConnectionDirection::Incoming,
         },
     );
-    all_peers
-        .update_connection_status(&peer_id, NewConnectionStatus::Disconnecting { banned: true });
+    all_peers.update_connection_status(
+        &peer_id,
+        NewConnectionStatus::Disconnecting { reason: DisconnectReason::Banned },
+    );
     let action = all_peers.update_connection_status(&peer_id, NewConnectionStatus::Disconnected);
     assert!(matches!(action, PeerAction::Ban(_)));
     let banned = all_peers.peer_banned(&peer_id);
@@ -379,8 +381,10 @@ fn test_ip_and_peer_banned() {
         },
     );
 
-    all_peers
-        .update_connection_status(&new_peer, NewConnectionStatus::Disconnecting { banned: true });
+    all_peers.update_connection_status(
+        &new_peer,
+        NewConnectionStatus::Disconnecting { reason: DisconnectReason::Banned },
+    );
     let action = all_peers.update_connection_status(&new_peer, NewConnectionStatus::Disconnected);
     assert!(matches!(action, PeerAction::Ban(_)));
     let banned = all_peers.peer_banned(&new_peer);
@@ -415,7 +419,7 @@ fn test_connected_peer_methods() {
 
     all_peers.update_connection_status(
         &disconnecting_peer_id,
-        NewConnectionStatus::Disconnecting { banned: false },
+        NewConnectionStatus::Disconnecting { reason: DisconnectReason::ExcessPeers },
     );
 
     // Test connected_peer_ids
@@ -473,13 +477,15 @@ fn test_connected_to_disconnecting_transition() {
     );
 
     // Test Connected -> Disconnecting
-    let action = all_peers
-        .update_connection_status(&peer_id, NewConnectionStatus::Disconnecting { banned: false });
+    let action = all_peers.update_connection_status(
+        &peer_id,
+        NewConnectionStatus::Disconnecting { reason: DisconnectReason::ExcessPeers },
+    );
 
     assert!(matches!(action, PeerAction::DisconnectWithPX));
     let peer = all_peers.get_peer(&peer_id).unwrap();
-    assert!(matches!(peer.connection_status(), ConnectionStatus::Disconnecting { banned }
-            if !(*banned)));
+    assert!(matches!(peer.connection_status(), ConnectionStatus::Disconnecting { reason }
+            if !reason.bans_peer()));
 }
 
 #[test]
@@ -496,8 +502,10 @@ fn test_disconnecting_to_disconnected_transition() {
             direction: ConnectionDirection::Incoming,
         },
     );
-    let action = all_peers
-        .update_connection_status(&peer_id, NewConnectionStatus::Disconnecting { banned: false });
+    let action = all_peers.update_connection_status(
+        &peer_id,
+        NewConnectionStatus::Disconnecting { reason: DisconnectReason::ExcessPeers },
+    );
     assert!(matches!(action, PeerAction::DisconnectWithPX));
 
     // Test Disconnecting -> Disconnected
@@ -607,8 +615,8 @@ fn test_connected_to_banned_transition() {
 
     assert!(matches!(action, PeerAction::Disconnect));
     let peer = all_peers.get_peer(&peer_id).unwrap();
-    assert!(matches!(peer.connection_status(), ConnectionStatus::Disconnecting { banned }
-            if *banned));
+    assert!(matches!(peer.connection_status(), ConnectionStatus::Disconnecting { reason }
+            if reason.bans_peer()));
 }
 
 #[test]
@@ -629,7 +637,10 @@ fn test_ban_action_returns_only_unbanned_ips() {
             direction: ConnectionDirection::Incoming,
         },
     );
-    all_peers.update_connection_status(&peer1, NewConnectionStatus::Disconnecting { banned: true });
+    all_peers.update_connection_status(
+        &peer1,
+        NewConnectionStatus::Disconnecting { reason: DisconnectReason::Banned },
+    );
     all_peers.update_connection_status(&peer1, NewConnectionStatus::Disconnected);
 
     // second peer also from ip1 - this should trigger IP ban
@@ -641,7 +652,10 @@ fn test_ban_action_returns_only_unbanned_ips() {
             direction: ConnectionDirection::Incoming,
         },
     );
-    all_peers.update_connection_status(&peer2, NewConnectionStatus::Disconnecting { banned: true });
+    all_peers.update_connection_status(
+        &peer2,
+        NewConnectionStatus::Disconnecting { reason: DisconnectReason::Banned },
+    );
     all_peers.update_connection_status(&peer2, NewConnectionStatus::Disconnected);
 
     // at this point, ip1 should be banned (2 peers banned from this IP)
@@ -663,8 +677,10 @@ fn test_ban_action_returns_only_unbanned_ips() {
     );
 
     // disconnect and reconnect from ip1 to add it to known addresses
-    all_peers
-        .update_connection_status(&peer3, NewConnectionStatus::Disconnecting { banned: false });
+    all_peers.update_connection_status(
+        &peer3,
+        NewConnectionStatus::Disconnecting { reason: DisconnectReason::ExcessPeers },
+    );
     all_peers.update_connection_status(&peer3, NewConnectionStatus::Disconnected);
     all_peers.update_connection_status(
         &peer3,
@@ -676,7 +692,10 @@ fn test_ban_action_returns_only_unbanned_ips() {
 
     // now peer3 has both ip1 (banned) and ip2 (not banned) in its history
     // ban peer3
-    all_peers.update_connection_status(&peer3, NewConnectionStatus::Disconnecting { banned: true });
+    all_peers.update_connection_status(
+        &peer3,
+        NewConnectionStatus::Disconnecting { reason: DisconnectReason::Banned },
+    );
     let action = all_peers.update_connection_status(&peer3, NewConnectionStatus::Disconnected);
 
     if let PeerAction::Ban(ips) = action {
