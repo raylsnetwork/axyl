@@ -403,6 +403,14 @@ impl<DB: Database> Certifier<DB> {
                             header_round, limit_round, cert_store_round, committed_round,
                             "ignoring too-old rejection: cert store covers limit round and DAG still progressing (transient proposer lag)"
                         );
+                        // Count the rejection under a distinct reason even though it isn't held
+                        // against the peer for demotion — otherwise the metric would show zero
+                        // while a node continuously trips the skip path, masking real trouble.
+                        self.consensus_bus
+                            .consensus_metrics()
+                            .vote_request_rejections
+                            .with_label_values(&[&peer_id.to_string(), "too_old_skipped"])
+                            .inc();
                         return VoteErrorAction::Continue;
                     }
                     warn!(

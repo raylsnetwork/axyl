@@ -270,14 +270,16 @@ where
 
         info!(target: "epoch-manager", tasks=?node_task_manager, "NODE TASKS\n");
 
-        // spawn node healthcheck + readiness service if enabled
+        // spawn node healthcheck + readiness service if enabled. Propagate a bind failure (e.g.
+        // the port is already in use) rather than silently starting the node without the endpoint
+        // an operator explicitly asked for.
         if let Some(port) = self.builder.healthcheck {
-            let _ = HealthcheckServer::spawn(
+            HealthcheckServer::spawn(
                 node_task_manager.get_spawner(),
                 port,
                 self.consensus_bus.node_mode().subscribe(),
             )
-            .await;
+            .await?;
         }
 
         // Catch the termination signal ourselves so we can drive a graceful, ORDERED
