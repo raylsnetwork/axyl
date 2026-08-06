@@ -5,8 +5,8 @@
 //!   connections — the pre-existing behaviour.
 //! - **readiness** (`GET /readyz`, alias `GET /ready`): `200 OK` only when the node is actually
 //!   participating — voting (`CvvActive`) or an operational observer — and `503 Service
-//!   Unavailable` while a validator is still catching up (`CvvInactive`). This lets a load
-//!   balancer / on-call distinguish "process up" from "actually voting in the current epoch".
+//!   Unavailable` while a validator is still catching up (`CvvInactive`). This lets a load balancer
+//!   / on-call distinguish "process up" from "actually voting in the current epoch".
 //!
 //! Designed for integration with GCP load balancers and similar health monitoring systems.
 use std::{io::ErrorKind, net::SocketAddr, time::Duration};
