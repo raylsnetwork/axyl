@@ -6,9 +6,34 @@ use crate::{
     },
 };
 use rayls_infrastructure_storage::ProposerStore;
-use rayls_infrastructure_types::{Database, RaylsReceiver, RaylsSender};
+use rayls_infrastructure_types::{Database, Epoch, RaylsReceiver, RaylsSender, Round};
 use tokio::{sync::oneshot, time::sleep};
 use tracing::{debug, info, warn};
+
+/// Whether a stored `last_proposed` header is stale relative to the proposer's current position,
+/// and therefore must NOT be re-proposed on the max-delay retransmit path.
+///
+/// Stale means either:
+/// - a different epoch — the check is `!=`, so a header from any epoch other than the current one
+///   is stale (a future epoch can't occur in normal operation, but the predicate rejects it too).
+///   Rounds reset per epoch, so the epoch is checked *before* the round (a round-3 header of epoch
+///   N+1 is newer than a round-4 header of epoch N), or
+/// - the same epoch but a round below `self_round`.
+///
+/// `self_round` can advance past `last_proposed` via the `process_parents` jump-ahead (see
+/// `round.rs`), which bumps the round WITHOUT writing `last_proposed`. Re-proposing a stale header
+/// then draws a "too old"/equivocation rejection from peers and — because the certifier aborts any
+/// in-flight proposal when a new header arrives — cancels the in-flight current-round
+/// certification every cycle, a livelock. Skipping it keeps `last_proposed` monotonic-in-round
+/// within an epoch and lets a fresh current-round header get certified instead.
+pub(super) fn last_proposed_is_stale(
+    self_round: Round,
+    self_epoch: Epoch,
+    header_round: Round,
+    header_epoch: Epoch,
+) -> bool {
+    header_epoch != self_epoch || header_round < self_round
+}
 
 impl<DB: Database> Proposer<DB> {
     /// Returns `Some(exec_round)` (the execution-anchor leader round) when execution lags consensus
@@ -183,11 +208,12 @@ impl<DB: Database> Proposer<DB> {
             // If we have not proposed a header in more than a max_header_delay time then repropose.
             // We may be in a race condition on a network restart...
             //
-            // No epoch/mode-transition guard: repropose only re-sends the existing `last_proposed`
-            // header. A stale header can't fork — the certifier rejects any header whose epoch
-            // != committee.epoch(), and `run_mode_transition` clears `LastProposed` (so repropose
-            // is a no-op there). The old `is_transitioning()` check was racy (TOCTOU) and thus
-            // never a correctness guarantee anyway.
+            // No *outer* mode-transition guard here: this condition only decides *whether* to enter
+            // the re-propose path. Epoch/round staleness of `last_proposed` IS guarded, inside the
+            // re-propose block below (see `last_proposed_is_stale`). A stale header can't fork
+            // regardless — the certifier rejects any header whose epoch != committee.epoch(), and
+            // `run_mode_transition` clears `LastProposed` (so repropose is a no-op there). The old
+            // `is_transitioning()` check was racy (TOCTOU) and thus never a correctness guarantee.
             let should_repropose_header = !should_create_header && max_delay_timed_out;
 
             debug!(
@@ -232,26 +258,122 @@ impl<DB: Database> Proposer<DB> {
                 min_delay_timed_out = false;
             } else if should_repropose_header {
                 if let Ok(Some(last_proposed)) = self.proposer_store.get_last_proposed() {
-                    warn!(target: "primary::proposer", interval=?self.max_delay_interval.period(), "re-proposing last header after max delay interval expired for round {}", self.round);
-                    let (tx, rx) = oneshot::channel();
-                    let consensus_bus = self.consensus_bus.clone();
-                    let proposer_store = self.proposer_store.clone();
-                    self.task_spawner.spawn_task("re-propose header after delay", async move {
-                        // use this instead of store_and_send to because rx always expects a Header
-                        let res = Proposer::repropose_header(
-                            last_proposed,
-                            proposer_store,
-                            &consensus_bus,
-                            "repropose header after delay".to_string(),
-                        )
-                        .await;
-                        let _ = tx.send(res);
-                    });
-                    max_delay_timed_out = false;
-                    min_delay_timed_out = false;
-                    pending_header = Some(rx);
+                    // Only re-propose a header that is still current. `self.round` can advance
+                    // past our last stored header via the `process_parents` jump-ahead (see
+                    // `round.rs`), which bumps the round WITHOUT writing `last_proposed`. So
+                    // `last_proposed` legitimately lags `self.round`. Re-proposing that stale
+                    // header is guaranteed a "too old" rejection by peers, and — because the
+                    // certifier aborts any in-flight proposal when a new header arrives — it also
+                    // cancels the in-flight current-round certification every cycle, a livelock.
+                    // Skip it; wait to build a fresh header at `self.round`. (A header from an
+                    // older epoch is likewise stale — rounds reset per epoch, so compare epochs
+                    // before rounds.)
+                    if last_proposed_is_stale(
+                        self.round,
+                        self.committee.epoch(),
+                        last_proposed.round(),
+                        last_proposed.epoch(),
+                    ) {
+                        warn!(
+                            target: "primary::proposer",
+                            authority=?self.authority_id,
+                            self_round = self.round,
+                            self_epoch = self.committee.epoch(),
+                            last_proposed_round = last_proposed.round(),
+                            last_proposed_epoch = last_proposed.epoch(),
+                            last_proposed_digest = ?last_proposed.digest(),
+                            "skipping re-propose of stale header (older round/epoch than current)",
+                        );
+                        // Reset timers so we don't busy-spin the skip; the next max-delay tick
+                        // re-evaluates. This only avoids *harm* (re-proposing a stale header that
+                        // would be rejected and would cancel the in-flight current-round
+                        // certification) -- it does not itself make progress. A fresh current-round
+                        // header is built only once the aggregator delivers a quorum of parents on
+                        // `parents()` (aggregators/certificates.rs), which requires the committee
+                        // to reach quorum for the round; if it can't (e.g.
+                        // a counted member isn't producing), this skips
+                        // quietly and the proposer waits.
+                        max_delay_timed_out = false;
+                        min_delay_timed_out = false;
+                    } else {
+                        warn!(target: "primary::proposer", interval=?self.max_delay_interval.period(), self_round = self.round, self_epoch = self.committee.epoch(), last_proposed_round = last_proposed.round(), last_proposed_epoch = last_proposed.epoch(), last_proposed_digest = ?last_proposed.digest(), "re-proposing last header after max delay interval expired");
+                        let (tx, rx) = oneshot::channel();
+                        let consensus_bus = self.consensus_bus.clone();
+                        let proposer_store = self.proposer_store.clone();
+                        self.task_spawner.spawn_task("re-propose header after delay", async move {
+                            // use this instead of store_and_send to because rx always expects a
+                            // Header
+                            let res = Proposer::repropose_header(
+                                last_proposed,
+                                proposer_store,
+                                &consensus_bus,
+                                "repropose header after delay".to_string(),
+                            )
+                            .await;
+                            let _ = tx.send(res);
+                        });
+                        max_delay_timed_out = false;
+                        min_delay_timed_out = false;
+                        pending_header = Some(rx);
+                    }
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::last_proposed_is_stale;
+
+    // The re-propose guard must skip a stored header that is behind the proposer's current
+    // position — this is what stops the round-N→round-(N-1) `last_proposed` regression that
+    // caused the equivocation wedge (val1 rebuilding a conflicting round-4 header on restart).
+    #[test]
+    fn stale_when_header_round_behind_current_round_same_epoch() {
+        // self at round 4, stored header at round 3, same epoch → stale (must skip).
+        assert!(last_proposed_is_stale(4, 579, 3, 579));
+    }
+
+    #[test]
+    fn not_stale_when_header_matches_current_round() {
+        // stored header IS the current round → re-propose is legitimate (restart recovery).
+        assert!(!last_proposed_is_stale(4, 579, 4, 579));
+    }
+
+    #[test]
+    fn not_stale_when_header_ahead_of_current_round() {
+        // `header_round > self_round` can't occur in normal operation: `last_proposed` is only
+        // written on a successful proposal, and proposals only happen at `self.round`, so a stored
+        // header never leads the current round. The predicate treats it as not-stale (only
+        // `header_round < self_round` is stale); this test pins that boundary.
+        assert!(!last_proposed_is_stale(4, 579, 5, 579));
+    }
+
+    #[test]
+    fn stale_when_older_epoch_even_if_round_looks_higher() {
+        // rounds reset per epoch: a round-4 header of epoch 579 is stale once we're in epoch 580
+        // at round 2 — epoch must be checked before round, or we'd wrongly re-propose it.
+        assert!(last_proposed_is_stale(2, 580, 4, 579));
+    }
+
+    #[test]
+    fn stale_when_newer_epoch_even_if_same_round() {
+        // the check is `!=`, not `<`: a header from a *future* epoch is stale too. This can't
+        // happen in normal operation, but the predicate pins it — guards against a later change
+        // to `<` that would wrongly re-propose it.
+        assert!(last_proposed_is_stale(2, 579, 2, 580));
+    }
+
+    #[test]
+    fn not_stale_across_epoch_boundary_for_current_epoch_low_round() {
+        // fresh epoch 580, self at round 2, stored header is this epoch's round 2 → not stale.
+        assert!(!last_proposed_is_stale(2, 580, 2, 580));
+    }
+
+    #[test]
+    fn not_stale_at_genesis() {
+        // round 0 / epoch 0 everywhere → not stale.
+        assert!(!last_proposed_is_stale(0, 0, 0, 0));
     }
 }

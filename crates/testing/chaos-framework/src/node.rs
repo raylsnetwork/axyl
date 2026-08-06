@@ -201,7 +201,9 @@ fn spawn_validator_process(
         .arg("--ipcdisable")
         .arg("--http")
         .arg("--http.port")
-        .arg(format!("{rpc_port}"));
+        .arg(format!("{rpc_port}"))
+        // v1 (plain) storage is no longer supported -- the node refuses to start without this
+        .arg("--storage.v2");
 
     command.spawn().expect("failed to spawn validator process")
 }
@@ -231,7 +233,9 @@ fn spawn_observer_process(
         .arg("--ipcdisable")
         .arg("--http")
         .arg("--http.port")
-        .arg(format!("{rpc_port}"));
+        .arg(format!("{rpc_port}"))
+        // v1 (plain) storage is no longer supported -- the node refuses to start without this
+        .arg("--storage.v2");
 
     command.spawn().expect("failed to spawn observer process")
 }

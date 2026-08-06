@@ -8,6 +8,7 @@ mod header;
 mod header_meta;
 mod info;
 mod output;
+mod participation_meta;
 mod reputation;
 mod vote;
 
@@ -18,6 +19,7 @@ pub use header::*;
 pub use header_meta::*;
 pub use info::*;
 pub use output::*;
+pub use participation_meta::*;
 pub use reputation::*;
 pub use vote::*;
 

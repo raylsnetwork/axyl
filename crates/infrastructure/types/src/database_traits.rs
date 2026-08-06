@@ -45,6 +45,16 @@ pub trait DbTx {
     /// Returns the value for the given key from the map, if it exists.
     fn get<T: Table>(&self, key: &T::Key) -> eyre::Result<Option<T::Value>>;
 
+    /// Returns the stored value for the given key as its raw on-disk bytes, if it exists.
+    ///
+    /// The bytes are the same canonical value encoding [`get`](Self::get) decodes, so a caller
+    /// that only relocates a payload (cold archival) skips the decode/re-encode round trip.
+    /// Backends that can lend the bytes from their backing store return `Cow::Borrowed` (valid for
+    /// the transaction); the default re-encodes the decoded value, which any backend can satisfy.
+    fn raw_get<T: Table>(&self, key: &T::Key) -> eyre::Result<Option<Cow<'_, [u8]>>> {
+        Ok(self.get::<T>(key)?.map(|value| Cow::Owned(crate::encode(&value))))
+    }
+
     /// Returns true if the map contains a value for the specified key.
     fn contains_key<T: Table>(&self, key: &T::Key) -> eyre::Result<bool> {
         Ok(self.get::<T>(key)?.is_some())
@@ -58,6 +68,16 @@ pub trait DbTx {
 
     /// Skips to the first key >= the provided key and iterates from there.
     fn skip_to<T: Table>(&self, key: &T::Key) -> eyre::Result<DBIter<'_, T>>;
+
+    /// Skips to the first key >= the provided key and iterates from there as raw bytes.
+    ///
+    /// The default filters a full [`raw_iter`](Self::raw_iter) scan, correct for any backend
+    /// whose raw iteration is ordered by encoded key; seekable backends override it to position
+    /// a cursor directly, skipping the leading scan entirely.
+    fn raw_skip_to<T: Table>(&self, key: &T::Key) -> eyre::Result<DBRawIter<'_>> {
+        let target = crate::encode_key(key);
+        Ok(Box::new(self.raw_iter::<T>().skip_while(move |(k, _)| k.as_ref() < target.as_slice())))
+    }
 
     /// Returns an iterator over all key-value pairs in reverse order.
     fn reverse_iter<T: Table>(&self) -> DBIter<'_, T>;
@@ -83,6 +103,18 @@ pub trait DbTxMut: DbTx {
 
     /// Removes the entry for the given key from the map.
     fn remove<T: Table>(&mut self, key: &T::Key) -> eyre::Result<()>;
+
+    /// Removes many keys from the durable store as one operation, bypassing any in-memory cache.
+    ///
+    /// Layered backends override it to hard-delete (no tombstone, which would shadow a
+    /// fall-through tier) and to hand the set to the writer as one unit; the default is per-key
+    /// removes.
+    fn evict_persistent_batch<T: Table>(&mut self, keys: &[T::Key]) -> eyre::Result<()> {
+        for key in keys {
+            self.remove::<T>(key)?;
+        }
+        Ok(())
+    }
 
     /// Removes every key-value pair from the table.
     fn clear_table<T: Table>(&mut self) -> eyre::Result<()>;

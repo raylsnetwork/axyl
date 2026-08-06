@@ -3,7 +3,8 @@
 //! Inspired by: crates/ethereum/evm/src/lib.rs
 
 use super::{
-    RaylsBlockAssembler, RaylsBlockExecutionCtx, RaylsBlockExecutorFactory, RaylsEvmFactory,
+    CloseEpochTally, RaylsBlockAssembler, RaylsBlockExecutionCtx, RaylsBlockExecutorFactory,
+    RaylsEvmFactory,
 };
 use crate::{
     chainspec::RaylsHardforks, error::RaylsRethError, traits::RaylsPrimitives, RaylsChainSpec,
@@ -23,7 +24,7 @@ use reth_revm::{
     context::{BlockEnv, CfgEnv},
     context_interface::block::BlobExcessGasAndPrice,
 };
-use std::{collections::BTreeMap, sync::Arc};
+use std::sync::Arc;
 
 /// Rayls-related EVM configuration.
 #[derive(Debug, Clone)]
@@ -195,7 +196,8 @@ impl ConfigureEvm for RaylsEvmConfig {
             None
         };
         let nonce: u64 = block.nonce.into();
-        let close_epoch_tally = self.compute_close_epoch_tally(close_epoch, nonce)?;
+        let close_epoch_tally =
+            self.compute_close_epoch_tally(close_epoch, nonce, block.header().number)?;
         Ok(RaylsBlockExecutionCtx {
             parent_hash: block.header().parent_hash,
             parent_beacon_block_root: block.header().parent_beacon_block_root,
@@ -218,7 +220,7 @@ impl ConfigureEvm for RaylsEvmConfig {
         let (ommers_hash, requests_hash) =
             self.resolve_batch_digest_fields(next_block, payload.batch_digest);
         let close_epoch_tally =
-            self.compute_close_epoch_tally(payload.close_epoch, payload.nonce)?;
+            self.compute_close_epoch_tally(payload.close_epoch, payload.nonce, next_block)?;
 
         Ok(RaylsBlockExecutionCtx {
             parent_hash: parent.hash(),
@@ -244,15 +246,29 @@ impl RaylsEvmConfig {
         &self,
         close_epoch: Option<B256>,
         nonce: u64,
-    ) -> Result<Option<BTreeMap<Address, u32>>, RaylsRethError> {
+        block_number: u64,
+    ) -> Result<Option<CloseEpochTally>, RaylsRethError> {
         if close_epoch.is_none() {
             return Ok(None);
         }
         let (epoch, last_round) = rayls_infrastructure_types::nonce::unpack_nonce(nonce);
-        let tally = self
-            .rewards_counter
-            .tally(epoch, last_round)
-            .map_err(|e| RaylsRethError::EVMCustom(format!("rewards tally: {e}")))?;
+        // Pick the ABI/tally by the close block's number, so an epoch closing at or after the
+        // HybridRewards fork is distributed with the hybrid blend. Epochs are timestamp-
+        // delineated but each closes in exactly one block, so this is a clean whole-epoch
+        // cutover — no epoch is split between the two models.
+        let tally = if self.chain_spec().is_hybrid_rewards_active_at_block(block_number) {
+            CloseEpochTally::Hybrid(
+                self.rewards_counter
+                    .tally_hybrid(epoch, last_round)
+                    .map_err(|e| RaylsRethError::EVMCustom(format!("hybrid rewards tally: {e}")))?,
+            )
+        } else {
+            CloseEpochTally::Legacy(
+                self.rewards_counter
+                    .tally(epoch, last_round)
+                    .map_err(|e| RaylsRethError::EVMCustom(format!("rewards tally: {e}")))?,
+            )
+        };
         Ok(Some(tally))
     }
 }

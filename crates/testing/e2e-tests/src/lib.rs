@@ -190,10 +190,17 @@ pub fn get_rayls_network_binary() -> &'static CargoRun {
             .find(|p| p.join("Cargo.toml").exists() && p.join("crates").exists())
             .expect("Cannot find workspace root");
 
+        // Respect CARGO_TARGET_DIR when set, so the build can target a space-free path.
+        // jemalloc-sys' configure rejects a build path containing spaces, which breaks
+        // in-tree builds under checkouts like `.../Luis Soares/axyl`; pointing
+        // CARGO_TARGET_DIR at a space-free dir avoids it. Falls back to workspace/target.
+        let target_dir = std::env::var_os("CARGO_TARGET_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| workspace_root.join("target"));
         let build = CargoBuild::new()
             .bin("rayls-network")
             .manifest_path(workspace_root.join("Cargo.toml"))
-            .target_dir(workspace_root.join("target"))
+            .target_dir(target_dir)
             .current_target();
         // The dev-mode e2e test needs the binary built with the `dev` feature so the
         // `dev` subcommand exists; other e2e tests don't, so only add it when this

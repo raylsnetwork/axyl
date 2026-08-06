@@ -18,7 +18,8 @@ use tracing::{debug, error, info, warn};
 /// 1. Not in committee -> Observer
 /// 2. Observer flag set -> Observer
 /// 3. Explicit mode-transition target pending -> adopt it
-/// 4. Prior mode preservation on respawn -> keep current mode
+/// 4. Prior mode preservation on respawn -> keep current mode (except Observer promotes to
+///    CvvInactive when now in-committee without observer_flag; see arm below)
 /// 5. Local consensus history exists -> CvvInactive (catch up)
 /// 6. No history, first boot -> CvvActive (fresh genesis)
 ///
@@ -45,7 +46,13 @@ pub(crate) fn decide_node_mode(
         return match prior_mode {
             NodeMode::CvvActive => (NodeMode::CvvActive, "prior-mode-active"),
             NodeMode::CvvInactive => (NodeMode::CvvInactive, "prior-mode-inactive"),
-            NodeMode::Observer => (NodeMode::Observer, "prior-mode-observer"),
+            // Promote a dynamic observer just admitted to the committee, instead of leaving it
+            // Observer forever. Reaching here means in_committee, !observer_flag, !initial_epoch,
+            // prior==Observer — the only path is "was not-in-committee last epoch, just staked in."
+            // Join as CvvInactive to catch up on the boundary without proposing/voting; the bridge
+            // subscriber requests CvvActive once synced. (Staying Observer would leave a silent
+            // committee member — counted toward quorum but never certifying — stalling consensus.)
+            NodeMode::Observer => (NodeMode::CvvInactive, "joined-committee"),
         };
     }
     if has_local_history {

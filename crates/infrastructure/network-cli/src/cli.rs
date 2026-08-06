@@ -118,11 +118,37 @@ impl<Ext: clap::Args + fmt::Debug> Cli<Ext> {
         // add network name to logs dir
         self.logs.log_file_directory = self.logs.log_file_directory.join("rayls-network-logs");
 
+        // The migration's progress lines are info-level and it can run for many minutes; floor
+        // its targets at info through the stdout filter (target directives override the global
+        // verbosity default) so a quieter `-v`/`-vv` does not run it silently. An explicit
+        // `--quiet` still wins.
+        #[cfg(feature = "cold-storage")]
+        if matches!(self.command, Commands::ColdMigrate(_))
+            && self.logs.verbosity.directive().to_string() != "off"
+        {
+            let floor = "cold-archive=info,epoch-manager=info,storage=info";
+            self.logs.log_stdout_filter = if self.logs.log_stdout_filter.is_empty() {
+                floor.to_owned()
+            } else {
+                format!("{},{floor}", self.logs.log_stdout_filter)
+            };
+        }
         let _guard = self.init_tracing()?;
 
         match self.command {
             Commands::Genesis(command) => command.execute(datadir),
             Commands::Node(command) => command.execute(datadir, passphrase, launcher),
+            // Reuses the node command's full argument surface but swaps the launcher: the
+            // orchestrator runs only the boot-time cold work and returns without starting the
+            // node. The maintenance entry point emits no node start banner and never
+            // dev-bootstraps the datadir; the BLS passphrase is never used.
+            #[cfg(feature = "cold-storage")]
+            Commands::ColdMigrate(command) => {
+                let ColdMigrateCommand { node, compact } = *command;
+                node.execute_maintenance(datadir, passphrase, move |builder, _, rl_datadir, _| {
+                    rayls_middleware_orchestrator::run_cold_migration(builder, rl_datadir, compact)
+                })
+            }
             Commands::Keytool(command) => command.execute(datadir, passphrase),
             #[cfg(feature = "dev-single-node-setup")]
             Commands::Dev(command) => command.execute(datadir, passphrase, launcher),
@@ -155,6 +181,14 @@ pub enum Commands<Ext: clap::Args + fmt::Debug = NoArgs> {
     #[command(name = "node")]
     Node(Box<node::NodeCommand<Ext>>),
 
+    /// Run the boot-time cold-storage migration and exit without starting the node.
+    ///
+    /// Accepts the same arguments as `node`, needs no BLS passphrase, and is idempotent: it
+    /// drains the cold backlog (and heals a crash-interrupted archive) ahead of a real start.
+    #[cfg(feature = "cold-storage")]
+    #[command(name = "cold-migrate")]
+    ColdMigrate(Box<ColdMigrateCommand<Ext>>),
+
     /// Run a one-command local dev chain.
     ///
     /// Bootstraps an empty datadir (validator key + single-validator genesis +
@@ -163,6 +197,38 @@ pub enum Commands<Ext: clap::Args + fmt::Debug = NoArgs> {
     #[cfg(feature = "dev-single-node-setup")]
     #[command(name = "dev")]
     Dev(Box<dev::DevCommand<Ext>>),
+}
+
+impl<Ext: clap::Args + fmt::Debug> Commands<Ext> {
+    /// Returns true when the command needs the BLS key passphrase to run.
+    ///
+    /// The per-command policy lives here, next to the variant declarations, so the binary's
+    /// passphrase gate stays free of feature-gated variant knowledge.
+    pub fn needs_bls_passphrase(&self) -> bool {
+        // The migration never opens the BLS key; every other command keeps the requirement so a
+        // missing passphrase fails closed before any real work starts.
+        #[cfg(feature = "cold-storage")]
+        if matches!(self, Commands::ColdMigrate(_)) {
+            return false;
+        }
+        true
+    }
+}
+
+/// Arguments for the `cold-migrate` command: the node surface plus migration-only options.
+#[cfg(feature = "cold-storage")]
+#[derive(Debug, Parser)]
+pub struct ColdMigrateCommand<Ext: clap::Args + fmt::Debug = NoArgs> {
+    /// The node arguments; `cold-migrate` accepts the same surface as `node`.
+    #[clap(flatten)]
+    pub node: node::NodeCommand<Ext>,
+
+    /// Copy-compact the consensus DB in place after the migration.
+    ///
+    /// Archival prunes most hot rows into the cold store, but MDBX only recycles the freed
+    /// pages; compaction rewrites the datafile to its live size, reclaiming the disk.
+    #[arg(long)]
+    pub compact: bool,
 }
 
 #[cfg(test)]
@@ -225,6 +291,23 @@ mod tests {
             "debug,net=trace",
         ])
         .unwrap();
+    }
+
+    /// `cold-migrate` accepts the node command's argument surface plus `--compact`.
+    #[cfg(feature = "cold-storage")]
+    #[test]
+    fn parse_cold_migrate() {
+        let rl = Cli::try_parse_args_from(["rl", "cold-migrate", "--observer"]).unwrap();
+        match rl.command {
+            Commands::ColdMigrate(cmd) => assert!(!cmd.compact, "--compact must default off"),
+            _ => panic!("expected ColdMigrate command"),
+        }
+
+        let rl = Cli::try_parse_args_from(["rl", "cold-migrate", "--compact"]).unwrap();
+        match rl.command {
+            Commands::ColdMigrate(cmd) => assert!(cmd.compact),
+            _ => panic!("expected ColdMigrate command"),
+        }
     }
 
     #[cfg(feature = "dev-single-node-setup")]

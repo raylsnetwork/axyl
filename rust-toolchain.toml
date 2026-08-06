@@ -3,5 +3,5 @@
 # README.md, and the toolchain installed in CI (.github/workflows/pr.yaml).
 [toolchain]
 channel = "1.91.0"
-components = ["rustfmt", "rust-src", "clippy"]
+components = ["rustfmt", "rust-src", "clippy", "rust-analyzer"]
 profile = "minimal"

@@ -1,4 +1,6 @@
 mod batches;
+#[cfg(feature = "cold-storage")]
+mod cold_archive;
 mod consensus;
 mod core;
 mod engine;
@@ -10,8 +12,10 @@ mod types;
 mod utils;
 mod worker;
 
+#[cfg(feature = "cold-storage")]
+pub(crate) use cold_archive::{acquire_consensus_db_lock, ColdArchival};
 pub use utils::catchup_accumulator;
-pub(crate) use utils::open_consensus_db;
+pub(crate) use utils::{open_consensus_db, recover_executed_anchor};
 
 pub(crate) use types::*;
 

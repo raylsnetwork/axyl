@@ -19,19 +19,13 @@ where
         engine_task_manager: &TaskManager,
         gas_accumulator: &GasAccumulator,
     ) -> eyre::Result<ExecutionNode> {
-        // create execution components (ie - reth env)
-        let basefee_address = self.builder.rayls_infrastructure_config.parameters.basefee_address;
-        let network = self.builder.rayls_infrastructure_config.parameters.network;
-        let min_base_fee = self.builder.rayls_infrastructure_config.parameters.min_base_fee;
-        let reth_env = RethEnv::new(
+        let reth_env = RethEnv::new_from_parameters(
             &self.builder.node_config,
+            &self.builder.rayls_infrastructure_config.parameters,
             engine_task_manager,
             self.reth_db.clone(),
-            basefee_address,
             gas_accumulator.rewards_counter(),
             &self.builder.build_metadata,
-            Some(network),
-            Some(min_base_fee),
             false,
         )
         .await?;

@@ -561,6 +561,192 @@ async fn test_is_validator() {
 
     // Verify random peer is not a validator
     assert!(!peer_manager.is_peer_validator(&random_peer_id));
+
+    // Verify the committee member this node had already resolved IS a validator. Without this the
+    // test passes even if `new_epoch` recognizes nobody at all.
+    let resolved: PeerId = config.key_config().primary_network_public_key().into();
+    assert!(peer_manager.is_peer_validator(&resolved));
+}
+
+/// A committee member this node resolves after the epoch boundary must be absolved from that
+/// moment, not from the next boundary. Committee membership is decided by stake; whether local
+/// discovery has caught up is this node's problem, not the validator's.
+///
+/// The node genuinely cannot exempt a peer before it resolves the key-to-peer mapping, so the
+/// invariant starts at resolution.
+#[tokio::test]
+async fn test_committee_member_resolved_mid_epoch_is_absolved_immediately() {
+    let all_nodes = CommitteeFixture::builder(MemDatabase::default).build();
+    let mut authorities = all_nodes.authorities();
+    let authority_1 = authorities.next().expect("first authority");
+    let authority_2 = authorities.next().expect("second authority");
+    let config = authority_1.consensus_config();
+    let mut peer_manager = PeerManager::new(config.network_config().peer_config());
+
+    // this node resolved itself but not authority_2, the ordinary state on a fresh start or a
+    // restart before discovery has caught up
+    peer_manager.add_known_peer(
+        *authority_1.authority().protocol_key(),
+        NetworkInfo {
+            pubkey: config.key_config().primary_network_public_key(),
+            multiaddrs: vec![config.primary_address()],
+            timestamp: now(),
+        },
+    );
+    peer_manager.new_epoch(config.committee_pub_keys());
+
+    // authority_2 connects before its record arrives, so it is tracked as an ordinary peer
+    let config_2 = authority_2.consensus_config();
+    let unresolved: PeerId = config_2.key_config().primary_network_public_key().into();
+    assert!(peer_manager.register_peer_connection(
+        &unresolved,
+        ConnectionType::IncomingConnection { multiaddr: create_multiaddr(None) }
+    ));
+
+    // discovery completes and the record resolves mid-epoch
+    peer_manager.add_known_peer(
+        *authority_2.authority().protocol_key(),
+        NetworkInfo {
+            pubkey: config_2.key_config().primary_network_public_key(),
+            multiaddrs: vec![config_2.primary_address()],
+            timestamp: now(),
+        },
+    );
+
+    // INVARIANT: resolution grants the exemption, so penalties from this point are absolved.
+    // PRE-FIX: `new_epoch` rebuilds `current_committee_keys` only from members it could already
+    // resolve, so `upsert_peer` sees an unknown key and leaves the peer untrusted for the epoch.
+    assert!(
+        peer_manager.is_peer_validator(&unresolved),
+        "a committee member resolved mid-epoch was not recognized as a validator"
+    );
+    peer_manager.process_penalty(unresolved, Penalty::Fatal);
+    assert!(!peer_manager.peer_banned(&unresolved), "a committee member was banned by a penalty");
+}
+
+/// A ban charged against a committee member before its record resolved is released when discovery
+/// trusts it. A lingering charge can evict an innocent peer under the cap or push a shared IP over
+/// the block threshold.
+#[tokio::test]
+async fn resolving_a_banned_committee_member_releases_its_ban() {
+    let all_nodes = CommitteeFixture::builder(MemDatabase::default).build();
+    let mut authorities = all_nodes.authorities();
+    let authority_1 = authorities.next().expect("first authority");
+    let authority_2 = authorities.next().expect("second authority");
+    let config = authority_1.consensus_config();
+    let mut peer_manager = PeerManager::new(config.network_config().peer_config());
+
+    // this node resolves itself, then installs a committee whose second member it cannot yet
+    // resolve
+    peer_manager.add_known_peer(
+        *authority_1.authority().protocol_key(),
+        NetworkInfo {
+            pubkey: config.key_config().primary_network_public_key(),
+            multiaddrs: vec![config.primary_address()],
+            timestamp: now(),
+        },
+    );
+    peer_manager.new_epoch(config.committee_pub_keys());
+
+    // authority_2 connects and is banned while still an ordinary, unresolved peer
+    let config_2 = authority_2.consensus_config();
+    let unresolved: PeerId = config_2.key_config().primary_network_public_key().into();
+    assert!(peer_manager.register_peer_connection(
+        &unresolved,
+        ConnectionType::IncomingConnection { multiaddr: create_multiaddr(None) }
+    ));
+    peer_manager.process_penalty(unresolved, Penalty::Fatal);
+    peer_manager.register_disconnected(&unresolved);
+    assert!(peer_manager.peer_banned(&unresolved), "precondition: banned before resolution");
+    let _ = collect_all_events(&mut peer_manager);
+
+    // discovery resolves the record mid-epoch and trusts the member
+    peer_manager.add_known_peer(
+        *authority_2.authority().protocol_key(),
+        NetworkInfo {
+            pubkey: config_2.key_config().primary_network_public_key(),
+            multiaddrs: vec![config_2.primary_address()],
+            timestamp: now(),
+        },
+    );
+
+    // INVARIANT: resolution releases the ban, surfacing an unban that repairs the gossipsub
+    // blacklist and the kad routing entry.
+    // PRE-FIX: `upsert_peer` only trusts the resolved member; the `Banned` status and IP charge
+    // survive discovery.
+    let events = collect_all_events(&mut peer_manager);
+    assert!(
+        events.iter().any(|e| matches!(e, PeerEvent::Unbanned(p) if *p == unresolved)),
+        "resolving a banned committee member must release its ban"
+    );
+}
+
+/// The admission check and the registration check must use the same ban predicate. If the swarm
+/// admits a connection that `register_peer_connection` then refuses, the node holds an open
+/// connection it does not track.
+///
+/// This is the path that emits `error ... "connected with banned peer"` in production.
+#[tokio::test]
+async fn test_admitted_connection_is_registered_under_the_same_ban_predicate() {
+    let all_nodes = CommitteeFixture::builder(MemDatabase::default).build();
+    let mut authorities = all_nodes.authorities();
+    let authority_1 = authorities.next().expect("first authority");
+    let config = authority_1.consensus_config();
+    let mut peer_manager = PeerManager::new(config.network_config().peer_config());
+
+    let blocklisted = create_multiaddr(Some(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 200))));
+    let clean = create_multiaddr(Some(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 201))));
+
+    // the validator is connected, so its record exists and `upsert_peer` will take the
+    // `update_net` branch rather than filing addresses under `listening_addrs`
+    let validator: PeerId = config.key_config().primary_network_public_key().into();
+    assert!(peer_manager.register_peer_connection(
+        &validator,
+        ConnectionType::IncomingConnection { multiaddr: clean.clone() }
+    ));
+
+    // the validator advertises a second address in its record, and joins the committee
+    peer_manager.add_known_peer(
+        *authority_1.authority().protocol_key(),
+        NetworkInfo {
+            pubkey: config.key_config().primary_network_public_key(),
+            multiaddrs: vec![blocklisted.clone()],
+            timestamp: now(),
+        },
+    );
+    peer_manager.new_epoch(config.committee_pub_keys());
+    assert!(peer_manager.is_peer_validator(&validator), "precondition: validator is in committee");
+
+    // two unrelated peers are banned at the advertised address, blocklisting it
+    for _ in 0..2 {
+        let other = PeerId::random();
+        assert!(peer_manager.register_peer_connection(
+            &other,
+            ConnectionType::IncomingConnection { multiaddr: blocklisted.clone() }
+        ));
+        peer_manager.process_penalty(other, Penalty::Fatal);
+        peer_manager.register_disconnected(&other);
+    }
+
+    // the validator reconnects from its clean address. `sanitize_ip_addr` passes (that address is
+    // not blocklisted) and `PeerManager::peer_banned` exempts it as a committee member, so the
+    // swarm admits the connection.
+    assert!(
+        !peer_manager.peer_banned(&validator),
+        "precondition: the swarm admits this connection"
+    );
+
+    // INVARIANT: a connection the admission checks accepted is registered.
+    // PRE-FIX: `register_peer_connection` gates on `AllPeers::peer_banned`, which has no committee
+    // exemption, so it refuses and logs `error "connected with banned peer"` - while
+    // `on_connection_established` discards the `false` and still emits `PeerEvent::PeerConnected`.
+    assert!(
+        peer_manager.register_peer_connection(
+            &validator,
+            ConnectionType::IncomingConnection { multiaddr: clean }
+        ),
+        "the swarm admitted this connection but the peer manager refused to register it"
+    );
 }
 
 #[tokio::test]
@@ -1073,4 +1259,35 @@ async fn test_discovery_heartbeat_removes_banned_ip_peers() {
 
     // discovery peer with banned ip should be removed
     assert!(!peer_manager.discovery_peers.contains_key(&discovery_peer));
+}
+
+/// A connection this node refuses to track must be closed, not announced upward. Announcing it
+/// leaves the application routing consensus traffic to a peer the manager does not manage.
+#[tokio::test]
+async fn test_refused_registration_disconnects_instead_of_announcing_the_peer() {
+    let mut peer_manager = create_test_peer_manager(None);
+    let peer_id = register_peer(&mut peer_manager, None);
+
+    peer_manager.process_penalty(peer_id, Penalty::Fatal);
+    peer_manager.register_disconnected(&peer_id);
+    collect_all_events(&mut peer_manager);
+    assert!(peer_manager.peer_banned(&peer_id), "precondition: the peer is banned");
+
+    // the ban landed between the admission hook and this callback, which is the only way a banned
+    // peer reaches registration now that both gates share one predicate
+    let registered = peer_manager.register_peer_connection(
+        &peer_id,
+        ConnectionType::IncomingConnection { multiaddr: create_multiaddr(None) },
+    );
+    assert!(!registered, "precondition: registration refuses a banned peer");
+
+    let events = collect_all_events(&mut peer_manager);
+    assert!(
+        !events.iter().any(|e| matches!(e, PeerEvent::PeerConnected(id, _) if *id == peer_id)),
+        "announced a peer it refused to track"
+    );
+    assert!(
+        events.iter().any(|e| matches!(e, PeerEvent::DisconnectPeer(id) if *id == peer_id)),
+        "refused registration left the connection open"
+    );
 }

@@ -6,7 +6,8 @@ use crate::{
     evm::hardforks,
     system_calls::{
         ConsensusRegistry::{self, RewardInfo, ValidatorInfo, ValidatorStatus},
-        RewardDistributor, CONSENSUS_REGISTRY_ADDRESS, REWARD_DISTRIBUTOR_ADDRESS, SYSTEM_ADDRESS,
+        ConsensusRegistryV2, RewardDistributor, CONSENSUS_REGISTRY_ADDRESS,
+        REWARD_DISTRIBUTOR_ADDRESS, SYSTEM_ADDRESS,
     },
     RaylsChainSpec,
 };
@@ -18,8 +19,9 @@ use alloy::{
 use alloy_evm::{block::StateChangeSource, eth::EthTxResult, tx::RecoveredTx as _, Database, Evm};
 use rand::{rngs::StdRng, seq::IteratorRandom, Rng as _, SeedableRng as _};
 use rayls_infrastructure_types::{
-    rewards::build_withdrawals, Address, Bytes, Encodable2718, ExecHeader, Receipt, SolValue,
-    TransactionSigned, Withdrawals, B256, EMPTY_WITHDRAWALS, U256,
+    rewards::{build_withdrawals, HybridEpochTally},
+    Address, Bytes, Encodable2718, ExecHeader, Receipt, SolValue, TransactionSigned, Withdrawals,
+    B256, EMPTY_WITHDRAWALS, U256,
 };
 use rayls_middleware_rewards::RewardsCounter;
 use reth_chainspec::{EthChainSpec, EthereumHardforks};
@@ -41,6 +43,35 @@ use reth_revm::{
 };
 use std::{collections::BTreeMap, sync::Arc};
 use tracing::{debug, error, info, trace};
+
+/// The reward tally for a closing epoch, in the shape the block's active ABI needs.
+///
+/// `Legacy` feeds the 1-arg `applyIncentives(RewardInfo[])` (leader-only counts); `Hybrid`
+/// feeds the 2-arg `applyIncentives(RewardInfo[], totalRounds)` from the HybridRewards fork.
+/// The variant is the single source of truth for which ABI the close-epoch system call
+/// encodes, so the fork check and the calldata shape can never disagree.
+#[derive(Debug, Clone)]
+pub enum CloseEpochTally {
+    /// Pre-HybridRewards: per-address committed-leader counts.
+    Legacy(BTreeMap<Address, u32>),
+    /// Post-HybridRewards: per-address participation + leader rounds plus the epoch total.
+    Hybrid(HybridEpochTally),
+}
+
+impl CloseEpochTally {
+    /// Per-address counts written to `Withdrawal.amount` (the withdrawals_root input).
+    ///
+    /// `Withdrawal.amount` keeps meaning "leader/anchor rounds" across the fork, so archive
+    /// replay reads it identically before and after activation.
+    fn withdrawal_counts(&self) -> BTreeMap<Address, u32> {
+        match self {
+            Self::Legacy(counts) => counts.clone(),
+            Self::Hybrid(tally) => {
+                tally.per_address.iter().map(|(addr, t)| (*addr, t.leader_rounds)).collect()
+            }
+        }
+    }
+}
 
 /// Context for Rayls block execution.
 #[derive(Debug, Clone)]
@@ -72,10 +103,11 @@ pub struct RaylsBlockExecutionCtx {
     pub difficulty: U256,
     /// Counter that resolves leader counts at epoch boundary.
     pub rewards_counter: RewardsCounter,
-    /// Pre-computed close-epoch leader tally. Populated at ctx construction
-    /// when `close_epoch.is_some()`; `None` otherwise. Read by both the
-    /// system-call site at `finish` and the withdrawals site at `assemble_block`.
-    pub close_epoch_tally: Option<BTreeMap<Address, u32>>,
+    /// Pre-computed close-epoch tally (leader-only or hybrid, per the active fork).
+    /// Populated at ctx construction when `close_epoch.is_some()`; `None` otherwise.
+    /// Read by both the system-call site at `finish` and the withdrawals site at
+    /// `assemble_block`.
+    pub close_epoch_tally: Option<CloseEpochTally>,
 }
 
 impl RaylsBlockExecutionCtx {
@@ -179,13 +211,18 @@ where
     /// Increase the beneficiary account balance and withdraw from governance safe.
     ///
     /// This must be called once per epoch, before the conclude epoch call.
-    fn apply_consensus_block_rewards(
-        &mut self,
-        rewards: BTreeMap<Address, u32>,
-    ) -> RaylsRethResult<()> {
-        let calldata = self.generate_apply_incentives_calldata(
-            rewards.iter().map(|(address, count)| (*address, *count)).collect(),
-        )?;
+    fn apply_consensus_block_rewards(&mut self, tally: &CloseEpochTally) -> RaylsRethResult<()> {
+        // The tally variant is the single source of truth for the ABI: Legacy encodes the
+        // pre-fork 1-arg call, Hybrid the post-fork 2-arg call. Both must match the currently
+        // deployed ConsensusRegistry at this block, or `transact_system_call` reverts.
+        let calldata = match tally {
+            CloseEpochTally::Legacy(counts) => self.generate_apply_incentives_calldata(
+                counts.iter().map(|(address, count)| (*address, *count)).collect(),
+            )?,
+            CloseEpochTally::Hybrid(hybrid) => {
+                self.generate_apply_incentives_calldata_hybrid(hybrid)?
+            }
+        };
 
         trace!(target: "engine", ?calldata, "apply incentives calldata");
 
@@ -359,6 +396,38 @@ where
                     consensusHeaderCount: U256::from(*count),
                 })
                 .collect(),
+        }
+        .abi_encode()
+        .into();
+
+        Ok(bytes)
+    }
+
+    /// Generate 2-arg `applyIncentives` calldata for the hybrid-reward ABI (post-fork).
+    fn generate_apply_incentives_calldata_hybrid(
+        &mut self,
+        tally: &HybridEpochTally,
+    ) -> RaylsRethResult<Bytes> {
+        debug!(
+            target: "engine",
+            validators = tally.per_address.len(),
+            total_rounds = tally.total_rounds,
+            "applying hybrid incentives"
+        );
+
+        let reward_infos = tally
+            .per_address
+            .iter()
+            .map(|(address, counts)| ConsensusRegistryV2::RewardInfo {
+                validatorAddress: *address,
+                participationRounds: U256::from(counts.participation_rounds),
+                anchorRounds: U256::from(counts.leader_rounds),
+            })
+            .collect();
+
+        let bytes = ConsensusRegistryV2::applyIncentivesCall {
+            rewardInfos: reward_infos,
+            totalRounds: U256::from(tally.total_rounds),
         }
         .abi_encode()
         .into();
@@ -748,33 +817,17 @@ where
             self.spec.is_spurious_dragon_active_at_block(self.evm.block().number().saturating_to());
         self.evm.db_mut().set_state_clear_flag(state_clear_flag);
 
-        // log newly activated hardforks on the first batch of an output
-        if self.ctx.first_batch() {
-            let block_number = self.evm.block().number().saturating_to::<u64>();
-            let parent_number = block_number.saturating_sub(1);
-            for fork in self.spec.newly_activated_forks(parent_number, block_number) {
-                info!(
-                    target: "engine",
-                    ?fork,
-                    block_number,
-                    "Rayls hardfork activated"
-                );
-            }
-        }
-
         // apply any one-shot hardfork state migrations newly activated at this block
-        if self.ctx.first_batch() {
-            let block_number = self.evm.block().number().saturating_to::<u64>();
-            let parent_number = block_number.saturating_sub(1);
-            hardforks::apply_activated_migrations(
-                &self.spec,
-                &mut *self.evm.db_mut(),
-                &mut self.state_hook,
-                self.receipts.len(),
-                parent_number,
-                block_number,
-            )?;
-        }
+        let block_number = self.evm.block().number().saturating_to::<u64>();
+        let parent_number = block_number.saturating_sub(1);
+        hardforks::apply_activated_migrations(
+            &self.spec,
+            &mut *self.evm.db_mut(),
+            &mut self.state_hook,
+            self.receipts.len(),
+            parent_number,
+            block_number,
+        )?;
 
         // apply system calls and cleanup state
         if self.ctx.first_batch() {
@@ -852,8 +905,12 @@ where
         // potentially close epoch boundary
         if let Some(randomness) = self.ctx.close_epoch {
             debug!(target: "engine", "ctx indicates close epoch");
-            let tally = self.ctx.close_epoch_tally.clone().unwrap_or_default();
-            self.apply_consensus_block_rewards(tally).map_err(|e| {
+            let tally = self
+                .ctx
+                .close_epoch_tally
+                .clone()
+                .unwrap_or_else(|| CloseEpochTally::Legacy(BTreeMap::new()));
+            self.apply_consensus_block_rewards(&tally).map_err(|e| {
                 BlockExecutionError::Internal(InternalBlockExecutionError::Other(e.into()))
             })?;
 
@@ -969,7 +1026,7 @@ where
             match (ctx.close_epoch, ctx.close_epoch_tally.as_ref()) {
                 (Some(_), Some(tally)) => {
                     info!(target: "engine", ?tally, "building withdrawals for closed epoch");
-                    let withdrawals = build_withdrawals(tally);
+                    let withdrawals = build_withdrawals(&tally.withdrawal_counts());
                     let withdrawals_root = calculate_withdrawals_root(withdrawals.as_ref());
                     (Some(withdrawals), Some(withdrawals_root))
                 }
@@ -1004,5 +1061,39 @@ where
             header,
             body: BlockBody { transactions, ommers: Default::default(), withdrawals },
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{
+        chainspec::RaylsChainSpec, native_erc20::ERC20_PRECOMPILE_ADDRESS,
+        test_utils::pre_execution::run_pre_execution,
+    };
+    use rayls_infrastructure_types::test_chain_spec_arc;
+
+    // A skipped activation leaves later system calls and execution running against un-migrated
+    // state, so the node diverges.
+    #[test]
+    fn migration_applies_when_activation_block_is_not_first_batch() {
+        const ACTIVATION_BLOCK: u64 = 2;
+        let spec = RaylsChainSpec::builder(test_chain_spec_arc())
+            .erc20_precompile_bytecode(ACTIVATION_BLOCK)
+            .build();
+
+        let state = run_pre_execution(spec, ACTIVATION_BLOCK, 1);
+
+        let account = state
+            .cache
+            .accounts
+            .get(&ERC20_PRECOMPILE_ADDRESS)
+            .expect("migration must create the precompile account even on a non-first batch")
+            .account
+            .as_ref()
+            .expect("account info present");
+        assert!(
+            account.info.code.is_some(),
+            "the Erc20PrecompileBytecode migration must install STOP bytecode on a non-first batch",
+        );
     }
 }
