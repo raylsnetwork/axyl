@@ -414,6 +414,11 @@ impl<DB: Database> Certifier<DB> {
                     );
                 }
                 let outcome = self.vote_failures.record_too_old(peer_id.clone());
+                self.consensus_bus
+                    .consensus_metrics()
+                    .vote_request_rejections
+                    .with_label_values(&[&peer_id.to_string(), "too_old"])
+                    .inc();
                 warn!(
                     target: "primary::certifier",
                     auth=?self.authority_id,
@@ -452,6 +457,11 @@ impl<DB: Database> Certifier<DB> {
                 }
 
                 let outcome = self.vote_failures.record_epoch_mismatch(peer_id.clone());
+                self.consensus_bus
+                    .consensus_metrics()
+                    .vote_request_rejections
+                    .with_label_values(&[&peer_id.to_string(), "epoch_mismatch"])
+                    .inc();
                 warn!(
                     target: "primary::certifier",
                     auth=?self.authority_id,

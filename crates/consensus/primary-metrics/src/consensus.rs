@@ -53,6 +53,16 @@ pub struct ConsensusMetrics {
     pub leader_commits: IntCounterVec,
     /// number of bad nodes in the committee
     pub num_of_bad_nodes: IntGauge,
+    /// This node's header vote requests rejected by a peer, labeled by the rejecting validator
+    /// (`authority`) and `reason` (`too_old` | `epoch_mismatch`). Node-local: high totals mean
+    /// this node is falling behind and being rejected by the committee.
+    pub vote_request_rejections: IntCounterVec,
+    /// Size of the committee for the current epoch.
+    pub committee_size: IntGauge,
+    /// Committed certificates per validator (by `authority`) — a direct per-validator liveness
+    /// signal: which validators' certificates actually land in committed sub-dags. Consistent
+    /// across nodes (every node commits the same sub-dags), unlike node-local rejection counts.
+    pub validator_participation: IntCounterVec,
 }
 
 impl ConsensusMetrics {
@@ -124,6 +134,23 @@ impl ConsensusMetrics {
             num_of_bad_nodes: register_int_gauge_with_registry!(
                 "num_of_bad_nodes",
                 "The number of bad nodes in the new leader schedule",
+                registry
+            )?,
+            vote_request_rejections: register_int_counter_vec_with_registry!(
+                "vote_request_rejections",
+                "This node's header vote requests rejected by a peer, by rejecting validator (authority) and reason",
+                &["authority", "reason"],
+                registry
+            )?,
+            committee_size: register_int_gauge_with_registry!(
+                "committee_size",
+                "Size of the committee for the current epoch",
+                registry
+            )?,
+            validator_participation: register_int_counter_vec_with_registry!(
+                "validator_participation",
+                "Committed certificates per validator (by authority) - a per-validator liveness signal",
+                &["authority"],
                 registry
             )?,
         })

@@ -270,9 +270,14 @@ where
 
         info!(target: "epoch-manager", tasks=?node_task_manager, "NODE TASKS\n");
 
-        // spawn node healthcheck service if enabled
+        // spawn node healthcheck + readiness service if enabled
         if let Some(port) = self.builder.healthcheck {
-            let _ = HealthcheckServer::spawn(node_task_manager.get_spawner(), port).await;
+            let _ = HealthcheckServer::spawn(
+                node_task_manager.get_spawner(),
+                port,
+                self.consensus_bus.node_mode().subscribe(),
+            )
+            .await;
         }
 
         // Catch the termination signal ourselves so we can drive a graceful, ORDERED
@@ -471,9 +476,12 @@ where
         // This needs to be created early so required machinery for other tasks exists when needed.
         let mut worker = worker_node.new_worker().await?;
         worker.set_batch_tracker(self.consensus_bus.batch_tracker().clone());
-        let current_epoch = primary.current_committee().await.epoch();
+        let current_committee = primary.current_committee().await;
+        let current_epoch = current_committee.epoch();
 
-        self.consensus_bus.consensus_metrics().current_epoch.set(current_epoch as i64);
+        let consensus_metrics = self.consensus_bus.consensus_metrics();
+        consensus_metrics.current_epoch.set(current_epoch as i64);
+        consensus_metrics.committee_size.set(current_committee.size() as i64);
 
         // Produce a "dummy" epoch 0 EpochRecord if missing.
         // This will let us use simple code to find any epoch including 0 at startup.
