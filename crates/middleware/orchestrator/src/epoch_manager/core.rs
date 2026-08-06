@@ -109,13 +109,15 @@ where
         // restart-loop the node during recovery. Readiness (`/readyz`) correctly reports
         // not-ready for the whole boot sequence: `node_mode` starts at its constructor-seeded
         // value (`CvvInactive`/`Observer`) and only becomes ready once consensus promotes it.
+        // Propagate a bind failure (e.g. the port is already in use) rather than silently
+        // starting the node without the endpoint an operator explicitly asked for.
         if let Some(port) = self.builder.healthcheck {
-            let _ = HealthcheckServer::spawn(
+            HealthcheckServer::spawn(
                 node_task_manager.get_spawner(),
                 port,
                 self.consensus_bus.node_mode().subscribe(),
             )
-            .await;
+            .await?;
         }
 
         // Heal any crash-interrupted archive before serving, while consensus and execution have not

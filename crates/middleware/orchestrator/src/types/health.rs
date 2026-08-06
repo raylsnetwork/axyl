@@ -3,10 +3,10 @@
 //! A minimal HTTP/1.1 server exposing two probes:
 //! - **liveness** (any path, e.g. `GET /`): always `200 OK` while the process is accepting
 //!   connections — the pre-existing behaviour.
-//! - **readiness** (`GET /readyz`): `200 OK` only when the node is actually participating —
-//!   voting (`CvvActive`) or an operational observer — and `503 Service Unavailable` while a
-//!   validator is still catching up (`CvvInactive`). This lets a load balancer / on-call
-//!   distinguish "process up" from "actually voting in the current epoch".
+//! - **readiness** (`GET /readyz`, alias `GET /ready`): `200 OK` only when the node is actually
+//!   participating — voting (`CvvActive`) or an operational observer — and `503 Service
+//!   Unavailable` while a validator is still catching up (`CvvInactive`). This lets a load
+//!   balancer / on-call distinguish "process up" from "actually voting in the current epoch".
 //!
 //! Designed for integration with GCP load balancers and similar health monitoring systems.
 use std::{io::ErrorKind, net::SocketAddr, time::Duration};
@@ -81,32 +81,46 @@ impl HealthcheckServer {
         info!(target: "epoch-manager", ?listen_on, "healthcheck listening");
 
         task_spawner.spawn_task("healthcheck", async move {
-            let mut backoff = Duration::from_millis(100);
+            let initial_backoff = Duration::from_millis(100);
+            let mut backoff = initial_backoff;
             let max_backoff = Duration::from_secs(5);
 
             loop {
                 match listener.accept().await {
                     Ok((mut socket, _)) => {
-                        // Read the request line to route by path. Bounded read with a short
-                        // timeout so a slow/partial client can't wedge the accept loop.
-                        let mut buf = [0u8; 256];
-                        let wants_readiness = matches!(
-                            tokio::time::timeout(Duration::from_millis(200), socket.read(&mut buf))
+                        // Reset backoff after a healthy accept so a past transient error doesn't
+                        // keep the delay elevated.
+                        backoff = initial_backoff;
+
+                        // Handle each connection in its own task: the request read is bounded by a
+                        // short timeout, but a client that connects and sends nothing would still
+                        // hold the accept loop for the full timeout, delaying every other probe.
+                        // A per-connection task keeps the accept loop free. `node_mode` is a cheap
+                        // watch receiver, cloned per connection.
+                        let node_mode = node_mode.clone();
+                        tokio::spawn(async move {
+                            let mut buf = [0u8; 256];
+                            let wants_readiness = matches!(
+                                tokio::time::timeout(
+                                    Duration::from_millis(200),
+                                    socket.read(&mut buf),
+                                )
                                 .await,
-                            Ok(Ok(n)) if n > 0 && request_targets_readiness(&buf[..n])
-                        );
+                                Ok(Ok(n)) if n > 0 && request_targets_readiness(&buf[..n])
+                            );
 
-                        let response = if wants_readiness {
-                            readiness_response(*node_mode.borrow())
-                        } else {
-                            // Any other path (incl. `/`) is a liveness probe: the process is up.
-                            LIVE_200
-                        };
+                            let response = if wants_readiness {
+                                readiness_response(*node_mode.borrow())
+                            } else {
+                                // Any other path (incl. `/`) is a liveness probe: process is up.
+                                LIVE_200
+                            };
 
-                        // write response, ignore errors (client disconnect, etc.), then drop.
-                        if let Err(e) = socket.write_all(response).await {
-                            tracing::error!(target: "healthcheck", ?e, "error writing healthcheck response");
-                        }
+                            // write response, ignore errors (client disconnect, etc.), then drop.
+                            if let Err(e) = socket.write_all(response).await {
+                                tracing::error!(target: "healthcheck", ?e, "error writing healthcheck response");
+                            }
+                        });
                     }
                     Err(ref e) if matches!(
                         e.kind(),
