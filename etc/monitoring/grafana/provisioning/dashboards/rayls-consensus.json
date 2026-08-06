@@ -1,0 +1,149 @@
+{
+  "annotations": { "list": [] },
+  "editable": true,
+  "graphTooltip": 1,
+  "title": "Rayls — Consensus & Validator Health",
+  "uid": "rayls-consensus",
+  "tags": ["rayls", "consensus"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "time": { "from": "now-1h", "to": "now" },
+  "refresh": "30s",
+  "templating": {
+    "list": [
+      {
+        "name": "DS",
+        "label": "Prometheus",
+        "type": "datasource",
+        "query": "prometheus",
+        "current": {},
+        "hide": 0,
+        "refresh": 1
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "title": "Current epoch",
+      "type": "stat",
+      "datasource": { "type": "prometheus", "uid": "${DS}" },
+      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 0 },
+      "targets": [{ "expr": "current_epoch", "refId": "A" }]
+    },
+    {
+      "id": 2,
+      "title": "Committee size",
+      "type": "stat",
+      "datasource": { "type": "prometheus", "uid": "${DS}" },
+      "gridPos": { "h": 4, "w": 6, "x": 6, "y": 0 },
+      "targets": [{ "expr": "committee_size", "refId": "A" }]
+    },
+    {
+      "id": 3,
+      "title": "Bad nodes (leader schedule)",
+      "type": "stat",
+      "datasource": { "type": "prometheus", "uid": "${DS}" },
+      "gridPos": { "h": 4, "w": 6, "x": 12, "y": 0 },
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "red", "value": 1 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "targets": [{ "expr": "num_of_bad_nodes", "refId": "A" }]
+    },
+    {
+      "id": 4,
+      "title": "Consensus rounds (proposer vs. committed)",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "${DS}" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 4 },
+      "description": "Gap between current_round and last_committed_round is the commit lag.",
+      "targets": [
+        { "expr": "current_round", "legendFormat": "proposer round", "refId": "A" },
+        { "expr": "last_committed_round", "legendFormat": "committed round", "refId": "B" }
+      ]
+    },
+    {
+      "id": 5,
+      "title": "Commit round latency (p95)",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "${DS}" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 4 },
+      "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(consensus_commit_rounds_latency_bucket[5m])) by (le))",
+          "legendFormat": "p95",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "title": "Leader election outcomes (rate)",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "${DS}" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 12 },
+      "targets": [
+        {
+          "expr": "sum by (outcome) (rate(leader_election[5m]))",
+          "legendFormat": "{{outcome}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 7,
+      "title": "Vote-request rejections by validator (rate)",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "${DS}" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 12 },
+      "description": "This node's header vote requests rejected by a peer. Rising totals mean this node is falling behind.",
+      "targets": [
+        {
+          "expr": "sum by (authority, reason) (rate(vote_request_rejections[5m]))",
+          "legendFormat": "{{authority}} — {{reason}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 8,
+      "title": "Connected peers",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "${DS}" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 20 },
+      "targets": [
+        {
+          "expr": "connected_peers_count",
+          "legendFormat": "{{kad_type}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 9,
+      "title": "Validator participation (committed certs/s)",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "${DS}" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 20 },
+      "description": "Rate of committed certificates per validator — a direct per-validator liveness signal, consistent across nodes. A validator whose line drops to zero has stopped contributing certificates.",
+      "targets": [
+        {
+          "expr": "sum by (authority) (rate(validator_participation[5m]))",
+          "legendFormat": "{{authority}}",
+          "refId": "A"
+        }
+      ]
+    }
+  ]
+}
