@@ -16,6 +16,10 @@ use libp2p::{
 use std::task::{Context, Poll};
 use tracing::{debug, error, info, trace};
 
+#[cfg(test)]
+#[path = "../tests/behavior.rs"]
+mod behavior_tests;
+
 impl NetworkBehaviour for PeerManager {
     type ConnectionHandler = ConnectionHandler;
     type ToSwarm = PeerEvent;
@@ -229,24 +233,30 @@ impl PeerManager {
 
         // register peers as connected by this point
         // even if the peer is to be immediately disconnected with peer-exchange (PX)
-        let multiaddr = match endpoint {
-            ConnectedPoint::Listener { send_back_addr, .. } => {
+        let (multiaddr, registered) = match endpoint {
+            ConnectedPoint::Listener { send_back_addr, .. } => (
+                send_back_addr.clone(),
                 self.register_peer_connection(
                     &peer_id,
                     ConnectionType::IncomingConnection { multiaddr: send_back_addr.clone() },
-                );
-                send_back_addr.clone()
-            }
-            ConnectedPoint::Dialer { address, .. } => {
+                ),
+            ),
+            ConnectedPoint::Dialer { address, .. } => (
+                address.clone(),
                 self.register_peer_connection(
                     &peer_id,
                     ConnectionType::OutgoingConnection { multiaddr: address.clone() },
-                );
-                address.clone()
-            }
+                ),
+            ),
         };
 
         // TODO: Issue #254 update metrics
+
+        // a peer this node refused to track must not be announced as connected, or the
+        // application routes requests to a peer the manager holds no state for
+        if !registered {
+            return;
+        }
 
         self.push_event(PeerEvent::PeerConnected(peer_id, multiaddr));
 

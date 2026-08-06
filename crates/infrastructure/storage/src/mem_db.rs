@@ -162,16 +162,11 @@ impl<'a> DbTx for MemDbTx<'a> {
     fn record_prior_to<T: Table>(&self, key: &T::Key) -> Option<(T::Key, T::Value)> {
         if let Some(table) = self.store.get(T::NAME) {
             let key_bytes = encode_key(key);
-            let mut last = None;
-            for (k, (removed, v)) in table.iter() {
-                if k >= &key_bytes {
-                    break;
-                }
-                if !*removed {
-                    last = Some((decode_key(k), decode(v)));
-                }
-            }
-            last
+            table
+                .range(..key_bytes)
+                .rev()
+                .find(|(_, (removed, _))| !*removed)
+                .map(|(k, (_, v))| (decode_key(k), decode(v)))
         } else {
             None
         }
@@ -272,16 +267,11 @@ impl<'a> DbTx for MemDbTxMut<'a> {
     fn record_prior_to<T: Table>(&self, key: &T::Key) -> Option<(T::Key, T::Value)> {
         if let Some(table) = self.store.get(T::NAME) {
             let key_bytes = encode_key(key);
-            let mut last = None;
-            for (k, (removed, v)) in table.iter() {
-                if k >= &key_bytes {
-                    break;
-                }
-                if !*removed {
-                    last = Some((decode_key(k), decode(v)));
-                }
-            }
-            last
+            table
+                .range(..key_bytes)
+                .rev()
+                .find(|(_, (removed, _))| !*removed)
+                .map(|(k, (_, v))| (decode_key(k), decode(v)))
         } else {
             None
         }
@@ -332,6 +322,19 @@ impl<'a> DbTxMut for MemDbTxMut<'a> {
     fn commit(self) -> eyre::Result<()> {
         // no need to do anything, the lock finishes with the tx drop
         Ok(())
+    }
+}
+
+impl<'a> MemDbTxMut<'a> {
+    /// Hard-removes `key` from the in-memory store, leaving no tombstone.
+    ///
+    /// Persistent eviction archives a row permanently (never re-inserted), so the cache entry is
+    /// dropped outright rather than tombstoned: this frees the cache and lets reads fall through to
+    /// a lower tier, whereas a tombstone would shadow it and never be reclaimed.
+    pub fn hard_delete<T: Table>(&mut self, key: &T::Key) {
+        if let Some(table) = self.store.get_mut(T::NAME) {
+            table.remove(&encode_key(key));
+        }
     }
 }
 
@@ -622,21 +625,11 @@ impl Database for MemDatabase {
     fn record_prior_to<T: Table>(&self, key: &T::Key) -> Option<(T::Key, T::Value)> {
         if let Some(table) = self.store.read().get(T::NAME) {
             let key_bytes = encode_key(key);
-            let mut last = None;
-            let guard = table;
-            for (k, v) in guard.iter() {
-                if k >= &key_bytes {
-                    break;
-                }
-                if !v.0 {
-                    last = Some((k, v));
-                }
-            }
-            last.map(|(key_bytes, marked_value_bytes)| {
-                let key = decode_key(key_bytes);
-                let value = decode(&marked_value_bytes.1);
-                (key, value)
-            })
+            table
+                .range(..key_bytes)
+                .rev()
+                .find(|(_, v)| !v.0)
+                .map(|(k, v)| (decode_key(k), decode(&v.1)))
         } else {
             None
         }

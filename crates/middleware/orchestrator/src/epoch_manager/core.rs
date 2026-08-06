@@ -1,11 +1,13 @@
 //! Epoch manager.
 //! Oversees per-epoch tasks and shared cross-epoch resources.
 
+#[cfg(feature = "cold-storage")]
+use super::cold_archive::ColdArchival;
 use crate::{
     engine::{ExecutionNode, RaylsBuilder},
     epoch_manager::{
         types::{EpochManager, ENGINE_TASK_MANAGER, EPOCH_TASK_MANAGER, NODE_TASK_MANAGER},
-        utils::catchup_accumulator,
+        utils::{catchup_accumulator, recover_executed_anchor},
     },
     primary::PrimaryNode,
     types::{HealthcheckServer, InitialBatchSeq, RunningOutcome, TransitionCtx},
@@ -15,10 +17,7 @@ use consensus_metrics::start_prometheus_server;
 use eyre::eyre;
 use futures::FutureExt;
 use rayls_consensus_primary::{ConsensusBus, NodeMode, QueChannel};
-use rayls_consensus_state_sync::{
-    epoch_committee_valid, highest_executed_anchor, last_executed_consensus_from_anchor,
-    spawn_epoch_record_collector,
-};
+use rayls_consensus_state_sync::{epoch_committee_valid, spawn_epoch_record_collector};
 use rayls_consensus_worker::{quorum_waiter::QuorumWaiterTrait, Worker};
 use rayls_execution_evm::{reth_env::RethEnv, system_calls::EpochState};
 use rayls_infrastructure_config::{KeyConfig, LibP2pConfig, NetworkConfig, RaylsDirs};
@@ -38,15 +37,6 @@ use std::{
 use tokio::sync::{mpsc, oneshot, watch};
 use tracing::{debug, error, info, warn};
 
-/// Number of recent EVM blocks scanned to recover the restart execution anchor.
-///
-/// A drained parked (out-of-order seq) batch's block carries its ORIGIN output's lower nonce and
-/// that output's digest as `parent_beacon_block_root`, yet lands after the in-order filler and
-/// becomes the canonical tip, so the tip can anchor to a PREVIOUS output. Scanning this window and
-/// taking the max-nonce block recovers the true highest executed output's consensus-header digest.
-/// Sized well above any plausible reorder/park run.
-const LAST_EXECUTED_SCAN_DEPTH: u64 = 200;
-
 impl<P, DB> EpochManager<P, DB>
 where
     P: RaylsDirs + Clone + 'static,
@@ -58,6 +48,7 @@ where
         rayls_datadir: P,
         passphrase: String,
         consensus_db: DB,
+        #[cfg(feature = "cold-storage")] cold_archival: ColdArchival,
     ) -> eyre::Result<Self> {
         // create key config for lifetime of the app
         let key_config = KeyConfig::read_config(&rayls_datadir, passphrase)?;
@@ -94,6 +85,8 @@ where
             epoch_record: None,
             prev_epoch_record: None,
             initial_epoch: true,
+            #[cfg(feature = "cold-storage")]
+            cold_archival,
         })
     }
 
@@ -103,6 +96,35 @@ where
         // Long-running tasks for the lifetime of the node.
         let mut node_task_manager = TaskManager::new(NODE_TASK_MANAGER);
         let node_task_spawner = node_task_manager.get_spawner();
+
+        // Bind the healthcheck before any boot-time cold work (crash reconcile + backlog
+        // migration). Both are synchronous and can be multi-minute on a large DB; binding the probe
+        // first keeps it answering throughout (the migration is `spawn_blocking`'d so the runtime
+        // stays free), so a short-deadline probe cannot blackout and restart-loop the node during
+        // recovery. LIVENESS (any path but `/readyz`) stays green throughout — the process is up.
+        // READINESS (`/readyz`) reads the live node mode and reports `503` until the node is voting
+        // or observing, so it is correctly not-ready during this boot recovery. A bind failure
+        // (e.g. the port is already in use) is propagated rather than silently swallowed — the
+        // operator asked for this endpoint.
+        if let Some(port) = self.builder.healthcheck {
+            HealthcheckServer::spawn(
+                node_task_manager.get_spawner(),
+                port,
+                self.consensus_bus.node_mode().subscribe(),
+            )
+            .await?;
+        }
+
+        // Heal any crash-interrupted archive before serving, while consensus and execution have not
+        // started so it cannot race the live path. Cheap: it touches only sealed-but-unreconciled
+        // epochs. The bulk first-start backlog migration is deferred until the EL execution anchor
+        // is known (below), so it can floor the cutoff by it. Steady-state archival runs in the
+        // background seal actor spawned further down.
+        // Best-effort on the node path: a failed reconcile is retried at the next boot.
+        #[cfg(feature = "cold-storage")]
+        if let Err(e) = self.cold_archival.reconcile_at_boot().await {
+            warn!(target: "epoch-manager", "cold reconcile failed: {e}");
+        }
 
         info!(target: "epoch-manager", "starting node and launching first epoch");
 
@@ -136,23 +158,12 @@ where
         // signal that never fires. (Proposer header numbering is seeded separately from the
         // consensus tip in `get_last_executed_consensus`.)
         //
-        // The anchor must be the HIGHEST-nonce recent EVM block's consensus header, not the literal
-        // canonical tip: a drained parked (out-of-order seq) batch's block carries its ORIGIN
-        // output's lower nonce/anchor yet lands after the in-order filler and becomes the tip, so
-        // the tip can anchor to a PREVIOUS output and regress the watermark. Scan the recent window
-        // and pick the max-nonce block's anchor; fall back to the tip when the window is empty.
-        // Startup runs before the engine starts, so the tip is frozen: acquire one `reth_env`
-        // handle and one tip, shared by both the execution-anchor recovery and the dedup-registry
-        // reconstruction below (they must agree on the same tip).
+        // Startup runs before the engine starts, so the tip is frozen: the anchor recovery and
+        // the dedup-registry reconstruction below read the same chain state. See
+        // `recover_executed_anchor` for why the anchor is the max-nonce recent block, not the tip.
         let reth_env = engine.get_reth_env().await;
-        let tip = reth_env.canonical_tip();
 
-        let last_execution_block = {
-            let start = tip.number.saturating_sub(LAST_EXECUTED_SCAN_DEPTH);
-            let window = reth_env.blocks_for_range(start..=tip.number)?;
-            let anchor = highest_executed_anchor(&window).or(tip.header().parent_beacon_block_root);
-            last_executed_consensus_from_anchor(anchor, &self.consensus_db)
-        };
+        let last_execution_block = recover_executed_anchor(&reth_env, &self.consensus_db)?;
 
         let last_consensus_block =
             self.consensus_db.last_record::<ConsensusBlocks>().map(|(_, header)| header);
@@ -177,6 +188,32 @@ where
             reth_env.lookup_head()?.number,
             &self.consensus_db,
         );
+
+        // First-start backlog migration: archive every epoch safely below the EL execution anchor
+        // into cold. Deferred to here (the reconcile above ran earlier) so it reads the seeded
+        // executed anchor and never seals an epoch the EL has not executed. Still runs before
+        // consensus and execution start, so it does not compete with the live path. Drained in
+        // bounded chunks (not one unbounded pass) so a large pre-existing DB never buffers its
+        // whole history at once; the probe is already bound so it answers throughout.
+        #[cfg(feature = "cold-storage")]
+        {
+            let el_anchor_epoch =
+                self.consensus_bus.executed_anchor().borrow().sub_dag.leader_epoch();
+            // Best-effort on the node path: a failed chunk resumes at the next boundary or boot.
+            if let Err(e) = self.cold_archival.migrate_backlog(el_anchor_epoch).await {
+                warn!(target: "epoch-manager", "cold boot backlog migration failed: {e}");
+            }
+
+            // Steady-state archival: the actor fully archives each newly finalized epoch in the
+            // background during the live epoch; nothing archival runs on the epoch transition.
+            // `node_shutdown` doubles as the actor's chunk-seam cancel flag, so teardown never
+            // waits on a seal.
+            self.cold_archival.spawn_actor(
+                &node_task_manager,
+                self.consensus_bus.executed_anchor().subscribe(),
+                self.node_shutdown.clone(),
+            );
+        }
 
         // Fires once the engine task has fully drained (its last block executed),
         // so the shutdown flush below runs *after* the final block, not before it.
@@ -269,18 +306,6 @@ where
         node_task_manager.update_tasks();
 
         info!(target: "epoch-manager", tasks=?node_task_manager, "NODE TASKS\n");
-
-        // spawn node healthcheck + readiness service if enabled. Propagate a bind failure (e.g.
-        // the port is already in use) rather than silently starting the node without the endpoint
-        // an operator explicitly asked for.
-        if let Some(port) = self.builder.healthcheck {
-            HealthcheckServer::spawn(
-                node_task_manager.get_spawner(),
-                port,
-                self.consensus_bus.node_mode().subscribe(),
-            )
-            .await?;
-        }
 
         // Catch the termination signal ourselves so we can drive a graceful, ORDERED
         // shutdown — rather than letting a task-manager join catch it (which would also fire

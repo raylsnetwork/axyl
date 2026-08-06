@@ -69,7 +69,9 @@ fn main() {
     // Sort out the BLS key passphrase depending on the command run.
     match cli.bls_passphrase_source {
         PassSource::Env => {} // Already have the env var if provided.
-        PassSource::Stdin => {
+        // Only read stdin for commands that use the passphrase: a passphrase-free command
+        // (cold-migrate) must not block on, or consume, piped input it will discard.
+        PassSource::Stdin if cli.command.needs_bls_passphrase() => {
             let mut buffer = String::new();
             if let Err(err) = std::io::stdin().read_line(&mut buffer) {
                 eprintln!("Error reading BLS passphrase from stdin: {err:?}");
@@ -77,6 +79,7 @@ fn main() {
             }
             passphrase = Some(buffer.trim_end().to_string());
         }
+        PassSource::Stdin => {}
         PassSource::Ask => match cli.command {
             Commands::Keytool(_) => {
                 // Need to ask and confirm before it used to encrypt.
@@ -88,6 +91,9 @@ fn main() {
                 passphrase =
                     rpassword::prompt_password("Enter the BLS key passphrase to decrypt: ").ok();
             }
+            // The migration never opens the BLS key, so there is nothing to ask for.
+            #[cfg(feature = "cold-storage")]
+            Commands::ColdMigrate(_) => {}
             // `dev` is one-command and supplies its own default passphrase below;
             // never prompt for it.
             #[cfg(feature = "dev-single-node-setup")]
@@ -104,13 +110,13 @@ fn main() {
         passphrase = Some(rayls_network_cli::dev::DEV_PASSPHRASE.to_string());
     }
 
-    if passphrase.is_none() {
+    if cli.command.needs_bls_passphrase() && passphrase.is_none() {
         eprintln!(
             "Error passphrase is required, see the option --bls-passphrase-source for options"
         );
         std::process::exit(1);
     }
-    let passphrase = passphrase.unwrap();
+    let passphrase = passphrase.unwrap_or_default();
 
     #[cfg(not(feature = "faucet"))]
     if let Err(err) = cli.run(passphrase, |builder, _, rl_datadir, passphrase| {

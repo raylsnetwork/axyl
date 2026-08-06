@@ -1227,6 +1227,158 @@ async fn test_close_epochs_with_dynamic_committee() -> eyre::Result<()> {
     Ok(())
 }
 
+/// Fork-boundary test for the `HybridRewards` hardfork.
+///
+/// With a synthetic schedule activating at `FORK_BLOCK`, drive epoch closes on both sides in a
+/// single run. Genesis deploys the pre-hybrid contract, so a successful close *before* the fork
+/// proves the legacy 1-arg `applyIncentives` matches it, and a successful close *at/after* the
+/// fork proves the in-place migration swapped the contract and the hybrid 2-arg `applyIncentives`
+/// matches the new one. A wrong ABI on either side (or a bad migration) would revert
+/// `applyIncentives` and fail block execution, so reaching `Ok` on both sides is the assertion;
+/// the registry code length (21929 -> 23042 bytes) is checked directly as migration proof.
+#[tokio::test]
+async fn test_hybrid_rewards_fork_boundary() -> eyre::Result<()> {
+    use crate::chainspec::{RaylsChainSpec, RaylsHardforks};
+    use reth_provider::StateProvider as _;
+
+    const FORK_BLOCK: u64 = 3;
+    const OLD_REGISTRY_LEN: usize = 21_929;
+    const HYBRID_REGISTRY_LEN: usize = 23_042;
+
+    // Four genesis validators with BLS proofs of possession.
+    let validator_addrs = [
+        Address::from_slice(&[0x11; 20]),
+        Address::from_slice(&[0x22; 20]),
+        Address::from_slice(&[0x33; 20]),
+        Address::from_slice(&[0x44; 20]),
+    ];
+    let validators: Vec<NodeInfo> = validator_addrs
+        .iter()
+        .enumerate()
+        .map(|(i, addr)| {
+            let mut rng = StdRng::seed_from_u64(i as u64);
+            let bls = BlsKeypair::generate(&mut rng);
+            let pop = generate_proof_of_possession_bls(&bls, addr).expect("pop generation failed");
+            NodeInfo {
+                name: format!("validator-{i}"),
+                bls_public_key: *bls.public(),
+                p2p_info: NodeP2pInfo::default(),
+                execution_address: *addr,
+                proof_of_possession: pop,
+            }
+        })
+        .collect();
+
+    let epoch_duration = 60 * 60 * 24;
+    let stake_config = ConsensusRegistry::StakeConfig {
+        stakeAmount: U256::from(parse_ether("1_000_000").unwrap()),
+        minWithdrawAmount: U256::from(parse_ether("1_000").unwrap()),
+        epochDuration: epoch_duration,
+    };
+
+    let mut governance_multisig =
+        TransactionFactory::new_random_from_seed(&mut StdRng::seed_from_u64(33));
+    let governance = governance_multisig.address();
+    let tmp_genesis = rayls_infrastructure_types::test_genesis().extend_accounts([(
+        governance,
+        GenesisAccount::default().with_balance(U256::from(parse_ether("100_000_000").unwrap())),
+    )]);
+
+    let genesis = RethEnv::create_consensus_registry_genesis_accounts(
+        validators.clone(),
+        tmp_genesis,
+        stake_config.clone(),
+        governance,
+        governance,
+        vec![(governance, stake_config.stakeAmount)],
+    )?;
+    let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+
+    // Synthetic schedule: only HybridRewards, active at FORK_BLOCK.
+    let rayls_chain_spec: Arc<RaylsChainSpec> =
+        Arc::new(RaylsChainSpec::builder(chain.clone()).hybrid_rewards(FORK_BLOCK).build());
+    assert!(
+        !rayls_chain_spec.is_hybrid_rewards_active_at_block(FORK_BLOCK - 1),
+        "HybridRewards must be inactive before the fork block"
+    );
+    assert!(
+        rayls_chain_spec.is_hybrid_rewards_active_at_block(FORK_BLOCK),
+        "HybridRewards must be active at the fork block"
+    );
+
+    let tmp_dir = TempDir::new()?;
+    let task_manager = TaskManager::new("Test Task Manager");
+    let reth_env = RethEnv::new_for_temp_chain_with_rayls_spec(
+        chain.clone(),
+        rayls_chain_spec.clone(),
+        tmp_dir.path(),
+        &task_manager,
+        None,
+    )
+    .await?;
+
+    let registry_code_len = |env: &RethEnv| -> eyre::Result<usize> {
+        Ok(env
+            .latest()?
+            .account_code(&CONSENSUS_REGISTRY_ADDRESS)?
+            .expect("ConsensusRegistry must have code")
+            .original_byte_slice()
+            .len())
+    };
+
+    // Genesis deploys the pre-hybrid ConsensusRegistry.
+    assert_eq!(
+        registry_code_len(&reth_env)?,
+        OLD_REGISTRY_LEN,
+        "genesis must be the pre-hybrid contract"
+    );
+
+    let mut epoch = 0u32;
+
+    // ── Block 1 (< FORK_BLOCK): no epoch close ──
+    let mut co = consensus_output_for_tests(2, epoch, 1);
+    co.close_epoch = false;
+    let payload = RLPayload::new_for_test(chain.sealed_genesis_header(), &co);
+    let block1 = execute_payload_and_update_canonical_chain(&reth_env, payload, vec![]).await?;
+    let mut header = block1.recovered_block.clone_sealed_header();
+
+    // ── Block 2 (< FORK_BLOCK): close epoch 0 via the LEGACY 1-arg ABI ──
+    let co = consensus_output_for_tests(2, epoch, 2);
+    let payload = RLPayload::new_for_test(header, &co);
+    let block2 = execute_payload_and_update_canonical_chain(&reth_env, payload, vec![]).await?;
+    header = block2.recovered_block.clone_sealed_header();
+    epoch += 1;
+    assert_eq!(
+        registry_code_len(&reth_env)?,
+        OLD_REGISTRY_LEN,
+        "contract must still be pre-hybrid before the fork block"
+    );
+
+    // ── Block 3 (== FORK_BLOCK): migration swaps the contract, then the HYBRID 2-arg ABI ──
+    let co = consensus_output_for_tests(2, epoch, 3);
+    let payload = RLPayload::new_for_test(header, &co);
+    let block3 = execute_payload_and_update_canonical_chain(&reth_env, payload, vec![]).await?;
+    header = block3.recovered_block.clone_sealed_header();
+    epoch += 1;
+    assert_eq!(
+        registry_code_len(&reth_env)?,
+        HYBRID_REGISTRY_LEN,
+        "fork block must migrate to the hybrid contract"
+    );
+
+    // ── Block 4 (> FORK_BLOCK): another hybrid-path close ──
+    let co = consensus_output_for_tests(2, epoch, 4);
+    let payload = RLPayload::new_for_test(header, &co);
+    execute_payload_and_update_canonical_chain(&reth_env, payload, vec![]).await?;
+    assert_eq!(
+        registry_code_len(&reth_env)?,
+        HYBRID_REGISTRY_LEN,
+        "hybrid contract must persist after the fork block"
+    );
+
+    Ok(())
+}
+
 #[test]
 fn test_rpc_validator() {
     let mut mods: Option<RpcModuleSelection> = None;

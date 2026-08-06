@@ -73,8 +73,10 @@ where
                         author = ?gossip_source,
                         ?topic,
                         ?propagation_source,
-                        "applying fatal penalty to message author (or propagation source as fallback)"
+                        "applying fatal penalty to message author"
                     );
+                    // Penalize the message author only, never the forwarding propagation source; a
+                    // relayer must not be banned for an invalid message it merely gossiped on.
                     if let Some(peer_id) = gossip_source {
                         self.swarm
                             .behaviour_mut()

@@ -27,6 +27,7 @@ futures = { workspace = true }
 rayls-consensus-network = { workspace = true }
 rayls-execution-evm = { workspace = true }
 consensus-metrics = { workspace = true }
+prometheus = { workspace = true }
 rayls-consensus-primary-metrics = { workspace = true }
 rayls-consensus-state-sync = { workspace = true }
 rayls-middleware-processor = { workspace = true }
@@ -36,12 +37,21 @@ jsonrpsee = { workspace = true }
 roaring = { workspace = true }
 alloy = { workspace = true}
 rayon = { workspace = true }
+# The consensus-DB process-exclusivity lock (reth's PID-liveness StorageLock).
+reth-db = { workspace = true, optional = true }
 
 # TODO: temporary solution until reth supports public rpc hooks
 rayls-execution-faucet = { workspace = true }
 
+# Per-thread scheduling priority for the background cold-seal thread (macOS QoS, Linux nice).
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [features]
-default = []
+# Propagates the consensus DB cold tier. On by default; disable to compile out the cold archiver
+# wiring (boot migration, boundary archival) along with the storage crate's cold-storage code.
+cold-storage = ["rayls-infrastructure-storage/cold-storage", "dep:reth-db"]
+default = ["cold-storage"]
 # Single-node / local dev consensus behavior (e.g. self-certifying the epoch close
 # without peers). Off by default; enabled transitively by the top-level `dev-single-node-setup`
 # feature. Forwards to the primary's `dev-single-node-setup` feature. NOT FOR PRODUCTION.
@@ -60,6 +70,8 @@ rayls-middleware-processor = { workspace = true, features = ["test-utils"] }
 rayls-testing-test-utils = { workspace = true }
 rayls-infrastructure-network-types = { workspace = true }
 serde_json = { workspace = true }
+# Reads a live foreign process's start time to fabricate a held consensus-DB lock in tests.
+sysinfo = "0.38"
 tempfile = { workspace = true }
 
 [lints]

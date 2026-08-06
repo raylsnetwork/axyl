@@ -6,6 +6,7 @@
 
 mod admin_transfer;
 mod erc20_precompile_bytecode;
+mod hybrid_rewards;
 mod rls_storage;
 mod tokenomics;
 mod usdr_supply_correction;
@@ -58,9 +59,16 @@ pub(crate) fn apply_activated_migrations<DB: alloy_evm::Database>(
 where
     DB::Error: core::fmt::Display,
 {
-    let newly = spec.newly_activated_forks(parent_number, block_number);
+    let newly_activated_forks = spec.newly_activated_forks(parent_number, block_number);
 
-    for fork in newly {
+    for fork in newly_activated_forks {
+        info!(
+            target: "engine",
+            ?fork,
+            block_number,
+            "Rayls hardfork activated"
+        );
+
         let mut state = match fork {
             RaylsHardFork::AdminTransfer => {
                 info!(
@@ -114,6 +122,16 @@ where
                 // Corrective migration: needs db read access to compute
                 // `slot + correction` at activation. See module docs.
                 usdr_supply_correction::usdr_supply_correction_state(db)?
+            }
+            RaylsHardFork::HybridRewards => {
+                info!(
+                    target: "engine",
+                    block_number,
+                    "Applying HybridRewards hardfork: swapping ConsensusRegistry to hybrid-reward bytecode (re-linking BlsG1 + _rls from the live contract)"
+                );
+                // Reads the live registry runtime code to carry the per-network BlsG1 address
+                // and `_rls` immutable into the new bytecode. See module docs.
+                hybrid_rewards::hybrid_rewards_state(db)?
             }
             // Continuous behavioral forks -- not one-shot migrations.
             RaylsHardFork::Eip1559
