@@ -817,33 +817,17 @@ where
             self.spec.is_spurious_dragon_active_at_block(self.evm.block().number().saturating_to());
         self.evm.db_mut().set_state_clear_flag(state_clear_flag);
 
-        // log newly activated hardforks on the first batch of an output
-        if self.ctx.first_batch() {
-            let block_number = self.evm.block().number().saturating_to::<u64>();
-            let parent_number = block_number.saturating_sub(1);
-            for fork in self.spec.newly_activated_forks(parent_number, block_number) {
-                info!(
-                    target: "engine",
-                    ?fork,
-                    block_number,
-                    "Rayls hardfork activated"
-                );
-            }
-        }
-
         // apply any one-shot hardfork state migrations newly activated at this block
-        if self.ctx.first_batch() {
-            let block_number = self.evm.block().number().saturating_to::<u64>();
-            let parent_number = block_number.saturating_sub(1);
-            hardforks::apply_activated_migrations(
-                &self.spec,
-                &mut *self.evm.db_mut(),
-                &mut self.state_hook,
-                self.receipts.len(),
-                parent_number,
-                block_number,
-            )?;
-        }
+        let block_number = self.evm.block().number().saturating_to::<u64>();
+        let parent_number = block_number.saturating_sub(1);
+        hardforks::apply_activated_migrations(
+            &self.spec,
+            &mut *self.evm.db_mut(),
+            &mut self.state_hook,
+            self.receipts.len(),
+            parent_number,
+            block_number,
+        )?;
 
         // apply system calls and cleanup state
         if self.ctx.first_batch() {
@@ -1077,5 +1061,39 @@ where
             header,
             body: BlockBody { transactions, ommers: Default::default(), withdrawals },
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{
+        chainspec::RaylsChainSpec, native_erc20::ERC20_PRECOMPILE_ADDRESS,
+        test_utils::pre_execution::run_pre_execution,
+    };
+    use rayls_infrastructure_types::test_chain_spec_arc;
+
+    // A skipped activation leaves later system calls and execution running against un-migrated
+    // state, so the node diverges.
+    #[test]
+    fn migration_applies_when_activation_block_is_not_first_batch() {
+        const ACTIVATION_BLOCK: u64 = 2;
+        let spec = RaylsChainSpec::builder(test_chain_spec_arc())
+            .erc20_precompile_bytecode(ACTIVATION_BLOCK)
+            .build();
+
+        let state = run_pre_execution(spec, ACTIVATION_BLOCK, 1);
+
+        let account = state
+            .cache
+            .accounts
+            .get(&ERC20_PRECOMPILE_ADDRESS)
+            .expect("migration must create the precompile account even on a non-first batch")
+            .account
+            .as_ref()
+            .expect("account info present");
+        assert!(
+            account.info.code.is_some(),
+            "the Erc20PrecompileBytecode migration must install STOP bytecode on a non-first batch",
+        );
     }
 }

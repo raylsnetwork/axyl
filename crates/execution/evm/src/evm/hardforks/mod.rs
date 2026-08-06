@@ -59,9 +59,16 @@ pub(crate) fn apply_activated_migrations<DB: alloy_evm::Database>(
 where
     DB::Error: core::fmt::Display,
 {
-    let newly = spec.newly_activated_forks(parent_number, block_number);
+    let newly_activated_forks = spec.newly_activated_forks(parent_number, block_number);
 
-    for fork in newly {
+    for fork in newly_activated_forks {
+        info!(
+            target: "engine",
+            ?fork,
+            block_number,
+            "Rayls hardfork activated"
+        );
+
         let mut state = match fork {
             RaylsHardFork::AdminTransfer => {
                 info!(

@@ -690,3 +690,63 @@ pub async fn create_committee_from_state(epoch_state: EpochState) -> eyre::Resul
     committee.load();
     Ok(committee)
 }
+
+/// Shared drivers for the crate's own executor unit tests.
+#[cfg(test)]
+pub(crate) mod pre_execution {
+    use crate::{
+        chainspec::RaylsChainSpec,
+        evm::{RaylsBlockExecutionCtx, RaylsBlockExecutor, RaylsEvmFactory},
+    };
+    use rayls_infrastructure_types::{B256, EMPTY_OMMER_ROOT_HASH, U256};
+    use rayls_middleware_rewards::RewardsCounter;
+    use reth_evm::{block::BlockExecutor as _, EvmEnv, EvmFactory as _};
+    use reth_evm_ethereum::RethReceiptBuilder;
+    use reth_revm::{
+        context::{BlockEnv, CfgEnv},
+        db::EmptyDBTyped,
+        primitives::hardfork::SpecId,
+        State,
+    };
+
+    /// Run the pre-execution phase for `spec` at `block_number` with the given intra-output
+    /// `batch_index`, against a fresh empty [`State`], and return the post-state for assertions.
+    ///
+    /// Boots no node. `batch_index > 0` makes `first_batch()` false, the case a one-shot hardfork
+    /// migration must still apply on.
+    pub(crate) fn run_pre_execution(
+        spec: RaylsChainSpec,
+        block_number: u64,
+        batch_index: usize,
+    ) -> State<EmptyDBTyped<core::convert::Infallible>> {
+        let mut state = State::builder()
+            .with_database(EmptyDBTyped::<core::convert::Infallible>::new())
+            .with_bundle_update()
+            .build();
+
+        let block_env = BlockEnv { number: U256::from(block_number), ..Default::default() };
+        // A pre-Osaka spec keeps the incidental EIP-2935 blockhashes system call from tripping the
+        // Osaka per-transaction gas cap; that call is orthogonal to the pre-execution phase.
+        let cfg = CfgEnv::new().with_spec_and_mainnet_gas_params(SpecId::CANCUN);
+        let evm = RaylsEvmFactory.create_evm(&mut state, EvmEnv::new(cfg, block_env));
+
+        let ctx = RaylsBlockExecutionCtx {
+            parent_hash: B256::ZERO,
+            parent_beacon_block_root: None,
+            nonce: 0,
+            ommers_hash: EMPTY_OMMER_ROOT_HASH,
+            requests_hash: None,
+            close_epoch: None,
+            // difficulty packs `batch_index << 16 | worker_id`, as block construction does; only
+            // the batch index matters here (worker id 0).
+            difficulty: U256::from(batch_index << 16),
+            rewards_counter: RewardsCounter::default(),
+            close_epoch_tally: None,
+        };
+
+        let mut executor = RaylsBlockExecutor::new(evm, ctx, spec, RethReceiptBuilder::default());
+        executor.apply_pre_execution_changes().expect("pre-execution changes succeed");
+        drop(executor);
+        state
+    }
+}
