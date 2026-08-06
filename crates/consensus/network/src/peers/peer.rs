@@ -1,13 +1,12 @@
 //! Information shared between peers.
 
 use super::{
-    score::{Reputation, ReputationUpdate, Score},
+    score::{global_score_config, Reputation, ReputationUpdate, Score},
     status::ConnectionStatus,
     types::ConnectionDirection,
     Penalty,
 };
 use libp2p::{core::multiaddr::Multiaddr, PeerId};
-use rayls_infrastructure_config::PeerConfig;
 use rayls_infrastructure_types::{BlsPublicKey, NetworkPublicKey, Protocol};
 use std::{collections::HashSet, net::IpAddr, time::Instant};
 use tracing::error;
@@ -26,8 +25,6 @@ pub(super) struct Peer {
     bls_public_key: Option<BlsPublicKey>,
     /// The peers network public key (libp2p public key).
     network_key: Option<NetworkPublicKey>,
-    /// The config
-    config: PeerConfig,
     /// The peer's score - used to derive [Reputation].
     score: Score,
     /// The multiaddrs this node has witnessed the peer using.
@@ -65,7 +62,6 @@ impl Peer {
             listening_addrs,
             score: Score::new_max(),
             is_trusted: true,
-            config: Default::default(),
             multiaddrs: Default::default(),
             connection_status: Default::default(),
             connection_direction: Default::default(),
@@ -85,7 +81,6 @@ impl Peer {
             listening_addrs,
             score: Score::default(),
             is_trusted: false,
-            config: Default::default(),
             multiaddrs: Default::default(),
             connection_status: Default::default(),
             connection_direction: Default::default(),
@@ -107,7 +102,6 @@ impl Peer {
             listening_addrs,
             score: Score::new_max(),
             is_trusted: false,
-            config: Default::default(),
             multiaddrs: Default::default(),
             connection_status: Default::default(),
             connection_direction: Default::default(),
@@ -116,6 +110,10 @@ impl Peer {
     }
 
     /// Update keys and network address.
+    ///
+    /// The addresses come from the peer's own record, so they are recorded as advertised rather
+    /// than witnessed. `multiaddrs` drives ban accounting and peer exchange, so a peer must not be
+    /// able to charge or advertise an address this node has not observed it connecting from.
     pub(super) fn update_net(
         &mut self,
         bls_public_key: BlsPublicKey,
@@ -124,8 +122,7 @@ impl Peer {
     ) {
         self.bls_public_key = Some(bls_public_key);
         self.network_key = Some(network_key);
-        self.multiaddrs.extend(multiaddrs);
-        self.prune_multiaddrs();
+        self.update_listening_addrs(multiaddrs);
     }
 
     /// Rayls: Remove excess multiaddrs when exceeding limit.
@@ -145,10 +142,15 @@ impl Peer {
     }
 
     /// Return a peer's reputation based on the aggregate score.
+    ///
+    /// The thresholds come from the score config, the same source [`Score::is_banned`] reads to arm
+    /// the decay freeze. A second pair of thresholds would have to agree with these for the freeze
+    /// and the verdict to describe the same peers, and nothing could enforce that.
     pub(super) fn reputation(&self) -> Reputation {
+        let config = global_score_config();
         match self.score.aggregate_score() {
-            score if score <= self.config.min_score_for_ban => Reputation::Banned,
-            score if score <= self.config.min_score_for_disconnect => Reputation::Disconnected,
+            score if score <= config.min_score_before_ban => Reputation::Banned,
+            score if score <= config.min_score_before_disconnect => Reputation::Disconnected,
             _ => Reputation::Trusted,
         }
     }
@@ -264,7 +266,7 @@ impl Peer {
     /// of being banned (connected/disconnecting).
     pub(super) fn can_dial(&self) -> bool {
         match self.connection_status {
-            ConnectionStatus::Disconnecting { banned } => !banned,
+            ConnectionStatus::Disconnecting { reason } => !reason.bans_peer(),
             ConnectionStatus::Connected { .. }
             | ConnectionStatus::Dialing { .. }
             | ConnectionStatus::Banned { .. } => false,
@@ -348,6 +350,10 @@ impl Peer {
     pub(super) fn update_listening_addrs(&mut self, multiaddrs: Vec<Multiaddr>) -> bool {
         let mut res = false;
         for multiaddr in multiaddrs {
+            // these are peer-supplied, so the set needs the same bound `multiaddrs` carries
+            if self.listening_addrs.len() >= MAX_MULTIADDRS_PER_PEER {
+                break;
+            }
             if !self.listening_addrs.contains(&multiaddr) {
                 self.listening_addrs.push(multiaddr);
                 res = true;

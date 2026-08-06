@@ -6,6 +6,39 @@ use super::types::ConnectionDirection;
 use libp2p::Multiaddr;
 use std::time::Instant;
 
+/// Why this node is disconnecting from a peer.
+///
+/// The reason decides two independent things: whether this node shares its peer table on the way
+/// out, and whether the completed disconnect becomes a ban. A single boolean cannot express the
+/// middle case, where a peer has earned a disconnect but not a ban.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(super) enum DisconnectReason {
+    /// Connection limits were reached and this peer was chosen to make room.
+    ///
+    /// The peer is healthy, so peer-exchange data is shared to help it find other peers.
+    ExcessPeers,
+    /// The peer's score crossed the disconnect threshold.
+    ///
+    /// No peer exchange, and no ban: the score is expected to decay back into range.
+    Penalized,
+    /// The peer's score crossed the ban threshold.
+    ///
+    /// No peer exchange, and the disconnect completes into a ban.
+    Banned,
+}
+
+impl DisconnectReason {
+    /// Whether the completed disconnect bans the peer.
+    pub(super) fn bans_peer(&self) -> bool {
+        matches!(self, Self::Banned)
+    }
+
+    /// Whether to share peer-exchange data with the peer on the way out.
+    pub(super) fn shares_peers(&self) -> bool {
+        matches!(self, Self::ExcessPeers)
+    }
+}
+
 /// Connection status of the peer.
 #[derive(Debug, Copy, Clone, Default)]
 pub(super) enum ConnectionStatus {
@@ -18,8 +51,8 @@ pub(super) enum ConnectionStatus {
     },
     /// The peer is in the process of disconnecing.
     Disconnecting {
-        // Indicates if the peer is banned after disconnection.
-        banned: bool,
+        /// Why the peer is being disconnected.
+        reason: DisconnectReason,
     },
     /// The peer has disconnected.
     Disconnected {
@@ -75,8 +108,9 @@ pub(super) enum NewConnectionStatus {
     },
     /// The peer is being disconnected.
     Disconnecting {
-        /// Whether the peer should be banned after the disconnect occurs.
-        banned: bool,
+        /// Why the peer is being disconnected, which decides peer exchange and whether the
+        /// completed disconnect bans the peer.
+        reason: DisconnectReason,
     },
     /// A peer is being dialed.
     Dialing,
