@@ -461,6 +461,13 @@ impl<DB: Database> Certifier<DB> {
                         peer_epoch, our_epoch,
                         "ignoring epoch rejection from stale peer"
                     );
+                    // Count it under a distinct reason even though a stale peer can't demote us —
+                    // mirrors `too_old_skipped`, keeping the raw rejection rate visible.
+                    self.consensus_bus
+                        .consensus_metrics()
+                        .vote_request_rejections
+                        .with_label_values(&[&peer_id.to_string(), "epoch_mismatch_stale"])
+                        .inc();
                     return VoteErrorAction::Continue;
                 }
 
