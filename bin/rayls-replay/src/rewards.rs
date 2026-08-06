@@ -6,7 +6,7 @@
 
 use parking_lot::Mutex;
 use rayls_infrastructure_types::{
-    rewards::{NoopRewardsBackend, RewardsBackend, RewardsCounter, RewardsError},
+    rewards::{HybridEpochTally, NoopRewardsBackend, RewardsBackend, RewardsCounter, RewardsError},
     Address, AuthorityIdentifier, Committee, Epoch,
 };
 use std::{collections::BTreeMap, sync::Arc};
@@ -58,6 +58,24 @@ impl RewardsBackend for SnapshotRewardsBackend {
         Ok(self.tallies.get(epoch))
     }
 
+    fn tally_hybrid(
+        &self,
+        epoch: Epoch,
+        _last_executed_round: u32,
+    ) -> Result<HybridEpochTally, RewardsError> {
+        // A `Withdrawal` (what a snapshot preserves) carries one `u32` per
+        // validator; a snapshot alone cannot recover per-validator
+        // `participation_rounds`. Fail loudly rather than silently
+        // reconstructing a wrong tally; archive-replay support for
+        // hybrid-reward epochs is a deferred follow-up (as is the hybrid
+        // activation itself). `Unsupported`, not `Database` - this is a
+        // permanent capability gap, not a retryable read failure.
+        Err(RewardsError::Unsupported(format!(
+            "hybrid-reward archive replay not implemented: snapshot epoch {epoch} cannot \
+             recover per-validator participation_rounds from Withdrawal.amount alone"
+        )))
+    }
+
     fn get_authority_address(&self, id: &AuthorityIdentifier) -> Option<Address> {
         self.committee.get_authority_address(id)
     }
@@ -99,6 +117,16 @@ mod tests {
 
         let backend = SnapshotRewardsBackend::new(store);
         assert_eq!(backend.tally(7, 0).unwrap(), expected);
+    }
+
+    #[test]
+    fn tally_hybrid_errors_loudly_instead_of_returning_wrong_data() {
+        let backend = SnapshotRewardsBackend::new(SnapshotTallyStore::default());
+        let err = backend.tally_hybrid(7, 0).expect_err("must not silently succeed");
+        assert!(
+            !err.is_transient(),
+            "this is a permanent capability gap, not a retryable DB error"
+        );
     }
 
     #[test]

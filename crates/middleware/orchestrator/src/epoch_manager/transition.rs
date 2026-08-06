@@ -197,8 +197,11 @@ where
             target_hash,
         )?;
         self.save_transition_checkpoint(epoch, EpochTransitionPhase::Draining, target_hash)?;
-        // Flush the consensus DB now that consensus has stopped: the writer queue is bounded, so
-        // this makes the transition checkpoints durable without stalling the cut (see phase 1).
+        // Flush the consensus DB now that consensus has stopped, making the transition checkpoints
+        // durable before execution proceeds. The writer queue is UNBOUNDED, so this drain stalls
+        // for as long as the writer is behind: a backlog accumulated over the live epoch surfaces
+        // here as a network-wide transition pause (every validator crosses the boundary on the
+        // same commit). persist() logs slow drains; the real guard is keeping the queue shallow.
         self.consensus_db.persist().await?;
         engine.flush_persistence().await?;
         info!(target: "epoch-manager", "phase 2/6: SHUTDOWN (drain confirmed)");
@@ -246,6 +249,10 @@ where
         self.clear_consensus_db_for_next_epoch()?;
         self.clear_transition_checkpoint(epoch)?;
         self.consensus_db.persist().await?;
+
+        // NOTE: no cold archival runs on the transition. Both the jar seal and the hot prune run
+        // entirely in the background seal actor (see spawn_seal_actor), pruning in yielding
+        // batches, so a large epoch's archival never stalls the transition or blocks consensus.
 
         // Phase 6: reset peer-derived signals.
         // Stale network head would make try_rejoin_consensus compare against the old epoch

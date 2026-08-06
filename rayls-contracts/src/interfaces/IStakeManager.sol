@@ -12,10 +12,14 @@ import {BlsG1} from "../consensus/BlsG1.sol";
  */
 
 /// @notice Protocol info for system calls to record block production performance
-/// @notice Used to weight fee-based reward distribution by consensus header count
+/// @notice Used to weight fee-based reward distribution by a hybrid of participation,
+/// anchor (leader) commit share, and a stake tier - see `ConsensusRegistry.applyIncentives`
 struct RewardInfo {
     address validatorAddress;
-    uint256 consensusHeaderCount;
+    /// @notice Distinct committed rounds this validator's certificate was included in
+    uint256 participationRounds;
+    /// @notice Committed rounds this validator led (formerly `consensusHeaderCount`)
+    uint256 anchorRounds;
 }
 
 /// @notice Slash information for system calls to decrement outstanding validator balances

@@ -56,6 +56,7 @@ interface IConsensusRegistry {
     error IneligibleUnstake(ValidatorInfo validator);
     error NotAllowlisted(address validatorAddress);
     error AllowlistBatchLengthMismatch();
+    error InvalidParticipationFloor(uint256 providedFloorBps);
 
     event ValidatorStaked(ValidatorInfo validator);
     event ValidatorPendingActivation(ValidatorInfo validator);
@@ -69,6 +70,7 @@ interface IConsensusRegistry {
     event ValidatorAllowlisted(address indexed validatorAddress);
     event ValidatorDelisted(address indexed validatorAddress);
     event DelegationPoolUpdated(address indexed oldPool, address indexed newPool);
+    event ParticipationFloorUpdated(uint256 oldFloorBps, uint256 newFloorBps);
 
     /// @dev Validators marked `Active || PendingActivation || PendingExit` are still operational
     /// and thus eligible for committees. Queriable via `getValidators(Active)` status
@@ -97,9 +99,13 @@ interface IConsensusRegistry {
     function concludeEpoch(address[] calldata newCommittee) external;
 
     /// @dev Records block production performance weights for the current epoch
-    /// @notice Weights are computed as stake × consensusHeaderCount per validator
+    /// @notice Weights are a hybrid blend of participation share, anchor (leader) commit
+    /// share, and a stake tier per validator - see `ConsensusRegistry.applyIncentives`
     /// @notice Called just before concludeEpoch; weights are consumed by RewardDistributor
-    function applyIncentives(RewardInfo[] calldata rewardInfos) external;
+    /// @param rewardInfos Per-validator round counts for the closing epoch
+    /// @param totalRounds Total committed rounds walked for the closing epoch (the shared
+    /// anchor-share and participation-floor denominator)
+    function applyIncentives(RewardInfo[] calldata rewardInfos, uint256 totalRounds) external;
 
     /// @dev Returns the performance weights recorded by the most recent applyIncentives call
     /// @notice Used by RewardDistributor to distribute fee-based rewards proportionally

@@ -10,25 +10,21 @@ use rayls_infrastructure_types::{
 use serde::{Deserialize, Serialize};
 use std::{
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
-    sync::{Arc, Once},
+    sync::Arc,
 };
 
 /// Default heartbeat for tests.
 #[allow(dead_code)] // used in network_tests.rs
 pub(crate) const TEST_HEARTBEAT_INTERVAL: u64 = 1;
 
-// ensure `init_peer_score_config` is only set once
-static INIT: Once = Once::new();
-
-// allow dead code due to compile warning that this fn is never used
-// but it is used in `all_peers` and `banned_peers`
-/// Initialize without error for unit tests.
-#[allow(dead_code)]
+/// Install a score configuration for the current test.
+///
+/// Overwrites any prior value: `cargo test --test-threads 1` shares one process, so each test
+/// installs the configuration it needs at setup rather than inheriting the first test's.
+#[allow(dead_code)] // used in `all_peers` and `banned_peers`
 pub(crate) fn ensure_score_config(config: Option<ScoreConfig>) {
-    INIT.call_once(|| {
-        // ignore result
-        let _ = GLOBAL_SCORE_CONFIG.set(Arc::new(config.unwrap_or_default()));
-    });
+    *GLOBAL_SCORE_CONFIG.write().expect("score config lock poisoned") =
+        Some(Arc::new(config.unwrap_or_default()));
 }
 
 // impl RLMessage trait for types

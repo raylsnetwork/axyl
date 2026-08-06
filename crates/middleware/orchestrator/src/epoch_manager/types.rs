@@ -7,6 +7,9 @@ use rayls_consensus_network::types::NetworkEvent;
 use rayls_consensus_primary::{network::PrimaryNetworkHandle, ConsensusBus, QueChannel};
 use rayls_consensus_worker::{WorkerNetworkHandle, WorkerRequest, WorkerResponse};
 use rayls_execution_evm::reth_env::RethDb;
+
+#[cfg(feature = "cold-storage")]
+use super::cold_archive::ColdArchival;
 use rayls_infrastructure_config::KeyConfig;
 use rayls_infrastructure_types::{EpochRecord, Notifier};
 
@@ -67,4 +70,11 @@ pub(crate) struct EpochManager<P, DB> {
 
     /// Indicates first epoch since process start
     pub(super) initial_epoch: bool,
+
+    /// Cold-archival aggregate: boot healing, backlog migration, and the background seal actor.
+    ///
+    /// Runs off the consensus path: reconciled once at boot, then each due epoch is fully
+    /// archived by the actor during the live epoch. Inert on backends without a cold tier (redb).
+    #[cfg(feature = "cold-storage")]
+    pub(super) cold_archival: ColdArchival,
 }
