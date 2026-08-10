@@ -31,7 +31,7 @@ ARG BUILD_FEATURES=""
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=./target \
-    cargo build --bin rayls-network --release ${BUILD_FEATURES:+--features ${BUILD_FEATURES}} \
+    cargo build -p rayls-network --bin rayls-network --release ${BUILD_FEATURES:+--features ${BUILD_FEATURES}} \
     && mv ./target/release/rayls-network /tmp/
 
 # production image
