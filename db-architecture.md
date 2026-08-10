@@ -157,7 +157,7 @@ Orchestrates MemDB, the persistent DB, and the cold tier. Provides per-txn write
 ```
 Application:
     txn = db.start_write_txn()     → creates WriteTxn
-    txn.lock("table")              → acquires table lock
+    txn.lock("table")?             → acquires table lock
     txn.begin()                    → opens persistent snapshot + cold snapshot (opt.)
     txn.get(key)                   → buffer → mem → persistent → cold (4-tier fallthrough)
     txn.insert(key, value)         → writes to both in-memory + persistent buffer

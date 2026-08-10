@@ -67,7 +67,7 @@ The architecture covers all read/write patterns in the codebase. The only respon
 | `clear_consensus_db_for_next_epoch()` | `orchestrator/state.rs` | 7 tables cleared | 541-551 |
 | `mode_change()` | `orchestrator/transition.rs` | `LastProposed`, `LastProposedByAuthority` | 300-302 |
 
-**New architecture:** `txn.lock("table1")` → `txn.lock("table2")` → ... → writes → `txn.commit()`. All buffered writes are applied atomically in a single short-lived MDBX write txn at commit time.
+**New architecture:** `txn.lock("table1")?` → `txn.lock("table2")?` → ... → writes → `txn.commit()`. All buffered writes are applied atomically in a single short-lived MDBX write txn at commit time.
 
 **Example — certificate write:**
 ```rust
@@ -121,7 +121,7 @@ fn write_all(&self, certificates) -> StoreResult<()> {
 | 11 | Orphan batches | `orchestrator/batches.rs:29` | `NodeBatchesCache` → `NodeBatchesCache` | MEDIUM |
 | 12 | Gossip batch check | `handler.rs:71` | `Batches` → `Batches` | MEDIUM |
 
-**New architecture:** Caller calls `txn.lock("table")` before the read. This blocks other writers to that table until commit. The read sees a consistent snapshot. The write is buffered and applied atomically at commit.
+**New architecture:** Caller calls `txn.lock("table")?` before the read. This blocks other writers to that table until commit. The read sees a consistent snapshot. The write is buffered and applied atomically at commit.
 
 **Example — certificate dedup:**
 ```rust
@@ -297,9 +297,9 @@ PHASE 6 - RESET SIGNALS:
 4. `EpochCerts` — written atomically with record
 
 **New architecture:**
-- Checkpoint writes: `txn.lock("epoch_transition_checkpoints")` → insert → commit
-- Clear 7 tables: `txn.lock("last_proposed")` → `txn.lock("votes")` → ... → `clear_table()` → commit (all in one txn)
-- Epoch record + cert: `txn.lock("epoch_records")` → `txn.lock("epoch_certs")` → insert → commit
+- Checkpoint writes: `txn.lock("epoch_transition_checkpoints")?` → insert → commit
+- Clear 7 tables: `txn.lock("last_proposed")?` → `txn.lock("votes")?` → ... → `clear_table()` → commit (all in one txn)
+- Epoch record + cert: `txn.lock("epoch_records")?` → `txn.lock("epoch_certs")?` → insert → commit
 
 **Verdict: Covered.**
 
@@ -361,21 +361,6 @@ PHASE 6 - RESET SIGNALS:
 | `storage/src/layered_db.rs` | Per-txn write buffer, `WriteTxn`, remove giant txn logic, cold integration, `QueueSender` backpressure |
 | `storage/src/write_lock.rs` (NEW) | `WriteLockManager`, `WriteLockGuard` |
 | `storage/src/cold/` (all files) | **UNCHANGED** — verify integration points with new `WriteTxn` and `LayeredDbTx` |
-| `storage/src/mdbx/database.rs` | Remove `DEFAULT_MAX_READ_TXN_DURATION_SECS`, remove `disable_long_read_safety()` |
-| `storage/src/redb/database.rs` | Remove `disable_long_read_safety()` |
-| `types/src/database_traits.rs` | Remove `ReadTimeout` enum, remove `disable_long_read_safety()` from trait |
-| `storage/src/lib.rs` | Remove `ReadTimeout` re-export, add `write_lock` module |
-| `middleware/rewards/src/lib.rs` | Remove `txn.disable_long_read_safety()` call |
-| `middleware/orchestrator/src/epoch_manager/utils.rs` | Remove `txn.disable_long_read_safety()` call |
-| `storage/src/stores/certificate_store.rs` | Remove `ReadTimeout` param from `after_round()` |
-| `consensus/primary/src/consensus/state.rs` | Remove `ReadTimeout::Exempt` usage |
-| `network-cli/src/args/consensus_database.rs` | Remove `--consensus-db.read-transaction-timeout` CLI arg |
-
-| File | Changes |
-|---|---|
-| `storage/src/mem_db.rs` | Replace `MemDbTx` + `MemDbTxMut` with `MemTxn` (buffered writes, atomic commit) |
-| `storage/src/layered_db.rs` | Per-txn write buffer, `WriteTxn`, remove giant txn logic, simplify `persist()` |
-| `storage/src/write_lock.rs` (NEW) | `WriteLockManager`, `WriteLockGuard` |
 | `storage/src/mdbx/database.rs` | Remove `DEFAULT_MAX_READ_TXN_DURATION_SECS`, remove `disable_long_read_safety()` |
 | `storage/src/redb/database.rs` | Remove `disable_long_read_safety()` |
 | `types/src/database_traits.rs` | Remove `ReadTimeout` enum, remove `disable_long_read_safety()` from trait |
