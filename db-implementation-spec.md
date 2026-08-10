@@ -22,15 +22,28 @@ WriteTxn (per-txn state)
     ├── MemTxn          → buffered writes, Arc<StoreType> snapshot
     ├── PersistBuffer   → batched ops for background thread
     ├── LockManager     → opt-in table-level locks
-    └── PersistentTx    → MDBX/ReDB read snapshot
+    ├── PersistentTx    → MDBX/ReDB read snapshot
+    └── ColdTx (opt.)   → cold-tier read fallthrough (cold-storage feature)
     │
     ▼
 LayeredDatabase (orchestrator)
     ├── MemDatabase     → in-memory cache (shared store)
     ├── DB: MdbxDatabase|ReDB → persistent backend
+    ├── ColdStore (opt.) → append-only nippy-jar cold archive (cold-storage feature)
     ├── BackgroundThread → applies persist_buffer to persistent DB
     └── WriteLockManager → per-table mutexes
 ```
+
+**Read resolution order (3-tier):**
+```
+buffer (private) → mem shared store → persistent DB → cold archive
+```
+
+**Cold tier properties:**
+- Feature-gated behind `#[cfg(feature = "cold-storage")]`
+- Append-only: `remove`, `clear_table`, `evict_persistent_batch` never target cold
+- Only `ConsensusBlocks` (by block number) and `Batches` (via `ColdBatchLocations` index) are archived
+- `without_cold()` returns a hot-only view for the archival producer
 
 ### 2.2 Layer Interaction Flow
 
@@ -38,8 +51,9 @@ LayeredDatabase (orchestrator)
 Application:
     txn = db.start_write_txn()     → creates WriteTxn
     txn.lock("table")              → acquires table lock
-    txn.begin()                    → opens persistent snapshot
+    txn.begin()                    → opens persistent snapshot + cold snapshot (opt.)
     txn.insert(key, value)         → writes to mem buffer + persist buffer
+    txn.get(key)                   → buffer → mem → persistent → cold (3-tier fallthrough)
     txn.commit()                   →
         1. MemTxn commits (merge mem buffer → shared store)
         2. PersistBuffer sent to bg thread as single batch
@@ -277,7 +291,7 @@ impl Drop for WriteLockGuard {
 
 ```rust
 /// Write transaction for LayeredDatabase.
-/// Orchestrates MemTxn + persistent snapshot + write buffer.
+/// Orchestrates MemTxn + persistent snapshot + write buffer + cold fallthrough.
 struct WriteTxn<'a, DB: Database> {
     /// Mem layer transaction (buffered).
     mem_txn: MemTxn<'a>,
@@ -286,18 +300,71 @@ struct WriteTxn<'a, DB: Database> {
     persistent_snapshot: DB::TX<'a>,
 
     /// Operations buffered for the background thread.
-    persist_buffer: WriteBuffer,
+    persist_buffer: Vec<Box<dyn PersistOp<DB>>>,
 
     /// Locks held by this transaction.
     locks: Vec<WriteLockGuard>,
 
     /// Channel to send committed buffer to background thread.
-    tx: Sender<CommitTxn<DB>>,
+    tx: QueueSender<CommitTxn<DB>>,
+
+    /// Cold tier read transaction (feature-gated, append-only reads only).
+    #[cfg(feature = "cold-storage")]
+    cold: Option<&'a ColdStore>,
 }
 
 impl<'a, DB: Database> Debug for WriteTxn<'a, DB> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "WriteTxn")
+    }
+}
+
+impl<'a, DB: Database> WriteTxn<'a, DB> {
+    /// Opens a cold read transaction over the attached tier.
+    #[cfg(feature = "cold-storage")]
+    fn cold_tx(&self) -> Option<ColdTx<'_>> {
+        let cold = self.cold?;
+        // Resolve ColdBatchLocations from the hot snapshot.
+        Some(ColdTx::new(cold, |digest| {
+            self.persistent_snapshot.get::<ColdBatchLocations>(digest)
+        }))
+    }
+
+    /// Serves `key` from cold after a hot miss.
+    #[cfg(feature = "cold-storage")]
+    fn cold_get<T: Table>(&self, key: &T::Key) -> eyre::Result<Option<T::Value>> {
+        match self.cold_tx() {
+            Some(tx) => tx.get::<T>(key),
+            None => Ok(None),
+        }
+    }
+
+    /// Cold storage compiled out: a hot miss is final.
+    #[cfg(not(feature = "cold-storage"))]
+    fn cold_get<T: Table>(&self, _key: &T::Key) -> eyre::Result<Option<T::Value>> {
+        Ok(None)
+    }
+
+    /// Chains the cold-ordered stream beneath `hot` iterator.
+    #[cfg(feature = "cold-storage")]
+    fn chain_cold<'i, T: Table>(
+        &'i self,
+        hot: DBIter<'i, T>,
+        from: Option<&T::Key>,
+        reverse: bool,
+    ) -> DBIter<'i, T> {
+        merge_cold::<T>(self.cold_tx(), hot, from, reverse)
+    }
+
+    /// Cold storage compiled out: iteration is hot-only.
+    #[cfg(not(feature = "cold-storage"))]
+    fn chain_cold<'i, T: Table>(
+        &'i self,
+        hot: DBIter<'i, T>,
+        _from: Option<&T::Key>,
+        _reverse: bool,
+    ) -> DBIter<'i, T> {
+        hot
     }
 }
 
@@ -312,16 +379,44 @@ impl<'a, DB: Database> DbTx for WriteTxn<'a, DB> {
             return Ok(Some(val));
         }
         // 3. Check persistent snapshot
-        self.persistent_snapshot.get::<T>(key)
+        if let Some(val) = self.persistent_snapshot.get::<T>(key)? {
+            return Ok(Some(val));
+        }
+        // 4. Check cold tier (feature-gated fallthrough)
+        self.cold_get::<T>(key)
+    }
+
+    fn raw_get<T: Table>(&self, key: &T::Key) -> eyre::Result<Option<Cow<'_, [u8]>>> {
+        // Same 4-tier fallthrough: buffer → mem → persistent → cold
+        if let Some(val) = self.mem_txn.buffer.get::<T>(key) {
+            return Ok(Some(Cow::Owned(encode(&val))));
+        }
+        if let Some((_, val)) = self.mem_txn.get_raw::<T>(key) {
+            return Ok(Some(Cow::Owned(encode(&val))));
+        }
+        match self.persistent_snapshot.raw_get::<T>(key)? {
+            Some(bytes) => return Ok(Some(bytes)),
+            None => {}
+        }
+        // Cold raw fallthrough
+        #[cfg(feature = "cold-storage")]
+        if let Some(tx) = self.cold_tx() {
+            if let Some(bytes) = tx.raw_get::<T>(key)? {
+                return Ok(Some(Cow::Owned(bytes.into_owned())));
+            }
+        }
+        Ok(None)
     }
 
     fn iter<T: Table>(&self) -> DBIter<'_, T> {
-        // Merge: mem buffer → mem shared store → persistent snapshot
+        // Merge: mem buffer → mem shared store → persistent → cold
         let db_iter = self.persistent_snapshot.iter::<T>();
         let mem_iter = self.mem_txn.iter::<T>();
         let is_tombstoned: Box<dyn Fn(&T::Key) -> bool + '_> =
             Box::new(|k| self.mem_txn.is_tombstoned::<T>(k));
-        Box::new(MergeJoinIter::<T>::forward(db_iter, mem_iter, is_tombstoned))
+        let hot: DBIter<'_, T> =
+            Box::new(MergeJoinIter::<T>::forward(db_iter, mem_iter, is_tombstoned));
+        self.chain_cold::<T>(hot, None, false)
     }
 
     fn raw_iter<T: Table>(&self) -> DBRawIter<'_> {
@@ -329,7 +424,9 @@ impl<'a, DB: Database> DbTx for WriteTxn<'a, DB> {
         let mem_iter = self.mem_txn.raw_iter::<T>();
         let is_tombstoned: Box<dyn Fn(&T::Key) -> bool + '_> =
             Box::new(|k| self.mem_txn.is_tombstoned::<T>(k));
-        Box::new(MergeJoinRawIter::<T>::forward(db_iter, mem_iter, is_tombstoned))
+        let hot: DBRawIter<'_> =
+            Box::new(MergeJoinRawIter::<T>::forward(db_iter, mem_iter, is_tombstoned));
+        self.chain_cold_raw::<T>(hot, None, false)
     }
 
     fn skip_to<T: Table>(&self, key: &T::Key) -> eyre::Result<DBIter<'_, T>> {
@@ -337,7 +434,9 @@ impl<'a, DB: Database> DbTx for WriteTxn<'a, DB> {
         let mem_iter = self.mem_txn.skip_to::<T>(key)?;
         let is_tombstoned: Box<dyn Fn(&T::Key) -> bool + '_> =
             Box::new(|k| self.mem_txn.is_tombstoned::<T>(k));
-        Ok(Box::new(MergeJoinIter::<T>::forward(db_iter, mem_iter, is_tombstoned)))
+        let hot: DBIter<'_, T> =
+            Box::new(MergeJoinIter::<T>::forward(db_iter, mem_iter, is_tombstoned));
+        Ok(self.chain_cold::<T>(hot, Some(key), false))
     }
 
     fn reverse_iter<T: Table>(&self) -> DBIter<'_, T> {
@@ -345,7 +444,9 @@ impl<'a, DB: Database> DbTx for WriteTxn<'a, DB> {
         let mem_iter = self.mem_txn.reverse_iter::<T>();
         let is_tombstoned: Box<dyn Fn(&T::Key) -> bool + '_> =
             Box::new(|k| self.mem_txn.is_tombstoned::<T>(k));
-        Box::new(MergeJoinIter::<T>::reverse(db_iter, mem_iter, is_tombstoned))
+        let hot: DBIter<'_, T> =
+            Box::new(MergeJoinIter::<T>::reverse(db_iter, mem_iter, is_tombstoned));
+        self.chain_cold::<T>(hot, None, true)
     }
 
     fn reverse_raw_iter<T: Table>(&self) -> DBRawIter<'_> {
@@ -353,7 +454,9 @@ impl<'a, DB: Database> DbTx for WriteTxn<'a, DB> {
         let mem_iter = self.mem_txn.reverse_raw_iter::<T>();
         let is_tombstoned: Box<dyn Fn(&T::Key) -> bool + '_> =
             Box::new(|k| self.mem_txn.is_tombstoned::<T>(k));
-        Box::new(MergeJoinRawIter::<T>::reverse(db_iter, mem_iter, is_tombstoned))
+        let hot: DBRawIter<'_> =
+            Box::new(MergeJoinRawIter::<T>::reverse(db_iter, mem_iter, is_tombstoned));
+        self.chain_cold_raw::<T>(hot, None, true)
     }
 
     fn last_record<T: Table>(&self) -> Option<(T::Key, T::Value)> {
@@ -363,30 +466,38 @@ impl<'a, DB: Database> DbTx for WriteTxn<'a, DB> {
     fn record_prior_to<T: Table>(&self, key: &T::Key) -> Option<(T::Key, T::Value)> {
         self.iter::<T>().take_while(|(k, _)| k < key).last()
     }
-
-    fn disable_long_read_safety(&self) {
-        // No-op: timeout removed from architecture
-        self.persistent_snapshot.disable_long_read_safety();
-    }
 }
 
 impl<'a, DB: Database> DbTxMut for WriteTxn<'a, DB> {
     fn insert<T: Table>(&mut self, key: &T::Key, value: &T::Value) -> eyre::Result<()> {
-        // ORCHESTRATE: write to BOTH buffers
+        // ORCHESTRATE: write to BOTH buffers (cold is append-only, never targeted)
         self.mem_txn.insert(key, value);
-        self.persist_buffer.insert(key, value);
+        self.persist_buffer.push(Box::new(PersistInsert { key: key.clone(), value: value.clone() }));
         Ok(())
     }
 
     fn remove<T: Table>(&mut self, key: &T::Key) -> eyre::Result<()> {
         self.mem_txn.remove(key);
-        self.persist_buffer.remove(key);
+        self.persist_buffer.push(Box::new(PersistRemove { key: key.clone() }));
+        Ok(())
+    }
+
+    fn evict_persistent_batch<T: Table>(&mut self, keys: &[T::Key]) -> eyre::Result<()> {
+        if keys.is_empty() {
+            return Ok(());
+        }
+        // Hard-delete from mem (no tombstone: would shadow cold fallthrough)
+        for key in keys {
+            self.mem_txn.hard_delete::<T>(key);
+        }
+        // Single batch message to persistent backend
+        self.persist_buffer.push(Box::new(PersistRemoveBatch { keys: keys.to_vec() }));
         Ok(())
     }
 
     fn clear_table<T: Table>(&mut self) -> eyre::Result<()> {
         self.mem_txn.clear_table::<T>();
-        self.persist_buffer.clear_table::<T>();
+        self.persist_buffer.push(Box::new(PersistClear::<T> { _phantom: PhantomData }));
         Ok(())
     }
 
@@ -395,7 +506,8 @@ impl<'a, DB: Database> DbTxMut for WriteTxn<'a, DB> {
         self.mem_txn.commit();
 
         // 2. Send persistent buffer to background thread as single batch
-        self.tx.send(CommitTxn(self.persist_buffer)).map_err(|_| eyre::eyre!("DB thread gone, FATAL!"))?;
+        self.tx.send(CommitTxn::Batch(self.persist_buffer))
+            .map_err(|_| eyre::eyre!("DB thread gone, FATAL!"))?;
 
         // 3. Locks released automatically when WriteTxn is dropped
         Ok(())
@@ -403,14 +515,25 @@ impl<'a, DB: Database> DbTxMut for WriteTxn<'a, DB> {
 }
 ```
 
+**Cold storage integration notes:**
+- Reads follow 4-tier fallthrough: `buffer → mem → persistent → cold`
+- Writes never target cold (append-only)
+- `evict_persistent_batch` hard-deletes from mem (no tombstone) so cold fallthrough isn't shadowed
+- All cold methods are `#[cfg(feature = "cold-storage")]` — stubbed to no-op when the feature is off
+- `merge_cold` / `merge_cold_raw` functions chain the cold iterator beneath the hot merged iterator
+- The cold auxiliary index (`ColdBatchLocations`) is resolved from the hot persistent snapshot
+
 ### 3.5 Read Transaction (REPLACES `LayeredDbTx`)
 
 ```rust
 /// Read transaction for LayeredDatabase.
-/// Merges mem_db snapshot + persistent snapshot.
+/// Merges mem_db snapshot + persistent snapshot + cold tier (feature-gated).
 struct LayeredDbTx<'a, DB: Database> {
     mem_txn: MemTxn<'a>,
     persistent_snapshot: DB::TX<'a>,
+    /// Cold tier read fallthrough (feature-gated, append-only reads).
+    #[cfg(feature = "cold-storage")]
+    cold: Option<&'a ColdStore>,
 }
 
 impl<'a, DB: Database> Debug for LayeredDbTx<'a, DB> {
@@ -419,14 +542,79 @@ impl<'a, DB: Database> Debug for LayeredDbTx<'a, DB> {
     }
 }
 
+impl<'a, DB: Database> LayeredDbTx<'a, DB> {
+    /// Opens a cold read transaction over the attached tier.
+    #[cfg(feature = "cold-storage")]
+    fn cold_tx(&self) -> Option<ColdTx<'_>> {
+        let cold = self.cold?;
+        Some(ColdTx::new(cold, |digest| {
+            self.persistent_snapshot.get::<ColdBatchLocations>(digest)
+        }))
+    }
+
+    #[cfg(feature = "cold-storage")]
+    fn cold_get<T: Table>(&self, key: &T::Key) -> eyre::Result<Option<T::Value>> {
+        match self.cold_tx() {
+            Some(tx) => tx.get::<T>(key),
+            None => Ok(None),
+        }
+    }
+
+    #[cfg(not(feature = "cold-storage"))]
+    fn cold_get<T: Table>(&self, _key: &T::Key) -> eyre::Result<Option<T::Value>> {
+        Ok(None)
+    }
+
+    #[cfg(feature = "cold-storage")]
+    fn chain_cold<'i, T: Table>(
+        &'i self,
+        hot: DBIter<'i, T>,
+        from: Option<&T::Key>,
+        reverse: bool,
+    ) -> DBIter<'i, T> {
+        merge_cold::<T>(self.cold_tx(), hot, from, reverse)
+    }
+
+    #[cfg(not(feature = "cold-storage"))]
+    fn chain_cold<'i, T: Table>(
+        &'i self,
+        hot: DBIter<'i, T>,
+        _from: Option<&T::Key>,
+        _reverse: bool,
+    ) -> DBIter<'i, T> {
+        hot
+    }
+}
+
 impl<'a, DB: Database> DbTx for LayeredDbTx<'a, DB> {
     fn get<T: Table>(&self, key: &T::Key) -> eyre::Result<Option<T::Value>> {
-        // 1. Check mem shared store
-        if let Some(val) = self.mem_txn.get::<T>(key) {
-            return Ok(Some(val));
+        // 1. Check mem shared store (tombstone-aware)
+        if !self.mem_txn.is_tombstoned::<T>(key) {
+            if let Some(val) = self.mem_txn.get::<T>(key) {
+                return Ok(Some(val));
+            }
         }
         // 2. Check persistent snapshot
-        self.persistent_snapshot.get::<T>(key)
+        if let Some(val) = self.persistent_snapshot.get::<T>(key)? {
+            return Ok(Some(val));
+        }
+        // 3. Check cold tier (feature-gated fallthrough)
+        self.cold_get::<T>(key)
+    }
+
+    fn raw_get<T: Table>(&self, key: &T::Key) -> eyre::Result<Option<Cow<'_, [u8]>>> {
+        // Same 3-tier fallthrough with cold
+        if self.mem_txn.is_tombstoned::<T>(key) {
+            return self.cold_raw_get::<T>(key);
+        }
+        if let Some((_, val)) = self.mem_txn.get_raw::<T>(key) {
+            return Ok(Some(Cow::Owned(encode(&val))));
+        }
+        match self.persistent_snapshot.raw_get::<T>(key)? {
+            Some(bytes) => return Ok(Some(bytes)),
+            None => {}
+        }
+        self.cold_raw_get::<T>(key)
     }
 
     fn iter<T: Table>(&self) -> DBIter<'_, T> {
@@ -434,10 +622,42 @@ impl<'a, DB: Database> DbTx for LayeredDbTx<'a, DB> {
         let mem_iter = self.mem_txn.iter::<T>();
         let is_tombstoned: Box<dyn Fn(&T::Key) -> bool + '_> =
             Box::new(|k| self.mem_txn.is_tombstoned::<T>(k));
-        Box::new(MergeJoinIter::<T>::forward(db_iter, mem_iter, is_tombstoned))
+        let hot: DBIter<'_, T> =
+            Box::new(MergeJoinIter::<T>::forward(db_iter, mem_iter, is_tombstoned));
+        self.chain_cold::<T>(hot, None, false)
     }
 
-    // ... same pattern as WriteTxn for all other DbTx methods
+    fn raw_iter<T: Table>(&self) -> DBRawIter<'_> {
+        let db_iter = self.persistent_snapshot.raw_iter::<T>();
+        let mem_iter = self.mem_txn.raw_iter::<T>();
+        let is_tombstoned: Box<dyn Fn(&T::Key) -> bool + '_> =
+            Box::new(|k| self.mem_txn.is_tombstoned::<T>(k));
+        let hot: DBRawIter<'_> =
+            Box::new(MergeJoinRawIter::<T>::forward(db_iter, mem_iter, is_tombstoned));
+        self.chain_cold_raw::<T>(hot, None, false)
+    }
+
+    fn skip_to<T: Table>(&self, key: &T::Key) -> eyre::Result<DBIter<'_, T>> {
+        let db_iter = self.persistent_snapshot.skip_to::<T>(key)?;
+        let mem_iter = self.mem_txn.skip_to::<T>(key)?;
+        let is_tombstoned: Box<dyn Fn(&T::Key) -> bool + '_> =
+            Box::new(|k| self.mem_txn.is_tombstoned::<T>(k));
+        let hot: DBIter<'_, T> =
+            Box::new(MergeJoinIter::<T>::forward(db_iter, mem_iter, is_tombstoned));
+        Ok(self.chain_cold::<T>(hot, Some(key), false))
+    }
+
+    fn reverse_iter<T: Table>(&self) -> DBIter<'_, T> {
+        let db_iter = self.persistent_snapshot.reverse_iter::<T>();
+        let mem_iter = self.mem_txn.reverse_iter::<T>();
+        let is_tombstoned: Box<dyn Fn(&T::Key) -> bool + '_> =
+            Box::new(|k| self.mem_txn.is_tombstoned::<T>(k));
+        let hot: DBIter<'_, T> =
+            Box::new(MergeJoinIter::<T>::reverse(db_iter, mem_iter, is_tombstoned));
+        self.chain_cold::<T>(hot, None, true)
+    }
+
+    // ... same pattern for reverse_raw_iter, raw_skip_to, last_record, record_prior_to
 }
 ```
 
@@ -447,173 +667,43 @@ impl<'a, DB: Database> DbTx for LayeredDbTx<'a, DB> {
 /// Message sent to background thread.
 /// Replaces the current StartTxn/CommitTxn refcount protocol + per-op messages.
 enum CommitTxn<DB: Database> {
-    /// All buffered operations from a committed WriteTxn.
-    Buffer(WriteBuffer),
+    /// Batch of trait-object operations from a committed WriteTxn.
+    Batch(Vec<Box<dyn PersistOp<DB>>>),
     /// Durability barrier: "have you flushed everything?"
     CaughtUp(oneshot::Sender<Result<(), String>>),
     /// Shutdown signal.
     Shutdown,
 }
 
-fn db_run<DB: Database>(db: DB, mem_db: MemDatabase, rx: Receiver<CommitTxn<DB>>) {
-    let mut pending_write_error: Option<String> = None;
-    let mut last_compact = Instant::now();
-
-    if let Err(e) = db.compact() {
-        tracing::error!(target: "layered_db_runner", "DB ERROR compacting DB on startup (background): {e}");
-    }
-
-    while let Ok(msg) = rx.recv() {
-        match msg {
-            CommitTxn::Buffer(write_buffer) => {
-                // Open short-lived write txn, apply all ops, commit immediately.
-                match db.write_txn() {
-                    Ok(mut txn) => {
-                        for (table_name, ops) in &write_buffer.ops {
-                            for op in ops {
-                                match op {
-                                    WriteOp::Insert { key, value } => {
-                                        if let Err(e) = apply_insert::<DB, _>(&mut txn, table_name, key, value) {
-                                            tracing::error!(target: "layered_db_runner", "DB TXN Insert: {e}");
-                                            pending_write_error = Some(format!("insert: {e}"));
-                                        }
-                                    }
-                                    WriteOp::Remove { key } => {
-                                        if let Err(e) = apply_remove::<DB, _>(&mut txn, table_name, key) {
-                                            tracing::error!(target: "layered_db_runner", "DB TXN Remove: {e}");
-                                            pending_write_error = Some(format!("remove: {e}"));
-                                        }
-                                    }
-                                    WriteOp::ClearTable => {
-                                        if let Err(e) = apply_clear::<DB, _>(&mut txn, table_name) {
-                                            tracing::error!(target: "layered_db_runner", "DB TXN Clear: {e}");
-                                            pending_write_error = Some(format!("clear: {e}"));
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        if let Err(e) = txn.commit() {
-                            tracing::error!(target: "layered_db_runner", "DB TXN Commit: {e}");
-                            pending_write_error = Some(format!("commit: {e}"));
-                        }
-                    }
-                    Err(e) => {
-                        tracing::error!(target: "layered_db_runner", "DB ERROR getting write txn (background): {e}");
-                        pending_write_error = Some(format!("txn: {e}"));
-                    }
-                }
-            }
-            CommitTxn::CaughtUp(tx) => {
-                let reply: Result<(), String> = match pending_write_error.take() {
-                    Some(e) => Err(e),
-                    None => Ok(()),
-                };
-                let _ = tx.send(reply);
-            }
-            CommitTxn::Shutdown => break,
-        }
-
-        if last_compact.elapsed() > Duration::from_secs(86_400) {
-            last_compact = Instant::now();
-            if let Err(e) = db.compact() {
-                tracing::error!(target: "layered_db_runner", "DB ERROR compacting DB (background): {e}");
-            }
-        }
-    }
-    tracing::info!(target: "layered_db_runner", "Layered DB thread Shutdown complete");
-}
-```
-
-The `apply_insert`, `apply_remove`, `apply_clear` helpers dispatch by table name to the correct typed operation. They need access to the typed `Table` trait but the buffer only has string names — this is the hardest part of the bg thread refactor.
-
-### 3.7 The Background Thread Dispatch Problem
-
-The current code uses trait objects (`InsertTrait`, `RemoveTrait`, `ClearTrait`) to handle typed operations in the bg thread. With the new `WriteBuffer` approach, we lose type information at the channel boundary.
-
-**Option A: Keep trait objects, but batch them**
-
-```rust
-enum CommitTxn<DB: Database> {
-    /// Batch of trait-object operations (same as current, but always batched).
-    Batch(Vec<Box<dyn PersistOp<DB>>>),
-    CaughtUp(oneshot::Sender<Result<(), String>>),
-    Shutdown,
-}
-```
-
-This is the simplest migration path — same trait object pattern, just batched per-txn instead of per-op.
-
-**Option B: Use a typed registry in the bg thread**
-
-The bg thread holds a `HashMap<&'static str, TableRegistry>` that maps table names to their typed insert/remove/clear functions. The `WriteBuffer` sends table names + raw bytes, and the registry dispatches.
-
-**Recommendation: Option A** — minimal change, same trait object pattern, just batched per-txn. The trait objects already know the table type at compile time.
-
-### 3.8 Revised Data Structures (with Option A)
-
-```rust
-/// Per-operation trait for bg thread dispatch.
-trait PersistOp<DB: Database>: Send + 'static {
-    fn apply(&self, txn: &mut DB::TXMut<'_>) -> eyre::Result<()>;
-}
-
-struct PersistInsert<T: Table> {
-    key: T::Key,
-    value: T::Value,
-}
-
-impl<T: Table, DB: Database> PersistOp<DB> for PersistInsert<T> {
-    fn apply(&self, txn: &mut DB::TXMut<'_>) -> eyre::Result<()> {
-        txn.insert::<T>(&self.key, &self.value)
-    }
-}
-
-// Similar: PersistRemove<T>, PersistClear<T>
-
-/// Message sent to background thread.
-enum CommitTxn<DB: Database> {
-    Batch(Vec<Box<dyn PersistOp<DB>>>),
-    CaughtUp(oneshot::Sender<Result<(), String>>),
-    Shutdown,
-}
-
-/// WriteTxn builds a Vec<Box<dyn PersistOp>> in its persist_buffer.
-struct WriteTxn<'a, DB: Database> {
-    mem_txn: MemTxn<'a>,
-    persistent_snapshot: DB::TX<'a>,
-    persist_ops: Vec<Box<dyn PersistOp<DB>>>,  // batched ops
-    locks: Vec<WriteLockGuard>,
+/// A [`DBMessage`] sender that tracks the writer queue's depth and applies
+/// soft backpressure when the queue exceeds `QUEUE_HIGH_WATER_MARK`.
+struct QueueSender<DB: Database> {
     tx: Sender<CommitTxn<DB>>,
+    depth: Arc<AtomicUsize>,
 }
 
-impl<'a, DB: Database> DbTxMut for WriteTxn<'a, DB> {
-    fn insert<T: Table>(&mut self, key: &T::Key, value: &T::Value) -> eyre::Result<()> {
-        self.mem_txn.insert(key, value);
-        self.persist_ops.push(Box::new(PersistInsert { key: key.clone(), value: value.clone() }));
-        Ok(())
-    }
+const QUEUE_HIGH_WATER_MARK: usize = 10_000;
+const QUEUE_PACE_SLEEP: Duration = Duration::from_millis(1);
 
-    fn remove<T: Table>(&mut self, key: &T::Key) -> eyre::Result<()> {
-        self.mem_txn.remove(key);
-        self.persist_ops.push(Box::new(PersistRemove { key: key.clone() }));
-        Ok(())
-    }
-
-    fn clear_table<T: Table>(&mut self) -> eyre::Result<()> {
-        self.mem_txn.clear_table::<T>();
-        self.persist_ops.push(Box::new(PersistClear::<T> { _casper: PhantomData }));
-        Ok(())
-    }
-
-    fn commit(self) -> eyre::Result<()> {
-        self.mem_txn.commit();
-        self.tx.send(CommitTxn::Batch(self.persist_ops)).map_err(|_| eyre::eyre!("DB thread gone, FATAL!"))?;
-        Ok(())
+impl<DB: Database> QueueSender<DB> {
+    fn send(&self, msg: CommitTxn<DB>) -> Result<(), SendError<CommitTxn<DB>>> {
+        // Data-plane messages pace when queue is deep; control messages never pace.
+        if !matches!(msg, CommitTxn::CaughtUp(_) | CommitTxn::Shutdown)
+            && self.depth.load(AtomicOrdering::Relaxed) > QUEUE_HIGH_WATER_MARK
+        {
+            std::thread::sleep(QUEUE_PACE_SLEEP);
+        }
+        self.depth.fetch_add(1, AtomicOrdering::Relaxed);
+        self.tx.send(msg)
     }
 }
 
-fn db_run<DB: Database>(db: DB, mem_db: MemDatabase, rx: Receiver<CommitTxn<DB>>) {
+fn db_run<DB: Database>(
+    db: DB,
+    mem_db: MemDatabase,
+    rx: Receiver<CommitTxn<DB>>,
+    queue_depth: Arc<AtomicUsize>,
+) {
     let mut pending_write_error: Option<String> = None;
     let mut last_compact = Instant::now();
 
@@ -645,6 +735,8 @@ fn db_run<DB: Database>(db: DB, mem_db: MemDatabase, rx: Receiver<CommitTxn<DB>>
             }
             CommitTxn::Shutdown => break,
         }
+        // Decrement queue depth on every dequeue.
+        queue_depth.fetch_sub(1, AtomicOrdering::Relaxed);
 
         if last_compact.elapsed() > Duration::from_secs(86_400) {
             last_compact = Instant::now();
@@ -653,8 +745,70 @@ fn db_run<DB: Database>(db: DB, mem_db: MemDatabase, rx: Receiver<CommitTxn<DB>>
             }
         }
     }
+    tracing::info!(target: "layered_db_runner", "Layered DB thread Shutdown complete");
 }
 ```
+
+**QueueSender backpressure:** Retained from current architecture. Data-plane messages (Batch) pace with a 1ms sleep when queue depth exceeds 10,000. Control messages (CaughtUp, Shutdown) never pace. This prevents a slow inner DB from causing a multi-minute `persist` drain at epoch boundaries.
+
+### 3.7 Background Thread Dispatch — Trait Objects (Option A)
+
+The current code uses trait objects (`InsertTrait`, `RemoveTrait`, `ClearTrait`) to handle typed operations in the bg thread. We keep the same pattern, but batch per-txn instead of per-op.
+
+```rust
+/// Per-operation trait for bg thread dispatch.
+trait PersistOp<DB: Database>: Send + 'static {
+    fn apply(&self, txn: &mut DB::TXMut<'_>) -> eyre::Result<()>;
+}
+
+struct PersistInsert<T: Table> {
+    key: T::Key,
+    value: T::Value,
+}
+
+impl<T: Table, DB: Database> PersistOp<DB> for PersistInsert<T> {
+    fn apply(&self, txn: &mut DB::TXMut<'_>) -> eyre::Result<()> {
+        txn.insert::<T>(&self.key, &self.value)
+    }
+}
+
+struct PersistRemove<T: Table> {
+    key: T::Key,
+}
+
+impl<T: Table, DB: Database> PersistOp<DB> for PersistRemove<T> {
+    fn apply(&self, txn: &mut DB::TXMut<'_>) -> eyre::Result<()> {
+        txn.remove::<T>(&self.key)
+    }
+}
+
+/// Hard-delete batch: removes keys from the persistent backend without tombstoning mem.
+/// Used by the cold archival producer to prune hot rows that have been archived.
+struct PersistRemoveBatch<T: Table> {
+    keys: Vec<T::Key>,
+}
+
+impl<T: Table, DB: Database> PersistOp<DB> for PersistRemoveBatch<T> {
+    fn apply(&self, txn: &mut DB::TXMut<'_>) -> eyre::Result<()> {
+        for key in &self.keys {
+            txn.remove::<T>(key)?;
+        }
+        Ok(())
+    }
+}
+
+struct PersistClear<T: Table> {
+    _phantom: PhantomData<T>,
+}
+
+impl<T: Table, DB: Database> PersistOp<DB> for PersistClear<T> {
+    fn apply(&self, txn: &mut DB::TXMut<'_>) -> eyre::Result<()> {
+        txn.clear_table::<T>()
+    }
+}
+```
+
+**Why trait objects:** The `WriteTxn` knows the concrete `Table` type at compile time for each operation. Boxing into `PersistOp<DB>` preserves type safety while allowing heterogeneous batches. The bg thread simply iterates the batch and calls `apply()` on each — no string dispatch, no registry, no runtime type mismatch.
 
 ### 3.9 LayeredDatabase — Simplified
 
@@ -663,22 +817,57 @@ fn db_run<DB: Database>(db: DB, mem_db: MemDatabase, rx: Receiver<CommitTxn<DB>>
 pub struct LayeredDatabase<DB: Database> {
     mem_db: MemDatabase,
     db: DB,
-    tx: Sender<CommitTxn<DB>>,
+    tx: QueueSender<CommitTxn<DB>>,
     lock_manager: Arc<WriteLockManager>,
     thread: Option<Arc<JoinHandle<()>>>,
+    /// Cold tier point reads fall through to on hot miss (feature-gated).
+    #[cfg(feature = "cold-storage")]
+    cold: Option<Arc<ColdStore>>,
 }
 
 impl<DB: Database> LayeredDatabase<DB> {
     pub fn open(db: DB) -> Self {
         let (tx, rx) = mpsc::channel();
+        let depth = Arc::new(AtomicUsize::new(0));
         let db_cloned = db.clone();
         let mem_db = MemDatabase::new();
         let mem_db_clone = mem_db.clone();
         let lock_manager = Arc::new(WriteLockManager::new());
+        let queue_depth = Arc::clone(&depth);
         let thread = Some(Arc::new(std::thread::spawn(move || {
-            db_run(db_cloned, mem_db_clone, rx)
+            db_run(db_cloned, mem_db_clone, rx, queue_depth)
         })));
-        Self { mem_db, db, tx, lock_manager, thread }
+        Self {
+            mem_db,
+            db,
+            tx: QueueSender { tx, depth },
+            lock_manager,
+            thread,
+            #[cfg(feature = "cold-storage")]
+            cold: None,
+        }
+    }
+
+    /// Attaches the cold tier for point-read fallthrough on hot miss.
+    #[cfg(feature = "cold-storage")]
+    pub fn with_cold(mut self, cold: Arc<ColdStore>) -> Self {
+        self.cold = Some(cold);
+        self
+    }
+
+    /// Returns a hot-only view (no cold layer) for the archival producer.
+    /// Ensures "is this row still hot?" is answered by the hot tier alone.
+    #[cfg(feature = "cold-storage")]
+    pub fn without_cold(&self) -> Self {
+        let mut view = self.clone();
+        view.cold = None;
+        view
+    }
+
+    /// Returns the attached cold tier, or `None` for a hot-only handle.
+    #[cfg(feature = "cold-storage")]
+    pub fn cold(&self) -> Option<&Arc<ColdStore>> {
+        self.cold.as_ref()
     }
 }
 
@@ -833,7 +1022,7 @@ impl MemDatabase {
         Ok(())
     }
 
-    // Helper methods for eviction (used by bg thread)
+    // Helper methods for eviction and cold archival
     pub fn delete_removed<T: Table>(&self, key: &T::Key, require_marked: bool) -> eyre::Result<()> {
         if let Some(table) = self.store.write().get_mut(T::NAME) {
             let key_bytes = encode_key(key);
@@ -845,6 +1034,30 @@ impl MemDatabase {
             }
         }
         Ok(())
+    }
+
+    /// Hard-delete a key from the mem overlay without tombstoning.
+    /// Used by the cold archival producer: a tombstone would shadow the cold fall-through,
+    /// so the archived row must be hard-deleted from the hot tier.
+    pub fn hard_delete<T: Table>(&self, key: &T::Key) {
+        if let Some(table) = self.store.write().get_mut(T::NAME) {
+            let key_bytes = encode_key(key);
+            table.remove(&key_bytes);
+        }
+    }
+
+    /// Gets the value without checking the tombstone flag.
+    /// Used by the layered read path which checks tombstones separately.
+    pub fn get_no_marked_check<T: Table>(&self, key: &T::Key) -> Option<(u64, T::Value)> {
+        if let Some(table) = self.store.read().get(T::NAME) {
+            let key_bytes = encode_key(key);
+            if let Some((removed, val_bytes)) = table.get(&key_bytes) {
+                if !*removed {
+                    return Some(/* access count, */ decode(val_bytes));
+                }
+            }
+        }
+        None
     }
 
     pub fn is_tombstoned<T: Table>(&self, key: &T::Key) -> bool {
@@ -1024,11 +1237,11 @@ pub mod redb;
 ### 5.6 `crates/infrastructure/storage/src/layered_db.rs` — REWRITE
 
 **Changes:**
-- Remove `LayeredDbTx` (replace with new version using `MemTxn`)
+- Remove `LayeredDbTx` (replace with new version using `MemTxn` + cold fallthrough)
 - Remove `LayeredDbTxMut` (replace with `WriteTxn`)
 - Remove `DBMessage` enum (replace with `CommitTxn`)
 - Remove `InsertTrait`, `RemoveTrait`, `ClearTrait` (replace with `PersistOp`)
-- Remove `KeyValueInsert`, `KeyRemove`, `ClearTable` structs (replace with `PersistInsert<T>`, etc.)
+- Remove `KeyValueInsert`, `KeyRemove`, `KeyRemoveBatch`, `ClearTable` structs (replace with `PersistInsert<T>`, etc.)
 - Rewrite `db_run()` to use `CommitTxn::Batch` instead of `StartTxn`/`CommitTxn` refcount
 - Remove `evict_committed()` — no longer needed (no per-op eviction cache)
 - Remove `CACHE_KEEP_TIME_SECS` and `MAX_CACHE_SIZE` constants
@@ -1036,9 +1249,14 @@ pub mod redb;
 
 **What stays the same:**
 - `MergeJoinIter` and `MergeJoinRawIter` (unchanged)
-- `LayeredDatabase` struct
+- `merge_cold` and `merge_cold_raw` helper functions (unchanged)
+- `QueueSender` struct with backpressure (retained, updated for new message type)
+- `QUEUE_HIGH_WATER_MARK`, `QUEUE_PACE_SLEEP` constants (retained)
+- `LayeredDatabase` struct (with cold field, `with_cold()`, `without_cold()`, `cold()`)
 - `persist()` and `sync_persist()` methods
+- `reverse_skip_to()` inherent method on both txn and db
 - `Drop` impl for `LayeredDatabase`
+- All cold-storage integration (`#[cfg(feature = "cold-storage")]` gates)
 - All tests
 
 **Key behavioral changes:**
@@ -1046,6 +1264,18 @@ pub mod redb;
 - Per-op sends to bg thread replaced by single batch send on commit
 - No more giant shared txn in bg thread — each commit gets its own short-lived txn
 - No more `evict_committed()` — the mem buffer is per-txn, not a global cache
+- Read path is 4-tier: `buffer → mem → persistent → cold` (was 3-tier: `mem → persistent → cold`)
+- `WriteTxn` supports read-after-write (was panic on all read methods)
+- `evict_persistent_batch` hard-deletes from mem (no tombstone) for cold archival
+
+### 5.6a `crates/infrastructure/storage/src/cold/` — UNCHANGED
+
+The cold storage module (`cold/mod.rs`, `cold/tx.rs`, `cold/jar.rs`, `cold/archiver.rs`, `cold/producer.rs`, `cold/reconcile.rs`) requires **no changes**. The cold tier is consumed through:
+- `ColdTx` / `ColdTxMut` — already implement `DbTx` / `DbTxMut`
+- `merge_cold` / `merge_cold_raw` — already chain cold iterators beneath hot
+- `ColdStore` — already feature-gated with `#[cfg(feature = "cold-storage")]`
+
+The only integration point is that `WriteTxn` and `LayeredDbTx` must carry the `cold: Option<&'a ColdStore>` field and call `cold_get`, `chain_cold`, `chain_cold_raw` in the same pattern as the current `LayeredDbTx`.
 
 ### 5.7 `crates/infrastructure/storage/src/mdbx/database.rs`
 
@@ -1200,6 +1430,25 @@ This is correct: readers only see committed state. The only difference from curr
 
 The `MergeJoinIter` and `MergeJoinRawIter` are already correct — they filter tombstoned keys via a closure. The closure captures `is_tombstoned` from the transaction, which checks both buffer and shared store. No changes needed.
 
+### 6.6 Cold Storage Integration
+
+The cold tier (`cold/` module) is **unchanged**. The integration is in the layered transaction types:
+
+**Read fallthrough:** `buffer → mem → persistent → cold` (4-tier, was 3-tier)
+- `WriteTxn::get()` / `LayeredDbTx::get()` fall through to `cold_get()` on hot miss
+- `iter()` / `raw_iter()` chain cold beneath hot via `merge_cold()` / `merge_cold_raw()`
+- `skip_to()` / `reverse_iter()` pass the key anchor to cold for correct boundary
+
+**Write exclusions:** Cold is append-only — `remove`, `clear_table`, `evict_persistent_batch` never target cold.
+
+**`evict_persistent_batch`:** Hard-deletes from mem (no tombstone) + removes from persistent. A tombstone would shadow the cold fallthrough, so the archived row must be hard-deleted.
+
+**Feature gates:** All cold methods use `#[cfg(feature = "cold-storage")]` with no-op stubs when the feature is off. The `merge_cold` / `merge_cold_raw` functions are already feature-gated.
+
+**Archival producer:** Uses `without_cold()` to get a hot-only view, ensuring "is this row still hot?" is answered by the hot tier alone.
+
+**Auxiliary index:** `ColdBatchLocations` (hot table) maps batch digest → `(epoch, row)`. The cold transaction resolves digests through this index on the caller's hot snapshot.
+
 ---
 
 ## 7. Migration Strategy
@@ -1215,8 +1464,15 @@ The `MergeJoinIter` and `MergeJoinRawIter` are already correct — they filter t
 
 ### Phase 2: LayeredDB Rewrite
 
-7. Rewrite `layered_db.rs` — `WriteTxn`, simplified bg thread
+7. Rewrite `layered_db.rs` — `WriteTxn`, simplified bg thread, cold integration
 8. Update `lib.rs` — add new modules, remove `ReadTimeout` re-export
+9. **Verify cold storage integration:**
+   - `WriteTxn` and `LayeredDbTx` carry `cold: Option<&'a ColdStore>` field
+   - All read methods fall through to cold (`cold_get`, `chain_cold`, `chain_cold_raw`)
+   - `with_cold()`, `without_cold()`, `cold()` on `LayeredDatabase` continue to work
+   - `evict_persistent_batch` hard-deletes from mem (no tombstone)
+   - `merge_cold` / `merge_cold_raw` chain cold beneath hot iterators
+   - Feature gates (`#[cfg(feature = "cold-storage")]`) compile correctly both ways
 
 ### Phase 3: Call Site Updates
 
@@ -1317,17 +1573,23 @@ txn.commit()?;
 
 3. **Tombstone timing** — tests that depend on immediate write visibility will fail. Need to identify and update all such tests.
 
+4. **Cold storage integration** — `WriteTxn` and `LayeredDbTx` must correctly chain the cold tier beneath hot iterators. The `merge_cold` / `merge_cold_raw` functions must handle the fault flag from cold scans. The `ColdBatchLocations` auxiliary index must resolve from the hot snapshot.
+
 ### 9.2 Medium Risk
 
-4. **`with_write_txn()` visibility change** — code that depends on writes being visible to other concurrent txns mid-transaction will break. This is unlikely in practice (the current code doesn't rely on this), but worth verifying.
+5. **`with_write_txn()` visibility change** — code that depends on writes being visible to other concurrent txns mid-transaction will break. This is unlikely in practice (the current code doesn't rely on this), but worth verifying.
 
-5. **Lock contention** — added `WriteLockManager` may change contention patterns. Need to verify no deadlocks.
+6. **Lock contention** — added `WriteLockManager` may change contention patterns. Need to verify no deadlocks.
+
+7. **`evict_persistent_batch` hard-delete** — must ensure hard-delete (no tombstone) is used for cold archival, otherwise tombstones shadow the cold fallthrough.
 
 ### 9.3 Low Risk
 
-6. **`ReadTimeout`/`disable_long_read_safety()` removal** — straightforward removal, no behavioral impact.
+8. **`ReadTimeout`/`disable_long_read_safety()` removal** — straightforward removal, no behavioral impact.
 
-7. **`evict_committed()` removal** — simplification, not a behavior change.
+9. **`evict_committed()` removal** — simplification, not a behavior change.
+
+10. **QueueSender backpressure** — retained from current architecture; no behavioral change.
 
 ---
 
@@ -1342,9 +1604,10 @@ Phase 1: Foundation
   mdbx/database.rs         (TRIM)
   redb/database.rs         (TRIM)
 
-Phase 2: LayeredDB
-  layered_db.rs            (REWRITE)
+Phase 2: LayeredDB (+ cold integration)
+  layered_db.rs            (REWRITE — WriteTxn, LayeredDbTx, bg thread, cold)
   lib.rs                   (UPDATE)
+  cold/ (all files)        (UNCHANGED — verify integration points)
 
 Phase 3: Call Sites
   certificate_store.rs     (TRIM)
@@ -1365,6 +1628,7 @@ Phase 4: Business Logic
 
 Phase 5: Tests
   All test suites
+  Cold storage tests (with and without feature flag)
 ```
 
 ---
@@ -1376,5 +1640,7 @@ Phase 5: Tests
 3. **Short-lived snapshots** — MDBX snapshots live only for the read duration
 4. **Accurate `persist()`** — waits for all committed txns to flush
 5. **Opt-in locking** — caller decides which tables to lock; database provides the mechanism
-6. **Read priority** — buffer → mem shared store → persistent snapshot
+6. **Read priority (4-tier)** — buffer → mem shared store → persistent snapshot → cold archive
 7. **Tombstone semantics** — tombstones visible only after commit; merge-join iterators filter them
+8. **Cold is append-only** — writes never target cold; `evict_persistent_batch` hard-deletes from hot
+9. **Cold feature gates** — all cold methods compile with no-op stubs when `cold-storage` is disabled

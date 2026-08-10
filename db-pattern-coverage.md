@@ -16,6 +16,9 @@ All read/write patterns in the codebase have been verified against the new archi
 | Long-running iterations | 3 (currently exempted) | Covered (timeout removed) |
 | Epoch transition pipeline | 1 (6 phases) | Covered |
 | Concurrent write conflicts | 8 | Covered (locks serialize) |
+| Cold storage fallthrough | all reads | Covered (4-tier: buffer → mem → persistent → cold) |
+| Cold archival producer | `without_cold()` view | Covered (hot-only view for archiver) |
+| `evict_persistent_batch` | cold archival prune | Covered (hard-delete from hot, never targets cold) |
 
 ### No Gaps Found
 
@@ -325,7 +328,48 @@ PHASE 6 - RESET SIGNALS:
 
 ---
 
+### 9. Cold Storage Fallthrough — 4-Tier Read Resolution
+
+**Pattern:** All read operations fall through to the cold tier on hot miss.
+
+**Current code:** `LayeredDbTx` reads follow `mem → persistent → cold` (3-tier).
+
+**New architecture:** `WriteTxn` and `LayeredDbTx` reads follow `buffer → mem → persistent → cold` (4-tier). The cold tier is feature-gated and append-only.
+
+**Cold integration points:**
+- `WriteTxn::get()` / `LayeredDbTx::get()` — fall through to `cold_get()` on hot miss
+- `iter()` / `raw_iter()` — chain cold beneath hot via `merge_cold()` / `merge_cold_raw()`
+- `skip_to()` / `reverse_iter()` — pass key anchor to cold for correct boundary
+- `evict_persistent_batch` — hard-deletes from hot (no tombstone) to avoid shadowing cold
+- `without_cold()` — returns hot-only view for archival producer
+
+**Cold-specific constraints:**
+- Only `ConsensusBlocks` (by block number) and `Batches` (via `ColdBatchLocations` index) are archived
+- `ColdBatchLocations` auxiliary index is resolved from the hot snapshot
+- Cold scans raise a fault flag on gap or read error inside the sealed span
+- All cold methods are `#[cfg(feature = "cold-storage")]` with no-op stubs when disabled
+
+**Verdict: Covered.**
+
+---
+
 ## Implementation Files
+
+| File | Changes |
+|---|---|
+| `storage/src/mem_db.rs` | Replace `MemDbTx` + `MemDbTxMut` with `MemTxn` (buffered writes, atomic commit, `hard_delete`) |
+| `storage/src/layered_db.rs` | Per-txn write buffer, `WriteTxn`, remove giant txn logic, cold integration, `QueueSender` backpressure |
+| `storage/src/write_lock.rs` (NEW) | `WriteLockManager`, `WriteLockGuard` |
+| `storage/src/cold/` (all files) | **UNCHANGED** — verify integration points with new `WriteTxn` and `LayeredDbTx` |
+| `storage/src/mdbx/database.rs` | Remove `DEFAULT_MAX_READ_TXN_DURATION_SECS`, remove `disable_long_read_safety()` |
+| `storage/src/redb/database.rs` | Remove `disable_long_read_safety()` |
+| `types/src/database_traits.rs` | Remove `ReadTimeout` enum, remove `disable_long_read_safety()` from trait |
+| `storage/src/lib.rs` | Remove `ReadTimeout` re-export, add `write_lock` module |
+| `middleware/rewards/src/lib.rs` | Remove `txn.disable_long_read_safety()` call |
+| `middleware/orchestrator/src/epoch_manager/utils.rs` | Remove `txn.disable_long_read_safety()` call |
+| `storage/src/stores/certificate_store.rs` | Remove `ReadTimeout` param from `after_round()` |
+| `consensus/primary/src/consensus/state.rs` | Remove `ReadTimeout::Exempt` usage |
+| `network-cli/src/args/consensus_database.rs` | Remove `--consensus-db.read-transaction-timeout` CLI arg |
 
 | File | Changes |
 |---|---|
@@ -351,3 +395,6 @@ PHASE 6 - RESET SIGNALS:
 3. **Short-lived snapshots** — MDBX snapshots live only for the read duration
 4. **Accurate persist()** — `persist()` waits for all committed txns to flush
 5. **Opt-in locking** — caller decides which tables to lock; database provides the mechanism
+6. **4-tier read resolution** — buffer → mem → persistent → cold (feature-gated)
+7. **Cold is append-only** — writes never target cold; `evict_persistent_batch` hard-deletes from hot
+8. **Cold feature gates** — all cold methods compile with no-op stubs when `cold-storage` is disabled

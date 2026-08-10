@@ -60,26 +60,68 @@ Persistent key-value storage on disk. Provides MVCC snapshots for reads and shor
 
 ---
 
+## Cold Storage (`cold/` module)
+
+### Responsibility
+
+Append-only compressed archive for historical data. Stores `ConsensusBlocks` (by block number) and `Batches` (via `ColdBatchLocations` auxiliary index) in per-epoch nippy-jar files with zstd compression.
+
+### Life Cycles
+
+**ColdStore**
+- Created once at node startup
+- Lives for the entire node lifetime
+- Two segments: `consensus_blocks` and `batches`
+- Each segment has per-epoch jars (append-only, sealed at epoch boundary)
+
+**ColdTx (read-only transaction)**
+- Created by `ColdStore` on demand
+- Resolves `Batches` digests through the hot `ColdBatchLocations` auxiliary index
+- **Reads:** point reads by block number or digest; scans over dense `ConsensusBlocks` spans
+- **Fault flag:** raised when a scan hits a gap or read error inside the sealed span
+- Lives for the duration of the read operation
+
+**ColdTxMut (write transaction)**
+- Created by `ColdTxMut::begin(cold, epoch, start_number)`
+- **Writes:** appends rows to the open epoch jar (ConsensusBlocks must be dense from `start_number`)
+- **Commit:** seals both segment jars (batches first, then consensus_blocks)
+- **Drop (without commit):** abandons appends; next `begin` heals leftovers
+- **Remove / clear / evict:** not supported — cold is append-only
+- Lives only for the duration of a single epoch archival
+
+### Integration with LayeredDatabase
+
+- **Read resolution:** mem → persistent DB → cold (3-tier fallthrough for reads, 4-tier with WriteTxn buffer)
+- **Feature-gated:** `#[cfg(feature = "cold-storage")]` with no-op stubs when disabled
+- **`with_cold()`:** attaches the cold tier to `LayeredDatabase`
+- **`without_cold()`:** returns a hot-only view for the archival producer
+- **`evict_persistent_batch`:** hard-deletes from hot (no tombstone) so cold fallthrough isn't shadowed
+- **Archival pipeline:** whole epochs of `Batches` and `ConsensusBlocks` move into per-epoch jars
+
+---
+
 ## LayeredDatabase
 
 ### Responsibility
 
-Orchestrates MemDB and the persistent DB. Provides per-txn write buffering, opt-in locking, async flush, and a durability barrier.
+Orchestrates MemDB, the persistent DB, and the cold tier. Provides per-txn write buffering, opt-in locking, async flush, a durability barrier, and 4-tier read resolution.
 
 ### Life Cycles
 
 **LayeredDatabase (top-level handle)**
 - Created once at node startup
 - Lives for the entire node lifetime
-- Owns MemDatabase + Persistent DB + background thread + lock manager
+- Owns MemDatabase + Persistent DB + ColdStore (opt.) + background thread + lock manager
+- `with_cold()` attaches cold tier; `without_cold()` returns hot-only view
 
 **WriteTxn (per-txn state)**
 - Created by `LayeredDatabase::start_write_txn()`
-- Holds: MemTxn + write buffer + lock manager reference
+- Holds: MemTxn + write buffer + lock manager reference + cold reference (opt.)
 - **Lock:** acquires table-level mutex (caller decides which tables)
-- **Begin:** opens persistent read snapshot (MDBX)
-- **Reads:** MemTxn buffer → persistent snapshot
+- **Begin:** opens persistent read snapshot (MDBX) + cold snapshot (opt.)
+- **Reads:** MemTxn buffer → persistent snapshot → cold (4-tier fallthrough)
 - **Writes:** MemTxn buffer (in-memory) + persistent write buffer (for flush)
+- **Cold writes:** never — cold is append-only
 - **Commit:**
   1. MemTxn commits (merge in-memory buffer)
   2. Persistent write buffer sent to background thread (async)
@@ -116,12 +158,13 @@ Orchestrates MemDB and the persistent DB. Provides per-txn write buffering, opt-
 Application:
     txn = db.start_write_txn()     → creates WriteTxn
     txn.lock("table")              → acquires table lock
-    txn.begin()                    → opens persistent snapshot
+    txn.begin()                    → opens persistent snapshot + cold snapshot (opt.)
+    txn.get(key)                   → buffer → mem → persistent → cold (4-tier fallthrough)
     txn.insert(key, value)         → writes to both in-memory + persistent buffer
     txn.commit()                   → merges in-memory, sends persistent buffer to background
-                                     (returns immediately)
+                                      (returns immediately)
     db.persist()                   → waits for background to flush
-                                     (returns when all committed txns flushed)
+                                      (returns when all committed txns flushed)
 ```
 
 ---
@@ -130,9 +173,10 @@ Application:
 
 | Layer | Does Not Do |
 |---|---|
-| **MemDB** | Persistence, MVCC snapshots, error recovery |
-| **MDBX** | Write buffering, lock management, tombstone tracking |
-| **LayeredDB** | Persistence, MVCC snapshots, in-memory caching |
+| **MemDB** | Persistence, MVCC snapshots, error recovery, cold archival |
+| **MDBX** | Write buffering, lock management, tombstone tracking, cold archival |
+| **Cold** | Writes (append-only), removal, clearing, random-access `Batches` (needs hot index) |
+| **LayeredDB** | Persistence, MVCC snapshots, in-memory caching, cold archival |
 
 ---
 
@@ -143,3 +187,6 @@ Application:
 3. **Short-lived snapshots** — MDBX snapshots live only for the read duration
 4. **Accurate persist()** — `persist()` waits for all committed txns to flush
 5. **Opt-in locking** — caller decides which tables to lock; database provides the mechanism
+6. **4-tier read resolution** — buffer → mem → persistent → cold (feature-gated)
+7. **Cold is append-only** — writes never target cold; `evict_persistent_batch` hard-deletes from hot
+8. **Cold feature gates** — all cold methods compile with no-op stubs when `cold-storage` is disabled
