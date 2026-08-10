@@ -81,13 +81,7 @@ pub fn catchup_accumulator<DB: Database>(
 
     // reverse-walk into a local map, then install atomically via
     // set_leader_counts so a re-run replaces rather than double-counts.
-    //
-    // Wrapped in with_read_txn so we can opt this txn out of mdbx's 30s
-    // long-read safety net: bootstrap is cold-cache by definition, the scan
-    // covers an entire epoch's worth of ConsensusBlocks, and the walk reads
-    // only immutable historical headers.
     let leader_counts: BTreeMap<AuthorityIdentifier, u32> = db.with_read_txn(|txn| {
-        txn.disable_long_read_safety();
         info!(target: "epoch-manager", "catchup_accumulator: read txn opened");
 
         let mut leader_counts: BTreeMap<AuthorityIdentifier, u32> = BTreeMap::new();
@@ -184,91 +178,4 @@ mod tests {
     use rayls_infrastructure_types::ConsensusHeader;
     use std::time::Duration;
     use tempfile::tempdir;
-
-    /// Proves the contract `catchup_accumulator` relies on, against the
-    /// production DB stack: `LayeredDatabase<MdbxDatabase>` (= `DatabaseType`),
-    /// not bare `MdbxDatabase`. The walk must survive past
-    /// `max_read_transaction_duration` when `disable_long_read_safety()` is
-    /// called; without it, mdbx's safety net aborts the persistent-layer
-    /// cursor and the walk returns nothing for rows that live only on disk.
-    ///
-    /// Seeding goes through a raw `MdbxDatabase` (then dropped) before the
-    /// `LayeredDatabase` is opened, so the rows live only in the persistent
-    /// layer — otherwise `LayeredDatabase::insert` also populates `mem_db`,
-    /// which would shadow the cursor failure and make both walks return all
-    /// rows (see [`LayeredDatabase::insert`] in the storage crate).
-    ///
-    /// libmdbx's check thread polls every 5s, so the smallest wait that
-    /// reliably exceeds "1s timeout + check interval" is ~7s. The two walks
-    /// run on parallel threads so both stalls overlap under one wall clock.
-    #[test]
-    fn catchup_walk_survives_mdbx_long_read_safety_when_exempted() {
-        const MAX_READ_TXN_DURATION: Duration = Duration::from_secs(1);
-        // 1s timeout + 5s mdbx check interval + 1s jitter buffer.
-        const WAIT_PAST_TIMEOUT: Duration = Duration::from_secs(7);
-        const ROWS: u64 = 8;
-
-        let temp_dir = tempdir().expect("failed to create temp dir");
-        let cfg =
-            MdbxConfig::default().with_max_read_transaction_duration(Some(MAX_READ_TXN_DURATION));
-
-        // Phase 1: seed persistent layer only.
-        {
-            let raw_mdbx = MdbxDatabase::open_with_config(temp_dir.path(), cfg.clone())
-                .expect("open raw mdbx for seeding");
-            raw_mdbx.open_table::<ConsensusBlocks>().expect("open ConsensusBlocks");
-            for n in 0..ROWS {
-                let header = ConsensusHeader { number: n, ..ConsensusHeader::default() };
-                raw_mdbx.insert::<ConsensusBlocks>(&n, &header).expect("seed ConsensusBlocks");
-            }
-        }
-
-        // Phase 2: reopen as the production stack. mem_db starts empty, so
-        // the merge-join walk must hit the persistent layer to see the rows.
-        let db = open_db_with_consensus_config(temp_dir.path(), &cfg);
-
-        // Fix under test: same call shape as `catchup_accumulator`. The
-        // iterator is constructed BEFORE the sleep so the underlying mdbx
-        // read txn is in the active list while the safety-net thread polls;
-        // this mirrors a cold-cache walk that takes ~30s to drain.
-        let exempted_db = db.clone();
-        let exempted = std::thread::spawn(move || -> eyre::Result<usize> {
-            exempted_db.with_read_txn(|txn| {
-                txn.disable_long_read_safety();
-                let iter = txn.reverse_iter::<ConsensusBlocks>();
-                std::thread::sleep(WAIT_PAST_TIMEOUT);
-                Ok(iter.count())
-            })
-        });
-
-        // Baseline: same walk, without the opt-out.
-        let bounded_db = db.clone();
-        let bounded = std::thread::spawn(move || -> eyre::Result<usize> {
-            bounded_db.with_read_txn(|txn| {
-                let iter = txn.reverse_iter::<ConsensusBlocks>();
-                std::thread::sleep(WAIT_PAST_TIMEOUT);
-                Ok(iter.count())
-            })
-        });
-
-        let exempted_count = exempted
-            .join()
-            .expect("exempted thread panicked")
-            .expect("with_read_txn should return Ok");
-        let bounded_count = bounded
-            .join()
-            .expect("bounded thread panicked")
-            .expect("with_read_txn should return Ok");
-
-        assert_eq!(
-            exempted_count, ROWS as usize,
-            "exempted walk must see every ConsensusBlocks row after the wait",
-        );
-        // mdbx tears down the timed-out txn's cursor, so reverse_iter on the
-        // bounded walk falls back to an empty iterator.
-        assert_eq!(
-            bounded_count, 0,
-            "bounded walk must NOT see rows once the safety net has fired",
-        );
-    }
 }

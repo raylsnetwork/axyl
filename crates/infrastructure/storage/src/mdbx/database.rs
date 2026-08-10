@@ -21,10 +21,9 @@ use rayls_infrastructure_types::{
 };
 use reth_libmdbx::{
     ffi, ffi::MDBX_dbi, Cursor, DatabaseFlags, Environment, EnvironmentFlags, Geometry,
-    HandleSlowReadersReturnCode, MaxReadTransactionDuration, Mode, PageSize, SyncMode, Transaction,
+    HandleSlowReadersReturnCode, Mode, PageSize, SyncMode, Transaction,
     TransactionKind, WriteFlags, RO, RW,
 };
-use tracing::debug;
 
 /// Maximum space (in bytes) that a slow reader can hold before triggering a warning.
 /// 50MB threshold for investigation purposes.
@@ -220,11 +219,6 @@ impl DbTx for MdbxTx {
             }
         }
     }
-
-    fn disable_long_read_safety(&self) {
-        debug!(target: "storage::mdbx", "disabling long read safety for database transaction");
-        self.inner.disable_timeout();
-    }
 }
 
 /// Wrapper for the libmdbx transaction.
@@ -341,12 +335,6 @@ impl DbTx for MdbxTxMut {
             }
         }
     }
-
-    fn disable_long_read_safety(&self) {
-        debug!(target: "storage::mdbx", "disabling long read safety for database transaction");
-
-        self.inner.disable_timeout();
-    }
 }
 
 impl DbTxMut for MdbxTxMut {
@@ -405,8 +393,7 @@ pub const MEGABYTE: usize = KILOBYTE * 1024;
 pub const GIGABYTE: usize = MEGABYTE * 1024;
 pub const TERABYTE: usize = GIGABYTE * 1024;
 
-/// Rayls: Default max read transaction duration in seconds.
-const DEFAULT_MAX_READ_TXN_DURATION_SECS: u64 = 30;
+/// Rayls: Default max readers.
 const DEFAULT_MAX_READERS: u32 = 256;
 
 /// Auto-sync cadence for the `SafeNoSync` write map.
@@ -419,8 +406,6 @@ const SYNC_PERIOD: Duration = Duration::from_secs(5);
 /// Configuration for MDBX database initialization.
 #[derive(Debug, Clone)]
 pub struct MdbxConfig {
-    /// Maximum duration for read transactions. None for unbounded.
-    pub max_read_transaction_duration: Option<Duration>,
     /// Maximum number of concurrent readers.
     pub max_readers: u32,
     /// Maximum database size in bytes.
@@ -432,9 +417,6 @@ pub struct MdbxConfig {
 impl Default for MdbxConfig {
     fn default() -> Self {
         Self {
-            max_read_transaction_duration: Some(Duration::from_secs(
-                DEFAULT_MAX_READ_TXN_DURATION_SECS,
-            )),
             max_readers: DEFAULT_MAX_READERS,
             max_db_size: 100 * GIGABYTE,
             growth_step: GIGABYTE,
@@ -446,12 +428,6 @@ impl MdbxConfig {
     /// Create a new configuration with default values.
     pub fn new() -> Self {
         Self::default()
-    }
-
-    /// Set the maximum duration for read transactions.
-    pub fn with_max_read_transaction_duration(mut self, duration: Option<Duration>) -> Self {
-        self.max_read_transaction_duration = duration;
-        self
     }
 
     /// Set the maximum number of concurrent readers.
@@ -504,15 +480,9 @@ impl MdbxDatabase {
         };
 
         // Convert config to MDBX settings
-        let max_read_txn_duration = match config.max_read_transaction_duration {
-            Some(duration) => MaxReadTransactionDuration::Set(duration),
-            None => MaxReadTransactionDuration::Unbounded,
-        };
-
         tracing::info!(
             target: "rayls::mdbx",
-            "Opening MDBX database with config: max_read_txn_duration={:?}, max_readers={}, max_size={}GB",
-            config.max_read_transaction_duration,
+            "Opening MDBX database with config: max_readers={}, max_size={}GB",
             config.max_readers,
             config.max_db_size / GIGABYTE
         );
@@ -533,9 +503,6 @@ impl MdbxDatabase {
             .set_rp_augment_limit(1024 * 1024)
             // MDBX syncs lazily on the first commit past the period (see SYNC_PERIOD)
             .set_sync_period(SYNC_PERIOD)
-            // Prevent writer starvation from long-held read transactions which can cause
-            // consensus delays. Configurable via MdbxConfig.
-            .set_max_read_transaction_duration(max_read_txn_duration)
             // Configurable concurrent readers limit for high-throughput consensus operations
             .set_max_readers(config.max_readers.into())
             // Detect slow readers that may be causing memory growth by holding pages

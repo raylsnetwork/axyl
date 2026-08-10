@@ -10,7 +10,7 @@ use rayls_infrastructure_types::{DBIter, DBRawIter, Database, Table};
 
 use super::ARCHIVE_HIGH_WATER_MARK_KEY;
 use crate::{
-    mem_db::{MemDatabase, MemDbTx, MemDbTxMut},
+    mem_db::{MemDatabase, MemTxn},
     tables::{ColdArchiveHighWaterMark, ColdBatchLocations},
 };
 
@@ -80,12 +80,12 @@ impl ProbeDb {
 
 impl Database for ProbeDb {
     type TX<'txn>
-        = MemDbTx<'txn>
+        = MemTxn<'txn>
     where
         Self: 'txn;
 
     type TXMut<'txn>
-        = MemDbTxMut<'txn>
+        = MemTxn<'txn>
     where
         Self: 'txn;
 

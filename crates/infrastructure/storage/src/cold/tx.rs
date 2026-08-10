@@ -125,10 +125,6 @@ impl DbTx for ColdTx<'_> {
         let prior_key = try_decode_key::<T::Key>(&encode_key(&prior)).ok()?;
         self.scan::<T>(Some(&prior_key), true)?.next()
     }
-
-    fn disable_long_read_safety(&self) {
-        // Jar reads run on mmapped files with no read-txn window to exempt.
-    }
 }
 
 /// A write transaction over the cold tier: the open epoch's jars across both segments.
@@ -228,10 +224,6 @@ impl DbTx for ColdTxMut<'_> {
 
     fn record_prior_to<T: Table>(&self, _key: &T::Key) -> Option<(T::Key, T::Value)> {
         panic!("DbTx record_prior_to() should not be called on a DbTxMut!");
-    }
-
-    fn disable_long_read_safety(&self) {
-        // Jar writes run outside any read-txn window; nothing to exempt.
     }
 }
 

@@ -1,6 +1,6 @@
 //! clap [Args](clap::Args) for database configuration
 
-use std::{fmt, str::FromStr, time::Duration};
+use std::{fmt, str::FromStr};
 
 // use crate::version::default_client_version;
 use clap::Args;
@@ -16,9 +16,6 @@ pub struct ConsensusDatabaseArgs {
     /// Database growth step (e.g., 4GB, 4KB)
     #[arg(long = "consensus-db.growth-step", value_parser = parse_byte_size)]
     pub consensus_db_growth_step: Option<usize>,
-    /// Read transaction timeout in seconds, 0 means no timeout.
-    #[arg(long = "consensus-db.read-transaction-timeout")]
-    pub consensus_db_read_transaction_timeout: Option<u64>,
     /// Maximum number of readers allowed to access the database concurrently.
     #[arg(long = "consensus-db.max-readers")]
     pub consensus_db_max_readers: Option<u32>,
@@ -27,12 +24,6 @@ pub struct ConsensusDatabaseArgs {
 impl ConsensusDatabaseArgs {
     pub fn database_args(&self) -> MdbxConfig {
         let config = MdbxConfig::new();
-
-        let max_read_transaction_duration = match self.consensus_db_read_transaction_timeout {
-            None => config.max_read_transaction_duration, // if not specified, use default value
-            Some(0) => None,
-            Some(secs) => Some(Duration::from_secs(secs)),
-        };
 
         let consensus_db_max_size = match self.consensus_db_max_size {
             None => config.max_db_size,
@@ -50,7 +41,6 @@ impl ConsensusDatabaseArgs {
         };
 
         MdbxConfig::new()
-            .with_max_read_transaction_duration(max_read_transaction_duration)
             .with_max_db_size(consensus_db_max_size)
             .with_growth_step(consensus_db_growth_step)
             .with_max_readers(consensus_db_max_readers)

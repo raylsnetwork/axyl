@@ -4,7 +4,6 @@ use std::{
     borrow::Cow,
     collections::{BTreeMap, HashMap},
     fmt::Debug,
-    marker::PhantomData,
     sync::{
         mpsc::{self, SyncSender},
         Arc,
@@ -12,18 +11,20 @@ use std::{
     time::Duration,
 };
 
-use ouroboros::self_referencing;
-use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};
+use parking_lot::RwLock;
 use prometheus::{default_registry, register_int_gauge_with_registry, IntGauge, Registry};
 use rayls_infrastructure_types::{
     decode, decode_key, encode, encode_key, DBIter, DBRawIter, Database, DbTx, DbTxMut, Table,
 };
 
-use crate::open_default_tables;
+use crate::{open_default_tables, write_buffer::{WriteBuffer, WriteOp}};
 
 type StoreTableValueType = (bool, Vec<u8>);
 type StoreTableType = BTreeMap<Vec<u8>, StoreTableValueType>;
-type StoreType = HashMap<&'static str, StoreTableType>;
+
+/// Map from table name → table data.
+/// `pub` so `write_buffer.rs` and `layered_db.rs` can import it.
+pub type StoreType = HashMap<&'static str, StoreTableType>;
 
 fn get_with_marked_check<T: Table>(store: &StoreType, key: &T::Key) -> Option<T::Value> {
     if let Some(table) = store.get(T::NAME) {
@@ -38,303 +39,233 @@ fn get_with_marked_check<T: Table>(store: &StoreType, key: &T::Key) -> Option<T:
     None
 }
 
-fn mark_value_for_deletion<T: Table>(value: &mut StoreTableValueType) {
-    // mark for actual deletion once tx committed
-    value.0 = true;
-}
-
+/// Unified transaction type for MemDatabase.
+/// Holds an Arc clone of the shared store (snapshot isolation) + private buffer.
 #[derive(Debug)]
-pub struct MemDbTx<'a> {
-    store: RwLockReadGuard<'a, StoreType>,
+pub struct MemTxn<'a> {
+    store: Arc<RwLock<StoreType>>,
+    buffer: WriteBuffer,
+    _marker: std::marker::PhantomData<&'a ()>,
 }
 
-impl<'a> MemDbTx<'a> {
-    pub fn get_no_marked_check<T: Table>(&self, key: &T::Key) -> Option<(bool, T::Value)> {
-        if let Some(table) = self.store.get(T::NAME) {
+impl<'a> MemTxn<'a> {
+    /// Read-only: check buffer first, then fall through to shared store.
+    /// A buffered remove (tombstone) shadows the shared store.
+    fn get<T: Table>(&self, key: &T::Key) -> Option<T::Value> {
+        // 1. Check buffer (read-after-write consistency)
+        if let Some(val) = self.buffer_get::<T>(key) {
+            return Some(val);
+        }
+        // 2. A buffered remove stops the fallthrough — uncommitted removes are visible
+        //    within the transaction but must not resurrect the shared-store value.
+        if self.buffer_is_tombstoned::<T>(key) == Some(true) {
+            return None;
+        }
+        // 3. Fall through to shared store
+        if let Some(table) = self.store.read().get(T::NAME) {
+            let key_bytes = encode_key(key);
+            if let Some((removed, val_bytes)) = table.get(&key_bytes) {
+                if !*removed {
+                    return Some(decode(val_bytes));
+                }
+            }
+        }
+        None
+    }
+
+    /// Check only the private buffer (for layered get to implement 4-tier fallthrough).
+    pub(crate) fn buffer_get<T: Table>(&self, key: &T::Key) -> Option<T::Value> {
+        self.buffer.get::<T>(key)
+    }
+
+    /// Raw check only the private buffer (for layered raw_get).
+    pub(crate) fn buffer_raw_get<T: Table>(&self, key: &T::Key) -> Option<Vec<u8>> {
+        self.buffer.raw_get::<T>(key)
+    }
+
+    /// Check only the private buffer for tombstone status.
+    /// Returns `Some(true)` if tombstoned, `Some(false)` if inserted, `None` if not in buffer.
+    /// Used by `WriteTxn::get` to implement correct read-after-write semantics.
+    pub(crate) fn buffer_is_tombstoned<T: Table>(&self, key: &T::Key) -> Option<bool> {
+        self.buffer.is_tombstoned::<T>(key)
+    }
+
+    /// Get raw value from shared store without tombstone check (for layered raw_get).
+    /// Returns (is_tombstoned, raw_bytes) so the caller avoids decode/encode round-trip.
+    pub(crate) fn get_raw<T: Table>(&self, key: &T::Key) -> Option<(bool, Vec<u8>)> {
+        if let Some(table) = self.store.read().get(T::NAME) {
             let key_bytes = encode_key(key);
             return table.get(&key_bytes).map(|(removed, val_bytes)| {
-                let val = decode(val_bytes);
-                (*removed, val)
+                (*removed, val_bytes.clone())
             });
         }
         None
     }
 
-    /// Check if a key is tombstoned (marked for deletion) without deserializing the value.
-    pub fn is_tombstoned<T: Table>(&self, key: &T::Key) -> bool {
-        if let Some(table) = self.store.get(T::NAME) {
+    pub(crate) fn is_tombstoned<T: Table>(&self, key: &T::Key) -> bool {
+        // Check buffer for tombstone
+        if let Some(tombstoned) = self.buffer.is_tombstoned::<T>(key) {
+            return tombstoned;
+        }
+        // Fall through to shared store
+        if let Some(table) = self.store.read().get(T::NAME) {
             let key_bytes = encode_key(key);
             return table.get(&key_bytes).map_or(false, |(removed, _)| *removed);
         }
         false
     }
+
+    /// Hard-delete a key from the mem overlay without tombstoning.
+    /// Used by the cold archival producer: a tombstone would shadow the cold fall-through,
+    /// so the archived row must be hard-deleted from the hot tier.
+    pub(crate) fn hard_delete<T: Table>(&mut self, key: &T::Key) {
+        // Remove from buffer if present
+        self.buffer.hard_delete::<T>(key);
+        // Remove from shared store
+        if let Some(table) = self.store.write().get_mut(T::NAME) {
+            let key_bytes = encode_key(key);
+            table.remove(&key_bytes);
+        }
+    }
 }
 
-impl<'a> DbTx for MemDbTx<'a> {
+impl<'a> DbTx for MemTxn<'a> {
     fn get<T: Table>(&self, key: &T::Key) -> eyre::Result<Option<T::Value>> {
-        Ok(get_with_marked_check::<T>(&self.store, key))
+        Ok(self.get::<T>(key))
+    }
+
+    fn raw_get<T: Table>(&self, key: &T::Key) -> eyre::Result<Option<Cow<'_, [u8]>>> {
+        // Avoid decode/encode round-trip by returning raw bytes directly.
+        // A buffered remove shadows the shared store (read-after-write).
+        if let Some(bytes) = self.buffer_raw_get::<T>(key) {
+            return Ok(Some(Cow::Owned(bytes)));
+        }
+        if self.buffer_is_tombstoned::<T>(key) == Some(true) {
+            return Ok(None);
+        }
+        if let Some((removed, raw)) = self.get_raw::<T>(key) {
+            if !removed {
+                return Ok(Some(Cow::Owned(raw)));
+            }
+        }
+        Ok(None)
     }
 
     fn iter<T: Table>(&self) -> DBIter<'_, T> {
-        if let Some(table) = self.store.get(T::NAME) {
-            let items: Vec<_> = table
-                .iter()
-                .filter(|(_, (removed, _))| !*removed)
-                .map(|(k, (_, v))| (decode_key::<T::Key>(k), decode::<T::Value>(v)))
+        // Merge buffer + shared store, respect tombstones: start from the store
+        // snapshot and replay the buffered ops in order (last write wins).
+        let items: Vec<(Vec<u8>, Vec<u8>)> = {
+            let shared = self.store.read();
+            let mut entries: Vec<(Vec<u8>, Vec<u8>)> = shared
+                .get(T::NAME)
+                .into_iter()
+                .flat_map(|t| {
+                    t.iter()
+                        .filter(|(_, (removed, _))| !*removed)
+                        .map(|(k, (_, v))| (k.clone(), v.clone()))
+                })
                 .collect();
-            Box::new(items.into_iter())
-        } else {
-            Box::new(std::iter::empty())
-        }
+            if let Some(ops) = self.buffer.ops_for(T::NAME) {
+                for op in ops {
+                    match op {
+                        WriteOp::Insert { key, value } => {
+                            entries.retain(|(k, _)| k != key);
+                            entries.push((key.clone(), value.clone()));
+                        }
+                        WriteOp::Remove { key } => {
+                            entries.retain(|(k, _)| k != key);
+                        }
+                        WriteOp::ClearTable => entries.clear(),
+                    }
+                }
+            }
+            // Buffered inserts can land out of order; restore key order.
+            entries.sort_by(|(ka, _), (kb, _)| ka.cmp(kb));
+            entries
+        };
+        Box::new(items.into_iter().map(|(k, v)| (decode_key::<T::Key>(&k), decode::<T::Value>(&v))))
     }
 
     fn raw_iter<T: Table>(&self) -> DBRawIter<'_> {
-        if let Some(table) = self.store.get(T::NAME) {
-            // The read guard is held by `self`, so we can borrow the stored
-            // bytes for the iterator's lifetime instead of cloning them.
-            Box::new(
-                table
-                    .iter()
-                    .filter(|(_, (removed, _))| !*removed)
-                    .map(|(k, (_, v))| (Cow::Borrowed(k.as_slice()), Cow::Borrowed(v.as_slice()))),
-            )
-        } else {
-            Box::new(std::iter::empty())
-        }
+        // Merge buffer + shared store as raw bytes, respect tombstones.
+        let items: Vec<(Vec<u8>, Vec<u8>)> = {
+            let shared = self.store.read();
+            let mut entries: Vec<(Vec<u8>, Vec<u8>)> = shared
+                .get(T::NAME)
+                .into_iter()
+                .flat_map(|t| {
+                    t.iter()
+                        .filter(|(_, (removed, _))| !*removed)
+                        .map(|(k, (_, v))| (k.clone(), v.clone()))
+                })
+                .collect();
+            if let Some(ops) = self.buffer.ops_for(T::NAME) {
+                for op in ops {
+                    match op {
+                        WriteOp::Insert { key, value } => {
+                            entries.retain(|(k, _)| k != key);
+                            entries.push((key.clone(), value.clone()));
+                        }
+                        WriteOp::Remove { key } => {
+                            entries.retain(|(k, _)| k != key);
+                        }
+                        WriteOp::ClearTable => entries.clear(),
+                    }
+                }
+            }
+            // Buffered inserts can land out of order; restore key order.
+            entries.sort_by(|(ka, _), (kb, _)| ka.cmp(kb));
+            entries
+        };
+        Box::new(items.into_iter().map(|(k, v)| (Cow::Owned(k), Cow::Owned(v))))
     }
 
     fn skip_to<T: Table>(&self, key: &T::Key) -> eyre::Result<DBIter<'_, T>> {
-        if let Some(table) = self.store.get(T::NAME) {
-            let key_bytes = encode_key(key);
-            let items: Vec<_> = table
-                .iter()
-                .filter(|(_, (removed, _))| !*removed)
-                .skip_while(|(k, _)| **k < key_bytes)
-                .map(|(k, (_, v))| (decode_key::<T::Key>(k), decode::<T::Value>(v)))
-                .collect();
-            Ok(Box::new(items.into_iter()))
-        } else {
-            Err(eyre::eyre!("Invalid table {}", T::NAME))
-        }
+        let key = key.clone();
+        Ok(Box::new(self.iter::<T>().skip_while(move |(k, _)| k < &key)))
     }
 
     fn reverse_iter<T: Table>(&self) -> DBIter<'_, T> {
-        if let Some(table) = self.store.get(T::NAME) {
-            let items: Vec<_> = table
-                .iter()
-                .rev()
-                .filter(|(_, (removed, _))| !*removed)
-                .map(|(k, (_, v))| (decode_key::<T::Key>(k), decode::<T::Value>(v)))
-                .collect();
-            Box::new(items.into_iter())
-        } else {
-            Box::new(std::iter::empty())
-        }
+        let items: Vec<_> = self.iter::<T>().collect();
+        Box::new(items.into_iter().rev())
     }
 
     fn reverse_raw_iter<T: Table>(&self) -> DBRawIter<'_> {
-        if let Some(table) = self.store.get(T::NAME) {
-            Box::new(
-                table
-                    .iter()
-                    .rev()
-                    .filter(|(_, (removed, _))| !*removed)
-                    .map(|(k, (_, v))| (Cow::Borrowed(k.as_slice()), Cow::Borrowed(v.as_slice()))),
-            )
-        } else {
-            Box::new(std::iter::empty())
-        }
+        let items: Vec<_> = self.raw_iter::<T>().collect();
+        Box::new(items.into_iter().rev())
     }
 
     fn last_record<T: Table>(&self) -> Option<(T::Key, T::Value)> {
-        if let Some(table) = self.store.get(T::NAME) {
-            for (key_bytes, (removed, value_bytes)) in table.iter().rev() {
-                if !*removed {
-                    return Some((decode_key(key_bytes), decode(value_bytes)));
-                }
-            }
-            None
-        } else {
-            None
-        }
+        self.reverse_iter::<T>().next()
     }
 
     fn record_prior_to<T: Table>(&self, key: &T::Key) -> Option<(T::Key, T::Value)> {
-        if let Some(table) = self.store.get(T::NAME) {
-            let key_bytes = encode_key(key);
-            table
-                .range(..key_bytes)
-                .rev()
-                .find(|(_, (removed, _))| !*removed)
-                .map(|(k, (_, v))| (decode_key(k), decode(v)))
-        } else {
-            None
-        }
+        self.iter::<T>().take_while(|(k, _)| k < key).last()
     }
-
-    fn disable_long_read_safety(&self) {}
 }
 
-#[derive(Debug)]
-pub struct MemDbTxMut<'a> {
-    store: RwLockWriteGuard<'a, StoreType>,
-}
-
-impl<'a> DbTx for MemDbTxMut<'a> {
-    fn get<T: Table>(&self, key: &T::Key) -> eyre::Result<Option<T::Value>> {
-        //if not in cache check store
-        Ok(get_with_marked_check::<T>(&self.store, key))
-    }
-
-    fn iter<T: Table>(&self) -> DBIter<'_, T> {
-        // if let Some(table) = self.store.get(T::NAME) {
-        //     let items: Vec<_> = table
-        //         .read()
-        //         .iter()
-        //         .filter(|(_, (removed, _))| !*removed)
-        //         .map(|(k, (_, v))| (decode_key::<T::Key>(k), decode::<T::Value>(v)))
-        //         .collect();
-        //     Box::new(items.into_iter())
-        // } else {
-        //     Box::new(std::iter::empty())
-        // }
-        //To implement this we need to merge results from cache and store in a temporary vector and
-        // return iterator over that. This is not expected to used in a transaction, so
-        // should be safe.
-        panic!("Should not be called on a tx mut!");
-    }
-
-    fn raw_iter<T: Table>(&self) -> DBRawIter<'_> {
-        panic!("Should not be called on a tx mut!");
-    }
-
-    fn skip_to<T: Table>(&self, key: &T::Key) -> eyre::Result<DBIter<'_, T>> {
-        if let Some(table) = self.store.get(T::NAME) {
-            let key_bytes = encode_key(key);
-            let items: Vec<_> = table
-                .iter()
-                .filter(|(_, (removed, _))| !*removed)
-                .skip_while(|(k, _)| **k < key_bytes)
-                .map(|(k, (_, v))| (decode_key::<T::Key>(k), decode::<T::Value>(v)))
-                .collect();
-            Ok(Box::new(items.into_iter()))
-        } else {
-            Err(eyre::eyre!("Invalid table {}", T::NAME))
-        }
-    }
-
-    fn reverse_iter<T: Table>(&self) -> DBIter<'_, T> {
-        if let Some(table) = self.store.get(T::NAME) {
-            let items: Vec<_> = table
-                .iter()
-                .rev()
-                .filter(|(_, (removed, _))| !*removed)
-                .map(|(k, (_, v))| (decode_key::<T::Key>(k), decode::<T::Value>(v)))
-                .collect();
-            Box::new(items.into_iter())
-        } else {
-            Box::new(std::iter::empty())
-        }
-    }
-
-    fn reverse_raw_iter<T: Table>(&self) -> DBRawIter<'_> {
-        if let Some(table) = self.store.get(T::NAME) {
-            Box::new(
-                table
-                    .iter()
-                    .rev()
-                    .filter(|(_, (removed, _))| !*removed)
-                    .map(|(k, (_, v))| (Cow::Borrowed(k.as_slice()), Cow::Borrowed(v.as_slice()))),
-            )
-        } else {
-            Box::new(std::iter::empty())
-        }
-    }
-
-    fn last_record<T: Table>(&self) -> Option<(T::Key, T::Value)> {
-        if let Some(table) = self.store.get(T::NAME) {
-            for (key_bytes, (removed, value_bytes)) in table.iter().rev() {
-                if !*removed {
-                    return Some((decode_key(key_bytes), decode(value_bytes)));
-                }
-            }
-            None
-        } else {
-            None
-        }
-    }
-
-    fn record_prior_to<T: Table>(&self, key: &T::Key) -> Option<(T::Key, T::Value)> {
-        if let Some(table) = self.store.get(T::NAME) {
-            let key_bytes = encode_key(key);
-            table
-                .range(..key_bytes)
-                .rev()
-                .find(|(_, (removed, _))| !*removed)
-                .map(|(k, (_, v))| (decode_key(k), decode(v)))
-        } else {
-            None
-        }
-    }
-
-    fn disable_long_read_safety(&self) {}
-}
-
-impl<'a> DbTxMut for MemDbTxMut<'a> {
+impl<'a> DbTxMut for MemTxn<'a> {
     fn insert<T: Table>(&mut self, key: &T::Key, value: &T::Value) -> eyre::Result<()> {
-        if let Some(table) = self.store.get_mut(T::NAME) {
-            let key_bytes = encode_key(key);
-            let value_bytes = encode(value);
-            table.insert(key_bytes.clone(), (false, value_bytes));
-
-            Ok(())
-        } else {
-            Err(eyre::eyre!("Invalid table {}", T::NAME))
-        }
+        self.buffer.insert::<T>(key, value);
+        Ok(())
     }
 
     fn remove<T: Table>(&mut self, key: &T::Key) -> eyre::Result<()> {
-        if let Some(table) = self.store.get_mut(T::NAME) {
-            let key_bytes = encode_key(key);
-            if let Some(value) = table.get_mut(&key_bytes) {
-                mark_value_for_deletion::<T>(value);
-            } else {
-                // tombstone for keys that only exist in the persistent layer
-                table.insert(key_bytes, (true, Vec::new()));
-            }
-            Ok(())
-        } else {
-            Err(eyre::eyre!("Invalid table {}", T::NAME))
-        }
+        self.buffer.remove::<T>(key);
+        Ok(())
     }
 
     fn clear_table<T: Table>(&mut self) -> eyre::Result<()> {
-        if let Some(table) = self.store.get_mut(T::NAME) {
-            for value in table.values_mut() {
-                mark_value_for_deletion::<T>(value);
-            }
-            Ok(())
-        } else {
-            Err(eyre::eyre!("Invalid table {}", T::NAME))
-        }
+        self.buffer.clear_table::<T>();
+        Ok(())
     }
 
     fn commit(self) -> eyre::Result<()> {
-        // no need to do anything, the lock finishes with the tx drop
+        // Commit: merge buffer into shared store.
+        // Consumes `self`; the `store` Arc outlives the txn, so the shared store persists.
+        let Self { store, buffer, _marker } = self;
+        buffer.apply_to_mem(&store);
         Ok(())
-    }
-}
-
-impl<'a> MemDbTxMut<'a> {
-    /// Hard-removes `key` from the in-memory store, leaving no tombstone.
-    ///
-    /// Persistent eviction archives a row permanently (never re-inserted), so the cache entry is
-    /// dropped outright rather than tombstoned: this frees the cache and lets reads fall through to
-    /// a lower tier, whereas a tombstone would shadow it and never be reclaimed.
-    pub fn hard_delete<T: Table>(&mut self, key: &T::Key) {
-        if let Some(table) = self.store.get_mut(T::NAME) {
-            table.remove(&encode_key(key));
-        }
     }
 }
 
@@ -385,6 +316,16 @@ impl MemDatabase {
             }
         }
         Ok(())
+    }
+
+    /// Hard-delete a key from the mem overlay without tombstoning.
+    /// Used by the cold archival producer: a tombstone would shadow the cold fall-through,
+    /// so the archived row must be hard-deleted from the hot tier.
+    pub fn hard_delete<T: Table>(&self, key: &T::Key) {
+        if let Some(table) = self.store.write().get_mut(T::NAME) {
+            let key_bytes = encode_key(key);
+            table.remove(&key_bytes);
+        }
     }
 
     /// Returns keys marked for deletion in the given table.
@@ -452,12 +393,12 @@ impl Default for MemDatabase {
 
 impl Database for MemDatabase {
     type TX<'txn>
-        = MemDbTx<'txn>
+        = MemTxn<'txn>
     where
         Self: 'txn;
 
     type TXMut<'txn>
-        = MemDbTxMut<'txn>
+        = MemTxn<'txn>
     where
         Self: 'txn;
 
@@ -482,11 +423,19 @@ impl Database for MemDatabase {
     }
 
     fn read_txn(&self) -> eyre::Result<Self::TX<'_>> {
-        Ok(MemDbTx { store: self.store.read() })
+        Ok(MemTxn {
+            store: Arc::clone(&self.store),
+            buffer: WriteBuffer::default(),
+            _marker: std::marker::PhantomData,
+        })
     }
 
-    fn write_txn(&self) -> eyre::Result<MemDbTxMut<'_>> {
-        Ok(MemDbTxMut { store: self.store.write() })
+    fn write_txn(&self) -> eyre::Result<Self::TXMut<'_>> {
+        Ok(MemTxn {
+            store: Arc::clone(&self.store),
+            buffer: WriteBuffer::default(),
+            _marker: std::marker::PhantomData,
+        })
     }
 
     fn contains_key<T: Table>(&self, key: &T::Key) -> eyre::Result<bool> {
@@ -516,7 +465,7 @@ impl Database for MemDatabase {
         if let Some(table) = self.store.write().get_mut(T::NAME) {
             let key_bytes = encode_key(key);
             if let Some(value) = table.get_mut(&key_bytes) {
-                mark_value_for_deletion::<T>(value);
+                value.0 = true;
             } else {
                 // tombstone for keys that only exist in the persistent layer
                 table.insert(key_bytes, (true, Vec::new()));
@@ -529,7 +478,7 @@ impl Database for MemDatabase {
         if let Some(table) = self.store.write().get_mut(T::NAME) {
             //mark all for deletion
             for value in table.values_mut() {
-                mark_value_for_deletion::<T>(value);
+                value.0 = true;
             }
         }
         Ok(())
@@ -649,55 +598,6 @@ impl Database for MemDatabase {
         } else {
             None
         }
-    }
-
-    /// Execute a write operation with automatic commit/abort.
-    fn with_write_txn<F, R>(&self, f: F) -> eyre::Result<R>
-    where
-        F: FnOnce(&mut Self::TXMut<'_>) -> eyre::Result<R>,
-    {
-        let mut tx = self.write_txn()?;
-        let result = f(&mut tx)?;
-        tx.commit()?;
-        Ok(result)
-    }
-}
-
-#[self_referencing]
-struct TabAndGuard<T>
-where
-    T: Table,
-{
-    casper: PhantomData<T>,
-    table: Arc<BTreeMap<Vec<u8>, Vec<u8>>>,
-    #[borrows(table)]
-    #[covariant]
-    guard: RwLockReadGuard<'this, BTreeMap<Vec<u8>, Vec<u8>>>,
-}
-
-#[self_referencing]
-pub struct MemDBIter<T>
-where
-    T: Table,
-{
-    casper: PhantomData<T>,
-    table: TabAndGuard<T>,
-    #[borrows(table)]
-    #[not_covariant]
-    iter: Box<dyn Iterator<Item = (&'this Vec<u8>, &'this Vec<u8>)> + 'this>,
-}
-
-impl<T: Table> Iterator for MemDBIter<T> {
-    type Item = (T::Key, T::Value);
-
-    fn next(&mut self) -> Option<Self::Item> {
-        self.with_mut(|fields| {
-            fields.iter.next().map(|(key_bytes, value_bytes)| {
-                let key = decode_key(key_bytes);
-                let value = decode(value_bytes);
-                (key, value)
-            })
-        })
     }
 }
 
@@ -842,33 +742,32 @@ mod test {
 
         for (key, val) in (0..101).map(|i| (i, i.to_string())) {
             let v = txn.get::<TestTable>(&key).unwrap();
-            assert!(v.is_some(), "Value should be present within the transaction before commit");
             assert_eq!(
-                v.unwrap(),
+                v,
                 val,
                 "Value should match inserted value within the transaction before commit"
             );
         }
 
-        drop(txn);
+        txn.commit().expect("Failed to commit write txn");
 
         // values should be present after commit
         assert!(!db.is_empty::<TestTable>(), "Table should not be empty after commit");
 
         for (key, val) in (0..101).map(|i| (i, i.to_string())) {
             let v = db.get::<TestTable>(&key).unwrap();
-            assert!(v.is_some(), "Value should be present within the transaction before commit");
+            assert!(v.is_some(), "Value should be present after commit");
             assert_eq!(
                 v.unwrap(),
                 val,
-                "Value should match inserted value within the transaction before commit"
+                "Value should match inserted value after commit"
             );
         }
 
         // test deleting non-existent key — logically a no-op
         let mut txn2 = db.write_txn().unwrap();
         txn2.remove::<TestTable>(&999).expect("Failed to remove non-existent key");
-        drop(txn2);
+        txn2.commit().expect("Failed to commit write txn");
 
         // key 999 was never inserted, so get should return None
         assert!(
@@ -889,42 +788,39 @@ mod test {
         txn3.insert::<TestTable>(&200, &"two hundred".to_string())
             .expect("Failed to insert key 200");
         let val_in_txn = txn3.get::<TestTable>(&200).unwrap();
-        assert!(
-            val_in_txn.is_some(),
+        assert_eq!(
+            val_in_txn,
+            "two hundred".to_string(),
             "Value for key 200 should be available within the same transaction"
         );
 
         // test removing it as well
         txn3.remove::<TestTable>(&200).expect("Failed to remove key 200");
-        let val_after_removal_in_txn = txn3.get::<TestTable>(&200).unwrap();
+        let val_after_removal_in_txn = DbTx::get::<TestTable>(&txn3, &200).unwrap();
         assert!(
             val_after_removal_in_txn.is_none(),
             "Value for key 200 should not be available within the same transaction after removal"
         );
-        drop(txn3);
+        txn3.commit().expect("Failed to commit write txn");
 
         ////////////////////////////////////////////////////////////////////////
         // check insert after remove of same value within the same transaction
         ////////////////////////////////////////////////////////////////////////
         let mut txn4 = db.write_txn().unwrap();
         txn4.remove::<TestTable>(&50).expect("Failed to remove key 50");
-        let val_after_removal = txn4.get::<TestTable>(&50).unwrap();
+        let val_after_removal = DbTx::get::<TestTable>(&txn4, &50).unwrap();
         assert!(
             val_after_removal.is_none(),
             "Value for key 50 should not be available within the same transaction after removal"
         );
         txn4.insert::<TestTable>(&50, &"fifty".to_string()).expect("Failed to insert key 50");
         let val_after_reinsertion = txn4.get::<TestTable>(&50).unwrap();
-        assert!(
-            val_after_reinsertion.is_some(),
+        assert_eq!(
+            val_after_reinsertion,
+            "fifty".to_string(),
             "Value for key 50 should be available within the same transaction after reinsertion"
         );
-        assert_eq!(
-            val_after_reinsertion.unwrap(),
-            "fifty".to_string(),
-            "Value for key 50 should match reinserted value within the same transaction"
-        );
-        drop(txn4);
+        txn4.commit().expect("Failed to commit write txn");
 
         //also there after commit
         let val_after_commit = db.get::<TestTable>(&50).unwrap();
@@ -933,6 +829,112 @@ mod test {
             val_after_commit.unwrap(),
             "fifty".to_string(),
             "Value for key 50 should match reinserted value after commit"
+        );
+    }
+
+    #[test]
+    fn mem_txn_buffer_is_private_until_commit() {
+        let db = open_db();
+        db.insert::<TestTable>(&1, &"old".to_string()).expect("insert");
+
+        let mut txn_a = db.write_txn().unwrap();
+        txn_a.insert::<TestTable>(&1, &"new".to_string()).expect("insert");
+        let txn_b = db.read_txn().unwrap();
+        assert_eq!(
+            txn_b.get::<TestTable>(&1).unwrap(),
+            "old".to_string(),
+            "txnA's write must be invisible to txnB"
+        );
+        assert_eq!(
+            txn_a.get::<TestTable>(&1).unwrap(),
+            "new".to_string(),
+            "read-after-write must see the buffer"
+        );
+        txn_a.commit().expect("commit");
+        let txn_b2 = db.read_txn().unwrap();
+        assert_eq!(
+            txn_b2.get::<TestTable>(&1).unwrap(),
+            "new".to_string(),
+            "write must be visible after commit"
+        );
+    }
+
+    #[test]
+    fn mem_txn_buffer_discarded_on_drop() {
+        let db = open_db();
+        db.insert::<TestTable>(&1, &"original".to_string()).expect("insert");
+
+        let mut txn = db.write_txn().unwrap();
+        txn.insert::<TestTable>(&1, &"modified".to_string()).expect("insert");
+        drop(txn);
+
+        let txn2 = db.read_txn().unwrap();
+        assert_eq!(
+            txn2.get::<TestTable>(&1).unwrap(),
+            "original".to_string(),
+            "uncommitted write must be discarded on drop"
+        );
+    }
+
+    #[test]
+    fn mem_txn_insert_remove_insert_sequence() {
+        let db = open_db();
+        db.insert::<TestTable>(&1, &"v1".to_string()).expect("insert");
+
+        let mut txn = db.write_txn().unwrap();
+        txn.insert::<TestTable>(&1, &"v2".to_string()).expect("insert");
+        txn.remove::<TestTable>(&1).expect("remove");
+        txn.insert::<TestTable>(&1, &"v3".to_string()).expect("insert");
+        assert_eq!(
+            txn.get::<TestTable>(&1).unwrap(),
+            "v3".to_string(),
+            "last operation wins in buffer"
+        );
+        txn.commit().expect("commit");
+        assert_eq!(
+            db.get::<TestTable>(&1).unwrap(),
+            Some("v3".to_string()),
+            "last operation wins after commit"
+        );
+    }
+
+    #[test]
+    fn mem_txn_remove_nonexistent_creates_tombstone() {
+        let db = open_db();
+
+        let mut txn = db.write_txn().unwrap();
+        txn.remove::<TestTable>(&42).expect("remove");
+        assert_eq!(
+            DbTx::get::<TestTable>(&txn, &42).unwrap(),
+            None,
+            "buffer tombstone must shadow the store"
+        );
+        assert!(
+            txn.is_tombstoned::<TestTable>(&42),
+            "buffer tombstone must be visible via is_tombstoned"
+        );
+        txn.commit().expect("commit");
+        assert!(
+            db.is_tombstoned::<TestTable>(&42),
+            "tombstone must be merged to the shared store"
+        );
+    }
+
+    #[test]
+    fn mem_txn_iter_merges_buffer_and_store() {
+        let db = open_db();
+        db.insert::<TestTable>(&1, &"a".to_string()).expect("insert");
+        db.insert::<TestTable>(&3, &"c".to_string()).expect("insert");
+
+        let mut txn = db.write_txn().unwrap();
+        txn.insert::<TestTable>(&2, &"b".to_string()).expect("insert");
+        txn.remove::<TestTable>(&1).expect("remove");
+
+        let items: Vec<_> = txn.iter::<TestTable>().collect();
+        assert_eq!(
+            items,
+            vec![(2, "b".to_string()), (3, "c".to_string())],
+            "buffer merge must add 2 and skip tombstoned 1"
         );
     }
 }

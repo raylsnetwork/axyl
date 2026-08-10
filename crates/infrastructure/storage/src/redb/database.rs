@@ -151,8 +151,6 @@ impl DbTx for ReDbTx {
         }
         last
     }
-
-    fn disable_long_read_safety(&self) {}
 }
 
 pub struct ReDbTxMut {
@@ -284,8 +282,6 @@ impl DbTx for ReDbTxMut {
         }
         last
     }
-
-    fn disable_long_read_safety(&self) {}
 }
 
 impl DbTxMut for ReDbTxMut {

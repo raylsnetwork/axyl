@@ -4,7 +4,6 @@ use std::{
     fmt::Debug,
     future::Future,
     iter::Peekable,
-    marker::PhantomData,
     sync::{
         atomic::{AtomicUsize, Ordering as AtomicOrdering},
         mpsc::{self, Receiver, Sender},
@@ -20,10 +19,14 @@ use crate::{
     tables::ColdBatchLocations,
 };
 
-use crate::mem_db::{MemDatabase, MemDbTx, MemDbTxMut};
+use crate::{
+    mem_db::{MemDatabase, MemTxn},
+    write_buffer::{PersistClear, PersistInsert, PersistOp, PersistRemove, PersistRemoveBatch},
+    write_lock::{WriteLockGuard, WriteLockManager},
+};
 use prometheus::{default_registry, register_int_gauge_with_registry, IntGauge, Registry};
 use rayls_infrastructure_types::{
-    decode_key, encode, DBIter, DBRawIter, Database, DbTx, DbTxMut, Table,
+    decode_key, DBIter, DBRawIter, Database, DbTx, DbTxMut, Table,
 };
 use tokio::sync::oneshot::{self, error::TryRecvError};
 
@@ -234,9 +237,500 @@ fn merge_cold_raw<'i, T: Table>(
 const CACHE_KEEP_TIME_SECS: u64 = 60;
 const MAX_CACHE_SIZE: usize = 10000;
 
+/// Manage the persistent DB in a background thread with daily compaction.
+/// Drop the mem overlay for committed inserts older than `CACHE_KEEP_TIME_SECS` or beyond
+/// `MAX_CACHE_SIZE`. Only safe for committed rows: it removes them from the mem layer.
+fn evict_committed<DB: Database>(
+    committed_inserts: &mut Vec<(Instant, Box<dyn PersistOp<DB>>)>,
+    mem_db: &MemDatabase,
+) {
+    let total_count = committed_inserts.len();
+    let mut remove_count: usize = 0;
+    for (instant, insert) in committed_inserts.iter() {
+        if instant.elapsed() > Duration::from_secs(CACHE_KEEP_TIME_SECS)
+            || total_count - remove_count > MAX_CACHE_SIZE
+        {
+            insert.clear_mem(mem_db);
+            remove_count += 1;
+            continue;
+        }
+        break;
+    }
+    committed_inserts.drain(..remove_count);
+}
+
+/// Depth at which the writer queue is treated as a backlog: `db_run` warns (rate-limited) and
+/// data-plane enqueues start pacing, so the imbalance never surfaces as a multi-minute `persist`
+/// drain at the next epoch boundary.
+const QUEUE_HIGH_WATER_MARK: usize = 10_000;
+const QUEUE_LAG_WARN_INTERVAL: Duration = Duration::from_secs(10);
+
+/// Pause paid by each insert/remove/clear enqueue while the queue is above
+/// [`QUEUE_HIGH_WATER_MARK`].
+///
+/// Soft backpressure: a slow inner DB surfaces as gradual producer slowdown instead of a
+/// network-wide stall at the deterministic boundary `persist`. Pacing can lag the node into
+/// demotion (recoverable; the boundary stall is not), and the sleep may land on an async worker
+/// thread (the `Database` write API is sync) - the accepted cost in an already-degraded regime.
+/// Control messages (persist barrier, shutdown) never pace.
+const QUEUE_PACE_SLEEP: Duration = Duration::from_millis(1);
+
+/// Drain time past which a `persist`/`sync_persist` is logged at `warn` rather than `debug`.
+const PERSIST_SLOW_WARN: Duration = Duration::from_secs(1);
+
+/// A [`CommitTxn`] sender that tracks the writer queue's depth: every enqueue bumps a shared
+/// counter `db_run` decrements as it drains, feeding the depth gauge and the
+/// [`QUEUE_HIGH_WATER_MARK`] pacing.
+struct QueueSender<DB: Database> {
+    tx: Sender<CommitTxn<DB>>,
+    depth: Arc<AtomicUsize>,
+}
+
+impl<DB: Database> Clone for QueueSender<DB> {
+    fn clone(&self) -> Self {
+        Self { tx: self.tx.clone(), depth: Arc::clone(&self.depth) }
+    }
+}
+
+impl<DB: Database> Debug for QueueSender<DB> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "QueueSender(depth: {})", self.depth())
+    }
+}
+
+impl<DB: Database> QueueSender<DB> {
+    /// Enqueues a writer message; data-plane messages pace once the depth is past
+    /// [`QUEUE_HIGH_WATER_MARK`] (see [`QUEUE_PACE_SLEEP`]).
+    fn send(&self, msg: CommitTxn<DB>) -> Result<(), mpsc::SendError<CommitTxn<DB>>> {
+        if matches!(msg, CommitTxn::Batch(_)) && self.depth() > QUEUE_HIGH_WATER_MARK {
+            std::thread::sleep(QUEUE_PACE_SLEEP);
+        }
+        // Bump before the send so the depth never reads low mid-flight. Relaxed: an advisory
+        // gauge, not a synchronization point.
+        self.depth.fetch_add(1, AtomicOrdering::Relaxed);
+        self.tx.send(msg)
+    }
+
+    /// Returns the writer messages enqueued but not yet applied by the background thread.
+    fn depth(&self) -> usize {
+        self.depth.load(AtomicOrdering::Relaxed)
+    }
+}
+
+/// Registers a metric on the process scrape registry, falling back to a private unscraped one on
+/// double registration (a second stack in one process, as tests build).
+pub(crate) fn register_metric_or_unscraped<T>(
+    register: impl Fn(&Registry) -> Result<T, prometheus::Error>,
+) -> T {
+    register(default_registry())
+        .unwrap_or_else(|_| register(&Registry::new()).expect("metric on a fresh registry"))
+}
+
+/// Returns the writer-queue-depth gauge; `db_run` samples it on every dequeue, so a dashboard
+/// shows the backlog ramp before it crosses the warn threshold.
+fn writer_queue_depth_gauge() -> IntGauge {
+    register_metric_or_unscraped(|registry| {
+        register_int_gauge_with_registry!(
+            "layered_db_writer_queue_depth",
+            "Consensus DB layered writer messages enqueued but not yet applied.",
+            registry,
+        )
+    })
+}
+
+/// Logs a `persist`/`sync_persist` drain: `warn` past [`PERSIST_SLOW_WARN`] (a backlog that stalled
+/// the barrier), `debug` otherwise. `depth` is the queue depth observed when the barrier enqueued.
+fn log_persist_latency(elapsed: Duration, depth: usize) {
+    if elapsed >= PERSIST_SLOW_WARN {
+        tracing::warn!(
+            target: "storage",
+            ?elapsed,
+            depth,
+            "consensus DB persist drained a slow writer backlog"
+        );
+    } else {
+        tracing::debug!(target: "storage", ?elapsed, depth, "consensus DB persist");
+    }
+}
+
+/// Applies commit batches to the persistent backend, one short-lived write transaction per
+/// batch, so a commit's ops land atomically and a failed batch can never poison a later one.
+///
+/// Failed batches stay in the mem overlay (the mem layer is the source of truth until the batch
+/// applies) and surface through the next `persist` barrier, exactly like a failed message did.
+fn db_run<DB: Database>(
+    db: DB,
+    mem_db: MemDatabase,
+    rx: Receiver<CommitTxn<DB>>,
+    depth: Arc<AtomicUsize>,
+) {
+    let mut last_compact = Instant::now();
+    let queue_depth_gauge = writer_queue_depth_gauge();
+    let mut last_lag_warn: Option<Instant> = None;
+
+    let mut committed_inserts: Vec<(Instant, Box<dyn PersistOp<DB>>)> = Vec::with_capacity(1000);
+    // last write/commit failure since the previous CaughtUp, reported by the next persist
+    let mut pending_write_error: Option<String> = None;
+    if let Err(e) = db.compact() {
+        tracing::error!(target: "layered_db_runner", "DB ERROR compacting DB on startup (background): {e}");
+    }
+    while let Ok(msg) = rx.recv() {
+        // Depth after taking this message off the queue (fetch_sub returns the count including it).
+        let queued = depth.fetch_sub(1, AtomicOrdering::Relaxed).saturating_sub(1);
+        queue_depth_gauge.set(queued as i64);
+        if queued > QUEUE_HIGH_WATER_MARK
+            && last_lag_warn.is_none_or(|at| at.elapsed() >= QUEUE_LAG_WARN_INTERVAL)
+        {
+            last_lag_warn = Some(Instant::now());
+            tracing::warn!(target: "storage", depth = queued, "layered DB writer queue backlog");
+        }
+        match msg {
+            CommitTxn::Batch(ops) => {
+                if ops.is_empty() {
+                    continue;
+                }
+                let mut txn = match db.write_txn() {
+                    Ok(txn) => txn,
+                    Err(e) => {
+                        tracing::error!(target: "layered_db_runner", "DB ERROR getting write txn (background): {e}");
+                        pending_write_error = Some(format!("write txn: {e}"));
+                        continue;
+                    }
+                };
+                let applied = ops.iter().try_for_each(|op| op.apply(&mut txn, &mem_db));
+                match applied {
+                    Ok(()) => match txn.commit() {
+                        Ok(()) => {
+                            for op in ops {
+                                committed_inserts.push((Instant::now(), op));
+                            }
+                            // Rayls: limit layer growth between commits
+                            if committed_inserts.len() > MAX_CACHE_SIZE * 2 {
+                                evict_committed(&mut committed_inserts, &mem_db);
+                            }
+                        }
+                        // surface via persist instead of aborting; rows stay in mem, not lost
+                        Err(e) => {
+                            tracing::error!(target: "layered_db_runner", "consensus DB commit failed: {e}");
+                            pending_write_error = Some(format!("commit: {e}"));
+                        }
+                    },
+                    // the batch is abandoned: rows stay in mem (not the eviction cache) so they
+                    // are not lost, and the error is surfaced by the next persist
+                    Err(e) => {
+                        tracing::error!(target: "layered_db_runner", "consensus DB batch failed: {e}");
+                        pending_write_error = Some(format!("batch: {e}"));
+                    }
+                }
+            }
+            // NOTE: proves prior messages were applied, not that an open shared txn committed.
+            // Safe at shutdown because consensus writers are torn down before persist runs.
+            CommitTxn::CaughtUp(tx) => {
+                let reply: Result<(), String> = match pending_write_error.take() {
+                    Some(e) => Err(e),
+                    None => Ok(()),
+                };
+                let _ = tx.send(reply);
+            }
+            CommitTxn::Shutdown => break,
+        }
+        if last_compact.elapsed() > Duration::from_secs(86_400) {
+            last_compact = Instant::now();
+            if let Err(e) = db.compact() {
+                tracing::error!(target: "layered_db_runner", "DB ERROR compacting DB (background): {e}");
+            }
+        }
+    }
+    tracing::info!(target: "layered_db_runner", "Layered DB thread Shutdown complete");
+}
+
+/// A write transaction over the layered database.
+///
+/// Writes go to a private buffer (invisible to every other transaction) until `commit` merges
+/// them into the shared mem overlay and hands the batch to the background writer. Reads walk
+/// buffer -> mem overlay -> persistent snapshot -> cold tier, so a transaction sees its own
+/// uncommitted writes and every earlier commit, but never an in-flight peer's buffer.
+pub struct WriteTxn<'a, DB: Database> {
+    mem_txn: MemTxn<'a>,
+    /// The typed ops of this transaction, applied to the persistent backend as one batch.
+    pending: Vec<Box<dyn PersistOp<DB>>>,
+    persistent_snapshot: DB::TX<'a>,
+    locks: Vec<WriteLockGuard>,
+    lock_manager: Arc<WriteLockManager>,
+    tx: QueueSender<DB>,
+    /// The cold tier reads fall through to on a hot miss, when attached.
+    #[cfg(feature = "cold-storage")]
+    cold: Option<&'a ColdStore>,
+}
+
+impl<'a, DB: Database> Debug for WriteTxn<'a, DB> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "WriteTxn")
+    }
+}
+
+impl<'a, DB: Database> WriteTxn<'a, DB> {
+    /// Locks the given table, so this transaction's reads of it cannot be interleaved by another
+    /// writer's reads of it. Held until this transaction is dropped or commits.
+    /// Not yet wired into consensus logic (Phase 4); exercised by tests.
+    #[allow(dead_code)]
+    pub(crate) fn lock(&mut self, table_name: &'static str) -> WriteLockGuard {
+        self.locks.push(self.lock_manager.lock(table_name));
+        self.locks.last().unwrap().clone()
+    }
+
+    /// Opens a cold read transaction over the attached tier, resolving the auxiliary index on
+    /// this transaction's own hot view (so an index row written this session is visible).
+    #[cfg(feature = "cold-storage")]
+    fn cold_tx(&self) -> Option<ColdTx<'_>> {
+        let cold = self.cold?;
+        Some(ColdTx::new(cold, |digest| self.get::<ColdBatchLocations>(digest)))
+    }
+
+    /// Serves `key` from the cold tier after a hot miss; `None` when no cold layer is attached.
+    #[cfg(feature = "cold-storage")]
+    fn cold_get<T: Table>(&self, key: &T::Key) -> eyre::Result<Option<T::Value>> {
+        match self.cold_tx() {
+            Some(tx) => tx.get::<T>(key),
+            None => Ok(None),
+        }
+    }
+
+    /// Cold storage compiled out: a hot miss is final.
+    #[cfg(not(feature = "cold-storage"))]
+    fn cold_get<T: Table>(&self, _key: &T::Key) -> eyre::Result<Option<T::Value>> {
+        Ok(None)
+    }
+
+    /// Serves `key`'s raw jar bytes from the cold tier after a hot miss.
+    #[cfg(feature = "cold-storage")]
+    fn cold_raw_get<T: Table>(&self, key: &T::Key) -> eyre::Result<Option<Cow<'_, [u8]>>> {
+        match self.cold_tx() {
+            Some(tx) => Ok(tx.raw_get::<T>(key)?.map(|bytes| Cow::Owned(bytes.into_owned()))),
+            None => Ok(None),
+        }
+    }
+
+    /// Cold storage compiled out: a hot miss is final.
+    #[cfg(not(feature = "cold-storage"))]
+    fn cold_raw_get<T: Table>(&self, _key: &T::Key) -> eyre::Result<Option<Cow<'_, [u8]>>> {
+        Ok(None)
+    }
+
+    /// Chains the cold-ordered stream for `T` beneath `hot` (see [`merge_cold`]).
+    #[cfg(feature = "cold-storage")]
+    fn chain_cold<'i, T: Table>(
+        &'i self,
+        hot: DBIter<'i, T>,
+        from: Option<&T::Key>,
+        reverse: bool,
+    ) -> DBIter<'i, T> {
+        merge_cold::<T>(self.cold_tx(), hot, from, reverse)
+    }
+
+    /// Cold storage compiled out: iteration is hot-only.
+    #[cfg(not(feature = "cold-storage"))]
+    fn chain_cold<'i, T: Table>(
+        &'i self,
+        hot: DBIter<'i, T>,
+        _from: Option<&T::Key>,
+        _reverse: bool,
+    ) -> DBIter<'i, T> {
+        hot
+    }
+
+    /// Chains the cold-ordered raw stream for `T` beneath `hot` (see [`merge_cold_raw`]).
+    #[cfg(feature = "cold-storage")]
+    fn chain_cold_raw<'i, T: Table>(
+        &'i self,
+        hot: DBRawIter<'i>,
+        from: Option<&T::Key>,
+        reverse: bool,
+    ) -> DBRawIter<'i> {
+        merge_cold_raw::<T>(self.cold_tx(), hot, from, reverse)
+    }
+
+    /// Cold storage compiled out: iteration is hot-only.
+    #[cfg(not(feature = "cold-storage"))]
+    fn chain_cold_raw<'i, T: Table>(
+        &'i self,
+        hot: DBRawIter<'i>,
+        _from: Option<&T::Key>,
+        _reverse: bool,
+    ) -> DBRawIter<'i> {
+        hot
+    }
+}
+
+impl<'a, DB: Database> DbTx for WriteTxn<'a, DB> {
+    fn get<T: Table>(&self, key: &T::Key) -> eyre::Result<Option<T::Value>> {
+        // 1. private buffer (read-after-write): a buffered remove shadows every tier
+        if let Some(val) = self.mem_txn.buffer_get::<T>(key) {
+            return Ok(Some(val));
+        }
+        if self.mem_txn.buffer_is_tombstoned::<T>(key) == Some(true) {
+            return Ok(None);
+        }
+        // 2. shared mem overlay (tombstone-aware): a committed remove shadows the persistent
+        //    tier, and only the archived copy may still serve the row.
+        if let Some(val) = self.mem_txn.get::<T>(key)? {
+            return Ok(Some(val));
+        }
+        if self.mem_txn.is_tombstoned::<T>(key) {
+            return self.cold_get::<T>(key);
+        }
+        // 3. persistent snapshot
+        if let Some(val) = self.persistent_snapshot.get::<T>(key)? {
+            return Ok(Some(val));
+        }
+        // 4. cold tier
+        self.cold_get::<T>(key)
+    }
+
+    fn raw_get<T: Table>(&self, key: &T::Key) -> eyre::Result<Option<Cow<'_, [u8]>>> {
+        // Same fallthrough as `get`, but raw bytes: the shared mem overlay stores them as-is, so
+        // the archival path skips the decode/re-encode round trip.
+        if let Some(bytes) = self.mem_txn.buffer_raw_get::<T>(key) {
+            return Ok(Some(Cow::Owned(bytes)));
+        }
+        if self.mem_txn.buffer_is_tombstoned::<T>(key) == Some(true) {
+            return Ok(None);
+        }
+        if let Some((removed, raw)) = self.mem_txn.get_raw::<T>(key) {
+            if !removed {
+                return Ok(Some(Cow::Owned(raw)));
+            }
+            return self.cold_raw_get::<T>(key);
+        }
+        match self.persistent_snapshot.raw_get::<T>(key)? {
+            Some(bytes) => Ok(Some(bytes)),
+            None => self.cold_raw_get::<T>(key),
+        }
+    }
+
+    fn iter<T: Table>(&self) -> DBIter<'_, T> {
+        let db_iter = self.persistent_snapshot.iter::<T>();
+        let mem_iter = self.mem_txn.iter::<T>();
+        let is_tombstoned: Box<dyn Fn(&T::Key) -> bool + '_> =
+            Box::new(|k| self.mem_txn.is_tombstoned::<T>(k));
+        let hot: DBIter<'_, T> =
+            Box::new(MergeJoinIter::<T>::forward(db_iter, mem_iter, is_tombstoned));
+        self.chain_cold::<T>(hot, None, false)
+    }
+
+    fn raw_iter<T: Table>(&self) -> DBRawIter<'_> {
+        let db_iter = self.persistent_snapshot.raw_iter::<T>();
+        let mem_iter = self.mem_txn.raw_iter::<T>();
+        let is_tombstoned: Box<dyn Fn(&T::Key) -> bool + '_> =
+            Box::new(|k| self.mem_txn.is_tombstoned::<T>(k));
+        let hot: DBRawIter<'_> =
+            Box::new(MergeJoinRawIter::<T>::forward(db_iter, mem_iter, is_tombstoned));
+        self.chain_cold_raw::<T>(hot, None, false)
+    }
+
+    fn skip_to<T: Table>(&self, key: &T::Key) -> eyre::Result<DBIter<'_, T>> {
+        let db_iter = self.persistent_snapshot.skip_to::<T>(key)?;
+        let mem_iter = self.mem_txn.skip_to::<T>(key)?;
+        let is_tombstoned: Box<dyn Fn(&T::Key) -> bool + '_> =
+            Box::new(|k| self.mem_txn.is_tombstoned::<T>(k));
+        let hot: DBIter<'_, T> =
+            Box::new(MergeJoinIter::<T>::forward(db_iter, mem_iter, is_tombstoned));
+        Ok(self.chain_cold::<T>(hot, Some(key), false))
+    }
+
+    fn raw_skip_to<T: Table>(&self, key: &T::Key) -> eyre::Result<DBRawIter<'_>> {
+        let db_iter = self.persistent_snapshot.raw_skip_to::<T>(key)?;
+        let mem_iter = self.mem_txn.raw_skip_to::<T>(key)?;
+        let is_tombstoned: Box<dyn Fn(&T::Key) -> bool + '_> =
+            Box::new(|k| self.mem_txn.is_tombstoned::<T>(k));
+        let hot: DBRawIter<'_> =
+            Box::new(MergeJoinRawIter::<T>::forward(db_iter, mem_iter, is_tombstoned));
+        Ok(self.chain_cold_raw::<T>(hot, Some(key), false))
+    }
+
+    fn reverse_iter<T: Table>(&self) -> DBIter<'_, T> {
+        let db_iter = self.persistent_snapshot.reverse_iter::<T>();
+        let mem_iter = self.mem_txn.reverse_iter::<T>();
+        let is_tombstoned: Box<dyn Fn(&T::Key) -> bool + '_> =
+            Box::new(|k| self.mem_txn.is_tombstoned::<T>(k));
+        let hot: DBIter<'_, T> =
+            Box::new(MergeJoinIter::<T>::reverse(db_iter, mem_iter, is_tombstoned));
+        self.chain_cold::<T>(hot, None, true)
+    }
+
+    fn reverse_raw_iter<T: Table>(&self) -> DBRawIter<'_> {
+        let db_iter = self.persistent_snapshot.reverse_raw_iter::<T>();
+        let mem_iter = self.mem_txn.reverse_raw_iter::<T>();
+        let is_tombstoned: Box<dyn Fn(&T::Key) -> bool + '_> =
+            Box::new(|k| self.mem_txn.is_tombstoned::<T>(k));
+        let hot: DBRawIter<'_> =
+            Box::new(MergeJoinRawIter::<T>::reverse(db_iter, mem_iter, is_tombstoned));
+        self.chain_cold_raw::<T>(hot, None, true)
+    }
+
+    fn last_record<T: Table>(&self) -> Option<(T::Key, T::Value)> {
+        self.reverse_iter::<T>().next()
+    }
+
+    fn record_prior_to<T: Table>(&self, key: &T::Key) -> Option<(T::Key, T::Value)> {
+        self.iter::<T>().take_while(|(k, _)| k < key).last()
+    }
+}
+
+impl<'a, DB: Database> DbTxMut for WriteTxn<'a, DB> {
+    fn insert<T: Table>(&mut self, key: &T::Key, value: &T::Value) -> eyre::Result<()> {
+        self.mem_txn.insert::<T>(key, value)?;
+        self.pending.push(Box::new(PersistInsert::<T> { key: key.clone(), value: value.clone() }));
+        Ok(())
+    }
+
+    fn remove<T: Table>(&mut self, key: &T::Key) -> eyre::Result<()> {
+        self.mem_txn.remove::<T>(key)?;
+        self.pending.push(Box::new(PersistRemove::<T> { key: key.clone() }));
+        Ok(())
+    }
+
+    fn evict_persistent_batch<T: Table>(&mut self, keys: &[T::Key]) -> eyre::Result<()> {
+        if keys.is_empty() {
+            return Ok(());
+        }
+        // Hard-delete (no tombstone): a tombstone would shadow the cold fall-through. The whole
+        // set is ONE writer message; a per-row message on a whole-epoch prune is pure overhead.
+        for key in keys {
+            self.mem_txn.hard_delete::<T>(key);
+        }
+        self.pending.push(Box::new(PersistRemoveBatch::<T> { keys: keys.to_vec() }));
+        Ok(())
+    }
+
+    fn clear_table<T: Table>(&mut self) -> eyre::Result<()> {
+        self.mem_txn.clear_table::<T>()?;
+        self.pending.push(Box::new(PersistClear::<T> { _phantom: std::marker::PhantomData }));
+        Ok(())
+    }
+
+    /// Applies the private buffer to the shared mem overlay, then hands the batch to the
+    /// background writer. The persistent snapshot is dropped before the locks so the backing
+    /// store's read slot is released first; locks release with `self` after the snapshot.
+    fn commit(mut self) -> eyre::Result<()> {
+        let batch = std::mem::take(&mut self.pending);
+        self.mem_txn.commit()?;
+        drop(self.persistent_snapshot);
+        self.locks.clear();
+        if batch.is_empty() {
+            return Ok(());
+        }
+        self.tx.send(CommitTxn::Batch(batch)).map_err(|_| eyre::eyre!("DB thread gone, FATAL!"))
+    }
+}
+
+/// A read transaction over the layered database: a snapshot of the shared mem overlay plus a
+/// persistent-backend read txn, with the cold tier falling through on a hot miss. Reads are
+/// tombstone-aware: a committed remove hides the persistent row, while the archived copy may
+/// still serve.
 pub struct LayeredDbTx<'a, DB: Database> {
-    mem_db: MemDbTx<'a>,
-    db: DB::TX<'a>,
+    mem_txn: MemTxn<'a>,
+    persistent_snapshot: DB::TX<'a>,
     /// The cold tier reads fall through to on a hot miss, when attached.
     #[cfg(feature = "cold-storage")]
     cold: Option<&'a ColdStore>,
@@ -289,7 +783,7 @@ impl<'a, DB: Database> LayeredDbTx<'a, DB> {
     /// side starts at the floor by positioned lookup and steps backwards one seek per row
     /// (`record_prior_to`), so a deep floor never pays for the rows above it.
     pub fn reverse_skip_to<T: Table>(&self, key: &T::Key) -> eyre::Result<DBIter<'_, T>> {
-        let db = &self.db;
+        let db = &self.persistent_snapshot;
         let db_first = db
             .get::<T>(key)?
             .map(|value| (key.clone(), value))
@@ -297,18 +791,18 @@ impl<'a, DB: Database> LayeredDbTx<'a, DB> {
         let db_iter: DBIter<'_, T> =
             Box::new(std::iter::successors(db_first, move |(k, _)| db.record_prior_to::<T>(k)));
 
-        let mem = &self.mem_db;
+        let mem = &self.mem_txn;
         let mem_first = if mem.is_tombstoned::<T>(key) {
             None
         } else {
-            mem.get_no_marked_check::<T>(key).map(|(_, value)| (key.clone(), value))
+            mem.get::<T>(key)?.map(|value| (key.clone(), value))
         }
         .or_else(|| mem.record_prior_to::<T>(key));
         let mem_iter: DBIter<'_, T> =
             Box::new(std::iter::successors(mem_first, move |(k, _)| mem.record_prior_to::<T>(k)));
 
         let is_tombstoned: Box<dyn Fn(&T::Key) -> bool + '_> =
-            Box::new(|k| self.mem_db.is_tombstoned::<T>(k));
+            Box::new(|k| self.mem_txn.is_tombstoned::<T>(k));
         let hot: DBIter<'_, T> =
             Box::new(MergeJoinIter::<T>::reverse(db_iter, mem_iter, is_tombstoned));
         Ok(self.chain_cold::<T>(hot, Some(key), true))
@@ -369,91 +863,90 @@ impl<'a, DB: Database> DbTx for LayeredDbTx<'a, DB> {
     fn get<T: Table>(&self, key: &T::Key) -> eyre::Result<Option<T::Value>> {
         // The hot answer (tombstone-aware mem snapshot, then the persistent tier) wins; only a
         // full hot miss consults the cold tier, so a row removed from hot still serves its
-        // archived copy.
-        let hot = if self.mem_db.is_tombstoned::<T>(key) {
-            None
-        } else if let Some((_, val)) = self.mem_db.get_no_marked_check::<T>(key) {
-            Some(val)
-        } else {
-            self.db.get::<T>(key)?
-        };
-        match hot {
-            Some(val) => Ok(Some(val)),
-            None => self.cold_get::<T>(key),
+        // archived copy. A committed tombstone hides the persistent tier: the snapshot must NOT
+        // resurrect the row below it.
+        if let Some(val) = self.mem_txn.get::<T>(key)? {
+            return Ok(Some(val));
         }
+        if self.mem_txn.is_tombstoned::<T>(key) {
+            return self.cold_get::<T>(key);
+        }
+        if let Some(val) = self.persistent_snapshot.get::<T>(key)? {
+            return Ok(Some(val));
+        }
+        self.cold_get::<T>(key)
     }
 
     fn raw_get<T: Table>(&self, key: &T::Key) -> eyre::Result<Option<Cow<'_, [u8]>>> {
-        if self.mem_db.is_tombstoned::<T>(key) {
+        // A mem hit holds the raw bytes (no re-encode); a mem tombstone hides the persistent
+        // tier, the archived copy may still serve.
+        if let Some((removed, raw)) = self.mem_txn.get_raw::<T>(key) {
+            if !removed {
+                return Ok(Some(Cow::Owned(raw)));
+            }
             return self.cold_raw_get::<T>(key);
         }
-        // A mem-overlay hit holds the typed value, so it must re-encode; the common archival path
-        // (old rows already evicted from the overlay) falls through to the inner backend's
-        // zero-copy raw read.
-        if let Some((_, val)) = self.mem_db.get_no_marked_check::<T>(key) {
-            return Ok(Some(Cow::Owned(encode(&val))));
-        }
-        match self.db.raw_get::<T>(key)? {
+        match self.persistent_snapshot.raw_get::<T>(key)? {
             Some(bytes) => Ok(Some(bytes)),
             None => self.cold_raw_get::<T>(key),
         }
     }
 
     fn iter<T: Table>(&self) -> DBIter<'_, T> {
-        let db_iter = self.db.iter::<T>();
-        let mem_iter = self.mem_db.iter::<T>();
+        let db_iter = self.persistent_snapshot.iter::<T>();
+        let mem_iter = self.mem_txn.iter::<T>();
         let is_tombstoned: Box<dyn Fn(&T::Key) -> bool + '_> =
-            Box::new(|k| self.mem_db.is_tombstoned::<T>(k));
+            Box::new(|k| self.mem_txn.is_tombstoned::<T>(k));
         let hot: DBIter<'_, T> =
             Box::new(MergeJoinIter::<T>::forward(db_iter, mem_iter, is_tombstoned));
         self.chain_cold::<T>(hot, None, false)
     }
 
     fn raw_iter<T: Table>(&self) -> DBRawIter<'_> {
-        let db_iter = self.db.raw_iter::<T>();
-        let mem_iter = self.mem_db.raw_iter::<T>();
+        let db_iter = self.persistent_snapshot.raw_iter::<T>();
+        let mem_iter = self.mem_txn.raw_iter::<T>();
         let is_tombstoned: Box<dyn Fn(&T::Key) -> bool + '_> =
-            Box::new(|k| self.mem_db.is_tombstoned::<T>(k));
+            Box::new(|k| self.mem_txn.is_tombstoned::<T>(k));
         let hot: DBRawIter<'_> =
             Box::new(MergeJoinRawIter::<T>::forward(db_iter, mem_iter, is_tombstoned));
         self.chain_cold_raw::<T>(hot, None, false)
     }
 
     fn skip_to<T: Table>(&self, key: &T::Key) -> eyre::Result<DBIter<'_, T>> {
-        let db_iter = self.db.skip_to::<T>(key)?;
-        let mem_iter = self.mem_db.skip_to::<T>(key)?;
+        let db_iter = self.persistent_snapshot.skip_to::<T>(key)?;
+        let mem_iter = self.mem_txn.skip_to::<T>(key)?;
         let is_tombstoned: Box<dyn Fn(&T::Key) -> bool + '_> =
-            Box::new(|k| self.mem_db.is_tombstoned::<T>(k));
+            Box::new(|k| self.mem_txn.is_tombstoned::<T>(k));
         let hot: DBIter<'_, T> =
             Box::new(MergeJoinIter::<T>::forward(db_iter, mem_iter, is_tombstoned));
         Ok(self.chain_cold::<T>(hot, Some(key), false))
     }
 
     fn raw_skip_to<T: Table>(&self, key: &T::Key) -> eyre::Result<DBRawIter<'_>> {
-        let db_iter = self.db.raw_skip_to::<T>(key)?;
-        let mem_iter = self.mem_db.raw_skip_to::<T>(key)?;
+        let db_iter = self.persistent_snapshot.raw_skip_to::<T>(key)?;
+        let mem_iter = self.mem_txn.raw_skip_to::<T>(key)?;
         let is_tombstoned: Box<dyn Fn(&T::Key) -> bool + '_> =
-            Box::new(|k| self.mem_db.is_tombstoned::<T>(k));
+            Box::new(|k| self.mem_txn.is_tombstoned::<T>(k));
         let hot: DBRawIter<'_> =
             Box::new(MergeJoinRawIter::<T>::forward(db_iter, mem_iter, is_tombstoned));
         Ok(self.chain_cold_raw::<T>(hot, Some(key), false))
     }
 
     fn reverse_iter<T: Table>(&self) -> DBIter<'_, T> {
-        let db_iter = self.db.reverse_iter::<T>();
-        let mem_iter = self.mem_db.reverse_iter::<T>();
+        let db_iter = self.persistent_snapshot.reverse_iter::<T>();
+        let mem_iter = self.mem_txn.reverse_iter::<T>();
         let is_tombstoned: Box<dyn Fn(&T::Key) -> bool + '_> =
-            Box::new(|k| self.mem_db.is_tombstoned::<T>(k));
+            Box::new(|k| self.mem_txn.is_tombstoned::<T>(k));
         let hot: DBIter<'_, T> =
             Box::new(MergeJoinIter::<T>::reverse(db_iter, mem_iter, is_tombstoned));
         self.chain_cold::<T>(hot, None, true)
     }
 
     fn reverse_raw_iter<T: Table>(&self) -> DBRawIter<'_> {
-        let db_iter = self.db.reverse_raw_iter::<T>();
-        let mem_iter = self.mem_db.reverse_raw_iter::<T>();
+        let db_iter = self.persistent_snapshot.reverse_raw_iter::<T>();
+        let mem_iter = self.mem_txn.reverse_raw_iter::<T>();
         let is_tombstoned: Box<dyn Fn(&T::Key) -> bool + '_> =
-            Box::new(|k| self.mem_db.is_tombstoned::<T>(k));
+            Box::new(|k| self.mem_txn.is_tombstoned::<T>(k));
         let hot: DBRawIter<'_> =
             Box::new(MergeJoinRawIter::<T>::reverse(db_iter, mem_iter, is_tombstoned));
         self.chain_cold_raw::<T>(hot, None, true)
@@ -466,350 +959,26 @@ impl<'a, DB: Database> DbTx for LayeredDbTx<'a, DB> {
     fn record_prior_to<T: Table>(&self, key: &T::Key) -> Option<(T::Key, T::Value)> {
         self.iter::<T>().take_while(|(k, _)| k < key).last()
     }
-
-    fn disable_long_read_safety(&self) {
-        // only the mdbx layer enforces a read-txn timeout; forward to the held
-        // inner txn so every cursor derived from it runs exempt. mem has none.
-        self.db.disable_long_read_safety();
-    }
 }
 
-pub struct LayeredDbTxMut<'a, DB: Database> {
-    mem_db: MemDbTxMut<'a>,
-    _db: DB,
-    tx: QueueSender<DB>,
+/// Messages handled by the background writer thread.
+enum CommitTxn<DB: Database> {
+    /// One commit's operations, applied to the persistent backend in a short-lived write
+    /// transaction so they land atomically.
+    Batch(Vec<Box<dyn PersistOp<DB>>>),
+    /// Durability barrier: replies after every earlier batch has been applied (or failed).
+    CaughtUp(oneshot::Sender<Result<(), String>>),
+    Shutdown,
 }
 
-impl<'a, DB: Database> Debug for LayeredDbTxMut<'a, DB> {
+impl<DB: Database> Debug for CommitTxn<DB> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "LayeredDbTxMut")
-    }
-}
-
-impl<'a, DB: Database> DbTx for LayeredDbTxMut<'a, DB> {
-    fn get<T: Table>(&self, _key: &T::Key) -> eyre::Result<Option<T::Value>> {
-        panic!("DbTx get() should not be called on a DbTxMut!");
-    }
-
-    fn raw_get<T: Table>(&self, _key: &T::Key) -> eyre::Result<Option<Cow<'_, [u8]>>> {
-        panic!("DbTx raw_get() should not be called on a DbTxMut!");
-    }
-
-    fn raw_skip_to<T: Table>(&self, _key: &T::Key) -> eyre::Result<DBRawIter<'_>> {
-        panic!("DbTx raw_skip_to() should not be called on a DbTxMut!");
-    }
-
-    fn iter<T: Table>(&self) -> DBIter<'_, T> {
-        panic!("DbTx iter() should not be called on a DbTxMut!");
-    }
-
-    fn raw_iter<T: Table>(&self) -> DBRawIter<'_> {
-        panic!("DbTx raw_iter() should not be called on a DbTxMut!");
-    }
-
-    fn skip_to<T: Table>(&self, _key: &T::Key) -> eyre::Result<DBIter<'_, T>> {
-        panic!("DbTx skip_to() should not be called on a DbTxMut!");
-    }
-
-    fn reverse_iter<T: Table>(&self) -> DBIter<'_, T> {
-        panic!("DbTx reverse_iter() should not be called on a DbTxMut!");
-    }
-
-    fn reverse_raw_iter<T: Table>(&self) -> DBRawIter<'_> {
-        panic!("DbTx reverse_raw_iter() should not be called on a DbTxMut!");
-    }
-
-    fn last_record<T: Table>(&self) -> Option<(T::Key, T::Value)> {
-        panic!("DbTx last_record() should not be called on a DbTxMut!");
-    }
-
-    fn record_prior_to<T: Table>(&self, _key: &T::Key) -> Option<(T::Key, T::Value)> {
-        panic!("DbTx record_prior_to() should not be called on a DbTxMut!");
-    }
-
-    fn disable_long_read_safety(&self) {
-        panic!("DbTx disable_long_read_safety() should not be called on a DbTxMut!");
-    }
-}
-
-impl<'a, DB: Database> DbTxMut for LayeredDbTxMut<'a, DB> {
-    fn insert<T: Table>(&mut self, key: &T::Key, value: &T::Value) -> eyre::Result<()> {
-        self.mem_db.insert::<T>(key, value)?;
-        let ins = Box::new(KeyValueInsert::<T> { key: key.clone(), value: value.clone() });
-        self.tx.send(DBMessage::Insert(ins)).map_err(|_| eyre::eyre!("DB thread gone, FATAL!"))?;
-        Ok(())
-    }
-
-    fn remove<T: Table>(&mut self, key: &T::Key) -> eyre::Result<()> {
-        self.mem_db.remove::<T>(key)?;
-        let rm = Box::new(KeyRemove::<T> { key: key.clone() });
-        self.tx.send(DBMessage::Remove(rm)).map_err(|_| eyre::eyre!("DB thread gone, FATAL!"))?;
-        Ok(())
-    }
-
-    fn evict_persistent_batch<T: Table>(&mut self, keys: &[T::Key]) -> eyre::Result<()> {
-        if keys.is_empty() {
-            return Ok(());
-        }
-        // Hard-delete (no tombstone): a tombstone would shadow the cold fall-through. The whole
-        // set is ONE writer message; a per-row message on a whole-epoch prune is pure overhead.
-        for key in keys {
-            self.mem_db.hard_delete::<T>(key);
-        }
-        let rm = Box::new(KeyRemoveBatch::<T> { keys: keys.to_vec() });
-        self.tx.send(DBMessage::Remove(rm)).map_err(|_| eyre::eyre!("DB thread gone, FATAL!"))?;
-        Ok(())
-    }
-
-    fn clear_table<T: Table>(&mut self) -> eyre::Result<()> {
-        self.mem_db.clear_table::<T>()?;
-        let clr = Box::new(ClearTable::<T> { _casper: PhantomData });
-        self.tx.send(DBMessage::Clear(clr)).map_err(|_| eyre::eyre!("DB thread gone, FATAL!"))?;
-        Ok(())
-    }
-
-    fn commit(self) -> eyre::Result<()> {
-        self.mem_db.commit()?;
-        self.tx.send(DBMessage::CommitTxn).map_err(|_| eyre::eyre!("DB thread gone, FATAL!"))?;
-        Ok(())
-    }
-}
-
-/// Manage the persistent DB in a background thread with daily compaction.
-/// Drop the mem overlay for committed inserts older than `CACHE_KEEP_TIME_SECS` or beyond
-/// `MAX_CACHE_SIZE`. Only safe for committed rows: it removes them from the mem layer.
-fn evict_committed<DB: Database>(
-    committed_inserts: &mut Vec<(Instant, Box<dyn InsertTrait<DB>>)>,
-    mem_db: &MemDatabase,
-) {
-    let total_count = committed_inserts.len();
-    let mut remove_count: usize = 0;
-    for (instant, insert) in committed_inserts.iter() {
-        if instant.elapsed() > Duration::from_secs(CACHE_KEEP_TIME_SECS)
-            || total_count - remove_count > MAX_CACHE_SIZE
-        {
-            insert.clear_insert_mem(mem_db);
-            remove_count += 1;
-            continue;
-        }
-        break;
-    }
-    committed_inserts.drain(..remove_count);
-}
-
-/// Depth at which the writer queue is treated as a backlog: `db_run` warns (rate-limited) and
-/// data-plane enqueues start pacing, so the imbalance never surfaces as a multi-minute `persist`
-/// drain at the next epoch boundary.
-const QUEUE_HIGH_WATER_MARK: usize = 10_000;
-const QUEUE_LAG_WARN_INTERVAL: Duration = Duration::from_secs(10);
-
-/// Pause paid by each insert/remove/clear enqueue while the queue is above
-/// [`QUEUE_HIGH_WATER_MARK`].
-///
-/// Soft backpressure: a slow inner DB surfaces as gradual producer slowdown instead of a
-/// network-wide stall at the deterministic boundary `persist`. Pacing can lag the node into
-/// demotion (recoverable; the boundary stall is not), and the sleep may land on an async worker
-/// thread (the `Database` write API is sync) - the accepted cost in an already-degraded regime.
-/// Control messages (txn markers, persist barrier, shutdown) never pace.
-const QUEUE_PACE_SLEEP: Duration = Duration::from_millis(1);
-
-/// Drain time past which a `persist`/`sync_persist` is logged at `warn` rather than `debug`.
-const PERSIST_SLOW_WARN: Duration = Duration::from_secs(1);
-
-/// A [`DBMessage`] sender that tracks the writer queue's depth: every enqueue bumps a shared
-/// counter `db_run` decrements as it drains, feeding the depth gauge and the
-/// [`QUEUE_HIGH_WATER_MARK`] pacing.
-struct QueueSender<DB: Database> {
-    tx: Sender<DBMessage<DB>>,
-    depth: Arc<AtomicUsize>,
-}
-
-impl<DB: Database> Clone for QueueSender<DB> {
-    fn clone(&self) -> Self {
-        Self { tx: self.tx.clone(), depth: Arc::clone(&self.depth) }
-    }
-}
-
-impl<DB: Database> Debug for QueueSender<DB> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "QueueSender(depth: {})", self.depth())
-    }
-}
-
-impl<DB: Database> QueueSender<DB> {
-    /// Enqueues a writer message; data-plane messages pace once the depth is past
-    /// [`QUEUE_HIGH_WATER_MARK`] (see [`QUEUE_PACE_SLEEP`]).
-    fn send(&self, msg: DBMessage<DB>) -> Result<(), mpsc::SendError<DBMessage<DB>>> {
-        if matches!(msg, DBMessage::Insert(_) | DBMessage::Remove(_) | DBMessage::Clear(_))
-            && self.depth() > QUEUE_HIGH_WATER_MARK
-        {
-            std::thread::sleep(QUEUE_PACE_SLEEP);
-        }
-        // Bump before the send so the depth never reads low mid-flight. Relaxed: an advisory
-        // gauge, not a synchronization point.
-        self.depth.fetch_add(1, AtomicOrdering::Relaxed);
-        self.tx.send(msg)
-    }
-
-    /// Returns the writer messages enqueued but not yet applied by the background thread.
-    fn depth(&self) -> usize {
-        self.depth.load(AtomicOrdering::Relaxed)
-    }
-}
-
-/// Registers a metric on the process scrape registry, falling back to a private unscraped one on
-/// double registration (a second stack in one process, as tests build).
-pub(crate) fn register_metric_or_unscraped<T>(
-    register: impl Fn(&Registry) -> Result<T, prometheus::Error>,
-) -> T {
-    register(default_registry())
-        .unwrap_or_else(|_| register(&Registry::new()).expect("metric on a fresh registry"))
-}
-
-/// Returns the writer-queue-depth gauge; `db_run` samples it on every dequeue, so a dashboard
-/// shows the backlog ramp before it crosses the warn threshold.
-fn writer_queue_depth_gauge() -> IntGauge {
-    register_metric_or_unscraped(|registry| {
-        register_int_gauge_with_registry!(
-            "layered_db_writer_queue_depth",
-            "Consensus DB layered writer messages enqueued but not yet applied.",
-            registry,
-        )
-    })
-}
-
-/// Logs a `persist`/`sync_persist` drain: `warn` past [`PERSIST_SLOW_WARN`] (a backlog that stalled
-/// the barrier), `debug` otherwise. `depth` is the queue depth observed when the barrier enqueued.
-fn log_persist_latency(elapsed: Duration, depth: usize) {
-    if elapsed >= PERSIST_SLOW_WARN {
-        tracing::warn!(
-            target: "storage",
-            ?elapsed,
-            depth,
-            "consensus DB persist drained a slow writer backlog"
-        );
-    } else {
-        tracing::debug!(target: "storage", ?elapsed, depth, "consensus DB persist");
-    }
-}
-
-fn db_run<DB: Database>(
-    db: DB,
-    mem_db: MemDatabase,
-    rx: Receiver<DBMessage<DB>>,
-    depth: Arc<AtomicUsize>,
-) {
-    let mut txn = None;
-    let mut last_compact = Instant::now();
-    let queue_depth_gauge = writer_queue_depth_gauge();
-    let mut last_lag_warn: Option<Instant> = None;
-
-    let mut committed_inserts: Vec<(Instant, Box<dyn InsertTrait<DB>>)> = Vec::with_capacity(1000);
-    // last write/commit failure since the previous CaughtUp, reported by the next persist
-    let mut pending_write_error: Option<String> = None;
-    if let Err(e) = db.compact() {
-        tracing::error!(target: "layered_db_runner", "DB ERROR compacting DB on startup (background): {e}");
-    }
-    while let Ok(msg) = rx.recv() {
-        // Depth after taking this message off the queue (fetch_sub returns the count including it).
-        let queued = depth.fetch_sub(1, AtomicOrdering::Relaxed).saturating_sub(1);
-        queue_depth_gauge.set(queued as i64);
-        if queued > QUEUE_HIGH_WATER_MARK
-            && last_lag_warn.is_none_or(|at| at.elapsed() >= QUEUE_LAG_WARN_INTERVAL)
-        {
-            last_lag_warn = Some(Instant::now());
-            tracing::warn!(target: "storage", depth = queued, "layered DB writer queue backlog");
-        }
-        match msg {
-            DBMessage::StartTxn => {
-                if let Some((_txn, count)) = &mut txn {
-                    *count += 1;
-                } else {
-                    match db.write_txn() {
-                        Ok(ntxn) => txn = Some((ntxn, 1)),
-                        Err(e) => {
-                            tracing::error!(target: "layered_db_runner", "DB ERROR getting write txn (background): {e}")
-                        }
-                    }
-                }
-            }
-            DBMessage::CommitTxn => {
-                if let Some((current_txn, count)) = txn.take() {
-                    if count <= 1 {
-                        match current_txn.commit() {
-                            Ok(()) => evict_committed(&mut committed_inserts, &mem_db),
-                            // surface via persist instead of aborting; rows stay in mem, not lost
-                            Err(e) => {
-                                tracing::error!(target: "layered_db_runner", "consensus DB commit failed: {e}");
-                                pending_write_error = Some(format!("commit: {e}"));
-                            }
-                        }
-                    } else {
-                        txn = Some((current_txn, count - 1));
-                    }
-                }
-            }
-            DBMessage::Insert(ins) => {
-                if let Some((txn, _)) = &mut txn {
-                    if let Err(e) = ins.insert_txn(txn) {
-                        // keep the failed row in mem (not the eviction cache) so it is not lost
-                        tracing::error!(target: "layered_db_runner", "DB TXN Insert: {e}");
-                        pending_write_error = Some(format!("insert: {e}"));
-                    } else {
-                        committed_inserts.push((Instant::now(), ins));
-
-                        // Rayls: limit layer growth between commits
-                        if committed_inserts.len() > MAX_CACHE_SIZE * 2 {
-                            evict_committed(&mut committed_inserts, &mem_db);
-                        }
-                    }
-                } else if let Err(e) = ins.insert(&db) {
-                    tracing::error!(target: "layered_db_runner", "DB Insert: {e}");
-                    ins.clear_insert_mem(&mem_db);
-                    pending_write_error = Some(format!("insert: {e}"));
-                }
-            }
-            DBMessage::Remove(rm) => {
-                if let Some((txn, _)) = &mut txn {
-                    if let Err(e) = rm.remove_txn(txn, &mem_db) {
-                        tracing::error!(target: "layered_db_runner", "DB TXN Remove: {e}");
-                        pending_write_error = Some(format!("remove: {e}"));
-                    }
-                } else if let Err(e) = rm.remove(&db, &mem_db) {
-                    tracing::error!(target: "layered_db_runner", "DB Remove: {e}");
-                    pending_write_error = Some(format!("remove: {e}"));
-                }
-            }
-            DBMessage::Clear(clr) => {
-                if let Some((txn, _)) = &mut txn {
-                    if let Err(e) = clr.clear_table_txn(txn, &mem_db) {
-                        tracing::error!("DB TXN Clear table: {e}");
-                        pending_write_error = Some(format!("clear: {e}"));
-                    }
-                } else if let Err(e) = clr.clear_table(&db, &mem_db) {
-                    tracing::error!("DB Clear: {e}");
-                    pending_write_error = Some(format!("clear: {e}"));
-                }
-            }
-            // NOTE: proves prior messages were applied, not that an open shared txn committed.
-            // Safe at shutdown because consensus writers are torn down before persist runs.
-            DBMessage::CaughtUp(tx) => {
-                let reply: Result<(), String> = match pending_write_error.take() {
-                    Some(e) => Err(e),
-                    None => Ok(()),
-                };
-                let _ = tx.send(reply);
-            }
-            DBMessage::Shutdown => break,
-        }
-        if last_compact.elapsed() > Duration::from_secs(86_400) {
-            last_compact = Instant::now();
-            if let Err(e) = db.compact() {
-                tracing::error!(target: "layered_db_runner", "DB ERROR compacting DB (background): {e}");
-            }
+        match self {
+            CommitTxn::Batch(ops) => write!(f, "Batch({} ops)", ops.len()),
+            CommitTxn::CaughtUp(_) => write!(f, "CaughtUp"),
+            CommitTxn::Shutdown => write!(f, "Shutdown"),
         }
     }
-    tracing::info!(target: "layered_db_runner", "Layerd DB thread Shutdown complete");
 }
 
 /// In-memory cache layer over a persistent database with background writes.
@@ -819,6 +988,7 @@ pub struct LayeredDatabase<DB: Database> {
     db: DB,
     tx: QueueSender<DB>,
     thread: Option<Arc<JoinHandle<()>>>,
+    lock_manager: Arc<WriteLockManager>,
     /// The cold tier point reads fall through to on a hot miss, when attached.
     #[cfg(feature = "cold-storage")]
     cold: Option<Arc<ColdStore>>,
@@ -828,7 +998,7 @@ impl<DB: Database> Drop for LayeredDatabase<DB> {
     fn drop(&mut self) {
         if Arc::strong_count(self.thread.as_ref().expect("no db thread!")) == 1 {
             tracing::info!(target: "layered_db", "LayeredDatabase Dropping, shutting down DB thread");
-            if let Err(e) = self.tx.send(DBMessage::Shutdown) {
+            if let Err(e) = self.tx.send(CommitTxn::Shutdown) {
                 tracing::error!(target: "layered_db", "Error while trying to send shutdown to layered DB thread {e}");
                 return; // The thread may not shutdown so don't try to join...
             }
@@ -861,6 +1031,7 @@ impl<DB: Database> LayeredDatabase<DB> {
             db,
             tx: QueueSender { tx, depth },
             thread,
+            lock_manager: Arc::new(WriteLockManager::default()),
             #[cfg(feature = "cold-storage")]
             cold: None,
         }
@@ -1027,7 +1198,7 @@ impl<DB: Database> Database for LayeredDatabase<DB> {
         Self: 'txn;
 
     type TXMut<'txn>
-        = LayeredDbTxMut<'txn, DB>
+        = WriteTxn<'txn, DB>
     where
         Self: 'txn;
 
@@ -1038,20 +1209,23 @@ impl<DB: Database> Database for LayeredDatabase<DB> {
 
     fn read_txn(&self) -> eyre::Result<Self::TX<'_>> {
         Ok(LayeredDbTx {
-            mem_db: self.mem_db.read_txn()?,
-            db: self.db.read_txn()?,
+            mem_txn: self.mem_db.read_txn()?,
+            persistent_snapshot: self.db.read_txn()?,
             #[cfg(feature = "cold-storage")]
             cold: self.cold.as_deref(),
         })
     }
 
-    /// Write transactions overlap and commit when the last one completes.
     fn write_txn(&self) -> eyre::Result<Self::TXMut<'_>> {
-        self.tx.send(DBMessage::StartTxn).map_err(|_| eyre::eyre!("DB thread gone, FATAL!"))?;
-        Ok(LayeredDbTxMut {
-            mem_db: self.mem_db.write_txn()?,
-            _db: self.db.clone(),
+        Ok(WriteTxn {
+            mem_txn: self.mem_db.write_txn()?,
+            pending: Vec::new(),
+            persistent_snapshot: self.db.read_txn()?,
+            locks: Vec::new(),
+            lock_manager: Arc::clone(&self.lock_manager),
             tx: self.tx.clone(),
+            #[cfg(feature = "cold-storage")]
+            cold: self.cold.as_deref(),
         })
     }
 
@@ -1086,23 +1260,26 @@ impl<DB: Database> Database for LayeredDatabase<DB> {
 
     fn insert<T: Table>(&self, key: &T::Key, value: &T::Value) -> eyre::Result<()> {
         self.mem_db.insert::<T>(key, value)?;
-        let ins = Box::new(KeyValueInsert::<T> { key: key.clone(), value: value.clone() });
-        self.tx.send(DBMessage::Insert(ins)).map_err(|_| eyre::eyre!("DB thread gone, FATAL!"))?;
-        Ok(())
+        let ins = Box::new(PersistInsert::<T> { key: key.clone(), value: value.clone() });
+        self.tx
+            .send(CommitTxn::Batch(vec![ins]))
+            .map_err(|_| eyre::eyre!("DB thread gone, FATAL!"))
     }
 
     fn remove<T: Table>(&self, key: &T::Key) -> eyre::Result<()> {
         self.mem_db.remove::<T>(key)?;
-        let rm = Box::new(KeyRemove::<T> { key: key.clone() });
-        self.tx.send(DBMessage::Remove(rm)).map_err(|_| eyre::eyre!("DB thread gone, FATAL!"))?;
-        Ok(())
+        let rm = Box::new(PersistRemove::<T> { key: key.clone() });
+        self.tx
+            .send(CommitTxn::Batch(vec![rm]))
+            .map_err(|_| eyre::eyre!("DB thread gone, FATAL!"))
     }
 
     fn clear_table<T: Table>(&self) -> eyre::Result<()> {
         self.mem_db.clear_table::<T>()?;
-        let clr = Box::new(ClearTable::<T> { _casper: PhantomData });
-        self.tx.send(DBMessage::Clear(clr)).map_err(|_| eyre::eyre!("DB thread gone, FATAL!"))?;
-        Ok(())
+        let clr = Box::new(PersistClear::<T> { _phantom: std::marker::PhantomData });
+        self.tx
+            .send(CommitTxn::Batch(vec![clr]))
+            .map_err(|_| eyre::eyre!("DB thread gone, FATAL!"))
     }
 
     fn is_empty<T: Table>(&self) -> bool {
@@ -1175,7 +1352,7 @@ impl<DB: Database> Database for LayeredDatabase<DB> {
         let (tx, rx) = oneshot::channel();
         let depth_at_send = self.tx.depth();
         let started = Instant::now();
-        let send_result = self.tx.send(DBMessage::CaughtUp(tx));
+        let send_result = self.tx.send(CommitTxn::CaughtUp(tx));
         async move {
             match send_result {
                 Ok(()) => match rx.await {
@@ -1208,7 +1385,7 @@ impl<DB: Database> Database for LayeredDatabase<DB> {
         let started = Instant::now();
         let r = self
             .tx
-            .send(DBMessage::CaughtUp(tx))
+            .send(CommitTxn::CaughtUp(tx))
             .map_err(|_| eyre::eyre!("DB thread gone, FATAL!"));
 
         if r.is_ok() {
@@ -1230,146 +1407,9 @@ impl<DB: Database> Database for LayeredDatabase<DB> {
     }
 }
 
-trait InsertTrait<DB: Database>: Send + 'static {
-    fn insert(&self, db: &DB) -> eyre::Result<()>;
-    fn insert_txn(&self, txn: &mut DB::TXMut<'_>) -> eyre::Result<()>;
-    /// Clear the inserted data from the memdb.
-    fn clear_insert_mem(&self, mem_db: &MemDatabase);
-}
-
-trait RemoveTrait<DB: Database>: Send + 'static {
-    fn remove(&self, db: &DB, mem_db: &MemDatabase) -> eyre::Result<()>;
-    fn remove_txn(&self, txn: &mut DB::TXMut<'_>, mem_db: &MemDatabase) -> eyre::Result<()>;
-}
-
-trait ClearTrait<DB: Database>: Send + 'static {
-    fn clear_table(&self, db: &DB, mem_db: &MemDatabase) -> eyre::Result<()>;
-    fn clear_table_txn(&self, txn: &mut DB::TXMut<'_>, mem_db: &MemDatabase) -> eyre::Result<()>;
-}
-
-struct KeyValueInsert<T: Table> {
-    key: T::Key,
-    value: T::Value,
-}
-
-struct KeyRemove<T: Table> {
-    key: T::Key,
-}
-
-struct KeyRemoveBatch<T: Table> {
-    keys: Vec<T::Key>,
-}
-
-struct ClearTable<T: Table> {
-    _casper: PhantomData<T>,
-}
-
-impl<T: Table, DB: Database> InsertTrait<DB> for KeyValueInsert<T> {
-    fn insert(&self, db: &DB) -> eyre::Result<()> {
-        db.insert::<T>(&self.key, &self.value)
-    }
-    fn insert_txn(&self, txn: &mut DB::TXMut<'_>) -> eyre::Result<()> {
-        txn.insert::<T>(&self.key, &self.value)
-    }
-    fn clear_insert_mem(&self, mem_db: &MemDatabase) {
-        let _ = mem_db.delete_removed::<T>(&self.key, false);
-    }
-}
-
-// Tombstones are NOT eagerly cleared from mem after persistent delete;
-// doing so races with the main thread's reads (MDBX write not yet visible).
-impl<T: Table, DB: Database> RemoveTrait<DB> for KeyRemove<T> {
-    fn remove(&self, db: &DB, mem_db: &MemDatabase) -> eyre::Result<()> {
-        // skip if key was re-inserted after the remove was queued
-        if mem_db.contains_key::<T>(&self.key)? {
-            return Ok(());
-        }
-        db.remove::<T>(&self.key)
-    }
-
-    fn remove_txn(
-        &self,
-        txn: &mut <DB as Database>::TXMut<'_>,
-        mem_db: &MemDatabase,
-    ) -> eyre::Result<()> {
-        if mem_db.contains_key::<T>(&self.key)? {
-            return Ok(());
-        }
-        txn.remove::<T>(&self.key)
-    }
-}
-
-// Batched `KeyRemove`: same per-key re-insert guard, one message for a whole-epoch prune (see
-// [`LayeredDbTxMut::evict_persistent_batch`]).
-impl<T: Table, DB: Database> RemoveTrait<DB> for KeyRemoveBatch<T> {
-    fn remove(&self, db: &DB, mem_db: &MemDatabase) -> eyre::Result<()> {
-        for key in &self.keys {
-            // skip if the key was re-inserted after the remove was queued
-            if mem_db.contains_key::<T>(key)? {
-                continue;
-            }
-            db.remove::<T>(key)?;
-        }
-        Ok(())
-    }
-
-    fn remove_txn(
-        &self,
-        txn: &mut <DB as Database>::TXMut<'_>,
-        mem_db: &MemDatabase,
-    ) -> eyre::Result<()> {
-        for key in &self.keys {
-            if mem_db.contains_key::<T>(key)? {
-                continue;
-            }
-            txn.remove::<T>(key)?;
-        }
-        Ok(())
-    }
-}
-
-impl<T: Table, DB: Database> ClearTrait<DB> for ClearTable<T> {
-    fn clear_table(&self, db: &DB, _mem_db: &MemDatabase) -> eyre::Result<()> {
-        // mem_db already cleared by main thread; re-clearing here would race with new inserts
-        db.clear_table::<T>()
-    }
-
-    fn clear_table_txn(
-        &self,
-        txn: &mut <DB as Database>::TXMut<'_>,
-        _mem_db: &MemDatabase,
-    ) -> eyre::Result<()> {
-        txn.clear_table::<T>()
-    }
-}
-
-enum DBMessage<DB: Database> {
-    StartTxn,
-    CommitTxn,
-    Insert(Box<dyn InsertTrait<DB>>),
-    Remove(Box<dyn RemoveTrait<DB>>),
-    Clear(Box<dyn ClearTrait<DB>>),
-    CaughtUp(oneshot::Sender<Result<(), String>>),
-    Shutdown,
-}
-
-impl<DB: Database> Debug for DBMessage<DB> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            DBMessage::StartTxn => write!(f, "StartTxn"),
-            DBMessage::CommitTxn => write!(f, "CommitTxn"),
-            DBMessage::Insert(_) => write!(f, "Insert"),
-            DBMessage::Remove(_) => write!(f, "Remove"),
-            DBMessage::Clear(_) => write!(f, "Clear"),
-            DBMessage::CaughtUp(_) => write!(f, "CaughtUp"),
-            DBMessage::Shutdown => write!(f, "Shutdown"),
-        }
-    }
-}
-
 #[cfg(test)]
 mod test {
-    use super::{DBMessage, InsertTrait, LayeredDatabase, QUEUE_HIGH_WATER_MARK, QUEUE_PACE_SLEEP};
+    use super::{CommitTxn, PersistOp, LayeredDatabase, QUEUE_HIGH_WATER_MARK, QUEUE_PACE_SLEEP};
     #[cfg(feature = "redb")]
     use crate::redb::ReDB;
     use crate::{
@@ -1377,8 +1417,8 @@ mod test {
         mem_db::MemDatabase,
         test::*,
     };
-    use rayls_infrastructure_types::{Database, DbTxMut};
-    use std::{path::Path, time::Instant};
+    use rayls_infrastructure_types::{Database, DbTx, DbTxMut, Table};
+    use std::{path::Path, time::Duration, time::Instant};
     use tempfile::tempdir;
 
     #[cfg(feature = "redb")]
@@ -1468,16 +1508,11 @@ mod test {
     /// real enqueued backlog behind a stalled writer.
     struct WriterGate(std::sync::mpsc::Receiver<()>);
 
-    impl<DB: Database> InsertTrait<DB> for WriterGate {
-        fn insert(&self, _db: &DB) -> eyre::Result<()> {
+    impl<DB: Database> PersistOp<DB> for WriterGate {
+        fn apply(&self, _txn: &mut DB::TXMut<'_>, _mem_db: &MemDatabase) -> eyre::Result<()> {
             let _ = self.0.recv();
             Ok(())
         }
-        fn insert_txn(&self, _txn: &mut DB::TXMut<'_>) -> eyre::Result<()> {
-            let _ = self.0.recv();
-            Ok(())
-        }
-        fn clear_insert_mem(&self, _mem_db: &MemDatabase) {}
     }
 
     /// A producer bursting into a seeded writer backlog must be paced above the high-water mark,
@@ -1492,7 +1527,7 @@ mod test {
 
         // Park the writer behind a gate so the seeded backlog cannot drain mid-measurement.
         let (release, gate) = std::sync::mpsc::channel::<()>();
-        db.tx.send(DBMessage::Insert(Box::new(WriterGate(gate)))).expect("gate enqueue");
+        db.tx.send(CommitTxn::Batch(vec![Box::new(WriterGate(gate))])).expect("gate enqueue");
 
         // Seed one message past the mark: every enqueue here is at or below it, hence unpaced.
         let value = "v".to_string();
@@ -1678,7 +1713,6 @@ mod test {
         // Tests that clear_table followed by inserts works correctly,
         // verifying that the background thread's clear operation doesn't
         // mark subsequently inserted items as deleted.
-        use rayls_infrastructure_types::{Database, DbTxMut};
         let temp_dir = tempdir().expect("failed to create temp dir");
         let db = open_mdbx(temp_dir.path());
 
@@ -1984,8 +2018,6 @@ mod test {
     #[test]
     fn test_layereddb_read_txn_layered() {
         // Tests LayeredDbTx (read transaction) with merged layers + tombstones.
-        use rayls_infrastructure_types::DbTx;
-
         let temp_dir = tempdir().expect("failed to create temp dir");
         let db = open_mdbx_prepopulated(temp_dir.path(), &[(1, "one"), (3, "three"), (5, "five")]);
 
@@ -2041,31 +2073,6 @@ mod test {
         );
     }
 
-    /// Open a `LayeredDatabase<MdbxDatabase>` holding `rows` on the disk layer
-    /// only, with a custom read-txn timeout.
-    fn open_layered_mdbx_disk_rows(
-        path: &Path,
-        rows: u64,
-        max_read: std::time::Duration,
-    ) -> LayeredDatabase<MdbxDatabase> {
-        use crate::mdbx::MdbxConfig;
-        let cfg = MdbxConfig::default().with_max_read_transaction_duration(Some(max_read));
-        // write straight to a bare mdbx db, then reopen behind a fresh (empty)
-        // mem layer so the walk is served entirely from the disk-side read txn.
-        {
-            let db = MdbxDatabase::open_with_config(path, cfg.clone()).expect("open mdbx");
-            db.open_table::<TestTable>().expect("open table");
-            for i in 1..=rows {
-                db.insert::<TestTable>(&i, &i.to_string()).unwrap();
-            }
-        }
-        let db = MdbxDatabase::open_with_config(path, cfg).expect("reopen mdbx");
-        db.open_table::<TestTable>().expect("open table");
-        let db = LayeredDatabase::open(db);
-        db.open_table::<TestTable>().expect("open table");
-        db
-    }
-
     /// `raw_get` returns the stored value's canonical bytes across both layers, so the cold
     /// archiver can relocate a payload without a decode/re-encode round trip.
     ///
@@ -2073,7 +2080,7 @@ mod test {
     /// mdbx), the mem overlay (a typed value re-encoded), and the tombstone/absent `None` cases.
     #[test]
     fn test_layereddb_raw_get_matches_encoded_value() {
-        use rayls_infrastructure_types::{encode, DbTx};
+        use rayls_infrastructure_types::encode;
 
         let temp_dir = tempdir().expect("failed to create temp dir");
         // Key 1 lives only on the persistent layer (mem empty), modelling an evicted/archivable
@@ -2098,7 +2105,7 @@ mod test {
     /// exactly what a full merged scan would from that key on.
     #[test]
     fn test_layereddb_raw_skip_to_merges_layers() {
-        use rayls_infrastructure_types::{decode_key, DbTx};
+        use rayls_infrastructure_types::decode_key;
 
         let temp_dir = tempdir().expect("failed to create temp dir");
         // Keys 1 and 3 on the persistent layer; 2 in the mem overlay; 3 tombstoned in mem.
@@ -2118,46 +2125,190 @@ mod test {
         assert_eq!(keys_from(3), Vec::<u64>::new(), "the tombstoned tail is empty");
     }
 
-    /// Prove `disable_long_read_safety` reaches the inner mdbx txn so a walk
-    /// straddling the read-txn timeout is not silently truncated.
-    ///
-    /// Regression for the leader-count undercount fork: the exemption was a no-op
-    /// on `LayeredDatabase`, so the monitor reset the walk's txn mid-scan and the
-    /// iterator stopped early. Slow (~3s): drives the real mdbx timeout monitor.
+    /// A write transaction's buffer is private: an uncommitted insert is invisible to every other
+    /// transaction, then appears everywhere once committed.
     #[test]
-    fn test_layereddb_disable_long_read_safety_survives_midwalk_timeout() {
-        use rayls_infrastructure_types::DbTx;
-        use std::time::Duration;
-
-        const ROWS: u64 = 64;
-        let max_read = Duration::from_secs(1);
+    fn write_txn_buffer_is_private_until_commit() {
         let temp_dir = tempdir().expect("failed to create temp dir");
-        let db = open_layered_mdbx_disk_rows(temp_dir.path(), ROWS, max_read);
+        let db = open_mdbx(temp_dir.path());
 
-        // exempt walker: opt out of the timeout, then start iterating so the read
-        // snapshot is live before we straddle the deadline.
-        let exempt = db.read_txn().unwrap();
-        exempt.disable_long_read_safety();
-        let mut walk = exempt.reverse_iter::<TestTable>();
-        let first = walk.next().expect("first row before timeout");
+        let mut txn = db.write_txn().unwrap();
+        txn.insert::<TestTable>(&1, &"one".to_string()).expect("buffered insert");
 
-        // control walker: identical but not exempted, proving the timeout fires.
-        let control = db.read_txn().unwrap();
+        // A concurrent reader (and the handle's one-shot reads) must not see the buffer.
+        let reader = db.read_txn().unwrap();
+        assert_eq!(reader.get::<TestTable>(&1).unwrap(), None, "uncommitted write leaked");
+        assert_eq!(db.get::<TestTable>(&1).unwrap(), None, "uncommitted write leaked");
 
-        // hold both open past max_read so the monitor resets every active,
-        // non-exempt read txn mid-flight, exactly like the ~30s tally walk.
-        std::thread::sleep(max_read + Duration::from_secs(2));
+        txn.commit().expect("commit");
+        assert_eq!(db.get::<TestTable>(&1).unwrap(), Some("one".to_string()));
+    }
 
-        // fix proof: the exempt walk finishes in full across the timeout boundary.
-        let rest = walk.count() as u64;
-        assert_eq!(rest + 1, ROWS, "exempt walk must not truncate across the timeout");
-        assert_eq!(first.0, ROWS);
+    /// Dropping a write transaction discards its buffer: nothing is applied and nothing is sent
+    /// to the background writer.
+    #[test]
+    fn write_txn_buffer_discarded_on_drop() {
+        let temp_dir = tempdir().expect("failed to create temp dir");
+        let db = open_mdbx(temp_dir.path());
 
-        // control: the un-exempt txn was reset, so a disk read now errors. without
-        // this a green exempt case could be a false positive (monitor never ran).
-        assert!(
-            control.get::<TestTable>(&ROWS).is_err(),
-            "un-exempt read txn must be reset by the timeout monitor",
+        let mut txn = db.write_txn().unwrap();
+        txn.insert::<TestTable>(&1, &"one".to_string()).expect("buffered insert");
+        drop(txn);
+
+        assert_eq!(db.get::<TestTable>(&1).unwrap(), None, "dropped txn applied its buffer");
+        db.sync_persist();
+        assert_eq!(db.get::<TestTable>(&1).unwrap(), None, "dropped txn reached the writer");
+    }
+
+    /// A write transaction reads its own uncommitted writes: insert-then-get and
+    /// remove-then-get resolve against the private buffer.
+    #[test]
+    fn write_txn_read_after_write() {
+        let temp_dir = tempdir().expect("failed to create temp dir");
+        let db = open_mdbx_prepopulated(temp_dir.path(), &[(1, "old")]);
+
+        let mut txn = db.write_txn().unwrap();
+        assert_eq!(txn.get::<TestTable>(&1).unwrap(), Some("old".to_string()));
+
+        txn.insert::<TestTable>(&2, &"two".to_string()).expect("insert");
+        assert_eq!(txn.get::<TestTable>(&2).unwrap(), Some("two".to_string()));
+        assert!(txn.contains_key::<TestTable>(&2).unwrap());
+
+        txn.remove::<TestTable>(&1).expect("remove");
+        assert_eq!(txn.get::<TestTable>(&1).unwrap(), None, "buffered remove must shadow");
+        assert_eq!(txn.raw_get::<TestTable>(&1).unwrap(), None, "buffered remove must shadow raw");
+
+        // The commit keeps both effects: key 1 gone, key 2 present.
+        txn.commit().expect("commit");
+        assert_eq!(db.get::<TestTable>(&1).unwrap(), None);
+        assert_eq!(db.get::<TestTable>(&2).unwrap(), Some("two".to_string()));
+    }
+
+    /// A committed remove tombstones the key for every transaction: the layered read paths must
+    /// not resurrect the persistent row the tombstone hides (regression: the old snapshots did).
+    #[test]
+    fn committed_tombstone_shadows_persistent_everywhere() {
+        let temp_dir = tempdir().expect("failed to create temp dir");
+        // Persistent layer holds the row; the remove below is never flushed, so the persistent
+        // copy survives on disk for the whole test.
+        let db = open_mdbx_prepopulated(temp_dir.path(), &[(1, "old"), (2, "two")]);
+
+        db.remove::<TestTable>(&1).expect("committed remove (not yet durable)");
+
+        assert_eq!(db.get::<TestTable>(&1).unwrap(), None, "handle read resurrected the row");
+        assert!(!db.contains_key::<TestTable>(&1).unwrap());
+
+        let txn = db.read_txn().unwrap();
+        assert_eq!(txn.get::<TestTable>(&1).unwrap(), None, "read txn resurrected the row");
+        assert_eq!(txn.raw_get::<TestTable>(&1).unwrap(), None, "read txn raw-resurrected the row");
+        assert_eq!(
+            txn.iter::<TestTable>().collect::<Vec<_>>(),
+            vec![(2, "two".to_string())],
+            "iter resurrected the row",
         );
+
+        let mut wt = db.write_txn().unwrap();
+        assert_eq!(wt.get::<TestTable>(&1).unwrap(), None, "write txn resurrected the row");
+        assert_eq!(wt.raw_get::<TestTable>(&1).unwrap(), None, "write txn raw-resurrected the row");
+        // A later txn can still bring the key back.
+        wt.insert::<TestTable>(&1, &"new".to_string()).expect("re-insert");
+        assert_eq!(wt.get::<TestTable>(&1).unwrap(), Some("new".to_string()));
+        wt.commit().expect("commit");
+        assert_eq!(db.get::<TestTable>(&1).unwrap(), Some("new".to_string()));
+    }
+
+    /// A remove inside a write transaction only shadows reads once committed; outside readers
+    /// keep seeing the persistent row until the tombstone lands.
+    #[test]
+    fn write_txn_remove_is_deferred_until_commit() {
+        let temp_dir = tempdir().expect("failed to create temp dir");
+        let db = open_mdbx_prepopulated(temp_dir.path(), &[(1, "one")]);
+
+        let mut txn = db.write_txn().unwrap();
+        txn.remove::<TestTable>(&1).expect("buffered remove");
+        assert_eq!(txn.get::<TestTable>(&1).unwrap(), None, "own remove must be visible");
+
+        let reader = db.read_txn().unwrap();
+        assert_eq!(
+            reader.get::<TestTable>(&1).unwrap(),
+            Some("one".to_string()),
+            "uncommitted remove leaked to another txn",
+        );
+
+        txn.commit().expect("commit");
+        assert_eq!(db.get::<TestTable>(&1).unwrap(), None);
+    }
+
+    /// Clearing a table inside a write transaction is deferred until commit, and is
+    /// read-after-write visible to the transaction itself.
+    #[test]
+    fn write_txn_clear_table_is_deferred_until_commit() {
+        let temp_dir = tempdir().expect("failed to create temp dir");
+        let db = open_mdbx_prepopulated(temp_dir.path(), &[(1, "one"), (2, "two")]);
+
+        let mut txn = db.write_txn().unwrap();
+        txn.clear_table::<TestTable>().expect("buffered clear");
+        assert_eq!(txn.get::<TestTable>(&1).unwrap(), None);
+        assert_eq!(txn.iter::<TestTable>().count(), 0);
+
+        let reader = db.read_txn().unwrap();
+        assert_eq!(reader.iter::<TestTable>().count(), 2, "uncommitted clear leaked");
+
+        txn.commit().expect("commit");
+        db.sync_persist();
+        assert!(db.is_empty::<TestTable>());
+    }
+
+    /// `lock` serializes read-then-write sequences on the same table: a second writer's `lock`
+    /// blocks until the first transaction drops or commits.
+    #[test]
+    fn write_lock_serializes_writers() {
+        let inner = MemDatabase::new();
+        inner.open_table::<TestTable>().expect("open inner table");
+        let db = LayeredDatabase::open(inner);
+        db.open_table::<TestTable>().expect("open layered table");
+
+        let mut t1 = db.write_txn().unwrap();
+        let _g1 = t1.lock(TestTable::NAME);
+
+        let db2 = db.clone();
+        let (waited, done) = std::sync::mpsc::channel::<()>();
+        let thread = std::thread::spawn(move || {
+            let mut t2 = db2.write_txn().unwrap();
+            let _g2 = t2.lock(TestTable::NAME);
+            waited.send(()).unwrap();
+        });
+
+        // The contender must be blocked on the held lock.
+        assert!(
+            done.recv_timeout(Duration::from_millis(200)).is_err(),
+            "second writer acquired a held lock",
+        );
+
+        // Releasing the first transaction unblocks the contender.
+        drop(t1);
+        assert!(done.recv_timeout(Duration::from_secs(5)).is_ok());
+        thread.join().expect("contender thread");
+    }
+
+    /// An `evict_persistent_batch` inside a write transaction hard-deletes from the mem overlay
+    /// immediately (no tombstone, so cold fall-through stays open); only the durable removal is
+    /// deferred until commit.
+    #[test]
+    fn write_txn_evict_batch_is_deferred_until_commit() {
+        let temp_dir = tempdir().expect("failed to create temp dir");
+        let db = open_mdbx_prepopulated(temp_dir.path(), &[(1, "one"), (2, "two")]);
+
+        let mut txn = db.write_txn().unwrap();
+        txn.evict_persistent_batch::<TestTable>(&[1]).expect("buffered evict");
+        txn.commit().expect("commit");
+
+        // The durable copy is still in place until the writer catches up, and the mem overlay was
+        // hard-cleared, so the row is visible again through the persistent layer.
+        assert_eq!(db.get::<TestTable>(&1).unwrap(), Some("one".to_string()));
+        assert_eq!(db.get::<TestTable>(&2).unwrap(), Some("two".to_string()));
+        db.sync_persist();
+        assert_eq!(db.get::<TestTable>(&1).unwrap(), None);
+        assert_eq!(db.get::<TestTable>(&2).unwrap(), Some("two".to_string()));
     }
 }

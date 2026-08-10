@@ -6,7 +6,7 @@ use crate::{
 };
 use consensus_metrics::monitored_future;
 use rayls_infrastructure_config::ConsensusConfig;
-use rayls_infrastructure_storage::{CertificateStore, ConsensusStore, ReadTimeout};
+use rayls_infrastructure_storage::{CertificateStore, ConsensusStore};
 use rayls_infrastructure_types::{
     AuthorityIdentifier, Certificate, CertificateDigest, CommittedSubDag, Committee, Database,
     Epoch, Hash as _, Noticer, RaylsReceiver, RaylsSender, Round, TaskManager, Timestamp,
@@ -104,10 +104,8 @@ impl ConsensusState {
 
         // Ascending round order + check_parents=true makes orphans self-reject
         // at insert time, yielding a sound-by-construction DAG.
-        // Exempt from the read-txn timeout: a transient I/O stall must not turn this bounded
-        // recovery scan into a panic (which would kill the node mid-write and risk DB corruption).
         let mut certificates =
-            cert_store.after_round(gc_round + 1, ReadTimeout::Exempt).expect("database available");
+            cert_store.after_round(gc_round + 1).expect("database available");
         certificates.sort_by_key(|c| c.round());
 
         let mut num_certs = 0;

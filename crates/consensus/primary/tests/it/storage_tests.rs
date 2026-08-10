@@ -11,7 +11,7 @@ use rayls_infrastructure_storage::{
         CertificateDigestByOrigin, ConsensusBlockNumbersByDigest, ConsensusBlocks,
         ConsensusBlocksCache,
     },
-    CertificateStore, ConsensusStore, ProposerStore, ReadTimeout,
+    CertificateStore, ConsensusStore, ProposerStore,
 };
 use rayls_infrastructure_types::{
     AuthorityIdentifier, Certificate, CertificateDigest, CommittedSubDag, ConsensusHeader,
@@ -380,7 +380,7 @@ async fn test_certificate_store_after_round() {
     tracing::debug!("Access after round {round_cutoff}, before {total_rounds}");
     let now = Instant::now();
     let result = store
-        .after_round(round_cutoff, ReadTimeout::Enforced)
+        .after_round(round_cutoff)
         .expect("Error returned while reading after_round");
 
     tracing::debug!("Total time: {} seconds", now.elapsed().as_secs_f32());

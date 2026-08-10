@@ -347,12 +347,8 @@ fn read_seal_chunk<TX: DbTx>(
     chunk_bytes: usize,
     archived: &mut B256Set,
 ) -> eyre::Result<(Vec<PendingBlock>, bool)> {
-    // The reads are immutable history, so a snapshot pinned past the mdbx read-txn timeout under
-    // IO pressure must not be force-reset: a silently truncated walk would look like the epoch's
-    // end and seal a short jar.
-    tx.disable_long_read_safety();
-    // Walk whole blocks until the header-byte budget or the fresh-digest cap is crossed; checking
-    // after the push keeps at least one block per chunk (progress even with a zero budget).
+    // The reads are immutable history, so a snapshot must not be force-reset mid-walk under IO
+    // pressure: a silently truncated walk would look like the epoch's end and seal a short jar.
     let mut headers = tx.raw_skip_to::<ConsensusBlocks>(&start_from)?;
     let mut selected: Vec<(Vec<u8>, Vec<BlockHash>)> = Vec::new();
     let mut header_bytes = 0usize;

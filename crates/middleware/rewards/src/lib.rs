@@ -75,14 +75,6 @@ impl<DB: Database> RewardsBackend for ConsensusRewardsCounter<DB> {
             .inner
             .consensus_db
             .with_read_txn(|txn| {
-                // The walk reverse-scans every ConsensusBlocks entry for the
-                // epoch; on a node with a cold page cache (e.g. just resumed
-                // after a backup) this can exceed mdbx's default 30s read-txn
-                // safety window and get force-aborted mid-walk. Opt this txn
-                // out — it's bounded by the epoch length and reads only
-                // immutable historical headers, so a long snapshot pin is
-                // acceptable.
-                txn.disable_long_read_safety();
                 info!(target: "rewards", ?epoch, "tally: read txn opened");
 
                 let mut acc: BTreeMap<Address, u32> = BTreeMap::new();
@@ -174,10 +166,6 @@ impl<DB: Database> RewardsBackend for ConsensusRewardsCounter<DB> {
         self.inner
             .consensus_db
             .with_read_txn(|txn| {
-                // See the identical comment in `tally()`: this walk is bounded by the
-                // epoch length and reads only immutable historical headers, so opting
-                // out of the 30s read-txn safety window is acceptable here too.
-                txn.disable_long_read_safety();
                 info!(target: "rewards", ?epoch, "tally_hybrid: read txn opened");
 
                 let mut per_address: BTreeMap<Address, ValidatorRoundTally> = BTreeMap::new();
