@@ -20,11 +20,6 @@ COPY crates/ ./crates/
 COPY chain-configs/ ./chain-configs/
 COPY rayls-contracts/ ./rayls-contracts/
 
-# The builder image has no `git` and no `.git` directory, so vergen cannot derive
-# the commit itself and reads this variable instead. Never let it expand to the
-# empty string: reth's own build script reads the same variable and slices the
-# first 7 bytes off it, panicking on "". Fall back to an all-zero sha so a build
-# without --build-arg still works (with an obviously-unstamped version).
 ARG VERGEN_GIT_SHA
 ENV VERGEN_GIT_SHA=${VERGEN_GIT_SHA:-0000000000000000000000000000000000000000}
 
@@ -32,12 +27,6 @@ ENV VERGEN_GIT_SHA=${VERGEN_GIT_SHA:-0000000000000000000000000000000000000000}
 # `node --dev` chains. Empty (default) -> a production build with no extra features.
 ARG BUILD_FEATURES=""
 
-# `cargo build -p rayls-network` is package-scoped deliberately. A bare `--bin rayls-network`
-# selects every default workspace member for feature resolution, so features enabled by the
-# testing crates unify into this binary -- e2e-tests and chaos-framework depend on
-# `rayls-infrastructure-config` with `features = ["test-utils"]`, which drops the BLS keystore
-# from 1_000_000 PBKDF2 rounds to 1. `-p` restricts resolution to the binary's own package.
-#
 # move binary out of cache for subsequent build steps
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \

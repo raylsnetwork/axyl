@@ -43,9 +43,6 @@ COPY rayls-contracts/ ./rayls-contracts/
 ARG VERGEN_GIT_SHA
 ENV VERGEN_GIT_SHA=${VERGEN_GIT_SHA:-0000000000000000000000000000000000000000}
 
-# build the replay binary; the archive-replay feature is selected by
-# bin/rayls-replay/Cargo.toml, so no extra --features flag is required.
-# `-p` scopes feature resolution to this package -- see etc/docker-network/Dockerfile.
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=./target \
@@ -75,11 +72,5 @@ USER $USER_NAME
 # copy binary
 COPY --from=builder /tmp/rayls-replay /usr/local/bin/rayls-replay
 
-# rayls-replay installs its own SIGTERM/SIGINT handler, so `docker stop` is caught
-# directly (it finishes the current output group, flushes, and exits resumable) —
-# no init wrapper needed even though the binary runs as PID 1.
-# parameters are appended as CLI flags, e.g.
-#   docker run <image> --snapshot-datadir /snapshot --archive-out /archive --chain mainnet
-# a bare `docker run <image>` prints usage via the default CMD.
 ENTRYPOINT ["rayls-replay"]
 CMD ["--help"]

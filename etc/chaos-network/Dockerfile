@@ -24,8 +24,6 @@ COPY rayls-contracts/ ./rayls-contracts/
 ARG VERGEN_GIT_SHA
 ENV VERGEN_GIT_SHA=${VERGEN_GIT_SHA:-0000000000000000000000000000000000000000}
 
-# build the binary. `-p` scopes feature resolution to the binary's own package so chaos
-# exercises the same build the release image ships -- see etc/docker-network/Dockerfile.
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=./target \
