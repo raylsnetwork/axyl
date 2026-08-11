@@ -81,7 +81,11 @@ jobs:
       - name: Build rayls-network (production, default features)
         env:
           VERGEN_GIT_SHA: ${{ github.sha }}
-        run: cargo build --bin rayls-network --release --locked
+        # `-p` is load-bearing: a bare `--bin rayls-network` selects every default
+        # workspace member for feature resolution, so features enabled by the testing
+        # crates (e2e-tests / chaos-framework pull in `rayls-infrastructure-config/test-utils`,
+        # which drops PBKDF2 to 1 round) unify into the shipping binary.
+        run: cargo build -p rayls-network --bin rayls-network --release --locked
 
       - name: sccache stats
         if: always()
@@ -139,7 +143,9 @@ jobs:
           VERGEN_GIT_SHA: ${{ github.sha }}
         # matrix.cargo_flags is a static, workflow-authored value (not user
         # input), so expanding it into the run line is safe.
-        run: cargo build --bin rayls-network --release --locked ${{ matrix.cargo_flags }}
+        # `-p` scopes feature resolution to the binary's own package — see the
+        # production job above.
+        run: cargo build -p rayls-network --bin rayls-network --release --locked ${{ matrix.cargo_flags }}
 
       - name: sccache stats
         if: always()

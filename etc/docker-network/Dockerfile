@@ -32,11 +32,17 @@ ENV VERGEN_GIT_SHA=${VERGEN_GIT_SHA:-0000000000000000000000000000000000000000}
 # `node --dev` chains. Empty (default) -> a production build with no extra features.
 ARG BUILD_FEATURES=""
 
+# `cargo build -p rayls-network` is package-scoped deliberately. A bare `--bin rayls-network`
+# selects every default workspace member for feature resolution, so features enabled by the
+# testing crates unify into this binary -- e2e-tests and chaos-framework depend on
+# `rayls-infrastructure-config` with `features = ["test-utils"]`, which drops the BLS keystore
+# from 1_000_000 PBKDF2 rounds to 1. `-p` restricts resolution to the binary's own package.
+#
 # move binary out of cache for subsequent build steps
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=./target \
-    cargo build --bin rayls-network --release ${BUILD_FEATURES:+--features ${BUILD_FEATURES}} \
+    cargo build -p rayls-network --bin rayls-network --release ${BUILD_FEATURES:+--features ${BUILD_FEATURES}} \
     && mv ./target/release/rayls-network /tmp/
 
 # production image

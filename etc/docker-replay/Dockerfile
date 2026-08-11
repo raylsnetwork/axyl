@@ -44,11 +44,12 @@ ARG VERGEN_GIT_SHA
 ENV VERGEN_GIT_SHA=${VERGEN_GIT_SHA:-0000000000000000000000000000000000000000}
 
 # build the replay binary; the archive-replay feature is selected by
-# bin/rayls-replay/Cargo.toml, so no extra --features flag is required
+# bin/rayls-replay/Cargo.toml, so no extra --features flag is required.
+# `-p` scopes feature resolution to this package -- see etc/docker-network/Dockerfile.
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=./target \
-    cargo build --bin rayls-replay --release \
+    cargo build -p rayls-replay --bin rayls-replay --release \
     && mv ./target/release/rayls-replay /tmp/
 
 # production image
