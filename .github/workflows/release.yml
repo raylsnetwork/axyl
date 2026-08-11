@@ -1,9 +1,13 @@
 name: Release — bump version
 
 # Manually start a release. Bumps the shared workspace version
-# ([workspace.package].version, inherited by all crates) and opens a PR.
-# Merging that PR triggers tag-on-release.yml, which tags v<version> and builds
-# the devnet image — so this workflow's only job is the version bump + PR.
+# ([workspace.package].version, inherited by all crates), commits it to a
+# release/v<version> branch and pushes that branch.
+#
+# Opening the PR is deliberately left to a human: this org does not grant
+# Actions permission to create pull requests. Open release/v<version> -> main
+# yourself (the run summary links straight to the compare page); merging it
+# triggers tag-on-release.yml, which tags v<version> and builds the devnet image.
 #
 # ACCESS: workflow_dispatch already requires write access to the repo, so only
 # collaborators / org members granted write can start a release. The job also
@@ -26,11 +30,10 @@ on:
 
 permissions:
   contents: write        # push the release/* branch
-  pull-requests: write   # open the release PR
 
 jobs:
   bump:
-    name: Bump ${{ inputs.bump }} and open PR
+    name: Bump ${{ inputs.bump }} and push release branch
     runs-on: ubuntu-latest
     # Fork guard: only run on the canonical org repo. Who may trigger is already
     # bounded by workflow_dispatch's write-access requirement (i.e. org members
@@ -86,13 +89,9 @@ jobs:
           echo "old=$OLD" >> "$GITHUB_OUTPUT"
           echo "new=$NEW" >> "$GITHUB_OUTPUT"
 
-      - name: Create branch, commit, open PR
+      - name: Create branch, commit and push
         env:
-          GH_TOKEN: ${{ github.token }}
           NEW: ${{ steps.bump.outputs.new }}
-          OLD: ${{ steps.bump.outputs.old }}
-          BUMP: ${{ inputs.bump }}
-          ACTOR: ${{ github.actor }}
         run: |
           set -euo pipefail
           BRANCH="release/v$NEW"
@@ -102,9 +101,25 @@ jobs:
           git add Cargo.toml Cargo.lock
           git commit -m "chore(release): v$NEW"
           git push --set-upstream origin "$BRANCH"
-          gh pr create --base main --head "$BRANCH" \
-            --title "chore(release): v$NEW" \
-            --assignee "$ACTOR" \
-            --body "Automated version bump \`$OLD\` → \`$NEW\` (level: \`$BUMP\`), triggered by @$ACTOR.
 
-          Merging this PR creates tag \`v$NEW\` and builds the \`devnet-v$NEW\` image (via \`tag-on-release.yml\`)."
+      # The PR is opened by hand, so leave the operator everything needed to do it.
+      - name: Summary
+        env:
+          NEW: ${{ steps.bump.outputs.new }}
+          OLD: ${{ steps.bump.outputs.old }}
+          BUMP: ${{ inputs.bump }}
+          REPO_URL: ${{ github.server_url }}/${{ github.repository }}
+        run: |
+          set -euo pipefail
+          BRANCH="release/v$NEW"
+          {
+            echo "## Release v$NEW"
+            echo
+            echo "Version bumped \`$OLD\` → \`$NEW\` (level: \`$BUMP\`) and pushed to \`$BRANCH\`."
+            echo
+            echo "**Next step — open the PR manually:**"
+            echo
+            echo "[Open \`$BRANCH\` → \`main\`]($REPO_URL/compare/main...$BRANCH?expand=1&title=chore%28release%29%3A+v$NEW)"
+            echo
+            echo "Merging it creates tag \`v$NEW\` and builds the \`devnet-v$NEW\` image (via \`tag-on-release.yml\`)."
+          } >> "$GITHUB_STEP_SUMMARY"

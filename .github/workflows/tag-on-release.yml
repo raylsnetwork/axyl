@@ -1,8 +1,8 @@
 name: Tag & build release
 
-# When the shared workspace version changes on main (via the release PR from
-# release.yml, or any manual edit to [workspace.package].version), create tag
-# v<version> and build the devnet image.
+# When the shared workspace version changes on main (via the manually opened PR
+# for the release/* branch that release.yml pushes, or any manual edit to
+# [workspace.package].version), create tag v<version> and build the devnet image.
 #
 # We invoke build-docker.yml directly (workflow_call) rather than relying on the
 # tag push to trigger it: a tag created with the default GITHUB_TOKEN does NOT
