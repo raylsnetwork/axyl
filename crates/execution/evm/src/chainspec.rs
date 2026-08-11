@@ -182,12 +182,12 @@ pub const TESTNET_DYNAMIC_COMMITTEE_SIZING_BLOCK: u64 = u64::MAX;
 pub const MAINNET_DYNAMIC_COMMITTEE_SIZING_BLOCK: u64 = u64::MAX;
 
 /// DynamicCommitteeSizing activation block on the local sandbox network.
-pub const LOCAL_DYNAMIC_COMMITTEE_SIZING_BLOCK: u64 = 0;
+pub const LOCAL_DYNAMIC_COMMITTEE_SIZING_BLOCK: u64 = 1_330_210; // devnet verification
 
 /// HybridRewards activation block on the local sandbox network. Block 1 (not 0): genesis
 /// deploys the pre-hybrid ConsensusRegistry, and the in-place bytecode-swap migration runs at
 /// the first post-genesis block, after which epoch closes use the hybrid `applyIncentives` ABI.
-pub const LOCAL_HYBRID_REWARDS_BLOCK: u64 = 1;
+pub const LOCAL_HYBRID_REWARDS_BLOCK: u64 = 1_330_210; // devnet verification
 
 impl RaylsHardFork {
     /// Return the protocol version byte for this hardfork.
