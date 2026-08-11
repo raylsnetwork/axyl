@@ -11,7 +11,7 @@ mod proposer_store;
 mod vote_digest_store;
 
 pub use batch_ordering_store::*;
-pub use certificate_store::*;
+pub use certificate_store::{save_cert, *};
 pub use checkpoint_store::*;
 pub use consensus_store::*;
 pub use epoch_store::*;

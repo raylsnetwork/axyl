@@ -13,11 +13,14 @@ use crate::{
 };
 use consensus_metrics::monitored_scope;
 use rayls_infrastructure_config::ConsensusConfig;
-use rayls_infrastructure_storage::CertificateStore;
+use rayls_infrastructure_storage::{
+    tables::{CertificateDigestByOrigin, CertificateDigestByRound, Certificates},
+    save_cert, CertificateStore,
+};
 use rayls_infrastructure_types::{
     error::{CertificateError, HeaderError},
-    Certificate, CertificateDigest, Database, Hash as _, Noticer, RaylsReceiver as _,
-    RaylsSender as _,
+    Certificate, CertificateDigest, Database, DbTxMut, Hash as _, Noticer, RaylsReceiver as _,
+    RaylsSender as _, Table,
 };
 use std::{
     collections::{HashSet, VecDeque},
@@ -302,7 +305,21 @@ where
         &mut self,
         certificates: &VecDeque<Certificate>,
     ) -> CertManagerResult<()> {
-        self.config.node_storage().write_all(certificates.clone())?;
+        // Certificates + both secondary indexes must be written atomically w.r.t.
+        // the epoch-boundary clear (which takes the same locks).
+        let storage = self.config.node_storage();
+        let mut txn = storage.write_txn()?;
+        txn.lock_table(Certificates::NAME)?;
+        txn.lock_table(CertificateDigestByRound::NAME)?;
+        txn.lock_table(CertificateDigestByOrigin::NAME)?;
+        for certificate in certificates {
+            let digest = certificate.digest();
+            if let Err(e) = save_cert(&mut txn, digest, certificate.clone()) {
+                error!(target: "primary::cert_manager", "Failed to write certificate for {digest} due to error {e}.");
+                return Err(e.into());
+            }
+        }
+        txn.commit()?;
 
         self.certs_accepted = self.certs_accepted.saturating_add(certificates.len() as u32);
         let gc_depth = self.config.parameters().gc_depth;

@@ -19,8 +19,6 @@ pub(crate) struct WriteLockManager {
 impl WriteLockManager {
     /// Acquire a write lock on the given table.
     /// Blocks until the lock is available, then returns a guard that holds it.
-    /// Not yet wired into consensus logic (Phase 4); exercised by tests.
-    #[allow(dead_code)]
     pub(crate) fn lock(&self, table_name: &'static str) -> WriteLockGuard {
         // First try to get existing mutex under read lock
         let mutex = { self.locks.read().unwrap().get(table_name).cloned() };

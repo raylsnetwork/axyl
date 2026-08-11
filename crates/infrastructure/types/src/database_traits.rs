@@ -100,6 +100,19 @@ pub trait DbTxMut: DbTx {
     /// Removes every key-value pair from the table.
     fn clear_table<T: Table>(&mut self) -> eyre::Result<()>;
 
+    /// Serialize this transaction's reads of `table` against other writers that also lock it.
+    ///
+    /// The lock is held until the transaction is committed or dropped. Backends without the
+    /// concept (MemDatabase, bare Mdbx/redb) no-op; `LayeredDatabase` serializes via its
+    /// [`WriteLockManager`](crate::write_lock::WriteLockManager).
+    ///
+    /// Required for read-then-write sequences: without it, the read and the write run in
+    /// separate transactions and two writers can interleave on the same key.
+    fn lock_table(&mut self, table_name: &'static str) -> eyre::Result<()> {
+        let _ = table_name;
+        Ok(())
+    }
+
     /// Commit data to durable storage.
     fn commit(self) -> eyre::Result<()>;
 }

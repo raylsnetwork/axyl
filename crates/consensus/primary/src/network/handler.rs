@@ -17,15 +17,16 @@ use parking_lot::Mutex;
 use rayls_consensus_network::GossipMessage;
 use rayls_infrastructure_config::{ConsensusConfig, LibP2pConfig};
 use rayls_infrastructure_storage::{
-    tables::ConsensusBlocks, ConsensusStore, EpochStore, ProposerStore, VoteDigestStore,
+    tables::{ConsensusBlocks, LastProposedByAuthority, Votes},
+    ConsensusStore, EpochStore,
 };
 use rayls_infrastructure_types::{
     ensure,
     error::{CertificateError, HeaderError, HeaderResult},
     now, to_intent_message, try_decode, AuthorityIdentifier, BlockHash, BlockNumHash, BlsPublicKey,
-    Certificate, CertificateDigest, ConsensusHeader, Database, Epoch, EpochCertificate,
-    EpochRecord, Hash as _, Header, ProtocolSignature, RaylsSender as _, Round,
-    SignatureVerificationState, Vote, VotesAggregator,
+    Certificate, CertificateDigest, ConsensusHeader, Database, DbTx, DbTxMut, Epoch,
+    EpochCertificate, EpochRecord, Hash as _, Header, ProtocolSignature, RaylsSender as _, Round,
+    SignatureVerificationState, Table, Vote, VotesAggregator,
 };
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
@@ -643,11 +644,15 @@ where
             }
         };
 
-        let previous_vote = self
-            .consensus_config
-            .node_storage()
-            .read_vote_info(header.author())
-            .map_err(HeaderError::Storage)?;
+        let storage = self.consensus_config.node_storage();
+        let mut txn = storage.write_txn()?;
+        // Read-then-write on Votes: the "already voted" check and the vote write must be atomic
+        // w.r.t. other vote requests for the same author, or an equivocation pair can both pass
+        // the check and both be stored. Lock the tables for the lifetime of the transaction.
+        txn.lock_table(Votes::NAME)?;
+        txn.lock_table(LastProposedByAuthority::NAME)?;
+
+        let previous_vote = txn.get::<Votes>(header.author())?;
         if let Some(vote_info) = previous_vote {
             ensure!(
                 header.epoch() == vote_info.epoch(),
@@ -689,11 +694,11 @@ where
 
         let vote = Vote::new(&header, authority_id, self.consensus_config.key_config());
 
-        self.consensus_config.node_storage().write_vote(&vote)?;
+        txn.insert::<Votes>(vote.origin(), &(&vote).into())?;
 
-        self.consensus_config
-            .node_storage()
-            .write_last_proposed_by_authority(header.author.clone(), &header)?;
+        txn.insert::<LastProposedByAuthority>(&header.author, &header)?;
+
+        txn.commit()?;
 
         Ok(PrimaryResponse::Vote(vote))
     }

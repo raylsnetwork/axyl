@@ -7,13 +7,12 @@ use crate::{
 use eyre::eyre;
 use rayls_consensus_primary::NodeMode;
 use rayls_infrastructure_config::RaylsDirs;
-use rayls_infrastructure_storage::{
-    tables::{EpochTransitionCheckpoints, LastProposed, LastProposedByAuthority},
-    CheckpointStore,
+use rayls_infrastructure_storage::tables::{
+    EpochTransitionCheckpoints, LastProposed, LastProposedByAuthority,
 };
 use rayls_infrastructure_types::{
-    BlockHash, ConsensusHeader, ConsensusOutput, Database as ReDatabase, Epoch, Notifier,
-    TaskManager, B256,
+    BlockHash, ConsensusHeader, ConsensusOutput, Database as ReDatabase, DbTxMut, Epoch, Notifier,
+    Table, TaskManager, B256,
 };
 use std::time::Duration;
 use tracing::{error, info, warn};
@@ -437,14 +436,20 @@ where
                 .unwrap_or_default()
                 .as_secs(),
         };
-        self.consensus_db.save_checkpoint(&checkpoint)?;
-        Ok(())
+        // Checkpoint read/write pairs (recover_partial_transition) must not
+        // interleave with a fresh transition's checkpoints.
+        let mut txn = self.consensus_db.write_txn()?;
+        txn.lock_table(EpochTransitionCheckpoints::NAME)?;
+        txn.insert::<EpochTransitionCheckpoints>(&checkpoint.epoch, &checkpoint)?;
+        txn.commit()
     }
 
     /// Remove the transition checkpoint after a successful transition.
     fn clear_transition_checkpoint(&self, epoch: Epoch) -> eyre::Result<()> {
-        self.consensus_db.clear_checkpoint(epoch)?;
-        Ok(())
+        let mut txn = self.consensus_db.write_txn()?;
+        txn.lock_table(EpochTransitionCheckpoints::NAME)?;
+        txn.remove::<EpochTransitionCheckpoints>(&epoch)?;
+        txn.commit()
     }
 }
 

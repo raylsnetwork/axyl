@@ -4,7 +4,7 @@ use crate::{metrics::WorkerMetrics, network::WorkerNetworkHandle};
 use async_trait::async_trait;
 use rayls_consensus_network::error::NetworkError;
 use rayls_infrastructure_storage::tables::Batches;
-use rayls_infrastructure_types::{now, Batch, BlockHash, Database, DbTxMut};
+use rayls_infrastructure_types::{now, Batch, BlockHash, Database, DbTxMut, Table};
 use std::{
     collections::{HashMap, HashSet},
     sync::Arc,
@@ -74,17 +74,27 @@ impl<DB: Database> BatchFetcher<DB> {
                     updated_new_batches.insert(*digest, batch);
                 }
                 // Also persist the batches, so they are available after restarts.
-                self.batch_store
-                    .with_write_txn(|txn| {
-                        for (digest, batch) in &updated_new_batches {
-                            txn.insert::<Batches>(digest, batch).map_err(|e| {
-                                tracing::error!(target: "batch_fetcher", "failed to insert batch! We can not continue.. {e}");
-                                e
-                            })?;
-                        }
-                        Ok(())
-                    })
+                // Serialize against other writers of the Batches table (the worker's own
+                // insert path) so a fetch landing on a digest being locally written cannot
+                // interleave a read-then-write mid-commit.
+                let mut txn = self
+                    .batch_store
+                    .write_txn()
                     .expect("unable to create DB transaction!");
+                txn.lock_table(Batches::NAME)
+                    .expect("unable to acquire batch store lock!");
+                if let Err(e) = (|| -> eyre::Result<()> {
+                    for (digest, batch) in &updated_new_batches {
+                        txn.insert::<Batches>(digest, batch).map_err(|e| {
+                            tracing::error!(target: "batch_fetcher", "failed to insert batch! We can not continue.. {e}");
+                            e
+                        })?;
+                    }
+                    Ok(())
+                })() {
+                    panic!("unable to insert batch: {e}");
+                }
+                txn.commit().expect("unable to commit batch transaction!");
                 fetched_batches.extend(updated_new_batches.into_iter());
 
                 if remaining_digests.is_empty() {

@@ -118,7 +118,7 @@ pub trait CertificateStore {
 }
 
 /// Save a cert using an open txn.
-fn save_cert<TX: DbTxMut>(
+pub fn save_cert<TX: DbTxMut>(
     txn: &mut TX,
     digest: CertificateDigest,
     certificate: Certificate,

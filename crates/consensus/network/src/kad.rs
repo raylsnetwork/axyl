@@ -17,7 +17,9 @@ use rayls_infrastructure_config::KeyConfig;
 use rayls_infrastructure_storage::tables::{
     KadProviderRecords, KadRecords, KadWorkerProviderRecords, KadWorkerRecords,
 };
-use rayls_infrastructure_types::{decode, encode, BlockHash, Database, DbTx, DefaultHashFunction};
+use rayls_infrastructure_types::{
+    decode, encode, BlockHash, Database, DbTx, DbTxMut, DefaultHashFunction, Table,
+};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_with::{serde_as, DeserializeAs, SerializeAs};
 
@@ -253,13 +255,23 @@ impl<DB: Database> RecordStore for KadStore<DB> {
 
         let key = self.key_to_hash(&r.key);
         let kr: KadRecord = r.into();
+        let table_name = match self.kad_type {
+            KadStoreType::Primary => KadRecords::NAME,
+            KadStoreType::Worker => KadWorkerRecords::NAME,
+        };
+
+        let mut txn = self.db.write_txn().map_err(|_| Error::ValueTooLarge)?;
+        // The read below and the insert must be atomic w.r.t. other writers of this table:
+        // without the lock, two concurrent puts can both count a new record and overflow the
+        // capacity accounting.
+        txn.lock_table(table_name).map_err(|_| Error::ValueTooLarge)?;
         // Are we adding a new record or replacing an existing?
         let new_record = match self.kad_type {
             KadStoreType::Primary => {
-                self.db.get::<KadRecords>(&key).map_err(|_| Error::ValueTooLarge)?.is_none()
+                txn.get::<KadRecords>(&key).map_err(|_| Error::ValueTooLarge)?.is_none()
             }
             KadStoreType::Worker => {
-                self.db.get::<KadWorkerRecords>(&key).map_err(|_| Error::ValueTooLarge)?.is_none()
+                txn.get::<KadWorkerRecords>(&key).map_err(|_| Error::ValueTooLarge)?.is_none()
             }
         };
         // We have a new record so go ahead and inc num_records.
@@ -272,16 +284,14 @@ impl<DB: Database> RecordStore for KadStore<DB> {
             }
         }
         match self.kad_type {
-            KadStoreType::Primary => self
-                .db
+            KadStoreType::Primary => txn
                 .insert::<KadRecords>(&key, &encode(&kr))
                 .map_err(|_| Error::ValueTooLarge)?,
-            KadStoreType::Worker => self
-                .db
+            KadStoreType::Worker => txn
                 .insert::<KadWorkerRecords>(&key, &encode(&kr))
                 .map_err(|_| Error::ValueTooLarge)?,
         }
-        Ok(())
+        txn.commit().map_err(|_| Error::ValueTooLarge)
     }
 
     fn remove(&mut self, k: &RecordKey) {
@@ -311,10 +321,19 @@ impl<DB: Database> RecordStore for KadStore<DB> {
         }
         let key = self.key_to_hash(&record.key);
         let kr: KadProviderRecord = record.into();
+        let table_name = match self.kad_type {
+            KadStoreType::Primary => KadProviderRecords::NAME,
+            KadStoreType::Worker => KadWorkerProviderRecords::NAME,
+        };
+
+        let mut txn = self.db.write_txn().map_err(|_| Error::ValueTooLarge)?;
+        // Read-modify-write on the provider list must be atomic w.r.t. other writers of this
+        // table, or two concurrent adds can both append the same provider.
+        txn.lock_table(table_name).map_err(|_| Error::ValueTooLarge)?;
         let mut inc_providers = false;
         let records: Vec<KadProviderRecord> = if let Ok(Some(recs)) = match self.kad_type {
-            KadStoreType::Primary => self.db.get::<KadProviderRecords>(&key),
-            KadStoreType::Worker => self.db.get::<KadWorkerProviderRecords>(&key),
+            KadStoreType::Primary => txn.get::<KadProviderRecords>(&key),
+            KadStoreType::Worker => txn.get::<KadWorkerProviderRecords>(&key),
         } {
             let mut recs: Vec<KadProviderRecord> = decode(&recs);
             let mut found = false;
@@ -336,15 +355,14 @@ impl<DB: Database> RecordStore for KadStore<DB> {
             vec![kr]
         };
         match self.kad_type {
-            KadStoreType::Primary => self
-                .db
+            KadStoreType::Primary => txn
                 .insert::<KadProviderRecords>(&key, &encode(&records))
                 .map_err(|_| libp2p::kad::store::Error::ValueTooLarge)?,
-            KadStoreType::Worker => self
-                .db
+            KadStoreType::Worker => txn
                 .insert::<KadWorkerProviderRecords>(&key, &encode(&records))
                 .map_err(|_| libp2p::kad::store::Error::ValueTooLarge)?,
         }
+        txn.commit().map_err(|_| libp2p::kad::store::Error::ValueTooLarge)?;
         if inc_providers {
             // If this was a new record and it was inserted then inc num_providers.
             // I.E. Don't inc if this updated an existing provider record.
@@ -375,32 +393,43 @@ impl<DB: Database> RecordStore for KadStore<DB> {
 
     fn remove_provider(&mut self, key: &RecordKey, p: &PeerId) {
         let key = self.key_to_hash(key);
+        let table_name = match self.kad_type {
+            KadStoreType::Primary => KadProviderRecords::NAME,
+            KadStoreType::Worker => KadWorkerProviderRecords::NAME,
+        };
+        let Ok(mut txn) = self.db.write_txn() else { return };
+        if txn.lock_table(table_name).is_err() {
+            return;
+        }
         if let Ok(Some(recs)) = match self.kad_type {
-            KadStoreType::Primary => self.db.get::<KadProviderRecords>(&key),
-            KadStoreType::Worker => self.db.get::<KadWorkerProviderRecords>(&key),
+            KadStoreType::Primary => txn.get::<KadProviderRecords>(&key),
+            KadStoreType::Worker => txn.get::<KadWorkerProviderRecords>(&key),
         } {
             let records: Vec<KadProviderRecord> = decode(&recs);
             let records: Vec<KadProviderRecord> =
                 records.into_iter().filter(|r| r.provider != *p).collect();
             if records.is_empty() {
                 if match self.kad_type {
-                    KadStoreType::Primary => self.db.remove::<KadProviderRecords>(&key),
-                    KadStoreType::Worker => self.db.remove::<KadWorkerProviderRecords>(&key),
+                    KadStoreType::Primary => txn.remove::<KadProviderRecords>(&key),
+                    KadStoreType::Worker => txn.remove::<KadWorkerProviderRecords>(&key),
                 }
                 .is_ok()
                 {
-                    // Provider is empty and we removed it so dec num_providers.
-                    self.num_providers = self.num_providers.saturating_sub(1);
+                    if txn.commit().is_ok() {
+                        // Provider is empty and we removed it so dec num_providers.
+                        self.num_providers = self.num_providers.saturating_sub(1);
+                    }
                 }
             } else {
                 let _ = match self.kad_type {
                     KadStoreType::Primary => {
-                        self.db.insert::<KadProviderRecords>(&key, &encode(&records))
+                        txn.insert::<KadProviderRecords>(&key, &encode(&records))
                     }
                     KadStoreType::Worker => {
-                        self.db.insert::<KadWorkerProviderRecords>(&key, &encode(&records))
+                        txn.insert::<KadWorkerProviderRecords>(&key, &encode(&records))
                     }
                 };
+                let _ = txn.commit();
             }
         }
     }

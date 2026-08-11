@@ -10,11 +10,11 @@ use rayls_infrastructure_storage::{
         KadWorkerProviderRecords, KadWorkerRecords, LastProposed, LastProposedByAuthority,
         NodeBatchesCache, NodeIdentity, Payload, Votes,
     },
-    CertificateStore as _, EpochStore as _, ProposerStore as _, LAST_PROPOSAL_KEY,
+    CertificateStore as _, EpochStore as _, LAST_PROPOSAL_KEY,
 };
 use rayls_infrastructure_types::{
     AuthorityIdentifier, BlsPublicKey, Committee, CommitteeBuilder, ConsensusHeader,
-    Database as ReDatabase, DbTxMut, Epoch, EpochRecord, B256,
+    Database as ReDatabase, DbTx, DbTxMut, Table, Epoch, EpochRecord, B256,
 };
 use std::collections::HashMap;
 use tracing::{debug, error, info, trace, warn};
@@ -238,33 +238,37 @@ where
             "foreign consensus DB detected, clearing identity-bound tables"
         );
 
+        let mut txn = self.consensus_db.write_txn()?;
+        // Read-then-write: preserve our last proposed header (read from
+        // LastProposedByAuthority) while wiping the identity-bound tables.
+        // Lock both involved tables so the read and the re-insert are atomic.
+        txn.lock_table(LastProposedByAuthority::NAME)?;
+        txn.lock_table(LastProposed::NAME)?;
+
         let mut last_proposed_header = None;
-        if let Ok(Some(header)) = self.consensus_db.get_last_proposed_by_authority(our_authority_id)
-        {
+        if let Ok(Some(header)) = txn.get::<LastProposedByAuthority>(&our_authority_id) {
             last_proposed_header = Some(header);
         }
 
-        self.consensus_db.with_write_txn(|txn| {
-            txn.clear_table::<LastProposed>()?;
-            txn.clear_table::<Votes>()?;
-            txn.clear_table::<Payload>()?;
-            // node-specific long-lived tables
-            txn.clear_table::<NodeBatchesCache>()?;
-            txn.clear_table::<EpochTransitionCheckpoints>()?;
-            txn.clear_table::<BatchSeqCounter>()?;
-            // KAD record tables: cleared on snapshot recovery so find_authorities
-            // re-queries fresh records, avoiding stale addresses from the snapshot epoch.
-            txn.clear_table::<KadRecords>()?;
-            txn.clear_table::<KadProviderRecords>()?;
-            txn.clear_table::<KadWorkerRecords>()?;
-            txn.clear_table::<KadWorkerProviderRecords>()?;
+        txn.clear_table::<LastProposed>()?;
+        txn.clear_table::<Votes>()?;
+        txn.clear_table::<Payload>()?;
+        // node-specific long-lived tables
+        txn.clear_table::<NodeBatchesCache>()?;
+        txn.clear_table::<EpochTransitionCheckpoints>()?;
+        txn.clear_table::<BatchSeqCounter>()?;
+        // KAD record tables: cleared on snapshot recovery so find_authorities
+        // re-queries fresh records, avoiding stale addresses from the snapshot epoch.
+        txn.clear_table::<KadRecords>()?;
+        txn.clear_table::<KadProviderRecords>()?;
+        txn.clear_table::<KadWorkerRecords>()?;
+        txn.clear_table::<KadWorkerProviderRecords>()?;
 
-            if let Some(h) = last_proposed_header {
-                txn.insert::<LastProposed>(&LAST_PROPOSAL_KEY, &h)?;
-            }
+        if let Some(h) = last_proposed_header {
+            txn.insert::<LastProposed>(&LAST_PROPOSAL_KEY, &h)?;
+        }
 
-            Ok(())
-        })?;
+        txn.commit()?;
 
         if !self.builder.rayls_infrastructure_config.observer {
             self.consensus_bus.node_mode().send_modify(|v| *v = NodeMode::CvvInactive);
@@ -538,17 +542,26 @@ where
         let highest_round = self.consensus_db.highest_round_number();
         info!(target: "epoch-manager::cert-store", highest_round, "clearing consensus tables at epoch boundary");
 
-        self.consensus_db.with_write_txn(|txn| {
-            txn.clear_table::<LastProposed>()?;
-            txn.clear_table::<LastProposedByAuthority>()?;
-            txn.clear_table::<Votes>()?;
-            txn.clear_table::<Certificates>()?;
-            txn.clear_table::<CertificateDigestByRound>()?;
-            txn.clear_table::<CertificateDigestByOrigin>()?;
-            txn.clear_table::<Payload>()?;
+        let mut txn = self.consensus_db.write_txn()?;
+        // Exclusive across the whole sweep: any writer interleaving between
+        // clears would have its rows wiped by a later clear_table.
+        txn.lock_table(LastProposed::NAME)?;
+        txn.lock_table(LastProposedByAuthority::NAME)?;
+        txn.lock_table(Votes::NAME)?;
+        txn.lock_table(Certificates::NAME)?;
+        txn.lock_table(CertificateDigestByRound::NAME)?;
+        txn.lock_table(CertificateDigestByOrigin::NAME)?;
+        txn.lock_table(Payload::NAME)?;
 
-            Ok(())
-        })?;
+        txn.clear_table::<LastProposed>()?;
+        txn.clear_table::<LastProposedByAuthority>()?;
+        txn.clear_table::<Votes>()?;
+        txn.clear_table::<Certificates>()?;
+        txn.clear_table::<CertificateDigestByRound>()?;
+        txn.clear_table::<CertificateDigestByOrigin>()?;
+        txn.clear_table::<Payload>()?;
+
+        txn.commit()?;
 
         Ok(())
     }

@@ -15,7 +15,7 @@ use rayls_infrastructure_storage::{
 };
 use rayls_infrastructure_types::{
     AuthorityIdentifier, ConsensusHeader, ConsensusOutput, Database, DbTx, DbTxMut, Epoch,
-    RaylsSender, SealedHeader, TaskSpawner, B256,
+    RaylsSender, SealedHeader, Table, TaskSpawner, B256,
 };
 use tracing::{debug, error, info, trace, warn};
 
@@ -196,15 +196,20 @@ pub fn save_consensus<DB: Database>(
     let header: ConsensusHeader = consensus_output.into();
     let header_digest = header.digest();
 
+    let mut txn = db.write_txn()?;
+    // Read-then-write on ConsensusBlocks: the priors read and the overwrite must be atomic
+    // w.r.t. another commit at the same number, or the stale-index pruning can race. The
+    // cache table is pruned 1:1 in the same transaction, so it is locked alongside.
+    txn.lock_table(ConsensusBlocks::NAME)?;
+    txn.lock_table(ConsensusBlocksCache::NAME)?;
+
     // The ByDigest index is append-only, so a re-commit under a different digest leaves a stale
     // entry. Capture the prior digests at this number before the write overwrites them, to prune
-    // below. Read in its own txn: `LayeredDbTxMut::get` panics inside a write txn.
-    let priors = db.with_read_txn(|txn| {
-        Ok([
-            txn.get::<ConsensusBlocks>(&header.number)?,
-            txn.get::<ConsensusBlocksCache>(&header.number)?,
-        ])
-    })?;
+    // below.
+    let priors = [
+        txn.get::<ConsensusBlocks>(&header.number)?,
+        txn.get::<ConsensusBlocksCache>(&header.number)?,
+    ];
     let superseded: Vec<B256> = priors
         .into_iter()
         .flatten()
@@ -212,39 +217,35 @@ pub fn save_consensus<DB: Database>(
         .filter(|&digest| digest != header_digest)
         .collect();
 
-    db.with_write_txn(|txn| {
-        for (digest, batch) in &batches_to_insert {
-            if let Err(e) = txn.insert::<Batches>(digest, batch) {
-                error!(target: "state-sync", ?e, "error saving a batch to persistent storage!");
-                return Err(e);
-            }
-        }
-        if let Err(e) = txn.insert::<ConsensusBlocks>(&header.number, &header) {
-            error!(target: "rayls-consensus-state-sync", ?e, "error saving a consensus header to persistent storage!");
+    for (digest, batch) in &batches_to_insert {
+        if let Err(e) = txn.insert::<Batches>(digest, batch) {
+            error!(target: "state-sync", ?e, "error saving a batch to persistent storage!");
             return Err(e);
         }
-        if let Err(e) = txn.insert::<ConsensusBlockNumbersByDigest>(&header_digest, &header.number)
-        {
-            error!(target: "rayls-consensus-state-sync", ?e, "error saving a consensus header number to persistent storage!");
-            return Err(e);
-        }
-        // promote: remove from cache now that it lives in ConsensusBlocks.
-        // batch cleanup of old cache entries was removed because scanning
-        // the table was slowing down recovery processing. each entry is
-        // cleaned 1:1 as it is promoted through this path.
-        let _ = txn.remove::<ConsensusBlocksCache>(&header.number);
+    }
+    if let Err(e) = txn.insert::<ConsensusBlocks>(&header.number, &header) {
+        error!(target: "rayls-consensus-state-sync", ?e, "error saving a consensus header to persistent storage!");
+        return Err(e);
+    }
+    if let Err(e) = txn.insert::<ConsensusBlockNumbersByDigest>(&header_digest, &header.number)
+    {
+        error!(target: "rayls-consensus-state-sync", ?e, "error saving a consensus header number to persistent storage!");
+        return Err(e);
+    }
+    // promote: remove from cache now that it lives in ConsensusBlocks.
+    // batch cleanup of old cache entries was removed because scanning
+    // the table was slowing down recovery processing. each entry is
+    // cleaned 1:1 as it is promoted through this path.
+    let _ = txn.remove::<ConsensusBlocksCache>(&header.number);
 
-        // Prune the digests this header supersedes at its number; this only fixes the common 1:1
-        // re-commit, so by-hash readers must still re-check digest == hash (older orphans persist).
-        for stale_digest in &superseded {
-            let _ = txn.remove::<ConsensusBlockNumbersByDigest>(stale_digest);
-        }
+    // Prune the digests this header supersedes at its number; this only fixes the common 1:1
+    // re-commit, so by-hash readers must still re-check digest == hash (older orphans persist).
+    for stale_digest in &superseded {
+        let _ = txn.remove::<ConsensusBlockNumbersByDigest>(stale_digest);
+    }
 
-        // Do not clean NodeBatchesCache table here. It must be clean in `process_committed_headers` in the proposer`
-        Ok(())
-    })?;
-
-    Ok(())
+    // Do not clean NodeBatchesCache table here. It must be clean in `process_committed_headers` in the proposer`
+    txn.commit()
 }
 
 /// The canonical consensus-chain tip, used to seed the live subscriber's header *numbering* so a

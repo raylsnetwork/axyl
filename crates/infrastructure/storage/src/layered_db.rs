@@ -472,8 +472,6 @@ impl<'a, DB: Database> Debug for WriteTxn<'a, DB> {
 impl<'a, DB: Database> WriteTxn<'a, DB> {
     /// Locks the given table, so this transaction's reads of it cannot be interleaved by another
     /// writer's reads of it. Held until this transaction is dropped or commits.
-    /// Not yet wired into consensus logic (Phase 4); exercised by tests.
-    #[allow(dead_code)]
     pub(crate) fn lock(&mut self, table_name: &'static str) -> WriteLockGuard {
         self.locks.push(self.lock_manager.lock(table_name));
         self.locks.last().unwrap().clone()
@@ -706,6 +704,11 @@ impl<'a, DB: Database> DbTxMut for WriteTxn<'a, DB> {
     fn clear_table<T: Table>(&mut self) -> eyre::Result<()> {
         self.mem_txn.clear_table::<T>()?;
         self.pending.push(Box::new(PersistClear::<T> { _phantom: std::marker::PhantomData }));
+        Ok(())
+    }
+
+    fn lock_table(&mut self, table_name: &'static str) -> eyre::Result<()> {
+        self.lock(table_name);
         Ok(())
     }
 
@@ -1035,6 +1038,16 @@ impl<DB: Database> LayeredDatabase<DB> {
             #[cfg(feature = "cold-storage")]
             cold: None,
         }
+    }
+
+    /// Open a buffered write transaction, optionally serializing reads against other writers
+    /// via [`DbTxMut::lock_table`].
+    ///
+    /// Reads see this transaction's own writes immediately (private buffer); nothing is visible
+    /// to other transactions until [`DbTxMut::commit`]. Equivalent to the [`Database::write_txn`]
+    /// entry point; named after the read-then-write workflow that motivates explicit locking.
+    pub fn start_write_txn(&self) -> eyre::Result<WriteTxn<'_, DB>> {
+        <Self as Database>::write_txn(self)
     }
 
     /// Attaches the cold tier point reads fall through to on a hot miss.
