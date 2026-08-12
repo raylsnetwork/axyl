@@ -122,7 +122,10 @@ contract MockConsensusRegistryExt {
 /// @notice Mock DelegationPool for testing (ERC-20 RLS)
 contract MockDelegationPoolExt {
     mapping(address => uint256) public delegatedStakes;
+    mapping(address => uint256) public openTierDelegatedStakes;
     mapping(address => uint256) public distributedRewards;
+    mapping(address => uint256) public trackAReceived;
+    mapping(address => uint256) public trackBReceived;
     IERC20 public rlsToken;
 
     function setRlsToken(address rls_) external {
@@ -133,12 +136,19 @@ contract MockDelegationPoolExt {
         delegatedStakes[validator] = stake;
     }
 
+    /// @dev Sets the Track B (open-tier) slice of `validator`'s already-set combined stake.
+    ///      Caller must ensure delegatedStakes[validator] >= this value, matching the real
+    ///      DelegationPool's getTotalDelegatedStake() == Track A + Track B invariant.
+    function setOpenTierDelegatedStake(address validator, uint256 stake) external {
+        openTierDelegatedStakes[validator] = stake;
+    }
+
     function getTotalDelegatedStake(address validator) external view returns (uint256) {
         return delegatedStakes[validator];
     }
 
-    function getTotalOpenTierDelegatedStake(address) external pure returns (uint256) {
-        return 0;
+    function getTotalOpenTierDelegatedStake(address validator) external view returns (uint256) {
+        return openTierDelegatedStakes[validator];
     }
 
     function distributePoolRewards(address validator, uint256 amount) external {
@@ -147,6 +157,8 @@ contract MockDelegationPoolExt {
 
     function distributePoolRewards(address validator, uint256 trackAAmount, uint256 trackBAmount) external {
         distributedRewards[validator] += trackAAmount + trackBAmount;
+        trackAReceived[validator] += trackAAmount;
+        trackBReceived[validator] += trackBAmount;
     }
 }
 
@@ -424,6 +436,83 @@ contract RewardDistributorExtendedTest is Test {
             distributor.getPendingRewards(validator2),
             "equal stake should yield equal rewards"
         );
+    }
+
+    // =========================================================================
+    //  7b. Track B (open-tier) target: distinct rate reaches the pool separately
+    // =========================================================================
+
+    /// @notice Minimal repro for the missing-coverage gap: every other test in this file leaves
+    ///         openTierTargetApyBps unset and MockDelegationPoolExt.getTotalOpenTierDelegatedStake
+    ///         returned a hardcoded 0, so _splitTarget's trackBTarget term and
+    ///         _distributeByTarget's trackBReward term were never exercised. This configures both
+    ///         APYs, gives the validator a real Track B stake, funds the distributor with exactly
+    ///         the combined target, and asserts Track A and Track B each land at their OWN
+    ///         configured rate — not blended, not zero.
+    function test_distributeRewards_trackBTarget_reachesPoolAtItsOwnRate() public {
+        registry.clearValidators();
+        registry.addActiveValidator(validator1, 0); // no own stake: isolates the two track rates
+
+        uint256 trackA = 100e18;
+        uint256 trackB = 200e18;
+        delegationPool.setDelegatedStake(validator1, trackA + trackB);
+        delegationPool.setOpenTierDelegatedStake(validator1, trackB);
+
+        vm.startPrank(owner);
+        distributor.setTargetApyBps(5000); // 50% Track A
+        distributor.setOpenTierTargetApyBps(2000); // 20% Track B — deliberately different rate
+        vm.stopPrank();
+
+        registry.setEpochDuration(86400); // 1 day
+
+        uint256 epochSecs = 86400;
+        uint256 priorityTarget = (trackA * 5000 * epochSecs) / (365 days * 10_000);
+        uint256 trackBTarget = (trackB * 2000 * epochSecs) / (365 days * 10_000);
+
+        // Fund exactly the combined target so fundingRatio == 1 and each track's share is exact.
+        _receiveRewards(priorityTarget + trackBTarget);
+
+        vm.prank(SYSTEM_ADDRESS);
+        distributor.distributeRewards();
+
+        assertEq(delegationPool.trackAReceived(validator1), priorityTarget, "Track A reaches its own 50% target");
+        assertEq(delegationPool.trackBReceived(validator1), trackBTarget, "Track B reaches its own 20% target, not zero and not blended with Track A");
+        // The two targets are computed from different stake amounts AND different APY bps, so an
+        // implementation that collapsed them into one stake-proportional split (ignoring
+        // openTierTargetApyBps) would produce a different, wrong trackBReceived value above.
+        assertTrue(trackBTarget != priorityTarget, "test fixture actually exercises two distinct rates");
+    }
+
+    /// @notice Same gap, but through the accumulator top-up path: with zero fee income, the
+    ///         entire combined target (Track A + Track B, each at its own rate) must be pulled
+    ///         from the accumulator in one shot, and land on the correct track.
+    function test_accumulatorTopUp_coversTrackBTargetAtItsOwnRate() public {
+        registry.clearValidators();
+        registry.addActiveValidator(validator1, 0);
+
+        uint256 trackA = 300e18;
+        uint256 trackB = 100e18;
+        delegationPool.setDelegatedStake(validator1, trackA + trackB);
+        delegationPool.setOpenTierDelegatedStake(validator1, trackB);
+
+        RLSAccumulator acc = _setupAccumulator(1_000_000e18); // sets targetApyBps = 5000, epoch = 1 day
+        vm.prank(owner);
+        distributor.setOpenTierTargetApyBps(1000); // 10% Track B
+
+        uint256 accBalanceBefore = rls.balanceOf(address(acc));
+
+        // No fee rewards received — the whole combined target must come from the accumulator.
+        vm.prank(SYSTEM_ADDRESS);
+        distributor.distributeRewards();
+
+        uint256 epochSecs = 86400;
+        uint256 priorityTarget = (trackA * 5000 * epochSecs) / (365 days * 10_000);
+        uint256 trackBTarget = (trackB * 1000 * epochSecs) / (365 days * 10_000);
+
+        uint256 pulled = accBalanceBefore - rls.balanceOf(address(acc));
+        assertEq(pulled, priorityTarget + trackBTarget, "accumulator pulls the combined Track A + Track B target");
+        assertEq(delegationPool.trackAReceived(validator1), priorityTarget, "Track A share of the top-up matches its own rate");
+        assertEq(delegationPool.trackBReceived(validator1), trackBTarget, "Track B share of the top-up matches its own rate, sourced from the accumulator");
     }
 
     // =========================================================================
