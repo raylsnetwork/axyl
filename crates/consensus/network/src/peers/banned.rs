@@ -2,6 +2,7 @@
 //!
 //! Peers that score poorly are eventually banned.
 use super::peer::Peer;
+use libp2p::PeerId;
 use std::{
     collections::{HashMap, HashSet},
     net::IpAddr,
@@ -15,30 +16,33 @@ mod banned_peers;
 /// Currently set to 1, so ips are banned if more than one peer is banned.
 const BANNED_PEERS_PER_IP_THRESHOLD: usize = 1;
 
-/// The total number of banned peers and a collection of the number of bad peers by IP address.
+/// The ip addresses charged for each banned peer, and the resulting per-ip counts.
 #[derive(Debug, Default)]
 pub(super) struct BannedPeers {
-    /// The total number of banned peers for this node.
-    total: usize,
+    /// The ip addresses charged when each peer was banned.
+    ///
+    /// A ban must be released against exactly the addresses it charged. A peer's address set
+    /// changes while it is banned, through record updates and address pruning, so re-reading it at
+    /// release time credits addresses the ban never debited and leaves others charged forever.
+    /// Keying on the peer also makes the total a derived value rather than a counter that can
+    /// drift from the map it is supposed to describe.
+    charged_ips: HashMap<PeerId, Vec<IpAddr>>,
     /// The number of banned peers by IP address.
     banned_peers_by_ip: HashMap<IpAddr, usize>,
 }
 
 impl BannedPeers {
-    /// Remove banned peers by IP address.
+    /// Release the ban charge for a peer, returning the ip addresses that are no longer banned.
     ///
-    /// This method always reduces the total number of banned peers by 1. The method also attempts
-    /// to reduce the number of banned peers by IP address. IP addresses that are no longer banned
-    /// are returned to the sender.
-    ///
-    /// NOTE: it's possible to have multiple peers from a single IP address
-    pub(super) fn remove_banned_peer(
-        &mut self,
-        ip_addresses: impl Iterator<Item = IpAddr>,
-    ) -> Vec<IpAddr> {
-        self.total = self.total.saturating_sub(1);
+    /// Releasing a peer that holds no charge is a no-op, so a caller that unbans indiscriminately
+    /// cannot drive the total below the number of banned peers.
+    pub(super) fn remove_banned_peer(&mut self, peer_id: &PeerId) -> Vec<IpAddr> {
+        let Some(ip_addresses) = self.charged_ips.remove(peer_id) else {
+            return Vec::new();
+        };
 
         ip_addresses
+            .into_iter()
             .filter(|ip| {
                 match self.banned_peers_by_ip.get_mut(ip) {
                     Some(count) => {
@@ -63,18 +67,26 @@ impl BannedPeers {
             .collect()
     }
 
-    /// Add IP addresse to the banned peers collection and update counts.
-    pub(super) fn add_banned_peer(&mut self, peer: &Peer) {
-        self.total = self.total.saturating_add(1);
-        for address in peer.known_ip_addresses() {
-            tracing::debug!(target: "peer-manager", ?address, "known ip address for banned peer");
-            *self.banned_peers_by_ip.entry(address.clone()).or_insert(0) += 1;
+    /// Charge a banned peer's ip addresses.
+    ///
+    /// Charging a peer that is already charged is a no-op, so a peer cannot hold two charges for
+    /// one ban.
+    pub(super) fn add_banned_peer(&mut self, peer_id: &PeerId, peer: &Peer) {
+        if self.charged_ips.contains_key(peer_id) {
+            return;
         }
+
+        let ip_addresses: Vec<_> = peer.known_ip_addresses().collect();
+        for address in &ip_addresses {
+            tracing::debug!(target: "peer-manager", ?address, "known ip address for banned peer");
+            *self.banned_peers_by_ip.entry(*address).or_insert(0) += 1;
+        }
+        self.charged_ips.insert(*peer_id, ip_addresses);
     }
 
     /// Return the number of banned peers.
     pub(super) fn total(&self) -> usize {
-        self.total
+        self.charged_ips.len()
     }
 
     /// Return a [HashSet] of banned IP addresses.

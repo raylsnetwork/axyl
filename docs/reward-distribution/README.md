@@ -21,8 +21,9 @@ Reward distribution happens in two stages that run on a different schedule:
 │                        EPOCH END (Automatic)                        │
 │                                                                     │
 │  Rust Client (block.rs::finish)                                     │
-│    ├─ applyIncentives(RewardInfo[])  → ConsensusRegistry            │
-│    │    Records stake × headerCount per validator as performance    │
+│    ├─ applyIncentives(RewardInfo[], totalRounds) → ConsensusRegistry│
+│    │    Records a hybrid blend (participation 80% + Anchor Commit   │
+│    │    Share 10% + stake tier 10%) per validator as performance     │
 │    │    weights for the completed epoch                             │
 │    │                                                                │
 │    └─ concludeEpoch(newCommittee[])  → ConsensusRegistry            │
@@ -44,7 +45,7 @@ Reward distribution happens in two stages that run on a different schedule:
 │                                                                     │
 │  Step 2: RewardDistributor.distributeRewards()                      │
 │    ├─ Reads performance weights from ConsensusRegistry              │
-│    ├─ Distributes RLS proportionally: stake × headerCount           │
+│    ├─ Distributes RLS proportionally to the recorded weights        │
 │    └─ Splits between validator own stake and delegation pool        │
 │                                                                     │
 │  Step 3: Validators call claimRewards() (permissionless)            │
@@ -80,9 +81,23 @@ All values are in basis points (1 bps = 0.01%). Total must equal 10,000 (100%).
 
 At each epoch boundary, the Rust execution layer makes two system calls:
 
-**`applyIncentives(RewardInfo[])`** — Records which validators produced blocks and how many:
-- Input: array of `(validatorAddress, consensusHeaderCount)` pairs
-- Computes `weight = stakeAmount × consensusHeaderCount` per validator
+**`applyIncentives(RewardInfo[], totalRounds)`** — Records each validator's hybrid performance weight:
+- Input: array of `(validatorAddress, participationRounds, anchorRounds)` triples, plus the
+  epoch-wide `totalRounds` committed
+- Computes a blended weight per validator: 80% normalized participation share (rounds whose
+  committed sub-dag included the validator's certificate), 10% Anchor Commit Share (rounds the
+  validator led — the sole signal in the pre-hybrid model), 10% stake tier (own required stake +
+  delegated stake, tiered above a configurable minimum)
+- A validator that contributed no certificate this epoch (`participationRounds == 0`) earns
+  nothing from any component; validators above zero but below an optional participation floor
+  (`participationFloorBps`, disabled by default) are also excluded
+- Stores in `_performanceWeights` for RewardDistributor to consume
+- Called with `SYSTEM_ADDRESS` as msg.sender
+
+> **Activation is out of scope for this change.** The blend above is implemented and tested, but
+> when/how it activates on a network (fork schedule, and how the contract carrying it is
+> deployed or upgraded) is a separate follow-up — see `src/consensus/design.md` ("Rollout is
+> intentionally out of scope").
 - Stores in `_performanceWeights` for RewardDistributor to consume
 - Called with `SYSTEM_ADDRESS` as msg.sender
 

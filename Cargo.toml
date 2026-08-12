@@ -53,7 +53,7 @@ exclude = ["crates/testing/fuzz-targets"]
 resolver = "2"
 
 [workspace.package]
-version = "1.2.2"
+version = "1.3.0"
 edition = "2021"
 # Remember to update:
 # - .clippy.toml
@@ -148,6 +148,7 @@ reth-eth-wire = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.0" }
 reth-cli-util = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.0" }
 reth-errors = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.0" }
 reth-libmdbx = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.0" }
+reth-nippy-jar = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.0" }
 reth-stages = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.0", features=["rocksdb"] }
 reth-downloaders = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.0" }
 reth-static-file = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.0" }
@@ -225,7 +226,11 @@ dashmap = "6.0.1"
 parking_lot = "0.12.3"
 scopeguard = "1.1"
 uuid = { version = "1.1.2", features = ["v4", "fast-rng"] }
-quinn-proto = "0.11.8"
+# Floor raised to 0.11.15 for GHSA-4w2j-m93h-cj5j (unbounded out-of-order
+# stream reassembly -> remote memory exhaustion). Reached transitively via
+# libp2p-quic -> quinn; keep this floor so a re-resolve can't pick a fixed-in
+# 0.11.x below the patch.
+quinn-proto = "0.11.15"
 derive_builder = "0.12.0"
 roaring = "0.10.1"
 serde_with = { version = "3.21.0", features = ["hex"] }
@@ -233,7 +238,9 @@ ouroboros = "0.17"
 proc-macro2 = "1.0.47"
 uint = "0.10"
 cfg-if = "1.0.0"
-lru = "0.10"
+# Matches reth's lru major so the lockfile carries one version (not 0.10 + 0.16).
+lru = "0.16"
+criterion = "0.5"
 tokio-stream = { version = "0.1.14", features = ["sync", "net"] }
 serde_yaml = "0.8.26"
 byteorder = "1.4.3"

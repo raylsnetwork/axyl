@@ -1,7 +1,11 @@
 // SPDX-License-Identifier: BUSL-1.1
 //! Persistent storage types
 
+#[cfg(feature = "cold-storage")]
+pub mod cold;
 mod stores;
+#[cfg(feature = "cold-storage")]
+pub use cold::{ColdArchiver, ColdConfig, ColdSegment, ColdSegmentKind, ColdStore, SealOutcome};
 use layered_db::LayeredDatabase;
 #[cfg(feature = "reth-libmdbx")]
 use mdbx::MdbxDatabase;
@@ -16,6 +20,8 @@ use tables::{
     KadProviderRecords, KadRecords, KadWorkerProviderRecords, KadWorkerRecords, LastProposed,
     LastProposedByAuthority, NodeBatchesCache, NodeIdentity, Payload, Votes,
 };
+#[cfg(feature = "cold-storage")]
+use tables::{ColdArchiveHighWaterMark, ColdBatchLocations};
 
 // Always build redb, we use it as the default for persistant consensus data.
 pub mod layered_db;
@@ -61,6 +67,10 @@ const EPOCH_TRANSITION_CHECKPOINTS_CF: &str = "epoch_transition_checkpoints";
 const BATCH_SEQ_COUNTER_CF: &str = "batch_seq_counter";
 const NODE_IDENTITY_CF: &str = "node_identity";
 const BATCH_ORDERING_STATE_CF: &str = "batch_ordering_state";
+#[cfg(feature = "cold-storage")]
+const COLD_BATCH_LOCATIONS_CF: &str = "cold_batch_locations";
+#[cfg(feature = "cold-storage")]
+const COLD_ARCHIVE_HIGH_WATER_MARK_CF: &str = "cold_archive_high_water_mark";
 
 macro_rules! tables {
     ( $($table:ident;$name:expr;<$K:ty, $V:ty>),*) => {
@@ -79,6 +89,8 @@ macro_rules! tables {
 
 pub mod tables {
     use super::{PayloadToken, ProposerKey};
+    #[cfg(feature = "cold-storage")]
+    use crate::cold::ColdLocation;
     use rayls_infrastructure_types::{
         batch_ordering::BatchOrderingState as TypeBatchOrderingState, AuthorityIdentifier, Batch,
         BlockHash, Certificate, CertificateDigest, ConsensusHeader, Epoch, EpochCertificate,
@@ -121,9 +133,21 @@ pub mod tables {
         // Batch ordering state for the current epoch.
         BatchOrderingState;crate::BATCH_ORDERING_STATE_CF;<u8, TypeBatchOrderingState>
     );
+
+    // Cold-tier tables, compiled only with the `cold-storage` feature.
+    #[cfg(feature = "cold-storage")]
+    tables!(
+        // Cold-tier aux index: batch digest -> (epoch jar, row); rebuildable from the jar.
+        ColdBatchLocations;crate::COLD_BATCH_LOCATIONS_CF;<BlockHash, ColdLocation>,
+        // Last fully-archived epoch; the atomicity commit boundary, at most one row.
+        ColdArchiveHighWaterMark;crate::COLD_ARCHIVE_HIGH_WATER_MARK_CF;<u8, Epoch>
+    );
 }
 
 // mdbx is  the default, if redb is set then is used (so priority is mdbx -> redb)
+// The cold tier is a layer inside `LayeredDatabase`: point reads resolve mem -> mdbx -> cold, and
+// archival writes go through the single layered writer (no second MDBX writer). The alias is the
+// same with or without the `cold-storage` feature; redb never attaches a cold layer.
 #[cfg(all(feature = "reth-libmdbx", not(feature = "redb")))]
 pub type DatabaseType = LayeredDatabase<MdbxDatabase>;
 #[cfg(feature = "redb")]
@@ -152,18 +176,59 @@ pub fn open_db_with_consensus_config<Path: AsRef<std::path::Path> + Send>(
     panic!("No DB configured!")
 }
 
+/// Concrete cold archiver for the active backend, cfg-selected like [`DatabaseType`].
+///
+/// The archiver drives the hot-only view of the layered database
+/// ([`LayeredDatabase::without_cold`]), so its reads and deletes never fall through to cold.
+#[cfg(all(feature = "cold-storage", feature = "reth-libmdbx", not(feature = "redb")))]
+pub type ColdArchiverType = Option<std::sync::Arc<ColdArchiver<LayeredDatabase<MdbxDatabase>>>>;
+/// Concrete cold archiver for the active backend, cfg-selected like [`DatabaseType`].
+///
+/// The redb backend has no cold tier; the alias still names a valid hot type so the `Option`
+/// stays callable, but the value is always `None`.
+#[cfg(all(feature = "cold-storage", not(all(feature = "reth-libmdbx", not(feature = "redb")))))]
+pub type ColdArchiverType = Option<std::sync::Arc<ColdArchiver<LayeredDatabase<ReDB>>>>;
+
+/// Builds the background cold archiver for the current database stack, or `None` for backends
+/// without a cold tier (redb).
+#[cfg(all(feature = "cold-storage", feature = "reth-libmdbx", not(feature = "redb")))]
+pub fn cold_archiver_for(db: &DatabaseType) -> ColdArchiverType {
+    use std::sync::Arc;
+    // The hot-only view, so the producer's "is this row still hot?" reads are never answered by
+    // the cold copy; index writes and evictions still route through the shared db_run writer.
+    db.cold().map(|cold| Arc::new(ColdArchiver::new(db.without_cold(), Arc::clone(cold))))
+}
+/// Builds the background cold archiver for the current database stack.
+///
+/// The active backend has no cold tier, so this is always `None`.
+#[cfg(all(feature = "cold-storage", not(all(feature = "reth-libmdbx", not(feature = "redb")))))]
+pub fn cold_archiver_for(db: &DatabaseType) -> ColdArchiverType {
+    let _ = db;
+    None
+}
+
 // The open functions below are the way they are so we can use if cfg!... on open_db.
 
-/// Open or reopen all the storage of the node backed by MDBX.
+/// Open or reopen all the storage of the node backed by MDBX, with the cold layer attached when
+/// the `cold-storage` feature is on.
 #[cfg(feature = "reth-libmdbx")]
 fn _open_mdbx<P: AsRef<std::path::Path> + Send>(
     store_path: P,
     consensus_db_config: &MdbxConfig,
 ) -> LayeredDatabase<MdbxDatabase> {
+    // Cold jars live in a `cold/` subdir of the consensus DB dir. NOTE: an operator wiping the
+    // consensus DB to shrink it must preserve this subdir, or the node loses the only copy of
+    // archived history and can no longer serve it to lagging peers.
+    #[cfg(feature = "cold-storage")]
+    let cold_dir = store_path.as_ref().join("cold");
     let persistent_db = MdbxDatabase::open_with_config(store_path, consensus_db_config.clone())
         .expect("Cannot open database");
-    // Don't forget to add a new table to MemDatabase...
     let mut db = LayeredDatabase::open(persistent_db);
+    #[cfg(feature = "cold-storage")]
+    {
+        let cold = ColdStore::open(&ColdConfig { dir: cold_dir }).expect("Cannot open cold store");
+        db = db.with_cold(std::sync::Arc::new(cold));
+    }
 
     open_default_tables(&mut db).expect("failed to open table!");
 
@@ -182,50 +247,41 @@ fn _open_redb<P: AsRef<std::path::Path> + Send>(store_path: P) -> LayeredDatabas
     db
 }
 
+/// Opens one table on `db`, folding [`rayls_infrastructure_types::Table::NAME`] into the error so
+/// the message cannot drift from the type.
+fn open_one<T: rayls_infrastructure_types::Table>(db: &mut impl Database) -> eyre::Result<()> {
+    db.open_table::<T>().map_err(|e| eyre::eyre!("failed to open {} table: {e}", T::NAME))
+}
+
 fn open_default_tables<DB: Database>(db: &mut DB) -> eyre::Result<()> {
-    db.open_table::<LastProposed>()
-        .map_err(|e| eyre::eyre!("failed to open LastProposed table: {e}"))?;
-    db.open_table::<LastProposedByAuthority>()
-        .map_err(|e| eyre::eyre!("failed to open LastProposedByAuthority table: {e}"))?;
-    db.open_table::<Votes>().map_err(|e| eyre::eyre!("failed to open Votes table: {e}"))?;
-    db.open_table::<Certificates>()
-        .map_err(|e| eyre::eyre!("failed to open Certificates table: {e}"))?;
-    db.open_table::<CertificateDigestByRound>()
-        .map_err(|e| eyre::eyre!("failed to open CertificateDigestByRound table: {e}"))?;
-    db.open_table::<CertificateDigestByOrigin>()
-        .map_err(|e| eyre::eyre!("failed to open CertificateDigestByOrigin table: {e}"))?;
-    db.open_table::<Payload>().map_err(|e| eyre::eyre!("failed to open Payload table: {e}"))?;
-    db.open_table::<Batches>().map_err(|e| eyre::eyre!("failed to open Batches table: {e}"))?;
-    db.open_table::<ConsensusBlocks>()
-        .map_err(|e| eyre::eyre!("failed to open ConsensusBlocks table: {e}"))?;
-    db.open_table::<ConsensusBlockNumbersByDigest>()
-        .map_err(|e| eyre::eyre!("failed to open ConsensusBlockNumbersByDigest table: {e}"))?;
-    db.open_table::<ConsensusBlocksCache>()
-        .map_err(|e| eyre::eyre!("failed to open ConsensusBlocksCache table: {e}"))?;
-    db.open_table::<NodeBatchesCache>()
-        .map_err(|e| eyre::eyre!("failed to open NodeBatchesCache table: {e}"))?;
-    db.open_table::<EpochRecords>()
-        .map_err(|e| eyre::eyre!("failed to open EpochRecords table: {e}"))?;
-    db.open_table::<EpochCerts>()
-        .map_err(|e| eyre::eyre!("failed to open EpochCerts table: {e}"))?;
-    db.open_table::<EpochRecordsIndex>()
-        .map_err(|e| eyre::eyre!("failed to open EpochRecordsIndex table: {e}"))?;
-    db.open_table::<EpochTransitionCheckpoints>()
-        .map_err(|e| eyre::eyre!("failed to open EpochTransitionCheckpoints table: {e}"))?;
-    db.open_table::<KadRecords>()
-        .map_err(|e| eyre::eyre!("failed to open KadRecords table: {e}"))?;
-    db.open_table::<KadProviderRecords>()
-        .map_err(|e| eyre::eyre!("failed to open KadProviderRecords table: {e}"))?;
-    db.open_table::<KadWorkerRecords>()
-        .map_err(|e| eyre::eyre!("failed to open KadWorkerRecords table: {e}"))?;
-    db.open_table::<KadWorkerProviderRecords>()
-        .map_err(|e| eyre::eyre!("failed to open KadWorkerProviderRecords table: {e}"))?;
-    db.open_table::<BatchSeqCounter>()
-        .map_err(|e| eyre::eyre!("failed to open BatchSeqCounter table: {e}"))?;
-    db.open_table::<NodeIdentity>()
-        .map_err(|e| eyre::eyre!("failed to open NodeIdentity table: {e}"))?;
-    db.open_table::<BatchOrderingState>()
-        .map_err(|e| eyre::eyre!("failed to open BatchOrdering table: {e}"))?;
+    open_one::<LastProposed>(db)?;
+    open_one::<LastProposedByAuthority>(db)?;
+    open_one::<Votes>(db)?;
+    open_one::<Certificates>(db)?;
+    open_one::<CertificateDigestByRound>(db)?;
+    open_one::<CertificateDigestByOrigin>(db)?;
+    open_one::<Payload>(db)?;
+    open_one::<Batches>(db)?;
+    open_one::<ConsensusBlocks>(db)?;
+    open_one::<ConsensusBlockNumbersByDigest>(db)?;
+    open_one::<ConsensusBlocksCache>(db)?;
+    open_one::<NodeBatchesCache>(db)?;
+    open_one::<EpochRecords>(db)?;
+    open_one::<EpochCerts>(db)?;
+    open_one::<EpochRecordsIndex>(db)?;
+    open_one::<EpochTransitionCheckpoints>(db)?;
+    open_one::<KadRecords>(db)?;
+    open_one::<KadProviderRecords>(db)?;
+    open_one::<KadWorkerRecords>(db)?;
+    open_one::<KadWorkerProviderRecords>(db)?;
+    open_one::<BatchSeqCounter>(db)?;
+    open_one::<NodeIdentity>(db)?;
+    open_one::<BatchOrderingState>(db)?;
+    #[cfg(feature = "cold-storage")]
+    {
+        open_one::<ColdBatchLocations>(db)?;
+        open_one::<ColdArchiveHighWaterMark>(db)?;
+    }
 
     Ok(())
 }

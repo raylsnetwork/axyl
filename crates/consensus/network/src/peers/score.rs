@@ -10,26 +10,35 @@ use rayls_infrastructure_config::ScoreConfig;
 use serde::Serialize;
 use std::{
     fmt::Display,
-    sync::{Arc, OnceLock},
+    sync::{Arc, RwLock},
     time::Instant,
 };
 
-/// Global static configuration that is initialized only once for all peers.
-pub(crate) static GLOBAL_SCORE_CONFIG: OnceLock<Arc<ScoreConfig>> = OnceLock::new();
+/// Global peer score configuration.
+///
+/// A node runs with one configuration for its whole life, so production installs it once through
+/// `init_peer_score_config`. The lock, rather than a `OnceLock`, lets the test harness install a
+/// fresh configuration per case: `cargo test` runs the whole suite in one process, so a write-once
+/// cell would leak the first case's configuration into every later one.
+pub(crate) static GLOBAL_SCORE_CONFIG: RwLock<Option<Arc<ScoreConfig>>> = RwLock::new(None);
 
-/// Initialize the global peer score configuration.
+/// Install the global peer score configuration.
+///
+/// Sets the configuration only once: a node installs it at startup, and a later caller (a second
+/// `PeerManager`, or a test's node harness) must not overwrite a configuration already in force.
 pub(super) fn init_peer_score_config(config: ScoreConfig) {
-    let config = Arc::new(config);
-
-    // allow multiple calls to this fn
-    let _ = GLOBAL_SCORE_CONFIG.set(config);
+    let mut guard = GLOBAL_SCORE_CONFIG.write().expect("score config lock poisoned");
+    if guard.is_none() {
+        *guard = Some(Arc::new(config));
+    }
 }
 
-/// Get a reference to the global peer score configuration
+/// Get a clone of the global peer score configuration.
 ///
-/// Panics if score config isn't set.
-fn global_score_config() -> Arc<ScoreConfig> {
-    GLOBAL_SCORE_CONFIG.get().expect("Peer score configuration not initialized").clone()
+/// Panics if the configuration has not been installed.
+pub(super) fn global_score_config() -> Arc<ScoreConfig> {
+    let config = GLOBAL_SCORE_CONFIG.read().expect("score config lock poisoned").clone();
+    config.expect("Peer score configuration not initialized")
 }
 
 /// A peer's score (perceived potential usefulness).
@@ -122,13 +131,17 @@ impl Score {
     /// NOTE: this is a separate method for testing purposes.
     fn update_at(&mut self, now: Instant) {
         if let Some(prev_update) =
-            now.checked_duration_since(self.last_updated).map(|d| d.as_secs())
+            now.checked_duration_since(self.last_updated).map(|d| d.as_secs_f64())
         {
             let config = global_score_config();
 
             // e^(-ln(2)/HL*t)
+            //
+            // the elapsed time is not truncated to whole seconds: `last_updated` advances
+            // unconditionally below, so a discarded remainder is never decayed later, and a
+            // caller running more often than once a second would stop decay entirely
             let halflife_decay = config.halflife_decay();
-            let decay_factor = (halflife_decay * prev_update as f64).exp();
+            let decay_factor = (halflife_decay * prev_update).exp();
             self.rayls_score *= decay_factor;
             self.last_updated = now;
             self.update_score();

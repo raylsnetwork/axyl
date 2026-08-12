@@ -382,6 +382,12 @@ mod tests {
     }
 
     #[test]
+    fn b256_read_round_trips() {
+        assert_read_roundtrip(&B256::repeat_byte(0xAB));
+        assert_read_roundtrip(&B256::ZERO);
+    }
+
+    #[test]
     fn vec_skip_consumes_exact() {
         let v: Vec<u32> = (0..1000).collect();
         assert_skip_exact(&v);

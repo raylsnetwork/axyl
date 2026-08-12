@@ -4,7 +4,7 @@ use super::{
     all_peers::AllPeers,
     cache::BannedPeerCache,
     score::init_peer_score_config,
-    status::NewConnectionStatus,
+    status::{DisconnectReason, NewConnectionStatus},
     types::{ConnectionDirection, ConnectionType, DialRequest, PeerAction},
     PeerEvent, PeerExchangeMap, Penalty,
 };
@@ -294,13 +294,16 @@ impl PeerManager {
     ///
     /// Actions on peers happen when their reputation or connection status changes.
     fn apply_peer_action(&mut self, peer_id: PeerId, action: PeerAction) {
+        // this is the single point every reputation-driven action passes through, and each arm
+        // fires only on an actual change, so the ban lifecycle is legible at warn/info without the
+        // per-penalty decay noise that sits at debug
         match action {
             PeerAction::Ban(ip_addrs) => {
-                debug!(target: "peer-manager", ?peer_id, ?ip_addrs, "reputation update results in ban");
+                warn!(target: "peer-manager", ?peer_id, score = ?self.peer_score(&peer_id), ?ip_addrs, "peer banned");
                 self.process_ban(&peer_id);
             }
             PeerAction::Disconnect => {
-                debug!(target: "peer-manager", ?peer_id, "reputation update results in disconnect");
+                info!(target: "peer-manager", ?peer_id, score = ?self.peer_score(&peer_id), "peer disconnected for reputation");
                 self.temporarily_banned.insert(peer_id);
                 self.push_event(PeerEvent::DisconnectPeer(peer_id));
             }
@@ -312,7 +315,7 @@ impl PeerManager {
                 self.events.push_back(PeerEvent::DisconnectPeerX(peer_id, exchange));
             }
             PeerAction::Unban(ip_addrs) => {
-                debug!(target: "peer-manager", ?peer_id, ?ip_addrs, "reputation update results in unban");
+                info!(target: "peer-manager", ?peer_id, ?ip_addrs, "peer unbanned");
                 self.push_event(PeerEvent::Unbanned(peer_id));
             }
 
@@ -379,7 +382,7 @@ impl PeerManager {
             ?peer_id,
             "checking if peer banned"
         );
-        temp_banned || self.peers.peer_banned(peer_id)
+        temp_banned || self.peers.score_or_ip_banned(peer_id)
     }
 
     #[cfg(test)]
@@ -462,7 +465,7 @@ impl PeerManager {
         self.events.push_back(event);
         let action = self.peers.update_connection_status(
             &peer_id,
-            NewConnectionStatus::Disconnecting { banned: false },
+            NewConnectionStatus::Disconnecting { reason: DisconnectReason::ExcessPeers },
         );
 
         debug!(target: "peer-manager", ?action, "disconnect peer results in:");
@@ -473,14 +476,18 @@ impl PeerManager {
     ///
     /// Returns a boolean if the peer was successfully registered. This is the initial
     /// method to call for registering a new peer through dialing or incoming connections.
+    ///
+    /// A refusal closes the connection: the admission gates share this method's predicate, so a
+    /// peer reaching here banned means the ban landed mid-handshake, and leaving that connection
+    /// open would route application traffic to a peer this manager does not track.
     pub(super) fn register_peer_connection(
         &mut self,
         peer_id: &PeerId,
         connection: ConnectionType,
     ) -> bool {
-        if self.peers.peer_banned(peer_id) {
-            // log error if the peer is banned
+        if self.peer_banned(peer_id) {
             error!(target: "peer-manager", ?peer_id, "connected with banned peer");
+            self.push_event(PeerEvent::DisconnectPeer(*peer_id));
             return false;
         }
 
@@ -640,34 +647,40 @@ impl PeerManager {
 
     /// Bool indicating if the peer is trusted or a validator.
     pub(crate) fn peer_is_important(&self, peer_id: &PeerId) -> bool {
-        self.is_peer_validator(peer_id)
+        self.peers.is_peer_recently_validator(peer_id)
             || self.peers.get_peer(peer_id).map(|p| p.is_trusted()).unwrap_or_default()
     }
 
     /// Update the committee for the new epoch.
     pub(crate) fn new_epoch(&mut self, committee: HashSet<BlsPublicKey>) {
         // remove from temporary banned and warn if validator was banned
-        let mut exp_committee = Vec::default();
+        //
+        // every committee key is forwarded, resolved or not: membership is decided by stake, so a
+        // member this node has not discovered yet must still be recognized the moment its record
+        // arrives rather than at the next boundary
+        let mut exp_committee = Vec::with_capacity(committee.len());
         for bls_key in &committee {
-            if let Some(NetworkInfo { pubkey, multiaddrs: multiaddr, timestamp }) =
+            let Some(NetworkInfo { pubkey, multiaddrs: multiaddr, timestamp }) =
                 self.known_peers.get(bls_key)
-            {
-                let peer_id: PeerId = pubkey.clone().into();
-                info!(target: "peer-manager", "adding committee member {bls_key}/{peer_id}");
-                if self.temporarily_banned.remove(&peer_id) {
-                    warn!(target: "peer-manager", ?peer_id, "removed committee member from temporarily banned list");
-                }
-                exp_committee.push((
-                    *bls_key,
-                    NetworkInfo {
-                        pubkey: pubkey.clone(),
-                        multiaddrs: multiaddr.clone(),
-                        timestamp: *timestamp,
-                    },
-                ));
-            } else {
+            else {
                 warn!(target: "peer-manager", "unknown committee member with key {bls_key}");
+                exp_committee.push((*bls_key, None));
+                continue;
+            };
+
+            let peer_id: PeerId = pubkey.clone().into();
+            info!(target: "peer-manager", "adding committee member {bls_key}/{peer_id}");
+            if self.temporarily_banned.remove(&peer_id) {
+                warn!(target: "peer-manager", ?peer_id, "removed committee member from temporarily banned list");
             }
+            exp_committee.push((
+                *bls_key,
+                Some(NetworkInfo {
+                    pubkey: pubkey.clone(),
+                    multiaddrs: multiaddr.clone(),
+                    timestamp: *timestamp,
+                }),
+            ));
         }
 
         // add trusted peer record
@@ -691,6 +704,18 @@ impl PeerManager {
             "add_known_peer",
         );
         self.peers.upsert_peer(bls_key, info.pubkey.clone(), info.multiaddrs.clone());
+
+        // A member banned before discovery resolved it still carries its ban after `upsert_peer`
+        // trusts it; release it so the unban action repairs the gossipsub blacklist and kad routing
+        // entry. Not in `upsert_peer`: `new_epoch` also calls it and does its own boundary unban.
+        if self.peers.is_peer_validator(&peer_id)
+            && self.peers.get_peer(&peer_id).is_some_and(|p| p.connection_status().is_banned())
+        {
+            let action =
+                self.peers.update_connection_status(&peer_id, NewConnectionStatus::Unbanned);
+            self.apply_peer_action(peer_id, action);
+        }
+
         self.known_peers.insert(bls_key, info.clone());
         self.known_peers_time_added.insert(bls_key, now());
         self.known_peerids.insert(peer_id, bls_key);

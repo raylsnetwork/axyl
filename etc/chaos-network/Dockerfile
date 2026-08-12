@@ -20,14 +20,14 @@ COPY crates/ ./crates/
 COPY chain-configs/ ./chain-configs/
 COPY rayls-contracts/ ./rayls-contracts/
 
+# Must never expand to the empty string -- see etc/docker-network/Dockerfile.
 ARG VERGEN_GIT_SHA
-ENV VERGEN_GIT_SHA=${VERGEN_GIT_SHA}
+ENV VERGEN_GIT_SHA=${VERGEN_GIT_SHA:-0000000000000000000000000000000000000000}
 
-# build the binary
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=./target \
-    cargo build --bin rayls-network --release \
+    cargo build -p rayls-network --bin rayls-network --release \
     && mv ./target/release/rayls-network /tmp/
 
 # production image with network tools for chaos testing

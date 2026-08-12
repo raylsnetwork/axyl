@@ -21,7 +21,7 @@ COPY chain-configs/ ./chain-configs/
 COPY rayls-contracts/ ./rayls-contracts/
 
 ARG VERGEN_GIT_SHA
-ENV VERGEN_GIT_SHA=${VERGEN_GIT_SHA}
+ENV VERGEN_GIT_SHA=${VERGEN_GIT_SHA:-0000000000000000000000000000000000000000}
 
 # Optional cargo features compiled into the binary, e.g. `dev-single-node-setup` for single-validator local
 # `node --dev` chains. Empty (default) -> a production build with no extra features.
@@ -31,7 +31,7 @@ ARG BUILD_FEATURES=""
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=./target \
-    cargo build --bin rayls-network --release ${BUILD_FEATURES:+--features ${BUILD_FEATURES}} \
+    cargo build -p rayls-network --bin rayls-network --release ${BUILD_FEATURES:+--features ${BUILD_FEATURES}} \
     && mv ./target/release/rayls-network /tmp/
 
 # production image

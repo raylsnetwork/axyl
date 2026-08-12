@@ -1758,6 +1758,90 @@ async fn test_kad_provider_store_exhaustion_does_not_propagate_error() -> eyre::
     Ok(())
 }
 
+/// A foreign inbound AddProvider record must not be stored.
+///
+/// Rayls discovers peers with `get_record` on the BLS key and never calls `get_providers`, so a
+/// stored provider record is never read - it only grows an unbounded, never-queried table that
+/// takes unsigned writes from any non-banned peer. The handler drops foreign provider records
+/// rather than persist them.
+#[tokio::test]
+async fn test_kad_foreign_provider_record_is_not_stored() -> eyre::Result<()> {
+    let TestTypes { peer1, .. } = create_test_types::<TestWorkerRequest, TestWorkerResponse>();
+    let mut network = peer1.network;
+
+    let key = RecordKey::new(b"foreign-provided-key");
+    let record = ProviderRecord {
+        key: key.clone(),
+        provider: PeerId::random(),
+        expires: None,
+        addresses: vec![],
+    };
+
+    let event = kad::Event::InboundRequest {
+        request: kad::InboundRequest::AddProvider { record: Some(record) },
+    };
+
+    let result = network.process_kad_event(event);
+    assert!(result.is_ok(), "processing an inbound provider record must not error");
+
+    let providers = network.swarm.behaviour_mut().kademlia.store_mut().providers(&key);
+    assert!(providers.is_empty(), "foreign provider record must not be stored");
+
+    Ok(())
+}
+
+/// A peer-exchange disconnect whose request fails must not orphan its tracked ack.
+///
+/// A PX disconnect is recorded in both `pending_px_disconnects` and `outbound_requests`. The
+/// expected outcome is an `OutboundFailure` (the node is dropping the peer), and that arm must
+/// clear the entry from BOTH maps - otherwise the `outbound_requests` ack lingers until the
+/// periodic sweep, one leaked entry per PX-disconnect.
+#[tokio::test]
+async fn test_px_disconnect_failure_clears_outbound_request() -> eyre::Result<()> {
+    use crate::peers::{PeerEvent, PeerExchangeMap};
+    use libp2p::{
+        request_response::{Event as ReqResEvent, OutboundFailure},
+        swarm::ConnectionId,
+    };
+
+    let TestTypes { peer1, .. } = create_test_types::<TestWorkerRequest, TestWorkerResponse>();
+    let mut network = peer1.network;
+
+    let peer_id = PeerId::random();
+
+    // drive a PX disconnect: inserts into pending_px_disconnects AND outbound_requests
+    network.process_peer_manager_event(PeerEvent::DisconnectPeerX(
+        peer_id,
+        PeerExchangeMap(std::collections::HashMap::new()),
+    ))?;
+
+    let request_id = *network
+        .pending_px_disconnects
+        .keys()
+        .next()
+        .expect("px disconnect registered a pending request");
+    assert!(
+        network.outbound_requests.contains_key(&(peer_id, request_id)),
+        "precondition: px request is tracked in outbound_requests"
+    );
+
+    // the px request fails - the expected path, since the node is dropping the peer
+    let event = ReqResEvent::OutboundFailure {
+        peer: peer_id,
+        request_id,
+        error: OutboundFailure::ConnectionClosed,
+        connection_id: ConnectionId::new_unchecked(0),
+    };
+    network.process_reqres_event(event)?;
+
+    assert!(
+        !network.outbound_requests.contains_key(&(peer_id, request_id)),
+        "px outbound failure must clear the tracked ack, not orphan it"
+    );
+
+    Ok(())
+}
+
 /// FIND-025 Path B: PutRecord store exhaustion must not propagate a fatal error.
 ///
 /// Pre-fill the record store to capacity, then submit a valid BLS-signed PutRecord.

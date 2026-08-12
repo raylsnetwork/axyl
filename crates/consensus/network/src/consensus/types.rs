@@ -36,10 +36,6 @@ pub(super) enum RecordInvalidReason {
     InvalidKeyFormat,
     #[error("Record failed application-level validation: {0}")]
     InvalidPeerRecord(String),
-    #[error("Max record size exceeded")]
-    MaxRecordSizeExceeded,
-    #[error("Max provided keys exceeded")]
-    MaxProvidedKeysExceeded,
 }
 
 /// Enum if the received gossip is initially accepted for further processing.
