@@ -582,7 +582,8 @@ async fn test_committee_member_resolved_mid_epoch_is_absolved_immediately() {
     let authority_1 = authorities.next().expect("first authority");
     let authority_2 = authorities.next().expect("second authority");
     let config = authority_1.consensus_config();
-    let mut peer_manager = PeerManager::new(config.network_config().peer_config());
+    let mut peer_manager =
+        PeerManager::new(config.network_config().peer_config(), PeerId::random());
 
     // this node resolved itself but not authority_2, the ordinary state on a fresh start or a
     // restart before discovery has caught up
@@ -635,7 +636,8 @@ async fn resolving_a_banned_committee_member_releases_its_ban() {
     let authority_1 = authorities.next().expect("first authority");
     let authority_2 = authorities.next().expect("second authority");
     let config = authority_1.consensus_config();
-    let mut peer_manager = PeerManager::new(config.network_config().peer_config());
+    let mut peer_manager =
+        PeerManager::new(config.network_config().peer_config(), PeerId::random());
 
     // this node resolves itself, then installs a committee whose second member it cannot yet
     // resolve
@@ -693,7 +695,8 @@ async fn test_admitted_connection_is_registered_under_the_same_ban_predicate() {
     let mut authorities = all_nodes.authorities();
     let authority_1 = authorities.next().expect("first authority");
     let config = authority_1.consensus_config();
-    let mut peer_manager = PeerManager::new(config.network_config().peer_config());
+    let mut peer_manager =
+        PeerManager::new(config.network_config().peer_config(), PeerId::random());
 
     let blocklisted = create_multiaddr(Some(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 200))));
     let clean = create_multiaddr(Some(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 201))));

@@ -6,7 +6,7 @@ use rayls_infrastructure_config::PeerConfig;
 
 /// Build a `PeerManager` with the default operator config.
 fn peer_manager() -> PeerManager {
-    PeerManager::new(&PeerConfig::default())
+    PeerManager::new(&PeerConfig::default(), PeerId::random())
 }
 
 /// An inbound connection endpoint from `addr`.
