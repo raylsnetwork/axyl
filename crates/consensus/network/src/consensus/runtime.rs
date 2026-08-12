@@ -166,7 +166,7 @@ where
                 // connections are relay legs and circuits, so a direct connection to a non-relay
                 // peer breaks the relayed-only topology. On a direct (no-reservation) node the
                 // same classification is the normal case and stays at debug.
-                if matches!(path, ConnectionPath::DirectNonRelay)
+                if matches!(path, ConnectionPath::DirectNonRelay { .. })
                     && !self.relay_reservations.is_empty()
                 {
                     warn!(

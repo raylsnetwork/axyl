@@ -15,7 +15,10 @@ use rayls_infrastructure_types::{
     encode, now, BlsPublicKey, BlsSignature, NetworkPublicKey, P2pNode, TimestampSec,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::{
+    collections::{BTreeMap, HashMap, HashSet},
+    net::IpAddr,
+};
 use tokio::sync::{mpsc, oneshot};
 use tracing::debug;
 
@@ -62,14 +65,24 @@ pub enum ConnectionPath {
     Circuit {
         /// The relay server the circuit runs through, when the address names it.
         relay: Option<PeerId>,
+        /// The relay server's IP (the first-hop leg the circuit rides on). This is NOT the peer's
+        /// own IP -- a relayed peer's address is never observable here (that's the point of the
+        /// relay) -- it's the address of the relay we're circuiting through, for log correlation.
+        relay_ip: Option<IpAddr>,
     },
     /// A direct connection to a registered relay server (the first-hop leg circuits ride on).
-    RelayDirect,
+    RelayDirect {
+        /// The relay server's IP.
+        ip: Option<IpAddr>,
+    },
     /// A direct connection to a non-relay peer.
     ///
     /// Forbidden in a relayed-only topology: a private validator must only ever hold relay legs
     /// and circuits.
-    DirectNonRelay,
+    DirectNonRelay {
+        /// The peer's IP.
+        ip: Option<IpAddr>,
+    },
 }
 
 impl ConnectionPath {
@@ -83,12 +96,13 @@ impl ConnectionPath {
             libp2p::core::ConnectedPoint::Dialer { address, .. } => address,
             libp2p::core::ConnectedPoint::Listener { local_addr, .. } => local_addr,
         };
+        let ip = multiaddr_ip(path_addr);
         if path_addr.iter().any(|p| matches!(p, Protocol::P2pCircuit)) {
-            Self::Circuit { relay: circuit_relay_peer_id(path_addr) }
+            Self::Circuit { relay: circuit_relay_peer_id(path_addr), relay_ip: ip }
         } else if peer_is_relay {
-            Self::RelayDirect
+            Self::RelayDirect { ip }
         } else {
-            Self::DirectNonRelay
+            Self::DirectNonRelay { ip }
         }
     }
 
@@ -96,10 +110,19 @@ impl ConnectionPath {
     pub fn metric_label(&self) -> &'static str {
         match self {
             Self::Circuit { .. } => "circuit",
-            Self::RelayDirect => "relay_direct",
-            Self::DirectNonRelay => "direct_nonrelay",
+            Self::RelayDirect { .. } => "relay_direct",
+            Self::DirectNonRelay { .. } => "direct_nonrelay",
         }
     }
+}
+
+/// Extract the IPv4/IPv6 address from a multiaddr, if it names one.
+fn multiaddr_ip(addr: &Multiaddr) -> Option<IpAddr> {
+    addr.iter().find_map(|p| match p {
+        Protocol::Ip4(ip) => Some(IpAddr::V4(ip)),
+        Protocol::Ip6(ip) => Some(IpAddr::V6(ip)),
+        _ => None,
+    })
 }
 
 /// Helper trait to cast lib-specific results into RPC messages.

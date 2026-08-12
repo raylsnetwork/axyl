@@ -52,7 +52,10 @@ fn test_connection_path_classification() {
     };
     assert_eq!(
         ConnectionPath::classify(&dialed, false),
-        ConnectionPath::Circuit { relay: Some(relay) }
+        ConnectionPath::Circuit {
+            relay: Some(relay),
+            relay_ip: Some("127.0.0.1".parse().unwrap())
+        }
     );
 
     // inbound circuit: the marker is on the local (listen) address; send-back is a bare /p2p
@@ -64,7 +67,10 @@ fn test_connection_path_classification() {
     };
     assert_eq!(
         ConnectionPath::classify(&inbound, false),
-        ConnectionPath::Circuit { relay: Some(relay) }
+        ConnectionPath::Circuit {
+            relay: Some(relay),
+            relay_ip: Some("127.0.0.1".parse().unwrap())
+        }
     );
 
     // direct leg to a registered relay vs a direct connection to a non-relay peer
@@ -73,6 +79,12 @@ fn test_connection_path_classification() {
         role_override: libp2p::core::Endpoint::Dialer,
         port_use: libp2p::core::transport::PortUse::Reuse,
     };
-    assert_eq!(ConnectionPath::classify(&direct, true), ConnectionPath::RelayDirect);
-    assert_eq!(ConnectionPath::classify(&direct, false), ConnectionPath::DirectNonRelay);
+    assert_eq!(
+        ConnectionPath::classify(&direct, true),
+        ConnectionPath::RelayDirect { ip: Some("127.0.0.1".parse().unwrap()) }
+    );
+    assert_eq!(
+        ConnectionPath::classify(&direct, false),
+        ConnectionPath::DirectNonRelay { ip: Some("127.0.0.1".parse().unwrap()) }
+    );
 }
