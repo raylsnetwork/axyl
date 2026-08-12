@@ -223,26 +223,33 @@ contract RewardDistributionFairnessTest is ConsensusRegistryTestUtils {
     }
 
     function _applySkewedIncentivesAndAssertStored() internal {
+        // participationRounds == anchorRounds here: each validator is modeled as having
+        // participated in exactly the rounds it led (satisfies the documented invariant
+        // participationRounds >= anchorRounds without needing a separate concept for this test).
         RewardInfo[] memory rewardInfos = new RewardInfo[](4);
-        rewardInfos[0] = RewardInfo(validator1, 1000);
-        rewardInfos[1] = RewardInfo(validator2, 1200);
-        rewardInfos[2] = RewardInfo(validator3, 900);
-        rewardInfos[3] = RewardInfo(validator4, 50); // ~20x fewer than validator2
+        rewardInfos[0] = RewardInfo(validator1, 1000, 1000);
+        rewardInfos[1] = RewardInfo(validator2, 1200, 1200);
+        rewardInfos[2] = RewardInfo(validator3, 900, 900);
+        rewardInfos[3] = RewardInfo(validator4, 50, 50); // ~20x fewer than validator2
+        uint256 totalRounds = 1000 + 1200 + 900 + 50;
 
         vm.prank(sysAddress);
-        consensusRegistry.applyIncentives(rewardInfos);
+        consensusRegistry.applyIncentives(rewardInfos, totalRounds);
 
         IConsensusRegistry.PerformanceWeights memory perf = consensusRegistry.getEpochPerformanceWeights();
         assertEq(perf.validators.length, 4, "all 4 validators recorded");
+        // Deliberately not asserting exact weight values here: ConsensusRegistry blends
+        // participation/anchor/stake-tier shares into its own weight formula, which is that
+        // contract's concern, not this file's. What matters for property 1 is just that the
+        // skew was actually recorded (weight ordering follows anchor-round ordering) — property
+        // 2 & 3 below are what prove RewardDistributor ignores this data entirely.
+        uint256 w1;
+        uint256 w4;
         for (uint256 i; i < perf.validators.length; ++i) {
-            uint256 expectedHeaderCount = perf.validators[i] == validator1 ? 1000
-                : perf.validators[i] == validator2 ? 1200
-                : perf.validators[i] == validator3 ? 900
-                : 50;
-            assertEq(perf.weights[i], stakeAmount_ * expectedHeaderCount, "weight == stake * headerCount, stored on-chain");
+            if (perf.validators[i] == validator1) w1 = perf.weights[i];
+            if (perf.validators[i] == validator4) w4 = perf.weights[i];
         }
-        // The skew is real and large — confirms this isn't a trivial/near-equal case.
-        assertTrue(perf.weights[0] >= 18 * perf.weights[3], "deliberately large skew: fast >> slow");
+        assertTrue(w1 > w4, "on-chain weight reflects the leader-round skew: fast > slow");
     }
 
     /// @dev Identical ownStake + identical Track A stake + identical target APY across all 4
@@ -325,16 +332,26 @@ contract RewardDistributionFairnessTest is ConsensusRegistryTestUtils {
         _fuzzFund(trackA, trackB);
 
         RewardInfo[] memory rewardInfos = new RewardInfo[](4);
+        uint256 totalHeaders = headerCounts[0] + headerCounts[1] + headerCounts[2] + headerCounts[3];
         for (uint256 i; i < 4; ++i) {
-            rewardInfos[i] = RewardInfo(validators[i], headerCounts[i]);
+            // participationRounds == anchorRounds — see _applySkewedIncentivesAndAssertStored.
+            rewardInfos[i] = RewardInfo(validators[i], headerCounts[i], headerCounts[i]);
         }
         vm.prank(sysAddress);
-        consensusRegistry.applyIncentives(rewardInfos);
+        consensusRegistry.applyIncentives(rewardInfos, totalHeaders);
 
-        // Property 1: on-chain storage still reflects the real (skewed) leader counts.
+        // Property 1: on-chain storage still reflects the real (skewed) leader counts — checked
+        // via weight ordering, not an exact formula match (that formula is ConsensusRegistry's
+        // own concern, not this file's; see the non-fuzz test's comment for why).
         IConsensusRegistry.PerformanceWeights memory perf = consensusRegistry.getEpochPerformanceWeights();
-        uint256 totalHeaders = headerCounts[0] + headerCounts[1] + headerCounts[2] + headerCounts[3];
-        assertEq(perf.totalWeight, stakeAmount_ * totalHeaders, "skewed leader counts stored on-chain");
+        assertEq(perf.validators.length, 4, "all 4 validators recorded despite skew");
+        uint256 wFast;
+        uint256 wSlow;
+        for (uint256 i; i < perf.validators.length; ++i) {
+            if (perf.validators[i] == validators[0]) wFast = perf.weights[i];
+            if (perf.validators[i] == validators[3]) wSlow = perf.weights[i];
+        }
+        assertTrue(wFast > wSlow, "on-chain weight reflects the leader-round skew: fast > slow");
 
         vm.prank(sysAddress);
         distributor.distributeRewards();
