@@ -9,20 +9,24 @@
 //! line naming the violation; the fixes have landed, so they now pass as regression guards.
 
 use super::*;
-use crate::common::{create_multiaddr, ensure_score_config};
+use crate::common::create_multiaddr;
 use libp2p::PeerId;
 use rand::{rngs::StdRng, SeedableRng as _};
 use rayls_infrastructure_config::{PeerConfig, ScoreConfig};
 use rayls_infrastructure_types::{now, BlsKeypair, NetworkKeypair};
 use std::net::{IpAddr, Ipv4Addr};
 
-/// Build an `AllPeers` from an operator config, installing its `ScoreConfig` for this test.
+/// Build an `AllPeers` from an operator config.
 ///
-/// The configuration is process-global but overwritten per test, so under `cargo test
-/// --test-threads 1` each case runs against the config it installs here.
+/// The `ScoreConfig` is owned by the store (threaded to every peer's `Score`), so each test is
+/// isolated and safe under parallel `cargo test` — no process-global to clobber.
 fn all_peers_with(config: PeerConfig) -> AllPeers {
-    ensure_score_config(Some(config.score_config));
-    AllPeers::new(Duration::from_secs(5), config.max_banned_peers, config.max_disconnected_peers)
+    AllPeers::new(
+        Duration::from_secs(5),
+        config.max_banned_peers,
+        config.max_disconnected_peers,
+        config.score_config,
+    )
 }
 
 /// Build an `AllPeers` with the default operator config.

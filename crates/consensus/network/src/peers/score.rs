@@ -8,44 +8,13 @@
 use super::types::Penalty;
 use rayls_infrastructure_config::ScoreConfig;
 use serde::Serialize;
-use std::{
-    fmt::Display,
-    sync::{Arc, RwLock},
-    time::Instant,
-};
-
-/// Global peer score configuration.
-///
-/// A node runs with one configuration for its whole life, so production installs it once through
-/// `init_peer_score_config`. The lock, rather than a `OnceLock`, lets the test harness install a
-/// fresh configuration per case: `cargo test` runs the whole suite in one process, so a write-once
-/// cell would leak the first case's configuration into every later one.
-pub(crate) static GLOBAL_SCORE_CONFIG: RwLock<Option<Arc<ScoreConfig>>> = RwLock::new(None);
-
-/// Install the global peer score configuration.
-///
-/// Sets the configuration only once: a node installs it at startup, and a later caller (a second
-/// `PeerManager`, or a test's node harness) must not overwrite a configuration already in force.
-pub(super) fn init_peer_score_config(config: ScoreConfig) {
-    let mut guard = GLOBAL_SCORE_CONFIG.write().expect("score config lock poisoned");
-    if guard.is_none() {
-        *guard = Some(Arc::new(config));
-    }
-}
-
-/// Get a clone of the global peer score configuration.
-///
-/// Panics if the configuration has not been installed.
-pub(super) fn global_score_config() -> Arc<ScoreConfig> {
-    let config = GLOBAL_SCORE_CONFIG.read().expect("score config lock poisoned").clone();
-    config.expect("Peer score configuration not initialized")
-}
+use std::{fmt::Display, time::Instant};
 
 /// A peer's score (perceived potential usefulness).
 ///
 /// This simplistic version consists of a global score per peer which decays to 0 over time. The
 /// decay rate applies equally to positive and negative scores.
-#[derive(PartialEq, Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 pub(super) struct Score {
     /// The global score used to accumulate penalties.
     ///
@@ -58,29 +27,42 @@ pub(super) struct Score {
     /// The time the score was last updated to perform time-based adjustments such as score-decay.
     #[serde(skip)]
     last_updated: Instant,
+    /// Peer scoring configuration (score bounds, halflife, ban thresholds).
+    ///
+    /// Node-scoped: owned by the `PeerManager` and threaded down through `AllPeers`/`Peer`, so
+    /// every score shares one configuration without a process-global. `ScoreConfig` is `Copy`.
+    #[serde(skip)]
+    config: ScoreConfig,
 }
 
-impl Default for Score {
-    fn default() -> Self {
-        let config = global_score_config();
-
-        Score {
-            rayls_score: config.default_score,
-            aggregate_score: config.default_score,
-            last_updated: Instant::now(),
-        }
+impl PartialEq for Score {
+    // The configuration is identical for every score in a node, so equality is defined by the
+    // mutable scoring state alone (matching the pre-config derived behaviour).
+    fn eq(&self, other: &Self) -> bool {
+        self.rayls_score == other.rayls_score
+            && self.aggregate_score == other.aggregate_score
+            && self.last_updated == other.last_updated
     }
 }
 
 impl Score {
-    /// Create `Self` with max values.
-    pub(super) fn new_max() -> Self {
-        let config = global_score_config();
+    /// Create a score initialized to the configured default (new-peer) score.
+    pub(super) fn new(config: ScoreConfig) -> Self {
+        Self {
+            rayls_score: config.default_score,
+            aggregate_score: config.default_score,
+            last_updated: Instant::now(),
+            config,
+        }
+    }
 
+    /// Create `Self` with max values.
+    pub(super) fn new_max(config: ScoreConfig) -> Self {
         Self {
             rayls_score: config.max_score,
             aggregate_score: config.max_score,
             last_updated: Instant::now(),
+            config,
         }
     }
 
@@ -91,7 +73,7 @@ impl Score {
 
     /// Modifies the score based on the penalty type and returns the new score.
     pub(super) fn apply_penalty(&mut self, penalty: Penalty) {
-        let config = global_score_config();
+        let config = self.config;
 
         // NOTE: these use `Self::add`
         // which cannot overflow using default config min and max scores
@@ -110,7 +92,7 @@ impl Score {
 
     /// Add an f64 to the currrent application score within the min/max limits.
     fn add(&mut self, score: f64) -> f64 {
-        let config = global_score_config();
+        let config = self.config;
         (self.rayls_score + score).clamp(config.min_score, config.max_score)
     }
 
@@ -133,7 +115,7 @@ impl Score {
         if let Some(prev_update) =
             now.checked_duration_since(self.last_updated).map(|d| d.as_secs_f64())
         {
-            let config = global_score_config();
+            let config = self.config;
 
             // e^(-ln(2)/HL*t)
             //
@@ -160,7 +142,7 @@ impl Score {
 
         // ban the peer if threshold reached
         if !already_banned && self.is_banned() {
-            let config = global_score_config();
+            let config = self.config;
 
             // ban the peer for at least BANNED_BEFORE_DECAY seconds
             self.last_updated += config.banned_before_decay();
@@ -169,8 +151,19 @@ impl Score {
 
     /// Helper method if a peer has reached the threshold for being banned.
     pub(super) fn is_banned(&self) -> bool {
-        let config = global_score_config();
-        self.aggregate_score <= config.min_score_before_ban
+        self.aggregate_score <= self.config.min_score_before_ban
+    }
+
+    /// The peer's reputation implied by its aggregate score.
+    ///
+    /// Reads the same thresholds [`Score::is_banned`] uses, so the verdict and the ban decay freeze
+    /// always describe the same peers from a single configuration source.
+    pub(super) fn reputation(&self) -> Reputation {
+        match self.aggregate_score {
+            score if score <= self.config.min_score_before_ban => Reputation::Banned,
+            score if score <= self.config.min_score_before_disconnect => Reputation::Disconnected,
+            _ => Reputation::Trusted,
+        }
     }
 }
 

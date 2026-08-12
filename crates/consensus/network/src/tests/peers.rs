@@ -1,7 +1,7 @@
 //! Unit tests for `AllPeers`
 
 use super::*;
-use crate::common::{create_multiaddr, ensure_score_config, random_ip_addr};
+use crate::common::{create_multiaddr, random_ip_addr};
 use libp2p::PeerId;
 use rand::{rngs::StdRng, SeedableRng as _};
 use rayls_infrastructure_config::{PeerConfig, ScoreConfig};
@@ -14,9 +14,13 @@ use std::{
 /// Helper function to create a test AllPeers instance
 fn create_all_peers(peer_config: Option<PeerConfig>) -> AllPeers {
     let config = peer_config.unwrap_or_default();
-    ensure_score_config(Some(config.score_config));
     let dial_timeout = Duration::from_secs(5);
-    AllPeers::new(dial_timeout, config.max_banned_peers, config.max_disconnected_peers)
+    AllPeers::new(
+        dial_timeout,
+        config.max_banned_peers,
+        config.max_disconnected_peers,
+        config.score_config,
+    )
 }
 
 #[test]
@@ -338,9 +342,8 @@ fn test_pruning_logic() {
 
 #[test]
 fn test_is_validator() {
-    ensure_score_config(None);
     let validator_id = PeerId::random();
-    let mut all_peers = AllPeers::new(Duration::from_secs(5), 10, 10);
+    let mut all_peers = AllPeers::new(Duration::from_secs(5), 10, 10, ScoreConfig::default());
     all_peers.current_committee.insert(validator_id);
     assert!(all_peers.is_peer_validator(&validator_id));
     assert!(!all_peers.is_peer_validator(&PeerId::random()));

@@ -7882,6 +7882,7 @@ dependencies = [
  "crossbeam-channel",
  "dirs-next",
  "eyre",
+ "fdlimit",
  "futures",
  "jsonrpsee",
  "parking_lot",

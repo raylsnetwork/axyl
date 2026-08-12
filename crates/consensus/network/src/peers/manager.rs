@@ -3,7 +3,6 @@
 use super::{
     all_peers::AllPeers,
     cache::BannedPeerCache,
-    score::init_peer_score_config,
     status::{DisconnectReason, NewConnectionStatus},
     types::{ConnectionDirection, ConnectionType, DialRequest, PeerAction},
     PeerEvent, PeerExchangeMap, Penalty,
@@ -98,11 +97,9 @@ impl PeerManager {
             config.dial_timeout,
             config.max_banned_peers,
             config.max_disconnected_peers,
+            config.score_config,
         );
         let temporarily_banned = BannedPeerCache::new(config.excess_peers_reconnection_timeout);
-
-        // initialize global score config
-        init_peer_score_config(config.score_config);
 
         Self {
             config: *config,

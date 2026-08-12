@@ -1,31 +1,17 @@
 //! Fixtures used in multiple tests.
 
-use crate::{peers::GLOBAL_SCORE_CONFIG, PeerExchangeMap, RLMessage};
+use crate::{PeerExchangeMap, RLMessage};
 use libp2p::Multiaddr;
 use rand::prelude::*;
-use rayls_infrastructure_config::ScoreConfig;
 use rayls_infrastructure_types::{
     BlockHash, Certificate, CertificateDigest, Header, SealedBatch, Vote,
 };
 use serde::{Deserialize, Serialize};
-use std::{
-    net::{IpAddr, Ipv4Addr, Ipv6Addr},
-    sync::Arc,
-};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 /// Default heartbeat for tests.
 #[allow(dead_code)] // used in network_tests.rs
 pub(crate) const TEST_HEARTBEAT_INTERVAL: u64 = 1;
-
-/// Install a score configuration for the current test.
-///
-/// Overwrites any prior value: `cargo test --test-threads 1` shares one process, so each test
-/// installs the configuration it needs at setup rather than inheriting the first test's.
-#[allow(dead_code)] // used in `all_peers` and `banned_peers`
-pub(crate) fn ensure_score_config(config: Option<ScoreConfig>) {
-    *GLOBAL_SCORE_CONFIG.write().expect("score config lock poisoned") =
-        Some(Arc::new(config.unwrap_or_default()));
-}
 
 // impl RLMessage trait for types
 impl RLMessage for TestWorkerRequest {

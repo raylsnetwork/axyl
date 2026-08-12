@@ -61,6 +61,8 @@ impl RethEnv {
     }
 
     /// Create a new RethEnv with a custom RaylsChainSpec for testing hardfork behavior.
+    ///
+    /// Raises the descriptor limit for the same reason [`RethEnv::new_for_temp_chain`] does.
     pub async fn new_for_temp_chain_with_rayls_spec<P: AsRef<Path>>(
         chain: Arc<RethChainSpec>,
         rayls_chain_spec: Arc<crate::RaylsChainSpec>,
@@ -80,6 +82,8 @@ impl RethEnv {
         };
         use reth_provider::providers::BlockchainProvider;
         use reth_storage_api::{BlockNumReader, DatabaseProviderFactory};
+
+        fdlimit::raise_fd_limit()?;
 
         let node_config = NodeConfig {
             datadir: DatadirArgs {

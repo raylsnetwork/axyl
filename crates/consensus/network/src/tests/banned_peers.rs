@@ -1,14 +1,12 @@
 //! Unit tests for banned peers
 
 use super::*;
-use crate::common::{ensure_score_config, random_ip_addr};
+use crate::common::random_ip_addr;
 use libp2p::{multiaddr::Protocol, Multiaddr, PeerId};
 use std::net::Ipv4Addr;
 
 /// Helper function to create a distinctly-identified peer with specific IP addresses.
 fn create_peer_with_ips(ips: Vec<IpAddr>) -> (PeerId, Peer) {
-    ensure_score_config(None);
-
     let mut peer = Peer::default_for_test();
 
     // add multiaddrs with the specified IPs
@@ -90,7 +88,6 @@ fn test_add_multiple_peers_same_ip() {
 
 #[test]
 fn test_add_peer_no_ip() {
-    ensure_score_config(None);
     let mut banned_peers = BannedPeers::default();
 
     // Create a peer with no IP addresses

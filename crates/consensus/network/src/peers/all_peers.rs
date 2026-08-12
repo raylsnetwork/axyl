@@ -19,6 +19,7 @@ use crate::{
 };
 use libp2p::{Multiaddr, PeerId};
 use rand::seq::SliceRandom as _;
+use rayls_infrastructure_config::ScoreConfig;
 use rayls_infrastructure_types::{BlsPublicKey, NetworkPublicKey};
 use std::{
     collections::{BinaryHeap, HashMap, HashSet},
@@ -67,6 +68,9 @@ pub(super) struct AllPeers {
     max_banned_peers: usize,
     /// The maximum number of disconnected peers to maintain before pruning.
     max_disconnected_peers: usize,
+    /// Peer scoring configuration, threaded into every [`Peer`]/`Score` this store creates so the
+    /// whole node shares one configuration without a process-global.
+    score_config: ScoreConfig,
 }
 
 impl AllPeers {
@@ -75,6 +79,7 @@ impl AllPeers {
         dial_timeout: Duration,
         max_banned_peers: usize,
         max_disconnected_peers: usize,
+        score_config: ScoreConfig,
     ) -> Self {
         Self {
             peers: Default::default(),
@@ -87,6 +92,7 @@ impl AllPeers {
             dial_timeout,
             max_banned_peers,
             max_disconnected_peers,
+            score_config,
         }
     }
 
@@ -100,7 +106,7 @@ impl AllPeers {
         addr: Vec<Multiaddr>,
     ) {
         let peer_id: PeerId = network_key.clone().into();
-        let trusted_peer = Peer::new_trusted(bls_public_key, network_key, addr);
+        let trusted_peer = Peer::new_trusted(bls_public_key, network_key, addr, self.score_config);
         let _ = self.banned_peers.remove_banned_peer(&peer_id);
         self.peers.insert(peer_id, trusted_peer);
     }
@@ -133,10 +139,14 @@ impl AllPeers {
             }
         } else if is_committee_member {
             debug!(target: "peer-manager", ?peer_id, "committee member peer does not exist, creating trusted");
-            self.peers.insert(peer_id, Peer::new_trusted(bls_public_key, network_key, addrs));
+            self.peers.insert(
+                peer_id,
+                Peer::new_trusted(bls_public_key, network_key, addrs, self.score_config),
+            );
         } else {
             debug!(target: "peer-manager", ?peer_id, "peer does not exist, creating new peer");
-            self.peers.insert(peer_id, Peer::new(bls_public_key, network_key, addrs));
+            self.peers
+                .insert(peer_id, Peer::new(bls_public_key, network_key, addrs, self.score_config));
         }
     }
 
@@ -201,7 +211,7 @@ impl AllPeers {
             }
 
             // add default peer
-            let mut peer = Peer::default();
+            let mut peer = Peer::empty(self.score_config);
             if self.is_peer_validator(peer_id) {
                 peer.make_trusted();
             }

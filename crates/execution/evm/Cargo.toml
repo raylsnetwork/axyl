@@ -15,6 +15,7 @@ rayls-infrastructure-types = { workspace = true }
 rayls-middleware-rewards = { workspace = true }
 rayls-consensus-worker = { workspace = true }
 dirs-next = "2.0.0"
+fdlimit = { workspace = true }
 parking_lot = { workspace = true }
 rayls-execution-metrics = { workspace = true }
 

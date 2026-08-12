@@ -1,12 +1,13 @@
 //! Information shared between peers.
 
 use super::{
-    score::{global_score_config, Reputation, ReputationUpdate, Score},
+    score::{Reputation, ReputationUpdate, Score},
     status::ConnectionStatus,
     types::ConnectionDirection,
     Penalty,
 };
 use libp2p::{core::multiaddr::Multiaddr, PeerId};
+use rayls_infrastructure_config::ScoreConfig;
 use rayls_infrastructure_types::{BlsPublicKey, NetworkPublicKey, Protocol};
 use std::{collections::HashSet, net::IpAddr, time::Instant};
 use tracing::error;
@@ -19,7 +20,7 @@ const MAX_MULTIADDRS_PER_PEER: usize = 20;
 /// It is possible we need to track a peer before we have network settings.
 /// These are only used for peer exchange and if not set then this peer will not
 /// be exchaged (which is fine since we don't have this info yet).
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub(super) struct Peer {
     /// The peers Bls public key.
     bls_public_key: Option<BlsPublicKey>,
@@ -27,6 +28,9 @@ pub(super) struct Peer {
     network_key: Option<NetworkPublicKey>,
     /// The peer's score - used to derive [Reputation].
     score: Score,
+    /// Peer scoring configuration, threaded from the `PeerManager` so a score rebuilt on a trust
+    /// change reuses the node's configuration.
+    config: ScoreConfig,
     /// The multiaddrs this node has witnessed the peer using.
     ///
     /// These are used to manage the banning process and are exchanged with peers.
@@ -55,12 +59,14 @@ impl Peer {
         bls_public_key: BlsPublicKey,
         network_key: NetworkPublicKey,
         listening_addrs: Vec<Multiaddr>,
+        config: ScoreConfig,
     ) -> Peer {
         Self {
             bls_public_key: Some(bls_public_key),
             network_key: Some(network_key),
             listening_addrs,
-            score: Score::new_max(),
+            score: Score::new_max(config),
+            config,
             is_trusted: true,
             multiaddrs: Default::default(),
             connection_status: Default::default(),
@@ -74,12 +80,32 @@ impl Peer {
         bls_public_key: BlsPublicKey,
         network_key: NetworkPublicKey,
         listening_addrs: Vec<Multiaddr>,
+        config: ScoreConfig,
     ) -> Peer {
         Self {
             bls_public_key: Some(bls_public_key),
             network_key: Some(network_key),
             listening_addrs,
-            score: Score::default(),
+            score: Score::new(config),
+            config,
+            is_trusted: false,
+            multiaddrs: Default::default(),
+            connection_status: Default::default(),
+            connection_direction: Default::default(),
+            routable: false,
+        }
+    }
+
+    /// Create an empty peer record (no keys yet) with the node's score configuration.
+    ///
+    /// Used when a connection status update arrives for a peer we have not yet recorded.
+    pub(super) fn empty(config: ScoreConfig) -> Peer {
+        Self {
+            bls_public_key: None,
+            network_key: None,
+            listening_addrs: Vec::new(),
+            score: Score::new(config),
+            config,
             is_trusted: false,
             multiaddrs: Default::default(),
             connection_status: Default::default(),
@@ -96,11 +122,13 @@ impl Peer {
         let bls_public_key = *BlsKeypair::generate(&mut rng).public();
         let network_key: NetworkPublicKey = NetworkKeypair::generate_ed25519().public().into();
         let listening_addrs = vec![Multiaddr::empty()];
+        let config = ScoreConfig::default();
         Self {
             bls_public_key: Some(bls_public_key),
             network_key: Some(network_key),
             listening_addrs,
-            score: Score::new_max(),
+            score: Score::new_max(config),
+            config,
             is_trusted: false,
             multiaddrs: Default::default(),
             connection_status: Default::default(),
@@ -143,16 +171,12 @@ impl Peer {
 
     /// Return a peer's reputation based on the aggregate score.
     ///
-    /// The thresholds come from the score config, the same source [`Score::is_banned`] reads to arm
-    /// the decay freeze. A second pair of thresholds would have to agree with these for the freeze
-    /// and the verdict to describe the same peers, and nothing could enforce that.
+    /// Delegates to [`Score::reputation`], which reads the same thresholds [`Score::is_banned`]
+    /// uses to arm the decay freeze — so the verdict and the freeze describe the same peers from a
+    /// single configuration source, rather than a second pair of thresholds nothing could keep in
+    /// agreement.
     pub(super) fn reputation(&self) -> Reputation {
-        let config = global_score_config();
-        match self.score.aggregate_score() {
-            score if score <= config.min_score_before_ban => Reputation::Banned,
-            score if score <= config.min_score_before_disconnect => Reputation::Disconnected,
-            _ => Reputation::Trusted,
-        }
+        self.score.reputation()
     }
 
     /// Return an iterator of known ip addresses for a peer.
@@ -332,7 +356,7 @@ impl Peer {
     pub(super) fn make_trusted(&mut self) {
         if !self.is_trusted {
             self.is_trusted = true;
-            self.score = Score::new_max();
+            self.score = Score::new_max(self.config);
         }
     }
 
@@ -340,7 +364,7 @@ impl Peer {
     pub(super) fn make_untrusted(&mut self) {
         if self.is_trusted {
             self.is_trusted = false;
-            self.score = Score::default();
+            self.score = Score::new(self.config);
         }
     }
 
