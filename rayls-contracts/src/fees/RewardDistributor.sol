@@ -19,7 +19,6 @@ import {SystemCallable} from "../consensus/SystemCallable.sol";
  *
  * @notice Distributes ERC-20 RLS staking rewards to validators and delegators
  * @dev Receives ERC-20 RLS from FeeAggregator (after USDr → RLS swap) and distributes
- *      based on block production performance weights (stake × consensusHeaderCount)
  * @dev Falls back to pure stake-based distribution if no performance data is available
  * @dev UUPS upgradeable with AccessControl
  * @dev RLS is an ERC-20 token; USDr is ERC-20 stablecoin
@@ -148,93 +147,178 @@ contract RewardDistributor is
 
     // ========== DISTRIBUTION ==========
 
+    /// @dev Per-validator stake snapshot
+    struct ValidatorStakes {
+        uint256 ownStake;
+        uint256 trackADelegated;
+        uint256 trackBDelegated;
+    }
+
     /// @inheritdoc IRewardDistributor
     /// @dev Distributes all pending rewards in a single call.
-    ///      Uses performance weights (stake × headerCount) if available, falls back to pure stake.
-    ///      Stakes are fetched on-demand per validator in both the weight-building pass and the
-    ///      distribution pass to avoid stack-too-deep with the dual-track arrays.
+    ///      Every validator's target reward is computed directly from its own stake at the
+    ///      configured target APY
     function distributeRewards() external override onlySystemCall nonReentrant {
         RewardDistributorStorage storage $ = _getRewardDistributorStorage();
 
+        IConsensusRegistry.ValidatorInfo[] memory activeValidators = $.consensusRegistry.getValidators(
+            IConsensusRegistry.ValidatorStatus.Active
+        );
+        uint256 len = activeValidators.length;
+        if (len == 0) revert NoActiveValidators();
+
+        uint256 epochSecs = $.consensusRegistry.getCurrentEpochInfo().epochDuration;
+        // Fetch all validator stakes in one pass
+        ValidatorStakes[] memory stakes = _fetchAllStakes(activeValidators);
+
+        uint256 totalTarget = _computeTotalTarget(stakes, epochSecs);
+
         uint256 totalRewards = $.totalPending;
-        address[] memory validators;
-        uint256[] memory weights;
-        uint256 totalWeight;
-        uint256 totalPriorityStake;
-        uint256 totalOpenTierStake;
-        uint256[] memory ownStakes;
-        uint256[] memory trackAStakes;
-        uint256[] memory trackBStakes;
-
-        // Use scoped block so `perf` is freed from the stack before the fallback block
-        {
-            IConsensusRegistry.PerformanceWeights memory perf =
-                $.consensusRegistry.getEpochPerformanceWeights();
-
-            if (perf.totalWeight > 0 && perf.validators.length > 0) {
-                validators = perf.validators;
-                weights = perf.weights;
-                totalWeight = perf.totalWeight;
-                ownStakes = new uint256[](validators.length);
-                trackAStakes = new uint256[](validators.length);
-                trackBStakes = new uint256[](validators.length);
-                for (uint256 i; i < validators.length; ++i) {
-                    (uint256 os, uint256 ta, uint256 tb) = _fetchValidatorStakes(validators[i]);
-                    ownStakes[i] = os;
-                    trackAStakes[i] = ta;
-                    trackBStakes[i] = tb;
-                    totalPriorityStake += os + ta;
-                    totalOpenTierStake += tb;
-                }
-            }
+        if (totalTarget > 0) {
+            totalRewards = _pullAccumulatorTopUp(totalRewards, totalTarget);
         }
-
-        if (totalWeight == 0) {
-            IConsensusRegistry.ValidatorInfo[] memory activeValidators = $.consensusRegistry.getValidators(
-                IConsensusRegistry.ValidatorStatus.Active
-            );
-            if (activeValidators.length == 0) revert NoActiveValidators();
-
-            validators = new address[](activeValidators.length);
-            weights = new uint256[](activeValidators.length);
-            ownStakes = new uint256[](activeValidators.length);
-            trackAStakes = new uint256[](activeValidators.length);
-            trackBStakes = new uint256[](activeValidators.length);
-            for (uint256 i; i < activeValidators.length; ++i) {
-                (uint256 os, uint256 ta, uint256 tb) = _fetchValidatorStakes(activeValidators[i].validatorAddress);
-                validators[i] = activeValidators[i].validatorAddress;
-                ownStakes[i] = os;
-                trackAStakes[i] = ta;
-                trackBStakes[i] = tb;
-                weights[i] = os + ta + tb;
-                totalWeight += weights[i];
-                totalPriorityStake += os + ta;
-                totalOpenTierStake += tb;
-            }
-        }
-
-        if (totalWeight == 0) revert NoActiveValidators();
-
-        totalRewards = _pullAccumulatorTopUp(totalRewards, totalPriorityStake, totalOpenTierStake);
 
         if (totalRewards == 0) {
             emit RewardsDistributed(0, 0);
             return;
         }
 
-        uint256 distributed;
-        uint256 len = validators.length;
-        for (uint256 i; i < len; ++i) {
-            uint256 validatorReward = (totalRewards * weights[i]) / totalWeight;
-            if (validatorReward == 0) continue;
-            distributed += _distributeToValidator(
-                validators[i], validatorReward, ownStakes[i], trackAStakes[i], trackBStakes[i]
-            );
-        }
+        uint256 distributed = totalTarget > 0
+            ? _distributeByTarget(activeValidators, stakes, totalRewards, totalTarget, epochSecs)
+            : _distributeByStake(activeValidators, stakes, totalRewards);
 
-        // Subtract full totalRewards so rounding dust is freed from totalPending
         $.totalPending -= totalRewards;
         emit RewardsDistributed(distributed, len);
+    }
+
+    /// @dev Fetches ownStake/Track A/Track B for every active validator in one pass.
+    function _fetchAllStakes(
+        IConsensusRegistry.ValidatorInfo[] memory activeValidators
+    ) internal view returns (ValidatorStakes[] memory stakes) {
+        uint256 len = activeValidators.length;
+        stakes = new ValidatorStakes[](len);
+        for (uint256 i; i < len; ++i) {
+            (uint256 os, uint256 ta, uint256 tb) = _fetchValidatorStakes(activeValidators[i].validatorAddress);
+            stakes[i] = ValidatorStakes(os, ta, tb);
+        }
+    }
+
+    /// @dev Sums each active validator's target reward (own stake + Track A at targetApyBps,
+    ///      Track B at openTierTargetApyBps) for the current epoch.
+    function _computeTotalTarget(
+        ValidatorStakes[] memory stakes,
+        uint256 epochSecs
+    ) internal view returns (uint256 totalTarget) {
+        uint256 len = stakes.length;
+        for (uint256 i; i < len; ++i) {
+            (uint256 priorityTarget, uint256 trackBTarget) = _splitTarget(
+                stakes[i].ownStake, stakes[i].trackADelegated, stakes[i].trackBDelegated, epochSecs
+            );
+            totalTarget += priorityTarget + trackBTarget;
+        }
+    }
+
+    /// @dev Scales each validator's pre-fetched target by totalRewards/totalTarget and
+    ///      distributes. 
+    function _distributeByTarget(
+        IConsensusRegistry.ValidatorInfo[] memory activeValidators,
+        ValidatorStakes[] memory stakes,
+        uint256 totalRewards,
+        uint256 totalTarget,
+        uint256 epochSecs
+    ) internal returns (uint256 distributed) {
+        uint256 len = activeValidators.length;
+        for (uint256 i; i < len; ++i) {
+            ValidatorStakes memory s = stakes[i];
+            (uint256 priorityTarget, uint256 trackBTarget) =
+                _splitTarget(s.ownStake, s.trackADelegated, s.trackBDelegated, epochSecs);
+
+            uint256 priorityReward = (totalRewards * priorityTarget) / totalTarget;
+            uint256 trackBReward = (totalRewards * trackBTarget) / totalTarget;
+            if (priorityReward == 0 && trackBReward == 0) continue;
+            distributed += _distributeToValidator(
+                activeValidators[i].validatorAddress, priorityReward, trackBReward, s.ownStake, s.trackADelegated
+            );
+        }
+    }
+
+    /// @dev Pre-tier fallback: distributes purely proportional to combined stake (own + Track A +
+    ///      Track B), with no APY-based track split, exactly as this contract behaved before
+    ///      target APYs existed. Only used when neither tier has a target APY configured.
+    function _distributeByStake(
+        IConsensusRegistry.ValidatorInfo[] memory activeValidators,
+        ValidatorStakes[] memory stakes,
+        uint256 totalRewards
+    ) internal returns (uint256 distributed) {
+        uint256 len = activeValidators.length;
+        uint256 totalWeight;
+        for (uint256 i; i < len; ++i) {
+            totalWeight += stakes[i].ownStake + stakes[i].trackADelegated + stakes[i].trackBDelegated;
+        }
+        if (totalWeight == 0) return 0;
+
+        for (uint256 i; i < len; ++i) {
+            ValidatorStakes memory s = stakes[i];
+            uint256 weight = s.ownStake + s.trackADelegated + s.trackBDelegated;
+            if (weight == 0) continue;
+            uint256 validatorReward = (totalRewards * weight) / totalWeight;
+            if (validatorReward == 0) continue;
+            distributed += _distributeToValidatorByStake(
+                activeValidators[i].validatorAddress, validatorReward, s.ownStake, s.trackADelegated, s.trackBDelegated
+            );
+        }
+    }
+
+    /// @dev Splits a stake-proportional reward between a validator's own claim and its delegated
+    ///      pool by combined-stake ratio, then splits the pool share between Track A/B by their
+    ///      own stake ratio (no APY weighting — there's no configured rate to honor here).
+    function _distributeToValidatorByStake(
+        address validatorAddr,
+        uint256 validatorReward,
+        uint256 ownStake,
+        uint256 trackADelegated,
+        uint256 trackBDelegated
+    ) internal returns (uint256) {
+        RewardDistributorStorage storage $ = _getRewardDistributorStorage();
+        uint256 totalDelegated = trackADelegated + trackBDelegated;
+        uint256 totalValidatorStake = ownStake + totalDelegated;
+
+        uint256 validatorShare = validatorReward;
+        uint256 poolShare;
+        if (totalDelegated > 0 && totalValidatorStake > 0 && address($.delegationPool) != address(0)) {
+            validatorShare = (validatorReward * ownStake) / totalValidatorStake;
+            poolShare = validatorReward - validatorShare;
+        }
+
+        uint256 trackAShare;
+        if (poolShare > 0) {
+            trackAShare = trackBDelegated == 0
+                ? poolShare
+                : (trackADelegated == 0 ? 0 : (poolShare * trackADelegated) / totalDelegated);
+            uint256 trackBShare = poolShare - trackAShare;
+            $.rls.safeTransfer(address($.delegationPool), poolShare);
+            $.delegationPool.distributePoolRewards(validatorAddr, trackAShare, trackBShare);
+        }
+
+        if (validatorShare > 0) {
+            $.pendingValidatorRewards[validatorAddr] += validatorShare;
+            $.totalUnclaimedRewards += validatorShare;
+        }
+        emit ValidatorRewardDistributed(validatorAddr, validatorShare, poolShare);
+
+        return validatorShare + poolShare;
+    }
+
+    /// @dev Splits a validator's stake into its priority (own + Track A) and Track B targets.
+    function _splitTarget(
+        uint256 ownStake,
+        uint256 trackADelegated,
+        uint256 trackBDelegated,
+        uint256 epochSecs
+    ) internal view returns (uint256 priorityTarget, uint256 trackBTarget) {
+        RewardDistributorStorage storage $ = _getRewardDistributorStorage();
+        priorityTarget = ((ownStake + trackADelegated) * $.targetApyBps * epochSecs) / (365 days * 10_000);
+        trackBTarget = (trackBDelegated * $.openTierTargetApyBps * epochSecs) / (365 days * 10_000);
     }
 
     /// @dev Fetches ownStake, Track A delegated, and Track B delegated for a validator in one call.
@@ -251,69 +335,46 @@ contract RewardDistributor is
         }
     }
 
-    /// @dev Distributes a reward to a validator, splitting between own stake and per-track pool shares.
-    ///      Uses pre-fetched stake values to avoid redundant external calls.
+    /// @dev Distributes validator's targeted rewards, splitting the priority
+    ///      (own stake + Track A) portion between the validator's own claim and Track A
+    ///      delegators by stake ratio.
+    ///      Track B reward passes through entirely as Track B's own-rate share.
     function _distributeToValidator(
         address validatorAddr,
-        uint256 validatorReward,
+        uint256 priorityReward,
+        uint256 trackBReward,
         uint256 ownStake,
-        uint256 trackADelegated,
-        uint256 trackBDelegated
+        uint256 trackADelegated
     ) internal returns (uint256) {
-        if (validatorReward == 0) return 0;
+        if (priorityReward == 0 && trackBReward == 0) return 0;
 
         RewardDistributorStorage storage $ = _getRewardDistributorStorage();
-        uint256 totalDelegated = trackADelegated + trackBDelegated;
-        uint256 totalValidatorStake = ownStake + totalDelegated;
+        uint256 priorityStake = ownStake + trackADelegated;
 
-        if (totalDelegated > 0 && totalValidatorStake > 0 && address($.delegationPool) != address(0)) {
-            uint256 validatorShare = (validatorReward * ownStake) / totalValidatorStake;
-            uint256 poolShare = validatorReward - validatorShare;
+        uint256 validatorShare = priorityReward;
+        uint256 trackAShare;
+        if (priorityStake > 0) {
+            validatorShare = (priorityReward * ownStake) / priorityStake;
+            trackAShare = priorityReward - validatorShare;
+        }
 
-            if (poolShare > 0) {
-                (uint256 trackAShare, uint256 trackBShare) =
-                    _splitPoolShare(poolShare, trackADelegated, trackBDelegated);
+        uint256 poolShare = trackAShare + trackBReward;
+        if (poolShare > 0 && address($.delegationPool) != address(0)) {
+            $.rls.safeTransfer(address($.delegationPool), poolShare);
+            $.delegationPool.distributePoolRewards(validatorAddr, trackAShare, trackBReward);
+        } else if (poolShare > 0) {
+            // no delegation pool wired up: nothing to route the pool share to
+            validatorShare += poolShare;
+            poolShare = 0;
+        }
 
-                $.rls.safeTransfer(address($.delegationPool), poolShare);
-                $.delegationPool.distributePoolRewards(validatorAddr, trackAShare, trackBShare);
-            }
-
+        if (validatorShare > 0) {
             $.pendingValidatorRewards[validatorAddr] += validatorShare;
             $.totalUnclaimedRewards += validatorShare;
-            emit ValidatorRewardDistributed(validatorAddr, validatorShare, poolShare);
-        } else {
-            $.pendingValidatorRewards[validatorAddr] += validatorReward;
-            $.totalUnclaimedRewards += validatorReward;
-            emit ValidatorRewardDistributed(validatorAddr, validatorReward, 0);
         }
+        emit ValidatorRewardDistributed(validatorAddr, validatorShare, poolShare);
 
-        return validatorReward;
-    }
-
-    /// @dev Splits a pool reward between Track A and Track B using APY-weighted stakes.
-    ///      Each track's share is proportional to (stake * targetApy), ensuring that
-    ///      the combined organic + subsidy reward approximates the configured APY ratio.
-    ///      Falls back to pure stake proportion when both APYs are zero.
-    function _splitPoolShare(
-        uint256 poolShare,
-        uint256 trackADelegated,
-        uint256 trackBDelegated
-    ) internal view returns (uint256 trackAShare, uint256 trackBShare) {
-        if (trackBDelegated == 0) return (poolShare, 0);
-        if (trackADelegated == 0) return (0, poolShare);
-
-        RewardDistributorStorage storage $ = _getRewardDistributorStorage();
-        uint256 weightA = trackADelegated * $.targetApyBps;
-        uint256 weightB = trackBDelegated * $.openTierTargetApyBps;
-        uint256 totalWeight = weightA + weightB;
-
-        if (totalWeight == 0) {
-            // Both APYs zero: fall back to stake proportion
-            trackAShare = (poolShare * trackADelegated) / (trackADelegated + trackBDelegated);
-        } else {
-            trackAShare = (poolShare * weightA) / totalWeight;
-        }
-        trackBShare = poolShare - trackAShare;
+        return validatorShare + poolShare;
     }
 
     // ========== CLAIMS ==========
@@ -438,29 +499,15 @@ contract RewardDistributor is
         emit OpenTierApyBpsUpdated(oldApyBps, newApyBps);
     }
 
-    /// @dev Pull RLS from the accumulator to cover APY shortfall.
-    ///      Computes separate targets for priority stake (ownStake + Track A, using targetApyBps)
-    ///      and open-tier stake (Track B, using openTierTargetApyBps), then pulls combined shortfall.
-    ///      Never reverts — failed pull is silently skipped.
+    /// @dev Pull RLS from the RLSAccumulator to cover the shortfall between fees and the per-validator 
+    ///      target reward for the current epoch.
     function _pullAccumulatorTopUp(
         uint256 currentRewards,
-        uint256 totalPriorityStake,
-        uint256 totalOpenTierStake
+        uint256 targetReward
     ) internal returns (uint256) {
         RewardDistributorStorage storage $ = _getRewardDistributorStorage();
 
         if ($.accumulator == address(0)) return currentRewards;
-
-        uint256 totalStaked = totalPriorityStake + totalOpenTierStake;
-        if (totalStaked == 0) return currentRewards;
-
-        uint256 epochSecs = $.consensusRegistry.getCurrentEpochInfo().epochDuration;
-
-        // Combined target: priority stake at targetApyBps, open-tier at openTierTargetApyBps
-        uint256 targetReward = (
-            totalPriorityStake * $.targetApyBps +
-            totalOpenTierStake * $.openTierTargetApyBps
-        ) * epochSecs / (365 days * 10_000);
 
         if (targetReward <= currentRewards) {
             return currentRewards;

@@ -214,23 +214,26 @@ contract RewardDistributorExtendedTest is Test {
     }
 
     // =========================================================================
-    //  1. Performance-weighted: 2x blocks -> 2x rewards (equal stake)
+    //  1. Block-production performance no longer affects reward size (equal stake)
     // =========================================================================
 
-    function test_distributeRewards_performanceWeighted_2xBlocks() public {
+    function test_distributeRewards_blockCountIgnored_equalStakeGetsEqualReward() public {
         registry.clearValidators();
         registry.addActiveValidator(validator1, 100e18);
         registry.addActiveValidator(validator2, 100e18);
 
-        // validator1 produces 10 blocks, validator2 produces 20 blocks
-        // weight = stake * headerCount => v1: 100e18*10 = 1000e18, v2: 100e18*20 = 2000e18
+        // validator1 produces 10 blocks, validator2 produces 20 blocks — this used to double
+        // validator2's weight (stake * headerCount) and, with it, its delegators' realized APY,
+        // purely from winning more leader rounds (latency, not stake). Reward sizing no longer
+        // reads performance weights at all, so this data is now inert: recording it must not
+        // change the split.
         address[] memory validators = new address[](2);
         uint256[] memory weights = new uint256[](2);
         validators[0] = validator1;
         validators[1] = validator2;
-        weights[0] = 100e18 * 10; // 1000e18
-        weights[1] = 100e18 * 20; // 2000e18
-        uint256 totalWeight = weights[0] + weights[1]; // 3000e18
+        weights[0] = 100e18 * 10;
+        weights[1] = 100e18 * 20;
+        uint256 totalWeight = weights[0] + weights[1];
 
         registry.setPerformanceWeights(validators, weights, totalWeight);
 
@@ -239,9 +242,10 @@ contract RewardDistributorExtendedTest is Test {
         vm.prank(SYSTEM_ADDRESS);
         distributor.distributeRewards();
 
-        // v1 gets 1000/3000 * 3000 = 1000, v2 gets 2000/3000 * 3000 = 2000
-        assertEq(distributor.getPendingRewards(validator1), 1000e18);
-        assertEq(distributor.getPendingRewards(validator2), 2000e18);
+        // Equal stake, no target APY configured (fallback to pure stake) -> equal split,
+        // regardless of the 2x block-count skew recorded above.
+        assertEq(distributor.getPendingRewards(validator1), 1500e18);
+        assertEq(distributor.getPendingRewards(validator2), 1500e18);
     }
 
     // =========================================================================

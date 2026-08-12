@@ -705,19 +705,19 @@ contract RewardDistributorTest is Test {
     // =========================================================================
 
     function test_distributeRewards_postSlash_splitUsesInitialStake() public {
+        // Isolate validator1 as the only active validator — reward distribution now covers
+        // every active validator (not just those named in performance weights), so the other
+        // two validators from setUp() would otherwise dilute the pool this test means to keep
+        // on validator1 alone.
+        registry.clearValidators();
+
         // Validator1: initial stake 100e18, slashed to 50e18
         // Delegation pool has 100e18 delegated to validator1
+        registry.addActiveValidator(validator1, 100e18);
         registry.setInitialStake(validator1, 100e18);
         registry.setBalance(validator1, 50e18); // post-slash
 
         delegationPool.setDelegatedStake(validator1, 100e18);
-
-        // Set performance weights (uses initial stake = 100e18 * 10 blocks = 1000)
-        address[] memory vals = new address[](1);
-        vals[0] = validator1;
-        uint256[] memory weights = new uint256[](1);
-        weights[0] = 1000e18; // only validator
-        registry.setPerformanceWeights(vals, weights, 1000e18);
 
         _receiveRewards(200e18);
 
