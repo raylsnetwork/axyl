@@ -23,7 +23,7 @@ fn create_test_peer_manager(network_config: Option<NetworkConfig>) -> PeerManage
     let mut authorities = all_nodes.authorities();
     let authority_1 = authorities.next().expect("first authority");
     let config = authority_1.consensus_config();
-    PeerManager::new(config.network_config().peer_config())
+    PeerManager::new(config.network_config().peer_config(), PeerId::random())
 }
 
 /// Helper function to extract events of a certain type
@@ -544,7 +544,8 @@ async fn test_is_validator() {
     let mut authorities = all_nodes.authorities();
     let authority_1 = authorities.next().expect("first authority");
     let config = authority_1.consensus_config();
-    let mut peer_manager = PeerManager::new(config.network_config().peer_config());
+    let mut peer_manager =
+        PeerManager::new(config.network_config().peer_config(), PeerId::random());
     let validator = *authority_1.authority().protocol_key();
     let random_peer_id = PeerId::random();
 
@@ -1289,5 +1290,71 @@ async fn test_refused_registration_disconnects_instead_of_announcing_the_peer() 
     assert!(
         events.iter().any(|e| matches!(e, PeerEvent::DisconnectPeer(id) if *id == peer_id)),
         "refused registration left the connection open"
+    );
+}
+
+/// Heartbeat must re-dial a committee member that is neither connected nor dialing: outside this
+/// path, committee dials happen only at the epoch boundary or when the node is fully isolated
+/// (discovery seeding), so a member whose relay or host recovers mid-epoch would otherwise stay
+/// partitioned until the next epoch.
+#[tokio::test]
+async fn test_heartbeat_redials_missing_committee_member() {
+    let all_nodes = CommitteeFixture::builder(MemDatabase::default)
+        .with_network_config(NetworkConfig::default())
+        .build();
+    let mut authorities = all_nodes.authorities();
+    let config = authorities.next().expect("first authority").consensus_config();
+
+    let mut rng = StdRng::seed_from_u64(33);
+
+    // this node's own identity, itself a committee member (observers must not pester committee)
+    let self_bls = *BlsKeypair::generate(&mut rng).public();
+    let self_netkey: NetworkPublicKey = NetworkKeypair::generate_ed25519().public().into();
+    let self_peer_id: PeerId = self_netkey.clone().into();
+    let mut peer_manager = PeerManager::new(config.network_config().peer_config(), self_peer_id);
+    peer_manager.add_known_peer(
+        self_bls,
+        NetworkInfo {
+            pubkey: self_netkey,
+            multiaddrs: vec![create_multiaddr(None)],
+            timestamp: now(),
+        },
+    );
+
+    // a fellow committee member, known but not connected
+    let member_bls = *BlsKeypair::generate(&mut rng).public();
+    let member_netkey: NetworkPublicKey = NetworkKeypair::generate_ed25519().public().into();
+    peer_manager.add_known_peer(
+        member_bls,
+        NetworkInfo {
+            pubkey: member_netkey,
+            multiaddrs: vec![create_multiaddr(None)],
+            timestamp: now(),
+        },
+    );
+
+    peer_manager.new_epoch(HashSet::from([self_bls, member_bls]));
+
+    // an unrelated peer is connected, so the node is not isolated (discovery seeding stays off)
+    register_peer(&mut peer_manager, None);
+    // drain anything setup may have queued
+    while peer_manager.next_dial_request().is_some() {}
+
+    peer_manager.heartbeat();
+
+    // the redial must route through the DialBls flow, which resolves `/dnsaddr` members to
+    // concrete circuits off-loop - dialing raw known_peers addresses installs the wrong
+    // relay-client handler for `/dnsaddr`-advertised members
+    let redials: Vec<_> = collect_all_events(&mut peer_manager)
+        .iter()
+        .filter_map(|e| match e {
+            PeerEvent::RedialCommittee(bls) => Some(*bls),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(redials, vec![member_bls], "one redial for the missing member, none for self");
+    assert!(
+        peer_manager.next_dial_request().is_none(),
+        "no raw dial may bypass the resolving dial path"
     );
 }

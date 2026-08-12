@@ -8,6 +8,7 @@ use libp2p::{
     relay::{self},
     request_response::{self, Codec},
     swarm::NetworkBehaviour,
+    PeerId,
 };
 use rayls_infrastructure_config::PeerConfig;
 use rayls_infrastructure_types::Database;
@@ -61,8 +62,9 @@ where
         kademlia: kad::Behaviour<KadStore<DB>>,
         peer_config: &PeerConfig,
         relay_client: relay::client::Behaviour,
+        local_peer_id: PeerId,
     ) -> Self {
-        let peer_manager = PeerManager::new(peer_config);
+        let peer_manager = PeerManager::new(peer_config, local_peer_id);
         Self { peer_manager, gossipsub, req_res, kademlia, relay_client }
     }
 }

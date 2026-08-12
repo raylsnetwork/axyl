@@ -235,6 +235,13 @@ where
                     self.kad_record_queries.insert(query_id, bls_key.into());
                 }
             }
+            PeerEvent::RedialCommittee(bls_key) => {
+                // route through DialBls so a `/dnsaddr`-advertised member is resolved to
+                // concrete circuits off-loop before dialing; the outcome is fire-and-forget
+                // (a failed attempt is retried on the next heartbeat)
+                let (reply, _outcome) = oneshot::channel();
+                self.process_command(crate::types::NetworkCommand::DialBls { bls_key, reply })?;
+            }
             PeerEvent::Discovery => {
                 let peer_id = PeerId::random();
                 self.swarm.behaviour_mut().kademlia.get_closest_peers(peer_id);

@@ -92,11 +92,17 @@ pub(crate) struct PeerManager {
     /// and every circuit routed through them. These peer ids are therefore exempt from penalties
     /// and pruning.
     relay_peers: HashSet<PeerId>,
+    /// This node's own peer id.
+    ///
+    /// Used to skip self when re-dialing missing committee members (this node appears in its own
+    /// committee and known-peers maps) and to detect whether this node is itself a committee
+    /// member.
+    local_peer_id: PeerId,
 }
 
 impl PeerManager {
     /// Create a new instance of Self.
-    pub(crate) fn new(config: &PeerConfig) -> Self {
+    pub(crate) fn new(config: &PeerConfig, local_peer_id: PeerId) -> Self {
         let heartbeat =
             tokio::time::interval(tokio::time::Duration::from_secs(config.heartbeat_interval));
 
@@ -121,6 +127,7 @@ impl PeerManager {
             temporarily_banned,
             discovery_peers: Default::default(),
             relay_peers: Default::default(),
+            local_peer_id,
         }
     }
 
@@ -291,8 +298,43 @@ impl PeerManager {
         // update timestamps
         self.unban_temp_banned_peers();
 
+        // heal committee connectivity without waiting for the epoch boundary
+        self.redial_missing_committee();
+
         // manage discovery peers
         self.discovery_heartbeat();
+    }
+
+    /// Requests a re-dial, via [`PeerEvent::RedialCommittee`], of every current-committee member
+    /// that is neither connected nor dialing.
+    ///
+    /// Committee connectivity must not wait for the epoch boundary: a member whose relay or host
+    /// recovers mid-epoch becomes reachable again immediately, while the only other committee
+    /// dial paths run at `NewEpoch` or when this node is fully isolated (discovery seeding). One
+    /// attempt per member per heartbeat bounds the dial rate; committee members are ban-exempt,
+    /// so failed attempts cannot escalate. Only committee members re-dial: an observer with
+    /// peers must not pester the committee, matching the epoch-boundary dial policy.
+    fn redial_missing_committee(&mut self) {
+        if !self.is_peer_validator(&self.local_peer_id) {
+            return;
+        }
+        let connected_or_dialing: HashSet<PeerId> =
+            self.connected_or_dialing_peers().into_iter().collect();
+        let missing: Vec<BlsPublicKey> = self
+            .known_peers
+            .iter()
+            .filter_map(|(bls_key, info)| {
+                let peer_id: PeerId = info.pubkey.clone().into();
+                (peer_id != self.local_peer_id
+                    && self.is_peer_validator(&peer_id)
+                    && !connected_or_dialing.contains(&peer_id))
+                .then_some(*bls_key)
+            })
+            .collect();
+        for bls_key in missing {
+            debug!(target: "peer-manager", ?bls_key, "requesting re-dial of missing committee member");
+            self.events.push_back(PeerEvent::RedialCommittee(bls_key));
+        }
     }
 
     /// Apply a [PeerAction].

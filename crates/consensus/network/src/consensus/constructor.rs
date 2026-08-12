@@ -192,7 +192,7 @@ where
             // wraps it (see note above). Uses RAYLS_DNS_SERVER when set, else the system resolver.
             .with_dns_config(resolver_cfg, resolver_opts)
             .with_behaviour(|_| {
-                RLBehavior::new(gossipsub, req_res, kademlia, peer_config, relay_behaviour)
+                RLBehavior::new(gossipsub, req_res, kademlia, peer_config, relay_behaviour, peer_id)
             })
             .map_err(|_| NetworkError::BuildSwarm)?
             .with_swarm_config(|c| {
