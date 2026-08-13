@@ -19,6 +19,17 @@
 //!   (libp2p's own default is 128 KiB).
 //! - `RELAY_MAX_RESERVATIONS` / `RELAY_MAX_CIRCUITS` (optional): tighten global caps (defaults
 //!   raised to 1024).
+//! - `RELAY_MAX_RESERVATIONS_PER_PEER` / `RELAY_MAX_CIRCUITS_PER_PEER` (optional): tighten the
+//!   per-peer caps (defaults raised to 64). `max_circuits_per_peer` bounds concurrent circuits for
+//!   a single source peer id.
+//! - `RELAY_CIRCUIT_SRC_PEER_BURST` / `RELAY_CIRCUIT_SRC_PEER_INTERVAL_SECS` (optional): enable a
+//!   per-source-peer-id circuit-open rate limiter (token bucket: `BURST` = capacity, one token
+//!   every `INTERVAL_SECS`). Setting either turns it on; the unset one defaults (burst 64, 1s).
+//! - `RELAY_CIRCUIT_SRC_IP_BURST` / `RELAY_CIRCUIT_SRC_IP_INTERVAL_SECS` (optional): same, keyed by
+//!   source IP (the knob that resists peer-id rotation). Setting either turns it on (burst 256, 1s
+//!   defaults). Both dimensions are independent: peer-only, IP-only, both, or neither (default OFF
+//!   -- the single-host local testnet hairpins every node through 127.0.0.1, so a per-IP limiter
+//!   would treat them as one source).
 //! - `RELAY_ALLOWED_RESERVERS` (optional): `;`-separated list of peer ids allowed to reserve on
 //!   this relay (the validator(s) it fronts). When set, only those peers may hold a reservation;
 //!   every other peer's reservation is denied so the relay can't be squatted as free inbound
@@ -26,7 +37,9 @@
 //!   through to reach a fronted one. Unset = any peer may reserve (the default the local testnet
 //!   relies on).
 //!
-//! No per-source rate limiting is configured (see `relay_config`).
+//! Every limit is env-tunable so a deployment can dial in values that fit it. The shipped defaults
+//! are deliberately open (effectively-unlimited caps, rate limiting off) except the reservation
+//! allow-list; production is expected to tighten these.
 
 use futures::StreamExt as _;
 use libp2p::{
@@ -40,6 +53,7 @@ use std::{
     collections::{HashMap, HashSet},
     env,
     net::{IpAddr, Ipv4Addr, SocketAddr},
+    num::NonZeroU32,
     time::Duration,
 };
 use tracing::{info, warn};
@@ -152,14 +166,45 @@ fn relay_config() -> eyre::Result<relay::Config> {
     cfg.max_reservations_per_peer = 64;
     cfg.max_circuits = 1024;
     cfg.max_circuits_per_peer = 64;
-    // No per-source rate limiters: libp2p's defaults (30/2min per peer, 60/hr per IP) trip on the
-    // local testnet, where every validator hairpins from 127.0.0.1 and reconnect churn exceeds the
-    // per-IP cap. Per-source limiters also can't meaningfully protect a shared relay here anyway
-    // (the only slot-reclaiming knob, a finite `max_circuit_duration`, would force-close live
-    // consensus links), so the relay relies on network-edge protection instead.
+
+    // Per-source circuit rate limiting is OFF by default and opt-in, with the two dimensions
+    // controlled INDEPENDENTLY: set RELAY_CIRCUIT_SRC_PEER_* to rate-limit by source peer id, set
+    // RELAY_CIRCUIT_SRC_IP_* to rate-limit by source IP, set both for both, set neither to disable.
+    // Each caps how fast one source can open NEW circuits so it cannot rapidly exhaust the circuit
+    // table. Within a dimension, an unset knob falls back to a sane default (per-peer burst 64,
+    // per-IP burst 256, one token/sec each). Token bucket: `burst` = capacity, one token refills
+    // every `interval` (sustained = 1/interval). A circuit is allowed only if every installed
+    // limiter passes; concurrency is separately bounded by max_circuits_per_peer, and the per-IP
+    // limiter is the one that resists peer-id rotation (ids are free to mint, IPs are not).
+    //
+    // Off by default because the single-host local testnet hairpins every node through 127.0.0.1,
+    // where a per-IP limiter would (wrongly) treat them all as one source. Reservations are gated
+    // by the allow-list below (membership, not rate), so their limiters stay cleared
+    // regardless.
     cfg.reservation_rate_limiters = Vec::new();
     cfg.circuit_src_rate_limiters = Vec::new();
-    warn!("relay rate limiting is disabled");
+    let peer_burst = env_parse::<u32>("RELAY_CIRCUIT_SRC_PEER_BURST")?;
+    let peer_secs = env_parse::<u64>("RELAY_CIRCUIT_SRC_PEER_INTERVAL_SECS")?;
+    let ip_burst = env_parse::<u32>("RELAY_CIRCUIT_SRC_IP_BURST")?;
+    let ip_secs = env_parse::<u64>("RELAY_CIRCUIT_SRC_IP_INTERVAL_SECS")?;
+    let mut enabled: Vec<String> = Vec::new();
+    if peer_burst.is_some() || peer_secs.is_some() {
+        let pb = peer_burst.unwrap_or(64).max(1);
+        let ps = peer_secs.unwrap_or(1).max(1);
+        cfg = cfg.circuit_src_per_peer(NonZeroU32::new(pb).expect(">=1"), Duration::from_secs(ps));
+        enabled.push(format!("per-peer(burst={pb}, 1/{ps}s)"));
+    }
+    if ip_burst.is_some() || ip_secs.is_some() {
+        let ib = ip_burst.unwrap_or(256).max(1);
+        let is = ip_secs.unwrap_or(1).max(1);
+        cfg = cfg.circuit_src_per_ip(NonZeroU32::new(ib).expect(">=1"), Duration::from_secs(is));
+        enabled.push(format!("per-ip(burst={ib}, 1/{is}s)"));
+    }
+    if enabled.is_empty() {
+        warn!("relay circuit source rate limiting is disabled (set RELAY_CIRCUIT_SRC_PEER_* and/or RELAY_CIRCUIT_SRC_IP_* to enable)");
+    } else {
+        info!(limiters = %enabled.join(", "), "relay circuit source rate limiting enabled");
+    }
 
     if let Some(secs) = env_parse::<u64>("RELAY_MAX_CIRCUIT_DURATION_SECS")? {
         cfg.max_circuit_duration = Duration::from_secs(secs);
@@ -170,8 +215,14 @@ fn relay_config() -> eyre::Result<relay::Config> {
     if let Some(n) = env_parse::<usize>("RELAY_MAX_RESERVATIONS")? {
         cfg.max_reservations = n;
     }
+    if let Some(n) = env_parse::<usize>("RELAY_MAX_RESERVATIONS_PER_PEER")? {
+        cfg.max_reservations_per_peer = n;
+    }
     if let Some(n) = env_parse::<usize>("RELAY_MAX_CIRCUITS")? {
         cfg.max_circuits = n;
+    }
+    if let Some(n) = env_parse::<usize>("RELAY_MAX_CIRCUITS_PER_PEER")? {
+        cfg.max_circuits_per_peer = n;
     }
 
     // Reservation allow-list. Each relay fronts a known, fixed set of validators, so only those
