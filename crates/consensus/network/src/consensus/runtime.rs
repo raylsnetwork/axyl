@@ -9,7 +9,7 @@ use futures::StreamExt as _;
 use libp2p::{core::transport::ListenerId, kad::Mode, swarm::SwarmEvent, Multiaddr};
 use rayls_infrastructure_types::{Database, RaylsSender};
 use std::time::{Duration, Instant};
-use tracing::{debug, error, info, instrument, trace, warn};
+use tracing::{debug, error, info, instrument, warn};
 
 impl<Req, Res, DB, Events> ConsensusNetwork<Req, Res, DB, Events>
 where
@@ -148,9 +148,26 @@ where
                 RLBehaviorEvent::PeerManager(event) => self.process_peer_manager_event(event)?,
                 RLBehaviorEvent::Kademlia(event) => self.process_kad_event(event)?,
                 RLBehaviorEvent::RelayClient(event) => {
-                    // Relay reservation / circuit lifecycle events. Connectivity is driven by the
-                    // swarm + peer manager; we only trace these for observability.
-                    trace!(target: "network", ?event, "relay client event");
+                    // Relay reservation / circuit lifecycle events. Connectivity itself is driven
+                    // by the swarm + peer manager; these are logged at info so relay reachability
+                    // is visible when debugging on site (there are no failure variants here --
+                    // reservation/circuit failures surface as connection errors, not these).
+                    use libp2p::relay::client::Event as RelayClientEvent;
+                    match event {
+                        RelayClientEvent::ReservationReqAccepted {
+                            relay_peer_id,
+                            renewal,
+                            limit,
+                        } => {
+                            info!(target: "network::relay::event", %relay_peer_id, renewal, ?limit, "remote relay accepted our reservation — we are now reachable through it");
+                        }
+                        RelayClientEvent::OutboundCircuitEstablished { relay_peer_id, limit } => {
+                            info!(target: "network::relay::event", %relay_peer_id, ?limit, "we opened an outbound circuit through this relay to reach a peer");
+                        }
+                        RelayClientEvent::InboundCircuitEstablished { src_peer_id, limit } => {
+                            info!(target: "network::relay::event", %src_peer_id, ?limit, "a remote peer reached us inbound through a relay");
+                        }
+                    }
                 }
             },
             SwarmEvent::ConnectionEstablished { peer_id, connection_id, endpoint, .. } => {
