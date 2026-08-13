@@ -1272,7 +1272,7 @@ impl<T: Table, DB: Database> InsertTrait<DB> for KeyValueInsert<T> {
         txn.insert::<T>(&self.key, &self.value)
     }
     fn clear_insert_mem(&self, mem_db: &MemDatabase) {
-        let _ = mem_db.delete_removed::<T>(&self.key, false);
+        let _ = mem_db.delete_tombstoned::<T>(&self.key, false);
     }
 }
 

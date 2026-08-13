@@ -354,9 +354,9 @@ impl MemDatabase {
     pub fn get_marked<T: Table>(&self, key: &T::Key) -> eyre::Result<Option<(bool, T::Value)>> {
         if let Some(table) = self.store.read().get(T::NAME) {
             let key_bytes = encode_key(key);
-            if let Some((removed, val_bytes)) = table.get(&key_bytes) {
+            if let Some((tombstoned, val_bytes)) = table.get(&key_bytes) {
                 let val = decode(val_bytes);
-                return Ok(Some((*removed, val)));
+                return Ok(Some((*tombstoned, val)));
             }
         }
 
@@ -367,21 +367,22 @@ impl MemDatabase {
     pub fn is_tombstoned<T: Table>(&self, key: &T::Key) -> bool {
         if let Some(table) = self.store.read().get(T::NAME) {
             let key_bytes = encode_key(key);
-            return table.get(&key_bytes).map_or(false, |(removed, _)| *removed);
+            return table.get(&key_bytes).map_or(false, |(tombstoned, _)| *tombstoned);
         }
         false
     }
 
-    pub fn delete_removed<T: Table>(&self, key: &T::Key, require_marked: bool) -> eyre::Result<()> {
+    pub fn delete_tombstoned<T: Table>(
+        &self,
+        key: &T::Key,
+        require_marked: bool,
+    ) -> eyre::Result<()> {
         if let Some(table) = self.store.write().get_mut(T::NAME) {
             let key_bytes = encode_key(key);
-            if let Some((removed, _)) = table.get(&key_bytes) {
-                if !*removed && require_marked {
-                    // Value was re-inserted after the remove was queued — keep it.
-                    return Ok(());
+            if let Some((tombstoned, _)) = table.get(&key_bytes) {
+                if *tombstoned || !require_marked {
+                    table.remove(&key_bytes);
                 }
-
-                table.remove(&key_bytes);
             }
         }
         Ok(())
@@ -390,7 +391,11 @@ impl MemDatabase {
     /// Returns keys marked for deletion in the given table.
     pub fn get_deleted_keys<T: Table>(&self) -> std::collections::HashSet<Vec<u8>> {
         if let Some(table) = self.store.read().get(T::NAME) {
-            table.iter().filter(|(_, (removed, _))| *removed).map(|(k, _)| k.clone()).collect()
+            table
+                .iter()
+                .filter(|(_, (tombstoned, _))| *tombstoned)
+                .map(|(k, _)| k.clone())
+                .collect()
         } else {
             std::collections::HashSet::new()
         }
