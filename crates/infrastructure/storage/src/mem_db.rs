@@ -298,7 +298,7 @@ impl<'a> DbTxMut for MemDbTxMut<'a> {
         if let Some(table) = self.store.get_mut(T::NAME) {
             let key_bytes = encode_key(key);
             let value_bytes = encode(value);
-            table.insert(key_bytes.clone(), (false, value_bytes));
+            table.insert(key_bytes, (false, value_bytes));
 
             Ok(())
         } else {
@@ -518,12 +518,7 @@ impl Database for MemDatabase {
     }
 
     fn insert<T: Table>(&self, key: &T::Key, value: &T::Value) -> eyre::Result<()> {
-        if let Some(table) = self.store.write().get_mut(T::NAME) {
-            let key_bytes = encode_key(key);
-            let value_bytes = encode(value);
-            table.insert(key_bytes, (false, value_bytes));
-        }
-        Ok(())
+        self.write_txn_impl().insert::<T>(key, value)
     }
 
     fn remove<T: Table>(&self, key: &T::Key) -> eyre::Result<()> {
