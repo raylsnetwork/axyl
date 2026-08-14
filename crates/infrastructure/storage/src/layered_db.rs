@@ -1,6 +1,7 @@
 use std::{
     borrow::Cow,
     cmp::Ordering,
+    collections::BinaryHeap,
     fmt::Debug,
     future::Future,
     iter::Peekable,
@@ -20,10 +21,10 @@ use crate::{
     tables::ColdBatchLocations,
 };
 
-use crate::mem_db::{MemDatabase, MemDbTx, MemDbTxMut};
+use crate::mem_db::{EvictionHeap, MemDatabase, MemDbTx, MemDbTxMut};
 use prometheus::{default_registry, register_int_gauge_with_registry, IntGauge, Registry};
 use rayls_infrastructure_types::{
-    decode_key, encode, DBIter, DBRawIter, Database, DbTx, DbTxMut, Table,
+    decode_key, encode, encode_key, DBIter, DBRawIter, Database, DbTx, DbTxMut, Table,
 };
 use tokio::sync::oneshot::{self, error::TryRecvError};
 
@@ -231,8 +232,22 @@ fn merge_cold_raw<'i, T: Table>(
     Box::new(merged.take_while(move |_| !faulted.get()))
 }
 
-const CACHE_KEEP_TIME_SECS: u64 = 60;
-const MAX_CACHE_SIZE: usize = 10000;
+/// Default cap on total cached rows (live and tombstoned) before the writer evicts settled keys.
+const DEFAULT_MAX_CACHE_SIZE: usize = 10000;
+
+/// Eviction policy for the mem cache.
+#[derive(Clone, Copy, Debug)]
+pub struct CacheConfig {
+    /// Total cached rows (live and tombstoned) allowed before the writer evicts settled keys
+    /// (in-flight == 0) in recency order. Small in tests, the default in production.
+    pub max_size: usize,
+}
+
+impl Default for CacheConfig {
+    fn default() -> Self {
+        Self { max_size: DEFAULT_MAX_CACHE_SIZE }
+    }
+}
 
 pub struct LayeredDbTx<'a, DB: Database> {
     mem_db: MemDbTx<'a>,
@@ -534,6 +549,9 @@ impl<'a, DB: Database> DbTx for LayeredDbTxMut<'a, DB> {
 
 impl<'a, DB: Database> DbTxMut for LayeredDbTxMut<'a, DB> {
     fn insert<T: Table>(&mut self, key: &T::Key, value: &T::Value) -> eyre::Result<()> {
+        // The txn producer already holds the mem write guard for its whole lifetime, so the
+        // mutation, the in-flight increment and the enqueue are one critical section by
+        // construction.
         self.mem_db.insert::<T>(key, value)?;
         let ins = Box::new(KeyValueInsert::<T> { key: key.clone(), value: value.clone() });
         self.tx.send(DBMessage::Insert(ins)).map_err(|_| eyre::eyre!("DB thread gone, FATAL!"))?;
@@ -562,8 +580,9 @@ impl<'a, DB: Database> DbTxMut for LayeredDbTxMut<'a, DB> {
     }
 
     fn clear_table<T: Table>(&mut self) -> eyre::Result<()> {
+        let keys = self.mem_db.raw_keys::<T>();
         self.mem_db.clear_table::<T>()?;
-        let clr = Box::new(ClearTable::<T> { _casper: PhantomData });
+        let clr = Box::new(ClearTable::<T> { _casper: PhantomData, keys });
         self.tx.send(DBMessage::Clear(clr)).map_err(|_| eyre::eyre!("DB thread gone, FATAL!"))?;
         Ok(())
     }
@@ -575,26 +594,22 @@ impl<'a, DB: Database> DbTxMut for LayeredDbTxMut<'a, DB> {
     }
 }
 
-/// Manage the persistent DB in a background thread with daily compaction.
-/// Drop the mem overlay for committed inserts older than `CACHE_KEEP_TIME_SECS` or beyond
-/// `MAX_CACHE_SIZE`. Only safe for committed rows: it removes them from the mem layer.
-fn evict_committed<DB: Database>(
-    committed_inserts: &mut Vec<(Instant, Box<dyn InsertTrait<DB>>)>,
-    mem_db: &MemDatabase,
-) {
-    let total_count = committed_inserts.len();
-    let mut remove_count: usize = 0;
-    for (instant, insert) in committed_inserts.iter() {
-        if instant.elapsed() > Duration::from_secs(CACHE_KEEP_TIME_SECS)
-            || total_count - remove_count > MAX_CACHE_SIZE
-        {
-            insert.clear_insert_mem(mem_db);
-            remove_count += 1;
-            continue;
+/// An op applied into a (possibly shared) write txn; its in-flight release must wait for the
+/// final commit to succeed.
+enum DeferredOp<DB: Database> {
+    Insert(Box<dyn InsertTrait<DB>>),
+    Remove(Box<dyn RemoveTrait<DB>>),
+    Clear(Box<dyn ClearTrait<DB>>),
+}
+
+impl<DB: Database> DeferredOp<DB> {
+    fn on_applied(&self, mem_db: &MemDatabase, heap: &mut EvictionHeap) {
+        match self {
+            DeferredOp::Insert(op) => op.on_applied(mem_db, heap),
+            DeferredOp::Remove(op) => op.on_applied(mem_db, heap),
+            DeferredOp::Clear(op) => op.on_applied(mem_db, heap),
         }
-        break;
     }
-    committed_inserts.drain(..remove_count);
 }
 
 /// Depth at which the writer queue is treated as a backlog: `db_run` warns (rate-limited) and
@@ -698,13 +713,15 @@ fn db_run<DB: Database>(
     mem_db: MemDatabase,
     rx: Receiver<DBMessage<DB>>,
     depth: Arc<AtomicUsize>,
+    max_size: usize,
 ) {
     let mut txn = None;
     let mut last_compact = Instant::now();
     let queue_depth_gauge = writer_queue_depth_gauge();
     let mut last_lag_warn: Option<Instant> = None;
 
-    let mut committed_inserts: Vec<(Instant, Box<dyn InsertTrait<DB>>)> = Vec::with_capacity(1000);
+    let mut eviction_heap: EvictionHeap = BinaryHeap::new();
+    let mut committed_ops: Vec<DeferredOp<DB>> = Vec::with_capacity(1000);
     // last write/commit failure since the previous CaughtUp, reported by the next persist
     let mut pending_write_error: Option<String> = None;
     if let Err(e) = db.compact() {
@@ -737,9 +754,16 @@ fn db_run<DB: Database>(
                 if let Some((current_txn, count)) = txn.take() {
                     if count <= 1 {
                         match current_txn.commit() {
-                            Ok(()) => evict_committed(&mut committed_inserts, &mem_db),
-                            // surface via persist instead of aborting; rows stay in mem, not lost
+                            Ok(()) => {
+                                for op in committed_ops.drain(..) {
+                                    op.on_applied(&mem_db, &mut eviction_heap);
+                                }
+                                mem_db.evict_if_needed(&mut eviction_heap, max_size);
+                            }
+                            // The txn's rows stay in mem with their in-flight counts, so a failed
+                            // commit is retained (not lost, not evictable) and surfaced via persist.
                             Err(e) => {
+                                committed_ops.clear();
                                 tracing::error!(target: "layered_db_runner", "consensus DB commit failed: {e}");
                                 pending_write_error = Some(format!("commit: {e}"));
                             }
@@ -752,21 +776,19 @@ fn db_run<DB: Database>(
             DBMessage::Insert(ins) => {
                 if let Some((txn, _)) = &mut txn {
                     if let Err(e) = ins.insert_txn(txn) {
-                        // keep the failed row in mem (not the eviction cache) so it is not lost
+                        // keep the failed row in mem (not evictable) so it is not lost
                         tracing::error!(target: "layered_db_runner", "DB TXN Insert: {e}");
                         pending_write_error = Some(format!("insert: {e}"));
                     } else {
-                        committed_inserts.push((Instant::now(), ins));
-
-                        // Rayls: limit layer growth between commits
-                        if committed_inserts.len() > MAX_CACHE_SIZE * 2 {
-                            evict_committed(&mut committed_inserts, &mem_db);
-                        }
+                        committed_ops.push(DeferredOp::Insert(ins));
                     }
                 } else if let Err(e) = ins.insert(&db) {
+                    // keep the failed row in mem (with its in-flight count, so not evictable)
                     tracing::error!(target: "layered_db_runner", "DB Insert: {e}");
-                    ins.clear_insert_mem(&mem_db);
                     pending_write_error = Some(format!("insert: {e}"));
+                } else {
+                    ins.on_applied(&mem_db, &mut eviction_heap);
+                    mem_db.evict_if_needed(&mut eviction_heap, max_size);
                 }
             }
             DBMessage::Remove(rm) => {
@@ -774,10 +796,15 @@ fn db_run<DB: Database>(
                     if let Err(e) = rm.remove_txn(txn, &mem_db) {
                         tracing::error!(target: "layered_db_runner", "DB TXN Remove: {e}");
                         pending_write_error = Some(format!("remove: {e}"));
+                    } else {
+                        committed_ops.push(DeferredOp::Remove(rm));
                     }
                 } else if let Err(e) = rm.remove(&db, &mem_db) {
                     tracing::error!(target: "layered_db_runner", "DB Remove: {e}");
                     pending_write_error = Some(format!("remove: {e}"));
+                } else {
+                    rm.on_applied(&mem_db, &mut eviction_heap);
+                    mem_db.evict_if_needed(&mut eviction_heap, max_size);
                 }
             }
             DBMessage::Clear(clr) => {
@@ -785,15 +812,21 @@ fn db_run<DB: Database>(
                     if let Err(e) = clr.clear_table_txn(txn, &mem_db) {
                         tracing::error!("DB TXN Clear table: {e}");
                         pending_write_error = Some(format!("clear: {e}"));
+                    } else {
+                        committed_ops.push(DeferredOp::Clear(clr));
                     }
                 } else if let Err(e) = clr.clear_table(&db, &mem_db) {
                     tracing::error!("DB Clear: {e}");
                     pending_write_error = Some(format!("clear: {e}"));
+                } else {
+                    clr.on_applied(&mem_db, &mut eviction_heap);
+                    mem_db.evict_if_needed(&mut eviction_heap, max_size);
                 }
             }
             // NOTE: proves prior messages were applied, not that an open shared txn committed.
             // Safe at shutdown because consensus writers are torn down before persist runs.
             DBMessage::CaughtUp(tx) => {
+                mem_db.evict_if_needed(&mut eviction_heap, max_size);
                 let reply: Result<(), String> = match pending_write_error.take() {
                     Some(e) => Err(e),
                     None => Ok(()),
@@ -847,6 +880,12 @@ impl<DB: Database> Drop for LayeredDatabase<DB> {
 
 impl<DB: Database> LayeredDatabase<DB> {
     pub fn open(db: DB) -> Self {
+        Self::open_with_config(db, CacheConfig::default())
+    }
+
+    /// Opens the layered DB with a custom eviction policy: small caches in tests, the default in
+    /// production.
+    pub fn open_with_config(db: DB, config: CacheConfig) -> Self {
         let (tx, rx) = mpsc::channel();
         let depth = Arc::new(AtomicUsize::new(0));
         let db_cloned = db.clone();
@@ -854,7 +893,7 @@ impl<DB: Database> LayeredDatabase<DB> {
         let mem_db_clone = mem_db.clone();
         let queue_depth = Arc::clone(&depth);
         let thread = Some(Arc::new(std::thread::spawn(move || {
-            db_run(db_cloned, mem_db_clone, rx, queue_depth)
+            db_run(db_cloned, mem_db_clone, rx, queue_depth, config.max_size)
         })));
         Self {
             mem_db,
@@ -1085,24 +1124,28 @@ impl<DB: Database> Database for LayeredDatabase<DB> {
     }
 
     fn insert<T: Table>(&self, key: &T::Key, value: &T::Value) -> eyre::Result<()> {
-        self.mem_db.insert::<T>(key, value)?;
-        let ins = Box::new(KeyValueInsert::<T> { key: key.clone(), value: value.clone() });
-        self.tx.send(DBMessage::Insert(ins)).map_err(|_| eyre::eyre!("DB thread gone, FATAL!"))?;
-        Ok(())
+        // The mem mutation, the in-flight increment and the enqueue share one critical section:
+        // channel order equals mem order, so a zero in-flight count is a sound "no queued ops".
+        self.mem_db.insert_queued::<T>(key, value, || {
+            let ins = Box::new(KeyValueInsert::<T> { key: key.clone(), value: value.clone() });
+            self.tx.send(DBMessage::Insert(ins)).map_err(|_| eyre::eyre!("DB thread gone, FATAL!"))
+        })
     }
 
     fn remove<T: Table>(&self, key: &T::Key) -> eyre::Result<()> {
-        self.mem_db.remove::<T>(key)?;
-        let rm = Box::new(KeyRemove::<T> { key: key.clone() });
-        self.tx.send(DBMessage::Remove(rm)).map_err(|_| eyre::eyre!("DB thread gone, FATAL!"))?;
-        Ok(())
+        self.mem_db.remove_queued::<T>(key, || {
+            let rm = Box::new(KeyRemove::<T> { key: key.clone() });
+            self.tx.send(DBMessage::Remove(rm)).map_err(|_| eyre::eyre!("DB thread gone, FATAL!"))
+        })
     }
 
     fn clear_table<T: Table>(&self) -> eyre::Result<()> {
-        self.mem_db.clear_table::<T>()?;
-        let clr = Box::new(ClearTable::<T> { _casper: PhantomData });
-        self.tx.send(DBMessage::Clear(clr)).map_err(|_| eyre::eyre!("DB thread gone, FATAL!"))?;
-        Ok(())
+        // The clear tombstones every row and bumps each in-flight count under the same lock that
+        // captures the key set for the writer, so no tombstone is evicted before the clear lands.
+        self.mem_db.clear_table_queued::<T>(|keys| {
+            let clr = Box::new(ClearTable::<T> { _casper: PhantomData, keys });
+            self.tx.send(DBMessage::Clear(clr)).map_err(|_| eyre::eyre!("DB thread gone, FATAL!"))
+        })
     }
 
     fn is_empty<T: Table>(&self) -> bool {
@@ -1233,18 +1276,23 @@ impl<DB: Database> Database for LayeredDatabase<DB> {
 trait InsertTrait<DB: Database>: Send + 'static {
     fn insert(&self, db: &DB) -> eyre::Result<()>;
     fn insert_txn(&self, txn: &mut DB::TXMut<'_>) -> eyre::Result<()>;
-    /// Clear the inserted data from the memdb.
-    fn clear_insert_mem(&self, mem_db: &MemDatabase);
+    /// Release the in-flight op for the inserted key once the write is durably applied; at zero
+    /// the key becomes an eviction candidate.
+    fn on_applied(&self, mem_db: &MemDatabase, heap: &mut EvictionHeap);
 }
 
 trait RemoveTrait<DB: Database>: Send + 'static {
     fn remove(&self, db: &DB, mem_db: &MemDatabase) -> eyre::Result<()>;
     fn remove_txn(&self, txn: &mut DB::TXMut<'_>, mem_db: &MemDatabase) -> eyre::Result<()>;
+    /// Release the in-flight op for the removed key(s) once the delete is durably applied.
+    fn on_applied(&self, mem_db: &MemDatabase, heap: &mut EvictionHeap);
 }
 
 trait ClearTrait<DB: Database>: Send + 'static {
     fn clear_table(&self, db: &DB, mem_db: &MemDatabase) -> eyre::Result<()>;
     fn clear_table_txn(&self, txn: &mut DB::TXMut<'_>, mem_db: &MemDatabase) -> eyre::Result<()>;
+    /// Release the in-flight op of every tombstoned key once the clear is durably applied.
+    fn on_applied(&self, mem_db: &MemDatabase, heap: &mut EvictionHeap);
 }
 
 struct KeyValueInsert<T: Table> {
@@ -1261,6 +1309,9 @@ struct KeyRemoveBatch<T: Table> {
 }
 
 struct ClearTable<T: Table> {
+    /// Raw keys tombstoned by the producer's clear: each must release its in-flight op when the
+    /// persistent clear applies, so no tombstone is evicted before then.
+    keys: Vec<Vec<u8>>,
     _casper: PhantomData<T>,
 }
 
@@ -1271,13 +1322,14 @@ impl<T: Table, DB: Database> InsertTrait<DB> for KeyValueInsert<T> {
     fn insert_txn(&self, txn: &mut DB::TXMut<'_>) -> eyre::Result<()> {
         txn.insert::<T>(&self.key, &self.value)
     }
-    fn clear_insert_mem(&self, mem_db: &MemDatabase) {
-        let _ = mem_db.delete_tombstoned::<T>(&self.key, false);
+    fn on_applied(&self, mem_db: &MemDatabase, heap: &mut EvictionHeap) {
+        mem_db.on_op_applied(T::NAME, &encode_key(&self.key), heap);
     }
 }
 
 // Tombstones are NOT eagerly cleared from mem after persistent delete;
 // doing so races with the main thread's reads (MDBX write not yet visible).
+// They are released by the eviction heap once their in-flight count settles.
 impl<T: Table, DB: Database> RemoveTrait<DB> for KeyRemove<T> {
     fn remove(&self, db: &DB, mem_db: &MemDatabase) -> eyre::Result<()> {
         // skip if key was re-inserted after the remove was queued
@@ -1296,6 +1348,10 @@ impl<T: Table, DB: Database> RemoveTrait<DB> for KeyRemove<T> {
             return Ok(());
         }
         txn.remove::<T>(&self.key)
+    }
+
+    fn on_applied(&self, mem_db: &MemDatabase, heap: &mut EvictionHeap) {
+        mem_db.on_op_applied(T::NAME, &encode_key(&self.key), heap);
     }
 }
 
@@ -1326,6 +1382,12 @@ impl<T: Table, DB: Database> RemoveTrait<DB> for KeyRemoveBatch<T> {
         }
         Ok(())
     }
+
+    fn on_applied(&self, mem_db: &MemDatabase, heap: &mut EvictionHeap) {
+        for key in &self.keys {
+            mem_db.on_op_applied(T::NAME, &encode_key(key), heap);
+        }
+    }
 }
 
 impl<T: Table, DB: Database> ClearTrait<DB> for ClearTable<T> {
@@ -1340,6 +1402,12 @@ impl<T: Table, DB: Database> ClearTrait<DB> for ClearTable<T> {
         _mem_db: &MemDatabase,
     ) -> eyre::Result<()> {
         txn.clear_table::<T>()
+    }
+
+    fn on_applied(&self, mem_db: &MemDatabase, heap: &mut EvictionHeap) {
+        for key in &self.keys {
+            mem_db.on_op_applied(T::NAME, key, heap);
+        }
     }
 }
 
@@ -1369,7 +1437,10 @@ impl<DB: Database> Debug for DBMessage<DB> {
 
 #[cfg(test)]
 mod test {
-    use super::{DBMessage, InsertTrait, LayeredDatabase, QUEUE_HIGH_WATER_MARK, QUEUE_PACE_SLEEP};
+    use super::{
+        CacheConfig, DBMessage, EvictionHeap, InsertTrait, LayeredDatabase, QUEUE_HIGH_WATER_MARK,
+        QUEUE_PACE_SLEEP,
+    };
     #[cfg(feature = "redb")]
     use crate::redb::ReDB;
     use crate::{
@@ -1477,7 +1548,7 @@ mod test {
             let _ = self.0.recv();
             Ok(())
         }
-        fn clear_insert_mem(&self, _mem_db: &MemDatabase) {}
+        fn on_applied(&self, _mem_db: &MemDatabase, _heap: &mut EvictionHeap) {}
     }
 
     /// A producer bursting into a seeded writer backlog must be paced above the high-water mark,
@@ -1528,17 +1599,182 @@ mod test {
         );
     }
 
-    #[test]
-    fn test_layereddb_contains_key() {
-        let temp_dir = tempdir().expect("failed to create temp dir");
-        #[cfg(feature = "redb")]
-        {
-            let db = open_redb(temp_dir.path());
-            test_contains_key(db);
-        }
-        let db = open_mdbx(temp_dir.path());
+    /// Insert a burst of keys into a tiny cache and confirm the writer evicts settled keys in
+/// recency order until the cache fits `max_size`, with the newest rows surviving in mem.
+#[test]
+fn eviction_keeps_cache_at_max_size_and_evicts_oldest_settled() {
+    let inner = MemDatabase::new();
+    inner.open_table::<TestTable>().expect("open inner table");
+    let db = LayeredDatabase::open_with_config(inner, CacheConfig { max_size: 3 });
+    db.open_table::<TestTable>().expect("open layered table");
+
+    for i in 0..10u64 {
+        db.insert::<TestTable>(&i, &format!("v{i}")).expect("insert");
+    }
+    db.sync_persist();
+
+    assert_eq!(db.mem_db.mem_size(), 3, "cache must be trimmed to max_size");
+    // The newest rows survive hot; older ones fall through to the persistent tier.
+    for i in 0..10u64 {
+        assert_eq!(
+            db.get::<TestTable>(&i).unwrap().as_deref(),
+            Some(format!("v{i}").as_str()),
+            "every key must still be readable after eviction"
+        );
+    }
+    for i in 7..10u64 {
+        assert!(db.mem_db.contains_key::<TestTable>(&i).unwrap(), "newest key {i} must stay hot");
+    }
+    for i in 0..7u64 {
+        assert!(!db.mem_db.contains_key::<TestTable>(&i).unwrap(), "settled key {i} must be evicted");
+    }
+}
+
+/// A tombstone whose remove is still queued must not be evicted, even when the cache is over its
+/// cap: the row shields reads from the persistent tier until the delete lands. Once the remove
+/// applies, the tombstone settles and becomes an eviction candidate.
+#[test]
+fn eviction_waits_for_in_flight_ops() {
+    let inner = MemDatabase::new();
+    inner.open_table::<TestTable>().expect("open inner table");
+    let db = LayeredDatabase::open_with_config(inner, CacheConfig { max_size: 1 });
+    db.open_table::<TestTable>().expect("open layered table");
+
+    // Two gates park the writer mid-drain so the in-flight window is observable.
+    let (release, gate1) = std::sync::mpsc::channel::<()>();
+    let (release2, gate2) = std::sync::mpsc::channel::<()>();
+    db.tx.send(DBMessage::Insert(Box::new(WriterGate(gate1)))).expect("gate1 enqueue");
+    db.insert::<TestTable>(&1, &"one".to_string()).expect("insert k1");
+    db.tx.send(DBMessage::Insert(Box::new(WriterGate(gate2)))).expect("gate2 enqueue");
+    db.remove::<TestTable>(&1).expect("remove k1");
+    db.insert::<TestTable>(&2, &"two".to_string()).expect("insert k2");
+
+    // Let the writer drain past K1's insert, then park again: K1's tombstone and K2's row are
+    // both in flight (count > 0), so eviction (run at every apply) must not drop anything even
+    // though the cache holds 2 rows against a cap of 1.
+    drop(release);
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    assert_eq!(
+        db.mem_db.mem_size(),
+        2,
+        "in-flight rows must not be evicted while ops are queued"
+    );
+    assert!(db.mem_db.is_tombstoned::<TestTable>(&1), "K1's tombstone must survive while queued");
+    drop(release2);
+    db.sync_persist();
+
+    // The remove applied, so K1's settled tombstone is now evictable; only K2 stays hot.
+    assert_eq!(db.mem_db.mem_size(), 1, "settled rows must be trimmed to max_size");
+    assert!(!db.mem_db.is_tombstoned::<TestTable>(&1), "K1 tombstone must be evicted post-apply");
+    assert!(db.mem_db.contains_key::<TestTable>(&2).unwrap(), "K2 must stay hot");
+    assert_eq!(db.get::<TestTable>(&1).unwrap(), None, "K1 is durably removed");
+    assert_eq!(db.get::<TestTable>(&2).unwrap(), Some("two".to_string()));
+}
+
+/// A tombstone for a key that was never in the cache (deleted from the persistent tier only)
+/// must not leak: it settles when the remove applies and is evicted like any other row.
+#[test]
+fn removed_never_inserted_tombstone_is_evicted() {
+    let inner = MemDatabase::new();
+    inner.open_table::<TestTable>().expect("open inner table");
+    let db = LayeredDatabase::open_with_config(inner, CacheConfig { max_size: 1 });
+    db.open_table::<TestTable>().expect("open layered table");
+
+    db.remove::<TestTable>(&999).expect("remove never-inserted key");
+    db.insert::<TestTable>(&1, &"one".to_string()).expect("insert");
+    db.insert::<TestTable>(&2, &"two".to_string()).expect("insert");
+    db.sync_persist();
+
+    assert_eq!(db.get::<TestTable>(&999).unwrap(), None);
+    assert!(!db.mem_db.is_tombstoned::<TestTable>(&999), "stray tombstone must be evicted");
+    assert_eq!(db.mem_db.mem_size(), 1, "cache must be trimmed");
+}
+
+/// A `clear_table` tombstones every cached row and holds them (in flight) until the persistent
+/// clear lands; only then are the tombstones released and evicted.
+#[test]
+fn clear_tombstones_are_held_until_the_persistent_clear_lands() {
+    let inner = MemDatabase::new();
+    inner.open_table::<TestTable>().expect("open inner table");
+    let db = LayeredDatabase::open_with_config(inner, CacheConfig { max_size: 2 });
+    db.open_table::<TestTable>().expect("open layered table");
+
+    db.insert::<TestTable>(&1, &"one".to_string()).expect("insert");
+    db.insert::<TestTable>(&2, &"two".to_string()).expect("insert");
+    db.insert::<TestTable>(&3, &"three".to_string()).expect("insert");
+    db.clear_table::<TestTable>().expect("clear");
+    db.insert::<TestTable>(&4, &"four".to_string()).expect("insert");
+    db.sync_persist();
+
+    assert_eq!(db.get::<TestTable>(&1).unwrap(), None);
+    assert_eq!(db.get::<TestTable>(&2).unwrap(), None);
+    assert_eq!(db.get::<TestTable>(&3).unwrap(), None);
+    assert_eq!(db.get::<TestTable>(&4).unwrap(), Some("four".to_string()));
+    assert_eq!(db.mem_db.mem_size(), 2, "cleared tombstones settle and are evicted");
+}
+
+/// Reading a hot key refreshes its recency (lock-free, throttled), so it survives eviction over
+/// a sibling that settled at the same time but was never read since.
+#[test]
+fn read_recency_protects_a_hot_key() {
+    let inner = MemDatabase::new();
+    inner.open_table::<TestTable>().expect("open inner table");
+    let db = LayeredDatabase::open_with_config(inner, CacheConfig { max_size: 2 });
+    db.open_table::<TestTable>().expect("open layered table");
+
+    for i in 1..=3u64 {
+        db.insert::<TestTable>(&i, &format!("v{i}")).expect("insert");
+    }
+    db.sync_persist();
+    // 1 settled first and was evicted; 2 and 3 are hot.
+    assert!(db.mem_db.contains_key::<TestTable>(&2).unwrap());
+    assert!(db.mem_db.contains_key::<TestTable>(&3).unwrap());
+
+    // Cross the recency throttle window, then read key 2: its clock bumps.
+    std::thread::sleep(std::time::Duration::from_millis(150));
+    assert_eq!(db.get::<TestTable>(&2).unwrap(), Some("v2".to_string()));
+
+    // Overflow the cache: without the read bump, key 2 (settled first) would be evicted.
+    db.insert::<TestTable>(&4, &"v4".to_string()).expect("insert");
+    db.sync_persist();
+
+    assert_eq!(db.mem_db.mem_size(), 2);
+    assert!(db.mem_db.contains_key::<TestTable>(&2).unwrap(), "read key must stay hot");
+    assert!(db.mem_db.contains_key::<TestTable>(&4).unwrap(), "newest key must stay hot");
+    assert!(!db.mem_db.contains_key::<TestTable>(&3).unwrap(), "unread sibling must be evicted");
+}
+
+/// Remove-then-reinsert of the same key must not leak its in-flight count: the remove's apply
+/// is skipped by the re-insert guard, but it still settles, so the row stays evictable.
+#[test]
+fn guard_skipped_remove_still_settles() {
+    let inner = MemDatabase::new();
+    inner.open_table::<TestTable>().expect("open inner table");
+    let db = LayeredDatabase::open_with_config(inner, CacheConfig { max_size: 1 });
+    db.open_table::<TestTable>().expect("open layered table");
+
+    db.insert::<TestTable>(&1, &"v1".to_string()).expect("insert");
+    db.remove::<TestTable>(&1).expect("remove");
+    db.insert::<TestTable>(&1, &"v3".to_string()).expect("reinsert");
+    db.insert::<TestTable>(&2, &"v2".to_string()).expect("insert");
+    db.insert::<TestTable>(&3, &"v3".to_string()).expect("insert");
+    db.sync_persist();
+
+    assert_eq!(db.get::<TestTable>(&1).unwrap(), Some("v3".to_string()));
+    assert_eq!(db.mem_db.mem_size(), 1, "no in-flight leak: the row is evictable");
+}
+
+#[test]
+fn test_layereddb_contains_key() {
+    let temp_dir = tempdir().expect("failed to create temp dir");
+    #[cfg(feature = "redb")]
+    {
+        let db = open_redb(temp_dir.path());
         test_contains_key(db);
     }
+    let db = open_mdbx(temp_dir.path());
+    test_contains_key(db);
+}
 
     #[test]
     fn test_layereddb_get() {

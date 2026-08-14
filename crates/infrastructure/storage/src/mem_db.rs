@@ -2,13 +2,15 @@
 
 use std::{
     borrow::Cow,
-    collections::{BTreeMap, HashMap},
+    cmp::Reverse,
+    collections::{BTreeMap, BinaryHeap, HashMap},
     fmt::Debug,
     sync::{
+        atomic::{AtomicU64, Ordering as AtomicOrdering},
         mpsc::{self, SyncSender},
-        Arc,
+        Arc, LazyLock,
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};
@@ -19,8 +21,95 @@ use rayls_infrastructure_types::{
 
 use crate::open_default_tables;
 
-type StoreTableValueType = (bool, Vec<u8>);
-type StoreTableType = BTreeMap<Vec<u8>, StoreTableValueType>;
+/// Bit 0 of a row's packed word: the row is a tombstone (deleted in mem, pending/durable removal).
+const TOMBSTONE_BIT: u32 = 1;
+
+/// Writes to a hot row's recency clock are throttled to one per window: reads only need a coarse
+/// ordering, and every store lands on the same cache line while the read lock is held.
+const RECENCY_BUMP_THRESHOLD: Duration = Duration::from_millis(100);
+
+static PROCESS_START: LazyLock<Instant> = LazyLock::new(Instant::now);
+
+/// Monotonic nanos since process start; cheap (vDSO) and lock-free.
+fn now_nanos() -> u64 {
+    PROCESS_START.elapsed().as_nanos() as u64
+}
+
+/// A single cached row: the encoded value plus a packed `(tombstoned, in_flight)` word and a
+/// lock-free recency clock.
+///
+/// `packed` bit 0 is the tombstone flag; bits 1..=31 are the number of writer ops queued for
+/// this key (the "in flight" count). It is a plain `u32` because every access happens under the
+/// store `RwLock`: producers increment under the write lock, the writer thread decrements under
+/// the write lock, and reads peek at the flag under the read lock. A count of zero means no
+/// queued op remains for the key, so the mem row exactly matches the persistent tier and the
+/// key is safe to evict.
+///
+/// `last_used` is an atomic so a hot read can refresh recency while holding only the read lock;
+/// writes are throttled to [`RECENCY_BUMP_THRESHOLD`] to keep the atomic cache line quiet.
+#[derive(Debug)]
+struct StoreEntry {
+    value: Vec<u8>,
+    packed: u32,
+    last_used: AtomicU64,
+}
+
+impl StoreEntry {
+    fn new(value: Vec<u8>) -> Self {
+        Self { value, packed: 0, last_used: AtomicU64::new(now_nanos()) }
+    }
+
+    fn tombstoned(&self) -> bool {
+        self.packed & TOMBSTONE_BIT != 0
+    }
+
+    fn in_flight(&self) -> u32 {
+        self.packed >> 1
+    }
+
+    fn mark_tombstone(&mut self) {
+        self.packed |= TOMBSTONE_BIT;
+    }
+
+    fn clear_tombstone(&mut self) {
+        self.packed &= !TOMBSTONE_BIT;
+    }
+
+    fn add_in_flight(&mut self) {
+        debug_assert!(
+            self.in_flight() < u32::MAX >> 1,
+            "in-flight op count overflow for a single key"
+        );
+        self.packed += 2;
+    }
+
+    fn dec_in_flight(&mut self) {
+        self.packed -= 2;
+    }
+
+    /// Refreshes the recency clock if the previous bump is older than the throttle window.
+    fn bump_last_used(&self) {
+        let now = now_nanos();
+        let last = self.last_used.load(AtomicOrdering::Relaxed);
+        if now.saturating_sub(last) >= RECENCY_BUMP_THRESHOLD.as_nanos() as u64 {
+            self.last_used.store(now, AtomicOrdering::Relaxed);
+        }
+    }
+
+    /// Unconditional recency refresh; used on writes, which already serialize on the write lock.
+    fn touch(&mut self) {
+        self.last_used.store(now_nanos(), AtomicOrdering::Relaxed);
+    }
+}
+
+/// Writer-owned min-heap of evictable keys ordered by recency: `Reverse<(last_used, table, key)>`.
+///
+/// Only the background writer pushes (when a key's in-flight count settles to zero) and pops
+/// (during eviction), so no lock guards it. Entries go stale when the key is re-inserted or the
+/// table is cleared; they are validated at pop under the store write lock and skipped.
+pub type EvictionHeap = BinaryHeap<Reverse<(u64, &'static str, Vec<u8>)>>;
+
+type StoreTableType = BTreeMap<Vec<u8>, StoreEntry>;
 type StoreType = HashMap<&'static str, StoreTableType>;
 
 #[derive(Debug)]
@@ -32,9 +121,12 @@ impl<'a> MemDbTx<'a> {
     pub fn get_no_marked_check<T: Table>(&self, key: &T::Key) -> Option<(bool, T::Value)> {
         if let Some(table) = self.store.get(T::NAME) {
             let key_bytes = encode_key(key);
-            if let Some((tombstoned, val_bytes)) = table.get(&key_bytes) {
-                let val = decode(val_bytes);
-                return Some((*tombstoned, val));
+            if let Some(entry) = table.get(&key_bytes) {
+                if !entry.tombstoned() {
+                    entry.bump_last_used();
+                }
+                let val = decode(&entry.value);
+                return Some((entry.tombstoned(), val));
             }
         }
         None
@@ -44,7 +136,7 @@ impl<'a> MemDbTx<'a> {
     pub fn is_tombstoned<T: Table>(&self, key: &T::Key) -> bool {
         if let Some(table) = self.store.get(T::NAME) {
             let key_bytes = encode_key(key);
-            return table.get(&key_bytes).map_or(false, |(tombstoned, _)| *tombstoned);
+            return table.get(&key_bytes).is_some_and(|entry| entry.tombstoned());
         }
         false
     }
@@ -111,11 +203,6 @@ pub struct MemDbTxMut<'a> {
 }
 
 impl<'a> MemDbTxMut<'a> {
-    fn mark_value_for_deletion(value: &mut StoreTableValueType) {
-        // mark for actual deletion once tx committed
-        value.0 = true;
-    }
-
     /// Hard-removes `key` from the in-memory store, leaving no tombstone.
     ///
     /// Persistent eviction archives a row permanently (never re-inserted), so the cache entry is
@@ -125,6 +212,15 @@ impl<'a> MemDbTxMut<'a> {
         if let Some(table) = self.store.get_mut(T::NAME) {
             table.remove(&encode_key(key));
         }
+    }
+
+    /// Raw keys of the table, for a `Clear` message: the writer needs the exact set that was
+    /// tombstoned (and counted) by this clear to release each key's in-flight op at apply time.
+    pub fn raw_keys<T: Table>(&self) -> Vec<Vec<u8>> {
+        self.store
+            .get(T::NAME)
+            .map(|table| table.keys().cloned().collect())
+            .unwrap_or_default()
     }
 }
 
@@ -194,41 +290,15 @@ impl<'a> DbTx for MemDbTxMut<'a> {
 
 impl<'a> DbTxMut for MemDbTxMut<'a> {
     fn insert<T: Table>(&mut self, key: &T::Key, value: &T::Value) -> eyre::Result<()> {
-        if let Some(table) = self.store.get_mut(T::NAME) {
-            let key_bytes = encode_key(key);
-            let value_bytes = encode(value);
-            table.insert(key_bytes, (false, value_bytes));
-
-            Ok(())
-        } else {
-            Err(eyre::eyre!("Invalid table {}", T::NAME))
-        }
+        insert_impl::<T>(&mut self.store, key, value)
     }
 
     fn remove<T: Table>(&mut self, key: &T::Key) -> eyre::Result<()> {
-        if let Some(table) = self.store.get_mut(T::NAME) {
-            let key_bytes = encode_key(key);
-            if let Some(value) = table.get_mut(&key_bytes) {
-                Self::mark_value_for_deletion(value);
-            } else {
-                // tombstone for keys that only exist in the persistent layer
-                table.insert(key_bytes, (true, Vec::new()));
-            }
-            Ok(())
-        } else {
-            Err(eyre::eyre!("Invalid table {}", T::NAME))
-        }
+        remove_impl::<T>(&mut self.store, key)
     }
 
     fn clear_table<T: Table>(&mut self) -> eyre::Result<()> {
-        if let Some(table) = self.store.get_mut(T::NAME) {
-            for value in table.values_mut() {
-                Self::mark_value_for_deletion(value);
-            }
-            Ok(())
-        } else {
-            Err(eyre::eyre!("Invalid table {}", T::NAME))
-        }
+        clear_table_impl::<T>(&mut self.store).map(|_| ())
     }
 
     fn commit(self) -> eyre::Result<()> {
@@ -296,20 +366,92 @@ impl MemDatabase {
         self.read_txn_impl().is_tombstoned::<T>(key)
     }
 
-    pub fn delete_tombstoned<T: Table>(
+    /// Enqueue a mem mutation and its writer message in one critical section: the in-flight count
+    /// is bumped under the same write lock that mutates the cache, and `on_queued` (the `send`)
+    /// runs before the lock is released, so the channel order matches the mem mutation order.
+    pub fn insert_queued<T: Table>(
         &self,
         key: &T::Key,
-        require_marked: bool,
+        value: &T::Value,
+        on_queued: impl FnOnce() -> eyre::Result<()>,
     ) -> eyre::Result<()> {
-        if let Some(table) = self.store.write().get_mut(T::NAME) {
-            let key_bytes = encode_key(key);
-            if let Some((tombstoned, _)) = table.get(&key_bytes) {
-                if *tombstoned || !require_marked {
-                    table.remove(&key_bytes);
-                }
-            }
+        let mut store = self.store.write();
+        insert_impl::<T>(&mut store, key, value)?;
+        on_queued()
+    }
+
+    pub fn remove_queued<T: Table>(
+        &self,
+        key: &T::Key,
+        on_queued: impl FnOnce() -> eyre::Result<()>,
+    ) -> eyre::Result<()> {
+        let mut store = self.store.write();
+        remove_impl::<T>(&mut store, key)?;
+        on_queued()
+    }
+
+    pub fn clear_table_queued<T: Table>(
+        &self,
+        on_queued: impl FnOnce(Vec<Vec<u8>>) -> eyre::Result<()>,
+    ) -> eyre::Result<()> {
+        let mut store = self.store.write();
+        let keys = clear_table_impl::<T>(&mut store)?;
+        on_queued(keys)
+    }
+
+    /// Releases one in-flight op for `key` after its writer message applied (or the txn
+    /// committed). When the count reaches zero the key is pushed onto the eviction heap: no
+    /// queued op remains, so the mem row equals the persistent tier and eviction cannot expose
+    /// a stale value.
+    pub fn on_op_applied(&self, table: &'static str, key_bytes: &[u8], heap: &mut EvictionHeap) {
+        let mut store = self.store.write();
+        let Some(table_map) = store.get_mut(table) else { return };
+        let Some(entry) = table_map.get_mut(key_bytes) else { return };
+        entry.dec_in_flight();
+        if entry.in_flight() == 0 {
+            heap.push(Reverse((
+                entry.last_used.load(AtomicOrdering::Relaxed),
+                table,
+                key_bytes.to_vec(),
+            )));
         }
-        Ok(())
+    }
+
+    /// Evicts settled keys (in-flight == 0) in recency order until the cache fits `max_size`.
+    /// Candidates are validated at pop: a key re-inserted since its settle, or a row cleared
+    /// away, is skipped. A key whose recency was refreshed by a read since it settled is
+    /// re-pushed with the fresh clock so hot keys survive eviction. The heap stays writer-owned;
+    /// producers never touch it. Every pop removes one entry, so the loop always terminates.
+    pub fn evict_if_needed(&self, heap: &mut EvictionHeap, max_size: usize) {
+        let mut store = self.store.write();
+        let mut total: usize = store.values().map(|table| table.len()).sum();
+        if total <= max_size {
+            return;
+        }
+        while total > max_size {
+            let Some(Reverse((heap_last_used, table, key))) = heap.pop() else { break };
+            let Some(table_map) = store.get_mut(table) else { continue };
+            let Some(entry) = table_map.get(&key) else { continue };
+            if entry.in_flight() != 0 {
+                continue;
+            }
+            let current_last_used = entry.last_used.load(AtomicOrdering::Relaxed);
+            if current_last_used != heap_last_used {
+                // A read refreshed the key after it settled: it is no longer least-recently
+                // used. Re-push with the fresh clock; recency bumps are throttled (~100ms), so
+                // each hot key pays at most ~10 re-pushes per second.
+                heap.push(Reverse((current_last_used, table, key)));
+                continue;
+            }
+            table_map.remove(&key);
+            total -= 1;
+        }
+    }
+
+    /// Total rows (live and tombstoned) held in the cache; the writer keeps this at or below the
+    /// configured max size.
+    pub fn mem_size(&self) -> usize {
+        self.store.read().values().map(|table| table.len()).sum()
     }
 
     /// Returns keys marked for deletion in the given table.
@@ -317,7 +459,7 @@ impl MemDatabase {
         if let Some(table) = self.store.read().get(T::NAME) {
             table
                 .iter()
-                .filter(|(_, (tombstoned, _))| *tombstoned)
+                .filter(|(_, entry)| entry.tombstoned())
                 .map(|(k, _)| k.clone())
                 .collect()
         } else {
@@ -414,7 +556,7 @@ impl Database for MemDatabase {
         self.store
             .read()
             .get(T::NAME)
-            .map_or(true, |table| table.values().all(|(tombstoned, _)| *tombstoned))
+            .is_none_or(|table| table.values().all(|entry| entry.tombstoned()))
     }
 
     fn iter<T: Table>(&self) -> DBIter<'_, T> {
@@ -505,12 +647,69 @@ impl Default for MemDBMetrics {
     }
 }
 
+/// Mutate + count a row: value replaced, tombstone cleared, one in-flight op registered, recency
+/// touched. Shared by the txn producers (guard already held) and the `*_queued` entry points.
+fn insert_impl<T: Table>(store: &mut StoreType, key: &T::Key, value: &T::Value) -> eyre::Result<()> {
+    let table = store.get_mut(T::NAME).ok_or_else(|| eyre::eyre!("Invalid table {}", T::NAME))?;
+    let key_bytes = encode_key(key);
+    match table.get_mut(&key_bytes) {
+        Some(entry) => {
+            entry.value = encode(value);
+            entry.clear_tombstone();
+            entry.add_in_flight();
+            entry.touch();
+        }
+        None => {
+            let mut entry = StoreEntry::new(encode(value));
+            entry.add_in_flight();
+            table.insert(key_bytes, entry);
+        }
+    }
+    Ok(())
+}
+
+/// Tombstone + count a row: the row is hidden from reads immediately, and its in-flight op keeps
+/// it in the cache until the persistent remove applies. A tombstone is inserted for keys that
+/// only exist in the persistent layer.
+fn remove_impl<T: Table>(store: &mut StoreType, key: &T::Key) -> eyre::Result<()> {
+    let table = store.get_mut(T::NAME).ok_or_else(|| eyre::eyre!("Invalid table {}", T::NAME))?;
+    let key_bytes = encode_key(key);
+    match table.get_mut(&key_bytes) {
+        Some(entry) => {
+            entry.mark_tombstone();
+            entry.add_in_flight();
+            entry.touch();
+        }
+        None => {
+            let mut entry = StoreEntry::new(Vec::new());
+            entry.mark_tombstone();
+            entry.add_in_flight();
+            table.insert(key_bytes, entry);
+        }
+    }
+    Ok(())
+}
+
+/// Tombstone every row of the table (the persistent clear is deferred) and bump each in-flight
+/// count so no tombstone is evicted before the clear applies. Returns the raw keys, which the
+/// writer needs to release each count once the clear lands.
+fn clear_table_impl<T: Table>(store: &mut StoreType) -> eyre::Result<Vec<Vec<u8>>> {
+    let table = store.get_mut(T::NAME).ok_or_else(|| eyre::eyre!("Invalid table {}", T::NAME))?;
+    let keys: Vec<Vec<u8>> = table.keys().cloned().collect();
+    for entry in table.values_mut() {
+        entry.mark_tombstone();
+        entry.add_in_flight();
+    }
+    Ok(keys)
+}
+
 fn get_with_marked_check<T: Table>(store: &StoreType, key: &T::Key) -> Option<T::Value> {
     if let Some(table) = store.get(T::NAME) {
         let key_bytes = encode_key(key);
-        if let Some((tombstoned, val_bytes)) = table.get(&key_bytes) {
-            if !*tombstoned {
-                let val = decode(val_bytes);
+        if let Some(entry) = table.get(&key_bytes) {
+            if !entry.tombstoned() {
+                entry.bump_last_used();
+                let val = decode(&entry.value);
                 return Some(val);
             }
         }
@@ -521,8 +720,12 @@ fn get_with_marked_check<T: Table>(store: &StoreType, key: &T::Key) -> Option<T:
 fn contains_key_impl<T: Table>(store: &StoreType, key: &T::Key) -> bool {
     if let Some(table) = store.get(T::NAME) {
         let key_bytes = encode_key(key);
-        if let Some((tombstoned, _)) = table.get(&key_bytes) {
-            return !*tombstoned;
+        if let Some(entry) = table.get(&key_bytes) {
+            if entry.tombstoned() {
+                return false;
+            }
+            entry.bump_last_used();
+            return true;
         }
     }
     false
@@ -530,29 +733,29 @@ fn contains_key_impl<T: Table>(store: &StoreType, key: &T::Key) -> bool {
 
 fn collect_typed<'t, T: Table, I>(iter: I) -> Vec<(T::Key, T::Value)>
 where
-    I: Iterator<Item = (&'t Vec<u8>, &'t (bool, Vec<u8>))>,
+    I: Iterator<Item = (&'t Vec<u8>, &'t StoreEntry)>,
 {
-    iter.filter(|(_, (tombstoned, _))| !*tombstoned)
-        .map(|(k, (_, v))| (decode_key::<T::Key>(k), decode::<T::Value>(v)))
+    iter.filter(|(_, entry)| !entry.tombstoned())
+        .map(|(k, entry)| (decode_key::<T::Key>(k), decode::<T::Value>(&entry.value)))
         .collect()
 }
 
 fn collect_raw_borrowed<'t, I>(iter: I) -> DBRawIter<'t>
 where
-    I: Iterator<Item = (&'t Vec<u8>, &'t (bool, Vec<u8>))> + 't,
+    I: Iterator<Item = (&'t Vec<u8>, &'t StoreEntry)> + 't,
 {
     Box::new(
-        iter.filter(|(_, (tombstoned, _))| !*tombstoned)
-            .map(|(k, (_, v))| (Cow::Borrowed(k.as_slice()), Cow::Borrowed(v.as_slice()))),
+        iter.filter(|(_, entry)| !entry.tombstoned())
+            .map(|(k, entry)| (Cow::Borrowed(k.as_slice()), Cow::Borrowed(entry.value.as_slice()))),
     )
 }
 
 fn collect_raw_owned<'t, I>(iter: I) -> Vec<(Cow<'static, [u8]>, Cow<'static, [u8]>)>
 where
-    I: Iterator<Item = (&'t Vec<u8>, &'t (bool, Vec<u8>))>,
+    I: Iterator<Item = (&'t Vec<u8>, &'t StoreEntry)>,
 {
-    iter.filter(|(_, (tombstoned, _))| !*tombstoned)
-        .map(|(k, (_, v))| (Cow::Owned(k.clone()), Cow::Owned(v.clone())))
+    iter.filter(|(_, entry)| !entry.tombstoned())
+        .map(|(k, entry)| (Cow::Owned(k.clone()), Cow::Owned(entry.value.clone())))
         .collect()
 }
 
@@ -598,9 +801,9 @@ fn reverse_raw_iter_owned_impl<T: Table>(
 
 fn last_record_impl<T: Table>(store: &StoreType) -> Option<(T::Key, T::Value)> {
     let table = store.get(T::NAME)?;
-    for (key_bytes, (tombstoned, value_bytes)) in table.iter().rev() {
-        if !*tombstoned {
-            return Some((decode_key(key_bytes), decode(value_bytes)));
+    for (key_bytes, entry) in table.iter().rev() {
+        if !entry.tombstoned() {
+            return Some((decode_key(key_bytes), decode(&entry.value)));
         }
     }
     None
@@ -612,8 +815,8 @@ fn record_prior_to_impl<T: Table>(store: &StoreType, key: &T::Key) -> Option<(T:
     table
         .range(..key_bytes)
         .rev()
-        .find(|(_, (tombstoned, _))| !*tombstoned)
-        .map(|(k, (_, v))| (decode_key(k), decode(v)))
+        .find(|(_, entry)| !entry.tombstoned())
+        .map(|(k, entry)| (decode_key(k), decode(&entry.value)))
 }
 
 #[cfg(test)]
