@@ -4,7 +4,6 @@ use std::{
     borrow::Cow,
     collections::{BTreeMap, HashMap},
     fmt::Debug,
-    marker::PhantomData,
     sync::{
         mpsc::{self, SyncSender},
         Arc,
@@ -12,7 +11,6 @@ use std::{
     time::Duration,
 };
 
-use ouroboros::self_referencing;
 use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use prometheus::{default_registry, register_int_gauge_with_registry, IntGauge, Registry};
 use rayls_infrastructure_types::{
@@ -58,13 +56,7 @@ impl<'a> DbTx for MemDbTx<'a> {
     }
 
     fn contains_key<T: Table>(&self, key: &T::Key) -> eyre::Result<bool> {
-        if let Some(table) = self.store.get(T::NAME) {
-            let key_bytes = encode_key(key);
-            if let Some((tombstoned, _)) = table.get(&key_bytes) {
-                return Ok(!*tombstoned);
-            }
-        }
-        Ok(false)
+        Ok(contains_key_impl::<T>(&self.store, key))
     }
 
     fn iter<T: Table>(&self) -> DBIter<'_, T> {
@@ -140,6 +132,10 @@ impl<'a> DbTx for MemDbTxMut<'a> {
     fn get<T: Table>(&self, key: &T::Key) -> eyre::Result<Option<T::Value>> {
         //if not in cache check store
         Ok(get_with_marked_check::<T>(&self.store, key))
+    }
+
+    fn contains_key<T: Table>(&self, key: &T::Key) -> eyre::Result<bool> {
+        Ok(contains_key_impl::<T>(&self.store, key))
     }
 
     fn iter<T: Table>(&self) -> DBIter<'_, T> {
@@ -478,44 +474,6 @@ impl Database for MemDatabase {
     }
 }
 
-#[self_referencing]
-struct TabAndGuard<T>
-where
-    T: Table,
-{
-    casper: PhantomData<T>,
-    table: Arc<BTreeMap<Vec<u8>, Vec<u8>>>,
-    #[borrows(table)]
-    #[covariant]
-    guard: RwLockReadGuard<'this, BTreeMap<Vec<u8>, Vec<u8>>>,
-}
-
-#[self_referencing]
-pub struct MemDBIter<T>
-where
-    T: Table,
-{
-    casper: PhantomData<T>,
-    table: TabAndGuard<T>,
-    #[borrows(table)]
-    #[not_covariant]
-    iter: Box<dyn Iterator<Item = (&'this Vec<u8>, &'this Vec<u8>)> + 'this>,
-}
-
-impl<T: Table> Iterator for MemDBIter<T> {
-    type Item = (T::Key, T::Value);
-
-    fn next(&mut self) -> Option<Self::Item> {
-        self.with_mut(|fields| {
-            fields.iter.next().map(|(key_bytes, value_bytes)| {
-                let key = decode_key(key_bytes);
-                let value = decode(value_bytes);
-                (key, value)
-            })
-        })
-    }
-}
-
 #[derive(Debug)]
 struct MemDBMetrics {
     table_counts: HashMap<&'static str, IntGauge>,
@@ -558,6 +516,16 @@ fn get_with_marked_check<T: Table>(store: &StoreType, key: &T::Key) -> Option<T:
         }
     }
     None
+}
+
+fn contains_key_impl<T: Table>(store: &StoreType, key: &T::Key) -> bool {
+    if let Some(table) = store.get(T::NAME) {
+        let key_bytes = encode_key(key);
+        if let Some((tombstoned, _)) = table.get(&key_bytes) {
+            return !*tombstoned;
+        }
+    }
+    false
 }
 
 fn collect_typed<'t, T: Table, I>(iter: I) -> Vec<(T::Key, T::Value)>
