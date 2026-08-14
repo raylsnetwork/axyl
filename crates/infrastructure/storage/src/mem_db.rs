@@ -38,6 +38,27 @@ fn get_with_marked_check<T: Table>(store: &StoreType, key: &T::Key) -> Option<T:
     None
 }
 
+fn iter_impl<T: Table>(store: &StoreType) -> Option<Vec<(T::Key, T::Value)>> {
+    let table = store.get(T::NAME)?;
+    Some(
+        table
+            .iter()
+            .filter(|(_, (tombstoned, _))| !*tombstoned)
+            .map(|(k, (_, v))| (decode_key::<T::Key>(k), decode::<T::Value>(v)))
+            .collect(),
+    )
+}
+
+fn raw_iter_impl<T: Table>(store: &StoreType) -> Option<DBRawIter<'_>> {
+    let table = store.get(T::NAME)?;
+    Some(Box::new(
+        table
+            .iter()
+            .filter(|(_, (tombstoned, _))| !*tombstoned)
+            .map(|(k, (_, v))| (Cow::Borrowed(k.as_slice()), Cow::Borrowed(v.as_slice()))),
+    ))
+}
+
 fn skip_to_impl<T: Table>(store: &StoreType, key: &T::Key) -> Option<Vec<(T::Key, T::Value)>> {
     let table = store.get(T::NAME)?;
     let key_bytes = encode_key(key);
@@ -117,30 +138,16 @@ impl<'a> DbTx for MemDbTx<'a> {
     }
 
     fn iter<T: Table>(&self) -> DBIter<'_, T> {
-        if let Some(table) = self.store.get(T::NAME) {
-            let items: Vec<_> = table
-                .iter()
-                .filter(|(_, (tombstoned, _))| !*tombstoned)
-                .map(|(k, (_, v))| (decode_key::<T::Key>(k), decode::<T::Value>(v)))
-                .collect();
-            Box::new(items.into_iter())
-        } else {
-            Box::new(std::iter::empty())
+        match iter_impl::<T>(&self.store) {
+            Some(items) => Box::new(items.into_iter()),
+            None => Box::new(std::iter::empty()),
         }
     }
 
     fn raw_iter<T: Table>(&self) -> DBRawIter<'_> {
-        if let Some(table) = self.store.get(T::NAME) {
-            // The read guard is held by `self`, so we can borrow the stored
-            // bytes for the iterator's lifetime instead of cloning them.
-            Box::new(
-                table
-                    .iter()
-                    .filter(|(_, (tombstoned, _))| !*tombstoned)
-                    .map(|(k, (_, v))| (Cow::Borrowed(k.as_slice()), Cow::Borrowed(v.as_slice()))),
-            )
-        } else {
-            Box::new(std::iter::empty())
+        match raw_iter_impl::<T>(&self.store) {
+            Some(iter) => iter,
+            None => Box::new(std::iter::empty()),
         }
     }
 
@@ -530,15 +537,9 @@ impl Database for MemDatabase {
     }
 
     fn iter<T: Table>(&self) -> DBIter<'_, T> {
-        if let Some(table) = self.store.read().get(T::NAME) {
-            let items: Vec<_> = table
-                .iter()
-                .filter(|(_, (tombstoned, _))| !*tombstoned)
-                .map(|(k, (_, v))| (decode_key::<T::Key>(k), decode::<T::Value>(v)))
-                .collect();
-            Box::new(items.into_iter())
-        } else {
-            panic!("Invalid table {}", T::NAME);
+        match iter_impl::<T>(&self.store.read()) {
+            Some(items) => Box::new(items.into_iter()),
+            None => panic!("Invalid table {}", T::NAME),
         }
     }
 
