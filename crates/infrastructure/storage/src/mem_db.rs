@@ -415,19 +415,10 @@ impl Database for MemDatabase {
     }
 
     fn is_empty<T: Table>(&self) -> bool {
-        if let Some(table) = self.store.read().get(T::NAME) {
-            // iterate table values and see if any are not marked for deletion
-            let guard = table;
-            for (tombstoned, _) in guard.values() {
-                if !*tombstoned {
-                    return false;
-                }
-            }
-
-            true
-        } else {
-            true
-        }
+        self.store
+            .read()
+            .get(T::NAME)
+            .map_or(true, |table| table.values().all(|(tombstoned, _)| *tombstoned))
     }
 
     fn iter<T: Table>(&self) -> DBIter<'_, T> {
