@@ -38,61 +38,49 @@ fn get_with_marked_check<T: Table>(store: &StoreType, key: &T::Key) -> Option<T:
     None
 }
 
+fn collect_typed<'t, T: Table, I>(iter: I) -> Vec<(T::Key, T::Value)>
+where
+    I: Iterator<Item = (&'t Vec<u8>, &'t (bool, Vec<u8>))>,
+{
+    iter.filter(|(_, (tombstoned, _))| !*tombstoned)
+        .map(|(k, (_, v))| (decode_key::<T::Key>(k), decode::<T::Value>(v)))
+        .collect()
+}
+
+fn collect_raw<'t, I>(iter: I) -> DBRawIter<'t>
+where
+    I: Iterator<Item = (&'t Vec<u8>, &'t (bool, Vec<u8>))> + 't,
+{
+    Box::new(
+        iter.filter(|(_, (tombstoned, _))| !*tombstoned)
+            .map(|(k, (_, v))| (Cow::Borrowed(k.as_slice()), Cow::Borrowed(v.as_slice()))),
+    )
+}
+
 fn iter_impl<T: Table>(store: &StoreType) -> Option<Vec<(T::Key, T::Value)>> {
     let table = store.get(T::NAME)?;
-    Some(
-        table
-            .iter()
-            .filter(|(_, (tombstoned, _))| !*tombstoned)
-            .map(|(k, (_, v))| (decode_key::<T::Key>(k), decode::<T::Value>(v)))
-            .collect(),
-    )
+    Some(collect_typed::<T, _>(table.iter()))
 }
 
 fn raw_iter_impl<T: Table>(store: &StoreType) -> Option<DBRawIter<'_>> {
     let table = store.get(T::NAME)?;
-    Some(Box::new(
-        table
-            .iter()
-            .filter(|(_, (tombstoned, _))| !*tombstoned)
-            .map(|(k, (_, v))| (Cow::Borrowed(k.as_slice()), Cow::Borrowed(v.as_slice()))),
-    ))
+    Some(collect_raw(table.iter()))
 }
 
 fn skip_to_impl<T: Table>(store: &StoreType, key: &T::Key) -> Option<Vec<(T::Key, T::Value)>> {
     let table = store.get(T::NAME)?;
     let key_bytes = encode_key(key);
-    Some(
-        table
-            .iter()
-            .filter(|(_, (tombstoned, _))| !*tombstoned)
-            .skip_while(|(k, _)| **k < key_bytes)
-            .map(|(k, (_, v))| (decode_key::<T::Key>(k), decode::<T::Value>(v)))
-            .collect(),
-    )
+    Some(collect_typed::<T, _>(table.iter().skip_while(|(k, _)| **k < key_bytes)))
 }
 
 fn reverse_iter_impl<T: Table>(store: &StoreType) -> Option<Vec<(T::Key, T::Value)>> {
     let table = store.get(T::NAME)?;
-    Some(
-        table
-            .iter()
-            .rev()
-            .filter(|(_, (tombstoned, _))| !*tombstoned)
-            .map(|(k, (_, v))| (decode_key::<T::Key>(k), decode::<T::Value>(v)))
-            .collect(),
-    )
+    Some(collect_typed::<T, _>(table.iter().rev()))
 }
 
 fn reverse_raw_iter_impl<T: Table>(store: &StoreType) -> Option<DBRawIter<'_>> {
     let table = store.get(T::NAME)?;
-    Some(Box::new(
-        table
-            .iter()
-            .rev()
-            .filter(|(_, (tombstoned, _))| !*tombstoned)
-            .map(|(k, (_, v))| (Cow::Borrowed(k.as_slice()), Cow::Borrowed(v.as_slice()))),
-    ))
+    Some(collect_raw(table.iter().rev()))
 }
 
 #[derive(Debug)]
