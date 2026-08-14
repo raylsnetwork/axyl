@@ -28,8 +28,8 @@ type StoreType = HashMap<&'static str, StoreTableType>;
 fn get_with_marked_check<T: Table>(store: &StoreType, key: &T::Key) -> Option<T::Value> {
     if let Some(table) = store.get(T::NAME) {
         let key_bytes = encode_key(key);
-        if let Some((removed, val_bytes)) = table.get(&key_bytes) {
-            if !*removed {
+        if let Some((tombstoned, val_bytes)) = table.get(&key_bytes) {
+            if !*tombstoned {
                 let val = decode(val_bytes);
                 return Some(val);
             }
@@ -47,10 +47,10 @@ impl<'a> MemDbTx<'a> {
     pub fn get_no_marked_check<T: Table>(&self, key: &T::Key) -> Option<(bool, T::Value)> {
         if let Some(table) = self.store.get(T::NAME) {
             let key_bytes = encode_key(key);
-            return table.get(&key_bytes).map(|(removed, val_bytes)| {
+            if let Some((tombstoned, val_bytes)) = table.get(&key_bytes) {
                 let val = decode(val_bytes);
-                (*removed, val)
-            });
+                return Some((*tombstoned, val));
+            }
         }
         None
     }
@@ -59,7 +59,7 @@ impl<'a> MemDbTx<'a> {
     pub fn is_tombstoned<T: Table>(&self, key: &T::Key) -> bool {
         if let Some(table) = self.store.get(T::NAME) {
             let key_bytes = encode_key(key);
-            return table.get(&key_bytes).map_or(false, |(removed, _)| *removed);
+            return table.get(&key_bytes).map_or(false, |(tombstoned, _)| *tombstoned);
         }
         false
     }
@@ -84,7 +84,7 @@ impl<'a> DbTx for MemDbTx<'a> {
         if let Some(table) = self.store.get(T::NAME) {
             let items: Vec<_> = table
                 .iter()
-                .filter(|(_, (removed, _))| !*removed)
+                .filter(|(_, (tombstoned, _))| !*tombstoned)
                 .map(|(k, (_, v))| (decode_key::<T::Key>(k), decode::<T::Value>(v)))
                 .collect();
             Box::new(items.into_iter())
@@ -100,7 +100,7 @@ impl<'a> DbTx for MemDbTx<'a> {
             Box::new(
                 table
                     .iter()
-                    .filter(|(_, (removed, _))| !*removed)
+                    .filter(|(_, (tombstoned, _))| !*tombstoned)
                     .map(|(k, (_, v))| (Cow::Borrowed(k.as_slice()), Cow::Borrowed(v.as_slice()))),
             )
         } else {
@@ -113,7 +113,7 @@ impl<'a> DbTx for MemDbTx<'a> {
             let key_bytes = encode_key(key);
             let items: Vec<_> = table
                 .iter()
-                .filter(|(_, (removed, _))| !*removed)
+                .filter(|(_, (tombstoned, _))| !*tombstoned)
                 .skip_while(|(k, _)| **k < key_bytes)
                 .map(|(k, (_, v))| (decode_key::<T::Key>(k), decode::<T::Value>(v)))
                 .collect();
@@ -128,7 +128,7 @@ impl<'a> DbTx for MemDbTx<'a> {
             let items: Vec<_> = table
                 .iter()
                 .rev()
-                .filter(|(_, (removed, _))| !*removed)
+                .filter(|(_, (tombstoned, _))| !*tombstoned)
                 .map(|(k, (_, v))| (decode_key::<T::Key>(k), decode::<T::Value>(v)))
                 .collect();
             Box::new(items.into_iter())
@@ -143,7 +143,7 @@ impl<'a> DbTx for MemDbTx<'a> {
                 table
                     .iter()
                     .rev()
-                    .filter(|(_, (removed, _))| !*removed)
+                    .filter(|(_, (tombstoned, _))| !*tombstoned)
                     .map(|(k, (_, v))| (Cow::Borrowed(k.as_slice()), Cow::Borrowed(v.as_slice()))),
             )
         } else {
@@ -153,8 +153,8 @@ impl<'a> DbTx for MemDbTx<'a> {
 
     fn last_record<T: Table>(&self) -> Option<(T::Key, T::Value)> {
         if let Some(table) = self.store.get(T::NAME) {
-            for (key_bytes, (removed, value_bytes)) in table.iter().rev() {
-                if !*removed {
+            for (key_bytes, (tombstoned, value_bytes)) in table.iter().rev() {
+                if !*tombstoned {
                     return Some((decode_key(key_bytes), decode(value_bytes)));
                 }
             }
@@ -170,7 +170,7 @@ impl<'a> DbTx for MemDbTx<'a> {
             table
                 .range(..key_bytes)
                 .rev()
-                .find(|(_, (removed, _))| !*removed)
+                .find(|(_, (tombstoned, _))| !*tombstoned)
                 .map(|(k, (_, v))| (decode_key(k), decode(v)))
         } else {
             None
@@ -236,7 +236,7 @@ impl<'a> DbTx for MemDbTxMut<'a> {
             let key_bytes = encode_key(key);
             let items: Vec<_> = table
                 .iter()
-                .filter(|(_, (removed, _))| !*removed)
+                .filter(|(_, (tombstoned, _))| !*tombstoned)
                 .skip_while(|(k, _)| **k < key_bytes)
                 .map(|(k, (_, v))| (decode_key::<T::Key>(k), decode::<T::Value>(v)))
                 .collect();
@@ -251,7 +251,7 @@ impl<'a> DbTx for MemDbTxMut<'a> {
             let items: Vec<_> = table
                 .iter()
                 .rev()
-                .filter(|(_, (removed, _))| !*removed)
+                .filter(|(_, (tombstoned, _))| !*tombstoned)
                 .map(|(k, (_, v))| (decode_key::<T::Key>(k), decode::<T::Value>(v)))
                 .collect();
             Box::new(items.into_iter())
@@ -266,7 +266,7 @@ impl<'a> DbTx for MemDbTxMut<'a> {
                 table
                     .iter()
                     .rev()
-                    .filter(|(_, (removed, _))| !*removed)
+                    .filter(|(_, (tombstoned, _))| !*tombstoned)
                     .map(|(k, (_, v))| (Cow::Borrowed(k.as_slice()), Cow::Borrowed(v.as_slice()))),
             )
         } else {
@@ -276,8 +276,8 @@ impl<'a> DbTx for MemDbTxMut<'a> {
 
     fn last_record<T: Table>(&self) -> Option<(T::Key, T::Value)> {
         if let Some(table) = self.store.get(T::NAME) {
-            for (key_bytes, (removed, value_bytes)) in table.iter().rev() {
-                if !*removed {
+            for (key_bytes, (tombstoned, value_bytes)) in table.iter().rev() {
+                if !*tombstoned {
                     return Some((decode_key(key_bytes), decode(value_bytes)));
                 }
             }
@@ -293,7 +293,7 @@ impl<'a> DbTx for MemDbTxMut<'a> {
             table
                 .range(..key_bytes)
                 .rev()
-                .find(|(_, (removed, _))| !*removed)
+                .find(|(_, (tombstoned, _))| !*tombstoned)
                 .map(|(k, (_, v))| (decode_key(k), decode(v)))
         } else {
             None
@@ -399,24 +399,12 @@ impl MemDatabase {
 
     // gets the value with the marking for delete flag
     pub fn get_marked<T: Table>(&self, key: &T::Key) -> eyre::Result<Option<(bool, T::Value)>> {
-        if let Some(table) = self.store.read().get(T::NAME) {
-            let key_bytes = encode_key(key);
-            if let Some((tombstoned, val_bytes)) = table.get(&key_bytes) {
-                let val = decode(val_bytes);
-                return Ok(Some((*tombstoned, val)));
-            }
-        }
-
-        Ok(None)
+        Ok(self.read_txn_impl().get_no_marked_check::<T>(key))
     }
 
     /// Check if a key is tombstoned (marked for deletion) without deserializing the value.
     pub fn is_tombstoned<T: Table>(&self, key: &T::Key) -> bool {
-        if let Some(table) = self.store.read().get(T::NAME) {
-            let key_bytes = encode_key(key);
-            return table.get(&key_bytes).map_or(false, |(tombstoned, _)| *tombstoned);
-        }
-        false
+        self.read_txn_impl().is_tombstoned::<T>(key)
     }
 
     pub fn delete_tombstoned<T: Table>(
@@ -537,8 +525,8 @@ impl Database for MemDatabase {
         if let Some(table) = self.store.read().get(T::NAME) {
             // iterate table values and see if any are not marked for deletion
             let guard = table;
-            for (removed, _) in guard.values() {
-                if !*removed {
+            for (tombstoned, _) in guard.values() {
+                if !*tombstoned {
                     return false;
                 }
             }
@@ -553,7 +541,7 @@ impl Database for MemDatabase {
         if let Some(table) = self.store.read().get(T::NAME) {
             let items: Vec<_> = table
                 .iter()
-                .filter(|(_, (removed, _))| !*removed)
+                .filter(|(_, (tombstoned, _))| !*tombstoned)
                 .map(|(k, (_, v))| (decode_key::<T::Key>(k), decode::<T::Value>(v)))
                 .collect();
             Box::new(items.into_iter())
@@ -568,7 +556,7 @@ impl Database for MemDatabase {
         if let Some(table) = self.store.read().get(T::NAME) {
             let items: Vec<(Cow<'_, [u8]>, Cow<'_, [u8]>)> = table
                 .iter()
-                .filter(|(_, (removed, _))| !*removed)
+                .filter(|(_, (tombstoned, _))| !*tombstoned)
                 .map(|(k, (_, v))| (Cow::Owned(k.clone()), Cow::Owned(v.clone())))
                 .collect();
             Box::new(items.into_iter())
@@ -582,7 +570,7 @@ impl Database for MemDatabase {
             let key_bytes = encode_key(key);
             let items: Vec<_> = table
                 .iter()
-                .filter(|(_, (removed, _))| !*removed)
+                .filter(|(_, (tombstoned, _))| !*tombstoned)
                 .skip_while(|(k, _)| **k < key_bytes)
                 .map(|(k, (_, v))| (decode_key::<T::Key>(k), decode::<T::Value>(v)))
                 .collect();
@@ -597,7 +585,7 @@ impl Database for MemDatabase {
             let items: Vec<_> = table
                 .iter()
                 .rev()
-                .filter(|(_, (removed, _))| !*removed)
+                .filter(|(_, (tombstoned, _))| !*tombstoned)
                 .map(|(k, (_, v))| (decode_key::<T::Key>(k), decode::<T::Value>(v)))
                 .collect();
             Box::new(items.into_iter())
@@ -611,7 +599,7 @@ impl Database for MemDatabase {
             let items: Vec<(Cow<'_, [u8]>, Cow<'_, [u8]>)> = table
                 .iter()
                 .rev()
-                .filter(|(_, (removed, _))| !*removed)
+                .filter(|(_, (tombstoned, _))| !*tombstoned)
                 .map(|(k, (_, v))| (Cow::Owned(k.clone()), Cow::Owned(v.clone())))
                 .collect();
             Box::new(items.into_iter())
@@ -620,33 +608,12 @@ impl Database for MemDatabase {
         }
     }
 
-    fn record_prior_to<T: Table>(&self, key: &T::Key) -> Option<(T::Key, T::Value)> {
-        if let Some(table) = self.store.read().get(T::NAME) {
-            let key_bytes = encode_key(key);
-            table
-                .range(..key_bytes)
-                .rev()
-                .find(|(_, v)| !v.0)
-                .map(|(k, v)| (decode_key(k), decode(&v.1)))
-        } else {
-            None
-        }
+    fn last_record<T: Table>(&self) -> Option<(T::Key, T::Value)> {
+        self.read_txn_impl().last_record::<T>()
     }
 
-    fn last_record<T: Table>(&self) -> Option<(T::Key, T::Value)> {
-        if let Some(table) = self.store.read().get(T::NAME) {
-            //redo with reverse iter
-            for (key_bytes, marked_value_bytes) in table.iter().rev() {
-                if marked_value_bytes.0 == false {
-                    let key = decode_key(key_bytes);
-                    let value = decode(&marked_value_bytes.1);
-                    return Some((key, value));
-                }
-            }
-            None
-        } else {
-            None
-        }
+    fn record_prior_to<T: Table>(&self, key: &T::Key) -> Option<(T::Key, T::Value)> {
+        self.read_txn_impl().record_prior_to::<T>(key)
     }
 
     /// Execute a write operation with automatic commit/abort.
