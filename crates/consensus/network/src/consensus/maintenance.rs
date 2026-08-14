@@ -73,4 +73,60 @@ where
             }
         }
     }
+
+    /// Republish this swarm's peer-address view as two gauges:
+    /// - `kad_known_peer_{primary,worker}` -- the kademlia routing table (`kbuckets`), i.e. peers
+    ///   actually *connected* and the working address they connected on.
+    /// - `advertised_peer_addr_{primary,worker}` -- the peer-manager's `known_peers` dial targets
+    ///   (addresses peers advertised that it will redial), including peers not yet connected. The
+    ///   diff between the two surfaces undialable/churn addresses.
+    ///
+    /// Rebuilt from scratch each call: this swarm's own vecs are reset first so a peer or address
+    /// that has left stops being reported (an info-style gauge otherwise lingers forever). Primary
+    /// and worker use separate vecs, so `reset()` only clears this swarm's rows. Both tables are
+    /// snapshotted into owned strings before touching the metrics so the swarm borrow is released
+    /// first.
+    pub(super) fn refresh_peer_addr_metrics(&mut self) {
+        // kad routing table (connected peers, working addresses)
+        let mut kad_entries: Vec<(String, String)> = Vec::new();
+        for bucket in self.swarm.behaviour_mut().kademlia.kbuckets() {
+            for entry in bucket.iter() {
+                let peer_id = entry.node.key.preimage().to_string();
+                for addr in entry.node.value.iter() {
+                    kad_entries.push((peer_id.clone(), addr.to_string()));
+                }
+            }
+        }
+
+        // known_peers dial targets (advertised addresses, incl. peers not connected)
+        let known_entries: Vec<(String, String)> = self
+            .swarm
+            .behaviour()
+            .peer_manager
+            .known_peer_addrs()
+            .into_iter()
+            .map(|(peer_id, addr)| (peer_id.to_string(), addr.to_string()))
+            .collect();
+
+        let (kad_gauge, known_gauge) = match self.network_label {
+            "worker" => (
+                &self.network_metrics.kad_known_peer_worker,
+                &self.network_metrics.advertised_peer_addr_worker,
+            ),
+            _ => (
+                &self.network_metrics.kad_known_peer_primary,
+                &self.network_metrics.advertised_peer_addr_primary,
+            ),
+        };
+
+        kad_gauge.reset();
+        for (peer_id, addr) in kad_entries {
+            kad_gauge.with_label_values(&[peer_id.as_str(), addr.as_str()]).set(1);
+        }
+
+        known_gauge.reset();
+        for (peer_id, addr) in known_entries {
+            known_gauge.with_label_values(&[peer_id.as_str(), addr.as_str()]).set(1);
+        }
+    }
 }

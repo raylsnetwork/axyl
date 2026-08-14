@@ -835,6 +835,24 @@ impl PeerManager {
         self.cleanup_known_peers();
     }
 
+    /// Snapshot the dial targets in `known_peers` as `(peer_id, multiaddr)` pairs (one per
+    /// advertised address). Used to expose what this node will redial -- including peers it has
+    /// not connected to -- for the `advertised_peer_addr_*` metric.
+    ///
+    /// This node is in its own committee, so `known_peers` contains itself; skip it (as `redial`
+    /// does) so the node's own address is not reported as a dial target -- otherwise it would show
+    /// as a phantom "never connected" entry in the diff against the routing table.
+    pub(crate) fn known_peer_addrs(&self) -> Vec<(PeerId, Multiaddr)> {
+        self.known_peers
+            .values()
+            .flat_map(|info| {
+                let peer_id: PeerId = info.pubkey.clone().into();
+                info.multiaddrs.iter().map(move |addr| (peer_id, addr.clone()))
+            })
+            .filter(|(peer_id, _)| *peer_id != self.local_peer_id)
+            .collect()
+    }
+
     /// Rayls: Remove oldest known peers when exceeding maximum size.
     fn cleanup_known_peers(&mut self) {
         if self.known_peers.len() <= MAX_KNOWN_PEERS {

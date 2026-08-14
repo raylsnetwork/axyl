@@ -23,6 +23,23 @@ pub struct NetworkMetrics {
     /// to a relay server or a `/p2p-circuit` through one. Non-zero means the node opened a direct
     /// connection to a peer, bypassing the relays.
     pub connections_by_path: IntCounterVec,
+    /// primary swarm's kademlia routing table (`kbuckets`), as an info-style gauge (like
+    /// `connected_peers`): one series per `(peer_id, multiaddr)` of a peer this node is CONNECTED
+    /// to, using the resolved address the connection runs on. Populated only on a successful
+    /// connect, so unreachable peers never appear here. Contrast `advertised_peer_addr_primary`,
+    /// which lists dial *intent*. Rebuilt each refresh (departed peers drop out); primary and
+    /// worker use separate vecs so each can `reset()` its own without touching the other.
+    pub kad_known_peer_primary: IntGaugeVec,
+    /// worker swarm's kademlia routing table; see [`Self::kad_known_peer_primary`].
+    pub kad_known_peer_worker: IntGaugeVec,
+    /// primary swarm's dial targets: one series per `(peer_id, multiaddr)` a peer ADVERTISED (via
+    /// its DHT `NodeRecord` or committee bootstrap) that this node will redial -- including peers
+    /// it has not connected to, so undialable/churn addresses show up here. Diff against
+    /// `kad_known_peer_primary` by `peer_id` (`advertised unless on(peer_id) kad_known`) to find
+    /// targets that never connect. Same separate-vec / reset scheme.
+    pub advertised_peer_addr_primary: IntGaugeVec,
+    /// worker swarm's dial targets; see [`Self::advertised_peer_addr_primary`].
+    pub advertised_peer_addr_worker: IntGaugeVec,
 }
 
 impl NetworkMetrics {
@@ -62,6 +79,30 @@ impl NetworkMetrics {
                 "connections_by_path",
                 "Established connections classified by transport path",
                 &["path", "kad_type"],
+                registry
+            )?,
+            kad_known_peer_primary: register_int_gauge_vec_with_registry!(
+                "kad_known_peer_primary",
+                "Primary kademlia routing table (kbuckets): connected peers and the resolved address in use",
+                &["peer_id", "multiaddr"],
+                registry
+            )?,
+            kad_known_peer_worker: register_int_gauge_vec_with_registry!(
+                "kad_known_peer_worker",
+                "Worker kademlia routing table (kbuckets): connected peers and the resolved address in use",
+                &["peer_id", "multiaddr"],
+                registry
+            )?,
+            advertised_peer_addr_primary: register_int_gauge_vec_with_registry!(
+                "advertised_peer_addr_primary",
+                "Primary dial targets peers advertised (DHT record / committee); includes not-yet-connected peers",
+                &["peer_id", "multiaddr"],
+                registry
+            )?,
+            advertised_peer_addr_worker: register_int_gauge_vec_with_registry!(
+                "advertised_peer_addr_worker",
+                "Worker dial targets peers advertised (DHT record / committee); includes not-yet-connected peers",
+                &["peer_id", "multiaddr"],
                 registry
             )?,
         })

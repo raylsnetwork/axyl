@@ -44,11 +44,20 @@ where
         // back restores the node's reachability without a restart.
         let mut relay_retry = tokio::time::interval(Duration::from_secs(15));
 
+        // Refresh the peer-address gauges (`kad_known_peer_*` and `advertised_peer_addr_*`) on a
+        // fixed 15s cadence. Kept as its own time-based interval (not the cleanup block, which
+        // also fires every 1000 events) so a busy node can't turn it into a per-event storm. The
+        // first tick fires immediately for an initial snapshot.
+        let mut peer_addr_metrics_refresh = tokio::time::interval(Duration::from_secs(15));
+
         loop {
             tokio::select! {
                 _ = relay_retry.tick() => {
                     self.retry_relay_reservations();
                 }
+                _ = peer_addr_metrics_refresh.tick() => {
+                    self.refresh_peer_addr_metrics();
+                },
                 event = self.swarm.select_next_some() => {
                     self.process_event(event).await.inspect_err(|e| {
                         error!(target: "network", ?e, "network event error")
