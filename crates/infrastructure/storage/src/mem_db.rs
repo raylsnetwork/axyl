@@ -70,6 +70,16 @@ impl<'a> DbTx for MemDbTx<'a> {
         Ok(get_with_marked_check::<T>(&self.store, key))
     }
 
+    fn contains_key<T: Table>(&self, key: &T::Key) -> eyre::Result<bool> {
+        if let Some(table) = self.store.get(T::NAME) {
+            let key_bytes = encode_key(key);
+            if let Some((tombstoned, _)) = table.get(&key_bytes) {
+                return Ok(!*tombstoned);
+            }
+        }
+        Ok(false)
+    }
+
     fn iter<T: Table>(&self) -> DBIter<'_, T> {
         if let Some(table) = self.store.get(T::NAME) {
             let items: Vec<_> = table
@@ -504,13 +514,7 @@ impl Database for MemDatabase {
     }
 
     fn contains_key<T: Table>(&self, key: &T::Key) -> eyre::Result<bool> {
-        if let Some(table) = self.store.read().get(T::NAME) {
-            let key_bytes = encode_key(key);
-            if let Some((removed, _)) = table.get(&key_bytes) {
-                return Ok(!*removed);
-            }
-        }
-        Ok(false)
+        self.read_txn_impl().contains_key::<T>(key)
     }
 
     fn get<T: Table>(&self, key: &T::Key) -> eyre::Result<Option<T::Value>> {
