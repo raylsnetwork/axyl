@@ -103,29 +103,11 @@ impl<'a> DbTx for MemDbTx<'a> {
     }
 
     fn last_record<T: Table>(&self) -> Option<(T::Key, T::Value)> {
-        if let Some(table) = self.store.get(T::NAME) {
-            for (key_bytes, (tombstoned, value_bytes)) in table.iter().rev() {
-                if !*tombstoned {
-                    return Some((decode_key(key_bytes), decode(value_bytes)));
-                }
-            }
-            None
-        } else {
-            None
-        }
+        last_record_impl::<T>(&self.store)
     }
 
     fn record_prior_to<T: Table>(&self, key: &T::Key) -> Option<(T::Key, T::Value)> {
-        if let Some(table) = self.store.get(T::NAME) {
-            let key_bytes = encode_key(key);
-            table
-                .range(..key_bytes)
-                .rev()
-                .find(|(_, (tombstoned, _))| !*tombstoned)
-                .map(|(k, (_, v))| (decode_key(k), decode(v)))
-        } else {
-            None
-        }
+        record_prior_to_impl::<T>(&self.store, key)
     }
 
     fn disable_long_read_safety(&self) {}
@@ -204,29 +186,11 @@ impl<'a> DbTx for MemDbTxMut<'a> {
     }
 
     fn last_record<T: Table>(&self) -> Option<(T::Key, T::Value)> {
-        if let Some(table) = self.store.get(T::NAME) {
-            for (key_bytes, (tombstoned, value_bytes)) in table.iter().rev() {
-                if !*tombstoned {
-                    return Some((decode_key(key_bytes), decode(value_bytes)));
-                }
-            }
-            None
-        } else {
-            None
-        }
+        last_record_impl::<T>(&self.store)
     }
 
     fn record_prior_to<T: Table>(&self, key: &T::Key) -> Option<(T::Key, T::Value)> {
-        if let Some(table) = self.store.get(T::NAME) {
-            let key_bytes = encode_key(key);
-            table
-                .range(..key_bytes)
-                .rev()
-                .find(|(_, (tombstoned, _))| !*tombstoned)
-                .map(|(k, (_, v))| (decode_key(k), decode(v)))
-        } else {
-            None
-        }
+        record_prior_to_impl::<T>(&self.store, key)
     }
 
     fn disable_long_read_safety(&self) {}
@@ -376,7 +340,7 @@ impl Drop for MemDatabase {
         // shutdown_tx is a sync sender with no buffer so this should block until the thread
         // reads it and shuts down.
         if let Err(e) = self.shutdown_tx.send(()) {
-            tracing::error!(target: "rayls::memdb", "Error while trying to send shutdown to MemDatabase metrics thread {e}"  );
+            tracing::error!(target: "rayls::memdb", "Error while trying to send shutdown to MemDatabase metrics thread {e}");
         }
     }
 }
@@ -671,6 +635,26 @@ fn reverse_raw_iter_owned_impl<T: Table>(
 ) -> Option<Vec<(Cow<'static, [u8]>, Cow<'static, [u8]>)>> {
     let table = store.get(T::NAME)?;
     Some(collect_raw_owned(table.iter().rev()))
+}
+
+fn last_record_impl<T: Table>(store: &StoreType) -> Option<(T::Key, T::Value)> {
+    let table = store.get(T::NAME)?;
+    for (key_bytes, (tombstoned, value_bytes)) in table.iter().rev() {
+        if !*tombstoned {
+            return Some((decode_key(key_bytes), decode(value_bytes)));
+        }
+    }
+    None
+}
+
+fn record_prior_to_impl<T: Table>(store: &StoreType, key: &T::Key) -> Option<(T::Key, T::Value)> {
+    let table = store.get(T::NAME)?;
+    let key_bytes = encode_key(key);
+    table
+        .range(..key_bytes)
+        .rev()
+        .find(|(_, (tombstoned, _))| !*tombstoned)
+        .map(|(k, (_, v))| (decode_key(k), decode(v)))
 }
 
 #[cfg(test)]
