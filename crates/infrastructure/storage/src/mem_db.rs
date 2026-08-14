@@ -38,8 +38,6 @@ fn get_with_marked_check<T: Table>(store: &StoreType, key: &T::Key) -> Option<T:
     None
 }
 
-
-
 #[derive(Debug)]
 pub struct MemDbTx<'a> {
     store: RwLockReadGuard<'a, StoreType>,
@@ -379,6 +377,16 @@ impl MemDatabase {
         Self { store, metrics, shutdown_tx: Arc::new(shutdown_tx) }
     }
 
+    /// Infallible read transaction; [`Database::read_txn`] wraps this.
+    fn read_txn_impl(&self) -> MemDbTx<'_> {
+        MemDbTx { store: self.store.read() }
+    }
+
+    /// Infallible write transaction; [`Database::write_txn`] wraps this.
+    fn write_txn_impl(&self) -> MemDbTxMut<'_> {
+        MemDbTxMut { store: self.store.write() }
+    }
+
     // gets the value with the marking for delete flag
     pub fn get_marked<T: Table>(&self, key: &T::Key) -> eyre::Result<Option<(bool, T::Value)>> {
         if let Some(table) = self.store.read().get(T::NAME) {
@@ -488,11 +496,11 @@ impl Database for MemDatabase {
     }
 
     fn read_txn(&self) -> eyre::Result<Self::TX<'_>> {
-        Ok(MemDbTx { store: self.store.read() })
+        Ok(self.read_txn_impl())
     }
 
     fn write_txn(&self) -> eyre::Result<MemDbTxMut<'_>> {
-        Ok(MemDbTxMut { store: self.store.write() })
+        Ok(self.write_txn_impl())
     }
 
     fn contains_key<T: Table>(&self, key: &T::Key) -> eyre::Result<bool> {
@@ -506,7 +514,7 @@ impl Database for MemDatabase {
     }
 
     fn get<T: Table>(&self, key: &T::Key) -> eyre::Result<Option<T::Value>> {
-        self.read_txn()?.get::<T>(key)
+        self.read_txn_impl().get::<T>(key)
     }
 
     fn insert<T: Table>(&self, key: &T::Key, value: &T::Value) -> eyre::Result<()> {
@@ -519,11 +527,11 @@ impl Database for MemDatabase {
     }
 
     fn remove<T: Table>(&self, key: &T::Key) -> eyre::Result<()> {
-        self.write_txn()?.remove::<T>(key)
+        self.write_txn_impl().remove::<T>(key)
     }
 
     fn clear_table<T: Table>(&self) -> eyre::Result<()> {
-        self.write_txn()?.clear_table::<T>()
+        self.write_txn_impl().clear_table::<T>()
     }
 
     fn is_empty<T: Table>(&self) -> bool {
