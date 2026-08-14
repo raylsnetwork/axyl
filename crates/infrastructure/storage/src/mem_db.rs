@@ -180,6 +180,19 @@ pub struct MemDbTxMut<'a> {
     store: RwLockWriteGuard<'a, StoreType>,
 }
 
+impl<'a> MemDbTxMut<'a> {
+    /// Hard-removes `key` from the in-memory store, leaving no tombstone.
+    ///
+    /// Persistent eviction archives a row permanently (never re-inserted), so the cache entry is
+    /// dropped outright rather than tombstoned: this frees the cache and lets reads fall through to
+    /// a lower tier, whereas a tombstone would shadow it and never be reclaimed.
+    pub fn hard_delete<T: Table>(&mut self, key: &T::Key) {
+        if let Some(table) = self.store.get_mut(T::NAME) {
+            table.remove(&encode_key(key));
+        }
+    }
+}
+
 impl<'a> DbTx for MemDbTxMut<'a> {
     fn get<T: Table>(&self, key: &T::Key) -> eyre::Result<Option<T::Value>> {
         //if not in cache check store
@@ -325,19 +338,6 @@ impl<'a> DbTxMut for MemDbTxMut<'a> {
     }
 }
 
-impl<'a> MemDbTxMut<'a> {
-    /// Hard-removes `key` from the in-memory store, leaving no tombstone.
-    ///
-    /// Persistent eviction archives a row permanently (never re-inserted), so the cache entry is
-    /// dropped outright rather than tombstoned: this frees the cache and lets reads fall through to
-    /// a lower tier, whereas a tombstone would shadow it and never be reclaimed.
-    pub fn hard_delete<T: Table>(&mut self, key: &T::Key) {
-        if let Some(table) = self.store.get_mut(T::NAME) {
-            table.remove(&encode_key(key));
-        }
-    }
-}
-
 /// Implement the Database trait with an in-memory store.
 /// This means no persistance.
 /// This DB also plays loose with transactions, but since it is in-memory and we do not do
@@ -350,6 +350,33 @@ pub struct MemDatabase {
 }
 
 impl MemDatabase {
+    pub fn new() -> Self {
+        let store: Arc<RwLock<StoreType>> = Arc::new(RwLock::new(HashMap::new()));
+        let metrics = Arc::new(RwLock::new(MemDBMetrics::default()));
+        let (shutdown_tx, rx) = mpsc::sync_channel::<()>(0);
+
+        let store_cloned: Arc<RwLock<StoreType>> = Arc::clone(&store);
+        let metrics_cloned = metrics.clone();
+
+        // Spawn thread to update metrics from MemDB stats every 30 seconds.
+        std::thread::spawn(move || {
+            tracing::info!(target: "rayls::memdb", "Starting MemDB metrics thread");
+            while let Err(mpsc::RecvTimeoutError::Timeout) =
+                rx.recv_timeout(Duration::from_secs(30))
+            {
+                let read_guard = store_cloned.read();
+                for (key, table) in read_guard.iter() {
+                    if let Some(m) = metrics_cloned.read().table_counts.get(key) {
+                        m.set(table.len().try_into().unwrap_or(-1));
+                    }
+                }
+            }
+            tracing::info!(target: "rayls::memdb", "Ending MemDB metrics thread");
+        });
+
+        Self { store, metrics, shutdown_tx: Arc::new(shutdown_tx) }
+    }
+
     // gets the value with the marking for delete flag
     pub fn get_marked<T: Table>(&self, key: &T::Key) -> eyre::Result<Option<(bool, T::Value)>> {
         if let Some(table) = self.store.read().get(T::NAME) {
@@ -404,44 +431,16 @@ impl MemDatabase {
 
 impl Drop for MemDatabase {
     fn drop(&mut self) {
-        if Arc::strong_count(&self.shutdown_tx) <= 1 {
-            tracing::info!(target: "rayls::memdb", "MemDatabase Dropping, shutting down metrics thread");
-            // shutdown_tx is a sync sender with no buffer so this should block until the thread
-            // reads it and shuts down.
-            if let Err(e) = self.shutdown_tx.send(()) {
-                tracing::error!(target: "rayls::memdb",
-                    "Error while trying to send shutdown to MemDatabase metrics thread {e}"
-                );
-            }
+        if Arc::strong_count(&self.shutdown_tx) > 1 {
+            return;
         }
-    }
-}
 
-impl MemDatabase {
-    pub fn new() -> Self {
-        let store: Arc<RwLock<StoreType>> = Arc::new(RwLock::new(HashMap::new()));
-        let metrics = Arc::new(RwLock::new(MemDBMetrics::default()));
-        let (shutdown_tx, rx) = mpsc::sync_channel::<()>(0);
-
-        let store_cloned: Arc<RwLock<StoreType>> = Arc::clone(&store);
-        let metrics_cloned = metrics.clone();
-        // Spawn thread to update metrics from MemDB stats every 30 seconds.
-        std::thread::spawn(move || {
-            tracing::info!(target: "rayls::memdb", "Starting MemDB metrics thread");
-            while let Err(mpsc::RecvTimeoutError::Timeout) =
-                rx.recv_timeout(Duration::from_secs(30))
-            {
-                let read_guard = store_cloned.read();
-                for (key, table) in read_guard.iter() {
-                    if let Some(m) = metrics_cloned.read().table_counts.get(key) {
-                        m.set(table.len().try_into().unwrap_or(-1));
-                    }
-                }
-            }
-            tracing::info!(target: "rayls::memdb", "Ending MemDB metrics thread");
-        });
-
-        Self { store, metrics, shutdown_tx: Arc::new(shutdown_tx) }
+        tracing::info!(target: "rayls::memdb", "MemDatabase Dropping, shutting down metrics thread");
+        // shutdown_tx is a sync sender with no buffer so this should block until the thread
+        // reads it and shuts down.
+        if let Err(e) = self.shutdown_tx.send(()) {
+            tracing::error!(target: "rayls::memdb", "Error while trying to send shutdown to MemDatabase metrics thread {e}"  );
+        }
     }
 }
 
