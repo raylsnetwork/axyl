@@ -38,10 +38,7 @@ fn get_with_marked_check<T: Table>(store: &StoreType, key: &T::Key) -> Option<T:
     None
 }
 
-fn mark_value_for_deletion<T: Table>(value: &mut StoreTableValueType) {
-    // mark for actual deletion once tx committed
-    value.0 = true;
-}
+
 
 #[derive(Debug)]
 pub struct MemDbTx<'a> {
@@ -181,6 +178,11 @@ pub struct MemDbTxMut<'a> {
 }
 
 impl<'a> MemDbTxMut<'a> {
+    fn mark_value_for_deletion(value: &mut StoreTableValueType) {
+        // mark for actual deletion once tx committed
+        value.0 = true;
+    }
+
     /// Hard-removes `key` from the in-memory store, leaving no tombstone.
     ///
     /// Persistent eviction archives a row permanently (never re-inserted), so the cache entry is
@@ -310,7 +312,7 @@ impl<'a> DbTxMut for MemDbTxMut<'a> {
         if let Some(table) = self.store.get_mut(T::NAME) {
             let key_bytes = encode_key(key);
             if let Some(value) = table.get_mut(&key_bytes) {
-                mark_value_for_deletion::<T>(value);
+                Self::mark_value_for_deletion(value);
             } else {
                 // tombstone for keys that only exist in the persistent layer
                 table.insert(key_bytes, (true, Vec::new()));
@@ -324,7 +326,7 @@ impl<'a> DbTxMut for MemDbTxMut<'a> {
     fn clear_table<T: Table>(&mut self) -> eyre::Result<()> {
         if let Some(table) = self.store.get_mut(T::NAME) {
             for value in table.values_mut() {
-                mark_value_for_deletion::<T>(value);
+                Self::mark_value_for_deletion(value);
             }
             Ok(())
         } else {
@@ -504,7 +506,7 @@ impl Database for MemDatabase {
     }
 
     fn get<T: Table>(&self, key: &T::Key) -> eyre::Result<Option<T::Value>> {
-        Ok(get_with_marked_check::<T>(&self.store.read(), key))
+        self.read_txn()?.get::<T>(key)
     }
 
     fn insert<T: Table>(&self, key: &T::Key, value: &T::Value) -> eyre::Result<()> {
@@ -517,26 +519,11 @@ impl Database for MemDatabase {
     }
 
     fn remove<T: Table>(&self, key: &T::Key) -> eyre::Result<()> {
-        if let Some(table) = self.store.write().get_mut(T::NAME) {
-            let key_bytes = encode_key(key);
-            if let Some(value) = table.get_mut(&key_bytes) {
-                mark_value_for_deletion::<T>(value);
-            } else {
-                // tombstone for keys that only exist in the persistent layer
-                table.insert(key_bytes, (true, Vec::new()));
-            }
-        }
-        Ok(())
+        self.write_txn()?.remove::<T>(key)
     }
 
     fn clear_table<T: Table>(&self) -> eyre::Result<()> {
-        if let Some(table) = self.store.write().get_mut(T::NAME) {
-            //mark all for deletion
-            for value in table.values_mut() {
-                mark_value_for_deletion::<T>(value);
-            }
-        }
-        Ok(())
+        self.write_txn()?.clear_table::<T>()
     }
 
     fn is_empty<T: Table>(&self) -> bool {
