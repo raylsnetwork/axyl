@@ -1,0 +1,191 @@
+// SPDX-License-Identifier: BUSL-1.1
+pragma solidity 0.8.26;
+
+import {Initializable} from "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
+import {UUPSUpgradeable} from "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
+import {AccessControlUpgradeable} from "@openzeppelin/contracts-upgradeable/access/AccessControlUpgradeable.sol";
+import {IRewardCurve} from "../interfaces/IRewardCurve.sol";
+
+/**
+ * @title RewardCurve
+ * @notice A Rayls Contract
+ *
+ * @notice Self-regulating, revenue-based staking reward curve (POC for issue #103)
+ * @dev APY = (baseMonthlyEmission + variableMonthlyEmission) * 12 / rlsStaked, always derived,
+ *      never stored. rlsStaked is a caller-supplied parameter — this contract does not read
+ *      ConsensusRegistry/DelegationPool itself, keeping it a pure function of emission state and
+ *      stake, testable in isolation and pluggable into whatever eventually supplies the total
+ *      (a test, a keeper/oracle, or RewardDistributor directly).
+ * @dev Does not custody or transfer RLS. Real payout stays in RewardDistributor/RLSAccumulator.
+ * @dev UUPS upgradeable with AccessControl
+ */
+contract RewardCurve is Initializable, UUPSUpgradeable, AccessControlUpgradeable, IRewardCurve {
+    bytes32 public constant UPGRADER_ROLE = keccak256("UPGRADER_ROLE");
+    uint256 public constant BPS_DENOMINATOR = 10_000;
+    uint256 public constant MONTHS_PER_YEAR = 12;
+
+    /// @custom:storage-location erc7201:rewardcurve.storage.v1
+    struct RewardCurveStorage {
+        /// @notice Flat monthly RLS emission committed by the Foundation treasury
+        uint256 baseMonthlyEmission;
+        /// @notice Rolling monthly RLS emission accumulated from reported network revenue
+        uint256 variableMonthlyEmission;
+        /// @notice Address allowed to call recordRevenue
+        address revenueReporter;
+        /// @notice Current emission funding phase (observable marker only)
+        Phase currentPhase;
+    }
+
+    // keccak256(abi.encode(uint256(keccak256("rewardcurve.storage.v1")) - 1)) & ~bytes32(uint256(0xff))
+    bytes32 private constant REWARD_CURVE_STORAGE_LOCATION =
+        0xc11643142d0559101211416e904d9720f39a4cca3864891ca622f773e0424100;
+
+    function _getRewardCurveStorage() private pure returns (RewardCurveStorage storage $) {
+        assembly {
+            $.slot := REWARD_CURVE_STORAGE_LOCATION
+        }
+    }
+
+    /// @custom:oz-upgrades-unsafe-allow constructor
+    constructor() {
+        _disableInitializers();
+    }
+
+    function initialize(address admin_) external initializer {
+        if (admin_ == address(0)) revert ZeroAddress();
+
+        __AccessControl_init();
+        __UUPSUpgradeable_init();
+
+        _grantRole(DEFAULT_ADMIN_ROLE, admin_);
+        _grantRole(UPGRADER_ROLE, admin_);
+    }
+
+    function _authorizeUpgrade(address) internal override onlyRole(UPGRADER_ROLE) {}
+
+    modifier onlyRevenueReporter() {
+        if (msg.sender != _getRewardCurveStorage().revenueReporter) revert OnlyRevenueReporter();
+        _;
+    }
+
+    // ========== VIEWS ==========
+
+    /// @inheritdoc IRewardCurve
+    function baseMonthlyEmission() external view override returns (uint256) {
+        return _getRewardCurveStorage().baseMonthlyEmission;
+    }
+
+    /// @inheritdoc IRewardCurve
+    function variableMonthlyEmission() external view override returns (uint256) {
+        return _getRewardCurveStorage().variableMonthlyEmission;
+    }
+
+    /// @inheritdoc IRewardCurve
+    function revenueReporter() external view override returns (address) {
+        return _getRewardCurveStorage().revenueReporter;
+    }
+
+    /// @inheritdoc IRewardCurve
+    function currentPhase() external view override returns (Phase) {
+        return _getRewardCurveStorage().currentPhase;
+    }
+
+    /// @inheritdoc IRewardCurve
+    function getEmissionBreakdown()
+        external
+        view
+        override
+        returns (uint256 baseMonthly, uint256 variableMonthly, uint256 annualEmission)
+    {
+        RewardCurveStorage storage $ = _getRewardCurveStorage();
+        baseMonthly = $.baseMonthlyEmission;
+        variableMonthly = $.variableMonthlyEmission;
+        annualEmission = (baseMonthly + variableMonthly) * MONTHS_PER_YEAR;
+    }
+
+    /// @inheritdoc IRewardCurve
+    function getCurrentApyBps(uint256 rlsStaked) external view override returns (uint256) {
+        return _currentApyBps(rlsStaked);
+    }
+
+    /// @inheritdoc IRewardCurve
+    function getApyBreakdown(
+        uint256 rlsStaked
+    ) external view override returns (uint256 baseApyBps, uint256 variableApyBps) {
+        RewardCurveStorage storage $ = _getRewardCurveStorage();
+        baseApyBps = _apyBps($.baseMonthlyEmission * MONTHS_PER_YEAR, rlsStaked);
+        variableApyBps = _apyBps($.variableMonthlyEmission * MONTHS_PER_YEAR, rlsStaked);
+    }
+
+    /// @inheritdoc IRewardCurve
+    function estimateYield(uint256 amount, uint256 rlsStaked) external view override returns (uint256) {
+        return (amount * _currentApyBps(rlsStaked)) / BPS_DENOMINATOR;
+    }
+
+    /// @inheritdoc IRewardCurve
+    function previewCurve(
+        uint256[] calldata stakeLevels
+    ) external view override returns (uint256[] memory apyBpsAtLevel) {
+        uint256 len = stakeLevels.length;
+        apyBpsAtLevel = new uint256[](len);
+        for (uint256 i; i < len; ++i) {
+            apyBpsAtLevel[i] = _currentApyBps(stakeLevels[i]);
+        }
+    }
+
+    function _currentApyBps(uint256 rlsStaked) internal view returns (uint256) {
+        RewardCurveStorage storage $ = _getRewardCurveStorage();
+        return _apyBps(($.baseMonthlyEmission + $.variableMonthlyEmission) * MONTHS_PER_YEAR, rlsStaked);
+    }
+
+    /// @dev Multiply-then-divide, matching RewardDistributor._splitTarget's existing idiom, to
+    ///      avoid truncating to zero when emission < rlsStaked (true almost everywhere near the
+    ///      >2B RLS staked scenario this curve is meant to handle gracefully).
+    function _apyBps(uint256 emissionAnnual, uint256 rlsStaked) internal pure returns (uint256) {
+        if (rlsStaked == 0) return 0;
+        return (emissionAnnual * BPS_DENOMINATOR) / rlsStaked;
+    }
+
+    // ========== GOVERNANCE ==========
+
+    /// @inheritdoc IRewardCurve
+    function setBaseMonthlyEmission(uint256 newBase) external override onlyRole(DEFAULT_ADMIN_ROLE) {
+        RewardCurveStorage storage $ = _getRewardCurveStorage();
+        uint256 oldBase = $.baseMonthlyEmission;
+        $.baseMonthlyEmission = newBase;
+        emit BaseMonthlyEmissionUpdated(oldBase, newBase);
+    }
+
+    /// @inheritdoc IRewardCurve
+    function recordRevenue(uint256 amount) external override onlyRevenueReporter {
+        if (amount == 0) revert ZeroAmount();
+        RewardCurveStorage storage $ = _getRewardCurveStorage();
+        $.variableMonthlyEmission += amount;
+        emit RevenueRecorded(amount, $.variableMonthlyEmission);
+    }
+
+    /// @inheritdoc IRewardCurve
+    function resetMonthlyRevenue() external override onlyRole(DEFAULT_ADMIN_ROLE) {
+        RewardCurveStorage storage $ = _getRewardCurveStorage();
+        uint256 cleared = $.variableMonthlyEmission;
+        $.variableMonthlyEmission = 0;
+        emit MonthlyRevenueReset(cleared);
+    }
+
+    /// @inheritdoc IRewardCurve
+    function setRevenueReporter(address newReporter) external override onlyRole(DEFAULT_ADMIN_ROLE) {
+        if (newReporter == address(0)) revert ZeroAddress();
+        RewardCurveStorage storage $ = _getRewardCurveStorage();
+        address oldReporter = $.revenueReporter;
+        $.revenueReporter = newReporter;
+        emit RevenueReporterUpdated(oldReporter, newReporter);
+    }
+
+    /// @inheritdoc IRewardCurve
+    function setPhase(Phase newPhase) external override onlyRole(DEFAULT_ADMIN_ROLE) {
+        RewardCurveStorage storage $ = _getRewardCurveStorage();
+        Phase oldPhase = $.currentPhase;
+        $.currentPhase = newPhase;
+        emit PhaseTransitioned(oldPhase, newPhase);
+    }
+}
