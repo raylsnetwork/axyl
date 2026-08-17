@@ -11,6 +11,7 @@ import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {ERC20} from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
 import {RLSAccumulator} from "src/fees/RLSAccumulator.sol";
+import {RewardCurve} from "src/fees/RewardCurve.sol";
 
 /// @notice Mock RLS token (ERC-20 staking token) for testing
 contract MockRLSExt is ERC20 {
@@ -223,6 +224,14 @@ contract RewardDistributorExtendedTest is Test {
 
         // Set epoch duration (1 day = 86400 seconds)
         registry.setEpochDuration(86400);
+    }
+
+    // Helper: deploy a RewardCurve (issue #103 POC), owner-administered
+    function _deployCurve() internal returns (RewardCurve curve) {
+        RewardCurve impl = new RewardCurve();
+        bytes memory initData = abi.encodeCall(RewardCurve.initialize, (owner));
+        ERC1967Proxy proxy = new ERC1967Proxy(address(impl), initData);
+        curve = RewardCurve(address(proxy));
     }
 
     // =========================================================================
@@ -602,5 +611,104 @@ contract RewardDistributorExtendedTest is Test {
         assertApproxEqRel(p1, (total * s1) / totalStake, 1e13, "v1 reward proportional to stake");
         assertApproxEqRel(p2, (total * s2) / totalStake, 1e13, "v2 reward proportional to stake");
         assertApproxEqRel(p3, (total * s3) / totalStake, 1e13, "v3 reward proportional to stake");
+    }
+
+    // =========================================================================
+    //  9. RewardCurve (issue #103 POC): curve-derived APY compresses the REAL
+    //     payout on both tracks, not just in isolated math
+    // =========================================================================
+
+    /// @notice Proves RewardCurve's numbers survive contact with the real
+    ///         _splitTarget/_distributeByTarget/DelegationPool split: two independently
+    ///         configured curves — Track A ("priority"/locked tier, base-heavy policy) and
+    ///         Track B ("open tier", revenue-leaning policy) — feed targetApyBps/
+    ///         openTierTargetApyBps each "epoch" the way an off-chain keeper/oracle would in
+    ///         production (RewardDistributor itself is unmodified and still only knows about a
+    ///         stored bps value — this models what pushes that value in). Track A and Track B
+    ///         stake grow on independent schedules; the realized per-epoch payout on EACH track
+    ///         must match its own curve's output exactly and compress as that track's own stake
+    ///         grows, proving the self-regulating mechanism holds after going through the real
+    ///         distribution pipeline, not just in RewardCurveTest's isolated math.
+    function test_curveDrivenApy_compressesRealizedPayout_acrossBothTracks() public {
+        RewardCurve priorityCurve = _deployCurve();
+        RewardCurve openTierCurve = _deployCurve();
+
+        vm.startPrank(owner);
+        priorityCurve.setBaseMonthlyEmission(500_000e18);
+        priorityCurve.setRevenueReporter(owner);
+        openTierCurve.setBaseMonthlyEmission(100_000e18);
+        openTierCurve.setRevenueReporter(owner);
+        priorityCurve.recordRevenue(100_000e18); // priority: base-heavy (500k base + 100k revenue)
+        openTierCurve.recordRevenue(500_000e18); // open tier: revenue-leaning (100k base + 500k revenue)
+        vm.stopPrank();
+
+        registry.clearValidators();
+        registry.addActiveValidator(validator1, 0); // no own stake: isolates the two track rates
+
+        _setupAccumulator(50_000_000e18); // targetApyBps=5000 set here is overwritten below every round
+
+        uint256[3] memory trackAStakes = [uint256(20_000_000e18), 200_000_000e18, 2_000_000_000e18];
+        uint256[3] memory trackBStakes = [uint256(50_000_000e18), 500_000_000e18, 1_000_000_000e18];
+
+        uint256 prevPriorityApy = type(uint256).max;
+        uint256 prevOpenTierApy = type(uint256).max;
+
+        for (uint256 i; i < 3; ++i) {
+            (uint256 priorityApy, uint256 openTierApy) = _runCurveRound(
+                priorityCurve, openTierCurve, trackAStakes[i], trackBStakes[i]
+            );
+
+            // Compression: as each track's OWN stake grows, its OWN curve-derived APY must
+            // strictly fall — proven independently per track, since they move on independent
+            // schedules (Track B growing must not be what compresses Track A, and vice versa).
+            assertLt(priorityApy, prevPriorityApy, "Track A APY must compress as Track A stake grows");
+            assertLt(openTierApy, prevOpenTierApy, "Track B APY must compress as Track B stake grows");
+            prevPriorityApy = priorityApy;
+            prevOpenTierApy = openTierApy;
+        }
+    }
+
+    /// @dev One curve-driven epoch: push both curves' current APY into RewardDistributor,
+    ///      distribute, and assert the realized payout on each track matches its curve exactly.
+    ///      Split out from the loop body above solely to keep stack depth low (legacy codegen,
+    ///      no --via-ir configured for this project).
+    function _runCurveRound(
+        RewardCurve priorityCurve,
+        RewardCurve openTierCurve,
+        uint256 trackA,
+        uint256 trackB
+    ) internal returns (uint256 priorityApy, uint256 openTierApy) {
+        delegationPool.setDelegatedStake(validator1, trackA + trackB);
+        delegationPool.setOpenTierDelegatedStake(validator1, trackB);
+
+        priorityApy = priorityCurve.getCurrentApyBps(trackA);
+        openTierApy = openTierCurve.getCurrentApyBps(trackB);
+        assertLe(priorityApy, 10_000, "must stay within RewardDistributor.MAX_APY_BPS");
+        assertLe(openTierApy, 10_000, "must stay within RewardDistributor.MAX_APY_BPS");
+
+        // Models an off-chain keeper/oracle pushing curve output into RewardDistributor each
+        // epoch. A real integration would likely have RewardDistributor read RewardCurve
+        // directly instead of an admin-set bps value — flagged as a follow-up, not solved here.
+        vm.startPrank(owner);
+        distributor.setTargetApyBps(priorityApy);
+        distributor.setOpenTierTargetApyBps(openTierApy);
+        vm.stopPrank();
+
+        uint256 trackABefore = delegationPool.trackAReceived(validator1);
+        uint256 trackBBefore = delegationPool.trackBReceived(validator1);
+
+        vm.prank(SYSTEM_ADDRESS);
+        distributor.distributeRewards();
+
+        uint256 trackADelta = delegationPool.trackAReceived(validator1) - trackABefore;
+        uint256 trackBDelta = delegationPool.trackBReceived(validator1) - trackBBefore;
+
+        // Accumulator fully funds the shortfall each round (no fee income received), so
+        // totalRewards == totalTarget and nothing gets proportionally scaled — the realized
+        // payout must match _splitTarget's own formula exactly.
+        uint256 expectedTrackA = (trackA * priorityApy * 86400) / (365 days * 10_000);
+        uint256 expectedTrackB = (trackB * openTierApy * 86400) / (365 days * 10_000);
+        assertEq(trackADelta, expectedTrackA, "Track A realized payout must match curve-derived target exactly");
+        assertEq(trackBDelta, expectedTrackB, "Track B realized payout must match curve-derived target exactly");
     }
 }
