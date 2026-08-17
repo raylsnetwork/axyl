@@ -30,6 +30,7 @@ interface IRewardCurve {
     error ZeroAddress();
     error ZeroAmount();
     error OnlyRevenueReporter();
+    error EmissionTooLarge();
 
     // events
     event BaseMonthlyEmissionUpdated(uint256 oldBase, uint256 newBase);
@@ -84,11 +85,15 @@ interface IRewardCurve {
     function previewCurve(uint256[] calldata stakeLevels) external view returns (uint256[] memory apyBpsAtLevel);
 
     /// @notice Set the flat monthly RLS emission committed by the Foundation treasury
-    /// @dev onlyRole(DEFAULT_ADMIN_ROLE) — models a governance-approved treasury commitment
+    /// @dev onlyRole(DEFAULT_ADMIN_ROLE) — models a governance-approved treasury commitment.
+    ///      Reverts EmissionTooLarge above MAX_MONTHLY_EMISSION (a defensive overflow backstop,
+    ///      not a policy cap — see MAX_MONTHLY_EMISSION's doc comment).
     function setBaseMonthlyEmission(uint256 newBase) external;
 
     /// @notice Report network revenue for the current month, adding to variableMonthlyEmission
-    /// @dev onlyRevenueReporter — mirrors RewardDistributor.receiveRewards/onlyFeeAggregator
+    /// @dev onlyRevenueReporter — mirrors RewardDistributor.receiveRewards/onlyFeeAggregator.
+    ///      Reverts EmissionTooLarge if the resulting variableMonthlyEmission would exceed
+    ///      MAX_MONTHLY_EMISSION.
     function recordRevenue(uint256 amount) external;
 
     /// @notice Zero out the rolling variable monthly emission (start of a new reporting month)
