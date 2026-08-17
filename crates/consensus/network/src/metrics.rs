@@ -29,17 +29,33 @@ pub struct NetworkMetrics {
     /// connect, so unreachable peers never appear here. Contrast `advertised_peer_addr_primary`,
     /// which lists dial *intent*. Rebuilt each refresh (departed peers drop out); primary and
     /// worker use separate vecs so each can `reset()` its own without touching the other.
-    pub kad_known_peer_primary: IntGaugeVec,
-    /// worker swarm's kademlia routing table; see [`Self::kad_known_peer_primary`].
-    pub kad_known_peer_worker: IntGaugeVec,
+    pub kad_known_peer_addr_primary: IntGaugeVec,
+    /// worker swarm's kademlia routing table; see [`Self::kad_known_peer_addr_primary`].
+    pub kad_known_peer_addr_worker: IntGaugeVec,
     /// primary swarm's dial targets: one series per `(peer_id, multiaddr)` a peer ADVERTISED (via
     /// its DHT `NodeRecord` or committee bootstrap) that this node will redial -- including peers
     /// it has not connected to, so undialable/churn addresses show up here. Diff against
-    /// `kad_known_peer_primary` by `peer_id` (`advertised unless on(peer_id) kad_known`) to find
-    /// targets that never connect. Same separate-vec / reset scheme.
+    /// `kad_known_peer_addr_primary` by `peer_id` (`advertised unless on(peer_id) kad_known`) to
+    /// find targets that never connect. Same separate-vec / reset scheme.
     pub advertised_peer_addr_primary: IntGaugeVec,
     /// worker swarm's dial targets; see [`Self::advertised_peer_addr_primary`].
     pub advertised_peer_addr_worker: IntGaugeVec,
+    /// primary swarm's kad-discovery dial candidates: one series per `(peer_id, multiaddr)` in the
+    /// peer-manager's `discovery_peers` -- peers learned from OTHER nodes' routing tables via
+    /// `get_closest_peers` and dialed on the heartbeat. Distinct from `advertised_peer_addr_*`
+    /// (record/committee) and `kad_known_peer_addr_*` (connected): this is where a
+    /// cross-host-unreachable address a co-located peer advertised (e.g. a `127.0.0.1`)
+    /// surfaces as churn. Same separate-vec / reset scheme.
+    pub discovery_peer_addr_primary: IntGaugeVec,
+    /// worker swarm's kad-discovery dial candidates; see [`Self::discovery_peer_addr_primary`].
+    pub discovery_peer_addr_worker: IntGaugeVec,
+    /// Failed outbound dials by target `(peer_id, multiaddr, swarm)` (`swarm` = primary/worker).
+    /// Each dial error
+    /// increments once per attempted address. A climbing count for an unreachable address (e.g. a
+    /// cross-host `127.0.0.1`) is the dial-churn signal -- and unlike the `*_peer_addr` gauges it
+    /// captures every dial path (kad iterative query, discovery heartbeat, committee redial),
+    /// including kad-internal dials that never land in an app-side map.
+    pub dial_peer_addr_failures: IntCounterVec,
 }
 
 impl NetworkMetrics {
@@ -81,14 +97,14 @@ impl NetworkMetrics {
                 &["path", "kad_type"],
                 registry
             )?,
-            kad_known_peer_primary: register_int_gauge_vec_with_registry!(
-                "kad_known_peer_primary",
+            kad_known_peer_addr_primary: register_int_gauge_vec_with_registry!(
+                "kad_known_peer_addr_primary",
                 "Primary kademlia routing table (kbuckets): connected peers and the resolved address in use",
                 &["peer_id", "multiaddr"],
                 registry
             )?,
-            kad_known_peer_worker: register_int_gauge_vec_with_registry!(
-                "kad_known_peer_worker",
+            kad_known_peer_addr_worker: register_int_gauge_vec_with_registry!(
+                "kad_known_peer_addr_worker",
                 "Worker kademlia routing table (kbuckets): connected peers and the resolved address in use",
                 &["peer_id", "multiaddr"],
                 registry
@@ -103,6 +119,24 @@ impl NetworkMetrics {
                 "advertised_peer_addr_worker",
                 "Worker dial targets peers advertised (DHT record / committee); includes not-yet-connected peers",
                 &["peer_id", "multiaddr"],
+                registry
+            )?,
+            discovery_peer_addr_primary: register_int_gauge_vec_with_registry!(
+                "discovery_peer_addr_primary",
+                "Primary kad-discovery dial candidates (discovery_peers: peers learned via get_closest_peers, dialed on heartbeat)",
+                &["peer_id", "multiaddr"],
+                registry
+            )?,
+            discovery_peer_addr_worker: register_int_gauge_vec_with_registry!(
+                "discovery_peer_addr_worker",
+                "Worker kad-discovery dial candidates (discovery_peers: peers learned via get_closest_peers, dialed on heartbeat)",
+                &["peer_id", "multiaddr"],
+                registry
+            )?,
+            dial_peer_addr_failures: register_int_counter_vec_with_registry!(
+                "dial_peer_addr_failures",
+                "Failed outbound dials by target address (increments per attempted multiaddr on each dial error)",
+                &["peer_id", "multiaddr", "swarm"],
                 registry
             )?,
         })

@@ -74,18 +74,22 @@ where
         }
     }
 
-    /// Republish this swarm's peer-address view as two gauges:
-    /// - `kad_known_peer_{primary,worker}` -- the kademlia routing table (`kbuckets`), i.e. peers
-    ///   actually *connected* and the working address they connected on.
+    /// Republish this swarm's peer-address view as three gauges:
+    /// - `kad_known_peer_addr_{primary,worker}` -- the kademlia routing table (`kbuckets`), i.e.
+    ///   peers actually *connected* and the working address they connected on.
     /// - `advertised_peer_addr_{primary,worker}` -- the peer-manager's `known_peers` dial targets
-    ///   (addresses peers advertised that it will redial), including peers not yet connected. The
-    ///   diff between the two surfaces undialable/churn addresses.
+    ///   (addresses peers advertised that it will redial), including peers not yet connected.
+    /// - `discovery_peer_addr_{primary,worker}` -- the peer-manager's `discovery_peers` candidates
+    ///   learned via `get_closest_peers` and dialed on the heartbeat (drained as it dials, so a
+    ///   fast-churning entry is often absent at snapshot time).
+    ///
+    /// (The `dial_peer_addr_failures` counter is updated separately, on each dial-error event.)
     ///
     /// Rebuilt from scratch each call: this swarm's own vecs are reset first so a peer or address
     /// that has left stops being reported (an info-style gauge otherwise lingers forever). Primary
-    /// and worker use separate vecs, so `reset()` only clears this swarm's rows. Both tables are
-    /// snapshotted into owned strings before touching the metrics so the swarm borrow is released
-    /// first.
+    /// and worker use separate vecs, so `reset()` only clears this swarm's rows. All three tables
+    /// are snapshotted into owned strings before touching the metrics so the swarm borrow is
+    /// released first.
     pub(super) fn refresh_peer_addr_metrics(&mut self) {
         // kad routing table (connected peers, working addresses)
         let mut kad_entries: Vec<(String, String)> = Vec::new();
@@ -108,14 +112,26 @@ where
             .map(|(peer_id, addr)| (peer_id.to_string(), addr.to_string()))
             .collect();
 
-        let (kad_gauge, known_gauge) = match self.network_label {
+        // discovery_peers dial candidates (learned via get_closest_peers, dialed on heartbeat)
+        let discovery_entries: Vec<(String, String)> = self
+            .swarm
+            .behaviour()
+            .peer_manager
+            .discovery_peer_addrs()
+            .into_iter()
+            .map(|(peer_id, addr)| (peer_id.to_string(), addr.to_string()))
+            .collect();
+
+        let (kad_gauge, known_gauge, discovery_gauge) = match self.network_label {
             "worker" => (
-                &self.network_metrics.kad_known_peer_worker,
+                &self.network_metrics.kad_known_peer_addr_worker,
                 &self.network_metrics.advertised_peer_addr_worker,
+                &self.network_metrics.discovery_peer_addr_worker,
             ),
             _ => (
-                &self.network_metrics.kad_known_peer_primary,
+                &self.network_metrics.kad_known_peer_addr_primary,
                 &self.network_metrics.advertised_peer_addr_primary,
+                &self.network_metrics.discovery_peer_addr_primary,
             ),
         };
 
@@ -127,6 +143,11 @@ where
         known_gauge.reset();
         for (peer_id, addr) in known_entries {
             known_gauge.with_label_values(&[peer_id.as_str(), addr.as_str()]).set(1);
+        }
+
+        discovery_gauge.reset();
+        for (peer_id, addr) in discovery_entries {
+            discovery_gauge.with_label_values(&[peer_id.as_str(), addr.as_str()]).set(1);
         }
     }
 }

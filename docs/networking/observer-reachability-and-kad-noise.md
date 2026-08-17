@@ -200,31 +200,37 @@ circuit-exhaustion and stale-circuit churn on the relay path. Worth pursuing the
 efficiency improvement, but orthogonal to this issue's root (kad advertising/dialing
 unreachable addresses, and counting unreachable members).
 
-## Observing it live: the peer-address metrics
+## Observing it live: the `*_peer_addr` metrics
 
-Two info-style gauges (per swarm) expose exactly this, refreshed every 15s and scrapable off
-the existing metrics port:
-
-- `kad_known_peer_{primary,worker}` — the kademlia routing table (`kbuckets`): peers this node
-  is **connected** to and the resolved address in use. Populated only on a successful connect,
-  so unreachable peers never appear here.
-- `advertised_peer_addr_{primary,worker}` — the peer-manager's `known_peers`: addresses peers
-  **advertised** that this node will redial, **including peers it never connected to**. This is
-  where an undialable address (e.g. an observer's `127.0.0.1`) shows up.
+Several metrics expose this off the existing metrics port; all carry a `peer_addr` token so one
+grep catches them:
 
 ```
-curl -s localhost:<metrics_port>/metrics | grep -E 'kad_known_peer|advertised_peer_addr'
+curl -s localhost:<metrics_port>/metrics | grep peer_addr
 ```
 
-The churn set — "trying to dial, never connected" — is the advertised targets with no matching
-routing-table entry. In PromQL:
+Per swarm (`_primary` / `_worker`), refreshed every 15s:
 
-```
-advertised_peer_addr_worker unless on(peer_id) kad_known_peer_worker
-```
+- `kad_known_peer_addr_*` — the kademlia routing table (`kbuckets`): peers this node is
+  **connected** to and the resolved address in use. Populated only on a successful connect, so
+  unreachable peers never appear here.
+- `advertised_peer_addr_*` — the peer-manager's `known_peers`: addresses peers **advertised**
+  (DHT record / committee) that this node will redial, incl. peers it never connected to.
+- `discovery_peer_addr_*` — the peer-manager's `discovery_peers`: candidates learned from
+  other nodes' routing tables via `get_closest_peers`, dialed on the heartbeat. Note this map is
+  drained as it dials, so a fast-churning entry is often absent at snapshot time.
 
-Any peer_id that appears in `advertised_peer_addr_*` but not in `kad_known_peer_*` is one this
-node keeps attempting but cannot reach — the dial-churn / counted-but-unreachable candidates.
+And a counter (labelled `kad_type`):
+
+- `dial_peer_addr_failures{peer_id,multiaddr,swarm}` — increments once per attempted address on
+  every failed outbound dial. This is the **reliable churn signal**: a climbing count for an
+  unreachable address (e.g. a cross-host `127.0.0.1`) shows up regardless of which path issued
+  the dial — kad iterative query, discovery heartbeat, or committee redial — including
+  kad-internal dials that never sit in an app-side map for the gauges to catch.
+
+The gauge-diff "trying to dial, never connected" is `advertised_peer_addr_worker unless
+on(peer_id) kad_known_peer_addr_worker`; for the full picture (incl. discovery / kad-internal
+churn) watch `rate(dial_peer_addr_failures[5m])` by `multiaddr`.
 
 ## Source anchors
 

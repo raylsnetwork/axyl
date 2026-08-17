@@ -6,7 +6,12 @@ use crate::{
     ConsensusNetwork,
 };
 use futures::StreamExt as _;
-use libp2p::{core::transport::ListenerId, kad::Mode, swarm::SwarmEvent, Multiaddr};
+use libp2p::{
+    core::transport::ListenerId,
+    kad::Mode,
+    swarm::{DialError, SwarmEvent},
+    Multiaddr, PeerId,
+};
 use rayls_infrastructure_types::{Database, RaylsSender};
 use std::time::{Duration, Instant};
 use tracing::{debug, error, info, instrument, warn};
@@ -44,10 +49,12 @@ where
         // back restores the node's reachability without a restart.
         let mut relay_retry = tokio::time::interval(Duration::from_secs(15));
 
-        // Refresh the peer-address gauges (`kad_known_peer_*` and `advertised_peer_addr_*`) on a
-        // fixed 15s cadence. Kept as its own time-based interval (not the cleanup block, which
-        // also fires every 1000 events) so a busy node can't turn it into a per-event storm. The
-        // first tick fires immediately for an initial snapshot.
+        // Refresh the peer-address gauges (`kad_known_peer_addr_*`, `advertised_peer_addr_*`,
+        // `discovery_peer_addr_*`) on a fixed 15s cadence. Kept as its own time-based interval (not
+        // the cleanup block, which also fires every 1000 events) so a busy node can't turn it into
+        // a per-event storm. The first tick fires immediately for an initial snapshot. (All three
+        // gauges above are refreshed here; the `dial_peer_addr_failures` counter is event-driven,
+        // updated in `record_dial_failure`, not refreshed here.)
         let mut peer_addr_metrics_refresh = tokio::time::interval(Duration::from_secs(15));
 
         loop {
@@ -264,9 +271,29 @@ where
 
                 self.handle_listener_closed(listener_id, &addresses)?;
             }
+            SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
+                self.record_dial_failure(peer_id, &error);
+            }
             // other events handled by peer manager and other behaviors
             _ => {}
         }
         Ok(())
+    }
+
+    /// Record a failed outbound dial into the `dial_peer_addr_failures` counter, one increment per
+    /// attempted address. Captures churn from every dial path (kad iterative query, discovery
+    /// heartbeat, committee redial) at a single point -- including kad-internal dials that
+    /// never land in an app-side map -- so an unreachable target (e.g. a cross-host
+    /// `127.0.0.1`) shows a climbing count in the metrics.
+    fn record_dial_failure(&self, peer_id: Option<PeerId>, error: &DialError) {
+        // Only the transport variant enumerates the addresses actually attempted.
+        let DialError::Transport(addrs) = error else { return };
+        let peer = peer_id.map(|p| p.to_string()).unwrap_or_else(|| "unknown".to_string());
+        for (addr, _) in addrs {
+            self.network_metrics
+                .dial_peer_addr_failures
+                .with_label_values(&[peer.as_str(), addr.to_string().as_str(), self.network_label])
+                .inc();
+        }
     }
 }

@@ -853,6 +853,18 @@ impl PeerManager {
             .collect()
     }
 
+    /// Snapshot the kad-discovery dial candidates in `discovery_peers` as `(peer_id, multiaddr)`
+    /// pairs. These are peers learned from other nodes' routing tables via `get_closest_peers` and
+    /// dialed on the heartbeat -- the path by which a cross-host-unreachable address (e.g. a
+    /// co-located peer's `127.0.0.1`) becomes dial churn. Exposed for the `discovery_peer_addr_*`
+    /// metric.
+    pub(crate) fn discovery_peer_addrs(&self) -> Vec<(PeerId, Multiaddr)> {
+        self.discovery_peers
+            .iter()
+            .flat_map(|(peer_id, addrs)| addrs.iter().map(move |addr| (*peer_id, addr.clone())))
+            .collect()
+    }
+
     /// Rayls: Remove oldest known peers when exceeding maximum size.
     fn cleanup_known_peers(&mut self) {
         if self.known_peers.len() <= MAX_KNOWN_PEERS {
