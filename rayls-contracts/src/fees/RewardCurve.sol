@@ -23,6 +23,13 @@ contract RewardCurve is Initializable, UUPSUpgradeable, AccessControlUpgradeable
     bytes32 public constant UPGRADER_ROLE = keccak256("UPGRADER_ROLE");
     uint256 public constant BPS_DENOMINATOR = 10_000;
     uint256 public constant MONTHS_PER_YEAR = 12;
+    /// @notice Defensive overflow backstop on individual monthly emission values, not a policy
+    ///         cap: 1 trillion RLS/month is orders of magnitude beyond any plausible network
+    ///         emission, but bounding it means `(base + variable) * MONTHS_PER_YEAR *
+    ///         BPS_DENOMINATOR` can never overflow uint256, so a bad `recordRevenue` call (from
+    ///         revenueReporter, a lower-trust role than DEFAULT_ADMIN_ROLE) can no longer
+    ///         permanently revert every view function until an admin calls resetMonthlyRevenue.
+    uint256 public constant MAX_MONTHLY_EMISSION = 1_000_000_000_000e18;
 
     /// @custom:storage-location erc7201:rewardcurve.storage.v1
     struct RewardCurveStorage {
@@ -126,10 +133,13 @@ contract RewardCurve is Initializable, UUPSUpgradeable, AccessControlUpgradeable
     function previewCurve(
         uint256[] calldata stakeLevels
     ) external view override returns (uint256[] memory apyBpsAtLevel) {
+        RewardCurveStorage storage $ = _getRewardCurveStorage();
+        uint256 emissionAnnual = ($.baseMonthlyEmission + $.variableMonthlyEmission) * MONTHS_PER_YEAR;
+
         uint256 len = stakeLevels.length;
         apyBpsAtLevel = new uint256[](len);
         for (uint256 i; i < len; ++i) {
-            apyBpsAtLevel[i] = _currentApyBps(stakeLevels[i]);
+            apyBpsAtLevel[i] = _apyBps(emissionAnnual, stakeLevels[i]);
         }
     }
 
@@ -150,6 +160,7 @@ contract RewardCurve is Initializable, UUPSUpgradeable, AccessControlUpgradeable
 
     /// @inheritdoc IRewardCurve
     function setBaseMonthlyEmission(uint256 newBase) external override onlyRole(DEFAULT_ADMIN_ROLE) {
+        if (newBase > MAX_MONTHLY_EMISSION) revert EmissionTooLarge();
         RewardCurveStorage storage $ = _getRewardCurveStorage();
         uint256 oldBase = $.baseMonthlyEmission;
         $.baseMonthlyEmission = newBase;
@@ -160,8 +171,10 @@ contract RewardCurve is Initializable, UUPSUpgradeable, AccessControlUpgradeable
     function recordRevenue(uint256 amount) external override onlyRevenueReporter {
         if (amount == 0) revert ZeroAmount();
         RewardCurveStorage storage $ = _getRewardCurveStorage();
-        $.variableMonthlyEmission += amount;
-        emit RevenueRecorded(amount, $.variableMonthlyEmission);
+        uint256 newVariable = $.variableMonthlyEmission + amount;
+        if (newVariable > MAX_MONTHLY_EMISSION) revert EmissionTooLarge();
+        $.variableMonthlyEmission = newVariable;
+        emit RevenueRecorded(amount, newVariable);
     }
 
     /// @inheritdoc IRewardCurve

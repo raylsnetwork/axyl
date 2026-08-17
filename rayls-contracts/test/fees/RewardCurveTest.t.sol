@@ -227,6 +227,34 @@ contract RewardCurveTest is Test {
         curve.setRevenueReporter(stranger);
     }
 
+    function test_setBaseMonthlyEmission_aboveMax_reverts() public {
+        // Read the constant into a local BEFORE arming prank/expectRevert — calling
+        // curve.MAX_MONTHLY_EMISSION() inline as an argument expression would itself be the
+        // "next call" that consumes both cheatcodes, before setBaseMonthlyEmission ever runs.
+        uint256 maxEmission = curve.MAX_MONTHLY_EMISSION();
+        vm.expectRevert(IRewardCurve.EmissionTooLarge.selector);
+        vm.prank(admin);
+        curve.setBaseMonthlyEmission(maxEmission + 1);
+    }
+
+    function test_recordRevenue_aboveMax_reverts() public {
+        uint256 maxEmission = curve.MAX_MONTHLY_EMISSION();
+        vm.prank(reporter);
+        curve.recordRevenue(maxEmission);
+
+        // Already at the ceiling — one more wei pushes the sum over it.
+        vm.expectRevert(IRewardCurve.EmissionTooLarge.selector);
+        vm.prank(reporter);
+        curve.recordRevenue(1);
+    }
+
+    function test_setBaseMonthlyEmission_atMax_succeeds() public {
+        uint256 maxEmission = curve.MAX_MONTHLY_EMISSION();
+        vm.prank(admin);
+        curve.setBaseMonthlyEmission(maxEmission);
+        assertEq(curve.baseMonthlyEmission(), maxEmission);
+    }
+
     function test_resetMonthlyRevenue_zeroesAccumulator_emitsEvent() public {
         vm.prank(reporter);
         curve.recordRevenue(42_000e18);
