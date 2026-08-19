@@ -276,23 +276,22 @@ impl CommitteeSlots {
     }
 }
 
-/// Validation of a peer's batch and admission of transactions received from other nodes.
-///
-/// Invalid transactions receive no further processing.
+/// Validation and admission of transactions, whether forwarded singly or received in a peer's
+/// batch.
 #[async_trait::async_trait]
 pub trait BatchValidation: Send + Sync + Debug {
     /// Determines whether this batch can be voted on.
-    async fn validate_batch(&self, b: SealedBatch) -> Result<(), BatchValidationError>;
+    async fn validate_batch(&self, b: &SealedBatch) -> Result<(), BatchValidationError>;
 
-    /// Admit a gossiped transaction message to the pool if its first transaction maps to a slot
-    /// this validator covers.
+    /// Submits encoded transactions to this node's pool, but only when the first transaction's
+    /// sender maps to a slot this validator covers.
     fn submit_batch_if_mine(
         &self,
         tx_bytes: &[Bytes],
         slots: &CommitteeSlots,
     ) -> Result<(), SubmitBatchError>;
 
-    /// Admit transactions forwarded directly by an observer, returning the hashes rejected as
+    /// Admits transactions forwarded directly by an observer, returning the hashes rejected as
     /// stale (already executed) so the sender stops re-forwarding them.
     ///
     /// Takes the decoded bytes by value so the owned buffer moves into the blocking recovery task

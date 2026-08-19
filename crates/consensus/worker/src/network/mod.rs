@@ -611,7 +611,7 @@ impl<DB: Database> PrimaryToWorkerClient for PrimaryReceiverHandler<DB> {
         for sealed_batch in sealed_batches_from_response.into_iter() {
             if !message.is_certified {
                 // This batch is not part of a certificate, so we need to validate it.
-                if let Err(err) = self.validator.validate_batch(sealed_batch.clone()).await {
+                if let Err(err) = self.validator.validate_batch(&sealed_batch).await {
                     return Err(eyre::eyre!("Invalid batch: {err}"));
                 }
             }
