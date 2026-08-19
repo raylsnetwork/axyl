@@ -518,6 +518,13 @@ MULTI_LISTEN="${MULTI_LISTEN:-0}"
 MULTI_LISTEN_BIND="${MULTI_LISTEN_BIND:-127.0.0.1}"
 PRIMARY_DIRECT_BASE=40000
 WORKER_DIRECT_BASE=41000
+# Observer p2p listener bind. Default 0.0.0.0 (all interfaces): libp2p-QUIC dials out of its
+# listener socket, so a 127.0.0.1-bound observer sources outbound packets from loopback and CANNOT
+# reach a routable relay (e.g. a cross-host node advertising a private address) -- those dials time
+# out forever. Without an explicit listener the node falls back to node-info's 127.0.0.1:<auto>, so
+# the bug bites any mixed loopback+routable topology. Loopback is a subset of 0.0.0.0, so pure
+# single-host testnets are unaffected. Matches add-observer.sh and how observers run on main.
+OBSERVER_LISTEN_HOST="${OBSERVER_LISTEN_HOST:-0.0.0.0}"
 # Precomputed for up to 32 validators (seed = byte (index+1) repeated 32x; peer id derived by
 # rayls-relay). Extend by running the relay with the next seed and reading its logged peer id.
 RELAY_PEER_IDS=(
@@ -869,9 +876,15 @@ if [ "$START" = true ]; then
             # the local dnsmasq -- otherwise it queries the system/public resolver, gets NXDomain
             # for *.rayls.test, resolves no circuits, and never connects to the committee. Observers
             # don't reserve on relays (peers don't dial them), so only the resolver env is needed.
-            OBSERVER_ENV=()
+            # Bind the p2p listeners on OBSERVER_LISTEN_HOST (default 0.0.0.0) instead of node-info's
+            # 127.0.0.1 fallback, so outbound QUIC can reach routable relays. Ports mirror
+            # add-observer.sh: primary 49000+instance / worker 49100+instance.
+            OBSERVER_ENV=(
+                "PRIMARY_LISTENER_MULTIADDR=/ip4/${OBSERVER_LISTEN_HOST}/udp/$((49000 + OBSERVER_INSTANCE))/quic-v1"
+                "WORKER_LISTENER_MULTIADDR=/ip4/${OBSERVER_LISTEN_HOST}/udp/$((49100 + OBSERVER_INSTANCE))/quic-v1"
+            )
             if [[ "$RELAY_DNS_MODE" == "true" ]]; then
-                OBSERVER_ENV=("RAYLS_DNS_SERVER=127.0.0.1:${DNSMASQ_PRIVATE_PORT}")
+                OBSERVER_ENV+=("RAYLS_DNS_SERVER=127.0.0.1:${DNSMASQ_PRIVATE_PORT}")
             fi
             env "${OBSERVER_ENV[@]}" "$scriptDir/../../target/${BUILD_CONFIG}/rayls-network" node \
                 --datadir "${ROOTDIR}/${OBSERVER}" \
