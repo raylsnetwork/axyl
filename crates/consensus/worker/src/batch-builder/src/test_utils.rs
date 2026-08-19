@@ -49,6 +49,11 @@ impl TxPool for TestPool {
         self.transactions.retain(|tx| !tx.is_eip4844());
         self.by_id.retain(|_, tx| !tx.is_eip4844());
     }
+
+    fn is_in_flight(&self, _tx_hash: &TxHash) -> bool {
+        // the test pool holds no in-flight tracker; seal-dedup is covered against the real pool.
+        false
+    }
 }
 
 impl TestPool {

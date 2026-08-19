@@ -11,7 +11,7 @@ use rayls_consensus_worker::{
 };
 use rayls_execution_evm::{
     payload::BuildArguments, recover_raw_transaction, reth_env::RethEnv,
-    test_utils::TransactionFactory, RethChainSpec,
+    test_utils::TransactionFactory, RethChainSpec, TxPool as _,
 };
 use rayls_infrastructure_network_types::{local::LocalNetwork, MockWorkerToPrimary};
 use rayls_infrastructure_storage::{open_db, tables::Batches};
@@ -197,11 +197,13 @@ async fn test_make_batch_el_to_cl() {
         .expect("batch in store");
     assert_eq!(batch_from_store.beneficiary, address);
 
-    // txpool should be empty after mining
-    // test_make_batch_no_ack_txs_in_pool_still tests for txs in pool without mining event
-    let pending_pool_len = txpool.pool_size().pending;
+    // Sealed transactions are marked in flight, not evicted, so they stay pending (RPC-visible)
+    // until execution drains them; every pending tx here reached quorum, so none is re-sealable.
+    // (test_make_batch_no_ack_txs_in_pool_still covers the no-quorum case.)
+    let pending = txpool.pending_transactions();
     debug!("pool_size(): {:?}", txpool.pool_size());
-    assert_eq!(pending_pool_len, 0);
+    assert_eq!(pending.len(), 3);
+    assert!(pending.iter().all(|tx| txpool.is_in_flight(tx.hash())));
 }
 
 /// Create 5 transactions.
@@ -391,10 +393,13 @@ async fn test_batch_builder_produces_valid_batches() {
     // yield to try and give pool a chance to update
     tokio::task::yield_now().await;
 
-    // assert all transactions mined/removed
+    // Sealed transactions are marked in flight, not evicted: they stay pending until execution.
+    // All four reached quorum across the two batches, so all are in flight; the blob was discarded.
     let pool_size = txpool.pool_size();
-    assert_eq!(pool_size.pending, 0);
+    assert_eq!(pool_size.pending, 4);
     assert_eq!(pool_size.blob, 0);
+    let pending = txpool.pending_transactions();
+    assert!(pending.iter().all(|tx| txpool.is_in_flight(tx.hash())));
 }
 
 /// Create 4 transactions.
@@ -573,8 +578,11 @@ async fn test_canonical_notification_updates_pool() {
     // yield to try and give pool a chance to update
     tokio::task::yield_now().await;
 
-    // assert pool empty
+    // tx1-3 executed and drained; the 4th was sealed to quorum, so it is marked in flight and
+    // stays pending (RPC-visible) until it too executes.
     let pool_size = txpool.pool_size();
     assert_eq!(pool_size.queued, 0);
-    assert_eq!(pool_size.pending, 0);
+    assert_eq!(pool_size.pending, 1);
+    let pending = txpool.pending_transactions();
+    assert!(pending.iter().all(|tx| txpool.is_in_flight(tx.hash())));
 }
