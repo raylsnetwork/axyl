@@ -275,7 +275,7 @@ impl BatchOrderingHarness {
         let parent_header = self.parent_for_next_session(&reth_env);
 
         let store = self.ordering_store.as_ref().expect("ordering_store open").clone();
-        let batch_ordering = BatchOrdering::from_history(store, 0);
+        let batch_ordering = BatchOrdering::from_history(store, 0, &Default::default());
 
         let capacity = outputs.len().max(1);
         let (to_engine, from_consensus) = mpsc::channel(capacity);
