@@ -92,9 +92,10 @@ pub mod tables {
     #[cfg(feature = "cold-storage")]
     use crate::cold::ColdLocation;
     use rayls_infrastructure_types::{
-        batch_ordering::BatchOrderingState as TypeBatchOrderingState, AuthorityIdentifier, Batch,
-        BlockHash, Certificate, CertificateDigest, ConsensusHeader, Epoch, EpochCertificate,
-        EpochRecord, EpochTransitionCheckpoint, Header, Round, VoteInfo, WorkerId, B256,
+        batch_ordering::StoredBatchOrderingState as TypeStoredBatchOrderingState,
+        AuthorityIdentifier, Batch, BlockHash, Certificate, CertificateDigest, ConsensusHeader,
+        Epoch, EpochCertificate, EpochRecord, EpochTransitionCheckpoint, Header, Round, VoteInfo,
+        WorkerId, B256,
     };
 
     tables!(
@@ -131,7 +132,7 @@ pub mod tables {
         // Node identity: stores this validator's AuthorityIdentifier for foreign DB detection.
         NodeIdentity;crate::NODE_IDENTITY_CF;<u8, AuthorityIdentifier>,
         // Batch ordering state for the current epoch.
-        BatchOrderingState;crate::BATCH_ORDERING_STATE_CF;<u8, TypeBatchOrderingState>
+        BatchOrderingState;crate::BATCH_ORDERING_STATE_CF;<u8, TypeStoredBatchOrderingState>
     );
 
     // Cold-tier tables, compiled only with the `cold-storage` feature.
