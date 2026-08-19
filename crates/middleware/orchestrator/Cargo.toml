@@ -36,7 +36,6 @@ rayls-batch-validator = { workspace = true }
 jsonrpsee = { workspace = true }
 roaring = { workspace = true }
 alloy = { workspace = true}
-rayon = { workspace = true }
 # The consensus-DB process-exclusivity lock (reth's PID-liveness StorageLock).
 reth-db = { workspace = true, optional = true }
 
