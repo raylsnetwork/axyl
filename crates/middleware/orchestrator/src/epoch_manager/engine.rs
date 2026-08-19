@@ -13,7 +13,7 @@ where
     P: RaylsDirs + Clone + 'static,
     DB: ReDatabase,
 {
-    /// Helper method to create all engine components.
+    /// Builds the execution node for this epoch manager.
     pub(super) async fn create_engine(
         &self,
         engine_task_manager: &TaskManager,
@@ -34,13 +34,15 @@ where
         Ok(engine)
     }
 
-    /// Spawn a node-scoped task to update `ConsensusBus::recently_executed_blocks` every time the
-    /// engine produces a new final block. This task must outlive individual epochs because the
-    /// engine continues executing queued outputs after epoch shutdown.
+    /// Spawns the node-scoped task that records each executed block on
+    /// `ConsensusBus::recently_executed_blocks` and runs the periodic gap check and in-flight
+    /// mark sweep. Node-scoped because the engine keeps executing queued outputs after an epoch
+    /// shuts down.
     pub(super) fn spawn_engine_update_task(
         &self,
         shutdown_rx: Noticer,
         mut engine_state: CanonStateNotificationStream,
+        engine: ExecutionNode,
         task_manager: &TaskManager,
     ) {
         let consensus_bus = self.consensus_bus.clone();
@@ -63,6 +65,16 @@ where
                     }
                     _ = gap_check_interval.tick() => {
                         consensus_bus.batch_tracker().check_gaps();
+                        // Pools are fetched per tick: workers are created during the first epoch,
+                        // after this node-scoped task starts.
+                        let anchor = consensus_bus.executed_anchor().borrow().number;
+                        for pool in engine.get_all_worker_transaction_pools().await {
+                            // Seal marks age out via the TTL sweep. Forward marks have no sweep,
+                            // so the O(pending) membership reconcile runs here too: its only other
+                            // driver is the canonical-stream task, which a burst can starve.
+                            pool.in_flight().sweep_due(anchor);
+                            pool.reconcile_in_flight();
+                        }
                     }
                 )
             }
