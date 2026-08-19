@@ -761,7 +761,8 @@ fn db_run<DB: Database>(
                                 mem_db.evict_if_needed(&mut eviction_heap, max_size);
                             }
                             // The txn's rows stay in mem with their in-flight counts, so a failed
-                            // commit is retained (not lost, not evictable) and surfaced via persist.
+                            // commit is retained (not lost, not evictable) and surfaced via
+                            // persist.
                             Err(e) => {
                                 committed_ops.clear();
                                 tracing::error!(target: "layered_db_runner", "consensus DB commit failed: {e}");
@@ -1600,181 +1601,196 @@ mod test {
     }
 
     /// Insert a burst of keys into a tiny cache and confirm the writer evicts settled keys in
-/// recency order until the cache fits `max_size`, with the newest rows surviving in mem.
-#[test]
-fn eviction_keeps_cache_at_max_size_and_evicts_oldest_settled() {
-    let inner = MemDatabase::new();
-    inner.open_table::<TestTable>().expect("open inner table");
-    let db = LayeredDatabase::open_with_config(inner, CacheConfig { max_size: 3 });
-    db.open_table::<TestTable>().expect("open layered table");
+    /// recency order until the cache fits `max_size`, with the newest rows surviving in mem.
+    #[test]
+    fn eviction_keeps_cache_at_max_size_and_evicts_oldest_settled() {
+        let inner = MemDatabase::new();
+        inner.open_table::<TestTable>().expect("open inner table");
+        let db = LayeredDatabase::open_with_config(inner, CacheConfig { max_size: 3 });
+        db.open_table::<TestTable>().expect("open layered table");
 
-    for i in 0..10u64 {
-        db.insert::<TestTable>(&i, &format!("v{i}")).expect("insert");
+        for i in 0..10u64 {
+            db.insert::<TestTable>(&i, &format!("v{i}")).expect("insert");
+        }
+        db.sync_persist();
+
+        assert_eq!(db.mem_db.mem_size(), 3, "cache must be trimmed to max_size");
+        // The newest rows survive hot; older ones fall through to the persistent tier.
+        for i in 0..10u64 {
+            assert_eq!(
+                db.get::<TestTable>(&i).unwrap().as_deref(),
+                Some(format!("v{i}").as_str()),
+                "every key must still be readable after eviction"
+            );
+        }
+        for i in 7..10u64 {
+            assert!(
+                db.mem_db.contains_key::<TestTable>(&i).unwrap(),
+                "newest key {i} must stay hot"
+            );
+        }
+        for i in 0..7u64 {
+            assert!(
+                !db.mem_db.contains_key::<TestTable>(&i).unwrap(),
+                "settled key {i} must be evicted"
+            );
+        }
     }
-    db.sync_persist();
 
-    assert_eq!(db.mem_db.mem_size(), 3, "cache must be trimmed to max_size");
-    // The newest rows survive hot; older ones fall through to the persistent tier.
-    for i in 0..10u64 {
+    /// A tombstone whose remove is still queued must not be evicted, even when the cache is over
+    /// its cap: the row shields reads from the persistent tier until the delete lands. Once the
+    /// remove applies, the tombstone settles and becomes an eviction candidate.
+    #[test]
+    fn eviction_waits_for_in_flight_ops() {
+        let inner = MemDatabase::new();
+        inner.open_table::<TestTable>().expect("open inner table");
+        let db = LayeredDatabase::open_with_config(inner, CacheConfig { max_size: 1 });
+        db.open_table::<TestTable>().expect("open layered table");
+
+        // Two gates park the writer mid-drain so the in-flight window is observable.
+        let (release, gate1) = std::sync::mpsc::channel::<()>();
+        let (release2, gate2) = std::sync::mpsc::channel::<()>();
+        db.tx.send(DBMessage::Insert(Box::new(WriterGate(gate1)))).expect("gate1 enqueue");
+        db.insert::<TestTable>(&1, &"one".to_string()).expect("insert k1");
+        db.tx.send(DBMessage::Insert(Box::new(WriterGate(gate2)))).expect("gate2 enqueue");
+        db.remove::<TestTable>(&1).expect("remove k1");
+        db.insert::<TestTable>(&2, &"two".to_string()).expect("insert k2");
+
+        // Let the writer drain past K1's insert, then park again: K1's tombstone and K2's row are
+        // both in flight (count > 0), so eviction (run at every apply) must not drop anything even
+        // though the cache holds 2 rows against a cap of 1.
+        drop(release);
+        std::thread::sleep(std::time::Duration::from_millis(100));
         assert_eq!(
-            db.get::<TestTable>(&i).unwrap().as_deref(),
-            Some(format!("v{i}").as_str()),
-            "every key must still be readable after eviction"
+            db.mem_db.mem_size(),
+            2,
+            "in-flight rows must not be evicted while ops are queued"
+        );
+        assert!(
+            db.mem_db.is_tombstoned::<TestTable>(&1),
+            "K1's tombstone must survive while queued"
+        );
+        drop(release2);
+        db.sync_persist();
+
+        // The remove applied, so K1's settled tombstone is now evictable; only K2 stays hot.
+        assert_eq!(db.mem_db.mem_size(), 1, "settled rows must be trimmed to max_size");
+        assert!(
+            !db.mem_db.is_tombstoned::<TestTable>(&1),
+            "K1 tombstone must be evicted post-apply"
+        );
+        assert!(db.mem_db.contains_key::<TestTable>(&2).unwrap(), "K2 must stay hot");
+        assert_eq!(db.get::<TestTable>(&1).unwrap(), None, "K1 is durably removed");
+        assert_eq!(db.get::<TestTable>(&2).unwrap(), Some("two".to_string()));
+    }
+
+    /// A tombstone for a key that was never in the cache (deleted from the persistent tier only)
+    /// must not leak: it settles when the remove applies and is evicted like any other row.
+    #[test]
+    fn removed_never_inserted_tombstone_is_evicted() {
+        let inner = MemDatabase::new();
+        inner.open_table::<TestTable>().expect("open inner table");
+        let db = LayeredDatabase::open_with_config(inner, CacheConfig { max_size: 1 });
+        db.open_table::<TestTable>().expect("open layered table");
+
+        db.remove::<TestTable>(&999).expect("remove never-inserted key");
+        db.insert::<TestTable>(&1, &"one".to_string()).expect("insert");
+        db.insert::<TestTable>(&2, &"two".to_string()).expect("insert");
+        db.sync_persist();
+
+        assert_eq!(db.get::<TestTable>(&999).unwrap(), None);
+        assert!(!db.mem_db.is_tombstoned::<TestTable>(&999), "stray tombstone must be evicted");
+        assert_eq!(db.mem_db.mem_size(), 1, "cache must be trimmed");
+    }
+
+    /// A `clear_table` tombstones every cached row and holds them (in flight) until the persistent
+    /// clear lands; only then are the tombstones released and evicted.
+    #[test]
+    fn clear_tombstones_are_held_until_the_persistent_clear_lands() {
+        let inner = MemDatabase::new();
+        inner.open_table::<TestTable>().expect("open inner table");
+        let db = LayeredDatabase::open_with_config(inner, CacheConfig { max_size: 2 });
+        db.open_table::<TestTable>().expect("open layered table");
+
+        db.insert::<TestTable>(&1, &"one".to_string()).expect("insert");
+        db.insert::<TestTable>(&2, &"two".to_string()).expect("insert");
+        db.insert::<TestTable>(&3, &"three".to_string()).expect("insert");
+        db.clear_table::<TestTable>().expect("clear");
+        db.insert::<TestTable>(&4, &"four".to_string()).expect("insert");
+        db.sync_persist();
+
+        assert_eq!(db.get::<TestTable>(&1).unwrap(), None);
+        assert_eq!(db.get::<TestTable>(&2).unwrap(), None);
+        assert_eq!(db.get::<TestTable>(&3).unwrap(), None);
+        assert_eq!(db.get::<TestTable>(&4).unwrap(), Some("four".to_string()));
+        assert_eq!(db.mem_db.mem_size(), 2, "cleared tombstones settle and are evicted");
+    }
+
+    /// Reading a hot key refreshes its recency (lock-free, throttled), so it survives eviction over
+    /// a sibling that settled at the same time but was never read since.
+    #[test]
+    fn read_recency_protects_a_hot_key() {
+        let inner = MemDatabase::new();
+        inner.open_table::<TestTable>().expect("open inner table");
+        let db = LayeredDatabase::open_with_config(inner, CacheConfig { max_size: 2 });
+        db.open_table::<TestTable>().expect("open layered table");
+
+        for i in 1..=3u64 {
+            db.insert::<TestTable>(&i, &format!("v{i}")).expect("insert");
+        }
+        db.sync_persist();
+        // 1 settled first and was evicted; 2 and 3 are hot.
+        assert!(db.mem_db.contains_key::<TestTable>(&2).unwrap());
+        assert!(db.mem_db.contains_key::<TestTable>(&3).unwrap());
+
+        // Cross the recency throttle window, then read key 2: its clock bumps.
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        assert_eq!(db.get::<TestTable>(&2).unwrap(), Some("v2".to_string()));
+
+        // Overflow the cache: without the read bump, key 2 (settled first) would be evicted.
+        db.insert::<TestTable>(&4, &"v4".to_string()).expect("insert");
+        db.sync_persist();
+
+        assert_eq!(db.mem_db.mem_size(), 2);
+        assert!(db.mem_db.contains_key::<TestTable>(&2).unwrap(), "read key must stay hot");
+        assert!(db.mem_db.contains_key::<TestTable>(&4).unwrap(), "newest key must stay hot");
+        assert!(
+            !db.mem_db.contains_key::<TestTable>(&3).unwrap(),
+            "unread sibling must be evicted"
         );
     }
-    for i in 7..10u64 {
-        assert!(db.mem_db.contains_key::<TestTable>(&i).unwrap(), "newest key {i} must stay hot");
+
+    /// Remove-then-reinsert of the same key must not leak its in-flight count: the remove's apply
+    /// is skipped by the re-insert guard, but it still settles, so the row stays evictable.
+    #[test]
+    fn guard_skipped_remove_still_settles() {
+        let inner = MemDatabase::new();
+        inner.open_table::<TestTable>().expect("open inner table");
+        let db = LayeredDatabase::open_with_config(inner, CacheConfig { max_size: 1 });
+        db.open_table::<TestTable>().expect("open layered table");
+
+        db.insert::<TestTable>(&1, &"v1".to_string()).expect("insert");
+        db.remove::<TestTable>(&1).expect("remove");
+        db.insert::<TestTable>(&1, &"v3".to_string()).expect("reinsert");
+        db.insert::<TestTable>(&2, &"v2".to_string()).expect("insert");
+        db.insert::<TestTable>(&3, &"v3".to_string()).expect("insert");
+        db.sync_persist();
+
+        assert_eq!(db.get::<TestTable>(&1).unwrap(), Some("v3".to_string()));
+        assert_eq!(db.mem_db.mem_size(), 1, "no in-flight leak: the row is evictable");
     }
-    for i in 0..7u64 {
-        assert!(!db.mem_db.contains_key::<TestTable>(&i).unwrap(), "settled key {i} must be evicted");
-    }
-}
 
-/// A tombstone whose remove is still queued must not be evicted, even when the cache is over its
-/// cap: the row shields reads from the persistent tier until the delete lands. Once the remove
-/// applies, the tombstone settles and becomes an eviction candidate.
-#[test]
-fn eviction_waits_for_in_flight_ops() {
-    let inner = MemDatabase::new();
-    inner.open_table::<TestTable>().expect("open inner table");
-    let db = LayeredDatabase::open_with_config(inner, CacheConfig { max_size: 1 });
-    db.open_table::<TestTable>().expect("open layered table");
-
-    // Two gates park the writer mid-drain so the in-flight window is observable.
-    let (release, gate1) = std::sync::mpsc::channel::<()>();
-    let (release2, gate2) = std::sync::mpsc::channel::<()>();
-    db.tx.send(DBMessage::Insert(Box::new(WriterGate(gate1)))).expect("gate1 enqueue");
-    db.insert::<TestTable>(&1, &"one".to_string()).expect("insert k1");
-    db.tx.send(DBMessage::Insert(Box::new(WriterGate(gate2)))).expect("gate2 enqueue");
-    db.remove::<TestTable>(&1).expect("remove k1");
-    db.insert::<TestTable>(&2, &"two".to_string()).expect("insert k2");
-
-    // Let the writer drain past K1's insert, then park again: K1's tombstone and K2's row are
-    // both in flight (count > 0), so eviction (run at every apply) must not drop anything even
-    // though the cache holds 2 rows against a cap of 1.
-    drop(release);
-    std::thread::sleep(std::time::Duration::from_millis(100));
-    assert_eq!(
-        db.mem_db.mem_size(),
-        2,
-        "in-flight rows must not be evicted while ops are queued"
-    );
-    assert!(db.mem_db.is_tombstoned::<TestTable>(&1), "K1's tombstone must survive while queued");
-    drop(release2);
-    db.sync_persist();
-
-    // The remove applied, so K1's settled tombstone is now evictable; only K2 stays hot.
-    assert_eq!(db.mem_db.mem_size(), 1, "settled rows must be trimmed to max_size");
-    assert!(!db.mem_db.is_tombstoned::<TestTable>(&1), "K1 tombstone must be evicted post-apply");
-    assert!(db.mem_db.contains_key::<TestTable>(&2).unwrap(), "K2 must stay hot");
-    assert_eq!(db.get::<TestTable>(&1).unwrap(), None, "K1 is durably removed");
-    assert_eq!(db.get::<TestTable>(&2).unwrap(), Some("two".to_string()));
-}
-
-/// A tombstone for a key that was never in the cache (deleted from the persistent tier only)
-/// must not leak: it settles when the remove applies and is evicted like any other row.
-#[test]
-fn removed_never_inserted_tombstone_is_evicted() {
-    let inner = MemDatabase::new();
-    inner.open_table::<TestTable>().expect("open inner table");
-    let db = LayeredDatabase::open_with_config(inner, CacheConfig { max_size: 1 });
-    db.open_table::<TestTable>().expect("open layered table");
-
-    db.remove::<TestTable>(&999).expect("remove never-inserted key");
-    db.insert::<TestTable>(&1, &"one".to_string()).expect("insert");
-    db.insert::<TestTable>(&2, &"two".to_string()).expect("insert");
-    db.sync_persist();
-
-    assert_eq!(db.get::<TestTable>(&999).unwrap(), None);
-    assert!(!db.mem_db.is_tombstoned::<TestTable>(&999), "stray tombstone must be evicted");
-    assert_eq!(db.mem_db.mem_size(), 1, "cache must be trimmed");
-}
-
-/// A `clear_table` tombstones every cached row and holds them (in flight) until the persistent
-/// clear lands; only then are the tombstones released and evicted.
-#[test]
-fn clear_tombstones_are_held_until_the_persistent_clear_lands() {
-    let inner = MemDatabase::new();
-    inner.open_table::<TestTable>().expect("open inner table");
-    let db = LayeredDatabase::open_with_config(inner, CacheConfig { max_size: 2 });
-    db.open_table::<TestTable>().expect("open layered table");
-
-    db.insert::<TestTable>(&1, &"one".to_string()).expect("insert");
-    db.insert::<TestTable>(&2, &"two".to_string()).expect("insert");
-    db.insert::<TestTable>(&3, &"three".to_string()).expect("insert");
-    db.clear_table::<TestTable>().expect("clear");
-    db.insert::<TestTable>(&4, &"four".to_string()).expect("insert");
-    db.sync_persist();
-
-    assert_eq!(db.get::<TestTable>(&1).unwrap(), None);
-    assert_eq!(db.get::<TestTable>(&2).unwrap(), None);
-    assert_eq!(db.get::<TestTable>(&3).unwrap(), None);
-    assert_eq!(db.get::<TestTable>(&4).unwrap(), Some("four".to_string()));
-    assert_eq!(db.mem_db.mem_size(), 2, "cleared tombstones settle and are evicted");
-}
-
-/// Reading a hot key refreshes its recency (lock-free, throttled), so it survives eviction over
-/// a sibling that settled at the same time but was never read since.
-#[test]
-fn read_recency_protects_a_hot_key() {
-    let inner = MemDatabase::new();
-    inner.open_table::<TestTable>().expect("open inner table");
-    let db = LayeredDatabase::open_with_config(inner, CacheConfig { max_size: 2 });
-    db.open_table::<TestTable>().expect("open layered table");
-
-    for i in 1..=3u64 {
-        db.insert::<TestTable>(&i, &format!("v{i}")).expect("insert");
-    }
-    db.sync_persist();
-    // 1 settled first and was evicted; 2 and 3 are hot.
-    assert!(db.mem_db.contains_key::<TestTable>(&2).unwrap());
-    assert!(db.mem_db.contains_key::<TestTable>(&3).unwrap());
-
-    // Cross the recency throttle window, then read key 2: its clock bumps.
-    std::thread::sleep(std::time::Duration::from_millis(150));
-    assert_eq!(db.get::<TestTable>(&2).unwrap(), Some("v2".to_string()));
-
-    // Overflow the cache: without the read bump, key 2 (settled first) would be evicted.
-    db.insert::<TestTable>(&4, &"v4".to_string()).expect("insert");
-    db.sync_persist();
-
-    assert_eq!(db.mem_db.mem_size(), 2);
-    assert!(db.mem_db.contains_key::<TestTable>(&2).unwrap(), "read key must stay hot");
-    assert!(db.mem_db.contains_key::<TestTable>(&4).unwrap(), "newest key must stay hot");
-    assert!(!db.mem_db.contains_key::<TestTable>(&3).unwrap(), "unread sibling must be evicted");
-}
-
-/// Remove-then-reinsert of the same key must not leak its in-flight count: the remove's apply
-/// is skipped by the re-insert guard, but it still settles, so the row stays evictable.
-#[test]
-fn guard_skipped_remove_still_settles() {
-    let inner = MemDatabase::new();
-    inner.open_table::<TestTable>().expect("open inner table");
-    let db = LayeredDatabase::open_with_config(inner, CacheConfig { max_size: 1 });
-    db.open_table::<TestTable>().expect("open layered table");
-
-    db.insert::<TestTable>(&1, &"v1".to_string()).expect("insert");
-    db.remove::<TestTable>(&1).expect("remove");
-    db.insert::<TestTable>(&1, &"v3".to_string()).expect("reinsert");
-    db.insert::<TestTable>(&2, &"v2".to_string()).expect("insert");
-    db.insert::<TestTable>(&3, &"v3".to_string()).expect("insert");
-    db.sync_persist();
-
-    assert_eq!(db.get::<TestTable>(&1).unwrap(), Some("v3".to_string()));
-    assert_eq!(db.mem_db.mem_size(), 1, "no in-flight leak: the row is evictable");
-}
-
-#[test]
-fn test_layereddb_contains_key() {
-    let temp_dir = tempdir().expect("failed to create temp dir");
-    #[cfg(feature = "redb")]
-    {
-        let db = open_redb(temp_dir.path());
+    #[test]
+    fn test_layereddb_contains_key() {
+        let temp_dir = tempdir().expect("failed to create temp dir");
+        #[cfg(feature = "redb")]
+        {
+            let db = open_redb(temp_dir.path());
+            test_contains_key(db);
+        }
+        let db = open_mdbx(temp_dir.path());
         test_contains_key(db);
     }
-    let db = open_mdbx(temp_dir.path());
-    test_contains_key(db);
-}
 
     #[test]
     fn test_layereddb_get() {
