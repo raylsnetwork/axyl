@@ -199,6 +199,16 @@ async fn test_make_batch_el_to_cl() {
         .expect("batch in store");
     assert_eq!(batch_from_store.beneficiary, address);
 
+    // The seal writes Batches only: nothing reads NodeBatchesCache any more, so a write there is
+    // a regression.
+    assert!(
+        store
+            .get::<rayls_infrastructure_storage::tables::NodeBatchesCache>(&expected_batch.digest())
+            .expect("cache read")
+            .is_none(),
+        "seal must not write the dead NodeBatchesCache table"
+    );
+
     // Sealed transactions are marked in flight, not evicted, so they stay pending (RPC-visible)
     // until execution drains them; every pending tx here reached quorum, so none is re-sealable.
     // (test_make_batch_no_ack_txs_in_pool_still covers the no-quorum case.)

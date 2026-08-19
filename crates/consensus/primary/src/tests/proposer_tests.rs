@@ -316,8 +316,7 @@ async fn test_retransmit_headers_on_gap() {
             worker_id: 1u16,
         });
 
-        proposer
-            .process_committed_headers(1, commited_headers.iter().map(|r| (*r, false)).collect());
+        proposer.process_committed_headers(1, commited_headers.to_vec());
 
         let updated_digests =
             proposer.digests.iter().map(|digest| digest.digest).collect::<Vec<_>>();

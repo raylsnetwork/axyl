@@ -341,9 +341,7 @@ struct ConsensusBusEpochInner {
     /// only if it already sent us its whole history.
     new_certificates: MeteredMpscChannel<Certificate>,
     /// Outputs the sequence of ordered certificates to the primary (for cleanup and feedback).
-    /// Each cert's `bool` is `true` when its committed subdag reaches the epoch boundary, so its
-    /// output is dropped by the subscriber cut and its batches must not be cleaned up.
-    committed_certificates: MeteredMpscChannel<(Round, Vec<(Certificate, bool)>)>,
+    committed_certificates: MeteredMpscChannel<(Round, Vec<Certificate>)>,
 
     /// Sends missing certificates to the `CertificateFetcher`.
     /// Receives certificates with missing parents from the `Synchronizer`.
@@ -359,9 +357,8 @@ struct ConsensusBusEpochInner {
     /// Updates when headers were committed by consensus.
     ///
     /// NOTE: this does not mean the header was executed yet.
-    /// Each round's `bool` is `true` when its commit reaches the epoch boundary (output dropped by
-    /// the subscriber cut), so the proposer must skip `NodeBatchesCache` cleanup for that header.
-    committed_own_headers: MeteredMpscChannel<(Round, Vec<(Round, bool)>)>,
+    /// Carries the rounds of this authority's own headers included in the commit.
+    committed_own_headers: MeteredMpscChannel<(Round, Vec<Round>)>,
 
     /// Outputs the sequence of ordered certificates to the application layer.
     sequence: MeteredMpscChannel<CommittedSubDag>,
@@ -507,7 +504,7 @@ impl ConsensusBus {
 
     /// Outputs the sequence of ordered certificates to the primary (for cleanup and feedback).
     /// Can only be subscribed to once.
-    pub fn committed_certificates(&self) -> &impl RaylsSender<(Round, Vec<(Certificate, bool)>)> {
+    pub fn committed_certificates(&self) -> &impl RaylsSender<(Round, Vec<Certificate>)> {
         &self.inner_epoch.committed_certificates
     }
 
@@ -566,7 +563,7 @@ impl ConsensusBus {
     ///
     /// NOTE: this does not mean the header was executed yet.
     /// Can only be subscribed to once.
-    pub fn committed_own_headers(&self) -> &impl RaylsSender<(Round, Vec<(Round, bool)>)> {
+    pub fn committed_own_headers(&self) -> &impl RaylsSender<(Round, Vec<Round>)> {
         &self.inner_epoch.committed_own_headers
     }
 
@@ -606,23 +603,15 @@ impl ConsensusBus {
         rx
     }
 
-    /// Track the most recently executed blocks (a bounded window, newest at the tip).
+    /// The most recently executed blocks (a bounded window, newest at the tip).
     ///
-    /// Safe to read for block *numbers* and *hashes* - those are monotonic. But the tip's nonce
-    /// (`epoch << 32 | round`) is NOT monotonic - neither half: draining a parked (out-of-order
-    /// seq) batch executes a block belonging to an OLDER output that still lands as the newest
-    /// height, so the tip's round (and, for a batch carried over from a previous epoch, its epoch)
-    /// can regress far below the true execution frontier.
-    ///
-    /// Example: execution has genuinely reached round 498. A batch for an earlier seq, mapping to
-    /// round 200, was parked; the gap then fills and it is drained and executed now. That fresh
-    /// block gets the next (highest) block number and becomes the tip, but its nonce encodes round
-    /// 200. A caller reading the round off the tip sees 200, not 498. The proposer throttle did
-    /// exactly this: with consensus at round 500 it computed lag `500 - 200 = 300 > threshold` and
-    /// throttled forever, wedging proposals - when the real lag was `500 - 498 = 2`.
-    ///
-    /// For the frontier epoch/round read the monotonic [`Self::executed_anchor`] instead, or scan
-    /// this window for the max-nonce block.
+    /// Block numbers and hashes in the window are monotonic; the tip's nonce
+    /// (`epoch << 32 | round`) is not, in either half. Draining a parked (out-of-order seq) batch
+    /// executes a block belonging to an older output that still lands as the newest height, so a
+    /// round or epoch read off the tip can regress far below the true execution frontier, and a
+    /// lag computed from it (a throttle, a catch-up gate) wedges on a false gap. For the
+    /// frontier epoch/round read the monotonic [`Self::executed_anchor`] instead, or scan this
+    /// window for the max-nonce block.
     pub fn recently_executed_blocks(&self) -> &watch::Sender<RecentlyExecutedBlocks> {
         &self.inner_app.tx_recently_executed_blocks
     }
@@ -641,13 +630,14 @@ impl ConsensusBus {
 
     /// True when the node-scoped engine has executed everything it admitted (queue empty, nothing
     /// in flight). A mode transition waits on this so the engine's admitted backlog finishes before
-    /// the next epoch's `get_missing_consensus` snapshot — otherwise a concurrently-finishing
+    /// the next epoch's `get_missing_consensus` snapshot - otherwise a concurrently-finishing
     /// output is dropped as stale (the demote→rejoin flap race).
     pub fn engine_idle(&self) -> &watch::Sender<bool> {
         &self.inner_app.tx_engine_idle
     }
 
-    /// Signal that execution replay of missed consensus outputs is complete.
+    /// Whether execution replay of missed consensus outputs is complete.
+    ///
     /// Set by the subscriber after replaying, read by the proposer before creating headers.
     pub fn execution_replay_complete(&self) -> &watch::Sender<bool> {
         &self.inner_app.tx_execution_replay_complete

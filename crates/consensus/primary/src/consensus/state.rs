@@ -549,17 +549,9 @@ impl<DB: Database> Consensus<DB> {
             Err(e) => return Err(e),
         };
         if self.active {
-            // We extract a list of headers from this specific validator that
-            // have been agreed upon, and signal this back to the narwhal sub-system
-            // to be used to re-send batches that have not made it to a commit.
+            // Committed certificates are reported back to the primary so the proposer can drop
+            // its own committed headers and re-propose the batches of those that missed commit.
             let mut committed_certificates = Vec::new();
-
-            // Each cert is tagged with whether its subdag reaches the epoch boundary: the
-            // subscriber drops those post-boundary outputs, so the proposer must keep
-            // (not clean) their batches for rescue. Computed here where both the subdag
-            // commit_timestamp and the epoch_boundary are known; carried per-cert to
-            // the proposer (no shared transition flag).
-            let epoch_boundary = self.consensus_config.epoch_boundary();
 
             // Output the sequence in the right order.
             let csd_len = committed_sub_dags.len();
@@ -581,10 +573,8 @@ impl<DB: Database> Consensus<DB> {
 
                 tracing::debug!(target: "rayls::consensus_state", "Commit in Sequence {:?}", committed_sub_dag.leader.nonce());
 
-                let dropped = committed_sub_dag.reaches_epoch_boundary(epoch_boundary);
-
                 for certificate in &committed_sub_dag.certificates {
-                    committed_certificates.push((certificate.clone(), dropped));
+                    committed_certificates.push(certificate.clone());
                 }
 
                 // NOTE: The size of the sub-dag can be arbitrarily large (depending on the network
@@ -601,7 +591,7 @@ impl<DB: Database> Consensus<DB> {
                 // expected by primary.
                 let leader_commit_round = committed_certificates
                     .iter()
-                    .map(|(c, _)| c.round())
+                    .map(|c| c.round())
                     .max()
                     .expect("committed_certificates isn't empty");
 
