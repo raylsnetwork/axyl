@@ -5,7 +5,7 @@
 use crate::types::ExecutionError;
 use eyre::OptionExt;
 use jsonrpsee::http_client::HttpClient;
-use rayls_batch_builder::BatchBuilder;
+use rayls_batch_builder::{BatchBuilder, BatchBuilderConfig, OwnWatermarkReceiver};
 use rayls_batch_validator::BatchValidator;
 use rayls_consensus_worker::WorkerNetworkHandle;
 use rayls_execution_evm::{
@@ -52,6 +52,9 @@ pub(super) struct ExecutionNodeInner {
     /// epoch's executor engine so execution-dropped txs are released for re-sealing from the
     /// first epoch after boot.
     pub(super) in_flight: InFlightTracker,
+    /// This authority's executed batch-sequence watch, captured when the engine starts and handed
+    /// to each batch builder so it resumes and paces sealing off its own execution progress.
+    pub(super) own_executed_sequence: Option<watch::Receiver<Option<u64>>>,
 }
 
 impl ExecutionNodeInner {
@@ -60,7 +63,7 @@ impl ExecutionNodeInner {
     /// The method is consumed by [PrimaryNodeInner::start].
     /// All tasks are spawned with the [ExecutionNodeInner]'s [TaskManager].
     pub(super) async fn start_engine<DB: Database>(
-        &self,
+        &mut self,
         rx_output: mpsc::Receiver<(CameFrom, ConsensusOutput)>,
         rx_shutdown: Noticer,
         gas_accumulator: GasAccumulator,
@@ -73,6 +76,10 @@ impl ExecutionNodeInner {
         executed_batch_registry: ExecutedBatchRegistry,
     ) -> eyre::Result<()> {
         let parent_header = self.reth_env.lookup_head()?;
+
+        // Capture this authority's executed-sequence watch before the ordering layer moves into the
+        // engine, so each batch builder started this epoch can resume and pace off execution.
+        self.own_executed_sequence = Some(batch_ordering.executed_own_watermark());
 
         // Keep a handle to the idle signal so we can flip it true when the engine task EXITS.
         // The engine's own poll() publishes idle only on the `Poll::Pending` path, not on
@@ -162,25 +169,34 @@ impl ExecutionNodeInner {
             .ok_or_eyre("worker components missing for {worker_id}")?
             .pool();
 
+        let own_executed_sequence = self
+            .own_executed_sequence
+            .clone()
+            .expect("own_executed_sequence must be initialized by start_engine before the builder");
+        let own_watermark_receiver = OwnWatermarkReceiver::new(own_executed_sequence);
+
         // create the batch builder for this epoch
         let batch_builder = BatchBuilder::new(
             &self.reth_env,
             transaction_pool.clone(),
             block_provider_sender,
-            self.address,
-            self.rayls_infrastructure_config.parameters.max_batch_delay,
             epoch_task_spawner.clone(),
-            worker_id,
             base_fee,
-            epoch,
-            initial_batch_seq,
-            epoch_boundary,
-            self.rayls_infrastructure_config.parameters.gas_limit,
+            own_watermark_receiver,
+            BatchBuilderConfig {
+                address: self.address,
+                worker_id,
+                epoch,
+                epoch_boundary,
+                max_delay: self.rayls_infrastructure_config.parameters.max_batch_delay,
+                next_batch_seq: initial_batch_seq,
+                gas_limit: self.rayls_infrastructure_config.parameters.gas_limit,
+            },
         );
 
         // spawn block builder task
         epoch_task_spawner.spawn_critical_task("batch builder", async move {
-            let res = batch_builder.await;
+            let res = batch_builder.run().await;
             info!(target: "rayls::execution", ?res, "batch builder task exited");
         });
 

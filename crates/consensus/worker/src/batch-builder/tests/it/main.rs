@@ -1,8 +1,6 @@
-//! Batch maker EL -> CL integration test
+//! Batch builder integration tests.
 
-// prevent clippy unused dep warning
-
-// it test
 mod build_batches;
+mod pipeline_typestate;
 
 fn main() {}

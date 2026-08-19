@@ -42,6 +42,7 @@ impl ExecutionNodeBuilder {
             rayls_infrastructure_config: self.rayls_infrastructure_config,
             workers: Vec::default(),
             in_flight: rayls_execution_evm::in_flight::InFlightTracker::new(),
+            own_executed_sequence: None,
         })
     }
 }

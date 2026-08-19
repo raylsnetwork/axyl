@@ -46,7 +46,7 @@ impl ExecutionNode {
         engine_done_tx: oneshot::Sender<()>,
         executed_batch_registry: ExecutedBatchRegistry,
     ) -> eyre::Result<()> {
-        let guard = self.internal.read().await;
+        let mut guard = self.internal.write().await;
         guard
             .start_engine(
                 rx_output,
