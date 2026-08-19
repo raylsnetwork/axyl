@@ -468,7 +468,7 @@ mod tests {
 
     /// Builds a minimal batch stored under a header's payload digest.
     fn batch_for(number: u64) -> Batch {
-        Batch { transactions: vec![vec![number as u8]], seq: number, ..Default::default() }
+        Batch { transactions: vec![vec![number as u8].into()], seq: number, ..Default::default() }
     }
 
     /// Builds a consensus header whose certificate payload references `digest`.

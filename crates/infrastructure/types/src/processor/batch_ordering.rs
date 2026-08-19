@@ -153,7 +153,7 @@ mod tests {
     use crate::{encode, try_decode, Batch, ExecHeader};
 
     fn legacy_state_with_parked() -> BatchOrderingState {
-        let batch = Batch::new_for_test(vec![vec![0u8; 64]], ExecHeader::default(), 0, 0, 7);
+        let batch = Batch::new_for_test(vec![vec![0u8; 64].into()], ExecHeader::default(), 0, 0, 7);
         let digest = batch.digest();
         let prepared = PreparedBatch {
             batch: Arc::new(batch),

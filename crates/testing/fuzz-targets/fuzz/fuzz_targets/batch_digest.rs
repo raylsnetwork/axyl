@@ -4,7 +4,6 @@
 //! batch contents. This tests:
 //! - Digest computation never panics on any input
 //! - Two identical batches always produce the same digest (determinism)
-//! - seal_slow().digest matches the pre-computed digest
 //! - Modifying any field changes the digest (collision resistance sanity check)
 //!
 //! Run: cargo +nightly fuzz run batch_digest
@@ -26,16 +25,13 @@ struct FuzzBatch {
 
 fuzz_target!(|input: FuzzBatch| {
     // Limit transactions to prevent OOM.
-    let transactions: Vec<Vec<u8>> = input
+    let transactions: Vec<rayls_infrastructure_types::Bytes> = input
         .transactions
         .into_iter()
         .take(5)
-        .map(|tx| {
-            if tx.len() > 1024 {
-                tx[..1024].to_vec()
-            } else {
-                tx
-            }
+        .map(|mut tx| {
+            tx.truncate(1024);
+            tx.into()
         })
         .collect();
 
@@ -55,10 +51,6 @@ fuzz_target!(|input: FuzzBatch| {
     // Same batch must produce the same digest (determinism).
     let digest2 = batch.clone().digest();
     assert_eq!(digest1, digest2, "digest is not deterministic");
-
-    // NOTE: a `seal_slow().digest == digest()` assertion was removed here — it is a
-    // tautology, since seal_slow() is literally `let d = self.digest(); self.seal(d)`,
-    // so it can never fail and tests nothing.
 
     // Modifying epoch should change the digest (basic collision resistance).
     if input.epoch < u32::MAX {
