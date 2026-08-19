@@ -576,7 +576,10 @@ mod tests {
 
         assert_eq!(*watermark.borrow_and_update(), None, "no batch accepted yet");
 
-        assert!(matches!(ord.try_accept(me, 1, make_parked(me, 1), false), AcceptResult::InOrder(_)));
+        assert!(matches!(
+            ord.try_accept(me, 1, make_parked(me, 1), false),
+            AcceptResult::InOrder(_)
+        ));
         assert_eq!(*watermark.borrow_and_update(), Some(1), "own in-order accept advances it");
 
         assert!(matches!(
@@ -585,10 +588,16 @@ mod tests {
         ));
         assert_eq!(*watermark.borrow(), Some(1), "a foreign authority must not advance our mark");
 
-        assert!(matches!(ord.try_accept(me, 2, make_parked(me, 2), false), AcceptResult::InOrder(_)));
+        assert!(matches!(
+            ord.try_accept(me, 2, make_parked(me, 2), false),
+            AcceptResult::InOrder(_)
+        ));
         assert_eq!(*watermark.borrow_and_update(), Some(2), "next own seq advances it");
 
-        assert!(matches!(ord.try_accept(me, 1, make_parked(me, 1), false), AcceptResult::InOrder(_)));
+        assert!(matches!(
+            ord.try_accept(me, 1, make_parked(me, 1), false),
+            AcceptResult::InOrder(_)
+        ));
         assert_eq!(*watermark.borrow(), Some(2), "a stale re-accept must not regress the mark");
     }
 
@@ -601,7 +610,10 @@ mod tests {
         let ord = BatchOrdering::new(store, BatchOrderingState::default(), &me);
         let mut watermark = ord.executed_own_watermark();
 
-        assert!(matches!(ord.try_accept(me, 1, make_parked(me, 1), false), AcceptResult::InOrder(_)));
+        assert!(matches!(
+            ord.try_accept(me, 1, make_parked(me, 1), false),
+            AcceptResult::InOrder(_)
+        ));
         assert_eq!(*watermark.borrow_and_update(), Some(1));
 
         // seq 3 arrives before seq 2, so it parks and the watch holds
@@ -609,7 +621,10 @@ mod tests {
         assert_eq!(*watermark.borrow(), Some(1));
 
         // seq 2 closes the gap; draining then flushes the parked seq 3 for execution
-        assert!(matches!(ord.try_accept(me, 2, make_parked(me, 2), false), AcceptResult::InOrder(_)));
+        assert!(matches!(
+            ord.try_accept(me, 2, make_parked(me, 2), false),
+            AcceptResult::InOrder(_)
+        ));
         let mut collected = Vec::new();
         ord.drain_consecutive(me, &mut collected, &ExecutedBatchRegistry::default(), None, false);
         assert_eq!(collected.len(), 1, "the parked batch drains for execution");
