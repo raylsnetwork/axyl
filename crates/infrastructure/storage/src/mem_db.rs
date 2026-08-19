@@ -110,8 +110,23 @@ impl StoreEntry {
 /// table is cleared; they are validated at pop under the store write lock and skipped.
 pub(crate) type EvictionHeap = BinaryHeap<Reverse<(u64, &'static str, Vec<u8>)>>;
 
-type StoreTableType = BTreeMap<Vec<u8>, StoreEntry>;
-type StoreType = HashMap<&'static str, StoreTableType>;
+/// One cached table: the rows plus a flag set while the producer's clear is queued but not yet
+/// applied to the persistent tier. `clearing` is set under the same write lock that enqueues the
+/// `Clear` message, so any reader that sees it is guaranteed the clear will land after all
+/// previously queued ops; it is cleared by the writer once the persistent clear applied.
+#[derive(Debug)]
+struct StoreTable {
+    rows: BTreeMap<Vec<u8>, StoreEntry>,
+    clearing: bool,
+}
+
+impl StoreTable {
+    fn new() -> Self {
+        Self { rows: BTreeMap::new(), clearing: false }
+    }
+}
+
+type StoreType = HashMap<&'static str, StoreTable>;
 
 #[derive(Debug)]
 pub struct MemDbTx<'a> {
@@ -122,7 +137,7 @@ impl<'a> MemDbTx<'a> {
     pub fn get_no_marked_check<T: Table>(&self, key: &T::Key) -> Option<(bool, T::Value)> {
         if let Some(table) = self.store.get(T::NAME) {
             let key_bytes = encode_key(key);
-            if let Some(entry) = table.get(&key_bytes) {
+            if let Some(entry) = table.rows.get(&key_bytes) {
                 if !entry.tombstoned() {
                     entry.touch_approximately();
                 }
@@ -137,9 +152,15 @@ impl<'a> MemDbTx<'a> {
     pub fn is_tombstoned<T: Table>(&self, key: &T::Key) -> bool {
         if let Some(table) = self.store.get(T::NAME) {
             let key_bytes = encode_key(key);
-            return table.get(&key_bytes).is_some_and(|entry| entry.tombstoned());
+            return table.rows.get(&key_bytes).is_some_and(|entry| entry.tombstoned());
         }
         false
+    }
+
+    /// Whether the table's clear is queued but not yet applied to the persistent tier (see
+    /// [`MemDatabase::is_clearing`]).
+    pub fn is_clearing<T: Table>(&self) -> bool {
+        self.store.get(T::NAME).is_some_and(|table| table.clearing)
     }
 }
 
@@ -211,14 +232,17 @@ impl<'a> MemDbTxMut<'a> {
     /// a lower tier, whereas a tombstone would shadow it and never be reclaimed.
     pub fn hard_delete<T: Table>(&mut self, key: &T::Key) {
         if let Some(table) = self.store.get_mut(T::NAME) {
-            table.remove(&encode_key(key));
+            table.rows.remove(&encode_key(key));
         }
     }
 
     /// Raw keys of the table, for a `Clear` message: the writer needs the exact set that was
     /// tombstoned (and counted) by this clear to release each key's in-flight op at apply time.
     pub fn raw_keys<T: Table>(&self) -> Vec<Vec<u8>> {
-        self.store.get(T::NAME).map(|table| table.keys().cloned().collect()).unwrap_or_default()
+        self.store
+            .get(T::NAME)
+            .map(|table| table.rows.keys().cloned().collect())
+            .unwrap_or_default()
     }
 }
 
@@ -233,18 +257,7 @@ impl<'a> DbTx for MemDbTxMut<'a> {
     }
 
     fn iter<T: Table>(&self) -> DBIter<'_, T> {
-        // if let Some(table) = self.store.get(T::NAME) {
-        //     let items: Vec<_> = table
-        //         .read()
-        //         .iter()
-        //         .filter(|(_, (removed, _))| !*removed)
-        //         .map(|(k, (_, v))| (decode_key::<T::Key>(k), decode::<T::Value>(v)))
-        //         .collect();
-        //     Box::new(items.into_iter())
-        // } else {
-        //     Box::new(std::iter::empty())
-        // }
-        //To implement this we need to merge results from cache and store in a temporary vector and
+        // To implement this we need to merge results from cache and store in a temporary vector and
         // return iterator over that. This is not expected to used in a transaction, so
         // should be safe.
         panic!("Should not be called on a tx mut!");
@@ -334,7 +347,7 @@ impl MemDatabase {
                 let read_guard = store_cloned.read();
                 for (key, table) in read_guard.iter() {
                     if let Some(m) = metrics_cloned.read().table_counts.get(key) {
-                        m.set(table.len().try_into().unwrap_or(-1));
+                        m.set(table.rows.len().try_into().unwrap_or(-1));
                     }
                 }
             }
@@ -404,7 +417,7 @@ impl MemDatabase {
     pub fn on_op_applied(&self, table: &'static str, key_bytes: &[u8], heap: &mut EvictionHeap) {
         let mut store = self.store.write();
         let Some(table_map) = store.get_mut(table) else { return };
-        let Some(entry) = table_map.get_mut(key_bytes) else { return };
+        let Some(entry) = table_map.rows.get_mut(key_bytes) else { return };
         entry.dec_in_flight();
         if entry.in_flight() == 0 {
             heap.push(Reverse((
@@ -415,6 +428,42 @@ impl MemDatabase {
         }
     }
 
+    /// Whether the table's clear is queued but not yet applied to the persistent tier.
+    ///
+    /// While set, layered reads must treat every key that is not live in the cache as deleted:
+    /// keys evicted before the clear (or never cached, e.g. right after startup) would otherwise
+    /// fall through to the persistent tier and surface stale pre-clear values. The flag is set
+    /// under the same write lock that enqueues the `Clear` message and cleared by the writer once
+    /// the persistent clear applied, so it is only ever observed while a clear is genuinely
+    /// pending.
+    pub fn is_clearing<T: Table>(&self) -> bool {
+        self.store.read().get(T::NAME).is_some_and(|table| table.clearing)
+    }
+
+    /// Clears the pending-clear flag and releases the in-flight op of every key the clear
+    /// tombstoned, in one critical section: the writer calls this after the persistent clear
+    /// applied, so once it returns the cache matches the (now empty) persistent tier again.
+    ///
+    /// If the persistent clear failed, this is never called: the flag stays set and the table
+    /// keeps reading as empty until a later clear retries and lands (same philosophy as rows
+    /// retained in mem on failure, surfaced by the next persist).
+    pub fn on_clear_applied<T: Table>(&self, keys: &[Vec<u8>], heap: &mut EvictionHeap) {
+        let mut store = self.store.write();
+        let Some(table) = store.get_mut(T::NAME) else { return };
+        table.clearing = false;
+        for key in keys {
+            let Some(entry) = table.rows.get_mut(key) else { continue };
+            entry.dec_in_flight();
+            if entry.in_flight() == 0 {
+                heap.push(Reverse((
+                    entry.last_used.load(AtomicOrdering::Relaxed),
+                    T::NAME,
+                    key.clone(),
+                )));
+            }
+        }
+    }
+
     /// Evicts settled keys (in-flight == 0) in recency order until the cache fits `max_size`.
     /// Candidates are validated at pop: a key re-inserted since its settle, or a row cleared
     /// away, is skipped. A key whose recency was refreshed by a read since it settled is
@@ -422,14 +471,14 @@ impl MemDatabase {
     /// producers never touch it. Every pop removes one entry, so the loop always terminates.
     pub fn evict_if_needed(&self, heap: &mut EvictionHeap, max_size: usize) {
         let mut store = self.store.write();
-        let mut total: usize = store.values().map(|table| table.len()).sum();
+        let mut total: usize = store.values().map(|table| table.rows.len()).sum();
         if total <= max_size {
             return;
         }
         while total > max_size {
             let Some(Reverse((heap_last_used, table, key))) = heap.pop() else { break };
             let Some(table_map) = store.get_mut(table) else { continue };
-            let Some(entry) = table_map.get(&key) else { continue };
+            let Some(entry) = table_map.rows.get(&key) else { continue };
             if entry.in_flight() != 0 {
                 continue;
             }
@@ -441,7 +490,7 @@ impl MemDatabase {
                 heap.push(Reverse((current_last_used, table, key)));
                 continue;
             }
-            table_map.remove(&key);
+            table_map.rows.remove(&key);
             total -= 1;
         }
     }
@@ -449,7 +498,7 @@ impl MemDatabase {
     /// Total rows (live and tombstoned) held in the cache; the writer keeps this at or below the
     /// configured max size.
     pub fn mem_size(&self) -> usize {
-        self.store.read().values().map(|table| table.len()).sum()
+        self.store.read().values().map(|table| table.rows.len()).sum()
     }
 }
 
@@ -490,7 +539,7 @@ impl Database for MemDatabase {
         Self: 'txn;
 
     fn open_table<T: Table>(&self) -> eyre::Result<()> {
-        self.store.write().insert(T::NAME, BTreeMap::new());
+        self.store.write().insert(T::NAME, StoreTable::new());
         match register_int_gauge_with_registry!(
             format!("memdb_{}_count", T::NAME),
             format!("Entries in the {} memory table.", T::NAME),
@@ -541,7 +590,7 @@ impl Database for MemDatabase {
         self.store
             .read()
             .get(T::NAME)
-            .is_none_or(|table| table.values().all(|entry| entry.tombstoned()))
+            .is_none_or(|table| table.rows.values().all(|entry| entry.tombstoned()))
     }
 
     fn iter<T: Table>(&self) -> DBIter<'_, T> {
@@ -641,7 +690,7 @@ fn insert_impl<T: Table>(
 ) -> eyre::Result<()> {
     let table = store.get_mut(T::NAME).ok_or_else(|| eyre::eyre!("Invalid table {}", T::NAME))?;
     let key_bytes = encode_key(key);
-    match table.get_mut(&key_bytes) {
+    match table.rows.get_mut(&key_bytes) {
         Some(entry) => {
             entry.value = encode(value);
             entry.clear_tombstone();
@@ -651,7 +700,7 @@ fn insert_impl<T: Table>(
         None => {
             let mut entry = StoreEntry::new(encode(value));
             entry.add_in_flight();
-            table.insert(key_bytes, entry);
+            table.rows.insert(key_bytes, entry);
         }
     }
     Ok(())
@@ -663,7 +712,7 @@ fn insert_impl<T: Table>(
 fn remove_impl<T: Table>(store: &mut StoreType, key: &T::Key) -> eyre::Result<()> {
     let table = store.get_mut(T::NAME).ok_or_else(|| eyre::eyre!("Invalid table {}", T::NAME))?;
     let key_bytes = encode_key(key);
-    match table.get_mut(&key_bytes) {
+    match table.rows.get_mut(&key_bytes) {
         Some(entry) => {
             entry.mark_tombstone();
             entry.add_in_flight();
@@ -673,7 +722,7 @@ fn remove_impl<T: Table>(store: &mut StoreType, key: &T::Key) -> eyre::Result<()
             let mut entry = StoreEntry::new(Vec::new());
             entry.mark_tombstone();
             entry.add_in_flight();
-            table.insert(key_bytes, entry);
+            table.rows.insert(key_bytes, entry);
         }
     }
     Ok(())
@@ -682,20 +731,26 @@ fn remove_impl<T: Table>(store: &mut StoreType, key: &T::Key) -> eyre::Result<()
 /// Tombstone every row of the table (the persistent clear is deferred) and bump each in-flight
 /// count so no tombstone is evicted before the clear applies. Returns the raw keys, which the
 /// writer needs to release each count once the clear lands.
+///
+/// Also raises the table's `clearing` flag: both callers enqueue the `Clear` message while still
+/// holding the write lock, so a reader that sees the flag can rely on the persistent tier being
+/// wiped shortly; until the writer applies the clear, reads must not fall through to it (keys
+/// evicted from the cache would otherwise surface stale pre-clear values).
 fn clear_table_impl<T: Table>(store: &mut StoreType) -> eyre::Result<Vec<Vec<u8>>> {
     let table = store.get_mut(T::NAME).ok_or_else(|| eyre::eyre!("Invalid table {}", T::NAME))?;
-    let keys: Vec<Vec<u8>> = table.keys().cloned().collect();
-    for entry in table.values_mut() {
+    let keys: Vec<Vec<u8>> = table.rows.keys().cloned().collect();
+    for entry in table.rows.values_mut() {
         entry.mark_tombstone();
         entry.add_in_flight();
     }
+    table.clearing = true;
     Ok(keys)
 }
 
 fn get_with_marked_check<T: Table>(store: &StoreType, key: &T::Key) -> Option<T::Value> {
     if let Some(table) = store.get(T::NAME) {
         let key_bytes = encode_key(key);
-        if let Some(entry) = table.get(&key_bytes) {
+        if let Some(entry) = table.rows.get(&key_bytes) {
             if !entry.tombstoned() {
                 entry.touch_approximately();
                 let val = decode(&entry.value);
@@ -709,7 +764,7 @@ fn get_with_marked_check<T: Table>(store: &StoreType, key: &T::Key) -> Option<T:
 fn contains_key_impl<T: Table>(store: &StoreType, key: &T::Key) -> bool {
     if let Some(table) = store.get(T::NAME) {
         let key_bytes = encode_key(key);
-        if let Some(entry) = table.get(&key_bytes) {
+        if let Some(entry) = table.rows.get(&key_bytes) {
             if entry.tombstoned() {
                 return false;
             }
@@ -750,47 +805,47 @@ where
 
 fn iter_impl<T: Table>(store: &StoreType) -> Option<Vec<(T::Key, T::Value)>> {
     let table = store.get(T::NAME)?;
-    Some(collect_typed::<T, _>(table.iter()))
+    Some(collect_typed::<T, _>(table.rows.iter()))
 }
 
 fn raw_iter_borrowed_impl<T: Table>(store: &StoreType) -> Option<DBRawIter<'_>> {
     let table = store.get(T::NAME)?;
-    Some(collect_raw_borrowed(table.iter()))
+    Some(collect_raw_borrowed(table.rows.iter()))
 }
 
 fn raw_iter_owned_impl<T: Table>(
     store: &StoreType,
 ) -> Option<Vec<(Cow<'static, [u8]>, Cow<'static, [u8]>)>> {
     let table = store.get(T::NAME)?;
-    Some(collect_raw_owned(table.iter()))
+    Some(collect_raw_owned(table.rows.iter()))
 }
 
 fn skip_to_impl<T: Table>(store: &StoreType, key: &T::Key) -> Option<Vec<(T::Key, T::Value)>> {
     let table = store.get(T::NAME)?;
     let key_bytes = encode_key(key);
-    Some(collect_typed::<T, _>(table.iter().skip_while(|(k, _)| **k < key_bytes)))
+    Some(collect_typed::<T, _>(table.rows.iter().skip_while(|(k, _)| **k < key_bytes)))
 }
 
 fn reverse_iter_impl<T: Table>(store: &StoreType) -> Option<Vec<(T::Key, T::Value)>> {
     let table = store.get(T::NAME)?;
-    Some(collect_typed::<T, _>(table.iter().rev()))
+    Some(collect_typed::<T, _>(table.rows.iter().rev()))
 }
 
 fn reverse_raw_iter_borrowed_impl<T: Table>(store: &StoreType) -> Option<DBRawIter<'_>> {
     let table = store.get(T::NAME)?;
-    Some(collect_raw_borrowed(table.iter().rev()))
+    Some(collect_raw_borrowed(table.rows.iter().rev()))
 }
 
 fn reverse_raw_iter_owned_impl<T: Table>(
     store: &StoreType,
 ) -> Option<Vec<(Cow<'static, [u8]>, Cow<'static, [u8]>)>> {
     let table = store.get(T::NAME)?;
-    Some(collect_raw_owned(table.iter().rev()))
+    Some(collect_raw_owned(table.rows.iter().rev()))
 }
 
 fn last_record_impl<T: Table>(store: &StoreType) -> Option<(T::Key, T::Value)> {
     let table = store.get(T::NAME)?;
-    for (key_bytes, entry) in table.iter().rev() {
+    for (key_bytes, entry) in table.rows.iter().rev() {
         if !entry.tombstoned() {
             return Some((decode_key(key_bytes), decode(&entry.value)));
         }
@@ -802,6 +857,7 @@ fn record_prior_to_impl<T: Table>(store: &StoreType, key: &T::Key) -> Option<(T:
     let table = store.get(T::NAME)?;
     let key_bytes = encode_key(key);
     table
+        .rows
         .range(..key_bytes)
         .rev()
         .find(|(_, entry)| !entry.tombstoned())

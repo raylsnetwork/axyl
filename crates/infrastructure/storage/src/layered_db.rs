@@ -305,10 +305,13 @@ impl<'a, DB: Database> LayeredDbTx<'a, DB> {
     /// (`record_prior_to`), so a deep floor never pays for the rows above it.
     pub fn reverse_skip_to<T: Table>(&self, key: &T::Key) -> eyre::Result<DBIter<'_, T>> {
         let db = &self.db;
-        let db_first = db
-            .get::<T>(key)?
-            .map(|value| (key.clone(), value))
-            .or_else(|| db.record_prior_to::<T>(key));
+        let db_first = if self.mem_db.is_clearing::<T>() {
+            None
+        } else {
+            db.get::<T>(key)?
+                .map(|value| (key.clone(), value))
+                .or_else(|| db.record_prior_to::<T>(key))
+        };
         let db_iter: DBIter<'_, T> =
             Box::new(std::iter::successors(db_first, move |(k, _)| db.record_prior_to::<T>(k)));
 
@@ -389,6 +392,9 @@ impl<'a, DB: Database> DbTx for LayeredDbTx<'a, DB> {
             None
         } else if let Some((_, val)) = self.mem_db.get_no_marked_check::<T>(key) {
             Some(val)
+        } else if self.mem_db.is_clearing::<T>() {
+            // Pending clear: keys not live in the cache are gone, not stale.
+            None
         } else {
             self.db.get::<T>(key)?
         };
@@ -408,6 +414,9 @@ impl<'a, DB: Database> DbTx for LayeredDbTx<'a, DB> {
         if let Some((_, val)) = self.mem_db.get_no_marked_check::<T>(key) {
             return Ok(Some(Cow::Owned(encode(&val))));
         }
+        if self.mem_db.is_clearing::<T>() {
+            return self.cold_raw_get::<T>(key);
+        }
         match self.db.raw_get::<T>(key)? {
             Some(bytes) => Ok(Some(bytes)),
             None => self.cold_raw_get::<T>(key),
@@ -415,7 +424,11 @@ impl<'a, DB: Database> DbTx for LayeredDbTx<'a, DB> {
     }
 
     fn iter<T: Table>(&self) -> DBIter<'_, T> {
-        let db_iter = self.db.iter::<T>();
+        let db_iter = if self.mem_db.is_clearing::<T>() {
+            Box::new(std::iter::empty())
+        } else {
+            self.db.iter::<T>()
+        };
         let mem_iter = self.mem_db.iter::<T>();
         let is_tombstoned: Box<dyn Fn(&T::Key) -> bool + '_> =
             Box::new(|k| self.mem_db.is_tombstoned::<T>(k));
@@ -425,7 +438,11 @@ impl<'a, DB: Database> DbTx for LayeredDbTx<'a, DB> {
     }
 
     fn raw_iter<T: Table>(&self) -> DBRawIter<'_> {
-        let db_iter = self.db.raw_iter::<T>();
+        let db_iter = if self.mem_db.is_clearing::<T>() {
+            Box::new(std::iter::empty())
+        } else {
+            self.db.raw_iter::<T>()
+        };
         let mem_iter = self.mem_db.raw_iter::<T>();
         let is_tombstoned: Box<dyn Fn(&T::Key) -> bool + '_> =
             Box::new(|k| self.mem_db.is_tombstoned::<T>(k));
@@ -435,7 +452,11 @@ impl<'a, DB: Database> DbTx for LayeredDbTx<'a, DB> {
     }
 
     fn skip_to<T: Table>(&self, key: &T::Key) -> eyre::Result<DBIter<'_, T>> {
-        let db_iter = self.db.skip_to::<T>(key)?;
+        let db_iter = if self.mem_db.is_clearing::<T>() {
+            Box::new(std::iter::empty())
+        } else {
+            self.db.skip_to::<T>(key)?
+        };
         let mem_iter = self.mem_db.skip_to::<T>(key)?;
         let is_tombstoned: Box<dyn Fn(&T::Key) -> bool + '_> =
             Box::new(|k| self.mem_db.is_tombstoned::<T>(k));
@@ -445,7 +466,11 @@ impl<'a, DB: Database> DbTx for LayeredDbTx<'a, DB> {
     }
 
     fn raw_skip_to<T: Table>(&self, key: &T::Key) -> eyre::Result<DBRawIter<'_>> {
-        let db_iter = self.db.raw_skip_to::<T>(key)?;
+        let db_iter = if self.mem_db.is_clearing::<T>() {
+            Box::new(std::iter::empty())
+        } else {
+            self.db.raw_skip_to::<T>(key)?
+        };
         let mem_iter = self.mem_db.raw_skip_to::<T>(key)?;
         let is_tombstoned: Box<dyn Fn(&T::Key) -> bool + '_> =
             Box::new(|k| self.mem_db.is_tombstoned::<T>(k));
@@ -455,7 +480,11 @@ impl<'a, DB: Database> DbTx for LayeredDbTx<'a, DB> {
     }
 
     fn reverse_iter<T: Table>(&self) -> DBIter<'_, T> {
-        let db_iter = self.db.reverse_iter::<T>();
+        let db_iter = if self.mem_db.is_clearing::<T>() {
+            Box::new(std::iter::empty())
+        } else {
+            self.db.reverse_iter::<T>()
+        };
         let mem_iter = self.mem_db.reverse_iter::<T>();
         let is_tombstoned: Box<dyn Fn(&T::Key) -> bool + '_> =
             Box::new(|k| self.mem_db.is_tombstoned::<T>(k));
@@ -465,7 +494,11 @@ impl<'a, DB: Database> DbTx for LayeredDbTx<'a, DB> {
     }
 
     fn reverse_raw_iter<T: Table>(&self) -> DBRawIter<'_> {
-        let db_iter = self.db.reverse_raw_iter::<T>();
+        let db_iter = if self.mem_db.is_clearing::<T>() {
+            Box::new(std::iter::empty())
+        } else {
+            self.db.reverse_raw_iter::<T>()
+        };
         let mem_iter = self.mem_db.reverse_raw_iter::<T>();
         let is_tombstoned: Box<dyn Fn(&T::Key) -> bool + '_> =
             Box::new(|k| self.mem_db.is_tombstoned::<T>(k));
@@ -843,7 +876,7 @@ fn db_run<DB: Database>(
             }
         }
     }
-    tracing::info!(target: "layered_db_runner", "Layerd DB thread Shutdown complete");
+    tracing::info!(target: "layered_db_runner", "Layered DB thread Shutdown complete");
 }
 
 /// In-memory cache layer over a persistent database with background writes.
@@ -986,10 +1019,13 @@ impl<DB: Database> LayeredDatabase<DB> {
     /// (`record_prior_to`), so a deep floor never pays for the rows above it.
     pub fn reverse_skip_to<T: Table>(&self, key: &T::Key) -> eyre::Result<DBIter<'_, T>> {
         let db = &self.db;
-        let db_first = db
-            .get::<T>(key)?
-            .map(|value| (key.clone(), value))
-            .or_else(|| db.record_prior_to::<T>(key));
+        let db_first = if self.mem_db.is_clearing::<T>() {
+            None
+        } else {
+            db.get::<T>(key)?
+                .map(|value| (key.clone(), value))
+                .or_else(|| db.record_prior_to::<T>(key))
+        };
         let db_iter: DBIter<'_, T> =
             Box::new(std::iter::successors(db_first, move |(k, _)| db.record_prior_to::<T>(k)));
 
@@ -1102,12 +1138,17 @@ impl<DB: Database> Database for LayeredDatabase<DB> {
     }
 
     fn contains_key<T: Table>(&self, key: &T::Key) -> eyre::Result<bool> {
-        let hot = if self.mem_db.is_tombstoned::<T>(key) {
-            false
-        } else {
-            self.mem_db.contains_key::<T>(key)? || self.db.contains_key::<T>(key)?
-        };
-        if hot {
+        if self.mem_db.is_tombstoned::<T>(key) {
+            return Ok(false);
+        }
+        if self.mem_db.contains_key::<T>(key)? {
+            return Ok(true);
+        }
+        if self.mem_db.is_clearing::<T>() {
+            // The table's clear is pending: keys not live in the cache are gone, not stale.
+            return self.cold_has::<T>(key);
+        }
+        if self.db.contains_key::<T>(key)? {
             return Ok(true);
         }
         self.cold_has::<T>(key)
@@ -1121,6 +1162,11 @@ impl<DB: Database> Database for LayeredDatabase<DB> {
             None
         } else if let Some((_, val)) = self.mem_db.get_marked::<T>(key)? {
             Some(val)
+        } else if self.mem_db.is_clearing::<T>() {
+            // The table's clear is pending: keys evicted from the cache (or never cached, e.g.
+            // right after startup) are gone, not stale - do not fall through to the persistent
+            // tier.
+            None
         } else {
             self.db.get::<T>(key)?
         };
@@ -1164,7 +1210,12 @@ impl<DB: Database> Database for LayeredDatabase<DB> {
     }
 
     fn iter<T: Table>(&self) -> DBIter<'_, T> {
-        let db_iter = self.db.iter::<T>();
+        let db_iter = if self.mem_db.is_clearing::<T>() {
+            // Pending clear: the persistent tier is stale, so the merge must not see its rows.
+            Box::new(std::iter::empty())
+        } else {
+            self.db.iter::<T>()
+        };
         let mem_iter = self.mem_db.iter::<T>();
         let is_tombstoned: Box<dyn Fn(&T::Key) -> bool + '_> =
             Box::new(|k| self.mem_db.is_tombstoned::<T>(k));
@@ -1174,7 +1225,11 @@ impl<DB: Database> Database for LayeredDatabase<DB> {
     }
 
     fn raw_iter<T: Table>(&self) -> DBRawIter<'_> {
-        let db_iter = self.db.raw_iter::<T>();
+        let db_iter = if self.mem_db.is_clearing::<T>() {
+            Box::new(std::iter::empty())
+        } else {
+            self.db.raw_iter::<T>()
+        };
         let mem_iter = self.mem_db.raw_iter::<T>();
         let is_tombstoned: Box<dyn Fn(&T::Key) -> bool + '_> =
             Box::new(|k| self.mem_db.is_tombstoned::<T>(k));
@@ -1184,7 +1239,11 @@ impl<DB: Database> Database for LayeredDatabase<DB> {
     }
 
     fn skip_to<T: Table>(&self, key: &T::Key) -> eyre::Result<DBIter<'_, T>> {
-        let db_iter = self.db.skip_to::<T>(key)?;
+        let db_iter = if self.mem_db.is_clearing::<T>() {
+            Box::new(std::iter::empty())
+        } else {
+            self.db.skip_to::<T>(key)?
+        };
         let mem_iter = self.mem_db.skip_to::<T>(key)?;
         let is_tombstoned: Box<dyn Fn(&T::Key) -> bool + '_> =
             Box::new(|k| self.mem_db.is_tombstoned::<T>(k));
@@ -1194,7 +1253,11 @@ impl<DB: Database> Database for LayeredDatabase<DB> {
     }
 
     fn reverse_iter<T: Table>(&self) -> DBIter<'_, T> {
-        let db_iter = self.db.reverse_iter::<T>();
+        let db_iter = if self.mem_db.is_clearing::<T>() {
+            Box::new(std::iter::empty())
+        } else {
+            self.db.reverse_iter::<T>()
+        };
         let mem_iter = self.mem_db.reverse_iter::<T>();
         let is_tombstoned: Box<dyn Fn(&T::Key) -> bool + '_> =
             Box::new(|k| self.mem_db.is_tombstoned::<T>(k));
@@ -1204,7 +1267,11 @@ impl<DB: Database> Database for LayeredDatabase<DB> {
     }
 
     fn reverse_raw_iter<T: Table>(&self) -> DBRawIter<'_> {
-        let db_iter = self.db.reverse_raw_iter::<T>();
+        let db_iter = if self.mem_db.is_clearing::<T>() {
+            Box::new(std::iter::empty())
+        } else {
+            self.db.reverse_raw_iter::<T>()
+        };
         let mem_iter = self.mem_db.reverse_raw_iter::<T>();
         let is_tombstoned: Box<dyn Fn(&T::Key) -> bool + '_> =
             Box::new(|k| self.mem_db.is_tombstoned::<T>(k));
@@ -1412,9 +1479,7 @@ impl<T: Table, DB: Database> ClearTrait<DB> for ClearTable<T> {
     }
 
     fn on_applied(&self, mem_db: &MemDatabase, heap: &mut EvictionHeap) {
-        for key in &self.keys {
-            mem_db.on_op_applied(T::NAME, key, heap);
-        }
+        mem_db.on_clear_applied::<T>(&self.keys, heap);
     }
 }
 
@@ -1455,8 +1520,8 @@ mod test {
         mem_db::MemDatabase,
         test::*,
     };
-    use rayls_infrastructure_types::{Database, DbTxMut};
-    use std::{path::Path, time::Instant};
+    use rayls_infrastructure_types::{DBIter, DBRawIter, Database, DbTxMut, Table};
+    use std::{path::Path, sync::Arc, time::Instant};
     use tempfile::tempdir;
 
     #[cfg(feature = "redb")]
@@ -1474,6 +1539,183 @@ mod test {
         let db = LayeredDatabase::open(db);
         db.open_table::<TestTable>().expect("failed to open table!");
         db
+    }
+
+    /// A [`MemDatabase`] whose `clear_table` parks until released: lets a test hold the
+    /// producer's clear window open deterministically while the writer is parked mid-apply.
+    #[derive(Clone, Debug)]
+    struct BlockingClearDb {
+        inner: MemDatabase,
+        state: Arc<parking_lot::Mutex<BlockState>>,
+        cv: Arc<parking_lot::Condvar>,
+    }
+
+    #[derive(Debug, Default)]
+    struct BlockState {
+        /// The next `clear_table` parks until `release_clear` is called.
+        block: bool,
+        /// The writer is parked inside `clear_table`.
+        entered: bool,
+    }
+
+    impl BlockingClearDb {
+        fn new() -> Self {
+            Self {
+                inner: MemDatabase::new(),
+                state: Arc::new(parking_lot::Mutex::new(BlockState::default())),
+                cv: Arc::new(parking_lot::Condvar::new()),
+            }
+        }
+
+        /// Park the writer's next `clear_table` until [`Self::release_clear`].
+        fn block_clear(&self) {
+            self.state.lock().block = true;
+        }
+
+        /// Signal the parked writer to proceed with the persistent clear.
+        fn release_clear(&self) {
+            self.state.lock().block = false;
+            self.cv.notify_all();
+        }
+
+        /// Blocks until the writer is parked inside `clear_table`: at that point the producer's
+        /// clear window is provably still open.
+        fn wait_clear_entered(&self) {
+            let mut state = self.state.lock();
+            while !state.entered {
+                self.cv.wait(&mut state);
+            }
+        }
+    }
+
+    impl Database for BlockingClearDb {
+        type TX<'txn>
+            = crate::mem_db::MemDbTx<'txn>
+        where
+            Self: 'txn;
+
+        type TXMut<'txn>
+            = crate::mem_db::MemDbTxMut<'txn>
+        where
+            Self: 'txn;
+
+        fn open_table<T: Table>(&self) -> eyre::Result<()> {
+            self.inner.open_table::<T>()
+        }
+        fn read_txn(&self) -> eyre::Result<Self::TX<'_>> {
+            self.inner.read_txn()
+        }
+        fn write_txn(&self) -> eyre::Result<Self::TXMut<'_>> {
+            self.inner.write_txn()
+        }
+        fn contains_key<T: Table>(&self, key: &T::Key) -> eyre::Result<bool> {
+            self.inner.contains_key::<T>(key)
+        }
+        fn get<T: Table>(&self, key: &T::Key) -> eyre::Result<Option<T::Value>> {
+            self.inner.get::<T>(key)
+        }
+        fn insert<T: Table>(&self, key: &T::Key, value: &T::Value) -> eyre::Result<()> {
+            self.inner.insert::<T>(key, value)
+        }
+        fn remove<T: Table>(&self, key: &T::Key) -> eyre::Result<()> {
+            self.inner.remove::<T>(key)
+        }
+        fn clear_table<T: Table>(&self) -> eyre::Result<()> {
+            {
+                let mut state = self.state.lock();
+                if state.block {
+                    state.entered = true;
+                    self.cv.notify_all();
+                    while state.block {
+                        self.cv.wait(&mut state);
+                    }
+                }
+            }
+            self.inner.clear_table::<T>()
+        }
+        fn is_empty<T: Table>(&self) -> bool {
+            self.inner.is_empty::<T>()
+        }
+        fn iter<T: Table>(&self) -> DBIter<'_, T> {
+            self.inner.iter::<T>()
+        }
+        fn raw_iter<T: Table>(&self) -> DBRawIter<'_> {
+            self.inner.raw_iter::<T>()
+        }
+        fn skip_to<T: Table>(&self, key: &T::Key) -> eyre::Result<DBIter<'_, T>> {
+            self.inner.skip_to::<T>(key)
+        }
+        fn reverse_iter<T: Table>(&self) -> DBIter<'_, T> {
+            self.inner.reverse_iter::<T>()
+        }
+        fn reverse_raw_iter<T: Table>(&self) -> DBRawIter<'_> {
+            self.inner.reverse_raw_iter::<T>()
+        }
+        fn record_prior_to<T: Table>(&self, key: &T::Key) -> Option<(T::Key, T::Value)> {
+            self.inner.record_prior_to::<T>(key)
+        }
+        fn last_record<T: Table>(&self) -> Option<(T::Key, T::Value)> {
+            self.inner.last_record::<T>()
+        }
+    }
+
+    /// Releases the writer's parked clear on drop, so a panicked assertion cannot deadlock the
+    /// writer join at test teardown.
+    struct ClearRelease<'a>(&'a BlockingClearDb);
+
+    impl Drop for ClearRelease<'_> {
+        fn drop(&mut self) {
+            self.0.release_clear();
+        }
+    }
+
+    /// `clear_table` tombstones only the cached rows, so keys already evicted from the cache have
+    /// nothing to hide behind: without the pending-clear gate they read stale pre-clear values
+    /// from the persistent tier until the writer applies the clear. The pending-clear flag must
+    /// close that window for `get`, `contains_key` and every iterator.
+    #[test]
+    fn clear_hides_evicted_keys_until_the_clear_applies() {
+        let inner = BlockingClearDb::new();
+        let db = LayeredDatabase::open_with_config(inner.clone(), CacheConfig { max_size: 2 });
+        db.open_table::<TestTable>().expect("open layered table");
+
+        db.insert::<TestTable>(&1, &"one".to_string()).expect("insert");
+        db.insert::<TestTable>(&2, &"two".to_string()).expect("insert");
+        db.insert::<TestTable>(&3, &"three".to_string()).expect("insert");
+        db.sync_persist();
+        // Key 1 settled first and was evicted: it is now live only in the persistent tier.
+        assert_eq!(db.mem_db.mem_size(), 2, "key 1 must be evicted");
+        assert!(!db.mem_db.contains_key::<TestTable>(&1).unwrap());
+
+        inner.block_clear();
+        let _release = ClearRelease(&inner);
+        db.clear_table::<TestTable>().expect("clear");
+        inner.wait_clear_entered();
+        // The writer is parked inside the persistent clear: the producer's window is open.
+        assert!(db.mem_db.is_clearing::<TestTable>());
+
+        // The evicted key must not leak from the persistent tier while the clear is pending.
+        assert_eq!(db.get::<TestTable>(&1).unwrap(), None, "evicted key must read as cleared");
+        assert_eq!(db.get::<TestTable>(&2).unwrap(), None, "cached key must read as cleared");
+        assert_eq!(db.get::<TestTable>(&3).unwrap(), None, "cached key must read as cleared");
+        assert!(!db.contains_key::<TestTable>(&1).unwrap(), "evicted key must not contain");
+        assert!(
+            db.iter::<TestTable>().collect::<Vec<_>>().is_empty(),
+            "iter must not leak stale rows"
+        );
+        assert!(db.is_empty::<TestTable>(), "table must read empty while the clear is pending");
+        // Writes during the window still read through the mem overlay.
+        db.insert::<TestTable>(&4, &"four".to_string()).expect("insert");
+        assert_eq!(db.get::<TestTable>(&4).unwrap(), Some("four".to_string()));
+
+        inner.release_clear();
+        db.sync_persist();
+        assert_eq!(db.get::<TestTable>(&1).unwrap(), None, "clear must land");
+        assert!(!db.mem_db.is_clearing::<TestTable>(), "pending-clear flag must settle");
+
+        db.insert::<TestTable>(&5, &"five".to_string()).expect("insert");
+        db.sync_persist();
+        assert_eq!(db.get::<TestTable>(&5).unwrap(), Some("five".to_string()));
     }
 
     /// `evict_persistent_batch` must drop exactly the given keys from the durable layer and leave
