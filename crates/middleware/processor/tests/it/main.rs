@@ -1937,3 +1937,105 @@ async fn test_dropped_txs_release_in_flight_marks() -> eyre::Result<()> {
     );
     Ok(())
 }
+
+/// Under OutputSeqNormalization, batches still parked at an epoch change are discarded, never
+/// force executed: their predecessor seq never executed in their epoch, so executing them out of
+/// order only drops their txs nonce-too-high or lands duplicates. The txs stay pooled and
+/// are re-sealed in the new epoch.
+#[tokio::test]
+async fn test_epoch_boundary_discards_parked_batches_under_seq_normalization() -> eyre::Result<()> {
+    use rayls_execution_evm::{BaseFeeParams, RaylsChainSpec};
+
+    let tmp_dir = TempDir::new().expect("temp dir");
+    let base_chain = test_chain_spec_arc();
+    let mut batches = rayls_execution_evm::test_utils::batches(base_chain, 3);
+    let genesis = test_genesis();
+    let (genesis, _, _) = seeded_genesis_from_random_batches(genesis, batches.iter());
+    let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+    let rayls_spec = Arc::new(
+        RaylsChainSpec::builder(chain.clone())
+            .batch_digest_v2(0)
+            .empty_output_block(0)
+            .output_seq_normalization(0)
+            .base_fee_params(BaseFeeParams::ethereum())
+            .build(),
+    );
+    let gas_accumulator = GasAccumulator::new(1);
+    let reth_env = RethEnv::new_for_temp_chain_with_rayls_spec(
+        chain.clone(),
+        rayls_spec,
+        tmp_dir.path(),
+        &TaskManager::default(),
+        Some(gas_accumulator.rewards_counter()),
+    )
+    .await?;
+    let (builder, _) = rayls_testing_test_utils::execution_builder_no_args(
+        Some(chain.clone()),
+        None,
+        tmp_dir.path(),
+    )?;
+    let execution_node = rayls_testing_test_utils::TestExecutionNode::new(&builder, reth_env)?;
+    let committee =
+        create_committee_from_state(execution_node.epoch_state_from_canonical_tip().await?).await?;
+    let authority_1 = committee.authorities().first().expect("first authority").id();
+    let producer = committee.authorities().get(2).expect("third authority").execution_address();
+    for batch in batches.iter_mut() {
+        batch.beneficiary = producer;
+        batch.base_fee_per_gas = MIN_PROTOCOL_BASE_FEE;
+        execute_test_batch(batch);
+    }
+    // epoch-0 output: seq 1 executes (fresh baseline), seq 3 parks behind the missing seq 2
+    batches[0].seq = 1;
+    batches[1].seq = 3;
+    // epoch-1 output: a fresh baseline for the new epoch
+    batches[2].seq = 1;
+
+    let mut leader_0 = Certificate::default();
+    leader_0.update_created_at_for_test(now());
+    leader_0.header_mut_for_test().author = authority_1.clone();
+    leader_0.header.round = 1;
+    let output_0 = ConsensusOutput {
+        sub_dag: Arc::new(CommittedSubDag::new(
+            vec![leader_0.clone()],
+            leader_0,
+            1,
+            ReputationScores::default(),
+            None,
+        )),
+        batches: vec![CertifiedBatch {
+            address: producer,
+            batches: vec![batches[0].clone(), batches[1].clone()],
+        }],
+        batch_digests: vec![batches[0].digest(), batches[1].digest()].into(),
+        ..Default::default()
+    };
+
+    let mut leader_1 = Certificate::default();
+    leader_1.update_created_at_for_test(now());
+    leader_1.header_mut_for_test().author = authority_1.clone();
+    leader_1.header.round = 3;
+    leader_1.header.epoch = 1;
+    let output_1 = ConsensusOutput {
+        sub_dag: Arc::new(CommittedSubDag::new(
+            vec![leader_1.clone()],
+            leader_1,
+            2,
+            ReputationScores::default(),
+            None,
+        )),
+        batches: vec![CertifiedBatch { address: producer, batches: vec![batches[2].clone()] }],
+        batch_digests: vec![batches[2].digest()].into(),
+        ..Default::default()
+    };
+
+    let reth_env =
+        run_engine(&execution_node, &chain, gas_accumulator, vec![output_0, output_1]).await?;
+
+    // seq 1 (epoch 0) + seq 1 (epoch 1) execute; the parked seq 3 is discarded at the boundary
+    assert_eq!(
+        reth_env.canonical_tip().number,
+        2,
+        "the parked batch must be discarded at the boundary, not force executed"
+    );
+    Ok(())
+}

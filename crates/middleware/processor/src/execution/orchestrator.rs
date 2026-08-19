@@ -18,7 +18,7 @@ use rayls_infrastructure_types::{
     gas_accumulator::GasAccumulator, AcceptResult, Address, Batch, CameFrom, Database, Epoch,
     Hash as _, PreparedBatch, SealedHeader, B256,
 };
-use std::sync::Arc;
+use std::{collections::BTreeMap, sync::Arc};
 use tracing::{debug, info, trace, warn};
 
 /// Shared services for the execution pipeline.
@@ -84,6 +84,13 @@ impl<DB: Database> Processor<DB> {
             .is_empty_output_block_active_at_block(parent_block_number + 1)
     }
 
+    /// Check if OutputSeqNormalization behavior is active at the next block after `parent`.
+    fn is_output_seq_normalization_active(&self, parent_block_number: u64) -> bool {
+        self.reth_env
+            .rayls_chain_spec()
+            .is_output_seq_normalization_active_at_block(parent_block_number + 1)
+    }
+
     /// Execute consensus output to extend the canonical chain.
     pub fn execute_consensus_output(
         &self,
@@ -98,10 +105,11 @@ impl<DB: Database> Processor<DB> {
         self.gas_accumulator.rewards_counter().inc_leader_count(output.leader().origin());
 
         let output_digest: B256 = output.digest().into();
-        let batches = output.flatten_batches();
+        let mut batches = output.flatten_batches();
         let epoch = output.leader().epoch();
 
         let batch_digest_v2 = self.is_batch_digest_v2_active(canonical_header.number);
+        let seq_normalization = self.is_output_seq_normalization_active(canonical_header.number);
 
         let capacity = batches.len().max(1);
         let mut executed_blocks = Vec::with_capacity(capacity);
@@ -152,16 +160,22 @@ impl<DB: Database> Processor<DB> {
             epoch,
         };
 
-        let batch_ctx = BatchContext {
-            batches,
-            arc_batches: std::mem::take(&mut output.batches)
-                .into_iter()
-                .map(|cb| (cb.address, cb.batches.into_iter().map(Arc::new).collect()))
-                .collect(),
-            digests: output.batch_digests.iter().copied().collect(),
-        };
+        let arc_batches: Vec<(Address, Vec<Arc<Batch>>)> = std::mem::take(&mut output.batches)
+            .into_iter()
+            .map(|cb| (cb.address, cb.batches.into_iter().map(Arc::new).collect()))
+            .collect();
+        let mut digests: Vec<B256> = output.batch_digests.iter().copied().collect();
+        if seq_normalization {
+            normalize_authority_seq_order(&mut batches, &mut digests, &arc_batches);
+        }
+        let batch_ctx = BatchContext { batches, arc_batches, digests };
 
-        let collected = self.collect_executable_batches(batch_ctx, &output_ctx, batch_digest_v2);
+        let collected = self.collect_executable_batches(
+            batch_ctx,
+            &output_ctx,
+            batch_digest_v2,
+            seq_normalization,
+        );
 
         let close_epoch_value = output.close_epoch.then(|| output.keccak_leader_sigs());
 
@@ -288,6 +302,24 @@ impl<DB: Database> Processor<DB> {
     ) -> EngineResult<(SealedHeader, Vec<ExecutedBlock>)> {
         let epoch_parked = self.batch_ordering.drain_epoch(epoch);
 
+        // Post-fork the parked batches are discarded, not force executed: a parked batch's
+        // predecessor seq never executed in its epoch, so executing it here only drops its txs
+        // nonce-too-high or lands duplicates. The txs stay pooled (the boundary in-flight clear
+        // frees their marks) and are re-sealed in the new epoch. Every node discards the same set:
+        // the parked set derives from committed outputs and the gate from the canonical block
+        // number.
+        if self.is_output_seq_normalization_active(canonical_header.number) {
+            for parked in epoch_parked {
+                if let Some(tracker) = &self.batch_tracker {
+                    tracker.batch_discarded_at_boundary(parked.batch_digest, parked.batch.seq);
+                }
+            }
+            // persist the emptied ordering state with the boundary rather than at the next
+            // periodic persist; a crash in between re-discards the same set either way
+            self.batch_ordering.persist();
+            return Ok((canonical_header, executed_blocks));
+        }
+
         for parked in epoch_parked {
             if batch_digest_v2 {
                 // V2: dedup check on epoch drain (parked batches not pre-registered)
@@ -317,6 +349,7 @@ impl<DB: Database> Processor<DB> {
         batch_ctx: BatchContext,
         output_ctx: &OutputContext,
         batch_digest_v2: bool,
+        seq_normalization: bool,
     ) -> Vec<PreparedBatch> {
         let mut executable_batches = Vec::with_capacity(batch_ctx.batches.len());
 
@@ -357,16 +390,20 @@ impl<DB: Database> Processor<DB> {
                     gas_limit: self.gas_limit,
                 };
 
-                let prepared =
-                    match self.batch_ordering.try_accept(beneficiary, batch.seq, prepared) {
-                        AcceptResult::Parked => {
-                            if let Some(tracker) = &self.batch_tracker {
-                                tracker.batch_parked(batch_digest);
-                            }
-                            continue;
+                let prepared = match self.batch_ordering.try_accept(
+                    beneficiary,
+                    batch.seq,
+                    prepared,
+                    seq_normalization,
+                ) {
+                    AcceptResult::Parked => {
+                        if let Some(tracker) = &self.batch_tracker {
+                            tracker.batch_parked(batch_digest);
                         }
-                        AcceptResult::InOrder(p) | AcceptResult::OverflowForced(p) => p,
-                    };
+                        continue;
+                    }
+                    AcceptResult::InOrder(p) | AcceptResult::OverflowForced(p) => p,
+                };
 
                 if !self.executed_batch_registry.try_register(batch_digest, output_ctx.digest) {
                     if let Some(tracker) = &self.batch_tracker {
@@ -407,16 +444,20 @@ impl<DB: Database> Processor<DB> {
                     gas_limit: self.gas_limit,
                 };
 
-                let prepared =
-                    match self.batch_ordering.try_accept(beneficiary, batch.seq, prepared) {
-                        AcceptResult::Parked => {
-                            if let Some(tracker) = &self.batch_tracker {
-                                tracker.batch_parked(batch_digest);
-                            }
-                            continue;
+                let prepared = match self.batch_ordering.try_accept(
+                    beneficiary,
+                    batch.seq,
+                    prepared,
+                    seq_normalization,
+                ) {
+                    AcceptResult::Parked => {
+                        if let Some(tracker) = &self.batch_tracker {
+                            tracker.batch_parked(batch_digest);
                         }
-                        AcceptResult::InOrder(p) | AcceptResult::OverflowForced(p) => p,
-                    };
+                        continue;
+                    }
+                    AcceptResult::InOrder(p) | AcceptResult::OverflowForced(p) => p,
+                };
 
                 executable_batches.push(prepared);
 
@@ -497,6 +538,40 @@ fn report_batch_execution(
                 nonce_too_high_details: details,
             },
         );
+    }
+}
+
+/// Reorders each authority's batches within one output into ascending seq, in place.
+///
+/// Only positions held by the same authority exchange contents, so the block count and every
+/// other authority's slots are unchanged. A requeued digest that lands in a later header of the
+/// same output would otherwise park its successors until the ordering walk reaches it; after the
+/// repair nothing parks for an intra-output inversion (cross-output gaps still park). The repair
+/// changes the replicated execution order, so it is gated on OutputSeqNormalization.
+fn normalize_authority_seq_order(
+    flattened: &mut [(usize, usize)],
+    digests: &mut [B256],
+    arc_batches: &[(Address, Vec<Arc<Batch>>)],
+) {
+    // Each authority's position set is disjoint, so the per-authority permutations are
+    // independent; BTreeMap keeps the visiting order deterministic.
+    let mut by_authority: BTreeMap<Address, Vec<usize>> = BTreeMap::new();
+    for (position, (cert_idx, _)) in flattened.iter().enumerate() {
+        by_authority.entry(arc_batches[*cert_idx].0).or_default().push(position);
+    }
+    for positions in by_authority.into_values() {
+        if positions.len() < 2 {
+            continue;
+        }
+        let mut entries: Vec<((usize, usize), B256)> =
+            positions.iter().map(|&position| (flattened[position], digests[position])).collect();
+        // stable sort: equal seqs (a re-proposed duplicate in the same output) keep encounter
+        // order for the dedup registry to resolve
+        entries.sort_by_key(|((cert_idx, batch_idx), _)| arc_batches[*cert_idx].1[*batch_idx].seq);
+        for (&position, (index, digest)) in positions.iter().zip(entries) {
+            flattened[position] = index;
+            digests[position] = digest;
+        }
     }
 }
 
