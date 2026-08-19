@@ -18,9 +18,10 @@ use rayls_infrastructure_storage::tables::{
     BatchSeqCounter, Batches, ConsensusBlocks, NodeBatchesCache,
 };
 use rayls_infrastructure_types::{
-    batch_tracker::BatchTracker, error::BlockSealError, AuthorityIdentifier, BatchReceiver,
-    BatchSender, BatchValidation, Database, Epoch, SealedBatch, SenderNonceRanges, TaskKind,
-    TaskManager, WorkerId,
+    batch_tracker::{BatchTracker, SealFailureReason},
+    error::BlockSealError,
+    AuthorityIdentifier, BatchReceiver, BatchSender, BatchValidation, Database, Epoch, SealedBatch,
+    SenderNonceRanges, TaskKind, TaskManager, WorkerId,
 };
 use std::{sync::Arc, time::Duration};
 use tracing::{error, info, warn};
@@ -393,6 +394,9 @@ impl<DB: Database, QW: QuorumWaiterTrait> Worker<DB, QW> {
                         let _ = self.network_handle.publish_batch(digest).await;
                     }
                     Err(e) => {
+                        if let Some(tracker) = &self.batch_tracker {
+                            tracker.batch_seal_failed(digest, SealFailureReason::Quorum);
+                        }
                         return Err(match e {
                             crate::quorum_waiter::QuorumWaiterError::QuorumRejected => {
                                 BlockSealError::QuorumRejected
@@ -414,18 +418,28 @@ impl<DB: Database, QW: QuorumWaiterTrait> Worker<DB, QW> {
             }
             Err(e) => {
                 error!(target: "worker::batch_provider", "Join error attempting batch quorum! {e}");
+                if let Some(tracker) = &self.batch_tracker {
+                    tracker.batch_seal_failed(digest, SealFailureReason::QuorumJoin);
+                }
                 return Err(BlockSealError::FailedQuorum);
             }
         }
 
-        // Send the batch to the primary.
+        // Report the batch to the primary. An unacknowledged report means the digest never
+        // entered the proposer's queue (the epoch-scoped proposer stops draining at teardown), so
+        // recording the batch as sealed would consume a seq no header ever carries: a permanent
+        // per-authority hole whose committed successors park until the boundary drain. Surface it
+        // as a seal failure instead, so the builder reuses the seq and the txs stay selectable.
+        // Reported as FailedQuorum: the batch reached availability but cannot be placed.
         let message = WorkerOwnBatchMessage { worker_id: self.id, digest };
         if let Err(err) = self.client.report_own_batch(message).await {
             error!(target: "worker::batch_provider", "Failed to report our batch: {err:?}");
-            // Should we return an error here?  Doing so complicates some tests but also the batch
-            // is sealed, etc. If we can not report our own batch is this a
-            // showstopper?
-        } else if let Some(tracker) = &self.batch_tracker {
+            if let Some(tracker) = &self.batch_tracker {
+                tracker.batch_seal_failed(digest, SealFailureReason::ReportUnacknowledged);
+            }
+            return Err(BlockSealError::FailedQuorum);
+        }
+        if let Some(tracker) = &self.batch_tracker {
             tracker.batch_reported_to_primary(digest);
         }
 

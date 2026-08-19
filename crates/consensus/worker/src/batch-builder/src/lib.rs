@@ -2,11 +2,11 @@
 //! The block builder maintains the transaction pool and builds the next block.
 //!
 //! Only the engine's canonical updates move transactions between sub-pools, and only the pending
-//! sub-pool feeds the next block. A built block goes to the worker's block provider, which
-//! publishes it to peers and seeks quorum within a time limit. On quorum failure the transactions
-//! are left untouched for the next round; on success they are marked in flight so the next round
-//! skips them, and they stay pending until the engine's canonical update mines them and releases
-//! the marks.
+//! sub-pool feeds the next batch. A built batch goes to the worker, which publishes it to peers
+//! and seals it (quorum within a time limit, then a report to the primary). A failed seal leaves
+//! the transactions untouched for the next round; a successful seal marks them in flight so the
+//! next round skips them, and they stay pending until the engine's canonical update mines them
+//! and releases the marks.
 
 // it tests
 #![allow(unused_crate_dependencies)]
@@ -315,8 +315,9 @@ impl Future for BatchBuilder {
 
                         // NOTE: empty vec returned for non-fatal error during block proposal
                         if mined_transactions.is_empty() {
-                            // Quorum failed: do NOT advance next_batch_seq so the same
-                            // seq number is reused for the next attempt, avoiding gaps.
+                            // Seal failed (no quorum, or the report went unacknowledged): do NOT
+                            // advance next_batch_seq so the same seq is reused for the next
+                            // attempt, avoiding gaps.
                             // reset interval to prevent immediate re-wake from stale tick
                             this.max_delay_interval.reset();
                             let _ = this.max_delay_interval.poll_tick(cx);
@@ -324,7 +325,7 @@ impl Future for BatchBuilder {
                             break;
                         }
 
-                        // Quorum succeeded: advance the seq counter past the one we just used.
+                        // Seal succeeded: advance the seq counter past the one we just used.
                         this.next_batch_seq = seq + 1;
 
                         debug!(target: "block-builder", "marking sealed transactions in flight");
@@ -723,6 +724,7 @@ mod tests {
                 Default::default(),
                 batch_ordering.clone(),
                 ETHEREUM_BLOCK_GAS_LIMIT_56BITS,
+                rayls_execution_evm::in_flight::InFlightTracker::new(),
             )
             .expect("output executed");
 

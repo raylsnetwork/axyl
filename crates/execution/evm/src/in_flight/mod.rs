@@ -59,11 +59,11 @@
 //!
 //! # Concurrency
 //!
-//! The tracker is a cheaply cloned handle over one shared `parking_lot::RwLock`, and up to four
-//! writers can race it: the builder marks, the canonical-chain task releases mined hashes, a sweep
-//! expires, and the epoch transition clears. Correctness does not depend on their interleaving.
-//! Every mutation reads the set size before and after its change under the one write lock and
-//! derives its metric delta from that pair, so the deltas telescope and the conservation identity
+//! The tracker is a cheaply cloned handle over one shared `parking_lot::RwLock`, and in production
+//! four writers race it: the builder marks, the canonical-chain task releases mined hashes, the
+//! engine tick sweeps, and the epoch transition clears. Correctness does not depend on their
+//! interleaving. Every mutation computes its metric delta under the same write lock that applies
+//! it, so the deltas telescope and the conservation identity
 //! `marked - reconcile - ttl - clear = live set size` (and the gauge) holds under any
 //! linearization.
 
@@ -148,18 +148,19 @@ impl InFlightTracker {
 }
 
 impl InFlightTracker {
-    /// Returns whether no hashes are tracked.
+    /// Returns whether no hashes are tracked, including `AckedStale` marks a sweep never releases.
     pub fn is_empty(&self) -> bool {
         self.inner.read().marks.is_empty()
     }
 
-    /// Returns the tracked hash count.
+    /// Returns the tracked hash count, counting both outstanding sends and marks stranded
+    /// past their TTL (`Mark::AckedStale`) that a sweep will never release.
     pub fn len(&self) -> usize {
         self.inner.read().marks.len()
     }
 
-    /// Returns whether the given hash is tracked; true for an `AckedStale` hash too, which no
-    /// sweep releases on its own.
+    /// Returns whether the given hash is tracked, including a `Mark::AckedStale` hash a
+    /// sweep will never release on its own.
     pub fn is_in_flight(&self, hash: &TxHash) -> bool {
         self.inner.read().marks.contains_key(hash)
     }
@@ -376,19 +377,25 @@ impl InFlightTracker {
     fn metrics(&self) -> &InFlightMetrics {
         &self.metrics
     }
+}
 
-    /// Marks the given hashes in-flight directly, bypassing the sealing/forwarding arm flow.
+/// Test levers that bypass the arm flow; production marks and sweeps only through the
+/// [`SealMarks`]/[`ForwardMarks`] handles.
+#[cfg(any(test, feature = "test-utils"))]
+impl InFlightTracker {
+    /// Marks the given hashes in-flight directly.
     pub fn mark_in_flight(&self, hashes: impl IntoIterator<Item = TxHash>) {
         self.track_all(hashes, Mark::Sent { at: Instant::now(), anchor: 0, attempts: 0 });
     }
 
-    /// Returns every tracked hash, `AckedStale` included.
+    /// Returns every tracked hash, including any `Mark::AckedStale` a sweep will never
+    /// release on its own.
     pub fn tracked_hashes(&self) -> Vec<TxHash> {
         let guard = self.inner.read();
         guard.marks.keys().cloned().collect()
     }
 
-    /// Releases the given hashes directly, bypassing the sealing/forwarding arm flow.
+    /// Releases the given hashes directly.
     pub fn release_in_flight(&self, hashes: impl IntoIterator<Item = TxHash>) {
         let mut guard = self.inner.write();
         let before = guard.marks.len();
@@ -401,7 +408,7 @@ impl InFlightTracker {
     }
 
     /// Releases marks older than the given TTL, independent of any armed policy.
-    pub fn sweep_expired(&self, ttl: Duration) -> usize {
+    pub fn sweep_expired(&self, ttl: std::time::Duration) -> usize {
         self.release_due(0, &DuePolicy::ttl(ttl))
     }
 }

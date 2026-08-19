@@ -8,6 +8,7 @@ use crate::{
 };
 use rayls_execution_evm::{
     chainspec::RaylsHardforks,
+    in_flight::InFlightTracker,
     payload::BuildArguments,
     reth_env::{RethEnv, TxValidationCounts},
     ExecutedBlock,
@@ -29,6 +30,9 @@ pub struct Processor<DB: Database> {
     pub(crate) executed_batch_registry: ExecutedBatchRegistry,
     pub(crate) batch_ordering: BatchOrdering<DB>,
     pub(crate) gas_limit: u64,
+    /// Pool in-flight tracker, shared with the worker pool so the marks of txs an executed batch
+    /// dropped are released for re-sealing.
+    pub(crate) in_flight_tracker: InFlightTracker,
 }
 
 impl<DB: Database> Processor<DB> {
@@ -40,6 +44,7 @@ impl<DB: Database> Processor<DB> {
         executed_batch_registry: ExecutedBatchRegistry,
         batch_ordering: BatchOrdering<DB>,
         gas_limit: u64,
+        in_flight_tracker: InFlightTracker,
     ) -> Self {
         Self {
             reth_env,
@@ -48,6 +53,7 @@ impl<DB: Database> Processor<DB> {
             executed_batch_registry,
             batch_ordering,
             gas_limit,
+            in_flight_tracker,
         }
     }
 
@@ -191,12 +197,12 @@ impl<DB: Database> Processor<DB> {
         // executes LATER as its own block once its seq becomes consecutive.
         let output_produced_block = executed_blocks.len() > blocks_before_output;
         let close_epoch_unconsumed = output.close_epoch && last_current_output_idx.is_none();
-        // Hardfork-gated. Post-fork (EmptyOutputBlock): every output yields >=1 block — emit a
+        // Hardfork-gated. Post-fork (EmptyOutputBlock): every output yields >=1 block, so build a
         // fallback whenever THIS output produced none, or a close_epoch batch was parked/drained.
         // Pre-fork: reproduce the EXACT pre-`e44a028` branch structure so replaying existing
         // history is bit-identical (the difference is the drained-parked case, where the old code
         // emitted no own block for the output). The old "all batches parked, no fallback" case
-        // produced no block at all — still safe because epoch-drained blocks kept the call
+        // produced no block at all - still safe because epoch-drained blocks kept the call
         // non-empty for `finish_executing_output`.
         let empty_output_block_active = self.is_empty_output_block_active(canonical_header.number);
         let output_had_batches = num_output_batches > 0;
@@ -451,7 +457,8 @@ impl<DB: Database> Processor<DB> {
             &prepared.batch.transactions,
             executed_blocks,
             &self.reth_env,
-        )?;
+        )?
+        .settle(Some(&self.in_flight_tracker));
         report_batch_execution(
             self.batch_tracker.as_ref(),
             prepared.batch_digest,
@@ -521,6 +528,7 @@ pub fn execute_consensus_output<DB: Database>(
     executed_batch_registry: ExecutedBatchRegistry,
     batch_ordering: BatchOrdering<DB>,
     gas_limit: u64,
+    in_flight_tracker: InFlightTracker,
 ) -> EngineResult<SealedHeader> {
     let processor = Processor::new(
         args.reth_env.clone(),
@@ -529,6 +537,7 @@ pub fn execute_consensus_output<DB: Database>(
         executed_batch_registry,
         batch_ordering,
         gas_limit,
+        in_flight_tracker,
     );
     processor.execute_consensus_output(args, CameFrom::FreeFn)
 }
