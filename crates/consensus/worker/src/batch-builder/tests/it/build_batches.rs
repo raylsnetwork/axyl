@@ -170,7 +170,7 @@ async fn test_make_batch_el_to_cl() {
         ETHEREUM_BLOCK_GAS_LIMIT_56BITS,
     );
 
-    let valid_batch_result = batch_validator.validate_batch(sealed_batch.clone()).await;
+    let valid_batch_result = batch_validator.validate_batch(&sealed_batch).await;
     assert!(valid_batch_result.is_ok());
 
     // ensure expected transaction is in batch
@@ -365,7 +365,7 @@ async fn test_batch_builder_produces_valid_batches() {
         ETHEREUM_BLOCK_GAS_LIMIT_56BITS,
     );
 
-    let valid_batch_result = batch_validator.validate_batch(first_batch.clone()).await;
+    let valid_batch_result = batch_validator.validate_batch(&first_batch).await;
     assert!(valid_batch_result.is_ok());
 
     // ensure expected transaction is in batch
@@ -391,7 +391,7 @@ async fn test_batch_builder_produces_valid_batches() {
     let _ = ack.send(Ok(()));
 
     // validate second block
-    let valid_batch_result = batch_validator.validate_batch(next_batch.clone()).await;
+    let valid_batch_result = batch_validator.validate_batch(&next_batch).await;
     assert!(valid_batch_result.is_ok());
 
     // assert only transaction in block
@@ -594,7 +594,7 @@ async fn test_canonical_notification_updates_pool() {
             .await
             .expect("block builder's sender didn't drop")
             .expect("batch was built");
-        assert!(batch_validator.validate_batch(batch).await.is_ok());
+        assert!(batch_validator.validate_batch(&batch).await.is_ok());
         let _ = ack.send(Ok(()));
         tokio::task::yield_now().await;
     }

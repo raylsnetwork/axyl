@@ -7792,6 +7792,7 @@ dependencies = [
  "assert_matches",
  "async-trait",
  "backoff",
+ "bcs",
  "consensus-metrics",
  "eyre",
  "futures",

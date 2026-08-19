@@ -148,7 +148,7 @@ where
 
         let client = self.consensus_config.local_network().clone();
         let store = self.consensus_config.node_storage().clone();
-        self.validator.validate_batch(sealed_batch.clone()).await?;
+        self.validator.validate_batch(&sealed_batch).await?;
 
         let (mut batch, digest) = sealed_batch.split();
 
