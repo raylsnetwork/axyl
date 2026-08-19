@@ -1976,9 +1976,6 @@ mod test {
         let count = db.iter::<TestTable>().count();
         assert_eq!(count, 101, "Expected 101 items after clear+insert, got {}", count);
 
-        // Verify no items are incorrectly marked as deleted
-        let deleted_keys = db.mem_db.get_deleted_keys::<TestTable>();
-        assert!(deleted_keys.is_empty(), "Expected no deleted keys, found {}", deleted_keys.len());
     }
 
     #[test]

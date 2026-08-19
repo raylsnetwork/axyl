@@ -451,15 +451,6 @@ impl MemDatabase {
     pub fn mem_size(&self) -> usize {
         self.store.read().values().map(|table| table.len()).sum()
     }
-
-    /// Returns keys marked for deletion in the given table.
-    pub fn get_deleted_keys<T: Table>(&self) -> std::collections::HashSet<Vec<u8>> {
-        if let Some(table) = self.store.read().get(T::NAME) {
-            table.iter().filter(|(_, entry)| entry.tombstoned()).map(|(k, _)| k.clone()).collect()
-        } else {
-            std::collections::HashSet::new()
-        }
-    }
 }
 
 impl Drop for MemDatabase {
