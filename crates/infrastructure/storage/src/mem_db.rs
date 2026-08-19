@@ -84,7 +84,7 @@ impl StoreEntry {
     }
 
     fn dec_in_flight(&mut self) {
-        debug_assert!(self.in_flight() == 0, "in-flight op count is 0 before decrementing it");
+        debug_assert!(self.in_flight() != 0, "in-flight op count is 0 before decrementing it");
         self.packed -= 2;
     }
 

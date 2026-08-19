@@ -1543,19 +1543,38 @@ mod test {
     }
 
     /// Writer message that parks `db_run` until the paired sender is dropped, so a test can pin a
-    /// real enqueued backlog behind a stalled writer.
-    struct WriterGate(std::sync::mpsc::Receiver<()>);
+    /// real enqueued backlog behind a stalled writer. It signals `reached` just before parking, so a
+    /// test can wait deterministically for the writer to have drained up to the gate instead of
+    /// sleeping on a fixed timeout.
+    struct WriterGate {
+        park: std::sync::mpsc::Receiver<()>,
+        reached: std::sync::mpsc::Sender<()>,
+    }
 
     impl<DB: Database> InsertTrait<DB> for WriterGate {
         fn insert(&self, _db: &DB) -> eyre::Result<()> {
-            let _ = self.0.recv();
+            let _ = self.reached.send(());
+            let _ = self.park.recv();
             Ok(())
         }
         fn insert_txn(&self, _txn: &mut DB::TXMut<'_>) -> eyre::Result<()> {
-            let _ = self.0.recv();
+            let _ = self.reached.send(());
+            let _ = self.park.recv();
             Ok(())
         }
         fn on_applied(&self, _mem_db: &MemDatabase, _heap: &mut EvictionHeap) {}
+    }
+
+    /// A `(release, reached, gate)` triple: dropping `release` lets the writer pass the gate, and
+    /// `reached` fires once the writer has drained up to and parked at the gate.
+    fn writer_gate() -> (
+        std::sync::mpsc::Sender<()>,
+        std::sync::mpsc::Receiver<()>,
+        WriterGate,
+    ) {
+        let (release, park) = std::sync::mpsc::channel::<()>();
+        let (reached, reached_rx) = std::sync::mpsc::channel::<()>();
+        (release, reached_rx, WriterGate { park, reached })
     }
 
     /// A producer bursting into a seeded writer backlog must be paced above the high-water mark,
@@ -1569,8 +1588,8 @@ mod test {
         db.open_table::<TestTable>().expect("open layered table");
 
         // Park the writer behind a gate so the seeded backlog cannot drain mid-measurement.
-        let (release, gate) = std::sync::mpsc::channel::<()>();
-        db.tx.send(DBMessage::Insert(Box::new(WriterGate(gate)))).expect("gate enqueue");
+        let (release, _reached, gate) = writer_gate();
+        db.tx.send(DBMessage::Insert(Box::new(gate))).expect("gate enqueue");
 
         // Seed one message past the mark: every enqueue here is at or below it, hence unpaced.
         let value = "v".to_string();
@@ -1654,19 +1673,21 @@ mod test {
         db.open_table::<TestTable>().expect("open layered table");
 
         // Two gates park the writer mid-drain so the in-flight window is observable.
-        let (release, gate1) = std::sync::mpsc::channel::<()>();
-        let (release2, gate2) = std::sync::mpsc::channel::<()>();
-        db.tx.send(DBMessage::Insert(Box::new(WriterGate(gate1)))).expect("gate1 enqueue");
+        let (release, gate1_reached, gate1) = writer_gate();
+        let (release2, gate2_reached, gate2) = writer_gate();
+        db.tx.send(DBMessage::Insert(Box::new(gate1))).expect("gate1 enqueue");
         db.insert::<TestTable>(&1, &"one".to_string()).expect("insert k1");
-        db.tx.send(DBMessage::Insert(Box::new(WriterGate(gate2)))).expect("gate2 enqueue");
+        db.tx.send(DBMessage::Insert(Box::new(gate2))).expect("gate2 enqueue");
         db.remove::<TestTable>(&1).expect("remove k1");
         db.insert::<TestTable>(&2, &"two".to_string()).expect("insert k2");
 
-        // Let the writer drain past K1's insert, then park again: K1's tombstone and K2's row are
-        // both in flight (count > 0), so eviction (run at every apply) must not drop anything even
-        // though the cache holds 2 rows against a cap of 1.
+        // Let the writer drain past K1's insert, then wait until it parks at gate2: K1's tombstone
+        // and K2's row are both in flight (count > 0), so eviction (run at every apply) must not
+        // drop anything even though the cache holds 2 rows against a cap of 1. Gate messages are
+        // processed in enqueue order, so gate2 being reached proves gate1 was drained.
         drop(release);
-        std::thread::sleep(std::time::Duration::from_millis(100));
+        let _ = gate1_reached.recv().expect("writer drains past gate1");
+        let _ = gate2_reached.recv().expect("writer parks at gate2");
         assert_eq!(
             db.mem_db.mem_size(),
             2,
