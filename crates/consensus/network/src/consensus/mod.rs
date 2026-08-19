@@ -30,7 +30,7 @@ mod command;
 mod constructor;
 mod debug;
 mod gossip;
-mod kad;
+pub(crate) mod kad;
 mod maintenance;
 mod peer_events;
 mod reqres;
@@ -91,18 +91,26 @@ where
     /// The collection of kademlia record requests.
     ///
     /// When the application layer makes a request, the swarm stores the kad::QueryId and the
-    /// the bls key associated with the desired authority's [NodeRecord]. The query runs until
+    /// bls key associated with the desired authority's [NodeRecord]. The query runs until
     /// the last step. During this time, results are tracked and compared to one another to
     /// ensure the latest valid record is used for the peer's info.
     kad_record_queries: HashMap<QueryId, KadQuery>,
-    /// Kad queries that are expected to fail because of having 0 peers
+    /// Kad queries that are expected to fail because of having 0 peers.
     kad_expecting_to_fail_query_ids: HashSet<QueryId>,
+    /// Fixed-window count of inbound kad PutRecord requests per peer, as `(window start in
+    /// seconds, puts seen)`.
+    ///
+    /// Every put reaching the verify path costs a BLS verification on the swarm event loop and a
+    /// validly signed replay earns no penalty, so without a budget one peer can convert puts into
+    /// event-loop CPU at will. Honest nodes republish their record on the order of minutes, so the
+    /// budget only bites floods.
+    pub(super) kad_put_budget: HashMap<PeerId, (u64, u32)>,
     /// The configurables for the libp2p consensus network implementation.
     config: LibP2pConfig,
     /// Track peers we have a connection with.
     ///
-    /// This explicitly tracked and is a VecDeque so we can use to round robin requests without an
-    /// explicit peer.
+    /// Tracked explicitly as a VecDeque so requests can round-robin over peers when the caller
+    /// names none.
     connected_peers: VecDeque<PeerId>,
     /// Key manager, provide the BLS public key and sign peer records published to kademlia.
     key_config: KeyConfig,
@@ -114,7 +122,7 @@ where
     node_record: NodeRecord,
     /// Last time cleanup was performed for time-based cleanup.
     last_cleanup: Instant,
-    ///Network metrics for the peer manager
+    /// Network metrics for the peer manager.
     network_metrics: Arc<NetworkMetrics>,
     /// A label for the network to use in metrics.
     network_label: &'static str,
