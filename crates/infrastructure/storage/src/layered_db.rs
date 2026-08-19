@@ -582,7 +582,7 @@ impl<'a, DB: Database> DbTxMut for LayeredDbTxMut<'a, DB> {
     fn clear_table<T: Table>(&mut self) -> eyre::Result<()> {
         let keys = self.mem_db.raw_keys::<T>();
         self.mem_db.clear_table::<T>()?;
-        let clr = Box::new(ClearTable::<T> { _casper: PhantomData, keys });
+        let clr = Box::new(ClearTable::<T> { _marker: PhantomData, keys });
         self.tx.send(DBMessage::Clear(clr)).map_err(|_| eyre::eyre!("DB thread gone, FATAL!"))?;
         Ok(())
     }
@@ -1150,7 +1150,7 @@ impl<DB: Database> Database for LayeredDatabase<DB> {
         // The clear tombstones every row and bumps each in-flight count under the same lock that
         // captures the key set for the writer, so no tombstone is evicted before the clear lands.
         self.mem_db.clear_table_queued::<T>(|keys| {
-            let clr = Box::new(ClearTable::<T> { _casper: PhantomData, keys });
+            let clr = Box::new(ClearTable::<T> { _marker: PhantomData, keys });
             self.tx.send(DBMessage::Clear(clr)).map_err(|_| eyre::eyre!("DB thread gone, FATAL!"))
         })
     }
@@ -1319,7 +1319,7 @@ struct ClearTable<T: Table> {
     /// Raw keys tombstoned by the producer's clear: each must release its in-flight op when the
     /// persistent clear applies, so no tombstone is evicted before then.
     keys: Vec<Vec<u8>>,
-    _casper: PhantomData<T>,
+    _marker: PhantomData<T>,
 }
 
 impl<T: Table, DB: Database> InsertTrait<DB> for KeyValueInsert<T> {
@@ -1567,11 +1567,7 @@ mod test {
 
     /// A `(release, reached, gate)` triple: dropping `release` lets the writer pass the gate, and
     /// `reached` fires once the writer has drained up to and parked at the gate.
-    fn writer_gate() -> (
-        std::sync::mpsc::Sender<()>,
-        std::sync::mpsc::Receiver<()>,
-        WriterGate,
-    ) {
+    fn writer_gate() -> (std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>, WriterGate) {
         let (release, park) = std::sync::mpsc::channel::<()>();
         let (reached, reached_rx) = std::sync::mpsc::channel::<()>();
         (release, reached_rx, WriterGate { park, reached })
@@ -1975,7 +1971,6 @@ mod test {
         // Verify all items are accessible via the layered iterator
         let count = db.iter::<TestTable>().count();
         assert_eq!(count, 101, "Expected 101 items after clear+insert, got {}", count);
-
     }
 
     #[test]
