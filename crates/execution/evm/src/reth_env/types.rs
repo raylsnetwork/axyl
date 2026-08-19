@@ -6,7 +6,7 @@ use crate::{
 use alloy::primitives::BlockHash;
 use rayls_infrastructure_config::FEE_AGGREGATOR_ADDRESS;
 use rayls_infrastructure_types::{
-    Address, NonceRange, RecoveredBlock, SenderNonceRanges, TransactionSigned, B256,
+    Address, Bytes, NonceRange, RecoveredBlock, SenderNonceRanges, TransactionSigned, B256,
 };
 use rayon::prelude::*;
 use reth::rpc::{
@@ -63,9 +63,9 @@ pub struct NonceTooHighDetail {
 /// Per-batch counts of transactions dropped during EVM execution, classified by reason.
 #[derive(Debug, Default)]
 pub struct TxValidationCounts {
-    /// Transactions with nonce higher than account state (gap — tx is lost).
+    /// Transactions with nonce higher than account state (gap: tx is lost).
     pub nonce_too_high: u32,
-    /// Transactions with nonce lower than account state (already executed — harmless).
+    /// Transactions with nonce lower than account state (already executed: harmless).
     pub nonce_too_low: u32,
     /// Transactions dropped for other validation reasons.
     pub other: u32,
@@ -96,32 +96,32 @@ impl TxValidationCounts {
 /// Receiver for failed transaction notifications.
 pub type ExecutedBatchDigestReceiver = broadcast::Receiver<BlockHash>;
 
-/// This will contain the address to receive base fees.  It is set per chain and
-/// will not change.  Implemented as a static OnceLock to work around the Reth lib interface.
+/// Chain-wide base-fee recipient, set once at startup. A static `OnceLock` because the reth EVM
+/// hooks that read it take no handle to node state.
 static BASEFEE_ADDRESS: OnceLock<Address> = OnceLock::new();
 
-/// Return the chains basefee address if set.
-/// Note the basefee address is set once for the chain and will not change (outside of a hard fork).
-/// Defaults to FEE_AGGREGATOR_ADDRESS so transaction base fees flow directly to fee distribution.
+/// Returns the chain's base-fee address, defaulting to `FEE_AGGREGATOR_ADDRESS` so base fees flow
+/// directly to fee distribution. Fixed for the life of the chain outside a hard fork.
 pub fn basefee_address() -> Address {
     *BASEFEE_ADDRESS.get().unwrap_or(&FEE_AGGREGATOR_ADDRESS)
 }
 
-/// Set the basefee address.  This will only work on the first call and should be during program
-/// initialization. Calling more than once will do nothing, not calling early can lead to an unset
-/// basefee address and a chain fork.
-/// Defaults to FEE_AGGREGATOR_ADDRESS for direct fee collection.
+/// Sets the base-fee address; only the first call takes effect, so it must run during
+/// initialization. A call after blocks have executed is ignored, and a node that executed with
+/// the default while its peers used a configured address has already forked.
 pub(super) fn set_basefee_address(address: Option<Address>) {
-    // Ignore the error. Should probably panic on error but this will break some test environments.
+    // A repeat call is ignored rather than a panic: test environments build several envs per
+    // process.
     let _ = BASEFEE_ADDRESS.set(address.unwrap_or(FEE_AGGREGATOR_ADDRESS));
 }
 
-/// Recover a batch of raw transactions, using parallelization for large batches.
+/// Recovers signers for a batch of raw transactions, fanning out over rayon once the batch is
+/// large enough for the thread hand-off to pay for itself.
 pub fn reth_recover_raw_transactions(
     batch_digest: Option<FixedBytes<32>>,
-    transactions: &[Vec<u8>],
+    transactions: &[Bytes],
 ) -> Vec<EthResult<Recovered<TransactionSigned>>> {
-    let rec_fn = |tx_bytes: &Vec<u8>| {
+    let rec_fn = |tx_bytes: &Bytes| {
         reth_recover_raw_transaction::<TransactionSigned>(tx_bytes).inspect_err(|e| {
             error!(
                 target: "engine",
@@ -133,15 +133,13 @@ pub fn reth_recover_raw_transactions(
     };
 
     if transactions.len() > 100 {
-        // use parallel iterator to speed up recovery of transactions
         transactions.par_iter().map(rec_fn).collect()
     } else {
-        // use normal iterator for small number of transactions
         transactions.iter().map(rec_fn).collect()
     }
 }
 
-/// Rpc Server type, used for getting the node started.
+/// RPC module set the node is started with.
 pub type RpcServer = TransportRpcModules<()>;
 
 /// The type to receive executed blocks from the engine and update canonical/finalized block state.
@@ -161,17 +159,14 @@ pub type ToTree = std::sync::mpsc::Sender<
     >,
 >;
 
-// replace deprecated reth name with this type
-/// Type alias to replace deprecated reth struct with new generic type:
-/// A block with senders recovered from the block’s transactions.
+/// A sealed block with the senders recovered from its transactions.
 ///
-/// This type is a SealedBlock with a list of senders that match the transactions in the block.
+/// Stands in for the deprecated reth `BlockWithSenders` over the generic [`RecoveredBlock`].
 pub type BlockWithSenders = RecoveredBlock<reth_ethereum_primitives::Block>;
 
 /// Shared handle to the payload processor for concurrent state root computation.
 pub(crate) type SharedPayloadProcessor = Arc<parking_lot::Mutex<PayloadProcessor<RaylsEvmConfig>>>;
 
-/// Type wrapper for a Reth DB.
-/// Used primary as a opaque type to allow
-/// the node launcher to create the DB upfront and reuse.
+/// Shared handle to the reth database, opened once by the node launcher and reused by every
+/// component.
 pub type RethDb = Arc<DatabaseEnv>;

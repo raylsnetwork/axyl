@@ -74,7 +74,7 @@ impl BatchValidation for BatchValidator {
             return Ok(());
         }
 
-        // A validator belongs to a worker and that worker only handles batches with it's id.
+        // A validator belongs to a worker and that worker only handles batches with its id.
         if batch.worker_id != self.worker_id {
             return Err(BatchValidationError::InvalidWorkerId {
                 expected_worker_id: self.worker_id,
@@ -221,7 +221,7 @@ impl BatchValidator {
     /// Validate the size of transactions (in bytes).
     fn validate_batch_size_bytes(
         &self,
-        transactions: &[Vec<u8>],
+        transactions: &[Bytes],
         epoch: Epoch,
     ) -> BatchValidationResult<()> {
         // calculate size (in bytes) of included transactions
@@ -246,7 +246,7 @@ impl BatchValidator {
     #[inline]
     fn decode_transactions(
         &self,
-        transactions: &Vec<Vec<u8>>,
+        transactions: &Vec<Bytes>,
         digest: BlockHash,
     ) -> BatchValidationResult<Vec<TransactionSigned>> {
         transactions
@@ -877,7 +877,7 @@ mod tests {
 
             // track totals
             total_bytes += tx.len();
-            too_many_txs.push(tx);
+            too_many_txs.push(tx.into());
         }
 
         // NOTE: these assertions aren't important but want to know if tx size changes
@@ -915,7 +915,7 @@ mod tests {
         let expected_len = too_big.len();
         assert_eq!(expected_len, 2_000_090);
 
-        let invalid_txs = vec![too_big];
+        let invalid_txs = vec![too_big.into()];
         block.transactions = invalid_txs;
         // ensure size method correctly accounts for struct+txs
         assert_eq!(block.size(), 2_000_178);
@@ -953,7 +953,7 @@ mod tests {
         let (mut batch, _) = valid_batch.split();
 
         // test batch with bad decode
-        batch.transactions = vec![b"this is a bad batch".to_vec()];
+        batch.transactions = vec![b"this is a bad batch".to_vec().into()];
 
         assert_matches!(
             validator.validate_batch(batch.clone().seal_slow()).await,
@@ -1011,7 +1011,7 @@ mod tests {
         );
 
         // test batch with eip4844 tx
-        batch.transactions = vec![signed_tx.encoded_2718()];
+        batch.transactions = vec![signed_tx.encoded_2718().into()];
 
         assert_matches!(
             validator.validate_batch(batch.clone().seal_slow()).await,

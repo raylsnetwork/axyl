@@ -68,7 +68,7 @@ struct Fixture {
 fn batch_for(number: u64, epoch: Epoch) -> Batch {
     Batch {
         // Distinct per block so the byte-identical readback assertion is meaningful.
-        transactions: vec![vec![number as u8; 1 + (number as usize % 7)]],
+        transactions: vec![vec![number as u8; 1 + (number as usize % 7)].into()],
         epoch,
         worker_id: 0,
         seq: number,

@@ -203,6 +203,7 @@ async fn test_empty_output_executes() -> eyre::Result<()> {
         committee.authority(&leader_id).expect("leader in committee").execution_address();
     gas_accumulator.rewards_counter().set_committee(committee);
 
+    // consensus side
     //
     // create consensus output bc transactions in batches
     // are randomly generated
@@ -371,15 +372,13 @@ async fn test_empty_output_executes() -> eyre::Result<()> {
     Ok(())
 }
 
-/// The engine drains its queue, then the channel, and shuts down once the sender is closed.
+/// The engine drains the queued output, then the output still in the channel, and shuts down
+/// gracefully once the sender is dropped, in that order.
 ///
-/// One output is pre-queued (already received) and another is sent on the channel before the
-/// sender is dropped and the engine starts: the queued output executes first, the channel output
-/// second, and the engine exits gracefully with nothing left. Transactions carry priority fees so
-/// the epoch-end governance, batch-producer, and block rewards can be asserted.
-///
-/// NOTE: all batches are built with genesis as the parent; building from historic parents is
-/// currently valid.
+/// One output is queued (already received) and another is sent on the channel before the sender
+/// is dropped and the engine starts. All batches are built with genesis as the parent, which is
+/// valid. Priority-fee transactions are included to assert governance, batch producer, and block
+/// rewards reach the correct addresses at the end of the epoch.
 #[tokio::test]
 async fn test_happy_path_full_execution_even_after_sending_channel_closed() -> eyre::Result<()> {
     let tmp_dir = TempDir::new().expect("temp dir");
@@ -418,10 +417,10 @@ async fn test_happy_path_full_execution_even_after_sending_channel_closed() -> e
         )
         .encoded_2718();
     if let Some(batch) = batches_1.first_mut() {
-        batch.transactions_mut().push(encoded_tx_priority_fee_1)
+        batch.transactions_mut().push(encoded_tx_priority_fee_1.into())
     }
     if let Some(batch) = batches_2.first_mut() {
-        batch.transactions_mut().push(encoded_tx_priority_fee_2)
+        batch.transactions_mut().push(encoded_tx_priority_fee_2.into())
     }
 
     // okay to clone these because they are only used to seed genesis, decode transactions, and
@@ -528,6 +527,8 @@ async fn test_happy_path_full_execution_even_after_sending_channel_closed() -> e
     // Reload all_batches so we can calculate mix_hash properly later.
     let all_batches = [batches_1.clone(), batches_2.clone()].concat();
 
+    // consensus side
+
     // create consensus output bc transactions in batches
     // are randomly generated
     //
@@ -592,6 +593,7 @@ async fn test_happy_path_full_execution_even_after_sending_channel_closed() -> e
     batch_digests_1.extend(batch_digests_2);
     let all_batch_digests: Vec<BlockHash> = batch_digests_1.into();
 
+    // execution side
     // setup rewards for first two rounds of consensus
     let rewards_counter = gas_accumulator.rewards_counter();
     rewards_counter.set_committee(committee.clone());
@@ -818,13 +820,12 @@ async fn test_happy_path_full_execution_even_after_sending_channel_closed() -> e
     Ok(())
 }
 
-/// A batch of duplicate transactions executes as an empty block and the engine shuts down clean.
+/// A batch whose transactions were already executed produces an empty block, and the engine
+/// drains its queue and shuts down gracefully.
 ///
-/// Transactions carry priority fees so the epoch-end governance, batch-producer, and block
-/// rewards can be asserted.
-///
-/// NOTE: all batches are built with genesis as the parent; building from historic parents is
-/// currently valid.
+/// All batches are built with genesis as the parent, which is valid. Priority-fee transactions
+/// are included to assert governance, batch producer, and block rewards reach the correct
+/// addresses at the end of the epoch.
 #[tokio::test]
 async fn test_execution_succeeds_with_duplicate_transactions() -> eyre::Result<()> {
     let tmp_dir = TempDir::new().unwrap();
@@ -863,10 +864,10 @@ async fn test_execution_succeeds_with_duplicate_transactions() -> eyre::Result<(
         )
         .encoded_2718();
     if let Some(batch) = batches_1.first_mut() {
-        batch.transactions_mut().push(encoded_tx_priority_fee_1)
+        batch.transactions_mut().push(encoded_tx_priority_fee_1.into())
     }
     if let Some(batch) = batches_2.first_mut() {
-        batch.transactions_mut().push(encoded_tx_priority_fee_2)
+        batch.transactions_mut().push(encoded_tx_priority_fee_2.into())
     }
     // duplicate transactions in last batch for each round
     //
@@ -1005,6 +1006,7 @@ async fn test_execution_succeeds_with_duplicate_transactions() -> eyre::Result<(
     assert_eq!(duplicate_batch_round_2.transactions(), duplicated_batch_for_round_2.transactions());
     assert_ne!(duplicate_batch_round_2, duplicated_batch_for_round_2);
 
+    // consensus side
     //
     // create consensus output bc transactions in batches
     // are randomly generated
@@ -1074,6 +1076,7 @@ async fn test_execution_succeeds_with_duplicate_transactions() -> eyre::Result<(
     batch_digests_1.extend(batch_digests_2);
     let all_batch_digests: Vec<BlockHash> = batch_digests_1.into();
 
+    // execution side
     // setup rewards for first two rounds of consensus
     let rewards_counter = gas_accumulator.rewards_counter();
     rewards_counter.set_committee(committee.clone());
@@ -1342,12 +1345,12 @@ async fn test_execution_succeeds_with_duplicate_transactions() -> eyre::Result<(
     Ok(())
 }
 
-/// The engine drops a duplicate ConsensusOutput via the deterministic `(epoch, leader_round)` +
-/// subdag-digest guard.
+/// The engine drops a duplicate `ConsensusOutput` via the deterministic `(epoch, leader_round)`
+/// + subdag-digest guard.
 ///
-/// Three empty outputs go through the channel: output_1 (epoch 0, round 0), a byte-for-byte
-/// re-delivery of it (the benign dual-feed case), and output_2 (round 2). Two blocks result, one
-/// per distinct output; the re-delivery is silently dropped.
+/// Three empty outputs are sent: output_1 (epoch 0, round 0), output_dup (a byte-for-byte
+/// re-delivery of output_1, the benign dual-feed case) and output_2 (epoch 0, round 2). Two
+/// blocks are produced, one per distinct output; the re-delivery is silently dropped.
 #[tokio::test]
 async fn test_duplicate_consensus_output_is_dropped() -> eyre::Result<()> {
     let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
@@ -1369,6 +1372,7 @@ async fn test_duplicate_consensus_output_is_dropped() -> eyre::Result<()> {
     let leader_id = committee.authorities().first().expect("first authority").id();
     gas_accumulator.rewards_counter().set_committee(committee);
 
+    // consensus side
     //
     // Build three empty ConsensusOutput objects:
     //   output_1: number=0 (valid)
@@ -1397,8 +1401,8 @@ async fn test_duplicate_consensus_output_is_dropped() -> eyre::Result<()> {
         ..Default::default()
     };
 
-    // output_dup: a true re-delivery of output_1 (identical epoch, round, and subdag
-    // content). The deterministic guard drops it as a benign dual-feed duplicate. ---
+    // output_dup: a true re-delivery of output_1 (identical epoch, round, and subdag content).
+    // The deterministic guard drops it as a benign dual-feed duplicate.
     let mut leader_dup = Certificate::default();
     leader_dup.header.round = 0;
     leader_dup.header.created_at = timestamp;
@@ -1439,6 +1443,8 @@ async fn test_duplicate_consensus_output_is_dropped() -> eyre::Result<()> {
         ..Default::default()
     };
     let consensus_output_2_hash = consensus_output_2.consensus_header_hash();
+
+    // execution side
 
     // channel capacity 3 so all outputs can be sent before engine starts
     let (to_engine, from_consensus) = tokio::sync::mpsc::channel(3);
@@ -1581,6 +1587,7 @@ async fn test_max_round_terminates_early() -> eyre::Result<()> {
         debug!("{idx}\n{:?}\n", batch);
     }
 
+    // consensus side
     //
     // create consensus output bc transactions in batches
     // are randomly generated
@@ -1637,6 +1644,8 @@ async fn test_max_round_terminates_early() -> eyre::Result<()> {
         number: 1,
         ..Default::default()
     };
+
+    // execution side
 
     let (_to_engine, from_consensus) = tokio::sync::mpsc::channel(1);
     // set max round to "1" - this should receive both digests, but stop after the first round
@@ -1871,7 +1880,7 @@ async fn test_dropped_txs_release_in_flight_marks() -> eyre::Result<()> {
     let gapped_hashes: Vec<B256> = gapped.iter().map(|tx| *tx.hash()).collect();
     let batch = batches.first_mut().expect("one batch");
     for tx in &gapped {
-        batch.transactions_mut().push(tx.encoded_2718());
+        batch.transactions_mut().push(tx.encoded_2718().into());
     }
 
     let (genesis, _txs, _signers) = seeded_genesis_from_random_batches(genesis, batches.iter());
