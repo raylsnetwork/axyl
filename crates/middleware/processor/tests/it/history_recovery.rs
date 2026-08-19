@@ -210,15 +210,15 @@ async fn recovery_seeds_state_and_enforces_ordering() {
     let ord = BatchOrdering::from_history(fixture.db().clone(), EPOCH);
 
     // in-order accept for AUTH_A at seq=4 (last=3 -> next=4)
-    let r = ord.try_accept(AUTH_A, 4, make_prepared(AUTH_A, 4));
+    let r = ord.try_accept(AUTH_A, 4, make_prepared(AUTH_A, 4), false);
     assert!(matches!(r, AcceptResult::InOrder(_)), "expected InOrder, got {:?}", r);
 
     // gap: AUTH_A at seq=6 (last is now 4, gap of 1)
-    let r = ord.try_accept(AUTH_A, 6, make_prepared(AUTH_A, 6));
+    let r = ord.try_accept(AUTH_A, 6, make_prepared(AUTH_A, 6), false);
     assert!(matches!(r, AcceptResult::Parked), "expected Parked, got {:?}", r);
 
     // stale: AUTH_A at seq=2 (already executed pre-recovery)
-    let r = ord.try_accept(AUTH_A, 2, make_prepared(AUTH_A, 2));
+    let r = ord.try_accept(AUTH_A, 2, make_prepared(AUTH_A, 2), false);
     assert!(
         matches!(r, AcceptResult::InOrder(_)),
         "stale-seq must defer to dedup (returns InOrder), got {:?}",
@@ -226,11 +226,11 @@ async fn recovery_seeds_state_and_enforces_ordering() {
     );
 
     // AUTH_B independent: last=2 -> seq=3 in-order
-    let r = ord.try_accept(AUTH_B, 3, make_prepared(AUTH_B, 3));
+    let r = ord.try_accept(AUTH_B, 3, make_prepared(AUTH_B, 3), false);
     assert!(matches!(r, AcceptResult::InOrder(_)), "expected InOrder, got {:?}", r);
 
     // fill gap for AUTH_A: seq=5 is the missing one (last=4)
-    let r = ord.try_accept(AUTH_A, 5, make_prepared(AUTH_A, 5));
+    let r = ord.try_accept(AUTH_A, 5, make_prepared(AUTH_A, 5), false);
     assert!(matches!(r, AcceptResult::InOrder(_)), "expected InOrder, got {:?}", r);
 
     // drain_consecutive should pick up the parked seq=6
@@ -252,7 +252,7 @@ async fn recovery_filters_prior_epoch_blocks() {
     let ord = BatchOrdering::from_history(fixture.db().clone(), EPOCH);
 
     // last for AUTH_A should be 10 (from current epoch), not 99 (prior)
-    let r = ord.try_accept(AUTH_A, 11, make_prepared(AUTH_A, 11));
+    let r = ord.try_accept(AUTH_A, 11, make_prepared(AUTH_A, 11), false);
     assert!(
         matches!(r, AcceptResult::InOrder(_)),
         "seq=11 with last=10 must be in-order, got {:?}",
@@ -260,11 +260,11 @@ async fn recovery_filters_prior_epoch_blocks() {
     );
 
     // seq=12 with last=11 still in-order
-    let r = ord.try_accept(AUTH_A, 12, make_prepared(AUTH_A, 12));
+    let r = ord.try_accept(AUTH_A, 12, make_prepared(AUTH_A, 12), false);
     assert!(matches!(r, AcceptResult::InOrder(_)));
 
     // seq=100 (huge gap from 12) must park, NOT be accepted in-order
-    let r = ord.try_accept(AUTH_A, 100, make_prepared(AUTH_A, 100));
+    let r = ord.try_accept(AUTH_A, 100, make_prepared(AUTH_A, 100), false);
     assert!(
         matches!(r, AcceptResult::Parked),
         "huge gap must park; if InOrder we recovered the prior-epoch seq incorrectly, got {:?}",
@@ -282,11 +282,11 @@ async fn recovery_empty_history_inaugural_first_batch() {
     let ord = BatchOrdering::from_history(fixture.db().clone(), EPOCH);
 
     // no prior state for AUTH_A; first batch at any seq is the inaugural one
-    let r = ord.try_accept(AUTH_A, 5, make_prepared(AUTH_A, 5));
+    let r = ord.try_accept(AUTH_A, 5, make_prepared(AUTH_A, 5), false);
     assert!(matches!(r, AcceptResult::InOrder(_)));
 
     // subsequent seq=4 is below last=5 -> stale (deferred to dedup)
-    let r = ord.try_accept(AUTH_A, 4, make_prepared(AUTH_A, 4));
+    let r = ord.try_accept(AUTH_A, 4, make_prepared(AUTH_A, 4), false);
     assert!(matches!(r, AcceptResult::InOrder(_)), "stale-seq must defer to dedup, got {:?}", r);
 }
 
@@ -312,7 +312,7 @@ async fn recovery_parks_gap_batch_after_state_loss() {
     let ord = BatchOrdering::from_history(fixture.db().clone(), EPOCH);
 
     // inject the gap batch: seq jumps from None/5 to N+3=8
-    let r = ord.try_accept(AUTH_A, 8, make_prepared(AUTH_A, 8));
+    let r = ord.try_accept(AUTH_A, 8, make_prepared(AUTH_A, 8), false);
 
     // without recovery: InOrder, jumping last to 8; with recovery: Parked
     assert!(
@@ -391,7 +391,7 @@ async fn recovery_at_full_epoch_scale_86400_blocks() {
     for (auth, expected_last) in authors.iter().zip(final_seqs.iter()) {
         // next consecutive seq must be in-order (last + 1)
         let next = expected_last + 1;
-        let r = ord.try_accept(*auth, next, make_prepared(*auth, next));
+        let r = ord.try_accept(*auth, next, make_prepared(*auth, next), false);
         assert!(
             matches!(r, AcceptResult::InOrder(_)),
             "auth at last={expected_last}, seq={next} must be in-order; got {r:?}"
@@ -399,7 +399,7 @@ async fn recovery_at_full_epoch_scale_86400_blocks() {
 
         // after the accept above, last advanced to `next`; a gap of 2 must park
         let gap = next + 2;
-        let r = ord.try_accept(*auth, gap, make_prepared(*auth, gap));
+        let r = ord.try_accept(*auth, gap, make_prepared(*auth, gap), false);
         assert!(
             matches!(r, AcceptResult::Parked),
             "auth at last={next}, seq={gap} must park; got {r:?}"
@@ -407,7 +407,7 @@ async fn recovery_at_full_epoch_scale_86400_blocks() {
 
         // stale-seq below the boundary defers to dedup
         let stale = expected_last / 2;
-        let r = ord.try_accept(*auth, stale, make_prepared(*auth, stale));
+        let r = ord.try_accept(*auth, stale, make_prepared(*auth, stale), false);
         assert!(
             matches!(r, AcceptResult::InOrder(_)),
             "auth at last={next}, seq={stale} stale-seq must defer to dedup (returns InOrder); got {r:?}"
