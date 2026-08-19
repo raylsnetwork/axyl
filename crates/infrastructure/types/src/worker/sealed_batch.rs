@@ -4,11 +4,11 @@
 //! have reached quorum.
 
 use crate::{
-    crypto, encode, Address, BlockHash, Epoch, ExecHeader, TimestampSec,
+    crypto, encode, Address, BlockHash, Bytes, Epoch, ExecHeader, TimestampSec,
     ETHEREUM_BLOCK_GAS_LIMIT_56BITS, MIN_PROTOCOL_BASE_FEE,
 };
 use serde::{Deserialize, Serialize};
-use std::fmt::Debug;
+use std::{fmt::Debug, hash::Hasher as _};
 use thiserror::Error;
 
 use super::WorkerId;
@@ -213,6 +213,26 @@ pub fn max_batch_size(_epoch: Epoch) -> usize {
     2_000_000
 }
 
+/// Pre-`TransactionLoadBalancing` slot digest: read the first 8 bytes as little-endian u64.
+///
+/// Caller must ensure `input.len() >= 8`.
+pub fn legacy_slot_digest(input: &[u8]) -> u64 {
+    let mut bytes = [0u8; 8];
+    bytes.copy_from_slice(&input[0..8]);
+    u64::from_le_bytes(bytes)
+}
+
+/// `FxHasher` over `input`, the committee-slot digest for load balancing.
+///
+/// Both the forwarder (over a sender address) and the receiving validator (over the same key)
+/// call this, so they must agree byte for byte. Do NOT replace with `FxBuildHasher::hash_one`:
+/// that path writes a slice-length prefix and changes the digest.
+pub fn fxhash_slot_digest(input: &[u8]) -> u64 {
+    let mut hasher = rustc_hash::FxHasher::default();
+    hasher.write(input);
+    hasher.finish()
+}
+
 /// Visit every committee slot once, in ring order, starting from `owner`.
 ///
 /// The committee is numbered deterministically (sorted authority order), so every validator walks
@@ -273,22 +293,28 @@ impl CommitteeSlots {
     }
 }
 
-/// Defines the validation procedure for receiving either a new single transaction (from a client)
-/// of a batch of transactions (from another validator).
+/// Validation of a peer's batch and admission of transactions received from other nodes.
 ///
-/// Invalid transactions will not receive further processing.
+/// Invalid transactions receive no further processing.
 #[async_trait::async_trait]
 pub trait BatchValidation: Send + Sync + Debug {
-    /// Determines if this batch can be voted on
+    /// Determines whether this batch can be voted on.
     async fn validate_batch(&self, b: SealedBatch) -> Result<(), BatchValidationError>;
 
-    /// Submit a batch (as bytes) for inclusion in a batch.
-    /// Will only submit if the batch's first transaction maps to a slot this validator covers.
+    /// Admit a gossiped transaction message to the pool if its first transaction maps to a slot
+    /// this validator covers.
     fn submit_batch_if_mine(
         &self,
-        tx_bytes: &[Vec<u8>],
+        tx_bytes: &[Bytes],
         slots: &CommitteeSlots,
     ) -> Result<(), SubmitBatchError>;
+
+    /// Admit transactions forwarded directly by an observer, returning the hashes rejected as
+    /// stale (already executed) so the sender stops re-forwarding them.
+    ///
+    /// Takes the decoded bytes by value so the owned buffer moves into the blocking recovery task
+    /// without a copy.
+    async fn submit_forwarded_txns(&self, tx_bytes: Vec<Bytes>) -> Vec<BlockHash>;
 }
 
 /// Errors that can occur during batch submission.

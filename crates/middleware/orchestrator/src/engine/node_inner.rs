@@ -1,7 +1,7 @@
-//! Inner-execution node components for both Worker and Primary execution.
-//!
-//! This module contains the logic for execution.
+//! Execution-layer components behind [`ExecutionNode`](super::ExecutionNode), for both worker and
+//! primary roles.
 
+use super::txn_forwarder::TxnForwarder;
 use crate::types::ExecutionError;
 use eyre::OptionExt;
 use jsonrpsee::http_client::HttpClient;
@@ -9,6 +9,7 @@ use rayls_batch_builder::{BatchBuilder, BatchBuilderConfig, OwnWatermarkReceiver
 use rayls_batch_validator::BatchValidator;
 use rayls_consensus_worker::WorkerNetworkHandle;
 use rayls_execution_evm::{
+    chainspec::RaylsHardforks,
     in_flight::InFlightTracker,
     reth_env::RethEnv,
     system_calls::EpochState,
@@ -48,13 +49,12 @@ pub(super) struct ExecutionNodeInner {
     /// Collection of execution components by worker.
     /// Index of vec is worker id.
     pub(super) workers: Vec<WorkerComponents>,
-    /// Node-scoped pool in-flight tracker, shared between the worker transaction pool and each
-    /// epoch's executor engine so execution-dropped txs are released for re-sealing from the
-    /// first epoch after boot.
-    pub(super) in_flight: InFlightTracker,
     /// This authority's executed batch-sequence watch, captured when the engine starts and handed
     /// to each batch builder so it resumes and paces sealing off its own execution progress.
     pub(super) own_executed_sequence: Option<watch::Receiver<Option<u64>>>,
+    /// Node-scoped in-flight tracker shared by the pool and whichever role the node runs (the
+    /// batch builder's sealing marks or the forwarder's dissemination marks).
+    pub(super) in_flight_tracker: InFlightTracker,
 }
 
 impl ExecutionNodeInner {
@@ -103,7 +103,7 @@ impl ExecutionNodeInner {
             engine_idle_tx,
             last_consensus_header,
             executed_batch_registry,
-            self.in_flight.clone(),
+            self.in_flight_tracker.clone(),
         );
         if let Some(tracker) = batch_tracker {
             rayls_middleware_processor.set_batch_tracker(tracker);
@@ -143,7 +143,7 @@ impl ExecutionNodeInner {
         Ok(())
     }
 
-    /// The worker's RPC, TX pool, and block builder
+    /// Spawn the worker's batch builder for one epoch.
     pub(super) async fn start_batch_builder(
         &mut self,
         worker_id: WorkerId,
@@ -203,9 +203,51 @@ impl ExecutionNodeInner {
         Ok(())
     }
 
+    /// Spawn the observer transaction forwarder for one epoch.
+    ///
+    /// `committee` is slot-ordered (authorities sorted by id) to match receiver-side dispatch. The
+    /// direct-submit path is fork-gated and re-read per tick, so an un-upgraded peer never receives
+    /// the new request and the fork may activate mid-epoch.
+    pub(super) fn start_txn_forwarder(
+        &self,
+        worker_id: WorkerId,
+        network_handle: WorkerNetworkHandle,
+        executed_anchor: watch::Receiver<ConsensusHeader>,
+        last_seen_header: watch::Receiver<ConsensusHeader>,
+        committee: Vec<BlsPublicKey>,
+        epoch_task_spawner: &TaskSpawner,
+        max_gossip_message_size: usize,
+    ) -> eyre::Result<()> {
+        let transaction_pool = self
+            .workers
+            .get(worker_id as usize)
+            .ok_or_eyre("worker components missing for {worker_id}")?
+            .pool();
+
+        let reth_env = self.reth_env.clone();
+        let direct_submit = Box::new(move || {
+            let next_block = reth_env.canonical_tip().number + 1;
+            reth_env
+                .rayls_chain_spec()
+                .is_sender_affinity_load_balancing_active_at_block(next_block)
+        });
+
+        TxnForwarder::new(
+            transaction_pool,
+            network_handle,
+            executed_anchor,
+            last_seen_header,
+            committee,
+            direct_submit,
+            max_gossip_message_size,
+        )
+        .spawn(self.rayls_infrastructure_config.parameters.max_batch_delay, epoch_task_spawner);
+
+        Ok(())
+    }
+
     /// Initialize the worker's transaction pool and public RPC.
-    /// Must call this function in accending worker_id order or will panic,
-    /// for instance call for worker id 0, then 1, etc.
+    /// Call in ascending worker_id order (0, then 1, ...); any other order panics.
     pub(super) async fn initialize_worker_components<EP>(
         &mut self,
         worker_id: WorkerId,
@@ -216,7 +258,7 @@ impl ExecutionNodeInner {
         EP: EngineToPrimary + Send + Sync + 'static,
     {
         let transaction_pool =
-            self.reth_env.init_txn_pool_with_in_flight(self.in_flight.clone())?;
+            self.reth_env.init_txn_pool_with_in_flight(self.in_flight_tracker.clone())?;
 
         let network = WorkerNetwork::new(
             self.reth_env.chainspec(),
@@ -264,7 +306,7 @@ impl ExecutionNodeInner {
 
         // take ownership of worker components
         let components = WorkerComponents::new(rpc_handle, transaction_pool, network);
-        // Must call this function in accending worker_id order or will panic.
+        // call in ascending worker_id order; any other order panics
         if worker_id as usize != self.workers.len() {
             panic!("initialize_worker_components not called with sequencial worker ids!")
         }
@@ -305,7 +347,7 @@ impl ExecutionNodeInner {
     /// Fetch the last executed state from the database.
     ///
     /// This method is called when the primary spawns to retrieve
-    /// the last committed sub dag from it's database in the case
+    /// the last committed sub dag from its database in the case
     /// of the node restarting.
     ///
     /// This returns the hash of the last executed ConsensusHeader on the consensus chain.
@@ -365,7 +407,7 @@ impl ExecutionNodeInner {
         Ok(blocks)
     }
 
-    /// Return an database provider.
+    /// Return a database provider.
     pub(super) fn get_reth_env(&self) -> RethEnv {
         self.reth_env.clone()
     }

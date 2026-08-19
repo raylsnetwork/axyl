@@ -17,8 +17,8 @@ use rayls_infrastructure_network_types::{
 };
 use rayls_infrastructure_storage::tables::Batches;
 use rayls_infrastructure_types::{
-    encode, now, Batch, BatchValidation, BlockHash, BlsPublicKey, Database, DbTxMut, RaylsReceiver,
-    SealedBatch, TaskKind, TaskSpawner, WorkerId,
+    encode, now, Batch, BatchValidation, BlockHash, BlsPublicKey, Bytes, Database, DbTxMut,
+    RaylsReceiver, SealedBatch, TaskKind, TaskSpawner, TxHash, WorkerId,
 };
 use std::{collections::HashSet, sync::Arc, time::Duration};
 use tokio::sync::{oneshot, Semaphore};
@@ -28,9 +28,9 @@ pub(crate) mod error;
 pub(crate) mod handler;
 pub(crate) mod message;
 
-/// Convenience type for Primary network.
+/// Request type of the worker network.
 pub(crate) type Req = WorkerRequest;
-/// Convenience type for Primary network.
+/// Response type of the worker network.
 pub(crate) type Res = WorkerResponse;
 
 /// Soft cap on this handle's concurrently in-flight outbound batch requests.
@@ -39,6 +39,23 @@ pub(crate) type Res = WorkerResponse;
 /// under it leaves headroom for inbound, `report_batch`, and the primary's reqres on the same
 /// connections. A frequency reducer, not a hard bound (see `outbound_failure_penalty`).
 const MAX_CONCURRENT_BATCH_REQUESTS: usize = 32;
+
+/// Cap on concurrently admitted inbound transaction submits.
+///
+/// Each submit recovers signers on the shared rayon pool that batch validation also uses, so an
+/// unbounded burst would starve consensus; excess submits are shed back to the sender, which
+/// retries the next validator.
+const MAX_CONCURRENT_SUBMIT_TXNS: usize = 16;
+
+/// Encoded size of a [`WorkerRequest::SubmitTxns`] carrying nothing: the envelope every direct
+/// submit pays on top of its transaction bytes.
+static TXN_SUBMIT_OVERHEAD: std::sync::LazyLock<usize> =
+    std::sync::LazyLock::new(|| encode(&WorkerRequest::SubmitTxns { transactions: vec![] }).len());
+
+/// Encoded size of a [`WorkerGossip::Txn`] carrying nothing: the frame every published payload
+/// pays on top of its transaction bytes.
+static TXN_GOSSIP_OVERHEAD: std::sync::LazyLock<usize> =
+    std::sync::LazyLock::new(|| encode(&WorkerGossip::Txn(vec![])).len());
 
 /// The wrapper around worker-specific network calls.
 #[derive(Clone, Debug)]
@@ -73,9 +90,7 @@ impl WorkerNetworkHandle {
         &self.task_spawner
     }
 
-    /// Convenience method for creating a new Self for tests- sends events no-where and does
-    /// nothing.
-    /// #[cfg(any(test, feature = "test-utils"))]
+    /// Create a handle for tests whose commands go nowhere.
     pub fn new_for_test(task_spawner: TaskSpawner) -> Self {
         let (tx, _rx) = tokio::sync::mpsc::channel(5);
         Self {
@@ -91,6 +106,42 @@ impl WorkerNetworkHandle {
         &self.handle
     }
 
+    /// Forward transactions directly to `peer_bls`, returning the hashes it rejected as stale.
+    pub async fn submit_txns(
+        &self,
+        peer_bls: BlsPublicKey,
+        transactions: Vec<Bytes>,
+        timeout: Duration,
+    ) -> NetworkResult<Vec<TxHash>> {
+        let request = WorkerRequest::SubmitTxns { transactions };
+        let res = self.handle.send_request(request, peer_bls).await?;
+        let res =
+            tokio::time::timeout(timeout, res).await.map_err(|_| NetworkError::Timeout)???;
+        match res {
+            WorkerResponse::SubmitTxns { stale } => Ok(stale),
+            WorkerResponse::ReportBatch
+            | WorkerResponse::RequestBatches { .. }
+            | WorkerResponse::PeerExchange { .. } => Err(NetworkError::RPCError(
+                "Got wrong response, not a submit txns response!".to_string(),
+            )),
+            WorkerResponse::Error(WorkerRPCError(s)) => Err(NetworkError::RPCError(s)),
+        }
+    }
+
+    /// The most transaction bytes one direct submit may carry, leaving room for the request
+    /// envelope under the RPC message-size cap.
+    pub fn direct_txn_payload_budget(&self) -> usize {
+        self.max_rpc_message_size.saturating_sub(*TXN_SUBMIT_OVERHEAD)
+    }
+
+    /// Transaction bytes that fit in one [`Self::publish_txn`] under `max_gossip_message_size`.
+    ///
+    /// Peers reject an over-budget message outright, so a publisher subtracts the encoding frame
+    /// itself rather than discover the cap on the receiving side.
+    pub fn txn_payload_budget(max_gossip_message_size: usize) -> usize {
+        max_gossip_message_size.saturating_sub(*TXN_GOSSIP_OVERHEAD)
+    }
+
     /// Publish a batch digest to the worker network.
     pub(crate) async fn publish_batch(&self, batch_digest: BlockHash) -> NetworkResult<()> {
         let data = encode(&WorkerGossip::Batch(batch_digest));
@@ -98,9 +149,9 @@ impl WorkerNetworkHandle {
         Ok(())
     }
 
-    /// Publish a transaction (as raw bytes) worker network.
-    /// Do this when not a committee member so a CVV can include the txn.
-    pub(crate) async fn publish_txn(&self, txn: Vec<Vec<u8>>) -> NetworkResult<()> {
+    /// Publish encoded transactions on the worker transaction topic so a committee member can
+    /// include them in a batch; the pre-fork path for a node that cannot seal batches.
+    pub async fn publish_txn(&self, txn: Vec<Bytes>) -> NetworkResult<()> {
         let data = encode(&WorkerGossip::Txn(txn));
         self.handle.publish(GOSSIP_TOPIC_TXN.into(), data).await?;
         Ok(())
@@ -124,6 +175,9 @@ impl WorkerNetworkHandle {
             )),
             WorkerResponse::PeerExchange { .. } => Err(NetworkError::RPCError(
                 "Got wrong response, not a report batch is peer exchange!".to_string(),
+            )),
+            WorkerResponse::SubmitTxns { .. } => Err(NetworkError::RPCError(
+                "Got wrong response, not a report batch is submit txns!".to_string(),
             )),
             WorkerResponse::Error(WorkerRPCError(s)) => Err(NetworkError::RPCError(s)),
         }
@@ -195,6 +249,9 @@ impl WorkerNetworkHandle {
                 }
                 Ok(batches)
             }
+            WorkerResponse::SubmitTxns { .. } => Err(NetworkError::RPCError(
+                "Got wrong response, not a request batches is submit txns!".to_string(),
+            )),
             WorkerResponse::Error(WorkerRPCError(s)) => Err(NetworkError::RPCError(s)),
         }
     }
@@ -290,15 +347,17 @@ impl WorkerNetworkHandle {
     }
 }
 
-/// Handle inter-node communication between primaries.
+/// Event loop that handles inbound worker requests and gossip for one epoch.
 #[derive(Debug)]
 pub struct WorkerNetwork<DB, Events> {
     /// Receiver for network events.
     network_events: Events,
     /// Network handle to send commands.
     network_handle: WorkerNetworkHandle,
-    // Request handler to process requests and return responses.
+    /// Request handler to process requests and return responses.
     request_handler: RequestHandler<DB>,
+    /// Bounds concurrent inbound submit fan-out onto the shared rayon pool.
+    submit_permits: Arc<Semaphore>,
 }
 
 impl<DB, Events> WorkerNetwork<DB, Events>
@@ -316,7 +375,8 @@ where
     ) -> Self {
         let request_handler =
             RequestHandler::new(id, validator, consensus_config, network_handle.clone());
-        Self { network_events, network_handle, request_handler }
+        let submit_permits = Arc::new(Semaphore::new(MAX_CONCURRENT_SUBMIT_TXNS));
+        Self { network_events, network_handle, request_handler, submit_permits }
     }
 
     /// Run the network for the epoch.
@@ -332,9 +392,8 @@ where
         );
     }
 
-    /// Handle events concurrently.
+    /// Dispatch one network event to a task so the event loop never blocks on handling.
     fn process_network_event(&self, event: NetworkEvent<Req, Res>) {
-        // match event
         match event {
             NetworkEvent::Request { peer, request, channel, cancel } => match request {
                 WorkerRequest::ReportBatch { sealed_batch } => {
@@ -353,6 +412,9 @@ where
                     // expect this is intercepted by network layer
                     warn!(target: "worker::network", "worker application received unexpected peer exchange message");
                 }
+                WorkerRequest::SubmitTxns { transactions } => {
+                    self.process_submit_txns(transactions, channel, cancel);
+                }
             },
             NetworkEvent::Gossip(msg, gossip_source) => {
                 self.process_gossip(msg, gossip_source);
@@ -370,9 +432,50 @@ where
         }
     }
 
+    /// Process directly-submitted transactions from a forwarding peer.
+    ///
+    /// Spawns a task that admits them to the pool and replies with the stale hashes, so the sender
+    /// can prune what has already executed instead of re-forwarding it. Any connected peer may
+    /// submit (observers are not committee members, so there is no membership gate to apply) and
+    /// pool validation still rejects anything invalid; signer recovery hops to the blocking pool
+    /// inside `submit_forwarded_txns`, so a flood cannot stall the network task.
+    fn process_submit_txns(
+        &self,
+        transactions: Vec<Bytes>,
+        channel: ResponseChannel<WorkerResponse>,
+        cancel: oneshot::Receiver<()>,
+    ) {
+        // Shed the submit when the inbound fan-out is at capacity: replying with the existing error
+        // variant (no wire change) makes the sender retry the next live validator immediately
+        // instead of queueing behind a rayon backlog that would also delay consensus validation.
+        let Ok(permit) = self.submit_permits.clone().try_acquire_owned() else {
+            let network_handle = self.network_handle.clone();
+            self.network_handle.get_task_spawner().spawn_task("submit-txns-shed", async move {
+                let response = WorkerResponse::Error(WorkerRPCError("submit backlog".into()));
+                let _ = network_handle.handle.send_response(response, channel).await;
+            });
+            return;
+        };
+
+        let request_handler = self.request_handler.clone();
+        let network_handle = self.network_handle.clone();
+        self.network_handle.get_task_spawner().spawn_task("process-submit-txns", async move {
+            // hold the permit across the rayon fan-out so the cap bounds concurrent CPU work
+            let _permit = permit;
+            tokio::select! {
+                stale = request_handler.submit_forwarded_txns(transactions) => {
+                    let response = WorkerResponse::SubmitTxns { stale };
+                    let _ = network_handle.handle.send_response(response, channel).await;
+                }
+                // cancel notification from the network layer
+                _ = cancel => (),
+            }
+        });
+    }
+
     /// Process a new reported batch.
     ///
-    /// Spawn a task to evaluate a peer's proposed header and return a response.
+    /// Spawn a task to validate the peer's batch and return a response.
     fn process_report_batch(
         &self,
         peer: BlsPublicKey,
@@ -458,10 +561,10 @@ where
     }
 }
 
-/// Defines how the network receiver handles incoming primary messages.
+/// Handler for the local primary's requests to this worker.
 #[derive(Debug)]
 pub(super) struct PrimaryReceiverHandler<DB> {
-    /// The batch store
+    /// The batch store.
     pub store: DB,
     /// Timeout on RequestBatches RPC.
     pub request_batches_timeout: Duration,
@@ -469,7 +572,7 @@ pub(super) struct PrimaryReceiverHandler<DB> {
     pub network: Option<WorkerNetworkHandle>,
     /// Fetch certificate payloads from other workers.
     pub batch_fetcher: Option<BatchFetcher<DB>>,
-    /// Validate incoming batches
+    /// Validates incoming batches.
     pub validator: Arc<dyn BatchValidation>,
 }
 

@@ -20,7 +20,7 @@ use reth_provider::{
 };
 use reth_rpc_eth_types::utils::recover_raw_transaction as reth_recover_raw_transaction;
 use reth_transaction_pool::{
-    error::{Eip4844PoolTransactionError, InvalidPoolTransactionError, PoolError},
+    error::{Eip4844PoolTransactionError, InvalidPoolTransactionError, PoolError, PoolErrorKind},
     identifier::TransactionId,
     maintain::{maintain_transaction_pool_future, MaintainPoolConfig},
     AddedTransactionOutcome, BestTransactions, CoinbaseTipOrdering, EthPooledTransaction, Pool,
@@ -118,9 +118,9 @@ pub type RaylsTransactionPool =
 pub struct WorkerTxPool {
     /// The reth pool.
     pool: RaylsTransactionPool,
-    /// Hashes sealed into a batch but not yet observed mined, so the sealer skips re-sealing
-    /// them while their batch is in flight; shared with the batch builder via
-    /// [`WorkerTxPool::in_flight`].
+    /// Node-scoped in-flight marks shared with the role the node runs: the batch builder marks
+    /// what it sealed so the next round skips it, the forwarder marks what it sent so it does not
+    /// re-send before the mark is due. Handed out via [`WorkerTxPool::in_flight`].
     in_flight_tracker: InFlightTracker,
     /// File the pending and queued transactions are snapshotted to on graceful shutdown and
     /// reloaded from on boot.
@@ -135,6 +135,10 @@ impl From<WorkerTxPool> for RaylsTransactionPool {
 
 impl WorkerTxPool {
     /// Builds the pool and spawns its node-scoped maintenance and in-flight release tasks.
+    ///
+    /// The `in_flight` tracker is node-scoped and shared with whichever role the node runs (the
+    /// batch builder's sealing marks or the forwarder's dissemination marks), so its
+    /// forwarding-role paths only come alive once a forwarder arms them.
     pub fn new(
         node_config: &NodeConfig<ChainSpec>,
         task_spawner: &TaskSpawner,
@@ -210,11 +214,11 @@ impl WorkerTxPool {
         self.pool.pending_transactions_listener_for(TransactionListenerKind::All)
     }
 
-    /// Returns the in-flight tracker shared with this pool's batch builder.
+    /// Returns the node-scoped in-flight tracker shared with the batch builder or the forwarder.
     ///
-    /// The builder marks a batch's hashes here on quorum so the next sealing round skips them
-    /// while the batch is in flight; the pool releases them again via [`Self::reconcile_in_flight`]
-    /// once execution removes them from the pending sub-pool.
+    /// The role marks hashes here (on quorum for a sealed batch, on send for a forwarded one) and
+    /// the pool releases them via [`Self::reconcile_in_flight`] once execution removes them from
+    /// the pending sub-pool.
     pub fn in_flight(&self) -> InFlightTracker {
         self.in_flight_tracker.clone()
     }
@@ -265,6 +269,31 @@ impl WorkerTxPool {
         tx: EthPooledTransaction,
     ) -> Result<AddedTransactionOutcome, crate::PoolError> {
         self.pool.add_transaction(TransactionOrigin::External, tx).await
+    }
+
+    /// Admit forwarded transactions and return the hashes the pool rejected as stale.
+    ///
+    /// Stale means `nonce too low`: the sender already executed that nonce, so the forwarder must
+    /// stop re-sending it. Every other rejection (fee caps, pool limits, already-imported) is not
+    /// stale: those transactions are still wanted, so they are omitted from the ack and stay
+    /// eligible for a later resend.
+    pub async fn add_forwarded_txns(&self, txs: Vec<EthPooledTransaction>) -> Vec<TxHash> {
+        self.pool
+            .add_transactions(TransactionOrigin::External, txs)
+            .await
+            .into_iter()
+            .filter_map(|res| match res {
+                Err(err)
+                    if matches!(
+                        &err.kind,
+                        PoolErrorKind::InvalidTransaction(invalid) if invalid.is_nonce_too_low()
+                    ) =>
+                {
+                    Some(err.hash)
+                }
+                _ => None,
+            })
+            .collect()
     }
 
     /// Adds a transaction with local origin and subscribes to its events.

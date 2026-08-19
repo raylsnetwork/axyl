@@ -11,7 +11,7 @@ use rayls_infrastructure_config::{ConsensusConfig, LibP2pConfig};
 use rayls_infrastructure_network_types::{WorkerOthersBatchMessage, WorkerToPrimaryClient};
 use rayls_infrastructure_storage::tables::Batches;
 use rayls_infrastructure_types::{
-    encode, ensure, now, try_decode, Batch, BatchValidation, BlockHash, BlsPublicKey,
+    encode, ensure, now, try_decode, Batch, BatchValidation, BlockHash, BlsPublicKey, Bytes,
     CommitteeSlots, Database, DbTx, SealedBatch, WorkerId,
 };
 use std::sync::{Arc, LazyLock};
@@ -128,6 +128,11 @@ where
         }
 
         Ok(())
+    }
+
+    /// Admit transactions forwarded directly by an observer, returning the stale-hash ack.
+    pub(super) async fn submit_forwarded_txns(&self, transactions: Vec<Bytes>) -> Vec<BlockHash> {
+        self.validator.submit_forwarded_txns(transactions).await
     }
 
     /// Process a new reported batch.
