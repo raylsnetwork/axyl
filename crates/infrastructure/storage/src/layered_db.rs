@@ -887,6 +887,12 @@ impl<DB: Database> LayeredDatabase<DB> {
     /// Opens the layered DB with a custom eviction policy: small caches in tests, the default in
     /// production.
     pub fn open_with_config(db: DB, config: CacheConfig) -> Self {
+        // This channel must always remain unbounded. This is necessary for the atomicity
+        // guarantee (mem mutation + enqueue in one critical section). It is safe today because
+        // mpsc::channel() is unbounded and send() never blocks. However, if the channel is ever
+        // changed to a bounded sync_channel (for backpressure), the producer would block with the
+        // write lock held while the writer thread is blocked trying to acquire the same lock to
+        // process the ops — a classic deadlock.
         let (tx, rx) = mpsc::channel();
         let depth = Arc::new(AtomicUsize::new(0));
         let db_cloned = db.clone();
