@@ -130,6 +130,69 @@ async fn run_engine_with_in_flight(
     Ok(reth_env)
 }
 
+/// At queue capacity the engine must stop draining its inbound channel, so execution lag
+/// backs up to consensus instead of being absorbed as unbounded memory. An engine that admits on
+/// every wake always empties the channel, and the lag never reaches the producer.
+#[tokio::test]
+async fn test_engine_stops_admitting_at_queue_capacity() -> eyre::Result<()> {
+    use futures::poll;
+    use rayls_middleware_processor::MAX_QUEUED_OUTPUTS;
+
+    let tmp_dir = TempDir::new().unwrap();
+    let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+    let execution_node = default_test_execution_node(
+        Some(chain.clone()),
+        None,
+        &tmp_dir.path().join("exc-node"),
+        None,
+    )
+    .await?;
+    let reth_env = execution_node.get_reth_env().await;
+    let shutdown = Notifier::default();
+    let task_manager = TaskManager::default();
+    let temp_db_dir = TempDir::new().unwrap();
+    let ordering_store = open_db(temp_db_dir.path());
+    let batch_ordering = BatchOrdering::new_with_empty_state(ordering_store);
+
+    let (to_engine, from_consensus) = tokio::sync::mpsc::channel(1);
+    let mut engine = ExecutorEngine::new_for_test(
+        reth_env.clone(),
+        None,
+        from_consensus,
+        chain.sealed_genesis_header(),
+        shutdown.subscribe(),
+        task_manager.get_spawner(),
+        GasAccumulator::default(),
+        None,
+        ETHEREUM_BLOCK_GAS_LIMIT_56BITS,
+        batch_ordering,
+        InFlightTracker::new(),
+    );
+
+    // fill the execution queue to its admission ceiling
+    for _ in 0..MAX_QUEUED_OUTPUTS {
+        engine.push_back_queued_for_test(ConsensusOutput::default());
+    }
+
+    // one output waiting in the channel (capacity 1, so the channel is now full)
+    to_engine
+        .send((rayls_infrastructure_types::CameFrom::Test, ConsensusOutput::default()))
+        .await?;
+    assert_eq!(to_engine.capacity(), 0, "channel holds the pending output");
+
+    // poll the engine: it must decline to admit rather than drain the channel
+    let mut engine = Box::pin(engine);
+    let _ = poll!(&mut engine);
+
+    assert_eq!(
+        to_engine.capacity(),
+        0,
+        "engine drained the channel while at capacity, so lag cannot reach consensus"
+    );
+
+    Ok(())
+}
+
 /// Helper function to assert EIP-4788 correctly executed. (cancun)
 fn assert_eip4788(
     reth_env: &RethEnv,
