@@ -1,26 +1,25 @@
 // SPDX-License-Identifier: BUSL-1.1
-//! Network messages for anemo communication
+//! Message types and client traits for primary-worker communication.
 
 pub mod local;
 mod notify;
 mod response;
 pub use notify::*;
-use rayls_infrastructure_types::{Batch, BlockHash};
+use rayls_infrastructure_types::{B256Map, B256Set, Batch};
 pub use response::*;
-use std::collections::{HashMap, HashSet};
 
 // async_trait for object safety, get rid of when possible.
 #[async_trait::async_trait]
 /// Worker to primary messages.
 pub trait WorkerToPrimaryClient: Send + Sync + 'static {
-    /// Report own batch
+    /// Reports a batch this node's worker sealed.
     async fn report_own_batch(&self, request: WorkerOwnBatchMessage) -> eyre::Result<()>;
 
-    /// Report a batch from a peer.
+    /// Reports a batch received from a peer's worker.
     async fn report_others_batch(&self, request: WorkerOthersBatchMessage) -> eyre::Result<()>;
 }
 
-/// Dumb mock to just return Ok on calls for tests.
+/// Mock that acknowledges every call.
 #[derive(Debug)]
 pub struct MockWorkerToPrimary();
 
@@ -35,7 +34,7 @@ impl WorkerToPrimaryClient for MockWorkerToPrimary {
     }
 }
 
-/// Dumb mock that pends forever on calls for tests.
+/// Mock that never completes a call, for tests that exercise a stalled primary.
 #[derive(Debug)]
 pub struct MockWorkerToPrimaryHang();
 
@@ -74,18 +73,18 @@ impl WorkerToPrimaryClient for MockWorkerToPrimaryError {
 #[async_trait::async_trait]
 /// Primary to worker messages.
 pub trait PrimaryToWorkerClient: Send + Sync + 'static {
-    /// Synchronize
+    /// Asks the worker to fetch the batches a header references.
     async fn synchronize(&self, message: WorkerSynchronizeMessage) -> eyre::Result<()>;
 
-    /// Fetch batches
-    async fn fetch_batches(&self, digests: HashSet<BlockHash>) -> eyre::Result<FetchBatchResponse>;
+    /// Fetches the batches for the given digests.
+    async fn fetch_batches(&self, digests: B256Set) -> eyre::Result<FetchBatchResponse>;
 }
 
-/// Type that can return batches.
+/// Mock that serves a fixed set of batches.
 #[derive(Default, Debug)]
 pub struct MockPrimaryToWorkerClient {
-    /// The batches for tests.
-    pub batches: HashMap<BlockHash, Batch>,
+    /// Batches returned by every `fetch_batches` call.
+    pub batches: B256Map<Batch>,
 }
 
 #[async_trait::async_trait]
@@ -94,10 +93,7 @@ impl PrimaryToWorkerClient for MockPrimaryToWorkerClient {
         Ok(())
     }
 
-    async fn fetch_batches(
-        &self,
-        _digests: HashSet<BlockHash>,
-    ) -> eyre::Result<FetchBatchResponse> {
+    async fn fetch_batches(&self, _digests: B256Set) -> eyre::Result<FetchBatchResponse> {
         Ok(FetchBatchResponse { batches: self.batches.clone() })
     }
 }

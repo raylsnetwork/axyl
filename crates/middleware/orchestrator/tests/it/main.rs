@@ -21,10 +21,10 @@ use rayls_infrastructure_storage::{
     tables::{ConsensusBlockNumbersByDigest, ConsensusBlocks},
 };
 use rayls_infrastructure_types::{
-    gas_accumulator::GasAccumulator, testnet_genesis, Batch, CommittedSubDag, ConsensusHeader,
-    ConsensusOutput, Database, DbTxMut, ExecHeader, Notifier, RaylsReceiver as _, RaylsSender as _,
-    ReputationScores, SealedHeader, TaskManager, B256, DEFAULT_BAD_NODES_STAKE_THRESHOLD,
-    ETHEREUM_BLOCK_GAS_LIMIT_56BITS,
+    gas_accumulator::GasAccumulator, testnet_genesis, B256Map, Batch, CommittedSubDag,
+    ConsensusHeader, ConsensusOutput, Database, DbTxMut, ExecHeader, Notifier, RaylsReceiver as _,
+    RaylsSender as _, ReputationScores, SealedHeader, TaskManager, B256,
+    DEFAULT_BAD_NODES_STAKE_THRESHOLD, ETHEREUM_BLOCK_GAS_LIMIT_56BITS,
 };
 use rayls_middleware_bridge::subscriber::spawn_subscriber;
 use rayls_middleware_orchestrator::epoch_manager::catchup_accumulator;
@@ -188,7 +188,7 @@ async fn test_catchup_accumulator() -> eyre::Result<()> {
 fn spawn_consensus(
     fixture: &CommitteeFixture<MemDatabase>,
     consensus_bus: &ConsensusBus,
-    batches: HashMap<B256, Batch>,
+    batches: B256Map<Batch>,
     config: ConsensusConfig<MemDatabase>,
     consensus_store: MemDatabase,
     task_manager: &TaskManager,

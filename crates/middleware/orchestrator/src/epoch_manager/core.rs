@@ -23,10 +23,10 @@ use rayls_execution_evm::{reth_env::RethEnv, system_calls::EpochState};
 use rayls_infrastructure_config::{KeyConfig, LibP2pConfig, NetworkConfig, RaylsDirs};
 use rayls_infrastructure_storage::{tables::ConsensusBlocks, EpochStore as _};
 use rayls_infrastructure_types::{
-    error::HeaderError, gas_accumulator::GasAccumulator, BlsAggregateSignature, BlsPublicKey,
-    BlsSignature, CameFrom, ConsensusOutput, Database as ReDatabase, Epoch, EpochCertificate,
-    EpochRecord, EpochVote, Noticer, Notifier, RaylsReceiver, RaylsSender, TaskJoinError, TaskKind,
-    TaskManager, VotesAggregator, B256,
+    error::HeaderError, gas_accumulator::GasAccumulator, B256Map, BlsAggregateSignature,
+    BlsPublicKey, BlsSignature, CameFrom, ConsensusOutput, Database as ReDatabase, Epoch,
+    EpochCertificate, EpochRecord, EpochVote, Noticer, Notifier, RaylsReceiver, RaylsSender,
+    TaskJoinError, TaskKind, TaskManager, VotesAggregator, B256,
 };
 use rayls_middleware_processor::{batch::BatchOrdering, reconstruct_batch_digests};
 use std::{
@@ -1022,7 +1022,7 @@ where
             let mut reached_quorum = false;
             let mut timeout = Duration::from_secs(5);
             let mut timeouts = 0;
-            let mut alt_recs: HashMap<B256, VotesAggregator<EpochVote>> = HashMap::default();
+            let mut alt_recs: B256Map<VotesAggregator<EpochVote>> = B256Map::default();
             loop {
                 // Break promptly when the consumer phase is signalled, rather than only
                 // noticing after the recv timeout. `biased` so shutdown wins over a vote arriving.

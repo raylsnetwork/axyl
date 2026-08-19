@@ -1,20 +1,17 @@
-//! Response message types
-use rayls_infrastructure_types::{Batch, BlockHash, Certificate};
+//! Response message types.
+use rayls_infrastructure_types::{B256Map, Batch, Certificate};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 
-/// Used by the primary to reply to FetchCertificatesRequest.
+/// Reply to a certificate fetch request.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct FetchCertificatesResponse {
     /// Certificates sorted from lower to higher rounds.
     pub certificates: Vec<Certificate>,
 }
 
-/// All batches requested by the primary.
+/// Reply to a batch fetch request.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct FetchBatchResponse {
     /// The missing batches fetched from peers.
-    pub batches: HashMap<BlockHash, Batch>,
+    pub batches: B256Map<Batch>,
 }
-
-//=== Engine
