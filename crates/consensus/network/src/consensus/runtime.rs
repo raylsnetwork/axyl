@@ -69,11 +69,12 @@ where
         let mut relay_retry = tokio::time::interval(Duration::from_secs(15));
 
         // Refresh the peer-address gauges (`kad_known_peer_addr_*`, `advertised_peer_addr_*`,
-        // `discovery_peer_addr_*`) on a fixed 15s cadence. Kept as its own time-based interval (not
-        // the cleanup block, which also fires every 1000 events) so a busy node can't turn it into
-        // a per-event storm. The first tick fires immediately for an initial snapshot. (All three
-        // gauges above are refreshed here; the `dial_peer_addr_failures` counter is event-driven,
-        // updated in `record_dial_failure`, not refreshed here.)
+        // `discovery_peer_addr_*`, `node_peer_addr_listen_*`, `node_peer_addr_reservation_*`) on a
+        // fixed 15s cadence. Kept as its own time-based interval (not the cleanup block, which also
+        // fires every 1000 events) so a busy node can't turn it into a per-event storm. The first
+        // tick fires immediately for an initial snapshot. (All five gauge families above are
+        // refreshed here; the set-once `node_peer_addr_self`/`node_peer_addr_external` are set in
+        // `run()` and the `dial_peer_addr_failures` counter is event-driven, not refreshed here.)
         let mut peer_addr_metrics_refresh = tokio::time::interval(Duration::from_secs(15));
 
         loop {

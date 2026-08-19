@@ -61,8 +61,9 @@ pub struct NetworkMetrics {
     /// per-swarm libp2p id. Set once at startup, so `grep peer_addr` maps any peer id seen
     /// elsewhere back to a node and its authority.
     pub node_peer_addr_self: IntGaugeVec,
-    /// The single address this node publishes (its `NodeRecord` / `external_addr`), per swarm.
-    /// Set once at startup.
+    /// The address(es) this node publishes (its `NodeRecord` / `external_addr`), per swarm. In
+    /// practice `NodeRecord::build` uses exactly one, but the record holds a `Vec`. Set once at
+    /// startup.
     pub node_peer_addr_external: IntGaugeVec,
     /// Addresses the primary swarm is currently listening on (`swarm.listeners()`). Refreshed each
     /// tick (listeners come and go); separate primary/worker vecs so each can `reset()` its own.
@@ -168,7 +169,7 @@ impl NetworkMetrics {
             )?,
             node_peer_addr_external: register_int_gauge_vec_with_registry!(
                 "node_peer_addr_external",
-                "The address this node publishes (its NodeRecord external_addr) per swarm",
+                "The address(es) this node publishes (its NodeRecord external_addr) per swarm",
                 &["multiaddr", "swarm"],
                 registry
             )?,

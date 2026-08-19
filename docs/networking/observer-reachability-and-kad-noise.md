@@ -220,7 +220,7 @@ Per swarm (`_primary` / `_worker`), refreshed every 15s:
   other nodes' routing tables via `get_closest_peers`, dialed on the heartbeat. Note this map is
   drained as it dials, so a fast-churning entry is often absent at snapshot time.
 
-And a counter (labelled `kad_type`):
+And a counter (labelled `swarm`):
 
 - `dial_peer_addr_failures{peer_id,multiaddr,swarm}` — increments once per attempted address on
   every failed outbound dial. This is the **reliable churn signal**: a climbing count for an
@@ -231,6 +231,22 @@ And a counter (labelled `kad_type`):
 The gauge-diff "trying to dial, never connected" is `advertised_peer_addr_worker unless
 on(peer_id) kad_known_peer_addr_worker`; for the full picture (incl. discovery / kad-internal
 churn) watch `rate(dial_peer_addr_failures[5m])` by `multiaddr`.
+
+And this node's own identity/addresses (same `peer_addr` grep):
+
+- `node_peer_addr_self{peer_id, authority, swarm}` — own peer id + BLS authority (set once); maps
+  any peer id seen elsewhere back to a node.
+- `node_peer_addr_external{multiaddr, swarm}` — the address(es) this node publishes.
+- `node_peer_addr_listen_{primary,worker}` — current listen addresses.
+- `node_peer_addr_reservation_{primary,worker}` — desired relay reservations, `1` = active,
+  `0` = desired but currently down.
+
+A relay-down alert falls straight out of the reservation gauge — it fires exactly when a relay is
+wanted but gone, which the listen set can't express:
+
+```
+node_peer_addr_reservation_primary == 0
+```
 
 ## Source anchors
 
