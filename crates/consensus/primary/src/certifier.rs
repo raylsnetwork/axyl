@@ -732,6 +732,9 @@ impl<DB: Database> Certifier<DB> {
                 Some(header) = rx_headers.recv() => {
                     let digest = header.digest();
                     let round = header.round();
+                    // Rounds restart every epoch, so a round number alone does not identify a
+                    // proposal in a log. Both dedup paths and the store-error path carry it.
+                    let epoch = header.epoch();
 
                     debug!(target: "primary::certifier", ?header, "{:?} received header!", &self.authority_id);
 
@@ -739,8 +742,74 @@ impl<DB: Database> Certifier<DB> {
                         if *d == digest && !h.is_finished() {
                             debug!(
                                 target: "primary::certifier",
-                                ?digest, round,
+                                ?digest, round, epoch,
                                 "re-propose dedup: in-flight proposal for same digest, skipping",
+                            );
+                            continue;
+                        }
+                    }
+
+                    // The guard above only covers a *running* attempt. An attempt that finished
+                    // successfully leaves `is_finished() == true`, and the proposer keeps
+                    // re-proposing until it observes its own certificate come back round - a
+                    // window that is milliseconds normally but seconds wide under load. Falling
+                    // through there mints a second certificate for the same header from whatever
+                    // quorum answers this time: same digest, different signer set, different
+                    // aggregate signature.
+                    //
+                    // Consensus cannot tell the two apart (`Certificate::digest()` is the header
+                    // digest) and receivers silently drop whichever arrives second, so nodes end
+                    // up holding different bytes for the same certificate. Harmless in the DAG,
+                    // but the epoch-closing block hashes that signature into `extra_data`, so the
+                    // two nodes seal different block hashes and the chain forks with consensus
+                    // none the wiser - see 2026-08-16, where a ~10s execution stall held round 408
+                    // uncertified until both attempts completed within the same flurry.
+                    //
+                    // LOAD-BEARING ORDERING, not visible from this file: the store lookup is only
+                    // a sufficient guard because a finished task is guaranteed to have already
+                    // written its certificate. `spawn_header_proposal` awaits
+                    // `process_own_certificate`, which awaits the certificate manager's reply
+                    // before returning, so the task cannot report `is_finished()` until the write
+                    // has landed. If that await is ever removed, batched, or the own-certificate
+                    // path starts going through `try_accept_certificate`'s pending branch (which
+                    // returns without storing), this check silently stops covering the window and
+                    // duplicate certificates become possible again.
+                    let cert_digest = CertificateDigest::new(digest.into());
+                    match self.certificate_store.contains(&cert_digest) {
+                        // `info!`, unlike the in-flight case above: reaching here means a
+                        // re-propose arrived for a header that had already certified, which is
+                        // exactly the condition that used to mint a second certificate. It is
+                        // worth seeing without enabling debug, and it is not extra noise - the
+                        // proposer already emits a `warn!` for every re-propose, so this only
+                        // ever appears alongside a louder line for the same event. A rising rate
+                        // here is itself the signal that certification is racing the proposer.
+                        Ok(true) => {
+                            info!(
+                                target: "primary::certifier",
+                                ?digest, round, epoch,
+                                "re-propose dedup: header already certified, skipping",
+                            );
+                            continue;
+                        }
+                        Ok(false) => {}
+                        // Fail closed. The lookup is the only thing standing between a finished
+                        // attempt and a second certificate for the same header, so re-certifying
+                        // when we cannot answer "did this already certify?" reintroduces exactly
+                        // the fork this guard exists to prevent - and a fork is silent, survives
+                        // restarts, and killed a validator for 20 hours the one time it happened.
+                        //
+                        // The cost is real and deliberate: this skips *all* proposals while the
+                        // error persists, not just re-proposals, so a node with a broken
+                        // certificate store stops contributing certificates entirely. That is
+                        // the safer failure - a stalled node is visible in this log line and
+                        // recoverable by restarting it, whereas a forked node looks healthy until
+                        // an epoch boundary and then cannot rejoin at all.
+                        Err(e) => {
+                            error!(
+                                target: "primary::certifier",
+                                auth=?self.authority_id,
+                                ?digest, round, epoch,
+                                "certificate store lookup failed, refusing to certify: {e}",
                             );
                             continue;
                         }
@@ -758,6 +827,7 @@ impl<DB: Database> Certifier<DB> {
                         auth = ?self.authority_id,
                         ?digest,
                         round,
+                        epoch,
                         "spawning proposal task"
                     );
 

@@ -212,7 +212,11 @@ impl<DB: Database> Proposer<DB> {
             // the re-propose path. Epoch/round staleness of `last_proposed` IS guarded, inside the
             // re-propose block below (see `last_proposed_is_stale`). A stale header can't fork
             // regardless — the certifier rejects any header whose epoch != committee.epoch(), and
-            // `run_mode_transition` clears `LastProposed` (so repropose is a no-op there). The old
+            // re-proposing across a mode transition is *why* `run_mode_transition` deliberately
+            // preserves `LastProposed`: the header we re-send is byte-identical to the one peers
+            // already saw, so they replay their cached vote instead of scoring it as equivocation.
+            // (Rebuilding one instead would embed a newer exec anchor, changing the digest at an
+            // already-proposed round — the livelock this store entry exists to prevent.) The old
             // `is_transitioning()` check was racy (TOCTOU) and thus never a correctness guarantee.
             let should_repropose_header = !should_create_header && max_delay_timed_out;
 
