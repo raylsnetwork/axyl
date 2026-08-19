@@ -84,6 +84,7 @@ impl StoreEntry {
     }
 
     fn dec_in_flight(&mut self) {
+        debug_assert!(self.in_flight() == 0, "in-flight op count is 0 before decrementing it");
         self.packed -= 2;
     }
 
@@ -107,7 +108,7 @@ impl StoreEntry {
 /// Only the background writer pushes (when a key's in-flight count settles to zero) and pops
 /// (during eviction), so no lock guards it. Entries go stale when the key is re-inserted or the
 /// table is cleared; they are validated at pop under the store write lock and skipped.
-pub type EvictionHeap = BinaryHeap<Reverse<(u64, &'static str, Vec<u8>)>>;
+pub(crate) type EvictionHeap = BinaryHeap<Reverse<(u64, &'static str, Vec<u8>)>>;
 
 type StoreTableType = BTreeMap<Vec<u8>, StoreEntry>;
 type StoreType = HashMap<&'static str, StoreTableType>;
