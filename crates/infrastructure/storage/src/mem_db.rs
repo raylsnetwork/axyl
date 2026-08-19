@@ -88,7 +88,7 @@ impl StoreEntry {
     }
 
     /// Refreshes the recency clock if the previous bump is older than the throttle window.
-    fn bump_last_used(&self) {
+    fn touch_approximately(&self) {
         let now = now_nanos();
         let last = self.last_used.load(AtomicOrdering::Relaxed);
         if now.saturating_sub(last) >= RECENCY_BUMP_THRESHOLD.as_nanos() as u64 {
@@ -123,7 +123,7 @@ impl<'a> MemDbTx<'a> {
             let key_bytes = encode_key(key);
             if let Some(entry) = table.get(&key_bytes) {
                 if !entry.tombstoned() {
-                    entry.bump_last_used();
+                    entry.touch_approximately();
                 }
                 let val = decode(&entry.value);
                 return Some((entry.tombstoned(), val));
@@ -217,10 +217,7 @@ impl<'a> MemDbTxMut<'a> {
     /// Raw keys of the table, for a `Clear` message: the writer needs the exact set that was
     /// tombstoned (and counted) by this clear to release each key's in-flight op at apply time.
     pub fn raw_keys<T: Table>(&self) -> Vec<Vec<u8>> {
-        self.store
-            .get(T::NAME)
-            .map(|table| table.keys().cloned().collect())
-            .unwrap_or_default()
+        self.store.get(T::NAME).map(|table| table.keys().cloned().collect()).unwrap_or_default()
     }
 }
 
@@ -457,11 +454,7 @@ impl MemDatabase {
     /// Returns keys marked for deletion in the given table.
     pub fn get_deleted_keys<T: Table>(&self) -> std::collections::HashSet<Vec<u8>> {
         if let Some(table) = self.store.read().get(T::NAME) {
-            table
-                .iter()
-                .filter(|(_, entry)| entry.tombstoned())
-                .map(|(k, _)| k.clone())
-                .collect()
+            table.iter().filter(|(_, entry)| entry.tombstoned()).map(|(k, _)| k.clone()).collect()
         } else {
             std::collections::HashSet::new()
         }
@@ -649,7 +642,11 @@ impl Default for MemDBMetrics {
 
 /// Mutate + count a row: value replaced, tombstone cleared, one in-flight op registered, recency
 /// touched. Shared by the txn producers (guard already held) and the `*_queued` entry points.
-fn insert_impl<T: Table>(store: &mut StoreType, key: &T::Key, value: &T::Value) -> eyre::Result<()> {
+fn insert_impl<T: Table>(
+    store: &mut StoreType,
+    key: &T::Key,
+    value: &T::Value,
+) -> eyre::Result<()> {
     let table = store.get_mut(T::NAME).ok_or_else(|| eyre::eyre!("Invalid table {}", T::NAME))?;
     let key_bytes = encode_key(key);
     match table.get_mut(&key_bytes) {
@@ -708,7 +705,7 @@ fn get_with_marked_check<T: Table>(store: &StoreType, key: &T::Key) -> Option<T:
         let key_bytes = encode_key(key);
         if let Some(entry) = table.get(&key_bytes) {
             if !entry.tombstoned() {
-                entry.bump_last_used();
+                entry.touch_approximately();
                 let val = decode(&entry.value);
                 return Some(val);
             }
@@ -724,7 +721,7 @@ fn contains_key_impl<T: Table>(store: &StoreType, key: &T::Key) -> bool {
             if entry.tombstoned() {
                 return false;
             }
-            entry.bump_last_used();
+            entry.touch_approximately();
             return true;
         }
     }
