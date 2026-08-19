@@ -28,12 +28,15 @@ use reth_transaction_pool::{
     TransactionPoolExt as _, ValidPoolTransaction,
 };
 use std::{
+    path::PathBuf,
     sync::Arc,
     time::{Duration, Instant},
 };
 use tracing::{debug, info};
 
 use crate::{error::RaylsRethResult, in_flight::InFlightTracker, traits::RaylsNode};
+
+mod backup;
 
 /// A pooled transaction id.
 pub type PoolTxnId = TransactionId;
@@ -119,6 +122,9 @@ pub struct WorkerTxPool {
     /// them while their batch is in flight; shared with the batch builder via
     /// [`WorkerTxPool::in_flight`].
     in_flight_tracker: InFlightTracker,
+    /// File the pending and queued transactions are snapshotted to on graceful shutdown and
+    /// reloaded from on boot.
+    backup_path: Arc<PathBuf>,
 }
 
 impl From<WorkerTxPool> for RaylsTransactionPool {
@@ -152,7 +158,11 @@ impl WorkerTxPool {
 
         info!(target: "rayls::execution", "Transaction pool initialized");
 
-        let this = Self { pool: transaction_pool, in_flight_tracker: InFlightTracker::new() };
+        let this = Self {
+            pool: transaction_pool,
+            in_flight_tracker: InFlightTracker::new(),
+            backup_path: Arc::new(data_dir.txpool_transactions()),
+        };
 
         // reth's maintenance future drains mined transactions, reloads changed accounts, and
         // updates the pending base fee on every commit. `no_local_exemptions` holds locally
