@@ -145,7 +145,9 @@ impl<DB: Database> Processor<DB> {
             );
         }
 
-        debug_assert_eq!(
+        // Release assert: a mismatch would otherwise surface as a messageless index abort in the
+        // raw digest indexing below.
+        assert_eq!(
             batches.len(),
             output.batch_digests.len(),
             "uneven number of sealed blocks from batches and batch digests"
