@@ -40,6 +40,25 @@ where
             "gossipsub network loop STARTING"
         );
 
+        // Publish this node's own identity + published address once (immutable for the swarm's
+        // life). `authority` is the BLS committee key (shared across primary+worker); `peer_id`
+        // is per-swarm. Lets `grep peer_addr` map any peer id back to a node and its authority.
+        let authority = self.key_config.primary_public_key().to_string();
+        self.network_metrics
+            .node_peer_addr_self
+            .with_label_values(&[
+                local_peer_id.to_string().as_str(),
+                authority.as_str(),
+                self.network_label,
+            ])
+            .set(1);
+        for addr in &self.node_record.info.multiaddrs {
+            self.network_metrics
+                .node_peer_addr_external
+                .with_label_values(&[addr.to_string().as_str(), self.network_label])
+                .set(1);
+        }
+
         // Counter for periodic cleanup
         let mut event_counter: u64 = 0;
         // Time-based cleanup interval (10 seconds)

@@ -74,7 +74,7 @@ where
         }
     }
 
-    /// Republish this swarm's peer-address view as three gauges:
+    /// Republish this swarm's peer-address view as refreshed gauges:
     /// - `kad_known_peer_addr_{primary,worker}` -- the kademlia routing table (`kbuckets`), i.e.
     ///   peers actually *connected* and the working address they connected on.
     /// - `advertised_peer_addr_{primary,worker}` -- the peer-manager's `known_peers` dial targets
@@ -82,14 +82,18 @@ where
     /// - `discovery_peer_addr_{primary,worker}` -- the peer-manager's `discovery_peers` candidates
     ///   learned via `get_closest_peers` and dialed on the heartbeat (drained as it dials, so a
     ///   fast-churning entry is often absent at snapshot time).
+    /// - `node_peer_addr_listen_{primary,worker}` -- this node's own live listen addresses.
+    /// - `node_peer_addr_reservation_{primary,worker}` -- this node's desired relay reservations (1
+    ///   = active, 0 = down), surfacing a flapping relay that the listen set cannot.
     ///
-    /// (The `dial_peer_addr_failures` counter is updated separately, on each dial-error event.)
+    /// (Set-once `node_peer_addr_self` / `node_peer_addr_external` are published in `run()`; the
+    /// `dial_peer_addr_failures` counter is updated on each dial-error event.)
     ///
     /// Rebuilt from scratch each call: this swarm's own vecs are reset first so a peer or address
     /// that has left stops being reported (an info-style gauge otherwise lingers forever). Primary
-    /// and worker use separate vecs, so `reset()` only clears this swarm's rows. All three tables
-    /// are snapshotted into owned strings before touching the metrics so the swarm borrow is
-    /// released first.
+    /// and worker use separate vecs, so `reset()` only clears this swarm's rows. All tables are
+    /// snapshotted into owned strings before touching the metrics so the swarm borrow is released
+    /// first.
     pub(super) fn refresh_peer_addr_metrics(&mut self) {
         // kad routing table (connected peers, working addresses)
         let mut kad_entries: Vec<(String, String)> = Vec::new();
@@ -122,18 +126,33 @@ where
             .map(|(peer_id, addr)| (peer_id.to_string(), addr.to_string()))
             .collect();
 
-        let (kad_gauge, known_gauge, discovery_gauge) = match self.network_label {
-            "worker" => (
-                &self.network_metrics.kad_known_peer_addr_worker,
-                &self.network_metrics.advertised_peer_addr_worker,
-                &self.network_metrics.discovery_peer_addr_worker,
-            ),
-            _ => (
-                &self.network_metrics.kad_known_peer_addr_primary,
-                &self.network_metrics.advertised_peer_addr_primary,
-                &self.network_metrics.discovery_peer_addr_primary,
-            ),
-        };
+        // this node's own listen addresses
+        let listen_entries: Vec<String> = self.swarm.listeners().map(|a| a.to_string()).collect();
+
+        // this node's desired relay reservations (1 = active, 0 = desired but currently down)
+        let reservation_entries: Vec<(String, i64)> = self
+            .relay_reservations
+            .iter()
+            .map(|(addr, active)| (addr.to_string(), i64::from(active.is_some())))
+            .collect();
+
+        let (kad_gauge, known_gauge, discovery_gauge, listen_gauge, reservation_gauge) =
+            match self.network_label {
+                "worker" => (
+                    &self.network_metrics.kad_known_peer_addr_worker,
+                    &self.network_metrics.advertised_peer_addr_worker,
+                    &self.network_metrics.discovery_peer_addr_worker,
+                    &self.network_metrics.node_peer_addr_listen_worker,
+                    &self.network_metrics.node_peer_addr_reservation_worker,
+                ),
+                _ => (
+                    &self.network_metrics.kad_known_peer_addr_primary,
+                    &self.network_metrics.advertised_peer_addr_primary,
+                    &self.network_metrics.discovery_peer_addr_primary,
+                    &self.network_metrics.node_peer_addr_listen_primary,
+                    &self.network_metrics.node_peer_addr_reservation_primary,
+                ),
+            };
 
         kad_gauge.reset();
         for (peer_id, addr) in kad_entries {
@@ -148,6 +167,16 @@ where
         discovery_gauge.reset();
         for (peer_id, addr) in discovery_entries {
             discovery_gauge.with_label_values(&[peer_id.as_str(), addr.as_str()]).set(1);
+        }
+
+        listen_gauge.reset();
+        for addr in listen_entries {
+            listen_gauge.with_label_values(&[addr.as_str()]).set(1);
+        }
+
+        reservation_gauge.reset();
+        for (addr, active) in reservation_entries {
+            reservation_gauge.with_label_values(&[addr.as_str()]).set(active);
         }
     }
 }

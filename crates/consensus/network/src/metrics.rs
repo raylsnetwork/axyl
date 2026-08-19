@@ -56,6 +56,27 @@ pub struct NetworkMetrics {
     /// captures every dial path (kad iterative query, discovery heartbeat, committee redial),
     /// including kad-internal dials that never land in an app-side map.
     pub dial_peer_addr_failures: IntCounterVec,
+    /// This node's own identity, per swarm: `node_peer_addr_self{peer_id, authority, swarm} = 1`.
+    /// `authority` is the node's BLS committee key (same across primary+worker); `peer_id` is the
+    /// per-swarm libp2p id. Set once at startup, so `grep peer_addr` maps any peer id seen
+    /// elsewhere back to a node and its authority.
+    pub node_peer_addr_self: IntGaugeVec,
+    /// The single address this node publishes (its `NodeRecord` / `external_addr`), per swarm.
+    /// Set once at startup.
+    pub node_peer_addr_external: IntGaugeVec,
+    /// Addresses the primary swarm is currently listening on (`swarm.listeners()`). Refreshed each
+    /// tick (listeners come and go); separate primary/worker vecs so each can `reset()` its own.
+    pub node_peer_addr_listen_primary: IntGaugeVec,
+    /// Addresses the worker swarm is currently listening on; see
+    /// [`Self::node_peer_addr_listen_primary`].
+    pub node_peer_addr_listen_worker: IntGaugeVec,
+    /// Primary swarm's desired relay reservations: value `1` = active, `0` = desired but currently
+    /// down (relay gone). Refreshed each tick. Surfaces a flapping relay that
+    /// `node_peer_addr_listen_*` cannot (a down reservation is not a live listener).
+    pub node_peer_addr_reservation_primary: IntGaugeVec,
+    /// Worker swarm's desired relay reservations; see
+    /// [`Self::node_peer_addr_reservation_primary`].
+    pub node_peer_addr_reservation_worker: IntGaugeVec,
 }
 
 impl NetworkMetrics {
@@ -137,6 +158,42 @@ impl NetworkMetrics {
                 "dial_peer_addr_failures",
                 "Failed outbound dials by target address (increments per attempted multiaddr on each dial error)",
                 &["peer_id", "multiaddr", "swarm"],
+                registry
+            )?,
+            node_peer_addr_self: register_int_gauge_vec_with_registry!(
+                "node_peer_addr_self",
+                "This node's own identity per swarm (peer_id + BLS authority)",
+                &["peer_id", "authority", "swarm"],
+                registry
+            )?,
+            node_peer_addr_external: register_int_gauge_vec_with_registry!(
+                "node_peer_addr_external",
+                "The address this node publishes (its NodeRecord external_addr) per swarm",
+                &["multiaddr", "swarm"],
+                registry
+            )?,
+            node_peer_addr_listen_primary: register_int_gauge_vec_with_registry!(
+                "node_peer_addr_listen_primary",
+                "Addresses the primary swarm is currently listening on",
+                &["multiaddr"],
+                registry
+            )?,
+            node_peer_addr_listen_worker: register_int_gauge_vec_with_registry!(
+                "node_peer_addr_listen_worker",
+                "Addresses the worker swarm is currently listening on",
+                &["multiaddr"],
+                registry
+            )?,
+            node_peer_addr_reservation_primary: register_int_gauge_vec_with_registry!(
+                "node_peer_addr_reservation_primary",
+                "Primary swarm desired relay reservations (1 = active, 0 = desired but currently down)",
+                &["multiaddr"],
+                registry
+            )?,
+            node_peer_addr_reservation_worker: register_int_gauge_vec_with_registry!(
+                "node_peer_addr_reservation_worker",
+                "Worker swarm desired relay reservations (1 = active, 0 = desired but currently down)",
+                &["multiaddr"],
                 registry
             )?,
         })
