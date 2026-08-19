@@ -219,7 +219,7 @@ impl BatchTracker {
                 ?sender,
                 nonce_min = range.min,
                 nonce_max = range.max,
-                nonce_span = range.max - range.min + 1,
+                nonce_span = range.span(),
                 "batch_sealed_sender_range"
             );
         }
@@ -371,7 +371,7 @@ impl BatchTracker {
                     ?sender,
                     nonce_min = range.min,
                     nonce_max = range.max,
-                    nonce_span = range.max - range.min + 1,
+                    nonce_span = range.span(),
                     "nonce_range_for_sender"
                 );
             }
