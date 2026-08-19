@@ -582,12 +582,12 @@ impl<DB: Database> PrimaryToWorkerClient for PrimaryReceiverHandler<DB> {
         let mut missing = HashSet::new();
         for digest in message.digests.iter() {
             // Check if we already have the batch.
-            match self.store.get::<Batches>(digest) {
-                Ok(None) => {
+            match self.store.contains_key::<Batches>(digest) {
+                Ok(false) => {
                     missing.insert(*digest);
                     debug!("Requesting sync for batch {digest}");
                 }
-                Ok(Some(_)) => {
+                Ok(true) => {
                     trace!("Digest {digest} already in store, nothing to sync");
                 }
                 Err(e) => {

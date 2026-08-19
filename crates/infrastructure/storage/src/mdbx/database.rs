@@ -400,9 +400,13 @@ impl Drop for MdbxDatabase {
     }
 }
 
+/// Bytes in a kilobyte.
 pub const KILOBYTE: usize = 1024;
+/// Bytes in a megabyte.
 pub const MEGABYTE: usize = KILOBYTE * 1024;
+/// Bytes in a gigabyte.
 pub const GIGABYTE: usize = MEGABYTE * 1024;
+/// Bytes in a terabyte.
 pub const TERABYTE: usize = GIGABYTE * 1024;
 
 /// Rayls: Default max read transaction duration in seconds.
@@ -719,7 +723,9 @@ impl Database for MdbxDatabase {
     }
 
     fn contains_key<T: Table>(&self, key: &T::Key) -> eyre::Result<bool> {
-        self.with_read_txn(|tx| Ok(tx.get::<T>(key)?.is_some()))
+        // A presence check must not copy and decode the value: `raw_get` borrows the page, while
+        // `get` would copy a row of up to 2MB and run a decode that aborts on a corrupt row.
+        self.with_read_txn(|tx| Ok(tx.raw_get::<T>(key)?.is_some()))
     }
 
     fn get<T: Table>(&self, key: &T::Key) -> eyre::Result<Option<T::Value>> {
@@ -897,8 +903,8 @@ where
 /// The `Database::raw_iter`/`reverse_raw_iter` variants own their read
 /// transaction *inside* the returned iterator, so a borrow into the mmap would
 /// dangle if the boxed iterator were dropped while a yielded item is still
-/// held. The `DbTx` variants don't need this — their transaction outlives the
-/// iterator — so they yield the borrow directly.
+/// held. The `DbTx` variants don't need this - their transaction outlives the
+/// iterator - so they yield the borrow directly.
 fn into_owned_pair<'i>((k, v): (Cow<'_, [u8]>, Cow<'_, [u8]>)) -> (Cow<'i, [u8]>, Cow<'i, [u8]>) {
     (Cow::Owned(k.into_owned()), Cow::Owned(v.into_owned()))
 }
