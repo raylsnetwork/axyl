@@ -147,6 +147,14 @@ impl ExecutionNodeInner {
         initial_batch_seq: u64,
         epoch_boundary: u64,
     ) -> eyre::Result<()> {
+        // The node-scoped in-flight tracker is shared by every worker pool: a second worker's
+        // boundary clear or reconcile would wipe the sibling's marks. Fence the assumption until
+        // multi-worker mark scoping exists.
+        eyre::ensure!(
+            self.workers.len() == 1,
+            "in-flight dedup assumes a single worker (found {})",
+            self.workers.len()
+        );
         // check for worker components and initialize if they're missing
         let transaction_pool = self
             .workers
