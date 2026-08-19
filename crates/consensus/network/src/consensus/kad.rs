@@ -16,6 +16,17 @@ use libp2p::{
 use rayls_infrastructure_types::{encode, now, try_decode, BlsPublicKey, Database, RaylsSender};
 use tracing::{debug, error, info, trace, warn};
 
+/// Fixed-window length for the per-peer inbound PutRecord budget.
+const KAD_PUT_BUDGET_WINDOW_SECS: u64 = 60;
+/// Maximum inbound PutRecord requests accepted per peer per window.
+const KAD_PUT_BUDGET_MAX: u32 = 10;
+
+/// Returns the per-peer PutRecord budget so a test can exhaust it.
+#[cfg(test)]
+pub(crate) fn kad_put_budget_max() -> u32 {
+    KAD_PUT_BUDGET_MAX
+}
+
 impl<Req, Res, DB, Events> ConsensusNetwork<Req, Res, DB, Events>
 where
     Req: RLMessage,
@@ -253,9 +264,14 @@ where
             return;
         };
 
-        if let Err(reason) =
-            self.verify_kad_put_authenticity(&key, &source, &record, &decoded_record)
-        {
+        // Budget gate before any per-record work. Not a penalty: an honest node can burst
+        // republishes across an epoch change, so over-budget puts are dropped, never charged.
+        if !self.within_kad_put_budget(&source) {
+            trace!(target: "network-kad", ?source, "kad put budget exceeded - dropping put request");
+            return;
+        }
+
+        if let Err(reason) = self.check_kad_put_admissibility(&source, &record, &decoded_record) {
             if matches!(
                 reason,
                 RecordInvalidReason::PublisherBanned
@@ -271,16 +287,39 @@ where
             return;
         }
 
-        // OldRecord branch: record already lives in our store from a prior PUT,
-        // so refreshing the in-memory BLS mapping (wiped on restart) is safe.
+        // Dedup before the signature verify: a replayed or stale record costs a store lookup
+        // instead of a BLS verification on the swarm event loop (a validly signed replay earns
+        // no penalty, so verifying first is a free CPU-amplification vector).
+        //
+        // A duplicate already lives in our store from a prior put, so refreshing the in-memory
+        // BLS mapping (wiped on restart) is safe, but only from the stored record's info, which
+        // passed the signature check when it was admitted; the incoming duplicate is unverified.
         if !self.is_newer_record(&record.key, &decoded_record) {
             trace!(target: "network-kad", ?source, "duplicate record, refreshing known_peers");
-            self.swarm.behaviour_mut().peer_manager.add_known_peer(key, decoded_record.info);
+            let stored_info = self
+                .swarm
+                .behaviour_mut()
+                .kademlia
+                .store_mut()
+                .get(&record.key)
+                .and_then(|existing| try_decode::<NodeRecord>(&existing.value).ok())
+                .map(|stored| stored.info);
+            if let Some(info) = stored_info {
+                self.swarm.behaviour_mut().peer_manager.add_known_peer(key, info);
+            }
+            return;
+        }
+
+        // Signature verify only for fresh records that passed every cheap gate.
+        if let Err(e) = self.peer_record_valid_decoded(&key, record.publisher, &decoded_record) {
+            let reason = RecordInvalidReason::InvalidPeerRecord(e);
+            self.apply_invalid_kad_request_penalty(&source, record.publisher, &reason);
+            error!(target: "network-kad", ?source, ?reason, "failed to process kad put request");
             return;
         }
 
         // Fresh record: store it first. add_known_peer only on success so a full
-        // store cannot be used as a side-channel to populate known_peers (PR #280).
+        // store cannot be used as a side-channel to populate known_peers.
         let publisher = record.publisher;
         if let Err(err) = self.swarm.behaviour_mut().kademlia.store_mut().put(record) {
             self.handle_kad_store_error(&source, publisher, err);
@@ -308,9 +347,10 @@ where
         }
     }
 
-    fn verify_kad_put_authenticity(
+    /// Reject a put from or about a banned peer, without a publisher, or dated too far in the
+    /// future, all of which are decided without touching the signature.
+    fn check_kad_put_admissibility(
         &mut self,
-        key: &BlsPublicKey,
         source: &PeerId,
         record: &kad::Record,
         decoded_record: &NodeRecord,
@@ -329,14 +369,29 @@ where
             return Err(RecordInvalidReason::TimestampTooFarInFuture);
         }
 
-        // verify record signature and ensure publisher matches record's network
-        self.peer_record_valid_decoded(key, record.publisher, decoded_record)
-            .map_err(RecordInvalidReason::InvalidPeerRecord)
+        Ok(())
+    }
+
+    /// Count an inbound PutRecord against `source`'s fixed window; `false` when over budget.
+    fn within_kad_put_budget(&mut self, source: &PeerId) -> bool {
+        let now = now();
+        // Drop stale windows so the map tracks recent senders, not every peer ever seen.
+        if self.kad_put_budget.len() > 1024 {
+            self.kad_put_budget
+                .retain(|_, (start, _)| now.saturating_sub(*start) <= KAD_PUT_BUDGET_WINDOW_SECS);
+        }
+        let (window_start, count) = self.kad_put_budget.entry(*source).or_insert((now, 0));
+        if now.saturating_sub(*window_start) > KAD_PUT_BUDGET_WINDOW_SECS {
+            *window_start = now;
+            *count = 0;
+        }
+        *count += 1;
+        *count <= KAD_PUT_BUDGET_MAX
     }
 
     /// Handle a store error from `put()`, charging the peer at fault, if any.
     ///
-    /// Runs after `verify_kad_put_authenticity`, so `publisher` is authenticated: an oversize
+    /// Runs after the signature verify, so `publisher` is authenticated: an oversize
     /// value charges only its author, never an honest relayer, matching
     /// [`kad_record_fault_penalty`]. A full store is a local capacity condition, so the deliverer
     /// is charged only `Penalty::Mild`.
