@@ -114,7 +114,9 @@ pub mod tables {
         ConsensusBlockNumbersByDigest;crate::CONSENSUS_BLOCK_NUMBER_BY_DIGEST_CF;<BlockHash, u64>,
         // This is a cache to store verified but unprocessed consensus headers, remove once processed.
         ConsensusBlocksCache;crate::CONSENSUS_BLOCK_CACHE_CF;<u64, ConsensusHeader>,
-        // This is a cache to store this nodes batches before consensus, remove once in a ConsensusHeader.
+        // No longer written: graceful-shutdown txpool persistence replaced the seal-time batch
+        // cache. Retained so existing databases keep a stable column-family set; still cleared
+        // on foreign-DB sanitization to purge rows written by older binaries.
         NodeBatchesCache;crate::NODE_BATCHES_CACHE_CF;<BlockHash, Batch>,
         // These tables are for the epoch chain not the normal consensus.
         EpochRecords;crate::EPOCH_RECORDS_CF;<Epoch, EpochRecord>,

@@ -240,7 +240,6 @@ pub fn save_consensus<DB: Database>(
             let _ = txn.remove::<ConsensusBlockNumbersByDigest>(stale_digest);
         }
 
-        // Do not clean NodeBatchesCache table here. It must be clean in `process_committed_headers` in the proposer`
         Ok(())
     })?;
 
@@ -250,22 +249,13 @@ pub fn save_consensus<DB: Database>(
 /// The canonical consensus-chain tip, used to seed the live subscriber's header *numbering* so a
 /// number the network already consumed is never reused.
 ///
-/// Returns the highest `ConsensusBlocks` header on the canonical chain. The raw table tip is not
-/// always canonical: a drain race at an epoch boundary can leave prior-epoch outputs saved above
-/// the certified checkpoint (a "post-boundary leak"). Seeding numbering from such a leak offsets
-/// every new-epoch header by the leak count and forks the chain via a divergent `ConsensusHeader`
-/// digest (which feeds the block's `mix_hash` / `parent_beacon_block_root`). When the tip is a
-/// prior-epoch header above the certified checkpoint, the certified (committee-signed) checkpoint
-/// is returned instead, so the new epoch's first number is the one every validator agrees on.
-///
-/// A current-epoch tip is returned directly, so numbering still sits >= the execution anchor when
-/// execution lags the commit (a crash/static-file heal must not regress numbering and reuse a
-/// number). IMPORTANT: use this ONLY for numbering. Do NOT anchor re-execution/replay on it - that
-/// must stay on the SSOT `executed_anchor`, or committed-but-unexecuted outputs get skipped on
-/// restart and the chain forks. See the note in `epoch_manager/core.rs`.
-///
-/// Returns `None` only when the consensus DB is empty (fresh boot); execution is at 0 then too,
-/// since `save_consensus` persists each header before it executes.
+/// The raw `ConsensusBlocks` tip is not always canonical: a drain race at an epoch boundary can
+/// leave prior-epoch outputs saved above the certified checkpoint, and numbering from them offsets
+/// every new-epoch header and forks the chain through a divergent `ConsensusHeader` digest. Such
+/// a tip yields the committee-signed checkpoint instead; a current-epoch tip is returned as is, so
+/// numbering stays >= the execution anchor when execution lags the commit. Use this for numbering
+/// only: replay must anchor on `executed_anchor`, or committed-but-unexecuted outputs are skipped
+/// on restart. Returns `None` only when the consensus DB is empty.
 pub fn consensus_chain_tip<DB: Database>(config: &ConsensusConfig<DB>) -> Option<ConsensusHeader> {
     let db = config.node_storage();
     let (_, tip) = db.last_record::<ConsensusBlocks>()?;
@@ -441,21 +431,13 @@ fn collect_replayable_headers<DB: Database>(
     result
 }
 
-/// Collect and return any consensus headers that were not executed before last shutdown.
-/// This will be consensus that was reached but had not executed before a shutdown.
+/// Collects the consensus headers that were reached but not executed before the last shutdown.
 ///
-/// ## Interaction with checkpoint-based crash recovery
-///
-/// The manager's `recover_partial_transition()` runs BEFORE this function is called.
-/// That method checks for incomplete epoch transitions (via a DB checkpoint) and either
-/// completes the remaining phases or clears a stale checkpoint. By the time this
-/// function executes, the checkpoint system guarantees that `recently_executed_blocks` accurately
-/// reflects the last executed block.
-///
-/// If a checkpoint still exists when this function runs, it indicates an unexpected
-/// ordering issue -- recovery should have handled it already. We log a warning but
-/// proceed, as the worst case is a harmless replay: the `ExecutorEngine` drops
-/// duplicate/out-of-order outputs via `last_seen_output_number` (processor `<=` check).
+/// `recover_partial_transition()` runs first and completes or clears any epoch-transition
+/// checkpoint, so `recently_executed_blocks` reflects the last executed block by the time this
+/// runs. A checkpoint still present here is an ordering bug; it is logged and the walk proceeds,
+/// since the worst case is a harmless replay that the `ExecutorEngine` drops via
+/// `last_seen_output_number`.
 pub async fn get_missing_consensus<DB: Database>(
     config: &ConsensusConfig<DB>,
     consensus_bus: &ConsensusBus,

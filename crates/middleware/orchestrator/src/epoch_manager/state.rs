@@ -70,7 +70,7 @@ where
                 self.prev_epoch_record.as_ref(),
                 epoch,
             );
-            // Neither memory nor disk has it — e.g. a restart before vote quorum
+            // Neither memory nor disk has it - e.g. a restart before vote quorum
             // persisted this node's copy. Peers closed the previous epoch and hold
             // its certified record, so fetch it directly instead of failing and
             // waiting for the async collector to backfill (which may not win the
@@ -149,7 +149,7 @@ where
         // and the durable canonical tip. Read the reth canonical head directly rather than the
         // in-memory recently_executed_blocks (which is fed asynchronously by the engine-update
         // task): the tip is the epoch-closing block the engine finalized before this runs,
-        // so parent_state is deterministic and race-free — and identical to the value the
+        // so parent_state is deterministic and race-free - and identical to the value the
         // pre-anchor code committed.
         let parent_state = engine.get_reth_env().await.canonical_tip().num_hash();
 
@@ -248,7 +248,8 @@ where
             txn.clear_table::<LastProposed>()?;
             txn.clear_table::<Votes>()?;
             txn.clear_table::<Payload>()?;
-            // node-specific long-lived tables
+            // node-specific long-lived tables (NodeBatchesCache is no longer written; cleared to
+            // purge rows an older binary may have left in an imported DB)
             txn.clear_table::<NodeBatchesCache>()?;
             txn.clear_table::<EpochTransitionCheckpoints>()?;
             txn.clear_table::<BatchSeqCounter>()?;

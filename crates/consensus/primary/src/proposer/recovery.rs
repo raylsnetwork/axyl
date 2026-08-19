@@ -1,5 +1,4 @@
 use crate::proposer::{types::ProposerDigest, Proposer, DIGEST_QUEUE_WARN_THRESHOLD};
-use rayls_infrastructure_storage::tables::NodeBatchesCache;
 use rayls_infrastructure_types::{Database, DbTxMut, Round};
 use std::collections::VecDeque;
 use tracing::{debug, warn};
@@ -59,34 +58,18 @@ impl<DB: Database> Proposer<DB> {
     pub(super) fn process_committed_headers(
         &mut self,
         commit_round: Round,
-        committed_headers: Vec<(Round, bool)>,
+        committed_headers: Vec<Round>,
     ) {
-        // Each `(round, dropped)`: skip NodeBatchesCache cleanup for a header whose subdag reaches
-        // the epoch boundary — the subscriber drops its output, so orphan_batches must still find
-        // its batches to rescue them. `dropped` is computed per-commit in the committer (where the
-        // subdag commit_timestamp and epoch_boundary are known) and carried on the channel — no
-        // shared transition flag, no TOCTOU.
-
         // drain every committed round (not just the lowest-matching one) so later
         // rounds cannot be re-queued by the retransmit loop below
-        for (round, dropped) in committed_headers.iter().copied() {
-            let Some(header) = self.proposed_headers.remove(&round) else { continue };
-            if dropped {
-                continue;
-            }
-            let _ = self.proposer_store.with_write_txn(|txn| {
-                for (batch_hash, _) in header.payload() {
-                    let _ = txn.remove::<NodeBatchesCache>(batch_hash);
-                }
-                Ok(())
-            });
+        for round in committed_headers.iter().copied() {
+            self.proposed_headers.remove(&round);
         }
 
         // Fall back to the commit round when none of our own headers committed: otherwise a
         // validator whose proposals keep getting rejected strands its quorum'd digests (consumed
         // seqs) in proposed_headers until GC, leaving a permanent per-authority seq gap on peers.
-        let highest_committed =
-            committed_headers.iter().map(|(r, _)| *r).max().unwrap_or(commit_round);
+        let highest_committed = committed_headers.iter().copied().max().unwrap_or(commit_round);
         let Some(&lowest_uncommitted) = self.proposed_headers.keys().next() else { return };
         if lowest_uncommitted >= highest_committed {
             return;

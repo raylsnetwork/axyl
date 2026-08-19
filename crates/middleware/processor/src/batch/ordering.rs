@@ -2,10 +2,7 @@
 
 use std::sync::Arc;
 
-use std::{
-    cmp::Ordering,
-    collections::{BTreeMap, HashMap},
-};
+use std::{cmp::Ordering, collections::BTreeMap};
 
 use parking_lot::Mutex;
 use rayls_infrastructure_storage::{
