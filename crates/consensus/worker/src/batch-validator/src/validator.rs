@@ -2,8 +2,8 @@
 
 use rayls_execution_evm::{
     bytes_to_txn, chainspec::RaylsHardforks, recover_pooled_transaction,
-    recover_signed_transaction, reth_env::RethEnv, EthPooledTransaction, FixedBytes,
-    PoolErrorKind, PoolTransaction as _, WorkerTxPool,
+    recover_signed_transaction, reth_env::RethEnv, EthPooledTransaction, FixedBytes, PoolErrorKind,
+    PoolTransaction as _, WorkerTxPool,
 };
 use rayls_infrastructure_types::{
     fxhash_slot_digest, gas_accumulator::BaseFeeContainer, legacy_slot_digest, max_batch_size,
@@ -122,6 +122,12 @@ impl BatchValidation for BatchValidator {
             if let Some(tx) = txs_bytes.iter().next() {
                 if tx.len() < 8 {
                     return Err(SubmitBatchError::InvalidTransactionBytes);
+                }
+                // An empty slot table (a committee gap mid-transition) must not reach the
+                // modulo: division by zero aborts the node, and a gossip message must never
+                // be able to do that.
+                if slots.size() == 0 {
+                    return Ok(());
                 }
                 let owner = self.slot_digest(tx) % slots.size();
                 // Under sender-affinity a down owner's senders fail over to the next live slot on
