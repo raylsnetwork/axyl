@@ -77,7 +77,7 @@ where
                     WorkerNetworkError::InvalidTopic
                 );
                 let store = self.consensus_config.node_storage();
-                if !matches!(store.get::<Batches>(&batch_hash), Ok(Some(_))) {
+                if !store.contains_key::<Batches>(&batch_hash).unwrap_or(false) {
                     // A committee member already holds the batch; a non-committee node prefetches
                     // what it will soon need.
                     match self.network_handle.request_batches(vec![batch_hash]).await {

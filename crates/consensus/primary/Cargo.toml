@@ -8,6 +8,7 @@ publish = false
 edition = "2021"
 
 [dependencies]
+bcs = { workspace = true }
 eyre = { workspace = true }
 backoff = { workspace = true }
 futures = { workspace = true }
