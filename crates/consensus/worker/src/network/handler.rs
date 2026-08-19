@@ -142,7 +142,7 @@ where
         sealed_batch: SealedBatch,
     ) -> WorkerNetworkResult<()> {
         // return error if reporter isn't in current committee
-        if !self.consensus_config.committee_pub_keys().contains(peer) {
+        if self.consensus_config.committee().authority_by_key(peer).is_none() {
             return Err(WorkerNetworkError::NonCommitteeBatch);
         }
 

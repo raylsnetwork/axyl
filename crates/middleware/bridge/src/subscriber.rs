@@ -20,19 +20,15 @@ use rayls_infrastructure_config::LibP2pConfig;
 use rayls_infrastructure_network_types::{local::LocalNetwork, PrimaryToWorkerClient};
 use rayls_infrastructure_storage::CertificateStore;
 use rayls_infrastructure_types::{
-    Address, AuthorityIdentifier, Batch, BlockHash, CameFrom, CertifiedBatch, CommittedSubDag,
-    Committee, ConsensusHeader, ConsensusOutput, Database, Epoch, Hash as _, Noticer,
-    RaylsReceiver, RaylsSender, Round, TaskKind, TaskManager, TaskSpawner, Timestamp, TimestampSec,
-    B256,
+    Address, AuthorityIdentifier, B256Map, B256Set, Batch, BlockHash, CameFrom, CertifiedBatch,
+    CommittedSubDag, Committee, ConsensusHeader, ConsensusOutput, Database, Epoch, Hash as _,
+    Noticer, RaylsReceiver, RaylsSender, Round, TaskKind, TaskManager, TaskSpawner, Timestamp,
+    TimestampSec, B256,
 };
 // production-only: signing the consensus result for gossip
 #[cfg(not(feature = "dev-single-node-setup"))]
 use rayls_infrastructure_types::{encode, to_intent_message, BlsSigner as _};
-use std::{
-    collections::{HashMap, HashSet},
-    sync::Arc,
-    time::Duration,
-};
+use std::{sync::Arc, time::Duration};
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, trace, warn};
 
@@ -982,7 +978,7 @@ impl<DB: Database> Subscriber<DB> {
                     let sig =
                         self.config.key_config().request_signature_direct(&encode(&to_intent_message(consensus_result_hash)));
 
-                    // pre-publish gossipsub diagnostics (production only — dev has no peers)
+                    // pre-publish gossipsub diagnostics (production only - dev has no peers)
                     #[cfg(not(feature = "dev-single-node-setup"))]
                     {
                         let consensus_output_topic = LibP2pConfig::consensus_output_topic();
@@ -1035,7 +1031,7 @@ impl<DB: Database> Subscriber<DB> {
                     let header_for_cache = ConsensusHeader { parent_hash, sub_dag: sub_dag.clone(), number, extra: B256::default() };
                     store_consensus_header_in_cache(self.config.node_storage(), &header_for_cache);
 
-                    // Dev (single-node): no peers — skip gossip entirely.
+                    // Dev (single-node): no peers - skip gossip entirely.
                     #[cfg(not(feature = "dev-single-node-setup"))]
                     if let Err(e) = self.network_handle.publish_consensus(epoch, round, number, last_parent, self.config.key_config().public_key(), sig).await {
                         error!(target: "subscriber", "error publishing latest consensus to network {:?}: {}", self.inner.authority_id, e);
@@ -1162,7 +1158,7 @@ impl<DB: Database> Subscriber<DB> {
             ..Default::default()
         };
 
-        let mut batch_set: HashSet<BlockHash> = HashSet::new();
+        let mut batch_set = B256Set::default();
 
         for cert in &sub_dag.certificates {
             for (digest, _) in cert.header().payload().iter() {
@@ -1221,9 +1217,9 @@ impl<DB: Database> Subscriber<DB> {
 
     async fn fetch_batches_from_peers(
         &self,
-        batch_digests: HashSet<BlockHash>,
-    ) -> SubscriberResult<HashMap<BlockHash, Batch>> {
-        let mut fetched_blocks = HashMap::new();
+        batch_digests: B256Set,
+    ) -> SubscriberResult<B256Map<Batch>> {
+        let mut fetched_blocks = B256Map::default();
 
         debug!(target: "subscriber", "Attempting to fetch {} digests peers", batch_digests.len(),);
         let blocks = match self.inner.client.fetch_batches(batch_digests.clone()).await {

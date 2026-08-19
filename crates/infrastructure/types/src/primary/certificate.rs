@@ -16,18 +16,18 @@ use crate::{
     Authority, AuthorityIdentifier, BlockHash, Committee, Digest, Epoch, Hash, Header, Round,
     TimestampSec, VotingPower,
 };
+use alloy::primitives::map::FbBuildHasher;
 use serde::{Deserialize, Serialize};
 use serde_with::serde_as;
 use std::{collections::BTreeMap, fmt};
 
-/// Certificates are the output of consensus.
-/// The certificate issued after a successful round of consensus.
+/// A header signed by a quorum (2f+1) of the committee.
 #[serde_as]
 #[derive(Default, Clone, Serialize, Deserialize)]
 pub struct Certificate {
     /// Certificate's header.
     pub header: Header,
-    /// Container for [BlsAggregateSignatureBytes].
+    /// The aggregate signature over the header and how far it has been verified.
     pub signature_verification_state: SignatureVerificationState,
     /// Bitmap that indicates which authorities from committee signed this certificate.
     #[serde_as(as = "RoaringBitmapSerde")]
@@ -39,7 +39,7 @@ pub struct Certificate {
 }
 
 impl Certificate {
-    /// Create a genesis certificate with empty payload.
+    /// Creates one empty round-0 certificate per authority.
     pub fn genesis(committee: &Committee) -> Vec<Self> {
         committee
             .authorities()
@@ -55,7 +55,7 @@ impl Certificate {
             .collect()
     }
 
-    /// Create a new, unsafe certificate that checks stake.
+    /// Builds a certificate from votes, requiring quorum stake but not verifying signatures.
     pub fn new_unverified(
         committee: &Committee,
         header: Header,
@@ -72,7 +72,7 @@ impl Certificate {
         )
     }
 
-    /// Create a new, unsafe certificate that does not check stake.
+    /// Builds a certificate from votes without a stake check, for tests.
     pub fn new_unsigned_for_test(
         committee: &Committee,
         header: Header,
@@ -89,7 +89,7 @@ impl Certificate {
         )
     }
 
-    /// Create a new certificate without verifying authority signatures.
+    /// Aggregates the votes into a certificate without verifying authority signatures.
     fn new_internal(
         committee: &Committee,
         header: Header,
@@ -165,17 +165,17 @@ impl Certificate {
         })
     }
 
-    /// Return the group of authorities that signed this certificate.
+    /// Returns the keys of the authorities that signed this certificate.
     ///
-    /// This function requires that certificate was verified against given committee
+    /// The certificate must belong to `committee`'s epoch.
     pub fn signed_authorities_with_committee(&self, committee: &Committee) -> Vec<BlsPublicKey> {
         assert_eq!(committee.epoch(), self.epoch());
         let (_stake, pks) = self.signed_by(&committee.bls_keys());
         pks
     }
 
-    /// Return the total stake and group of authorities that formed the committee for this
-    /// certificate.
+    /// Returns the signing weight and the signers' keys, given the committee keys in committee
+    /// order.
     pub fn signed_by(&self, committee: &[BlsPublicKey]) -> (VotingPower, Vec<BlsPublicKey>) {
         // Ensure the certificate has a quorum.
         let mut weight = 0;
@@ -197,30 +197,9 @@ impl Certificate {
         (weight, pks)
     }
 
-    /// Validate the certificate and verify signatures against the committee.
-    ///
-    /// The method returns a certificate with verified signature state.
-    ///
-    /// [SignatureVerificationState] stores both the verification status and signature bytes
-    /// together. While this creates some data redundancy with signed_authorities, keeping them
-    /// coupled provides important benefits:
-    ///
-    /// 1. Atomic State Updates - Changes to verification status are guaranteed to reference the
-    ///    exact signature bytes that were verified. This prevents state/signature mismatches that
-    ///    could occur if stored separately.
-    ///
-    /// 2. Verification Integrity - The verification status can only transition while operating on
-    ///    the specific signature bytes that were validated. This maintains a clear chain of trust
-    ///    through the verification process.
-    ///
-    /// 3. Invariant Preservation - Makes it impossible to have invalid states like:
-    ///    - VerifiedDirectly status with different signature bytes than what was actually verified
-    ///    - An Unsigned state containing signature bytes
-    ///    - A Verified state with missing/corrupted signature bytes
-    ///
-    /// While storing signatures in both places uses more memory, the strong correctness guarantees
-    /// outweigh the storage cost for certificate verification where maintaining cryptographic
-    /// integrity is critical.
+    /// Validates the certificate against the committee and verifies its aggregate signature,
+    /// returning it in verified state. See [`SignatureVerificationState`] for why the state and
+    /// the signature bytes travel together.
     pub fn validate_and_verify(self, committee: &Committee) -> CertificateResult<Certificate> {
         // ensure the header is from the correct epoch
         ensure!(
@@ -249,8 +228,8 @@ impl Certificate {
         Ok(verified_cert)
     }
 
-    /// Performs a signature verification of a certificate against committee.
-    /// Will clear the state first and revalidate even if it appears to be valid.
+    /// Verifies the aggregate signature against `committee`, resetting the verification state
+    /// first so an already-verified certificate is re-checked.
     pub fn verify_cert(mut self, committee: &[BlsPublicKey]) -> CertificateResult<Certificate> {
         self = self.validate_received()?;
         let (weight, pks) = self.signed_by(committee);
@@ -264,7 +243,7 @@ impl Certificate {
         Ok(verified_cert)
     }
 
-    /// Check the verification state and try to verify directly.
+    /// Verifies the signature unless the state already says it was verified.
     #[allow(deprecated)]
     fn verify_signature(mut self, pks: Vec<BlsPublicKey>) -> CertificateResult<Certificate> {
         // get signature from verification state
@@ -291,7 +270,7 @@ impl Certificate {
         Ok(self)
     }
 
-    /// Validate certificate was received and ready for verification.
+    /// Marks a received certificate as unverified so it must pass signature verification.
     pub fn validate_received(mut self) -> CertificateResult<Self> {
         self.set_signature_verification_state(SignatureVerificationState::Unverified(
             self.aggregated_signature()
@@ -310,7 +289,7 @@ impl Certificate {
         self.header.epoch()
     }
 
-    /// The nonce this certificate.
+    /// The nonce of this certificate's header.
     pub fn nonce(&self) -> u64 {
         self.header.nonce()
     }
@@ -325,7 +304,7 @@ impl Certificate {
         &self.header
     }
 
-    /// The aggregate signature for the certriciate.
+    /// The aggregate signature, absent for genesis.
     #[allow(deprecated)]
     pub fn aggregated_signature(&self) -> Option<BlsSignature> {
         match &self.signature_verification_state {
@@ -337,7 +316,7 @@ impl Certificate {
         }
     }
 
-    /// State of the Signature verification
+    /// The signature verification state.
     pub fn signature_verification_state(&self) -> &SignatureVerificationState {
         &self.signature_verification_state
     }
@@ -349,19 +328,17 @@ impl Certificate {
         &self.created_at
     }
 
-    /// Set the state of the Signature verification.
+    /// Sets the signature verification state.
     pub fn set_signature_verification_state(&mut self, state: SignatureVerificationState) {
         self.signature_verification_state = state;
     }
 
-    /// The bitmap of signed authorities for the certificate.
-    ///
-    /// This is the aggregate signature of all authorities for the certificate.
+    /// The bitmap of authorities, in committee order, whose votes form the aggregate signature.
     pub fn signed_authorities(&self) -> &roaring::RoaringBitmap {
         &self.signed_authorities
     }
 
-    /// Helper method if the certificate's verification state is verified.
+    /// Returns true if the signature has been verified or the certificate is genesis.
     #[allow(deprecated)]
     pub fn is_verified(&self) -> bool {
         matches!(
@@ -372,25 +349,17 @@ impl Certificate {
         )
     }
 
-    // Used for testing.
-
-    /// Change the certificate's header.
-    ///
-    /// Only Used for testing.
+    /// Replaces the certificate's header. Test-only.
     pub fn update_header_for_test(&mut self, header: Header) {
         self.header = header;
     }
 
-    /// Return a mutable reference to the header.
-    ///
-    /// Only Used for testing.
+    /// Returns the header mutably. Test-only.
     pub fn header_mut_for_test(&mut self) -> &mut Header {
         &mut self.header
     }
 
-    /// Change the certificate's created_at timestamp.
-    ///
-    /// Only Used for testing.
+    /// Replaces the creation timestamp. Test-only.
     pub fn update_created_at_for_test(&mut self, timestamp: TimestampSec) {
         self.created_at = timestamp;
     }
@@ -409,7 +378,7 @@ impl From<&Certificate> for Vec<u8> {
 }
 
 impl Certificate {
-    /// Skip one BCS-encoded certificate, returning the embedded header's byte span (the range
+    /// Skips one BCS-encoded certificate, returning the embedded header's byte span (the range
     /// [`Header::digest`] hashes, and therefore the certificate's digest preimage).
     pub fn skip_with_header_span<'a>(c: &mut BcsCursor<'a>) -> Result<&'a [u8], BcsLayoutError> {
         let header = c.take_span::<Header>()?;
@@ -429,42 +398,23 @@ impl BcsLayout for Certificate {
     }
 }
 
-// This will be used to take advantage of the
-// certificate chain that is formed via the DAG by only verifying the
-// leaves of the certificate chain when they are fetched from validators
-// during catchup.
-/// SignatureVerificationState stores both the verification status and signature bytes together.
-/// While this creates some data redundancy with signed_authorities, keeping them coupled provides
-/// important benefits:
-/// - atomic state updates: changes to verification status are guaranteed to reference the exact
-///   signature bytes that were verified. this prevents state/signature mismatches that could occur
-///   if stored separately.
+/// Verification status of a certificate's aggregate signature, carrying the signature bytes.
 ///
-/// - verification integrity: the verification status can only transition while operating on the
-///   specific signature bytes that were validated. this maintains a clear chain of trust through
-///   the verification process.
-///
-/// - impossible to have invalid states like:
-///    - `VerifiedDirectly` status with different signature bytes than what was actually verified
-///    - an unsigned state containing signature bytes
-///    - a verified state with missing/corrupted signature bytes
+/// The bytes live inside the state rather than beside it so a status can only be reached by
+/// operating on the exact bytes it describes: a verified state cannot hold bytes other than the
+/// ones that were verified, and an unsigned state cannot hold a quorum signature.
 #[derive(Copy, Clone, Serialize, Deserialize, Debug)]
 pub enum SignatureVerificationState {
-    /// This state occurs when the certificate has not yet received a quorum of
-    /// signatures.
+    /// The certificate has not yet received a quorum of signatures.
     Unsigned(BlsSignature),
-    /// This state occurs when a certificate has just been received from the network
-    /// and has not been verified yet.
+    /// The certificate arrived from the network and has not been verified.
     Unverified(BlsSignature),
-    /// This state occurs when a certificate was either created locally, received
-    /// via brodacast, or fetched but was not the parent of another certificate.
-    /// Therefore this certificate had to be verified directly.
+    /// The aggregate signature was verified on this node.
     VerifiedDirectly(BlsSignature),
     /// Kept for BCS variant index stability with existing consensus DBs.
     #[deprecated(note = "not assigned, kept for serialization index stability")]
     VerifiedIndirectly(BlsSignature),
-    /// This state occurs only for genesis certificates which always has valid
-    /// signatures bytes but the bytes are garbage so we don't mark them as verified.
+    /// A genesis certificate, which carries no signature and needs no verification.
     Genesis,
 }
 
@@ -490,10 +440,7 @@ impl BcsLayout for SignatureVerificationState {
     }
 }
 
-/// Process certificate received by setting the verification state.
-///
-/// Recover signature bytes from the aggregated signature and set the signature verification state
-/// to unverified.
+/// Marks a received certificate as unverified so it must pass signature verification.
 pub fn validate_received_certificate(
     mut certificate: Certificate,
 ) -> CertificateResult<Certificate> {
@@ -505,14 +452,26 @@ pub fn validate_received_certificate(
     Ok(certificate)
 }
 
-/// Certificate digest.
+/// Digest of a certificate, equal to the digest of its header.
 #[derive(
     Clone, Copy, Default, PartialEq, Eq, std::hash::Hash, PartialOrd, Ord, Serialize, Deserialize,
 )]
 pub struct CertificateDigest(Digest<{ crypto::DIGEST_LENGTH }>);
 
+/// Hash map keyed by [`CertificateDigest`].
+///
+/// The key is already a uniformly distributed 32-byte hash, so the hasher consumes its bytes
+/// directly instead of running SipHash over them on every lookup. Sound because the derived
+/// `Hash` writes exactly the digest's 32 bytes: array length prefixes route through
+/// `write_usize`, which this hasher discards.
+pub type CertificateDigestMap<V> =
+    std::collections::HashMap<CertificateDigest, V, FbBuildHasher<32>>;
+
+/// Hash set of [`CertificateDigest`]; see [`CertificateDigestMap`] for why the hasher is sound.
+pub type CertificateDigestSet = std::collections::HashSet<CertificateDigest, FbBuildHasher<32>>;
+
 impl CertificateDigest {
-    /// Create a new instance of CertificateDigest.
+    /// Creates a digest from its raw bytes.
     pub fn new(digest: [u8; crypto::DIGEST_LENGTH]) -> Self {
         CertificateDigest(Digest { digest })
     }
@@ -590,9 +549,29 @@ impl PartialEq for Certificate {
 
 #[cfg(test)]
 mod tests {
+
+    /// The fixed-bytes hasher requires every key to hash as exactly 32 bytes and enforces it
+    /// with a debug assertion, so this exercises real map operations to pin that
+    /// `CertificateDigest`'s derived `Hash` satisfies the contract. A key that also wrote a
+    /// length prefix would trip the assertion here.
+    #[test]
+    fn certificate_digest_map_hashes_exactly_the_digest_bytes() {
+        let mut map = super::CertificateDigestMap::default();
+        let mut set = super::CertificateDigestSet::default();
+        for byte in 0..8u8 {
+            let digest = CertificateDigest::new([byte; crypto::DIGEST_LENGTH]);
+            map.insert(digest, byte);
+            set.insert(digest);
+        }
+        let probe = CertificateDigest::new([3u8; crypto::DIGEST_LENGTH]);
+        assert_eq!(map.get(&probe), Some(&3));
+        assert!(set.contains(&probe));
+        assert_eq!(map.len(), 8);
+    }
+
     use super::*;
 
-    /// Create a minimal certificate for serialization tests.
+    /// Creates a minimal certificate for serialization tests.
     fn make_test_certificate(state: SignatureVerificationState) -> Certificate {
         Certificate {
             header: Header::default(),
@@ -602,7 +581,7 @@ mod tests {
         }
     }
 
-    /// Verify BCS roundtrip for every SignatureVerificationState variant.
+    /// Verifies the BCS roundtrip for every SignatureVerificationState variant.
     /// Removing or reordering variants breaks persisted certificate deserialization.
     #[test]
     #[allow(deprecated)]
@@ -644,7 +623,7 @@ mod tests {
         }
     }
 
-    /// Pin BCS variant indices to expected positions.
+    /// Pins BCS variant indices to expected positions.
     /// BCS uses ULEB128 variant indices; shifting breaks DB compatibility.
     #[test]
     #[allow(deprecated)]
