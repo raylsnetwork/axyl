@@ -101,7 +101,7 @@ impl<DB: Database> ColdArchiver<DB> {
         let seal_elapsed = seal_started.elapsed();
         let finalize_started = std::time::Instant::now();
         let finalized = finalize_sealed(&self.hot, &sealed, &should_cancel, PRUNE_YIELD)
-            .map_err(|e| eyre::eyre!("cold finalize failed: {e}"))?;
+            .map_err(|e| eyre::Report::new(e).wrap_err("cold finalize failed"))?;
         // Reporting a cancelled finalize as sealed would let the caller close the epoch out and
         // skip the retry that sweeps its leftover hot rows.
         let Finalized::Complete(_) = finalized else {

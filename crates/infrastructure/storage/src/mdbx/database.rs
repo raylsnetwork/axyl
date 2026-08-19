@@ -1208,7 +1208,7 @@ mod test {
             for n in 0..8u64 {
                 db.insert::<TestTable>(&n, &format!("row-{n}")).expect("insert");
             }
-            db.sync_persist();
+            db.sync_persist().expect("persist");
         }
 
         let stats = compact_in_place(temp_dir.path(), &cfg).expect("compact after stack drop");

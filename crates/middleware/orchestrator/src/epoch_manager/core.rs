@@ -391,6 +391,9 @@ where
 
         // Flush both layers, each under catch_unwind so a panic in one still runs the other.
         // Consensus goes first so a crash between them leaves consensus >= execution (replayable).
+        // A flush failure here is logged, not faulted: the process is exiting, so the layered
+        // cache's failed rows die with it (no unbounded pinning), and consensus >= execution
+        // replays the unflushed tail on restart.
         let consensus_flush = AssertUnwindSafe(self.consensus_db.persist()).catch_unwind().await;
         match consensus_flush {
             Ok(Ok(())) => info!(target: "engine", "shutdown consensus DB flush complete"),

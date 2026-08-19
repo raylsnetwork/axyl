@@ -1378,7 +1378,12 @@ impl<DB: Database> Database for LayeredDatabase<DB> {
 
     /// Blocks the calling thread until the writer has applied all queued messages; never call it
     /// on an async runtime worker.
-    fn sync_persist(&self) {
+    ///
+    /// Returns any write/commit failure the writer observed since the previous barrier, so a
+    /// caller cannot mistake a failed flush for durability. Callers must treat the error as
+    /// fatal (fault the node): failed rows stay pinned in the mem cache (in-flight counts never
+    /// settle) until a restart rebuilds it, so an ignored error leaks them unboundedly.
+    fn sync_persist(&self) -> eyre::Result<()> {
         let (tx, mut rx) = oneshot::channel();
         let depth_at_send = self.tx.depth();
         let started = Instant::now();
@@ -1391,18 +1396,21 @@ impl<DB: Database> Database for LayeredDatabase<DB> {
             loop {
                 match rx.try_recv() {
                     Err(TryRecvError::Empty) => std::thread::sleep(Duration::from_millis(100)),
-                    Err(TryRecvError::Closed) => break,
+                    Err(TryRecvError::Closed) => {
+                        return Err(eyre::eyre!("consensus DB sync_persist: reply dropped"));
+                    }
                     Ok(Ok(())) => {
                         log_persist_latency(started.elapsed(), depth_at_send);
-                        break;
+                        return Ok(());
                     }
                     Ok(Err(e)) => {
                         tracing::error!(target: "storage", "consensus DB sync_persist: write failed: {e}");
-                        break;
+                        return Err(eyre::eyre!("consensus DB sync_persist: {e}"));
                     }
                 }
             }
         }
+        r.map(|_| ())
     }
 }
 
@@ -1792,11 +1800,11 @@ mod test {
             Ok(())
         })
         .expect("seed");
-        db.sync_persist();
+        db.sync_persist().expect("persist");
 
         // An empty batch is a no-op: nothing is removed.
         db.with_write_txn(|txn| txn.evict_persistent_batch::<TestTable>(&[])).expect("empty batch");
-        db.sync_persist();
+        db.sync_persist().expect("persist");
         for i in 0..10u64 {
             assert!(db.contains_key::<TestTable>(&i).unwrap(), "empty batch removed key {i}");
         }
@@ -1804,7 +1812,7 @@ mod test {
         let evicted = [1u64, 3, 5, 7];
         db.with_write_txn(|txn| txn.evict_persistent_batch::<TestTable>(&evicted))
             .expect("batch evict");
-        db.sync_persist();
+        db.sync_persist().expect("persist");
 
         for i in 0..10u64 {
             let present = db.contains_key::<TestTable>(&i).unwrap();
@@ -1840,6 +1848,33 @@ mod test {
         assert!(
             db.persist().await.is_err(),
             "persist must surface the write failure instead of reporting success"
+        );
+    }
+
+    /// The blocking sibling of `test_failed_write_is_surfaced_by_persist`: `sync_persist` must
+    /// also surface a failed commit, so blocking callers (cold archival) cannot mistake a failed
+    /// flush for durability and proceed to prune rows the index never durably landed.
+    #[test]
+    fn test_failed_commit_is_surfaced_by_sync_persist() {
+        let temp_dir = tempdir().expect("failed to create temp dir");
+        let cfg = MdbxConfig::default().with_max_db_size(1024 * 1024).with_growth_step(256 * 1024);
+        let mdbx = MdbxDatabase::open_with_config(temp_dir.path(), cfg).expect("open mdbx");
+        mdbx.open_table::<TestTable>().expect("open mdbx table");
+        let db = LayeredDatabase::open(mdbx);
+        db.open_table::<TestTable>().expect("open layered table");
+
+        // Queue far more data than the map can hold so the background writer hits MAP_FULL.
+        let big = "x".repeat(4096);
+        let _ = db.with_write_txn(|txn| {
+            for i in 0..4_000u64 {
+                txn.insert::<TestTable>(&i, &big)?;
+            }
+            Ok(())
+        });
+
+        assert!(
+            db.sync_persist().is_err(),
+            "sync_persist must surface the failed commit instead of reporting success"
         );
     }
 
@@ -1934,7 +1969,7 @@ mod test {
         for i in 0..10u64 {
             db.insert::<TestTable>(&i, &format!("v{i}")).expect("insert");
         }
-        db.sync_persist();
+        db.sync_persist().expect("persist");
 
         assert_eq!(db.mem_db.mem_size(), 3, "cache must be trimmed to max_size");
         // The newest rows survive hot; older ones fall through to the persistent tier.
@@ -1995,7 +2030,7 @@ mod test {
             "K1's tombstone must survive while queued"
         );
         drop(release2);
-        db.sync_persist();
+        db.sync_persist().expect("persist");
 
         // The remove applied, so K1's settled tombstone is now evictable; only K2 stays hot.
         assert_eq!(db.mem_db.mem_size(), 1, "settled rows must be trimmed to max_size");
@@ -2020,7 +2055,7 @@ mod test {
         db.remove::<TestTable>(&999).expect("remove never-inserted key");
         db.insert::<TestTable>(&1, &"one".to_string()).expect("insert");
         db.insert::<TestTable>(&2, &"two".to_string()).expect("insert");
-        db.sync_persist();
+        db.sync_persist().expect("persist");
 
         assert_eq!(db.get::<TestTable>(&999).unwrap(), None);
         assert!(!db.mem_db.is_tombstoned::<TestTable>(&999), "stray tombstone must be evicted");
@@ -2041,7 +2076,7 @@ mod test {
         db.insert::<TestTable>(&3, &"three".to_string()).expect("insert");
         db.clear_table::<TestTable>().expect("clear");
         db.insert::<TestTable>(&4, &"four".to_string()).expect("insert");
-        db.sync_persist();
+        db.sync_persist().expect("persist");
 
         assert_eq!(db.get::<TestTable>(&1).unwrap(), None);
         assert_eq!(db.get::<TestTable>(&2).unwrap(), None);
@@ -2062,7 +2097,7 @@ mod test {
         for i in 1..=3u64 {
             db.insert::<TestTable>(&i, &format!("v{i}")).expect("insert");
         }
-        db.sync_persist();
+        db.sync_persist().expect("persist");
         // 1 settled first and was evicted; 2 and 3 are hot.
         assert!(db.mem_db.contains_key::<TestTable>(&2).unwrap());
         assert!(db.mem_db.contains_key::<TestTable>(&3).unwrap());
@@ -2073,7 +2108,7 @@ mod test {
 
         // Overflow the cache: without the read bump, key 2 (settled first) would be evicted.
         db.insert::<TestTable>(&4, &"v4".to_string()).expect("insert");
-        db.sync_persist();
+        db.sync_persist().expect("persist");
 
         assert_eq!(db.mem_db.mem_size(), 2);
         assert!(db.mem_db.contains_key::<TestTable>(&2).unwrap(), "read key must stay hot");
@@ -2098,7 +2133,7 @@ mod test {
         db.insert::<TestTable>(&1, &"v3".to_string()).expect("reinsert");
         db.insert::<TestTable>(&2, &"v2".to_string()).expect("insert");
         db.insert::<TestTable>(&3, &"v3".to_string()).expect("insert");
-        db.sync_persist();
+        db.sync_persist().expect("persist");
 
         assert_eq!(db.get::<TestTable>(&1).unwrap(), Some("v3".to_string()));
         assert_eq!(db.mem_db.mem_size(), 1, "no in-flight leak: the row is evictable");
@@ -2267,7 +2302,7 @@ mod test {
             txn.insert::<TestTable>(&key, &val).expect("Failed to insert");
         }
         txn.commit().unwrap();
-        db.sync_persist();
+        db.sync_persist().expect("persist");
 
         // Verify all items are accessible via the layered iterator
         let count = db.iter::<TestTable>().count();

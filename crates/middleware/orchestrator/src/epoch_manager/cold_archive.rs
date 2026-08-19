@@ -14,14 +14,14 @@ use prometheus::{
     Histogram, IntCounter, Registry,
 };
 use rayls_infrastructure_storage::{
-    cold_archiver_for, ColdArchiver, ColdArchiverType, DatabaseType, SealOutcome,
+    cold::ColdError, cold_archiver_for, ColdArchiver, ColdArchiverType, DatabaseType, SealOutcome,
 };
 use rayls_infrastructure_types::{
     ConsensusHeader, Database, Epoch, Notifier, TaskKind, TaskManager,
 };
 use reth_db::lockfile::StorageLock;
 use tokio::sync::{oneshot, watch};
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 /// Acquires the process-exclusivity lock on the consensus-DB directory: the cold tier assumes a
 /// single archiver process (a concurrent writer could truncate a torn jar under a reconcile).
@@ -292,6 +292,23 @@ async fn seal_due_epochs<DB: Database>(
             Ok(Ok(SealOutcome::Cancelled)) => return false,
             Ok(Err(e)) => {
                 metrics.cold_archive_failures.inc();
+                // A hot-tier durability failure is fatal: the failed rows stay pinned in the
+                // hot cache until a restart rebuilds it, and retrying the same epoch only pins
+                // more. Fault the node (the critical task manager's join surfaces the panic as
+                // a `CriticalExitError`) so the restart bounds the leak. Any other pass failure
+                // (corruption, contiguity) stays retriable after the cooldown.
+                if e.downcast_ref::<ColdError>()
+                    .is_some_and(|err| matches!(err, ColdError::WriteFailed(_)))
+                {
+                    error!(
+                        target: "epoch-manager",
+                        ?e,
+                        "cold epoch archive: hot-tier write not durable, faulting node"
+                    );
+                    std::panic::panic_any(format!(
+                        "critical task Cold Seal Actor returned Err: {e:?}"
+                    ));
+                }
                 warn!(target: "epoch-manager", "cold epoch archive failed: {e}");
                 return false;
             }
@@ -368,7 +385,7 @@ mod tests {
             Ok(())
         })
         .expect("seed");
-        db.sync_persist();
+        db.sync_persist().expect("persist");
 
         let archiver = cold_archiver_for(&db).expect("mdbx stack has a cold tier");
         let shutdown = Notifier::new();
@@ -464,7 +481,7 @@ mod tests {
             Ok(())
         })
         .expect("seed");
-        db.sync_persist();
+        db.sync_persist().expect("persist");
 
         let shutdown = Notifier::new();
         let mut task_manager = TaskManager::new("seal-actor-retry-test");
@@ -486,7 +503,7 @@ mod tests {
             txn.insert::<ConsensusBlocks>(&1, &header_with_batch(1, 0, digest))
         })
         .expect("repair the gap");
-        db.sync_persist();
+        db.sync_persist().expect("persist");
         anchor_tx.send_replace(header_for(5, 2));
         for _ in 0..1_000 {
             tokio::task::yield_now().await;
@@ -531,7 +548,7 @@ mod tests {
             Ok(())
         })
         .expect("seed");
-        db.sync_persist();
+        db.sync_persist().expect("persist");
 
         let archival = ColdArchival::new(&db);
         let result = archival.migrate_backlog(2).await;

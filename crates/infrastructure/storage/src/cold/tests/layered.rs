@@ -200,7 +200,7 @@ fn layered_iter_spans_cold_jars_and_hot_tail() {
     // Three epochs archive into three jars; the recent epoch stays hot.
     let cutoff: Epoch = EPOCHS - 1;
     archive_below_epoch(&hot, db.cold().expect("cold attached"), cutoff, None).expect("archive");
-    hot.sync_persist();
+    hot.sync_persist().expect("persist");
 
     let scanned: Vec<(u64, Vec<u8>)> =
         db.iter::<ConsensusBlocks>().map(|(n, h)| (n, encode(&h))).collect();
@@ -217,7 +217,7 @@ fn archived_db(tmp: &TempDir, fixtures: &[Fixture]) -> (TestDb, HotDb) {
     seed_hot(&hot, fixtures);
     let cutoff: Epoch = EPOCHS - 1;
     archive_below_epoch(&hot, db.cold().expect("cold attached"), cutoff, None).expect("archive");
-    hot.sync_persist();
+    hot.sync_persist().expect("persist");
     (db, hot)
 }
 
@@ -274,7 +274,7 @@ fn scan_created_before_archival_drains_complete() {
 
     // First pass archives epoch 0 only, so the scan starts over two populated tiers.
     archive_below_epoch(&hot, db.cold().expect("cold attached"), 1, None).expect("first pass");
-    hot.sync_persist();
+    hot.sync_persist().expect("persist");
 
     let mut scan = db.iter::<ConsensusBlocks>();
     // Drain a prefix, leaving the scan parked before rows the next pass moves to cold.
@@ -284,7 +284,7 @@ fn scan_created_before_archival_drains_complete() {
     // Mid-scan, the second pass archives epochs 1 and 2 and prunes them from hot.
     archive_below_epoch(&hot, db.cold().expect("cold attached"), EPOCHS - 1, None)
         .expect("second pass");
-    hot.sync_persist();
+    hot.sync_persist().expect("persist");
 
     let total = EPOCHS as u64 * BLOCKS_PER_EPOCH;
     let tail: Vec<u64> = scan.map(|(n, _)| n).collect();
@@ -423,7 +423,7 @@ fn reverse_skip_to_steps_instead_of_scanning() {
         db.insert::<ConsensusBlocks>(&n, &header_for(n, 0, BlockHash::repeat_byte(0xDD)))
             .expect("insert");
     }
-    db.sync_persist();
+    db.sync_persist().expect("persist");
 
     let walked: Vec<u64> =
         db.reverse_skip_to::<ConsensusBlocks>(&5).expect("walk back").map(|(n, _)| n).collect();

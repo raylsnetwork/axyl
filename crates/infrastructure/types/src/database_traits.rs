@@ -247,6 +247,12 @@ pub trait Database: Send + Sync + Clone + Unpin + 'static {
     fn persist(&self) -> impl Future<Output = eyre::Result<()>> + Send {
         std::future::ready(Ok(()))
     }
-    /// Sync version of persist- useful for test not for prod code.
-    fn sync_persist(&self) {}
+    /// Blocking variant of `persist`, for callers that cannot await.
+    ///
+    /// Returns any write/commit failure the background writer observed since the previous
+    /// barrier. Callers must treat an error as fatal (fault the node): failed rows stay pinned
+    /// in a layered DB's mem cache until a restart rebuilds it, so an ignored error leaks them.
+    fn sync_persist(&self) -> eyre::Result<()> {
+        Ok(())
+    }
 }

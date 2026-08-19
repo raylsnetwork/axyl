@@ -48,6 +48,12 @@ pub enum ColdError {
     /// A jar or index is internally inconsistent and cannot be reconciled.
     #[error("cold store corruption: {0}")]
     Corruption(String),
+
+    /// The hot tier rejected a write or its durability barrier (persist) failed, so rows the
+    /// archival just moved may not be durable. A fatal condition for the node: the hot cache
+    /// pins the failed rows until restart, so callers must fault rather than retry indefinitely.
+    #[error("hot-tier write not durable: {0}")]
+    WriteFailed(String),
 }
 
 /// Location of an archived batch within the cold tier.

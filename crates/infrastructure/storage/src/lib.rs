@@ -321,7 +321,7 @@ mod test {
             Ok(())
         })
         .unwrap();
-        db.sync_persist();
+        db.sync_persist().expect("persist");
 
         println!("DBBENCH [{name}] insert {max}: {}", start.elapsed().as_secs_f64());
         let startc = std::time::Instant::now();
@@ -450,7 +450,7 @@ mod test {
         db.insert::<TestTable>(&123, &"123".to_string()).expect("Failed to insert");
         db.insert::<TestTable>(&456, &"456".to_string()).expect("Failed to insert");
         db.insert::<TestTable>(&789, &"789".to_string()).expect("Failed to insert");
-        db.sync_persist(); // Either a no-op or a chance for write ops to catch up.
+        db.sync_persist().expect("persist"); // Either a no-op or a chance for write ops to catch up.
 
         // Skip all smaller
         let key_vals: Vec<_> = db.skip_to::<TestTable>(&456).expect("Seek failed").collect();
@@ -474,7 +474,7 @@ mod test {
         txn.insert::<TestTable>(&456, &"456".to_string()).expect("Failed to insert");
         txn.insert::<TestTable>(&789, &"789".to_string()).expect("Failed to insert");
         txn.commit().unwrap();
-        db.sync_persist(); // Either a no-op or a chance for write ops to catch up.
+        db.sync_persist().expect("persist"); // Either a no-op or a chance for write ops to catch up.
 
         // Skip to the one before the end
         let key_val = db.record_prior_to::<TestTable>(&999).expect("Seek failed");
@@ -493,7 +493,7 @@ mod test {
             }
         }
         txn.commit().unwrap();
-        db.sync_persist(); // Either a no-op or a chance for write ops to catch up.
+        db.sync_persist().expect("persist"); // Either a no-op or a chance for write ops to catch up.
                            // Skip prior to will return an iterator starting with an "unexpected" key if the sought one
                            // is not in the table
         let val = db.record_prior_to::<TestTable>(&50).map(|(k, _)| k).unwrap();
@@ -566,12 +566,12 @@ mod test {
             txn.insert::<TestTable>(&key, &val).expect("Failed to batch insert");
         }
         txn.commit().unwrap();
-        db.sync_persist(); // Either a no-op or a chance for write ops to catch up.
+        db.sync_persist().expect("persist"); // Either a no-op or a chance for write ops to catch up.
 
         // Check we have multiple entries
         assert!(db.iter::<TestTable>().count() > 1);
         let _ = db.clear_table::<TestTable>();
-        db.sync_persist(); // Either a no-op or a chance for write ops to catch up.
+        db.sync_persist().expect("persist"); // Either a no-op or a chance for write ops to catch up.
         assert_eq!(db.iter::<TestTable>().count(), 0);
         // Clear again to ensure safety when clearing empty map
         let _ = db.clear_table::<TestTable>();
@@ -580,7 +580,7 @@ mod test {
         let _ = db.insert::<TestTable>(&1, &"e".to_string());
         assert_eq!(db.iter::<TestTable>().count(), 1);
         let _ = db.clear_table::<TestTable>();
-        db.sync_persist(); // Either a no-op or a chance for write ops to catch up.
+        db.sync_persist().expect("persist"); // Either a no-op or a chance for write ops to catch up.
         assert_eq!(db.iter::<TestTable>().count(), 0);
     }
 
@@ -602,7 +602,7 @@ mod test {
 
         // Clear again to ensure empty works after clearing
         let _ = db.clear_table::<TestTable>();
-        db.sync_persist(); // Either a no-op or a chance for write ops to catch up.
+        db.sync_persist().expect("persist"); // Either a no-op or a chance for write ops to catch up.
         assert_eq!(db.iter::<TestTable>().count(), 0);
         assert!(db.is_empty::<TestTable>());
     }
@@ -640,7 +640,7 @@ mod test {
             txn.remove::<TestTable>(&key).expect("Failed to batch remove");
         }
         txn.commit().unwrap();
-        db.sync_persist(); // Either a no-op or a chance for write ops to catch up.
+        db.sync_persist().expect("persist"); // Either a no-op or a chance for write ops to catch up.
                            // Rayls: Asserting against fetched items, due to chaining of in memory and persistent db,
                            // resulting in double iter size.
         for (k, _) in (0..101).map(|i| (i, i.to_string())).take(50) {

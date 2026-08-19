@@ -465,7 +465,7 @@ pub(super) fn commit_index<DB: Database>(
         .map_err(to_cold)?;
     }
     // Every location must be applied before the prune removes the rows they address.
-    db.sync_persist();
+    db.sync_persist().map_err(to_write_failed)?;
     Ok(())
 }
 
@@ -481,7 +481,7 @@ pub(super) fn advance_high_water_mark<DB: Database>(db: &DB, epoch: Epoch) -> Co
         txn.insert::<ColdArchiveHighWaterMark>(&ARCHIVE_HIGH_WATER_MARK_KEY, &epoch)
     })
     .map_err(to_cold)?;
-    db.sync_persist();
+    db.sync_persist().map_err(to_write_failed)?;
     high_water_mark_gauge().set(epoch as i64);
     Ok(())
 }
@@ -518,18 +518,19 @@ pub(super) fn delete_archived_rows<DB: Database>(
     // zero yield (boot, migration, reconcile) nothing shares the writer, and every `sync_persist`
     // would cost its full polling quantum per chunk for nothing. Deletes queued at a crash just
     // leave more hot leftovers for reconcile's last-block probe to sweep.
-    let pace = |db: &DB| {
+    let pace = |db: &DB| -> ColdResult<()> {
         if !yield_between.is_zero() {
-            db.sync_persist();
+            db.sync_persist().map_err(to_write_failed)?;
             std::thread::sleep(yield_between);
         }
+        Ok(())
     };
     for chunk in digests.chunks(WRITE_BATCH_ROWS) {
         if should_cancel() {
             return Ok(None);
         }
         db.with_write_txn(|txn| txn.evict_persistent_batch::<Batches>(chunk)).map_err(to_cold)?;
-        pace(db);
+        pace(db)?;
     }
     // Chunk the dense range directly instead of materializing every block number up front; only
     // one chunk's numbers are ever held at a time.
@@ -542,7 +543,7 @@ pub(super) fn delete_archived_rows<DB: Database>(
         let chunk: Vec<u64> = (chunk_start..=chunk_end).collect();
         db.with_write_txn(|txn| txn.evict_persistent_batch::<ConsensusBlocks>(&chunk))
             .map_err(to_cold)?;
-        pace(db);
+        pace(db)?;
         match chunk_end.checked_add(1) {
             Some(next) if next <= *numbers.end() => chunk_start = next,
             _ => break,
@@ -554,4 +555,10 @@ pub(super) fn delete_archived_rows<DB: Database>(
 /// Converts an `eyre` error from the `Database`/`DbTx` trait boundary into a [`ColdError`].
 pub(super) fn to_cold(err: eyre::Report) -> ColdError {
     ColdError::Corruption(err.to_string())
+}
+
+/// Converts a hot-tier durability-barrier failure into a [`ColdError::WriteFailed`], the variant
+/// the seal actor treats as fatal for the node (unlike corruption, which is retried).
+pub(super) fn to_write_failed(err: eyre::Report) -> ColdError {
+    ColdError::WriteFailed(err.to_string())
 }
