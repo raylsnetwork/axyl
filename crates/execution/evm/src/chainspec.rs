@@ -176,7 +176,7 @@ pub const LOCAL_EMPTY_OUTPUT_BLOCK_BLOCK: u64 = 0;
 pub const DEVNET_DYNAMIC_COMMITTEE_SIZING_BLOCK: u64 = u64::MAX;
 
 /// DynamicCommitteeSizing activation block on the Rayls testnet
-pub const TESTNET_DYNAMIC_COMMITTEE_SIZING_BLOCK: u64 = u64::MAX;
+pub const TESTNET_DYNAMIC_COMMITTEE_SIZING_BLOCK: u64 = 10_934_554;
 
 /// DynamicCommitteeSizing activation block on the Rayls mainnet
 pub const MAINNET_DYNAMIC_COMMITTEE_SIZING_BLOCK: u64 = u64::MAX;
