@@ -336,7 +336,9 @@ impl<DB: Database> Processor<DB> {
                 }
             }
             // V1: no dedup check (batches were registered at park time)
-
+            if let Some(tracker) = &self.batch_tracker {
+                tracker.batch_force_drained(parked.batch_digest, parked.batch.seq);
+            }
             let (header, _) =
                 self.execute_prepared_batch(&parked, canonical_header, None, &mut executed_blocks)?;
             canonical_header = header;

@@ -47,6 +47,9 @@ pub enum BatchStage {
     DiscardedAtBoundary = 1 << 13,
     /// Proposer requeued the digest for re-proposal (GC eviction or a missed commit window).
     RequeuedInProposer = 1 << 14,
+    /// Parked batch force-drained by the epoch-boundary reset (pre OutputSeqNormalization only;
+    /// the fork discards instead).
+    ForceDrained = 1 << 15,
 }
 
 impl fmt::Display for BatchStage {
@@ -67,6 +70,7 @@ impl fmt::Display for BatchStage {
             Self::SealFailed => "SealFailed",
             Self::DiscardedAtBoundary => "DiscardedAtBoundary",
             Self::RequeuedInProposer => "RequeuedInProposer",
+            Self::ForceDrained => "ForceDrained",
         })
     }
 }
@@ -180,7 +184,7 @@ impl BatchEntry {
     }
 
     fn stages_str(&self) -> String {
-        const ALL: [BatchStage; 15] = [
+        const ALL: [BatchStage; 16] = [
             BatchStage::Sealed,
             BatchStage::QuorumReached,
             BatchStage::ReportedToPrimary,
@@ -196,6 +200,7 @@ impl BatchEntry {
             BatchStage::SealFailed,
             BatchStage::DiscardedAtBoundary,
             BatchStage::RequeuedInProposer,
+            BatchStage::ForceDrained,
         ];
         ALL.iter().filter(|s| self.has(**s)).map(|s| s.to_string()).collect::<Vec<_>>().join(",")
     }
@@ -408,6 +413,15 @@ impl BatchTracker {
         let mut entry = self.batches.entry(digest).or_default();
         entry.mark(BatchStage::Parked);
         trace!(target: "batch_tracker", ?digest, "batch_parked");
+    }
+
+    /// Parked batch force-drained by the epoch-boundary reset: its predecessor seq never executed
+    /// in the batch's created epoch, so it executes out of order at the boundary. Pre
+    /// OutputSeqNormalization only; the fork discards instead.
+    pub fn batch_force_drained(&self, digest: crate::BlockHash, seq: u64) {
+        let mut entry = self.batches.entry(digest).or_default();
+        entry.mark(BatchStage::ForceDrained);
+        warn!(target: "batch_tracker", ?digest, seq, "batch_force_drained");
     }
 
     /// Parked batch discarded whole at the epoch boundary instead of force executed out of
