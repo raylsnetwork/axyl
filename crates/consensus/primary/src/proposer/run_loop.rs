@@ -7,25 +7,19 @@ use crate::{
 };
 use rayls_infrastructure_storage::ProposerStore;
 use rayls_infrastructure_types::{Database, Epoch, RaylsReceiver, RaylsSender, Round};
-use tokio::{sync::oneshot, time::sleep};
+use tokio::sync::oneshot;
 use tracing::{debug, info, warn};
 
 /// Whether a stored `last_proposed` header is stale relative to the proposer's current position,
-/// and therefore must NOT be re-proposed on the max-delay retransmit path.
+/// and therefore must not be re-proposed on the max-delay retransmit path.
 ///
-/// Stale means either:
-/// - a different epoch — the check is `!=`, so a header from any epoch other than the current one
-///   is stale (a future epoch can't occur in normal operation, but the predicate rejects it too).
-///   Rounds reset per epoch, so the epoch is checked *before* the round (a round-3 header of epoch
-///   N+1 is newer than a round-4 header of epoch N), or
-/// - the same epoch but a round below `self_round`.
-///
+/// Stale means a different epoch (rounds reset per epoch, so the epoch is checked first and any
+/// other epoch, past or future, is stale) or the same epoch but a round below `self_round`.
 /// `self_round` can advance past `last_proposed` via the `process_parents` jump-ahead (see
-/// `round.rs`), which bumps the round WITHOUT writing `last_proposed`. Re-proposing a stale header
-/// then draws a "too old"/equivocation rejection from peers and — because the certifier aborts any
-/// in-flight proposal when a new header arrives — cancels the in-flight current-round
-/// certification every cycle, a livelock. Skipping it keeps `last_proposed` monotonic-in-round
-/// within an epoch and lets a fresh current-round header get certified instead.
+/// `round.rs`), which bumps the round without writing `last_proposed`. Re-proposing a stale header
+/// draws a "too old"/equivocation rejection from peers and, because the certifier aborts any
+/// in-flight proposal when a new header arrives, cancels the current-round certification every
+/// cycle: a livelock.
 pub(super) fn last_proposed_is_stale(
     self_round: Round,
     self_epoch: Epoch,
@@ -66,7 +60,7 @@ impl<DB: Database> Proposer<DB> {
                 tokio::select! {
                     biased;
                     _ = &self.rx_shutdown => return Ok(()),
-                    // watch::Receiver::changed() is cancellation-safe — it only updates
+                    // watch::Receiver::changed() is cancellation-safe - it only updates
                     // the "seen" mark, the value persists in the channel.
                     res = replay_rx.changed() => {
                         if res.is_err() || *replay_rx.borrow() {
@@ -85,6 +79,10 @@ impl<DB: Database> Proposer<DB> {
         let mut pending_header = None;
         let mut max_delay_timed_out = false;
         let mut min_delay_timed_out = false;
+        // While throttled the proposer keeps draining digests, parents and shutdown via the
+        // select! and only skips proposing; a bare sleep here would freeze intake for the whole
+        // delay, stalling batch sealing exactly when the node is already behind.
+        let mut throttle_until: Option<tokio::time::Instant> = None;
         loop {
             tokio::select! {
                 _ = &self.rx_shutdown => {
@@ -142,14 +140,21 @@ impl<DB: Database> Proposer<DB> {
                 }
             }
 
-            // Check if pending queue is high before proposing - backpressure mechanism
-            let pending_count = self
-                .consensus_bus
-                .primary_metrics()
-                .node_metrics
-                .certificates_currently_suspended
-                .get()
-                .max(0) as usize;
+            // An active throttle gates proposing only; intake above stays live. The next
+            // select! event (digests, parents, an interval tick) re-evaluates it, so release
+            // lags the deadline by at most one tick.
+            if let Some(deadline) = throttle_until {
+                if tokio::time::Instant::now() < deadline {
+                    continue; // Skip this proposal cycle
+                }
+                throttle_until = None;
+            }
+
+            // Check if pending queue is high before proposing - backpressure mechanism.
+            // Read the typed watch owned by the certificate manager, never the metrics
+            // gauge: a metrics-facade regression reading zero would silently delete this
+            // brake.
+            let pending_count = *self.consensus_bus.suspended_cert_count().borrow();
 
             if pending_count > PENDING_BACKPRESSURE_THRESHOLD {
                 warn!(
@@ -158,7 +163,7 @@ impl<DB: Database> Proposer<DB> {
                     threshold = PENDING_BACKPRESSURE_THRESHOLD,
                     "Pending queue high, delaying proposal"
                 );
-                sleep(BACKPRESSURE_DELAY).await;
+                throttle_until = Some(tokio::time::Instant::now() + BACKPRESSURE_DELAY);
                 continue; // Skip this proposal cycle
             }
 
@@ -172,7 +177,7 @@ impl<DB: Database> Proposer<DB> {
                     threshold = EXECUTION_LAG_THRESHOLD,
                     "Execution lagging behind consensus, delaying proposal"
                 );
-                sleep(EXECUTION_BACKPRESSURE_DELAY).await;
+                throttle_until = Some(tokio::time::Instant::now() + EXECUTION_BACKPRESSURE_DELAY);
                 continue; // Skip this proposal cycle
             }
 
@@ -211,12 +216,12 @@ impl<DB: Database> Proposer<DB> {
             // No *outer* mode-transition guard here: this condition only decides *whether* to enter
             // the re-propose path. Epoch/round staleness of `last_proposed` IS guarded, inside the
             // re-propose block below (see `last_proposed_is_stale`). A stale header can't fork
-            // regardless — the certifier rejects any header whose epoch != committee.epoch(), and
+            // regardless - the certifier rejects any header whose epoch != committee.epoch(), and
             // re-proposing across a mode transition is *why* `run_mode_transition` deliberately
             // preserves `LastProposed`: the header we re-send is byte-identical to the one peers
             // already saw, so they replay their cached vote instead of scoring it as equivocation.
             // (Rebuilding one instead would embed a newer exec anchor, changing the digest at an
-            // already-proposed round — the livelock this store entry exists to prevent.) The old
+            // already-proposed round - the livelock this store entry exists to prevent.) The old
             // `is_transitioning()` check was racy (TOCTOU) and thus never a correctness guarantee.
             let should_repropose_header = !should_create_header && max_delay_timed_out;
 
@@ -262,16 +267,9 @@ impl<DB: Database> Proposer<DB> {
                 min_delay_timed_out = false;
             } else if should_repropose_header {
                 if let Ok(Some(last_proposed)) = self.proposer_store.get_last_proposed() {
-                    // Only re-propose a header that is still current. `self.round` can advance
-                    // past our last stored header via the `process_parents` jump-ahead (see
-                    // `round.rs`), which bumps the round WITHOUT writing `last_proposed`. So
-                    // `last_proposed` legitimately lags `self.round`. Re-proposing that stale
-                    // header is guaranteed a "too old" rejection by peers, and — because the
-                    // certifier aborts any in-flight proposal when a new header arrives — it also
-                    // cancels the in-flight current-round certification every cycle, a livelock.
-                    // Skip it; wait to build a fresh header at `self.round`. (A header from an
-                    // older epoch is likewise stale — rounds reset per epoch, so compare epochs
-                    // before rounds.)
+                    // Only re-propose a header that is still current; a stale one livelocks
+                    // certification (see `last_proposed_is_stale`). Skip it and wait to build a
+                    // fresh header at `self.round`.
                     if last_proposed_is_stale(
                         self.round,
                         self.committee.epoch(),
@@ -331,8 +329,8 @@ mod tests {
     use super::last_proposed_is_stale;
 
     // The re-propose guard must skip a stored header that is behind the proposer's current
-    // position — this is what stops the round-N→round-(N-1) `last_proposed` regression that
-    // caused the equivocation wedge (val1 rebuilding a conflicting round-4 header on restart).
+    // position; re-proposing it regresses `last_proposed` by a round and rebuilds a conflicting
+    // header on restart, an equivocation wedge.
     #[test]
     fn stale_when_header_round_behind_current_round_same_epoch() {
         // self at round 4, stored header at round 3, same epoch → stale (must skip).
@@ -357,14 +355,14 @@ mod tests {
     #[test]
     fn stale_when_older_epoch_even_if_round_looks_higher() {
         // rounds reset per epoch: a round-4 header of epoch 579 is stale once we're in epoch 580
-        // at round 2 — epoch must be checked before round, or we'd wrongly re-propose it.
+        // at round 2 - epoch must be checked before round, or we'd wrongly re-propose it.
         assert!(last_proposed_is_stale(2, 580, 4, 579));
     }
 
     #[test]
     fn stale_when_newer_epoch_even_if_same_round() {
         // the check is `!=`, not `<`: a header from a *future* epoch is stale too. This can't
-        // happen in normal operation, but the predicate pins it — guards against a later change
+        // happen in normal operation, but the predicate pins it - guards against a later change
         // to `<` that would wrongly re-propose it.
         assert!(last_proposed_is_stale(2, 579, 2, 580));
     }

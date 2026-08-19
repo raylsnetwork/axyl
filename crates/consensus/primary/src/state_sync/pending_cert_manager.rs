@@ -102,6 +102,8 @@ impl PendingCertificateManager {
             self.missing_for_pending.entry((parent_round, parent)).or_default().insert(digest);
         }
 
+        let _ = self.consensus_bus.suspended_cert_count().send(self.pending.len());
+        // metrics mirror only - decisions read the watch above
         self.consensus_bus
             .primary_metrics()
             .node_metrics
