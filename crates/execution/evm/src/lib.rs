@@ -37,6 +37,7 @@ pub mod txn_pool;
 pub use txn_pool::*;
 pub mod error;
 mod evm;
+pub mod in_flight;
 pub mod native_erc20;
 pub(crate) mod persistence;
 pub mod reth_env;

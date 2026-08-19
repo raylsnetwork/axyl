@@ -76,12 +76,14 @@ serde_json = { workspace = true }
 tokio = { workspace = true, features = ["macros", "time"] }
 reth-ethereum-primitives = { workspace = true }
 secp256k1 = { workspace = true, optional = true }
+prometheus = { workspace = true }
 
 [dev-dependencies]
 rayls-infrastructure-types = { workspace = true, features = ["test-utils"] }
 rayls-execution-evm = { path = ".", features = ["test-utils"] }
 secp256k1 = { workspace = true }
 criterion = "0.5"
+proptest = { workspace = true }
 
 [features]
 default = []
