@@ -1,5 +1,5 @@
 //! Implement a container for channels used internally by consensus.
-//! This allows easier examination of message flow and avoids excessives channel passing as
+//! This allows easier examination of message flow and avoids excessive channel passing as
 //! arguments.
 
 use crate::{
@@ -76,7 +76,7 @@ impl<T> Drop for QueChanReceiver<T> {
 }
 
 /// Wrapper around an mpsc channel.  It allows a channel to exist for application lifetime
-/// even if used for epoch messages.  It tracks subscibers so that each epoch will be able to
+/// even if used for epoch messages.  It tracks subscribers so that each epoch will be able to
 /// "subscribe" to the channel (after the last epoch has dropped it's subscription).
 #[derive(Debug)]
 pub struct QueChannel<T> {
@@ -371,6 +371,11 @@ struct ConsensusBusEpochInner {
     /// Drain signal from manager to subscriber. Manager sends `Some(boundary_round)` to
     /// initiate drain with the deterministic epoch boundary round. `None` means no drain.
     drain_signal: watch::Sender<Option<Round>>,
+    /// Count of certificates currently suspended awaiting parents, owned by the certificate
+    /// manager. The proposer's backpressure gate reads this, never the mirrored metrics gauge:
+    /// control state lives in a component, a metric handle is write-only. Published on each
+    /// suspension, so a drained queue is reflected only at the next suspension.
+    suspended_cert_count: watch::Sender<usize>,
 
     /// Subscriber sends drain acknowledgment when all in-flight work is complete.
     /// Wrapped in Arc<Mutex<Option>> because oneshot::Sender is consumed on use and is not Clone.
@@ -432,6 +437,7 @@ impl ConsensusBusEpochInner {
         );
 
         let (drain_signal, _) = watch::channel(None);
+        let (suspended_cert_count, _) = watch::channel(0);
         let (drain_ack_tx, drain_ack_rx) = oneshot::channel();
 
         Self {
@@ -445,6 +451,7 @@ impl ConsensusBusEpochInner {
             sequence,
             certificate_manager,
             drain_signal,
+            suspended_cert_count,
             drain_ack_tx: Arc::new(Mutex::new(Some(drain_ack_tx))),
             drain_ack_rx: Arc::new(Mutex::new(Some(drain_ack_rx))),
         }
@@ -587,6 +594,11 @@ impl ConsensusBus {
     /// Send `Some(boundary_round)` to signal the subscriber with the deterministic cutoff round.
     pub fn drain_signal(&self) -> &watch::Sender<Option<Round>> {
         &self.inner_epoch.drain_signal
+    }
+
+    /// Count of certificates suspended awaiting parents (epoch-scoped, resets with the epoch).
+    pub fn suspended_cert_count(&self) -> &watch::Sender<usize> {
+        &self.inner_epoch.suspended_cert_count
     }
 
     /// Take the drain acknowledgment sender for the subscriber.
