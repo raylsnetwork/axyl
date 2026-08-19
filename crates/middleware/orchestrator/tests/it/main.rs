@@ -103,6 +103,7 @@ async fn test_catchup_accumulator() -> eyre::Result<()> {
         None,
         ETHEREUM_BLOCK_GAS_LIMIT_56BITS,
         batch_ordering,
+        rayls_execution_evm::in_flight::InFlightTracker::new(),
     );
     let (tx, mut rx) = oneshot::channel();
     task_manager.spawn_task("test task eng", async move {

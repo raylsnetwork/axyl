@@ -9,6 +9,7 @@ use rayls_batch_builder::BatchBuilder;
 use rayls_batch_validator::BatchValidator;
 use rayls_consensus_worker::WorkerNetworkHandle;
 use rayls_execution_evm::{
+    in_flight::InFlightTracker,
     reth_env::RethEnv,
     system_calls::EpochState,
     worker::{WorkerComponents, WorkerNetwork},
@@ -47,6 +48,10 @@ pub(super) struct ExecutionNodeInner {
     /// Collection of execution components by worker.
     /// Index of vec is worker id.
     pub(super) workers: Vec<WorkerComponents>,
+    /// Node-scoped pool in-flight tracker, shared between the worker transaction pool and each
+    /// epoch's executor engine so execution-dropped txs are released for re-sealing from the
+    /// first epoch after boot.
+    pub(super) in_flight: InFlightTracker,
 }
 
 impl ExecutionNodeInner {
@@ -91,6 +96,7 @@ impl ExecutionNodeInner {
             engine_idle_tx,
             last_consensus_header,
             executed_batch_registry,
+            self.in_flight.clone(),
         );
         if let Some(tracker) = batch_tracker {
             rayls_middleware_processor.set_batch_tracker(tracker);
@@ -99,7 +105,7 @@ impl ExecutionNodeInner {
         // spawn rayls engine as a Drainable critical task. Drainable (not Doomed) so the
         // engine future is NOT dropped by a cancelling shutdown select: dropping it would
         // orphan the detached execution task (spawn_blocking_task), which then finalizes
-        // blocks AFTER the shutdown flush — the serialize-replay fork. Instead the engine
+        // blocks AFTER the shutdown flush - the serialize-replay fork. Instead the engine
         // observes shutdown via its own rx_shutdown, drains queued + in-flight outputs, and
         // exits gracefully. `spawn_drainable_result_task` still surfaces a fatal exit (e.g.
         // `ConsensusFork`) as a CriticalExitError so the restart cause stays unambiguous.
@@ -111,7 +117,7 @@ impl ExecutionNodeInner {
                     Ok(_) => info!(target: "engine", "Rayls Engine exited gracefully"),
                     Err(e) => error!(target: "engine", ?e, "Rayls Engine error - halting node"),
                 }
-                // The engine task has stopped — nothing more will execute. Publish idle=true so a
+                // The engine task has stopped - nothing more will execute. Publish idle=true so a
                 // mode-transition drain waiting on `engine_idle` unblocks immediately instead of
                 // waiting out its timeout (poll() only publishes idle on the Pending path, never on
                 // this exit path).
@@ -185,7 +191,8 @@ impl ExecutionNodeInner {
     where
         EP: EngineToPrimary + Send + Sync + 'static,
     {
-        let transaction_pool = self.reth_env.init_txn_pool()?;
+        let transaction_pool =
+            self.reth_env.init_txn_pool_with_in_flight(self.in_flight.clone())?;
 
         let network = WorkerNetwork::new(
             self.reth_env.chainspec(),
@@ -407,7 +414,7 @@ impl ExecutionNodeInner {
                         epoch,
                         addr = ?v.validatorAddress,
                         pubkey_len = v.blsPubkey.len(),
-                        "BLS key parsing FAILED — validator DROPPED from committee: {e:?}",
+                        "BLS key parsing FAILED - validator DROPPED from committee: {e:?}",
                     );
                 }
             }

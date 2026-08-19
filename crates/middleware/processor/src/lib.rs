@@ -111,7 +111,7 @@ const DIGEST_RECONSTRUCTION_DEPTH: u64 = 2000;
 /// An empty EVM block can mean two different things, and `consensus_db` (the batch's transactions)
 /// plus current EVM state are consulted to tell them apart: a batch whose txns are still PENDING
 /// (nonce-too-high) must be re-enabled for retry (`drop_digest`), but a batch whose txns are
-/// already MINED (nonce-too-low — it was only a stale reproposal) must stay registered, otherwise
+/// already MINED (nonce-too-low - it was only a stale reproposal) must stay registered, otherwise
 /// a restart re-executes it and forks the chain.
 pub fn reconstruct_batch_digests<CDB: Database>(
     reth_env: &RethEnv,
@@ -190,6 +190,7 @@ impl<DB: Database> ExecutorEngine<DB> {
         engine_idle_tx: Option<watch::Sender<bool>>,
         last_consensus_header: ConsensusHeader,
         executed_batch_registry: ExecutedBatchRegistry,
+        in_flight_tracker: rayls_execution_evm::in_flight::InFlightTracker,
     ) -> Self {
         let consensus_output_stream = ReceiverStream::new(rx_consensus_output);
 
@@ -200,6 +201,7 @@ impl<DB: Database> ExecutorEngine<DB> {
             executed_batch_registry,
             batch_ordering,
             gas_limit,
+            in_flight_tracker,
         );
 
         // Seed the dedup anchor from the last executed consensus header. A genesis/default
@@ -243,6 +245,7 @@ impl<DB: Database> ExecutorEngine<DB> {
         batch_tracker_arg: Option<Arc<BatchTracker>>,
         gas_limit: u64,
         batch_ordering: BatchOrdering<DB>,
+        in_flight_tracker: rayls_execution_evm::in_flight::InFlightTracker,
     ) -> Self {
         Self::new(
             reth_env,
@@ -259,6 +262,7 @@ impl<DB: Database> ExecutorEngine<DB> {
             None,
             ConsensusHeader::default(),
             ExecutedBatchRegistry::default(),
+            in_flight_tracker,
         )
     }
 
@@ -534,7 +538,7 @@ impl<DB: Database> Future for ExecutorEngine<DB> {
                             Ok(header) => header,
                             // ONLY a closed result channel during shutdown is benign: the blocking
                             // execution task was torn down before sending, so no block was
-                            // finalized. Every other error — including ConsensusFork — propagates
+                            // finalized. Every other error - including ConsensusFork - propagates
                             // even during shutdown, and a closed channel outside shutdown (the
                             // execution task panicked) is a real fault.
                             Err(RLEngineError::ChannelClosed) if this.shutdown_requested => {

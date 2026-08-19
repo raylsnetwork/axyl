@@ -142,6 +142,7 @@ async fn executed_anchor_advances_on_every_output() -> eyre::Result<()> {
         None,
         ConsensusHeader::default(),
         ExecutedBatchRegistry::default(),
+        rayls_execution_evm::in_flight::InFlightTracker::new(),
     );
 
     // anchor starts at the default genesis header (number 0).
@@ -254,12 +255,13 @@ async fn engine_idle_flips_true_after_draining_queue() -> eyre::Result<()> {
         Some(idle_tx), // engine_idle_tx
         ConsensusHeader::default(),
         ExecutedBatchRegistry::default(),
+        rayls_execution_evm::in_flight::InFlightTracker::new(),
     );
 
     assert!(!*idle_rx.borrow(), "engine_idle starts false (engine not yet idle)");
 
     // Keep `to_engine` alive so the engine, after executing the output and emptying its queue,
-    // parks on Poll::Pending (channel open, no items) and publishes idle=true — rather than
+    // parks on Poll::Pending (channel open, no items) and publishes idle=true - rather than
     // exiting on channel-close before reaching the idle-publish path.
     to_engine.send((rayls_infrastructure_types::CameFrom::Test, output)).await?;
 

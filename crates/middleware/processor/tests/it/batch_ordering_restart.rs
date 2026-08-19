@@ -263,6 +263,7 @@ impl BatchOrderingHarness {
             None,
             ETHEREUM_BLOCK_GAS_LIMIT_56BITS,
             batch_ordering,
+            rayls_execution_evm::in_flight::InFlightTracker::new(),
         );
 
         for output in outputs {

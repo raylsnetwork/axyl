@@ -139,6 +139,7 @@ impl WorkerTxPool {
         node_config: &NodeConfig<ChainSpec>,
         task_spawner: &TaskSpawner,
         blockchain_provider: &BlockchainProvider<RaylsNode>,
+        in_flight: InFlightTracker,
     ) -> eyre::Result<Self> {
         let data_dir = node_config.datadir();
         let pool_config = node_config.txpool.pool_config();
@@ -160,7 +161,7 @@ impl WorkerTxPool {
 
         let this = Self {
             pool: transaction_pool,
-            in_flight_tracker: InFlightTracker::new(),
+            in_flight_tracker: in_flight,
             backup_path: Arc::new(data_dir.txpool_transactions()),
         };
 
