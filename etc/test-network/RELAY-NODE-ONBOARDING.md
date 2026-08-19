@@ -70,6 +70,15 @@ for restarting a single node and the chaos loop.
   - both resolvers bind **`DNSMASQ_BIND` (default `127.0.0.1`, loopback only)**; set
     `DNSMASQ_BIND=0.0.0.0` to serve the `/dnsaddr` records to another machine that points its
     `RAYLS_DNS_SERVER` here.
+  - **Why `/dnsaddr`, not `/dns4`.** These records must carry *whole* multiaddrs, not just a
+    resolved IP. `/dns4/host/udp/PORT/quic-v1/p2p/X` only swaps `host`→IP inside a **fixed address
+    shape**, so it cannot express a **relay circuit**
+    (`…/p2p/<relay>/p2p-circuit/p2p/<validator>`) or return **several** relays for failover.
+    `/dnsaddr` resolves the `_dnsaddr.<name>` **TXT** records to one or more *complete* multiaddrs
+    (a direct `/ip4/…` **or** a full circuit), which is exactly what the split-horizon views
+    (direct vs circuit) and multi-relay failover need. It's also required for correctness: a
+    `/p2p-circuit` address makes the relay client dial **through the relay** (classified as
+    relayed), whereas a plain `dns4` IP would be dialed **directly on QUIC**, bypassing the relay.
 - `MULTI_LISTEN=1` makes each validator additionally open a **direct listener**
   (primary `40000+i`, worker `41000+i`) alongside its relay reservation. It binds
   **`MULTI_LISTEN_BIND` (default `127.0.0.1`, loopback only)** — matching the direct
