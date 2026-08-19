@@ -624,34 +624,60 @@ where
         // starts feeding the engine (serialized, no dual delivery).
         let _ = execution_replay_completed_rx.changed().await;
 
-        // Only eligible nodes build batches, and not while a transition is pending - the outer
-        // select is about to tear this epoch down.
+        // Start nothing while a transition is pending - the outer select is about to tear this
+        // epoch down. Otherwise an active CVV builds batches and an observer forwards.
         let mode = *self.consensus_bus.node_mode().borrow();
         let transition_pending = self.consensus_bus.mode_transition().borrow().is_some();
-        if mode.is_batch_producing() && !transition_pending {
-            match self.resolve_initial_batch_seq(&worker, &primary, current_epoch).await {
-                InitialBatchSeq::Use(seq) => {
-                    // Spawn the worker-side consumer before the engine-side producer so the
-                    // batch channel has a receiver for the first sealed batch.
-                    let worker_task_manager_name = worker_task_manager_name(worker_node.id().await);
-                    worker.spawn_batch_builder(&worker_task_manager_name, &epoch_task_manager);
-                    engine
-                        .start_batch_builder(
-                            worker.id(),
-                            worker.batches_tx(),
-                            &epoch_task_manager.get_spawner(),
-                            gas_accumulator.base_fee(worker.id()),
-                            current_epoch,
-                            seq,
-                            epoch_boundary,
-                        )
-                        .await?;
-                }
-                InitialBatchSeq::Defer => {
-                    info!(target: "epoch-manager",
+        if !transition_pending {
+            if mode.is_batch_producing() {
+                match self.resolve_initial_batch_seq(&worker, &primary, current_epoch).await {
+                    InitialBatchSeq::Use(seq) => {
+                        // Spawn the worker-side consumer before the engine-side producer so the
+                        // batch channel has a receiver for the first sealed batch.
+                        let worker_task_manager_name =
+                            worker_task_manager_name(worker_node.id().await);
+                        worker.spawn_batch_builder(&worker_task_manager_name, &epoch_task_manager);
+                        engine
+                            .start_batch_builder(
+                                worker.id(),
+                                worker.batches_tx(),
+                                &epoch_task_manager.get_spawner(),
+                                gas_accumulator.base_fee(worker.id()),
+                                current_epoch,
+                                seq,
+                                epoch_boundary,
+                            )
+                            .await?;
+                    }
+                    InitialBatchSeq::Defer => {
+                        info!(target: "epoch-manager",
                         "execution replay incomplete; deferring batch builder to next epoch");
+                    }
+                    InitialBatchSeq::Shutdown => return Ok(()),
                 }
-                InitialBatchSeq::Shutdown => return Ok(()),
+            } else if mode.is_observer() {
+                // An observer cannot seal, so it forwards its RPC-accepted transactions to the
+                // committee instead of the batch builder.
+                engine
+                    .start_txn_forwarder(
+                        worker.id(),
+                        worker.network_handle(),
+                        self.consensus_bus.executed_anchor().subscribe(),
+                        // peer-derived latest header: the catch-up gate compares it against the
+                        // executed anchor so a lagging node never re-sends
+                        self.consensus_bus.last_consensus_header().subscribe(),
+                        // slot-ordered (authorities sorted by id), matching receiver-side dispatch
+                        primary
+                            .current_committee()
+                            .await
+                            .authorities()
+                            .iter()
+                            .map(|authority| *authority.protocol_key())
+                            .collect(),
+                        &epoch_task_manager.get_spawner(),
+                        network_config.libp2p_config().max_gossip_message_size,
+                    )
+                    .await?;
             }
         }
 

@@ -168,13 +168,15 @@ impl NodeMode {
         matches!(self, NodeMode::Observer)
     }
 
-    /// True if this node should run a batch builder (active CVV sequences, observer disburses).
+    /// True if this node should run a batch builder (active CVVs sequence into consensus).
     ///
-    /// A catching-up `CvvInactive` node must not: with no proposer draining `our_digests`, a
-    /// sealed batch wedges the worker batch-builder on `report_own_batch`, and that Drainable task
-    /// never observes shutdown, stalling the epoch-transition drain.
+    /// An `Observer` is not batch-producing: it cannot seal, so it forwards its pending
+    /// transactions to the committee instead (see the transaction forwarder). A catching-up
+    /// `CvvInactive` node must not either: with no proposer draining `our_digests`, a sealed batch
+    /// wedges the worker batch-builder on `report_own_batch`, and that Drainable task never
+    /// observes shutdown, stalling the epoch-transition drain.
     pub fn is_batch_producing(&self) -> bool {
-        matches!(self, NodeMode::CvvActive | NodeMode::Observer)
+        matches!(self, NodeMode::CvvActive)
     }
 }
 
