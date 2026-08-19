@@ -385,4 +385,55 @@ mod tests {
         assert_eq!(read.bytes, 2);
         assert!(receiver.try_recv().is_err());
     }
+
+    /// A forwarding snapshot survives a restart through the on-disk mark backup: it persists,
+    /// reloads on a fresh pool, and comes live once the forwarding role re-arms. A sealing
+    /// snapshot writes nothing, since restoring sealing marks would suppress exactly the head
+    /// transactions the committed-state seq recovery re-seals and wedge the builder into
+    /// park/force-drain cycles (see [`WorkerTxPool::save_mark_backup`]).
+    #[tokio::test]
+    async fn forwarding_marks_survive_the_backup_file_round_trip() {
+        use crate::{
+            in_flight::{DuePolicy, InFlightTracker},
+            reth_env::RethEnv,
+        };
+        use alloy::primitives::TxHash;
+        use rayls_infrastructure_types::TaskManager;
+        use std::time::{Duration, Instant};
+
+        let tmp = tempfile::tempdir().expect("temporary directory");
+        let task_manager = TaskManager::new("mark-backup-test");
+        let env = RethEnv::new_for_test(tmp.path(), &task_manager, None).await.expect("reth env");
+        let hash = TxHash::from([7u8; 32]);
+        let policy = DuePolicy::ttl(Duration::from_secs(10));
+
+        // A sealing snapshot is never persisted: no file, so nothing reloads.
+        let sealer = InFlightTracker::new();
+        let sealing_pool = env.init_txn_pool_with_in_flight(sealer.clone()).expect("sealing pool");
+        sealer.arm_sealing(policy).mark([hash]);
+        assert_eq!(
+            sealing_pool.save_mark_backup(),
+            0,
+            "a sealing snapshot must die with the process"
+        );
+        assert!(!sealing_pool.mark_backup_path().exists(), "sealing writes no backup file");
+
+        // A forwarding snapshot is persisted to the file.
+        let saver = InFlightTracker::new();
+        let saving_pool = env.init_txn_pool_with_in_flight(saver.clone()).expect("saving pool");
+        saver.arm_forwarding(policy).mark_forwarded([hash], Instant::now(), 0);
+        assert_eq!(saving_pool.save_mark_backup(), 1, "a forwarding snapshot is persisted");
+        assert!(saving_pool.mark_backup_path().exists(), "forwarding writes the backup file");
+
+        // A fresh pool on the same datadir reloads it; the first forwarding arm makes it live.
+        let loader = InFlightTracker::new();
+        let loading_pool = env.init_txn_pool_with_in_flight(loader.clone()).expect("loading pool");
+        assert_eq!(loading_pool.load_mark_backup().await, 1, "the saved mark reloads");
+        assert!(
+            !loading_pool.mark_backup_path().exists(),
+            "load deletes the backup for at-most-once replay"
+        );
+        loader.arm_forwarding(policy);
+        assert!(loader.is_in_flight(&hash), "the reloaded mark is live once forwarding re-arms");
+    }
 }
