@@ -17,7 +17,7 @@ use std::{
     sync::Arc,
 };
 use tokio::sync::mpsc;
-use tracing::{error, warn};
+use tracing::{error, info, warn};
 
 /// A global sequence number assigned to every CommittedSubDag.
 pub type SequenceNumber = u64;
@@ -142,11 +142,32 @@ impl ConsensusOutput {
     /// NOTE: this cannot fail - uses [BlsSignature::default] and is considered acceptable with
     /// permissioned validator set, but should never happen.
     pub fn keccak_leader_sigs(&self) -> B256 {
-        let randomness = self.leader().aggregated_signature().unwrap_or_else(|| {
+        let leader = self.leader();
+        let randomness = leader.aggregated_signature().unwrap_or_else(|| {
             error!(target: "engine", ?self, "BLS signature missing for leader - using default for closing epoch");
             BlsSignature::default()
         });
-        keccak256(randomness.to_bytes())
+        let randomness = keccak256(randomness.to_bytes());
+
+        // The aggregate signature is NOT part of the consensus commitment
+        // (`CommittedSubDag::digest` hashes certificate digests only), so two nodes can hold
+        // different certificates for the same leader header and stamp different `extra_data`
+        // into the epoch-closing block - a fork that consensus cannot see. Log the signer set
+        // that produced this value so a divergence can be attributed directly instead of being
+        // inferred from block hashes after the fact. Once per epoch close.
+        info!(
+            target: "engine",
+            epoch = leader.epoch(),
+            round = leader.round(),
+            leader = %leader.origin(),
+            header_digest = ?leader.digest(),
+            signer_count = leader.signed_authorities().len(),
+            signers = ?leader.signed_authorities().iter().collect::<Vec<_>>(),
+            ?randomness,
+            "epoch-close randomness derived from leader certificate",
+        );
+
+        randomness
     }
 }
 

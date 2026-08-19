@@ -7,10 +7,7 @@ use crate::{
 use eyre::eyre;
 use rayls_consensus_primary::NodeMode;
 use rayls_infrastructure_config::RaylsDirs;
-use rayls_infrastructure_storage::{
-    tables::{EpochTransitionCheckpoints, LastProposed, LastProposedByAuthority},
-    CheckpointStore,
-};
+use rayls_infrastructure_storage::{tables::EpochTransitionCheckpoints, CheckpointStore};
 use rayls_infrastructure_types::{
     BlockHash, ConsensusHeader, ConsensusOutput, Database as ReDatabase, Epoch, Notifier,
     TaskManager, B256,
@@ -300,14 +297,25 @@ where
         // backstop so a hung engine warns and proceeds instead of stalling the transition forever.
         self.drain_engine_backlog(Duration::from_secs(15)).await;
 
-        // Phase 2: PERSISTENCE_FLUSH + clear LastProposed; a stale header would be
-        // reproposed at the same (round, epoch) with outdated parents, causing a fork
-        // if transition from Inactive to Active then it is safe to keep the LastPropose as there is
-        // so stale headers
-        if prior_mode != NodeMode::CvvInactive || target_mode != NodeMode::CvvActive {
-            self.consensus_db.clear_table::<LastProposed>()?;
-            self.consensus_db.clear_table::<LastProposedByAuthority>()?;
-        }
+        // Phase 2: PERSISTENCE_FLUSH.
+        //
+        // `LastProposed` is deliberately NOT cleared here. A mode transition never crosses an
+        // epoch, and within an epoch that entry is this node's only record of "I already proposed
+        // at round R" — the anti-equivocation guard read by `propose_next_header`. Clearing it let
+        // a demote→re-promote flap (CvvActive → CvvInactive → CvvActive at the *same* epoch and
+        // round) build a second, different header for a round already proposed: the exec anchor
+        // advances during teardown, so the digest differs. Peers keep one slot per author and
+        // reject any different digest at a same-or-older round with `AlreadyVotedForLaterRound`,
+        // which is irrecoverable *and* short-circuits ahead of the epoch check — masking the
+        // wrong-epoch rejection that would otherwise have demoted this node into a catch-up sync.
+        // Result was a permanent livelock re-proposing a header that could never certify.
+        //
+        // Keeping the entry makes the re-promoted proposer re-send the byte-identical header, for
+        // which peers replay their cached vote. Nothing is leaked across epochs: real epoch
+        // boundaries clear both tables in `clear_consensus_db_for_next_epoch`, and both readers of
+        // `LastProposed` already filter on `(round, epoch)` themselves — `propose_next_header`
+        // matches `round == current_round && epoch == current_epoch`, and the max-delay retransmit
+        // path is guarded by `last_proposed_is_stale` — so a stale entry is inert either way.
         engine.flush_persistence().await?;
         info!(target: "epoch-manager", ?target_mode, "mode-change phase 2/3: PERSISTENCE_FLUSH");
 

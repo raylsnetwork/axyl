@@ -254,6 +254,14 @@ impl<DB: Database> Processor<DB> {
             output_number = output.number,
             output_ms = %output_elapsed.as_millis(),
             head = canonical_header.number,
+            // Which authority's certificate Bullshark picked as leader for this commit. Every
+            // validator logs `spawning proposal task` for its *own* header each round, so those
+            // lines cannot identify the leader - it is only decided here, at commit. Without
+            // this, attributing a commit to an authority means reading the certificate out of
+            // the node database after the fact.
+            leader = %output.leader().origin(),
+            leader_round = output.leader_round(),
+            epoch,
             "output executed"
         );
 
