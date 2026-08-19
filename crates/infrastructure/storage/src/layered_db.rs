@@ -1543,9 +1543,9 @@ mod test {
     }
 
     /// Writer message that parks `db_run` until the paired sender is dropped, so a test can pin a
-    /// real enqueued backlog behind a stalled writer. It signals `reached` just before parking, so a
-    /// test can wait deterministically for the writer to have drained up to the gate instead of
-    /// sleeping on a fixed timeout.
+    /// real enqueued backlog behind a stalled writer. It signals `reached` just before parking, so
+    /// a test can wait deterministically for the writer to have drained up to the gate instead
+    /// of sleeping on a fixed timeout.
     struct WriterGate {
         park: std::sync::mpsc::Receiver<()>,
         reached: std::sync::mpsc::Sender<()>,
