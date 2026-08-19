@@ -60,6 +60,10 @@ hardfork!(
         /// boundary are discarded whole instead of force executed, and an overflow-forced jump
         /// prunes the parked entries it abandons.
         OutputSeqNormalization,
+        /// Key committee-slot dispatch on the first transaction's sender, so one validator owns a
+        /// sender's whole nonce chain instead of consecutive ranges scattering across pools and
+        /// parking nonce-gapped. Also enables live-successor failover for a down slot owner.
+        SenderAffinityLoadBalancing,
     }
 );
 
@@ -146,6 +150,10 @@ pub const MAINNET_LOAD_BALANCING_BLOCK: u64 = 893_558;
 /// Load Balancing activation block on local network.
 pub const LOCAL_LOAD_BALANCING_BLOCK: u64 = 0;
 
+/// Sender-affinity load balancing activation block on local network. Real networks stay `Never`
+/// until an activation block is chosen operationally.
+pub const LOCAL_SENDER_AFFINITY_LOAD_BALANCING_BLOCK: u64 = 0;
+
 // NOTE: UsdrSupplyCorrection is active on local and mainnet; testnet/devnet
 // stay `Never` until an activation block is chosen operationally. Flip the
 // relevant network entry in the schedule below from `ForkCondition::Never` to
@@ -215,11 +223,12 @@ impl RaylsHardFork {
             Self::DynamicCommitteeSizing => 0x0c,
             Self::HybridRewards => 0x0d,
             Self::OutputSeqNormalization => 0x0e,
+            Self::SenderAffinityLoadBalancing => 0x0f,
         }
     }
 
     /// Devnet hardfork schedule.
-    pub const fn devnet() -> [(Self, ForkCondition); 14] {
+    pub const fn devnet() -> [(Self, ForkCondition); 15] {
         [
             (Self::Eip1559, ForkCondition::Block(DEVNET_EIP1559_BLOCK)),
             (Self::BatchDigestV2, ForkCondition::Block(DEVNET_BATCH_DIGEST_V2_BLOCK)),
@@ -242,11 +251,13 @@ impl RaylsHardFork {
             // Never until SRE schedules a concrete devnet activation block.
             (Self::HybridRewards, ForkCondition::Never),
             (Self::OutputSeqNormalization, ForkCondition::Never),
+            // Never until an operational activation block is chosen; the mechanism ships dormant.
+            (Self::SenderAffinityLoadBalancing, ForkCondition::Never),
         ]
     }
 
     /// Testnet hardfork schedule.
-    pub const fn testnet() -> [(Self, ForkCondition); 14] {
+    pub const fn testnet() -> [(Self, ForkCondition); 15] {
         [
             (Self::Eip1559, ForkCondition::Block(TESTNET_EIP1559_BLOCK)),
             (Self::BatchDigestV2, ForkCondition::Block(TESTNET_BATCH_DIGEST_V2_BLOCK)),
@@ -267,11 +278,13 @@ impl RaylsHardFork {
             // Never until SRE schedules a concrete testnet activation block.
             (Self::HybridRewards, ForkCondition::Never),
             (Self::OutputSeqNormalization, ForkCondition::Never),
+            // Never until an operational activation block is chosen; the mechanism ships dormant.
+            (Self::SenderAffinityLoadBalancing, ForkCondition::Never),
         ]
     }
 
     /// Mainnet hardfork schedule.
-    pub const fn mainnet() -> [(Self, ForkCondition); 14] {
+    pub const fn mainnet() -> [(Self, ForkCondition); 15] {
         [
             (Self::Eip1559, ForkCondition::Block(MAINNET_EIP1559_BLOCK)),
             (Self::BatchDigestV2, ForkCondition::Block(MAINNET_BATCH_DIGEST_V2_BLOCK)),
@@ -299,11 +312,13 @@ impl RaylsHardFork {
             (Self::HybridRewards, ForkCondition::Never),
             // Never until SRE schedules a concrete mainnet activation block.
             (Self::OutputSeqNormalization, ForkCondition::Never),
+            // Never until an operational activation block is chosen; the mechanism ships dormant.
+            (Self::SenderAffinityLoadBalancing, ForkCondition::Never),
         ]
     }
 
     /// Local network hardfork schedule (first four hardforks active at genesis).
-    pub const fn local() -> [(Self, ForkCondition); 14] {
+    pub const fn local() -> [(Self, ForkCondition); 15] {
         [
             (Self::Eip1559, ForkCondition::Block(LOCAL_EIP1559_BLOCK)),
             (Self::BatchDigestV2, ForkCondition::Block(LOCAL_BATCH_DIGEST_V2_BLOCK)),
@@ -328,11 +343,15 @@ impl RaylsHardFork {
                 Self::OutputSeqNormalization,
                 ForkCondition::Block(LOCAL_OUTPUT_SEQ_NORMALIZATION_BLOCK),
             ),
+            (
+                Self::SenderAffinityLoadBalancing,
+                ForkCondition::Block(LOCAL_SENDER_AFFINITY_LOAD_BALANCING_BLOCK),
+            ),
         ]
     }
 
     /// Return the hardfork schedule for the given network.
-    pub const fn for_network(network: RaylsNetwork) -> [(Self, ForkCondition); 14] {
+    pub const fn for_network(network: RaylsNetwork) -> [(Self, ForkCondition); 15] {
         match network {
             RaylsNetwork::Devnet => Self::devnet(),
             RaylsNetwork::Testnet => Self::testnet(),
@@ -450,6 +469,11 @@ pub trait RaylsHardforks {
     /// Return true if the TransactionLoadBalancing fork is active at `block`.
     fn is_transaction_load_balancing_active_at_block(&self, block: u64) -> bool {
         self.is_rayls_fork_active_at_block(RaylsHardFork::TransactionLoadBalancing, block)
+    }
+
+    /// Return true if the SenderAffinityLoadBalancing fork is active at `block`.
+    fn is_sender_affinity_load_balancing_active_at_block(&self, block: u64) -> bool {
+        self.is_rayls_fork_active_at_block(RaylsHardFork::SenderAffinityLoadBalancing, block)
     }
 
     /// Return true if the EmptyOutputBlock fork is active at `block`.
@@ -901,20 +925,21 @@ mod tests {
     fn local_network_version_byte_at_block_0() {
         let hardforks = RaylsChainHardforks::local();
         let version = hardforks.version_byte_at_block(0);
-        // OutputSeqNormalization (0x0e) activates at block 0 on local and is the highest such
-        // fork.
-        assert_eq!(version, Some(0x0e));
+        // SenderAffinityLoadBalancing (0x0f) activates at block 0 on local and is the highest
+        // such fork, so it owns the version byte from block 0.
+        assert_eq!(version, Some(0x0f));
     }
 
     #[test]
     fn local_network_version_byte_is_the_max_active_code() {
-        // OutputSeqNormalization (0x0e) is genesis-active on local, so it owns the version byte
-        // across every later activation (HybridRewards at 0x0d included): the byte reports the
-        // max active code, not the most recently crossed block.
+        // SenderAffinityLoadBalancing (0x0f) is genesis-active on local, so it owns the version
+        // byte across every later activation (HybridRewards at 0x0d included): the byte reports
+        // the max active code, not the most recently crossed block. On real networks it is Never,
+        // so there the highest active fork still advances the byte normally.
         let hardforks = RaylsChainHardforks::local();
-        assert_eq!(hardforks.version_byte_at_block(LOCAL_HYBRID_REWARDS_BLOCK - 1), Some(0x0e));
-        assert_eq!(hardforks.version_byte_at_block(LOCAL_HYBRID_REWARDS_BLOCK), Some(0x0e));
-        assert_eq!(hardforks.version_byte_at_block(1_000_000), Some(0x0e));
+        assert_eq!(hardforks.version_byte_at_block(LOCAL_HYBRID_REWARDS_BLOCK - 1), Some(0x0f));
+        assert_eq!(hardforks.version_byte_at_block(LOCAL_HYBRID_REWARDS_BLOCK), Some(0x0f));
+        assert_eq!(hardforks.version_byte_at_block(1_000_000), Some(0x0f));
     }
 
     #[test]
@@ -926,7 +951,7 @@ mod tests {
             RaylsNetwork::Local,
         ] {
             let schedule = RaylsHardFork::for_network(network);
-            assert_eq!(schedule.len(), 14, "expected 14 hardforks for {network}");
+            assert_eq!(schedule.len(), 15, "expected 15 hardforks for {network}");
             assert_eq!(schedule[0].0, RaylsHardFork::Eip1559);
             assert_eq!(schedule[1].0, RaylsHardFork::BatchDigestV2);
             assert_eq!(schedule[2].0, RaylsHardFork::AdminTransfer);
@@ -941,6 +966,7 @@ mod tests {
             assert_eq!(schedule[11].0, RaylsHardFork::DynamicCommitteeSizing);
             assert_eq!(schedule[12].0, RaylsHardFork::HybridRewards);
             assert_eq!(schedule[13].0, RaylsHardFork::OutputSeqNormalization);
+            assert_eq!(schedule[14].0, RaylsHardFork::SenderAffinityLoadBalancing);
         }
     }
 

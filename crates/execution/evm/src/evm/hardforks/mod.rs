@@ -135,7 +135,8 @@ where
             | RaylsHardFork::TransactionLoadBalancing
             | RaylsHardFork::EmptyOutputBlock
             | RaylsHardFork::DynamicCommitteeSizing
-            | RaylsHardFork::OutputSeqNormalization => continue,
+            | RaylsHardFork::OutputSeqNormalization
+            | RaylsHardFork::SenderAffinityLoadBalancing => continue,
         };
 
         // Pre-load accounts into cache and copy their real AccountInfo.
