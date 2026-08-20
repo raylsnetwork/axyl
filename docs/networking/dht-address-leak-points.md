@@ -1,0 +1,217 @@
+# DHT address "leak" points
+
+How un-reachable-from-here addresses (loopback, cross-vantage private, dead
+circuits, bare `/p2p/<peer>`) enter this node's dial candidates.
+
+## The root cause
+
+A peer's `NodeRecord` addresses are **author-controlled** and are only ever
+**cryptographically validated** (`peer_record_valid` checks the signature and
+timestamp) — **never reachability-validated**. So whatever a node advertises
+propagates verbatim through the DHT into every other node's dial candidates,
+regardless of whether *this* node, from *its* vantage, can actually reach those
+addresses.
+
+That is why a static IP-class filter at ingestion is wrong: a `10.x` / `192.168.x`
+/ `127.0.0.1` address is legitimately reachable from a co-located / same-LAN peer
+and unreachable from another. Only the **dial layer** knows the truth for this
+vantage, so the correct fix (an empirical per-address failure backoff) lives
+there, not at ingestion.
+
+## Three roles in any Kademlia lookup
+
+- **Querier** — the node that calls `get_record` / `get_closest_peers`. This is
+  *us*, the node whose `known_peers` / `discovery_peers` fills up. It is the node
+  with the leak.
+- **Queried (responders)** — the peers whose ids sit closest to the key in the
+  keyspace. We contact them (dialing if needed); they answer.
+- **Subject** — whoever's addresses come back in the answer. **Not necessarily a
+  peer we talked to.**
+
+`QueryResult` (inside `kad::Event::OutboundQueryProgressed`) is always the outcome
+of a query **we** started — so in the outbound leaks (1, 2, 5) this node is the
+querier. `kad::Event::InboundRequest` (leak 4) is the reverse: someone queries us.
+
+Everything funnels through one handler: `process_kad_event`
+(`crates/consensus/network/src/consensus/kad.rs:71`).
+
+## The leak list
+
+| # | Trigger (libp2p event) | Path | Lands in | Who queries |
+|---|------------------------|------|----------|-------------|
+| 1 | `OutboundQueryProgressed { GetRecord }` `kad.rs:109` | `process_kad_query_result` `kad.rs:413` → `close_kad_query` `kad.rs:468` → `add_known_peer` `manager.rs:806` | `known_peers` (dialed by `redial_missing_committee`/`DialBls`) | us |
+| 2 | `OutboundQueryProgressed { GetClosestPeers }` `kad.rs:181` | `process_peers_for_discovery` `manager.rs:999` | `discovery_peers` (dialed on the heartbeat) | us |
+| 3 | startup preload | `load_known_peers_from_kad_store` `kad.rs:485` (called `runtime.rs:30`) → `add_known_peer` | `known_peers` | us (from disk) |
+| 4 | `InboundRequest::PutRecord` `kad.rs:85` | `process_kad_put_request` `kad.rs:228` | kad store → later `known_peers` | **them** |
+| 5 | the query's own dials | `handle_pending_outbound_connection` returns `[]` `behavior.rs:60`, kad supplies the address | swarm dial (address-less `/p2p/<peer>` when kad has no address) | us |
+
+Only reachability-relevant validation on the way in: `eligible_for_discovery` →
+`has_valid_unbanned_ips` drops **banned** IPs only — it does **not** filter by
+reachability class, so private/loopback pass straight through.
+
+## Concrete examples
+
+Topology for the examples: committee `v1..v15`, non-committee `node-16..node-30`,
+plus observers, several co-located on one host (so their real listen address is a
+`127.0.0.1:<port>`), others behind relays.
+
+### Leak 1 — `GetRecord` (one subject: the record owner)
+
+The observer is missing committee member **v7** (it has v7's BLS key from the
+committee list but no record yet), so `MissingAuthorities`
+(`peer_events.rs:234`) fires `get_record(v7_bls)`.
+
+1. The observer contacts **v1** and **v2** — the peers closest to v7's key that it
+   already knows — dialing them if needed.
+2. **v1** holds v7's `NodeRecord` and returns it. The record advertises, say,
+   `/ip4/10.10.0.7/udp/50007/quic-v1/.../p2p-circuit/.../v7`.
+3. `close_kad_query` → `add_known_peer(v7_bls, ...)` stores `10.10.0.7` in the
+   observer's `known_peers`. The observer will now redial it via `DialBls`.
+
+- **Querier** = observer. **Queried** = v1, v2. **Subject** = **v7**.
+- The leak: the observer stores and dials `10.10.0.7` **even though it never
+  talked to v7**, and even if `10.10.0.7` is not routable from the observer's
+  vantage → repeated dial failures.
+
+### Leak 2 — `GetClosestPeers` (many subjects, none asked for by identity)
+
+The observer has 4 peers but wants `target_num_peers = 30`, so every 30s heartbeat
+`discovery_heartbeat` sees `discovery_peers` low and pushes `PeerEvent::Discovery`
+(`manager.rs:1120`), which runs `get_closest_peers(PeerId::random())`
+(`peer_events.rs:247`). Call the random key **R**.
+
+1. The observer contacts the peers in its routing table closest to **R** — **v1,
+   v2, v3**.
+2. Each responder replies with **the peers from its own kbuckets nearest R, plus
+   the addresses it holds for them**. Crucially, the observer did **not** ask for
+   any of these peers by identity — it asked for "closest to R", and got back a
+   *firehose of third-party entries*.
+3. Suppose **v1** learned **node-16** back when node-16 connected to v1. On a
+   single-host testnet v1 recorded node-16 at its co-located listen address
+   `/ip4/127.0.0.1/udp/41016/quic-v1/.../node-16`. v1 returns exactly that.
+4. `process_peers_for_discovery` inserts `node-16 → 127.0.0.1:41016` into the
+   observer's `discovery_peers`. Next heartbeat the observer dials it, hits **its
+   own loopback**, and fails. Every heartbeat re-discovers it → churn.
+
+- **Querier** = observer. **Queried** = v1, v2, v3. **Subjects** = node-16 (and
+  every other kbucket neighbor the responders name).
+- Contrast with Leak 1: `GetRecord` returns exactly **one** subject — the record
+  owner whose key we asked for. `GetClosestPeers` returns **many** subjects that we
+  never named; we asked only for *proximity to a random key*. That is why it is the
+  broadest firehose of unreachable addresses, and why a co-located peer's
+  `127.0.0.1` reaches us via a **third** node rather than from the peer itself.
+
+### Leak 3 — persistent store preload (a stale subject, no query at all)
+
+The observer restarts. Before any live query runs,
+`load_known_peers_from_kad_store` (`runtime.rs:30`) walks **every** record
+persisted in the kad store and calls `add_known_peer` for each.
+
+1. A record for **node-22** persisted from a previous run advertises
+   `/ip4/10.0.0.22/...`, but node-22 has since moved / that address is no longer
+   reachable from here.
+2. The stale `10.0.0.22` is back in `known_peers` at boot and gets dialed
+   immediately — the unreachable address survives restarts without anyone
+   re-advertising it.
+
+- **Querier** = us, from disk (no network query). **Subject** = **node-22** (a past
+  record).
+- The leak: restarts re-introduce stale addresses before the network can correct
+  them.
+
+### Leak 4 — inbound `PutRecord` (they query us)
+
+A peer pushes its own record to us rather than us pulling it.
+
+1. **node-19** does a Kademlia `PUT_RECORD` of its `NodeRecord` toward the peers
+   closest to its key, and this node is one of them.
+2. `kad::InboundRequest::PutRecord` (`kad.rs:85`) → `process_kad_put_request`
+   (`kad.rs:228`) writes node-19's record into our store; it later surfaces into
+   `known_peers`.
+3. If node-19 advertises `/ip4/192.168.5.19/...` that we cannot route to, we now
+   hold and will dial it.
+
+- **Querier** = **node-19** (the initiator). We are the responder/store.
+  **Subject** = node-19 (itself).
+- The leak: we accept and later dial an address a peer *pushed* at us, again with
+  no reachability check. (`AddProvider`, `kad.rs:81`, is the provider-side analog.)
+
+### Leak 5 — the query's own dials (address-less `/p2p/<peer>`)
+
+To *run* Leak 1 or Leak 2, the querier must **dial the peers it is querying** — and
+the closer peers they point it to.
+
+1. During a `get_closest_peers` walk, kad wants to query **node-16** (to ask *it*
+   for peers near R), but kad holds only node-16's **peer id**, no address:
+   `add_address` runs only on a successful connect (`peer_events.rs:168`) and
+   circuit addresses are deliberately kept out of the DHT
+   (`peer_events.rs:159-166`), so a relay-only peer never connected to has no kad
+   address.
+2. `handle_pending_outbound_connection` returns `[]` (`behavior.rs:60`) and kad has
+   nothing to add, so the swarm dials the peer id expressed as a multiaddr —
+   `/p2p/12D3KooW...node16` — which no transport can dial → `MultiaddrNotSupported`,
+   every 30s.
+
+- **Querier** = us, dialing a peer we want to query. **Subject** = node-16 (address
+  unknown to kad).
+- The leak: kad "knows who, not where", so the dial degrades to a bare
+  `/p2p/<peer>` that fails forever.
+
+## Note: advertising `0.0.0.0` behaves like loopback (and is not what you want)
+
+The advertised address comes from `node-info.yaml`'s `network_address`
+(`p2p_info.primary/worker.network_address`), read verbatim at startup
+(`epoch_manager/network.rs:116`) and baked into the signed `NodeRecord`. It is the
+node's *advertise* address, entirely separate from its *listen* bind
+(`PRIMARY_LISTENER_MULTIADDR` / the keygen listener) — setting one does not change
+the other.
+
+If `node-info.yaml` sets `network_address` to `0.0.0.0`, e.g.
+
+```
+network_address: /ip4/0.0.0.0/udp/37907/quic-v1/p2p/12D3KooWH7iu...
+```
+
+then that is exactly what is published to the DHT — **verbatim, no expansion**. It
+is *not* translated to the node's concrete interface IPs (that expansion only
+happens for `0.0.0.0` *listen* binds, via `NewListenAddr`, never for the advertised
+`external_addr`). So `node_peer_addr_external` shows `/ip4/0.0.0.0/udp/37907/...`,
+and nothing on the host actually listens on `37907` (it is a keygen-time ephemeral
+port — `get_available_udp_port` opened `127.0.0.1:0`, read the number, and closed
+it; the real sockets are the `*_LISTENER_MULTIADDR` ports). `37907` is therefore a
+**phantom port**: advertised, bound by nobody, absent from `ss`.
+
+`0.0.0.0` is a *bind* wildcard, not a routable *destination*. When a remote peer
+dials `/ip4/0.0.0.0/udp/37907/quic-v1/p2p/<key>`, on Linux `connect()` to `0.0.0.0`
+is mapped to **localhost**, so the dialer ends up attempting **its own**
+`127.0.0.1:37907` — where nothing useful listens. This is identical in outcome to
+advertising `/ip4/127.0.0.1/...` directly: both make every remote dialer bang on
+its own loopback and fail.
+
+The failure is harmless — no ban, no penalty. A dial to a phantom/own port either
+gets `connection refused`/timeout, or, if some unrelated process happens to hold
+that port, is rejected at the libp2p secure handshake with `WrongPeerId` (the
+remote's key can never match the expected `/p2p/<key>`, which lives only on the
+advertising node). libp2p verifies identity **before** stream-mux and protocol
+negotiation, so a misdial never reaches gossip and never triggers the
+gossip-authorization ban path. And `on_dial_failure` (`behavior.rs:313`) applies no
+penalty. So the net effect of advertising `0.0.0.0` (or `127.0.0.1`) is **pure
+churn**: repeated, harmless, self-directed loopback dials — the same waste this
+document is about, just self-inflicted via a bad advertise address.
+
+Takeaway: `0.0.0.0` is the right value for the *listen* bind (all interfaces) and
+the wrong value for the *advertise* address. For a node that must be dialable,
+advertise a concrete routable IP (or a relay / `/dnsaddr`). For an observer (which
+nothing dials), the fix is to **not publish a dial target at all**, not to pick a
+different wildcard.
+
+## Why the fix is at the dial layer
+
+Every leak deposits an address the **querier trusts and later dials** without
+checking whether *this vantage* can reach it — a subject's own record (1, 3, 4),
+third-party kbucket entries (2), or a bare peer id (5). None can be safely filtered
+at ingestion, because the same address class is reachable for a co-located peer and
+unreachable for a remote one. The dial layer is the only place that observes actual
+reachability, so an **empirical per-address failure backoff** (increment on dial
+failure, reset on a successful connect, skip during exponential cooldown; committee
+members exempt to protect consensus liveness) is the correct, vantage-aware fix.
