@@ -462,7 +462,10 @@ pub(super) fn commit_index<DB: Database>(
             }
             Ok(())
         })
-        .map_err(to_cold)?;
+        // A txn-closure failure is a hot-tier fault (mem-cache mutation or a dead writer thread),
+        // not corruption: it must take the fatal path, not retry forever. The underlying MDBX
+        // write failure of these ops surfaces via the sync_persist below instead.
+        .map_err(to_write_failed)?;
     }
     // Every location must be applied before the prune removes the rows they address.
     db.sync_persist().map_err(to_write_failed)?;
@@ -480,7 +483,8 @@ pub(super) fn advance_high_water_mark<DB: Database>(db: &DB, epoch: Epoch) -> Co
     db.with_write_txn(|txn| {
         txn.insert::<ColdArchiveHighWaterMark>(&ARCHIVE_HIGH_WATER_MARK_KEY, &epoch)
     })
-    .map_err(to_cold)?;
+    // Same hot-tier fault classification as `commit_index`; see the comment there.
+    .map_err(to_write_failed)?;
     db.sync_persist().map_err(to_write_failed)?;
     high_water_mark_gauge().set(epoch as i64);
     Ok(())
@@ -529,7 +533,9 @@ pub(super) fn delete_archived_rows<DB: Database>(
         if should_cancel() {
             return Ok(None);
         }
-        db.with_write_txn(|txn| txn.evict_persistent_batch::<Batches>(chunk)).map_err(to_cold)?;
+        db.with_write_txn(|txn| txn.evict_persistent_batch::<Batches>(chunk))
+            // Hot-tier fault, not corruption; see `commit_index`.
+            .map_err(to_write_failed)?;
         pace(db)?;
     }
     // Chunk the dense range directly instead of materializing every block number up front; only
@@ -542,7 +548,8 @@ pub(super) fn delete_archived_rows<DB: Database>(
         let chunk_end = chunk_start.saturating_add(WRITE_BATCH_ROWS as u64 - 1).min(*numbers.end());
         let chunk: Vec<u64> = (chunk_start..=chunk_end).collect();
         db.with_write_txn(|txn| txn.evict_persistent_batch::<ConsensusBlocks>(&chunk))
-            .map_err(to_cold)?;
+            // Hot-tier fault, not corruption; see `commit_index`.
+            .map_err(to_write_failed)?;
         pace(db)?;
         match chunk_end.checked_add(1) {
             Some(next) if next <= *numbers.end() => chunk_start = next,

@@ -12,6 +12,7 @@ use rayls_execution_evm::reth_env::RethDb;
 use super::cold_archive::ColdArchival;
 use rayls_infrastructure_config::KeyConfig;
 use rayls_infrastructure_types::{EpochRecord, Notifier};
+use tokio::sync::watch;
 
 use crate::engine::RaylsBuilder;
 
@@ -49,6 +50,12 @@ pub(crate) struct EpochManager<P, DB> {
     /// directly (engine, network, vote collector), so the epoch teardown stays ordered.
     /// `node_shutdown` is fired only afterward, for the node-level drain + flush.
     pub(super) sigterm_trigger: Notifier,
+    /// One-shot channel for a consensus-DB write/durability error observed by the background
+    /// archival (a [`ColdError::WriteFailed`]). The node treats it as fatal: `run()` responds
+    /// with the graceful ordered shutdown (same as a node-task crash, but without a panic) and
+    /// exits non-zero, keeping the last known durable data. Losing the mem cache and any
+    /// uncommitted mdbx transaction is acceptable, so nothing is retried once this fires.
+    pub(super) fatal_db_error: watch::Sender<Option<String>>,
     /// Reth DB, keep for entire execution.
     pub(super) reth_db: RethDb,
     /// Consensus DB, keep for entire execution.

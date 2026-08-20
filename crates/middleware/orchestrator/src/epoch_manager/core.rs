@@ -70,6 +70,10 @@ where
         // create dbs to survive between sync state transitions
         let reth_db = RethEnv::new_database(&builder.node_config, rayls_datadir.reth_db_path())?;
 
+        // Fired once if the consensus DB rejects a hot-tier write or its durability barrier:
+        // the node winds down gracefully (keeping the durable state) instead of panicking.
+        let (fatal_db_error, _) = watch::channel(None);
+
         Ok(Self {
             builder,
             rayls_datadir,
@@ -78,6 +82,7 @@ where
             key_config,
             node_shutdown,
             sigterm_trigger: Notifier::new(),
+            fatal_db_error,
             reth_db,
             consensus_db,
             consensus_bus,
@@ -204,6 +209,7 @@ where
                 &node_task_manager,
                 self.consensus_bus.executed_anchor().subscribe(),
                 self.node_shutdown.clone(),
+                self.fatal_db_error.clone(),
             );
         }
 
@@ -332,6 +338,12 @@ where
         // strictly happen-before the close: the engine polls rx_shutdown before its input, so it
         // sees shutdown_requested=true and exits Ok. Cheap mpsc clone, held for run()'s lifetime.
         let engine_input_keepalive = to_engine.clone();
+        // A consensus-DB write error is fatal WITHOUT a panic: the durable state is the last
+        // known valid data, and the mem cache plus any uncommitted mdbx transaction are safe
+        // to lose. The select arm below requests the same ordered wind-down the crash path
+        // uses, then surfaces the error (non-zero exit) so a supervisor can restart and
+        // rebuild the cache.
+        let fatal_db_error = self.fatal_db_error.subscribe();
         let outcome = AssertUnwindSafe(async {
             let epochs = self.run_epochs(&engine, network_config, to_engine, gas_accumulator);
             tokio::pin!(epochs);
@@ -342,6 +354,9 @@ where
             // `node_shutdown` below.
             let node_join = node_task_manager.join(node_shutdown.clone());
             tokio::pin!(node_join);
+
+            let fatal_db_error = fatal_db_error;
+            tokio::pin!(fatal_db_error);
 
             tokio::select! {
                 // run_epochs returned on its own: a graceful loop break after sigterm_trigger
@@ -357,6 +372,19 @@ where
                         Ok(()) => epoch_result,
                         Err(e) => epoch_result.and(Err(eyre!("Node task shutdown: {e}"))),
                     }
+                }
+
+                // A hot-tier write/durability failure (cold archival). Same ordered wind-down,
+                // surfaced as an error instead of a panic.
+                _ = fatal_db_error.changed() => {
+                    let msg = fatal_db_error.borrow().clone().unwrap_or_default();
+                    error!(
+                        target: "epoch-manager",
+                        "consensus DB write error: {msg}"
+                    );
+                    sigterm_trigger.notify();
+                    let epoch_result = epochs.await;
+                    epoch_result.and(Err(eyre!("consensus DB write error: {msg}")))
                 }
             }
         })

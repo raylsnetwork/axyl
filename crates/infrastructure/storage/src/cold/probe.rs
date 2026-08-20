@@ -34,6 +34,8 @@ pub(crate) struct ProbeDb {
     inner: MemDatabase,
     /// Stands in for the MDBX faults a read can hit (txn open error, map resized, poisoned dbi).
     read_fault: bool,
+    /// Stands in for a hot tier rejecting writes outright (e.g. its map is full).
+    write_fault: bool,
     /// Read transactions opened so far, shared across clones.
     read_txns: Arc<AtomicUsize>,
     /// Full reverse scans requested so far, shared across clones.
@@ -48,6 +50,7 @@ impl ProbeDb {
         let mut db = Self {
             inner: MemDatabase::new(),
             read_fault: false,
+            write_fault: false,
             read_txns: Arc::new(AtomicUsize::new(0)),
             reverse_iters: Arc::new(AtomicUsize::new(0)),
             write_starts: Arc::new(Mutex::new(Vec::new())),
@@ -60,6 +63,11 @@ impl ProbeDb {
     /// Builds a probe whose every `read_txn` fails.
     pub(crate) fn failing_reads() -> Self {
         Self { read_fault: true, ..Self::new() }
+    }
+
+    /// Builds a probe whose every `write_txn` fails: a hot tier rejecting writes outright.
+    pub(crate) fn failing_writes() -> Self {
+        Self { write_fault: true, ..Self::new() }
     }
 
     /// Returns how many read transactions have been opened.
@@ -98,6 +106,9 @@ impl Database for ProbeDb {
     }
 
     fn write_txn(&self) -> eyre::Result<Self::TXMut<'_>> {
+        if self.write_fault {
+            eyre::bail!("hot tier rejecting writes");
+        }
         self.write_starts.lock().push(TxnStart {
             locations: self.inner.iter::<ColdBatchLocations>().count(),
             high_water_mark: self

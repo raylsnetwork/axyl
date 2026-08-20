@@ -5,7 +5,10 @@ use std::time::Duration;
 use super::*;
 use crate::cold::{
     probe::ProbeDb,
-    producer::{commit_index, finalize_sealed, Finalized, SealedJars},
+    producer::{
+        advance_high_water_mark, commit_index, delete_archived_rows, finalize_sealed, Finalized,
+        SealedJars,
+    },
 };
 
 /// Builds `count` staged locations for `epoch`, in the row order a seal would append them.
@@ -70,4 +73,30 @@ fn high_water_mark_advances_only_after_a_completed_prune() {
         Some(EPOCH),
         "a completed finalize marks the epoch archived"
     );
+}
+
+/// A hot tier rejecting the write txn outright (e.g. its map is full) must surface as the fatal
+/// `WriteFailed` variant, not as retryable `Corruption`: the producer's txn-closure failures are
+/// hot-tier faults, and callers shut the node down gracefully on them rather than retrying forever.
+#[test]
+fn rejected_hot_tier_writes_surface_as_write_failed() {
+    let locations = vec![(BlockHash::repeat_byte(0xAA), ColdLocation { epoch: 0, row: 0 })];
+
+    let err = commit_index(&ProbeDb::failing_writes(), &locations)
+        .expect_err("a rejected hot-tier txn must surface");
+    assert!(matches!(err, ColdError::WriteFailed(_)), "commit_index: got {err:?}");
+
+    let err = advance_high_water_mark(&ProbeDb::failing_writes(), 0)
+        .expect_err("a rejected hot-tier txn must surface");
+    assert!(matches!(err, ColdError::WriteFailed(_)), "advance_high_water_mark: got {err:?}");
+
+    let err = delete_archived_rows(
+        &ProbeDb::failing_writes(),
+        0..=0,
+        &locations,
+        &|| false,
+        Duration::ZERO,
+    )
+    .expect_err("a rejected hot-tier txn must surface");
+    assert!(matches!(err, ColdError::WriteFailed(_)), "delete_archived_rows: got {err:?}");
 }

@@ -823,7 +823,10 @@ fn db_run<DB: Database>(
                             }
                             // The txn's rows stay in mem with their in-flight counts, so a failed
                             // commit is retained (not lost, not evictable) and surfaced via
-                            // persist.
+                            // persist. The counts never settle, so the caller treats the surfaced
+                            // error as fatal: the node shuts down gracefully, the pinned rows die
+                            // with the process, and the cache rebuilds from the durable tier on
+                            // the next start (see `sync_persist`).
                             Err(e) => {
                                 committed_ops.clear();
                                 tracing::error!(target: "layered_db_runner", "consensus DB commit failed: {e}");
@@ -1749,7 +1752,7 @@ mod test {
         db.insert::<TestTable>(&1, &"one".to_string()).expect("insert");
         db.insert::<TestTable>(&2, &"two".to_string()).expect("insert");
         db.insert::<TestTable>(&3, &"three".to_string()).expect("insert");
-        db.sync_persist();
+        db.sync_persist().expect("persist");
         // Key 1 settled first and was evicted: it is now live only in the persistent tier.
         assert_eq!(db.mem_db.mem_size(), 2, "key 1 must be evicted");
         assert!(!db.mem_db.contains_key::<TestTable>(&1).unwrap());
@@ -1776,12 +1779,12 @@ mod test {
         assert_eq!(db.get::<TestTable>(&4).unwrap(), Some("four".to_string()));
 
         inner.release_clear();
-        db.sync_persist();
+        db.sync_persist().expect("persist");
         assert_eq!(db.get::<TestTable>(&1).unwrap(), None, "clear must land");
         assert!(!db.mem_db.is_clearing::<TestTable>(), "pending-clear flag must settle");
 
         db.insert::<TestTable>(&5, &"five".to_string()).expect("insert");
-        db.sync_persist();
+        db.sync_persist().expect("persist");
         assert_eq!(db.get::<TestTable>(&5).unwrap(), Some("five".to_string()));
     }
 
