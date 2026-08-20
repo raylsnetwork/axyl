@@ -21,7 +21,7 @@ use crate::{
     tables::ColdBatchLocations,
 };
 
-use crate::mem_db::{EvictionHeap, MemDatabase, MemDbTx, MemDbTxMut};
+use crate::mem_db::{EvictionHeap, EvictionStats, MemDatabase, MemDbTx, MemDbTxMut};
 use prometheus::{default_registry, register_int_gauge_with_registry, IntGauge, Registry};
 use rayls_infrastructure_types::{
     decode_key, encode, encode_key, DBIter, DBRawIter, Database, DbTx, DbTxMut, Table,
@@ -651,6 +651,10 @@ impl<DB: Database> DeferredOp<DB> {
 const QUEUE_HIGH_WATER_MARK: usize = 10_000;
 const QUEUE_LAG_WARN_INTERVAL: Duration = Duration::from_secs(10);
 
+/// Cadence of the mem cache occupancy heartbeat in `db_run`: one `info` line per interval with
+/// the cache size, its cap, the writer queue depth and the open write txn count.
+const OCCUPANCY_LOG_INTERVAL: Duration = Duration::from_secs(30);
+
 /// Pause paid by each insert/remove/clear enqueue while the queue is above
 /// [`QUEUE_HIGH_WATER_MARK`].
 ///
@@ -741,6 +745,24 @@ fn log_persist_latency(elapsed: Duration, depth: usize) {
     }
 }
 
+/// Runs one eviction pass and logs its outcome at `info`: the cache size before and after and
+/// the number of rows evicted, plus the open write transactions observed at that moment.
+/// Eviction only runs once no producer txn is open, so `open_txns` is normally 0 except at a
+/// `CaughtUp` barrier.
+fn evict_and_log(mem_db: &MemDatabase, heap: &mut EvictionHeap, max_size: usize, open_txns: usize) {
+    let EvictionStats { before, after, evicted } = mem_db.evict_if_needed(heap, max_size);
+    if evicted > 0 {
+        tracing::debug!(
+            target: "storage",
+            before,
+            after,
+            evicted,
+            open_txns,
+            "mem cache evicted"
+        );
+    }
+}
+
 fn db_run<DB: Database>(
     db: DB,
     mem_db: MemDatabase,
@@ -750,6 +772,7 @@ fn db_run<DB: Database>(
 ) {
     let mut txn = None;
     let mut last_compact = Instant::now();
+    let mut last_occupancy_log = Instant::now();
     let queue_depth_gauge = writer_queue_depth_gauge();
     let mut last_lag_warn: Option<Instant> = None;
 
@@ -791,7 +814,12 @@ fn db_run<DB: Database>(
                                 for op in committed_ops.drain(..) {
                                     op.on_applied(&mem_db, &mut eviction_heap);
                                 }
-                                mem_db.evict_if_needed(&mut eviction_heap, max_size);
+                                evict_and_log(
+                                    &mem_db,
+                                    &mut eviction_heap,
+                                    max_size,
+                                    txn.as_ref().map(|(_, count)| *count).unwrap_or(0),
+                                );
                             }
                             // The txn's rows stay in mem with their in-flight counts, so a failed
                             // commit is retained (not lost, not evictable) and surfaced via
@@ -822,7 +850,12 @@ fn db_run<DB: Database>(
                     pending_write_error = Some(format!("insert: {e}"));
                 } else {
                     ins.on_applied(&mem_db, &mut eviction_heap);
-                    mem_db.evict_if_needed(&mut eviction_heap, max_size);
+                    evict_and_log(
+                        &mem_db,
+                        &mut eviction_heap,
+                        max_size,
+                        txn.as_ref().map(|(_, count)| *count).unwrap_or(0),
+                    );
                 }
             }
             DBMessage::Remove(rm) => {
@@ -838,7 +871,12 @@ fn db_run<DB: Database>(
                     pending_write_error = Some(format!("remove: {e}"));
                 } else {
                     rm.on_applied(&mem_db, &mut eviction_heap);
-                    mem_db.evict_if_needed(&mut eviction_heap, max_size);
+                    evict_and_log(
+                        &mem_db,
+                        &mut eviction_heap,
+                        max_size,
+                        txn.as_ref().map(|(_, count)| *count).unwrap_or(0),
+                    );
                 }
             }
             DBMessage::Clear(clr) => {
@@ -854,13 +892,23 @@ fn db_run<DB: Database>(
                     pending_write_error = Some(format!("clear: {e}"));
                 } else {
                     clr.on_applied(&mem_db, &mut eviction_heap);
-                    mem_db.evict_if_needed(&mut eviction_heap, max_size);
+                    evict_and_log(
+                        &mem_db,
+                        &mut eviction_heap,
+                        max_size,
+                        txn.as_ref().map(|(_, count)| *count).unwrap_or(0),
+                    );
                 }
             }
             // NOTE: proves prior messages were applied, not that an open shared txn committed.
             // Safe at shutdown because consensus writers are torn down before persist runs.
             DBMessage::CaughtUp(tx) => {
-                mem_db.evict_if_needed(&mut eviction_heap, max_size);
+                evict_and_log(
+                    &mem_db,
+                    &mut eviction_heap,
+                    max_size,
+                    txn.as_ref().map(|(_, count)| *count).unwrap_or(0),
+                );
                 let reply: Result<(), String> = match pending_write_error.take() {
                     Some(e) => Err(e),
                     None => Ok(()),
@@ -868,6 +916,17 @@ fn db_run<DB: Database>(
                 let _ = tx.send(reply);
             }
             DBMessage::Shutdown => break,
+        }
+        if last_occupancy_log.elapsed() >= OCCUPANCY_LOG_INTERVAL {
+            last_occupancy_log = Instant::now();
+            tracing::info!(
+                target: "storage",
+                occupancy = mem_db.mem_size(),
+                max = max_size,
+                queue = queued,
+                open_txns = txn.as_ref().map(|(_, count)| *count).unwrap_or(0),
+                "mem cache occupancy"
+            );
         }
         if last_compact.elapsed() > Duration::from_secs(86_400) {
             last_compact = Instant::now();

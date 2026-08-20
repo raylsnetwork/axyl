@@ -110,6 +110,17 @@ impl StoreEntry {
 /// table is cleared; they are validated at pop under the store write lock and skipped.
 pub(crate) type EvictionHeap = BinaryHeap<Reverse<(u64, &'static str, Vec<u8>)>>;
 
+/// Outcome of one eviction pass, for the layered writer's cache-pressure logs.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct EvictionStats {
+    /// Total cached rows (live and tombstoned) when the pass started.
+    pub before: usize,
+    /// Total cached rows after the pass.
+    pub after: usize,
+    /// Rows removed during the pass.
+    pub evicted: usize,
+}
+
 /// One cached table: the rows plus a flag set while the producer's clear is queued but not yet
 /// applied to the persistent tier. `clearing` is set under the same write lock that enqueues the
 /// `Clear` message, so any reader that sees it is guaranteed the clear will land after all
@@ -469,12 +480,13 @@ impl MemDatabase {
     /// away, is skipped. A key whose recency was refreshed by a read since it settled is
     /// re-pushed with the fresh clock so hot keys survive eviction. The heap stays writer-owned;
     /// producers never touch it. Every pop removes one entry, so the loop always terminates.
-    pub fn evict_if_needed(&self, heap: &mut EvictionHeap, max_size: usize) {
+    pub fn evict_if_needed(&self, heap: &mut EvictionHeap, max_size: usize) -> EvictionStats {
         let mut store = self.store.write();
         let mut total: usize = store.values().map(|table| table.rows.len()).sum();
         if total <= max_size {
-            return;
+            return EvictionStats { before: total, after: total, evicted: 0 };
         }
+        let mut evicted = 0usize;
         while total > max_size {
             let Some(Reverse((heap_last_used, table, key))) = heap.pop() else { break };
             let Some(table_map) = store.get_mut(table) else { continue };
@@ -492,7 +504,9 @@ impl MemDatabase {
             }
             table_map.rows.remove(&key);
             total -= 1;
+            evicted += 1;
         }
+        EvictionStats { before: total + evicted, after: total, evicted }
     }
 
     /// Total rows (live and tombstoned) held in the cache; the writer keeps this at or below the
