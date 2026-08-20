@@ -479,7 +479,7 @@ ANVIL_VALIDATOR_ADDRESSES=(
 # deterministic ed25519 keys. Your relay app MUST run with the matching identity for each port:
 # the identity is ed25519 with a 32-byte seed equal to the byte (validator index + 1) repeated 32x
 # (i.e. 0x01*32 for validator-1, 0x02*32 for validator-2, ...). See RELAY_KEYS.md for the secrets.
-RELAY_HOST="127.0.0.1"
+RELAY_HOST="${RELAY_HOST:-127.0.0.1}"
 # The IP advertised for the relays in the PUBLIC (relay-circuit) dnsaddr records that outsiders
 # resolve -- as opposed to RELAY_HOST, which is how co-located validators dial their own relay to
 # reserve. Default RELAY_HOST (loopback, single-host testnet). To let a node on ANOTHER machine join,
