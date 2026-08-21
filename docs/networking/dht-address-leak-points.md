@@ -43,11 +43,84 @@ Everything funnels through one handler: `process_kad_event`
 | 2 | `OutboundQueryProgressed { GetClosestPeers }` `kad.rs:181` | `process_peers_for_discovery` `manager.rs:999` | `discovery_peers` (dialed on the heartbeat) | us |
 | 3 | startup preload | `load_known_peers_from_kad_store` `kad.rs:485` (called `runtime.rs:30`) → `add_known_peer` | `known_peers` | us (from disk) |
 | 4 | `InboundRequest::PutRecord` `kad.rs:85` | `process_kad_put_request` `kad.rs:228` | kad store → later `known_peers` | **them** |
-| 5 | the query's own dials | `handle_pending_outbound_connection` returns `[]` `behavior.rs:60`, kad supplies the address | swarm dial (address-less `/p2p/<peer>` when kad has no address) | us |
+| 5 | relayed inbound send-back `/p2p/<src>` (no IP — `behavior.rs:71-74`) | `kademlia.add_address` on connect → kbucket → FIND_NODE | discoverer's dial → bare `/p2p/<peer>` (**FIXED: `add_address` now requires a transport**) | us (discovery walk) |
 
 Only reachability-relevant validation on the way in: `eligible_for_discovery` →
 `has_valid_unbanned_ips` drops **banned** IPs only — it does **not** filter by
 reachability class, so private/loopback pass straight through.
+
+## It all reduces to two kad writes
+
+The five leaks above are surface symptoms; every propagatable address enters
+kademlia through exactly **two** writes, and everything else is a delete, a read, a
+query, or an app-level side effect. Enumerating every `kademlia.` call in the crate:
+
+| Write | Store | Carries | Propagates via |
+|-------|-------|---------|----------------|
+| `add_address` (sole writer; `BucketInserts::Manual` disables auto-insert) | routing table (kbuckets) | the **connection** address (inbound send-back / outbound dialed) | FIND_NODE responses (**pull only**) |
+| `put_record` / `put_record_to` (ours) **+** `store_mut().put(record)` (inbound `PutRecord` from a peer) | record store | the peer's **advertised** `NodeRecord` address (`external_addr` from keygen/node-info) | `get_record` responses (pull) **+** `put_record` active push to the K-closest |
+
+Not address sources:
+- `remove_peer`, `remove_record` — deletions.
+- `kbuckets()`, `store_mut().records()` — reads (metrics, startup load).
+- `get_record`, `get_closest_peers` — **queries** (reads); their *responses* populate
+  the **app-level** `known_peers` / `discovery_peers` maps. Those maps are effects,
+  not sources — they hold what *this* node ingested from *other* nodes'
+  `add_address` / `put_record`, and they feed the dialer (`DialBls` / discovery).
+- `start_providing` — a provider record for *our own* key only.
+- `set_mode` — client/server mode.
+
+Two consequences worth holding onto:
+1. The two writes carry **different** addresses — `add_address` leaks the
+   *connection* view (fixed by the transport-less gate, leak 5); `put_record` leaks
+   the *advertised* view (an observer's loopback `external_addr`, addressed by "don't
+   publish a dial target for outbound-only nodes"). A complete fix must consider both.
+2. Routing-table entries are **pull-only** (they reach another node solely when it
+   queries you and the entry is among the K-closest to its key) — there is no
+   broadcast or periodic sync. Records, by contrast, are actively **pushed** by
+   `put_record` to the K-closest nodes. "Committee-only kad" clamps *both* by gating
+   on membership: only committee peers get `add_address`'d, and only committee records
+   are accepted/served.
+
+## What's in a `NodeRecord` (the `put_record` payload)
+
+`put_record` publishes the record built by `get_peer_record` (`kad.rs:522`):
+
+```rust
+kad::Record {
+    key:       RecordKey::new(&primary_public_key()),  // your BLS pubkey — the index others look up
+    value:     encode(&node_record),                   // BCS-encoded NodeRecord (below)
+    publisher: Some(local_peer_id),
+    expires:   None,                                   // never expires
+}
+```
+
+The `value` is the `NodeRecord` (`types.rs:800`), which is just signed network info:
+
+```rust
+NodeRecord {
+    info: NetworkInfo {
+        pubkey:     <network public key>,   // the libp2p key your peer id derives from
+        multiaddrs: vec![ <external_addr> ],// ONE entry — your advertised network_address
+        timestamp:  <now>,                  // used to keep the newest record
+    },
+    signature: <BLS signature over encode(&info)>,   // lets ingesters authenticate it
+}
+```
+
+Key facts:
+- It is keyed on the **BLS authority key**; the **network pubkey** inside yields the
+  **peer id** others dial; `multiaddrs` holds exactly **one** address —
+  `external_addr`, whatever keygen baked into `node-info.yaml`'s `network_address`
+  (loopback for an observer, a concrete `/p2p-circuit` under `--relay`, a `/dnsaddr`
+  under `--relay-dns`). See `NodeRecord::build` (`types.rs:816`).
+- **Validation on ingest is signature + timestamp + peer-id match only** — never
+  reachability. A valid record's `info` is written straight into the ingester's
+  `known_peers` via `add_known_peer`, i.e. `bls_key -> (peer_id, [external_addr])`,
+  which `DialBls` later dials.
+- So the record propagates **your advertised address, verbatim, to everyone**. If
+  `external_addr` is loopback (the observer default), every ingester stores and dials
+  that loopback — this is the `put_record` (advertised-view) half of the leak.
 
 ## Concrete examples
 
@@ -136,26 +209,44 @@ A peer pushes its own record to us rather than us pulling it.
 - The leak: we accept and later dial an address a peer *pushed* at us, again with
   no reachability check. (`AddProvider`, `kad.rs:81`, is the provider-side analog.)
 
-### Leak 5 — the query's own dials (address-less `/p2p/<peer>`)
+### Leak 5 — the transport-less `/p2p/<peer>` send-back (FIXED at source)
 
-To *run* Leak 1 or Leak 2, the querier must **dial the peers it is querying** — and
-the closer peers they point it to.
+This is the bare `/p2p/<peer>` churn, and its source is precise: a **relayed inbound
+connection's send-back address**.
 
-1. During a `get_closest_peers` walk, kad wants to query **node-16** (to ask *it*
-   for peers near R), but kad holds only node-16's **peer id**, no address:
-   `add_address` runs only on a successful connect (`peer_events.rs:168`) and
-   circuit addresses are deliberately kept out of the DHT
-   (`peer_events.rs:159-166`), so a relay-only peer never connected to has no kad
-   address.
-2. `handle_pending_outbound_connection` returns `[]` (`behavior.rs:60`) and kad has
-   nothing to add, so the swarm dials the peer id expressed as a multiaddr —
-   `/p2p/12D3KooW...node16` — which no transport can dial → `MultiaddrNotSupported`,
-   every 30s.
+1. A relay-only peer (e.g. an observer, or any node behind a relay) dials the
+   committee **through a relay** — outbound for it, **inbound** for each committee
+   member. At the destination, `handle_pending_inbound_connection` documents that
+   the send-back address for a relayed inbound is **just `/p2p/<src>` with no IP**
+   (`behavior.rs:71-74`).
+2. On `PeerEvent::PeerConnected` the destination calls
+   `kademlia.add_address(peer, /p2p/<src>)` (`peer_events.rs`), seeding its kbucket
+   with a **transport-less** entry. `add_address` is the sole populator of the
+   kbuckets (`BucketInserts::Manual`), so this is *the* way the entry gets in.
+3. FIND_NODE then hands that entry to any discoverer (a `get_closest_peers` walk).
+   The discoverer has a peer id and no dialable address, so the swarm dials the peer
+   id expressed as a multiaddr — `/p2p/<peer>` — which no transport can dial →
+   `MultiaddrNotSupported`, every 30s.
 
-- **Querier** = us, dialing a peer we want to query. **Subject** = node-16 (address
-  unknown to kad).
-- The leak: kad "knows who, not where", so the dial degrades to a bare
-  `/p2p/<peer>` that fails forever.
+- **Source** = the destination `add_address`ing a relayed inbound's bare send-back.
+  **Propagation** = FIND_NODE. **Subject** = the relay-only peer.
+- Unlike the other leaks this is **not vantage-dependent**: a `/p2p/<peer>` with no
+  transport is undialable for *everyone*, always. So it is fixable structurally, at
+  the source.
+
+**Fix (implemented):** gate `add_address` on the address carrying a real transport
+(`/ip4`, `/ip6`, or `/dns*`); skip a bare `/p2p/<src>` send-back
+(`peer_events.rs`). This keeps kbuckets — and therefore FIND_NODE responses — free
+of transport-less entries network-wide, so a relay-only peer's id never propagates
+address-less and no one ever dials `/p2p/<peer>`. Nothing is lost: a relay-only
+peer is reached via its published record (`get_record` -> `DialBls` -> circuit), not
+this send-back. (The one use a relayed address normally has is DCUtR relay->direct
+upgrade, but there is no `dcutr` behaviour here, and DCUtR would drive off the live
+relayed connection, not this kad entry.)
+
+Note this filters only the KAD store (`kademlia.add_address`), which is what
+propagates. The swarm's local address book (`swarm.add_peer_address`) still records
+the send-back, but that is node-local and never enters FIND_NODE.
 
 ## Note: advertising `0.0.0.0` behaves like loopback (and is not what you want)
 
@@ -205,13 +296,30 @@ advertise a concrete routable IP (or a relay / `/dnsaddr`). For an observer (whi
 nothing dials), the fix is to **not publish a dial target at all**, not to pick a
 different wildcard.
 
-## Why the fix is at the dial layer
+## Where each leak is fixed — two layers
 
-Every leak deposits an address the **querier trusts and later dials** without
-checking whether *this vantage* can reach it — a subject's own record (1, 3, 4),
-third-party kbucket entries (2), or a bare peer id (5). None can be safely filtered
-at ingestion, because the same address class is reachable for a co-located peer and
-unreachable for a remote one. The dial layer is the only place that observes actual
-reachability, so an **empirical per-address failure backoff** (increment on dial
-failure, reset on a successful connect, skip during exponential cooldown; committee
-members exempt to protect consensus liveness) is the correct, vantage-aware fix.
+The leaks split into two kinds, and each has its own correct fix:
+
+**Structurally-undialable (leak 5): fix at the source.** A bare `/p2p/<peer>` has no
+transport — it is undialable from *every* vantage, always. That is not a
+reachability guess, so it can be filtered deterministically where it enters the DHT:
+gate `add_address` on the address carrying a transport, so a transport-less
+send-back never reaches a kbucket and never propagates via FIND_NODE. **Implemented**
+(see leak 5). This is vantage-independent and needs no probing.
+
+**Vantage-dependent (leaks 1-4): fix at the dial layer.** The rest deposit an
+address that *has* a transport but may or may not be reachable *from here* — a
+subject's own record (1, 3, 4) or a third-party kbucket entry (2). The **same
+address class** (`127.0.0.1`, a `10.x`/`192.168.x` private IP, a `/p2p-circuit`
+through a relay) is reachable for a co-located / same-VPC peer and unreachable for a
+remote one, so no static rule at ingestion is correct. Only the dial layer observes
+actual reachability, so an **empirical per-address failure backoff** (increment on
+dial failure, reset on a successful connect, skip during exponential cooldown with a
+cap and half-open re-probe; committee members exempt to protect consensus liveness)
+is the correct, vantage-aware fix. **Not yet implemented.**
+
+A related source-side lever for the observer/outbound-only case: such a node has no
+reason to publish a dial target at all (nothing dials it), so gating
+`publish_our_data`/`publish_our_data_to_peer` for non-dialable nodes stops its
+(useless) address from ever entering the DHT. The backoff remains the catch-all for
+anything that still leaks.

@@ -5,7 +5,7 @@ use crate::{
     types::{NetworkEvent, NetworkResult},
     ConsensusNetwork,
 };
-use libp2p::{kad, PeerId};
+use libp2p::{core::multiaddr::Protocol, kad, PeerId};
 use rayls_infrastructure_types::{Database, RaylsSender};
 use tokio::sync::oneshot;
 use tracing::{debug, info, warn};
@@ -164,8 +164,40 @@ where
                 if self.swarm.behaviour().peer_manager.is_relay(&peer_id) {
                     debug!(target: "network-kad", ?peer_id, "skipping kad add/publish for relay peer");
                 } else {
-                    // add as a kademlia peer
-                    self.swarm.behaviour_mut().kademlia.add_address(&peer_id, addr);
+                    // A relayed inbound connection's send-back address is a bare `/p2p/<src>` with
+                    // no transport (see `handle_pending_inbound_connection`). It is undialable, and
+                    // if seeded into kad it propagates via FIND_NODE as a `/p2p/<peer>` that every
+                    // discoverer then fails to dial forever. Only add a concrete, dialable address
+                    // (one carrying an ip/dns transport) to the routing table; a relay-only peer's
+                    // real reachability comes from its published record (get_record -> DialBls),
+                    // not from this send-back. `add_address` is the sole
+                    // populator of the kbuckets (BucketInserts::Manual), so
+                    // filtering here keeps FIND_NODE responses clean.
+                    //
+                    // The one thing a relayed connection's address is normally
+                    // good for is DCUtR (upgrading a relayed connection to a
+                    // direct one). That does not apply here: there is no `dcutr`
+                    // behaviour in this swarm, and even with one DCUtR drives off
+                    // the live relayed connection via the relay client, not this
+                    // kad entry -- so dropping the send-back from kad costs
+                    // nothing.
+                    let dialable = addr.iter().any(|p| {
+                        matches!(
+                            p,
+                            Protocol::Ip4(_)
+                                | Protocol::Ip6(_)
+                                | Protocol::Dns(_)
+                                | Protocol::Dns4(_)
+                                | Protocol::Dns6(_)
+                                | Protocol::Dnsaddr(_)
+                        )
+                    });
+                    if dialable {
+                        // add as a kademlia peer
+                        self.swarm.behaviour_mut().kademlia.add_address(&peer_id, addr);
+                    } else {
+                        debug!(target: "network-kad", ?peer_id, ?addr, "skipping kad add for transport-less address (bare /p2p send-back)");
+                    }
                     self.publish_our_data_to_peer(peer_id);
                 }
 
