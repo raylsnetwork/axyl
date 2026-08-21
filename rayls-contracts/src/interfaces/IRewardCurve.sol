@@ -21,22 +21,27 @@ interface IRewardCurve {
     ///         no transition logic is gated on it; phase changes are always an explicit governance
     ///         (admin) action here, matching "each shift requires a governance vote".
     enum Phase {
+        /// @notice Phase 1 (today -> ~2y): Foundation-backed bootstrapping. Emission = Base +
+        ///         Variable, with Base anchoring early growth while the network is young.
         FoundationHeavy,
+        /// @notice Phase 2 (~2-3y): transitional. Base decreases as Variable (real network
+        ///         revenue) grows to take over a larger share of emission.
         Mixed,
+        /// @notice Phase 3 (long term): Foundation base retired entirely. Emission = Variable
+        ///         only — staking rewards are funded purely by network revenue.
         RevenueOnly
     }
 
     // errors
     error ZeroAddress();
     error ZeroAmount();
-    error OnlyRevenueReporter();
     error EmissionTooLarge();
+    error TooManyStakeLevels();
 
     // events
     event BaseMonthlyEmissionUpdated(uint256 oldBase, uint256 newBase);
     event RevenueRecorded(uint256 amount, uint256 newVariableMonthlyEmission);
     event MonthlyRevenueReset(uint256 clearedAmount);
-    event RevenueReporterUpdated(address indexed oldReporter, address indexed newReporter);
     event PhaseTransitioned(Phase oldPhase, Phase newPhase);
 
     /// @notice Get the flat monthly RLS emission committed by the Foundation treasury
@@ -44,9 +49,6 @@ interface IRewardCurve {
 
     /// @notice Get the rolling monthly RLS emission accumulated from reported network revenue
     function variableMonthlyEmission() external view returns (uint256);
-
-    /// @notice Get the address allowed to call recordRevenue
-    function revenueReporter() external view returns (address);
 
     /// @notice Get the current emission funding phase
     function currentPhase() external view returns (Phase);
@@ -80,6 +82,9 @@ interface IRewardCurve {
     function estimateYield(uint256 amount, uint256 rlsStaked) external view returns (uint256 projectedAnnualRls);
 
     /// @notice Preview the APY curve at a caller-supplied list of hypothetical total-stake levels
+    /// @dev Reverts TooManyStakeLevels above MAX_PREVIEW_LEVELS — a caller-controlled array length
+    ///      is otherwise an unbounded-loop surface if this is ever called from another contract's
+    ///      transaction rather than an off-chain eth_call.
     /// @param stakeLevels Hypothetical total RLS staked values to evaluate, in 1e18 scale
     /// @return apyBpsAtLevel APY in bps at each corresponding stakeLevels entry
     function previewCurve(uint256[] calldata stakeLevels) external view returns (uint256[] memory apyBpsAtLevel);
@@ -91,18 +96,19 @@ interface IRewardCurve {
     function setBaseMonthlyEmission(uint256 newBase) external;
 
     /// @notice Report network revenue for the current month, adding to variableMonthlyEmission
-    /// @dev onlyRevenueReporter — mirrors RewardDistributor.receiveRewards/onlyFeeAggregator.
+    /// @dev onlyRole(REVENUE_REPORTER_ROLE) — a standard AccessControl role (grant/revoke via the
+    ///      inherited grantRole/revokeRole, admin-gated by DEFAULT_ADMIN_ROLE by default), so more
+    ///      than one reporter address can be authorized at once. Mirrors
+    ///      RewardDistributor.receiveRewards/onlyFeeAggregator in spirit.
     ///      Reverts EmissionTooLarge if the resulting variableMonthlyEmission would exceed
     ///      MAX_MONTHLY_EMISSION.
     function recordRevenue(uint256 amount) external;
 
     /// @notice Zero out the rolling variable monthly emission (start of a new reporting month)
-    /// @dev onlyRole(DEFAULT_ADMIN_ROLE) — deliberately manual, no automatic time-based reset
+    /// @dev onlyRole(REVENUE_REPORTER_ROLE) — paired with recordRevenue under the same role, since
+    ///      whoever manages the monthly revenue-reporting cycle also closes it out; deliberately
+    ///      manual, no automatic time-based reset
     function resetMonthlyRevenue() external;
-
-    /// @notice Set the address allowed to call recordRevenue
-    /// @dev onlyRole(DEFAULT_ADMIN_ROLE)
-    function setRevenueReporter(address newReporter) external;
 
     /// @notice Set the current emission funding phase (observable marker only, no gating logic)
     /// @dev onlyRole(DEFAULT_ADMIN_ROLE) — the governance vote itself happens off-chain; this call

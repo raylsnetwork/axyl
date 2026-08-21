@@ -20,7 +20,6 @@ export type CurveSnapshot = {
   variableMonthly: bigint;
   annualEmission: bigint;
   currentPhase: number;
-  revenueReporter: `0x${string}`;
   apyBps: bigint;
   baseApyBps: bigint;
   variableApyBps: bigint;
@@ -33,7 +32,7 @@ async function fetchSnapshot(
   rlsStaked: bigint,
   yieldAmount: bigint,
 ): Promise<CurveSnapshot> {
-  const [breakdown, currentPhase, revenueReporter, apyBps, apyBreakdown, estimatedYield, curveApys] =
+  const [breakdown, currentPhase, apyBps, apyBreakdown, estimatedYield, curveApys] =
     await Promise.all([
       publicClient.readContract({
         address,
@@ -41,11 +40,6 @@ async function fetchSnapshot(
         functionName: "getEmissionBreakdown",
       }) as Promise<[bigint, bigint, bigint]>,
       publicClient.readContract({ address, abi: curveAbi, functionName: "currentPhase" }) as Promise<number>,
-      publicClient.readContract({
-        address,
-        abi: curveAbi,
-        functionName: "revenueReporter",
-      }) as Promise<`0x${string}`>,
       publicClient.readContract({
         address,
         abi: curveAbi,
@@ -80,7 +74,6 @@ async function fetchSnapshot(
     variableMonthly,
     annualEmission,
     currentPhase,
-    revenueReporter,
     apyBps,
     baseApyBps,
     variableApyBps,

@@ -24,8 +24,12 @@ contract RewardCurveTest is Test {
         ERC1967Proxy proxy = new ERC1967Proxy(address(impl), initData);
         curve = RewardCurve(address(proxy));
 
+        // Hoist the role constant into a local before the prank — curve.REVENUE_REPORTER_ROLE()
+        // is itself an external call to `curve`, so evaluating it inline as an argument would
+        // consume the queued prank before grantRole ever runs.
+        bytes32 reporterRole = curve.REVENUE_REPORTER_ROLE();
         vm.prank(admin);
-        curve.setRevenueReporter(reporter);
+        curve.grantRole(reporterRole, reporter);
     }
 
     // =========================================================================
@@ -172,6 +176,18 @@ contract RewardCurveTest is Test {
         }
     }
 
+    function test_previewCurve_aboveMaxLevels_reverts() public {
+        uint256[] memory stakeLevels = new uint256[](curve.MAX_PREVIEW_LEVELS() + 1);
+        vm.expectRevert(IRewardCurve.TooManyStakeLevels.selector);
+        curve.previewCurve(stakeLevels);
+    }
+
+    function test_previewCurve_atMaxLevels_succeeds() public view {
+        uint256[] memory stakeLevels = new uint256[](curve.MAX_PREVIEW_LEVELS());
+        uint256[] memory apys = curve.previewCurve(stakeLevels);
+        assertEq(apys.length, curve.MAX_PREVIEW_LEVELS());
+    }
+
     function test_previewCurve_zeroStakeLevel_returnsZeroNotRevert() public {
         vm.prank(admin);
         curve.setBaseMonthlyEmission(1_000_000e18);
@@ -189,8 +205,12 @@ contract RewardCurveTest is Test {
     //  3. Governance access control
     // =========================================================================
 
-    function test_recordRevenue_onlyRevenueReporter_reverts() public {
-        vm.expectRevert(IRewardCurve.OnlyRevenueReporter.selector);
+    function test_recordRevenue_onlyReporterRole_reverts() public {
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                IAccessControl.AccessControlUnauthorizedAccount.selector, stranger, curve.REVENUE_REPORTER_ROLE()
+            )
+        );
         vm.prank(stranger);
         curve.recordRevenue(1e18);
     }
@@ -211,20 +231,42 @@ contract RewardCurveTest is Test {
         curve.setPhase(IRewardCurve.Phase.Mixed);
     }
 
-    function test_resetMonthlyRevenue_onlyAdmin_reverts() public {
+    function test_resetMonthlyRevenue_onlyReporterRole_reverts() public {
         vm.expectRevert(
-            abi.encodeWithSelector(IAccessControl.AccessControlUnauthorizedAccount.selector, stranger, bytes32(0))
+            abi.encodeWithSelector(
+                IAccessControl.AccessControlUnauthorizedAccount.selector, stranger, curve.REVENUE_REPORTER_ROLE()
+            )
         );
         vm.prank(stranger);
         curve.resetMonthlyRevenue();
     }
 
-    function test_setRevenueReporter_onlyAdmin_reverts() public {
+    function test_grantRevenueReporterRole_onlyAdmin_reverts() public {
+        bytes32 reporterRole = curve.REVENUE_REPORTER_ROLE();
         vm.expectRevert(
             abi.encodeWithSelector(IAccessControl.AccessControlUnauthorizedAccount.selector, stranger, bytes32(0))
         );
         vm.prank(stranger);
-        curve.setRevenueReporter(stranger);
+        curve.grantRole(reporterRole, stranger);
+    }
+
+    function test_revenueReporterRole_supportsMultipleHolders() public {
+        address secondReporter = address(0xCAFE);
+        bytes32 reporterRole = curve.REVENUE_REPORTER_ROLE();
+
+        vm.prank(admin);
+        curve.grantRole(reporterRole, secondReporter);
+
+        // Both the original reporter (granted in setUp) and the newly granted one can report —
+        // the whole point of moving this from a single settable address to an AccessControl role.
+        vm.prank(reporter);
+        curve.recordRevenue(100e18);
+        vm.prank(secondReporter);
+        curve.recordRevenue(200e18);
+
+        assertEq(curve.variableMonthlyEmission(), 300e18);
+        assertTrue(curve.hasRole(curve.REVENUE_REPORTER_ROLE(), reporter));
+        assertTrue(curve.hasRole(curve.REVENUE_REPORTER_ROLE(), secondReporter));
     }
 
     function test_setBaseMonthlyEmission_aboveMax_reverts() public {
@@ -262,7 +304,7 @@ contract RewardCurveTest is Test {
 
         vm.expectEmit(true, true, true, true);
         emit IRewardCurve.MonthlyRevenueReset(42_000e18);
-        vm.prank(admin);
+        vm.prank(reporter);
         curve.resetMonthlyRevenue();
 
         assertEq(curve.variableMonthlyEmission(), 0);
