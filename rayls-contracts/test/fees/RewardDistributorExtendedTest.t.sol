@@ -633,11 +633,11 @@ contract RewardDistributorExtendedTest is Test {
         RewardCurve priorityCurve = _deployCurve();
         RewardCurve openTierCurve = _deployCurve();
 
+        // owner already holds REVENUE_REPORTER_ROLE on both curves — _deployCurve() initializes
+        // each with owner as admin_, and initialize() grants that role to admin_ by default.
         vm.startPrank(owner);
         priorityCurve.setBaseMonthlyEmission(500_000e18);
-        priorityCurve.setRevenueReporter(owner);
         openTierCurve.setBaseMonthlyEmission(100_000e18);
-        openTierCurve.setRevenueReporter(owner);
         priorityCurve.recordRevenue(100_000e18); // priority: base-heavy (500k base + 100k revenue)
         openTierCurve.recordRevenue(500_000e18); // open tier: revenue-leaning (100k base + 500k revenue)
         vm.stopPrank();

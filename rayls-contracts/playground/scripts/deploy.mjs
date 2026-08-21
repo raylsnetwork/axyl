@@ -74,15 +74,8 @@ async function main() {
     const proxyReceipt = await publicClient.waitForTransactionReceipt({ hash: proxyHash });
     const proxyAddress = proxyReceipt.contractAddress;
 
-    // revenueReporter must be set before recordRevenue will accept calls from `account`.
-    const setReporterHash = await walletClient.writeContract({
-      address: proxyAddress,
-      abi: curveAbi,
-      functionName: "setRevenueReporter",
-      args: [account.address],
-    });
-    await publicClient.waitForTransactionReceipt({ hash: setReporterHash });
-
+    // No separate reporter-role grant needed: initialize() grants REVENUE_REPORTER_ROLE to
+    // admin_ (== account) directly. Additional reporters can be added later via grantRole.
     const setBaseHash = await walletClient.writeContract({
       address: proxyAddress,
       abi: curveAbi,
