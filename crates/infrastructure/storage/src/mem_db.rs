@@ -24,6 +24,11 @@ use crate::open_default_tables;
 /// Bit 0 of a row's packed word: the row is a tombstone (deleted in mem, pending/durable removal).
 const TOMBSTONE_BIT: u32 = 1;
 
+/// One in-flight op occupies bit 1 onward, i.e. the count field starts at bit 1, so each count
+/// increment is `1 << TOMBSTONE_BIT` (2) on the packed word. It is even on purpose: adding or
+/// subtracting it can never touch bit 0, keeping the tombstone flag intact through arithmetic.
+const IN_FLIGHT_UNIT: u32 = 1 << TOMBSTONE_BIT;
+
 /// Writes to a hot row's recency clock are throttled to one per window: reads only need a coarse
 /// ordering, and every store lands on the same cache line while the read lock is held.
 const RECENCY_BUMP_THRESHOLD: Duration = Duration::from_millis(100);
@@ -64,7 +69,7 @@ impl StoreEntry {
     }
 
     fn in_flight(&self) -> u32 {
-        self.packed >> 1
+        self.packed >> TOMBSTONE_BIT
     }
 
     fn mark_tombstone(&mut self) {
@@ -77,15 +82,15 @@ impl StoreEntry {
 
     fn add_in_flight(&mut self) {
         debug_assert!(
-            self.in_flight() < u32::MAX >> 1,
+            self.in_flight() < u32::MAX >> TOMBSTONE_BIT,
             "in-flight op count overflow for a single key"
         );
-        self.packed += 2;
+        self.packed += IN_FLIGHT_UNIT;
     }
 
     fn dec_in_flight(&mut self) {
         debug_assert!(self.in_flight() != 0, "in-flight op count is 0 before decrementing it");
-        self.packed -= 2;
+        self.packed -= IN_FLIGHT_UNIT;
     }
 
     /// Refreshes the recency clock if the previous bump is older than the throttle window.
