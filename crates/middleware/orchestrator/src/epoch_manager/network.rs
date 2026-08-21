@@ -314,26 +314,28 @@ where
         network_pubkey: NetworkPublicKey,
         fallback: Multiaddr,
     ) -> eyre::Result<Multiaddr> {
-        std::env::var(env_var)
-            .map(|addr| {
-                addr.parse()
-                    .map_err(|e| {
-                        eyre::eyre!(
-                            "Failed to parse listener multiaddr from env {env_var} ({addr})\n{e}"
-                        )
-                    })
-                    // add Protocol::P2p to multiaddr to maintain consistency with
-                    // bin/rayls-network/src/keytool/generate.rs
-                    .and_then(|multi: Multiaddr| {
-                        multi.with_p2p(network_pubkey.into()).map_err(|_| {
-                            eyre::eyre!(
-                                "{env_var} multiaddr contains a different P2P protocol {:?}",
-                                std::env::var(env_var)
-                            )
-                        })
-                    })
-            })
-            .unwrap_or(Ok(fallback))
+        // No env override: listen on `network_address` (the fallback) when it is listenable -- a
+        // routable ip, a `/dnsaddr` (skipped downstream in `start_swarm_listeners`), or a relay
+        // circuit. But an outbound-only node (observer) advertises a bare `/p2p/<key>` as its
+        // `network_address`: undialable by design and equally unlistenable. We refuse to invent a
+        // port for it (a random one is unpredictable for firewalls/observability, a fixed one
+        // collides on a shared host), so such a node MUST pin its listen address via the env.
+        let Ok(addr) = std::env::var(env_var) else {
+            if address_is_listenable(&fallback) {
+                return Ok(fallback);
+            }
+            return Err(eyre::eyre!(
+                "network_address {fallback} is identity-only (not listenable); set {env_var} to a \
+                 concrete listen address, e.g. /ip4/0.0.0.0/udp/<port>/quic-v1"
+            ));
+        };
+        let multi: Multiaddr = addr.parse().map_err(|e| {
+            eyre::eyre!("Failed to parse listener multiaddr from env {env_var} ({addr})\n{e}")
+        })?;
+        // add Protocol::P2p to multiaddr to maintain consistency with keytool generate.rs
+        multi.with_p2p(network_pubkey.into()).map_err(|_| {
+            eyre::eyre!("{env_var} multiaddr contains a different P2P protocol ({addr})")
+        })
     }
 
     /// Build circuit-relay-v2 listen addresses for a comma-separated list of relay base multiaddrs
@@ -417,6 +419,25 @@ fn advertised_relay_covered(advertised: &Multiaddr, reservations: &[Multiaddr]) 
         return false;
     };
     reservations.iter().any(|r| circuit_relay_peer_id(r) == Some(relay_id))
+}
+
+/// Returns true when `addr` carries a transport the swarm can bind or reserve on: a concrete
+/// ip/dns quic address, a `/dnsaddr` (advertise-only, skipped later but not an error), or a relay
+/// circuit. A bare `/p2p/<peer-id>` (an identity-only advertise address) has none of these and is
+/// unlistenable.
+fn address_is_listenable(addr: &Multiaddr) -> bool {
+    addr.iter().any(|p| {
+        matches!(
+            p,
+            Protocol::Ip4(_)
+                | Protocol::Ip6(_)
+                | Protocol::Dns(_)
+                | Protocol::Dns4(_)
+                | Protocol::Dns6(_)
+                | Protocol::Dnsaddr(_)
+                | Protocol::P2pCircuit
+        )
+    })
 }
 
 #[cfg(test)]

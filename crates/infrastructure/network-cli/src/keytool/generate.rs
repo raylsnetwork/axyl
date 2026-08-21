@@ -107,6 +107,20 @@ pub struct KeygenArgs {
     /// over `--relay`.
     #[arg(long, value_name = "HOST", env = "RL_ADVERTISE_DNSADDR")]
     pub advertise_dnsaddr: Option<String>,
+
+    /// Advertise an identity-only `/p2p/<peer-id>` address instead of a dialable one.
+    ///
+    /// Sets `network_address` (for both primary and worker) to a bare `/p2p/<peer-id>`: the node
+    /// still publishes its record and its `committee.yaml` entry, so peers map its `peer_id ->
+    /// bls` and accept its request-response traffic (e.g. serve its batch requests), but the
+    /// address is undialable so nothing ever tries to connect to it. Because that
+    /// `network_address` is not listenable, such a node MUST pin its listen socket via
+    /// `PRIMARY/WORKER_LISTENER_MULTIADDR` at startup (e.g.
+    /// `/ip4/0.0.0.0/udp/<port>/quic-v1`). Intended for outbound-only nodes (observers) that
+    /// must follow consensus but must not be dialed. Overrides any address set by
+    /// `--external-primary-addr` / `--external-worker-addrs` / `--relay` / `--advertise-dnsaddr`.
+    #[arg(long, env = "RL_ADVERTISE_IDENTITY_ONLY")]
+    pub advertise_identity_only: bool,
 }
 
 /// Build a `/dnsaddr/<host>/p2p/<node-peer-id>` advertise address.
@@ -190,6 +204,23 @@ impl KeygenArgs {
         };
 
         info!(target: "rl::generate_keys", worker=?node_info.p2p_info.worker.network_address, "updating worker external network address");
+
+        // Identity-only advertise: overwrite `network_address` (for both primary and worker) with a
+        // bare `/p2p/<peer-id>`. The node still publishes its record and lands in `committee.yaml`,
+        // so peers map its `peer_id -> bls` and accept its request-response traffic, but the
+        // address is undialable so nothing tries to connect to it. It is also not
+        // listenable -- the node binds via `PRIMARY/WORKER_LISTENER_MULTIADDR` at startup
+        // (see the flag docs). Runs last so it overrides any address set above. For
+        // outbound-only nodes (observers).
+        if self.advertise_identity_only {
+            let primary_p2p = Multiaddr::empty()
+                .with(Protocol::P2p(key_config.primary_network_public_key().into()));
+            let worker_p2p = Multiaddr::empty()
+                .with(Protocol::P2p(key_config.worker_network_public_key().into()));
+            node_info.p2p_info.primary.network_address = primary_p2p.clone();
+            node_info.p2p_info.worker.network_address = worker_p2p.clone();
+            info!(target: "rl::generate_keys", primary=?primary_p2p, worker=?worker_p2p, "advertising identity-only /p2p addresses (undialable)");
+        }
         Ok(())
     }
 

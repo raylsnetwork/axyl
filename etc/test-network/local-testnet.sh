@@ -521,9 +521,10 @@ WORKER_DIRECT_BASE=41000
 # Observer p2p listener bind. Default 0.0.0.0 (all interfaces): libp2p-QUIC dials out of its
 # listener socket, so a 127.0.0.1-bound observer sources outbound packets from loopback and CANNOT
 # reach a routable relay (e.g. a cross-host node advertising a private address) -- those dials time
-# out forever. Without an explicit listener the node falls back to node-info's 127.0.0.1:<auto>, so
-# the bug bites any mixed loopback+routable topology. Loopback is a subset of 0.0.0.0, so pure
-# single-host testnets are unaffected. Matches add-observer.sh and how observers run on main.
+# out forever. This env is also mandatory for the observer: its node-info network_address is an
+# identity-only /p2p (undialable, unlistenable), so the node errors at startup without an explicit
+# listener rather than binding anything. Loopback is a subset of 0.0.0.0, so pure single-host
+# testnets are unaffected. Matches add-observer.sh.
 OBSERVER_LISTEN_HOST="${OBSERVER_LISTEN_HOST:-0.0.0.0}"
 # Precomputed for up to 32 validators (seed = byte (index+1) repeated 32x; peer id derived by
 # rayls-relay). Extend by running the relay with the next seed and reading its logged peer id.
@@ -745,12 +746,21 @@ else
     if [[ "$NUM_OBSERVERS" -gt 0 ]]; then
         for ((o=0; o<NUM_OBSERVERS; o++)); do
             OBSERVER="observer-$((NUM_VALIDATORS+o+1))"
+            OBSERVER_INSTANCE=$((NUM_VALIDATORS+o+1))
             echo "creating datadir for $OBSERVER"
             DATADIR="${ROOTDIR}/${OBSERVER}"
             mkdir -p "${DATADIR}/genesis"
+            # Observer is outbound-only: it must follow consensus but nothing should dial it.
+            #  - --advertise-identity-only: sets network_address = /p2p/<key> (undialable), so peers
+            #    map its peer_id -> bls (accept its batch requests) but never try to dial it.
+            # The listen socket is bound separately via PRIMARY/WORKER_LISTENER_MULTIADDR at startup
+            # (OBSERVER_LISTEN_HOST, default 0.0.0.0), so the observer can reach the committee's real
+            # relay IPs (a loopback bind couldn't). That env is required: an identity-only
+            # network_address is not listenable on its own.
             "$scriptDir/../../target/${BUILD_CONFIG}/rayls-network" keytool generate observer \
                 --datadir "${DATADIR}" \
-                --address "0x0000000000000000000000000000000000000000"
+                --address "0x0000000000000000000000000000000000000000" \
+                --advertise-identity-only
             cp "${ROOTDIR}/${GENESISDIR}/genesis.yaml" "${DATADIR}/genesis"
             cp "${ROOTDIR}/${GENESISDIR}/committee.yaml" "${DATADIR}/genesis"
             cp "${ROOTDIR}/parameters.yaml" "${DATADIR}/"
@@ -876,9 +886,10 @@ if [ "$START" = true ]; then
             # the local dnsmasq -- otherwise it queries the system/public resolver, gets NXDomain
             # for *.rayls.test, resolves no circuits, and never connects to the committee. Observers
             # don't reserve on relays (peers don't dial them), so only the resolver env is needed.
-            # Bind the p2p listeners on OBSERVER_LISTEN_HOST (default 0.0.0.0) instead of node-info's
-            # 127.0.0.1 fallback, so outbound QUIC can reach routable relays. Ports mirror
-            # add-observer.sh: primary 49000+instance / worker 49100+instance.
+            # Bind the p2p listeners on OBSERVER_LISTEN_HOST (default 0.0.0.0) so outbound QUIC can
+            # reach routable relays. This env is required: the observer's node-info network_address is
+            # an identity-only /p2p (undialable), which is not listenable -- the node errors at startup
+            # without it. Ports mirror add-observer.sh: primary 49000+instance / worker 49100+instance.
             OBSERVER_ENV=(
                 "PRIMARY_LISTENER_MULTIADDR=/ip4/${OBSERVER_LISTEN_HOST}/udp/$((49000 + OBSERVER_INSTANCE))/quic-v1"
                 "WORKER_LISTENER_MULTIADDR=/ip4/${OBSERVER_LISTEN_HOST}/udp/$((49100 + OBSERVER_INSTANCE))/quic-v1"

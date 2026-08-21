@@ -72,12 +72,13 @@ HTTP_PORT=$((8545 - (NODE_NUM - 1)))
 WS_PORT=$((8546 - (NODE_NUM - 1)))
 NODE_NAME="observer-${NODE_NUM}"
 
-# p2p listener bind address. Default 0.0.0.0 (all interfaces) -- REQUIRED for a remote observer: a
-# socket bound to keygen's node-info default (127.0.0.1) can't reach external peers, so outbound QUIC
-# to the committee's relays fails and no dial ever completes. Binding 0.0.0.0 makes libp2p announce
-# the concrete per-interface addresses, so committee peers can also reach it back. This matches how
-# base observers run on main. Override the bind IP with LISTEN_HOST=<ip>, or replace the whole
-# multiaddr with PRIMARY_LISTENER_MULTIADDR / WORKER_LISTENER_MULTIADDR (the env vars the node reads).
+# p2p listener bind address. Default 0.0.0.0 (all interfaces). REQUIRED for an observer: keygen set
+# its node-info network_address to an identity-only /p2p/<key> (undialable, so nothing ever dials it
+# -- committee traffic flows back over the connection the observer itself opens). That address is not
+# listenable, so the node errors at startup unless PRIMARY/WORKER_LISTENER_MULTIADDR gives it a real
+# socket. Binding 0.0.0.0 (not 127.0.0.1) lets its outbound QUIC reach the committee's relays from any
+# interface. Override the bind IP with LISTEN_HOST=<ip>, or replace the whole multiaddr with
+# PRIMARY_LISTENER_MULTIADDR / WORKER_LISTENER_MULTIADDR (the env vars the node reads).
 LISTEN_HOST="${LISTEN_HOST:-0.0.0.0}"
 export PRIMARY_LISTENER_MULTIADDR="${PRIMARY_LISTENER_MULTIADDR:-/ip4/${LISTEN_HOST}/udp/$((49000 + NODE_NUM))/quic-v1}"
 export WORKER_LISTENER_MULTIADDR="${WORKER_LISTENER_MULTIADDR:-/ip4/${LISTEN_HOST}/udp/$((49100 + NODE_NUM))/quic-v1}"
@@ -113,9 +114,16 @@ if [[ ! -d "$DATADIR" ]]; then
     done
     echo "Generating observer keys for ${NODE_NAME} (no relay in front)..."
     mkdir -p "${DATADIR}/genesis"
+    # Observer is outbound-only: it must follow consensus but nothing should dial it.
+    #  - --advertise-identity-only: sets network_address = /p2p/<key> (undialable), so peers map its
+    #    peer_id -> bls (accept its batch requests) but never try to dial it.
+    # The listen socket is bound separately via PRIMARY/WORKER_LISTENER_MULTIADDR (exported above),
+    # binding 0.0.0.0 so the observer can reach the committee's real relay IPs (a loopback bind
+    # couldn't). That env is required: an identity-only network_address is not listenable on its own.
     "$BIN" keytool generate observer \
         --datadir "$DATADIR" \
-        --address "0x0000000000000000000000000000000000000000"
+        --address "0x0000000000000000000000000000000000000000" \
+        --advertise-identity-only
     cp "${ROOTDIR}/genesis/genesis.yaml"   "${DATADIR}/genesis/"
     cp "${ROOTDIR}/genesis/committee.yaml" "${DATADIR}/genesis/"
     cp "${ROOTDIR}/parameters.yaml"        "${DATADIR}/"

@@ -58,7 +58,7 @@ query, or an app-level side effect. Enumerating every `kademlia.` call in the cr
 | Write | Store | Carries | Propagates via |
 |-------|-------|---------|----------------|
 | `add_address` (sole writer; `BucketInserts::Manual` disables auto-insert) | routing table (kbuckets) | the **connection** address (inbound send-back / outbound dialed) | FIND_NODE responses (**pull only**) |
-| `put_record` / `put_record_to` (ours) **+** `store_mut().put(record)` (inbound `PutRecord` from a peer) | record store | the peer's **advertised** `NodeRecord` address (`external_addr` from keygen/node-info) | `get_record` responses (pull) **+** `put_record` active push to the K-closest |
+| `put_record` / `put_record_to` (ours) **+** `store_mut().put(record)` (inbound `PutRecord` from a peer) | record store | the peer's **advertised** `NodeRecord` address (its `network_address` from keygen/node-info) | `get_record` responses (pull) **+** `put_record` active push to the K-closest |
 
 Not address sources:
 - `remove_peer`, `remove_record` — deletions.
@@ -73,8 +73,14 @@ Not address sources:
 Two consequences worth holding onto:
 1. The two writes carry **different** addresses — `add_address` leaks the
    *connection* view (fixed by the transport-less gate, leak 5); `put_record` leaks
-   the *advertised* view (an observer's loopback `external_addr`, addressed by "don't
-   publish a dial target for outbound-only nodes"). A complete fix must consider both.
+   the *advertised* view (an outbound-only node's loopback `network_address`). A
+   complete fix must consider both. The advertised view is addressed by advertising an
+   **identity-only `network_address`** (see below): an outbound-only node sets its
+   `network_address` to a bare `/p2p/<peer-id>` (keytool `--advertise-identity-only`)
+   and binds its listen socket separately via `*_LISTENER_MULTIADDR`, so its published
+   record still carries identity but is undialable. Note it MUST still publish (a node
+   that skips publishing becomes unidentifiable -- see "The record is identity, not just
+   an address" below).
 2. Routing-table entries are **pull-only** (they reach another node solely when it
    queries you and the entry is among the K-closest to its key) — there is no
    broadcast or periodic sync. Records, by contrast, are actively **pushed** by
@@ -101,7 +107,7 @@ The `value` is the `NodeRecord` (`types.rs:800`), which is just signed network i
 NodeRecord {
     info: NetworkInfo {
         pubkey:     <network public key>,   // the libp2p key your peer id derives from
-        multiaddrs: vec![ <external_addr> ],// ONE entry — your advertised network_address
+        multiaddrs: vec![ <network_address> ],// ONE entry — your advertised network_address
         timestamp:  <now>,                  // used to keep the newest record
     },
     signature: <BLS signature over encode(&info)>,   // lets ingesters authenticate it
@@ -110,17 +116,18 @@ NodeRecord {
 
 Key facts:
 - It is keyed on the **BLS authority key**; the **network pubkey** inside yields the
-  **peer id** others dial; `multiaddrs` holds exactly **one** address —
-  `external_addr`, whatever keygen baked into `node-info.yaml`'s `network_address`
-  (loopback for an observer, a concrete `/p2p-circuit` under `--relay`, a `/dnsaddr`
-  under `--relay-dns`). See `NodeRecord::build` (`types.rs:816`).
+  **peer id** others dial; `multiaddrs` holds exactly **one** advertised address —
+  `node-info.yaml`'s **`network_address`**: a concrete `/p2p-circuit` under `--relay`, a
+  `/dnsaddr` under `--relay-dns`, an identity-only `/p2p/<peer-id>` for an observer
+  (`--advertise-identity-only`), or `127.0.0.1` for the bare default. See
+  `NodeRecord::build` (`types.rs`).
 - **Validation on ingest is signature + timestamp + peer-id match only** — never
   reachability. A valid record's `info` is written straight into the ingester's
-  `known_peers` via `add_known_peer`, i.e. `bls_key -> (peer_id, [external_addr])`,
+  `known_peers` via `add_known_peer`, i.e. `bls_key -> (peer_id, [network_address])`,
   which `DialBls` later dials.
 - So the record propagates **your advertised address, verbatim, to everyone**. If
-  `external_addr` is loopback (the observer default), every ingester stores and dials
-  that loopback — this is the `put_record` (advertised-view) half of the leak.
+  `network_address` is loopback, every ingester stores and dials that loopback — this is
+  the `put_record` (advertised-view) half of the leak.
 
 ## Concrete examples
 
@@ -252,10 +259,10 @@ the send-back, but that is node-local and never enters FIND_NODE.
 
 The advertised address comes from `node-info.yaml`'s `network_address`
 (`p2p_info.primary/worker.network_address`), read verbatim at startup
-(`epoch_manager/network.rs:116`) and baked into the signed `NodeRecord`. It is the
-node's *advertise* address, entirely separate from its *listen* bind
-(`PRIMARY_LISTENER_MULTIADDR` / the keygen listener) — setting one does not change
-the other.
+(`epoch_manager/network.rs:116`) and baked into the signed `NodeRecord`. It is also
+the node's *listen* bind — unless `PRIMARY/WORKER_LISTENER_MULTIADDR` overrides it
+(`parse_listener_address_for_swarm`), which is how you make what you *advertise*
+differ from what you *bind* (e.g. advertise a public ip, bind `0.0.0.0`).
 
 If `node-info.yaml` sets `network_address` to `0.0.0.0`, e.g.
 
@@ -266,7 +273,7 @@ network_address: /ip4/0.0.0.0/udp/37907/quic-v1/p2p/12D3KooWH7iu...
 then that is exactly what is published to the DHT — **verbatim, no expansion**. It
 is *not* translated to the node's concrete interface IPs (that expansion only
 happens for `0.0.0.0` *listen* binds, via `NewListenAddr`, never for the advertised
-`external_addr`). So `node_peer_addr_external` shows `/ip4/0.0.0.0/udp/37907/...`,
+`network_address`). So `node_peer_addr_external` shows `/ip4/0.0.0.0/udp/37907/...`,
 and nothing on the host actually listens on `37907` (it is a keygen-time ephemeral
 port — `get_available_udp_port` opened `127.0.0.1:0`, read the number, and closed
 it; the real sockets are the `*_LISTENER_MULTIADDR` ports). `37907` is therefore a
@@ -291,10 +298,14 @@ churn**: repeated, harmless, self-directed loopback dials — the same waste thi
 document is about, just self-inflicted via a bad advertise address.
 
 Takeaway: `0.0.0.0` is the right value for the *listen* bind (all interfaces) and
-the wrong value for the *advertise* address. For a node that must be dialable,
-advertise a concrete routable IP (or a relay / `/dnsaddr`). For an observer (which
-nothing dials), the fix is to **not publish a dial target at all**, not to pick a
-different wildcard.
+the wrong value for the *advertise* address. For a node that must be dialable, set
+`network_address` to a concrete routable IP (or a relay / `/dnsaddr`) and, if it binds
+a different socket, point `*_LISTENER_MULTIADDR` at the bind (e.g. `0.0.0.0`). For an
+observer (which nothing dials), set `network_address` to an **identity-only bare
+`/p2p/<peer-id>`** (keytool `--advertise-identity-only`) and bind via
+`*_LISTENER_MULTIADDR` — do **not** try to make `0.0.0.0` (or skipping publish
+entirely) do that job. `/p2p/<peer-id>` is undialable (every dial filter rejects a
+transport-less address) yet still publishable, so the observer stays identifiable.
 
 ## Where each leak is fixed — two layers
 
@@ -318,8 +329,26 @@ dial failure, reset on a successful connect, skip during exponential cooldown wi
 cap and half-open re-probe; committee members exempt to protect consensus liveness)
 is the correct, vantage-aware fix. **Not yet implemented.**
 
-A related source-side lever for the observer/outbound-only case: such a node has no
-reason to publish a dial target at all (nothing dials it), so gating
-`publish_our_data`/`publish_our_data_to_peer` for non-dialable nodes stops its
-(useless) address from ever entering the DHT. The backoff remains the catch-all for
-anything that still leaks.
+A source-side handling for the observer / outbound-only case — an
+**identity-only `network_address`**: such a node sets its `network_address` to a bare
+`/p2p/<peer-id>` (keytool `--advertise-identity-only`). It advertises identity-only —
+undialable (leak-5 filter rejects it everywhere) yet still published, so peers can
+identify it. It must NOT skip publishing (see below). Because that `network_address`
+is not listenable, the node binds its listen socket via `*_LISTENER_MULTIADDR`
+(`parse_listener_address_for_swarm` errors if it is unset), and dials out normally.
+The backoff remains the catch-all for anything that still leaks.
+
+## The record is identity, not just an address
+
+A tempting but wrong "fix" is to have an outbound-only node **skip publishing** its
+record (if nothing dials it, why advertise?). This breaks it: the published record is
+also the node's **identity**. When it sends a request-response message (e.g. an
+observer fetching batches), the responder does `peer_to_bls(peer_id)` — populated by
+`add_known_peer` from that node's **published record** — to decide whether to serve
+it. No record ⇒ `peer_to_bls` is `None` ⇒ the responder rejects with
+`"requesting peer unknown"` (`reqres.rs`) ⇒ the node can never fetch batches and
+falls out of sync. Identity comes from the record's **`pubkey`**, independent of the
+`multiaddrs`, so the address can be an undialable `/p2p/<peer-id>` and identity still
+works. Hence: **advertise `/p2p/<peer-id>` (undialable) but keep publishing the record
+(identity).** Do not skip publishing for any node that participates in
+request-response.
