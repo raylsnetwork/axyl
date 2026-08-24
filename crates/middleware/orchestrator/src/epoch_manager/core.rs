@@ -375,7 +375,10 @@ where
                 }
 
                 // A hot-tier write/durability failure (cold archival). Same ordered wind-down,
-                // surfaced as an error instead of a panic.
+                // surfaced as an error instead of a panic. `fatal_db_error` preserves the first
+                // (root-cause) signal via `send_if_modified` in both `db_run::trip` and
+                // `cold_archive::seal_due_epochs`, so `borrow()` is the original writer failure,
+                // not a secondary archival error.
                 _ = fatal_db_error.changed() => {
                     let msg = fatal_db_error.borrow().clone().unwrap_or_default();
                     error!(

@@ -118,6 +118,10 @@ impl ColdArchival {
     /// `shutdown` doubles as the cancel flag at chunk seams. The actor is [`TaskKind::Drainable`]
     /// so teardown joins its blocking pass rather than aborting mid-pass and detaching a thread
     /// that still holds a database handle.
+    ///
+    /// `fatal_db_error` is a `watch` that is overwritten on `send`; both the writer thread
+    /// (`layered_db::trip`) and this actor may signal it, but `send_if_modified` preserves the
+    /// first (root-cause) error so `core.rs` logs the original failure.
     pub(crate) fn spawn_actor(
         &self,
         task_manager: &TaskManager,
@@ -319,7 +323,17 @@ async fn seal_due_epochs<DB: Database>(
                         ?e,
                         "cold epoch archive: hot-tier write not durable, requesting graceful node shutdown"
                     );
-                    let _ = fatal_db_error.send(Some(format!("{e:?}")));
+                    // Preserve the first fatal signal (root cause). The writer thread's `trip()`
+                    // may have already sent the original `write_txn`/`commit` failure; `watch`
+                    // overwrites on `send`, so only set if still `None`.
+                    let _ = fatal_db_error.send_if_modified(|cur| {
+                        if cur.is_none() {
+                            *cur = Some(format!("{e:?}"));
+                            true
+                        } else {
+                            false
+                        }
+                    });
                     return false;
                 }
                 warn!(target: "epoch-manager", "cold epoch archive failed: {e}");

@@ -823,10 +823,19 @@ fn db_run<DB: Database>(
     let mut committed_ops: Vec<DeferredOp<DB>> = Vec::with_capacity(1000);
     // Latch the first fatal failure, then signal the node's fatal-error channel (when wired) so
     // the wind-down starts immediately; both `send` results are advisory and ignored.
+    // The watch preserves the first error (root cause): a later `WriteFailed` from cold archival
+    // must not overwrite the original writer failure that `core.rs` logs.
     let trip = |msg: String| {
         let _ = fatal.set(msg.clone());
         if let Some(signal) = fatal_signal.get() {
-            let _ = signal.send(Some(msg));
+            let _ = signal.send_if_modified(|cur| {
+                if cur.is_none() {
+                    *cur = Some(msg.clone());
+                    true
+                } else {
+                    false
+                }
+            });
         }
     };
     if let Err(e) = db.compact() {
