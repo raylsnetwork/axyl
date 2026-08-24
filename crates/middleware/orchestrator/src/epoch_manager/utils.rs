@@ -13,6 +13,7 @@ use rayls_infrastructure_types::{
 #[cfg(not(feature = "dev-single-node-setup"))]
 use rayls_infrastructure_types::MIN_RAYLS_PROTOCOL_BASE_FEE;
 use std::collections::BTreeMap;
+use tokio::sync::watch;
 use tracing::info;
 
 /// Number of recent EVM blocks scanned to recover the restart execution anchor.
@@ -141,14 +142,23 @@ pub fn catchup_accumulator<DB: Database>(
 }
 
 /// Create a consensus DB that lives for program lifetime.
+///
+/// When `fatal_db_error` is provided it is wired into the DB: the background writer signals it
+/// with the stored error on the first fatal write failure, so the node winds down gracefully
+/// instead of continuing to write into a failing tier.
 pub(crate) fn open_consensus_db<P: RaylsDirs + 'static>(
     rayls_datadir: &P,
     consensus_db_config: &MdbxConfig,
+    fatal_db_error: Option<watch::Sender<Option<String>>>,
 ) -> eyre::Result<DatabaseType> {
     let consensus_db_path = rayls_datadir.consensus_db_path();
 
     let _ = std::fs::create_dir_all(&consensus_db_path);
     let db = open_db_with_consensus_config(&consensus_db_path, consensus_db_config);
+    let db = match fatal_db_error {
+        Some(signal) => db.with_fatal_signal(signal),
+        None => db,
+    };
 
     info!(target: "epoch-manager", ?consensus_db_path, "opened consensus storage");
 

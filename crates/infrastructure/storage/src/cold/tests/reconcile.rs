@@ -38,7 +38,7 @@ fn test_reconcile_heals_interrupted_archive() {
             Ok(())
         })
         .expect("simulate crash window");
-        hot.sync_persist();
+        hot.sync_persist().expect("persist");
 
         // Sanity: the jars are durable, so no row is absent from both tiers even pre-reconcile.
         let sealed: BTreeSet<Epoch> =
@@ -54,7 +54,7 @@ fn test_reconcile_heals_interrupted_archive() {
     let (db, hot) = open_test_db(&tmp);
     reconcile(&hot, db.cold().expect("cold attached")).expect("reconcile");
     // Flush so any reconcile hot deletes land in the bare MDBX we probe for boundedness.
-    hot.sync_persist();
+    hot.sync_persist().expect("persist");
 
     // The auxiliary index and high-water mark are rebuilt from the self-describing jars.
     let high_water_mark = db
@@ -148,7 +148,7 @@ fn reconcile_preserves_epoch_torn_between_jar_commits() {
             Ok(())
         })
         .expect("carve crash window");
-        hot.sync_persist();
+        hot.sync_persist().expect("persist");
         // Drop the process state; phase 2 reopens from disk to model a real reboot.
     }
 
@@ -168,7 +168,7 @@ fn reconcile_preserves_epoch_torn_between_jar_commits() {
     );
 
     reconcile(&hot, db.cold().expect("cold attached")).expect("reconcile");
-    hot.sync_persist();
+    hot.sync_persist().expect("persist");
 
     // The torn epoch's rows must still resolve. With the fix they stay hot (reconcile skips the
     // epoch); against the bug both reads are None because reconcile evicted the hot rows with no
@@ -220,7 +220,7 @@ fn reconcile_rebuilds_shared_digest_to_correct_row() {
             Ok(())
         })
         .expect("seed hot");
-        hot.sync_persist();
+        hot.sync_persist().expect("persist");
     };
 
     // Phase 1: archive into durable jars, then roll back the post-jar hot txn to model a crash
@@ -242,13 +242,13 @@ fn reconcile_rebuilds_shared_digest_to_correct_row() {
             Ok(())
         })
         .expect("simulate crash window");
-        hot.sync_persist();
+        hot.sync_persist().expect("persist");
     }
 
     // Phase 2: reopen and reconcile, then both batches must read back through cold.
     let (db, hot) = open_test_db(&tmp);
     reconcile(&hot, db.cold().expect("cold attached")).expect("reconcile");
-    hot.sync_persist();
+    hot.sync_persist().expect("persist");
 
     let got_shared = db
         .get::<Batches>(&shared)
@@ -297,7 +297,7 @@ fn reconcile_rebuilds_cross_epoch_shared_digest_from_the_jar() {
             Ok(())
         })
         .expect("seed hot");
-        hot.sync_persist();
+        hot.sync_persist().expect("persist");
 
         // Archive one epoch at a time, flushing between: epoch 1's seal must observe `shared`
         // already gone from hot, which is what makes it skip the row.
@@ -310,7 +310,7 @@ fn reconcile_rebuilds_cross_epoch_shared_digest_from_the_jar() {
             )
             .expect("seal")
             .expect("one epoch below the cutoff");
-            hot.sync_persist();
+            hot.sync_persist().expect("persist");
         }
 
         // Roll back the index and high-water mark, the crash window boot reconcile rebuilds from.
@@ -321,12 +321,12 @@ fn reconcile_rebuilds_cross_epoch_shared_digest_from_the_jar() {
             Ok(())
         })
         .expect("simulate crash window");
-        hot.sync_persist();
+        hot.sync_persist().expect("persist");
     }
 
     let (db, hot) = open_test_db(&tmp);
     reconcile(&hot, db.cold().expect("cold attached")).expect("reconcile");
-    hot.sync_persist();
+    hot.sync_persist().expect("persist");
 
     // Against the drift, `shared` is re-pointed at epoch 1 row 0 (which holds `only_later`) and
     // `only_later` at a row epoch 1's jar does not have.
@@ -365,7 +365,7 @@ fn reconcile_rebuilds_rows_independently_of_the_batches_start_key() {
         Ok(())
     })
     .expect("seed hot");
-    hot.sync_persist();
+    hot.sync_persist().expect("persist");
 
     // Seal epoch 0 by hand so the batches jar is rooted at a non-zero sentinel; the seal path
     // always passes 0, which is exactly what would hide a start-key-based row mapping.
@@ -387,7 +387,7 @@ fn reconcile_rebuilds_rows_independently_of_the_batches_start_key() {
     db.cold().expect("cold attached").consensus_blocks().commit().expect("commit blocks");
 
     reconcile(&hot, db.cold().expect("cold attached")).expect("reconcile");
-    hot.sync_persist();
+    hot.sync_persist().expect("persist");
 
     for (row, (digest, batch)) in digests.iter().zip(&batches).enumerate() {
         assert_eq!(
@@ -415,7 +415,7 @@ fn reconcile_rejects_a_high_water_mark_the_jars_do_not_cover() {
         seed_hot(&hot, &fixtures);
         archive_below_epoch(&hot, db.cold().expect("cold attached"), cutoff, None)
             .expect("archive");
-        hot.sync_persist();
+        hot.sync_persist().expect("persist");
     }
     std::fs::remove_dir_all(tmp.path().join("cold")).expect("restore without the cold directory");
 
@@ -437,8 +437,8 @@ fn reconcile_rejects_a_high_water_mark_the_jars_do_not_cover() {
 }
 
 /// The durable residue of a seal whose index txn was lost while its hot prune landed (the layered
-/// writer surfaces a failed commit only through `sync_persist`, which logs and continues): jars
-/// durable, hot rows pruned, auxiliary index and high-water mark absent. Boot reconcile must
+/// writer surfaces a failed commit only through `sync_persist`; callers must treat it as fatal):
+/// jars durable, hot rows pruned, auxiliary index and high-water mark absent. Boot reconcile must
 /// rebuild the index from the jars so every archived row still serves.
 #[test]
 fn reconcile_restores_pruned_but_unindexed_epochs() {
@@ -462,12 +462,12 @@ fn reconcile_restores_pruned_but_unindexed_epochs() {
             Ok(())
         })
         .expect("carve residue");
-        hot.sync_persist();
+        hot.sync_persist().expect("persist");
     }
 
     let (db, hot) = open_test_db(&tmp);
     reconcile(&hot, db.cold().expect("cold attached")).expect("reconcile");
-    hot.sync_persist();
+    hot.sync_persist().expect("persist");
 
     let high_water_mark = db
         .get::<ColdArchiveHighWaterMark>(&ARCHIVE_HIGH_WATER_MARK_KEY)
@@ -514,12 +514,12 @@ fn reconcile_skips_epochs_at_or_below_the_high_water_mark() {
             Ok(())
         })
         .expect("carve crash window");
-        hot.sync_persist();
+        hot.sync_persist().expect("persist");
     }
 
     let (db, hot) = open_test_db(&tmp);
     reconcile(&hot, db.cold().expect("cold attached")).expect("reconcile");
-    hot.sync_persist();
+    hot.sync_persist().expect("persist");
 
     let mdbx = hot.inner();
     let numbers: BTreeSet<u64> =
@@ -597,7 +597,7 @@ fn finalize_never_gaps_reads_through_fall_through() {
 
     // The finalize completed the migration: hot rows pruned, every row serves from cold. A
     // zero-yield finalize queues its deletes without draining, so flush before the raw probe.
-    hot.sync_persist();
+    hot.sync_persist().expect("persist");
     assert_eq!(count_hot_rows::<ConsensusBlocks, _>(hot.inner(), |_| true), 0, "hot pruned");
     for (number, _) in &blocks {
         assert!(db.get::<ConsensusBlocks>(number).expect("read").is_some(), "cold serves");
@@ -625,7 +625,7 @@ fn paced_prune_cancelled_after_seal_heals_on_reconcile() {
         Ok(())
     })
     .expect("seed markers");
-    hot.sync_persist();
+    hot.sync_persist().expect("persist");
 
     let archiver = ColdArchiver::new(hot.clone(), db.cold().expect("cold attached").clone());
     // Cancel the instant epoch 0's jar is committed: the seal completes and the high-water mark
@@ -638,7 +638,7 @@ fn paced_prune_cancelled_after_seal_heals_on_reconcile() {
         SealOutcome::Cancelled,
         "a pass whose prune was cancelled has not archived the epoch"
     );
-    hot.sync_persist();
+    hot.sync_persist().expect("persist");
 
     // The high-water mark did NOT advance, so the epoch stays above it and reconcile revisits it;
     // its rows are in cold either way, so serving is unaffected.
@@ -655,7 +655,7 @@ fn paced_prune_cancelled_after_seal_heals_on_reconcile() {
 
     // Reconcile sweeps the leftover hot rows, completing the prune idempotently.
     archiver.reconcile().expect("heal");
-    hot.sync_persist();
+    hot.sync_persist().expect("persist");
     assert_eq!(
         count_hot_rows::<ConsensusBlocks, _>(hot.inner(), |n| *n <= 2),
         0,
@@ -688,7 +688,7 @@ fn reconcile_sweeps_partially_paced_pruned_epoch() {
         Ok(())
     })
     .expect("seed");
-    hot.sync_persist();
+    hot.sync_persist().expect("persist");
 
     // Seal + index, then cancel the paced prune right before its SECOND block chunk: the digests
     // and blocks 0..=4095 are deleted and committed, block 4096 (the epoch's last) stays hot.
@@ -710,7 +710,7 @@ fn reconcile_sweeps_partially_paced_pruned_epoch() {
         matches!(finalized, Finalized::Cancelled),
         "a prune stopped before its last batch has not finished archiving the epoch"
     );
-    hot.sync_persist();
+    hot.sync_persist().expect("persist");
 
     // The partial-archive state a shutdown leaves: index committed, first block gone, last block
     // still hot, and the high-water mark un-advanced so the epoch is still due.
@@ -723,7 +723,7 @@ fn reconcile_sweeps_partially_paced_pruned_epoch() {
 
     // Reconcile must sweep the leftover tail; probing only the first block would skip it.
     reconcile(&hot, db.cold().expect("cold attached")).expect("heal");
-    hot.sync_persist();
+    hot.sync_persist().expect("persist");
     assert_eq!(
         count_hot_rows::<ConsensusBlocks, _>(hot.inner(), |n| *n < BLOCKS),
         0,

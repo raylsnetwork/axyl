@@ -148,7 +148,7 @@ fn seed_hot(hot: &HotDb, fixtures: &[Fixture]) {
         Ok(())
     })
     .expect("seed hot");
-    hot.sync_persist();
+    hot.sync_persist().expect("persist");
 }
 
 /// Counts the rows of a table in the bare MDBX whose key satisfies `keep`.
@@ -184,5 +184,5 @@ fn seed_chunk_blocks(hot: &HotDb, blocks: &[(u64, Vec<BlockHash>)], batches: &[(
         Ok(())
     })
     .expect("seed hot");
-    hot.sync_persist();
+    hot.sync_persist().expect("persist");
 }

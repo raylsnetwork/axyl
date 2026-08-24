@@ -384,7 +384,7 @@ mod tests {
             Ok(())
         })
         .expect("seed");
-        db.sync_persist();
+        db.sync_persist().expect("persist");
 
         let counter = ConsensusRewardsCounter::new(db.clone());
         counter.set_committee(committee);
@@ -396,7 +396,7 @@ mod tests {
         let archiver = cold_archiver_for(&db).expect("mdbx stack has a cold tier");
         assert_eq!(archiver.seal_due(1, || false).expect("seal"), SealOutcome::Sealed(0));
         assert_eq!(archiver.seal_due(1, || false).expect("drained"), SealOutcome::Drained);
-        db.sync_persist();
+        db.sync_persist().expect("persist");
 
         let after = counter.tally(1, 6).expect("post-archival tally");
         assert_eq!(after, before, "the closing epoch's tally must survive archival at the floor");

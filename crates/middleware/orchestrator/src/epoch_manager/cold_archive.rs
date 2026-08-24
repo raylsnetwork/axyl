@@ -14,14 +14,14 @@ use prometheus::{
     Histogram, IntCounter, Registry,
 };
 use rayls_infrastructure_storage::{
-    cold_archiver_for, ColdArchiver, ColdArchiverType, DatabaseType, SealOutcome,
+    cold::ColdError, cold_archiver_for, ColdArchiver, ColdArchiverType, DatabaseType, SealOutcome,
 };
 use rayls_infrastructure_types::{
     ConsensusHeader, Database, Epoch, Notifier, TaskKind, TaskManager,
 };
 use reth_db::lockfile::StorageLock;
 use tokio::sync::{oneshot, watch};
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 /// Acquires the process-exclusivity lock on the consensus-DB directory: the cold tier assumes a
 /// single archiver process (a concurrent writer could truncate a torn jar under a reconcile).
@@ -123,6 +123,7 @@ impl ColdArchival {
         task_manager: &TaskManager,
         mut anchor_rx: watch::Receiver<ConsensusHeader>,
         shutdown: Notifier,
+        fatal_db_error: watch::Sender<Option<String>>,
     ) {
         let Some(archiver) = self.archiver.clone() else { return };
         let noticer = shutdown.subscribe();
@@ -140,11 +141,19 @@ impl ColdArchival {
                         // no sooner than the cooldown (see [`FAILED_PASS_COOLDOWN`]). A pass the
                         // shutdown flag stopped is not a failure, so it must not arm the cooldown:
                         // a later non-teardown cancel source would otherwise stall archival.
-                        if seal_due_epochs(&archiver, anchor_epoch, &shutdown).await {
+                        if seal_due_epochs(&archiver, anchor_epoch, &shutdown, &fatal_db_error)
+                            .await
+                        {
                             sealed_for = Some(anchor_epoch);
                         } else if !shutdown.was_notified() {
                             retry_at = tokio::time::Instant::now() + FAILED_PASS_COOLDOWN;
                         }
+                    }
+                    // A write error was signaled: the node is winding down gracefully (run()'
+                    // handles the ordered teardown), so this actor must NOT arm the retry
+                    // cooldown and keep sealing into a failing tier.
+                    if fatal_db_error.borrow().is_some() {
+                        return;
                     }
                     tokio::select! {
                         biased;
@@ -235,10 +244,13 @@ impl ColdArchiveMetrics {
 ///
 /// Returns whether the backlog below the cutoff was drained; a spawn failure, a failed pass, a
 /// panicked pass and a cancelled pass all return `false`, leaving the epoch due for a retry.
+/// A hot-tier write failure instead signals `fatal_db_error` and returns `false`: the node winds
+/// down gracefully (keeping the durable tier), and the actor exits without retrying.
 async fn seal_due_epochs<DB: Database>(
     archiver: &Arc<ColdArchiver<DB>>,
     el_anchor_epoch: Epoch,
     shutdown: &Notifier,
+    fatal_db_error: &watch::Sender<Option<String>>,
 ) -> bool {
     loop {
         // Checked before each pass, not only at a chunk seam: a shutdown landing on a completed
@@ -292,6 +304,24 @@ async fn seal_due_epochs<DB: Database>(
             Ok(Ok(SealOutcome::Cancelled)) => return false,
             Ok(Err(e)) => {
                 metrics.cold_archive_failures.inc();
+                // A hot-tier durability failure is fatal, but the node shuts down GRACEFULLY
+                // rather than panicking: the durable tier is the last known valid data, and
+                // losing the mem cache and any uncommitted mdbx transaction is acceptable.
+                // Signal the epoch manager (run() requests the ordered wind-down and exits
+                // non-zero) and stop retrying — retrying the same epoch only pins more rows in
+                // the failing cache, and the process exit discards them anyway. Any other pass
+                // failure (corruption, contiguity) stays retriable after the cooldown.
+                if e.downcast_ref::<ColdError>()
+                    .is_some_and(|err| matches!(err, ColdError::WriteFailed(_)))
+                {
+                    error!(
+                        target: "epoch-manager",
+                        ?e,
+                        "cold epoch archive: hot-tier write not durable, requesting graceful node shutdown"
+                    );
+                    let _ = fatal_db_error.send(Some(format!("{e:?}")));
+                    return false;
+                }
                 warn!(target: "epoch-manager", "cold epoch archive failed: {e}");
                 return false;
             }
@@ -334,7 +364,9 @@ fn lower_current_thread_priority() {}
 mod tests {
     use super::*;
     use rayls_infrastructure_storage::{
-        cold_archiver_for, open_db,
+        cold_archiver_for,
+        mdbx::MdbxConfig,
+        open_db, open_db_with_consensus_config,
         tables::{Batches, ColdBatchLocations, ConsensusBlocks},
         DatabaseType,
     };
@@ -368,7 +400,7 @@ mod tests {
             Ok(())
         })
         .expect("seed");
-        db.sync_persist();
+        db.sync_persist().expect("persist");
 
         let archiver = cold_archiver_for(&db).expect("mdbx stack has a cold tier");
         let shutdown = Notifier::new();
@@ -381,6 +413,7 @@ mod tests {
             &task_manager,
             anchor_rx,
             shutdown.clone(),
+            watch::channel(None).0,
         );
 
         // Wake the actor and wait until a blocking pass is provably in flight: the pass's
@@ -464,13 +497,18 @@ mod tests {
             Ok(())
         })
         .expect("seed");
-        db.sync_persist();
+        db.sync_persist().expect("persist");
 
         let shutdown = Notifier::new();
         let mut task_manager = TaskManager::new("seal-actor-retry-test");
         task_manager.set_join_wait(500);
         let (anchor_tx, anchor_rx) = watch::channel(ConsensusHeader::default());
-        ColdArchival::new(&db).spawn_actor(&task_manager, anchor_rx, shutdown.clone());
+        ColdArchival::new(&db).spawn_actor(
+            &task_manager,
+            anchor_rx,
+            shutdown.clone(),
+            watch::channel(None).0,
+        );
 
         let failures = || ColdArchiveMetrics::get().cold_archive_failures.get();
         let before = failures();
@@ -486,7 +524,7 @@ mod tests {
             txn.insert::<ConsensusBlocks>(&1, &header_with_batch(1, 0, digest))
         })
         .expect("repair the gap");
-        db.sync_persist();
+        db.sync_persist().expect("persist");
         anchor_tx.send_replace(header_for(5, 2));
         for _ in 0..1_000 {
             tokio::task::yield_now().await;
@@ -517,6 +555,59 @@ mod tests {
             .expect("probe aux index")
     }
 
+    /// A hot-tier durability failure must signal the fatal channel (the epoch manager then winds
+    /// the node down gracefully, keeping the durable tier) instead of panicking: losing the mem
+    /// cache and any uncommitted mdbx transaction is acceptable.
+    #[tokio::test]
+    async fn write_failure_signals_fatal_shutdown_not_a_panic() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = MdbxConfig::default().with_max_db_size(1024 * 1024).with_growth_step(256 * 1024);
+        let db = open_db_with_consensus_config(tmp.path(), &cfg);
+
+        // Seed one small due epoch (blocks 0-2 in epoch 0) plus marker epochs making it due.
+        db.with_write_txn(|txn| {
+            for number in 0..3u64 {
+                let digest = digest_for(number);
+                txn.insert::<Batches>(&digest, &batch_for(number))?;
+                txn.insert::<ConsensusBlocks>(&number, &header_with_batch(number, 0, digest))?;
+            }
+            txn.insert::<ConsensusBlocks>(&3, &header_for(3, 1))?;
+            txn.insert::<ConsensusBlocks>(&4, &header_for(4, 2))?;
+            Ok(())
+        })
+        .expect("seed");
+        db.sync_persist().expect("persist");
+
+        // Overflow the map: the writer's commit of this oversized txn fails with MAP_FULL and
+        // poisons the DB. Queueing may itself fail mid-batch — once the writer trips, the
+        // producer's in-flight inserts fail fast — but the DB is poisoned either way. The junk
+        // never commits, so the seal's reads stay clean; the archival pass then fails on the
+        // poisoned DB and surfaces the failure as a `WriteFailed`.
+        let big = Batch { transactions: vec![vec![0u8; 4096]], ..Default::default() };
+        match db.with_write_txn(|txn| {
+            for i in 0..4_000u64 {
+                txn.insert::<Batches>(&digest_for(10_000 + i), &big)?;
+            }
+            Ok(())
+        }) {
+            Ok(()) => {}
+            Err(e) => assert!(
+                e.to_string().contains("poisoned"),
+                "a mid-batch queueing failure must be the poison, got: {e}"
+            ),
+        }
+
+        let archiver = cold_archiver_for(&db).expect("mdbx stack has a cold tier");
+        let shutdown = Notifier::new();
+        let (fatal_tx, fatal_rx) = watch::channel(None);
+        let drained = seal_due_epochs(&archiver, 3, &shutdown, &fatal_tx).await;
+        assert!(!drained, "a failed pass must not report its epoch drained");
+        assert!(
+            fatal_rx.borrow().is_some(),
+            "a hot-tier durability failure must signal the graceful node shutdown, not panic"
+        );
+    }
+
     /// A failed archive chunk must surface as an error (the CLI's exit code), never be swallowed
     /// into a success: a gapped epoch fails the seal's contiguity check mid-drain.
     #[tokio::test]
@@ -531,7 +622,7 @@ mod tests {
             Ok(())
         })
         .expect("seed");
-        db.sync_persist();
+        db.sync_persist().expect("persist");
 
         let archival = ColdArchival::new(&db);
         let result = archival.migrate_backlog(2).await;

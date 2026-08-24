@@ -43,7 +43,7 @@ fn seal_layout(layout: &[(u64, BlockHash)], chunk_bytes: usize) -> (TempDir, Tes
     crate::cold::producer::seal_next_epoch(&hot, db.cold().expect("cold attached"), 1, chunk_bytes)
         .expect("seal epoch")
         .expect("one epoch below the cutoff");
-    hot.sync_persist();
+    hot.sync_persist().expect("persist");
     (tmp, db)
 }
 
@@ -126,12 +126,12 @@ fn chunked_seal_retry_after_late_chunk_failure_reseals_cleanly() {
     // Heal the cause and retry: begin_epoch must recover the partially-appended jars.
     hot.with_write_txn(|txn| txn.insert::<Batches>(&DIGEST_C, &batch_for(2, 0)))
         .expect("insert missing batch");
-    hot.sync_persist();
+    hot.sync_persist().expect("persist");
     let stats =
         crate::cold::producer::seal_next_epoch(&hot, db.cold().expect("cold attached"), 1, 0)
             .expect("retried seal")
             .expect("epoch sealed on retry");
-    hot.sync_persist();
+    hot.sync_persist().expect("persist");
     assert_eq!((stats.blocks_archived, stats.batches_archived, stats.epochs_sealed), (3, 3, 1));
 
     // The resealed epoch serves every row and the hot rows are pruned.
@@ -188,7 +188,7 @@ fn cancelled_seal_leaves_jars_uncommitted_and_reseals_whole() {
         crate::cold::producer::seal_next_epoch(&hot, db.cold().expect("cold attached"), 1, 0)
             .expect("retried seal")
             .expect("epoch sealed on retry");
-    hot.sync_persist();
+    hot.sync_persist().expect("persist");
     assert_eq!((stats.blocks_archived, stats.batches_archived, stats.epochs_sealed), (3, 3, 1));
 
     // ...and its jars are byte-identical to a never-cancelled seal of the same layout.
@@ -216,7 +216,7 @@ fn seal_due_fully_archives_and_matches_fused() {
         background.seal_due(Epoch::MAX, || false).expect("archive pass"),
         SealOutcome::Sealed(_)
     ) {}
-    hot_bg.sync_persist();
+    hot_bg.sync_persist().expect("persist");
 
     let tmp_fused = TempDir::new().unwrap();
     let (db_fused, hot_fused) = open_test_db(&tmp_fused);
@@ -225,7 +225,7 @@ fn seal_due_fully_archives_and_matches_fused() {
         ColdArchiver::new(hot_fused.clone(), db_fused.cold().expect("cold attached").clone());
     let stats = fused.archive_due(Epoch::MAX, None).expect("fused archive");
     assert_eq!(stats.epochs_sealed, 3);
-    hot_fused.sync_persist();
+    hot_fused.sync_persist().expect("persist");
 
     assert_eq!(
         dir_files(&tmp_bg.path().join("cold")),
@@ -281,7 +281,7 @@ fn short_jar_is_never_reopened_by_a_later_pass() {
         Ok(())
     })
     .expect("seed hot");
-    hot.sync_persist();
+    hot.sync_persist().expect("persist");
 
     // Seal a jar covering only the first SHORT blocks of epoch 0.
     db.cold().expect("cold attached").consensus_blocks().begin_epoch(0, 0).expect("begin blocks");
@@ -314,7 +314,7 @@ fn short_jar_is_never_reopened_by_a_later_pass() {
         Ok(())
     })
     .expect("finalize the short jar");
-    hot.sync_persist();
+    hot.sync_persist().expect("persist");
     assert!(
         db.get::<ConsensusBlocks>(&0).expect("read").is_some(),
         "cold must serve before the pass"
@@ -367,7 +367,7 @@ fn archive_rejects_non_contiguous_consensus_blocks() {
         Ok(())
     })
     .expect("seed hot");
-    hot.sync_persist();
+    hot.sync_persist().expect("persist");
 
     // Archiving epoch 0 (cutoff 1) must reject the gap rather than seal a misaligned jar.
     let result = archive_below_epoch(&hot, db.cold().expect("cold attached"), 1, None);

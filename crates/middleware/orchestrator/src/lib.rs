@@ -50,7 +50,12 @@ where
         .build()?;
 
     let res = runtime.block_on(async move {
-        let consensus_db = open_consensus_db(&rayls_datadir, &builder.consensus_db_config)?;
+        let (fatal_db_error, _fatal_db_error_rx) = tokio::sync::watch::channel(None);
+        let consensus_db = open_consensus_db(
+            &rayls_datadir,
+            &builder.consensus_db_config,
+            Some(fatal_db_error.clone()),
+        )?;
         // One aggregate owns cold archival end to end; inert on backends without a cold tier.
         #[cfg(feature = "cold-storage")]
         let cold_archival = epoch_manager::ColdArchival::new(&consensus_db);
@@ -59,6 +64,7 @@ where
             rayls_datadir,
             passphrase,
             consensus_db,
+            fatal_db_error,
             #[cfg(feature = "cold-storage")]
             cold_archival,
         )?;
@@ -113,7 +119,9 @@ where
         .build()?;
 
     let migrated = runtime.block_on(async {
-        let consensus_db = open_consensus_db(&rayls_datadir, &builder.consensus_db_config)?;
+        // No node is running, so there is no fatal-error channel to signal: a failed pass is the
+        // error returned here (fail-closed, nonzero exit).
+        let consensus_db = open_consensus_db(&rayls_datadir, &builder.consensus_db_config, None)?;
         let archival = epoch_manager::ColdArchival::new(&consensus_db);
         if !archival.is_active() {
             info!(target: "epoch-manager", "database stack has no cold tier; nothing to migrate");

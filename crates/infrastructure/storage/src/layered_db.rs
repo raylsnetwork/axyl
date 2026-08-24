@@ -9,7 +9,7 @@ use std::{
     sync::{
         atomic::{AtomicUsize, Ordering as AtomicOrdering},
         mpsc::{self, Receiver, Sender},
-        Arc,
+        Arc, OnceLock,
     },
     thread::JoinHandle,
     time::{Duration, Instant},
@@ -582,6 +582,9 @@ impl<'a, DB: Database> DbTx for LayeredDbTxMut<'a, DB> {
 
 impl<'a, DB: Database> DbTxMut for LayeredDbTxMut<'a, DB> {
     fn insert<T: Table>(&mut self, key: &T::Key, value: &T::Value) -> eyre::Result<()> {
+        if let Some(e) = poisoned_error(self.tx.fatal()) {
+            return Err(e);
+        }
         // The txn producer already holds the mem write guard for its whole lifetime, so the
         // mutation, the in-flight increment and the enqueue are one critical section by
         // construction.
@@ -592,6 +595,9 @@ impl<'a, DB: Database> DbTxMut for LayeredDbTxMut<'a, DB> {
     }
 
     fn remove<T: Table>(&mut self, key: &T::Key) -> eyre::Result<()> {
+        if let Some(e) = poisoned_error(self.tx.fatal()) {
+            return Err(e);
+        }
         self.mem_db.remove::<T>(key)?;
         let rm = Box::new(KeyRemove::<T> { key: key.clone() });
         self.tx.send(DBMessage::Remove(rm)).map_err(|_| eyre::eyre!("DB thread gone, FATAL!"))?;
@@ -599,6 +605,9 @@ impl<'a, DB: Database> DbTxMut for LayeredDbTxMut<'a, DB> {
     }
 
     fn evict_persistent_batch<T: Table>(&mut self, keys: &[T::Key]) -> eyre::Result<()> {
+        if let Some(e) = poisoned_error(self.tx.fatal()) {
+            return Err(e);
+        }
         if keys.is_empty() {
             return Ok(());
         }
@@ -613,6 +622,9 @@ impl<'a, DB: Database> DbTxMut for LayeredDbTxMut<'a, DB> {
     }
 
     fn clear_table<T: Table>(&mut self) -> eyre::Result<()> {
+        if let Some(e) = poisoned_error(self.tx.fatal()) {
+            return Err(e);
+        }
         let keys = self.mem_db.raw_keys::<T>();
         self.mem_db.clear_table::<T>()?;
         let clr = Box::new(ClearTable::<T> { _marker: PhantomData, keys });
@@ -621,6 +633,9 @@ impl<'a, DB: Database> DbTxMut for LayeredDbTxMut<'a, DB> {
     }
 
     fn commit(self) -> eyre::Result<()> {
+        if let Some(e) = poisoned_error(self.tx.fatal()) {
+            return Err(e);
+        }
         self.mem_db.commit()?;
         self.tx.send(DBMessage::CommitTxn).map_err(|_| eyre::eyre!("DB thread gone, FATAL!"))?;
         Ok(())
@@ -670,21 +685,25 @@ const PERSIST_SLOW_WARN: Duration = Duration::from_secs(1);
 
 /// A [`DBMessage`] sender that tracks the writer queue's depth: every enqueue bumps a shared
 /// counter `db_run` decrements as it drains, feeding the depth gauge and the
-/// [`QUEUE_HIGH_WATER_MARK`] pacing.
+/// [`QUEUE_HIGH_WATER_MARK`] pacing. It also carries the poison latch: once the writer observes
+/// a fatal failure, every producer write path fails fast and nothing further is applied.
 struct QueueSender<DB: Database> {
     tx: Sender<DBMessage<DB>>,
     depth: Arc<AtomicUsize>,
+    /// The first fatal writer failure, if any. Once set the DB is poisoned: the writer applies
+    /// nothing further and every write attempt fails fast with this error.
+    fatal: Arc<OnceLock<String>>,
 }
 
 impl<DB: Database> Clone for QueueSender<DB> {
     fn clone(&self) -> Self {
-        Self { tx: self.tx.clone(), depth: Arc::clone(&self.depth) }
+        Self { tx: self.tx.clone(), depth: Arc::clone(&self.depth), fatal: Arc::clone(&self.fatal) }
     }
 }
 
 impl<DB: Database> Debug for QueueSender<DB> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "QueueSender(depth: {})", self.depth())
+        write!(f, "QueueSender(depth: {}, poisoned: {})", self.depth(), self.fatal.get().is_some())
     }
 }
 
@@ -707,6 +726,18 @@ impl<DB: Database> QueueSender<DB> {
     fn depth(&self) -> usize {
         self.depth.load(AtomicOrdering::Relaxed)
     }
+
+    /// The first fatal writer failure, if any: once set, no further writes are applied and every
+    /// producer write path fails fast.
+    fn fatal(&self) -> Option<&String> {
+        self.fatal.get()
+    }
+}
+
+/// Builds the fail-fast error every write path returns once the DB is poisoned, carrying the
+/// original writer failure.
+fn poisoned_error(fatal: Option<&String>) -> Option<eyre::Error> {
+    fatal.map(|e| eyre::eyre!("consensus DB poisoned: no further writes will be attempted: {e}"))
 }
 
 /// Registers a metric on the process scrape registry, falling back to a private unscraped one on
@@ -763,12 +794,24 @@ fn evict_and_log(mem_db: &MemDatabase, heap: &mut EvictionHeap, max_size: usize,
     }
 }
 
+/// The background writer loop.
+///
+/// A write/commit failure POISONS the DB: the failure is latched (first failure wins), the
+/// optional node fatal-error channel is signaled, and from then on this loop never touches the
+/// database again — it discards every `StartTxn`/`CommitTxn`/`Insert`/`Remove`/`Clear` message,
+/// rejects each `CaughtUp` barrier with the stored error, and waits for `Shutdown`. Producers
+/// independently fail fast on the same latch, so the node winds down instead of continuing to
+/// write into a failing tier. The failed rows stay pinned in mem (their in-flight counts never
+/// settle) and die with the process; the cache rebuilds from the durable tier on the next start.
+/// Only `compact` failures stay advisory.
 fn db_run<DB: Database>(
     db: DB,
     mem_db: MemDatabase,
     rx: Receiver<DBMessage<DB>>,
     depth: Arc<AtomicUsize>,
     max_size: usize,
+    fatal: Arc<OnceLock<String>>,
+    fatal_signal: Arc<OnceLock<tokio::sync::watch::Sender<Option<String>>>>,
 ) {
     let mut txn = None;
     let mut last_compact = Instant::now();
@@ -778,8 +821,14 @@ fn db_run<DB: Database>(
 
     let mut eviction_heap: EvictionHeap = BinaryHeap::new();
     let mut committed_ops: Vec<DeferredOp<DB>> = Vec::with_capacity(1000);
-    // last write/commit failure since the previous CaughtUp, reported by the next persist
-    let mut pending_write_error: Option<String> = None;
+    // Latch the first fatal failure, then signal the node's fatal-error channel (when wired) so
+    // the wind-down starts immediately; both `send` results are advisory and ignored.
+    let trip = |msg: String| {
+        let _ = fatal.set(msg.clone());
+        if let Some(signal) = fatal_signal.get() {
+            let _ = signal.send(Some(msg));
+        }
+    };
     if let Err(e) = db.compact() {
         tracing::error!(target: "layered_db_runner", "DB ERROR compacting DB on startup (background): {e}");
     }
@@ -793,6 +842,23 @@ fn db_run<DB: Database>(
             last_lag_warn = Some(Instant::now());
             tracing::warn!(target: "storage", depth = queued, "layered DB writer queue backlog");
         }
+        // Poisoned: the DB is no longer writable. Apply nothing further (no DB access at all,
+        // including eviction and compact), reject the barriers with the stored error, and wait
+        // for shutdown so the producer-side fail-fast and the node wind-down run to completion.
+        if let Some(err) = fatal.get() {
+            match msg {
+                DBMessage::CaughtUp(tx) => {
+                    let _ = tx.send(Err(err.clone()));
+                }
+                DBMessage::Shutdown => break,
+                DBMessage::StartTxn
+                | DBMessage::CommitTxn
+                | DBMessage::Insert(_)
+                | DBMessage::Remove(_)
+                | DBMessage::Clear(_) => {}
+            }
+            continue;
+        }
         match msg {
             DBMessage::StartTxn => {
                 if let Some((_txn, count)) = &mut txn {
@@ -801,7 +867,8 @@ fn db_run<DB: Database>(
                     match db.write_txn() {
                         Ok(ntxn) => txn = Some((ntxn, 1)),
                         Err(e) => {
-                            tracing::error!(target: "layered_db_runner", "DB ERROR getting write txn (background): {e}")
+                            tracing::error!(target: "layered_db_runner", "DB ERROR getting write txn (background); the DB is poisoned: {e}");
+                            trip(format!("write_txn: {e}"));
                         }
                     }
                 }
@@ -821,13 +888,15 @@ fn db_run<DB: Database>(
                                     txn.as_ref().map(|(_, count)| *count).unwrap_or(0),
                                 );
                             }
-                            // The txn's rows stay in mem with their in-flight counts, so a failed
-                            // commit is retained (not lost, not evictable) and surfaced via
-                            // persist.
+                            // Poison the DB: nothing further is applied, producers fail fast, and
+                            // the next barrier rejects with this error. The txn's rows stay in mem
+                            // with their in-flight counts (retained, not lost, not evictable); the
+                            // counts never settle, the pinned rows die with the process, and the
+                            // cache rebuilds from the durable tier on the next start.
                             Err(e) => {
                                 committed_ops.clear();
-                                tracing::error!(target: "layered_db_runner", "consensus DB commit failed: {e}");
-                                pending_write_error = Some(format!("commit: {e}"));
+                                tracing::error!(target: "layered_db_runner", "consensus DB commit failed; the DB is poisoned: {e}");
+                                trip(format!("commit: {e}"));
                             }
                         }
                     } else {
@@ -839,15 +908,15 @@ fn db_run<DB: Database>(
                 if let Some((txn, _)) = &mut txn {
                     if let Err(e) = ins.insert_txn(txn) {
                         // keep the failed row in mem (not evictable) so it is not lost
-                        tracing::error!(target: "layered_db_runner", "DB TXN Insert: {e}");
-                        pending_write_error = Some(format!("insert: {e}"));
+                        tracing::error!(target: "layered_db_runner", "DB TXN Insert failed; the DB is poisoned: {e}");
+                        trip(format!("insert: {e}"));
                     } else {
                         committed_ops.push(DeferredOp::Insert(ins));
                     }
                 } else if let Err(e) = ins.insert(&db) {
                     // keep the failed row in mem (with its in-flight count, so not evictable)
-                    tracing::error!(target: "layered_db_runner", "DB Insert: {e}");
-                    pending_write_error = Some(format!("insert: {e}"));
+                    tracing::error!(target: "layered_db_runner", "DB Insert failed; the DB is poisoned: {e}");
+                    trip(format!("insert: {e}"));
                 } else {
                     ins.on_applied(&mem_db, &mut eviction_heap);
                     evict_and_log(
@@ -861,14 +930,14 @@ fn db_run<DB: Database>(
             DBMessage::Remove(rm) => {
                 if let Some((txn, _)) = &mut txn {
                     if let Err(e) = rm.remove_txn(txn, &mem_db) {
-                        tracing::error!(target: "layered_db_runner", "DB TXN Remove: {e}");
-                        pending_write_error = Some(format!("remove: {e}"));
+                        tracing::error!(target: "layered_db_runner", "DB TXN Remove failed; the DB is poisoned: {e}");
+                        trip(format!("remove: {e}"));
                     } else {
                         committed_ops.push(DeferredOp::Remove(rm));
                     }
                 } else if let Err(e) = rm.remove(&db, &mem_db) {
-                    tracing::error!(target: "layered_db_runner", "DB Remove: {e}");
-                    pending_write_error = Some(format!("remove: {e}"));
+                    tracing::error!(target: "layered_db_runner", "DB Remove failed; the DB is poisoned: {e}");
+                    trip(format!("remove: {e}"));
                 } else {
                     rm.on_applied(&mem_db, &mut eviction_heap);
                     evict_and_log(
@@ -882,14 +951,14 @@ fn db_run<DB: Database>(
             DBMessage::Clear(clr) => {
                 if let Some((txn, _)) = &mut txn {
                     if let Err(e) = clr.clear_table_txn(txn, &mem_db) {
-                        tracing::error!("DB TXN Clear table: {e}");
-                        pending_write_error = Some(format!("clear: {e}"));
+                        tracing::error!(target: "layered_db_runner", "DB TXN Clear table failed; the DB is poisoned: {e}");
+                        trip(format!("clear: {e}"));
                     } else {
                         committed_ops.push(DeferredOp::Clear(clr));
                     }
                 } else if let Err(e) = clr.clear_table(&db, &mem_db) {
-                    tracing::error!("DB Clear: {e}");
-                    pending_write_error = Some(format!("clear: {e}"));
+                    tracing::error!(target: "layered_db_runner", "DB Clear table failed; the DB is poisoned: {e}");
+                    trip(format!("clear: {e}"));
                 } else {
                     clr.on_applied(&mem_db, &mut eviction_heap);
                     evict_and_log(
@@ -902,6 +971,8 @@ fn db_run<DB: Database>(
             }
             // NOTE: proves prior messages were applied, not that an open shared txn committed.
             // Safe at shutdown because consensus writers are torn down before persist runs.
+            // A poisoned DB never reaches this arm: its barriers are rejected above with the
+            // stored error, so a successful reply here means every write so far landed.
             DBMessage::CaughtUp(tx) => {
                 evict_and_log(
                     &mem_db,
@@ -909,11 +980,7 @@ fn db_run<DB: Database>(
                     max_size,
                     txn.as_ref().map(|(_, count)| *count).unwrap_or(0),
                 );
-                let reply: Result<(), String> = match pending_write_error.take() {
-                    Some(e) => Err(e),
-                    None => Ok(()),
-                };
-                let _ = tx.send(reply);
+                let _ = tx.send(Ok(()));
             }
             DBMessage::Shutdown => break,
         }
@@ -939,12 +1006,20 @@ fn db_run<DB: Database>(
 }
 
 /// In-memory cache layer over a persistent database with background writes.
+///
+/// A fatal writer failure poisons the DB: the writer applies nothing further, every write
+/// attempt fails fast with the stored error, and (when [`Self::with_fatal_signal`] is set) the
+/// node's fatal-error channel is signaled so the process winds down instead of continuing to
+/// write into a failing tier. Reads keep serving from the mem cache and the durable tier.
 #[derive(Clone, Debug)]
 pub struct LayeredDatabase<DB: Database> {
     mem_db: MemDatabase,
     db: DB,
     tx: QueueSender<DB>,
     thread: Option<Arc<JoinHandle<()>>>,
+    /// Slot for the node's fatal-error channel, shared with the writer thread: `with_fatal_signal`
+    /// sets it, `db_run` signals it on the first fatal failure.
+    fatal_signal: Arc<OnceLock<tokio::sync::watch::Sender<Option<String>>>>,
     /// The cold tier point reads fall through to on a hot miss, when attached.
     #[cfg(feature = "cold-storage")]
     cold: Option<Arc<ColdStore>>,
@@ -977,7 +1052,8 @@ impl<DB: Database> LayeredDatabase<DB> {
     }
 
     /// Opens the layered DB with a custom eviction policy: small caches in tests, the default in
-    /// production.
+    /// production. The DB starts unpoisoned; a fatal writer failure latches the poison
+    /// (see [`Self::with_fatal_signal`] and [`db_run`]).
     pub fn open_with_config(db: DB, config: CacheConfig) -> Self {
         // This channel must always remain unbounded. This is necessary for the atomicity
         // guarantee (mem mutation + enqueue in one critical section). It is safe today because
@@ -987,21 +1063,43 @@ impl<DB: Database> LayeredDatabase<DB> {
         // process the ops — a classic deadlock.
         let (tx, rx) = mpsc::channel();
         let depth = Arc::new(AtomicUsize::new(0));
+        let fatal = Arc::new(OnceLock::new());
+        let fatal_signal = Arc::new(OnceLock::new());
         let db_cloned = db.clone();
         let mem_db = MemDatabase::new();
         let mem_db_clone = mem_db.clone();
         let queue_depth = Arc::clone(&depth);
+        let fatal_for_thread = Arc::clone(&fatal);
+        let signal_for_thread = Arc::clone(&fatal_signal);
         let thread = Some(Arc::new(std::thread::spawn(move || {
-            db_run(db_cloned, mem_db_clone, rx, queue_depth, config.max_size)
+            db_run(
+                db_cloned,
+                mem_db_clone,
+                rx,
+                queue_depth,
+                config.max_size,
+                fatal_for_thread,
+                signal_for_thread,
+            )
         })));
         Self {
             mem_db,
             db,
-            tx: QueueSender { tx, depth },
+            tx: QueueSender { tx, depth, fatal },
             thread,
+            fatal_signal,
             #[cfg(feature = "cold-storage")]
             cold: None,
         }
+    }
+
+    /// Wires the node's fatal-error channel: when the background writer observes a fatal write
+    /// failure it signals this channel with the stored error, requesting the node wind-down
+    /// (see [`db_run`]). Call before starting writes; the first failure signals it once, and
+    /// every barrier and write attempt then rejects with the stored error.
+    pub fn with_fatal_signal(self, signal: tokio::sync::watch::Sender<Option<String>>) -> Self {
+        let _ = self.fatal_signal.set(signal);
+        self
     }
 
     /// Attaches the cold tier point reads fall through to on a hot miss.
@@ -1188,6 +1286,9 @@ impl<DB: Database> Database for LayeredDatabase<DB> {
 
     /// Write transactions overlap and commit when the last one completes.
     fn write_txn(&self) -> eyre::Result<Self::TXMut<'_>> {
+        if let Some(e) = poisoned_error(self.tx.fatal()) {
+            return Err(e);
+        }
         self.tx.send(DBMessage::StartTxn).map_err(|_| eyre::eyre!("DB thread gone, FATAL!"))?;
         Ok(LayeredDbTxMut {
             mem_db: self.mem_db.write_txn()?,
@@ -1236,6 +1337,11 @@ impl<DB: Database> Database for LayeredDatabase<DB> {
     }
 
     fn insert<T: Table>(&self, key: &T::Key, value: &T::Value) -> eyre::Result<()> {
+        // Checked before the mem mutation: `insert_queued` has no rollback, so a poisoned DB
+        // must not touch the cache at all.
+        if let Some(e) = poisoned_error(self.tx.fatal()) {
+            return Err(e);
+        }
         // The mem mutation, the in-flight increment and the enqueue share one critical section:
         // channel order equals mem order, so a zero in-flight count is a sound "no queued ops".
         self.mem_db.insert_queued::<T>(key, value, || {
@@ -1245,6 +1351,9 @@ impl<DB: Database> Database for LayeredDatabase<DB> {
     }
 
     fn remove<T: Table>(&self, key: &T::Key) -> eyre::Result<()> {
+        if let Some(e) = poisoned_error(self.tx.fatal()) {
+            return Err(e);
+        }
         self.mem_db.remove_queued::<T>(key, || {
             let rm = Box::new(KeyRemove::<T> { key: key.clone() });
             self.tx.send(DBMessage::Remove(rm)).map_err(|_| eyre::eyre!("DB thread gone, FATAL!"))
@@ -1252,6 +1361,9 @@ impl<DB: Database> Database for LayeredDatabase<DB> {
     }
 
     fn clear_table<T: Table>(&self) -> eyre::Result<()> {
+        if let Some(e) = poisoned_error(self.tx.fatal()) {
+            return Err(e);
+        }
         // The clear tombstones every row and bumps each in-flight count under the same lock that
         // captures the key set for the writer, so no tombstone is evicted before the clear lands.
         self.mem_db.clear_table_queued::<T>(|keys| {
@@ -1348,11 +1460,17 @@ impl<DB: Database> Database for LayeredDatabase<DB> {
     }
 
     fn persist(&self) -> impl Future<Output = eyre::Result<()>> + Send {
+        // A poisoned DB fails immediately with the stored error (the writer would reject the
+        // barrier with the same error anyway).
+        let poisoned = poisoned_error(self.tx.fatal());
         let (tx, rx) = oneshot::channel();
         let depth_at_send = self.tx.depth();
         let started = Instant::now();
         let send_result = self.tx.send(DBMessage::CaughtUp(tx));
         async move {
+            if let Some(e) = poisoned {
+                return Err(e);
+            }
             match send_result {
                 Ok(()) => match rx.await {
                     Ok(Ok(())) => {
@@ -1378,7 +1496,17 @@ impl<DB: Database> Database for LayeredDatabase<DB> {
 
     /// Blocks the calling thread until the writer has applied all queued messages; never call it
     /// on an async runtime worker.
-    fn sync_persist(&self) {
+    ///
+    /// Returns any write/commit failure the writer observed since the previous barrier, so a
+    /// caller cannot mistake a failed flush for durability. Callers must treat the error as
+    /// fatal (fault the node): a failed flush poisons the DB — the writer applies nothing
+    /// further, every write method returns the stored error immediately, and the failed rows
+    /// stay pinned in the mem cache (in-flight counts never settle) until a restart rebuilds
+    /// it, so an ignored error leaks them unboundedly.
+    fn sync_persist(&self) -> eyre::Result<()> {
+        if let Some(e) = poisoned_error(self.tx.fatal()) {
+            return Err(e);
+        }
         let (tx, mut rx) = oneshot::channel();
         let depth_at_send = self.tx.depth();
         let started = Instant::now();
@@ -1391,18 +1519,21 @@ impl<DB: Database> Database for LayeredDatabase<DB> {
             loop {
                 match rx.try_recv() {
                     Err(TryRecvError::Empty) => std::thread::sleep(Duration::from_millis(100)),
-                    Err(TryRecvError::Closed) => break,
+                    Err(TryRecvError::Closed) => {
+                        return Err(eyre::eyre!("consensus DB sync_persist: reply dropped"));
+                    }
                     Ok(Ok(())) => {
                         log_persist_latency(started.elapsed(), depth_at_send);
-                        break;
+                        return Ok(());
                     }
                     Ok(Err(e)) => {
                         tracing::error!(target: "storage", "consensus DB sync_persist: write failed: {e}");
-                        break;
+                        return Err(eyre::eyre!("consensus DB sync_persist: {e}"));
                     }
                 }
             }
         }
+        r.map(|_| ())
     }
 }
 
@@ -1569,8 +1700,8 @@ impl<DB: Database> Debug for DBMessage<DB> {
 #[cfg(test)]
 mod test {
     use super::{
-        CacheConfig, DBMessage, EvictionHeap, InsertTrait, LayeredDatabase, QUEUE_HIGH_WATER_MARK,
-        QUEUE_PACE_SLEEP,
+        CacheConfig, DBMessage, EvictionHeap, InsertTrait, KeyValueInsert, LayeredDatabase,
+        QUEUE_HIGH_WATER_MARK, QUEUE_PACE_SLEEP,
     };
     #[cfg(feature = "redb")]
     use crate::redb::ReDB;
@@ -1741,7 +1872,7 @@ mod test {
         db.insert::<TestTable>(&1, &"one".to_string()).expect("insert");
         db.insert::<TestTable>(&2, &"two".to_string()).expect("insert");
         db.insert::<TestTable>(&3, &"three".to_string()).expect("insert");
-        db.sync_persist();
+        db.sync_persist().expect("persist");
         // Key 1 settled first and was evicted: it is now live only in the persistent tier.
         assert_eq!(db.mem_db.mem_size(), 2, "key 1 must be evicted");
         assert!(!db.mem_db.contains_key::<TestTable>(&1).unwrap());
@@ -1768,12 +1899,12 @@ mod test {
         assert_eq!(db.get::<TestTable>(&4).unwrap(), Some("four".to_string()));
 
         inner.release_clear();
-        db.sync_persist();
+        db.sync_persist().expect("persist");
         assert_eq!(db.get::<TestTable>(&1).unwrap(), None, "clear must land");
         assert!(!db.mem_db.is_clearing::<TestTable>(), "pending-clear flag must settle");
 
         db.insert::<TestTable>(&5, &"five".to_string()).expect("insert");
-        db.sync_persist();
+        db.sync_persist().expect("persist");
         assert_eq!(db.get::<TestTable>(&5).unwrap(), Some("five".to_string()));
     }
 
@@ -1792,11 +1923,11 @@ mod test {
             Ok(())
         })
         .expect("seed");
-        db.sync_persist();
+        db.sync_persist().expect("persist");
 
         // An empty batch is a no-op: nothing is removed.
         db.with_write_txn(|txn| txn.evict_persistent_batch::<TestTable>(&[])).expect("empty batch");
-        db.sync_persist();
+        db.sync_persist().expect("persist");
         for i in 0..10u64 {
             assert!(db.contains_key::<TestTable>(&i).unwrap(), "empty batch removed key {i}");
         }
@@ -1804,7 +1935,7 @@ mod test {
         let evicted = [1u64, 3, 5, 7];
         db.with_write_txn(|txn| txn.evict_persistent_batch::<TestTable>(&evicted))
             .expect("batch evict");
-        db.sync_persist();
+        db.sync_persist().expect("persist");
 
         for i in 0..10u64 {
             let present = db.contains_key::<TestTable>(&i).unwrap();
@@ -1840,6 +1971,148 @@ mod test {
         assert!(
             db.persist().await.is_err(),
             "persist must surface the write failure instead of reporting success"
+        );
+    }
+
+    /// The blocking sibling of `test_failed_write_is_surfaced_by_persist`: `sync_persist` must
+    /// also surface a failed commit, so blocking callers (cold archival) cannot mistake a failed
+    /// flush for durability and proceed to prune rows the index never durably landed.
+    #[test]
+    fn test_failed_commit_is_surfaced_by_sync_persist() {
+        let temp_dir = tempdir().expect("failed to create temp dir");
+        let cfg = MdbxConfig::default().with_max_db_size(1024 * 1024).with_growth_step(256 * 1024);
+        let mdbx = MdbxDatabase::open_with_config(temp_dir.path(), cfg).expect("open mdbx");
+        mdbx.open_table::<TestTable>().expect("open mdbx table");
+        let db = LayeredDatabase::open(mdbx);
+        db.open_table::<TestTable>().expect("open layered table");
+
+        // Queue far more data than the map can hold so the background writer hits MAP_FULL.
+        let big = "x".repeat(4096);
+        let _ = db.with_write_txn(|txn| {
+            for i in 0..4_000u64 {
+                txn.insert::<TestTable>(&i, &big)?;
+            }
+            Ok(())
+        });
+
+        assert!(
+            db.sync_persist().is_err(),
+            "sync_persist must surface the failed commit instead of reporting success"
+        );
+    }
+
+    /// A layered MDBX whose map is sized so the background writer hits MAP_FULL, as on a full
+    /// disk: the first failing write poisons the DB.
+    fn open_poisonable_mdbx(path: &Path) -> LayeredDatabase<MdbxDatabase> {
+        let cfg = MdbxConfig::default().with_max_db_size(1024 * 1024).with_growth_step(256 * 1024);
+        let mdbx = MdbxDatabase::open_with_config(path, cfg).expect("open mdbx");
+        mdbx.open_table::<TestTable>().expect("open mdbx table");
+        let db = LayeredDatabase::open(mdbx);
+        db.open_table::<TestTable>().expect("open layered table");
+        db
+    }
+
+    /// Queue far more data than the map can hold so the background writer's next commit fails and
+    /// poisons the DB. The failure is only observable at the next durability barrier.
+    fn queue_poisoning_writes(db: &LayeredDatabase<MdbxDatabase>) {
+        let big = "x".repeat(4096);
+        let _ = db.with_write_txn(|txn| {
+            for i in 0..4_000u64 {
+                txn.insert::<TestTable>(&i, &big)?;
+            }
+            Ok(())
+        });
+    }
+
+    fn assert_poisoned(err: &eyre::Error, what: &str) {
+        assert!(
+            err.to_string().contains("poisoned"),
+            "{what} on a poisoned DB must fail fast with the poison reason: {err}"
+        );
+    }
+
+    /// Once a write failure has been observed, every write path fails fast with the stored error
+    /// and the DB stays poisoned for its lifetime: nothing is retried, queued, or applied.
+    #[tokio::test]
+    async fn test_poisoned_db_fails_further_writes_fast() {
+        let temp_dir = tempdir().expect("failed to create temp dir");
+        let db = open_poisonable_mdbx(temp_dir.path());
+        queue_poisoning_writes(&db);
+        assert!(db.persist().await.is_err(), "persist must surface the write failure");
+
+        let big = "x".repeat(4096);
+        let err = db.insert::<TestTable>(&7, &big).expect_err("insert must fail fast");
+        assert_poisoned(&err, "insert");
+        let err = db.remove::<TestTable>(&7).expect_err("remove must fail fast");
+        assert_poisoned(&err, "remove");
+        let err = db.clear_table::<TestTable>().expect_err("clear_table must fail fast");
+        assert_poisoned(&err, "clear_table");
+        let err = db.write_txn().map(|_| ()).expect_err("write_txn must fail fast");
+        assert_poisoned(&err, "write_txn");
+        let err = db.persist().await.expect_err("persist must fail fast");
+        assert_poisoned(&err, "persist");
+        let err = db.sync_persist().expect_err("sync_persist must fail fast");
+        assert_poisoned(&err, "sync_persist");
+    }
+
+    /// After the poison latches, the writer applies nothing further — not even a message a
+    /// producer enqueued before it could fail fast — and reads keep serving from the cache and
+    /// the durable tier.
+    #[test]
+    fn test_poisoned_writer_applies_nothing_further() {
+        let temp_dir = tempdir().expect("failed to create temp dir");
+        let db = open_poisonable_mdbx(temp_dir.path());
+
+        // A row that lands before the failure, so reads have something to serve afterwards.
+        // Key 9000 sits outside the poisoning batch's range (0..4000), so the batch cannot
+        // clobber it in the mem cache.
+        db.insert::<TestTable>(&9000, &"pre-failure".to_string()).expect("pre-failure insert");
+        db.sync_persist().expect("pre-failure persist");
+
+        queue_poisoning_writes(&db);
+        assert!(db.sync_persist().is_err(), "sync_persist must surface the write failure");
+
+        // A message enqueued directly, as if by a producer that slipped past the fail-fast check:
+        // the poisoned writer must discard it, not apply it.
+        let ins = Box::new(KeyValueInsert::<TestTable> { key: 99, value: "late".to_string() });
+        db.tx.send(DBMessage::Insert(ins)).expect("the poisoned writer still drains messages");
+
+        // The depth gauge is decremented per message the writer takes off the queue (applied or
+        // discarded), so zero means the writer has drained past the late insert.
+        let deadline = Instant::now() + std::time::Duration::from_secs(5);
+        while db.tx.depth() > 0 {
+            assert!(
+                Instant::now() < deadline,
+                "the writer did not drain the queue after the poison"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+
+        assert!(
+            db.db.get::<TestTable>(&99).expect("durable read").is_none(),
+            "a message enqueued after the poison must not be applied to the durable tier"
+        );
+        assert_eq!(
+            db.get::<TestTable>(&9000).expect("cache read").as_deref(),
+            Some("pre-failure"),
+            "reads must keep serving after the poison"
+        );
+    }
+
+    /// `with_fatal_signal` wires the node's wind-down channel: the first fatal writer failure
+    /// signals it with the stored error, so the process stops instead of writing further.
+    #[tokio::test]
+    async fn test_fatal_signal_fires_on_writer_failure() {
+        let temp_dir = tempdir().expect("failed to create temp dir");
+        let (signal, rx) = tokio::sync::watch::channel(None);
+        let db = open_poisonable_mdbx(temp_dir.path()).with_fatal_signal(signal);
+
+        queue_poisoning_writes(&db);
+        assert!(db.persist().await.is_err(), "persist must surface the write failure");
+
+        assert!(
+            rx.borrow().is_some(),
+            "the node fatal-error channel must be signaled on the first fatal failure"
         );
     }
 
@@ -1934,7 +2207,7 @@ mod test {
         for i in 0..10u64 {
             db.insert::<TestTable>(&i, &format!("v{i}")).expect("insert");
         }
-        db.sync_persist();
+        db.sync_persist().expect("persist");
 
         assert_eq!(db.mem_db.mem_size(), 3, "cache must be trimmed to max_size");
         // The newest rows survive hot; older ones fall through to the persistent tier.
@@ -1995,7 +2268,7 @@ mod test {
             "K1's tombstone must survive while queued"
         );
         drop(release2);
-        db.sync_persist();
+        db.sync_persist().expect("persist");
 
         // The remove applied, so K1's settled tombstone is now evictable; only K2 stays hot.
         assert_eq!(db.mem_db.mem_size(), 1, "settled rows must be trimmed to max_size");
@@ -2020,7 +2293,7 @@ mod test {
         db.remove::<TestTable>(&999).expect("remove never-inserted key");
         db.insert::<TestTable>(&1, &"one".to_string()).expect("insert");
         db.insert::<TestTable>(&2, &"two".to_string()).expect("insert");
-        db.sync_persist();
+        db.sync_persist().expect("persist");
 
         assert_eq!(db.get::<TestTable>(&999).unwrap(), None);
         assert!(!db.mem_db.is_tombstoned::<TestTable>(&999), "stray tombstone must be evicted");
@@ -2041,7 +2314,7 @@ mod test {
         db.insert::<TestTable>(&3, &"three".to_string()).expect("insert");
         db.clear_table::<TestTable>().expect("clear");
         db.insert::<TestTable>(&4, &"four".to_string()).expect("insert");
-        db.sync_persist();
+        db.sync_persist().expect("persist");
 
         assert_eq!(db.get::<TestTable>(&1).unwrap(), None);
         assert_eq!(db.get::<TestTable>(&2).unwrap(), None);
@@ -2062,7 +2335,7 @@ mod test {
         for i in 1..=3u64 {
             db.insert::<TestTable>(&i, &format!("v{i}")).expect("insert");
         }
-        db.sync_persist();
+        db.sync_persist().expect("persist");
         // 1 settled first and was evicted; 2 and 3 are hot.
         assert!(db.mem_db.contains_key::<TestTable>(&2).unwrap());
         assert!(db.mem_db.contains_key::<TestTable>(&3).unwrap());
@@ -2073,7 +2346,7 @@ mod test {
 
         // Overflow the cache: without the read bump, key 2 (settled first) would be evicted.
         db.insert::<TestTable>(&4, &"v4".to_string()).expect("insert");
-        db.sync_persist();
+        db.sync_persist().expect("persist");
 
         assert_eq!(db.mem_db.mem_size(), 2);
         assert!(db.mem_db.contains_key::<TestTable>(&2).unwrap(), "read key must stay hot");
@@ -2098,7 +2371,7 @@ mod test {
         db.insert::<TestTable>(&1, &"v3".to_string()).expect("reinsert");
         db.insert::<TestTable>(&2, &"v2".to_string()).expect("insert");
         db.insert::<TestTable>(&3, &"v3".to_string()).expect("insert");
-        db.sync_persist();
+        db.sync_persist().expect("persist");
 
         assert_eq!(db.get::<TestTable>(&1).unwrap(), Some("v3".to_string()));
         assert_eq!(db.mem_db.mem_size(), 1, "no in-flight leak: the row is evictable");
@@ -2267,7 +2540,7 @@ mod test {
             txn.insert::<TestTable>(&key, &val).expect("Failed to insert");
         }
         txn.commit().unwrap();
-        db.sync_persist();
+        db.sync_persist().expect("persist");
 
         // Verify all items are accessible via the layered iterator
         let count = db.iter::<TestTable>().count();

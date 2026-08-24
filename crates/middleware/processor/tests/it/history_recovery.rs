@@ -113,7 +113,7 @@ impl ConsensusHistoryFixture {
             })
             .expect("bulk write txn for scattered blocks");
         self.next_block_num = start_block_num + count;
-        self.db.sync_persist();
+        self.db.sync_persist().expect("persist");
         seqs
     }
 

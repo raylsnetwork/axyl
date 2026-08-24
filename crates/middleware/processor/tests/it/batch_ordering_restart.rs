@@ -120,7 +120,7 @@ impl BatchOrderingHarness {
 
         self.execution_node = None;
         if let Some(store) = self.ordering_store.take() {
-            store.sync_persist();
+            store.sync_persist().expect("persist");
             drop(store);
         }
         tokio::task::yield_now().await;

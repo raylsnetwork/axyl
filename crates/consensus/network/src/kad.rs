@@ -569,13 +569,13 @@ mod test {
         let rec = test_record(false);
         let rec2 = test_record(false);
         let rec3 = test_record(false);
-        kad_store.db.sync_persist();
+        kad_store.db.sync_persist().expect("persist");
 
         assert!(kad_store.get(&rec.key).is_none());
         assert_eq!(kad_store.records().count(), 0);
         kad_store.put(rec.clone()).expect("put record");
         kad_store_worker.put(rec.clone()).expect("put record");
-        kad_store.db.sync_persist();
+        kad_store.db.sync_persist().expect("persist");
         test_rec(&rec, &kad_store);
         test_rec(&rec, &kad_store_worker);
         assert_eq!(kad_store.num_records, 1);
@@ -584,14 +584,14 @@ mod test {
         assert_eq!(kad_store_worker.records().count(), 1);
 
         kad_store.remove(&rec.key);
-        kad_store.db.sync_persist();
+        kad_store.db.sync_persist().expect("persist");
         test_rec(&rec, &kad_store_worker);
         assert_eq!(kad_store.records().count(), 0);
         assert_eq!(kad_store.num_records, 0);
         assert_eq!(kad_store_worker.records().count(), 1);
         assert_eq!(kad_store_worker.num_records, 1);
         kad_store_worker.remove(&rec.key);
-        kad_store.db.sync_persist();
+        kad_store.db.sync_persist().expect("persist");
         assert!(kad_store_worker.get(&rec.key).is_none());
         assert!(kad_store.get(&rec.key).is_none());
         assert_eq!(kad_store.records().count(), 0);
@@ -601,7 +601,7 @@ mod test {
         kad_store_worker.put(rec.clone()).expect("put record");
         kad_store.put(rec2.clone()).expect("put record");
         kad_store.put(rec3.clone()).expect("put record");
-        kad_store.db.sync_persist();
+        kad_store.db.sync_persist().expect("persist");
 
         assert_eq!(kad_store.num_records, 3);
         assert_eq!(kad_store_worker.num_records, 1);
@@ -691,13 +691,13 @@ mod test {
         kad_store.remove_provider(&provider_rec1_1.key, &provider_rec1_1.provider);
         assert_eq!(kad_store.num_providers, 3);
         kad_store.remove_provider(&provider_rec1_2.key, &provider_rec1_2.provider);
-        kad_store.db.sync_persist();
+        kad_store.db.sync_persist().expect("persist");
 
         assert_eq!(kad_store.num_providers, 2);
         assert_eq!(kad_store.provided().count(), 0);
         assert_eq!(kad_store.providers(&provider_rec1.key).len(), 0);
         kad_store.remove_provider(&provider_rec2.key, &provider_rec2.provider);
-        kad_store.db.sync_persist();
+        kad_store.db.sync_persist().expect("persist");
 
         assert_eq!(kad_store.num_providers, 1);
         assert_eq!(kad_store.providers(&provider_rec2.key).len(), 0);
@@ -716,11 +716,11 @@ mod test {
 
         // Bogus remove, mismatches key and provider.
         kad_store.remove_provider(&provider_rec3.key, &provider_rec2.provider);
-        kad_store.db.sync_persist();
+        kad_store.db.sync_persist().expect("persist");
 
         assert_eq!(kad_store.num_providers, 1);
         kad_store.remove_provider(&provider_rec3.key, &provider_rec3.provider);
-        kad_store.db.sync_persist();
+        kad_store.db.sync_persist().expect("persist");
 
         assert_eq!(kad_store.num_providers, 0);
         kad_store_worker.remove_provider(&provider_rec3.key, &provider_rec2.provider);

@@ -244,9 +244,20 @@ pub trait Database: Send + Sync + Clone + Unpin + 'static {
     /// Wait for enqueued background writes to commit, returning an error if any failed.
     ///
     /// A successful result means committed, not fsync'd to disk; deferred-sync backends sync later.
+    ///
+    /// In a layered DB, a failure poisons the DB: every write method then fails fast with the
+    /// stored error and the background writer applies nothing further.
     fn persist(&self) -> impl Future<Output = eyre::Result<()>> + Send {
         std::future::ready(Ok(()))
     }
-    /// Sync version of persist- useful for test not for prod code.
-    fn sync_persist(&self) {}
+    /// Blocking variant of `persist`, for callers that cannot await.
+    ///
+    /// Returns any write/commit failure the background writer observed since the previous
+    /// barrier. Callers must treat an error as fatal (fault the node): a failed flush poisons a
+    /// layered DB (every write then fails fast and the writer applies nothing further), and the
+    /// failed rows stay pinned in its mem cache until a restart rebuilds it, so an ignored
+    /// error leaks them unboundedly.
+    fn sync_persist(&self) -> eyre::Result<()> {
+        Ok(())
+    }
 }

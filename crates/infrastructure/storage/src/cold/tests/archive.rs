@@ -34,7 +34,7 @@ fn test_archive_keeps_hot_bounded_and_serves_cold() {
     // through the full stack (cold outermost).
     archive_below_epoch(&hot, db.cold().expect("cold attached"), cutoff, None).expect("archive");
     // Flush the layered write queue so the archive's deletes land in the bare MDBX we probe.
-    hot.sync_persist();
+    hot.sync_persist().expect("persist");
 
     // (a) Boundedness: archived epochs leave the hot tables, the recent epoch stays.
     assert_eq!(
@@ -120,7 +120,7 @@ fn archived_batch_serves_via_read_txn_and_get() {
     let cutoff: Epoch = EPOCHS - 1;
     archive_below_epoch(&hot, db.cold().expect("cold attached"), cutoff, None).expect("archive");
     // Flush the layered write queue so the archive's deletes land in the bare hot tier.
-    hot.sync_persist();
+    hot.sync_persist().expect("persist");
 
     // An archived (below-cutoff) batch: pruned from hot, present only in cold.
     let archived = fixtures.iter().find(|f| f.epoch < cutoff).expect("an archived fixture");
@@ -157,7 +157,7 @@ fn archive_due_floors_cutoff_by_el_anchor() {
     // An anchor inside epoch 1 proves epoch 0 is fully executed: exactly epoch 0 seals while
     // consensus alone (current epoch 3) would allow more.
     let stats = archiver.archive_due(1, None).expect("bitten pass");
-    hot.sync_persist();
+    hot.sync_persist().expect("persist");
     assert_eq!(stats.epochs_sealed, 1, "only the epoch below the floored cutoff seals");
 
     let mdbx = hot.inner();
@@ -180,7 +180,7 @@ fn archive_due_floors_cutoff_by_el_anchor() {
 
     // Advancing the anchor into epoch 2 unlocks exactly the next epoch.
     let stats = archiver.archive_due(2, None).expect("advanced pass");
-    hot.sync_persist();
+    hot.sync_persist().expect("persist");
     assert_eq!(stats.epochs_sealed, 1, "the anchor advance unlocks one more epoch");
     let epoch2 = 2 * BLOCKS_PER_EPOCH..3 * BLOCKS_PER_EPOCH;
     assert_eq!(count_hot_rows::<ConsensusBlocks, _>(mdbx, |n| epoch1.contains(n)), 0);
@@ -214,7 +214,7 @@ fn seal_due_seals_prior_epoch_during_live_epoch() {
     let outcome = archiver.seal_due(1, || false).expect("drained pass");
     assert_eq!(outcome, SealOutcome::Drained, "the live epoch must stay hot");
 
-    hot.sync_persist();
+    hot.sync_persist().expect("persist");
     assert_eq!(
         count_hot_rows::<ConsensusBlocks, _>(hot.inner(), |n| *n < BLOCKS_PER_EPOCH),
         0,
@@ -243,19 +243,19 @@ fn archive_below_epoch_caps_epochs_per_pass() {
     // A cap of one seals exactly one epoch; without the cap this single pass would seal both.
     let first = archive_below_epoch(&hot, db.cold().expect("cold attached"), cutoff, Some(1))
         .expect("first capped pass");
-    hot.sync_persist();
+    hot.sync_persist().expect("persist");
     assert_eq!(first.epochs_sealed, 1, "a cap of one seals exactly one epoch");
 
     // The next pass resumes past the high-water mark and seals the next eligible epoch.
     let second = archive_below_epoch(&hot, db.cold().expect("cold attached"), cutoff, Some(1))
         .expect("second capped pass");
-    hot.sync_persist();
+    hot.sync_persist().expect("persist");
     assert_eq!(second.epochs_sealed, 1, "the resumable high-water mark advances the capped passes");
 
     // The backlog is now drained; a further (uncapped) pass seals nothing.
     let third = archive_below_epoch(&hot, db.cold().expect("cold attached"), cutoff, None)
         .expect("drained pass");
-    hot.sync_persist();
+    hot.sync_persist().expect("persist");
     assert_eq!(third.epochs_sealed, 0, "nothing remains after the backlog drained");
 
     // The capped passes together moved the whole eligible backlog out of hot, served via cold.
@@ -433,7 +433,7 @@ fn validate_real_db_archive() {
         Err(e) => panic!("archive failed (finding, not a test bug): {e}"),
     };
     let elapsed = started.elapsed();
-    hot.sync_persist();
+    hot.sync_persist().expect("persist");
 
     // Post-archive: count hot blocks still below the cutoff (should reach 0) and size each jar dir.
     let hot_blocks_below_after = hot
