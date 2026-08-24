@@ -1545,7 +1545,7 @@ impl<DB: Database> Database for LayeredDatabase<DB> {
                 }
             }
         }
-        r.map(|_| ())
+        r
     }
 }
 
