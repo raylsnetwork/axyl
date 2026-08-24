@@ -189,6 +189,64 @@ port `51000+(N-1)`, seed byte `0xb0+(N-1)`. While a relay is down, a base valida
 its backup; an added node (single relay) stays reachable only via its own outbound links until the
 relay returns.
 
+## Split topology: relays on a separate host (migration example)
+
+Validators on **hostA**, relays on **hostB**. The script always spawns relays on the host it runs
+on and `RELAY_HOST` only sets the *advertised* IP, so a split setup needs `RELAY_SPAWN=0` on hostA
+(skip the local relay spawn, still wire the addresses) plus relays started by hand on hostB. This
+example first brings the network up co-located on hostA, then flips the advertised relay IP to
+hostB and relaunches against the remote relays.
+
+```bash
+# === ON HOSTB (10.10.0.10): run the relays there (matching seeds -> matching peer ids) ===
+# relay-ctl.sh needs the local-validators dir to exist for its pidfiles/logs.
+rm -rf etc/test-network/local-validators
+mkdir -p etc/test-network/local-validators/
+BUILD_CONFIG=debug ./etc/test-network/relay-ctl.sh start 1   # relay-1 @ 10.10.0.10:50000
+BUILD_CONFIG=debug ./etc/test-network/relay-ctl.sh start 2   # relay-2 @ 10.10.0.10:50001
+BUILD_CONFIG=debug ./etc/test-network/relay-ctl.sh start 3   # relay-3 @ 10.10.0.10:50002
+BUILD_CONFIG=debug ./etc/test-network/relay-ctl.sh start 4   # relay-4 @ 10.10.0.10:50003
+# (drop BUILD_CONFIG=debug for a release build)
+
+# === ON HOSTA (172.16.19.19): bring the network up, then migrate it to the hostB relays ===
+
+# 1. initial bring-up, co-located (relays spawned locally on hostA, advertised at hostA's IP)
+RELAY_HOST=172.16.19.19 ./etc/test-network/local-testnet.sh --start \
+    --dev-funds 0x57b9D26eF4a6d4738E17932AC4d0191EfE6dBc88 --relay
+
+# 2. stop the validators (leave them down while you flip addresses)
+killall rayls-network      # validators first; kill hostA's local relays too if any: killall rayls-relay
+
+# 3. flip the advertised relay IP hostA->hostB in EVERY node's committee.yaml + node-info.yaml.
+#    Each node reads its OWN <datadir>/genesis/committee.yaml (re-loaded each epoch), so the shared
+#    staging copy is NOT enough -- edit them all.
+find etc/test-network/local-validators/ -name "committee.yaml" | xargs sed -i 's/172.16.19.19/10.10.0.10/g'
+find etc/test-network/local-validators/ -name "node-info.yaml"  | xargs sed -i 's/172.16.19.19/10.10.0.10/g'
+
+# 4. relaunch WITHOUT spawning local relays (RELAY_SPAWN=0) -- validators now reserve on / dial the
+#    hostB relays. --start reuses the existing datadir (it skips config when local-validators exists),
+#    so keys/genesis/DB are preserved; it just relaunches.
+RELAY_SPAWN=0 RELAY_HOST=10.10.0.10 ./etc/test-network/local-testnet.sh --start \
+    --dev-funds 0x57b9D26eF4a6d4738E17932AC4d0191EfE6dBc88 --relay
+
+# 5. wait for peers to shift to the new addresses (reservations re-established on hostB, mesh reforms).
+
+# --- diagnostics: which relay addresses each validator actually dials (should be 10.10.0.10) ---
+for i in 0 1 2 3; do curl -s localhost:910$i/metrics | grep peer_addr | grep -v '#' | grep primary; done
+```
+
+Gotchas (learned the hard way):
+- **One relay identity per host.** Relays share peer ids across hosts (same seeds); libp2p merges all
+  addresses it learns for a peer id (config + `identify`), so a stray hostA relay makes validators
+  also dial its `172` address -> reservations/circuits land on the wrong copy (`NoReservation`). Use
+  `RELAY_SPAWN=0` and `killall rayls-relay` on hostA -- don't just "ignore" the local relays.
+- **`--start` skips config if `local-validators/` exists** ("directory already exists"). It never
+  regenerates on a re-run; it relaunches the on-disk files. `rm -rf local-validators` for a truly
+  fresh network.
+- **Edit every per-node `committee.yaml`**, not the shared staging copy -- that's the one loaded.
+- `RELAY_B_PEER_IDS[i]` (in `local-testnet.sh`) lets `RELAY_SPAWN=0` point backups at real remote
+  backup relays; left empty, the backup reservation just reuses the primary relay.
+
 ## Ports (node N; base validators use 9100+i etc.)
 
 `INSTANCE = 100+N`; RPC `= 8545-(INSTANCE-1)`, WS `= 18556-(N-1)`, consensus
