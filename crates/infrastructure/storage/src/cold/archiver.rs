@@ -100,6 +100,10 @@ impl<DB: Database> ColdArchiver<DB> {
 
         let seal_elapsed = seal_started.elapsed();
         let finalize_started = std::time::Instant::now();
+        // eyre::Report::new preserves the ColdError type in the chain; seal_due_epochs
+        // uses downcast_ref::<ColdError>() to distinguish WriteFailed (fatal) from
+        // Corruption (retriable). Do not use eyre::eyre!("...: {e}") here — that would
+        // stringify the error and lose the concrete type.
         let finalized = finalize_sealed(&self.hot, &sealed, &should_cancel, PRUNE_YIELD)
             .map_err(|e| eyre::Report::new(e).wrap_err("cold finalize failed"))?;
         // Reporting a cancelled finalize as sealed would let the caller close the epoch out and
