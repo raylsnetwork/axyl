@@ -1461,18 +1461,21 @@ impl<DB: Database> Database for LayeredDatabase<DB> {
 
     fn persist(&self) -> impl Future<Output = eyre::Result<()>> + Send {
         // A poisoned DB fails immediately with the stored error (the writer would reject the
-        // barrier with the same error anyway).
+        // barrier with the same error anyway) — without enqueuing a CaughtUp, so a loop
+        // retrying persist() on a poisoned DB does not spam the writer queue (see
+        // sync_persist() which also short-circuits before send).
+        let tx = self.tx.clone();
         let poisoned = poisoned_error(self.tx.fatal());
-        let (tx, rx) = oneshot::channel();
-        let depth_at_send = self.tx.depth();
-        let started = Instant::now();
-        let send_result = self.tx.send(DBMessage::CaughtUp(tx));
         async move {
             if let Some(e) = poisoned {
                 return Err(e);
             }
+            let (ca_tx, ca_rx) = oneshot::channel();
+            let depth_at_send = tx.depth();
+            let started = Instant::now();
+            let send_result = tx.send(DBMessage::CaughtUp(ca_tx));
             match send_result {
-                Ok(()) => match rx.await {
+                Ok(()) => match ca_rx.await {
                     Ok(Ok(())) => {
                         log_persist_latency(started.elapsed(), depth_at_send);
                         Ok(())
