@@ -195,6 +195,22 @@ start_relay_pair() {
 
     # primary relay (identity must match the baked node-info addresses)
     local port=$((RELAY_BASE_PORT + i))
+
+    # External relays (RELAY_SPAWN=0): the relays run on another host. Don't spawn anything locally
+    # -- just build the reservation/advertise addresses from RELAY_HOST + the known peer ids. This
+    # avoids co-locating a same-peer-id relay here (which libp2p would merge into the peer's address
+    # set via identify and then dial on this host's IP). Backup points at the primary unless
+    # RELAY_B_PEER_IDS[i] is provided.
+    if [[ "$RELAY_SPAWN" == "0" ]]; then
+        RELAY_A_ADDR[$i]="/ip4/${RELAY_HOST}/udp/${port}/quic-v1/p2p/${RELAY_PEER_IDS[$i]}"
+        if [[ -n "${RELAY_B_PEER_IDS[$i]:-}" ]]; then
+            RELAY_B_ADDR[$i]="/ip4/${RELAY_HOST}/udp/$((RELAY_B_BASE_PORT + i))/quic-v1/p2p/${RELAY_B_PEER_IDS[$i]}"
+        else
+            RELAY_B_ADDR[$i]="${RELAY_A_ADDR[$i]}"
+        fi
+        echo "RELAY_SPAWN=0: not spawning relay-$((i+1)) locally; validator reserves/advertises via ${RELAY_A_ADDR[$i]}"
+        return
+    fi
     local pidf="${ROOTDIR}/relay-$((i+1)).pid"
     if relay_alive "$pidf"; then
         echo "relay-$((i+1)) already running on ${RELAY_HOST}:${port} (peer ${RELAY_PEER_IDS[$i]})"
@@ -493,6 +509,20 @@ RELAY_BASE_PORT=50000
 # (relay-N-b) instead of shutting down -- that's the multi-reservation failover test. (Peers won't
 # re-reach it via the backup without /dnsaddr advertisement; the network continues on quorum.)
 RELAY_B_BASE_PORT=51000
+# RELAY_SPAWN=0: do NOT spawn the relay binaries on this host -- the relays run elsewhere (e.g. a
+# dedicated relay host). The script still wires each validator's reservation/advertise addresses
+# from RELAY_HOST + the known peer ids, so committee.yaml/node-info are unchanged; it just skips the
+# local `rayls-relay` processes. Use this for a split topology (validators here, relays on another
+# box): set RELAY_HOST to the relay host's IP and start the relays there yourself with the matching
+# seeds. Default 1 (co-locate relays with validators, the single-host testnet behavior).
+# IMPORTANT: co-located relays share the SAME peer ids as remote ones (same seeds); libp2p merges
+# all addresses under one peer id (via identify), so a stray local relay makes validators also dial
+# its local IP -- set RELAY_SPAWN=0 (not just ignore them) when the relays live on another host.
+RELAY_SPAWN="${RELAY_SPAWN:-1}"
+# RELAY_SPAWN=0 only: peer ids of the BACKUP relays (ports 51000+i), if you run real backups on the
+# relay host and want failover reservations. Left empty, each validator's backup reservation points
+# at its PRIMARY relay instead (one reservation, no failover). Index-aligned with RELAY_PEER_IDS.
+RELAY_B_PEER_IDS=()
 # --relay-dns only: validators advertise /dnsaddr/v<i>.${RELAY_DNS_DOMAIN}, resolved by a local
 # dnsmasq on ${DNSMASQ_BIND}:${DNSMASQ_PRIVATE_PORT} (high port, no systemd-resolved/NetworkManager conflict).
 RELAY_DNS_DOMAIN="rayls.test"
