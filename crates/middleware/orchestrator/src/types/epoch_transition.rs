@@ -1,10 +1,9 @@
 //! Types for the phase-based epoch transition state machine.
 
 use crate::{engine::ExecutionNode, primary::PrimaryNode};
-use rayls_consensus_primary::NodeMode;
 use rayls_infrastructure_types::{
-    gas_accumulator::GasAccumulator, CameFrom, ConsensusOutput, Database, Notifier, TaskManager,
-    B256,
+    gas_accumulator::GasAccumulator, CameFrom, ConsensusOutput, Database, NodeMode, Notifier,
+    TaskManager, B256,
 };
 use tokio::sync::mpsc;
 

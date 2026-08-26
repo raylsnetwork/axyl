@@ -11,7 +11,7 @@ use crate::{
         state::{AuthVoteState, InFlightGuard, IN_FLIGHT_TTL},
     },
     state_sync::{CertificateCollector, StateSynchronizer},
-    ConsensusBus, NodeMode, RecentlyExecutedBlocks,
+    ConsensusBus, RecentlyExecutedBlocks,
 };
 use parking_lot::Mutex;
 use rayls_consensus_network::GossipMessage;
@@ -24,8 +24,8 @@ use rayls_infrastructure_types::{
     error::{CertificateError, HeaderError, HeaderResult},
     now, to_intent_message, try_decode, AuthorityIdentifier, B256Map, BlockHash, BlockNumHash,
     BlsPublicKey, Certificate, CertificateDigest, ConsensusHeader, Database, Epoch,
-    EpochCertificate, EpochRecord, Hash as _, Header, ProtocolSignature, RaylsSender as _, Round,
-    SignatureVerificationState, Vote, VotesAggregator,
+    EpochCertificate, EpochRecord, Hash as _, Header, NodeMode, ProtocolSignature,
+    RaylsSender as _, Round, SignatureVerificationState, Vote, VotesAggregator,
 };
 use std::{
     collections::{BTreeMap, BTreeSet},

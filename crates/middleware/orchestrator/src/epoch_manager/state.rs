@@ -1,6 +1,6 @@
 use crate::{engine::ExecutionNode, epoch_manager::types::EpochManager, primary::PrimaryNode};
 use eyre::eyre;
-use rayls_consensus_primary::{NodeMode, RecentlyExecutedBlocks};
+use rayls_consensus_primary::RecentlyExecutedBlocks;
 use rayls_execution_evm::system_calls::ConsensusRegistry;
 use rayls_infrastructure_config::{Config, ConfigFmt, ConfigTrait as _, RaylsDirs};
 use rayls_infrastructure_storage::{
@@ -14,7 +14,7 @@ use rayls_infrastructure_storage::{
 };
 use rayls_infrastructure_types::{
     AuthorityIdentifier, BlsPublicKey, Committee, CommitteeBuilder, ConsensusHeader,
-    Database as ReDatabase, DbTxMut, Epoch, EpochRecord, B256,
+    Database as ReDatabase, DbTxMut, Epoch, EpochRecord, NodeMode, B256,
 };
 use std::collections::HashMap;
 use tracing::{debug, error, info, trace, warn};

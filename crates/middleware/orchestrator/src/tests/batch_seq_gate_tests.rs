@@ -3,8 +3,7 @@
 //! pre-check and the select.
 
 use crate::epoch_manager::{await_execution_replay, ReplayWaitOutcome};
-use rayls_consensus_primary::NodeMode;
-use rayls_infrastructure_types::Notifier;
+use rayls_infrastructure_types::{NodeMode, Notifier};
 use std::time::Duration;
 use tokio::sync::watch;
 

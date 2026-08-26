@@ -4,8 +4,9 @@ use crate::{errors::SubscriberResult, SubscriberError};
 use consensus_metrics::monitored_future;
 use futures::{future::BoxFuture, stream::FuturesOrdered, StreamExt};
 use rayls_consensus_primary::{
-    consensus::ConsensusRound, network::PrimaryNetworkHandle, ConsensusBus, NodeMode,
+    consensus::ConsensusRound, network::PrimaryNetworkHandle, ConsensusBus,
 };
+use rayls_infrastructure_types::NodeMode;
 // production-only: consensus-result hashing for gossip signatures
 #[cfg(not(feature = "dev-single-node-setup"))]
 use rayls_consensus_primary::network::ConsensusResult;

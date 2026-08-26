@@ -4,7 +4,7 @@ use crate::{
     aggregators::HeaderVotesAggregator,
     network::{PrimaryNetworkHandle, RequestVoteResult},
     state_sync::StateSynchronizer,
-    ConsensusBus, NodeMode,
+    ConsensusBus,
 };
 use consensus_metrics::monitored_future;
 use rayls_consensus_network::error::NetworkError;
@@ -15,7 +15,8 @@ use rayls_infrastructure_types::{
     ensure,
     error::{DagError, DagResult},
     AuthorityIdentifier, BlsPublicKey, Certificate, CertificateDigest, Committee, Database, Header,
-    HeaderDigest, Noticer, Notifier, RaylsReceiver, RaylsSender, TaskManager, TaskSpawner, Vote,
+    HeaderDigest, NodeMode, Noticer, Notifier, RaylsReceiver, RaylsSender, TaskManager,
+    TaskSpawner, Vote,
 };
 use std::{
     sync::Arc,

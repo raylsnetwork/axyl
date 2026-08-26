@@ -5,9 +5,11 @@
 //! which race condition it targets and why the new architecture prevents it.
 
 use crate::epoch_manager::{decide_node_mode, node_has_local_history, select_recovery_checkpoint};
-use rayls_consensus_primary::{ConsensusBus, NodeMode};
+use rayls_consensus_primary::ConsensusBus;
 use rayls_infrastructure_storage::{mem_db::MemDatabase, CheckpointStore};
-use rayls_infrastructure_types::{EpochTransitionCheckpoint, EpochTransitionPhase, Notifier, B256};
+use rayls_infrastructure_types::{
+    EpochTransitionCheckpoint, EpochTransitionPhase, NodeMode, Notifier, B256,
+};
 use std::sync::{
     atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
     Arc,
@@ -398,7 +400,7 @@ fn test_running_outcome_variants_complete() {
     let _boundary = RunningOutcome::EpochBoundary(B256::ZERO, Box::new(ConsensusOutput::default()));
 
     // ModeTransition
-    let _mode = RunningOutcome::ModeTransition(rayls_consensus_primary::NodeMode::CvvInactive);
+    let _mode = RunningOutcome::ModeTransition(NodeMode::CvvInactive);
 
     // TaskCrash
     let _crash = RunningOutcome::TaskCrash(eyre::eyre!("test crash"));
@@ -1744,7 +1746,7 @@ async fn test_controlled_shutdown_cvv_inactive_skips_drain() {
     let bus = ConsensusBus::new();
 
     // Set node mode to CvvInactive.
-    bus.node_mode().send_replace(rayls_consensus_primary::NodeMode::CvvInactive);
+    bus.node_mode().send_replace(NodeMode::CvvInactive);
     assert!(!bus.node_mode().borrow().is_active_cvv());
 
     // Even with drain_round=Some, needs_drain is false for CvvInactive.
@@ -1764,7 +1766,7 @@ async fn test_controlled_shutdown_cvv_inactive_skips_drain() {
 async fn test_controlled_shutdown_observer_skips_drain() {
     let bus = ConsensusBus::new();
 
-    bus.node_mode().send_replace(rayls_consensus_primary::NodeMode::Observer);
+    bus.node_mode().send_replace(NodeMode::Observer);
     assert!(!bus.node_mode().borrow().is_active_cvv());
 
     let drain_round = Some(100u32);
@@ -1993,7 +1995,7 @@ async fn test_mode_transition_drain_timeout_continues() {
 
     // In run_mode_transition, this is non-fatal: warn and continue.
     // Verify mode can still be changed after timeout.
-    let target_mode = rayls_consensus_primary::NodeMode::CvvInactive;
+    let target_mode = NodeMode::CvvInactive;
     bus.node_mode().send_replace(target_mode);
     assert!(!bus.node_mode().borrow().is_active_cvv());
 }
@@ -2003,7 +2005,7 @@ async fn test_mode_transition_drain_timeout_continues() {
 #[tokio::test]
 async fn test_mode_transition_apply_phase_clear_does_not_re_notify() {
     let bus = ConsensusBus::new();
-    let target_mode = rayls_consensus_primary::NodeMode::CvvActive;
+    let target_mode = NodeMode::CvvActive;
 
     // Producer: request a transition.
     bus.mode_transition().send_replace(Some(target_mode));
@@ -2040,7 +2042,7 @@ async fn test_mode_transition_apply_phase_clear_does_not_re_notify() {
 /// transition away from Observer, regardless of target.
 #[tokio::test]
 async fn test_request_mode_transition_observer_is_sticky() {
-    use rayls_consensus_primary::NodeMode;
+    use NodeMode;
     let bus = ConsensusBus::new();
     bus.node_mode().send_replace(NodeMode::Observer);
 
@@ -2053,7 +2055,7 @@ async fn test_request_mode_transition_observer_is_sticky() {
 /// request_mode_transition is idempotent: asking for the current mode is a no-op.
 #[tokio::test]
 async fn test_request_mode_transition_idempotent_for_current_mode() {
-    use rayls_consensus_primary::NodeMode;
+    use NodeMode;
     let bus = ConsensusBus::new();
     bus.node_mode().send_replace(NodeMode::CvvActive);
 
@@ -2094,14 +2096,14 @@ async fn test_mode_transition_round_trip() {
     assert!(bus.node_mode().borrow().is_active_cvv());
 
     // CvvActive → CvvInactive.
-    bus.node_mode().send_replace(rayls_consensus_primary::NodeMode::CvvInactive);
+    bus.node_mode().send_replace(NodeMode::CvvInactive);
     assert!(!bus.node_mode().borrow().is_active_cvv());
 
     // Reset for new epoch (as run_epochs would).
     bus.reset_for_epoch();
 
     // CvvInactive → CvvActive.
-    bus.node_mode().send_replace(rayls_consensus_primary::NodeMode::CvvActive);
+    bus.node_mode().send_replace(NodeMode::CvvActive);
     assert!(bus.node_mode().borrow().is_active_cvv());
 
     // Verify clean state after round-trip.
@@ -2142,7 +2144,7 @@ async fn test_full_mode_transition_simulation() {
     // Phase 2: FLUSH — (simulated, no real engine).
 
     // Phase 3: APPLY — switch mode.
-    let target_mode = rayls_consensus_primary::NodeMode::CvvInactive;
+    let target_mode = NodeMode::CvvInactive;
     bus.node_mode().send_replace(target_mode);
 
     // Post-transition verification.
@@ -2180,7 +2182,7 @@ async fn test_full_mode_transition_drain_timeout_completes() {
     let shutdown = Notifier::new();
     shutdown.notify();
 
-    let target_mode = rayls_consensus_primary::NodeMode::CvvInactive;
+    let target_mode = NodeMode::CvvInactive;
     bus.node_mode().send_replace(target_mode);
 
     assert!(!bus.node_mode().borrow().is_active_cvv());

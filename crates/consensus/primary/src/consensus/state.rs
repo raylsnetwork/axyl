@@ -2,14 +2,14 @@
 
 use crate::{
     consensus::{bullshark::Bullshark, utils::gc_round, ConsensusError, ConsensusMetrics},
-    ConsensusBus, NodeMode,
+    ConsensusBus,
 };
 use consensus_metrics::monitored_future;
 use rayls_infrastructure_config::ConsensusConfig;
 use rayls_infrastructure_storage::{CertificateStore, ConsensusStore, ReadTimeout};
 use rayls_infrastructure_types::{
     AuthorityIdentifier, Certificate, CertificateDigest, CommittedSubDag, Committee, Database,
-    Epoch, Hash as _, Noticer, RaylsReceiver, RaylsSender, Round, TaskManager, Timestamp,
+    Epoch, Hash as _, NodeMode, Noticer, RaylsReceiver, RaylsSender, Round, TaskManager, Timestamp,
 };
 use std::{
     cmp::{max, Ordering},
