@@ -323,7 +323,8 @@ mod tests {
         let store = config.node_storage().clone();
 
         // Equal-sized batches so the budget maps cleanly to a batch count.
-        let sample = Batch { transactions: vec![vec![1u8; 256].into()], ..Default::default() };
+        let sample =
+            Batch { transactions: vec![Bytes::from(vec![1u8; 256])], ..Default::default() };
         let batch_size = sample.size();
 
         const TOTAL: usize = 20;
@@ -359,12 +360,14 @@ mod tests {
         let store = config.node_storage().clone();
 
         let hot_digest = B256::repeat_byte(0x11);
-        let hot_batch = Batch { transactions: vec![vec![1u8; 64].into()], ..Default::default() };
+        let hot_batch =
+            Batch { transactions: vec![Bytes::from(vec![1u8; 64])], ..Default::default() };
         store.insert::<Batches>(&hot_digest, &hot_batch).expect("insert hot batch");
 
         // The cold batch exists only as a jar row plus its auxiliary-index entry, never hot.
         let cold_digest = B256::repeat_byte(0x22);
-        let cold_batch = Batch { transactions: vec![vec![2u8; 64].into()], ..Default::default() };
+        let cold_batch =
+            Batch { transactions: vec![Bytes::from(vec![2u8; 64])], ..Default::default() };
         let cold = store.cold().expect("cold attached");
         cold.batches().begin_epoch(1, 0).expect("begin epoch");
         cold.batches()
@@ -395,7 +398,8 @@ mod tests {
         let store = config.node_storage().clone();
 
         let hot = [B256::repeat_byte(0x11), B256::repeat_byte(0x22)];
-        let hot_batch = Batch { transactions: vec![vec![1u8; 64].into()], ..Default::default() };
+        let hot_batch =
+            Batch { transactions: vec![Bytes::from(vec![1u8; 64])], ..Default::default() };
         for digest in &hot {
             store.insert::<Batches>(digest, &hot_batch).expect("insert hot batch");
         }
@@ -432,8 +436,10 @@ mod tests {
         let store = config.node_storage().clone();
 
         const PRESENT: usize = 4;
-        let within_cap = Batch { transactions: vec![vec![1u8; 64].into()], ..Default::default() };
-        let past_cap = Batch { transactions: vec![vec![2u8; 64].into()], ..Default::default() };
+        let within_cap =
+            Batch { transactions: vec![Bytes::from(vec![1u8; 64])], ..Default::default() };
+        let past_cap =
+            Batch { transactions: vec![Bytes::from(vec![2u8; 64])], ..Default::default() };
 
         // Stored batches sit on both sides of the cap, separated by a run of digests with nothing
         // stored. Misses cost no response bytes, so only the cap can decide where serving stops,

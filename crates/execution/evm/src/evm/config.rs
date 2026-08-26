@@ -11,8 +11,8 @@ use crate::{
 };
 use alloy::eips::eip7685::EMPTY_REQUESTS_HASH;
 use rayls_infrastructure_types::{
-    payload::RLPayload, Address, BlockHeader as _, SealedBlock, SealedHeader, B256,
-    EMPTY_OMMER_ROOT_HASH, U256,
+    payload::RLPayload, BlockHeader as _, SealedBlock, SealedHeader, B256, EMPTY_OMMER_ROOT_HASH,
+    U256,
 };
 use rayls_middleware_rewards::RewardsCounter;
 use reth_chainspec::{EthChainSpec as _, EthereumHardforks as _};
