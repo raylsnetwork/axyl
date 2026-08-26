@@ -147,6 +147,21 @@ mod tests {
         assert!(matches!(decoded, WorkerResponse::Error(WorkerRPCError(s)) if s == "boom"));
     }
 
+    /// Pins `Vec<Bytes>` to the `Vec<Vec<u8>>` bytes an un-upgraded peer emits and expects.
+    #[test]
+    fn worker_gossip_txn_payload_is_bcs_identical_to_vec_vec_u8() {
+        let vecs: Vec<Vec<u8>> = vec![vec![1, 2, 3], vec![], vec![4; 300]];
+        let bytes: Vec<Bytes> = vecs.iter().cloned().map(Bytes::from).collect();
+        assert_eq!(encode(&bytes), encode(&vecs));
+
+        let gossip = WorkerGossip::Txn(bytes);
+        let mut old_wire = vec![1u8]; // Txn is bcs variant index 1
+        old_wire.extend(encode(&vecs));
+        assert_eq!(encode(&gossip), old_wire);
+        let decoded: WorkerGossip = try_decode(&old_wire).unwrap();
+        assert_eq!(decoded, gossip);
+    }
+
     #[test]
     fn worker_request_submit_txns_is_appended_last() {
         assert_eq!(encode(&WorkerRequest::SubmitTxns { transactions: vec![] })[0], 3);
