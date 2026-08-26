@@ -9,7 +9,7 @@ use crate::{
     batch::SelectedForSeal, error::BatchBuilderResult, BOUNDARY_QUIESCE_WINDOW_SECS, MAX_SEAL_AHEAD,
 };
 use rayls_execution_evm::in_flight::SealMarks;
-use std::fmt;
+use std::{fmt, time::Instant};
 use tokio::sync::oneshot;
 
 /// Phase with no candidate transactions pending a seal.
@@ -35,6 +35,8 @@ pub struct AwaitingQuorum {
     /// Whether a candidate event arrived mid-build, so the seal must re-accumulate rather than
     /// return to clean and lose the wake.
     pub(crate) event_arrived_while_waiting: bool,
+    /// When the build task was spawned, so the resolution log reports the real quorum latency.
+    pub(crate) started: Instant,
 }
 
 impl fmt::Debug for AwaitingQuorum {
@@ -42,6 +44,7 @@ impl fmt::Debug for AwaitingQuorum {
         f.debug_struct("AwaitingQuorum")
             .field("rx", &"<oneshot::Receiver>")
             .field("event_arrived_while_waiting", &self.event_arrived_while_waiting)
+            .field("started", &self.started)
             .finish()
     }
 }
@@ -205,7 +208,11 @@ impl BatchPipeline<Accumulating> {
         rx: oneshot::Receiver<BatchBuilderResult<TaskOutcome>>,
     ) -> BatchPipeline<AwaitingQuorum> {
         BatchPipeline {
-            state: AwaitingQuorum { rx, event_arrived_while_waiting: false },
+            state: AwaitingQuorum {
+                rx,
+                event_arrived_while_waiting: false,
+                started: Instant::now(),
+            },
             data: self.data,
         }
     }
@@ -236,7 +243,11 @@ impl BatchPipeline<BacklogDraining> {
         rx: oneshot::Receiver<BatchBuilderResult<TaskOutcome>>,
     ) -> BatchPipeline<AwaitingQuorum> {
         BatchPipeline {
-            state: AwaitingQuorum { rx, event_arrived_while_waiting: false },
+            state: AwaitingQuorum {
+                rx,
+                event_arrived_while_waiting: false,
+                started: Instant::now(),
+            },
             data: self.data,
         }
     }

@@ -319,7 +319,7 @@ impl BatchBuilder {
         };
 
         let current_seq = awaiting.current_seq();
-        let start_time = std::time::Instant::now();
+        let start_time = awaiting.state.started;
 
         let outcome = match res.map_err(BatchBuilderError::from).and_then(|r| r) {
             Ok(out) => out,
