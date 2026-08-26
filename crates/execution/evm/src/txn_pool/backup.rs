@@ -433,7 +433,7 @@ mod tests {
             !loading_pool.mark_backup_path().exists(),
             "load deletes the backup for at-most-once replay"
         );
-        loader.arm_forwarding(policy);
+        let _fwd = loader.arm_forwarding(policy);
         assert!(loader.is_in_flight(&hash), "the reloaded mark is live once forwarding re-arms");
     }
 }

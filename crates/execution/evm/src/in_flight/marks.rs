@@ -71,6 +71,7 @@ pub(crate) enum Armed {
 
 /// A capability handle scoping mark writes to the sealing role, returned by
 /// `InFlightTracker::arm_sealing` so a caller cannot mark hashes without first arming.
+#[must_use = "dropping the handle discards the sealing capability the arm just minted"]
 #[derive(Debug)]
 pub struct SealMarks {
     tracker: InFlightTracker,
@@ -100,6 +101,7 @@ pub struct ForwardProbe {
 
 /// A capability handle scoping mark writes to the forwarding role, returned by
 /// `InFlightTracker::arm_forwarding` so a caller cannot mark hashes without first arming.
+#[must_use = "dropping the handle discards the forwarding capability the arm just minted"]
 #[derive(Debug, Clone)]
 pub struct ForwardMarks {
     tracker: InFlightTracker,

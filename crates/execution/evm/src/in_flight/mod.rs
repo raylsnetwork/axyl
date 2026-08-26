@@ -331,6 +331,16 @@ impl InFlightTracker {
 
     fn consume_stash(guard: &mut Inner, role: MarkRole) -> usize {
         let Some(backup) = guard.pending_restore.take() else { return 0 };
+        if backup.version != MARK_BACKUP_VERSION {
+            info!(
+                target: "rayls::txpool",
+                discarded = backup.marks.len(),
+                saved_version = backup.version,
+                current_version = MARK_BACKUP_VERSION,
+                "discarded restored in-flight marks from another schema version"
+            );
+            return 0;
+        }
         if backup.role != role {
             info!(
                 target: "rayls::txpool",

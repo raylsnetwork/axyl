@@ -609,3 +609,17 @@ fn clear_with_nothing_armed_keeps_the_stash() {
         "an actor-less clear must not eat the next actor's stash"
     );
 }
+
+/// bcs is positional, so a backup from another schema version can decode into wrong marks; it is
+/// rejected whole rather than restored best-effort.
+#[test]
+fn arm_rejects_a_backup_from_another_schema_version() {
+    let tracker = InFlightTracker::with_fresh_metrics();
+    tracker.stash_restore(MarkBackup {
+        version: MARK_BACKUP_VERSION + 1,
+        role: MarkRole::Sealing,
+        marks: vec![SavedMark { hash: hash(1), kind: SavedMarkKind::Sent { attempts: 0 } }],
+    });
+    let _seal = tracker.arm_sealing(DuePolicy::ttl(Duration::from_secs(60)));
+    assert!(!tracker.is_in_flight(&hash(1)), "a foreign-version backup restores nothing");
+}
