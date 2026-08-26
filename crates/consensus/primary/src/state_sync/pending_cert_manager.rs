@@ -102,15 +102,23 @@ impl PendingCertificateManager {
             self.missing_for_pending.entry((parent_round, parent)).or_default().insert(digest);
         }
 
-        let _ = self.consensus_bus.suspended_cert_count().send(self.pending.len());
+        self.publish_count();
+
+        Ok(())
+    }
+
+    /// Publishes the pending count to the proposer's backpressure watch and the metrics mirror.
+    ///
+    /// `send_replace`, not `send`: nobody holds a receiver (the proposer borrows the sender), and
+    /// a `send` with no receivers discards the value instead of storing it.
+    fn publish_count(&self) {
+        self.consensus_bus.suspended_cert_count().send_replace(self.pending.len());
         // metrics mirror only - decisions read the watch above
         self.consensus_bus
             .primary_metrics()
             .node_metrics
             .certificates_currently_suspended
             .set(self.pending.len() as i64);
-
-        Ok(())
     }
 
     /// When a certificate is accepted, returns all of its children that are now ready to be
@@ -162,6 +170,8 @@ impl PendingCertificateManager {
             }
         }
 
+        // the drain must publish too, or the proposer brake stays stuck at the last suspension
+        self.publish_count();
         Ok(ready_certificates)
     }
 
