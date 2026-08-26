@@ -3,7 +3,6 @@
 
 use super::txn_forwarder::TxnForwarder;
 use crate::types::ExecutionError;
-use eyre::OptionExt;
 use jsonrpsee::http_client::HttpClient;
 use rayls_batch_builder::{BatchBuilder, BatchBuilderConfig, OwnWatermarkReceiver};
 use rayls_batch_validator::BatchValidator;
@@ -166,7 +165,7 @@ impl ExecutionNodeInner {
         let transaction_pool = self
             .workers
             .get(worker_id as usize)
-            .ok_or_eyre("worker components missing for {worker_id}")?
+            .ok_or_else(|| eyre::eyre!("worker components missing for worker {worker_id}"))?
             .pool();
 
         let own_executed_sequence = self
@@ -221,7 +220,7 @@ impl ExecutionNodeInner {
         let transaction_pool = self
             .workers
             .get(worker_id as usize)
-            .ok_or_eyre("worker components missing for {worker_id}")?
+            .ok_or_else(|| eyre::eyre!("worker components missing for worker {worker_id}"))?
             .pool();
 
         let reth_env = self.reth_env.clone();
