@@ -423,13 +423,16 @@ where
         // first reconcile. Best-effort: a panic here must not skip the drain.
         {
             let pools = engine.get_all_worker_transaction_pools().await;
-            let _ = tokio::task::spawn_blocking(move || {
+            let saved = tokio::task::spawn_blocking(move || {
                 for pool in &pools {
                     pool.save_backup();
                     pool.save_mark_backup();
                 }
             })
             .await;
+            if let Err(e) = saved {
+                error!(target: "engine", %e, "pre-drain txpool backup task panicked");
+            }
         }
 
         match engine_done_rx.await {

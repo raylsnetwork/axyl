@@ -178,6 +178,8 @@ impl WorkerTxPool {
             blockchain_provider.canonical_state_stream(),
             task_spawner.clone(),
             MaintainPoolConfig {
+                // bounds the queued (non-executable) sub-pool only; a pending tx is never
+                // lifetime-evicted, so this caps nonce-gapped stranding, not seal latency
                 max_tx_lifetime: Duration::from_mins(5),
                 no_local_exemptions: true,
                 ..Default::default()
