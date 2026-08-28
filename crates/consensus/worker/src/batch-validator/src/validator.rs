@@ -150,19 +150,18 @@ impl BatchValidation for BatchValidator {
             let parsed_txns = if txs_bytes.len() < 100 {
                 txs_bytes
                     .iter()
-                    .map(|tx_bytes| bytes_to_txn(tx_bytes))
-                    .collect::<Vec<Result<EthPooledTransaction, _>>>()
+                    .filter_map(|tx_bytes| bytes_to_txn(tx_bytes).ok())
+                    .collect::<Vec<EthPooledTransaction>>()
             } else {
                 txs_bytes
                     .par_iter()
-                    .map(|tx_bytes| bytes_to_txn(tx_bytes))
-                    .collect::<Vec<Result<EthPooledTransaction, _>>>()
+                    .filter_map(|tx_bytes| bytes_to_txn(tx_bytes).ok())
+                    .collect::<Vec<EthPooledTransaction>>()
             };
 
             let tx_pool = tx_pool.clone();
             self.reth_env.get_task_spawner().spawn_task("submit-tx-batch", async move {
-                let txs: Vec<_> = parsed_txns.into_iter().flatten().collect();
-                for res in tx_pool.add_raw_transactions_external(txs).await {
+                for res in tx_pool.add_raw_transactions_external(parsed_txns).await {
                     match res {
                         Ok(_) => {}
                         // A hash this pool already holds is ordinary gossip dedup: multiple
@@ -173,7 +172,9 @@ impl BatchValidation for BatchValidator {
                             debug!(target: "worker::validator", "gossipped txn already in pool: {e}");
                         }
                         Err(e) => {
-                            warn!(target: "worker::validator", "failed to submit gossipped txn: {e}");
+                            // This can get pretty noisy hence setting it to debug level.
+                            // REVISIT: Expose metrics counting such failed txn submissions.
+                            debug!(target: "worker::validator", "failed to submit gossipped txn: {e}");
                         }
                     }
                 }
