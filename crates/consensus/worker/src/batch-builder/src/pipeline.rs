@@ -24,6 +24,13 @@ pub struct Accumulating;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BacklogDraining;
 
+/// Phase after a failed seal, parked until the next batching window re-arms the retry.
+///
+/// Candidate ingress and mark releases do not leave this phase: a seal that fails fast (peers
+/// unreachable) would otherwise be rebuilt on every wake in a tight build/seal-fail loop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QuorumRetry;
+
 /// Terminal phase once the epoch boundary is reached.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Closed;
@@ -127,7 +134,9 @@ pub struct PipelineData {
 /// Legal transitions, each a consuming method on the matching `impl` block:
 /// - `Clean` -> `Accumulating` on a candidate event;
 /// - `Accumulating` | `BacklogDraining` -> `AwaitingQuorum` when a build spawns;
-/// - `AwaitingQuorum` -> `Clean` | `Accumulating` | `BacklogDraining` on the quorum outcome;
+/// - `AwaitingQuorum` -> `Clean` | `Accumulating` | `BacklogDraining` on the quorum outcome, or
+///   `QuorumRetry` on a failed seal;
+/// - `QuorumRetry` -> `Accumulating` on the next batching window;
 /// - any phase -> `Closed` once the canonical tip reaches the epoch boundary; `Closed` has no
 ///   outgoing transition.
 #[derive(Debug)]
@@ -151,6 +160,12 @@ impl<S> BatchPipeline<S> {
         self.data.highest_durable_sealed_seq
     }
 
+    /// Records the latest canonical tip timestamp, which gates the boundary and quiesce checks.
+    #[inline]
+    pub fn on_canonical_update(&mut self, timestamp: u64) {
+        self.data.last_canonical_timestamp = timestamp;
+    }
+
     /// Closes the pipeline when the canonical tip has reached the epoch boundary.
     pub fn check_boundary(self, epoch_boundary: u64) -> Result<Self, BatchPipeline<Closed>> {
         if self.data.last_canonical_timestamp >= epoch_boundary {
@@ -158,12 +173,6 @@ impl<S> BatchPipeline<S> {
         } else {
             Ok(self)
         }
-    }
-
-    /// Records the latest canonical tip timestamp, which gates the boundary and quiesce checks.
-    #[inline]
-    pub fn on_canonical_update(&mut self, timestamp: u64) {
-        self.data.last_canonical_timestamp = timestamp;
     }
 }
 
@@ -262,9 +271,9 @@ impl BatchPipeline<AwaitingQuorum> {
         BatchPipeline { state: Clean, data: self.data }
     }
 
-    /// Returns to `Accumulating` to retry after a failed quorum.
-    pub fn into_accumulating(self) -> BatchPipeline<Accumulating> {
-        BatchPipeline { state: Accumulating, data: self.data }
+    /// Parks the retry of a failed seal until the next batching window.
+    pub fn into_retry(self) -> BatchPipeline<QuorumRetry> {
+        BatchPipeline { state: QuorumRetry, data: self.data }
     }
 
     /// Marks the sealed batch in flight, advances the sequence, and picks the next phase.
@@ -300,6 +309,13 @@ impl BatchPipeline<AwaitingQuorum> {
     }
 }
 
+impl BatchPipeline<QuorumRetry> {
+    /// Re-arms the retry once the batching window has elapsed.
+    pub fn on_window(self) -> BatchPipeline<Accumulating> {
+        BatchPipeline { state: Accumulating, data: self.data }
+    }
+}
+
 impl BatchPipeline<Closed> {
     /// Returns true; the terminal phase has no outgoing transitions.
     #[inline]
@@ -330,6 +346,8 @@ pub enum PipelineState {
     BacklogDraining(BatchPipeline<BacklogDraining>),
     /// A build is in flight awaiting quorum.
     AwaitingQuorum(BatchPipeline<AwaitingQuorum>),
+    /// A seal failed; the retry waits for the next batching window.
+    QuorumRetry(BatchPipeline<QuorumRetry>),
 }
 
 impl From<SealedTransition> for PipelineState {
@@ -357,6 +375,7 @@ impl PipelineState {
             Self::Accumulating(p) => p.current_seq(),
             Self::BacklogDraining(p) => p.current_seq(),
             Self::AwaitingQuorum(p) => p.current_seq(),
+            Self::QuorumRetry(p) => p.current_seq(),
         }
     }
 
@@ -372,7 +391,7 @@ impl PipelineState {
     }
 
     /// Registers a candidate event, moving `Clean` to `Accumulating` and flagging an in-flight
-    /// build.
+    /// build; a parked retry waits for its window regardless.
     pub fn on_event(self) -> Self {
         match self {
             Self::Clean(p) => Self::Accumulating(p.on_event()),
@@ -382,6 +401,15 @@ impl PipelineState {
                 p.on_event();
                 Self::AwaitingQuorum(p)
             }
+            Self::QuorumRetry(p) => Self::QuorumRetry(p),
+        }
+    }
+
+    /// Registers a batching-window tick, re-arming a parked retry; every other phase is unchanged.
+    pub fn on_window(self) -> Self {
+        match self {
+            Self::QuorumRetry(p) => Self::Accumulating(p.on_window()),
+            other => other,
         }
     }
 
@@ -392,6 +420,7 @@ impl PipelineState {
             Self::Accumulating(p) => p.on_canonical_update(timestamp),
             Self::BacklogDraining(p) => p.on_canonical_update(timestamp),
             Self::AwaitingQuorum(p) => p.on_canonical_update(timestamp),
+            Self::QuorumRetry(p) => p.on_canonical_update(timestamp),
         }
     }
 
@@ -402,6 +431,7 @@ impl PipelineState {
             Self::Accumulating(p) => p.check_boundary(epoch_boundary).map(Self::Accumulating),
             Self::BacklogDraining(p) => p.check_boundary(epoch_boundary).map(Self::BacklogDraining),
             Self::AwaitingQuorum(p) => p.check_boundary(epoch_boundary).map(Self::AwaitingQuorum),
+            Self::QuorumRetry(p) => p.check_boundary(epoch_boundary).map(Self::QuorumRetry),
         }
     }
 }
