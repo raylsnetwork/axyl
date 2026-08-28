@@ -26,6 +26,7 @@ rayls-testing-test-utils = { workspace = true }
 rayls-consensus-primary = { workspace = true, features = ["test-utils"] }
 rayls-consensus-network = { workspace = true }
 rayls-execution-evm = { workspace = true, features = ["test-utils"] }
+rayls-infrastructure-storage = { workspace = true, features = ["test-utils"] }
 
 [features]
 default = []

@@ -190,10 +190,7 @@ impl<'a> DbTx for MemDbTx<'a> {
     }
 
     fn iter<T: Table>(&self) -> DBIter<'_, T> {
-        match iter_impl::<T>(&self.store) {
-            Some(items) => Box::new(items.into_iter()),
-            None => Box::new(std::iter::empty()),
-        }
+        iter_borrowed_impl::<T>(&self.store).unwrap_or_else(|| Box::new(std::iter::empty()))
     }
 
     fn raw_iter<T: Table>(&self) -> DBRawIter<'_> {
@@ -204,17 +201,12 @@ impl<'a> DbTx for MemDbTx<'a> {
     }
 
     fn skip_to<T: Table>(&self, key: &T::Key) -> eyre::Result<DBIter<'_, T>> {
-        match skip_to_impl::<T>(&self.store, key) {
-            Some(items) => Ok(Box::new(items.into_iter())),
-            None => Err(eyre::eyre!("Invalid table {}", T::NAME)),
-        }
+        skip_to_borrowed_impl::<T>(&self.store, key)
+            .ok_or_else(|| eyre::eyre!("Invalid table {}", T::NAME))
     }
 
     fn reverse_iter<T: Table>(&self) -> DBIter<'_, T> {
-        match reverse_iter_impl::<T>(&self.store) {
-            Some(items) => Box::new(items.into_iter()),
-            None => Box::new(std::iter::empty()),
-        }
+        reverse_iter_borrowed_impl::<T>(&self.store).unwrap_or_else(|| Box::new(std::iter::empty()))
     }
 
     fn reverse_raw_iter<T: Table>(&self) -> DBRawIter<'_> {
@@ -284,17 +276,12 @@ impl<'a> DbTx for MemDbTxMut<'a> {
     }
 
     fn skip_to<T: Table>(&self, key: &T::Key) -> eyre::Result<DBIter<'_, T>> {
-        match skip_to_impl::<T>(&self.store, key) {
-            Some(items) => Ok(Box::new(items.into_iter())),
-            None => Err(eyre::eyre!("Invalid table {}", T::NAME)),
-        }
+        skip_to_borrowed_impl::<T>(&self.store, key)
+            .ok_or_else(|| eyre::eyre!("Invalid table {}", T::NAME))
     }
 
     fn reverse_iter<T: Table>(&self) -> DBIter<'_, T> {
-        match reverse_iter_impl::<T>(&self.store) {
-            Some(items) => Box::new(items.into_iter()),
-            None => Box::new(std::iter::empty()),
-        }
+        reverse_iter_borrowed_impl::<T>(&self.store).unwrap_or_else(|| Box::new(std::iter::empty()))
     }
 
     fn reverse_raw_iter<T: Table>(&self) -> DBRawIter<'_> {
@@ -613,7 +600,7 @@ impl Database for MemDatabase {
     }
 
     fn iter<T: Table>(&self) -> DBIter<'_, T> {
-        match iter_impl::<T>(&self.store.read()) {
+        match iter_owned_impl::<T>(&self.store.read()) {
             Some(items) => Box::new(items.into_iter()),
             None => panic!("Invalid table {}", T::NAME),
         }
@@ -629,14 +616,14 @@ impl Database for MemDatabase {
     }
 
     fn skip_to<T: Table>(&self, key: &T::Key) -> eyre::Result<DBIter<'_, T>> {
-        match skip_to_impl::<T>(&self.store.read(), key) {
+        match skip_to_owned_impl::<T>(&self.store.read(), key) {
             Some(items) => Ok(Box::new(items.into_iter())),
             None => Err(eyre::eyre!("Invalid table {}", T::NAME)),
         }
     }
 
     fn reverse_iter<T: Table>(&self) -> DBIter<'_, T> {
-        match reverse_iter_impl::<T>(&self.store.read()) {
+        match reverse_iter_owned_impl::<T>(&self.store.read()) {
             Some(items) => Box::new(items.into_iter()),
             None => panic!("Invalid table {}", T::NAME),
         }
@@ -794,13 +781,18 @@ fn contains_key_impl<T: Table>(store: &StoreType, key: &T::Key) -> bool {
     false
 }
 
-fn collect_typed<'t, T: Table, I>(iter: I) -> Vec<(T::Key, T::Value)>
+/// Decodes the live (non-tombstoned) rows of `iter` on demand.
+///
+/// Lazy rather than collected: a caller that stops after a handful of rows never pays to decode
+/// the rest of the table, which for a table of certificates or headers dwarfs the walk itself.
+fn decode_typed<'t, T: Table, I>(iter: I) -> DBIter<'t, T>
 where
-    I: Iterator<Item = (&'t Vec<u8>, &'t StoreEntry)>,
+    I: Iterator<Item = (&'t Vec<u8>, &'t StoreEntry)> + 't,
 {
-    iter.filter(|(_, entry)| !entry.tombstoned())
-        .map(|(k, entry)| (decode_key::<T::Key>(k), decode::<T::Value>(&entry.value)))
-        .collect()
+    Box::new(
+        iter.filter(|(_, entry)| !entry.tombstoned())
+            .map(|(k, entry)| (decode_key::<T::Key>(k), decode::<T::Value>(&entry.value))),
+    )
 }
 
 fn collect_raw_borrowed<'t, I>(iter: I) -> DBRawIter<'t>
@@ -822,9 +814,14 @@ where
         .collect()
 }
 
-fn iter_impl<T: Table>(store: &StoreType) -> Option<Vec<(T::Key, T::Value)>> {
+/// Snapshots the table for a caller whose read guard is a temporary (see [`raw_iter_owned_impl`]).
+fn iter_owned_impl<T: Table>(store: &StoreType) -> Option<Vec<(T::Key, T::Value)>> {
+    Some(iter_borrowed_impl::<T>(store)?.collect())
+}
+
+fn iter_borrowed_impl<T: Table>(store: &StoreType) -> Option<DBIter<'_, T>> {
     let table = store.get(T::NAME)?;
-    Some(collect_typed::<T, _>(table.rows.iter()))
+    Some(decode_typed::<T, _>(table.rows.iter()))
 }
 
 fn raw_iter_borrowed_impl<T: Table>(store: &StoreType) -> Option<DBRawIter<'_>> {
@@ -839,15 +836,28 @@ fn raw_iter_owned_impl<T: Table>(
     Some(collect_raw_owned(table.rows.iter()))
 }
 
-fn skip_to_impl<T: Table>(store: &StoreType, key: &T::Key) -> Option<Vec<(T::Key, T::Value)>> {
-    let table = store.get(T::NAME)?;
-    let key_bytes = encode_key(key);
-    Some(collect_typed::<T, _>(table.rows.iter().skip_while(|(k, _)| **k < key_bytes)))
+fn skip_to_owned_impl<T: Table>(
+    store: &StoreType,
+    key: &T::Key,
+) -> Option<Vec<(T::Key, T::Value)>> {
+    Some(skip_to_borrowed_impl::<T>(store, key)?.collect())
 }
 
-fn reverse_iter_impl<T: Table>(store: &StoreType) -> Option<Vec<(T::Key, T::Value)>> {
+fn skip_to_borrowed_impl<'s, T: Table>(
+    store: &'s StoreType,
+    key: &T::Key,
+) -> Option<DBIter<'s, T>> {
     let table = store.get(T::NAME)?;
-    Some(collect_typed::<T, _>(table.rows.iter().rev()))
+    Some(decode_typed::<T, _>(table.rows.range(encode_key(key)..)))
+}
+
+fn reverse_iter_owned_impl<T: Table>(store: &StoreType) -> Option<Vec<(T::Key, T::Value)>> {
+    Some(reverse_iter_borrowed_impl::<T>(store)?.collect())
+}
+
+fn reverse_iter_borrowed_impl<T: Table>(store: &StoreType) -> Option<DBIter<'_, T>> {
+    let table = store.get(T::NAME)?;
+    Some(decode_typed::<T, _>(table.rows.iter().rev()))
 }
 
 fn reverse_raw_iter_borrowed_impl<T: Table>(store: &StoreType) -> Option<DBRawIter<'_>> {
@@ -947,6 +957,12 @@ mod test {
     fn test_memdb_iter_reverse() {
         let db = open_db();
         test_iter_reverse(db)
+    }
+
+    #[test]
+    fn test_memdb_txn_iter_order() {
+        let db = open_db();
+        test_txn_iter_order(db)
     }
 
     #[test]

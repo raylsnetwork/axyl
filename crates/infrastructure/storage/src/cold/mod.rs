@@ -142,6 +142,3 @@ pub type ColdResult<T> = Result<T, ColdError>;
 
 /// Sentinel key for the single `ColdArchiveHighWaterMark` row (the table holds at most one entry).
 pub const ARCHIVE_HIGH_WATER_MARK_KEY: u8 = 0;
-
-#[cfg(test)]
-pub(crate) mod probe;

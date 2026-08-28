@@ -416,7 +416,7 @@ fn reverse_skip_to_respects_tombstones_and_cold_copies() {
 /// tier is stepped by positioned lookups only, never drained from the tip.
 #[test]
 fn reverse_skip_to_steps_instead_of_scanning() {
-    let mut db = LayeredDatabase::open(crate::cold::probe::ProbeDb::new());
+    let mut db = LayeredDatabase::open(crate::test_utils::TestDb::new());
     open_default_tables(&mut db).expect("open tables");
     // Sparse keys prove the stepping follows the backend's order, not arithmetic.
     for n in [1u64, 3, 5, 7] {

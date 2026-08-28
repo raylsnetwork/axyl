@@ -29,6 +29,8 @@ pub mod layered_db;
 pub mod mdbx;
 pub mod mem_db;
 pub mod redb;
+#[cfg(any(test, feature = "test-utils"))]
+pub mod test_utils;
 
 pub use rayls_infrastructure_types::{error::StoreError, ReadTimeout};
 
@@ -558,6 +560,36 @@ mod test {
         assert_eq!(Some((2, "2".to_string())), iter.next());
         assert_eq!(Some((3, "3".to_string())), iter.next());
         assert_eq!(None, iter.next());
+    }
+
+    /// Guards the ordering contract of the transaction-scoped iterators, which serve their rows
+    /// lazily and so cannot lean on a snapshot to sort them.
+    pub(crate) fn test_txn_iter_order<DB: Database>(db: DB) {
+        use rayls_infrastructure_types::DbTx;
+
+        let mut txn = db.write_txn().unwrap();
+        for (key, val) in (1..=5u64).map(|i| (i, i.to_string())) {
+            txn.insert::<TestTable>(&key, &val).expect("Failed to insert");
+        }
+        txn.remove::<TestTable>(&3).expect("Failed to remove");
+        txn.commit().unwrap();
+        db.sync_persist().expect("persist");
+
+        db.with_read_txn(|txn| {
+            let forward: Vec<_> = txn.iter::<TestTable>().map(|(k, _)| k).collect();
+            assert_eq!(forward, vec![1, 2, 4, 5]);
+
+            let reverse: Vec<_> = txn.reverse_iter::<TestTable>().map(|(k, _)| k).collect();
+            assert_eq!(reverse, vec![5, 4, 2, 1]);
+
+            // Starts at the first key at or after the bound, tombstone or no tombstone.
+            let from_three: Vec<_> = txn.skip_to::<TestTable>(&3)?.map(|(k, _)| k).collect();
+            assert_eq!(from_three, vec![4, 5]);
+            assert_eq!(txn.skip_to::<TestTable>(&2)?.next(), Some((2, "2".to_string())));
+            assert_eq!(txn.skip_to::<TestTable>(&6)?.next(), None);
+            Ok(())
+        })
+        .unwrap();
     }
 
     pub(crate) fn test_clear<DB: Database>(db: DB) {

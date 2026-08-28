@@ -420,8 +420,8 @@ impl TaskManager {
         self.join_wait_millis = millis;
     }
 
-    /// Override the per-phase stall bound. Test-only — production uses [`PHASE_STALL_BOUND`].
-    #[cfg(test)]
+    /// Override the per-phase stall bound. Test-only - production uses [`PHASE_STALL_BOUND`].
+    #[cfg(any(test, feature = "test-utils"))]
     pub fn set_phase_stall_bound(&mut self, bound: Duration) {
         self.phase_stall_bound = bound;
     }

@@ -224,7 +224,10 @@ where
         };
 
         // stamp our identity regardless of whether sanitization was needed
-        if let Err(e) = self.consensus_db.insert::<NodeIdentity>(&0, &our_authority_id) {
+        if let Err(e) = self
+            .consensus_db
+            .with_write_txn(|txn| txn.insert::<NodeIdentity>(&0, &our_authority_id))
+        {
             warn!(target: "epoch-manager", ?e, "failed to stamp node identity");
         }
 

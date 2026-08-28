@@ -17,7 +17,9 @@ use rayls_infrastructure_config::KeyConfig;
 use rayls_infrastructure_storage::tables::{
     KadProviderRecords, KadRecords, KadWorkerProviderRecords, KadWorkerRecords,
 };
-use rayls_infrastructure_types::{decode, encode, BlockHash, Database, DbTx, DefaultHashFunction};
+use rayls_infrastructure_types::{
+    decode, encode, BlockHash, Database, DbTx, DbTxMut, DefaultHashFunction,
+};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_with::{serde_as, DeserializeAs, SerializeAs};
 
@@ -274,11 +276,11 @@ impl<DB: Database> RecordStore for KadStore<DB> {
         match self.kad_type {
             KadStoreType::Primary => self
                 .db
-                .insert::<KadRecords>(&key, &encode(&kr))
+                .with_write_txn(|txn| txn.insert::<KadRecords>(&key, &encode(&kr)))
                 .map_err(|_| Error::ValueTooLarge)?,
             KadStoreType::Worker => self
                 .db
-                .insert::<KadWorkerRecords>(&key, &encode(&kr))
+                .with_write_txn(|txn| txn.insert::<KadWorkerRecords>(&key, &encode(&kr)))
                 .map_err(|_| Error::ValueTooLarge)?,
         }
         Ok(())
@@ -287,8 +289,10 @@ impl<DB: Database> RecordStore for KadStore<DB> {
     fn remove(&mut self, k: &RecordKey) {
         let key = self.key_to_hash(k);
         if match self.kad_type {
-            KadStoreType::Primary => self.db.remove::<KadRecords>(&key),
-            KadStoreType::Worker => self.db.remove::<KadWorkerRecords>(&key),
+            KadStoreType::Primary => self.db.with_write_txn(|txn| txn.remove::<KadRecords>(&key)),
+            KadStoreType::Worker => {
+                self.db.with_write_txn(|txn| txn.remove::<KadWorkerRecords>(&key))
+            }
         }
         .is_ok()
         {
@@ -338,11 +342,13 @@ impl<DB: Database> RecordStore for KadStore<DB> {
         match self.kad_type {
             KadStoreType::Primary => self
                 .db
-                .insert::<KadProviderRecords>(&key, &encode(&records))
+                .with_write_txn(|txn| txn.insert::<KadProviderRecords>(&key, &encode(&records)))
                 .map_err(|_| libp2p::kad::store::Error::ValueTooLarge)?,
             KadStoreType::Worker => self
                 .db
-                .insert::<KadWorkerProviderRecords>(&key, &encode(&records))
+                .with_write_txn(|txn| {
+                    txn.insert::<KadWorkerProviderRecords>(&key, &encode(&records))
+                })
                 .map_err(|_| libp2p::kad::store::Error::ValueTooLarge)?,
         }
         if inc_providers {
@@ -384,8 +390,12 @@ impl<DB: Database> RecordStore for KadStore<DB> {
                 records.into_iter().filter(|r| r.provider != *p).collect();
             if records.is_empty() {
                 if match self.kad_type {
-                    KadStoreType::Primary => self.db.remove::<KadProviderRecords>(&key),
-                    KadStoreType::Worker => self.db.remove::<KadWorkerProviderRecords>(&key),
+                    KadStoreType::Primary => {
+                        self.db.with_write_txn(|txn| txn.remove::<KadProviderRecords>(&key))
+                    }
+                    KadStoreType::Worker => {
+                        self.db.with_write_txn(|txn| txn.remove::<KadWorkerProviderRecords>(&key))
+                    }
                 }
                 .is_ok()
                 {
@@ -394,12 +404,12 @@ impl<DB: Database> RecordStore for KadStore<DB> {
                 }
             } else {
                 let _ = match self.kad_type {
-                    KadStoreType::Primary => {
-                        self.db.insert::<KadProviderRecords>(&key, &encode(&records))
-                    }
-                    KadStoreType::Worker => {
-                        self.db.insert::<KadWorkerProviderRecords>(&key, &encode(&records))
-                    }
+                    KadStoreType::Primary => self.db.with_write_txn(|txn| {
+                        txn.insert::<KadProviderRecords>(&key, &encode(&records))
+                    }),
+                    KadStoreType::Worker => self.db.with_write_txn(|txn| {
+                        txn.insert::<KadWorkerProviderRecords>(&key, &encode(&records))
+                    }),
                 };
             }
         }

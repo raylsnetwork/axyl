@@ -12,7 +12,7 @@ use rayls_infrastructure_network_types::{WorkerOthersBatchMessage, WorkerToPrima
 use rayls_infrastructure_storage::tables::Batches;
 use rayls_infrastructure_types::{
     encode, ensure, now, try_decode, Batch, BatchValidation, BlockHash, BlsPublicKey, Bytes,
-    CommitteeSlots, Database, DbTx, SealedBatch, WorkerId,
+    CommitteeSlots, Database, DbTx, DbTxMut, SealedBatch, WorkerId,
 };
 use std::sync::{Arc, LazyLock};
 use tracing::{debug, error};
@@ -83,11 +83,15 @@ where
                     match self.network_handle.request_batches(vec![batch_hash]).await {
                         Ok(batches) => {
                             if let Some(batch) = batches.first() {
-                                store.insert::<Batches>(&batch.digest(), batch).map_err(|e| {
-                                    WorkerNetworkError::Internal(format!(
-                                        "failed to write to batch store: {e}"
-                                    ))
-                                })?;
+                                store
+                                    .with_write_txn(|txn| {
+                                        txn.insert::<Batches>(&batch.digest(), batch)
+                                    })
+                                    .map_err(|e| {
+                                        WorkerNetworkError::Internal(format!(
+                                            "failed to write to batch store: {e}"
+                                        ))
+                                    })?;
                             }
                         }
                         Err(e) => {
@@ -154,7 +158,7 @@ where
 
         // Set received_at timestamp for remote batch.
         batch.set_received_at(now());
-        store.insert::<Batches>(&digest, &batch).map_err(|e| {
+        store.with_write_txn(|txn| txn.insert::<Batches>(&digest, &batch)).map_err(|e| {
             WorkerNetworkError::Internal(format!("failed to write to batch store: {e}"))
         })?;
 

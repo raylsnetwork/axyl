@@ -258,6 +258,23 @@ pub struct LayeredDbTx<'a, DB: Database> {
 }
 
 impl<'a, DB: Database> LayeredDbTx<'a, DB> {
+    /// Merges the tips of the two hot layers, dropping a persisted tip that mem has tombstoned.
+    /// The caller supplies the fallback scan for when both layers are empty or the tip is stale.
+    fn merge_tips<T: Table>(
+        &self,
+        mem: Option<(T::Key, T::Value)>,
+        db: Option<(T::Key, T::Value)>,
+    ) -> Option<(T::Key, T::Value)> {
+        match (mem, db) {
+            (Some(mem), Some(db)) if db.0 > mem.0 => {
+                (!self.mem_db.is_tombstoned::<T>(&db.0)).then_some(db)
+            }
+            (Some(mem), _) => Some(mem),
+            (None, Some(db)) if !self.mem_db.is_tombstoned::<T>(&db.0) => Some(db),
+            _ => None,
+        }
+    }
+
     /// Opens a cold read transaction over the attached tier, resolving the auxiliary index on
     /// this transaction's own hot snapshot.
     #[cfg(feature = "cold-storage")]
@@ -508,11 +525,21 @@ impl<'a, DB: Database> DbTx for LayeredDbTx<'a, DB> {
     }
 
     fn last_record<T: Table>(&self) -> Option<(T::Key, T::Value)> {
-        self.reverse_iter::<T>().next()
+        // Tips of the two hot layers (each O(1)), falling back to the merged scan only when the
+        // persisted tip is tombstoned in mem or the hot layers are empty (cold-only table). The
+        // merged iterators snapshot and decode the whole mem table, which callers on per-cert
+        // paths cannot afford.
+        self.merge_tips::<T>(self.mem_db.last_record::<T>(), self.db.last_record::<T>())
+            .or_else(|| self.reverse_iter::<T>().next())
     }
 
     fn record_prior_to<T: Table>(&self, key: &T::Key) -> Option<(T::Key, T::Value)> {
-        self.iter::<T>().take_while(|(k, _)| k < key).last()
+        // Same shape as `last_record`, positioned below `key` on each layer.
+        self.merge_tips::<T>(
+            self.mem_db.record_prior_to::<T>(key),
+            self.db.record_prior_to::<T>(key),
+        )
+        .or_else(|| self.iter::<T>().take_while(|(k, _)| k < key).last())
     }
 
     fn disable_long_read_safety(&self) {
@@ -1461,11 +1488,11 @@ impl<DB: Database> Database for LayeredDatabase<DB> {
     }
 
     fn record_prior_to<T: Table>(&self, key: &T::Key) -> Option<(T::Key, T::Value)> {
-        self.iter::<T>().take_while(|(k, _)| k < key).last()
+        self.read_txn().ok()?.record_prior_to::<T>(key)
     }
 
     fn last_record<T: Table>(&self) -> Option<(T::Key, T::Value)> {
-        self.reverse_iter::<T>().next()
+        self.read_txn().ok()?.last_record::<T>()
     }
 
     fn persist(&self) -> impl Future<Output = eyre::Result<()>> + Send {
@@ -1659,11 +1686,10 @@ impl<T: Table, DB: Database> RemoveTrait<DB> for KeyRemoveBatch<T> {
         Ok(())
     }
 
-    fn on_applied(&self, mem_db: &MemDatabase, heap: &mut EvictionHeap) {
-        for key in &self.keys {
-            mem_db.on_op_applied(T::NAME, &encode_key(key), heap);
-        }
-    }
+    // `hard_delete` dropped the cache entries without taking an in-flight op, so there is nothing
+    // to release: a key re-inserted while this remove was queued owns its entry's ops, and
+    // releasing one here would underflow the count when that insert applies.
+    fn on_applied(&self, _mem_db: &MemDatabase, _heap: &mut EvictionHeap) {}
 }
 
 impl<T: Table, DB: Database> ClearTrait<DB> for ClearTable<T> {
@@ -1709,10 +1735,73 @@ impl<DB: Database> Debug for DBMessage<DB> {
     }
 }
 
+/// Rig helpers for tests that need to stall or inspect the layered writer.
+#[cfg(any(test, feature = "test-utils"))]
+pub mod test_utils {
+    use super::{DBMessage, EvictionHeap, InsertTrait, LayeredDatabase, MemDatabase};
+    use rayls_infrastructure_types::Database;
+    use std::sync::mpsc::{Receiver, Sender};
+
+    /// Writer message that parks `db_run` until the paired sender is dropped, so a test can pin a
+    /// real enqueued backlog behind a stalled writer. It signals `reached` just before parking, so
+    /// a test can wait deterministically for the writer to have drained up to the gate instead
+    /// of sleeping on a fixed timeout.
+    pub(super) struct WriterGate {
+        pub(super) park: Receiver<()>,
+        pub(super) reached: Sender<()>,
+    }
+
+    impl<DB: Database> InsertTrait<DB> for WriterGate {
+        fn insert(&self, _db: &DB) -> eyre::Result<()> {
+            let _ = self.reached.send(());
+            let _ = self.park.recv();
+            Ok(())
+        }
+        fn insert_txn(&self, _txn: &mut DB::TXMut<'_>) -> eyre::Result<()> {
+            let _ = self.reached.send(());
+            let _ = self.park.recv();
+            Ok(())
+        }
+        fn on_applied(&self, _mem_db: &MemDatabase, _heap: &mut EvictionHeap) {}
+    }
+
+    /// A parked writer; dropping it lets the writer run again.
+    #[must_use = "dropping the hold releases the writer"]
+    pub struct WriterHold {
+        _release: Sender<()>,
+        reached: Receiver<()>,
+    }
+
+    impl WriterHold {
+        /// Blocks until the writer has drained everything enqueued before the park and is parked.
+        pub fn wait_parked(&self) {
+            let _ = self.reached.recv();
+        }
+    }
+
+    /// Parks the writer at the current queue tail: every message enqueued afterwards stays queued
+    /// until the returned hold is dropped, so a test can measure a real backlog without timing.
+    pub fn park_writer<DB: Database>(db: &LayeredDatabase<DB>) -> WriterHold {
+        let (release, park) = std::sync::mpsc::channel::<()>();
+        let (reached, reached_rx) = std::sync::mpsc::channel::<()>();
+        db.tx
+            .send(DBMessage::Insert(Box::new(WriterGate { park, reached })))
+            .expect("writer alive");
+        WriterHold { _release: release, reached: reached_rx }
+    }
+
+    /// A layered DB over an in-memory tier with the node's default tables open on both layers.
+    pub fn open_layered_mem_db() -> LayeredDatabase<MemDatabase> {
+        let mut db = LayeredDatabase::open(MemDatabase::default());
+        crate::open_default_tables(&mut db).expect("open default tables on the layered mem db");
+        db
+    }
+}
+
 #[cfg(test)]
 mod test {
     use super::{
-        CacheConfig, DBMessage, EvictionHeap, InsertTrait, KeyValueInsert, LayeredDatabase,
+        test_utils::WriterGate, CacheConfig, DBMessage, KeyValueInsert, LayeredDatabase,
         QUEUE_HIGH_WATER_MARK, QUEUE_PACE_SLEEP,
     };
     #[cfg(feature = "redb")]
@@ -1722,7 +1811,7 @@ mod test {
         mem_db::MemDatabase,
         test::*,
     };
-    use rayls_infrastructure_types::{DBIter, DBRawIter, Database, DbTxMut, Table};
+    use rayls_infrastructure_types::{DBIter, DBRawIter, Database, DbTx, DbTxMut, Table};
     use std::{path::Path, sync::Arc, time::Instant};
     use tempfile::tempdir;
 
@@ -2128,35 +2217,39 @@ mod test {
         );
     }
 
-    /// Writer message that parks `db_run` until the paired sender is dropped, so a test can pin a
-    /// real enqueued backlog behind a stalled writer. It signals `reached` just before parking, so
-    /// a test can wait deterministically for the writer to have drained up to the gate instead
-    /// of sleeping on a fixed timeout.
-    struct WriterGate {
-        park: std::sync::mpsc::Receiver<()>,
-        reached: std::sync::mpsc::Sender<()>,
-    }
-
-    impl<DB: Database> InsertTrait<DB> for WriterGate {
-        fn insert(&self, _db: &DB) -> eyre::Result<()> {
-            let _ = self.reached.send(());
-            let _ = self.park.recv();
-            Ok(())
-        }
-        fn insert_txn(&self, _txn: &mut DB::TXMut<'_>) -> eyre::Result<()> {
-            let _ = self.reached.send(());
-            let _ = self.park.recv();
-            Ok(())
-        }
-        fn on_applied(&self, _mem_db: &MemDatabase, _heap: &mut EvictionHeap) {}
-    }
-
     /// A `(release, reached, gate)` triple: dropping `release` lets the writer pass the gate, and
     /// `reached` fires once the writer has drained up to and parked at the gate.
     fn writer_gate() -> (std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>, WriterGate) {
         let (release, park) = std::sync::mpsc::channel::<()>();
         let (reached, reached_rx) = std::sync::mpsc::channel::<()>();
         (release, reached_rx, WriterGate { park, reached })
+    }
+
+    /// A prune's batched remove releases no in-flight op: `hard_delete` drops the cache entry
+    /// outright (no tombstone, no op), so a key re-inserted while the remove is still queued must
+    /// keep its own insert's in-flight op until that insert applies. Releasing it early drives the
+    /// count below zero when the re-insert applies (an overflow abort in release builds), a window
+    /// the archiver exposes on every prune chunk once it no longer drains the writer between them.
+    #[tokio::test]
+    async fn batched_prune_remove_does_not_release_a_reinserted_keys_in_flight_op() {
+        let inner = MemDatabase::new();
+        inner.open_table::<TestTable>().expect("open inner table");
+        let db = LayeredDatabase::open(inner);
+        db.open_table::<TestTable>().expect("open layered table");
+        let key = 7u64;
+        db.insert::<TestTable>(&key, &"archived".to_string()).expect("insert");
+        db.persist().await.expect("applied");
+
+        // Park the writer so the prune's remove is still queued when the key comes back.
+        let (release, reached, gate) = writer_gate();
+        db.tx.send(DBMessage::Insert(Box::new(gate))).expect("gate enqueue");
+        reached.recv().expect("writer parked");
+        db.with_write_txn(|txn| txn.evict_persistent_batch::<TestTable>(&[key])).expect("prune");
+        db.insert::<TestTable>(&key, &"reinserted".to_string()).expect("re-insert");
+        drop(release);
+
+        db.persist().await.expect("the writer must apply the prune and the re-insert");
+        assert_eq!(db.get::<TestTable>(&key).expect("read"), Some("reinserted".to_string()));
     }
 
     /// A producer bursting into a seeded writer backlog must be paced above the high-water mark,
@@ -2461,6 +2554,61 @@ mod test {
         test_iter_skip_to_previous_gap(db);
     }
 
+    /// `last_record` and `record_prior_to` answer from the layer tips without a full scan, so
+    /// they must agree with the merged iterators across every layer shape: persisted max
+    /// tombstoned in mem, mem-only max above the persisted max, prior record on either layer, and
+    /// an empty table.
+    #[test]
+    fn last_record_and_record_prior_to_match_the_merged_iterators() {
+        let temp_dir = tempdir().expect("failed to create temp dir");
+        let db = open_mdbx(temp_dir.path());
+        assert!(db.last_record::<TestTable>().is_none());
+        assert!(db.record_prior_to::<TestTable>(&5).is_none());
+
+        let mut txn = db.write_txn().unwrap();
+        for i in 1..=10 {
+            txn.insert::<TestTable>(&i, &i.to_string()).unwrap();
+        }
+        txn.commit().unwrap();
+        db.sync_persist().expect("persist");
+
+        // tombstone the two largest persisted keys; the max now sits below them in the db
+        db.remove::<TestTable>(&10).unwrap();
+        db.remove::<TestTable>(&9).unwrap();
+        // mem-only rows: a new max, and an overwrite below the target key
+        let mut txn = db.write_txn().unwrap();
+        txn.insert::<TestTable>(&5, &"five".to_string()).unwrap();
+        txn.commit().unwrap();
+
+        let check = |db: &LayeredDatabase<MdbxDatabase>, target: u64| {
+            let txn = db.read_txn().unwrap();
+            assert_eq!(txn.last_record::<TestTable>(), txn.reverse_iter::<TestTable>().next());
+            assert_eq!(
+                txn.record_prior_to::<TestTable>(&target),
+                txn.iter::<TestTable>().take_while(|(k, _)| *k < target).last()
+            );
+            assert_eq!(db.last_record::<TestTable>(), txn.last_record::<TestTable>());
+            assert_eq!(
+                db.record_prior_to::<TestTable>(&target),
+                txn.record_prior_to::<TestTable>(&target)
+            );
+        };
+        assert_eq!(db.last_record::<TestTable>(), Some((8, "8".to_string())));
+        assert_eq!(db.record_prior_to::<TestTable>(&6), Some((5, "five".to_string())));
+        assert_eq!(db.record_prior_to::<TestTable>(&11), Some((8, "8".to_string())));
+        for target in [1, 5, 6, 9, 11] {
+            check(&db, target);
+        }
+
+        let mut txn = db.write_txn().unwrap();
+        txn.insert::<TestTable>(&12, &"12".to_string()).unwrap();
+        txn.commit().unwrap();
+        assert_eq!(db.last_record::<TestTable>(), Some((12, "12".to_string())));
+        for target in [9, 12, 13] {
+            check(&db, target);
+        }
+    }
+
     #[test]
     fn test_layereddb_remove() {
         let temp_dir = tempdir().expect("failed to create temp dir");
@@ -2507,6 +2655,18 @@ mod test {
         }
         let db = open_mdbx(temp_dir.path());
         test_iter_reverse(db);
+    }
+
+    #[test]
+    fn test_layereddb_txn_iter_order() {
+        let temp_dir = tempdir().expect("failed to create temp dir");
+        #[cfg(feature = "redb")]
+        {
+            let db = open_redb(temp_dir.path());
+            test_txn_iter_order(db);
+        }
+        let db = open_mdbx(temp_dir.path());
+        test_txn_iter_order(db);
     }
 
     #[test]

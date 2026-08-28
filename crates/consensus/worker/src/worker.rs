@@ -18,8 +18,8 @@ use rayls_infrastructure_storage::tables::{BatchSeqCounter, Batches, ConsensusBl
 use rayls_infrastructure_types::{
     batch_tracker::{BatchTracker, SealFailureReason},
     error::BlockSealError,
-    AuthorityIdentifier, BatchReceiver, BatchSender, BatchValidation, Bytes, Database, Epoch,
-    SealedBatch, SenderNonceRanges, TaskKind, TaskManager, WorkerId,
+    AuthorityIdentifier, BatchReceiver, BatchSender, BatchValidation, Bytes, Database, DbTx,
+    DbTxMut, Epoch, SealedBatch, SenderNonceRanges, TaskKind, TaskManager, WorkerId,
 };
 use std::{sync::Arc, time::Duration};
 use tracing::{error, info, warn};
@@ -119,31 +119,42 @@ pub(crate) fn walk_consensus_blocks_for_max_seq<DB: Database>(
     authority_id: AuthorityIdentifier,
     current_epoch: Epoch,
 ) -> Option<u64> {
-    let mut max_seq: Option<u64> = None;
-    for (_block_num, consensus_block) in store.reverse_iter::<ConsensusBlocks>() {
-        if consensus_block.sub_dag.leader_epoch() < current_epoch {
-            break;
-        }
-        let mut found_in_block = false;
-        for cert in &consensus_block.sub_dag.certificates {
-            if cert.header.author != authority_id {
-                continue;
-            }
-            for (batch_digest, wid) in cert.header.payload() {
-                if *wid != worker_id {
-                    continue;
+    // Walk under a read txn so `reverse_iter` is lazy: the scan pulls blocks from the tip and stops
+    // at the epoch boundary or first match, rather than the non-txn iterator materializing the
+    // whole ConsensusBlocks table up front. The txn also snapshots the batch reads against the
+    // same view.
+    store
+        .with_read_txn(|txn| {
+            let mut max_seq: Option<u64> = None;
+            // TODO: migrate to reverse_raw_iter once a raw projection for the leader epoch and this
+            // author+worker's batch digests exists, to skip the certificate BLS decode that
+            // dominates a cold whole-epoch scan.
+            for (_block_num, consensus_block) in txn.reverse_iter::<ConsensusBlocks>() {
+                if consensus_block.sub_dag.leader_epoch() < current_epoch {
+                    break;
                 }
-                if let Ok(Some(batch)) = store.get::<Batches>(batch_digest) {
-                    max_seq = Some(max_seq.map_or(batch.seq, |m| m.max(batch.seq)));
-                    found_in_block = true;
+                let mut found_in_block = false;
+                for cert in &consensus_block.sub_dag.certificates {
+                    if cert.header.author != authority_id {
+                        continue;
+                    }
+                    for (batch_digest, wid) in cert.header.payload() {
+                        if *wid != worker_id {
+                            continue;
+                        }
+                        if let Ok(Some(batch)) = txn.get::<Batches>(batch_digest) {
+                            max_seq = Some(max_seq.map_or(batch.seq, |m| m.max(batch.seq)));
+                            found_in_block = true;
+                        }
+                    }
+                }
+                if found_in_block {
+                    break;
                 }
             }
-        }
-        if found_in_block {
-            break;
-        }
-    }
-    max_seq
+            Ok(max_seq)
+        })
+        .expect("open a read txn for the consensus max-seq scan")
 }
 
 /// Process batch from EL into sealed batches for CL.
@@ -319,7 +330,9 @@ impl<DB: Database, QW: QuorumWaiterTrait> Worker<DB, QW> {
 
     /// Persist the batch sequence counter for this worker to DB.
     fn persist_batch_seq_counter(&self, next_seq: u64) {
-        if let Err(e) = self.store.insert::<BatchSeqCounter>(&self.id, &next_seq) {
+        if let Err(e) =
+            self.store.with_write_txn(|txn| txn.insert::<BatchSeqCounter>(&self.id, &next_seq))
+        {
             error!(target: "worker::batch_provider", "Failed to persist batch seq counter: {:?}", e);
         }
     }
@@ -378,7 +391,9 @@ impl<DB: Database, QW: QuorumWaiterTrait> Worker<DB, QW> {
                         }
 
                         // Now save it to permanent storage
-                        if let Err(e) = self.store.insert::<Batches>(&digest, &batch) {
+                        if let Err(e) =
+                            self.store.with_write_txn(|txn| txn.insert::<Batches>(&digest, &batch))
+                        {
                             error!(target: "worker::batch_provider", "Store failed with error: {:?}", e);
                             return Err(BlockSealError::FatalDBFailure);
                         }

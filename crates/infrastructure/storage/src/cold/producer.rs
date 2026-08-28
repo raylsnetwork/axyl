@@ -178,7 +178,10 @@ pub(super) enum JarSeal {
 /// `#[must_use]` because dropping it silently reports a cancelled pass as a completed archive.
 #[must_use]
 pub(super) enum Finalized {
-    /// The index, the high-water mark and the whole hot prune landed; carries the pass counts.
+    /// The index, the whole hot prune and the high-water mark are enqueued on the hot writer in
+    /// that order; carries the pass counts. Applied means enqueued, not committed: the single
+    /// writer applies in enqueue order, and a crash before the high-water mark lands leaves the
+    /// epoch for boot `reconcile` to re-finalize idempotently.
     Complete(ArchiveStats),
     /// `should_cancel` tripped mid-prune: the jars and the index are durable, so every row is in
     /// cold, and the leftover hot rows are swept by the next
@@ -186,10 +189,13 @@ pub(super) enum Finalized {
     Cancelled,
 }
 
-/// Finalizes one sealed epoch from its carried metadata: index + high-water mark in bounded synced
-/// txns, then the hot prune in bounded batches. The tail of the crash-atomic ordering; the jars
-/// are already durable. The live archiver passes its cancel flag and [`PRUNE_YIELD`]; the fused
-/// boot/offline paths pass no-cancel and zero yield (nothing shares the hot writer yet).
+/// Finalizes one sealed epoch from its carried metadata: index, then the hot prune in bounded
+/// batches, then the high-water mark. The tail of the crash-atomic ordering; the jars are already
+/// durable, and the hot writer's FIFO queue applies these writes in enqueue order, so no step waits
+/// on the writer: a barrier here re-waits every consensus write queued ahead of it, which on a
+/// catching-up node is minutes per barrier. The live archiver passes its cancel flag and
+/// [`PRUNE_YIELD`]; the fused boot/offline paths pass no-cancel and zero yield (nothing shares the
+/// hot writer yet).
 pub(super) fn finalize_sealed<DB: Database>(
     db: &DB,
     sealed: &SealedJars,
@@ -447,10 +453,11 @@ fn first_unsealed_block<DB: Database>(
     .map_err(to_cold)
 }
 
-/// Inserts the staged batch locations in bounded hot txns and drains them.
+/// Inserts the staged batch locations in bounded hot txns.
 ///
-/// The drain orders, it does not fsync (SafeNoSync env): MDBX commits monotonically, so a later
-/// delete can never be durable while this is not, and the fsynced jars let boot reconcile rebuild.
+/// Nothing drains: the writer's FIFO queue applies these before the prune enqueued after them, and
+/// MDBX commits monotonically, so a later delete can never be durable while this is not; the
+/// fsynced jars let boot reconcile rebuild.
 pub(super) fn commit_index<DB: Database>(
     db: &DB,
     locations: &[(BlockHash, ColdLocation)],
@@ -463,16 +470,15 @@ pub(super) fn commit_index<DB: Database>(
             Ok(())
         })
         // A txn-closure failure is a hot-tier fault (mem-cache mutation or a dead writer thread),
-        // not corruption: it must take the fatal path, not retry forever. The underlying MDBX
-        // write failure of these ops surfaces via the sync_persist below instead.
+        // not corruption: it must take the fatal path, not retry forever. An MDBX write failure
+        // of these ops poisons the layered DB, so the next archiver write fails fast on it.
         .map_err(to_write_failed)?;
     }
-    // Every location must be applied before the prune removes the rows they address.
-    db.sync_persist().map_err(to_write_failed)?;
     Ok(())
 }
 
-/// Marks `epoch` fully archived, after its index and its whole hot prune have landed.
+/// Marks `epoch` fully archived; enqueued after its index and its whole hot prune, so the writer
+/// applies it last.
 ///
 /// NOTE: this is the LAST step of a finalize, never an earlier one. The high-water mark's only
 /// meaning is "archived through here", which is what lets reconcile skip an epoch without probing
@@ -485,7 +491,6 @@ pub(super) fn advance_high_water_mark<DB: Database>(db: &DB, epoch: Epoch) -> Co
     })
     // Same hot-tier fault classification as `commit_index`; see the comment there.
     .map_err(to_write_failed)?;
-    db.sync_persist().map_err(to_write_failed)?;
     high_water_mark_gauge().set(epoch as i64);
     Ok(())
 }
@@ -507,8 +512,9 @@ pub(super) const PRUNE_YIELD: Duration = Duration::from_millis(5);
 /// Removes an archived epoch's hot rows in bounded per-txn batches addressed from the sealed jar,
 /// returning the block count, or `None` if `should_cancel` tripped mid-prune.
 ///
-/// Only safe after the jars are durable and the high-water mark synced. A partial delete strands
-/// nothing: the epoch's LAST block is deleted last, which is what reconcile probes to sweep it.
+/// Only safe after the jars are durable and the index is enqueued ahead of it. A partial delete
+/// strands nothing: the epoch's LAST block is deleted last, which is what reconcile probes to sweep
+/// it.
 pub(super) fn delete_archived_rows<DB: Database>(
     db: &DB,
     numbers: RangeInclusive<u64>,
@@ -518,16 +524,13 @@ pub(super) fn delete_archived_rows<DB: Database>(
 ) -> ColdResult<Option<u64>> {
     let count = numbers.end() - numbers.start() + 1;
     let digests: Vec<BlockHash> = locations.iter().map(|(digest, _)| *digest).collect();
-    // The between-chunk drain and yield hand the shared hot writer back to live consensus; with
-    // zero yield (boot, migration, reconcile) nothing shares the writer, and every `sync_persist`
-    // would cost its full polling quantum per chunk for nothing. Deletes queued at a crash just
-    // leave more hot leftovers for reconcile's last-block probe to sweep.
-    let pace = |db: &DB| -> ColdResult<()> {
+    // The between-chunk yield hands the shared hot writer back to live consensus; with zero yield
+    // (boot, migration, reconcile) nothing shares the writer. Deletes queued at a crash just leave
+    // more hot leftovers for reconcile's last-block probe to sweep.
+    let pace = || {
         if !yield_between.is_zero() {
-            db.sync_persist().map_err(to_write_failed)?;
             std::thread::sleep(yield_between);
         }
-        Ok(())
     };
     for chunk in digests.chunks(WRITE_BATCH_ROWS) {
         if should_cancel() {
@@ -536,7 +539,7 @@ pub(super) fn delete_archived_rows<DB: Database>(
         db.with_write_txn(|txn| txn.evict_persistent_batch::<Batches>(chunk))
             // Hot-tier fault, not corruption; see `commit_index`.
             .map_err(to_write_failed)?;
-        pace(db)?;
+        pace();
     }
     // Chunk the dense range directly instead of materializing every block number up front; only
     // one chunk's numbers are ever held at a time.
@@ -550,7 +553,7 @@ pub(super) fn delete_archived_rows<DB: Database>(
         db.with_write_txn(|txn| txn.evict_persistent_batch::<ConsensusBlocks>(&chunk))
             // Hot-tier fault, not corruption; see `commit_index`.
             .map_err(to_write_failed)?;
-        pace(db)?;
+        pace();
         match chunk_end.checked_add(1) {
             Some(next) if next <= *numbers.end() => chunk_start = next,
             _ => break,

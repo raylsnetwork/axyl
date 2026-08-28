@@ -4,7 +4,7 @@ use crate::{
 };
 use rayls_infrastructure_types::{
     batch_ordering::{AuthoritySeqState, BatchOrderingState, StoredBatchOrderingState},
-    try_decode, B256Map, Batch, Database, DbTx, B256,
+    try_decode, B256Map, Batch, Database, DbTx, DbTxMut, B256,
 };
 use std::{collections::BTreeMap, sync::Arc};
 use tracing::warn;
@@ -26,7 +26,7 @@ impl<DB: Database> BatchOrderingStore for DB {
         // Persist parked batches by digest, not by value: a committed batch's `Batches` row
         // survives the reboot, so the transaction bytes would only be duplicated in the blob.
         let stored = StoredBatchOrderingState::from(ordering);
-        self.insert::<TableBatchOrderingState>(&ORDERING_KEY, &stored)
+        self.with_write_txn(|txn| txn.insert::<TableBatchOrderingState>(&ORDERING_KEY, &stored))
     }
 
     fn read_batch_ordering_state(&self) -> StoreResult<Option<BatchOrderingState>> {

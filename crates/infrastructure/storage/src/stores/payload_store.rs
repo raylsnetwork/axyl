@@ -1,5 +1,5 @@
 use crate::tables::Payload;
-use rayls_infrastructure_types::{BlockHash, Database, WorkerId};
+use rayls_infrastructure_types::{BlockHash, Database, DbTxMut, WorkerId};
 
 /// Access the batch digests for the primary node for the own created batches.
 pub trait PayloadStore {
@@ -12,9 +12,7 @@ pub trait PayloadStore {
 
 impl<DB: Database> PayloadStore for DB {
     fn write_payload(&self, digest: &BlockHash, worker_id: &WorkerId) -> eyre::Result<()> {
-        self.insert::<Payload>(&(*digest, *worker_id), &0u8)?;
-
-        Ok(())
+        self.with_write_txn(|txn| txn.insert::<Payload>(&(*digest, *worker_id), &0u8))
     }
 
     fn contains_payload(&self, digest: BlockHash, worker_id: WorkerId) -> eyre::Result<bool> {

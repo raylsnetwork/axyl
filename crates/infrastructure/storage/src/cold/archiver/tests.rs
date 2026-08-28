@@ -5,7 +5,10 @@ use std::sync::Arc;
 use tempfile::TempDir;
 
 use super::ColdArchiver;
-use crate::cold::{probe::ProbeDb, ColdConfig, ColdStore};
+use crate::{
+    cold::{ColdConfig, ColdStore},
+    test_utils::TestDb,
+};
 
 /// A hot read that fails must surface as an error, never as "nothing left to archive": the
 /// caller counts the failure and retries, where a `Drained` would stop archival for good while
@@ -16,7 +19,7 @@ fn unreadable_hot_tier_fails_the_pass() {
     let cold = Arc::new(
         ColdStore::open(&ColdConfig { dir: tmp.path().to_path_buf() }).expect("open cold store"),
     );
-    let archiver = ColdArchiver::new(ProbeDb::failing_reads(), cold);
+    let archiver = ColdArchiver::new(TestDb::failing_reads(), cold);
 
     let sealed = archiver.seal_due(1, || false);
     assert!(sealed.is_err(), "an unreadable hot tier must fail the seal, got {sealed:?}");

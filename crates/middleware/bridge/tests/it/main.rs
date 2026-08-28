@@ -15,8 +15,8 @@ use rayls_infrastructure_storage::{
 };
 use rayls_infrastructure_types::{
     CameFrom, Certificate, CommittedSubDag, ConsensusHeader, ConsensusOutput, Database, DbTxMut,
-    ExecHeader, RaylsReceiver as _, RaylsSender as _, ReputationScores, SealedHeader, TaskManager,
-    B256, DEFAULT_BAD_NODES_STAKE_THRESHOLD,
+    ExecHeader, NodeMode, RaylsReceiver as _, RaylsSender as _, ReputationScores, Round,
+    SealedHeader, TaskManager, B256, DEFAULT_BAD_NODES_STAKE_THRESHOLD,
 };
 use rayls_middleware_bridge::subscriber::spawn_subscriber;
 use rayls_testing_test_utils::{create_signed_certificates_for_rounds, CommitteeFixture};
