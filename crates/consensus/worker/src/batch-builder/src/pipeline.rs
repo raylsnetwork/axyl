@@ -151,6 +151,15 @@ impl<S> BatchPipeline<S> {
         self.data.highest_durable_sealed_seq
     }
 
+    /// Closes the pipeline when the canonical tip has reached the epoch boundary.
+    pub fn check_boundary(self, epoch_boundary: u64) -> Result<Self, BatchPipeline<Closed>> {
+        if self.data.last_canonical_timestamp >= epoch_boundary {
+            Err(BatchPipeline { state: Closed, data: self.data })
+        } else {
+            Ok(self)
+        }
+    }
+
     /// Records the latest canonical tip timestamp, which gates the boundary and quiesce checks.
     #[inline]
     pub fn on_canonical_update(&mut self, timestamp: u64) {
@@ -181,15 +190,6 @@ impl BatchPipeline<Clean> {
     pub fn on_event(self) -> BatchPipeline<Accumulating> {
         BatchPipeline { state: Accumulating, data: self.data }
     }
-
-    /// Closes the pipeline when the canonical tip has reached the epoch boundary.
-    pub fn check_boundary(self, epoch_boundary: u64) -> Result<Self, BatchPipeline<Closed>> {
-        if self.data.last_canonical_timestamp >= epoch_boundary {
-            Err(BatchPipeline { state: Closed, data: self.data })
-        } else {
-            Ok(self)
-        }
-    }
 }
 
 impl BatchPipeline<Accumulating> {
@@ -216,15 +216,6 @@ impl BatchPipeline<Accumulating> {
             data: self.data,
         }
     }
-
-    /// Closes the pipeline when the canonical tip has reached the epoch boundary.
-    pub fn check_boundary(self, epoch_boundary: u64) -> Result<Self, BatchPipeline<Closed>> {
-        if self.data.last_canonical_timestamp >= epoch_boundary {
-            Err(BatchPipeline { state: Closed, data: self.data })
-        } else {
-            Ok(self)
-        }
-    }
 }
 
 impl BatchPipeline<BacklogDraining> {
@@ -249,15 +240,6 @@ impl BatchPipeline<BacklogDraining> {
                 started: Instant::now(),
             },
             data: self.data,
-        }
-    }
-
-    /// Closes the pipeline when the canonical tip has reached the epoch boundary.
-    pub fn check_boundary(self, epoch_boundary: u64) -> Result<Self, BatchPipeline<Closed>> {
-        if self.data.last_canonical_timestamp >= epoch_boundary {
-            Err(BatchPipeline { state: Closed, data: self.data })
-        } else {
-            Ok(self)
         }
     }
 }
@@ -314,15 +296,6 @@ impl BatchPipeline<AwaitingQuorum> {
             SealedTransition::Accumulating(BatchPipeline { state: Accumulating, data: self.data })
         } else {
             SealedTransition::Clean(BatchPipeline { state: Clean, data: self.data })
-        }
-    }
-
-    /// Closes the pipeline when the canonical tip has reached the epoch boundary.
-    pub fn check_boundary(self, epoch_boundary: u64) -> Result<Self, BatchPipeline<Closed>> {
-        if self.data.last_canonical_timestamp >= epoch_boundary {
-            Err(BatchPipeline { state: Closed, data: self.data })
-        } else {
-            Ok(self)
         }
     }
 }
