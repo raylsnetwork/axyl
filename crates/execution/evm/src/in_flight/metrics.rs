@@ -51,7 +51,7 @@ impl InFlightMetrics {
             )?,
             released_dropped: prometheus::register_int_counter_with_registry!(
                 RELEASED_DROPPED_COUNTER,
-                "Marks released because the batch executed but dropped the transaction (nonce too high); the tx stays pooled and re-sealable",
+                "Held marks released because the sender's state nonce advanced (nonce too high); the tx stays pooled and re-sealable",
                 registry
             )?,
             released_ttl: prometheus::register_int_counter_with_registry!(

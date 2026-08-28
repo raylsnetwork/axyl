@@ -42,8 +42,9 @@
 //!
 //! A mark leaves the set through one of several paths, each counted under its own cause so TTL
 //! churn stays distinguishable from healthy execution-driven release: reconcile against the live
-//! pending set ([`InFlightTracker::release_mined`]), an explicit drop of pool-rejected hashes
-//! ([`InFlightTracker::release_dropped`]), the sealing TTL sweep, and the epoch-transition clear.
+//! pending set ([`InFlightTracker::release_mined`]), the release of hashes execution dropped as
+//! nonce-too-high once their sender's state nonce advances ([`InFlightTracker::hold_dropped`] then
+//! [`InFlightTracker::release_advanced`]), the sealing TTL sweep, and the epoch-transition clear.
 //! Every release that frees at least one mark ticks the release watch
 //! ([`InFlightTracker::release_events`]) exactly once - once per release *call*, not per hash -
 //! which is the builder's only wake-up signal that transactions are re-selectable again; a no-op
@@ -69,8 +70,8 @@
 
 use crate::in_flight::metrics::{InFlightMetrics, IN_FLIGHT_METRICS};
 use alloy::primitives::{
-    map::{B256Map, B256Set},
-    TxHash,
+    map::{AddressSet, B256Map, B256Set},
+    Address, TxHash,
 };
 use parking_lot::RwLock;
 #[cfg(test)]
@@ -204,25 +205,37 @@ impl InFlightTracker {
     fn release_due(&self, anchor: u64, policy: &DuePolicy) -> usize {
         let mut guard = self.inner.write();
         let previous_marks_len = guard.marks.len();
-        guard.marks.retain(|_, mark| !mark.is_due(Instant::now(), anchor, policy));
+        let now = Instant::now();
+        guard.marks.retain(|_, mark| !mark.is_due(now, anchor, policy));
         let current_marks_len = guard.marks.len();
         drop(guard);
         self.on_released(previous_marks_len, current_marks_len, &self.metrics.released_ttl);
         previous_marks_len - current_marks_len
     }
 
-    /// Releases the given hashes, e.g. transactions the pool dropped before mining.
-    pub fn release_dropped(&self, hashes: impl IntoIterator<Item = TxHash>) {
-        let mut hashes = hashes.into_iter().peekable();
-        if hashes.peek().is_none() {
-            return;
+    /// Holds tracked hashes execution dropped as nonce-too-high: each stays in flight (neither
+    /// re-sealed nor re-forwarded) until [`Self::release_advanced`] sees its sender's state nonce
+    /// move or [`DROPPED_HOLD`] lapses. Untracked hashes are ignored, and a hash already held keeps
+    /// its stamp, so a peer re-sealing it cannot extend the hold.
+    pub fn hold_dropped(&self, dropped: impl IntoIterator<Item = (Address, TxHash)>) {
+        let now = Instant::now();
+        let mut guard = self.inner.write();
+        for (sender, hash) in dropped {
+            if let Some(mark @ Mark::Sent { .. }) = guard.marks.get_mut(&hash) {
+                *mark = Mark::Held { at: now, sender };
+            }
         }
+    }
 
+    /// Releases every held hash of the given senders, whose state nonce a block just advanced:
+    /// their dropped successors may now execute, so they are re-sealable and re-forwardable.
+    pub fn release_advanced(&self, senders: impl IntoIterator<Item = Address>) {
+        let advanced: AddressSet = senders.into_iter().collect();
         let mut guard = self.inner.write();
         let previous_marks_len = guard.marks.len();
-        for hash in hashes {
-            guard.marks.remove(&hash);
-        }
+        guard.marks.retain(
+            |_, mark| !matches!(mark, Mark::Held { sender, .. } if advanced.contains(sender)),
+        );
         let current_marks_len = guard.marks.len();
         drop(guard);
         self.on_released(previous_marks_len, current_marks_len, &self.metrics.released_dropped);
@@ -313,8 +326,11 @@ impl InFlightTracker {
             .iter()
             .map(|(hash, mark)| SavedMark {
                 hash: *hash,
+                // A hold is a wall-clock claim that does not survive the process: the restored
+                // mark re-stamps as a fresh send and re-earns its hold if it drops again.
                 kind: match *mark {
                     Mark::Sent { attempts, .. } => SavedMarkKind::Sent { attempts },
+                    Mark::Held { .. } => SavedMarkKind::Sent { attempts: 0 },
                     Mark::AckedStale => SavedMarkKind::AckedStale,
                 },
             })

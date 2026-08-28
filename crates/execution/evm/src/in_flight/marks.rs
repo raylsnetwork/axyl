@@ -1,5 +1,5 @@
 use crate::in_flight::InFlightTracker;
-use alloy::primitives::TxHash;
+use alloy::primitives::{Address, TxHash};
 use std::time::{Duration, Instant};
 
 /// Governs when a mark becomes eligible for release: a base wait, an exponential backoff cap
@@ -23,14 +23,23 @@ impl DuePolicy {
     }
 }
 
-/// The state of one tracked hash: sent and awaiting a due check, or acknowledged stale by the
-/// forwarder. `AckedStale` is a terminal state outside the resend/expiry cycle - see `is_due`.
+/// Upper bound on how long a dropped hash stays held when its sender never advances, so a
+/// predecessor lost for good is still retried, just not every round.
+pub const DROPPED_HOLD: Duration = Duration::from_secs(60);
+
+/// The state of one tracked hash: sent and awaiting a due check, acknowledged stale by the
+/// forwarder, or held after execution dropped it as nonce-too-high. `AckedStale` is a terminal
+/// state outside the resend/expiry cycle - see `is_due`.
 #[derive(Copy, Clone, Debug)]
 pub(crate) enum Mark {
     /// Sent at `at` while the execution anchor was `anchor`, after `attempts` prior resends.
     Sent { at: Instant, anchor: u64, attempts: u32 },
     /// Confirmed no longer live by the forwarder; never due, released only by reconcile or clear.
     AckedStale,
+    /// Executed as nonce-too-high at `at`: pooled and unexecutable until `sender`'s state nonce
+    /// advances, which releases it ([`InFlightTracker::release_advanced`]); due only once
+    /// [`DROPPED_HOLD`] lapses, since a re-seal or re-send before that drops it again.
+    Held { at: Instant, sender: Address },
 }
 
 impl Mark {
@@ -46,16 +55,20 @@ impl Mark {
                 now.duration_since(at) >= wait
                     && anchor >= mark_anchor.saturating_add(policy.min_anchor_advance)
             }
+            Mark::Held { at, .. } => now.duration_since(at) >= DROPPED_HOLD,
             Mark::AckedStale => false,
         }
     }
 
-    /// Refreshes a `Sent` mark to the given time/anchor and bumps its attempt count; a no-op
-    /// on an `AckedStale` mark, which never resends.
+    /// Refreshes a `Sent` or `Held` mark to the given time/anchor and bumps its attempt count; a
+    /// no-op on an `AckedStale` mark, which never resends.
     pub(crate) fn resend(&mut self, now: Instant, anchor: u64) {
-        if let Self::Sent { attempts, .. } = self {
-            *self = Self::Sent { at: now, anchor, attempts: attempts.saturating_add(1) };
-        }
+        let attempts = match *self {
+            Self::Sent { attempts, .. } => attempts,
+            Self::Held { .. } => 0,
+            Self::AckedStale => return,
+        };
+        *self = Self::Sent { at: now, anchor, attempts: attempts.saturating_add(1) };
     }
 }
 

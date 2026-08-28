@@ -486,18 +486,70 @@ proptest! {
     }
 }
 
-/// `release_dropped` frees exactly the given hashes and counts them under its own release
-/// cause, leaving unrelated marks in place.
+/// A dropped (nonce-too-high) hash keeps its mark until its sender's state nonce advances: the
+/// transaction is pooled and unexecutable, so re-sealing it before its predecessor lands only
+/// drops it again.
 #[test]
-fn release_dropped_frees_only_the_given_hashes() {
+fn dropped_hashes_stay_in_flight_until_their_sender_advances() {
+    let tracker = InFlightTracker::with_fresh_metrics();
+    let sealing = tracker.arm_sealing(DuePolicy::ttl(Duration::from_secs(60)));
+    let (a, b) = (Address::random(), Address::random());
+    sealing.mark([hash(1), hash(2), hash(3)]);
+
+    tracker.hold_dropped([(a, hash(1)), (a, hash(2)), (b, hash(3))]);
+    assert_eq!(tracker.len(), 3, "a dropped hash stays in flight");
+
+    tracker.release_advanced([b]);
+    assert!(tracker.is_in_flight(&hash(1)) && tracker.is_in_flight(&hash(2)));
+    assert!(!tracker.is_in_flight(&hash(3)), "the advanced sender's hashes are re-sealable");
+
+    tracker.release_advanced([a, b]);
+    assert!(tracker.is_empty());
+    assert_eq!(tracker.metrics().released_dropped.get(), 3);
+}
+
+/// Holding an unmarked hash is a no-op: only a hash this node sealed or forwarded is held.
+#[test]
+fn hold_dropped_ignores_untracked_hashes() {
+    let tracker = InFlightTracker::with_fresh_metrics();
+    let sealing = tracker.arm_sealing(DuePolicy::ttl(Duration::from_secs(60)));
+    sealing.mark([hash(1)]);
+    tracker.hold_dropped([(Address::ZERO, hash(2))]);
+    assert_eq!(tracker.len(), 1);
+}
+
+/// A held hash outlasts the forwarding backoff: the validator already pools it, so re-forwarding
+/// cannot close the gap; only the hold window bounds it.
+#[test]
+fn held_hash_is_not_due_before_the_hold_window() {
     let tracker = InFlightTracker::new();
-    let kept = TxHash::random();
-    let dropped = TxHash::random();
-    tracker.mark_in_flight([kept, dropped]);
-    tracker.release_dropped([dropped]);
-    assert_eq!(tracker.len(), 1, "only the dropped hash is released");
-    tracker.release_dropped([dropped]);
-    assert_eq!(tracker.len(), 1, "an already-released hash is a no-op");
+    let policy =
+        DuePolicy { after: Duration::from_secs(3), backoff_shift_cap: 1, min_anchor_advance: 2 };
+    let forward = tracker.arm_forwarding(policy);
+    let now = Instant::now();
+    forward.mark_forwarded([hash(1)], now, 0);
+    tracker.hold_dropped([(Address::ZERO, hash(1))]);
+
+    assert!(!forward.is_due(&hash(1), now + Duration::from_secs(10), 100), "held past the backoff");
+    // the hold is stamped after `now`, so allow it a second to lapse
+    let lapsed = now + DROPPED_HOLD + Duration::from_secs(1);
+    assert!(forward.is_due(&hash(1), lapsed, 100), "the hold window bounds it");
+}
+
+/// Re-dropping a held hash (another validator's batch carrying it executes locally) does not
+/// extend the hold, so a peer still re-sealing it cannot pin the hold open.
+#[test]
+fn re_holding_a_held_hash_keeps_the_original_hold() {
+    let tracker = InFlightTracker::new();
+    let forward = tracker.arm_forwarding(DuePolicy::ttl(Duration::from_secs(3)));
+    let before = Instant::now();
+    forward.mark_forwarded([hash(1)], before, 0);
+    tracker.hold_dropped([(Address::ZERO, hash(1))]);
+    std::thread::sleep(Duration::from_millis(200));
+    tracker.hold_dropped([(Address::ZERO, hash(1))]);
+
+    let lapsed = before + DROPPED_HOLD + Duration::from_millis(100);
+    assert!(forward.is_due(&hash(1), lapsed, 100), "the second drop did not extend the hold");
 }
 
 /// A sealing snapshot round-trips through the next boot's matching arm: marks reinstalled
