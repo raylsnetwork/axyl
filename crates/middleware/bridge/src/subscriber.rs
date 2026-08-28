@@ -379,7 +379,7 @@ impl<DB: Database> Subscriber<DB> {
         if let Err(e) = self.config.node_storage().write(output.sub_dag.leader.clone()) {
             warn!(target: "subscriber", ?e, "failed to write leader cert to store");
         }
-        if let Err(e) = self.config.node_storage().write_all(output.sub_dag.certificates.clone()) {
+        if let Err(e) = self.config.node_storage().write_all(&output.sub_dag.certificates) {
             warn!(target: "subscriber", ?e, "failed to write subdag certs to store");
         }
 
