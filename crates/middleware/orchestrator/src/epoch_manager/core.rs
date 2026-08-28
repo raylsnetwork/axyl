@@ -16,7 +16,7 @@ use crate::{
 use consensus_metrics::start_prometheus_server;
 use eyre::eyre;
 use futures::FutureExt;
-use rayls_consensus_primary::{ConsensusBus, NodeMode, QueChannel};
+use rayls_consensus_primary::{ConsensusBus, QueChannel};
 use rayls_consensus_state_sync::{epoch_committee_valid, spawn_epoch_record_collector};
 use rayls_consensus_worker::{quorum_waiter::QuorumWaiterTrait, Worker};
 use rayls_execution_evm::{reth_env::RethEnv, system_calls::EpochState};
@@ -25,8 +25,8 @@ use rayls_infrastructure_storage::{tables::ConsensusBlocks, EpochStore as _};
 use rayls_infrastructure_types::{
     error::HeaderError, gas_accumulator::GasAccumulator, B256Map, BlsAggregateSignature,
     BlsPublicKey, BlsSignature, CameFrom, ConsensusOutput, Database as ReDatabase, Epoch,
-    EpochCertificate, EpochRecord, EpochVote, Noticer, Notifier, RaylsReceiver, RaylsSender,
-    TaskJoinError, TaskKind, TaskManager, VotesAggregator, B256,
+    EpochCertificate, EpochRecord, EpochVote, NodeMode, Noticer, Notifier, RaylsReceiver,
+    RaylsSender, TaskJoinError, TaskKind, TaskManager, VotesAggregator, B256,
 };
 use rayls_middleware_processor::{batch::BatchOrdering, reconstruct_batch_digests};
 use std::{
@@ -665,10 +665,7 @@ where
                     .start_txn_forwarder(
                         worker.id(),
                         worker.network_handle(),
-                        self.consensus_bus.executed_anchor().subscribe(),
-                        // peer-derived latest header: the catch-up gate compares it against the
-                        // executed anchor so a lagging node never re-sends
-                        self.consensus_bus.last_consensus_header().subscribe(),
+                        &self.consensus_bus,
                         // slot-ordered (authorities sorted by id), matching receiver-side dispatch
                         primary
                             .current_committee()

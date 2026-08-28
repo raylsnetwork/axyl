@@ -4,7 +4,7 @@ use crate::{
     tables::{LastProposed, LastProposedByAuthority},
     ProposerKey, StoreResult,
 };
-use rayls_infrastructure_types::{AuthorityIdentifier, Database, Header};
+use rayls_infrastructure_types::{AuthorityIdentifier, Database, DbTxMut, Header};
 
 /// The last proposal key - always 0.
 pub const LAST_PROPOSAL_KEY: ProposerKey = 0;
@@ -32,26 +32,20 @@ pub trait ProposerStore {
 }
 
 impl<DB: Database> ProposerStore for DB {
-    #[allow(clippy::let_and_return)]
     fn write_last_proposed(&self, header: &Header) -> StoreResult<()> {
-        let result = self.insert::<LastProposed>(&LAST_PROPOSAL_KEY, header);
-
-        result
+        self.with_write_txn(|txn| txn.insert::<LastProposed>(&LAST_PROPOSAL_KEY, header))
     }
 
     fn get_last_proposed(&self) -> StoreResult<Option<Header>> {
         self.get::<LastProposed>(&LAST_PROPOSAL_KEY)
     }
 
-    #[allow(clippy::let_and_return)]
     fn write_last_proposed_by_authority(
         &self,
         authority_id: AuthorityIdentifier,
         header: &Header,
     ) -> StoreResult<()> {
-        let result = self.insert::<LastProposedByAuthority>(&authority_id, header);
-
-        result
+        self.with_write_txn(|txn| txn.insert::<LastProposedByAuthority>(&authority_id, header))
     }
 
     fn get_last_proposed_by_authority(

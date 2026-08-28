@@ -3,12 +3,12 @@
 use std::time::Duration;
 
 use super::*;
-use crate::cold::{
-    probe::ProbeDb,
-    producer::{
+use crate::{
+    cold::producer::{
         advance_high_water_mark, commit_index, delete_archived_rows, finalize_sealed, Finalized,
-        SealedJars,
+        SealedJars, PRUNE_YIELD,
     },
+    test_utils::TestDb,
 };
 
 /// Builds `count` staged locations for `epoch`, in the row order a seal would append them.
@@ -26,7 +26,7 @@ fn staged_locations(epoch: Epoch, count: u64) -> Vec<(BlockHash, ColdLocation)> 
 fn index_commit_chunks_locations_and_leaves_the_high_water_mark_alone() {
     // One digest past two full chunks, so the split is observable and the boundary is exercised.
     const EPOCH: Epoch = 3;
-    let db = ProbeDb::new();
+    let db = TestDb::new();
     let locations = staged_locations(EPOCH, 4097);
 
     commit_index(&db, &locations).expect("commit index");
@@ -55,7 +55,7 @@ fn high_water_mark_advances_only_after_a_completed_prune() {
     let sealed =
         SealedJars { epoch: EPOCH, numbers: 0..=9, locations: staged_locations(EPOCH, 4097) };
 
-    let cancelled = ProbeDb::new();
+    let cancelled = TestDb::new();
     let outcome = finalize_sealed(&cancelled, &sealed, &|| true, Duration::ZERO).expect("finalize");
     assert!(matches!(outcome, Finalized::Cancelled), "a cancelled prune is not a complete archive");
     assert_eq!(
@@ -64,7 +64,7 @@ fn high_water_mark_advances_only_after_a_completed_prune() {
         "a cancelled prune must leave the epoch above the high-water mark so reconcile revisits it"
     );
 
-    let completed = ProbeDb::new();
+    let completed = TestDb::new();
     let outcome =
         finalize_sealed(&completed, &sealed, &|| false, Duration::ZERO).expect("finalize");
     assert!(matches!(outcome, Finalized::Complete(_)), "an uncancelled prune completes");
@@ -82,16 +82,16 @@ fn high_water_mark_advances_only_after_a_completed_prune() {
 fn rejected_hot_tier_writes_surface_as_write_failed() {
     let locations = vec![(BlockHash::repeat_byte(0xAA), ColdLocation { epoch: 0, row: 0 })];
 
-    let err = commit_index(&ProbeDb::failing_writes(), &locations)
+    let err = commit_index(&TestDb::failing_writes(), &locations)
         .expect_err("a rejected hot-tier txn must surface");
     assert!(matches!(err, ColdError::WriteFailed(_)), "commit_index: got {err:?}");
 
-    let err = advance_high_water_mark(&ProbeDb::failing_writes(), 0)
+    let err = advance_high_water_mark(&TestDb::failing_writes(), 0)
         .expect_err("a rejected hot-tier txn must surface");
     assert!(matches!(err, ColdError::WriteFailed(_)), "advance_high_water_mark: got {err:?}");
 
     let err = delete_archived_rows(
-        &ProbeDb::failing_writes(),
+        &TestDb::failing_writes(),
         0..=0,
         &locations,
         &|| false,
@@ -99,4 +99,24 @@ fn rejected_hot_tier_writes_surface_as_write_failed() {
     )
     .expect_err("a rejected hot-tier txn must surface");
     assert!(matches!(err, ColdError::WriteFailed(_)), "delete_archived_rows: got {err:?}");
+}
+
+/// A live finalize must not wait on the writer: `sync_persist` is a FIFO barrier that re-waits the
+/// whole backlog queued ahead of it, and the FIFO queue already applies index, prune and high-water
+/// mark in enqueue order, so nothing needs to wait.
+#[test]
+fn live_finalize_issues_no_writer_barrier() {
+    const EPOCH: Epoch = 3;
+    let db = TestDb::new();
+    let sealed =
+        SealedJars { epoch: EPOCH, numbers: 0..=9, locations: staged_locations(EPOCH, 4097) };
+
+    let outcome = finalize_sealed(&db, &sealed, &|| false, PRUNE_YIELD).expect("finalize");
+
+    assert!(matches!(outcome, Finalized::Complete(_)), "an uncancelled prune completes");
+    assert_eq!(
+        db.barriers(),
+        0,
+        "a live finalize must never block on a writer barrier: each one re-waits the whole backlog"
+    );
 }

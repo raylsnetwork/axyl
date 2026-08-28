@@ -7,6 +7,7 @@ const RELEASED_RECONCILE_COUNTER: &str = "rayls_txpool_in_flight_released_reconc
 const RELEASED_TTL_COUNTER: &str = "rayls_txpool_in_flight_released_ttl";
 const RELEASED_CLEAR_COUNTER: &str = "rayls_txpool_in_flight_released_clear";
 const RELEASED_DROPPED_COUNTER: &str = "rayls_txpool_in_flight_released_dropped";
+const RELEASED_EXECUTED_COUNTER: &str = "rayls_txpool_in_flight_released_executed";
 const MARKED_FORWARD_COUNTER: &str = "rayls_txpool_in_flight_marked_forward";
 const RESTORED_COUNTER: &str = "rayls_txpool_in_flight_restored_total";
 
@@ -19,6 +20,7 @@ pub(super) struct InFlightMetrics {
     pub marked_forward: IntCounter,
     pub released_reconcile: IntCounter,
     pub released_dropped: IntCounter,
+    pub released_executed: IntCounter,
     pub released_ttl: IntCounter,
     pub released_clear: IntCounter,
     pub restored: IntCounter,
@@ -52,6 +54,11 @@ impl InFlightMetrics {
             released_dropped: prometheus::register_int_counter_with_registry!(
                 RELEASED_DROPPED_COUNTER,
                 "Held marks released because the sender's state nonce advanced (nonce too high); the tx stays pooled and re-sealable",
+                registry
+            )?,
+            released_executed: prometheus::register_int_counter_with_registry!(
+                RELEASED_EXECUTED_COUNTER,
+                "Marks released by the executed-hash lookup once the pool dropped the mined transaction",
                 registry
             )?,
             released_ttl: prometheus::register_int_counter_with_registry!(

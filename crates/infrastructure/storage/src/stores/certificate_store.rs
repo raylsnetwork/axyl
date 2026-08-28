@@ -1,6 +1,6 @@
 //! NOTE: tests for this module are in test-utils storage_tests.rs to avoid circular dependancies.
 
-use std::{cmp::Ordering, collections::BTreeMap, future::Future, sync::LazyLock};
+use std::{borrow::Borrow, cmp::Ordering, collections::BTreeMap, future::Future, sync::LazyLock};
 
 use crate::{
     tables::{CertificateDigestByOrigin, CertificateDigestByRound, Certificates},
@@ -36,7 +36,10 @@ pub trait CertificateStore {
     /// Inserts multiple certificates in the storage. This is an atomic operation.
     /// In the end it notifies any subscribers that are waiting to hear for the
     /// value.
-    fn write_all(&self, certificates: impl IntoIterator<Item = Certificate>) -> StoreResult<()>;
+    fn write_all(
+        &self,
+        certificates: impl IntoIterator<Item = impl Borrow<Certificate>>,
+    ) -> StoreResult<()>;
 
     /// Retrieves a certificate from the store. If not found
     /// then None is returned as result.
@@ -121,9 +124,9 @@ pub trait CertificateStore {
 fn save_cert<TX: DbTxMut>(
     txn: &mut TX,
     digest: CertificateDigest,
-    certificate: Certificate,
+    certificate: &Certificate,
 ) -> StoreResult<()> {
-    txn.insert::<Certificates>(&digest, &certificate)?;
+    txn.insert::<Certificates>(&digest, certificate)?;
 
     // write the certificates id by their rounds
     let key = (certificate.round(), certificate.origin().clone());
@@ -133,7 +136,7 @@ fn save_cert<TX: DbTxMut>(
     let key = (certificate.origin().clone(), certificate.round());
     txn.insert::<CertificateDigestByOrigin>(&key, &digest)?;
 
-    NOTIFY_SUBSCRIBERS.notify(&digest, &certificate);
+    NOTIFY_SUBSCRIBERS.notify(&digest, certificate);
 
     Ok(())
 }
@@ -143,7 +146,7 @@ impl<DB: Database> CertificateStore for DB {
     fn write(&self, certificate: Certificate) -> StoreResult<()> {
         let id = certificate.digest();
         self.with_write_txn(|txn| {
-            save_cert(txn, id, certificate)?;
+            save_cert(txn, id, &certificate)?;
             Ok(())
         })
     }
@@ -151,9 +154,13 @@ impl<DB: Database> CertificateStore for DB {
     /// Inserts multiple certificates in the storage. This is an atomic operation.
     /// In the end it notifies any subscribers that are waiting to hear for the
     /// value.
-    fn write_all(&self, certificates: impl IntoIterator<Item = Certificate>) -> StoreResult<()> {
+    fn write_all(
+        &self,
+        certificates: impl IntoIterator<Item = impl Borrow<Certificate>>,
+    ) -> StoreResult<()> {
         self.with_write_txn(|txn| {
             for certificate in certificates {
+                let certificate = certificate.borrow();
                 let digest = certificate.digest();
                 if let Err(e) = save_cert(txn, digest, certificate) {
                     tracing::error!("Failed to write certificate for {digest} due to error {e}.");

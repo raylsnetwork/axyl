@@ -1291,6 +1291,13 @@ mod test {
     }
 
     #[test]
+    fn test_mdbx_txn_iter_order() {
+        let temp_dir = tempdir().expect("failed to create temp dir");
+        let db = open_db(temp_dir.path());
+        test_txn_iter_order(db)
+    }
+
+    #[test]
     fn test_mdbx_clear() {
         let temp_dir = tempdir().expect("failed to create temp dir");
         let db = open_db(temp_dir.path());

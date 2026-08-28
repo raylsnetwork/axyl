@@ -11,7 +11,7 @@ use crate::{
         state::{AuthVoteState, InFlightGuard, IN_FLIGHT_TTL},
     },
     state_sync::{CertificateCollector, StateSynchronizer},
-    ConsensusBus, NodeMode, RecentlyExecutedBlocks,
+    ConsensusBus, RecentlyExecutedBlocks,
 };
 use parking_lot::Mutex;
 use rayls_consensus_network::GossipMessage;
@@ -20,12 +20,12 @@ use rayls_infrastructure_storage::{
     tables::ConsensusBlocks, ConsensusStore, EpochStore, ProposerStore, VoteDigestStore,
 };
 use rayls_infrastructure_types::{
-    ensure,
+    decode_key, ensure,
     error::{CertificateError, HeaderError, HeaderResult},
     now, to_intent_message, try_decode, AuthorityIdentifier, B256Map, BlockHash, BlockNumHash,
-    BlsPublicKey, Certificate, CertificateDigest, ConsensusHeader, Database, Epoch,
-    EpochCertificate, EpochRecord, Hash as _, Header, ProtocolSignature, RaylsSender as _, Round,
-    SignatureVerificationState, Vote, VotesAggregator,
+    BlsPublicKey, Certificate, CertificateDigest, ConsensusHeader, ConsensusHeaderMeta, Database,
+    DbTx, Epoch, EpochCertificate, EpochRecord, Hash as _, Header, NodeMode, ProtocolSignature,
+    RaylsSender as _, Round, SignatureVerificationState, Vote, VotesAggregator,
 };
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -151,12 +151,8 @@ where
             return false;
         }
 
-        let (exec_number, exec_epoch, exec_round) = self
-            .consensus_config
-            .node_storage()
-            .last_record::<ConsensusBlocks>()
-            .map(|(n, h)| (n, h.sub_dag.leader_epoch(), h.sub_dag.leader_round()))
-            .unwrap_or((0, 0, 0));
+        let (exec_number, exec_epoch, exec_round) =
+            executed_consensus_tip(self.consensus_config.node_storage()).unwrap_or((0, 0, 0));
 
         let relative_gc_depth = self.consensus_config.parameters().gc_depth / 4;
         let active_cvv = self.consensus_bus.node_mode().borrow().is_active_cvv();
@@ -991,9 +987,28 @@ fn evict_oldest_completed(cache: &mut AuthEquivocationMap, max_entries: usize) {
     trace!(target: "primary::handler", removed = keys.len(), remaining = cache.len(), "evicted old vote cache entries");
 }
 
+/// Returns `(number, leader epoch, leader round)` of the last stored consensus header.
+///
+/// Projects the three fields from the raw row instead of decoding the whole sub-dag: this runs on
+/// every gossiped certificate, and a full decode reconstructs every certificate's BLS signature.
+fn executed_consensus_tip<DB: Database>(store: &DB) -> Option<(u64, Epoch, Round)> {
+    // Read the tip through a txn: the txn raw iter is lazy, so `.next()` touches only the tip row,
+    // where the store-level raw iter clones the whole mem-resident table before yielding.
+    store
+        .with_read_txn(|txn| {
+            let Some((key, value)) = txn.reverse_raw_iter::<ConsensusBlocks>().next() else {
+                return Ok(None);
+            };
+            let meta = ConsensusHeaderMeta::from_bytes(&value).ok();
+            Ok(meta.map(|m| (decode_key::<u64>(&key), m.leader_epoch, m.leader_round)))
+        })
+        .ok()
+        .flatten()
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{anchor_diverges_from_executed, BehindTracker};
+    use super::{anchor_diverges_from_executed, executed_consensus_tip, BehindTracker};
     use crate::RecentlyExecutedBlocks;
     use rayls_infrastructure_types::{BlockNumHash, ExecHeader, SealedHeader, B256};
     use std::time::Duration;
@@ -1003,6 +1018,45 @@ mod tests {
             ExecHeader { number, ..Default::default() },
             B256::repeat_byte(number as u8),
         )
+    }
+
+    /// The raw projection behind `behind_consensus` agrees with a full decode of the last stored
+    /// header, and reads nothing from an empty store.
+    #[test]
+    fn executed_consensus_tip_matches_full_decode() {
+        use rayls_infrastructure_storage::{mem_db::MemDatabase, tables::ConsensusBlocks};
+        use rayls_infrastructure_types::{
+            Certificate, CommittedSubDag, ConsensusHeader, Database, DbTx, ReputationScores,
+        };
+
+        let db = MemDatabase::new();
+        db.open_table::<ConsensusBlocks>().unwrap();
+        assert!(executed_consensus_tip(&db).is_none());
+
+        let mut leader = Certificate::default();
+        leader.header.round = 7;
+        leader.header.epoch = 3;
+        let header = ConsensusHeader {
+            sub_dag: CommittedSubDag::new(
+                vec![leader.clone()],
+                leader,
+                42,
+                ReputationScores::default(),
+                None,
+            )
+            .into(),
+            number: 42,
+            ..Default::default()
+        };
+        db.insert::<ConsensusBlocks>(&41, &ConsensusHeader::default()).unwrap();
+        db.insert::<ConsensusBlocks>(&42, &header).unwrap();
+
+        let (n, h) = db.read_txn().unwrap().last_record::<ConsensusBlocks>().unwrap();
+        assert_eq!(
+            executed_consensus_tip(&db),
+            Some((n, h.sub_dag.leader_epoch(), h.sub_dag.leader_round()))
+        );
+        assert_eq!(executed_consensus_tip(&db), Some((42, 3, 7)));
     }
 
     /// The non-blocking fork circuit-breaker: a divergent already-executed anchor is rejected, a

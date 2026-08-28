@@ -6,12 +6,12 @@ use crate::{
         LeaderSwapTable,
     },
     test_utils::make_optimal_certificates,
-    ConsensusBus, NodeMode,
+    ConsensusBus,
 };
 use rayls_infrastructure_storage::{mem_db::MemDatabase, CertificateStore, ConsensusStore};
 use rayls_infrastructure_types::{
-    Certificate, ExecHeader, Hash as _, RaylsReceiver, RaylsSender, ReputationScores, SealedHeader,
-    TaskManager, B256, DEFAULT_BAD_NODES_STAKE_THRESHOLD,
+    Certificate, ExecHeader, Hash as _, NodeMode, RaylsReceiver, RaylsSender, ReputationScores,
+    SealedHeader, TaskManager, B256, DEFAULT_BAD_NODES_STAKE_THRESHOLD,
 };
 use rayls_testing_test_utils_committee::CommitteeFixture;
 use std::{collections::BTreeSet, sync::Arc};

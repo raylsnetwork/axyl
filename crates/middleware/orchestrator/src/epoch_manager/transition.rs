@@ -5,11 +5,10 @@ use crate::{
     types::{EpochTransitionCheckpoint, EpochTransitionPhase, ShutdownOutcome, TransitionCtx},
 };
 use eyre::eyre;
-use rayls_consensus_primary::NodeMode;
 use rayls_infrastructure_config::RaylsDirs;
 use rayls_infrastructure_storage::{tables::EpochTransitionCheckpoints, CheckpointStore};
 use rayls_infrastructure_types::{
-    BlockHash, ConsensusHeader, ConsensusOutput, Database as ReDatabase, Epoch, Notifier,
+    BlockHash, ConsensusHeader, ConsensusOutput, Database as ReDatabase, Epoch, NodeMode, Notifier,
     TaskManager, B256,
 };
 use std::time::Duration;

@@ -1,11 +1,12 @@
 //! Execution-layer components behind [`ExecutionNode`](super::ExecutionNode), for both worker and
 //! primary roles.
 
-use super::txn_forwarder::TxnForwarder;
+use super::txn_forwarder::{TxnForwarder, FORWARD_POLICY};
 use crate::types::ExecutionError;
 use jsonrpsee::http_client::HttpClient;
 use rayls_batch_builder::{BatchBuilder, BatchBuilderConfig, OwnWatermarkReceiver};
 use rayls_batch_validator::BatchValidator;
+use rayls_consensus_primary::ConsensusBus;
 use rayls_consensus_worker::WorkerNetworkHandle;
 use rayls_execution_evm::{
     chainspec::RaylsHardforks,
@@ -211,8 +212,7 @@ impl ExecutionNodeInner {
         &self,
         worker_id: WorkerId,
         network_handle: WorkerNetworkHandle,
-        executed_anchor: watch::Receiver<ConsensusHeader>,
-        last_seen_header: watch::Receiver<ConsensusHeader>,
+        consensus_bus: &ConsensusBus,
         committee: Vec<BlsPublicKey>,
         epoch_task_spawner: &TaskSpawner,
         max_gossip_message_size: usize,
@@ -234,11 +234,12 @@ impl ExecutionNodeInner {
         TxnForwarder::new(
             transaction_pool,
             network_handle,
-            executed_anchor,
-            last_seen_header,
+            consensus_bus.executed_anchor().subscribe(),
+            consensus_bus.last_consensus_header().subscribe(),
             committee,
             direct_submit,
             max_gossip_message_size,
+            FORWARD_POLICY,
         )
         .spawn(self.rayls_infrastructure_config.parameters.max_batch_delay, epoch_task_spawner);
 

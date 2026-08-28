@@ -2,12 +2,12 @@ use crate::epoch_manager::types::EpochManager;
 use rayls_consensus_network::{
     error::NetworkError, types::NetworkHandle, ConsensusNetwork, NetworkMetrics, RLMessage,
 };
-use rayls_consensus_primary::{network::PrimaryNetworkHandle, ConsensusBus, NodeMode};
+use rayls_consensus_primary::{network::PrimaryNetworkHandle, ConsensusBus};
 use rayls_consensus_state_sync::prime_consensus;
 use rayls_consensus_worker::WorkerNetworkHandle;
 use rayls_infrastructure_config::{ConsensusConfig, NetworkConfig, RaylsDirs};
 use rayls_infrastructure_types::{
-    BlsPublicKey, Database as ReDatabase, Multiaddr, NetworkPublicKey, TaskSpawner,
+    BlsPublicKey, Database as ReDatabase, Multiaddr, NetworkPublicKey, NodeMode, TaskSpawner,
 };
 use std::{sync::Arc, time::Duration};
 use tracing::{debug, error, info, warn};

@@ -5,8 +5,7 @@
 
 use consensus_metrics::monitored_future;
 use rayls_consensus_primary::{
-    consensus::ConsensusRound, network::PrimaryNetworkHandle, ConsensusBus, NodeMode,
-    EXECUTION_STALL_TIMEOUT,
+    consensus::ConsensusRound, network::PrimaryNetworkHandle, ConsensusBus, EXECUTION_STALL_TIMEOUT,
 };
 use rayls_infrastructure_config::ConsensusConfig;
 use rayls_infrastructure_storage::{
@@ -15,7 +14,7 @@ use rayls_infrastructure_storage::{
 };
 use rayls_infrastructure_types::{
     AuthorityIdentifier, ConsensusHeader, ConsensusOutput, Database, DbTx, DbTxMut, Epoch,
-    RaylsSender, SealedHeader, TaskSpawner, B256,
+    NodeMode, RaylsSender, SealedHeader, TaskSpawner, B256,
 };
 use tracing::{debug, error, info, trace, warn};
 

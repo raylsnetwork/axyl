@@ -190,6 +190,7 @@ where
             consensus_config.clone(),
             *worker_id,
             validator,
+            self.consensus_bus.node_mode().subscribe(),
         )
         .spawn(&epoch_task_spawner);
 

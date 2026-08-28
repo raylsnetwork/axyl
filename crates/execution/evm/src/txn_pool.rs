@@ -36,6 +36,10 @@ use tracing::{debug, info};
 
 use crate::{error::RaylsRethResult, in_flight::InFlightTracker, traits::RaylsNode};
 
+/// Interval between re-checks of executed hashes against the pool, i.e. the bound on how long an
+/// executed transaction's in-flight mark outlives its removal from the pool.
+const EXECUTED_RELEASE_INTERVAL: Duration = Duration::from_secs(1);
+
 mod backup;
 
 /// A pooled transaction id.
@@ -187,14 +191,30 @@ impl WorkerTxPool {
         );
         task_spawner.spawn_critical_task("maintain txn pool", maintain_fut);
 
-        // Release in-flight marks once maintenance drops the sealed transactions from the
-        // pending sub-pool. A separate subscription: the maintenance future consumes its own
-        // stream, and this one must see the same commits.
+        // Maintenance drops mined transactions asynchronously, so committed hashes are re-checked
+        // on a fixed tick rather than per commit: release latency stays bounded after the last
+        // commit and pool-lock time does not grow with blocks per second. Demotions out of pending
+        // have no commit to hook; the engine-tick membership reconcile covers those.
         let mut release_stream = blockchain_provider.canonical_state_stream();
         let release_pool = this.clone();
         task_spawner.spawn_critical_task("in-flight release", async move {
-            while release_stream.next().await.is_some() {
-                release_pool.reconcile_in_flight();
+            let mut executed: Vec<TxHash> = Vec::new();
+            let mut release_tick = tokio::time::interval(EXECUTED_RELEASE_INTERVAL);
+            // Delay, not Burst: a stalled tick has nothing to catch up on, since the next lookup
+            // sees every hash the skipped ones would have.
+            release_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tokio::select! {
+                    notification = release_stream.next() => {
+                        let Some(notification) = notification else { break };
+                        executed.extend(notification.committed().inner().0.transaction_hashes());
+                    }
+                    _ = release_tick.tick() => {
+                        if !executed.is_empty() {
+                            executed = release_pool.release_executed(std::mem::take(&mut executed));
+                        }
+                    },
+                }
             }
         });
         Ok(this)
@@ -225,11 +245,31 @@ impl WorkerTxPool {
         self.in_flight_tracker.clone()
     }
 
+    /// Releases the marks of the given executed hashes the pool has already dropped, returning the
+    /// tracked ones it still holds so a later call re-checks them.
+    fn release_executed(&self, executed: Vec<TxHash>) -> Vec<TxHash> {
+        // only this node's marks matter: most committed transactions were sealed by peers
+        let tracked = self.in_flight_tracker.tracked_among(executed);
+        if tracked.is_empty() {
+            return tracked;
+        }
+        let still_pooled: B256Set =
+            self.pool.get_all(tracked.clone()).iter().map(|tx| *tx.hash()).collect();
+        let (carried, gone): (Vec<_>, Vec<_>) =
+            tracked.into_iter().partition(|hash| still_pooled.contains(hash));
+        let released = self.in_flight_tracker.release_executed(gone);
+        if released > 0 {
+            debug!(target: "rayls::txpool", released, carried = carried.len(), "released in-flight marks for executed transactions");
+        }
+        carried
+    }
+
     /// Releases in-flight marks for hashes no longer in the pending sub-pool.
     ///
-    /// A sealed transaction stays pending (and RPC-visible) until it executes; once execution
-    /// drops it from pending, its mark is stale and released so a later resubmission of the same
-    /// nonce is not skipped.
+    /// A sealed transaction stays pending (and RPC-visible) until it executes; once it leaves
+    /// pending its mark is stale and released so a later resubmission of the same nonce is not
+    /// skipped. Snapshots the whole pending sub-pool under the pool lock, so it runs only on the
+    /// fixed-rate engine tick.
     pub fn reconcile_in_flight(&self) {
         if self.in_flight_tracker.is_empty() {
             return;
@@ -427,4 +467,50 @@ pub fn recover_pooled_transaction(
     let recovered = reth_recover_raw_transaction::<TransactionSigned>(tx)?;
     let pooled = EthPooledTransaction::try_from_consensus(recovered)?;
     Ok(pooled)
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{reth_env::RethEnv, test_utils::TransactionFactory};
+    use rayls_infrastructure_types::{test_genesis, Address, TaskManager, TxHash, U256};
+    use reth_chainspec::ChainSpec as RethChainSpec;
+    use reth_transaction_pool::TransactionPool as _;
+    use std::sync::Arc;
+    use tempfile::TempDir;
+
+    /// An executed hash keeps its mark until the pool drops the transaction.
+    #[tokio::test]
+    async fn executed_mark_is_released_only_after_the_pool_drops_the_transaction() {
+        let tmp_dir = TempDir::new().unwrap();
+        let task_manager = TaskManager::default();
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let reth_env =
+            RethEnv::new_for_temp_chain(chain.clone(), tmp_dir.path(), &task_manager, None)
+                .await
+                .unwrap();
+        let pool = reth_env.init_txn_pool().unwrap();
+        let gas_price = reth_env.get_gas_price().unwrap();
+        let tx = TransactionFactory::new().create_eip1559_encoded(
+            chain,
+            None,
+            gas_price,
+            Some(Address::ZERO),
+            U256::from(1),
+            Default::default(),
+        );
+        let tx = super::recover_pooled_transaction(&tx).unwrap();
+        let hash = pool.add_transaction_local(tx).await.unwrap().hash;
+        let tracker = pool.in_flight();
+        tracker.mark_in_flight([hash]);
+
+        // a peer-sealed hash this node never marked is dropped from the carry, not looked up
+        let executed = pool.release_executed(vec![hash, TxHash::repeat_byte(0xee)]);
+        assert!(tracker.is_in_flight(&hash), "pooled transaction must keep its mark");
+        assert_eq!(executed, [hash], "only the tracked hash is carried to the next check");
+
+        pool.pool.remove_transactions(vec![hash]);
+        let executed = pool.release_executed(executed);
+        assert!(!tracker.is_in_flight(&hash));
+        assert!(executed.is_empty());
+    }
 }

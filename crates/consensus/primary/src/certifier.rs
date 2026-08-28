@@ -4,7 +4,7 @@ use crate::{
     aggregators::HeaderVotesAggregator,
     network::{PrimaryNetworkHandle, RequestVoteResult},
     state_sync::StateSynchronizer,
-    ConsensusBus, NodeMode,
+    ConsensusBus,
 };
 use consensus_metrics::monitored_future;
 use rayls_consensus_network::error::NetworkError;
@@ -15,7 +15,8 @@ use rayls_infrastructure_types::{
     ensure,
     error::{DagError, DagResult},
     AuthorityIdentifier, BlsPublicKey, Certificate, CertificateDigest, Committee, Database, Header,
-    HeaderDigest, Noticer, Notifier, RaylsReceiver, RaylsSender, TaskManager, TaskSpawner, Vote,
+    HeaderDigest, NodeMode, Noticer, Notifier, RaylsReceiver, RaylsSender, TaskManager,
+    TaskSpawner, Vote,
 };
 use std::{
     sync::Arc,
@@ -542,6 +543,7 @@ impl<DB: Database> Certifier<DB> {
         let (tx_votes, mut rx_votes) = tokio::sync::mpsc::channel(self.committee.size().max(16));
 
         // create network requests for votes from peers
+        let header_digest = header.digest();
         let peers = self.committee.others_primaries_by_id(Some(&self.authority_id)).into_iter();
         for (name, target) in peers {
             let header_clone = header.clone();
@@ -551,7 +553,7 @@ impl<DB: Database> Certifier<DB> {
             let committee = self.committee.clone();
             let cancel_proposal = self.new_proposal.subscribe();
             let quorum_reached = quorum_notifier.subscribe();
-            let task_name = format!("vote-{header:?}-{name}");
+            let task_name = format!("vote-{header_digest}-{name}");
 
             self.task_spawner.spawn_task(task_name, async move {
                 // process request for vote

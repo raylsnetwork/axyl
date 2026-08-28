@@ -52,6 +52,8 @@ reth-libmdbx = ["dep:reth-libmdbx", "dep:page_size"]
 cold-storage = ["dep:reth-nippy-jar", "dep:thiserror", "dep:serde", "dep:lru"]
 default = ["reth-libmdbx", "cold-storage"]
 archive-replay = []
+# Test rigs that need to stall or inspect the layered writer (parked-writer backlog tests).
+test-utils = []
 
 [lints]
 workspace = true

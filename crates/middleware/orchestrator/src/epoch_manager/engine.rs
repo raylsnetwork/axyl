@@ -99,8 +99,8 @@ pub(crate) async fn engine_update_loop(
                 let anchor = consensus_bus.executed_anchor().borrow().number;
                 for pool in engine.get_all_worker_transaction_pools().await {
                     // sealing marks age out via the sweep; forwarding marks have no sweep, so drive
-                    // the O(pending) membership reconcile here too: its only other trigger is
-                    // the canonical-stream task, which a burst can starve. both are idempotent
+                    // the membership reconcile here: a demotion out of pending has no commit to
+                    // hook, so this tick is its sole trigger. both are idempotent
                     pool.in_flight().sweep_due(anchor);
                     pool.reconcile_in_flight();
                 }

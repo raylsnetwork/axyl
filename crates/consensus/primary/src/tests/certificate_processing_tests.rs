@@ -263,10 +263,12 @@ async fn test_gc_pending_certs() -> eyre::Result<()> {
     // wait for certs to storage
     timeout(Duration::from_secs(3), certificate_store.notify_read(last_digest)).await??;
 
-    // assert all certs accepted in causal order
+    // assert all certs accepted in causal order; the store write completes on the blocking pool
+    // before the manager forwards, so await the forwards rather than expecting them queued.
     let mut causal_round = 0;
     for _ in &later_rounds {
-        let received = rx_new_certificates.try_recv().expect("new cert");
+        let received =
+            timeout(Duration::from_secs(3), rx_new_certificates.recv()).await?.expect("new cert");
         // cert rounds should only accend
         let cert_round = received.round();
         if cert_round > causal_round {

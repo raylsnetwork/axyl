@@ -1,8 +1,8 @@
-use rayls_consensus_primary::{ConsensusBus, NodeMode};
+use rayls_consensus_primary::ConsensusBus;
 use rayls_execution_rpc::{EngineToPrimary, NodeRole, NodeStatus};
 use rayls_infrastructure_storage::{ConsensusStore, EpochStore};
 use rayls_infrastructure_types::{
-    BlockHash, ConsensusHeader, Database, Epoch, EpochCertificate, EpochRecord,
+    BlockHash, ConsensusHeader, Database, Epoch, EpochCertificate, EpochRecord, NodeMode,
 };
 
 #[derive(Debug)]

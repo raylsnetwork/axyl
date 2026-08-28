@@ -4,8 +4,9 @@ use crate::{errors::SubscriberResult, SubscriberError};
 use consensus_metrics::monitored_future;
 use futures::{future::BoxFuture, stream::FuturesOrdered, StreamExt};
 use rayls_consensus_primary::{
-    consensus::ConsensusRound, network::PrimaryNetworkHandle, ConsensusBus, NodeMode,
+    consensus::ConsensusRound, network::PrimaryNetworkHandle, ConsensusBus,
 };
+use rayls_infrastructure_types::NodeMode;
 // production-only: consensus-result hashing for gossip signatures
 #[cfg(not(feature = "dev-single-node-setup"))]
 use rayls_consensus_primary::network::ConsensusResult;
@@ -378,7 +379,7 @@ impl<DB: Database> Subscriber<DB> {
         if let Err(e) = self.config.node_storage().write(output.sub_dag.leader.clone()) {
             warn!(target: "subscriber", ?e, "failed to write leader cert to store");
         }
-        if let Err(e) = self.config.node_storage().write_all(output.sub_dag.certificates.clone()) {
+        if let Err(e) = self.config.node_storage().write_all(&output.sub_dag.certificates) {
             warn!(target: "subscriber", ?e, "failed to write subdag certs to store");
         }
 

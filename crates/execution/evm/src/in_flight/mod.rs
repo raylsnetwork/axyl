@@ -31,12 +31,11 @@
 //! # Marks and due-ness
 //!
 //! A tracked hash holds one `Mark`: `Sent`, carrying the send time, the execution anchor at send,
-//! and a resend-attempt count; or `AckedStale`, the terminal state the forwarder mints once it has
-//! confirmed a forwarded transaction is no longer live but still wants further resends suppressed.
-//! A `Sent` mark comes due under a [`DuePolicy`] combining a base wait, a per-attempt exponential
-//! backoff (capped), and a minimum anchor advance, so a mark cannot release on wall-clock time
-//! alone before the node has seen at least one new block. An `AckedStale` mark is never due; only
-//! an explicit reconcile or clear releases it.
+//! and a resend-attempt count. A mark comes due under a [`DuePolicy`] combining a base wait, a
+//! per-attempt exponential backoff (capped), and a minimum anchor advance, so a mark cannot release
+//! on wall-clock time alone before the node has seen at least one new block. A validator's stale
+//! ack is stamped as a send: an honest one is followed by the pool pruning the hash, so a hash
+//! still pending after the window re-sends and the ack cannot silence a transaction.
 //!
 //! # Release paths and the release watch
 //!
@@ -65,8 +64,8 @@
 //! engine tick sweeps, and the epoch transition clears. Correctness does not depend on their
 //! interleaving. Every mutation computes its metric delta under the same write lock that applies
 //! it, so the deltas telescope and the conservation identity
-//! `marked - reconcile - ttl - clear = live set size` (and the gauge) holds under any
-//! linearization.
+//! `marked - reconcile - executed - dropped - ttl - clear = live set size` (and the gauge) holds
+//! under any linearization.
 
 use crate::in_flight::metrics::{InFlightMetrics, IN_FLIGHT_METRICS};
 use alloy::primitives::{
@@ -149,19 +148,17 @@ impl InFlightTracker {
 }
 
 impl InFlightTracker {
-    /// Returns whether no hashes are tracked, including `AckedStale` marks a sweep never releases.
+    /// Returns whether no hashes are tracked.
     pub fn is_empty(&self) -> bool {
         self.inner.read().marks.is_empty()
     }
 
-    /// Returns the tracked hash count, counting both outstanding sends and marks stranded
-    /// past their TTL (`Mark::AckedStale`) that a sweep will never release.
+    /// Returns the tracked hash count.
     pub fn len(&self) -> usize {
         self.inner.read().marks.len()
     }
 
-    /// Returns whether the given hash is tracked, including a `Mark::AckedStale` hash a
-    /// sweep will never release on its own.
+    /// Returns whether the given hash is tracked.
     pub fn is_in_flight(&self, hash: &TxHash) -> bool {
         self.inner.read().marks.contains_key(hash)
     }
@@ -239,6 +236,38 @@ impl InFlightTracker {
         let current_marks_len = guard.marks.len();
         drop(guard);
         self.on_released(previous_marks_len, current_marks_len, &self.metrics.released_dropped);
+    }
+
+    /// Returns the subset of `hashes` currently tracked, under one read lock.
+    pub(crate) fn tracked_among(&self, hashes: impl IntoIterator<Item = TxHash>) -> Vec<TxHash> {
+        let guard = self.inner.read();
+        hashes.into_iter().filter(|hash| guard.marks.contains_key(hash)).collect()
+    }
+
+    /// Releases executed hashes the caller has confirmed the pool no longer holds; a mark released
+    /// while the pool still holds the transaction lets the builder seal it again.
+    pub(crate) fn release_executed(&self, hashes: impl IntoIterator<Item = TxHash>) -> usize {
+        self.release_hashes(hashes, &self.metrics.released_executed)
+    }
+
+    fn release_hashes(
+        &self,
+        hashes: impl IntoIterator<Item = TxHash>,
+        counter: &prometheus::IntCounter,
+    ) -> usize {
+        let mut hashes = hashes.into_iter().peekable();
+        if hashes.peek().is_none() {
+            return 0;
+        }
+
+        let mut guard = self.inner.write();
+        let previous_marks_len = guard.marks.len();
+        for hash in hashes {
+            guard.marks.remove(&hash);
+        }
+        let current_marks_len = guard.marks.len();
+        drop(guard);
+        self.on_released(previous_marks_len, current_marks_len, counter)
     }
 
     /// Reconciles against the given live set, releasing every tracked hash absent from it.
@@ -331,7 +360,6 @@ impl InFlightTracker {
                 kind: match *mark {
                     Mark::Sent { attempts, .. } => SavedMarkKind::Sent { attempts },
                     Mark::Held { .. } => SavedMarkKind::Sent { attempts: 0 },
-                    Mark::AckedStale => SavedMarkKind::AckedStale,
                 },
             })
             .collect();
@@ -372,10 +400,6 @@ impl InFlightTracker {
         for mark in backup.marks {
             let restored = match mark.kind {
                 SavedMarkKind::Sent { attempts } => Mark::Sent { at: now, anchor: 0, attempts },
-                // only the forwarder mints acked-stale marks; under a sealing arm one would
-                // strand its tx past the TTL (the sweep never releases acked-stale)
-                SavedMarkKind::AckedStale if role == MarkRole::Sealing => continue,
-                SavedMarkKind::AckedStale => Mark::AckedStale,
             };
             guard.marks.insert(mark.hash, restored);
         }

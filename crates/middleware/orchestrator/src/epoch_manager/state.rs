@@ -1,6 +1,6 @@
 use crate::{engine::ExecutionNode, epoch_manager::types::EpochManager, primary::PrimaryNode};
 use eyre::eyre;
-use rayls_consensus_primary::{NodeMode, RecentlyExecutedBlocks};
+use rayls_consensus_primary::RecentlyExecutedBlocks;
 use rayls_execution_evm::system_calls::ConsensusRegistry;
 use rayls_infrastructure_config::{Config, ConfigFmt, ConfigTrait as _, RaylsDirs};
 use rayls_infrastructure_storage::{
@@ -14,7 +14,7 @@ use rayls_infrastructure_storage::{
 };
 use rayls_infrastructure_types::{
     AuthorityIdentifier, BlsPublicKey, Committee, CommitteeBuilder, ConsensusHeader,
-    Database as ReDatabase, DbTxMut, Epoch, EpochRecord, B256,
+    Database as ReDatabase, DbTxMut, Epoch, EpochRecord, NodeMode, B256,
 };
 use std::collections::HashMap;
 use tracing::{debug, error, info, trace, warn};
@@ -224,7 +224,10 @@ where
         };
 
         // stamp our identity regardless of whether sanitization was needed
-        if let Err(e) = self.consensus_db.insert::<NodeIdentity>(&0, &our_authority_id) {
+        if let Err(e) = self
+            .consensus_db
+            .with_write_txn(|txn| txn.insert::<NodeIdentity>(&0, &our_authority_id))
+        {
             warn!(target: "epoch-manager", ?e, "failed to stamp node identity");
         }
 

@@ -263,7 +263,7 @@ where
         debug!(target: "primary::cert_manager", ?certificates, "accepting {:?} certificates", certificates.len());
 
         // persist first so downstream failures still leave the store authoritative
-        self.persist_and_advance_high_water_mark(&certificates)?;
+        let certificates = self.persist_and_advance_high_water_mark(certificates).await?;
 
         for cert in certificates.into_iter() {
             self.record_accepted_metrics(&cert);
@@ -289,11 +289,24 @@ where
     }
 
     /// Persist certs and advance `cert_store_round` without forwarding to the DAG.
-    fn persist_and_advance_high_water_mark(
+    ///
+    /// The store write is synchronous and, behind a writer backlog, paces every insert under the
+    /// mem-store lock, so it runs on the blocking pool: a worker parked inside it would pin this
+    /// future on its stack, where an epoch-teardown abort can never reach it. Awaiting the join
+    /// handle is the yield point at which the abort drops the future while the write finishes on
+    /// its own thread.
+    async fn persist_and_advance_high_water_mark(
         &mut self,
-        certificates: &VecDeque<Certificate>,
-    ) -> CertManagerResult<()> {
-        self.config.node_storage().write_all(certificates.clone())?;
+        certificates: VecDeque<Certificate>,
+    ) -> CertManagerResult<VecDeque<Certificate>> {
+        let store = self.config.node_storage().clone();
+        // Move the certs onto the blocking thread, write them by reference, and hand them back: the
+        // caller still forwards each to the DAG, so ownership makes the round trip without a copy.
+        let certificates = tokio::task::spawn_blocking(move || {
+            store.write_all(&certificates).map(|()| certificates)
+        })
+        .await
+        .map_err(|_| CertManagerError::JoinError)??;
 
         self.certs_accepted = self.certs_accepted.saturating_add(certificates.len() as u32);
         let gc_depth = self.config.parameters().gc_depth;
@@ -309,7 +322,7 @@ where
                 });
             }
         }
-        Ok(())
+        Ok(certificates)
     }
 
     /// Update per-cert acceptance metrics.
@@ -365,7 +378,7 @@ where
             if unlocked.is_empty() {
                 continue;
             }
-            self.persist_and_advance_high_water_mark(&unlocked)?;
+            let unlocked = self.persist_and_advance_high_water_mark(unlocked).await?;
             for cert in unlocked {
                 self.record_accepted_metrics(&cert);
                 self.forward_to_dag(cert).await?;

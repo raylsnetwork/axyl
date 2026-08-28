@@ -44,7 +44,7 @@ async-trait = { workspace = true }
 futures = { workspace = true }
 proptest = { workspace = true }
 tracing = { workspace = true }
-rayls-infrastructure-storage = { workspace = true }
+rayls-infrastructure-storage = { workspace = true, features = ["test-utils"] }
 assert_matches = { workspace = true }
 rayls-infrastructure-types = { workspace = true, features = ["test-utils"] }
 rayls-consensus-primary = { workspace = true, features = ["test-utils"] }

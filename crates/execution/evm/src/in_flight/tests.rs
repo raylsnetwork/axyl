@@ -7,32 +7,6 @@ fn hash(n: u64) -> TxHash {
     TxHash::from(bytes)
 }
 
-/// A stale ack is terminal: never due again however far time and the anchor advance, not
-/// revived by a racing forward mark, released only by the membership reconcile. Fails
-/// against release-on-ack semantics, where the hash reads unmarked and due.
-#[test]
-fn acked_stale_suppresses_resends_until_released_by_membership() {
-    let tracker = InFlightTracker::with_fresh_metrics();
-    let marks = tracker.arm_forwarding(DuePolicy {
-        after: Duration::from_secs(10),
-        backoff_shift_cap: 4,
-        min_anchor_advance: 20,
-    });
-    let now = Instant::now();
-    marks.mark_forwarded([hash(1)], now, 0);
-    marks.mark_acked_stale([hash(1)]);
-
-    let late = now + Duration::from_secs(3600);
-    assert!(marks.is_forwarded(&hash(1)));
-    assert!(!marks.is_due(&hash(1), late, u64::MAX));
-    // a racing forward mark does not downgrade the ack
-    marks.mark_forwarded([hash(1)], late, u64::MAX);
-    assert!(!marks.is_due(&hash(1), late + Duration::from_secs(3600), u64::MAX));
-    // execution pruning the transaction from the pool is the release path
-    tracker.release_in_flight([hash(1)]);
-    assert!(marks.is_due(&hash(1), late, 0));
-}
-
 #[test]
 fn mark_and_query_roundtrip() {
     let tracker = InFlightTracker::new();
@@ -309,22 +283,20 @@ fn clear_keeps_forward_marks_and_disarms() {
 
 /// A promotion carries an Observer epoch's forward marks across the boundary (clear() keeps
 /// them under Armed::Forwarding), but arm_sealing must start the sealing set empty: a leftover
-/// mark - especially AckedStale, which the TTL sweep never releases - would make the newly
-/// promoted validator's builder skip a transaction it now solely owns. Fails against an
-/// arm_sealing that only sets the sweep policy.
+/// mark would make the newly promoted validator's builder skip a transaction it now solely owns.
+/// Fails against an arm_sealing that only sets the sweep policy.
 #[test]
 fn arm_sealing_clears_forward_marks_left_by_a_promotion() {
     let tracker = InFlightTracker::new();
     let forward = tracker.arm_forwarding(forward_policy());
-    forward.mark_forwarded([hash(1)], Instant::now(), 0);
-    forward.mark_acked_stale([hash(2)]);
+    forward.mark_forwarded([hash(1), hash(2)], Instant::now(), 0);
     tracker.clear(); // epoch boundary: Armed::Forwarding keeps the forward marks
     assert_eq!(tracker.len(), 2, "clear keeps forward marks across the boundary");
 
     // Observer -> CvvActive promotion: the builder arms for sealing the next epoch
     let _seal = tracker.arm_sealing(DuePolicy::ttl(Duration::from_secs(60)));
     assert!(!tracker.is_in_flight(&hash(1)), "a Sent mark must not survive into sealing");
-    assert!(!tracker.is_in_flight(&hash(2)), "an AckedStale mark must not survive into sealing");
+    assert!(!tracker.is_in_flight(&hash(2)));
 }
 
 /// `is_forwarded` distinguishes a first send from a re-send: the catch-up gate blocks only
@@ -356,6 +328,23 @@ fn release_mined_retains_only_the_live_set() {
 
     // everything tracked is live: a no-op, and no spurious wake
     assert_eq!(tracker.release_mined(&live), 0);
+    assert_eq!(*events.borrow(), 1);
+}
+
+/// Releasing executed hashes touches only those marks and bumps the release watch once; a commit
+/// carrying no tracked hash bumps nothing.
+#[test]
+fn release_executed_releases_only_the_listed_hashes() {
+    let tracker = InFlightTracker::new();
+    let events = tracker.release_events();
+    tracker.mark_in_flight([hash(1), hash(2), hash(3)]);
+
+    assert_eq!(tracker.release_executed([hash(1), hash(3), hash(9)]), 2);
+    assert!(tracker.is_in_flight(&hash(2)));
+    assert_eq!(tracker.len(), 1);
+    assert_eq!(*events.borrow(), 1);
+
+    assert_eq!(tracker.release_executed([hash(9)]), 0);
     assert_eq!(*events.borrow(), 1);
 }
 
@@ -603,9 +592,8 @@ fn arm_sealing_clears_residue_and_installs_the_matching_stash() {
     assert!(tracker.is_in_flight(&hash(1)), "the matching stash installs");
 }
 
-/// Forward backoff survives the round trip: a restored mark reads as forwarded (no
-/// first-send flood), its attempts keep the backoff window, and acked-stale stays
-/// never-due; an acked-stale mark also snapshots back out.
+/// Forward backoff survives the round trip: a restored mark reads as forwarded (no first-send
+/// flood) and its attempts keep the backoff window; it also snapshots back out.
 #[test]
 fn forward_backoff_survives_the_round_trip() {
     let policy =
@@ -614,10 +602,7 @@ fn forward_backoff_survives_the_round_trip() {
     tracker.stash_restore(MarkBackup {
         version: MARK_BACKUP_VERSION,
         role: MarkRole::Forwarding,
-        marks: vec![
-            SavedMark { hash: hash(1), kind: SavedMarkKind::Sent { attempts: 3 } },
-            SavedMark { hash: hash(2), kind: SavedMarkKind::AckedStale },
-        ],
+        marks: vec![SavedMark { hash: hash(1), kind: SavedMarkKind::Sent { attempts: 3 } }],
     });
     let fwd = tracker.arm_forwarding(policy);
     assert!(fwd.is_forwarded(&hash(1)), "a restored mark is a re-send, not a first send");
@@ -625,13 +610,9 @@ fn forward_backoff_survives_the_round_trip() {
         !fwd.is_due(&hash(1), Instant::now(), u64::MAX),
         "the restored backoff window holds at the rebased stamp"
     );
-    assert!(
-        !fwd.is_due(&hash(2), Instant::now() + Duration::from_secs(3600), u64::MAX),
-        "acked-stale is never due"
-    );
     let backup = tracker.snapshot().expect("armed");
     assert_eq!(backup.role, MarkRole::Forwarding);
-    assert!(backup.marks.iter().any(|m| m.kind == SavedMarkKind::AckedStale));
+    assert!(backup.marks.iter().any(|m| m.kind == SavedMarkKind::Sent { attempts: 3 }));
 }
 
 /// An unarmed tracker has no role whose marks mean anything: no snapshot.

@@ -18,10 +18,10 @@ use rayls_infrastructure_network_types::{
 use rayls_infrastructure_storage::tables::Batches;
 use rayls_infrastructure_types::{
     encode, now, B256Set, Batch, BatchValidation, BlockHash, BlsPublicKey, Bytes, Database,
-    DbTxMut, RaylsReceiver, SealedBatch, TaskKind, TaskSpawner, TxHash, WorkerId,
+    DbTxMut, NodeMode, RaylsReceiver, SealedBatch, TaskKind, TaskSpawner, TxHash, WorkerId,
 };
 use std::{collections::HashSet, sync::Arc, time::Duration};
-use tokio::sync::{oneshot, Semaphore};
+use tokio::sync::{oneshot, watch, OwnedSemaphorePermit, Semaphore};
 use tracing::{debug, trace, warn};
 
 pub(crate) mod error;
@@ -51,6 +51,44 @@ const MAX_CONCURRENT_SUBMIT_TXNS: usize = 16;
 /// submit pays on top of its transaction bytes.
 static TXN_SUBMIT_OVERHEAD: std::sync::LazyLock<usize> =
     std::sync::LazyLock::new(|| encode(&WorkerRequest::SubmitTxns { transactions: vec![] }).len());
+
+/// Why an inbound transaction submit was refused before any admission work was spawned.
+///
+/// The reply reuses the existing error variant (no wire change) carrying the `Display` string,
+/// which a sender parses back with [`Self::parse`]: the strings are a wire contract and stay stable
+/// across upgrades.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum SubmitRejection {
+    /// This node cannot seal batches, so pooling forwarded transactions would strand them.
+    #[error("not batch-producing")]
+    NotBatchProducing,
+    /// The inbound submit fan-out is at capacity.
+    #[error("submit backlog")]
+    Backlog,
+}
+
+impl SubmitRejection {
+    /// Every rejection a receiver can reply with.
+    const ALL: [Self; 2] = [Self::NotBatchProducing, Self::Backlog];
+
+    /// Parse a receiver's error reply back into the rejection it displayed; any other reply is
+    /// not a rejection.
+    fn parse(reply: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|rejection| rejection.to_string() == reply)
+    }
+}
+
+/// Why a direct submit to a validator failed.
+#[derive(Debug, thiserror::Error)]
+pub enum SubmitError {
+    /// The receiver's gate refused the submit before admission: its explicit self-report.
+    #[error(transparent)]
+    Rejected(#[from] SubmitRejection),
+    /// The request produced no reply this node can act on: transport failure, timeout, or an
+    /// error reply that is not a gate rejection.
+    #[error(transparent)]
+    Network(#[from] NetworkError),
+}
 
 /// Encoded size of a [`WorkerGossip::Txn`] carrying nothing: the frame every published payload
 /// pays on top of its transaction bytes.
@@ -112,20 +150,32 @@ impl WorkerNetworkHandle {
         peer_bls: BlsPublicKey,
         transactions: Vec<Bytes>,
         timeout: Duration,
-    ) -> NetworkResult<Vec<TxHash>> {
+    ) -> Result<Vec<TxHash>, SubmitError> {
         let request = WorkerRequest::SubmitTxns { transactions };
-        let res = self.handle.send_request(request, peer_bls).await?;
-        let res =
-            tokio::time::timeout(timeout, res).await.map_err(|_| NetworkError::Timeout)???;
-        match res {
+        match self.request_within(request, peer_bls, timeout).await? {
             WorkerResponse::SubmitTxns { stale } => Ok(stale),
             WorkerResponse::ReportBatch
             | WorkerResponse::RequestBatches { .. }
             | WorkerResponse::PeerExchange { .. } => Err(NetworkError::RPCError(
                 "Got wrong response, not a submit txns response!".to_string(),
-            )),
-            WorkerResponse::Error(WorkerRPCError(s)) => Err(NetworkError::RPCError(s)),
+            )
+            .into()),
+            WorkerResponse::Error(WorkerRPCError(s)) => Err(match SubmitRejection::parse(&s) {
+                Some(rejection) => rejection.into(),
+                None => NetworkError::RPCError(s).into(),
+            }),
         }
+    }
+
+    /// Send `request` to `peer_bls` and await its reply within `timeout`.
+    async fn request_within(
+        &self,
+        request: WorkerRequest,
+        peer_bls: BlsPublicKey,
+        timeout: Duration,
+    ) -> NetworkResult<WorkerResponse> {
+        let res = self.handle.send_request(request, peer_bls).await?;
+        tokio::time::timeout(timeout, res).await.map_err(|_| NetworkError::Timeout)??
     }
 
     /// The most transaction bytes one direct submit may carry, leaving room for the request
@@ -353,6 +403,9 @@ pub struct WorkerNetwork<DB, Events> {
     request_handler: RequestHandler<DB>,
     /// Bounds concurrent inbound submit fan-out onto the shared rayon pool.
     submit_permits: Arc<Semaphore>,
+    /// The node's mode, gating inbound transaction submits to batch-producing nodes; app-scoped on
+    /// the consensus bus, so the watch survives epoch transitions.
+    node_mode: watch::Receiver<NodeMode>,
 }
 
 impl<DB, Events> WorkerNetwork<DB, Events>
@@ -367,11 +420,12 @@ where
         consensus_config: ConsensusConfig<DB>,
         id: WorkerId,
         validator: Arc<dyn BatchValidation>,
+        node_mode: watch::Receiver<NodeMode>,
     ) -> Self {
         let request_handler =
             RequestHandler::new(id, validator, consensus_config, network_handle.clone());
         let submit_permits = Arc::new(Semaphore::new(MAX_CONCURRENT_SUBMIT_TXNS));
-        Self { network_events, network_handle, request_handler, submit_permits }
+        Self { network_events, network_handle, request_handler, submit_permits, node_mode }
     }
 
     /// Run the network for the epoch.
@@ -440,31 +494,25 @@ where
         channel: ResponseChannel<WorkerResponse>,
         cancel: oneshot::Receiver<()>,
     ) {
-        // Shed the submit when the inbound fan-out is at capacity: replying with the existing error
+        // Refuse the submit before spawning any admission work: replying with the existing error
         // variant (no wire change) makes the sender retry the next live validator immediately
         // instead of queueing behind a rayon backlog that would also delay consensus validation.
-        let Ok(permit) = self.submit_permits.clone().try_acquire_owned() else {
-            let network_handle = self.network_handle.clone();
-            self.network_handle.get_task_spawner().spawn_task("submit-txns-shed", async move {
-                let response = WorkerResponse::Error(WorkerRPCError("submit backlog".into()));
-                let _ = network_handle.handle.send_response(response, channel).await;
-            });
-            return;
-        };
-
+        let admitted = admit_submit(&self.node_mode, &self.submit_permits);
         let request_handler = self.request_handler.clone();
         let network_handle = self.network_handle.clone();
         self.network_handle.get_task_spawner().spawn_task("process-submit-txns", async move {
-            // hold the permit across the rayon fan-out so the cap bounds concurrent CPU work
-            let _permit = permit;
-            tokio::select! {
-                stale = request_handler.submit_forwarded_txns(transactions) => {
-                    let response = WorkerResponse::SubmitTxns { stale };
-                    let _ = network_handle.handle.send_response(response, channel).await;
-                }
-                // cancel notification from the network layer
-                _ = cancel => (),
-            }
+            let response = match admitted {
+                Err(rejection) => WorkerResponse::Error(WorkerRPCError(rejection.to_string())),
+                // hold the permit across the rayon fan-out so the cap bounds concurrent CPU work
+                Ok(_permit) => tokio::select! {
+                    stale = request_handler.submit_forwarded_txns(transactions) => {
+                        WorkerResponse::SubmitTxns { stale }
+                    }
+                    // cancel notification from the network layer
+                    _ = cancel => return,
+                },
+            };
+            let _ = network_handle.handle.send_response(response, channel).await;
         });
     }
 
@@ -554,6 +602,19 @@ where
             }
         });
     }
+}
+
+/// Admit one inbound transaction submit, holding a fan-out permit, or name the refusal.
+///
+/// The mode is checked first so a node that cannot seal sheds without consuming admission capacity.
+fn admit_submit(
+    node_mode: &watch::Receiver<NodeMode>,
+    permits: &Arc<Semaphore>,
+) -> Result<OwnedSemaphorePermit, SubmitRejection> {
+    if !node_mode.borrow().is_batch_producing() {
+        return Err(SubmitRejection::NotBatchProducing);
+    }
+    permits.clone().try_acquire_owned().map_err(|_| SubmitRejection::Backlog)
 }
 
 /// Handler for the local primary's requests to this worker.
@@ -655,9 +716,71 @@ impl<DB: Database> PrimaryToWorkerClient for PrimaryReceiverHandler<DB> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use assert_matches::assert_matches;
     use rayls_consensus_network::types::NetworkCommand;
     use rayls_infrastructure_types::{BlsPublicKey, TaskManager, B256};
     use tokio::sync::mpsc::error::TryRecvError;
+
+    /// The gate refuses a non-batch-producing node before capacity without consuming a permit,
+    /// sheds at capacity, and follows the live watch across demotion and re-promotion.
+    #[test]
+    fn admit_submit_gates_on_mode_then_capacity() {
+        let permits = Arc::new(Semaphore::new(1));
+        let (tx, node_mode) = watch::channel(NodeMode::CvvActive);
+        let admit = || admit_submit(&node_mode, &permits);
+
+        for mode in [NodeMode::CvvInactive, NodeMode::Observer] {
+            tx.send_replace(mode);
+            assert_eq!(admit().err(), Some(SubmitRejection::NotBatchProducing));
+            assert_eq!(permits.available_permits(), 1, "a mode reject must not consume a permit");
+        }
+        tx.send_replace(NodeMode::CvvActive);
+        let permit = admit().expect("re-promotion admits again");
+        assert_eq!(admit().err(), Some(SubmitRejection::Backlog), "at capacity: shed");
+        drop(permit);
+        assert!(admit().is_ok());
+    }
+
+    /// The reply strings are a wire contract: a sender parses back exactly what a receiver
+    /// displayed, the two stay distinct, and anything else is not a rejection.
+    #[test]
+    fn submit_rejection_replies_round_trip_and_stay_distinct() {
+        for rejection in SubmitRejection::ALL {
+            assert_eq!(SubmitRejection::parse(&rejection.to_string()), Some(rejection));
+        }
+        assert_eq!(SubmitRejection::NotBatchProducing.to_string(), "not batch-producing");
+        assert_eq!(SubmitRejection::Backlog.to_string(), "submit backlog");
+        assert!(SubmitRejection::parse("boom").is_none());
+    }
+
+    /// A receiver's gate reply comes back as the typed rejection it displayed; any other error
+    /// reply stays a network error, so the caller matches an enum instead of parsing strings.
+    #[tokio::test]
+    async fn submit_txns_types_the_gate_replies() {
+        let (tx, mut commands) = tokio::sync::mpsc::channel::<NetworkCommand<Req, Res>>(4);
+        let task_manager = TaskManager::default();
+        let handle = WorkerNetworkHandle::new(
+            NetworkHandle::new(tx),
+            task_manager.get_spawner(),
+            1024 * 1024,
+        );
+        let mut replies = ["not batch-producing", "submit backlog", "boom"].into_iter();
+        tokio::spawn(async move {
+            while let Some(NetworkCommand::SendRequest { reply, .. }) = commands.recv().await {
+                let text = replies.next().expect("one reply per submit").to_string();
+                let _ = reply.send(Ok(WorkerResponse::Error(WorkerRPCError(text))));
+            }
+        });
+
+        let peer = BlsPublicKey::default();
+        let submit = || handle.submit_txns(peer, Vec::new(), Duration::from_secs(1));
+        assert_matches!(
+            submit().await,
+            Err(SubmitError::Rejected(SubmitRejection::NotBatchProducing))
+        );
+        assert_matches!(submit().await, Err(SubmitError::Rejected(SubmitRejection::Backlog)));
+        assert_matches!(submit().await, Err(SubmitError::Network(NetworkError::RPCError(s))) if s == "boom");
+    }
 
     /// Asserts concurrently in-flight outbound batch requests never exceed
     /// [`MAX_CONCURRENT_BATCH_REQUESTS`]. The mock buffers every pending request before answering
