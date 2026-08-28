@@ -384,10 +384,16 @@ impl TxnForwarder {
             .map(|(owner, txns)| {
                 let connected = Arc::clone(&connected);
                 let stream: OwnerStream<'_> = Box::pin(async move {
+                    // The validator that acked the last chunk leads the next one, so a stream
+                    // that failed over stays whole on one pool instead of splitting a sender's
+                    // nonce chain between a flapping owner and its successor.
+                    let mut acked_by = None;
                     for message in
                         Self::chunk_under_budget(txns, self.direct_budget, MAX_TXNS_PER_MESSAGE)
                     {
-                        self.submit_message(owner, &connected, message, anchor, now).await;
+                        acked_by = self
+                            .submit_message(owner, &connected, message, anchor, now, acked_by)
+                            .await;
                     }
                     owner
                 });
@@ -410,7 +416,8 @@ impl TxnForwarder {
         }
     }
 
-    /// Submit a message to the first candidate on the ring walk ([`ValidatorHealth::candidates`]).
+    /// Submits a message to the first candidate on the ring walk ([`ValidatorHealth::candidates`]),
+    /// or to `lead` first when the stream's previous chunk landed there; returns the acking peer.
     ///
     /// A failure feeds the breaker and walks on; if every candidate fails the message stays
     /// unstamped and the next tick retries it. Acked hashes are stamped with the current anchor.
@@ -421,18 +428,23 @@ impl TxnForwarder {
         message: Vec<(TxHash, Arc<PoolTxn>)>,
         anchor: u64,
         now: Instant,
-    ) {
+        lead: Option<BlsPublicKey>,
+    ) -> Option<BlsPublicKey> {
         // Encode once outside the failover loop: a retry to the next validator re-uses the same
         // hashes and clones the `Bytes` payloads (refcount bumps, not re-serialization).
         let hashes = message.iter().map(|(hash, _)| *hash).collect::<Vec<_>>();
         let payloads: Vec<Bytes> = message.iter().map(|(_, txn)| encode_txn(txn)).collect();
 
-        let candidates = self.health.lock().candidates(owner, &self.committee, connected, now);
+        let mut candidates = self.health.lock().candidates(owner, &self.committee, connected, now);
+        if let Some(index) = lead.and_then(|lead| candidates.iter().position(|peer| *peer == lead))
+        {
+            candidates[..=index].rotate_right(1);
+        }
         if candidates.is_empty() {
             // No committee member is connected, not a walk exhausting: the network layer already
             // reports the disconnect, so a warn here would repeat it once per pending message.
             debug!(target: "worker::txn_forwarder", txns = message.len(), "no connected validator; retrying next tick");
-            return;
+            return None;
         }
         for peer in candidates {
             match self.network_handle.submit_txns(peer, payloads.clone(), SUBMIT_TIMEOUT).await {
@@ -455,7 +467,7 @@ impl TxnForwarder {
                     // accepted send and, if still pending after the window, re-sends one slot
                     // on. A validator cannot silence a hash by calling it stale.
                     self.marks.mark_forwarded(hashes, Instant::now(), anchor);
-                    return;
+                    return Some(peer);
                 }
                 Err(e) => {
                     if matches!(e, SubmitError::Rejected(SubmitRejection::NotBatchProducing)) {
@@ -482,6 +494,7 @@ impl TxnForwarder {
             txns = message.len(),
             "no live validator accepted the message; retrying next tick"
         );
+        None
     }
 
     /// Publish one message on the worker transaction topic (the pre-fork path).
@@ -549,6 +562,14 @@ impl TxnForwarder {
             messages.push(message);
         }
         messages
+    }
+
+    /// Overrides the direct-submit byte budget, so a test forces multi-chunk streams with a
+    /// handful of transactions.
+    #[cfg(test)]
+    fn with_direct_budget(mut self, direct_budget: usize) -> Self {
+        self.direct_budget = direct_budget;
+        self
     }
 
     /// A sender's owner in EVM block `block`'s window ([`OWNER_ROTATION_SHIFT`]) with every

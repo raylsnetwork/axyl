@@ -743,6 +743,51 @@ async fn censoring_owner_is_escaped_once_its_breaker_trips() {
     assert_eq!(resent, txns, "carrying the same transactions");
 }
 
+/// A sender's stream sticks to the validator that acked its first chunk: once a chunk fails over,
+/// the rest of the stream follows it, so a flapping owner cannot split one nonce chain across two
+/// pools (each then gapped and queued until the other executes).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_over_stream_keeps_its_chunks_on_one_validator() {
+    let task_manager = TaskManager::default();
+    let mut fixture = PoolFixture::new(&task_manager).await;
+    let txns = 6;
+    for _ in 1..txns {
+        fixture.add_next().await;
+    }
+    let committee: Vec<_> = (1..=2).map(key).collect();
+    let owner = TxnForwarder::owner_slot(fixture.sender(), 0, &committee) as usize;
+    let (flapper, live) = (committee[owner], committee[1 - owner]);
+
+    let (delivered_tx, mut delivered) = mpsc::channel::<Delivered>(16);
+    let mut owner_submits = 0u32;
+    let network_handle =
+        spawn_mock_network(&task_manager, committee.clone(), move |peer, txns, reply| {
+            // The owner drops only the stream's first chunk, then answers every later one.
+            if peer == flapper {
+                owner_submits += 1;
+                if owner_submits == 1 {
+                    let _ = reply.send(Err(NetworkError::Timeout));
+                    return;
+                }
+            }
+            let _ = delivered_tx.try_send((peer, txns.len()));
+            let _ = reply.send(ack());
+        });
+    // Two transactions per chunk, so the stream is several chunks.
+    let forwarder =
+        idle_forwarder_over(&fixture, network_handle, committee).with_direct_budget(260);
+    task_manager
+        .get_spawner()
+        .spawn_task("txn forwarder", forwarder.run(Duration::from_millis(20)));
+
+    let deliveries = next_txns(&mut delivered, txns).await;
+    assert!(deliveries.len() > 1, "the stream must span several chunks: {deliveries:?}");
+    assert!(
+        deliveries.iter().all(|(peer, _)| *peer == live),
+        "every chunk follows the first failover to the live validator: {deliveries:?}"
+    );
+}
+
 /// The breaker's steady-state claim: a censor that acks and drops is held out after three re-sent
 /// groups, and once its cooldown lapses it gets one probe, not the slot's traffic. Every fresh
 /// sender first-sent after the lapse that the censor captures pays a full resend window.
