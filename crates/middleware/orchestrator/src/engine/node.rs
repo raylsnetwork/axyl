@@ -2,6 +2,7 @@ use crate::engine::{
     node_builder::ExecutionNodeBuilder, node_inner::ExecutionNodeInner, rayls_builder::RaylsBuilder,
 };
 
+use rayls_consensus_primary::ConsensusBus;
 use rayls_consensus_worker::WorkerNetworkHandle;
 use rayls_execution_evm::{
     reth_env::RethEnv, system_calls::EpochState, CanonStateNotificationStream, WorkerTxPool,
@@ -113,13 +114,11 @@ impl ExecutionNode {
     }
 
     /// Spawn the observer transaction forwarder for one epoch.
-    #[allow(clippy::too_many_arguments)]
     pub async fn start_txn_forwarder(
         &self,
         worker_id: WorkerId,
         network_handle: WorkerNetworkHandle,
-        executed_anchor: watch::Receiver<ConsensusHeader>,
-        last_seen_header: watch::Receiver<ConsensusHeader>,
+        consensus_bus: &ConsensusBus,
         committee: Vec<BlsPublicKey>,
         task_spawner: &TaskSpawner,
         max_gossip_message_size: usize,
@@ -128,8 +127,7 @@ impl ExecutionNode {
         guard.start_txn_forwarder(
             worker_id,
             network_handle,
-            executed_anchor,
-            last_seen_header,
+            consensus_bus,
             committee,
             task_spawner,
             max_gossip_message_size,

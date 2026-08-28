@@ -10,6 +10,7 @@ authors = [
 ]
 
 [dependencies]
+parking_lot = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 tokio-stream = { workspace = true }
@@ -65,6 +66,7 @@ dev-single-node-setup = [
 rand = { workspace = true }
 rayls-consensus-primary = { workspace = true, features = ["test-utils"] }
 rayls-infrastructure-types = { workspace = true, features = ["test-utils"] }
+rayls-execution-evm = { workspace = true, features = ["test-utils"] }
 rayls-middleware-processor = { workspace = true, features = ["test-utils"] }
 rayls-testing-test-utils = { workspace = true }
 rayls-infrastructure-network-types = { workspace = true }

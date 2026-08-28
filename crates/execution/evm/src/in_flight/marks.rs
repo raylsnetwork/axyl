@@ -11,8 +11,9 @@ pub struct DuePolicy {
     /// Upper bound on the backoff shift applied per resend attempt, so wait time plateaus
     /// instead of growing unbounded under a stuck transaction.
     pub backoff_shift_cap: u32,
-    /// Minimum execution-anchor advance required since the mark was set, in addition to the
-    /// time-based wait, so a mark cannot come due before at least one new block was seen.
+    /// Minimum advance of the local execution anchor past the head the mark was stamped with, in
+    /// addition to the time-based wait, so a mark cannot come due before execution has passed
+    /// where the send could first have landed.
     pub min_anchor_advance: u64,
 }
 
@@ -27,15 +28,17 @@ impl DuePolicy {
 /// predecessor lost for good is still retried, just not every round.
 pub const DROPPED_HOLD: Duration = Duration::from_secs(60);
 
-/// The state of one tracked hash: sent and awaiting a due check, acknowledged stale by the
-/// forwarder, or held after execution dropped it as nonce-too-high. `AckedStale` is a terminal
-/// state outside the resend/expiry cycle - see `is_due`.
+/// The state of one tracked hash: sent and awaiting a due check, or held after execution dropped
+/// it as nonce-too-high.
+///
+/// A validator's stale ack is stamped as a send too: an honest one is followed by the pool pruning
+/// the hash within a few blocks, so a hash still pending after the window re-sends, and an ack
+/// cannot silence a transaction.
 #[derive(Copy, Clone, Debug)]
 pub(crate) enum Mark {
-    /// Sent at `at` while the execution anchor was `anchor`, after `attempts` prior resends.
+    /// Sent at `at` against head `anchor` (the caller's head at send time, which the due check
+    /// measures local execution against), after `attempts` prior resends.
     Sent { at: Instant, anchor: u64, attempts: u32 },
-    /// Confirmed no longer live by the forwarder; never due, released only by reconcile or clear.
-    AckedStale,
     /// Executed as nonce-too-high at `at`: pooled and unexecutable until `sender`'s state nonce
     /// advances, which releases it ([`InFlightTracker::release_advanced`]); due only once
     /// [`DROPPED_HOLD`] lapses, since a re-seal or re-send before that drops it again.
@@ -44,9 +47,6 @@ pub(crate) enum Mark {
 
 impl Mark {
     /// Returns whether this mark is eligible for release under the given policy at `now`/`anchor`.
-    ///
-    /// An `AckedStale` mark is never due: it is released only by an explicit reconcile or clear,
-    /// never by a TTL sweep, since the forwarder already knows the transaction is stale.
     pub(crate) fn is_due(&self, now: Instant, anchor: u64, policy: &DuePolicy) -> bool {
         match *self {
             Mark::Sent { at, anchor: mark_anchor, attempts } => {
@@ -56,17 +56,14 @@ impl Mark {
                     && anchor >= mark_anchor.saturating_add(policy.min_anchor_advance)
             }
             Mark::Held { at, .. } => now.duration_since(at) >= DROPPED_HOLD,
-            Mark::AckedStale => false,
         }
     }
 
-    /// Refreshes a `Sent` or `Held` mark to the given time/anchor and bumps its attempt count; a
-    /// no-op on an `AckedStale` mark, which never resends.
+    /// Refreshes the mark to the given time/anchor and bumps its attempt count.
     pub(crate) fn resend(&mut self, now: Instant, anchor: u64) {
         let attempts = match *self {
             Self::Sent { attempts, .. } => attempts,
             Self::Held { .. } => 0,
-            Self::AckedStale => return,
         };
         *self = Self::Sent { at: now, anchor, attempts: attempts.saturating_add(1) };
     }
@@ -176,12 +173,6 @@ impl ForwardMarks {
         self.tracker.on_marked(previous_marks_len, current_marks_len);
         self.tracker.on_forwarded(previous_marks_len, current_marks_len);
     }
-
-    /// Marks the given hashes acknowledged-stale: forwarded once, confirmed no longer live, and
-    /// exempt from further resend or TTL release until explicitly reconciled or cleared.
-    pub fn mark_acked_stale(&self, hashes: impl IntoIterator<Item = TxHash>) {
-        self.tracker.track_all(hashes, Mark::AckedStale);
-    }
 }
 
 /// Schema version of `MarkBackup`, bumped whenever its serialized shape changes so a backup
@@ -224,6 +215,4 @@ pub struct SavedMark {
 pub enum SavedMarkKind {
     /// A `Mark::Sent` reduced to its resend count; the clock and anchor are re-stamped on restore.
     Sent { attempts: u32 },
-    /// A `Mark::AckedStale`.
-    AckedStale,
 }
