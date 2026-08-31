@@ -24,7 +24,22 @@ use reth_primitives_traits::Block as _;
 impl RethEnv {
     /// Initialize a new transaction pool for worker.
     pub fn init_txn_pool(&self) -> eyre::Result<WorkerTxPool> {
-        WorkerTxPool::new(&self.node_config, &self.task_spawner, &self.blockchain_provider)
+        self.init_txn_pool_with_in_flight(crate::in_flight::InFlightTracker::new())
+    }
+
+    /// Initialize the worker transaction pool around a caller-owned in-flight tracker, so the
+    /// same tracker can be handed to the executor engine, which releases the marks of
+    /// execution-dropped transactions.
+    pub fn init_txn_pool_with_in_flight(
+        &self,
+        in_flight: crate::in_flight::InFlightTracker,
+    ) -> eyre::Result<WorkerTxPool> {
+        WorkerTxPool::new(
+            &self.node_config,
+            &self.task_spawner,
+            &self.blockchain_provider,
+            in_flight,
+        )
     }
 
     /// Return a channel receiver that will return each canonical block in turn.

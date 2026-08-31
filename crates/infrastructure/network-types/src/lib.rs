@@ -35,7 +35,7 @@ impl WorkerToPrimaryClient for MockWorkerToPrimary {
     }
 }
 
-/// Dumb mock to just pends forever on calls for tests.
+/// Dumb mock that pends forever on calls for tests.
 #[derive(Debug)]
 pub struct MockWorkerToPrimaryHang();
 
@@ -47,6 +47,26 @@ impl WorkerToPrimaryClient for MockWorkerToPrimaryHang {
 
     async fn report_others_batch(&self, _request: WorkerOthersBatchMessage) -> eyre::Result<()> {
         std::future::pending().await
+    }
+}
+
+/// Mock whose `report_own_batch` always errors, for tests of a seal whose report goes
+/// unacknowledged (the proposer has stopped draining).
+#[derive(Debug, Default)]
+pub struct MockWorkerToPrimaryError {
+    /// Count of `report_own_batch` calls, so a test can wait for the seal before asserting.
+    pub attempts: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl WorkerToPrimaryClient for MockWorkerToPrimaryError {
+    async fn report_own_batch(&self, _request: WorkerOwnBatchMessage) -> eyre::Result<()> {
+        self.attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        eyre::bail!("report_own_batch failed: proposer not draining (epoch teardown)")
+    }
+
+    async fn report_others_batch(&self, _request: WorkerOthersBatchMessage) -> eyre::Result<()> {
+        Ok(())
     }
 }
 

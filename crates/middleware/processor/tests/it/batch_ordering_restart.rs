@@ -14,10 +14,11 @@ use rayls_execution_evm::{
 };
 use rayls_infrastructure_storage::{open_db, DatabaseType};
 use rayls_infrastructure_types::{
-    gas_accumulator::GasAccumulator, now, test_genesis, Address, AuthorityIdentifier, Batch,
-    BlockHash, Certificate, CertifiedBatch, CommittedSubDag, Committee, ConsensusOutput, Database,
-    ExecHeader, Notifier, ReputationScores, SealedHeader, TaskManager, B256,
-    ETHEREUM_BLOCK_GAS_LIMIT_56BITS, MIN_PROTOCOL_BASE_FEE,
+    batch_tracker::{BatchStage, BatchTracker},
+    gas_accumulator::GasAccumulator,
+    now, test_genesis, Address, AuthorityIdentifier, Batch, BlockHash, Certificate, CertifiedBatch,
+    CommittedSubDag, Committee, ConsensusOutput, Database, ExecHeader, Notifier, ReputationScores,
+    SealedHeader, TaskManager, B256, ETHEREUM_BLOCK_GAS_LIMIT_56BITS, MIN_PROTOCOL_BASE_FEE,
 };
 use rayls_middleware_processor::{batch::BatchOrdering, ExecutorEngine, RLEngineError};
 use rayls_testing_test_utils::{execution_builder_no_args, TestExecutionNode};
@@ -50,19 +51,32 @@ pub struct BatchOrderingHarness {
     last_consensus_hash: B256,
     next_output_number: u64,
     next_round: u32,
+    /// Batch lifecycle tracker handed to every subsequent session's engine, so a test observes
+    /// park and execution events instead of inferring them from the chain tip.
+    tracker: Option<Arc<BatchTracker>>,
 }
 
 impl BatchOrderingHarness {
     /// Boot a fresh harness with a 4-authority committee and BatchDigestV2 active from block 0.
     pub async fn new() -> eyre::Result<Self> {
+        Self::boot(false).await
+    }
+
+    /// Boot with the OutputSeqNormalization fork also active from genesis.
+    pub async fn new_with_seq_normalization() -> eyre::Result<Self> {
+        Self::boot(true).await
+    }
+
+    async fn boot(seq_normalization: bool) -> eyre::Result<Self> {
         let base_chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
-        let rayls_spec = Arc::new(
-            RaylsChainSpec::builder(base_chain.clone())
-                .batch_digest_v2(0)
-                .empty_output_block(0)
-                .base_fee_params(BaseFeeParams::ethereum())
-                .build(),
-        );
+        let mut builder = RaylsChainSpec::builder(base_chain.clone())
+            .batch_digest_v2(0)
+            .empty_output_block(0)
+            .base_fee_params(BaseFeeParams::ethereum());
+        if seq_normalization {
+            builder = builder.output_seq_normalization(0);
+        }
+        let rayls_spec = Arc::new(builder.build());
 
         let tmp_dir = TempDir::new()?;
         let ordering_dir = TempDir::new()?;
@@ -94,7 +108,13 @@ impl BatchOrderingHarness {
             last_consensus_hash: B256::ZERO,
             next_output_number: 0,
             next_round: 0,
+            tracker: None,
         })
+    }
+
+    /// Install a batch lifecycle tracker observed by every subsequent session.
+    pub fn set_tracker(&mut self, tracker: Arc<BatchTracker>) {
+        self.tracker = Some(tracker);
     }
 
     fn node(&self) -> &TestExecutionNode {
@@ -260,9 +280,10 @@ impl BatchOrderingHarness {
             shutdown.subscribe(),
             task_manager.get_spawner(),
             self.gas_accumulator.clone(),
-            None,
+            self.tracker.clone(),
             ETHEREUM_BLOCK_GAS_LIMIT_56BITS,
             batch_ordering,
+            rayls_execution_evm::in_flight::InFlightTracker::new(),
         );
 
         for output in outputs {
@@ -367,6 +388,78 @@ async fn parking_and_drain_single_session() -> eyre::Result<()> {
         tip, 6,
         "three in-order + one parked-fallback-empty + one in-order-filler + one drained = six blocks"
     );
+    Ok(())
+}
+
+/// One output carrying an authority's batches in requeue-shaped order: seqs 2 and 3 ride ahead
+/// of seq 1 inside the SAME consensus output (a requeued digest lands in a later-round header,
+/// and certificates collate round-ascending). The certificate collation must preserve the
+/// output's internal order - so the engine parks 2 and 3 on encounter - and the moment 1 lands
+/// the drain collects both within the same output pass, executing blocks in seq order.
+///
+/// Pins two contracts at once: the collation never silently reorders (the park marks prove the
+/// inverted encounter order reached the ordering state), and an intra-output inversion costs
+/// only same-pass park/collect churn - never a stall, never a changed replicated block order.
+#[tokio::test]
+async fn intra_output_inversion_parks_and_drains_within_one_output() -> eyre::Result<()> {
+    let mut h = BatchOrderingHarness::new().await?;
+    let authority = h.authority_address(0);
+    // seq 1 seeds `last_executed_seq`: the very first batch from an authority is accepted
+    // unconditionally, so a park needs an established watermark to trip over
+    let seed = h.build_batch_output(0, 1);
+    let inverted =
+        h.build_output_with_batches(vec![(authority, 3), (authority, 4), (authority, 2)]);
+    // digests in the inverted output's own order: [seq 3, seq 4, seq 2]
+    let digests: Vec<BlockHash> = inverted.batch_digests.iter().copied().collect();
+
+    let tracker = Arc::new(BatchTracker::new());
+    h.set_tracker(tracker.clone());
+    let tip = h.drive_session(vec![seed, inverted]).await?;
+    assert_eq!(tip, 4, "the seed and all three inverted batches execute; nothing stays parked");
+
+    // the collation preserved the inverted encounter order: the two leading higher seqs parked
+    assert!(tracker.batch_reached(digests[0], BatchStage::Parked), "seq 3 must park");
+    assert!(tracker.batch_reached(digests[1], BatchStage::Parked), "seq 4 must park");
+    assert!(!tracker.batch_reached(digests[2], BatchStage::Parked), "seq 2 is in order");
+
+    // the same-pass drain normalized execution to seq order
+    assert_eq!(tracker.batch_executed_block(digests[2]), Some(2), "seq 2 executes first");
+    assert_eq!(tracker.batch_executed_block(digests[0]), Some(3), "parked seq 3 drains second");
+    assert_eq!(tracker.batch_executed_block(digests[1]), Some(4), "parked seq 4 drains third");
+    Ok(())
+}
+
+/// With OutputSeqNormalization active, an intra-output inversion is repaired in place before
+/// the ordering walk: each authority's batches execute in seq order at the positions that
+/// authority already held, other authorities' batches keep their slots, and nothing parks.
+/// The pre-fork behavior (park, then gap-fill placement) is pinned by
+/// `intra_output_inversion_parks_and_drains_within_one_output`; together the pair is the
+/// rolling-safety contract at the fork boundary.
+#[tokio::test]
+async fn seq_normalization_repairs_intra_output_inversion_in_place() -> eyre::Result<()> {
+    let mut h = BatchOrderingHarness::new_with_seq_normalization().await?;
+    let a = h.authority_address(0);
+    let b = h.authority_address(1);
+    // seed both authorities' seq watermarks
+    let seed = h.build_output_with_batches(vec![(a, 1), (b, 1)]);
+    // one output where A's seqs invert around B's in-order batch: positions run A, B, A
+    let inverted = h.build_output_with_batches(vec![(a, 3), (b, 2), (a, 2)]);
+    // digests in the output's own order: [A seq 3, B seq 2, A seq 2]
+    let digests: Vec<BlockHash> = inverted.batch_digests.iter().copied().collect();
+
+    let tracker = Arc::new(BatchTracker::new());
+    h.set_tracker(tracker.clone());
+    let tip = h.drive_session(vec![seed, inverted]).await?;
+    assert_eq!(tip, 5, "two seed batches plus three normalized batches");
+
+    // the inversion was repaired before the ordering walk: nothing parks
+    for digest in &digests {
+        assert!(!tracker.batch_reached(*digest, BatchStage::Parked), "no batch parks");
+    }
+    // in place: A's batches take A's original slots in seq order; B's batch keeps its slot
+    assert_eq!(tracker.batch_executed_block(digests[2]), Some(3), "A seq 2 takes A's first slot");
+    assert_eq!(tracker.batch_executed_block(digests[1]), Some(4), "B seq 2 keeps its slot");
+    assert_eq!(tracker.batch_executed_block(digests[0]), Some(5), "A seq 3 takes A's second slot");
     Ok(())
 }
 

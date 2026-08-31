@@ -13,8 +13,13 @@ use rayls_execution_evm::{
     payload::BuildArguments, recover_raw_transaction, reth_env::RethEnv,
     test_utils::TransactionFactory, RethChainSpec, TxPool as _,
 };
-use rayls_infrastructure_network_types::{local::LocalNetwork, MockWorkerToPrimary};
-use rayls_infrastructure_storage::{open_db, tables::Batches};
+use rayls_infrastructure_network_types::{
+    local::LocalNetwork, MockWorkerToPrimary, MockWorkerToPrimaryError,
+};
+use rayls_infrastructure_storage::{
+    open_db,
+    tables::{BatchSeqCounter, Batches},
+};
 use rayls_infrastructure_types::{
     gas_accumulator::{BaseFeeContainer, GasAccumulator},
     test_genesis, Address, Batch, BatchValidation, Bytes, Certificate, CertifiedBatch,
@@ -32,7 +37,6 @@ async fn test_make_batch_el_to_cl() {
     let tmp_dir = TempDir::new().expect("temp dir");
     let task_manager = TaskManager::default();
     //
-    //=== Consensus Layer
     //
 
     let network_client = LocalNetwork::new_with_empty_id();
@@ -56,7 +60,6 @@ async fn test_make_batch_el_to_cl() {
     );
     batch_provider.spawn_batch_builder("test builder", &task_manager);
     //
-    //=== Execution Layer
     //
 
     // testnet genesis with TxFactory funded
@@ -140,7 +143,6 @@ async fn test_make_batch_el_to_cl() {
     let _batch_builder = tokio::spawn(Box::pin(batch_builder));
 
     //
-    //=== Test batch flow
     //
 
     // wait for new batch
@@ -215,7 +217,6 @@ async fn test_make_batch_el_to_cl() {
 #[tokio::test]
 async fn test_batch_builder_produces_valid_batches() {
     //
-    //=== Execution Layer
     //
     // testnet genesis with TxFactory funded
     let genesis = test_genesis();
@@ -311,7 +312,6 @@ async fn test_batch_builder_produces_valid_batches() {
     let _batch_builder = tokio::spawn(Box::pin(batch_builder));
 
     //
-    //=== Test batch flow
     //
 
     // plenty of time for batch production
@@ -409,7 +409,6 @@ async fn test_batch_builder_produces_valid_batches() {
 #[tokio::test]
 async fn test_canonical_notification_updates_pool() {
     //
-    //=== Execution Layer
     //
     // testnet genesis with TxFactory funded
     let genesis = test_genesis();
@@ -484,7 +483,6 @@ async fn test_canonical_notification_updates_pool() {
     let _batch_builder = tokio::spawn(Box::pin(batch_builder));
 
     //
-    //=== Test block flow
     //
 
     // submit new transaction before sending ack
@@ -539,6 +537,7 @@ async fn test_canonical_notification_updates_pool() {
         Default::default(),
         batch_ordering.clone(),
         ETHEREUM_BLOCK_GAS_LIMIT_56BITS,
+        rayls_execution_evm::in_flight::InFlightTracker::new(),
     )
     .expect("output executed");
 
@@ -585,4 +584,107 @@ async fn test_canonical_notification_updates_pool() {
     assert_eq!(pool_size.pending, 1);
     let pending = txpool.pending_transactions();
     assert!(pending.iter().all(|tx| txpool.is_in_flight(tx.hash())));
+}
+
+/// A failed `report_own_batch` must not consume the batch seq or mark its txs in-flight.
+///
+/// When the epoch-scoped proposer has stopped draining `our_digests`, the report goes
+/// unacknowledged. A seal that swallows the error advances the seq and marks the txs in-flight
+/// for a digest no header will carry: a permanent per-authority seq hole whose committed
+/// successors park until the boundary drain. The txs must instead stay selectable and the seq
+/// unconsumed, so the same seq is retried.
+#[tokio::test]
+async fn test_failed_report_leaves_txs_selectable_and_seq_unconsumed() {
+    let tmp_dir = TempDir::new().expect("temp dir");
+    let task_manager = TaskManager::default();
+
+    let network_client = LocalNetwork::new_with_empty_id();
+    let store = open_db(tmp_dir.path().join("c-db"));
+    let node_metrics = WorkerMetrics::default();
+
+    // the proposer is not draining: every report_own_batch errors
+    let report = Arc::new(MockWorkerToPrimaryError::default());
+    let attempts = report.attempts.clone();
+    network_client.set_worker_to_primary_local_handler(report);
+
+    let qw = TestMakeBlockQuorumWaiter::new_test();
+    let mut batch_provider = Worker::new(
+        0,
+        Some(qw.clone()),
+        Arc::new(node_metrics),
+        network_client,
+        store.clone(),
+        Duration::from_secs(5),
+        WorkerNetworkHandle::new_for_test(task_manager.get_spawner()),
+    );
+    batch_provider.spawn_batch_builder("test builder", &task_manager);
+
+    let genesis = test_genesis();
+    let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+    let reth_env = RethEnv::new_for_temp_chain(chain.clone(), tmp_dir.path(), &task_manager, None)
+        .await
+        .unwrap();
+    let txpool = reth_env.init_txn_pool().unwrap();
+    let address = Address::from(U160::from(333));
+
+    let batch_builder = BatchBuilder::new(
+        &reth_env,
+        txpool.clone(),
+        batch_provider.batches_tx(),
+        address,
+        Duration::from_secs(1),
+        task_manager.get_spawner(),
+        0,
+        BaseFeeContainer::default(),
+        0,
+        0,
+        u64::MAX,
+        ETHEREUM_BLOCK_GAS_LIMIT_56BITS,
+    );
+
+    let gas_price = reth_env.get_gas_price().unwrap();
+    let value = U256::from(10).checked_pow(U256::from(18)).expect("1e18 fits U256");
+    let mut tx_factory = TransactionFactory::new();
+    for _ in 0..3 {
+        let tx = tx_factory.create_eip1559(
+            chain.clone(),
+            None,
+            gas_price,
+            Some(Address::ZERO),
+            value,
+            Bytes::new(),
+        );
+        tx_factory.submit_tx_to_pool(tx, txpool.clone()).await;
+    }
+    assert_eq!(txpool.pool_size().pending, 3);
+
+    let _batch_builder = tokio::spawn(Box::pin(batch_builder));
+
+    // wait until the worker has sealed a batch and attempted the report at least once, so the
+    // assertions observe post-report state rather than a pre-seal race
+    for _ in 0..50 {
+        if attempts.load(std::sync::atomic::Ordering::SeqCst) >= 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        attempts.load(std::sync::atomic::Ordering::SeqCst) >= 1,
+        "worker never attempted a batch report"
+    );
+    // let the seal path finish handling the failed report result
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // the report failed, so the batch never reaches a header; a seal that swallows the error
+    // fails both assertions (txs marked in-flight, seq persisted)
+    let pending = txpool.pending_transactions();
+    assert_eq!(pending.len(), 3, "the txs must stay in the pending pool");
+    assert!(
+        pending.iter().all(|tx| !txpool.is_in_flight(tx.hash())),
+        "a failed report must leave the batch's txs selectable (no in-flight mark)"
+    );
+    assert!(
+        store.get::<BatchSeqCounter>(&0).unwrap().is_none(),
+        "a failed report must not consume/persist the batch seq"
+    );
 }

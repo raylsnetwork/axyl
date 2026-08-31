@@ -11,6 +11,7 @@ mod history_recovery;
 use assert_matches::assert_matches;
 use rayls_batch_builder::test_utils::execute_test_batch;
 use rayls_execution_evm::{
+    in_flight::InFlightTracker,
     reth_env::RethEnv,
     test_utils::{
         calculate_withdrawals_root, create_committee_from_state,
@@ -79,6 +80,17 @@ async fn run_engine(
     gas_accumulator: GasAccumulator,
     outputs: Vec<ConsensusOutput>,
 ) -> eyre::Result<RethEnv> {
+    run_engine_with_in_flight(execution_node, chain, gas_accumulator, outputs, None).await
+}
+
+/// [`run_engine`] with a pool in-flight tracker wired into the engine, as production wires it.
+async fn run_engine_with_in_flight(
+    execution_node: &rayls_testing_test_utils::TestExecutionNode,
+    chain: &Arc<RethChainSpec>,
+    gas_accumulator: GasAccumulator,
+    outputs: Vec<ConsensusOutput>,
+    in_flight: Option<InFlightTracker>,
+) -> eyre::Result<RethEnv> {
     let (to_engine, from_consensus) = tokio::sync::mpsc::channel(outputs.len());
     let reth_env = execution_node.get_reth_env().await;
     let shutdown = Notifier::default();
@@ -97,6 +109,7 @@ async fn run_engine(
         None,
         ETHEREUM_BLOCK_GAS_LIMIT_56BITS,
         batch_ordering,
+        in_flight.unwrap_or_else(InFlightTracker::new),
     );
 
     for output in outputs {
@@ -190,7 +203,6 @@ async fn test_empty_output_executes() -> eyre::Result<()> {
         committee.authority(&leader_id).expect("leader in committee").execution_address();
     gas_accumulator.rewards_counter().set_committee(committee);
 
-    //=== Consensus
     //
     // create consensus output bc transactions in batches
     // are randomly generated
@@ -240,6 +252,7 @@ async fn test_empty_output_executes() -> eyre::Result<()> {
         None,
         ETHEREUM_BLOCK_GAS_LIMIT_56BITS,
         batch_ordering,
+        rayls_execution_evm::in_flight::InFlightTracker::new(),
     );
 
     // send output
@@ -358,22 +371,15 @@ async fn test_empty_output_executes() -> eyre::Result<()> {
     Ok(())
 }
 
-/// Test the engine shuts down after the sending half of the broadcast channel is closed.
+/// The engine drains its queue, then the channel, and shuts down once the sender is closed.
 ///
-/// One output is queued (simulating output already received) in the engine and another is sent
-/// on the channel. Then, the sender is dropped and the engine task is started.
+/// One output is pre-queued (already received) and another is sent on the channel before the
+/// sender is dropped and the engine starts: the queued output executes first, the channel output
+/// second, and the engine exits gracefully with nothing left. Transactions carry priority fees so
+/// the epoch-end governance, batch-producer, and block rewards can be asserted.
 ///
-/// Expected result:
-/// - engine receives last broadcast
-/// - engine processes queued output first
-/// - engine processes last broadcast second
-/// - engine has no more output in queue and gracefully shuts down
-///
-/// NOTE: all batches are built with genesis as the parent. Building blocks from historic
-/// parents is currently valid.
-///
-/// This test also adds transactions with priority fees to assert governance, batch producer, and
-/// block rewards go to the correct addresses at the end of an epoch.
+/// NOTE: all batches are built with genesis as the parent; building from historic parents is
+/// currently valid.
 #[tokio::test]
 async fn test_happy_path_full_execution_even_after_sending_channel_closed() -> eyre::Result<()> {
     let tmp_dir = TempDir::new().expect("temp dir");
@@ -522,8 +528,6 @@ async fn test_happy_path_full_execution_even_after_sending_channel_closed() -> e
     // Reload all_batches so we can calculate mix_hash properly later.
     let all_batches = [batches_1.clone(), batches_2.clone()].concat();
 
-    //=== Consensus
-
     // create consensus output bc transactions in batches
     // are randomly generated
     //
@@ -588,7 +592,6 @@ async fn test_happy_path_full_execution_even_after_sending_channel_closed() -> e
     batch_digests_1.extend(batch_digests_2);
     let all_batch_digests: Vec<BlockHash> = batch_digests_1.into();
 
-    //=== Execution
     // setup rewards for first two rounds of consensus
     let rewards_counter = gas_accumulator.rewards_counter();
     rewards_counter.set_committee(committee.clone());
@@ -622,6 +625,7 @@ async fn test_happy_path_full_execution_even_after_sending_channel_closed() -> e
         None,
         ETHEREUM_BLOCK_GAS_LIMIT_56BITS,
         batch_ordering,
+        rayls_execution_evm::in_flight::InFlightTracker::new(),
     );
 
     // assert the canonical chain in-memory is empty
@@ -814,18 +818,13 @@ async fn test_happy_path_full_execution_even_after_sending_channel_closed() -> e
     Ok(())
 }
 
-/// Test the engine successfully executes a duplicate batch (duplicate transactions);
+/// A batch of duplicate transactions executes as an empty block and the engine shuts down clean.
 ///
-/// Expected result:
-/// - engine receives output with duplicate transactions
-/// - engine produces empty block for duplicate batch
-/// - engine has no more output in queue and gracefully shuts down
+/// Transactions carry priority fees so the epoch-end governance, batch-producer, and block
+/// rewards can be asserted.
 ///
-/// NOTE: all batches are built with genesis as the parent. Building blocks from historic
-/// parents is currently valid.
-///
-/// This test also adds transactions with priority fees to assert governance, batch producer, and
-/// block rewards go to the correct addresses at the end of an epoch.
+/// NOTE: all batches are built with genesis as the parent; building from historic parents is
+/// currently valid.
 #[tokio::test]
 async fn test_execution_succeeds_with_duplicate_transactions() -> eyre::Result<()> {
     let tmp_dir = TempDir::new().unwrap();
@@ -1006,7 +1005,6 @@ async fn test_execution_succeeds_with_duplicate_transactions() -> eyre::Result<(
     assert_eq!(duplicate_batch_round_2.transactions(), duplicated_batch_for_round_2.transactions());
     assert_ne!(duplicate_batch_round_2, duplicated_batch_for_round_2);
 
-    //=== Consensus
     //
     // create consensus output bc transactions in batches
     // are randomly generated
@@ -1076,7 +1074,6 @@ async fn test_execution_succeeds_with_duplicate_transactions() -> eyre::Result<(
     batch_digests_1.extend(batch_digests_2);
     let all_batch_digests: Vec<BlockHash> = batch_digests_1.into();
 
-    //=== Execution
     // setup rewards for first two rounds of consensus
     let rewards_counter = gas_accumulator.rewards_counter();
     rewards_counter.set_committee(committee.clone());
@@ -1114,6 +1111,7 @@ async fn test_execution_succeeds_with_duplicate_transactions() -> eyre::Result<(
         None,
         ETHEREUM_BLOCK_GAS_LIMIT_56BITS,
         batch_ordering,
+        rayls_execution_evm::in_flight::InFlightTracker::new(),
     );
 
     // queue the first output - simulate already received from channel
@@ -1344,18 +1342,12 @@ async fn test_execution_succeeds_with_duplicate_transactions() -> eyre::Result<(
     Ok(())
 }
 
-/// Test that the engine drops a duplicate ConsensusOutput via the deterministic
-/// `(epoch, leader_round)` + subdag-digest guard.
+/// The engine drops a duplicate ConsensusOutput via the deterministic `(epoch, leader_round)` +
+/// subdag-digest guard.
 ///
-/// Three empty outputs are sent through the channel:
-///   - output_1: epoch=0, round=0 (valid, first seen)
-///   - output_dup: a byte-for-byte re-delivery of output_1 (same position AND content; the benign
-///     dual-feed case, should be dropped)
-///   - output_2: epoch=0, round=2 (valid, advances)
-///
-/// Expected result:
-/// - engine processes 2 outputs producing 2 blocks (one per distinct output)
-/// - the identical re-delivery is silently dropped
+/// Three empty outputs go through the channel: output_1 (epoch 0, round 0), a byte-for-byte
+/// re-delivery of it (the benign dual-feed case), and output_2 (round 2). Two blocks result, one
+/// per distinct output; the re-delivery is silently dropped.
 #[tokio::test]
 async fn test_duplicate_consensus_output_is_dropped() -> eyre::Result<()> {
     let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
@@ -1377,7 +1369,6 @@ async fn test_duplicate_consensus_output_is_dropped() -> eyre::Result<()> {
     let leader_id = committee.authorities().first().expect("first authority").id();
     gas_accumulator.rewards_counter().set_committee(committee);
 
-    //=== Consensus
     //
     // Build three empty ConsensusOutput objects:
     //   output_1: number=0 (valid)
@@ -1386,7 +1377,7 @@ async fn test_duplicate_consensus_output_is_dropped() -> eyre::Result<()> {
 
     let timestamp = now();
 
-    // --- output 1 (number=0) ---
+    // output 1 (number=0)
     let mut leader_1 = Certificate::default();
     leader_1.header.round = 0;
     leader_1.header.created_at = timestamp;
@@ -1406,7 +1397,7 @@ async fn test_duplicate_consensus_output_is_dropped() -> eyre::Result<()> {
         ..Default::default()
     };
 
-    // --- output_dup: a true re-delivery of output_1 (identical epoch, round, and subdag
+    // output_dup: a true re-delivery of output_1 (identical epoch, round, and subdag
     // content). The deterministic guard drops it as a benign dual-feed duplicate. ---
     let mut leader_dup = Certificate::default();
     leader_dup.header.round = 0;
@@ -1427,7 +1418,7 @@ async fn test_duplicate_consensus_output_is_dropped() -> eyre::Result<()> {
         ..Default::default()
     };
 
-    // --- output 2 (number=1) ---
+    // output 2 (number=1)
     let mut leader_2 = Certificate::default();
     leader_2.header.round = 2;
     leader_2.header.created_at = timestamp + 2;
@@ -1448,8 +1439,6 @@ async fn test_duplicate_consensus_output_is_dropped() -> eyre::Result<()> {
         ..Default::default()
     };
     let consensus_output_2_hash = consensus_output_2.consensus_header_hash();
-
-    //=== Execution
 
     // channel capacity 3 so all outputs can be sent before engine starts
     let (to_engine, from_consensus) = tokio::sync::mpsc::channel(3);
@@ -1473,6 +1462,7 @@ async fn test_duplicate_consensus_output_is_dropped() -> eyre::Result<()> {
         None,
         ETHEREUM_BLOCK_GAS_LIMIT_56BITS,
         batch_ordering,
+        rayls_execution_evm::in_flight::InFlightTracker::new(),
     );
 
     // send all three outputs through the channel (dedup guard only applies to stream)
@@ -1591,7 +1581,6 @@ async fn test_max_round_terminates_early() -> eyre::Result<()> {
         debug!("{idx}\n{:?}\n", batch);
     }
 
-    //=== Consensus
     //
     // create consensus output bc transactions in batches
     // are randomly generated
@@ -1649,8 +1638,6 @@ async fn test_max_round_terminates_early() -> eyre::Result<()> {
         ..Default::default()
     };
 
-    //=== Execution
-
     let (_to_engine, from_consensus) = tokio::sync::mpsc::channel(1);
     // set max round to "1" - this should receive both digests, but stop after the first round
     let max_round = Some(1);
@@ -1673,6 +1660,7 @@ async fn test_max_round_terminates_early() -> eyre::Result<()> {
         None,
         ETHEREUM_BLOCK_GAS_LIMIT_56BITS,
         batch_ordering,
+        rayls_execution_evm::in_flight::InFlightTracker::new(),
     );
 
     // queue both output - simulate already received from channel
@@ -1846,5 +1834,208 @@ async fn test_batch_digest_v2_hardfork_transition() -> eyre::Result<()> {
         );
     }
 
+    Ok(())
+}
+
+/// Marks of txs an executed batch dropped as nonce-too-high are released for re-sealing.
+///
+/// A commit-order inversion executes a successor batch before its predecessor: the successor's
+/// txs all drop nonce-too-high while staying pooled and marked in-flight from their seal. The
+/// spent marks must release on the drop, or the txs sit unselectable until the TTL sweep while
+/// every following batch of the sender drops in full.
+#[tokio::test]
+async fn test_dropped_txs_release_in_flight_marks() -> eyre::Result<()> {
+    let tmp_dir = TempDir::new().expect("temp dir");
+    let chain = test_chain_spec_arc();
+    let mut batches = rayls_execution_evm::test_utils::batches(chain, 1);
+
+    // two txs nonce-gapped ahead of the sender's account nonce (0): both drop nonce-too-high
+    let genesis = test_genesis();
+    let mut tx_factory = TransactionFactory::new_random();
+    let gapped: Vec<_> = [5u64, 6]
+        .iter()
+        .map(|nonce| {
+            tx_factory.create_explicit_eip1559(
+                Some(genesis.config.chain_id),
+                Some(*nonce),
+                Some(MAX_PRIORITY_FEE_PER_GAS),
+                Some(MAX_FEE_PER_GAS),
+                None,
+                Some(Address::random()),
+                None,
+                None,
+                None,
+            )
+        })
+        .collect();
+    let gapped_hashes: Vec<B256> = gapped.iter().map(|tx| *tx.hash()).collect();
+    let batch = batches.first_mut().expect("one batch");
+    for tx in &gapped {
+        batch.transactions_mut().push(tx.encoded_2718());
+    }
+
+    let (genesis, _txs, _signers) = seeded_genesis_from_random_batches(genesis, batches.iter());
+    let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+
+    let gas_accumulator = GasAccumulator::new(1);
+    let execution_node = default_test_execution_node(
+        Some(chain.clone()),
+        None,
+        tmp_dir.path(),
+        Some(gas_accumulator.rewards_counter()),
+    )
+    .await?;
+    let committee =
+        create_committee_from_state(execution_node.epoch_state_from_canonical_tip().await?).await?;
+    let authority_1 = committee.authorities().first().expect("first authority").id();
+    let batch_producer =
+        committee.authorities().get(2).expect("third authority").execution_address();
+    for batch in batches.iter_mut() {
+        batch.beneficiary = batch_producer;
+        batch.base_fee_per_gas = MIN_PROTOCOL_BASE_FEE;
+    }
+    let batch_digests: VecDeque<BlockHash> = batches.iter().map(|b| b.digest()).collect();
+
+    // the marks a seal would have left: the two gapped txs, plus one unrelated mark that must
+    // survive the release untouched
+    let in_flight = InFlightTracker::new();
+    let decoy = B256::random();
+    in_flight.mark_in_flight(gapped_hashes.iter().copied().chain([decoy]));
+    assert_eq!(in_flight.len(), 3);
+
+    let mut leader = Certificate::default();
+    leader.update_created_at_for_test(now());
+    leader.header_mut_for_test().author = authority_1;
+    leader.header.round = 1;
+    let subdag = Arc::new(CommittedSubDag::new(
+        vec![leader.clone()],
+        leader,
+        1,
+        ReputationScores::default(),
+        None,
+    ));
+    let consensus_output = ConsensusOutput {
+        sub_dag: subdag,
+        batches: vec![CertifiedBatch { address: batch_producer, batches }],
+        batch_digests,
+        ..Default::default()
+    };
+
+    run_engine_with_in_flight(
+        &execution_node,
+        &chain,
+        gas_accumulator,
+        vec![consensus_output],
+        Some(in_flight.clone()),
+    )
+    .await?;
+
+    assert_eq!(
+        in_flight.len(),
+        1,
+        "the dropped txs' marks must release on execution; only the unrelated mark remains"
+    );
+    Ok(())
+}
+
+/// Under OutputSeqNormalization, batches still parked at an epoch change are discarded, never
+/// force executed: their predecessor seq never executed in their epoch, so executing them out of
+/// order only drops their txs nonce-too-high or lands duplicates. The txs stay pooled and
+/// are re-sealed in the new epoch.
+#[tokio::test]
+async fn test_epoch_boundary_discards_parked_batches_under_seq_normalization() -> eyre::Result<()> {
+    use rayls_execution_evm::{BaseFeeParams, RaylsChainSpec};
+
+    let tmp_dir = TempDir::new().expect("temp dir");
+    let base_chain = test_chain_spec_arc();
+    let mut batches = rayls_execution_evm::test_utils::batches(base_chain, 3);
+    let genesis = test_genesis();
+    let (genesis, _, _) = seeded_genesis_from_random_batches(genesis, batches.iter());
+    let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+    let rayls_spec = Arc::new(
+        RaylsChainSpec::builder(chain.clone())
+            .batch_digest_v2(0)
+            .empty_output_block(0)
+            .output_seq_normalization(0)
+            .base_fee_params(BaseFeeParams::ethereum())
+            .build(),
+    );
+    let gas_accumulator = GasAccumulator::new(1);
+    let reth_env = RethEnv::new_for_temp_chain_with_rayls_spec(
+        chain.clone(),
+        rayls_spec,
+        tmp_dir.path(),
+        &TaskManager::default(),
+        Some(gas_accumulator.rewards_counter()),
+    )
+    .await?;
+    let (builder, _) = rayls_testing_test_utils::execution_builder_no_args(
+        Some(chain.clone()),
+        None,
+        tmp_dir.path(),
+    )?;
+    let execution_node = rayls_testing_test_utils::TestExecutionNode::new(&builder, reth_env)?;
+    let committee =
+        create_committee_from_state(execution_node.epoch_state_from_canonical_tip().await?).await?;
+    let authority_1 = committee.authorities().first().expect("first authority").id();
+    let producer = committee.authorities().get(2).expect("third authority").execution_address();
+    for batch in batches.iter_mut() {
+        batch.beneficiary = producer;
+        batch.base_fee_per_gas = MIN_PROTOCOL_BASE_FEE;
+        execute_test_batch(batch);
+    }
+    // epoch-0 output: seq 1 executes (fresh baseline), seq 3 parks behind the missing seq 2
+    batches[0].seq = 1;
+    batches[1].seq = 3;
+    // epoch-1 output: a fresh baseline for the new epoch
+    batches[2].seq = 1;
+
+    let mut leader_0 = Certificate::default();
+    leader_0.update_created_at_for_test(now());
+    leader_0.header_mut_for_test().author = authority_1.clone();
+    leader_0.header.round = 1;
+    let output_0 = ConsensusOutput {
+        sub_dag: Arc::new(CommittedSubDag::new(
+            vec![leader_0.clone()],
+            leader_0,
+            1,
+            ReputationScores::default(),
+            None,
+        )),
+        batches: vec![CertifiedBatch {
+            address: producer,
+            batches: vec![batches[0].clone(), batches[1].clone()],
+        }],
+        batch_digests: vec![batches[0].digest(), batches[1].digest()].into(),
+        ..Default::default()
+    };
+
+    let mut leader_1 = Certificate::default();
+    leader_1.update_created_at_for_test(now());
+    leader_1.header_mut_for_test().author = authority_1.clone();
+    leader_1.header.round = 3;
+    leader_1.header.epoch = 1;
+    let output_1 = ConsensusOutput {
+        sub_dag: Arc::new(CommittedSubDag::new(
+            vec![leader_1.clone()],
+            leader_1,
+            2,
+            ReputationScores::default(),
+            None,
+        )),
+        batches: vec![CertifiedBatch { address: producer, batches: vec![batches[2].clone()] }],
+        batch_digests: vec![batches[2].digest()].into(),
+        ..Default::default()
+    };
+
+    let reth_env =
+        run_engine(&execution_node, &chain, gas_accumulator, vec![output_0, output_1]).await?;
+
+    // seq 1 (epoch 0) + seq 1 (epoch 1) execute; the parked seq 3 is discarded at the boundary
+    assert_eq!(
+        reth_env.canonical_tip().number,
+        2,
+        "the parked batch must be discarded at the boundary, not force executed"
+    );
     Ok(())
 }

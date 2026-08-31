@@ -1,7 +1,7 @@
 //! One-shot hardfork state migrations.
 //!
 //! Each submodule builds a `HashMap<Address, RevmAccount>` that is committed to the EVM
-//! database exactly once — the first time the fork's activation block is reached.
+//! database exactly once - the first time the fork's activation block is reached.
 //! Continuous behavioral forks (Eip1559, BatchDigestV2) are **not** handled here.
 
 mod admin_transfer;
@@ -38,16 +38,11 @@ pub(super) fn account_with_code(bytecode: &[u8]) -> RevmAccount {
 
 /// Collect newly activated one-shot migrations and apply them to the database.
 ///
-/// For each migration this:
-/// 1. Pre-loads affected accounts into the state cache
-/// 2. Copies their real `AccountInfo` (preserving new bytecode for code-replacement accounts)
-/// 3. Notifies the state hook
-/// 4. Applies state changes directly via `CacheAccount::change()`, bypassing `State::commit()`
-///
-/// We deliberately avoid `State::commit()` because it runs EIP-161 state-clear logic
-/// (`apply_account_state`) which panics when a `Loaded`-status account in the cache is
-/// committed with empty `AccountInfo`.  Hardfork migrations are not EVM transaction outputs
-/// so that path is not appropriate here.
+/// Each migration pre-loads its accounts into the state cache, copies their real `AccountInfo`
+/// (keeping new bytecode for code-replacement accounts), notifies the state hook, and applies the
+/// change through `CacheAccount::change()` rather than `State::commit()`: commit runs the EIP-161
+/// state-clear logic (`apply_account_state`), which panics when a `Loaded` cache account is
+/// committed with empty `AccountInfo`, and hardfork migrations are not transaction outputs.
 pub(crate) fn apply_activated_migrations<DB: alloy_evm::Database>(
     spec: &impl RaylsHardforks,
     db: &mut State<DB>,
@@ -139,13 +134,14 @@ where
             | RaylsHardFork::PrecompileGasFix
             | RaylsHardFork::TransactionLoadBalancing
             | RaylsHardFork::EmptyOutputBlock
-            | RaylsHardFork::DynamicCommitteeSizing => continue,
+            | RaylsHardFork::DynamicCommitteeSizing
+            | RaylsHardFork::OutputSeqNormalization => continue,
         };
 
         // Pre-load accounts into cache and copy their real AccountInfo.
         //
         // When the hardfork explicitly supplies new bytecode (account.info.code is Some),
-        // we must NOT overwrite it with the cached code — otherwise bytecode replacements
+        // we must NOT overwrite it with the cached code - otherwise bytecode replacements
         // (e.g. the DelegationPool/RewardDistributor proxy migration) are discarded.
         // We still carry over nonce and balance from the on-chain account.
         for (address, account) in state.iter_mut() {
@@ -156,7 +152,7 @@ where
             })?;
             if let Some(info) = cached.account_info() {
                 if account.info.code.is_some() {
-                    // Hardfork is replacing the bytecode — keep the new code
+                    // Hardfork is replacing the bytecode - keep the new code
                     // but carry over nonce/balance from the on-chain account.
                     account.info.nonce = info.nonce;
                     account.info.balance = info.balance;
@@ -221,8 +217,6 @@ mod tests {
     fn build_state() -> State<TestDb> {
         State::builder().with_database(EmptyDBTyped::new()).with_bundle_update().build()
     }
-
-    // ── AdminTransfer migration tests ───────────────────────────────────
 
     /// Addresses from admin_transfer.rs
     const NATIVE_TOKEN_CONTROLLER: Address = address!("07e17e17e17e17e17e17e17e17e17e17e17e17e6");
@@ -307,7 +301,7 @@ mod tests {
         )
         .expect("migration should succeed");
 
-        // No accounts should be in cache — migration didn't run.
+        // No accounts should be in cache - migration didn't run.
         assert!(db.cache.accounts.is_empty(), "AdminTransfer should not apply before activation");
     }
 
@@ -381,8 +375,6 @@ mod tests {
         }
     }
 
-    // ── BatchDigestV2 / Eip1559 skip tests ──────────────────────────────
-
     #[test]
     fn eip1559_activation_produces_no_state_changes() {
         // Use testnet where Eip1559 activates at a non-zero block.
@@ -402,8 +394,6 @@ mod tests {
 
         assert!(db.cache.accounts.is_empty(), "Eip1559 should not modify any accounts");
     }
-
-    // ── Both forks activating at same block ─────────────────────────────
 
     #[test]
     fn multiple_forks_at_same_block_only_applies_state_migrations() {
@@ -428,8 +418,6 @@ mod tests {
             "AdminTransfer state migration should have applied"
         );
     }
-
-    // ── Erc20PrecompileBytecode dispatcher tests ────────────────────────
 
     const ERC20_PRECOMPILE: Address = address!("0000000000000000000000000000000000000400");
     const ACTIVATION_BLOCK: u64 = 1_000;

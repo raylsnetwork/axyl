@@ -30,6 +30,7 @@ pub struct BatchOrdering<DB: BatchOrderingStore> {
 }
 
 impl<DB: Database> BatchOrdering<DB> {
+    /// Create an ordering over `store` seeded with `batch_ordering_state`.
     pub fn new(store: DB, batch_ordering_state: BatchOrderingState) -> Self {
         Self {
             inner: Arc::new(BatchOrderingInner {
@@ -39,6 +40,7 @@ impl<DB: Database> BatchOrdering<DB> {
         }
     }
 
+    /// Create an ordering over `store` with no recorded authorities.
     pub fn new_with_empty_state(store: DB) -> Self {
         Self::new(store, Default::default())
     }
@@ -46,11 +48,16 @@ impl<DB: Database> BatchOrdering<DB> {
     /// Try to accept a batch for the given authority.
     ///
     /// `seq == 0` means a pre-upgrade node - skip ordering, return [`AcceptResult::InOrder`].
+    ///
+    /// `seq_normalization` is the OutputSeqNormalization activation at the block being built: it
+    /// gates the overflow prune, which changes replicated output, so every node must flip it at
+    /// the same block.
     pub fn try_accept(
         &self,
         authority: Address,
         batch_seq: u64,
         prepared: PreparedBatch,
+        seq_normalization: bool,
     ) -> AcceptResult {
         if batch_seq == 0 {
             return AcceptResult::InOrder(prepared);
@@ -85,6 +92,15 @@ impl<DB: Database> BatchOrdering<DB> {
                     );
                     // fall through - accept as in-order (forced)
                     auth.last_executed_seq = Some(batch_seq);
+                    // Drop the parked entries the forced jump abandoned: drain_consecutive only
+                    // looks at last_executed_seq + 1, so they can never drain, and leaving them
+                    // pins parked.len() at the limit (every later gap force-executes forever).
+                    // Pre-fork the stranded entries still force-drain as blocks at the epoch
+                    // boundary, so pruning them on only some validators would fork the chain
+                    // there.
+                    if seq_normalization {
+                        auth.parked = auth.parked.split_off(&(batch_seq + 1));
+                    }
                     return AcceptResult::OverflowForced(prepared);
                 }
 
@@ -226,7 +242,7 @@ impl<DB: Database> BatchOrdering<DB> {
                 old_epoch = state.epoch,
                 new_epoch,
                 drained_count = drained.len(),
-                "epoch changed, executing drained parked batches"
+                "epoch changed, drained parked batches from previous epoch"
             );
         } else {
             info!(
@@ -240,6 +256,7 @@ impl<DB: Database> BatchOrdering<DB> {
         drained
     }
 
+    /// Write the current ordering state to the store.
     pub fn persist(&self) {
         let state = self.inner.batch_ordering_state.lock();
         self.inner
@@ -481,5 +498,75 @@ mod tests {
         // the boundary drain on the first new-epoch output flushes them as their own blocks
         let drained = ord.drain_epoch(88);
         assert_eq!(drained.len(), 5, "parked batches drain into the new epoch");
+    }
+
+    #[test]
+    fn overflow_forced_drops_the_stranded_parked_entries() {
+        // Fill the parking budget with a gap, then force one batch far past it. The forced jump
+        // abandons every parked seq below it; leaving them in the map orphans them forever
+        // (drain_consecutive only looks at last_executed_seq + 1) and pins parked.len() at the
+        // limit, so ordering stays off for the authority for the rest of the epoch.
+        let store = MemDatabase::default();
+        let ord = BatchOrdering::new_with_empty_state(store);
+        let auth = Address::from([1u8; 20]);
+
+        // seq 1 executes; the following seqs park behind the missing seq 2 (exactly the limit).
+        assert!(matches!(
+            ord.try_accept(auth, 1, make_parked(auth, 1), false),
+            AcceptResult::InOrder(_)
+        ));
+        for seq in 3..=(2 + MAX_PARKED_PER_AUTHORITY as u64) {
+            assert!(matches!(
+                ord.try_accept(auth, seq, make_parked(auth, seq), false),
+                AcceptResult::Parked
+            ));
+        }
+        assert_eq!(ord.parked_count(auth), MAX_PARKED_PER_AUTHORITY);
+
+        // the next gapped batch trips the overflow and forces execution at seq 100.
+        assert!(matches!(
+            ord.try_accept(auth, 100, make_parked(auth, 100), true),
+            AcceptResult::OverflowForced(_)
+        ));
+        assert_eq!(ord.last_executed_seq(auth), Some(100));
+
+        // the invariant "parked only holds seqs > last_executed_seq" must hold: the abandoned
+        // sub-100 entries are gone, not stranded.
+        assert_eq!(ord.parked_count(auth), 0, "stranded parked entries must be dropped");
+
+        // and ordering is live again: a fresh gap parks rather than force-executing.
+        assert!(matches!(
+            ord.try_accept(auth, 200, make_parked(auth, 200), true),
+            AcceptResult::Parked
+        ));
+    }
+
+    #[test]
+    fn overflow_forced_keeps_stranded_entries_pre_fork() {
+        // Pre-fork pin: un-upgraded peers still boundary-force-drain the stranded entries as
+        // blocks, so the prune must not fire until OutputSeqNormalization activates.
+        let store = MemDatabase::default();
+        let ord = BatchOrdering::new_with_empty_state(store);
+        let auth = Address::from([1u8; 20]);
+
+        assert!(matches!(
+            ord.try_accept(auth, 1, make_parked(auth, 1), false),
+            AcceptResult::InOrder(_)
+        ));
+        for seq in 3..=(2 + MAX_PARKED_PER_AUTHORITY as u64) {
+            assert!(matches!(
+                ord.try_accept(auth, seq, make_parked(auth, seq), false),
+                AcceptResult::Parked
+            ));
+        }
+        assert!(matches!(
+            ord.try_accept(auth, 100, make_parked(auth, 100), false),
+            AcceptResult::OverflowForced(_)
+        ));
+        assert_eq!(
+            ord.parked_count(auth),
+            MAX_PARKED_PER_AUTHORITY,
+            "pre-fork the stranded entries stay parked for the boundary force-drain"
+        );
     }
 }
