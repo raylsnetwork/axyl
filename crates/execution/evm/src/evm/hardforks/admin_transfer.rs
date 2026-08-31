@@ -282,7 +282,8 @@ pub(crate) fn admin_transfer_state() -> HashMap<Address, RevmAccount> {
         clear_slot(&mut dp, U256::ZERO, addr_to_u256(POOL_ADMIN)); // slot 0: _owner
         clear_slot(&mut dp, U256::from(1), DP_MIN_DELEGATION); // slot 1: config.minDelegation
         clear_slot(&mut dp, U256::from(2), DP_MAX_DELEGATION); // slot 2: config.maxDelegation
-        clear_slot(&mut dp, U256::from(3), DP_MAX_VALIDATOR_DELEGATION); // slot 3: config.maxValidatorDelegation
+        clear_slot(&mut dp, U256::from(3), DP_MAX_VALIDATOR_DELEGATION); // slot 3: config.
+                                                                         // maxValidatorDelegation
         clear_slot(&mut dp, U256::from(4), DP_CONFIG_PACKED); // slot 4: config packed epochs
 
         // ERC-1967 implementation slot → DelegationPoolImpl

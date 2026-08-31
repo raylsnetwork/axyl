@@ -637,7 +637,8 @@ impl<'a, DB: Database> DbTxMut for LayeredDbTxMut<'a, DB> {
             return Err(e);
         }
         // Enqueue the commit before releasing the mem write lock: the next `write_txn` cannot
-        // enqueue `StartTxn` until this lock drops, so channel order is StartTxn -> ops -> CommitTxn.
+        // enqueue `StartTxn` until this lock drops, so channel order is StartTxn -> ops ->
+        // CommitTxn.
         //
         // This is safe because `MemDbTxMut::commit` is an infallible no-op that only drops the
         // `parking_lot` write guard; it performs no I/O. If that ever becomes fallible, do not

@@ -148,7 +148,8 @@ fn run_restart_tests1(
         kill_child(child2);
         error!(target: "restart-test", ?e, "failed to advance network in restart_tests1");
     })?;
-    std::thread::sleep(Duration::from_secs(2)); // Advancing, so pause so that upcoming checks will fail if a node is lagging.
+    std::thread::sleep(Duration::from_secs(2)); // Advancing, so pause so that upcoming checks will
+                                                // fail if a node is lagging.
 
     let key = get_key("test-source");
     let to_account = address_from_word("testing");
@@ -226,7 +227,8 @@ fn run_restart_tests_lagged1(
         kill_child(child2);
         error!(target: "restart-test", ?e, "failed to advance network in restart_tests1");
     })?;
-    std::thread::sleep(Duration::from_secs(2)); // Advancing, so pause so that upcoming checks will fail if a node is lagging.
+    std::thread::sleep(Duration::from_secs(2)); // Advancing, so pause so that upcoming checks will
+                                                // fail if a node is lagging.
 
     let key = get_key("test-source");
     let to_account = address_from_word("testing");
@@ -304,7 +306,8 @@ fn run_restart_tests_lagged1(
 /// Run the second part of tests, broken up like this to allow more robust node shutdown.
 fn run_restart_tests2(client_urls: &[String; 4]) -> eyre::Result<()> {
     network_advancing(client_urls)?;
-    std::thread::sleep(Duration::from_secs(2)); // Advancing, so pause so that upcoming checks will fail if a node is lagging.
+    std::thread::sleep(Duration::from_secs(2)); // Advancing, so pause so that upcoming checks will
+                                                // fail if a node is lagging.
     test_blocks_same(client_urls)?; // Starting from a solid position after a restart?
     let key = get_key("test-source");
     let to_account = address_from_word("testing");
@@ -482,7 +485,8 @@ fn test_restartstt() -> eyre::Result<()> {
 /// Run some test to make sure an observer is participating in the network.
 fn run_observer_tests(client_urls: &[String; 4], obs_url: &str) -> eyre::Result<()> {
     network_advancing(client_urls)?;
-    std::thread::sleep(Duration::from_secs(2)); // Advancing, so pause so that upcoming checks will fail if a node is lagging.
+    std::thread::sleep(Duration::from_secs(2)); // Advancing, so pause so that upcoming checks will
+                                                // fail if a node is lagging.
 
     let key = get_key("test-source");
     let to_account = address_from_word("testing");

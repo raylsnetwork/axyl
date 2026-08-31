@@ -174,7 +174,8 @@ async fn test_faucet_transfers_rls_and_xyz_with_google_kms_e2e() -> eyre::Result
     let init_max_limit = U256::MAX;
     let init_min_limit = U256::from(1_000);
     let kms_faucets = vec![kms_address];
-    let xyz_amount = U256::from(10).checked_pow(U256::from(6)).expect("1e6 doesn't overflow U256"); // 1 $XYZ
+    let xyz_amount = U256::from(10).checked_pow(U256::from(6)).expect("1e6 doesn't overflow U256"); // 1
+                                                                                                    // $XYZ
     let rls_amount =
         U256::from(10).checked_pow(U256::from(18)).expect("1e18 doesn't overflow U256"); // 1 $RLS
 
