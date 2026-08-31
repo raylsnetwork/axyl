@@ -63,6 +63,12 @@ const RESEND_MAX_LOCAL_LAG: u64 = 20;
 const FORWARD_POLICY: DuePolicy =
     DuePolicy { after: Duration::from_secs(10), backoff_shift_cap: 4, min_anchor_advance: 20 };
 
+/// The observer shifts each sender's owner validator one slot along the ring every this many
+/// executed anchors, so no sender is pinned to a single validator: a dishonest owner can withhold a
+/// sender's transactions for at most one window before the next validator takes over. Only the
+/// observer reads this (the receiver accepts unconditionally), so it needs no cross-node agreement.
+const OWNER_ROTATION_BLOCKS: u64 = 2048;
+
 /// Instrumentation for the per-tick pool scan, settling whether re-examining the whole pending set
 /// each tick is a real cost or noise absorbed by the interval.
 #[derive(Clone)]
@@ -329,8 +335,17 @@ impl TxnForwarder {
             let sender = txn.sender();
             let (_, group) = by_sender.entry(sender).or_insert_with(|| {
                 // An empty committee has no owner; slot zero is only used by the gossip fallback.
-                let owner =
-                    fxhash_slot_digest(sender.as_slice()).checked_rem(committee_size).unwrap_or(0);
+                // Rotate the owner one slot every OWNER_ROTATION_BLOCKS so a sender is never pinned
+                // to a single validator: a persistently dishonest owner can withhold it for at most
+                // one window, after which the next validator on the ring takes over. Keyed on the
+                // observer's own executed anchor - the receiver accepts unconditionally, so no
+                // cross-node agreement on the window is required. `submit_message` still fails over
+                // from the rotated slot to the next live validator on the ring.
+                let window = anchor / OWNER_ROTATION_BLOCKS;
+                let owner = fxhash_slot_digest(sender.as_slice())
+                    .wrapping_add(window)
+                    .checked_rem(committee_size)
+                    .unwrap_or(0);
                 (owner, Vec::new())
             });
             group.push((txn.nonce(), *txn.hash(), txn.clone()));
