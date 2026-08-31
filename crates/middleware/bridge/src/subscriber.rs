@@ -336,40 +336,62 @@ impl<DB: Database> Subscriber<DB> {
         verified: ConsensusHeader,
     ) -> BoxFuture<'static, SubscriberResult<(ConsensusOutput, u64)>> {
         let sub = self.clone();
-        let shutdown = self.config.shutdown().clone();
         let sub_dag = verified.sub_dag.clone();
         let parent_hash = verified.parent_hash;
         let number = verified.number;
         Box::pin(async move {
-            let mut retry_count = 0u32;
-            loop {
-                match sub.fetch_batches(sub_dag.clone(), parent_hash, number).await {
-                    Ok(output) => return Ok((output, number)),
-                    Err(e) if e.is_batch_fetch_error() && retry_count < 5 => {
-                        retry_count += 1;
-                        let delay = Duration::from_secs(2).min(
-                            Duration::from_millis(500) * 2u32.saturating_pow(retry_count.min(5)),
-                        );
+            let output = sub.fetch_batches_retrying(sub_dag, parent_hash, number).await?;
+            Ok((output, number))
+        })
+    }
+
+    /// Fetch one committed output's batches, treating a transient batch-fetch failure as
+    /// non-fatal: retry with capped backoff until it succeeds or shutdown fires.
+    ///
+    /// A batch in a committed subdag cannot be skipped (skipping forks the chain) and is held by
+    /// peers -- and, for a rejoining node, usually on local disk too -- so a momentary
+    /// `PeerNotConnected`, most often the worker network still re-meshing after a mode transition,
+    /// must be waited out, never surfaced as fatal. Panicking is strictly worse: a critical-task
+    /// panic tears down the whole epoch task stack and the relaunch re-enters this same wall,
+    /// whereas waiting rides out the blackout with no teardown. Shutdown is the only exit.
+    async fn fetch_batches_retrying(
+        &self,
+        deliver: CommittedSubDag,
+        parent_hash: B256,
+        number: u64,
+    ) -> SubscriberResult<ConsensusOutput> {
+        let shutdown = self.config.shutdown().clone();
+        let mut retry_count = 0u32;
+        loop {
+            match self.fetch_batches(deliver.clone(), parent_hash, number).await {
+                Ok(output) => return Ok(output),
+                Err(e) if e.is_batch_fetch_error() => {
+                    retry_count += 1;
+                    let delay = Duration::from_secs(2)
+                        .min(Duration::from_millis(500) * 2u32.saturating_pow(retry_count.min(5)));
+                    // Loud for the first few attempts, then a throttled heartbeat so a prolonged
+                    // outage stays visible without flooding the log.
+                    if retry_count <= 5 || retry_count % 15 == 0 {
                         warn!(
                             target: "subscriber",
                             header_number = number,
                             retry_count,
                             delay_ms = delay.as_millis(),
-                            "catchup pipeline: batch fetch failed, retrying: {e}"
+                            "catchup batch fetch failed, retrying (transient, non-fatal): {e}"
                         );
-                        let rx_shutdown = shutdown.subscribe();
-                        tokio::select! {
-                            biased;
-                            _ = rx_shutdown => {
-                                return Err(SubscriberError::ClosedChannel("shutdown during retry".to_string()));
-                            }
-                            _ = tokio::time::sleep(delay) => continue,
-                        }
                     }
-                    Err(e) => return Err(e),
+                    let rx_shutdown = shutdown.subscribe();
+                    tokio::select! {
+                        biased;
+                        _ = rx_shutdown => {
+                            return Err(SubscriberError::ClosedChannel("shutdown during retry".to_string()));
+                        }
+                        _ = tokio::time::sleep(delay) => continue,
+                    }
                 }
+                Err(e) => return Err(e),
             }
-        })
+        }
     }
 
     /// Persist a fetched consensus output and forward it to the engine.
@@ -784,7 +806,7 @@ impl<DB: Database> Subscriber<DB> {
 
         for consensus_header in missing.into_iter() {
             let consensus_output = self
-                .fetch_batches(
+                .fetch_batches_retrying(
                     consensus_header.sub_dag.clone(),
                     consensus_header.parent_hash,
                     consensus_header.number,
