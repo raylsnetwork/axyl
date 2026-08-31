@@ -494,10 +494,9 @@ pub(super) fn advance_high_water_mark<DB: Database>(db: &DB, epoch: Epoch) -> Co
 /// single hot writer (shared with live consensus) for tens of seconds, and the writer queue's
 /// over-mark pacing sleeps under it.
 ///
-/// NOTE: this bounds the transaction, it does not isolate it. The layered writer refcounts
-/// overlapping transactions, so a consensus write spanning a chunk boundary merges that chunk into
-/// its transaction and the archiver's commit only decrements the count. The delay is one consensus
-/// transaction, which is short, but a chunk boundary is not a guaranteed commit point.
+/// NOTE: this bounds the transaction, and the mem-write-lock serialization makes each
+/// `with_write_txn` a real commit point. A consensus write that needs the hot writer blocks until
+/// this transaction's `CommitTxn` is enqueued, rather than merging into the archiver's transaction.
 const WRITE_BATCH_ROWS: usize = 4096;
 
 /// A yield between live prune batches: long enough for consensus writes queued during the batch
