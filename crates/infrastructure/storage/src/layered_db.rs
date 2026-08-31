@@ -3040,7 +3040,7 @@ mod test {
         let db_clone = db.clone();
         let (second_done, second_rx) = std::sync::mpsc::channel::<()>();
         let second = std::thread::spawn(move || {
-            let result = db_clone.write_txn().map(|_| ());
+            let result = db_clone.write_txn().and_then(|tx| tx.commit());
             let _ = second_done.send(());
             result
         });
@@ -3055,7 +3055,7 @@ mod test {
         );
 
         tx.commit().expect("commit");
-        second.join().expect("second writer thread").expect("second write_txn");
+        second.join().expect("second writer thread").expect("second write_txn commit");
         db.sync_persist().expect("persist");
     }
 
