@@ -1,9 +1,10 @@
-//! Batch fetcher tests
+//! Batch fetcher tests.
 use super::*;
 use crate::test_utils::TestRequestBatchesNetwork;
 use rayls_execution_evm::test_utils::transaction;
 use rayls_infrastructure_storage::open_db;
 use rayls_infrastructure_types::test_chain_spec_arc;
+use std::collections::{HashMap, HashSet};
 use tempfile::TempDir;
 
 #[tokio::test]
@@ -259,7 +260,7 @@ async fn test_fetcher_returns_partial_on_unfetchable_digests() {
     let batch2 = Batch { transactions: vec![transaction(chain)], ..Default::default() };
     let unfetchable_digest = batch2.digest();
 
-    // Only put batch1 on the network — batch2 is nowhere.
+    // Only put batch1 on the network; batch2 is nowhere.
     network.put(&[1, 2], batch1.clone()).await;
 
     let digests = HashSet::from_iter(vec![batch1.digest(), unfetchable_digest]);
@@ -272,7 +273,7 @@ async fn test_fetcher_returns_partial_on_unfetchable_digests() {
     // Must complete (not hang forever) and return only batch1.
     let fetched = tokio::time::timeout(std::time::Duration::from_secs(15), fetcher.fetch(digests))
         .await
-        .expect("fetch must not hang — MAX_FETCH_RETRIES should bound it");
+        .expect("fetch must not hang - MAX_FETCH_RETRIES should bound it");
 
     assert!(fetched.contains_key(&batch1.digest()), "fetchable batch must be returned");
     assert!(

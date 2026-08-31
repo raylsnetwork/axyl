@@ -4,14 +4,14 @@ use crate::{
     WorkerSynchronizeMessage, WorkerToPrimaryClient,
 };
 use parking_lot::RwLock;
-use rayls_infrastructure_types::{BlockHash, BlsPublicKey};
-use std::{collections::HashSet, sync::Arc};
+use rayls_infrastructure_types::{B256Set, BlsPublicKey};
+use std::sync::Arc;
 
-/// LocalNetwork provides the interface to send requests to other nodes, and call other components
-/// directly if they live in the same process. It is used by both primary and worker(s).
+/// In-process request path between a primary and its worker(s).
 ///
-/// Currently this only supports local direct calls, and it will be extended to support remote
-/// network calls.
+/// Handlers are registered after construction because the primary and worker are built
+/// independently; before a handler is set, a primary-to-worker request errors and a
+/// worker-to-primary report is dropped with a warning.
 #[derive(Debug, Clone)]
 pub struct LocalNetwork {
     inner: Arc<RwLock<Inner>>,
@@ -33,7 +33,7 @@ impl std::fmt::Debug for Inner {
 }
 
 impl LocalNetwork {
-    /// Create a new instance of [Self].
+    /// Creates a new instance of [Self].
     pub fn new(primary_bls_key: BlsPublicKey) -> Self {
         Self {
             inner: Arc::new(RwLock::new(Inner {
@@ -44,30 +44,30 @@ impl LocalNetwork {
         }
     }
 
-    /// Create a new instance of [Self] with a randomly generated ed25519 key.
+    /// Creates a new instance of [Self] with a default BLS key, for tests.
     pub fn new_with_empty_id() -> Self {
         Self::new(BlsPublicKey::default())
     }
 
-    /// Set the handler for worker to primary messages.
+    /// Sets the handler for worker to primary messages.
     pub fn set_worker_to_primary_local_handler(&self, handler: Arc<dyn WorkerToPrimaryClient>) {
         let mut inner = self.inner.write();
         inner.worker_to_primary_handler = Some(handler);
     }
 
-    /// Set the handler for primary to worker messages.
+    /// Sets the handler for primary to worker messages.
     pub fn set_primary_to_worker_local_handler(&self, handler: Arc<dyn PrimaryToWorkerClient>) {
         let mut inner = self.inner.write();
         inner.primary_to_worker_handler = Some(handler);
     }
 
-    /// Get the handler for worker to primary messages.
+    /// Returns the handler for primary to worker messages.
     async fn get_primary_to_worker_handler(&self) -> Option<Arc<dyn PrimaryToWorkerClient>> {
         let inner = self.inner.read();
         inner.primary_to_worker_handler.clone()
     }
 
-    /// Get the handler for primary to worker messages.
+    /// Returns the handler for worker to primary messages.
     async fn get_worker_to_primary_handler(&self) -> Option<Arc<dyn WorkerToPrimaryClient>> {
         let inner = self.inner.read();
         inner.worker_to_primary_handler.clone()
@@ -85,7 +85,7 @@ impl PrimaryToWorkerClient for LocalNetwork {
         }
     }
 
-    async fn fetch_batches(&self, digests: HashSet<BlockHash>) -> eyre::Result<FetchBatchResponse> {
+    async fn fetch_batches(&self, digests: B256Set) -> eyre::Result<FetchBatchResponse> {
         if let Some(c) = self.get_primary_to_worker_handler().await {
             c.fetch_batches(digests).await
         } else {

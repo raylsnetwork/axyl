@@ -17,8 +17,8 @@ use rayls_infrastructure_network_types::{
 };
 use rayls_infrastructure_storage::tables::Batches;
 use rayls_infrastructure_types::{
-    encode, now, Batch, BatchValidation, BlockHash, BlsPublicKey, Bytes, Database, DbTxMut,
-    RaylsReceiver, SealedBatch, TaskKind, TaskSpawner, TxHash, WorkerId,
+    encode, now, B256Set, Batch, BatchValidation, BlockHash, BlsPublicKey, Bytes, Database,
+    DbTxMut, RaylsReceiver, SealedBatch, TaskKind, TaskSpawner, TxHash, WorkerId,
 };
 use std::{collections::HashSet, sync::Arc, time::Duration};
 use tokio::sync::{oneshot, Semaphore};
@@ -265,18 +265,15 @@ impl WorkerNetworkHandle {
     ) -> NetworkResult<Vec<Batch>> {
         let mut peers = self.handle.connected_peers().await?;
         if requested_digests.is_empty() || peers.is_empty() {
-            // Nothing to do, either no digests requested or no one to ask.
-            // Return nothing.
+            // nothing requested or no one to ask
             return Ok(vec![]);
         }
         let mut remaining_digests = requested_digests.clone();
         let num_peers = peers.len();
         let mut all_batches = Vec::new();
-        // Attempt to try different batches with different peers.
-        // Ideally this will work first time and spread out the network traffic.
-        // It is possible for this algorithm to send same batches to the same peer,
-        // it is not that precise but should mix up things sufficiently to get batches
-        // if peers have them.
+        // Spread digests across peers and rotate the assignment each round so load is shared and
+        // a digest one peer lacks is asked of another. The rotation is approximate: a digest may
+        // land on the same peer twice.
         for _ in 0..num_peers {
             let mut batch_of_batches = Vec::with_capacity(num_peers);
             (0..num_peers).for_each(|_| batch_of_batches.push(vec![]));
@@ -303,13 +300,11 @@ impl WorkerNetworkHandle {
                         for batch in batches {
                             let batch_digest = batch.digest();
                             if requested_digests.contains(&batch_digest) {
-                                // Sanity check we actually asked for this digest...
                                 if !all_batches.contains(&batch) {
                                     remaining_digests.retain(|d| *d != batch_digest);
                                     all_batches.push(batch);
                                 }
                             } else {
-                                // Got a batch we did not ask for...
                                 warn!(target: "worker::network", "recieved a batch not requested {batch_digest}");
                             }
                         }
@@ -587,12 +582,12 @@ impl<DB: Database> PrimaryToWorkerClient for PrimaryReceiverHandler<DB> {
         let mut missing = HashSet::new();
         for digest in message.digests.iter() {
             // Check if we already have the batch.
-            match self.store.get::<Batches>(digest) {
-                Ok(None) => {
+            match self.store.contains_key::<Batches>(digest) {
+                Ok(false) => {
                     missing.insert(*digest);
                     debug!("Requesting sync for batch {digest}");
                 }
-                Ok(Some(_)) => {
+                Ok(true) => {
                     trace!("Digest {digest} already in store, nothing to sync");
                 }
                 Err(e) => {
@@ -616,7 +611,7 @@ impl<DB: Database> PrimaryToWorkerClient for PrimaryReceiverHandler<DB> {
         for sealed_batch in sealed_batches_from_response.into_iter() {
             if !message.is_certified {
                 // This batch is not part of a certificate, so we need to validate it.
-                if let Err(err) = self.validator.validate_batch(sealed_batch.clone()).await {
+                if let Err(err) = self.validator.validate_batch(&sealed_batch).await {
                     return Err(eyre::eyre!("Invalid batch: {err}"));
                 }
             }
@@ -646,7 +641,7 @@ impl<DB: Database> PrimaryToWorkerClient for PrimaryReceiverHandler<DB> {
         Err(eyre::eyre!("failed to synchronize batches!".to_string()))
     }
 
-    async fn fetch_batches(&self, digests: HashSet<BlockHash>) -> eyre::Result<FetchBatchResponse> {
+    async fn fetch_batches(&self, digests: B256Set) -> eyre::Result<FetchBatchResponse> {
         let Some(batch_fetcher) = self.batch_fetcher.as_ref() else {
             return Err(eyre::eyre!(
                 "fetch_batches() is unsupported via RPC interface, please call via local worker handler instead".to_string(),

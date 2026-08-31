@@ -1,3 +1,5 @@
+//! Consensus header: a primary's per-round proposal of worker batches and parent certificates.
+
 use crate::{
     bcs_layout::{BcsCursor, BcsLayout, BcsLayoutError},
     crypto, encode,
@@ -17,29 +19,29 @@ use std::{collections::BTreeSet, fmt};
 pub struct Header {
     /// Primary that created the header. Must be the same primary that broadcasted the header.
     pub author: AuthorityIdentifier,
-    /// The round for this header
+    /// The round for this header.
     pub round: Round,
     /// The epoch this Header was created in.
     pub epoch: Epoch,
     /// The timestamp for when the header was requested to be created.
     pub created_at: TimestampSec,
-    /// IndexMap of the [BatchDigest] to the [WorkerId]
+    /// Batch digests proposed by this header, each mapped to the worker that sealed it.
     #[serde(with = "indexmap::map::serde_seq")]
     pub payload: IndexMap<BlockHash, WorkerId>,
     /// Parent certificates for this Header.
     pub parents: BTreeSet<CertificateDigest>,
-    /// Hash and number of the latest known execution block when this Header was build.
-    /// This may be our parent block or may not but it does include our latest
-    /// execution result in a signed and validated structure which validates
-    /// this execution block as well.
+    /// Hash and number of the latest execution block known when the header was built.
+    ///
+    /// Carrying it in a signed header lets peers validate the author's execution result along with
+    /// the proposal.
     pub latest_execution_block: BlockNumHash,
-    /// The [HeaderDigest].
+    /// Cached digest. Off-wire, so a decoded header recomputes it on first use.
     #[serde(skip)]
     pub digest: OnceCell<HeaderDigest>,
 }
 
 impl Header {
-    /// Initialize a new instance of [HeaderV1]
+    /// Creates a header and seals its digest.
     pub fn new(
         author: AuthorityIdentifier,
         round: Round,
@@ -63,14 +65,14 @@ impl Header {
         header
     }
 
-    /// Hashed digest for Header
+    /// Returns the header digest, computing and caching it on first use.
     pub fn digest(&self) -> HeaderDigest {
         *self.digest.get_or_init(|| Hash::digest(self))
     }
 
-    /// Ensure the header is valid based on the current committee and workercache.
+    /// Validates the header against the current committee.
     ///
-    /// The digest is calculated with the sealed header, so the EL data is also verified.
+    /// The digest covers the whole header, so the execution-layer fields are verified with it.
     pub fn validate(&self, committee: &Committee) -> HeaderResult<()> {
         // Ensure the header is from the correct epoch.
         if self.epoch != committee.epoch() {
@@ -82,8 +84,11 @@ impl Header {
             return Err(HeaderError::TooManyParents(self.parents.len(), committee.size()));
         }
 
-        // Ensure the header digest is well formed.
-        if Hash::digest(self) != self.digest() {
+        // Hash once: a decoded header's cell is empty (the digest is off-wire), so seeding it
+        // with the computed value fills the cache, while a cell set before a later mutation still
+        // fails the comparison.
+        let computed = Hash::digest(self);
+        if *self.digest.get_or_init(|| computed) != computed {
             return Err(HeaderError::InvalidHeaderDigest);
         }
 
@@ -127,23 +132,17 @@ impl Header {
         &self.parents
     }
 
-    // Used for testing.
-
-    /// Replace the header's payload with a new one.
-    ///
-    /// Only used for testing.
+    /// Replaces the header's payload. Test-only.
     pub fn update_payload_for_test(&mut self, new_payload: IndexMap<BlockHash, WorkerId>) {
         self.payload = new_payload;
     }
 
-    /// Replace the header's round with a new one.
-    ///
-    /// Only used for testing.
+    /// Replaces the header's round. Test-only.
     pub fn update_round_for_test(&mut self, new_round: Round) {
         self.round = new_round;
     }
 
-    /// Clear the header's parents.
+    /// Clears the header's parents. Test-only.
     pub fn clear_parents_for_test(&mut self) {
         self.parents.clear();
     }
@@ -161,9 +160,8 @@ impl From<Header> for CertificateDigest {
 }
 
 impl HeaderBuilder {
-    /// "Build" the header by taking all fields and calculating the hash.
-    /// This is used for tests, if used for "real" code then at least latest_execution_block will
-    /// need to be visited.
+    /// Builds the header and seals its digest. Test-only: `latest_execution_block` defaults to
+    /// zero, which a real proposal must never carry.
     pub fn build(self) -> Header {
         let h = Header {
             author: self.author.expect("author set for header builder"),
@@ -181,7 +179,7 @@ impl HeaderBuilder {
         h
     }
 
-    /// Helper method to directly set values of the payload
+    /// Adds `batch` to the payload under `worker_id`.
     pub fn with_payload_batch(mut self, batch: Batch, worker_id: WorkerId) -> Self {
         if self.payload.is_none() {
             self.payload = Some(Default::default());
@@ -201,7 +199,7 @@ impl HeaderBuilder {
 pub struct HeaderDigest(Digest<{ crypto::DIGEST_LENGTH }>);
 
 impl HeaderDigest {
-    /// Create a new HeaderDigest based on the crate's `DIGEST_LENGTH` constant.
+    /// Creates a digest from its raw bytes.
     pub fn new(digest: [u8; crypto::DIGEST_LENGTH]) -> Self {
         HeaderDigest(Digest { digest })
     }

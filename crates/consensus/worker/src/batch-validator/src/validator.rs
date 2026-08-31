@@ -61,11 +61,12 @@ impl BatchValidation for BatchValidator {
     /// Validate a peer's batch.
     ///
     /// Workers do not execute full batches. This method validates the required information.
-    async fn validate_batch(&self, sealed_batch: SealedBatch) -> Result<(), BatchValidationError> {
+    async fn validate_batch(&self, sealed_batch: &SealedBatch) -> Result<(), BatchValidationError> {
         // ensure digest matches batch
-        let (batch, digest) = sealed_batch.split();
+        let batch = &sealed_batch.batch;
+        let digest = sealed_batch.digest();
 
-        let verified_hash = batch.clone().seal_slow().digest();
+        let verified_hash = batch.digest();
         if digest != verified_hash {
             return Err(BatchValidationError::InvalidDigest);
         }
@@ -74,7 +75,7 @@ impl BatchValidation for BatchValidator {
             return Ok(());
         }
 
-        // A validator belongs to a worker and that worker only handles batches with it's id.
+        // A validator belongs to a worker and that worker only handles batches with its id.
         if batch.worker_id != self.worker_id {
             return Err(BatchValidationError::InvalidWorkerId {
                 expected_worker_id: self.worker_id,
@@ -103,8 +104,11 @@ impl BatchValidation for BatchValidator {
         // all batches for a worker and epoch share one base fee
         self.validate_basefee(batch.base_fee_per_gas)?;
 
-        self.validated_batches.retain(|_, v| *v > rayls_infrastructure_types::now() - 60_000); // keep last minute
-        self.validated_batches.insert(digest, rayls_infrastructure_types::now());
+        // `now()` is in seconds, so the dedup window is 60; sweep before insert so the map
+        // stays bounded by the recent-batch rate.
+        let now = rayls_infrastructure_types::now();
+        self.validated_batches.retain(|_, v| *v > now.saturating_sub(60));
+        self.validated_batches.insert(digest, now);
 
         Ok(())
     }
@@ -157,8 +161,9 @@ impl BatchValidation for BatchValidator {
 
             let tx_pool = tx_pool.clone();
             self.reth_env.get_task_spawner().spawn_task("submit-tx-batch", async move {
-                for tx in parsed_txns.into_iter().flatten() {
-                    match tx_pool.add_raw_transaction_external(tx).await {
+                let txs: Vec<_> = parsed_txns.into_iter().flatten().collect();
+                for res in tx_pool.add_raw_transactions_external(txs).await {
+                    match res {
                         Ok(_) => {}
                         // A hash this pool already holds is ordinary gossip dedup: multiple
                         // observers forward overlapping pools, and a forwarder re-sends what
@@ -221,7 +226,7 @@ impl BatchValidator {
     /// Validate the size of transactions (in bytes).
     fn validate_batch_size_bytes(
         &self,
-        transactions: &[Vec<u8>],
+        transactions: &[Bytes],
         epoch: Epoch,
     ) -> BatchValidationResult<()> {
         // calculate size (in bytes) of included transactions
@@ -246,7 +251,7 @@ impl BatchValidator {
     #[inline]
     fn decode_transactions(
         &self,
-        transactions: &Vec<Vec<u8>>,
+        transactions: &Vec<Bytes>,
         digest: BlockHash,
     ) -> BatchValidationResult<Vec<TransactionSigned>> {
         transactions
@@ -365,7 +370,7 @@ pub struct NoopBatchValidator;
 #[cfg(any(test, feature = "test-utils"))]
 #[async_trait::async_trait]
 impl BatchValidation for NoopBatchValidator {
-    async fn validate_batch(&self, _batch: SealedBatch) -> Result<(), BatchValidationError> {
+    async fn validate_batch(&self, _batch: &SealedBatch) -> Result<(), BatchValidationError> {
         Ok(())
     }
 
@@ -669,18 +674,37 @@ mod tests {
 
     #[serial]
     #[tokio::test]
+    async fn dedup_cache_sweep_keeps_only_the_last_minute() {
+        let tmp_dir = TempDir::new().unwrap();
+        let task_manager = TaskManager::default();
+        let TestTools { valid_batch, validator } = test_tools(tmp_dir.path(), &task_manager).await;
+
+        // Seed an entry two minutes old; the sweep promises to keep only the last minute.
+        let stale = FixedBytes::<32>::random();
+        validator.validated_batches.insert(stale, rayls_infrastructure_types::now() - 120);
+
+        validator.validate_batch(&valid_batch).await.unwrap();
+
+        assert!(
+            !validator.validated_batches.contains_key(&stale),
+            "two-minute-old dedup entry survived the keep-last-minute sweep"
+        );
+    }
+
+    #[serial]
+    #[tokio::test]
     async fn test_valid_batch() {
         let tmp_dir = TempDir::new().unwrap();
         let task_manager = TaskManager::default();
         let TestTools { valid_batch, validator } = test_tools(tmp_dir.path(), &task_manager).await;
-        let result = validator.validate_batch(valid_batch.clone()).await;
+        let result = validator.validate_batch(&valid_batch.clone()).await;
         assert!(result.is_ok());
 
         // ensure non-serialized data does not affect validity
         let (mut batch, _) = valid_batch.split();
         batch.received_at = Some(rayls_infrastructure_types::now());
         let different_block = batch.seal_slow();
-        let result = validator.validate_batch(different_block).await;
+        let result = validator.validate_batch(&different_block).await;
         assert!(result.is_ok());
     }
 
@@ -706,7 +730,7 @@ mod tests {
             received_at,
         };
         assert_matches!(
-            validator.validate_batch(invalid_batch.seal_slow()).await,
+            validator.validate_batch(&invalid_batch.seal_slow()).await,
             Err(BatchValidationError::CanonicalChain { block_hash }) if block_hash == wrong_parent_hash
         );
     }
@@ -722,7 +746,7 @@ mod tests {
         batch.epoch += 1;
 
         assert_matches!(
-        validator.validate_batch(batch.clone().seal_slow()).await,
+        validator.validate_batch(&batch.clone().seal_slow()).await,
         Err(BatchValidationError::InvalidEpoch{expected, found}) if expected == 0 && found == 1
         );
     }
@@ -877,7 +901,7 @@ mod tests {
 
             // track totals
             total_bytes += tx.len();
-            too_many_txs.push(tx);
+            too_many_txs.push(tx.into());
         }
 
         // NOTE: these assertions aren't important but want to know if tx size changes
@@ -889,7 +913,7 @@ mod tests {
         let invalid_batch = block.clone().seal_slow();
 
         assert_matches!(
-            validator.validate_batch(invalid_batch).await,
+            validator.validate_batch(&invalid_batch).await,
             Err(BatchValidationError::HeaderTransactionBytesExceedsMax(wrong)) if wrong == total_bytes
         );
 
@@ -915,7 +939,7 @@ mod tests {
         let expected_len = too_big.len();
         assert_eq!(expected_len, 2_000_090);
 
-        let invalid_txs = vec![too_big];
+        let invalid_txs = vec![too_big.into()];
         block.transactions = invalid_txs;
         // ensure size method correctly accounts for struct+txs
         assert_eq!(block.size(), 2_000_178);
@@ -923,7 +947,7 @@ mod tests {
         // ensure size method correct accounts for struct+txs+digest
         assert_eq!(invalid_batch.size(), 2_000_210);
         assert_matches!(
-            validator.validate_batch(invalid_batch).await,
+            validator.validate_batch(&invalid_batch).await,
             Err(BatchValidationError::HeaderTransactionBytesExceedsMax(wrong)) if wrong == expected_len
         );
     }
@@ -939,7 +963,7 @@ mod tests {
         // test batch with no transactions
         batch.transactions = Vec::new();
         assert_matches!(
-            validator.validate_batch(batch.clone().seal_slow()).await,
+            validator.validate_batch(&batch.clone().seal_slow()).await,
             Err(BatchValidationError::EmptyBatch)
         );
     }
@@ -953,10 +977,10 @@ mod tests {
         let (mut batch, _) = valid_batch.split();
 
         // test batch with bad decode
-        batch.transactions = vec![b"this is a bad batch".to_vec()];
+        batch.transactions = vec![b"this is a bad batch".to_vec().into()];
 
         assert_matches!(
-            validator.validate_batch(batch.clone().seal_slow()).await,
+            validator.validate_batch(&batch.clone().seal_slow()).await,
             Err(BatchValidationError::RecoverTransaction(_, _))
         );
     }
@@ -967,21 +991,21 @@ mod tests {
         let tmp_dir = TempDir::new().unwrap();
         let task_manager = TaskManager::default();
         let TestTools { valid_batch, validator } = test_tools(tmp_dir.path(), &task_manager).await;
-        // Note validator will use MIN_PROROCOL_BASE_FEE.
+        // Note validator will use MIN_PROTOCOL_BASE_FEE.
         let (mut batch, _) = valid_batch.split();
 
-        assert_matches!(validator.validate_batch(batch.clone().seal_slow()).await, Ok(()));
+        assert_matches!(validator.validate_batch(&batch.clone().seal_slow()).await, Ok(()));
 
         batch.base_fee_per_gas = 0;
         assert_matches!(
-            validator.validate_batch(batch.clone().seal_slow()).await,
+            validator.validate_batch(&batch.clone().seal_slow()).await,
             Err(BatchValidationError::InvalidBaseFee { expected_base_fee: _, base_fee: _ })
         );
 
         let badfee = MIN_PROTOCOL_BASE_FEE * 100;
         batch.base_fee_per_gas = badfee;
         assert_matches!(
-            validator.validate_batch(batch.clone().seal_slow()).await,
+            validator.validate_batch(&batch.clone().seal_slow()).await,
             Err(BatchValidationError::InvalidBaseFee { expected_base_fee: _, base_fee: _ })
         );
     }
@@ -1011,10 +1035,10 @@ mod tests {
         );
 
         // test batch with eip4844 tx
-        batch.transactions = vec![signed_tx.encoded_2718()];
+        batch.transactions = vec![signed_tx.encoded_2718().into()];
 
         assert_matches!(
-            validator.validate_batch(batch.clone().seal_slow()).await,
+            validator.validate_batch(&batch.clone().seal_slow()).await,
             Err(BatchValidationError::InvalidTx4844(_))
         );
     }

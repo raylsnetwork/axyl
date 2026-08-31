@@ -179,6 +179,7 @@ where
             inbound_requests: Default::default(),
             kad_record_queries: Default::default(),
             kad_expecting_to_fail_query_ids: Default::default(),
+            kad_put_budget: Default::default(),
             config,
             connected_peers: VecDeque::new(),
             pending_px_disconnects,

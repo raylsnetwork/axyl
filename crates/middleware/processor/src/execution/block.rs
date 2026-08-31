@@ -10,8 +10,8 @@ use rayls_execution_evm::{
     ExecutedBlock,
 };
 use rayls_infrastructure_types::{
-    gas_accumulator::GasAccumulator, payload::RLPayload, ConsensusOutput, SealedHeader, B256,
-    MIN_PROTOCOL_BASE_FEE,
+    gas_accumulator::GasAccumulator, payload::RLPayload, Bytes, ConsensusOutput, SealedHeader,
+    B256, MIN_PROTOCOL_BASE_FEE,
 };
 use tracing::{debug, error};
 
@@ -50,7 +50,7 @@ impl UnsettledExecution {
 /// Execute a batch payload and collect the resulting block.
 pub(crate) fn execute_payload(
     payload: RLPayload,
-    transactions: &[Vec<u8>],
+    transactions: &[Bytes],
     executed_blocks: &mut Vec<ExecutedBlock>,
     reth_env: &RethEnv,
 ) -> EngineResult<UnsettledExecution> {

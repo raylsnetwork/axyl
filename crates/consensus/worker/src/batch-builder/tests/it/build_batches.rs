@@ -38,8 +38,7 @@ use tracing::debug;
 async fn test_make_batch_el_to_cl() {
     let tmp_dir = TempDir::new().expect("temp dir");
     let task_manager = TaskManager::default();
-    //
-    //
+    // consensus layer
 
     let network_client = LocalNetwork::new_with_empty_id();
     let store = open_db(tmp_dir.path().join("c-db"));
@@ -61,13 +60,11 @@ async fn test_make_batch_el_to_cl() {
         WorkerNetworkHandle::new_for_test(task_manager.get_spawner()),
     );
     batch_provider.spawn_batch_builder("test builder", &task_manager);
-    //
-    //
+    // execution layer
 
     // testnet genesis with TxFactory funded
     let genesis = test_genesis();
 
-    // let genesis = genesis.extend_accounts(account);
     let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
 
     let reth_env = RethEnv::new_for_temp_chain(chain.clone(), tmp_dir.path(), &task_manager, None)
@@ -148,14 +145,13 @@ async fn test_make_batch_el_to_cl() {
     // spawn batch_builder once worker is ready
     let _batch_builder = tokio::spawn(batch_builder.run());
 
-    //
-    //
+    // test batch flow
 
     // wait for new batch
     let mut sealed_batch = None;
     for _ in 0..5 {
         let _ = tokio::time::sleep(Duration::from_secs(1)).await;
-        // Ensure the batch is stored - use with_read_txn for proper transaction scoping
+        // ensure the batch is stored
         if let Ok(Some((digest, wb))) = store.with_read_txn(|txn| Ok(txn.iter::<Batches>().next()))
         {
             sealed_batch = Some(SealedBatch::new(wb, digest));
@@ -174,15 +170,15 @@ async fn test_make_batch_el_to_cl() {
         ETHEREUM_BLOCK_GAS_LIMIT_56BITS,
     );
 
-    let valid_batch_result = batch_validator.validate_batch(sealed_batch.clone()).await;
+    let valid_batch_result = batch_validator.validate_batch(&sealed_batch).await;
     assert!(valid_batch_result.is_ok());
 
     // ensure expected transaction is in batch
     let expected_batch = Batch {
         transactions: vec![
-            transaction1.encoded_2718(),
-            transaction2.encoded_2718(),
-            transaction3.encoded_2718(),
+            transaction1.encoded_2718().into(),
+            transaction2.encoded_2718().into(),
+            transaction3.encoded_2718().into(),
         ],
         received_at: None,
         ..*sealed_batch.batch()
@@ -192,9 +188,8 @@ async fn test_make_batch_el_to_cl() {
     let batch_txs = sealed_batch.batch().transactions();
     assert_eq!(batch_txs, expected_batch.batch().transactions());
 
-    // ensure enough time passes for store to pass
+    // give the store time to commit
     let _ = tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-    // Use with_read_txn for proper transaction scoping
     let first_batch = store.with_read_txn(|txn| Ok(txn.iter::<Batches>().next())).ok().flatten();
     debug!("first batch? {:?}", first_batch);
 
@@ -232,8 +227,7 @@ async fn test_make_batch_el_to_cl() {
 /// Before a canonical state change, mine the 5th transaction in the next batch.
 #[tokio::test]
 async fn test_batch_builder_produces_valid_batches() {
-    //
-    //
+    // execution layer
     // testnet genesis with TxFactory funded
     let genesis = test_genesis();
 
@@ -331,8 +325,7 @@ async fn test_batch_builder_produces_valid_batches() {
     // spawn batch_builder once worker is ready
     let _batch_builder = tokio::spawn(batch_builder.run());
 
-    //
-    //
+    // test batch flow
 
     // plenty of time for batch production
     let duration = std::time::Duration::from_secs(5);
@@ -372,15 +365,15 @@ async fn test_batch_builder_produces_valid_batches() {
         ETHEREUM_BLOCK_GAS_LIMIT_56BITS,
     );
 
-    let valid_batch_result = batch_validator.validate_batch(first_batch.clone()).await;
+    let valid_batch_result = batch_validator.validate_batch(&first_batch).await;
     assert!(valid_batch_result.is_ok());
 
     // ensure expected transaction is in batch
     let expected_batch = Batch {
         transactions: vec![
-            transaction1.encoded_2718(),
-            transaction2.encoded_2718(),
-            transaction3.encoded_2718(),
+            transaction1.encoded_2718().into(),
+            transaction2.encoded_2718().into(),
+            transaction3.encoded_2718().into(),
         ],
         received_at: None,
         ..*first_batch.batch()
@@ -398,7 +391,7 @@ async fn test_batch_builder_produces_valid_batches() {
     let _ = ack.send(Ok(()));
 
     // validate second block
-    let valid_batch_result = batch_validator.validate_batch(next_batch.clone()).await;
+    let valid_batch_result = batch_validator.validate_batch(&next_batch).await;
     assert!(valid_batch_result.is_ok());
 
     // assert only transaction in block
@@ -428,8 +421,7 @@ async fn test_batch_builder_produces_valid_batches() {
 /// Before a canonical state change, mine the 4th transaction in the next block.
 #[tokio::test]
 async fn test_canonical_notification_updates_pool() {
-    //
-    //
+    // execution layer
     // testnet genesis with TxFactory funded
     let genesis = test_genesis();
     let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
@@ -506,8 +498,7 @@ async fn test_canonical_notification_updates_pool() {
     // spawn batch_builder once worker is ready
     let _batch_builder = tokio::spawn(batch_builder.run());
 
-    //
-    //
+    // test block flow
 
     // submit new transaction before sending ack
     let _ = tx_factory
@@ -527,9 +518,9 @@ async fn test_canonical_notification_updates_pool() {
     // ensure expected transaction is in batch
     let mut first_batch = Batch {
         transactions: vec![
-            transaction1.encoded_2718(),
-            transaction2.encoded_2718(),
-            transaction3.encoded_2718(),
+            transaction1.encoded_2718().into(),
+            transaction2.encoded_2718().into(),
+            transaction3.encoded_2718().into(),
         ],
         ..Default::default()
     };
@@ -603,7 +594,7 @@ async fn test_canonical_notification_updates_pool() {
             .await
             .expect("block builder's sender didn't drop")
             .expect("batch was built");
-        assert!(batch_validator.validate_batch(batch).await.is_ok());
+        assert!(batch_validator.validate_batch(&batch).await.is_ok());
         let _ = ack.send(Ok(()));
         tokio::task::yield_now().await;
     }

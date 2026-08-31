@@ -5,17 +5,16 @@ use rand::{rngs::StdRng, SeedableRng as _};
 use rayls_execution_evm::{
     reth_env::types::reth_recover_raw_transactions, test_utils::TransactionFactory,
 };
-use rayls_infrastructure_types::{TransactionSigned, U256};
+use rayls_infrastructure_types::{Bytes, TransactionSigned, U256};
 use reth::rpc::server_types::eth::utils::recover_raw_transaction as reth_recover_raw_transaction;
 use std::sync::Arc;
 use tracing::error;
 
-/// Helper to generate a list of dummy signed transactions as Vec<u8>.
-fn generate_dummy_transactions(count: usize) -> Vec<Vec<u8>> {
+/// Generates `count` deterministic signed transactions, encoded as [`Bytes`].
+fn generate_dummy_transactions(count: usize) -> Vec<Bytes> {
     let mut rng = StdRng::seed_from_u64(42);
     let mut txs = Vec::with_capacity(count);
     for _ in 0..count {
-        // Use TransactionFactory to generate a random transaction and encode it
         let mut tf = TransactionFactory::new_random_from_seed(&mut rng);
         let tx = tf.create_eip1559_encoded(
             Arc::new(rayls_infrastructure_types::test_genesis().into()),
@@ -45,7 +44,7 @@ fn test_reth_recover_raw_transactions_sequentialbench(c: &mut Criterion) {
     let txs = generate_dummy_transactions(200);
     let batch_digest = Some(FixedBytes::<32>::ZERO);
 
-    let rec_fn = |tx_bytes: &Vec<u8>| {
+    let rec_fn = |tx_bytes: &Bytes| {
         reth_recover_raw_transaction::<TransactionSigned>(tx_bytes).inspect_err(|e| {
             error!(
                 target: "engine",

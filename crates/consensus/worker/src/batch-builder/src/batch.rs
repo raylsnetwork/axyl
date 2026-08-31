@@ -49,7 +49,7 @@ pub struct BatchBuilderOutput {
     pub(crate) at_capacity: bool,
 }
 
-/// Construct an Rayls batch using the best transactions from the pool.
+/// Construct a Rayls batch using the best transactions from the pool.
 ///
 /// Returns the [`BatchBuilderOutput`] and cannot fail. The batch continues to add
 /// transactions to the proposed block until either:
@@ -84,8 +84,7 @@ pub fn build_batch<P: TxPool>(
 
     // NOTE: batches always build off the latest finalized block
 
-    // collect data for successful transactions
-    // let mut sum_blob_gas_used = 0;
+    // collect data for selected transactions
     let mut total_bytes_size = 0;
     let mut total_possible_gas = 0;
     let mut at_capacity = false;
@@ -94,8 +93,7 @@ pub fn build_batch<P: TxPool>(
     let mut blob_transactions = Vec::new();
     let mut sender_nonce_ranges = SenderNonceRanges::new();
 
-    // begin loop through sorted "best" transactions in pending pool
-    // and execute them to build the block
+    // walk the sorted "best" transactions in the pending pool; they are selected, not executed
     while let Some(pool_tx) = best_txs.next() {
         // skip a transaction already sealed into a batch still in flight, so a stuck inclusion
         // backlog is not re-sealed batch after batch. The skip cannot open a nonce gap: an
@@ -108,10 +106,8 @@ pub fn build_batch<P: TxPool>(
 
         // ensure block has capacity (in gas) for this transaction
         if total_possible_gas + pool_tx.gas_limit() > gas_limit {
-            // the tx could exceed max gas limit for the block
-            // marking as invalid within the context of the `BestTransactions` pulled in this
-            // current iteration  all dependents for this transaction are now considered invalid
-            // before continuing loop
+            // the tx would exceed the batch's gas cap: it and all its dependents are invalid for
+            // the rest of this `BestTransactions` iteration
             best_txs.exceeds_gas_limit(&pool_tx, gas_limit);
             debug!(target: "worker::batch_builder", ?pool_tx, "marking tx invalid due to gas constraint");
             // Only a non-empty batch is "at capacity": a tx whose own gas exceeds the whole cap can
@@ -135,10 +131,8 @@ pub fn build_batch<P: TxPool>(
 
         // ensure block has capacity (in bytes) for this transaction
         if total_bytes_size + tx.size() > max_size {
-            // the tx could exceed max gas limit for the block
-            // marking as invalid within the context of the `BestTransactions` pulled in this
-            // current iteration  all dependents for this transaction are now considered invalid
-            // before continuing loop
+            // the tx would exceed the batch's byte cap: as with the gas branch, it and its
+            // dependents are invalid for the rest of this iteration
             best_txs.max_batch_size(&pool_tx, tx.size(), max_size);
             debug!(target: "worker::batch_builder", ?pool_tx, "marking tx invalid due to bytes constraint");
             // As with the gas branch: a tx larger than the whole batch is unbatchable, not backlog.
@@ -161,9 +155,9 @@ pub fn build_batch<P: TxPool>(
             })
             .or_insert(NonceRange { min: nonce, max: nonce });
 
-        // append transaction to the list of executed transactions
+        // append transaction to the batch
         mined_transactions.push(*pool_tx.hash());
-        transactions.push(tx.into_inner().encoded_2718());
+        transactions.push(tx.into_inner().encoded_2718().into());
     }
 
     // batch

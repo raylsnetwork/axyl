@@ -263,12 +263,12 @@ impl WorkerTxPool {
         self.pool.add_transaction(TransactionOrigin::Local, recovered).await
     }
 
-    /// Adds a transaction with external origin.
-    pub async fn add_raw_transaction_external(
+    /// Adds external transactions to the pool in one call, one outcome per input in order.
+    pub async fn add_raw_transactions_external(
         &self,
-        tx: EthPooledTransaction,
-    ) -> Result<AddedTransactionOutcome, crate::PoolError> {
-        self.pool.add_transaction(TransactionOrigin::External, tx).await
+        txs: Vec<EthPooledTransaction>,
+    ) -> Vec<Result<AddedTransactionOutcome, crate::PoolError>> {
+        self.pool.add_transactions(TransactionOrigin::External, txs).await
     }
 
     /// Admit forwarded transactions and return the hashes the pool rejected as stale.

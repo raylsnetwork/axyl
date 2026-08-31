@@ -385,8 +385,8 @@ mod tests {
         DatabaseType,
     };
     use rayls_infrastructure_types::{
-        Batch, BlockHash, Certificate, CommittedSubDag, ConsensusHeader, DbTx, DbTxMut, Epoch,
-        Header, ReputationScores,
+        Batch, BlockHash, Bytes, Certificate, CommittedSubDag, ConsensusHeader, DbTx, DbTxMut,
+        Epoch, Header, ReputationScores,
     };
     use tempfile::TempDir;
 
@@ -468,7 +468,11 @@ mod tests {
 
     /// Builds a minimal batch stored under a header's payload digest.
     fn batch_for(number: u64) -> Batch {
-        Batch { transactions: vec![vec![number as u8]], seq: number, ..Default::default() }
+        Batch {
+            transactions: vec![Bytes::from(vec![number as u8])],
+            seq: number,
+            ..Default::default()
+        }
     }
 
     /// Builds a consensus header whose certificate payload references `digest`.
@@ -597,7 +601,7 @@ mod tests {
         // producer's in-flight inserts fail fast — but the DB is poisoned either way. The junk
         // never commits, so the seal's reads stay clean; the archival pass then fails on the
         // poisoned DB and surfaces the failure as a `WriteFailed`.
-        let big = Batch { transactions: vec![vec![0u8; 4096]], ..Default::default() };
+        let big = Batch { transactions: vec![Bytes::from(vec![0u8; 4096])], ..Default::default() };
         match db.with_write_txn(|txn| {
             for i in 0..4_000u64 {
                 txn.insert::<Batches>(&digest_for(10_000 + i), &big)?;

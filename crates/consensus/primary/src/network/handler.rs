@@ -22,13 +22,13 @@ use rayls_infrastructure_storage::{
 use rayls_infrastructure_types::{
     ensure,
     error::{CertificateError, HeaderError, HeaderResult},
-    now, to_intent_message, try_decode, AuthorityIdentifier, BlockHash, BlockNumHash, BlsPublicKey,
-    Certificate, CertificateDigest, ConsensusHeader, Database, Epoch, EpochCertificate,
-    EpochRecord, Hash as _, Header, ProtocolSignature, RaylsSender as _, Round,
+    now, to_intent_message, try_decode, AuthorityIdentifier, B256Map, BlockHash, BlockNumHash,
+    BlsPublicKey, Certificate, CertificateDigest, ConsensusHeader, Database, Epoch,
+    EpochCertificate, EpochRecord, Hash as _, Header, ProtocolSignature, RaylsSender as _, Round,
     SignatureVerificationState, Vote, VotesAggregator,
 };
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet},
     sync::Arc,
     time::Duration,
 };
@@ -37,24 +37,22 @@ use tracing::{debug, error, info, trace, warn};
 
 const MAX_AUTH_LAST_VOTE_ENTRIES: usize = 1000;
 const MAX_CONSENSUS_CERTS_ENTRIES: usize = 100;
-/// How long `committed_round` must stay flat while we keep looking behind before we demote to
-/// `CvvInactive`. Any commit advance resets the clock, so a node that's catching up (or mid
-/// epoch/mode transition) never trips it — only one genuinely stuck for the whole window does.
+/// How long `committed_round` must stay flat, while verdicts keep saying behind, before demoting
+/// to `CvvInactive`. Any commit advance resets the clock, so a node catching up or mid epoch/mode
+/// transition never trips it; only one stuck for the whole window does.
 ///
-/// We anchor the stall on wall-clock, NOT on a verdict/round count, on purpose. The verdicts come
-/// from incoming gossip and `primary_round` is bumped to the highest *received* round, so both are
-/// peer-arrival-driven — a burst of ahead-certs would jump them while commit legitimately lags,
-/// faking a stall. The clock is the only "how long" a burst can't accelerate. ~5s ≈ 5 rounds under
-/// load (the only regime where we're actually behind; idle means no traffic, so not behind), which
-/// is a sane "we produced rounds but committed nothing" threshold without depending on the (chain-
-/// varying, idle-ceiling) `max_header_delay`.
+/// Anchored on wall-clock, not on a verdict or round count, on purpose: verdicts come from
+/// incoming gossip and `primary_round` tracks the highest *received* round, so a burst of
+/// ahead-certs would jump both while commit legitimately lags, faking a stall. ~5s is ~5 rounds
+/// under load (the only regime where the node is actually behind), a sane "produced rounds but
+/// committed nothing" threshold that does not depend on the chain-varying `max_header_delay`.
 const BEHIND_STALL_WINDOW: Duration = Duration::from_secs(5);
 
 /// Tracks consensus-commit progress across `behind_consensus` "behind" verdicts, so we demote only
 /// when genuinely stuck (`committed_round` flat for a whole window) rather than merely mid-
 /// transition (commits still advancing). We track the DAG commit watermark, not the executed tip:
 /// execution lags commit, and a node that's committing fine but executing slowly is still
-/// participating — gating on the executed tip is exactly what produced the transition false
+/// participating - gating on the executed tip is exactly what produced the transition false
 /// positives. Shared across `RequestHandler` clones, hence behind a lock.
 #[derive(Debug)]
 struct BehindTracker {
@@ -108,7 +106,7 @@ pub(crate) struct RequestHandler<DB> {
     /// Per-authority vote state for equivocation detection and caching.
     auth_last_vote: Arc<Mutex<AuthEquivocationMap>>,
     /// Consensus result signers per digest.
-    consensus_certs: Arc<Mutex<HashMap<BlockHash, VotesAggregator<ConsensusResult>>>>,
+    consensus_certs: Arc<Mutex<B256Map<VotesAggregator<ConsensusResult>>>>,
     /// Commit-progress tracker gating demotion to `CvvInactive` (see [`behind_consensus`]).
     behind_tracker: Arc<Mutex<BehindTracker>>,
 }
@@ -142,11 +140,11 @@ where
 
     /// Return true and request CvvInactive if the peer's cert shows we are *stuck* behind.
     ///
-    /// "Behind" alone is not enough to demote: a node mid epoch/mode transition — or simply
-    /// syncing — is briefly behind by construction yet keeps committing and self-heals.
+    /// "Behind" alone is not enough to demote: a node mid epoch/mode transition - or simply
+    /// syncing - is briefly behind by construction yet keeps committing and self-heals.
     /// We demote only when behind AND not making progress: `committed_round` stays flat for the
     /// whole `BEHIND_STALL_WINDOW`. This replaces the old `is_transitioning()` suppressor, which
-    /// was racy (TOCTOU) and, worse, blind to the window before we detect our own boundary —
+    /// was racy (TOCTOU) and, worse, blind to the window before we detect our own boundary  -
     /// exactly when a lagging node would wrongly self-demote.
     async fn behind_consensus(&self, epoch: Epoch, round: Round, number: Option<u64>) -> bool {
         if self.consensus_config.shutdown().was_notified() {
@@ -163,7 +161,7 @@ where
         let relative_gc_depth = self.consensus_config.parameters().gc_depth / 4;
         let active_cvv = self.consensus_bus.node_mode().borrow().is_active_cvv();
         let our_epoch = self.consensus_config.committee().epoch();
-        // DAG commit watermark — the progress signal we gate the stall on. Advances on our own
+        // DAG commit watermark - the progress signal we gate the stall on. Advances on our own
         // commits (self-paced), so a gossip burst can't accelerate it the way it does the executed
         // tip or `primary_round`.
         let committed_round = *self.consensus_bus.committed_round_updates().borrow();
@@ -198,7 +196,7 @@ where
 
         // We look behind. Demote only if commit has been flat for the whole stall window: a
         // transitioning or syncing node keeps committing and resets the clock, so it never demotes
-        // — only one stuck for the full window does. record_behind re-arms the clock when it fires,
+        // - only one stuck for the full window does. record_behind re-arms the clock when it fires,
         // so a concurrent clone (they share the Arc<Mutex>) can't re-trigger demotion in a loop.
         let stalled =
             self.behind_tracker.lock().record_behind(committed_round, BEHIND_STALL_WINDOW);

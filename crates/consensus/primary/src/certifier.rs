@@ -1,4 +1,4 @@
-//! Certifier broadcasts headers and certificates for this primary.
+//! Certifier publishes headers and certificates for this primary.
 
 use crate::{
     aggregators::HeaderVotesAggregator,
@@ -37,8 +37,7 @@ enum VoteErrorAction {
     Continue,
 }
 
-/// This component is responisble for proposing headers to peers, collecting votes on headers,
-/// and certifying headers into certificates.
+/// Header proposer that collects peer votes and certifies headers into certificates.
 ///
 /// It receives headers to propose from Proposer via `rx_headers`, and publishes certificates to
 /// gossip network.
@@ -60,7 +59,7 @@ pub(crate) struct Certifier<DB> {
     consensus_bus: ConsensusBus,
     /// A network sender to send the batches to the other workers.
     network: PrimaryNetworkHandle,
-    /// Metrics handler
+    /// Metrics handler.
     metrics: Arc<PrimaryMetrics>,
     /// Spawn epoch-related tasks.
     task_spawner: TaskSpawner,
@@ -140,8 +139,8 @@ impl<DB: Database> Certifier<DB> {
     /// Rayls: Maximum vote request attempts before giving up.
     const MAX_VOTE_REQUEST_ATTEMPTS: u32 = 30;
 
-    /// Rayls: How long the committed round may stall — while we already hold the certs for a peer's
-    /// limit round — before a "too old" rejection counts toward demotion anyway. Below this, the
+    /// Rayls: How long the committed round may stall - while we already hold the certs for a peer's
+    /// limit round - before a "too old" rejection counts toward demotion anyway. Below this, the
     /// lag is treated as a transient proposer stall (certs arriving, not yet usable as parents)
     /// and the rejection is ignored; beyond it, the proposer is considered wedged and allowed
     /// to demote. Far above the normal sub-second commit interval, so transient gaps never trip
@@ -376,7 +375,7 @@ impl<DB: Database> Certifier<DB> {
     fn handle_vote_error(&self, error: &DagError, header: &Header) -> VoteErrorAction {
         match error {
             DagError::TooOldRejectedByPeers { peer_id, header_round, limit_round } => {
-                // A "too old" rejection means our PROPOSER is lagging in rounds — not that we lack
+                // A "too old" rejection means our PROPOSER is lagging in rounds - not that we lack
                 // data. If our cert store already covers the peer's limit round, we hold every cert
                 // CvvInactive would sync; the lag is transient (those certs are suspended on
                 // missing grandparents and not yet usable as parents, but they are
@@ -387,7 +386,7 @@ impl<DB: Database> Certifier<DB> {
                 // Mirrors `should_count_epoch_rejection`, which drops rejections carrying no
                 // liveness signal.
                 // `limit_round > 0` excludes the legacy string-based path (set to 0 at the
-                // request site), where we don't know the peer's real limit — those count normally
+                // request site), where we don't know the peer's real limit - those count normally
                 // toward demotion rather than always satisfying `cert_store_round >= 0`.
                 let cert_store_round = *self.consensus_bus.cert_store_round().borrow();
                 if *limit_round > 0 && cert_store_round >= *limit_round {
@@ -684,9 +683,9 @@ impl<DB: Database> Certifier<DB> {
                         }
 
                         // try to publish the certificate on gossip network.
-                        // Dev (single-node): no peers to gossip to — we already processed our
+                        // Dev (single-node): no peers to gossip to - we already processed our
                         // own certificate above, and publishing would only fail every round
-                        // with NoPeersSubscribedToTopic — so skip it entirely.
+                        // with NoPeersSubscribedToTopic - so skip it entirely.
                         #[cfg(not(feature = "dev-single-node-setup"))]
                         if let Err(e) = self.network.publish_certificate(certificate).await {
                             error!(target: "primary::certifier", ?e, "failed to gossip certificate");
@@ -718,9 +717,9 @@ impl<DB: Database> Certifier<DB> {
         }
     }
 
-    /// Execute the main certification task.  Will run until shutdown is signalled.
-    /// If this exits outside of shutdown it will log an error and this will trigger a node
-    /// shutdown.
+    /// Execute the main certification task until shutdown is signalled.
+    ///
+    /// Exiting outside of shutdown logs an error and triggers a node shutdown.
     async fn run(mut self) {
         info!(target: "primary::certifier", "Certifier on node {} has started successfully.", &self.authority_id);
         let mut rx_headers = self.consensus_bus.headers().subscribe();
@@ -729,6 +728,19 @@ impl<DB: Database> Certifier<DB> {
         let mut in_flight: Option<(HeaderDigest, tokio::task::AbortHandle)> = None;
         loop {
             tokio::select! {
+                // shutdown wins: certifying a further header during teardown wastes a vote
+                // round trip the epoch is about to discard
+                biased;
+
+                _ = shutdown => {
+                    debug!(target: "primary::certifier", "Certifier received shutdown signal");
+                    // cancel any outstanding proposals and vote requests
+                    self.new_proposal.notify();
+                    if let Some((_, h)) = in_flight.take() {
+                        h.abort();
+                    }
+                    break;
+                }
                 Some(header) = rx_headers.recv() => {
                     let digest = header.digest();
                     let round = header.round();
@@ -839,16 +851,6 @@ impl<DB: Database> Certifier<DB> {
                     in_flight = Some((digest, abort));
                 },
 
-                // listen for consensus shutdown
-                _ = shutdown => {
-                    debug!(target: "primary::certifier", "Certifier received shutdown signal");
-                    // cancel any outstanding proposals and vote requests
-                    self.new_proposal.notify();
-                    if let Some((_, h)) = in_flight.take() {
-                        h.abort();
-                    }
-                    break;
-                }
             }
         }
     }

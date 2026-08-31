@@ -85,7 +85,7 @@ fn create_test_peers<Req: RLMessage, Res: RLMessage>(
     (target, peers, task_manager)
 }
 
-/// A peer on RL
+/// A peer on RL.
 struct TestPeer<Req, Res, DB = MemDatabase>
 where
     Req: RLMessage,
@@ -103,7 +103,7 @@ where
     /// Network metrics shared with the spawned task.
     network_metrics: Arc<NetworkMetrics>,
 }
-/// A peer on RL
+/// A peer on RL.
 struct NetworkPeer<Req, Res, DB = MemDatabase>
 where
     Req: RLMessage,
@@ -121,7 +121,7 @@ where
     network_metrics: Arc<NetworkMetrics>,
 }
 
-/// The type for holding testng components.
+/// The type for holding testing components.
 struct TestTypes<Req, Res, DB = MemDatabase>
 where
     Req: RLMessage,
@@ -1711,6 +1711,93 @@ async fn test_newer_kad_record_replaced() -> eyre::Result<()> {
     Ok(())
 }
 
+/// A replayed or stale record must be deduped before the signature verify: an invalid
+/// signature on a duplicate is never examined, so it must not earn a penalty. A verify-first
+/// ordering would trip the invalid-record penalty and ban an honest peer for a stale replay.
+#[tokio::test]
+async fn test_kad_put_stale_duplicate_deduped_before_signature_verify() -> eyre::Result<()> {
+    let TestTypes { peer1, mut peer2, .. } =
+        create_test_types::<TestWorkerRequest, TestWorkerResponse>();
+    let mut network = peer1.network;
+
+    // store peer2's valid record
+    let valid_record = peer2.network.get_peer_record();
+    network.swarm.behaviour_mut().kademlia.store_mut().put(valid_record.clone())?;
+
+    // craft a stale duplicate (older timestamp) with a garbage signature
+    let mut stale_info = peer2.network.node_record.info.clone();
+    stale_info.timestamp = now() - 10_000;
+    let garbage_signature = peer2.config.key_config().request_signature_direct(&encode(&"garbage"));
+    peer2.network.node_record = NodeRecord { info: stale_info, signature: garbage_signature };
+    let stale_record = peer2.network.get_peer_record();
+
+    let peer2_id = *peer2.network.swarm.local_peer_id();
+    network.process_kad_put_request(peer2_id, stale_record);
+
+    // the stored record is untouched and the sender is not penalized for a signature
+    // that was never checked
+    let store_record = network
+        .swarm
+        .behaviour_mut()
+        .kademlia
+        .store_mut()
+        .get(&valid_record.key)
+        .expect("peer2 record in local kad store");
+    assert_eq!(*store_record, valid_record);
+    assert!(
+        !network.swarm.behaviour().peer_manager.peer_banned(&peer2_id),
+        "stale duplicate must be dropped by the dedup, not verified and penalized"
+    );
+
+    Ok(())
+}
+
+/// Puts beyond the per-peer fixed-window budget are dropped before any per-record work,
+/// so a flood cannot push a fresh record into the store once the window is exhausted.
+#[tokio::test]
+async fn test_kad_put_budget_drops_flood() -> eyre::Result<()> {
+    let TestTypes { peer1, mut peer2, .. } =
+        create_test_types::<TestWorkerRequest, TestWorkerResponse>();
+    let mut network = peer1.network;
+    let peer2_id = *peer2.network.swarm.local_peer_id();
+
+    // store an old-but-valid record for peer2
+    let mut old_info = peer2.network.node_record.info.clone();
+    old_info.timestamp = now() - 10_000;
+    let signature = peer2.config.key_config().request_signature_direct(&encode(&old_info));
+    peer2.network.node_record = NodeRecord { info: old_info, signature };
+    let old_record = peer2.network.get_peer_record();
+    network.swarm.behaviour_mut().kademlia.store_mut().put(old_record.clone())?;
+
+    // exhaust the budget with duplicate puts (each is deduped but still counted)
+    for _ in 0..crate::consensus::kad::kad_put_budget_max() {
+        network.process_kad_put_request(peer2_id, old_record.clone());
+    }
+
+    // a genuinely newer, validly signed record now arrives - over budget, so it is dropped
+    let mut fresh_info = peer2.network.node_record.info.clone();
+    fresh_info.timestamp = now();
+    let signature = peer2.config.key_config().request_signature_direct(&encode(&fresh_info));
+    peer2.network.node_record = NodeRecord { info: fresh_info, signature };
+    let fresh_record = peer2.network.get_peer_record();
+    network.process_kad_put_request(peer2_id, fresh_record.clone());
+
+    let store_record = network
+        .swarm
+        .behaviour_mut()
+        .kademlia
+        .store_mut()
+        .get(&old_record.key)
+        .expect("peer2 record in local kad store");
+    assert_eq!(*store_record, old_record, "over-budget put must not reach the store");
+    assert!(
+        !network.swarm.behaviour().peer_manager.peer_banned(&peer2_id),
+        "over-budget puts are dropped, never penalized"
+    );
+
+    Ok(())
+}
+
 /// FIND-025 Path A: AddProvider store exhaustion must not propagate a fatal error.
 ///
 /// Pre-fill the provider table to capacity, then verify that an overflow AddProvider
@@ -1891,7 +1978,7 @@ async fn test_kad_record_store_exhaustion_does_not_propagate_error() -> eyre::Re
 
 /// `load_known_peers_from_kad_store` rehydrates the in-memory BLS map from persistent
 /// records at startup, so a restarted node does not need to wait for peer re-PUTs to
-/// route gossip. Pins the load-bearing fix for the observer-restart bug.
+/// route gossip.
 #[tokio::test]
 async fn test_load_known_peers_from_kad_store_rehydrates_after_restart() -> eyre::Result<()> {
     let TestTypes { peer1, peer2, .. } =
@@ -2040,7 +2127,7 @@ async fn test_connected_peers_count_double_decrement() -> eyre::Result<()> {
     let connected = peer1_handle.connected_peer_ids().await?;
     assert!(!connected.contains(&peer2_id), "peer2 should be disconnected after fatal penalty");
 
-    // The gauge should be 0 — exactly one peer disconnected.
+    // The gauge should be 0 - exactly one peer disconnected.
     assert_eq!(
         gauge.get(),
         0,

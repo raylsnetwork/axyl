@@ -20,8 +20,8 @@ use rayls_execution_evm::{
 use rayls_infrastructure_config::{Config, ConfigFmt, ConfigTrait as _, NodeInfo};
 use rayls_infrastructure_types::{
     test_utils::{self, CommandParser},
-    Address, EpochCertificate, EpochRecord, Genesis, GenesisAccount, MIN_RAYLS_PROTOCOL_BASE_FEE,
-    U256,
+    Address, Bytes, EpochCertificate, EpochRecord, Genesis, GenesisAccount,
+    MIN_RAYLS_PROTOCOL_BASE_FEE, U256,
 };
 use rayls_network_cli::genesis::GenesisArgs;
 use std::{collections::BTreeMap, panic, path::Path, process::Child, sync::Arc, time::Duration};
@@ -38,7 +38,7 @@ const SELECTABLE_TRIALS_TARGET: usize = 25;
 // Bumped from 5s: at short cadences a loaded CI runner can miss the epoch-advance
 // window, tripping the `loop_epochs` debounce ("Old and new epoch equal"). The few
 // seconds of CI jitter that break 5s (its debounce tolerance is only ~11s) are
-// roughly absolute, not proportional — so 30s (tolerance ~61s) gives ample margin
+// roughly absolute, not proportional - so 30s (tolerance ~61s) gives ample margin
 // while keeping test_epoch_boundary's shuffle wait under the 60-min job cap.
 // Retry-based record checks stay correct regardless of cadence.
 const EPOCH_DURATION: u64 = 30;
@@ -72,7 +72,7 @@ async fn test_epoch_boundary_inner(
 
     // submit txs to stake and activate the new validator.
     //
-    // A mined tx can still have REVERTED — `watch()` only confirms inclusion, not
+    // A mined tx can still have REVERTED - `watch()` only confirms inclusion, not
     // success. So fetch each receipt and assert it succeeded, naming which tx failed.
     // Without this, a reverted stake/activate silently leaves the validator
     // unregistered and only surfaces much later as a misleading "never shuffled".
@@ -113,7 +113,7 @@ async fn test_epoch_boundary_inner(
     // The new validator can't appear in a *current* committee right away: it goes
     // Active at `activationEpoch` and committees are selected ~2 epochs ahead (see
     // reth_env: "read new committee (always 2 epochs ahead)"). Read its
-    // activationEpoch so we only count genuine selection trials — and assert it's
+    // activationEpoch so we only count genuine selection trials - and assert it's
     // actually eligible. If the stake/activate tx was dropped (e.g. submitted right
     // as an epoch switched; see the submit loop above), the validator never enters
     // the candidate set and "never shuffled" would be a false negative, not bad luck.
@@ -121,11 +121,11 @@ async fn test_epoch_boundary_inner(
     assert_eq!(
         new_val_info.validatorAddress,
         new_validator.address(),
-        "new validator not registered in ConsensusRegistry — stake/activate tx was dropped"
+        "new validator not registered in ConsensusRegistry - stake/activate tx was dropped"
     );
     assert!(
         new_val_info.activationEpoch > 0,
-        "new validator registered but activationEpoch=0 — activate tx was not applied; \
+        "new validator registered but activationEpoch=0 - activate tx was not applied; \
          it can never be shuffled into a committee"
     );
     // Earliest epoch at which it can show up in the *current* committee.
@@ -187,8 +187,8 @@ async fn test_epoch_boundary_inner(
 
     if shuffled {
         // Check that all nodes have valid (certified) Epoch Records. `latest_epoch`
-        // is the current, in-progress epoch — its record isn't certified until it
-        // concludes — so verify only epochs strictly before it (all concluded).
+        // is the current, in-progress epoch - its record isn't certified until it
+        // concludes - so verify only epochs strictly before it (all concluded).
         for p in 8540..=8545u16 {
             let rpc_url = format!("http://127.0.0.1:{p}");
             let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
@@ -301,7 +301,7 @@ async fn test_epoch_sync_inner(
 /// verify it against its certificate.
 ///
 /// A node that is still catching up returns `NotFound` (401) for a not-yet-synced
-/// epoch, so a transient error is retried up to `deadline` — this is what makes
+/// epoch, so a transient error is retried up to `deadline` - this is what makes
 /// the completeness check tolerant of a legitimately-lagging node. A record that
 /// IS returned but fails cert verification is a real correctness bug and fails
 /// immediately (no retry). A node that never produces the record fails once the
@@ -658,14 +658,14 @@ struct OnboardTx {
     from: Address,
     to: Address,
     calldata: Vec<u8>,
-    raw: Vec<u8>,
+    raw: Bytes,
 }
 
 /// Generate all the transactions needed to onboard the new validator so it becomes
 /// eligible for committee selection.
 ///
 /// `ConsensusRegistry.stake()` requires the validator to be (1) allowlisted by the
-/// registry owner and (2) to have approved the registry to pull its ERC-20 RLS — and
+/// registry owner and (2) to have approved the registry to pull its ERC-20 RLS - and
 /// it is NOT payable (funds move via `transferFrom`, not `msg.value`). So the full
 /// ordered flow is: governance allowlists → validator approves RLS → validator stakes
 /// (value 0) → validator activates. The validator is already RLS-funded at genesis,
@@ -715,7 +715,7 @@ fn generate_new_validator_txs(
         approve_calldata.clone().into(),
     );
 
-    // 3. Stake — value 0; the registry pulls RLS via transferFrom (non-payable fn).
+    // 3. Stake - value 0; the registry pulls RLS via transferFrom (non-payable fn).
     let proof = ConsensusRegistry::ProofOfPossession {
         uncompressedPubkey: new_validator_info.bls_public_key.serialize().into(),
         uncompressedSignature: new_validator_info.proof_of_possession.serialize().into(),
@@ -734,7 +734,7 @@ fn generate_new_validator_txs(
         stake_calldata.clone().into(),
     );
 
-    // 4. Activate — request entry into a future committee.
+    // 4. Activate - request entry into a future committee.
     let activate_calldata = ConsensusRegistry::activateCall {}.abi_encode();
     let activate_raw = new_validator.create_eip1559_encoded(
         chain.clone(),

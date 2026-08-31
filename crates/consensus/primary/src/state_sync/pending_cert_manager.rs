@@ -7,8 +7,10 @@ use crate::{
     error::{CertManagerError, CertManagerResult},
     ConsensusBus,
 };
-use rayls_infrastructure_types::{Certificate, CertificateDigest, Hash as _, Round};
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use rayls_infrastructure_types::{
+    Certificate, CertificateDigest, CertificateDigestMap, CertificateDigestSet, Hash as _, Round,
+};
+use std::collections::{BTreeMap, VecDeque};
 use tracing::{debug, warn};
 
 /// Warn when pending certificates exceed this threshold.
@@ -23,12 +25,12 @@ struct PendingCertificate {
     certificate: Certificate,
     /// The certificate's missing parents that must be retrieved before the pending certificate is
     /// accepted.
-    missing_parent_digests: HashSet<CertificateDigest>,
+    missing_parent_digests: CertificateDigestSet,
 }
 
 impl PendingCertificate {
     /// Create a new instance of Self.
-    fn new(certificate: Certificate, missing_parents: HashSet<CertificateDigest>) -> Self {
+    fn new(certificate: Certificate, missing_parents: CertificateDigestSet) -> Self {
         Self { certificate, missing_parent_digests: missing_parents }
     }
 }
@@ -41,15 +43,15 @@ impl PendingCertificate {
 /// NOTE: all pending certificates must be verified.
 #[derive(Debug)]
 pub(super) struct PendingCertificateManager {
-    /// Each certificate entry tracks both the certificate itself and its dependency state
-    ///
     /// Pending certificates that cannot be accepted yet.
-    pending: HashMap<CertificateDigest, PendingCertificate>,
-    /// Map of a the missing certificate digests and the pending certificates that are blocked by
+    ///
+    /// Each entry tracks both the certificate itself and its dependency state.
+    pending: CertificateDigestMap<PendingCertificate>,
+    /// Map of the missing certificate digests and the pending certificates that are blocked by
     /// them.
     ///
     /// The keys are (round, digest) to enable garbage collection by round.
-    missing_for_pending: BTreeMap<(Round, CertificateDigest), HashSet<CertificateDigest>>,
+    missing_for_pending: BTreeMap<(Round, CertificateDigest), CertificateDigestSet>,
     /// Consensus channels.
     consensus_bus: ConsensusBus,
 }
@@ -64,7 +66,7 @@ impl PendingCertificateManager {
     pub(super) fn insert_pending(
         &mut self,
         certificate: Certificate,
-        missing_parents: HashSet<CertificateDigest>,
+        missing_parents: CertificateDigestSet,
     ) -> CertManagerResult<()> {
         let digest = certificate.digest();
         let parent_round = certificate.round().saturating_sub(1);
@@ -100,6 +102,8 @@ impl PendingCertificateManager {
             self.missing_for_pending.entry((parent_round, parent)).or_default().insert(digest);
         }
 
+        let _ = self.consensus_bus.suspended_cert_count().send(self.pending.len());
+        // metrics mirror only - decisions read the watch above
         self.consensus_bus
             .primary_metrics()
             .node_metrics
@@ -189,7 +193,7 @@ impl PendingCertificateManager {
         Some((round, digest))
     }
 
-    /// Returns whether a certificate is being tracked
+    /// Returns whether a certificate is being tracked.
     pub(super) fn is_pending(&self, digest: &CertificateDigest) -> bool {
         self.pending.contains_key(digest)
     }

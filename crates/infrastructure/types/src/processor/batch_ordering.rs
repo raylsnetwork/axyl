@@ -150,10 +150,11 @@ impl From<&BatchOrderingState> for StoredBatchOrderingState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{encode, try_decode, Batch, ExecHeader};
+    use crate::{encode, try_decode, Batch, Bytes, ExecHeader};
 
     fn legacy_state_with_parked() -> BatchOrderingState {
-        let batch = Batch::new_for_test(vec![vec![0u8; 64]], ExecHeader::default(), 0, 0, 7);
+        let batch =
+            Batch::new_for_test(vec![Bytes::from(vec![0u8; 64])], ExecHeader::default(), 0, 0, 7);
         let digest = batch.digest();
         let prepared = PreparedBatch {
             batch: Arc::new(batch),

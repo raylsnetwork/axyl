@@ -36,8 +36,13 @@ use tracing::{debug, error, info, warn};
 
 use crate::batch::BatchOrdering;
 
-/// Maximum queued outputs for execution.
-const MAX_QUEUED_OUTPUTS: usize = 100;
+/// Admission ceiling for the local execution queue.
+///
+/// At the ceiling the engine stops draining its inbound channel instead of growing the queue, so
+/// execution lag backs up the channel and reaches consensus as backpressure rather than being
+/// absorbed as memory (each queued output owns its transaction payloads). Nothing is dropped:
+/// unadmitted outputs wait in the channel until the queue drains.
+pub const MAX_QUEUED_OUTPUTS: usize = 100;
 
 /// Type alias for the blocking task that executes consensus output and returns the finalized
 /// [`SealedHeader`].
@@ -379,8 +384,16 @@ impl<DB: Database> Future for ExecutorEngine<DB> {
         }
 
         loop {
-            // check if output is available from consensus to keep broadcast stream from "lagging"
-            match this.consensus_output_stream.poll_next_unpin(cx) {
+            // At capacity, leave the output in the inbound channel: that is what carries the
+            // backpressure to consensus (see [`MAX_QUEUED_OUTPUTS`]). No waker is registered on
+            // the stream here; the pending execution task wakes the engine when it completes, and
+            // admission resumes once the queue has room.
+            let poll = if this.queued.len() >= MAX_QUEUED_OUTPUTS {
+                Poll::Pending
+            } else {
+                this.consensus_output_stream.poll_next_unpin(cx)
+            };
+            match poll {
                 Poll::Ready(Some((came_from, output))) => {
                     // Dedup and order on the deterministic `(epoch, leader_round)` + subdag
                     // digest, not the node-local `number` (which can drift across handoffs).
@@ -481,18 +494,7 @@ impl<DB: Database> Future for ExecutorEngine<DB> {
                         tracker.output_received(output.number);
                     }
 
-                    // Warn if queue is growing too large - indicates execution lag
-                    if this.queued.len() >= MAX_QUEUED_OUTPUTS {
-                        warn!(
-                            target: "engine",
-                            queue_size = this.queued.len(),
-                            "Execution queue at capacity ({MAX_QUEUED_OUTPUTS}), \
-                             consensus is producing faster than execution can consume"
-                        );
-                    }
                     // Queue the output for local execution.
-                    // We accept even when at capacity to preserve consensus correctness,
-                    // but the warning above indicates a performance issue.
                     this.queued.push_back((came_from, output))
                 }
                 Poll::Ready(None) => {

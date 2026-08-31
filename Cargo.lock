@@ -7792,6 +7792,7 @@ dependencies = [
  "assert_matches",
  "async-trait",
  "backoff",
+ "bcs",
  "consensus-metrics",
  "eyre",
  "futures",
@@ -7848,7 +7849,6 @@ version = "1.3.0"
 dependencies = [
  "assert_matches",
  "async-trait",
- "consensus-metrics",
  "eyre",
  "futures",
  "indexmap 2.13.0",

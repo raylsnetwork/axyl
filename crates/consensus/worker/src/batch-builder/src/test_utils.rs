@@ -6,7 +6,7 @@ use rayls_execution_evm::{
     SenderIdentifiers, TxPool,
 };
 use rayls_infrastructure_types::{
-    Batch, BatchBuilderArgs, Recovered, TransactionTrait as _, TxHash,
+    Batch, BatchBuilderArgs, Bytes, Recovered, TransactionTrait as _, TxHash,
     ETHEREUM_BLOCK_GAS_LIMIT_56BITS, MIN_PROTOCOL_BASE_FEE,
 };
 use std::{
@@ -16,8 +16,7 @@ use std::{
 
 /// Attempt to update batch with accurate header information.
 ///
-/// NOTE: this is loosely based on reth's auto-seal consensus
-/// NOTE2: this assumes worker 0.
+/// NOTE: loosely based on reth's auto-seal consensus; assumes worker 0.
 pub fn execute_test_batch(test_batch: &mut Batch) {
     let pool = TestPool::new(&test_batch.transactions);
 
@@ -30,7 +29,7 @@ pub fn execute_test_batch(test_batch: &mut Batch) {
     // Don't reset base_fee_per_gas, some tests need that value to remain.
 }
 
-/// A test pool that ensures every transaction is in the pending pool
+/// A test pool that treats every transaction as pending.
 #[derive(Default, Clone, Debug)]
 struct TestPool {
     transactions: Vec<Arc<PoolTxn>>,
@@ -58,7 +57,7 @@ impl TxPool for TestPool {
 
 impl TestPool {
     /// Create a new instance of Self.
-    fn new(txs: &[Vec<u8>]) -> Self {
+    fn new(txs: &[Bytes]) -> Self {
         let mut sender_ids = SenderIdentifiers::default();
         let mut by_id = Vec::with_capacity(txs.len());
         let transactions = txs
@@ -131,7 +130,7 @@ struct BestTestTransactions {
 }
 
 impl BestTestTransactions {
-    /// Mark the transaction and it's descendants as invalid.
+    /// Marks the transaction and its descendants as invalid.
     fn mark_invalid(&mut self, tx: &Arc<PoolTxn>) {
         self.invalid.insert(*tx.hash());
     }
@@ -143,7 +142,7 @@ impl BestTransactions for BestTestTransactions {
     }
 
     fn no_updates(&mut self) {
-        // does not need to implement it for tests because tests does not push data while running
+        // no-op: tests never push transactions while the iterator runs
     }
 
     fn skip_blobs(&mut self) {

@@ -1,14 +1,10 @@
-//! Node implementation for reth compatibility
+//! Worker-side stand-in for the reth network traits its RPC namespaces require.
 //!
-//! Inspired by reth_node_ethereum crate.
-//!
-//! A network implementation for worker RPC.
-//!
-//! This is useful for wiring components together that don't require network but still need to be
-//! generic over it.
+//! Workers have no devp2p network, but reth's `net`, `web3`, and `eth` RPC modules are generic
+//! over one; this answers their queries from the worker's libp2p peer count and leaves the
+//! `admin`-only methods as no-ops.
 
 use crate::{reth_env::ChainSpec, WorkerTxPool};
-use parking_lot::RwLock;
 use rayls_consensus_worker::WorkerNetworkHandle;
 use reth::{network::config::SecretKey, rpc::builder::RpcServerHandle};
 use reth_chainspec::ChainSpec as RethChainSpec;
@@ -21,7 +17,10 @@ use reth_network_api::{
 use reth_network_peers::{Enr, NodeRecord, PeerId as RethPeerId};
 use std::{
     net::{IpAddr, SocketAddr},
-    sync::Arc,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
     time::Duration,
 };
 
@@ -32,7 +31,7 @@ pub struct WorkerComponents {
     rpc_handle: RpcServerHandle,
     /// The worker's transaction pool.
     pool: WorkerTxPool,
-    /// Keep the WorkerNetwork around so we can update it's task(s).
+    /// Network stand-in, kept so its peer-count task can be respawned each epoch.
     network: WorkerNetwork,
 }
 
@@ -42,7 +41,7 @@ impl WorkerComponents {
         Self { rpc_handle, pool, network }
     }
 
-    /// Return a reference to the rpc handle
+    /// Return a reference to the rpc handle.
     pub fn rpc_handle(&self) -> &RpcServerHandle {
         &self.rpc_handle
     }
@@ -52,23 +51,22 @@ impl WorkerComponents {
         self.pool.clone()
     }
 
-    /// Return the worker network inteface (RPC helper) for this worker.
+    /// Return the worker network interface (RPC helper) for this worker.
     pub fn worker_network(&self) -> &WorkerNetwork {
         &self.network
     }
 }
 
-/// A type that implements traits used by Reth for it's RPC.
-/// Traits are filled out to provide data for net, web3 and eth namespaces when available.
-/// Much of these traits are NO-OPS are not used, they support the admin namespace for
-/// instance which Rayls does not use or support.
+/// Implementation of the reth network traits behind the `net`, `web3`, and `eth` RPC namespaces.
+///
+/// Most methods are no-ops: they back the `admin` namespace, which Rayls does not serve.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct WorkerNetwork {
-    /// Chainspec
+    /// Chain spec.
     chain_spec: RethChainSpec,
-    /// Track our peer count for queries.
-    peer_count: Arc<RwLock<usize>>,
+    /// Connected peer count, refreshed by the polling task and served to `net_peerCount`.
+    peer_count: Arc<AtomicUsize>,
     /// App version.
     version: &'static str,
 }
@@ -80,7 +78,7 @@ impl WorkerNetwork {
         worker_network: WorkerNetworkHandle,
         version: &'static str,
     ) -> Self {
-        let peer_count = Arc::new(RwLock::new(0));
+        let peer_count = Arc::new(AtomicUsize::new(0));
         Self::spawn_peer_count_task(&peer_count, worker_network);
         Self { chain_spec: chain_spec.reth_chain_spec(), peer_count, version }
     }
@@ -91,22 +89,18 @@ impl WorkerNetwork {
         Self::spawn_peer_count_task(&self.peer_count, worker_network);
     }
 
-    /// Rayls: Spawn peer count polling task.
-    fn spawn_peer_count_task(peer_count: &Arc<RwLock<usize>>, worker_network: WorkerNetworkHandle) {
+    /// Spawn the peer-count polling task on the handle's task spawner.
+    fn spawn_peer_count_task(peer_count: &Arc<AtomicUsize>, worker_network: WorkerNetworkHandle) {
         let peer_count = peer_count.clone();
         let spawner = worker_network.get_task_spawner().clone();
         spawner.spawn_task("Worker Network Peers", async move {
-            // Use a bounded number of iterations as a safety check
-            // This ensures the task doesn't run forever even if abort fails
-            // The task will be re-spawned on epoch change anyway
+            // Bounded so a task that outlives its abort cannot poll forever; the epoch rollover
+            // respawns it.
             const MAX_ITERATIONS: u32 = 10_000; // ~41 hours at 15 sec intervals
             for _ in 0..MAX_ITERATIONS {
-                // Check peer count - this is interruptible
                 if let Ok(peers) = worker_network.connected_peers_count().await {
-                    let mut guard = peer_count.write();
-                    *guard = peers;
+                    peer_count.store(peers, Ordering::Relaxed);
                 }
-                // Sleep is interruptible by task abort
                 tokio::time::sleep(Duration::from_secs(15)).await;
             }
             tracing::debug!(target: "worker", "Peer count task reached max iterations, exiting");
@@ -153,7 +147,7 @@ impl NetworkInfo for WorkerNetwork {
 impl PeersInfo for WorkerNetwork {
     // net_peerCount
     fn num_connected_peers(&self) -> usize {
-        *self.peer_count.read()
+        self.peer_count.load(Ordering::Relaxed)
     }
 
     // Rayls Unused

@@ -100,9 +100,9 @@ pub(crate) struct CertificateFetcher<DB> {
     /// The max allowable RPC message size shared with peers (in bytes).
     /// This value should match the `request_response` codec's "max_rpc_message_size".
     max_rpc_message_size: usize,
-    /// Track consecutive fetch failures for exponential backoff
+    /// Track consecutive fetch failures for exponential backoff.
     consecutive_failures: u32,
-    /// Last fetch attempt time for rate limiting
+    /// Last fetch attempt time for rate limiting.
     last_fetch_attempt: Option<Instant>,
     /// Suppresses probes until this instant after an epoch-mismatch outcome.
     /// Prevents tight spin when all peers are on a future epoch.
@@ -786,7 +786,8 @@ async fn fetch_certificates_helper(
                     result
                 }));
             }
-            let mut interval = Box::pin(sleep(request_interval));
+            let interval = sleep(request_interval);
+            tokio::pin!(interval);
             tokio::select! {
                 res = fut.next() => match res {
                     Some(Ok(certificates)) => {
