@@ -14,9 +14,9 @@ async-trait = { workspace = true }
 rayls-infrastructure-types = { workspace = true }
 rayls-execution-evm = { workspace = true }
 rayon = { workspace = true }
+tokio = { workspace = true, features = ["rt"] }
 tracing = { workspace = true }
 dashmap = { workspace = true }
-rustc-hash = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

@@ -18,8 +18,8 @@ use rayls_infrastructure_storage::tables::{BatchSeqCounter, Batches, ConsensusBl
 use rayls_infrastructure_types::{
     batch_tracker::{BatchTracker, SealFailureReason},
     error::BlockSealError,
-    AuthorityIdentifier, BatchReceiver, BatchSender, BatchValidation, Database, Epoch, SealedBatch,
-    SenderNonceRanges, TaskKind, TaskManager, WorkerId,
+    AuthorityIdentifier, BatchReceiver, BatchSender, BatchValidation, Bytes, Database, Epoch,
+    SealedBatch, SenderNonceRanges, TaskKind, TaskManager, WorkerId,
 };
 use std::{sync::Arc, time::Duration};
 use tracing::{error, info, warn};
@@ -329,7 +329,8 @@ impl<DB: Database, QW: QuorumWaiterTrait> Worker<DB, QW> {
     /// Send all the txns in sealed_batch to CVVs so they can be included in blocks.
     /// Use this when not a CVV so that transactions you accept can be included in a block.
     pub async fn disburse_txns(&self, sealed_batch: SealedBatch) -> Result<(), BlockSealError> {
-        if let Err(err) = self.network_handle.publish_txn(sealed_batch.batch.transactions).await {
+        let payloads = sealed_batch.batch.transactions.into_iter().map(Bytes::from).collect();
+        if let Err(err) = self.network_handle.publish_txn(payloads).await {
             error!(target: "worker::batch_provider", "Error publishing transaction: {err}");
         }
         Ok(())

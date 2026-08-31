@@ -1,59 +1,56 @@
-//! Block validator
+//! Validation of peer batches and admission of gossiped and forwarded transactions.
 
 use rayls_execution_evm::{
-    bytes_to_txn, chainspec::RaylsHardforks, recover_signed_transaction, reth_env::RethEnv,
-    EthPooledTransaction, FixedBytes, PoolErrorKind, WorkerTxPool,
+    bytes_to_txn, chainspec::RaylsHardforks, recover_pooled_transaction,
+    recover_signed_transaction, reth_env::RethEnv, EthPooledTransaction, FixedBytes, PoolErrorKind,
+    PoolTransaction as _, WorkerTxPool,
 };
 use rayls_infrastructure_types::{
-    gas_accumulator::BaseFeeContainer, max_batch_size, BatchValidation, BatchValidationError,
-    BlockHash, Epoch, SealedBatch, SubmitBatchError, TransactionSigned, TransactionTrait as _,
-    WorkerId,
+    fxhash_slot_digest, gas_accumulator::BaseFeeContainer, legacy_slot_digest, max_batch_size,
+    BatchValidation, BatchValidationError, BlockHash, Bytes, CommitteeSlots, Epoch, SealedBatch,
+    SubmitBatchError, TransactionSigned, TransactionTrait as _, WorkerId,
 };
 use rayon::iter::{IntoParallelRefIterator as _, ParallelIterator as _};
 
 use dashmap::DashMap;
-use rustc_hash::FxHasher;
-use std::hash::Hasher;
 use tracing::{debug, trace, warn};
 
-/// Type convenience for implementing block validation errors.
+/// Result alias for batch validation.
 type BatchValidationResult<T> = Result<T, BatchValidationError>;
 
-/// Pre-`TransactionLoadBalancing` slot digest: read the first 8 bytes as little-endian u64.
-/// Caller must ensure `tx.len() >= 8`.
-fn legacy_slot_digest(tx: &[u8]) -> u64 {
-    let mut bytes = [0u8; 8];
-    bytes.copy_from_slice(&tx[0..8]);
-    u64::from_le_bytes(bytes)
+/// Recover signers in parallel above this many transactions; below it the rayon fan-out costs more
+/// than it saves.
+const PARALLEL_PARSE_THRESHOLD: usize = 100;
+
+/// Recover signers for forwarded transactions, in parallel once the batch is large enough.
+///
+/// Invalid encodings are dropped; the pool validates the rest and reports any that are stale.
+fn recover_forwarded_txns<T: AsRef<[u8]> + Sync>(txs_bytes: &[T]) -> Vec<EthPooledTransaction> {
+    if txs_bytes.len() < PARALLEL_PARSE_THRESHOLD {
+        txs_bytes.iter().filter_map(|bytes| bytes_to_txn(bytes.as_ref()).ok()).collect()
+    } else {
+        txs_bytes.par_iter().filter_map(|bytes| bytes_to_txn(bytes.as_ref()).ok()).collect()
+    }
 }
 
-/// Post-`TransactionLoadBalancing` slot digest: `FxHasher` over the full transaction bytes.
-/// Do NOT replace with `FxBuildHasher::hash_one(tx)`: that path writes a slice-length
-/// prefix and changes the digest.
-fn fxhash_slot_digest(tx: &[u8]) -> u64 {
-    let mut hasher = FxHasher::default();
-    hasher.write(tx);
-    hasher.finish()
-}
-
-/// Batch validator
-/// Important note about batch validation, we rely on libp2p to verify that
-/// batches came from a committee member.  This means we do not generate or
-/// check our own signatures for batches since they all came from current
-/// committee members.
+/// Validator for peer batches and the dispatch gate for inbound transactions.
+///
+/// Batches carry no signature of their own: libp2p authenticates the sending peer as a committee
+/// member, so validation checks only the batch contents.
 #[derive(Clone, Debug)]
 pub struct BatchValidator {
-    /// Database provider to encompass tree and provider factory.
+    /// Execution environment providing the canonical tip and the chain spec.
     reth_env: RethEnv,
-    /// A handle to the transaction pool for submitting gossipped transactions.
+    /// The transaction pool inbound transactions are admitted to; `None` on a node that does not
+    /// pool for the committee.
     tx_pool: Option<WorkerTxPool>,
     /// Worker id for this validator.
     worker_id: WorkerId,
-    /// Current base fee for this validators worker.
+    /// Current base fee for this validator's worker.
     base_fee: BaseFeeContainer,
     /// Epoch we are validating for.
     epoch: Epoch,
-    /// holds recently validated batches to prevent re-validation
+    /// Digests validated within the last minute, so a re-gossiped batch is not re-validated.
     validated_batches: DashMap<FixedBytes<32>, u64>,
     /// Block gas limit.
     gas_limit: u64,
@@ -95,21 +92,15 @@ impl BatchValidation for BatchValidator {
         // obtain info for validation
         let transactions = batch.transactions();
 
-        // validate batch size (bytes)
-        // Use the parent timestamp for consistency with the batch builder.
         self.validate_batch_size_bytes(transactions, batch.epoch)?;
 
-        // validate txs decode
         let decoded_txs = self.decode_transactions(transactions, digest)?;
 
-        // validate no txs are eip4844
         self.validate_no_blob_txs(&decoded_txs)?;
 
-        // validate gas limit
-        // Use the parent timestamp for consistency with the batch builder.
         self.validate_batch_gas(&decoded_txs)?;
 
-        // validate base fee- all batches for a worker and epoch have the same base fee.
+        // all batches for a worker and epoch share one base fee
         self.validate_basefee(batch.base_fee_per_gas)?;
 
         self.validated_batches.retain(|_, v| *v > rayls_infrastructure_types::now() - 60_000); // keep last minute
@@ -118,25 +109,38 @@ impl BatchValidation for BatchValidator {
         Ok(())
     }
 
-    /// Submit a transaction received from the gossip pool to the worker's transaction pool.
-    /// This method is only active if the node is part of the committee.
+    /// Admit a gossiped transaction message to the pool when this node owns its committee slot.
+    ///
+    /// The message's first transaction decides the owner slot, so a forwarder must keep one
+    /// sender's run in a single message. A node without a pool ignores every message.
     fn submit_batch_if_mine(
         &self,
-        txs_bytes: &[Vec<u8>],
-        committee_size: u64,
-        committee_slot: u64,
+        txs_bytes: &[Bytes],
+        slots: &CommitteeSlots,
     ) -> Result<(), SubmitBatchError> {
         if let Some(tx_pool) = &self.tx_pool {
-            // loop to check if the batch is for this validator because some txns may be errors
             if let Some(tx) = txs_bytes.iter().next() {
                 if tx.len() < 8 {
                     return Err(SubmitBatchError::InvalidTransactionBytes);
                 }
-                let digest = self.slot_digest(tx);
-                if (digest % committee_size) != committee_slot {
+                // An empty slot table (a committee gap mid-transition) must not reach the
+                // modulo: division by zero aborts the node, and a gossip message must never
+                // be able to do that.
+                if slots.size() == 0 {
                     return Ok(());
                 }
-                trace!(target: "worker::validator", ?digest, "tx accepted as committee owner");
+                let owner = self.slot_digest(tx) % slots.size();
+                // Under sender-affinity a down owner's senders fail over to the next live slot on
+                // the ring; pre-fork ownership is exact, with no failover.
+                let mine = if self.sender_affinity_active() {
+                    slots.covers(owner)
+                } else {
+                    owner == slots.own_slot
+                };
+                if !mine {
+                    return Ok(());
+                }
+                trace!(target: "worker::validator", ?owner, "tx accepted as committee owner");
             }
 
             let parsed_txns = if txs_bytes.len() < 100 {
@@ -173,10 +177,28 @@ impl BatchValidation for BatchValidator {
 
         Ok(())
     }
+
+    async fn submit_forwarded_txns(&self, tx_bytes: Vec<Bytes>) -> Vec<BlockHash> {
+        let Some(tx_pool) = &self.tx_pool else {
+            return Vec::new();
+        };
+        // Recover signers off the runtime; the owned Vec moves straight into the blocking task.
+        let parsed =
+            match tokio::task::spawn_blocking(move || recover_forwarded_txns(&tx_bytes)).await {
+                Ok(parsed) => parsed,
+                // A cancelled blocking task means runtime teardown; ack nothing so the sender keeps
+                // the transactions and retries.
+                Err(e) => {
+                    warn!(target: "worker::validator", ?e, "signer recovery task did not complete");
+                    return Vec::new();
+                }
+            };
+        tx_pool.add_forwarded_txns(parsed).await
+    }
 }
 
 impl BatchValidator {
-    /// Create a new instance of [Self]
+    /// Create a validator for one worker and epoch.
     pub fn new(
         reth_env: RethEnv,
         tx_pool: Option<WorkerTxPool>,
@@ -258,23 +280,39 @@ impl BatchValidator {
         Ok(())
     }
 
-    /// Compute the committee-slot dispatch digest for a single transaction.
-    /// Branches on the `TransactionLoadBalancing` hardfork at the next block: pre-fork
-    /// uses [`legacy_slot_digest`], post-fork uses [`fxhash_slot_digest`]. Caller must
-    /// ensure `tx.len() >= 8`.
+    /// Compute the committee-slot dispatch digest for one transaction, which must be at least 8
+    /// bytes.
     ///
-    /// Gate reads the local canonical tip, so validators can briefly disagree on the
-    /// algorithm across the fork block. Worst case is more than one validator includes
-    /// the tx in a batch; the duplicate executions then fail with `nonce too low`. No
+    /// The algorithm follows the hardforks active at the next block: [`legacy_slot_digest`] of
+    /// the bytes, then [`fxhash_slot_digest`] of the bytes under `TransactionLoadBalancing`, then
+    /// [`fxhash_slot_digest`] of the recovered sender under `SenderAffinityLoadBalancing`. The
+    /// gate reads the local canonical tip, so validators can briefly disagree across a fork block;
+    /// the worst case is a duplicate inclusion that fails nonce-too-low at execution, never a
     /// consensus fork.
     fn slot_digest(&self, tx: &[u8]) -> u64 {
         let chain_spec = self.reth_env.rayls_chain_spec();
         let next_block = self.reth_env.canonical_tip().number + 1;
-        if chain_spec.is_transaction_load_balancing_active_at_block(next_block) {
+        if chain_spec.is_sender_affinity_load_balancing_active_at_block(next_block) {
+            // Key the slot on the sender so one validator owns a sender's whole nonce chain instead
+            // of consecutive ranges scattering across pools and parking nonce-gapped.
+            if let Ok(pooled) = recover_pooled_transaction(tx) {
+                return fxhash_slot_digest(pooled.sender().as_slice());
+            }
+            fxhash_slot_digest(tx)
+        } else if chain_spec.is_transaction_load_balancing_active_at_block(next_block) {
             fxhash_slot_digest(tx)
         } else {
             legacy_slot_digest(tx)
         }
+    }
+
+    /// Whether sender-affinity dispatch (and its live-successor failover) is active for the next
+    /// block. Reads the local canonical tip, so validators can briefly disagree across the fork.
+    fn sender_affinity_active(&self) -> bool {
+        let next_block = self.reth_env.canonical_tip().number + 1;
+        self.reth_env
+            .rayls_chain_spec()
+            .is_sender_affinity_load_balancing_active_at_block(next_block)
     }
 
     /// Validate the block's basefee.
@@ -287,7 +325,7 @@ impl BatchValidator {
         let tip = self.reth_env.canonical_tip();
         let next_block = tip.number + 1;
         if chain_spec.is_eip1559_active_at_block(next_block) {
-            // per-block EIP-1559 active - skip exact match
+            // the payload builder derives the base fee from the parent header; see above
             return Ok(());
         }
         let expected_base_fee = self.base_fee.base_fee();
@@ -298,7 +336,7 @@ impl BatchValidator {
         }
     }
 
-    /// Validate the block's basefee
+    /// Reject a batch carrying an EIP-4844 transaction: the blob sidecar does not travel with it.
     fn validate_no_blob_txs(
         &self,
         transactions: &[TransactionSigned],
@@ -309,7 +347,7 @@ impl BatchValidator {
         Ok(())
     }
 
-    /// Helper function for decoding and recovering transactions.
+    /// Decode and recover one transaction, attributing a failure to the batch digest.
     fn recover_and_validate(
         tx: &[u8],
         digest: BlockHash,
@@ -319,7 +357,7 @@ impl BatchValidator {
     }
 }
 
-/// Noop validation struct that validates any block.
+/// Validator that accepts every batch and admits nothing.
 #[cfg(any(test, feature = "test-utils"))]
 #[derive(Default, Clone, Debug)]
 pub struct NoopBatchValidator;
@@ -333,11 +371,14 @@ impl BatchValidation for NoopBatchValidator {
 
     fn submit_batch_if_mine(
         &self,
-        _tx_bytes: &[Vec<u8>],
-        _committee_size: u64,
-        _committee_slot: u64,
+        _tx_bytes: &[Bytes],
+        _slots: &CommitteeSlots,
     ) -> Result<(), SubmitBatchError> {
         Ok(())
+    }
+
+    async fn submit_forwarded_txns(&self, _tx_bytes: Vec<Bytes>) -> Vec<BlockHash> {
+        Vec::new()
     }
 }
 
@@ -461,9 +502,9 @@ mod tests {
         let task_manager = TaskManager::default();
         let TestTools { validator, .. } = test_tools(tmp_dir.path(), &task_manager).await;
 
-        let txs = vec![vec![0u8; 4]];
+        let txs = vec![Bytes::from(vec![0u8; 4])];
         assert_matches!(
-            validator.submit_batch_if_mine(&txs, 4, 0),
+            validator.submit_batch_if_mine(&txs, &CommitteeSlots::all_live(4, 0)),
             Err(SubmitBatchError::InvalidTransactionBytes)
         );
     }
@@ -479,9 +520,12 @@ mod tests {
         let committee_size = 4_u64;
         let matching_slot = legacy_slot_digest(&FIXED_TX_BYTES) % committee_size;
         let mismatching_slot = (matching_slot + 1) % committee_size;
-        let txs = vec![FIXED_TX_BYTES.to_vec()];
+        let txs = vec![Bytes::from(FIXED_TX_BYTES.to_vec())];
         assert_matches!(
-            validator.submit_batch_if_mine(&txs, committee_size, mismatching_slot),
+            validator.submit_batch_if_mine(
+                &txs,
+                &CommitteeSlots::all_live(committee_size as usize, mismatching_slot)
+            ),
             Ok(())
         );
     }
@@ -495,9 +539,12 @@ mod tests {
 
         let committee_size = 4_u64;
         let matching_slot = legacy_slot_digest(&FIXED_TX_BYTES) % committee_size;
-        let txs = vec![FIXED_TX_BYTES.to_vec()];
+        let txs = vec![Bytes::from(FIXED_TX_BYTES.to_vec())];
         assert_matches!(
-            validator.submit_batch_if_mine(&txs, committee_size, matching_slot),
+            validator.submit_batch_if_mine(
+                &txs,
+                &CommitteeSlots::all_live(committee_size as usize, matching_slot)
+            ),
             Ok(())
         );
     }
@@ -509,8 +556,11 @@ mod tests {
         let task_manager = TaskManager::default();
         let TestTools { validator, .. } = test_tools(tmp_dir.path(), &task_manager).await;
 
-        let txs: Vec<Vec<u8>> = Vec::new();
-        assert_matches!(validator.submit_batch_if_mine(&txs, 4, 0), Ok(()));
+        let txs: Vec<Bytes> = Vec::new();
+        assert_matches!(
+            validator.submit_batch_if_mine(&txs, &CommitteeSlots::all_live(4, 0)),
+            Ok(())
+        );
     }
 
     #[serial]
@@ -532,8 +582,11 @@ mod tests {
 
         // tx_pool=None short-circuits before any slot computation, so even a too-short tx
         // is silently ignored.
-        let txs = vec![vec![0u8; 4]];
-        assert_matches!(validator.submit_batch_if_mine(&txs, 4, 0), Ok(()));
+        let txs = vec![Bytes::from(vec![0u8; 4])];
+        assert_matches!(
+            validator.submit_batch_if_mine(&txs, &CommitteeSlots::all_live(4, 0)),
+            Ok(())
+        );
     }
 
     /// Return the next valid sealed batch
@@ -964,5 +1017,128 @@ mod tests {
             validator.validate_batch(batch.clone().seal_slow()).await,
             Err(BatchValidationError::InvalidTx4844(_))
         );
+    }
+
+    #[serial]
+    #[tokio::test]
+    async fn sender_affinity_routes_a_sender_nonce_chain_to_one_slot() {
+        use rayls_execution_evm::RaylsChainSpec;
+        use rayls_infrastructure_types::RaylsNetwork;
+
+        let tmp_dir = TempDir::new().unwrap();
+        let task_manager = TaskManager::default();
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        // Local activates SenderAffinityLoadBalancing at block 0.
+        let rayls_chain_spec = Arc::new(
+            RaylsChainSpec::builder(chain.clone()).rayls_hardforks(RaylsNetwork::Local).build(),
+        );
+        let reth_env = RethEnv::new_for_temp_chain_with_rayls_spec(
+            chain.clone(),
+            rayls_chain_spec,
+            tmp_dir.path(),
+            &task_manager,
+            None,
+        )
+        .await
+        .unwrap();
+        let gas_price = reth_env.get_gas_price().unwrap();
+        let validator = BatchValidator::new(
+            reth_env,
+            None,
+            0,
+            BaseFeeContainer::default(),
+            0,
+            ETHEREUM_BLOCK_GAS_LIMIT_56BITS,
+        );
+
+        // two transactions from one sender at consecutive nonces
+        let mut factory = TransactionFactory::new();
+        let value = U256::from(1_000_000_000u64);
+        let tx0 = factory
+            .create_eip1559(
+                chain.clone(),
+                None,
+                gas_price,
+                Some(Address::ZERO),
+                value,
+                Bytes::new(),
+            )
+            .encoded_2718();
+        let tx1 = factory
+            .create_eip1559(
+                chain.clone(),
+                None,
+                gas_price,
+                Some(Address::ZERO),
+                value,
+                Bytes::new(),
+            )
+            .encoded_2718();
+
+        // the two encodings genuinely differ (different nonces)...
+        assert_ne!(fxhash_slot_digest(&tx0), fxhash_slot_digest(&tx1));
+        // ...yet sender-affinity keys the slot on the shared sender, so both route to one owner
+        assert_eq!(validator.slot_digest(&tx0), validator.slot_digest(&tx1));
+
+        // and that slot is exactly the fxhash of the sender address, not of the tx bytes
+        let sender = recover_pooled_transaction(&tx0).unwrap().sender();
+        assert_eq!(validator.slot_digest(&tx0), fxhash_slot_digest(sender.as_slice()));
+    }
+
+    #[serial]
+    #[tokio::test]
+    async fn submit_forwarded_txns_reports_only_nonce_too_low_as_stale() {
+        use rayls_infrastructure_types::{GenesisAccount, U256};
+
+        let tmp_dir = TempDir::new().unwrap();
+        let task_manager = TaskManager::default();
+        let mut factory = TransactionFactory::new();
+        // Seed the sender at nonce 1, so its nonce-0 transaction is already executed (stale) while
+        // its nonce-1 transaction is the next valid one.
+        let genesis = test_genesis().extend_accounts([(
+            factory.address(),
+            GenesisAccount::default().with_balance(U256::MAX).with_nonce(Some(1)),
+        )]);
+        let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+        let reth_env =
+            RethEnv::new_for_temp_chain(chain.clone(), tmp_dir.path(), &task_manager, None)
+                .await
+                .unwrap();
+        let tx_pool = reth_env.init_txn_pool().unwrap();
+        let gas_price = reth_env.get_gas_price().unwrap();
+        let validator = BatchValidator::new(
+            reth_env,
+            Some(tx_pool),
+            0,
+            BaseFeeContainer::default(),
+            0,
+            ETHEREUM_BLOCK_GAS_LIMIT_56BITS,
+        );
+
+        let value = U256::from(1);
+        factory.set_nonce(0);
+        let stale_tx = factory.create_eip1559(
+            chain.clone(),
+            None,
+            gas_price,
+            Some(Address::ZERO),
+            value,
+            Bytes::new(),
+        );
+        factory.set_nonce(1);
+        let ok_tx = factory.create_eip1559(
+            chain.clone(),
+            None,
+            gas_price,
+            Some(Address::ZERO),
+            value,
+            Bytes::new(),
+        );
+
+        let payloads =
+            vec![Bytes::from(stale_tx.encoded_2718()), Bytes::from(ok_tx.encoded_2718())];
+        let stale = validator.submit_forwarded_txns(payloads).await;
+
+        assert_eq!(stale, vec![*stale_tx.hash()], "only the nonce-too-low tx is reported stale");
     }
 }

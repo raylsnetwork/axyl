@@ -87,7 +87,7 @@ impl ExecutionNode {
         guard.respawn_worker_network_tasks(network_handle).await
     }
 
-    /// Batch maker
+    /// Spawn the batch builder for one epoch.
     pub async fn start_batch_builder(
         &self,
         worker_id: WorkerId,
@@ -112,7 +112,31 @@ impl ExecutionNode {
             .await
     }
 
-    /// Batch validator
+    /// Spawn the observer transaction forwarder for one epoch.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn start_txn_forwarder(
+        &self,
+        worker_id: WorkerId,
+        network_handle: WorkerNetworkHandle,
+        executed_anchor: watch::Receiver<ConsensusHeader>,
+        last_seen_header: watch::Receiver<ConsensusHeader>,
+        committee: Vec<BlsPublicKey>,
+        task_spawner: &TaskSpawner,
+        max_gossip_message_size: usize,
+    ) -> eyre::Result<()> {
+        let guard = self.internal.read().await;
+        guard.start_txn_forwarder(
+            worker_id,
+            network_handle,
+            executed_anchor,
+            last_seen_header,
+            committee,
+            task_spawner,
+            max_gossip_message_size,
+        )
+    }
+
+    /// Create the batch validator for one epoch.
     pub async fn new_batch_validator(
         &self,
         worker_id: &WorkerId,
