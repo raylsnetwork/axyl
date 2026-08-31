@@ -14,9 +14,7 @@ use rayls_infrastructure_config::ConsensusConfig;
 use rayls_infrastructure_network_types::{
     local::LocalNetwork, WorkerOwnBatchMessage, WorkerToPrimaryClient,
 };
-use rayls_infrastructure_storage::tables::{
-    BatchSeqCounter, Batches, ConsensusBlocks, NodeBatchesCache,
-};
+use rayls_infrastructure_storage::tables::{BatchSeqCounter, Batches, ConsensusBlocks};
 use rayls_infrastructure_types::{
     batch_tracker::{BatchTracker, SealFailureReason},
     error::BlockSealError,
@@ -361,12 +359,6 @@ impl<DB: Database, QW: QuorumWaiterTrait> Worker<DB, QW> {
         );
 
         let (batch, digest) = sealed_batch.split();
-        if let Err(e) = self.store.insert::<NodeBatchesCache>(&digest, &batch) {
-            // Cache the batch early, avoid race conditions.
-            // Note the cache should be cleared every epoch after processing.
-            error!(target: "worker::batch_provider", "Store failed (batch cache) with error: {:?}", e);
-            return Err(BlockSealError::FatalDBFailure);
-        }
         if let Some(tracker) = &self.batch_tracker {
             tracker.batch_sealed(digest, batch.transactions.len(), &sender_nonce_ranges);
         }

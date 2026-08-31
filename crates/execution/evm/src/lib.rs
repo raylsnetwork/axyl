@@ -23,7 +23,7 @@ pub use reth_provider::{AccountReader, CanonStateNotificationStream, ExecutionOu
 pub use reth_rpc_eth_types::EthApiError;
 pub use reth_tracing::FileWorkerGuard;
 pub use reth_transaction_pool::{
-    error::{InvalidPoolTransactionError, PoolError, PoolTransactionError},
+    error::{InvalidPoolTransactionError, PoolError, PoolErrorKind, PoolTransactionError},
     identifier::SenderIdentifiers,
     BestTransactions, EthPooledTransaction, PoolTransaction, TransactionPool as TransactionPoolT,
 };

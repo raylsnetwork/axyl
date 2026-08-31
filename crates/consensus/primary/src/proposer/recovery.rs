@@ -1,8 +1,13 @@
 use crate::proposer::{types::ProposerDigest, Proposer, DIGEST_QUEUE_WARN_THRESHOLD};
-use rayls_infrastructure_storage::tables::NodeBatchesCache;
-use rayls_infrastructure_types::{Database, DbTxMut, Round};
+use rayls_infrastructure_types::{batch_tracker::RequeueReason, Database, Header, Round};
 use std::collections::VecDeque;
 use tracing::{debug, warn};
+
+/// Rounds below a foreign commit round before an uncommitted own header is re-proposed.
+///
+/// Ordinary commit lag (certificates still collecting votes) stays inside the grace window, so
+/// only a header that has clearly missed its commit is retransmitted.
+pub(super) const FALLBACK_REQUEUE_GRACE_ROUNDS: Round = 4;
 
 impl<DB: Database> Proposer<DB> {
     /// Rayls: Push a batch digest; never drops.
@@ -22,114 +27,112 @@ impl<DB: Database> Proposer<DB> {
         self.digests.push_back(digest);
     }
 
-    /// Rayls: Evict proposed headers beyond gc_depth from current round.
-    pub(super) fn evict_old_proposed_headers(&mut self) {
-        if self.round <= self.gc_depth {
-            return;
-        }
-        let gc_round = self.round - self.gc_depth;
-        let old_count = self.proposed_headers.len();
-
-        // Remove all headers from rounds at or before gc_round
-        self.proposed_headers.retain(|&round, _| round > gc_round);
-
-        let evicted = old_count - self.proposed_headers.len();
-        if evicted > 0 {
-            debug!(
-                target: "primary::proposer",
-                evicted,
-                gc_round,
-                current_round = self.round,
-                remaining = self.proposed_headers.len(),
-                "Evicted old proposed headers"
-            );
-        }
+    /// Re-queues the payload digests of `headers` ahead of the pending queue and reports them to
+    /// the batch tracker under `reason`; returns how many digests were re-queued.
+    fn requeue_front<'a>(
+        &mut self,
+        headers: impl IntoIterator<Item = &'a Header>,
+        reason: RequeueReason,
+    ) -> usize {
+        let mut requeued: VecDeque<ProposerDigest> = headers
+            .into_iter()
+            .flat_map(|header| header.payload().into_iter())
+            .map(|(digest, worker_id)| ProposerDigest { digest: *digest, worker_id: *worker_id })
+            .collect();
+        let count = requeued.len();
+        self.consensus_bus
+            .batch_tracker()
+            .digests_requeued_in_proposer(requeued.iter().map(|d| d.digest), reason);
+        requeued.append(&mut self.digests);
+        self.digests = requeued;
+        count
     }
 
-    /// Process notifications that Proposer's own headers have been committed in the DAG for a
-    /// particular round.
+    /// Rayls: Drop proposed headers more than `gc_depth` below the committed round, re-queueing
+    /// their digests (upstream never evicts proposed headers; the requeue keeps its never-drop
+    /// rule on this fork-added path).
     ///
-    /// Committed headers are removed from the collection of `self.proposed_headers`. Headers
-    /// that are skipped with no hope of being committed (proposed in a previous round) are also
-    /// removed after adding the expired header's proposed block digests and system messages to
-    /// the beginning of the queue.
+    /// The horizon keys on the committed round, not `self.round`: commits trail the proposal
+    /// frontier, so a header in the lag window is still committable. Commit rounds are monotone,
+    /// so every future leader round L >= C and an evicted round R <= C - gc_depth is already
+    /// excluded by `order_dag`; re-proposing its digests cannot double-commit the old header.
+    /// Re-queueing is mandatory: the digests are quorum'd and seq-consumed, so dropping them gaps
+    /// the original seq permanently on peers. Queue growth is bounded by the seal-ahead gate.
+    pub(super) fn evict_old_proposed_headers(&mut self) {
+        let committed = *self.consensus_bus.committed_round_updates().borrow();
+        let Some(gc_round) = committed.checked_sub(self.gc_depth) else {
+            return;
+        };
+        if gc_round == 0 {
+            return;
+        }
+
+        // rounds <= gc_round stay behind in `self.proposed_headers`, the rest are retained
+        let retained = self.proposed_headers.split_off(&gc_round.saturating_add(1));
+        let evicted_headers = std::mem::replace(&mut self.proposed_headers, retained);
+        if evicted_headers.is_empty() {
+            return;
+        }
+
+        let requeued_digests = self.requeue_front(evicted_headers.values(), RequeueReason::GcEvict);
+
+        debug!(
+            target: "primary::proposer",
+            evicted = evicted_headers.len(),
+            requeued_digests,
+            gc_round,
+            current_round = self.round,
+            remaining = self.proposed_headers.len(),
+            "Evicted old proposed headers, requeued their digests"
+        );
+    }
+
+    /// Processes a commit notification for the proposer's own headers.
     ///
-    /// This method ensures batches that were previously proposed but weren't committed are
-    /// added back to the queue so their transactions are included in the next proposal.
+    /// Committed rounds leave `self.proposed_headers`; headers old enough that they can no longer
+    /// commit are removed too, with their payload digests re-queued at the front so the batches
+    /// land in the next proposal.
     pub(super) fn process_committed_headers(
         &mut self,
         commit_round: Round,
-        committed_headers: Vec<(Round, bool)>,
+        committed_headers: Vec<Round>,
     ) {
-        // Each `(round, dropped)`: skip NodeBatchesCache cleanup for a header whose subdag reaches
-        // the epoch boundary — the subscriber drops its output, so orphan_batches must still find
-        // its batches to rescue them. `dropped` is computed per-commit in the committer (where the
-        // subdag commit_timestamp and epoch_boundary are known) and carried on the channel — no
-        // shared transition flag, no TOCTOU.
-
-        // drain every committed round (not just the lowest-matching one) so later
-        // rounds cannot be re-queued by the retransmit loop below
-        for (round, dropped) in committed_headers.iter().copied() {
-            let Some(header) = self.proposed_headers.remove(&round) else { continue };
-            if dropped {
-                continue;
-            }
-            let _ = self.proposer_store.with_write_txn(|txn| {
-                for (batch_hash, _) in header.payload() {
-                    let _ = txn.remove::<NodeBatchesCache>(batch_hash);
-                }
-                Ok(())
-            });
+        // drain every committed round (not just the lowest) so the retransmit split below cannot
+        // re-queue a round that already committed
+        for round in committed_headers.iter().copied() {
+            self.proposed_headers.remove(&round);
         }
 
         // Fall back to the commit round when none of our own headers committed: otherwise a
         // validator whose proposals keep getting rejected strands its quorum'd digests (consumed
-        // seqs) in proposed_headers until GC, leaving a permanent per-authority seq gap on peers.
-        let highest_committed =
-            committed_headers.iter().map(|(r, _)| *r).max().unwrap_or(commit_round);
-        let Some(&lowest_uncommitted) = self.proposed_headers.keys().next() else { return };
-        if lowest_uncommitted >= highest_committed {
+        // seqs) in proposed_headers until the GC-horizon requeue, parking its batches on peers for
+        // gc_depth rounds. Unlike the own-commit key this is NOT airtight: a requeued header below
+        // a foreign commit round may still commit later (this authority's last_committed did not
+        // advance), so the original AND the re-proposal can both land.
+        // `ExecutedBatchRegistry::try_register` absorbs that duplicate at execution admission, so
+        // the registry dedup is load-bearing here: do not weaken one without the other. The
+        // horizon sits `FALLBACK_REQUEUE_GRACE_ROUNDS` below the commit round so ordinary commit
+        // lag never triggers it.
+        let highest_committed = committed_headers
+            .iter()
+            .copied()
+            .max()
+            .unwrap_or_else(|| commit_round.saturating_sub(FALLBACK_REQUEUE_GRACE_ROUNDS));
+        // Split at the horizon: rounds below it are retransmitted; rounds at or above are fresh
+        // (certificates still collecting votes) and the normal commit path handles them, so
+        // re-queueing those would only create duplicates.
+        let fresh = self.proposed_headers.split_off(&highest_committed);
+        let retransmitted = std::mem::replace(&mut self.proposed_headers, fresh);
+        if retransmitted.is_empty() {
             return;
         }
 
-        // re-insert batches for any proposed header from a round below the current commit
-        //
-        // ensure batches are FIFO to re-send them
-        //
-        // payloads: oldest -> newest
-        let mut digests_to_resend = VecDeque::new();
-        // Oldest to newest rounds.
-        let mut retransmit_rounds = Vec::new();
-
-        // loop through proposed headers in order by round
-        for (header_round, header) in &mut self.proposed_headers {
-            let mut digests = header
-                .payload()
-                .into_iter()
-                .map(|(k, v)| ProposerDigest { digest: *k, worker_id: *v })
-                .collect();
-
-            // add payloads and system messages from oldest to newest
-            digests_to_resend.append(&mut digests);
-            retransmit_rounds.push(*header_round);
-        }
-
-        // process rounds that need to be retransmitted
-        if retransmit_rounds.is_empty() {
-            return;
-        }
-
-        let num_digests_to_resend = digests_to_resend.len();
-
-        // prepend missing batches from previous round and update `self`
-        digests_to_resend.append(&mut self.digests);
-        self.digests = digests_to_resend;
-
-        // remove the old headers that failed
-        // the proposed blocks are included in the next header
-        for round in &retransmit_rounds {
-            self.proposed_headers.remove(round);
-        }
+        // Re-queued, never dropped: these digests are quorum'd and seq-consumed, so dropping one
+        // gaps that seq permanently on peers. Pinned by
+        // `digests_survive_gc_advance_and_later_round_commit`.
+        let retransmit_rounds: Vec<Round> = retransmitted.keys().copied().collect();
+        let num_digests_to_resend =
+            self.requeue_front(retransmitted.values(), RequeueReason::CommitLag);
 
         warn!(
             target: "primary::proposer",

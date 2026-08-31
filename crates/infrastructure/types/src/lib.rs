@@ -58,8 +58,9 @@ pub use alloy::{
     genesis::{Genesis, GenesisAccount},
     hex::{self, FromHex},
     primitives::{
-        address, hex_literal, keccak256, map::B256Set, Address, BlockHash, BlockNumber, Bloom,
-        Bytes, Sealable, TxHash, TxKind, B256, U160, U256,
+        address, hex_literal, keccak256,
+        map::{B256Map, B256Set},
+        Address, BlockHash, BlockNumber, Bloom, Bytes, Sealable, TxHash, TxKind, B256, U160, U256,
     },
     rpc::types::{AccessList, Withdrawals},
     signers::Signature as EthSignature,

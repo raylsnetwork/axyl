@@ -229,6 +229,15 @@ impl BatchOrderingHarness {
             let mut batch = Batch::new_for_test(vec![], ExecHeader::default(), 0, 0, seq);
             batch.beneficiary = beneficiary;
             batch.base_fee_per_gas = MIN_PROTOCOL_BASE_FEE;
+            // Seed the batch body row. In production the engine's store is the consensus DB, where
+            // every committed batch is stored before execution and the by-digest parked
+            // persistence reloads bodies on restart; the harness's separate ordering DB models
+            // that here.
+            self.ordering_store
+                .as_ref()
+                .expect("ordering_store open")
+                .insert::<rayls_infrastructure_storage::tables::Batches>(&batch.digest(), &batch)
+                .expect("seed batch body row");
             digests.push_back(batch.digest());
             certified.push(CertifiedBatch { address: beneficiary, batches: vec![batch] });
         }

@@ -673,7 +673,7 @@ where
             self.collect_epoch_votes(&primary, epoch_rec, &epoch_task_manager).await;
         }
 
-        // biased: shutdown > boundary > mode_transition > task crash
+        // biased: node shutdown > consensus shutdown > boundary > mode_transition > task crash
         // snapshot before select: join() fires shutdown as side-effect
         let was_externally_shutdown = epoch_shutdown_rx.noticed();
 
@@ -681,6 +681,12 @@ where
             biased;
 
             _ = node_ended => RunningOutcome::NodeShutdown,
+
+            // An external consensus shutdown arriving during the select resolves here rather than
+            // through the join arm below, where a critical task exiting Ok in response to it would
+            // be misclassified as a crash and kill the node. `was_externally_shutdown` only
+            // samples the state before the select, so it cannot catch a notify that lands during.
+            _ = epoch_shutdown_rx => RunningOutcome::NodeShutdown,
 
             res = self.detect_epoch_boundary(epoch_boundary, to_engine, consensus_output) => {
                 match res {

@@ -2,7 +2,7 @@
 
 use rayls_execution_evm::{
     bytes_to_txn, chainspec::RaylsHardforks, recover_signed_transaction, reth_env::RethEnv,
-    EthPooledTransaction, FixedBytes, WorkerTxPool,
+    EthPooledTransaction, FixedBytes, PoolErrorKind, WorkerTxPool,
 };
 use rayls_infrastructure_types::{
     gas_accumulator::BaseFeeContainer, max_batch_size, BatchValidation, BatchValidationError,
@@ -14,7 +14,7 @@ use rayon::iter::{IntoParallelRefIterator as _, ParallelIterator as _};
 use dashmap::DashMap;
 use rustc_hash::FxHasher;
 use std::hash::Hasher;
-use tracing::{trace, warn};
+use tracing::{debug, trace, warn};
 
 /// Type convenience for implementing block validation errors.
 type BatchValidationResult<T> = Result<T, BatchValidationError>;
@@ -154,9 +154,18 @@ impl BatchValidation for BatchValidator {
             let tx_pool = tx_pool.clone();
             self.reth_env.get_task_spawner().spawn_task("submit-tx-batch", async move {
                 for tx in parsed_txns.into_iter().flatten() {
-                    let res = tx_pool.add_raw_transaction_external(tx).await;
-                    if let Err(e) = res {
-                        warn!(target: "worker::validator", "failed to submit gossipped txn: {e}");
+                    match tx_pool.add_raw_transaction_external(tx).await {
+                        Ok(_) => {}
+                        // A hash this pool already holds is ordinary gossip dedup: multiple
+                        // observers forward overlapping pools, and a forwarder re-sends what
+                        // it cannot confirm landed. Under load this is the common outcome, so
+                        // logging it at warn buries the submissions that did fail.
+                        Err(e) if matches!(e.kind, PoolErrorKind::AlreadyImported) => {
+                            debug!(target: "worker::validator", "gossipped txn already in pool: {e}");
+                        }
+                        Err(e) => {
+                            warn!(target: "worker::validator", "failed to submit gossipped txn: {e}");
+                        }
                     }
                 }
             });
@@ -278,7 +287,7 @@ impl BatchValidator {
         let tip = self.reth_env.canonical_tip();
         let next_block = tip.number + 1;
         if chain_spec.is_eip1559_active_at_block(next_block) {
-            // per-block EIP-1559 active — skip exact match
+            // per-block EIP-1559 active - skip exact match
             return Ok(());
         }
         let expected_base_fee = self.base_fee.base_fee();

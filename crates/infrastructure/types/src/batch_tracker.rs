@@ -45,6 +45,11 @@ pub enum BatchStage {
     /// Parked batch discarded at the epoch boundary instead of force executed; its txs stay
     /// pooled.
     DiscardedAtBoundary = 1 << 13,
+    /// Proposer requeued the digest for re-proposal (GC eviction or a missed commit window).
+    RequeuedInProposer = 1 << 14,
+    /// Parked batch force-drained by the epoch-boundary reset (pre OutputSeqNormalization only;
+    /// the fork discards instead).
+    ForceDrained = 1 << 15,
 }
 
 impl fmt::Display for BatchStage {
@@ -64,6 +69,8 @@ impl fmt::Display for BatchStage {
             Self::Parked => "Parked",
             Self::SealFailed => "SealFailed",
             Self::DiscardedAtBoundary => "DiscardedAtBoundary",
+            Self::RequeuedInProposer => "RequeuedInProposer",
+            Self::ForceDrained => "ForceDrained",
         })
     }
 }
@@ -77,6 +84,24 @@ pub enum SealFailureReason {
     QuorumJoin,
     /// The primary never acknowledged the batch report, so the digest never reached the proposer.
     ReportUnacknowledged,
+}
+
+/// Why the proposer requeued a header's digests for re-proposal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RequeueReason {
+    /// GC evicted the proposed header past the committed-round horizon.
+    GcEvict,
+    /// The header missed its commit window while a later round committed.
+    CommitLag,
+}
+
+impl fmt::Display for RequeueReason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::GcEvict => "gc_evict",
+            Self::CommitLag => "commit_lag",
+        })
+    }
 }
 
 impl fmt::Display for SealFailureReason {
@@ -159,7 +184,7 @@ impl BatchEntry {
     }
 
     fn stages_str(&self) -> String {
-        const ALL: [BatchStage; 14] = [
+        const ALL: [BatchStage; 16] = [
             BatchStage::Sealed,
             BatchStage::QuorumReached,
             BatchStage::ReportedToPrimary,
@@ -174,6 +199,8 @@ impl BatchEntry {
             BatchStage::Parked,
             BatchStage::SealFailed,
             BatchStage::DiscardedAtBoundary,
+            BatchStage::RequeuedInProposer,
+            BatchStage::ForceDrained,
         ];
         ALL.iter().filter(|s| self.has(**s)).map(|s| s.to_string()).collect::<Vec<_>>().join(",")
     }
@@ -191,7 +218,6 @@ struct OutputEntry {
 pub struct BatchTracker {
     batches: DashMap<crate::BlockHash, BatchEntry>,
     outputs: DashMap<u64, OutputEntry>,
-    // counters
     total_tracked: AtomicU64,
     total_dropped_proposer: AtomicU64,
     total_txs_dropped: AtomicU64,
@@ -216,7 +242,7 @@ impl Default for BatchTracker {
 }
 
 impl BatchTracker {
-    /// Create a new tracker.
+    /// Creates an empty tracker.
     pub fn new() -> Self {
         Self {
             batches: DashMap::new(),
@@ -280,6 +306,18 @@ impl BatchTracker {
         let mut entry = self.batches.entry(digest).or_default();
         entry.mark(BatchStage::ReportedToPrimary);
         trace!(target: "batch_tracker", ?digest, "batch_reported_to_primary");
+    }
+
+    /// Proposer requeued a header's digests for re-proposal.
+    pub fn digests_requeued_in_proposer(
+        &self,
+        digests: impl IntoIterator<Item = crate::BlockHash>,
+        reason: RequeueReason,
+    ) {
+        for digest in digests {
+            self.batches.entry(digest).or_default().mark(BatchStage::RequeuedInProposer);
+            trace!(target: "batch_tracker", ?digest, %reason, "digest_requeued_in_proposer");
+        }
     }
 
     /// Proposer received a digest.
@@ -377,6 +415,15 @@ impl BatchTracker {
         trace!(target: "batch_tracker", ?digest, "batch_parked");
     }
 
+    /// Parked batch force-drained by the epoch-boundary reset: its predecessor seq never executed
+    /// in the batch's created epoch, so it executes out of order at the boundary. Pre
+    /// OutputSeqNormalization only; the fork discards instead.
+    pub fn batch_force_drained(&self, digest: crate::BlockHash, seq: u64) {
+        let mut entry = self.batches.entry(digest).or_default();
+        entry.mark(BatchStage::ForceDrained);
+        warn!(target: "batch_tracker", ?digest, seq, "batch_force_drained");
+    }
+
     /// Parked batch discarded whole at the epoch boundary instead of force executed out of
     /// order; its txs stay pooled and are re-sealed in the new epoch.
     pub fn batch_discarded_at_boundary(&self, digest: crate::BlockHash, seq: u64) {
@@ -459,11 +506,10 @@ impl BatchTracker {
         }
     }
 
-    /// Check for batches stuck at intermediate stages and log gaps.
+    /// Logs batches stuck at an intermediate stage and evicts stale entries.
     ///
-    /// Call periodically (e.g. every 30s or on each new block notification).
-    /// Combines stuck-batch detection and cleanup in a single `retain` pass
-    /// to avoid multiple O(n) iterations over the DashMap.
+    /// Call periodically. Detection and cleanup share one `retain` pass so the map is walked
+    /// once.
     pub fn check_gaps(&self) {
         let now = Instant::now();
         let stale_threshold = std::time::Duration::from_secs(60);
@@ -499,7 +545,6 @@ impl BatchTracker {
             true // keep
         });
 
-        // Always log periodic summary at info level so it's visible
         let total_tracked = self.total_tracked.load(Ordering::Relaxed);
         let total_dropped = self.total_dropped_proposer.load(Ordering::Relaxed);
         let total_txs_dropped = self.total_txs_dropped.load(Ordering::Relaxed);
@@ -533,7 +578,7 @@ impl BatchTracker {
         self.check_output_gaps();
     }
 
-    /// Detect gaps in output numbers.
+    /// Warns on gaps between tracked output numbers.
     fn check_output_gaps(&self) {
         let mut numbers: Vec<u64> = self.outputs.iter().map(|e| *e.key()).collect();
         if numbers.len() < 2 {
@@ -554,7 +599,7 @@ impl BatchTracker {
         }
     }
 
-    /// Log a summary of current tracking state.
+    /// Logs a summary of the current tracking state.
     pub fn summary(&self) {
         trace!(
             target: "batch_tracker",

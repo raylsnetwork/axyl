@@ -145,7 +145,9 @@ impl<DB: Database> Processor<DB> {
             );
         }
 
-        debug_assert_eq!(
+        // Release assert: a mismatch would otherwise surface as a messageless index abort in the
+        // raw digest indexing below.
+        assert_eq!(
             batches.len(),
             output.batch_digests.len(),
             "uneven number of sealed blocks from batches and batch digests"
@@ -334,7 +336,9 @@ impl<DB: Database> Processor<DB> {
                 }
             }
             // V1: no dedup check (batches were registered at park time)
-
+            if let Some(tracker) = &self.batch_tracker {
+                tracker.batch_force_drained(parked.batch_digest, parked.batch.seq);
+            }
             let (header, _) =
                 self.execute_prepared_batch(&parked, canonical_header, None, &mut executed_blocks)?;
             canonical_header = header;

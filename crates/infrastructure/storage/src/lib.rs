@@ -92,9 +92,10 @@ pub mod tables {
     #[cfg(feature = "cold-storage")]
     use crate::cold::ColdLocation;
     use rayls_infrastructure_types::{
-        batch_ordering::BatchOrderingState as TypeBatchOrderingState, AuthorityIdentifier, Batch,
-        BlockHash, Certificate, CertificateDigest, ConsensusHeader, Epoch, EpochCertificate,
-        EpochRecord, EpochTransitionCheckpoint, Header, Round, VoteInfo, WorkerId, B256,
+        batch_ordering::StoredBatchOrderingState as TypeStoredBatchOrderingState,
+        AuthorityIdentifier, Batch, BlockHash, Certificate, CertificateDigest, ConsensusHeader,
+        Epoch, EpochCertificate, EpochRecord, EpochTransitionCheckpoint, Header, Round, VoteInfo,
+        WorkerId, B256,
     };
 
     tables!(
@@ -113,7 +114,9 @@ pub mod tables {
         ConsensusBlockNumbersByDigest;crate::CONSENSUS_BLOCK_NUMBER_BY_DIGEST_CF;<BlockHash, u64>,
         // This is a cache to store verified but unprocessed consensus headers, remove once processed.
         ConsensusBlocksCache;crate::CONSENSUS_BLOCK_CACHE_CF;<u64, ConsensusHeader>,
-        // This is a cache to store this nodes batches before consensus, remove once in a ConsensusHeader.
+        // No longer written: graceful-shutdown txpool persistence replaced the seal-time batch
+        // cache. Retained so existing databases keep a stable column-family set; still cleared
+        // on foreign-DB sanitization to purge rows written by older binaries.
         NodeBatchesCache;crate::NODE_BATCHES_CACHE_CF;<BlockHash, Batch>,
         // These tables are for the epoch chain not the normal consensus.
         EpochRecords;crate::EPOCH_RECORDS_CF;<Epoch, EpochRecord>,
@@ -131,7 +134,7 @@ pub mod tables {
         // Node identity: stores this validator's AuthorityIdentifier for foreign DB detection.
         NodeIdentity;crate::NODE_IDENTITY_CF;<u8, AuthorityIdentifier>,
         // Batch ordering state for the current epoch.
-        BatchOrderingState;crate::BATCH_ORDERING_STATE_CF;<u8, TypeBatchOrderingState>
+        BatchOrderingState;crate::BATCH_ORDERING_STATE_CF;<u8, TypeStoredBatchOrderingState>
     );
 
     // Cold-tier tables, compiled only with the `cold-storage` feature.
