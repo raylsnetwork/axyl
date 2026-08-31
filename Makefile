@@ -9,6 +9,11 @@ BASE_DIR:=$(shell basename $(ROOT_DIR))
 # Default tag is latest if not specified
 TAG ?= latest
 
+# Date-pinned nightly for rustfmt — unstable-option behavior drifts between
+# nightlies, so fmt must match CI (.github/workflows/pr.yaml fmt job).
+# Install with: rustup toolchain install $(FMT_NIGHTLY) --profile minimal --component rustfmt
+FMT_NIGHTLY := nightly-2026-06-24
+
 help:
 	@echo ;
 	@echo "make attest" ;
@@ -33,7 +38,7 @@ help:
 	@echo "    :::> Test restart integration tests." ;
 	@echo ;
 	@echo "make fmt" ;
-	@echo "    :::> cargo +nightly fmt" ;
+	@echo "    :::> cargo +$(FMT_NIGHTLY) fmt (date-pinned to match the CI fmt check)" ;
 	@echo ;
 	@echo "make clippy" ;
 	@echo "    :::> Cargo +nightly clippy for all features with fix enabled." ;
@@ -86,9 +91,9 @@ test-faucet:
 test-restarts:
 	cargo test test_restarts -- --ignored ;
 
-# format using +nightly toolchain
+# format using the pinned nightly toolchain (same as the CI fmt check)
 fmt:
-	cargo +nightly fmt ;
+	cargo +$(FMT_NIGHTLY) fmt ;
 
 # clippy formatter + try to fix problems
 clippy:

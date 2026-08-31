@@ -48,10 +48,13 @@ jobs:
       # rustfmt.toml uses nightly-only options (wrap_comments, comment_width,
       # format_code_in_doc_comments, doc_comment_code_block_width), so the check
       # must run on nightly rustfmt — stable would silently ignore them.
+      # The nightly is date-pinned because unstable-option behavior drifts
+      # between nightlies (keep in sync with the Makefile fmt target and
+      # rustfmt.toml); bump the pin together with a reformat commit.
       - name: Install nightly rustfmt
         uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
         with:
-          toolchain: nightly
+          toolchain: nightly-2026-06-24
           components: rustfmt
 
       # --check fails (non-zero exit) if any file is not formatted per rustfmt.toml
