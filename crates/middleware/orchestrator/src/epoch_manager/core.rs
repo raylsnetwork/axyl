@@ -143,7 +143,9 @@ where
         let EpochState { epoch, .. } = engine.epoch_state_from_canonical_tip().await?;
 
         // load persisted BatchOrdering or reconstruct from chain history when missing
-        let batch_ordering = BatchOrdering::from_history(self.consensus_db.clone(), epoch);
+        let execution_address = self.builder.rayls_infrastructure_config.execution_address();
+        let batch_ordering =
+            BatchOrdering::from_history(self.consensus_db.clone(), epoch, execution_address);
 
         // The engine's dedup anchor MUST be the EL execution anchor (the consensus header the
         // highest executed EVM block commits to), NOT the consensus-chain tip. The anchor marks the

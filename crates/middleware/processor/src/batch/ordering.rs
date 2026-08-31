@@ -21,6 +21,28 @@ use tracing::{debug, info, warn};
 struct BatchOrderingInner<DB: BatchOrderingStore> {
     batch_ordering_state: Mutex<BatchOrderingState>,
     batch_ordering_store: DB,
+    /// This node's execution address, the one authority whose sequence the watch tracks.
+    authority: Address,
+    /// The highest accepted sequence for `authority`; the batch builder paces on it.
+    executed_own_watermark: tokio::sync::watch::Sender<Option<u64>>,
+}
+
+impl<DB: BatchOrderingStore> BatchOrderingInner<DB> {
+    /// Advances the own-authority accepted-sequence watch, ignoring other authorities and
+    /// regressions.
+    fn update_executed_watermark(&self, authority: Address, watermark: Option<u64>) {
+        if authority != self.authority {
+            return;
+        }
+
+        self.executed_own_watermark.send_if_modified(|p| {
+            let updated = watermark > *p;
+            if updated {
+                *p = watermark
+            }
+            updated
+        });
+    }
 }
 
 /// Per-authority batch ordering with parking and epoch-reset.
@@ -30,19 +52,31 @@ pub struct BatchOrdering<DB: BatchOrderingStore> {
 }
 
 impl<DB: Database> BatchOrdering<DB> {
-    /// Create an ordering over `store` seeded with `batch_ordering_state`.
-    pub fn new(store: DB, batch_ordering_state: BatchOrderingState) -> Self {
+    /// Creates the ordering over `store`, seeding the own-authority watch for `address` from the
+    /// given state.
+    pub fn new(store: DB, batch_ordering_state: BatchOrderingState, address: &Address) -> Self {
+        let last_executed_watermark =
+            batch_ordering_state.authorities.get(address).and_then(|s| s.last_executed_seq);
+
         Self {
             inner: Arc::new(BatchOrderingInner {
                 batch_ordering_state: Mutex::new(batch_ordering_state),
                 batch_ordering_store: store,
+                authority: *address,
+                executed_own_watermark: tokio::sync::watch::Sender::new(last_executed_watermark),
             }),
         }
     }
 
-    /// Create an ordering over `store` with no recorded authorities.
+    /// Creates the ordering with no prior state and a zero authority address.
     pub fn new_with_empty_state(store: DB) -> Self {
-        Self::new(store, Default::default())
+        Self::new(store, Default::default(), &Default::default())
+    }
+
+    /// Subscribes to this authority's highest accepted batch sequence, the pacing signal the
+    /// builder uses to resume after a restart and to bound how far ahead of execution it seals.
+    pub fn executed_own_watermark(&self) -> tokio::sync::watch::Receiver<Option<u64>> {
+        self.inner.executed_own_watermark.subscribe()
     }
 
     /// Try to accept a batch for the given authority.
@@ -91,6 +125,7 @@ impl<DB: Database> BatchOrdering<DB> {
                         "parking limit reached, executing batch out of order"
                     );
                     auth.last_executed_seq = Some(batch_seq);
+                    self.inner.update_executed_watermark(authority, Some(batch_seq));
                     // Drop the parked entries the forced jump abandoned: drain_consecutive only
                     // looks at last_executed_seq + 1, so they can never drain, and leaving them
                     // pins parked.len() at the limit (every later gap force-executes forever).
@@ -120,6 +155,7 @@ impl<DB: Database> BatchOrdering<DB> {
         }
 
         auth.last_executed_seq = Some(batch_seq);
+        self.inner.update_executed_watermark(authority, Some(batch_seq));
         AcceptResult::InOrder(prepared)
     }
 
@@ -129,7 +165,7 @@ impl<DB: Database> BatchOrdering<DB> {
     /// and the next epoch's first output leaves the closing epoch's parked batches undrained (so
     /// `persisted.epoch` lags by one), and reseeding would drop them and fork the chain short.
     /// State further behind is stale and reseeded.
-    pub fn from_history(store: DB, current_epoch: Epoch) -> Self {
+    pub fn from_history(store: DB, current_epoch: Epoch, address: &Address) -> Self {
         let mut state = store
             .read_batch_ordering_state()
             .expect("BatchOrdering: initial DB read failed")
@@ -149,7 +185,7 @@ impl<DB: Database> BatchOrdering<DB> {
             state.authorities = recovered;
             state.epoch = current_epoch;
         }
-        Self::new(store, state)
+        Self::new(store, state, address)
     }
 
     /// Drains consecutive parked batches starting from the next expected seq into `collected`.
@@ -165,7 +201,7 @@ impl<DB: Database> BatchOrdering<DB> {
         check_dedup: bool,
     ) {
         loop {
-            let parked = {
+            let (next_seq, parked) = {
                 let mut state = self.inner.batch_ordering_state.lock();
                 let Some(auth) = state.authorities.get_mut(&authority) else {
                     break;
@@ -175,11 +211,15 @@ impl<DB: Database> BatchOrdering<DB> {
                 match auth.parked.remove(&next_seq) {
                     Some(parked) => {
                         auth.last_executed_seq = Some(next_seq);
-                        parked
+                        (next_seq, parked)
                     }
                     None => break,
                 }
             };
+
+            // Draining a parked own batch advances execution just as an in-order accept does, so
+            // the builder's pacing watch must track it too, or the seal-ahead budget never reopens.
+            self.inner.update_executed_watermark(authority, Some(next_seq));
 
             if check_dedup {
                 if !executed_batch_registry.try_register(parked.batch_digest, parked.output_digest)
@@ -442,7 +482,7 @@ mod tests {
         let auth = Address::from([7u8; 20]);
         write_consensus_block(&store, 1, 3, auth, 100);
 
-        let ord = BatchOrdering::from_history(store, 3);
+        let ord = BatchOrdering::from_history(store, 3, &auth);
         let state = ord.inner.batch_ordering_state.lock();
         assert_eq!(state.epoch, 3);
         assert_eq!(state.authorities.get(&auth).unwrap().last_executed_seq, Some(100));
@@ -463,7 +503,7 @@ mod tests {
 
         write_consensus_block(&store, 1, 3, auth, 999);
 
-        let ord = BatchOrdering::from_history(store, 3);
+        let ord = BatchOrdering::from_history(store, 3, &auth);
         let state = ord.inner.batch_ordering_state.lock();
         assert_eq!(state.authorities.get(&auth).unwrap().last_executed_seq, Some(50));
     }
@@ -510,7 +550,7 @@ mod tests {
         // A history reseed against the post-boundary epoch would rebuild empty parked.
         write_consensus_block(&store, 1, 88, auth, 1441);
 
-        let ord = BatchOrdering::from_history(store, 88);
+        let ord = BatchOrdering::from_history(store, 88, &auth);
 
         {
             let state = ord.inner.batch_ordering_state.lock();
@@ -522,6 +562,73 @@ mod tests {
         // the boundary drain on the first new-epoch output flushes them as their own blocks
         let drained = ord.drain_epoch(88);
         assert_eq!(drained.len(), 5, "parked batches drain into the new epoch");
+    }
+
+    #[test]
+    fn executed_own_watermark_tracks_own_authority_monotonically() {
+        // The builder resumes and paces sealing off this watch, so it must reflect only our own
+        // accepted sequence, never regress, and ignore other authorities' progress.
+        let store = MemDatabase::default();
+        let me = Address::from([1u8; 20]);
+        let other = Address::from([2u8; 20]);
+        let ord = BatchOrdering::new(store, BatchOrderingState::default(), &me);
+        let mut watermark = ord.executed_own_watermark();
+
+        assert_eq!(*watermark.borrow_and_update(), None, "no batch accepted yet");
+
+        assert!(matches!(
+            ord.try_accept(me, 1, make_parked(me, 1), false),
+            AcceptResult::InOrder(_)
+        ));
+        assert_eq!(*watermark.borrow_and_update(), Some(1), "own in-order accept advances it");
+
+        assert!(matches!(
+            ord.try_accept(other, 9, make_parked(other, 9), false),
+            AcceptResult::InOrder(_)
+        ));
+        assert_eq!(*watermark.borrow(), Some(1), "a foreign authority must not advance our mark");
+
+        assert!(matches!(
+            ord.try_accept(me, 2, make_parked(me, 2), false),
+            AcceptResult::InOrder(_)
+        ));
+        assert_eq!(*watermark.borrow_and_update(), Some(2), "next own seq advances it");
+
+        assert!(matches!(
+            ord.try_accept(me, 1, make_parked(me, 1), false),
+            AcceptResult::InOrder(_)
+        ));
+        assert_eq!(*watermark.borrow(), Some(2), "a stale re-accept must not regress the mark");
+    }
+
+    #[test]
+    fn executed_own_watermark_advances_when_parked_own_batches_drain() {
+        // The builder paces on this watch, so a parked-then-drained own batch must advance it just
+        // like an in-order accept, or the seal-ahead budget stays exhausted and the builder stalls.
+        let store = MemDatabase::default();
+        let me = Address::from([1u8; 20]);
+        let ord = BatchOrdering::new(store, BatchOrderingState::default(), &me);
+        let mut watermark = ord.executed_own_watermark();
+
+        assert!(matches!(
+            ord.try_accept(me, 1, make_parked(me, 1), false),
+            AcceptResult::InOrder(_)
+        ));
+        assert_eq!(*watermark.borrow_and_update(), Some(1));
+
+        // seq 3 arrives before seq 2, so it parks and the watch holds
+        assert!(matches!(ord.try_accept(me, 3, make_parked(me, 3), false), AcceptResult::Parked));
+        assert_eq!(*watermark.borrow(), Some(1));
+
+        // seq 2 closes the gap; draining then flushes the parked seq 3 for execution
+        assert!(matches!(
+            ord.try_accept(me, 2, make_parked(me, 2), false),
+            AcceptResult::InOrder(_)
+        ));
+        let mut collected = Vec::new();
+        ord.drain_consecutive(me, &mut collected, &ExecutedBatchRegistry::default(), None, false);
+        assert_eq!(collected.len(), 1, "the parked batch drains for execution");
+        assert_eq!(*watermark.borrow(), Some(3), "the watch tracks the drained own batch");
     }
 
     #[test]

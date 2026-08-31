@@ -207,7 +207,7 @@ async fn recovery_seeds_state_and_enforces_ordering() {
     fixture.append_block(EPOCH, vec![(AUTH_A, vec![2])]);
     fixture.append_block(EPOCH, vec![(AUTH_A, vec![3]), (AUTH_B, vec![2])]);
 
-    let ord = BatchOrdering::from_history(fixture.db().clone(), EPOCH);
+    let ord = BatchOrdering::from_history(fixture.db().clone(), EPOCH, &AUTH_A);
 
     // in-order accept for AUTH_A at seq=4 (last=3 -> next=4)
     let r = ord.try_accept(AUTH_A, 4, make_prepared(AUTH_A, 4), false);
@@ -249,7 +249,7 @@ async fn recovery_filters_prior_epoch_blocks() {
     fixture.append_block(EPOCH - 1, vec![(AUTH_A, vec![99])]); // prior epoch - ignored
     fixture.append_block(EPOCH, vec![(AUTH_A, vec![10])]);
 
-    let ord = BatchOrdering::from_history(fixture.db().clone(), EPOCH);
+    let ord = BatchOrdering::from_history(fixture.db().clone(), EPOCH, &AUTH_A);
 
     // last for AUTH_A should be 10 (from current epoch), not 99 (prior)
     let r = ord.try_accept(AUTH_A, 11, make_prepared(AUTH_A, 11), false);
@@ -279,7 +279,7 @@ async fn recovery_filters_prior_epoch_blocks() {
 async fn recovery_empty_history_inaugural_first_batch() {
     let fixture = ConsensusHistoryFixture::new();
 
-    let ord = BatchOrdering::from_history(fixture.db().clone(), EPOCH);
+    let ord = BatchOrdering::from_history(fixture.db().clone(), EPOCH, &AUTH_A);
 
     // no prior state for AUTH_A; first batch at any seq is the inaugural one
     let r = ord.try_accept(AUTH_A, 5, make_prepared(AUTH_A, 5), false);
@@ -309,7 +309,7 @@ async fn recovery_parks_gap_batch_after_state_loss() {
     }
 
     // recovery seeds last_executed_seq[AUTH_A] = 5
-    let ord = BatchOrdering::from_history(fixture.db().clone(), EPOCH);
+    let ord = BatchOrdering::from_history(fixture.db().clone(), EPOCH, &AUTH_A);
 
     // inject the gap batch: seq jumps from None/5 to N+3=8
     let r = ord.try_accept(AUTH_A, 8, make_prepared(AUTH_A, 8), false);
@@ -353,7 +353,7 @@ async fn recovery_at_full_epoch_scale_86400_blocks() {
     }
 
     let recover_start = Instant::now();
-    let ord = BatchOrdering::from_history(fixture.db().clone(), EPOCH);
+    let ord = BatchOrdering::from_history(fixture.db().clone(), EPOCH, &AUTH_A);
     let recover_elapsed = recover_start.elapsed();
     println!(
         "recovery: walked ~{} blocks in {:.3}s ({:.0} blocks/sec)",

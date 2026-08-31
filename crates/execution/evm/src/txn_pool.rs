@@ -24,8 +24,8 @@ use reth_transaction_pool::{
     identifier::TransactionId,
     maintain::{maintain_transaction_pool_future, MaintainPoolConfig},
     AddedTransactionOutcome, BestTransactions, CoinbaseTipOrdering, EthPooledTransaction, Pool,
-    PoolSize, PoolTransaction, TransactionEvents, TransactionOrigin, TransactionPool as _,
-    TransactionPoolExt as _, ValidPoolTransaction,
+    PoolSize, PoolTransaction, TransactionEvents, TransactionListenerKind, TransactionOrigin,
+    TransactionPool as _, TransactionPoolExt as _, ValidPoolTransaction,
 };
 use std::{
     path::PathBuf,
@@ -202,6 +202,12 @@ impl WorkerTxPool {
     /// Returns the queued transactions (not yet executable).
     pub fn queued_transactions(&self) -> Vec<Arc<PoolTxn>> {
         self.pool.queued_transactions()
+    }
+
+    /// Subscribes to hashes as transactions enter the pending sub-pool, so the builder wakes
+    /// promptly on new candidates instead of waiting for the next batching-window tick.
+    pub fn pending_transactions_listener(&self) -> tokio::sync::mpsc::Receiver<TxHash> {
+        self.pool.pending_transactions_listener_for(TransactionListenerKind::All)
     }
 
     /// Returns the in-flight tracker shared with this pool's batch builder.
