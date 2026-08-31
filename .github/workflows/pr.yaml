@@ -59,7 +59,7 @@ jobs:
 
       # --check fails (non-zero exit) if any file is not formatted per rustfmt.toml
       - name: Check formatting
-        run: cargo +nightly fmt --all --check
+        run: cargo +nightly-2026-06-24 fmt --all --check
 
   # ===========================================================================
   # TESTS - Rust workspace tests, across feature sets
