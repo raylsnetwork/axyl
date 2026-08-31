@@ -329,7 +329,8 @@ impl<'a> DbTxMut for MemDbTxMut<'a> {
     }
 
     fn commit(self) -> eyre::Result<()> {
-        // no need to do anything, the lock finishes with the tx drop
+        // Infallible by design: dropping the write guard releases the lock and performs no I/O.
+        // `LayeredDbTxMut::commit` relies on this after it has already enqueued `CommitTxn`.
         Ok(())
     }
 }

@@ -42,9 +42,11 @@ hardfork!(
         Uups,
         /// Seed STOP bytecode at the native ERC-20 precompile to prevent EIP-161 cleanup.
         Erc20PrecompileBytecode,
-        /// Hash full tx bytes with FxHasher for committee-slot dispatch, replacing the first-8-bytes-as-u64 prefix.
+        /// Hash full tx bytes with FxHasher for committee-slot dispatch, replacing the
+        /// first-8-bytes-as-u64 prefix.
         TransactionLoadBalancing,
-        /// Rebase the USDR precompile's TOTAL_SUPPLY slot to match the true sum of native balances.
+        /// Rebase the USDR precompile's TOTAL_SUPPLY slot to match the true sum of native
+        /// balances.
         UsdrSupplyCorrection,
         /// Produce a fallback empty block for any consensus output that contributed no block
         /// (no batches, all deduped, or all parked), so every output maps to a block.
