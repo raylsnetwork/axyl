@@ -638,6 +638,10 @@ impl<'a, DB: Database> DbTxMut for LayeredDbTxMut<'a, DB> {
         }
         // Enqueue the commit before releasing the mem write lock: the next `write_txn` cannot
         // enqueue `StartTxn` until this lock drops, so channel order is StartTxn -> ops -> CommitTxn.
+        //
+        // This is safe because `MemDbTxMut::commit` is an infallible no-op that only drops the
+        // `parking_lot` write guard; it performs no I/O. If that ever becomes fallible, do not
+        // enqueue `CommitTxn` before the mem commit can fail.
         self.tx.send(DBMessage::CommitTxn).map_err(|_| eyre::eyre!("DB thread gone, FATAL!"))?;
         self.mem_db.commit()
     }
@@ -3039,9 +3043,11 @@ mod test {
             let _ = second_done.send(());
             result
         });
+        // Negative assertion: use a scheduling margin. A premature return inside this window is a
+        // serialization bug; absence of return is the expected blocked state.
         assert!(
             matches!(
-                second_rx.recv_timeout(std::time::Duration::from_millis(50)),
+                second_rx.recv_timeout(std::time::Duration::from_millis(500)),
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout)
             ),
             "a second write_txn must block while the first is still open"
