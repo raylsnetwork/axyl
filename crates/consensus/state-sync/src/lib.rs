@@ -655,6 +655,7 @@ async fn catch_up_consensus_from_to<DB: Database>(
         );
     }
     let db = config.node_storage();
+    let epoch = config.epoch();
     let mut result_header = from;
     let mut streamed = 0u64;
     for number in last_consensus_height + 1..=max_consensus_height {
@@ -687,6 +688,29 @@ async fn catch_up_consensus_from_to<DB: Database>(
                 }
             }
         };
+        // A streamed output whose subdag belongs to a CLOSED epoch is a post-boundary leak: this
+        // node has already transitioned past it, so re-executing it forks the chain (the live
+        // subscriber's cut and the DB-replay path in `collect_replayable_headers` both drop it).
+        // The forward streamer fetches by number and only chains by digest, so without this guard a
+        // lagging node keeps replaying epoch-tail stragglers into the new epoch. Halt here and let
+        // the streamer resume from the executed anchor for the current epoch.
+        let leader_epoch = consensus_header.sub_dag.leader_epoch();
+        if leader_epoch < epoch {
+            // Logged at `debug!`: this halt is an expected, self-healing condition, and the
+            // incomplete return schedules a 500ms retry that re-hits this row until the backwards
+            // walk overwrites it -- a `warn!` here would spam the exact slow-network window that
+            // triggers the leak. The real event is already recorded validator-side when the output
+            // is dropped past the epoch boundary.
+            debug!(
+                target: "rayls-consensus-state-sync",
+                number,
+                leader_epoch,
+                epoch,
+                "halting forward-streamer catch-up: streamed output belongs to a closed epoch (post-boundary leak)"
+            );
+            return Ok(result_header);
+        }
+
         let parent_hash = last_parent;
         last_parent =
             ConsensusHeader::digest_from_parts(parent_hash, &consensus_header.sub_dag, number);
