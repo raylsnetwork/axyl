@@ -63,7 +63,7 @@ pub fn build_batch<P: TxPool>(
     // Disable live transaction updates to prevent intra-sender nonce gaps.
     // The default BestTransactions iterator receives new pending transactions via a
     // broadcast channel during iteration. If a transaction arrives whose predecessor
-    // is not in the snapshot, it starts a new independent nonce chain — producing
+    // is not in the snapshot, it starts a new independent nonce chain, producing
     // batches with non-contiguous nonces that cause nonce_too_high at execution.
     best_txs.no_updates();
 
@@ -81,6 +81,15 @@ pub fn build_batch<P: TxPool>(
     // begin loop through sorted "best" transactions in pending pool
     // and execute them to build the block
     while let Some(pool_tx) = best_txs.next() {
+        // skip a transaction already sealed into a batch still in flight, so a stuck inclusion
+        // backlog is not re-sealed batch after batch. The skip cannot open a nonce gap: an
+        // in-flight tx stays pending, so its descendants still trail it here, and same-authority
+        // batches execute in seq order, so the in-flight prefix and this batch stay
+        // nonce-contiguous at execution.
+        if pool.is_in_flight(pool_tx.hash()) {
+            continue;
+        }
+
         // ensure block has capacity (in gas) for this transaction
         if total_possible_gas + pool_tx.gas_limit() > gas_limit {
             // the tx could exceed max gas limit for the block

@@ -7886,6 +7886,8 @@ dependencies = [
  "futures",
  "jsonrpsee",
  "parking_lot",
+ "prometheus",
+ "proptest",
  "rand 0.9.3",
  "rayls-consensus-worker",
  "rayls-execution-evm",

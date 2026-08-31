@@ -1,17 +1,12 @@
 // SPDX-License-Identifier: BUSL-1.1
 //! The block builder maintains the transaction pool and builds the next block.
 //!
-//! The block builder listens for canonical state changes from the engine and updates the
-//! transaction pool. These updates move transactions to the correct sub-pools. Only transactions in
-//! the pending pool are considered for the next block.
-//!
-//! Upon successfully building the next block, the block builder forwards to the worker's block
-//! provider. The worker's block provider reliably broadcasts the block and tries to reach quorum
-//! within a time limit. If quorum fails, the block builder receives the error and does not mine the
-//! transactions. If quorum is reached, the transactions are mined and removed from the pending
-//! pool. When this task removes transactions from the pending pool, it uses the current canonical
-//! tip and basefee calculated for the round. Only the engine's canonical updates affect the pool's
-//! tracked `tip`, basefee, and blob fees sorting transactions into sub-pools.
+//! Only the engine's canonical updates move transactions between sub-pools, and only the pending
+//! sub-pool feeds the next block. A built block goes to the worker's block provider, which
+//! publishes it to peers and seeks quorum within a time limit. On quorum failure the transactions
+//! are left untouched for the next round; on success they are marked in flight so the next round
+//! skips them, and they stay pending until the engine's canonical update mines them and releases
+//! the marks.
 
 // it tests
 #![allow(unused_crate_dependencies)]
@@ -20,7 +15,9 @@ pub use batch::{build_batch, BatchBuilderOutput};
 use error::{BatchBuilderError, BatchBuilderResult};
 use futures_util::{FutureExt, StreamExt};
 use rayls_execution_evm::{
-    reth_env::RethEnv, CanonStateNotificationStream, TxPool as _, WorkerTxPool,
+    in_flight::{DuePolicy, SealMarks},
+    reth_env::RethEnv,
+    CanonStateNotificationStream, TxPool as _, WorkerTxPool,
 };
 use rayls_infrastructure_types::{
     error::BlockSealError, gas_accumulator::BaseFeeContainer, Address, BatchBuilderArgs,
@@ -43,6 +40,11 @@ pub mod test_utils;
 /// Result from a batch build attempt: mined tx hashes and the seq number used.
 type BuildResult = oneshot::Receiver<BatchBuilderResult<(Vec<TxHash>, u64)>>;
 
+/// How long a sealed transaction stays marked in flight before [`InFlightTracker::sweep_due`] may
+/// presume its batch lost and release it for resealing. Reconcile against the pending sub-pool
+/// releases marks on execution well before this, so the sweep is the backstop, not the norm.
+const IN_FLIGHT_TTL: Duration = Duration::from_secs(60);
+
 /// The type that builds blocks for workers to propose.
 ///
 /// This is a future that:
@@ -56,12 +58,16 @@ pub struct BatchBuilder {
     pending_task: Option<BuildResult>,
     /// The transaction pool with pending transactions.
     pool: WorkerTxPool,
+    /// Sealing capability over the pool's in-flight tracker: marks a batch's hashes on quorum so
+    /// the next round skips them until execution releases them. Armed once per (epoch-scoped)
+    /// builder.
+    in_flight: SealMarks,
     /// The sending side to the worker's batch maker.
     ///
-    /// Sending the new block through this channel triggers a broadcast to all peers.
+    /// Sending the new block through this channel publishes it to all peers.
     ///
     /// The worker's block maker sends an ack once the block has been stored in db
-    /// which guarantees the worker will attempt to broadcast the new block until
+    /// which guarantees the worker will keep publishing the new block until
     /// quorum is reached.
     to_worker: BatchSender,
     /// The address for batch's beneficiary.
@@ -115,9 +121,11 @@ impl BatchBuilder {
         let max_delay_interval = tokio::time::interval(max_delay);
         let state_changed = reth_env.canonical_block_stream();
         let last_canonical_update = Self::latest_canon_block(reth_env);
+        let in_flight = pool.in_flight().arm_sealing(DuePolicy::ttl(IN_FLIGHT_TTL));
         Self {
             pending_task: None,
             pool,
+            in_flight,
             to_worker,
             address,
             max_delay_interval,
@@ -133,16 +141,8 @@ impl BatchBuilder {
         }
     }
 
-    /// Spawns a task to build the batch and propose to peers.
-    ///
-    /// This approach allows the batch builder to yield back to the runtime while mining batches.
-    ///
-    /// The task performs the following actions:
-    /// - create a batch
-    /// - send the batch to worker's batch proposer
-    /// - wait for ack that quorum was reached
-    /// - convert result to fatal/non-fatal
-    /// - return result
+    /// Spawns a blocking task that builds the batch, sends it to the worker's batch proposer, and
+    /// waits for the quorum ack, so the builder yields to the runtime meanwhile.
     ///
     /// Workers only propose one batch at a time.
     fn spawn_execution_task(&mut self) -> BuildResult {
@@ -155,7 +155,7 @@ impl BatchBuilder {
         let (result, done) = oneshot::channel();
         let worker_id = self.worker_id;
         let base_fee = self.base_fee.base_fee();
-        // Use the current seq but do NOT increment yet — only advance on quorum success.
+        // Use the current seq but do NOT increment yet: only advance on quorum success.
         let seq = self.next_batch_seq;
         let gas_limit = self.gas_limit;
 
@@ -266,7 +266,7 @@ impl Future for BatchBuilder {
             // subscriber enforces. If execution lags commit, our cutoff trails the subscriber's by
             // that gap, so we may seal a few extra batches just past the boundary. That's benign:
             // those batches don't make it into this epoch's blocks and are rescued next epoch by
-            // orphan_batches — no data loss.
+            // orphan_batches, so nothing is lost.
             if this.pending_task.is_none()
                 && this.last_canonical_update.timestamp >= this.epoch_boundary
             {
@@ -278,8 +278,14 @@ impl Future for BatchBuilder {
 
             // only propose one block at a time
             if this.pending_task.is_none() {
-                // check for pending transactions
-                if this.pool.best_transactions().next().is_none() {
+                // Seal only when some pending transaction is not already in flight: sealed txs
+                // stay pending until execution releases them, so `best_transactions` keeps
+                // yielding them and gating on the bare iterator would spin sealing empty batches.
+                // The scan is O(pending) only when every pending tx is in flight, which the next
+                // canonical update (release + wake) clears.
+                let has_sealable =
+                    this.pool.best_transactions().any(|tx| !this.pool.is_in_flight(tx.hash()));
+                if !has_sealable {
                     // reset interval to wake up after some time
                     //
                     // only need to reset here if there is no pending block being built
@@ -288,7 +294,7 @@ impl Future for BatchBuilder {
                     // tick interval to ensure it advances
                     let _ = this.max_delay_interval.poll_tick(cx);
 
-                    // nothing pending
+                    // nothing to seal
                     break;
                 }
 
@@ -309,7 +315,7 @@ impl Future for BatchBuilder {
 
                         // NOTE: empty vec returned for non-fatal error during block proposal
                         if mined_transactions.is_empty() {
-                            // Quorum failed — do NOT advance next_batch_seq so the same
+                            // Quorum failed: do NOT advance next_batch_seq so the same
                             // seq number is reused for the next attempt, avoiding gaps.
                             // reset interval to prevent immediate re-wake from stale tick
                             this.max_delay_interval.reset();
@@ -318,24 +324,15 @@ impl Future for BatchBuilder {
                             break;
                         }
 
-                        // Quorum succeeded — advance the seq counter past the one we just used.
+                        // Quorum succeeded: advance the seq counter past the one we just used.
                         this.next_batch_seq = seq + 1;
 
-                        debug!(target: "block-builder", "applying block builder's update");
+                        debug!(target: "block-builder", "marking sealed transactions in flight");
 
-                        let base_fee_per_gas = this
-                            .last_canonical_update
-                            .base_fee_per_gas
-                            .unwrap_or_else(|| this.pool.get_pending_base_fee());
-
-                        // update pool to remove mined transactions
-                        this.pool.update_canonical_state(
-                            &this.last_canonical_update,
-                            base_fee_per_gas,
-                            Some(u128::MAX), // set max fee for blobs
-                            mined_transactions,
-                            vec![],
-                        );
+                        // Mark rather than evict: the txs stay pending (RPC-visible) until
+                        // execution, and `is_in_flight` keeps the next seal from re-proposing
+                        // them across the quorum-to-execution window.
+                        this.in_flight.mark(mined_transactions);
 
                         // loop again to check for any other pending transactions
                         // and possibly start building the next block
@@ -887,8 +884,71 @@ mod tests {
         // yield to try and give pool a chance to update
         tokio::task::yield_now().await;
 
-        // assert all transactions mined
-        let pending_pool_len = txpool.pool_size().pending;
-        assert_eq!(pending_pool_len, 0);
+        // Sealed transactions are marked in flight rather than evicted, so all four stay pending
+        // (RPC-visible) until execution; both batches reached quorum, so none is re-sealable.
+        let pending = txpool.pending_transactions();
+        assert_eq!(pending.len(), 4);
+        assert!(pending.iter().all(|tx| txpool.is_in_flight(tx.hash())));
+    }
+
+    /// A transaction sealed into a batch is marked in flight and skipped by the next seal, so the
+    /// same txs are not re-sealed across the quorum-to-execution window while they stay pending.
+    #[tokio::test]
+    async fn in_flight_txs_are_skipped_on_the_next_seal() {
+        let tmp_dir = TempDir::new().unwrap();
+        // keep task_manager alive: dropping it tears down the pool's validation service
+        let TestTools { mut tx_factory, execution_components, task_manager: _task_manager } =
+            get_test_tools(tmp_dir.path()).await;
+        let TestExecutionComponents { reth_env, txpool, chain } = execution_components;
+        let address = Address::from(U160::from(33));
+
+        let gas_price = reth_env.get_gas_price().unwrap();
+        let value = U256::from(10).checked_pow(U256::from(18)).expect("1e18 fits U256");
+
+        // three txs from one sender: sequential nonces, all land in the pending sub-pool
+        for _ in 0..3 {
+            tx_factory
+                .create_and_submit_eip1559_pool_tx(
+                    chain.clone(),
+                    gas_price,
+                    Address::ZERO,
+                    value,
+                    txpool.clone(),
+                )
+                .await;
+        }
+        assert_eq!(txpool.pool_size().pending, 3);
+
+        let base_fee = txpool.get_pending_base_fee();
+        let gas_limit = ETHEREUM_BLOCK_GAS_LIMIT_56BITS;
+
+        // first seal takes all three
+        let first = build_batch(
+            BatchBuilderArgs::new(txpool.clone(), address, 0),
+            0,
+            base_fee,
+            0,
+            gas_limit,
+        );
+        assert_eq!(first.mined_transactions.len(), 3);
+
+        // mark them in flight through the sealing capability, as quorum success does
+        let seal = txpool.in_flight().arm_sealing(DuePolicy::ttl(Duration::from_secs(60)));
+        seal.mark(first.mined_transactions.clone());
+
+        // the txs are still pending but now skipped, so the next seal is empty
+        assert_eq!(txpool.pool_size().pending, 3);
+        let second = build_batch(
+            BatchBuilderArgs::new(txpool.clone(), address, 0),
+            0,
+            base_fee,
+            1,
+            gas_limit,
+        );
+        assert!(second.mined_transactions.is_empty(), "in-flight txs must not be re-sealed");
+
+        // reconcile keeps the marks while the txs remain pending (not yet executed)
+        txpool.reconcile_in_flight();
+        assert!(txpool.is_in_flight(first.mined_transactions.first().unwrap()));
     }
 }
