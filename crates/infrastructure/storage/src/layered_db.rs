@@ -637,8 +637,7 @@ impl<'a, DB: Database> DbTxMut for LayeredDbTxMut<'a, DB> {
             return Err(e);
         }
         // Enqueue the commit before releasing the mem write lock: the next `write_txn` cannot
-        // enqueue `StartTxn` until this lock drops, so channel order is StartTxn -> ops ->
-        // CommitTxn.
+        // enqueue `StartTxn` until this lock drops, so channel order is StartTxn -> ops -> CommitTxn.
         self.tx.send(DBMessage::CommitTxn).map_err(|_| eyre::eyre!("DB thread gone, FATAL!"))?;
         self.mem_db.commit()
     }
