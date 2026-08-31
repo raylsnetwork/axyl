@@ -10,7 +10,7 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
     time::Instant,
 };
-use tracing::{trace, warn};
+use tracing::{debug, trace, warn};
 
 /// Lifecycle stages a batch passes through.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -375,9 +375,12 @@ impl BatchTracker {
                     "nonce_range_for_sender"
                 );
             }
-            // log each nonce-too-high tx for full traceability
+            // Per-tx detail is noisy (one line per dropped tx — thousands in a single-sender
+            // burst), and the per-sender range above already carries the actionable gap
+            // info. Keep it at debug for when you're actually chasing a nonce gap
+            // (RUST_LOG=batch_tracker=debug).
             for (tx_hash, sender, tx_nonce, state_nonce) in &report.nonce_too_high_details {
-                warn!(
+                debug!(
                     target: "batch_tracker",
                     digest = ?report.digest,
                     ?tx_hash,

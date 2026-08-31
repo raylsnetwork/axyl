@@ -7,6 +7,7 @@ pub use libp2p::gossipsub::MessageId;
 use libp2p::{
     core::transport::ListenerId,
     gossipsub::{PublishError, SubscriptionError, TopicHash},
+    multiaddr::Protocol,
     request_response::ResponseChannel,
     Multiaddr, PeerId, TransportError,
 };
@@ -14,7 +15,11 @@ use rayls_infrastructure_types::{
     encode, now, BlsPublicKey, BlsSignature, NetworkPublicKey, P2pNode, TimestampSec,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::{
+    collections::{BTreeMap, HashMap, HashSet},
+    fmt,
+    net::{IpAddr, SocketAddr},
+};
 use tokio::sync::{mpsc, oneshot};
 use tracing::debug;
 
@@ -24,6 +29,229 @@ mod network_types;
 
 /// The result for network operations.
 pub type NetworkResult<T> = Result<T, NetworkError>;
+
+/// Returns true when the address contains a `/dnsaddr` component.
+///
+/// Such an address is advertise-only: it names relay circuits via `_dnsaddr` DNS TXT records,
+/// so it can neither be listened on nor dialed raw (the relay client selects its connection
+/// handler from the literal address shape) - it must be resolved to concrete circuits first.
+pub fn is_dnsaddr(addr: &Multiaddr) -> bool {
+    addr.iter().any(|p| matches!(p, Protocol::Dnsaddr(_)))
+}
+
+/// Extracts the relay server's [`PeerId`] from a circuit address of the form
+/// `<relay-addr>/p2p/<relay-id>/p2p-circuit/p2p/<dst-id>`: the `P2p` component immediately
+/// preceding the `P2pCircuit` protocol. Returns `None` for non-relayed addresses.
+pub fn circuit_relay_peer_id(addr: &Multiaddr) -> Option<PeerId> {
+    let mut last_p2p = None;
+    for proto in addr.iter() {
+        match proto {
+            Protocol::P2p(peer) => last_p2p = Some(peer),
+            Protocol::P2pCircuit => return last_p2p,
+            _ => {}
+        }
+    }
+    None
+}
+
+/// The transport path a swarm connection was established over.
+///
+/// Every protocol (gossipsub, kademlia, request-response) is multiplexed over the swarm's
+/// connections, so classifying each connection once at establishment is sufficient to audit that
+/// a relayed-only node never exchanges a message with a peer outside a `/p2p-circuit`: a request
+/// cannot travel over a connection that does not exist.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ConnectionPath {
+    /// A `/p2p-circuit` connection relayed through a relay server.
+    Circuit {
+        /// The relay server the circuit runs through, when the address names it.
+        relay: Option<PeerId>,
+        /// The relay server's transport endpoint (the first-hop leg the circuit rides on). This is
+        /// NOT the peer's own endpoint -- a relayed peer's address is never observable here
+        /// (that's the point of the relay) -- it's the relay we circuit through, for log
+        /// correlation.
+        relay_endpoint: Option<Endpoint>,
+    },
+    /// A direct connection to a registered relay server (the first-hop leg circuits ride on).
+    RelayDirect {
+        /// The relay server's transport endpoint.
+        endpoint: Option<Endpoint>,
+    },
+    /// A direct connection to a non-relay peer.
+    ///
+    /// Forbidden in a relayed-only topology: a private validator must only ever hold relay legs
+    /// and circuits.
+    DirectNonRelay {
+        /// The peer's transport endpoint.
+        endpoint: Option<Endpoint>,
+    },
+}
+
+impl ConnectionPath {
+    /// Classifies the negotiated endpoint of an established connection.
+    ///
+    /// The circuit marker sits on the dial address for outbound connections and on the local
+    /// (listen) address for inbound ones - a relayed inbound's send-back address is a bare
+    /// `/p2p/<src>` with no transport to classify.
+    pub fn classify(endpoint: &libp2p::core::ConnectedPoint, peer_is_relay: bool) -> Self {
+        let path_addr = match endpoint {
+            libp2p::core::ConnectedPoint::Dialer { address, .. } => address,
+            libp2p::core::ConnectedPoint::Listener { local_addr, .. } => local_addr,
+        };
+        let ep = Endpoint::from_multiaddr(path_addr);
+        if path_addr.iter().any(|p| matches!(p, Protocol::P2pCircuit)) {
+            Self::Circuit { relay: circuit_relay_peer_id(path_addr), relay_endpoint: ep }
+        } else if peer_is_relay {
+            Self::RelayDirect { endpoint: ep }
+        } else {
+            Self::DirectNonRelay { endpoint: ep }
+        }
+    }
+
+    /// Returns the `path` label value for the `connections_by_path` metric.
+    pub fn metric_label(&self) -> &'static str {
+        match self {
+            Self::Circuit { .. } => "circuit",
+            Self::RelayDirect { .. } => "relay_direct",
+            Self::DirectNonRelay { .. } => "direct_nonrelay",
+        }
+    }
+}
+
+impl fmt::Debug for ConnectionPath {
+    /// Compact one-line form for logs, e.g. `circuit via 10.20.0.11:4001/quic-v1 relay=12D3KooW…`,
+    /// `relay-direct 10.20.0.11:4001/quic-v1`, `direct 10.0.0.5:4001/tcp` -- no `Some(..)`/struct
+    /// noise. An unknown endpoint (bare `/p2p`) or relay is elided.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Circuit { relay, relay_endpoint } => {
+                f.write_str("circuit")?;
+                if let Some(ep) = relay_endpoint {
+                    write!(f, " {ep:?}")?;
+                }
+                if let Some(relay) = relay {
+                    write!(f, " relay={relay}")?;
+                }
+                Ok(())
+            }
+            Self::RelayDirect { endpoint } => {
+                f.write_str("relay-direct")?;
+                if let Some(ep) = endpoint {
+                    write!(f, " {ep:?}")?;
+                }
+                Ok(())
+            }
+            Self::DirectNonRelay { endpoint } => {
+                f.write_str("direct")?;
+                if let Some(ep) = endpoint {
+                    write!(f, " {ep:?}")?;
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+/// Logging wrapper for the next hop a message traversed -- an optional [`ConnectionPath`]. Renders
+/// the path's compact one-line form, or `closed` when the connection is gone. `Copy` and cheap to
+/// construct, so it can be built on the message hot path; the `Debug` formatting only runs if the
+/// log event is actually enabled (no allocation or work when the level is filtered out).
+#[derive(Clone, Copy)]
+pub struct NexthopFmt(pub Option<ConnectionPath>);
+
+impl fmt::Debug for NexthopFmt {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match &self.0 {
+            Some(path) => fmt::Debug::fmt(path, f),
+            None => f.write_str("closed"),
+        }
+    }
+}
+
+/// The transport (L4) protocol of a connection endpoint, read from the multiaddr's typed protocols
+/// (QUIC runs over UDP but is kept distinct from raw UDP).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Transport {
+    /// QUIC (over UDP).
+    Quic,
+    /// Raw UDP (no QUIC negotiated).
+    Udp,
+    /// TCP.
+    Tcp,
+    /// WebSocket.
+    Ws,
+    /// No transport recognized in the address.
+    Other,
+}
+
+impl Transport {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Quic => "quic-v1",
+            Self::Udp => "udp",
+            Self::Tcp => "tcp",
+            Self::Ws => "ws",
+            Self::Other => "?",
+        }
+    }
+}
+
+impl fmt::Debug for Transport {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// A connection's transport endpoint: `ip:port` plus the transport protocol.
+///
+/// `SocketAddr` carries ip + port (and formats IPv6 with brackets); [`Transport`] carries the L4
+/// protocol, which `SocketAddr` alone cannot distinguish. `Copy`, so [`ConnectionPath`] stays
+/// `Copy`. Renders compactly as `127.0.0.1:4001/quic-v1`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct Endpoint {
+    /// The `ip:port`.
+    pub addr: SocketAddr,
+    /// The transport protocol.
+    pub transport: Transport,
+}
+
+impl Endpoint {
+    /// Extract the transport endpoint from a multiaddr by reading its typed protocols up to the
+    /// overlay (`/p2p`, `/p2p-circuit`) layer. Not string parsing -- `Multiaddr::iter` yields the
+    /// `Protocol` enum, which is how libp2p models the transport the socket was opened with.
+    /// Returns `None` if the address names no ip+port transport (e.g. a bare `/p2p/<peer>`).
+    pub fn from_multiaddr(addr: &Multiaddr) -> Option<Self> {
+        let mut ip = None;
+        let mut port = None;
+        let mut transport = Transport::Other;
+        for proto in addr.iter() {
+            match proto {
+                Protocol::Ip4(a) => ip = Some(IpAddr::V4(a)),
+                Protocol::Ip6(a) => ip = Some(IpAddr::V6(a)),
+                Protocol::Udp(p) => {
+                    port = Some(p);
+                    transport = Transport::Udp;
+                }
+                Protocol::Tcp(p) => {
+                    port = Some(p);
+                    transport = Transport::Tcp;
+                }
+                Protocol::QuicV1 | Protocol::Quic => transport = Transport::Quic,
+                Protocol::Ws(_) | Protocol::Wss(_) => transport = Transport::Ws,
+                // stop at the overlay layer: /p2p and /p2p-circuit carry peer ids, not transport
+                Protocol::P2p(_) | Protocol::P2pCircuit => break,
+                _ => {}
+            }
+        }
+        Some(Self { addr: SocketAddr::new(ip?, port?), transport })
+    }
+}
+
+impl fmt::Debug for Endpoint {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}/{}", self.addr, self.transport.as_str())
+    }
+}
 
 /// Helper trait to cast lib-specific results into RPC messages.
 pub trait IntoResponse<M> {
@@ -136,6 +364,16 @@ where
         /// Reply for connection outcome.
         reply: oneshot::Sender<NetworkResult<()>>,
     },
+    /// Register relays discovered from `/dnsaddr` resolution as protected.
+    ///
+    /// Sent by an off-loop discovery task (see `AddBootstrapPeers`) so the blocking DNS lookup
+    /// never runs on the swarm event loop -- blocking the loop stops the swarm from servicing
+    /// relayed (yamux-over-circuit) connections, which have no transport-level keep-alive and get
+    /// reset by peers. Registration itself is cheap and runs on the loop. Fire-and-forget.
+    RegisterRelays {
+        /// Circuit multiaddrs whose `/p2p/<relay>` peer ids should be exempted from banning.
+        circuits: Vec<Multiaddr>,
+    },
     /// Dial a peer to establish a connection.
     Dial {
         /// The peer's id.
@@ -149,6 +387,21 @@ where
     DialBls {
         /// The peer's bls public key.
         bls_key: BlsPublicKey,
+        /// Oneshot for reply
+        reply: oneshot::Sender<NetworkResult<()>>,
+    },
+    /// Dial a peer with a set of already-resolved addresses.
+    ///
+    /// Used by `DialBls` after resolving a committee peer's `/dnsaddr` to concrete
+    /// `/p2p-circuit` addresses off the swarm loop. The dialed address MUST be the concrete
+    /// circuit (not `/dnsaddr`): the relay client behaviour selects its connection handler by
+    /// multiaddr shape (`is_relayed`), so it has to see the `/p2p-circuit` to treat the
+    /// connection as relayed rather than as a direct link to a relay.
+    DialResolved {
+        /// The peer's id.
+        peer_id: PeerId,
+        /// Concrete addresses to dial (e.g. circuits via each advertised relay).
+        addrs: Vec<Multiaddr>,
         /// Oneshot for reply
         reply: oneshot::Sender<NetworkResult<()>>,
     },

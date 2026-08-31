@@ -531,6 +531,13 @@ where
 
     /// Publish and provide our network addresses and peer id under our BLS public key for
     /// discovery.
+    ///
+    /// A node always publishes, even when its advertised address is identity-only (a bare
+    /// `/p2p/<peer-id>`, e.g. an outbound-only observer): the record is the peer's identity, and
+    /// others rely on it to map our `peer_id -> bls` (`peer_to_bls`) so they accept our
+    /// request-response traffic (serving our batch requests). An undialable advertised address is
+    /// harmless -- the `add_address`/discovery transport-less filters keep it out of every dial
+    /// path -- but skipping publish would leave us unidentifiable ("requesting peer unknown").
     pub(super) fn provide_our_data(&mut self) {
         let record = self.get_peer_record();
         info!(target: "network-kad", ?record, "Providing our record to kademlia for peer {:?}", self.swarm.local_peer_id());

@@ -106,8 +106,20 @@ where
                 consensus_config.primary_networkkey(),
                 consensus_config.primary_address(),
             )?;
-            info!(target: "epoch-manager", ?primary_address, "listening to {primary_address}");
-            network_handle.inner_handle().start_listening(primary_address).await?;
+            // Explicit relay reservations (comma-separated relay base multiaddrs): an alternate
+            // leg of the advertised relay (e.g. a dual-homed DMZ relay's inside address) or
+            // additional relays for failover.
+            let relay_reservations = Self::relay_listen_addresses(
+                "PRIMARY_RELAY_MULTIADDRS",
+                consensus_config.primary_networkkey(),
+            )?;
+            super::network::start_swarm_listeners(
+                network_handle.inner_handle(),
+                primary_address,
+                relay_reservations,
+                "PRIMARY_RELAY_MULTIADDRS",
+            )
+            .await?;
         }
 
         let mut peers = network_handle.connected_peers_count().await.unwrap_or(0);

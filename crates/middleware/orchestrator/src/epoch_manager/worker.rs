@@ -109,7 +109,19 @@ where
                 consensus_config.primary_networkkey(),
                 consensus_config.worker_address(),
             )?;
-            network_handle.inner_handle().start_listening(worker_address).await?;
+            // Explicit relay reservations, using the worker's own network key for the circuit
+            // listen addresses (see the primary's equivalent block).
+            let relay_reservations = Self::relay_listen_addresses(
+                "WORKER_RELAY_MULTIADDRS",
+                consensus_config.worker_networkkey(),
+            )?;
+            super::network::start_swarm_listeners(
+                network_handle.inner_handle(),
+                worker_address,
+                relay_reservations,
+                "WORKER_RELAY_MULTIADDRS",
+            )
+            .await?;
         }
 
         // Rayls: Always rebuild identity mappings (known_peers, known_peerids) every epoch.

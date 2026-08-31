@@ -119,6 +119,34 @@ pub fn spawn_subscriber<DB: Database>(
                             Ok(()) => {
                                 info!(target: "subscriber", "subscriber catch-up exited normally")
                             }
+                            // A batch-fetch failure (MissingFetchedBatch / ClientRequestsFailed)
+                            // that outlives the in-loop retries means no peer we are CURRENTLY
+                            // connected to served a batch a committed output references. NB: this is
+                            // NOT garbage collection -- GC prunes the certificate DAG (rounds), not
+                            // the worker batch store, so the batch almost certainly still exists on
+                            // some holder. It's a connectivity/timing gap: most often a restarting
+                            // node whose worker mesh isn't fully re-established yet, so the holder
+                            // isn't among its connected peers within the retry window.
+                            // Do NOT abort the whole rayls-network process over it: step this CVV
+                            // back to Observer so it keeps following best-effort and re-attempts
+                            // catch-up at a later epoch boundary (by which point the mesh is up).
+                            //
+                            // XXX / REVISIT: the proper fix is to make the fetch connectivity-aware
+                            // -- keep retrying while the worker is connected to fewer than the
+                            // committee's workers, rather than declaring a batch "missing" against a
+                            // half-connected mesh. Demotion just converts a fatal panic into a
+                            // survivable degraded state that self-heals once connectivity returns.
+                            Err(e) if e.is_batch_fetch_error() => {
+                                warn!(
+                                    target: "subscriber",
+                                    "catch-up could not fetch a referenced batch from any connected \
+                                     peer (batch not GC'd -- likely mesh not yet re-established); \
+                                     demoting to Observer instead of aborting: {e}"
+                                );
+                                subscriber
+                                    .consensus_bus
+                                    .request_mode_transition(NodeMode::Observer);
+                            }
                             Err(e) => panic!("subscriber catch-up failed fatally: {e}"),
                         }
                     },
@@ -138,6 +166,22 @@ pub fn spawn_subscriber<DB: Database>(
                         match subscriber.follow_consensus(clone, rx_shutdown).await {
                             Ok(()) => {
                                 info!(target: "subscriber", "subscriber follow exited normally")
+                            }
+                            // Same batch-unavailable case as the catch-up path above (no connected
+                            // peer served the batch -- a connectivity/timing gap, NOT GC; the batch
+                            // still exists on some holder). An Observer has no lower mode to fall
+                            // back to, so don't abort the whole process: exit this follow attempt
+                            // without panicking. spawn_subscriber re-arms the follower at the next
+                            // epoch boundary, by which point the mesh should be up.
+                            // XXX / REVISIT: make the fetch connectivity-aware instead -- see the
+                            // catch-up arm above.
+                            Err(e) if e.is_batch_fetch_error() => {
+                                warn!(
+                                    target: "subscriber",
+                                    "follow could not fetch a referenced batch from any connected \
+                                     peer (batch not GC'd -- likely mesh not yet re-established); \
+                                     exiting follow without aborting the node: {e}"
+                                );
                             }
                             Err(e) => panic!("subscriber follow consensus failed fatally: {e}"),
                         }

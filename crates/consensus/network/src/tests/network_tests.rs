@@ -13,10 +13,14 @@ use crate::{
 };
 use assert_matches::assert_matches;
 use eyre::eyre;
+use futures::StreamExt as _;
 use libp2p::{
+    core::transport::ListenerId,
     gossipsub::{Message as GossipMessage, TopicHash},
     kad::{self, store::RecordStore, ProviderRecord, RecordKey},
-    PeerId,
+    multiaddr::Protocol,
+    swarm::SwarmEvent,
+    Multiaddr, PeerId,
 };
 use rayls_execution_evm::test_utils::fixture_batch_with_transactions;
 use rayls_infrastructure_config::{ConsensusConfig, NetworkConfig};
@@ -2048,6 +2052,235 @@ async fn test_connected_peers_count_double_decrement() -> eyre::Result<()> {
          but asymmetric inc/dec in DisconnectPeer/PeerDisconnected/Banned handlers \
          causes the gauge to drift negative"
     );
+
+    Ok(())
+}
+
+/// A swarm with zero listeners must shut down only when nothing can re-create a listener: with
+/// relay reservations desired, `retry_relay_reservations` re-issues them, so an all-relays-down
+/// window (a boot race, a simultaneous relay outage) is retried instead of shutting the network
+/// down.
+#[tokio::test]
+async fn test_zero_listeners_retried_when_relay_reservations_desired() -> eyre::Result<()> {
+    let TestTypes { peer1, .. } = create_test_types::<TestPrimaryRequest, TestPrimaryResponse>();
+    let mut network = peer1.network;
+
+    // no listeners were started: a closed listener with no desired relay reservations is fatal
+    assert_matches!(
+        network.handle_listener_closed(ListenerId::next(), &[]),
+        Err(NetworkError::AllListenersClosed)
+    );
+
+    // with a desired relay reservation the same state is a retried outage, not a shutdown
+    let circuit: Multiaddr =
+        "/ip4/127.0.0.1/udp/4001/quic-v1/p2p/12D3KooWK99VoVxNE7XzyBwXEzW7xhK7Gpv85r9F3V3fyKSUKPH5/p2p-circuit/p2p/12D3KooWJWoaqZhDaoEFshF7Rh1bpY9ohihFhzcW6d69Lr2NASuq"
+            .parse()
+            .expect("valid circuit multiaddr");
+    network.relay_reservations.insert(circuit, None);
+    assert!(network.handle_listener_closed(ListenerId::next(), &[]).is_ok());
+
+    Ok(())
+}
+
+/// Spawns an in-process circuit-relay-v2 server on localhost QUIC, returning its dialable
+/// `/ip4/127.0.0.1/udp/<port>/quic-v1/p2p/<relay-id>` address.
+async fn spawn_relay_server() -> eyre::Result<Multiaddr> {
+    let mut relay_swarm = libp2p::SwarmBuilder::with_new_identity()
+        .with_tokio()
+        .with_quic()
+        .with_behaviour(|keypair| {
+            libp2p::relay::Behaviour::new(keypair.public().to_peer_id(), Default::default())
+        })?
+        .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(60)))
+        .build();
+    let relay_id = *relay_swarm.local_peer_id();
+    relay_swarm.listen_on("/ip4/127.0.0.1/udp/0/quic-v1".parse()?)?;
+    let listen_addr = timeout(Duration::from_secs(5), async {
+        loop {
+            if let SwarmEvent::NewListenAddr { address, .. } = relay_swarm.select_next_some().await
+            {
+                break address;
+            }
+        }
+    })
+    .await?;
+    let relay_addr = listen_addr.with(Protocol::P2p(relay_id));
+    // reservation vouchers advertise the relay's external addresses
+    relay_swarm.add_external_address(relay_addr.clone());
+    tokio::spawn(async move {
+        loop {
+            relay_swarm.select_next_some().await;
+        }
+    });
+    Ok(relay_addr)
+}
+
+/// A request-response round trip between two nodes whose only path to each other is a
+/// circuit-relay-v2 server, on a host where direct connectivity IS physically possible. Every
+/// connection either end establishes must classify as a relay leg or a circuit - the
+/// `direct_nonrelay` count stays 0 - proving the relayed-only topology is a property of the
+/// node's dial/listen behavior, not of the network isolation (firewalls, VPC routing) around it.
+#[tokio::test]
+async fn test_reqres_via_relay_classifies_every_connection_relayed() -> eyre::Result<()> {
+    let relay_addr = spawn_relay_server().await?;
+
+    let TestTypes { peer1, peer2, .. } =
+        create_test_types::<TestWorkerRequest, TestWorkerResponse>();
+
+    // peer1 is the destination behind the relay
+    let NetworkPeer {
+        config: config_1,
+        network_handle: peer1,
+        network_events: mut network_events_1,
+        network,
+        network_metrics: metrics_1,
+    } = peer1;
+    tokio::spawn(async move {
+        network.run().await.expect("network run failed!");
+    });
+
+    // peer2 reaches peer1 through the relay
+    let NetworkPeer {
+        config: config_2,
+        network_handle: peer2,
+        network,
+        network_metrics: metrics_2,
+        ..
+    } = peer2;
+    tokio::spawn(async move {
+        network.run().await.expect("network run failed!");
+    });
+
+    // peer1's ONLY listener is a reservation on the relay - it never listens on a direct address
+    let circuit_listen = relay_addr.clone().with(Protocol::P2pCircuit);
+    peer1.start_listening(circuit_listen.clone()).await?;
+    // the circuit address is reported as a listener once the relay accepts the reservation
+    timeout(Duration::from_secs(10), async {
+        loop {
+            let listeners = peer1.listeners().await.unwrap_or_default();
+            if listeners.iter().any(|a| a.iter().any(|p| matches!(p, Protocol::P2pCircuit))) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await?;
+
+    // peer2 knows peer1 ONLY by its circuit address
+    let peer1_bls = config_1.key_config().primary_public_key();
+    let peer1_id: PeerId = config_1.primary_networkkey().into();
+    let peer1_circuit = circuit_listen.with(Protocol::P2p(peer1_id));
+    peer2.add_explicit_peer(peer1_bls, config_1.primary_networkkey(), peer1_circuit).await?;
+    peer2.dial_by_bls(peer1_bls).await?;
+
+    // peer1 must learn peer2's bls key (kad record published on connect) to accept its request
+    let peer2_bls = config_2.key_config().primary_public_key();
+    timeout(Duration::from_secs(10), async {
+        loop {
+            if peer1.connected_peers().await.unwrap_or_default().contains(&peer2_bls) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await?;
+
+    // full request-response round trip through the circuit
+    let missing_block = fixture_batch_with_transactions(3).seal_slow();
+    let digests = vec![missing_block.digest()];
+    let batch_req = TestWorkerRequest::MissingBatches(digests);
+    let batch_res = TestWorkerResponse::MissingBatches { batches: vec![missing_block] };
+    let response = peer2.send_request(batch_req.clone(), peer1_bls).await?;
+    let event = timeout(Duration::from_secs(5), network_events_1.recv())
+        .await?
+        .expect("network event received");
+    let NetworkEvent::Request { request, channel, .. } = event else {
+        panic!("unexpected network event received");
+    };
+    assert_eq!(request, batch_req);
+    peer1.send_response(batch_res.clone(), channel).await?;
+    assert_eq!(
+        timeout(Duration::from_secs(5), response).await?.expect("response received")?,
+        batch_res
+    );
+
+    // the topology proof: messages flowed, yet neither node ever established a direct connection
+    // to anything but the relay
+    for (label, metrics) in [("peer1", &metrics_1), ("peer2", &metrics_2)] {
+        let count =
+            |path: &str| metrics.connections_by_path.with_label_values(&[path, "primary"]).get();
+        assert_eq!(
+            count("direct_nonrelay"),
+            0,
+            "{label} opened a direct connection to a non-relay peer"
+        );
+        assert!(count("circuit") >= 1, "{label} should hold at least one circuit");
+        assert!(count("relay_direct") >= 1, "{label} should hold its relay leg");
+    }
+
+    Ok(())
+}
+
+/// The path classifier is not vacuously green: two nodes connected directly, with no relay
+/// involved, classify their connections as `direct_nonrelay` on both ends and never as circuits.
+#[tokio::test]
+async fn test_direct_connection_classifies_direct_nonrelay() -> eyre::Result<()> {
+    let TestTypes { peer1, peer2, .. } =
+        create_test_types::<TestWorkerRequest, TestWorkerResponse>();
+    let NetworkPeer {
+        config: config_1,
+        network_handle: peer1,
+        network,
+        network_metrics: metrics_1,
+        ..
+    } = peer1;
+    tokio::spawn(async move {
+        network.run().await.expect("network run failed!");
+    });
+    let NetworkPeer {
+        config: config_2,
+        network_handle: peer2,
+        network,
+        network_metrics: metrics_2,
+        ..
+    } = peer2;
+    tokio::spawn(async move {
+        network.run().await.expect("network run failed!");
+    });
+
+    peer1.start_listening(config_1.primary_address()).await?;
+    peer2.start_listening(config_2.primary_address()).await?;
+
+    peer1
+        .add_explicit_peer(
+            config_2.key_config().primary_public_key(),
+            config_2.primary_networkkey(),
+            config_2.primary_address(),
+        )
+        .await?;
+    peer1.dial_by_bls(config_2.key_config().primary_public_key()).await?;
+
+    // the dial reply can resolve before the network task processes the establishment event, so
+    // poll the counters instead of asserting immediately
+    let direct = |m: &Arc<NetworkMetrics>| {
+        m.connections_by_path.with_label_values(&["direct_nonrelay", "primary"]).get()
+    };
+    timeout(Duration::from_secs(10), async {
+        loop {
+            if direct(&metrics_1) >= 1 && direct(&metrics_2) >= 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await?;
+
+    for (label, metrics) in [("peer1", &metrics_1), ("peer2", &metrics_2)] {
+        let count =
+            |path: &str| metrics.connections_by_path.with_label_values(&[path, "primary"]).get();
+        assert_eq!(count("circuit"), 0, "{label} has no relay, so no circuit connections");
+        assert_eq!(count("relay_direct"), 0, "{label} has no relay, so no relay legs");
+    }
 
     Ok(())
 }

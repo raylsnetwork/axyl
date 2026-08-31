@@ -2,14 +2,19 @@ use crate::{
     codec::{RLCodec, RLMessage},
     consensus::behaviour::RLBehaviorEvent,
     error::NetworkError,
-    types::{NetworkEvent, NetworkResult},
+    types::{ConnectionPath, NetworkEvent, NetworkResult},
     ConsensusNetwork,
 };
 use futures::StreamExt as _;
-use libp2p::{kad::Mode, swarm::SwarmEvent};
+use libp2p::{
+    core::transport::ListenerId,
+    kad::Mode,
+    swarm::{DialError, SwarmEvent},
+    Multiaddr, PeerId,
+};
 use rayls_infrastructure_types::{Database, RaylsSender};
 use std::time::{Duration, Instant};
-use tracing::{debug, error, info, instrument};
+use tracing::{debug, error, info, instrument, warn};
 
 impl<Req, Res, DB, Events> ConsensusNetwork<Req, Res, DB, Events>
 where
@@ -35,13 +40,51 @@ where
             "gossipsub network loop STARTING"
         );
 
+        // Publish this node's own identity + published address once (immutable for the swarm's
+        // life). `authority` is the BLS committee key (shared across primary+worker); `peer_id`
+        // is per-swarm. Lets `grep peer_addr` map any peer id back to a node and its authority.
+        let authority = self.key_config.primary_public_key().to_string();
+        self.network_metrics
+            .node_peer_addr_self
+            .with_label_values(&[
+                local_peer_id.to_string().as_str(),
+                authority.as_str(),
+                self.network_label,
+            ])
+            .set(1);
+        for addr in &self.node_record.info.multiaddrs {
+            self.network_metrics
+                .node_peer_addr_external
+                .with_label_values(&[addr.to_string().as_str(), self.network_label])
+                .set(1);
+        }
+
         // Counter for periodic cleanup
         let mut event_counter: u64 = 0;
         // Time-based cleanup interval (10 seconds)
         const CLEANUP_INTERVAL: Duration = Duration::from_secs(10);
 
+        // Periodically re-attempt any relay reservation whose relay went away, so a relay coming
+        // back restores the node's reachability without a restart.
+        let mut relay_retry = tokio::time::interval(Duration::from_secs(15));
+
+        // Refresh the peer-address gauges (`kad_known_peer_addr_*`, `advertised_peer_addr_*`,
+        // `discovery_peer_addr_*`, `node_peer_addr_listen_*`, `node_peer_addr_reservation_*`) on a
+        // fixed 15s cadence. Kept as its own time-based interval (not the cleanup block, which also
+        // fires every 1000 events) so a busy node can't turn it into a per-event storm. The first
+        // tick fires immediately for an initial snapshot. (All five gauge families above are
+        // refreshed here; the set-once `node_peer_addr_self`/`node_peer_addr_external` are set in
+        // `run()` and the `dial_peer_addr_failures` counter is event-driven, not refreshed here.)
+        let mut peer_addr_metrics_refresh = tokio::time::interval(Duration::from_secs(15));
+
         loop {
             tokio::select! {
+                _ = relay_retry.tick() => {
+                    self.retry_relay_reservations();
+                }
+                _ = peer_addr_metrics_refresh.tick() => {
+                    self.refresh_peer_addr_metrics();
+                },
                 event = self.swarm.select_next_some() => {
                     self.process_event(event).await.inspect_err(|e| {
                         error!(target: "network", ?e, "network event error")
@@ -68,6 +111,66 @@ where
         }
     }
 
+    /// Re-issue `listen_on` for any desired relay reservation that currently has no active
+    /// listener (its relay went away). Safe to call repeatedly: a still-down relay just closes
+    /// again and is retried on the next tick, while a recovered relay re-establishes the
+    /// reservation. Once re-reserved on the node's committee-advertised relay, peers reconnect on
+    /// their own without a restart.
+    fn retry_relay_reservations(&mut self) {
+        let missing: Vec<Multiaddr> = self
+            .relay_reservations
+            .iter()
+            .filter(|(_, active)| active.is_none())
+            .map(|(addr, _)| addr.clone())
+            .collect();
+        for addr in missing {
+            match self.swarm.listen_on(addr.clone()) {
+                Ok(id) => {
+                    info!(target: "network", ?addr, "re-attempting relay reservation");
+                    self.relay_reservations.insert(addr, Some(id));
+                }
+                Err(e) => {
+                    warn!(target: "network", ?addr, ?e, "failed to re-attempt relay reservation");
+                }
+            }
+        }
+    }
+
+    /// Handles a closed listener, deciding whether the swarm can keep running.
+    ///
+    /// A lost relay reservation is dropped from the active set but stays in the desired set so
+    /// `retry_relay_reservations` re-establishes it when the relay returns (the address stays
+    /// reachable via committee, so peers reconnect on their own once the reservation is back).
+    pub(super) fn handle_listener_closed(
+        &mut self,
+        listener_id: ListenerId,
+        addresses: &[Multiaddr],
+    ) -> NetworkResult<()> {
+        if let Some((addr, active)) =
+            self.relay_reservations.iter_mut().find(|(_, active)| **active == Some(listener_id))
+        {
+            warn!(target: "network", ?addr, "relay reservation lost; will retry to re-reserve");
+            *active = None;
+        }
+
+        if self.swarm.listeners().count() == 0 {
+            // Zero listeners is fatal only when nothing re-creates them: direct listeners never
+            // come back on their own, while desired relay reservations are re-issued by
+            // `retry_relay_reservations`, so an all-relays-down window (a boot race, a
+            // simultaneous relay outage) is waited out instead of shutting the network down.
+            // NOTE: only relay reservations are retried. A node mixing a direct listener with
+            // relay reservations keeps running but never re-establishes the direct listener
+            // (pre-existing behavior restored it via fatal-exit-and-restart); no shipped
+            // topology mixes them today.
+            if self.relay_reservations.is_empty() {
+                error!(target: "network", ?addresses, "no listeners for swarm - network shutting down");
+                return Err(NetworkError::AllListenersClosed);
+            }
+            warn!(target: "network", ?addresses, "all listeners closed; desired relay reservations will be retried");
+        }
+        Ok(())
+    }
+
     /// Process events from the swarm.
     #[instrument(level = "trace", target = "network::events", skip(self), fields(topics = ?self.authorized_publishers.keys()))]
     async fn process_event(
@@ -80,7 +183,86 @@ where
                 RLBehaviorEvent::ReqRes(event) => self.process_reqres_event(event)?,
                 RLBehaviorEvent::PeerManager(event) => self.process_peer_manager_event(event)?,
                 RLBehaviorEvent::Kademlia(event) => self.process_kad_event(event)?,
+                RLBehaviorEvent::RelayClient(event) => {
+                    // Relay reservation / circuit lifecycle events. Connectivity itself is driven
+                    // by the swarm + peer manager; these are logged at info so relay reachability
+                    // is visible when debugging on site (there are no failure variants here --
+                    // reservation/circuit failures surface as connection errors, not these).
+                    use libp2p::relay::client::Event as RelayClientEvent;
+                    match event {
+                        RelayClientEvent::ReservationReqAccepted {
+                            relay_peer_id,
+                            renewal,
+                            limit,
+                        } => {
+                            info!(target: "network::relay::event", %relay_peer_id, renewal, ?limit, "remote relay accepted our reservation — we are now reachable through it");
+                        }
+                        RelayClientEvent::OutboundCircuitEstablished { relay_peer_id, limit } => {
+                            info!(target: "network::relay::event", %relay_peer_id, ?limit, "we opened an outbound circuit through this relay to reach a peer");
+                        }
+                        RelayClientEvent::InboundCircuitEstablished { src_peer_id, limit } => {
+                            info!(target: "network::relay::event", %src_peer_id, ?limit, "a remote peer reached us inbound through a relay");
+                        }
+                    }
+                }
             },
+            SwarmEvent::ConnectionEstablished { peer_id, connection_id, endpoint, .. } => {
+                let path = ConnectionPath::classify(
+                    &endpoint,
+                    self.swarm.behaviour().peer_manager.is_relay(&peer_id),
+                );
+                self.network_metrics
+                    .connections_by_path
+                    .with_label_values(&[path.metric_label(), self.network_label])
+                    .inc();
+                // A node holding an *established* circuit reservation is a relayed node: its only
+                // legitimate connections are relay legs and circuits, so a direct connection to a
+                // non-relay peer breaks the relayed-only topology. On a direct (no-reservation)
+                // node the same classification is the normal case and stays at
+                // debug.
+                //
+                // Test for an active reservation (`Some` value), not a merely-requested one:
+                // entries are inserted when the reservation is requested (value
+                // `None`) before the RESERVE handshake completes, so `!is_empty()`
+                // is true during the boot window while nothing is reserved yet --
+                // direct dials completing then would false-positive.
+                if matches!(path, ConnectionPath::DirectNonRelay { .. })
+                    && self.relay_reservations.values().any(Option::is_some)
+                {
+                    warn!(
+                        target: "network",
+                        ?peer_id,
+                        addr = ?endpoint.get_remote_address(),
+                        "direct connection to a non-relay peer on a relayed node"
+                    );
+                } else {
+                    debug!(target: "network", ?peer_id, ?connection_id, ?path, "connection path classified");
+                }
+                self.connection_paths.insert(connection_id, path);
+            }
+            SwarmEvent::ConnectionClosed {
+                peer_id,
+                connection_id,
+                endpoint,
+                num_established,
+                cause,
+            } => {
+                let path = self.connection_paths.remove(&connection_id);
+                // Diagnostic: the bare swarm event records no cause, which left the duplicate-
+                // connection churn (a peer with both a dialed and an inbound relayed connection
+                // has one dropped ~seconds later) impossible to attribute. Log the transport path,
+                // how many connections to this peer remain, and the `ConnectionError` cause so the
+                // teardown reason is explicit in the file log.
+                info!(
+                    target: "network",
+                    ?peer_id,
+                    ?path,
+                    num_established,
+                    ?cause,
+                    addr = ?endpoint.get_remote_address(),
+                    "connection closed"
+                );
+            }
             SwarmEvent::ExternalAddrConfirmed { address: _ } => {
                 // New confirmed address so lets publish/update or kademlia address rocord.
                 self.provide_our_data();
@@ -101,21 +283,37 @@ where
                     "listener error"
                 );
             }
-            SwarmEvent::ListenerClosed { addresses, reason, .. } => {
+            SwarmEvent::ListenerClosed { listener_id, addresses, reason } => {
                 // log errors
                 if let Err(e) = reason {
                     error!(target: "network", ?e, "listener unexpectedly closed");
                 }
 
-                // critical failure
-                if self.swarm.listeners().count() == 0 {
-                    error!(target: "network", ?addresses, "no listeners for swarm - network shutting down");
-                    return Err(NetworkError::AllListenersClosed);
-                }
+                self.handle_listener_closed(listener_id, &addresses)?;
+            }
+            SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
+                self.record_dial_failure(peer_id, &error);
             }
             // other events handled by peer manager and other behaviors
             _ => {}
         }
         Ok(())
+    }
+
+    /// Record a failed outbound dial into the `dial_peer_addr_failures` counter, one increment per
+    /// attempted address. Captures churn from every dial path (kad iterative query, discovery
+    /// heartbeat, committee redial) at a single point -- including kad-internal dials that
+    /// never land in an app-side map -- so an unreachable target (e.g. a cross-host
+    /// `127.0.0.1`) shows a climbing count in the metrics.
+    fn record_dial_failure(&self, peer_id: Option<PeerId>, error: &DialError) {
+        // Only the transport variant enumerates the addresses actually attempted.
+        let DialError::Transport(addrs) = error else { return };
+        let peer = peer_id.map(|p| p.to_string()).unwrap_or_else(|| "unknown".to_string());
+        for (addr, _) in addrs {
+            self.network_metrics
+                .dial_peer_addr_failures
+                .with_label_values(&[peer.as_str(), addr.to_string().as_str(), self.network_label])
+                .inc();
+        }
     }
 }
