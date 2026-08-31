@@ -8165,7 +8165,6 @@ dependencies = [
  "rayls-middleware-processor",
  "rayls-middleware-rewards",
  "rayls-testing-test-utils",
- "rayon",
  "reth-db",
  "roaring 0.10.12",
  "serde_json",

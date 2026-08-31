@@ -296,6 +296,7 @@ where
         self.spawn_engine_update_task(
             self.node_shutdown.subscribe(),
             engine.canonical_block_stream().await,
+            engine.clone(),
             &node_task_manager,
         );
 
@@ -306,7 +307,7 @@ where
         info!(target: "epoch-manager", tasks=?node_task_manager, "NODE TASKS\n");
 
         // Catch the termination signal ourselves so we can drive a graceful, ORDERED
-        // shutdown — rather than letting a task-manager join catch it (which would also fire
+        // shutdown - rather than letting a task-manager join catch it (which would also fire
         // its notifier and tear node tasks down). On SIGTERM/ctrl-c this listener fires ONLY
         // `sigterm_trigger`, never `node_shutdown`, so the tasks that subscribe to
         // `node_shutdown` directly (engine, network, vote collector) are NOT woken
@@ -332,7 +333,7 @@ where
         let sigterm_trigger = self.sigterm_trigger.clone();
         // Keep one `to_engine` sender alive past `run_epochs` so the engine's input does NOT close
         // until we say so. `run_epochs` owns the other senders, so its return would close the input
-        // BEFORE `node_shutdown.notify()` below sets the engine's `shutdown_requested` — and the
+        // BEFORE `node_shutdown.notify()` below sets the engine's `shutdown_requested` - and the
         // engine faults (`ConsensusOutputStreamClosed`) on an input close while that flag is false
         // (a TOCTOU on its shutdown check). We drop this only AFTER `notify()`, making notify()
         // strictly happen-before the close: the engine polls rx_shutdown before its input, so it
@@ -347,7 +348,7 @@ where
         let outcome = AssertUnwindSafe(async {
             let epochs = self.run_epochs(&engine, network_config, to_engine, gas_accumulator);
             tokio::pin!(epochs);
-            // `join` (do_exit=false) so this does NOT catch the termination signal — only a
+            // `join` (do_exit=false) so this does NOT catch the termination signal - only a
             // node-task crash (or `node_shutdown`) completes it. SIGTERM is handled by the
             // listener above; on SIGTERM this stays pending and is dropped via the `epochs`
             // branch, leaving node tasks (the engine) running until the post-teardown
@@ -399,9 +400,9 @@ where
         // returns fast on shutdown) while the engine task is still draining queued
         // outputs; flushing then persists a prefix and lets a later block land
         // post-flush (the serialize-replay fork). Signal shutdown (idempotent) so
-        // the engine begins its drain, then wait — UNBOUNDED — for it to report done.
+        // the engine begins its drain, then wait - UNBOUNDED - for it to report done.
         // A finite timeout that fired mid-drain (e.g. a large queued backlog, each output
-        // up to seconds) would flush a prefix and let a later block land post-flush — the
+        // up to seconds) would flush a prefix and let a later block land post-flush - the
         // exact serialize-replay fork. The engine is Drainable and exits cleanly on
         // shutdown, so engine_done fires in every case except a genuine execution deadlock;
         // that rare hang is bounded externally by the supervisor's SIGKILL and is fork-safe
@@ -411,12 +412,49 @@ where
         // observed by the engine only after `notify()` (program order: this drop is after the
         // notify), so it exits Ok via its shutdown path rather than faulting.
         drop(engine_input_keepalive);
+
+        // Safety-net txpool snapshot before the unbounded drain await below: a hung engine would
+        // otherwise reach the supervisor's SIGKILL with no backup, losing exactly the
+        // sealed-but-uncommitted txs the backup exists to protect. Both snapshots are idempotent
+        // tmp-then-rename, so the post-drain one wins on the healthy path; a tx executed during
+        // the drain is rejected nonce-too-low on reload and its restored mark is released by the
+        // first reconcile. Best-effort: a panic here must not skip the drain.
+        {
+            let pools = engine.get_all_worker_transaction_pools().await;
+            let _ = tokio::task::spawn_blocking(move || {
+                for pool in &pools {
+                    pool.save_backup();
+                    pool.save_mark_backup();
+                }
+            })
+            .await;
+        }
+
         match engine_done_rx.await {
             Ok(()) => info!(target: "engine", "engine drained before shutdown flush"),
             // Sender dropped without signalling: the engine task was torn down before its
-            // drain completed (so no in-flight block was finalized) — safe to flush.
+            // drain completed (so no in-flight block was finalized) - safe to flush.
             Err(_) => {
                 warn!(target: "engine", "engine task ended without drain signal; flushing")
+            }
+        }
+
+        // Final txpool snapshot now that the engine has drained: pending and queued transactions
+        // (including sealed-but-uncommitted ones still marked in flight) reload on the next boot.
+        // Serialize and write are blocking work kept off the async workers, and a panic in one
+        // pool must not abort the DB flush below.
+        {
+            let pools = engine.get_all_worker_transaction_pools().await;
+            let saved = AssertUnwindSafe(tokio::task::spawn_blocking(move || {
+                for pool in &pools {
+                    pool.save_backup();
+                    pool.save_mark_backup();
+                }
+            }))
+            .catch_unwind()
+            .await;
+            if saved.is_err() {
+                error!(target: "engine", "txpool backup task panicked");
             }
         }
 
@@ -558,7 +596,13 @@ where
         }
         gas_accumulator.rewards_counter().set_committee(primary.current_committee().await);
 
-        self.orphan_batches(engine.clone(), worker.clone()).await?;
+        // Reload each worker pool's transactions and in-flight marks saved by the previous
+        // graceful shutdown. Sealed-but-uncommitted transactions survive a restart as pending
+        // and marked in flight, so no batch has to be re-collected from `NodeBatchesCache`.
+        for pool in engine.get_all_worker_transaction_pools().await {
+            pool.load_backup().await;
+            pool.load_mark_backup().await;
+        }
 
         // Check for incomplete epoch transition from a previous crash.
         self.recover_partial_transition(&primary, engine).await?;
@@ -704,7 +748,7 @@ where
                 result?;
             }
             RunningOutcome::NodeShutdown => {
-                // Ordered teardown — same producer→consumer sequencing as an epoch/mode
+                // Ordered teardown - same producer→consumer sequencing as an epoch/mode
                 // transition, instead of `abort_all_tasks()` (which hard-aborts Drainable
                 // consumers unordered, alongside producers, and never awaits their drop).
                 // `drain_round = None`: node shutdown doesn't run the subscriber drain
@@ -771,7 +815,7 @@ where
             return InitialBatchSeq::Use(seq);
         }
 
-        // Dev (single-node): no peers to replay from — the execution_replay_complete
+        // Dev (single-node): no peers to replay from - the execution_replay_complete
         // gate below waits on a signal that can be missed on the initial epoch, leaving
         // the batch builder unstarted and txs never mined. Resolve directly.
         #[cfg(feature = "dev-single-node-setup")]
@@ -788,7 +832,7 @@ where
             // Fresh subs so our observe doesn't consume the outer receiver's signal.
             self.consensus_bus.execution_replay_complete().subscribe(),
             self.consensus_bus.mode_transition().subscribe(),
-            // Abort the replay wait on graceful wind-down — the SAME signal run_epoch's outer
+            // Abort the replay wait on graceful wind-down - the SAME signal run_epoch's outer
             // select observes. Must be `sigterm_trigger`, not `node_shutdown`: `node_shutdown`
             // is deferred until after run_epoch returns, so a replay wait keyed to it would
             // deadlock a SIGTERM arriving during setup. Fresh Noticer so we don't consume the
@@ -895,7 +939,7 @@ where
                 "publishing epoch record {epoch_hash}",
             );
 
-            // Dev (single-node): self-certify and return — no peers to gossip to or
+            // Dev (single-node): self-certify and return - no peers to gossip to or
             // collect votes from. The sole vote already meets super_quorum(1)==1.
             // The `== 1` guard is kept (not redundant): it keeps the production
             // gossip/vote-collection path below reachable in dev builds and acts as a
@@ -934,7 +978,7 @@ where
         }
 
         let mut rx = self.consensus_bus.new_epoch_votes().subscribe();
-        // This is a Drainable consumer, so it drains on the task manager's `local_shutdown` —
+        // This is a Drainable consumer, so it drains on the task manager's `local_shutdown`  -
         // fired by `join_internal`'s consumer phase AFTER producers are reaped (or by `Drop`).
         // That makes wind-down graceful AND ordered for every teardown (epoch/mode transition
         // and SIGTERM). NOT `node_shutdown` (now deferred → this would be force-aborted) and
@@ -1219,7 +1263,7 @@ where
     /// Wait for the engine to execute the epoch-closing boundary output.
     ///
     /// Sends the boundary output to the engine, then subscribes to the `executed_anchor` watch and
-    /// waits until `anchor.number >= boundary_output.number` — a monotonic, drop-free completion
+    /// waits until `anchor.number >= boundary_output.number` - a monotonic, drop-free completion
     /// signal, immune to which block ends up the canonical tip (e.g. a drained parked batch, whose
     /// block anchors to a previous output). `target_hash` is used only for diagnostics, not
     /// matching. Consensus shutdown must already be complete before calling this.
@@ -1266,7 +1310,7 @@ where
                 gas_accumulator.clear();
                 return Ok(());
             }
-            // Wait for the next anchor advance. An error means the sender was dropped — the engine
+            // Wait for the next anchor advance. An error means the sender was dropped - the engine
             // task is gone, so execution can never complete.
             if anchor_rx.changed().await.is_err() {
                 error!(

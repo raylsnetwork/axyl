@@ -1,10 +1,12 @@
-//! Implement an abstraction around the Reth transaction pool.
-//! This should insulate from shifting Reth internals, etc.
+//! Worker-side wrapper around the reth transaction pool.
+//!
+//! Keeps reth pool internals out of the batch builder and RPC paths, and owns the pieces reth
+//! does not: the in-flight mark tracker and the shutdown backup in `backup`.
 
 use eyre::Error;
 use futures::StreamExt as _;
 use rayls_infrastructure_types::{
-    Address, EnvKzgSettings, Recovered, SealedBlock, TaskSpawner, TransactionSigned, TxHash,
+    Address, B256Set, EnvKzgSettings, Recovered, TaskSpawner, TransactionSigned, TxHash,
     MIN_PROTOCOL_BASE_FEE,
 };
 use reth::transaction_pool::{
@@ -14,39 +16,27 @@ use reth_chainspec::ChainSpec;
 use reth_node_builder::{NodeConfig, RethTransactionPoolConfig};
 use reth_primitives_traits::SignedTransaction;
 use reth_provider::{
-    providers::BlockchainProvider, AccountReader as _, CanonStateNotification,
-    CanonStateSubscriptions as _, Chain, ChainSpecProvider, ChangedAccount, StateProviderFactory,
+    providers::BlockchainProvider, CanonStateSubscriptions as _, ChainSpecProvider,
 };
 use reth_rpc_eth_types::utils::recover_raw_transaction as reth_recover_raw_transaction;
 use reth_transaction_pool::{
     error::{Eip4844PoolTransactionError, InvalidPoolTransactionError, PoolError},
     identifier::TransactionId,
-    AddedTransactionOutcome, BestTransactions, CanonicalStateUpdate, CoinbaseTipOrdering,
-    EthPooledTransaction, Pool, PoolSize, PoolTransaction, PoolUpdateKind, TransactionEvents,
-    TransactionOrigin, TransactionPool as _, TransactionPoolExt as _, ValidPoolTransaction,
+    maintain::{maintain_transaction_pool_future, MaintainPoolConfig},
+    AddedTransactionOutcome, BestTransactions, CoinbaseTipOrdering, EthPooledTransaction, Pool,
+    PoolSize, PoolTransaction, TransactionEvents, TransactionOrigin, TransactionPool as _,
+    TransactionPoolExt as _, ValidPoolTransaction,
 };
-use std::{collections::HashMap, sync::Arc, time::Instant};
-use tracing::{debug, info, trace, warn};
-
-use crate::{
-    bypass_validator::{BypassHandle, BypassableValidator},
-    error::RaylsRethResult,
-    in_flight::InFlightTracker,
-    traits::RaylsNode,
+use std::{
+    path::PathBuf,
+    sync::Arc,
+    time::{Duration, Instant},
 };
-use alloy::primitives::map::B256Set;
+use tracing::{debug, info};
 
-/// Owned version of CanonicalStateUpdate for use in blocking tasks.
-///
-/// The original CanonicalStateUpdate holds references, but we need owned data
-/// to move into a blocking task.
-struct OwnedCanonicalStateUpdate {
-    new_tip: SealedBlock,
-    pending_block_base_fee: u64,
-    pending_block_blob_fee: Option<u128>,
-    changed_accounts: Vec<ChangedAccount>,
-    mined_transactions: Vec<TxHash>,
-}
+use crate::{error::RaylsRethResult, in_flight::InFlightTracker, traits::RaylsNode};
+
+mod backup;
 
 /// A pooled transaction id.
 pub type PoolTxnId = TransactionId;
@@ -57,7 +47,7 @@ pub type RecoveredPoolTxn = Recovered<EthPooledTransaction>;
 
 pub use reth_primitives_traits::InMemorySize as TxnSize;
 
-/// Generate a new pooled transaction from an eth transaction and id.
+/// Builds a pooled transaction from an eth transaction and id.
 pub fn new_pool_txn(transaction: EthPooledTransaction, transaction_id: PoolTxnId) -> PoolTxn {
     ValidPoolTransaction {
         transaction,
@@ -69,7 +59,7 @@ pub fn new_pool_txn(transaction: EthPooledTransaction, transaction_id: PoolTxnId
     }
 }
 
-/// Decode transaction bytes back to a ['TransactionSigned'].
+/// Decodes EIP-2718 transaction bytes into a pooled transaction.
 pub fn bytes_to_txn(tx_bytes: &[u8]) -> eyre::Result<EthPooledTransaction> {
     let transaction = decode_transaction::<TransactionSigned>(&tx_bytes)
         .map_err(|_| eyre::eyre!("failed to recover transaction"))?;
@@ -96,43 +86,45 @@ fn decode_transaction<T: SignedTransaction>(mut data: &[u8]) -> Result<T, Error>
     Ok(transaction)
 }
 
-/// Trait on a transaction pool to produce the best transaction.
+/// The pool surface the batch builder seals from.
 pub trait TxPool {
-    /// Return an iterator over the best transactions in a pool.
+    /// Returns an iterator over the best transactions in the pool.
     fn best_transactions(&self) -> BestTxns;
-    /// Return the pending txn base fee.
+    /// Returns the pending base fee.
     fn get_pending_base_fee(&self) -> u64;
-    /// Remove EIP-4844 blob transactions from the pool and delete the sidecars from blob store.
+    /// Removes EIP-4844 blob transactions from the pool and deletes their sidecars from the blob
+    /// store.
     fn remove_eip4844_txs(&mut self, blobs: Vec<TxHash>);
-    /// Return whether the hash is sealed into a batch still in flight, so the sealer skips it.
+    /// Returns whether the hash is sealed into a batch still in flight, so the sealer skips it.
     fn is_in_flight(&self, tx_hash: &TxHash) -> bool;
 }
 
-/// The reth EthTransactionValidator type used by this pool.
+/// The reth transaction validator used by this pool.
 type EthValidator = reth_transaction_pool::EthTransactionValidator<
     BlockchainProvider<RaylsNode>,
     EthPooledTransaction,
     crate::evm::RaylsEvmConfig,
 >;
 
-/// The full validator stack: bypass wrapper around the task executor.
-type RaylsValidator = BypassableValidator<TransactionValidationTaskExecutor<EthValidator>>;
+/// The validator wrapped in reth's validation task executor.
+type RaylsValidator = TransactionValidationTaskExecutor<EthValidator>;
 
 /// The concrete pool type used by Rayls workers.
 pub type RaylsTransactionPool =
     Pool<RaylsValidator, CoinbaseTipOrdering<EthPooledTransaction>, DiskFileBlobStore>;
 
-/// A rayls network transaction pool.
+/// A worker's transaction pool, kept canonical by reth's maintenance task.
 #[derive(Clone, Debug)]
 pub struct WorkerTxPool {
+    /// The reth pool.
     pool: RaylsTransactionPool,
-    task_spawner: TaskSpawner,
-    bypass_handle: BypassHandle,
-    blockchain_provider: BlockchainProvider<RaylsNode>,
     /// Hashes sealed into a batch but not yet observed mined, so the sealer skips re-sealing
-    /// them while their batch is in flight; created here and shared with the batch builder via
+    /// them while their batch is in flight; shared with the batch builder via
     /// [`WorkerTxPool::in_flight`].
     in_flight_tracker: InFlightTracker,
+    /// File the pending and queued transactions are snapshotted to on graceful shutdown and
+    /// reloaded from on boot.
+    backup_path: Arc<PathBuf>,
 }
 
 impl From<WorkerTxPool> for RaylsTransactionPool {
@@ -142,7 +134,7 @@ impl From<WorkerTxPool> for RaylsTransactionPool {
 }
 
 impl WorkerTxPool {
-    /// Create a new instance of `Self`.
+    /// Builds the pool and spawns its node-scoped maintenance and in-flight release tasks.
     pub fn new(
         node_config: &NodeConfig<ChainSpec>,
         task_spawner: &TaskSpawner,
@@ -161,184 +153,57 @@ impl WorkerTxPool {
                 .with_max_tx_input_bytes(node_config.txpool.max_tx_input_bytes)
                 .build_with_tasks(task_spawner.clone(), blob_store.clone());
 
-        // wrap in BypassableValidator so orphan transactions can skip re-validation
-        let (bypass_validator, bypass_handle) = BypassableValidator::new(task_executor);
-
         let transaction_pool =
-            Pool::new(bypass_validator, CoinbaseTipOrdering::default(), blob_store, pool_config);
+            Pool::new(task_executor, CoinbaseTipOrdering::default(), blob_store, pool_config);
 
         info!(target: "rayls::execution", "Transaction pool initialized");
 
-        // TODO- save/load txn pool on start/stop (reth's backup_local_transactions_task
-        // interface does not work with custom TaskManager, needs upstream PR)
-
-        let mut state_stream = blockchain_provider.canonical_state_stream();
         let this = Self {
             pool: transaction_pool,
-            task_spawner: task_spawner.clone(),
-            bypass_handle,
-            blockchain_provider: blockchain_provider.clone(),
             in_flight_tracker: InFlightTracker::new(),
+            backup_path: Arc::new(data_dir.txpool_transactions()),
         };
-        let txn_pool_clone = this.clone();
-        // Update the txn pool as the canonical tip changes.
-        task_spawner.spawn_critical_task("canonical txn pool", async move {
-            while let Some(update) = state_stream.next().await {
-                match update {
-                    CanonStateNotification::Commit { new } => {
-                        txn_pool_clone.process_canon_state_update(new);
-                    }
-                    _ => unreachable!("Rayls reorgs are impossible"),
-                }
+
+        // reth's maintenance future drains mined transactions, reloads changed accounts, and
+        // updates the pending base fee on every commit. `no_local_exemptions` holds locally
+        // submitted transactions to the same fee and eviction rules as external ones.
+        let maintain_fut = maintain_transaction_pool_future(
+            blockchain_provider.clone(),
+            this.pool.clone(),
+            blockchain_provider.canonical_state_stream(),
+            task_spawner.clone(),
+            MaintainPoolConfig {
+                max_tx_lifetime: Duration::from_mins(5),
+                no_local_exemptions: true,
+                ..Default::default()
+            },
+        );
+        task_spawner.spawn_critical_task("maintain txn pool", maintain_fut);
+
+        // Release in-flight marks once maintenance drops the sealed transactions from the
+        // pending sub-pool. A separate subscription: the maintenance future consumes its own
+        // stream, and this one must see the same commits.
+        let mut release_stream = blockchain_provider.canonical_state_stream();
+        let release_pool = this.clone();
+        task_spawner.spawn_critical_task("in-flight release", async move {
+            while release_stream.next().await.is_some() {
+                release_pool.reconcile_in_flight();
             }
         });
         Ok(this)
     }
 
-    /// Update pool to remove mined transactions synchronously.
-    ///
-    /// Use this when immediate deduplication is required (e.g., in BatchBuilder to prevent
-    /// duplicate transactions in consecutive batches).
-    pub fn update_canonical_state(
-        &self,
-        new_tip: &SealedBlock,
-        pending_block_base_fee: u64,
-        pending_block_blob_fee: Option<u128>,
-        mined_transactions: Vec<TxHash>,
-        changed_accounts: Vec<ChangedAccount>,
-    ) {
-        let mined_count = mined_transactions.len();
-        let changed_count = changed_accounts.len();
-        let start = Instant::now();
-
-        // create canonical state update
-        let update = CanonicalStateUpdate {
-            new_tip,
-            pending_block_base_fee,
-            pending_block_blob_fee,
-            changed_accounts,
-            mined_transactions,
-            update_kind: PoolUpdateKind::Commit,
-        };
-
-        self.pool.on_canonical_state_change(update);
-
-        let elapsed = start.elapsed();
-        debug!(
-            target: "rayls::txpool",
-            mined_txs = mined_count,
-            changed_accounts = changed_count,
-            elapsed_ms = elapsed.as_millis(),
-            "pool canonical state update completed (sync)"
-        );
-    }
-
-    /// Update pool to remove mined transactions asynchronously.
-    ///
-    /// This spawns a blocking task to avoid blocking the async runtime during high load.
-    /// Use this for canonical stream updates where immediate deduplication is not required.
-    /// The pool handles its own internal locking, so fire-and-forget is safe here.
-    pub fn update_canonical_state_async(
-        &self,
-        new_tip: &SealedBlock,
-        pending_block_base_fee: u64,
-        pending_block_blob_fee: Option<u128>,
-        mined_transactions: Vec<TxHash>,
-        changed_accounts: Vec<ChangedAccount>,
-    ) {
-        let mined_count = mined_transactions.len();
-        let changed_count = changed_accounts.len();
-
-        // create owned canonical state update for the blocking task
-        let update = OwnedCanonicalStateUpdate {
-            new_tip: new_tip.clone(),
-            pending_block_base_fee,
-            pending_block_blob_fee,
-            changed_accounts,
-            mined_transactions,
-        };
-
-        let pool = self.pool.clone();
-
-        // spawn blocking task to avoid blocking the async runtime
-        // this prevents RPC degradation under high transaction load
-        self.task_spawner.spawn_blocking_task("pool-canonical-update", move || {
-            let start = Instant::now();
-
-            // create the borrowed update from owned data
-            let canonical_update = CanonicalStateUpdate {
-                new_tip: &update.new_tip,
-                pending_block_base_fee: update.pending_block_base_fee,
-                pending_block_blob_fee: update.pending_block_blob_fee,
-                changed_accounts: update.changed_accounts,
-                mined_transactions: update.mined_transactions,
-                update_kind: PoolUpdateKind::Commit,
-            };
-
-            pool.on_canonical_state_change(canonical_update);
-
-            let elapsed = start.elapsed();
-            debug!(
-                target: "rayls::txpool",
-                mined_txs = mined_count,
-                changed_accounts = changed_count,
-                elapsed_ms = elapsed.as_millis(),
-                "pool canonical state update completed (async)"
-            );
-        });
-    }
-
-    /// Return pending transactions.
+    /// Returns the pending transactions.
     pub fn pending_transactions(&self) -> Vec<Arc<PoolTxn>> {
         self.pool.pending_transactions()
     }
 
-    /// Return queued transaction (not able to execute yet).
+    /// Returns the queued transactions (not yet executable).
     pub fn queued_transactions(&self) -> Vec<Arc<PoolTxn>> {
         self.pool.queued_transactions()
     }
 
-    /// Applies a canonical state update to the pool so the next build sees the new tip.
-    fn process_canon_state_update(&self, update: Arc<Chain>) {
-        trace!(target: "worker::block-builder", ?update, "canon state update from engine");
-
-        // update pool based with canonical tip update
-        let (blocks, state) = update.inner();
-        let tip = blocks.tip();
-
-        // collect all accounts that changed in last round of consensus
-        let changed_accounts: Vec<ChangedAccount> = state
-            .accounts_iter()
-            .filter_map(|(addr, acc)| acc.map(|acc| (addr, acc)))
-            .map(|(address, acc)| ChangedAccount {
-                address,
-                nonce: acc.nonce,
-                balance: acc.balance,
-            })
-            .collect();
-
-        debug!(target: "block-builder", ?changed_accounts);
-
-        // collect tx hashes to remove any transactions from this pool that were mined
-        let mined_transactions: Vec<TxHash> = blocks.transaction_hashes().collect();
-
-        debug!(target: "block-builder", ?mined_transactions);
-
-        let base_fee_per_gas = tip.base_fee_per_gas.unwrap_or_else(|| self.get_pending_base_fee());
-        // async pool update spawned as blocking task to prevent RPC degradation
-        // this is safe because canonical stream updates don't require immediate deduplication
-        self.update_canonical_state(
-            tip.sealed_block(),
-            base_fee_per_gas,
-            Some(u128::MAX), // set max fee for blobs
-            mined_transactions,
-            changed_accounts,
-        );
-
-        self.reconcile_in_flight();
-    }
-
-    /// The in-flight tracker shared with this pool's batch builder.
+    /// Returns the in-flight tracker shared with this pool's batch builder.
     ///
     /// The builder marks a batch's hashes here on quorum so the next sealing round skips them
     /// while the batch is in flight; the pool releases them again via [`Self::reconcile_in_flight`]
@@ -364,22 +229,22 @@ impl WorkerTxPool {
         }
     }
 
-    /// Return the current status of the pool.
+    /// Returns the pool's view of the canonical tip.
     pub fn block_info(&self) -> BlockInfo {
         self.pool.block_info()
     }
 
-    /// Set the current status of the pool.
+    /// Sets the pool's view of the canonical tip.
     pub fn set_block_info(&self, block_info: BlockInfo) {
         self.pool.set_block_info(block_info);
     }
 
-    /// Return the transactions for an address from the pool.
+    /// Returns the pooled transactions sent by `address`.
     pub fn get_transactions_by_sender(&self, address: Address) -> Vec<Arc<PoolTxn>> {
         self.pool.get_transactions_by_sender(address)
     }
 
-    /// Adds a local (NOT external) transaction to the pool.
+    /// Adds a transaction with local origin.
     pub async fn add_transaction_local(
         &self,
         recovered: EthPooledTransaction,
@@ -387,112 +252,7 @@ impl WorkerTxPool {
         self.pool.add_transaction(TransactionOrigin::Local, recovered).await
     }
 
-    /// Adds a local (NOT external) transaction to the pool.
-    pub async fn add_transactions_local(
-        &self,
-        recovered: Vec<EthPooledTransaction>,
-    ) -> Vec<Result<AddedTransactionOutcome, crate::PoolError>> {
-        self.pool.add_transactions(TransactionOrigin::Local, recovered).await
-    }
-
-    /// Add orphan transactions that were already validated in a previous epoch.
-    ///
-    /// This bypasses the expensive per-transaction state validation by:
-    /// 1. Reading sender state once per unique sender (batch read)
-    /// 2. Pre-populating the bypass map so the validator returns `Valid` immediately
-    /// 3. Calling the normal `add_transactions` path (which hits the bypass → instant)
-    pub async fn add_orphan_transactions(
-        &self,
-        transactions: Vec<EthPooledTransaction>,
-    ) -> Vec<Result<AddedTransactionOutcome, crate::PoolError>> {
-        if transactions.is_empty() {
-            return Vec::new();
-        }
-
-        let start = Instant::now();
-
-        // collect unique senders
-        let unique_senders: Vec<Address> = {
-            let mut seen = std::collections::HashSet::with_capacity(transactions.len());
-            transactions
-                .iter()
-                .filter_map(|tx| {
-                    let sender = tx.sender();
-                    if seen.insert(sender) {
-                        Some(sender)
-                    } else {
-                        None
-                    }
-                })
-                .collect()
-        };
-
-        // batch-read sender state from a single snapshot
-        let sender_accounts = match self.blockchain_provider.latest() {
-            Ok(state) => {
-                let mut accounts = HashMap::with_capacity(unique_senders.len());
-                for sender in &unique_senders {
-                    match state.basic_account(sender) {
-                        Ok(Some(account)) => {
-                            accounts.insert(*sender, account);
-                        }
-                        Ok(None) => {
-                            // account not found - use defaults (balance=0, nonce=0)
-                            accounts.insert(*sender, reth_primitives_traits::Account::default());
-                        }
-                        Err(e) => {
-                            warn!(
-                                target: "orphan-batches",
-                                ?sender,
-                                ?e,
-                                "Failed to read sender account for orphan bypass"
-                            );
-                        }
-                    }
-                }
-                accounts
-            }
-            Err(e) => {
-                warn!(
-                    target: "orphan-batches",
-                    ?e,
-                    "Failed to get state provider for orphan bypass, falling back to normal validation"
-                );
-                return self.pool.add_transactions(TransactionOrigin::Local, transactions).await;
-            }
-        };
-
-        let state_read_elapsed = start.elapsed();
-
-        // activate bypass: the validator will return Valid immediately for these txs
-        self.bypass_handle.activate(&transactions, &sender_accounts);
-
-        let tx_count = transactions.len();
-        let sender_count = sender_accounts.len();
-
-        // insert through normal path - validator short-circuits via bypass map
-        let results = self.pool.add_transactions(TransactionOrigin::Local, transactions).await;
-
-        // deactivate bypass
-        self.bypass_handle.deactivate();
-
-        let ok_count = results.iter().filter(|r| r.is_ok()).count();
-        let total_elapsed = start.elapsed();
-        warn!(
-            target: "orphan-batches",
-            tx_count,
-            sender_count,
-            ok_count,
-            err_count = tx_count - ok_count,
-            state_read_ms = state_read_elapsed.as_millis(),
-            total_ms = total_elapsed.as_millis(),
-            "Orphan transactions inserted via bypass"
-        );
-
-        results
-    }
-
-    /// Adds an external transaction to the pool.
+    /// Adds a transaction with external origin.
     pub async fn add_raw_transaction_external(
         &self,
         tx: EthPooledTransaction,
@@ -500,7 +260,7 @@ impl WorkerTxPool {
         self.pool.add_transaction(TransactionOrigin::External, tx).await
     }
 
-    /// Adds a local (NOT external) transaction to the pool and subscribes to transaction events.
+    /// Adds a transaction with local origin and subscribes to its events.
     pub async fn add_transaction_and_subscribe_local(
         &self,
         recovered: EthPooledTransaction,
@@ -508,12 +268,12 @@ impl WorkerTxPool {
         Ok(self.pool.add_transaction_and_subscribe(TransactionOrigin::Local, recovered).await?)
     }
 
-    /// Retrieves a transaction by hash from the pool.
+    /// Returns the pooled transaction with this hash, if any.
     pub fn get(&self, tx: &TxHash) -> Option<Arc<PoolTxn>> {
         self.pool.get(tx)
     }
 
-    /// Retrieve the pool size stats for the pool.
+    /// Returns the pool size stats.
     pub fn pool_size(&self) -> PoolSize {
         self.pool.pool_size()
     }
@@ -524,7 +284,7 @@ impl WorkerTxPool {
     }
 }
 
-/// Block info defining a transaction pool status.
+/// The pool's view of the canonical tip.
 pub type BlockInfo = RethBlockInfo;
 
 impl TxPool for WorkerTxPool {
@@ -532,11 +292,9 @@ impl TxPool for WorkerTxPool {
         BestTxns { inner: self.pool.best_transactions() }
     }
 
-    /// Return the pending txn base fee.  Currently just the min protocol base fee.
     fn get_pending_base_fee(&self) -> u64 {
-        // TODO issue 114: calculate the next basefee HERE for the entire round
-        //
-        // for now, always use lowest base fee possible
+        // TODO(issue 114): compute the next base fee for the whole round; until then the pool
+        // seals at the protocol minimum.
         MIN_PROTOCOL_BASE_FEE
     }
 
@@ -550,8 +308,9 @@ impl TxPool for WorkerTxPool {
     }
 }
 
-/// An iterator that produces the best transactions from a pool.
+/// An iterator over the best transactions of a pool.
 pub struct BestTxns {
+    /// The reth iterator this wraps.
     inner: Box<dyn BestTransactions<Item = Arc<PoolTxn>>>,
 }
 
@@ -562,24 +321,23 @@ impl std::fmt::Debug for BestTxns {
 }
 
 impl BestTxns {
-    /// Create a new BestTxns (for testing only- normally this comes from a call on the pool).
+    /// Wraps a reth iterator directly; tests only, production goes through [`TxPool`].
     pub fn new_for_test(inner: Box<dyn BestTransactions<Item = Arc<PoolTxn>>>) -> Self {
         Self { inner }
     }
 }
 
 impl BestTxns {
-    /// Disable live transaction updates from the pool during iteration.
+    /// Disables live transaction updates from the pool during iteration.
     ///
-    /// Without this, the iterator receives new pending transactions via a broadcast
-    /// channel while iterating. If a transaction arrives whose predecessor is not in the
-    /// snapshot, it becomes a new independent chain, creating intra-sender nonce gaps
-    /// that cause `nonce_too_high` at execution time.
+    /// Without this the iterator keeps receiving new pending transactions while iterating; one
+    /// whose predecessor is not in the snapshot starts an independent chain, leaving an
+    /// intra-sender nonce gap that fails `nonce_too_high` at execution.
     pub fn no_updates(&mut self) {
         self.inner.no_updates();
     }
 
-    /// When the best transactions exceed our gas limit notify the pool.
+    /// Marks the transaction invalid for exceeding the batch gas limit.
     pub fn exceeds_gas_limit(&mut self, pool_tx: &Arc<PoolTxn>, gas_limit: u64) {
         self.inner.mark_invalid(
             pool_tx,
@@ -587,7 +345,7 @@ impl BestTxns {
         );
     }
 
-    /// When the best transactions are too large for a batch notify the pool.
+    /// Marks the transaction invalid for exceeding the batch size limit.
     pub fn max_batch_size(&mut self, pool_tx: &Arc<PoolTxn>, tx_size: usize, max_size: usize) {
         self.inner.mark_invalid(
             pool_tx,
@@ -595,7 +353,7 @@ impl BestTxns {
         );
     }
 
-    /// Mark the EIP-4844 transaction as invalid.
+    /// Marks the EIP-4844 transaction invalid; batches carry no blob sidecars.
     pub fn ignore_eip4844(&mut self, pool_tx: &Arc<PoolTxn>) {
         self.inner.mark_invalid(
             pool_tx,
@@ -612,19 +370,19 @@ impl Iterator for BestTxns {
     }
 }
 
-/// Recover bytes into a transaction.
+/// Recovers the signer of EIP-2718 transaction bytes.
 pub fn recover_raw_transaction(tx: &[u8]) -> RaylsRethResult<Recovered<TransactionSigned>> {
     let recovered = reth_recover_raw_transaction::<TransactionSigned>(tx)?;
     Ok(recovered)
 }
 
-/// Recover bytes into a signed transaction.
+/// Decodes EIP-2718 transaction bytes, verifying the signature but dropping the signer.
 pub fn recover_signed_transaction(tx: &[u8]) -> RaylsRethResult<TransactionSigned> {
     let recovered = reth_recover_raw_transaction::<TransactionSigned>(tx)?;
     Ok(recovered.into_inner())
 }
 
-/// Recover a pooled transaction.
+/// Recovers EIP-2718 transaction bytes into a pooled transaction.
 pub fn recover_pooled_transaction(
     tx: &[u8],
 ) -> eyre::Result<EthPooledTransaction<TransactionSigned>> {
