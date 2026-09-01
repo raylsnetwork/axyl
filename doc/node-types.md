@@ -1,5 +1,8 @@
 # Node types: Validator, Observer, Archive
 
+> Code pointers below are file-level, not line-pinned — line numbers drift faster than this
+> page gets updated. Last verified against commit `69ee8ab`.
+
 This page answers "what are the deployable node types on Rayls mainnet, why does each
 one matter, and how is each one configured?" — a stakeholder-facing counterpart to
 [`glossary.md`](glossary.md#validator--observer--node) and
@@ -42,11 +45,11 @@ flowchart TD
 allowlist → stake → activate (see [`node-lifecycle.md`](node-lifecycle.md), "Joining
 the network — on-chain registration") — and is a current member of the committee.
 While `NodeMode::CvvActive`
-(`crates/consensus/primary/src/consensus_bus.rs:148`), it proposes headers, votes on
+(`crates/consensus/primary/src/consensus_bus.rs`), it proposes headers, votes on
 peers' headers, and participates in the Bullshark commit that produces the DAG's
 totally-ordered output. A validator temporarily behind on sync runs as
 `NodeMode::CvvInactive` — still a validator, just not currently voting
-(`crates/consensus/primary/src/consensus_bus.rs:150`, and see
+(same file, and see
 [`glossary.md#cvv-states-nodemode`](glossary.md#cvv-states-nodemode)).
 
 **Why it's important.** Validators are the only node type whose votes count toward
@@ -57,23 +60,23 @@ without them, nothing commits.
 **Configuration.**
 - *Consensus participation*: full, when `CvvActive`. Gated independently in several
   places — `Certifier::spawn` requires `config.authority_id()` to be `Some`
-  (`crates/consensus/primary/src/certifier.rs:82-87`); the Proposer is only
+  (`crates/consensus/primary/src/certifier.rs`); the Proposer is only
   constructed and only spawns when `is_active_cvv()`
-  (`crates/consensus/primary/src/primary.rs:100-119`,
-  `crates/consensus/primary/src/proposer/mod.rs:172-187`); the Bullshark commit loop
+  (`crates/consensus/primary/src/primary.rs`,
+  `crates/consensus/primary/src/proposer/mod.rs`); the Bullshark commit loop
   itself only runs `if is_active_cvv()`
-  (`crates/consensus/primary/src/consensus/state.rs:433-447`); and vote requests are
+  (`crates/consensus/primary/src/consensus/state.rs`); and vote requests are
   rejected outright for any node with no `authority_id`
-  (`crates/consensus/primary/src/network/handler.rs:634-644`).
+  (`crates/consensus/primary/src/network/handler.rs`).
 - *State pruning*: not gated by node type in code at all — every node type takes the
   same `PruningArgs` (`--full`/`--minimal`, flattened into the `node` CLI via
-  `crates/execution/evm/src/reth_env/config.rs:79-81`). Reference deployments in this
-  repo run validators with `--full` (`etc/docker-network/compose.yaml:121`,
-  `etc/validator/README.md:113-124`'s `activate-validator.sh --start`).
+  `crates/execution/evm/src/reth_env/config.rs`). Reference deployments in this
+  repo run validators with `--full` (`etc/docker-network/compose.yaml`,
+  `etc/validator/README.md`'s `activate-validator.sh --start`).
 - *RPC exposure*: `RpcServerArgs::http_addr` defaults to loopback
-  (`Ipv4Addr::LOCALHOST`) for every node type
-  (`crates/execution/evm/src/rpc_server_args.rs:57-58`); `--http` itself defaults to
-  `false` outside `--dev` mode (`:53-54`). Keeping a validator's RPC off the public
+  (`Ipv4Addr::LOCALHOST`) for every node type, and `--http` itself defaults to
+  `false` outside `--dev` mode
+  (`crates/execution/evm/src/rpc_server_args.rs`). Keeping a validator's RPC off the public
   path — so transactions can't be submitted directly through it — is an **operator
   convention enforced by not overriding the default and not exposing the port**, not a
   code-level restriction. (The bundled `etc/docker-network/` local test topology *does*
@@ -89,13 +92,13 @@ and liveness lever in a way the other two node types are not.
 
 **Role.** A node that is not in the committee — `NodeMode::Observer`, which the enum's
 own doc comment describes as "follower not in the committee (staked or unstaked)"
-(`crates/consensus/primary/src/consensus_bus.rs:151-152`). Committee membership, not
+(`crates/consensus/primary/src/consensus_bus.rs`). Committee membership, not
 stake, is what makes a node an Observer (see
 [`glossary.md#validator--observer--node`](glossary.md#validator--observer--node)). It
 runs the identical `rayls-network node --observer` binary, holds the same execution
 state as a validator, and follows consensus by streaming committed `ConsensusOutput`
 from a peer instead of running the DAG itself
-(`crates/middleware/bridge/src/subscriber.rs:130`,
+(`crates/middleware/bridge/src/subscriber.rs`,
 [`doc/crates/middleware/overview.md`](crates/middleware/overview.md)).
 
 **Why it's important.** An Observer decouples *read/write access to the network* from
@@ -105,27 +108,26 @@ handed any consensus power or needing to stake.
 
 **Configuration.**
 - *Consensus participation*: never votes or proposes — `is_observer()` is the exact
-  inverse of committee membership (`crates/consensus/primary/src/consensus_bus.rs:167-169`).
+  inverse of committee membership (`crates/consensus/primary/src/consensus_bus.rs`).
   It does, however, still run the Worker's batch builder
   (`NodeMode::is_batch_producing()` is true for `CvvActive | Observer`, deliberately
-  excluding the catching-up `CvvInactive` —
-  `crates/consensus/primary/src/consensus_bus.rs:176-178`), so transactions submitted
+  excluding the catching-up `CvvInactive` — same file), so transactions submitted
   to an Observer's RPC are sealed into batches and gossiped into the network for a
   validator's Primary to eventually reference.
 - *State pruning*: same `PruningArgs` CLI surface as a Validator — code does not
   special-case Observers. The reference runbook happens to pass `--full`
-  (`etc/observer/README.md:178-190`), but that is an operator choice, not a
+  (`etc/observer/README.md`), but that is an operator choice, not a
   requirement.
 - *RPC exposure*: same loopback default as any node type, but the intended posture is
   the opposite of a Validator's — Observers are meant to be the public-facing entry
   point for transaction submission and general RPC traffic
-  (`etc/observer/README.md:1-5`: "serves RPC traffic but does not participate in block
+  (`etc/observer/README.md`: "serves RPC traffic but does not participate in block
   production").
 
 **Why it matters for Rayls.** Observers let the network scale RPC/read capacity and
 give partners operational independence, without growing the trust-sensitive validator
 set. Key generation for an Observer produces literally the same key material as a
-Validator (`crates/infrastructure/network-cli/src/keytool/mod.rs:79-89` routes both
+Validator (`crates/infrastructure/network-cli/src/keytool/mod.rs` routes both
 `NodeType::ValidatorKeys` and `NodeType::ObserverKeys` through the same `KeygenArgs`
 code path) — the BLS key exists so the Observer can authenticate its own p2p gossip
 (e.g. forwarding user-submitted transactions toward a validator), not to vote
@@ -140,11 +142,11 @@ this is the intended reading is the doc comment on `RethEnv::new_for_archive_rep
 (used by the offline `rayls-replay` tool, not a live node, but describing the same
 underlying mechanism): *"Pruning is DISABLED (default `NodeConfig::default()` has
 `prune_config() == None`), producing a full archive"*
-(`crates/execution/evm/src/reth_env/init.rs:186-192`). For a live node, the same
+(`crates/execution/evm/src/reth_env/init.rs`). For a live node, the same
 absence-of-a-pruning-flag path applies:
 `spawn_persistence` falls back to a no-op pruner — zero prune segments,
 `usize::MAX` interval, `0` delete limit — whenever no `PruneConfig` is supplied
-(`crates/execution/evm/src/persistence.rs:27-45`). **This page is the first place that
+(`crates/execution/evm/src/persistence.rs`). **This page is the first place that
 names "Archive" as a distinct node type** — there is no prior doc or code convention to
 defer to here, and it is a synthesis from the pruning wiring above, not a pre-existing
 named feature.
