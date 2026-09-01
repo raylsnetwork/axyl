@@ -8137,6 +8137,7 @@ name = "rayls-middleware-orchestrator"
 version = "1.2.2"
 dependencies = [
  "alloy",
+ "axum 0.8.8",
  "consensus-metrics",
  "eyre",
  "futures",
