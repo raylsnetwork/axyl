@@ -2,10 +2,10 @@
 
 use crate::{ConfigFmt, ConfigTrait, NodeInfo, RaylsDirs};
 use rayls_infrastructure_types::{
-    get_available_udp_port, test_genesis, Address, BlsPublicKey,
-    BlsSignature, Genesis, NetworkPublicKey, RaylsNetwork,
-    ETHEREUM_BLOCK_GAS_LIMIT_56BITS, MAINNET_COMMITTEE, MAINNET_GENESIS, MAINNET_PARAMETERS,
-    MIN_RAYLS_PROTOCOL_BASE_FEE, TESTNET_COMMITTEE, TESTNET_GENESIS, TESTNET_PARAMETERS,
+    get_available_udp_port, test_genesis, Address, BlsPublicKey, BlsSignature, Genesis,
+    NetworkPublicKey, RaylsNetwork, ETHEREUM_BLOCK_GAS_LIMIT_56BITS, MAINNET_COMMITTEE,
+    MAINNET_GENESIS, MAINNET_PARAMETERS, MIN_RAYLS_PROTOCOL_BASE_FEE, TESTNET_COMMITTEE,
+    TESTNET_GENESIS, TESTNET_PARAMETERS,
 };
 use reth_chainspec::ChainSpec;
 use serde::{Deserialize, Serialize};

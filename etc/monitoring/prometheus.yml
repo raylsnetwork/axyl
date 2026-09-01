@@ -19,7 +19,7 @@ scrape_configs:
   # ExecutorMetrics, plus storage gauges. Set `metrics_address` in the node's parameters.yaml.
   - job_name: rayls-consensus
     static_configs:
-      - targets: ["host.docker.internal:9184"]
+      - targets: ["host.docker.internal:9100"]
         labels:
           layer: consensus
 
@@ -27,7 +27,7 @@ scrape_configs:
   # Set `reth_metrics_address` in the node's parameters.yaml.
   - job_name: rayls-execution
     static_configs:
-      - targets: ["host.docker.internal:9001"]
+      - targets: ["host.docker.internal:9200"]
         labels:
           layer: execution
 

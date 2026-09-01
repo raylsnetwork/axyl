@@ -2,8 +2,8 @@
 #
 # Quick start (see README.md for the full walkthrough):
 #   1. Enable the node's metrics endpoints in its parameters.yaml:
-#        metrics_address: "0.0.0.0:9184"        # consensus / Narwhal suite
-#        reth_metrics_address: "0.0.0.0:9001"   # reth execution layer
+#        metrics_address: "0.0.0.0:9100"        # consensus / Narwhal suite
+#        reth_metrics_address: "0.0.0.0:9200"   # reth execution layer
 #      (or pass --metrics / --reth-metrics on the CLI). Restart the node.
 #   2. Adjust the targets in prometheus.yml if the node isn't on the docker host.
 #   3. `docker compose -f etc/monitoring/docker-compose.yml up -d`
@@ -14,7 +14,7 @@
 
 services:
   prometheus:
-    image: prom/prometheus:latest
+    image: prom/prometheus:v3.8.1
     container_name: rayls-prometheus
     restart: unless-stopped
     command:
@@ -29,7 +29,7 @@ services:
       - "host.docker.internal:host-gateway"
 
   grafana:
-    image: grafana/grafana:latest
+    image: grafana/grafana:12.1
     container_name: rayls-grafana
     restart: unless-stopped
     environment:
@@ -45,7 +45,7 @@ services:
       - prometheus
 
   node-exporter:
-    image: prom/node-exporter:latest
+    image: prom/node-exporter:v1.10.2
     container_name: rayls-node-exporter
     restart: unless-stopped
     command:
@@ -54,7 +54,12 @@ services:
     volumes:
       - /:/host:ro,rslave
     ports:
-      - "9100:9100"
+      # Host-side port only, for local debugging (curl localhost:9101/metrics) — Prometheus
+      # itself scrapes this container internally via the "node-exporter:9100" docker-network
+      # address below, unaffected by this mapping. Published on 9101, not node_exporter's
+      # own default 9100, because 9100 is also the consensus-metrics port a node on this same
+      # host would bind via --metrics — publishing both on host 9100 would collide.
+      - "9101:9100"
 
 volumes:
   prometheus-data:
