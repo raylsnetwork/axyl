@@ -1,5 +1,8 @@
 # Glossary
 
+> Code pointers below are file-level, not line-pinned — line numbers drift faster than this
+> page gets updated. Last verified against commit `69ee8ab`.
+
 This page exists because a term can mean different things in different parts of Axyl —
 a word used casually in a design doc, a Rust crate name, and a Solidity concept can all be
 spelled the same way and mean three unrelated things. That ambiguity is expensive: it showed
@@ -65,7 +68,7 @@ different software:
 |---|---|---|
 | **Node** | Any running instance of the node binary (see "Network" sense 1 above), validator or observer. | — |
 | **Validator** | A node whose authority has been admitted on-chain (`ConsensusRegistry.allowlistValidator` → stake → activate) and can sign/vote on consensus — i.e. a CVV, at least while its `NodeMode` is `CvvActive` (see below). | [`etc/validator/README.md`](../etc/validator/README.md) |
-| **Observer** | A node that syncs consensus and execution but never signs or votes, and exposes the same RPC surface as a validator. Per `NodeMode::Observer`: "follower not in the committee (**staked or unstaked**)" — an observer can hold stake without being in the committee; what makes it an Observer is not being admitted, not its stake. | [`crates/consensus/primary/src/consensus_bus.rs:151`](../crates/consensus/primary/src/consensus_bus.rs), [`etc/observer/README.md`](../etc/observer/README.md) |
+| **Observer** | A node that syncs consensus and execution but never signs or votes, and exposes the same RPC surface as a validator. Per `NodeMode::Observer`: "follower not in the committee (**staked or unstaked**)" — an observer can hold stake without being in the committee; what makes it an Observer is not being admitted, not its stake. | [`crates/consensus/primary/src/consensus_bus.rs`](../crates/consensus/primary/src/consensus_bus.rs), [`etc/observer/README.md`](../etc/observer/README.md) |
 
 **Don't confuse with:** a validator that's temporarily catching up (`NodeMode::CvvInactive`, see
 below) is still a Validator — it's just not currently signing/voting. It is not an Observer; the
@@ -81,8 +84,8 @@ Observer — never-pruned — not a distinct code concept).
 Primaries propose one header per round and need 2f+1 certificates to advance; leaders are elected
 on even rounds only.
 
-- Type: [`crates/infrastructure/types/src/primary/mod.rs:38`](../crates/infrastructure/types/src/primary/mod.rs)
-- Leader election on even rounds: [`crates/consensus/primary/src/consensus/bullshark.rs:133`](../crates/consensus/primary/src/consensus/bullshark.rs)
+- Type: [`crates/infrastructure/types/src/primary/mod.rs`](../crates/infrastructure/types/src/primary/mod.rs)
+- Leader election on even rounds: [`crates/consensus/primary/src/consensus/bullshark.rs`](../crates/consensus/primary/src/consensus/bullshark.rs)
 - Encoded as the **low** 32 bits of the EVM block `nonce` field (epoch is the high 32 bits) —
   see the header-field-encoding table in [`index.md`](index.md).
 
@@ -94,7 +97,7 @@ BLS `EpochCertificate` (the trust anchor light/syncing nodes bootstrap from), an
 by a `ConsensusRegistry.concludeEpoch` system call that applies incentives and rotates the
 committee.
 
-- Type: [`crates/infrastructure/types/src/committee.rs:19`](../crates/infrastructure/types/src/committee.rs)
+- Type: [`crates/infrastructure/types/src/committee.rs`](../crates/infrastructure/types/src/committee.rs)
 - Trust-anchor detail: [`index.md`](index.md#rpc-interface), [`../SYNC.md`](../SYNC.md)
 - Encoded as the **high** 32 bits of the EVM block `nonce` field (round is the low 32 bits).
 
@@ -111,7 +114,7 @@ monotonic `seq`. Hashing a `Batch` produces a `SealedBatch` (`Batch::seal_slow`)
 in `crates/consensus/worker` is what assembles and seals one. One committed sub-DAG maps to one
 EVM block per batch it contains (see [`index.md`](index.md)).
 
-- Struct: [`crates/infrastructure/types/src/worker/sealed_batch.rs:63`](../crates/infrastructure/types/src/worker/sealed_batch.rs)
+- Struct: [`crates/infrastructure/types/src/worker/sealed_batch.rs`](../crates/infrastructure/types/src/worker/sealed_batch.rs)
 
 **Don't confuse with:** casually calling a group of RPC calls or DB writes "a batch" — unrelated
 to the consensus `Batch` type.
@@ -123,7 +126,7 @@ certificates sequenced by consensus, waits until every batch they reference has 
 dedups, and forwards each `ConsensusOutput` to the execution engine (`ExecutorEngine`) over an
 mpsc channel. Purely an internal consensus→execution handoff — nothing cross-chain.
 
-- [`crates/middleware/bridge/src/subscriber.rs:43`](../crates/middleware/bridge/src/subscriber.rs)
+- [`crates/middleware/bridge/src/subscriber.rs`](../crates/middleware/bridge/src/subscriber.rs)
 
 **Don't confuse with:** any cross-chain/interop "bridge" (moving assets or messages between two
 chains). If a design doc means that, say "interop bridge" or name the actual mechanism — this
@@ -140,7 +143,7 @@ currently admitted to the committee and, if so, whether it's actually voting rig
 | `CvvInactive` | Staked CVV **catching up** — allowed to sync past the GC window so it can rejoin. Still a validator, just not currently signing/voting. | ✓ | ✗ |
 | `Observer` | Follower not in the committee (staked or unstaked). Never votes. | ✗ | ✗ |
 
-- Enum + doc comments: [`crates/consensus/primary/src/consensus_bus.rs:146`](../crates/consensus/primary/src/consensus_bus.rs)
+- Enum + doc comments: [`crates/consensus/primary/src/consensus_bus.rs`](../crates/consensus/primary/src/consensus_bus.rs)
 - `is_batch_producing()` is `CvvActive | Observer` — deliberately **excludes** `CvvInactive`: a
   catching-up node must not run the batch builder, or a sealed batch wedges the worker on
   `report_own_batch` with no proposer draining it, stalling epoch-transition drain.

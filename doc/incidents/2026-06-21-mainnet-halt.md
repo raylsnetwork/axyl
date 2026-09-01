@@ -96,6 +96,10 @@ frontier. Reading a **monotonic** anchor instead removes the regression.
 
 ## Evidence (file:line)
 
+> Line numbers below are pinned to the pre-fix code **as it stood during this incident**
+> (2026-06-21) — a forensic record, not a current pointer. Don't expect these to match
+> `main` today; use the file paths to navigate and re-derive current line numbers if needed.
+
 - `seq` assignment: `crates/consensus/worker/src/batch-builder/src/lib.rs:92,161,314`
 - batch availability 2f+1 acks: `crates/consensus/worker/src/quorum_waiter.rs:150-153`
 - parents = first 2f+1: `crates/consensus/primary/src/aggregators/certificates.rs:113`
