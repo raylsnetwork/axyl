@@ -102,14 +102,22 @@ where
         let mut node_task_manager = TaskManager::new(NODE_TASK_MANAGER);
         let node_task_spawner = node_task_manager.get_spawner();
 
-        // Bind the liveness healthcheck before any boot-time cold work (crash reconcile + backlog
+        // Bind the healthcheck before any boot-time cold work (crash reconcile + backlog
         // migration). Both are synchronous and can be multi-minute on a large DB; binding the probe
         // first keeps it answering throughout (the migration is `spawn_blocking`'d so the runtime
         // stays free), so a short-deadline probe cannot blackout and restart-loop the node during
-        // recovery. NOTE: the probe is liveness-only by design (it does not report readiness), so
-        // it is green while these run.
+        // recovery. LIVENESS (any path but `/readyz`) stays green throughout — the process is up.
+        // READINESS (`/readyz`) reads the live node mode and reports `503` until the node is voting
+        // or observing, so it is correctly not-ready during this boot recovery. A bind failure
+        // (e.g. the port is already in use) is propagated rather than silently swallowed — the
+        // operator asked for this endpoint.
         if let Some(port) = self.builder.healthcheck {
-            let _ = HealthcheckServer::spawn(node_task_manager.get_spawner(), port).await;
+            HealthcheckServer::spawn(
+                node_task_manager.get_spawner(),
+                port,
+                self.consensus_bus.node_mode().subscribe(),
+            )
+            .await?;
         }
 
         // Heal any crash-interrupted archive before serving, while consensus and execution have not
@@ -529,9 +537,12 @@ where
         // This needs to be created early so required machinery for other tasks exists when needed.
         let mut worker = worker_node.new_worker().await?;
         worker.set_batch_tracker(self.consensus_bus.batch_tracker().clone());
-        let current_epoch = primary.current_committee().await.epoch();
+        let current_committee = primary.current_committee().await;
+        let current_epoch = current_committee.epoch();
 
-        self.consensus_bus.consensus_metrics().current_epoch.set(current_epoch as i64);
+        let consensus_metrics = self.consensus_bus.consensus_metrics();
+        consensus_metrics.current_epoch.set(current_epoch as i64);
+        consensus_metrics.committee_size.set(current_committee.size() as i64);
 
         // Produce a "dummy" epoch 0 EpochRecord if missing.
         // This will let us use simple code to find any epoch including 0 at startup.

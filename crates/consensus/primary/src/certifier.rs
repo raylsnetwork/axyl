@@ -403,6 +403,14 @@ impl<DB: Database> Certifier<DB> {
                             header_round, limit_round, cert_store_round, committed_round,
                             "ignoring too-old rejection: cert store covers limit round and DAG still progressing (transient proposer lag)"
                         );
+                        // Count the rejection under a distinct reason even though it isn't held
+                        // against the peer for demotion — otherwise the metric would show zero
+                        // while a node continuously trips the skip path, masking real trouble.
+                        self.consensus_bus
+                            .consensus_metrics()
+                            .vote_request_rejections
+                            .with_label_values(&[&peer_id.to_string(), "too_old_skipped"])
+                            .inc();
                         return VoteErrorAction::Continue;
                     }
                     warn!(
@@ -414,6 +422,11 @@ impl<DB: Database> Certifier<DB> {
                     );
                 }
                 let outcome = self.vote_failures.record_too_old(peer_id.clone());
+                self.consensus_bus
+                    .consensus_metrics()
+                    .vote_request_rejections
+                    .with_label_values(&[&peer_id.to_string(), "too_old"])
+                    .inc();
                 warn!(
                     target: "primary::certifier",
                     auth=?self.authority_id,
@@ -448,10 +461,22 @@ impl<DB: Database> Certifier<DB> {
                         peer_epoch, our_epoch,
                         "ignoring epoch rejection from stale peer"
                     );
+                    // Count it under a distinct reason even though a stale peer can't demote us —
+                    // mirrors `too_old_skipped`, keeping the raw rejection rate visible.
+                    self.consensus_bus
+                        .consensus_metrics()
+                        .vote_request_rejections
+                        .with_label_values(&[&peer_id.to_string(), "epoch_mismatch_stale"])
+                        .inc();
                     return VoteErrorAction::Continue;
                 }
 
                 let outcome = self.vote_failures.record_epoch_mismatch(peer_id.clone());
+                self.consensus_bus
+                    .consensus_metrics()
+                    .vote_request_rejections
+                    .with_label_values(&[&peer_id.to_string(), "epoch_mismatch"])
+                    .inc();
                 warn!(
                     target: "primary::certifier",
                     auth=?self.authority_id,

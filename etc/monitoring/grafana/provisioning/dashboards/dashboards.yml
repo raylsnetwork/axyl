@@ -1,0 +1,13 @@
+# Grafana dashboard provisioning — auto-loads the JSON dashboards in this directory on start.
+apiVersion: 1
+
+providers:
+  - name: rayls
+    orgId: 1
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 30
+    allowUiUpdates: true
+    options:
+      path: /etc/grafana/provisioning/dashboards
+      foldersFromFilesStructure: false
