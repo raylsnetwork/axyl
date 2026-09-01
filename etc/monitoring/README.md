@@ -24,8 +24,8 @@ passed.
 Add to the node's `parameters.yaml`:
 
 ```yaml
-metrics_address: "0.0.0.0:9184"        # consensus / Narwhal suite
-reth_metrics_address: "0.0.0.0:9001"   # reth execution layer
+metrics_address: "0.0.0.0:9100"        # consensus / Narwhal suite
+reth_metrics_address: "0.0.0.0:9200"   # reth execution layer
 ```
 
 Restart the node. It logs the active endpoints at startup (`… metrics enabled`).
