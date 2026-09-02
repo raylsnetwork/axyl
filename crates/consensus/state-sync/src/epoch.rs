@@ -8,6 +8,13 @@ use rayls_infrastructure_types::{
 };
 use tracing::info;
 
+/// Maximum number of consecutive orphaned epoch records to skip past during catch-up.
+/// When an epoch record is unavailable network-wide, we probe up to this many successors
+/// to decide whether it is a hole below the tip (skip it) or simply the chain tip (stop).
+/// Bounds how far a rare run of consecutive holes can be crossed, and how many probes the
+/// tip check costs.
+const MAX_GAP_SKIP: Epoch = 8;
+
 /// Return true if committee is compatable with epoch_rec_committee.
 /// These will usually be equal but it is possible for a validator to be
 /// booted and still in committee but not in epoch_rec.committee.
@@ -75,22 +82,37 @@ where
         // Try to recover by downloading the epoch record and cert from a peer.
         match primary_handle.request_epoch_cert(Some(epoch), None).await {
             Ok((epoch_rec, cert)) => {
-                let (parent_hash, committee) =
-                    if let Ok((parent_hash, committee)) = get_committee(db, epoch) {
-                        (parent_hash, committee)
-                    } else {
-                        // We are missing epoch records.
-                        // Should not be here but if so just skipping won't really help...
-                        // Reduce last_epoch by one and once this loop finishes skipping we can
-                        // try to get the missing epoch again.
-                        return epoch - 1;
-                    };
-                // Verify the epoch has the expected parent and committee and is signed by
-                // that committee.
-                if parent_hash == epoch_rec.parent_hash
-                    && epoch_committee_valid(&epoch_rec, &committee)
-                    && epoch_rec.verify_with_cert(&cert)
-                {
+                // Validate the fetched record. Normally we anchor it to its parent
+                // (parent_hash + committee derived from the previous record). If the
+                // parent record is a permanent hole - orphaned network-wide, so it can
+                // never be fetched or (here, without chain access) rebuilt - fall back to
+                // trusting the certificate alone: it proves 2f+1 of the committee named in
+                // the record signed it, and the next epoch re-anchors the chain against
+                // this one (its `parent_hash` must match). This lets catch-up cross a lost
+                // epoch instead of stalling on it forever.
+                let validated = match get_committee(db, epoch) {
+                    Ok((parent_hash, committee)) => {
+                        parent_hash == epoch_rec.parent_hash
+                            && epoch_committee_valid(&epoch_rec, &committee)
+                            && epoch_rec.verify_with_cert(&cert)
+                    }
+                    Err(_) => {
+                        // Parent missing: cert-only acceptance, guarded by a committee-size
+                        // floor (matching `epoch_committee_valid`) so a bogus single-signer
+                        // record cannot slip through.
+                        let ok = epoch_rec.epoch == epoch
+                            && epoch_rec.committee.len() >= 4
+                            && epoch_rec.verify_with_cert(&cert);
+                        if ok {
+                            tracing::warn!(
+                                target: "epoch-manager",
+                                "epoch {epoch} parent record is orphaned; accepting cert-verified record to skip the gap",
+                            );
+                        }
+                        ok
+                    }
+                };
+                if validated {
                     let epoch_hash = epoch_rec.digest();
                     if let Err(e) = db.save_epoch_record_with_cert(&epoch_rec, &cert) {
                         tracing::error!(
@@ -112,6 +134,31 @@ where
                     target: "epoch-manager",
                     "failed to retrieve epoch from a peer {epoch}: {err}",
                 );
+                // `epoch` may simply be past the tip (nothing to fetch), or it may be a
+                // record that is orphaned network-wide while later epochs still exist -
+                // possibly across a short run of consecutive holes. Probe up to
+                // MAX_GAP_SKIP successors: if any is fetchable, `epoch` is a hole below the
+                // tip and we skip it so catch-up can continue; if none are, we are at the
+                // tip and stop.
+                let mut later_epoch_exists = false;
+                for ahead in 1..=MAX_GAP_SKIP {
+                    if matches!(
+                        primary_handle.request_epoch_cert(Some(epoch + ahead), None).await,
+                        Ok(_)
+                    ) {
+                        later_epoch_exists = true;
+                        break;
+                    }
+                }
+                if later_epoch_exists {
+                    tracing::warn!(
+                        target: "epoch-manager",
+                        "epoch {epoch} is unavailable network-wide but a later epoch exists; skipping the gap",
+                    );
+                    // Mark progress so the loop advances past the hole instead of breaking.
+                    result_epoch = epoch;
+                    continue;
+                }
             }
         }
         if result_epoch != epoch {
