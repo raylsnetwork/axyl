@@ -1,7 +1,7 @@
 //! Worker-side wrapper around the reth transaction pool.
 //!
 //! Keeps reth pool internals out of the batch builder and RPC paths, and owns the pieces reth
-//! does not: the in-flight mark tracker and the shutdown backup in `backup`.
+//! does not: the in-flight mark tracker.
 
 use eyre::Error;
 use futures::StreamExt as _;
@@ -28,15 +28,12 @@ use reth_transaction_pool::{
     TransactionPool as _, TransactionPoolExt as _, ValidPoolTransaction,
 };
 use std::{
-    path::PathBuf,
     sync::Arc,
     time::{Duration, Instant},
 };
 use tracing::{debug, info};
 
 use crate::{error::RaylsRethResult, in_flight::InFlightTracker, traits::RaylsNode};
-
-mod backup;
 
 /// A pooled transaction id.
 pub type PoolTxnId = TransactionId;
@@ -122,9 +119,6 @@ pub struct WorkerTxPool {
     /// what it sealed so the next round skips it, the forwarder marks what it sent so it does not
     /// re-send before the mark is due. Handed out via [`WorkerTxPool::in_flight`].
     in_flight_tracker: InFlightTracker,
-    /// File the pending and queued transactions are snapshotted to on graceful shutdown and
-    /// reloaded from on boot.
-    backup_path: Arc<PathBuf>,
 }
 
 impl From<WorkerTxPool> for RaylsTransactionPool {
@@ -166,7 +160,6 @@ impl WorkerTxPool {
         let this = Self {
             pool: transaction_pool,
             in_flight_tracker: in_flight,
-            backup_path: Arc::new(data_dir.txpool_transactions()),
         };
 
         // reth's maintenance future drains mined transactions, reloads changed accounts, and

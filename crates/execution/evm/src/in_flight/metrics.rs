@@ -8,7 +8,6 @@ const RELEASED_TTL_COUNTER: &str = "rayls_txpool_in_flight_released_ttl";
 const RELEASED_CLEAR_COUNTER: &str = "rayls_txpool_in_flight_released_clear";
 const RELEASED_DROPPED_COUNTER: &str = "rayls_txpool_in_flight_released_dropped";
 const MARKED_FORWARD_COUNTER: &str = "rayls_txpool_in_flight_marked_forward";
-const RESTORED_COUNTER: &str = "rayls_txpool_in_flight_restored_total";
 
 /// Prometheus counters and gauge backing one `InFlightTracker`; each registration description is
 /// that metric's HELP text.
@@ -21,7 +20,6 @@ pub(super) struct InFlightMetrics {
     pub released_dropped: IntCounter,
     pub released_ttl: IntCounter,
     pub released_clear: IntCounter,
-    pub restored: IntCounter,
 }
 
 impl InFlightMetrics {
@@ -62,11 +60,6 @@ impl InFlightMetrics {
             released_clear: prometheus::register_int_counter_with_registry!(
                 RELEASED_CLEAR_COUNTER,
                 "Marks released by the epoch-transition clear",
-                registry
-            )?,
-            restored: prometheus::register_int_counter_with_registry!(
-                RESTORED_COUNTER,
-                "Marks reinstated from the shutdown mark backup at the first arming",
                 registry
             )?,
         })
