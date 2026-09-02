@@ -157,10 +157,7 @@ impl WorkerTxPool {
 
         info!(target: "rayls::execution", "Transaction pool initialized");
 
-        let this = Self {
-            pool: transaction_pool,
-            in_flight_tracker: in_flight,
-        };
+        let this = Self { pool: transaction_pool, in_flight_tracker: in_flight };
 
         // reth's maintenance future drains mined transactions, reloads changed accounts, and
         // updates the pending base fee on every commit. `no_local_exemptions` holds locally
@@ -187,7 +184,10 @@ impl WorkerTxPool {
         let release_pool = this.clone();
         task_spawner.spawn_critical_task("in-flight release", async move {
             while release_stream.next().await.is_some() {
-                release_pool.reconcile_in_flight();
+                // reconcile scans the whole pending sub-pool (O(pending)) under the pool read
+                // lock; keep it off the async worker so a large pool cannot pin one.
+                let pool = release_pool.clone();
+                let _ = tokio::task::spawn_blocking(move || pool.reconcile_in_flight()).await;
             }
         });
         Ok(this)

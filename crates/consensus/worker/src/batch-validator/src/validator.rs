@@ -160,8 +160,25 @@ impl BatchValidation for BatchValidator {
             };
 
             let tx_pool = tx_pool.clone();
+            let handle = tokio::runtime::Handle::current();
             self.reth_env.get_task_spawner().spawn_task("submit-tx-batch", async move {
-                for res in tx_pool.add_raw_transactions_external(parsed_txns).await {
+                // Admit off the async runtime: reth's `add_transactions` takes a blocking
+                // `parking_lot` write lock, so a flood of owner-submitted gossip batches would
+                // park every tokio worker on that lock and starve the runtime. Same hazard and
+                // fix as `submit_forwarded_txns`; run it on a blocking thread and drive the async
+                // submit with `block_on`.
+                let results = match tokio::task::spawn_blocking(move || {
+                    handle.block_on(tx_pool.add_raw_transactions_external(parsed_txns))
+                })
+                .await
+                {
+                    Ok(results) => results,
+                    Err(e) => {
+                        warn!(target: "worker::validator", ?e, "gossip-txn pool submit did not complete");
+                        return;
+                    }
+                };
+                for res in results {
                     match res {
                         Ok(_) => {}
                         // A hash this pool already holds is ordinary gossip dedup: multiple
