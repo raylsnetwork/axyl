@@ -7,7 +7,8 @@
 //! from resends until local execution prunes them. Delivery is never assumed: transactions stay in
 //! the local pool, and the shared in-flight tracker re-marks anything still pending once its mark
 //! is due ([`FORWARD_POLICY`]) but only while this node is caught up, since a lagging node cannot
-//! tell a lost send from its own lag.
+//! tell a lost send from its own lag. A transaction still pending after [`FORWARD_PRUNE_ATTEMPTS`]
+//! re-sends is dropped as unmineable rather than forwarded forever.
 
 use alloy::primitives::map::AddressMap;
 use prometheus::{
@@ -69,6 +70,20 @@ const FORWARD_POLICY: DuePolicy =
 /// observer reads this (the receiver accepts unconditionally), so it needs no cross-node agreement.
 const OWNER_ROTATION_BLOCKS: u64 = 2048;
 
+/// Drop a forwarded transaction still sitting in the pending pool after this many re-send attempts.
+/// Each attempt already required the executed anchor to advance `min_anchor_advance` blocks, so a
+/// transaction that has survived this many re-sends is not going to be mined (the chain moved on
+/// without it); forwarding it forever only wastes submits. The client resubmits if it is still
+/// wanted, so dropping it is safe.
+///
+/// The check runs before the re-send gate, so a transaction that reached the cap while caught up is
+/// still dropped even if the node has since fallen behind. But `attempts` only climbs while caught
+/// up (re-sends are gated by lag), so a node that has been lagging throughout - holding, not
+/// re-sending, while it catches up - never reaches the cap here: its pending transactions are stuck
+/// because it is behind, not because they are dead, and most are mined once it catches up. A node
+/// that can never catch up is a separate problem, not papered over here.
+const FORWARD_PRUNE_ATTEMPTS: u32 = 5;
+
 /// Instrumentation for the per-tick pool scan, settling whether re-examining the whole pending set
 /// each tick is a real cost or noise absorbed by the interval.
 #[derive(Clone)]
@@ -85,6 +100,8 @@ struct ForwardMetrics {
     acked_stale: IntCounter,
     /// Ticks where re-sends were gated because local execution trailed the seen header.
     resend_gated: IntCounter,
+    /// Transactions dropped from the pool after repeated forwards without being mined.
+    pruned: IntCounter,
 }
 
 impl ForwardMetrics {
@@ -124,6 +141,11 @@ impl ForwardMetrics {
                 "Ticks where re-sends were withheld because this node trailed the seen header",
                 registry
             )?,
+            pruned: register_int_counter_with_registry!(
+                "rayls_txn_forwarder_pruned_total",
+                "Transactions dropped from the pool after repeated forwards without being mined",
+                registry
+            )?,
         })
     }
 
@@ -149,6 +171,11 @@ impl ForwardMetrics {
     /// Record hashes a validator acked as already-executed on a direct submit.
     fn on_acked_stale(&self, count: u64) {
         self.acked_stale.inc_by(count);
+    }
+
+    /// Record transactions dropped from the pool as unmineable after repeated forwards.
+    fn on_pruned(&self, count: u64) {
+        self.pruned.inc_by(count);
     }
 }
 
@@ -310,6 +337,7 @@ impl TxnForwarder {
         let mut by_sender = AddressMap::default();
         let mut forwarded = 0u64;
         let mut resent = 0u64;
+        let mut prune_hashes: Vec<TxHash> = Vec::new();
         let committee_size = committee.len() as u64;
 
         let best_transactions = {
@@ -325,8 +353,20 @@ impl TxnForwarder {
             if txn.is_eip4844() {
                 continue;
             }
-            // One tracker probe provides both the due decision and re-send classification.
+            // One tracker probe provides the due decision, re-send classification, and attempt
+            // count.
             let probe = marks.probe(txn.hash(), now, anchor);
+            // A transaction still pending after FORWARD_PRUNE_ATTEMPTS re-sends is not going to be
+            // mined (each attempt already required the anchor to advance, so the chain moved on
+            // without it). Drop it instead of forwarding it forever; the client resubmits if still
+            // wanted. Removing it clears its in-flight mark on the next reconcile (it leaves
+            // pending). Checked before the send gate so a transaction that reached the cap while
+            // caught up is still pruned if the node has since fallen behind (`attempts` only climbs
+            // while caught up, so this cannot fire for one that has been lagging throughout).
+            if probe.attempts >= FORWARD_PRUNE_ATTEMPTS {
+                prune_hashes.push(*txn.hash());
+                continue;
+            }
             if !Self::should_send(probe, allow_resend) {
                 continue;
             }
@@ -350,6 +390,13 @@ impl TxnForwarder {
             });
             group.push((txn.nonce(), *txn.hash(), txn.clone()));
             forwarded += 1;
+        }
+
+        if !prune_hashes.is_empty() {
+            metrics.on_pruned(prune_hashes.len() as u64);
+            // Their in-flight marks are released by the next reconcile (they leave the pending
+            // pool).
+            pool.remove_transactions(prune_hashes);
         }
 
         metrics.on_scan(scan_start.elapsed(), pool.pool_size().pending as u64, forwarded, resent);
@@ -556,9 +603,9 @@ mod tests {
 
     #[test]
     fn should_send_flows_first_sends_but_gates_resends() {
-        let first_due = ForwardProbe { forwarded: false, due: true };
-        let resend_due = ForwardProbe { forwarded: true, due: true };
-        let not_due = ForwardProbe { forwarded: true, due: false };
+        let first_due = ForwardProbe { forwarded: false, due: true, attempts: 0 };
+        let resend_due = ForwardProbe { forwarded: true, due: true, attempts: 1 };
+        let not_due = ForwardProbe { forwarded: true, due: false, attempts: 1 };
 
         // a first send flows whether or not re-sends are currently allowed
         assert!(TxnForwarder::should_send(first_due, false));

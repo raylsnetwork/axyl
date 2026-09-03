@@ -110,6 +110,9 @@ pub struct ForwardProbe {
     pub forwarded: bool,
     /// Whether the hash is untracked or its mark is due for resend/release.
     pub due: bool,
+    /// Re-send attempts recorded for this hash (0 if untracked or not a `Sent` mark). Used to
+    /// decide when a repeatedly-forwarded transaction should be pruned as unmineable.
+    pub attempts: u32,
 }
 
 /// A capability handle scoping mark writes to the forwarding role, returned by
@@ -146,6 +149,10 @@ impl ForwardMarks {
         ForwardProbe {
             forwarded: mark.is_some(),
             due: mark.is_none_or(|m| m.is_due(now, anchor, &self.policy)),
+            attempts: match mark {
+                Some(Mark::Sent { attempts, .. }) => *attempts,
+                _ => 0,
+            },
         }
     }
 

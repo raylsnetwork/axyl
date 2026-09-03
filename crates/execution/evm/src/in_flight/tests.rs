@@ -551,3 +551,20 @@ fn re_holding_a_held_hash_keeps_the_original_hold() {
     let lapsed = before + DROPPED_HOLD + Duration::from_millis(100);
     assert!(forward.is_due(&hash(1), lapsed, 100), "the second drop did not extend the hold");
 }
+
+#[test]
+fn probe_reports_resend_attempts() {
+    let tracker = InFlightTracker::with_fresh_metrics();
+    let forward = tracker.arm_forwarding(DuePolicy::ttl(Duration::from_secs(10)));
+    let now = Instant::now();
+
+    forward.mark_forwarded([hash(1)], now, 0);
+    assert_eq!(forward.probe(&hash(1), now, 0).attempts, 0, "first send is attempt 0");
+
+    // a re-send bumps the recorded attempt count the pruner keys on
+    forward.mark_forwarded([hash(1)], now, 0);
+    assert_eq!(forward.probe(&hash(1), now, 0).attempts, 1, "a re-send increments attempts");
+
+    // an untracked hash reports zero attempts
+    assert_eq!(forward.probe(&hash(2), now, 0).attempts, 0, "untracked hash has no attempts");
+}
