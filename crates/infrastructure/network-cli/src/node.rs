@@ -57,23 +57,9 @@ fn check_dev_mode(dev: bool, committee_size: usize, chain_id: u64) -> eyre::Resu
     Ok(())
 }
 
-/// Avaliable "named" chains.
-/// These will have embedded config files and can be joined after gereating keys.
-#[derive(Debug, Copy, Clone, clap::ValueEnum)]
-pub enum NamedChain {
-    /// Testnet
-    Testnet,
-    /// Mainnet
-    Mainnet,
-}
-
 /// Start the node
 #[derive(Debug, Parser)]
 pub struct NodeCommand<Ext: clap::Args + fmt::Debug = NoArgs> {
-    /// Join a named rayls network (for instance test or main net).
-    #[arg(long, value_name = "NAMED_RL_NETWORK", verbatim_doc_comment)]
-    pub chain: Option<NamedChain>,
-
     /// Enable Prometheus consensus metrics.
     ///
     /// The metrics will be served at the given interface and port.
@@ -148,7 +134,7 @@ pub struct NodeCommand<Ext: clap::Args + fmt::Debug = NoArgs> {
     /// network (mainnet = 487). Pair with a single-validator genesis generated
     /// locally via `keytool generate validator` and `genesis`.
     #[cfg(feature = "dev-single-node-setup")]
-    #[arg(long, default_value_t = false, conflicts_with = "chain")]
+    #[arg(long, default_value_t = false)]
     pub dev: bool,
 
     /// Additional cli arguments
@@ -216,7 +202,7 @@ impl<Ext: clap::Args + fmt::Debug> NodeCommand<Ext> {
     /// [`execute_maintenance`](Self::execute_maintenance); `enforce_dev_gate` applies the dev
     /// single-validator gating only on the node path (unused in non-dev builds).
     fn build_and_launch<L>(
-        mut self,
+        self,
         rl_datadir: PathBuf,
         passphrase: String,
         launcher: L,
@@ -243,20 +229,9 @@ impl<Ext: clap::Args + fmt::Debug> NodeCommand<Ext> {
             error!("Failed to initialize global thread pool for rayon: {}", err)
         }
 
-        // overwrite all genesis if `genesis` was passed to CLI
-        let mut rayls_infrastructure_config = if let Some(chain) = self.chain.take() {
-            info!(target: "cli", "Overwriting RL config with named chain: {chain:?}");
-            match chain {
-                NamedChain::Testnet => {
-                    Config::load_testnet(&rl_datadir, self.observer, SHORT_VERSION)?
-                }
-                NamedChain::Mainnet => {
-                    Config::load_mainnet(&rl_datadir, self.observer, SHORT_VERSION)?
-                }
-            }
-        } else {
-            Config::load(&rl_datadir, self.observer, SHORT_VERSION)?
-        };
+        // Load the node config from the datadir.
+        let mut rayls_infrastructure_config =
+            Config::load(&rl_datadir, self.observer, SHORT_VERSION)?;
 
         // override network hardfork profile if specified via CLI / env
         if let Some(network) = self.network {
@@ -291,7 +266,6 @@ impl<Ext: clap::Args + fmt::Debug> NodeCommand<Ext> {
 
         // get the worker's transaction address from the config
         let Self {
-            chain: _,    // Used above
             observer: _, // Used above
             network: _,  // Used above
             #[cfg(feature = "dev-single-node-setup")]

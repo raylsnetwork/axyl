@@ -3,13 +3,12 @@
 use crate::{ConfigFmt, ConfigTrait, NodeInfo, RaylsDirs};
 use rayls_infrastructure_types::{
     get_available_tcp_port, get_available_udp_port, test_genesis, Address, BlsPublicKey,
-    BlsSignature, Genesis, Multiaddr, NetworkPublicKey, RaylsNetwork,
-    ETHEREUM_BLOCK_GAS_LIMIT_56BITS, MAINNET_COMMITTEE, MAINNET_GENESIS, MAINNET_PARAMETERS,
-    MIN_RAYLS_PROTOCOL_BASE_FEE, TESTNET_COMMITTEE, TESTNET_GENESIS, TESTNET_PARAMETERS,
+    BlsSignature, Genesis, Multiaddr, NetworkPublicKey, RaylsNetwork, ETHEREUM_BLOCK_GAS_LIMIT_56BITS,
+    MIN_RAYLS_PROTOCOL_BASE_FEE,
 };
 use reth_chainspec::ChainSpec;
 use serde::{Deserialize, Serialize};
-use std::{fs::File, io::Write, time::Duration};
+use std::time::Duration;
 use tracing::info;
 
 /// The filename to use when reading/writing the validator's BlsKey.
@@ -92,50 +91,6 @@ impl Config {
             Config::load_from_path(rayls_datadir.node_config_parameters_path(), ConfigFmt::YAML)?;
         let genesis: Genesis =
             Config::load_from_path(rayls_datadir.genesis_file_path(), ConfigFmt::YAML)?;
-
-        Ok(Config { node_info: validator_info, parameters, genesis, observer, version })
-    }
-
-    /// Load a config from it's component parts.
-    pub fn load_testnet<P: RaylsDirs>(
-        rayls_datadir: &P,
-        observer: bool,
-        version: &'static str,
-    ) -> eyre::Result<Self> {
-        let validator_info: NodeInfo =
-            Config::load_from_path(rayls_datadir.node_info_path(), ConfigFmt::YAML)?;
-        let parameters: Parameters =
-            serde_yaml::from_str(TESTNET_PARAMETERS).expect("bad testnet parameters yaml data");
-        let genesis: Genesis =
-            serde_yaml::from_str(TESTNET_GENESIS).expect("bad testnet genesis yaml data");
-        // If the default committee file does not exist then save it.
-        let committee_path = rayls_datadir.committee_path();
-        if !committee_path.exists() {
-            std::fs::create_dir_all(rayls_datadir.genesis_path())?;
-            File::create_new(committee_path)?.write_all(TESTNET_COMMITTEE.as_bytes())?
-        }
-
-        Ok(Config { node_info: validator_info, parameters, genesis, observer, version })
-    }
-
-    /// Load a config from it's component parts.
-    pub fn load_mainnet<P: RaylsDirs>(
-        rayls_datadir: &P,
-        observer: bool,
-        version: &'static str,
-    ) -> eyre::Result<Self> {
-        let validator_info: NodeInfo =
-            Config::load_from_path(rayls_datadir.node_info_path(), ConfigFmt::YAML)?;
-        let parameters: Parameters =
-            serde_yaml::from_str(MAINNET_PARAMETERS).expect("bad testnet parameters yaml data");
-        let genesis: Genesis =
-            serde_yaml::from_str(MAINNET_GENESIS).expect("bad testnet genesis yaml data");
-        // If the default committee file does not exist then save it.
-        let committee_path = rayls_datadir.committee_path();
-        if !committee_path.exists() {
-            std::fs::create_dir_all(rayls_datadir.genesis_path())?;
-            File::create_new(committee_path)?.write_all(MAINNET_COMMITTEE.as_bytes())?
-        }
 
         Ok(Config { node_info: validator_info, parameters, genesis, observer, version })
     }

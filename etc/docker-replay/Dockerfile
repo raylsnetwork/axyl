@@ -36,7 +36,6 @@ RUN apt-get update && \
 COPY Cargo* ./
 COPY bin/ ./bin/
 COPY crates/ ./crates/
-COPY chain-configs/ ./chain-configs/
 COPY rayls-contracts/ ./rayls-contracts/
 
 # Must never expand to the empty string -- see etc/docker-network/Dockerfile.

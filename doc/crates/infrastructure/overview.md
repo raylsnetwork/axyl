@@ -238,7 +238,7 @@ The main entry point for running a node. Key flags:
 
 | Flag | Purpose |
 |---|---|
-| `--chain <NAME>` | Join a named network (`testnet` or `mainnet`); loads embedded config |
+| `--network <NAME>` | Override the Rayls hardfork profile (`devnet`, `testnet`, `mainnet`, `local`) from the baked-in schedule |
 | `--observer` | Start as a non-validating observer node |
 | `--instance <N>` | Offset ports by instance number (max 200) to run multiple nodes on one host |
 | `--with-unused-ports` | Let the OS assign random free ports (testing) |

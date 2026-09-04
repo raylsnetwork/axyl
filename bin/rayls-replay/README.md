@@ -106,11 +106,12 @@ Full per-block detail is written to `<archive-out>/rayls-replay.log` (honors
 
 ### Config resolution
 
-`genesis.yaml` and `parameters.yaml` are read from the snapshot datadir when
-present (`<datadir>/genesis/genesis.yaml`, `<datadir>/parameters.yaml`), falling
-back to the embedded `chain-configs/<chain>/` copies otherwise. The committee is
-read from the on-chain `ConsensusRegistry` at the archive tip (as the live node
-does), so no `committee.yaml` is needed and committee rotations are tracked.
+`genesis.yaml` and `parameters.yaml` are read from the snapshot datadir
+(`<datadir>/genesis/genesis.yaml`, `<datadir>/parameters.yaml`) or from an
+explicit `--genesis` / `--parameters` override. Both files must exist — there is
+no embedded fallback. The committee is read from the on-chain `ConsensusRegistry`
+at the archive tip (as the live node does), so no `committee.yaml` is needed and
+committee rotations are tracked.
 
 `--chain` independently selects the Rayls hardfork schedule applied to both envs.
 It must match the network the snapshot came from; with a local or devnet snapshot,
@@ -130,8 +131,8 @@ resume from the unwound tip. Use this to retry a run that diverged partway.
 | `--snapshot-datadir <PATH>` | required | Snapshot rayls datadir (`db/`, `consensus-db/`, `genesis/`). |
 | `--archive-out <PATH>` | required | Fresh datadir to rebuild into. |
 | `--consensus-db <PATH>` | `<snapshot>/consensus-db` | Override consensus DB path. |
-| `--genesis <PATH>` | `<snapshot>/genesis/genesis.yaml` | Override genesis YAML; embedded fallback. |
-| `--parameters <PATH>` | `<snapshot>/parameters.yaml` | Override parameters YAML; embedded fallback. Sets `basefee_address`, critical for state parity. |
+| `--genesis <PATH>` | `<snapshot>/genesis/genesis.yaml` | Override genesis YAML. Must exist (no embedded fallback). |
+| `--parameters <PATH>` | `<snapshot>/parameters.yaml` | Override parameters YAML. Must exist (no embedded fallback). Sets `basefee_address`, critical for state parity. |
 | `--chain <CHAIN>` | `mainnet` | `mainnet`, `testnet`, `local`, `devnet`. Selects the hardfork schedule. |
 | `--from-block <N>` | `1` | First block to replay (inclusive). |
 | `--to-block <N>` | snapshot tip | Last block to replay (inclusive). Clamped to the tip. |

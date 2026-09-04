@@ -319,12 +319,4 @@ mod tests {
             _ => panic!("expected Node command"),
         }
     }
-
-    #[cfg(feature = "dev-single-node-setup")]
-    #[test]
-    fn dev_flag_conflicts_with_chain() {
-        let err = Cli::try_parse_args_from(["rl", "node", "--dev", "--chain", "mainnet"])
-            .expect_err("--dev must conflict with --chain");
-        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
-    }
 }
