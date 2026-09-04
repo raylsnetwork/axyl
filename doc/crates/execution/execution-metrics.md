@@ -45,7 +45,7 @@ in the standard reth metrics pipeline without any Rayls-specific glue.
 | `task_executor` | The shared reth task executor created at node startup. |
 | `provider_factory` | The reth provider that owns the execution DB. |
 | `pprof_dumps` | Filesystem path for on-demand pprof dumps (`/debug/pprof/...`). |
-| `chain_name` | The literal string `"Axyl"` — hardcoded at the call site (`reth_env/init.rs:113`); not parsed from `--chain`. |
+| `chain_name` | The literal string `"Axyl"` — hardcoded at the call site (`reth_env/init.rs:113`). |
 | `build` | Build metadata embedded at compile time (version, git SHA, target triple). |
 
 ## Output

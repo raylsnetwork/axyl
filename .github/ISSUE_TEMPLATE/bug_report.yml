@@ -25,7 +25,7 @@ body:
       label: How can it be reproduced?
       description: Minimal steps, commands, RPC calls, or config snippets that reproduce the issue. If logs are relevant, paste the smallest excerpt that shows the failure.
       placeholder: |
-        1. Start a validator with `rayls-network node --chain testnet ...`
+        1. Start a validator with `rayls-network node ...`
         2. Submit transaction X via `eth_sendRawTransaction`
         3. Observe ...
     validations:

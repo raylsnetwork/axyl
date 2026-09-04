@@ -9,8 +9,7 @@ use rayls_execution_evm::reth_env::RethEnv;
 use rayls_infrastructure_config::Parameters;
 use rayls_infrastructure_storage::open_db;
 use rayls_infrastructure_types::{
-    rewards::RewardsCounter, Address, Genesis, RaylsNetwork, TaskManager, MAINNET_GENESIS,
-    MAINNET_PARAMETERS, TESTNET_GENESIS, TESTNET_PARAMETERS,
+    rewards::RewardsCounter, Address, Genesis, RaylsNetwork, TaskManager,
 };
 use rayls_replay::{
     rewards::{SnapshotRewardsBackend, SnapshotTallyStore},
@@ -52,18 +51,20 @@ struct Cli {
     #[arg(long, value_name = "PATH")]
     consensus_db: Option<PathBuf>,
 
-    /// Override genesis YAML path. Defaults to `<snapshot-datadir>/genesis/genesis.yaml`,
-    /// falling back to the embedded network genesis if absent.
+    /// Override genesis YAML path. Defaults to `<snapshot-datadir>/genesis/genesis.yaml`.
+    /// Must exist — there is no embedded fallback.
     #[arg(long, value_name = "PATH")]
     genesis: Option<PathBuf>,
 
-    /// Override parameters YAML path. Defaults to `<snapshot-datadir>/parameters.yaml`,
-    /// falling back to the embedded network parameters if absent. CRITICAL for
+    /// Override parameters YAML path. Defaults to `<snapshot-datadir>/parameters.yaml`.
+    /// Must exist — there is no embedded fallback. CRITICAL for
     /// execution-state parity: `basefee_address` must match what live used.
     #[arg(long, value_name = "PATH")]
     parameters: Option<PathBuf>,
 
-    /// Chain selector: `mainnet`, `testnet`, `local`, `devnet`.
+    /// Rayls network hardfork profile: `mainnet`, `testnet`, `local`, `devnet`.
+    /// Selects which baked-in hardfork schedule to apply (the replay analogue of the
+    /// node's `--network`); it no longer selects a genesis/parameters source.
     #[arg(long, value_enum, default_value_t = RaylsNetwork::Mainnet)]
     chain: RaylsNetwork,
 
@@ -153,9 +154,8 @@ async fn run(cli: Cli) -> eyre::Result<()> {
     let parameters_path =
         cli.parameters.clone().unwrap_or_else(|| cli.snapshot_datadir.join("parameters.yaml"));
 
-    let base_chain = base_chain_spec(cli.chain, &genesis_path)?;
-    let NetworkParams { basefee_address, min_base_fee } =
-        network_params(cli.chain, &parameters_path)?;
+    let base_chain = base_chain_spec(&genesis_path)?;
+    let NetworkParams { basefee_address, min_base_fee } = network_params(&parameters_path)?;
     info!(
         target: "rayls_replay::main",
         genesis = %genesis_path.display(),
@@ -424,20 +424,18 @@ fn copy_recursive(src: &Path, dst: &Path) -> eyre::Result<()> {
     Ok(())
 }
 
-/// Resolve `--chain` + optional genesis file to the base reth `ChainSpec`.
+/// Read the genesis YAML at `genesis_path` into the base reth `ChainSpec`.
 ///
-/// Prefers `genesis_path` if it exists on disk (so the archive uses the same
-/// genesis the snapshot was bootstrapped from), otherwise falls back to the
-/// embedded YAML for `network`. Rayls-side hardforks are applied downstream
-/// by `new_for_archive_replay` via `RaylsChainSpec::builder().rayls_hardforks`.
-fn base_chain_spec(
-    network: RaylsNetwork,
-    genesis_path: &std::path::Path,
-) -> eyre::Result<Arc<RethChainSpec>> {
-    let yaml = resolve_config_yaml(network, genesis_path, "genesis", |n| match n {
-        RaylsNetwork::Mainnet => Some(MAINNET_GENESIS),
-        RaylsNetwork::Testnet => Some(TESTNET_GENESIS),
-        RaylsNetwork::Devnet | RaylsNetwork::Local => None,
+/// The file must exist (the snapshot's `genesis/genesis.yaml` or an explicit
+/// `--genesis`): there is no embedded genesis fallback. Rayls-side hardforks
+/// are applied downstream by `new_for_archive_replay` via
+/// `RaylsChainSpec::builder().rayls_hardforks`.
+fn base_chain_spec(genesis_path: &std::path::Path) -> eyre::Result<Arc<RethChainSpec>> {
+    let yaml = std::fs::read_to_string(genesis_path).wrap_err_with(|| {
+        format!(
+            "read genesis YAML at {} (pass --genesis if it is absent)",
+            genesis_path.display()
+        )
     })?;
     let genesis: Genesis = serde_yaml::from_str(&yaml).wrap_err("parse genesis YAML")?;
     Ok(Arc::new(genesis.into()))
@@ -449,49 +447,25 @@ struct NetworkParams {
     min_base_fee: u64,
 }
 
-/// Extract `basefee_address` and `min_base_fee` from `parameters_path` if it
-/// exists, otherwise the embedded YAML for `network`. Critical for
+/// Extract `basefee_address` and `min_base_fee` from the parameters YAML at
+/// `parameters_path`. The file must exist (the snapshot's `parameters.yaml` or
+/// an explicit `--parameters`): there is no embedded fallback. Critical for
 /// execution-state parity: the standard node reads from the snapshot's
 /// `parameters.yaml`, and `basefee_address` selects where each block's base
 /// fee credit lands. A mismatch silently diverges state at the first
 /// tx-bearing block.
-fn network_params(
-    network: RaylsNetwork,
-    parameters_path: &std::path::Path,
-) -> eyre::Result<NetworkParams> {
-    let params_yaml = resolve_config_yaml(network, parameters_path, "parameters", |n| match n {
-        RaylsNetwork::Mainnet => Some(MAINNET_PARAMETERS),
-        RaylsNetwork::Testnet => Some(TESTNET_PARAMETERS),
-        RaylsNetwork::Devnet | RaylsNetwork::Local => None,
+fn network_params(parameters_path: &std::path::Path) -> eyre::Result<NetworkParams> {
+    let params_yaml = std::fs::read_to_string(parameters_path).wrap_err_with(|| {
+        format!(
+            "read parameters YAML at {} (pass --parameters if it is absent)",
+            parameters_path.display()
+        )
     })?;
 
     let params: Parameters =
         serde_yaml::from_str(&params_yaml).wrap_err("parse parameters YAML")?;
 
     Ok(NetworkParams { basefee_address: params.basefee_address, min_base_fee: params.min_base_fee })
-}
-
-/// Read YAML from `path` if present, else the embedded constant for `network`.
-/// Errors for chains that bake no embedded config (`local`/`devnet`).
-fn resolve_config_yaml(
-    network: RaylsNetwork,
-    path: &Path,
-    kind: &str,
-    embedded: fn(RaylsNetwork) -> Option<&'static str>,
-) -> eyre::Result<String> {
-    if path.exists() {
-        info!(target: "rayls_replay::main", kind, path = %path.display(), "loading config from snapshot datadir");
-        return std::fs::read_to_string(path)
-            .wrap_err_with(|| format!("read {kind} at {}", path.display()));
-    }
-    let embedded = embedded(network).ok_or_else(|| {
-        eyre!(
-            "chain `{network}` does not bake a {kind} and {} does not exist; pass --{kind} explicitly",
-            path.display()
-        )
-    })?;
-    info!(target: "rayls_replay::main", kind, %network, "loading embedded config");
-    Ok(embedded.to_string())
 }
 
 /// Initialize layered non-blocking tracing and return the writer guards.

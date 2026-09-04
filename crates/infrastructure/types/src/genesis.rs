@@ -99,26 +99,12 @@ fn _testnet_chain_spec_arc() -> Arc<ChainSpec> {
     Arc::new(_testnet_chain_spec())
 }
 
-// The raw strings for the testnet genesis and config.
-/// Static strig for (testnet) genesis.
-///
-/// Used by CLI and other methods above.
-///
+// The raw string for the testnet genesis, kept as a test fixture.
+/// Static string for the (testnet) genesis used by the test fixtures above.
 ///
 /// Faucet addresses:
 /// - 0xe626ce81714cb7777b1bf8ad2323963fb3398ad5
 /// - 0xb3fabbd1d2edde4d9ced3ce352859ce1bebf7907
 /// - 0xa3478861957661b2d8974d9309646a71271d98b9
 /// - 0xe69151677e5aec0b4fc0a94bfcaf20f6f0f975eb
-pub const TESTNET_GENESIS: &str = include_str!("../../../../chain-configs/testnet/genesis.yaml");
-pub const TESTNET_COMMITTEE: &str =
-    include_str!("../../../../chain-configs/testnet/committee.yaml");
-pub const TESTNET_PARAMETERS: &str =
-    include_str!("../../../../chain-configs/testnet/parameters.yaml");
-
-// The raw strings for the mainnet genesis and config.
-pub const MAINNET_GENESIS: &str = include_str!("../../../../chain-configs/mainnet/genesis.yaml");
-pub const MAINNET_COMMITTEE: &str =
-    include_str!("../../../../chain-configs/mainnet/committee.yaml");
-pub const MAINNET_PARAMETERS: &str =
-    include_str!("../../../../chain-configs/mainnet/parameters.yaml");
+pub const TESTNET_GENESIS: &str = include_str!("./testdata/testnet-genesis.yaml");

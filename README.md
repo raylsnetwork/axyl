@@ -87,12 +87,9 @@ Start your observer node, with a `DATADIR` and passphrase matching the step abov
 target/release/rayls-network node -vvv \
     --http \
     --observer \
-    --chain testnet \
     --bls-passphrase-source ask \
     --datadir DATADIR
 ```
-
-The only valid values for `--chain` are `testnet` and `mainnet`; the embedded chain spec is selected from the value.
 
 ### Run a local multi-validator network
 

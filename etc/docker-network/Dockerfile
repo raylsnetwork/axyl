@@ -17,7 +17,6 @@ RUN apt-get update && \
 COPY Cargo* ./
 COPY bin/ ./bin/
 COPY crates/ ./crates/
-COPY chain-configs/ ./chain-configs/
 COPY rayls-contracts/ ./rayls-contracts/
 
 ARG VERGEN_GIT_SHA
