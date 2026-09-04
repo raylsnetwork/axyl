@@ -31,6 +31,7 @@ pub use reth_transaction_pool::{
 pub mod bypass_validator;
 pub mod chainspec;
 pub mod dirs;
+pub mod network_profile;
 pub mod payload;
 pub mod traits;
 pub mod txn_pool;
@@ -45,6 +46,9 @@ pub mod system_calls;
 pub mod worker;
 
 pub use chainspec::RaylsChainSpec;
+pub use network_profile::{
+    active_profile, set_active_profile, ForkActivation, NetworkConfigFile, NetworkProfile,
+};
 
 #[cfg(any(feature = "test-utils", test))]
 pub mod test_utils;

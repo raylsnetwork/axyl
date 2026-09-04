@@ -32,3 +32,35 @@ impl std::fmt::Display for RaylsNetwork {
         }
     }
 }
+
+impl RaylsNetwork {
+    /// The chain-id a datadir for this network must carry.
+    ///
+    /// Mainnet is `487`; testnet, devnet and local all run `2017` today (dev
+    /// bootstrap, genesis CLI default and faucet). The node verifies the
+    /// datadir's genesis chain-id against this at boot, so a datadir from the
+    /// wrong network (or client) is refused before anything runs.
+    pub const fn chain_id(self) -> u64 {
+        match self {
+            Self::Mainnet => 487,
+            Self::Testnet | Self::Devnet | Self::Local => 2017,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::RaylsNetwork;
+
+    #[test]
+    fn chain_id_mainnet() {
+        assert_eq!(RaylsNetwork::Mainnet.chain_id(), 487);
+    }
+
+    #[test]
+    fn chain_id_non_mainnet_is_2017() {
+        assert_eq!(RaylsNetwork::Testnet.chain_id(), 2017);
+        assert_eq!(RaylsNetwork::Devnet.chain_id(), 2017);
+        assert_eq!(RaylsNetwork::Local.chain_id(), 2017);
+    }
+}

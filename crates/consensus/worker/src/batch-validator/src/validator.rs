@@ -419,7 +419,9 @@ mod tests {
         let task_manager = TaskManager::default();
         let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
         let rayls_chain_spec = Arc::new(
-            RaylsChainSpec::builder(chain.clone()).rayls_hardforks(RaylsNetwork::Local).build(),
+            RaylsChainSpec::builder(chain.clone())
+                .add_rayls_hardforks_by_type(RaylsNetwork::Local)
+                .build(),
         );
         let reth_env = RethEnv::new_for_temp_chain_with_rayls_spec(
             chain,

@@ -573,8 +573,20 @@ impl RaylsChainSpecBuilder {
     }
 
     /// Apply the baked-in hardfork schedule for the given network.
-    pub fn rayls_hardforks(mut self, network: RaylsNetwork) -> Self {
+    pub fn add_rayls_hardforks_by_type(mut self, network: RaylsNetwork) -> Self {
         for (fork, condition) in RaylsHardFork::for_network(network) {
+            self.inner.hardforks.insert(fork, condition);
+        }
+        self
+    }
+
+    /// Apply an explicit hardfork schedule, as resolved from an external
+    /// network config file. Forks absent from the schedule stay `Never`.
+    pub fn add_rayls_hardforks_by_schedule(
+        mut self,
+        schedule: impl IntoIterator<Item = (RaylsHardFork, ForkCondition)>,
+    ) -> Self {
+        for (fork, condition) in schedule {
             self.inner.hardforks.insert(fork, condition);
         }
         self
@@ -937,7 +949,7 @@ mod tests {
         let genesis = rayls_infrastructure_types::test_genesis();
         let chain_spec: ChainSpec = genesis.into();
         let spec = RaylsChainSpec::builder(Arc::new(chain_spec))
-            .rayls_hardforks(RaylsNetwork::Devnet)
+            .add_rayls_hardforks_by_type(RaylsNetwork::Devnet)
             .batch_digest_v2(999)
             .build();
         assert!(!spec.is_batch_digest_v2_active_at_block(998));

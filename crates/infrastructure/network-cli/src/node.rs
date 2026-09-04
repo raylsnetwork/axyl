@@ -2,12 +2,14 @@
 //!
 //! Starts the client
 use crate::{args::ConsensusDatabaseArgs, version::SHORT_VERSION, NoArgs};
-use clap::{value_parser, Parser};
+use clap::{value_parser, Parser, ValueHint};
 use core::fmt;
+use eyre::Context;
 use fdlimit::raise_fd_limit;
 use rayls_execution_evm::{
     parse_socket_address,
     reth_env::{RethCommand, RethConfig},
+    set_active_profile, NetworkConfigFile, NetworkProfile,
 };
 use rayls_infrastructure_config::Config;
 // dev-only: reading the committee file for the single-validator gating check
@@ -18,7 +20,12 @@ use rayls_infrastructure_types::Committee;
 use rayls_infrastructure_types::{BuildMetadata, RaylsNetwork};
 use rayls_middleware_orchestrator::engine::RaylsBuilder;
 use rayon::ThreadPoolBuilder;
-use std::{net::SocketAddr, path::PathBuf, sync::Arc, thread::available_parallelism};
+use std::{
+    net::SocketAddr,
+    path::{Path, PathBuf},
+    sync::Arc,
+    thread::available_parallelism,
+};
 use tracing::*;
 
 /// Chain-ids that must never be paired with `--dev`. Mainnet only — testnet and
@@ -52,6 +59,51 @@ fn check_dev_mode(dev: bool, committee_size: usize, chain_id: u64) -> eyre::Resu
         eyre::bail!(
             "--dev cannot be used with production chain-id {chain_id} \
              (production chain-ids: {PROD_CHAIN_IDS:?})"
+        );
+    }
+    Ok(())
+}
+
+/// Load the client's network config file and select the requested subnet.
+///
+/// Validates the profile (known hardforks, non-empty schedule) before the node
+/// starts, so a broken file fails fast with an actionable message.
+fn load_subnet_profile(config_file: &Path, subnet: &str) -> eyre::Result<NetworkProfile> {
+    let yaml = std::fs::read_to_string(config_file)
+        .wrap_err_with(|| format!("failed to read network config file {config_file:?}"))?;
+    let file: NetworkConfigFile = serde_yaml::from_str(&yaml)
+        .wrap_err_with(|| format!("failed to parse network config file {config_file:?}"))?;
+    let profile = file.subnet(subnet).cloned().ok_or_else(|| {
+        let known = file
+            .networks
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(", ");
+        eyre::eyre!("subnet '{subnet}' not found in {config_file:?}; available subnets: {known}")
+    })?;
+    profile.validate_hardforks()?;
+    if profile.hardforks.is_empty() {
+        eyre::bail!(
+            "subnet '{subnet}' in {config_file:?} defines no `hardforks`; every subnet must \
+             define its hardfork schedule (a block number or \"never\" per fork)"
+        );
+    }
+    Ok(profile)
+}
+
+/// Verify that the datadir's genesis chain-id matches the chain-id of the
+/// selected schedule source (a config-file subnet, or the baked-in network
+/// profile). A mismatch means the datadir belongs to a different network or
+/// client, and running it would apply the wrong hardfork schedule — refuse to
+/// boot.
+fn verify_datadir_chain_id(actual: u64, expected: u64, source: &str) -> eyre::Result<()> {
+    if actual != expected {
+        eyre::bail!(
+            "datadir chain-id {actual} does not match the expected chain-id {expected} \
+             from {source}. The datadir appears to belong to a different network or client. \
+             Use a datadir whose genesis chain-id is {expected}, or select a schedule source \
+             whose chain-id is {actual}."
         );
     }
     Ok(())
@@ -123,6 +175,21 @@ pub struct NodeCommand<Ext: clap::Args + fmt::Debug = NoArgs> {
     /// a re-genesis. Useful for activating hardforks on existing networks.
     #[arg(long, value_name = "RAYLS_NETWORK", global = true, env = "RAYLS_NETWORK")]
     pub network: Option<RaylsNetwork>,
+
+    /// The client's network config file (YAML).
+    ///
+    /// The file holds any number of named subnets; each subnet carries the
+    /// network's hardfork schedule. When set, `--subnet` selects which subnet
+    /// this node runs, and its `hardforks` section replaces the schedule baked
+    /// into the binary. Everything else (genesis, parameters, committee, node
+    /// identity) still comes from the datadir, exactly as without the file.
+    /// Cannot be combined with `--network`.
+    #[arg(long, value_name = "PATH", value_hint = ValueHint::FilePath, requires = "subnet")]
+    pub config_file: Option<PathBuf>,
+
+    /// The subnet to run, as named in `--config-file`.
+    #[arg(long, value_name = "SUBNET", requires = "config_file")]
+    pub subnet: Option<String>,
 
     /// Run as a single-node developer network.
     ///
@@ -229,14 +296,66 @@ impl<Ext: clap::Args + fmt::Debug> NodeCommand<Ext> {
             error!("Failed to initialize global thread pool for rayon: {}", err)
         }
 
-        // Load the node config from the datadir.
+        // Resolve the hardfork schedule from the client's network config file, if
+        // given — before touching the datadir, so a flag conflict or a broken
+        // file fails fast with an actionable message.
+        let file_schedule = if let Some(config_file) = &self.config_file {
+            // The file's `hardforks` section is the only schedule source; the
+            // baked-in `--network` profile cannot be combined with it.
+            if self.network.is_some() {
+                eyre::bail!(
+                    "--network cannot be combined with --config-file: the subnet's `hardforks` \
+                     section in the config file is the only schedule source"
+                );
+            }
+            let subnet =
+                self.subnet.as_deref().expect("clap requires --subnet with --config-file");
+            Some((
+                config_file.clone(),
+                subnet.to_string(),
+                load_subnet_profile(config_file, subnet)?,
+            ))
+        } else {
+            None
+        };
+
+        // Load the node config from the datadir (genesis, parameters, committee,
+        // node identity), as before. The hardfork schedule then either comes
+        // from the config file resolved above or is selected by
+        // `parameters.network` / `--network` as before.
         let mut rayls_infrastructure_config =
             Config::load(&rl_datadir, self.observer, SHORT_VERSION)?;
 
-        // override network hardfork profile if specified via CLI / env
-        if let Some(network) = self.network {
-            info!(target: "cli", %network, "overriding network hardfork profile from CLI");
-            rayls_infrastructure_config.parameters.network = network;
+        // The datadir must carry the chain-id of the schedule source selected
+        // for this boot, otherwise it belongs to a different network or client
+        // and would run the wrong hardfork schedule.
+        let (expected_chain_id, chain_id_source) =
+            if let Some((config_file, subnet, profile)) = &file_schedule {
+                (
+                    profile.chain_id,
+                    format!("subnet '{subnet}' of {config_file:?}"),
+                )
+            } else if let Some(network) = self.network {
+                // override network hardfork profile if specified via CLI / env
+                info!(target: "cli", %network, "overriding network hardfork profile from CLI");
+                rayls_infrastructure_config.parameters.network = network;
+                (network.chain_id(), format!("network '{network}'"))
+            } else {
+                let network = rayls_infrastructure_config.parameters.network;
+                (network.chain_id(), format!("network '{network}'"))
+            };
+        let actual_chain_id = rayls_infrastructure_config.genesis().config.chain_id;
+        verify_datadir_chain_id(actual_chain_id, expected_chain_id, &chain_id_source)?;
+
+        if let Some((config_file, subnet, profile)) = file_schedule {
+            info!(
+                target: "cli",
+                ?config_file,
+                subnet,
+                chain_id = actual_chain_id,
+                "loading hardfork schedule from file"
+            );
+            set_active_profile(profile)?;
         }
 
         debug!(target: "cli", validator = ?rayls_infrastructure_config.node_info.name, "rl datadir for node command: {rl_datadir:?}");
@@ -268,6 +387,8 @@ impl<Ext: clap::Args + fmt::Debug> NodeCommand<Ext> {
         let Self {
             observer: _, // Used above
             network: _,  // Used above
+            config_file: _, // Used above
+            subnet: _,     // Used above
             #[cfg(feature = "dev-single-node-setup")]
                 dev: _, // Used above
             metrics,
@@ -358,5 +479,25 @@ mod tests {
         // surfaces later when consensus loads it.
         assert!(check_dev_mode(false, 0, DEV_CHAIN_ID).is_ok());
         assert!(check_dev_mode(true, 0, DEV_CHAIN_ID).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod chain_id_tests {
+    use super::verify_datadir_chain_id;
+
+    #[test]
+    fn matching_chain_id_passes() {
+        assert!(verify_datadir_chain_id(2017, 2017, "network 'testnet'").is_ok());
+        assert!(verify_datadir_chain_id(487, 487, "subnet 'mainnet' of \"/x/y.yaml\"").is_ok());
+    }
+
+    #[test]
+    fn mismatched_chain_id_is_refused() {
+        let err = verify_datadir_chain_id(487, 2017, "network 'testnet'").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("487"), "{msg}");
+        assert!(msg.contains("2017"), "{msg}");
+        assert!(msg.contains("network 'testnet'"), "{msg}");
     }
 }

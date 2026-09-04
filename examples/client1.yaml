@@ -1,0 +1,47 @@
+# Network configuration for client "client1".
+#
+# Each subnet defines the chain-id of its datadir and its hardfork schedule:
+# Rayls hardfork name -> activation block, or `never`. Forks absent from the
+# list stay `never`.
+#
+# The node reads everything else (genesis, parameters, committee, node
+# identity) from its datadir exactly as without this file — the file only
+# replaces the chain-id and hardfork schedule baked into the binary. At boot
+# the datadir's genesis chain-id is checked against the subnet's `chain_id`
+# and the node refuses to start on a mismatch (wrong datadir for this subnet).
+#
+#   rayls-network node --config-file examples/client1.yaml --subnet testnet
+
+networks:
+  mainnet:
+    chain_id: 487
+    hardforks:
+      Eip1559: 0
+      BatchDigestV2: 0
+      AdminTransfer: never
+      PrecompileGasFix: 0
+      RlsStorage: never
+      Tokenomics: never
+      Uups: never
+      Erc20PrecompileBytecode: 893558
+      TransactionLoadBalancing: 893558
+      UsdrSupplyCorrection: 3569194
+      EmptyOutputBlock: 3569194
+      DynamicCommitteeSizing: 18446744073709551615
+      HybridRewards: never
+  testnet:
+    chain_id: 2017
+    hardforks:
+      Eip1559: 281800
+      BatchDigestV2: 560539
+      AdminTransfer: 560539
+      PrecompileGasFix: 900000
+      RlsStorage: 900000
+      Tokenomics: 1879000
+      Uups: 2872000
+      Erc20PrecompileBytecode: never
+      TransactionLoadBalancing: 4386290
+      UsdrSupplyCorrection: never
+      EmptyOutputBlock: 6663630
+      DynamicCommitteeSizing: 18446744073709551615
+      HybridRewards: never

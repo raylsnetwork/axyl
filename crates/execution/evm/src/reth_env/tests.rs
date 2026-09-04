@@ -1661,3 +1661,48 @@ async fn test_fix_genesis_account_history_seeds_after_clear_and_skips_multishard
 
     Ok(())
 }
+
+/// The active profile's hardfork schedule (installed at node start from
+/// `--config-file` / `--subnet`) wins over the baked-in schedule in the chain
+/// spec `RethEnv::new` builds.
+///
+/// This is the only test in the crate allowed to install the active profile —
+/// it is a process-wide `OnceLock`. The schedule chosen here matches the
+/// no-profile behavior at every block below the distinctive fork block, so
+/// the other tests in this binary are unaffected regardless of execution
+/// order.
+#[tokio::test]
+async fn active_profile_schedule_reaches_chain_spec() -> eyre::Result<()> {
+    use crate::{
+        chainspec::{RaylsHardFork, RaylsHardforks},
+        network_profile::{set_active_profile, NetworkProfile},
+    };
+    use reth_chainspec::ForkCondition;
+
+    let profile: NetworkProfile = serde_yaml::from_str(
+        r#"
+chain_id: 2017
+hardforks:
+  TransactionLoadBalancing: 777777
+"#,
+    )?;
+    set_active_profile(profile)?;
+
+    let chain = rayls_infrastructure_types::test_chain_spec_arc();
+    let tmp_dir = TempDir::new()?;
+    let task_manager = TaskManager::new("Test Task Manager");
+    let reth_env =
+        RethEnv::new_for_temp_chain(chain, tmp_dir.path(), &task_manager, None).await?;
+
+    let spec = reth_env.evm_config.chain_spec();
+    assert_eq!(
+        spec.rayls_fork_activation(RaylsHardFork::TransactionLoadBalancing),
+        ForkCondition::Block(777777)
+    );
+    // A fork absent from the file's schedule stays `Never`.
+    assert_eq!(
+        spec.rayls_fork_activation(RaylsHardFork::Eip1559),
+        ForkCondition::Never
+    );
+    Ok(())
+}

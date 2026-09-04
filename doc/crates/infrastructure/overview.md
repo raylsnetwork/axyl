@@ -238,7 +238,9 @@ The main entry point for running a node. Key flags:
 
 | Flag | Purpose |
 |---|---|
-| `--network <NAME>` | Override the Rayls hardfork profile (`devnet`, `testnet`, `mainnet`, `local`) from the baked-in schedule |
+| `--config-file <PATH>` | Load the chain-id and hardfork schedule of the selected subnet from an external per-client YAML file (replaces the baked-in values); requires `--subnet` |
+| `--subnet <NAME>` | Select the subnet entry inside `--config-file`; requires `--config-file` |
+| `--network <NAME>` | Override the Rayls hardfork profile (`devnet`, `testnet`, `mainnet`, `local`) from the baked-in schedule; refused if combined with `--config-file` |
 | `--observer` | Start as a non-validating observer node |
 | `--instance <N>` | Offset ports by instance number (max 200) to run multiple nodes on one host |
 | `--with-unused-ports` | Let the OS assign random free ports (testing) |
@@ -249,6 +251,33 @@ The main entry point for running a node. Key flags:
 
 The `node` command delegates to `launch_node` (orchestrator crate) after building
 the `RaylsBuilder` / `RethConfig` from the parsed CLI arguments.
+
+#### External hardfork configuration (`--config-file` / `--subnet`)
+
+A node can run the chain-id and hardfork schedule of the selected subnet from
+an external per-client YAML file instead of the values baked into the binary.
+One file holds every subnet a client operates (the number of subnets is not
+fixed); see `examples/client1.yaml` and `examples/new-client.template.yaml` in
+the repository root. With `--config-file`:
+
+- the selected subnet's `chain_id` and `hardforks` section are the single
+  source of truth (installed in a process-wide profile the execution layer
+  reads); fork names are case-insensitive, an absent fork stays `never`, every
+  given fork name must be a real one, and `chain_id` is required (all validated
+  before startup);
+- everything else — genesis, parameters, committee, node identity — comes from
+  the datadir, exactly as without the file, so the datadir must be fully
+  provisioned as before. At boot the datadir's genesis chain-id is verified
+  against the subnet's `chain_id`, and the node refuses to start on a mismatch
+  (the datadir belongs to a different network or client);
+- the datadir's `parameters.network` is ignored while the file is active, and the
+  flag cannot be combined with `--network`.
+
+Without `--config-file` the schedule is as before (the baked-in schedule
+selected by `parameters.network`, or `--network`), but the datadir's genesis
+chain-id is still verified against the effective network's baked-in chain-id
+(mainnet is `487`, testnet/devnet/local are `2017`) and the node refuses to
+start on a mismatch.
 
 ### `genesis` command (`GenesisArgs`)
 

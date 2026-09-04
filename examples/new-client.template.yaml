@@ -1,0 +1,43 @@
+# Template for a new client's network configuration file.
+#
+# Copy to <client>.yaml, fill in one entry per subnet this client operates.
+# The number of subnets is not fixed - each client defines its own.
+#
+# Start a node from it with:
+#
+#   rayls node --config-file <client>.yaml --subnet <subnet-name>
+#
+# The file only externalizes the chain-id and hardfork schedule of the
+# selected subnet - that is the part that used to be baked into the binary.
+# Everything else (EVM genesis, consensus parameters, committee, node
+# identity) still comes from the node's datadir, exactly as without this file.
+#
+# At boot the datadir's genesis chain-id is checked against the subnet's
+# `chain_id` and the node refuses to start on a mismatch (wrong datadir for
+# this subnet).
+
+networks:
+  <subnet-name>:
+    # Chain-id of this subnet's datadir (verified against the datadir's
+    # genesis at boot). Mainnet is 487; testnet/devnet/local run 2017.
+    chain_id: <chain-id>
+    # Hardfork schedule: Rayls hardfork name -> activation block, or `never`.
+    # Forks absent from this map stay `never`. Names (case-insensitive):
+    # Eip1559, BatchDigestV2, AdminTransfer, PrecompileGasFix, RlsStorage,
+    # Tokenomics, Uups, Erc20PrecompileBytecode, TransactionLoadBalancing,
+    # UsdrSupplyCorrection, EmptyOutputBlock, DynamicCommitteeSizing,
+    # HybridRewards.
+    hardforks:
+      Eip1559: 0
+      BatchDigestV2: 0
+      AdminTransfer: never
+      PrecompileGasFix: 0
+      RlsStorage: never
+      Tokenomics: never
+      Uups: never
+      Erc20PrecompileBytecode: never
+      TransactionLoadBalancing: never
+      UsdrSupplyCorrection: never
+      EmptyOutputBlock: never
+      DynamicCommitteeSizing: never
+      HybridRewards: never
