@@ -106,7 +106,10 @@ pub(crate) async fn engine_update_loop(
                 let _ = tokio::task::spawn_blocking(move || {
                     for pool in pools {
                         pool.in_flight().sweep_due(anchor);
-                        pool.reconcile_in_flight();
+                        // Backstop full-scan sweep (no mined set): reaps marks for txns that left
+                        // pending WITHOUT mining. The per-block mined-set release lives on the
+                        // canonical-stream task and never touches the pool lock.
+                        pool.reconcile_in_flight(None::<std::iter::Empty<_>>);
                     }
                 })
                 .await;

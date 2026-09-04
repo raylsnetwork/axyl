@@ -238,6 +238,23 @@ impl InFlightTracker {
         self.on_released(previous_marks_len, current_marks_len, &self.metrics.released_reconcile)
     }
 
+    /// Releases marks for exactly the given hashes - the txns a block just mined, taken straight
+    /// from the canonical notification. Touches only this tracker's own lock and is O(mined): no
+    /// pending snapshot and no pool lock, so it cannot tax execution or gap the execution
+    /// heartbeat. Complements [`Self::release_mined`], the periodic full-scan backstop that also
+    /// reaps marks for txns that left the pending sub-pool WITHOUT mining
+    /// (dropped/replaced/evicted).
+    pub fn release_hashes(&self, mined: impl IntoIterator<Item = TxHash>) -> usize {
+        let mut guard = self.inner.write();
+        let previous_marks_len = guard.marks.len();
+        for hash in mined {
+            guard.marks.remove(&hash);
+        }
+        let current_marks_len = guard.marks.len();
+        drop(guard);
+        self.on_released(previous_marks_len, current_marks_len, &self.metrics.released_reconcile)
+    }
+
     /// Disarms the tracker, releasing all tracked marks except forwarding marks (which persist
     /// for the next arm to inherit or explicitly release).
     pub fn clear(&self) {

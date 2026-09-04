@@ -183,11 +183,19 @@ impl WorkerTxPool {
         let mut release_stream = blockchain_provider.canonical_state_stream();
         let release_pool = this.clone();
         task_spawner.spawn_critical_task("in-flight release", async move {
-            while release_stream.next().await.is_some() {
-                // reconcile scans the whole pending sub-pool (O(pending)) under the pool read
-                // lock; keep it off the async worker so a large pool cannot pin one.
+            while let Some(notification) = release_stream.next().await {
+                // Release marks for exactly the txns this commit mined, straight from the
+                // notification: O(mined), in-flight lock only, NO pool lock and no pending
+                // snapshot - so it can neither tax execution nor gap the heartbeat regardless of
+                // pool size. Move the committed chain into the blocking closure so the mined-hash
+                // iterator is built there, with no intermediate Vec.
+                let committed = notification.committed();
                 let pool = release_pool.clone();
-                let _ = tokio::task::spawn_blocking(move || pool.reconcile_in_flight()).await;
+                let _ = tokio::task::spawn_blocking(move || {
+                    let (blocks, _) = committed.inner();
+                    pool.reconcile_in_flight(Some(blocks.transaction_hashes()));
+                })
+                .await;
             }
         });
         Ok(this)
@@ -218,20 +226,34 @@ impl WorkerTxPool {
         self.in_flight_tracker.clone()
     }
 
-    /// Releases in-flight marks for hashes no longer in the pending sub-pool.
+    /// Releases in-flight marks for hashes that have left the pending sub-pool.
     ///
     /// A sealed transaction stays pending (and RPC-visible) until it executes; once execution
     /// drops it from pending, its mark is stale and released so a later resubmission of the same
     /// nonce is not skipped.
-    pub fn reconcile_in_flight(&self) {
+    ///
+    /// `Some(mined)` — the cheap per-block path: release exactly the txns a commit mined (from the
+    /// canonical notification). Touches only the in-flight tracker's own lock, is O(mined), and
+    /// takes NO pool lock — so it can't tax execution or gap the execution heartbeat.
+    ///
+    /// `None` — the periodic backstop: snapshot the whole pending sub-pool under the pool lock and
+    /// release marks no longer pending. O(pending) and pool-locked, so keep it off any hot path;
+    /// it exists to reap marks for txns that left pending WITHOUT mining
+    /// (dropped/replaced/evicted), which the mined set can't see.
+    pub fn reconcile_in_flight(&self, mined: Option<impl IntoIterator<Item = TxHash>>) {
         if self.in_flight_tracker.is_empty() {
             return;
         }
-        let pending: B256Set =
-            self.pool.pending_transactions().iter().map(|tx| *tx.hash()).collect();
-        let released = self.in_flight_tracker.release_mined(&pending);
+        let released = match mined {
+            Some(hashes) => self.in_flight_tracker.release_hashes(hashes),
+            None => {
+                let pending: B256Set =
+                    self.pool.pending_transactions().iter().map(|tx| *tx.hash()).collect();
+                self.in_flight_tracker.release_mined(&pending)
+            }
+        };
         if released > 0 {
-            debug!(target: "rayls::txpool", released, "released in-flight marks against pending sub-pool");
+            debug!(target: "rayls::txpool", released, "released in-flight marks");
         }
     }
 
