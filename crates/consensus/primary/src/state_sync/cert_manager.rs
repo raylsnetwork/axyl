@@ -161,14 +161,6 @@ where
                         "certificate suspended - missing parents"
                     );
                     self.pending.insert_pending(cert, missing_parents)?;
-                    let _ =
-                        self.consensus_bus.suspended_cert_count().send(self.pending.num_pending());
-                    // metrics mirror only - decisions read the watch above
-                    self.consensus_bus
-                        .primary_metrics()
-                        .node_metrics
-                        .certificates_currently_suspended
-                        .set(self.pending.num_pending() as i64);
 
                     // Cascade detection: warn when pending queue is growing large
                     let pending_count = self.pending.num_pending();

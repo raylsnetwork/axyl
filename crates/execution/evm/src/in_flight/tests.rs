@@ -486,126 +486,85 @@ proptest! {
     }
 }
 
-/// `release_dropped` frees exactly the given hashes and counts them under its own release
-/// cause, leaving unrelated marks in place.
+/// A dropped (nonce-too-high) hash keeps its mark until its sender's state nonce advances: the
+/// transaction is pooled and unexecutable, so re-sealing it before its predecessor lands only
+/// drops it again.
 #[test]
-fn release_dropped_frees_only_the_given_hashes() {
+fn dropped_hashes_stay_in_flight_until_their_sender_advances() {
+    let tracker = InFlightTracker::with_fresh_metrics();
+    let sealing = tracker.arm_sealing(DuePolicy::ttl(Duration::from_secs(60)));
+    let (a, b) = (Address::random(), Address::random());
+    sealing.mark([hash(1), hash(2), hash(3)]);
+
+    tracker.hold_dropped([(a, hash(1)), (a, hash(2)), (b, hash(3))]);
+    assert_eq!(tracker.len(), 3, "a dropped hash stays in flight");
+
+    tracker.release_advanced([b]);
+    assert!(tracker.is_in_flight(&hash(1)) && tracker.is_in_flight(&hash(2)));
+    assert!(!tracker.is_in_flight(&hash(3)), "the advanced sender's hashes are re-sealable");
+
+    tracker.release_advanced([a, b]);
+    assert!(tracker.is_empty());
+    assert_eq!(tracker.metrics().released_dropped.get(), 3);
+}
+
+/// Holding an unmarked hash is a no-op: only a hash this node sealed or forwarded is held.
+#[test]
+fn hold_dropped_ignores_untracked_hashes() {
+    let tracker = InFlightTracker::with_fresh_metrics();
+    let sealing = tracker.arm_sealing(DuePolicy::ttl(Duration::from_secs(60)));
+    sealing.mark([hash(1)]);
+    tracker.hold_dropped([(Address::ZERO, hash(2))]);
+    assert_eq!(tracker.len(), 1);
+}
+
+/// A held hash outlasts the forwarding backoff: the validator already pools it, so re-forwarding
+/// cannot close the gap; only the hold window bounds it.
+#[test]
+fn held_hash_is_not_due_before_the_hold_window() {
     let tracker = InFlightTracker::new();
-    let kept = TxHash::random();
-    let dropped = TxHash::random();
-    tracker.mark_in_flight([kept, dropped]);
-    tracker.release_dropped([dropped]);
-    assert_eq!(tracker.len(), 1, "only the dropped hash is released");
-    tracker.release_dropped([dropped]);
-    assert_eq!(tracker.len(), 1, "an already-released hash is a no-op");
-}
-
-/// A sealing snapshot round-trips through the next boot's matching arm: marks reinstalled
-/// with rebased clocks, sorted persisted output, and nothing live until the arm.
-#[test]
-fn snapshot_round_trips_through_a_matching_sealing_arm() {
-    let source = InFlightTracker::with_fresh_metrics();
-    let seal = source.arm_sealing(DuePolicy::ttl(Duration::from_secs(60)));
-    seal.mark([hash(2), hash(1)]);
-    let backup = source.snapshot().expect("an armed tracker snapshots");
-    assert_eq!(backup.role, MarkRole::Sealing);
-    assert_eq!(backup.marks.len(), 2);
-    assert!(backup.marks.windows(2).all(|w| w[0].hash < w[1].hash), "sorted by hash");
-
-    let restored = InFlightTracker::with_fresh_metrics();
-    restored.stash_restore(backup);
-    assert!(restored.is_empty(), "the stash must not touch the live set");
-    let _seal = restored.arm_sealing(DuePolicy::ttl(Duration::from_secs(60)));
-    assert_eq!(restored.len(), 2, "the matching arm installs the stash");
-    assert!(restored.is_in_flight(&hash(1)) && restored.is_in_flight(&hash(2)));
-}
-
-/// An arming of the other role discards the stash: it cannot honor marks whose semantics
-/// belong to a role the node no longer runs.
-#[test]
-fn restored_marks_are_discarded_on_a_role_change() {
-    let source = InFlightTracker::with_fresh_metrics();
-    let seal = source.arm_sealing(DuePolicy::ttl(Duration::from_secs(60)));
-    seal.mark([hash(1)]);
-    let backup = source.snapshot().expect("armed");
-
-    let restored = InFlightTracker::with_fresh_metrics();
-    restored.stash_restore(backup);
-    let _fwd = restored.arm_forwarding(DuePolicy::ttl(Duration::from_secs(10)));
-    assert!(restored.is_empty(), "a sealing stash must not survive a forwarding arm");
-}
-
-/// The promotion-safety clear still wipes cross-role residue while the matching stash
-/// installs: an Observer -> CvvActive boot keeps only what the sealing role owns.
-#[test]
-fn arm_sealing_clears_residue_and_installs_the_matching_stash() {
-    let tracker = InFlightTracker::with_fresh_metrics();
-    tracker.mark_in_flight([hash(9)]);
-    tracker.stash_restore(MarkBackup {
-        version: MARK_BACKUP_VERSION,
-        role: MarkRole::Sealing,
-        marks: vec![SavedMark { hash: hash(1), kind: SavedMarkKind::Sent { attempts: 0 } }],
-    });
-    let _seal = tracker.arm_sealing(DuePolicy::ttl(Duration::from_secs(60)));
-    assert!(!tracker.is_in_flight(&hash(9)), "cross-role residue is cleared");
-    assert!(tracker.is_in_flight(&hash(1)), "the matching stash installs");
-}
-
-/// Forward backoff survives the round trip: a restored mark reads as forwarded (no
-/// first-send flood), its attempts keep the backoff window, and acked-stale stays
-/// never-due; an acked-stale mark also snapshots back out.
-#[test]
-fn forward_backoff_survives_the_round_trip() {
     let policy =
-        DuePolicy { after: Duration::from_secs(10), backoff_shift_cap: 4, min_anchor_advance: 0 };
-    let tracker = InFlightTracker::with_fresh_metrics();
-    tracker.stash_restore(MarkBackup {
-        version: MARK_BACKUP_VERSION,
-        role: MarkRole::Forwarding,
-        marks: vec![
-            SavedMark { hash: hash(1), kind: SavedMarkKind::Sent { attempts: 3 } },
-            SavedMark { hash: hash(2), kind: SavedMarkKind::AckedStale },
-        ],
-    });
-    let fwd = tracker.arm_forwarding(policy);
-    assert!(fwd.is_forwarded(&hash(1)), "a restored mark is a re-send, not a first send");
-    assert!(
-        !fwd.is_due(&hash(1), Instant::now(), u64::MAX),
-        "the restored backoff window holds at the rebased stamp"
-    );
-    assert!(
-        !fwd.is_due(&hash(2), Instant::now() + Duration::from_secs(3600), u64::MAX),
-        "acked-stale is never due"
-    );
-    let backup = tracker.snapshot().expect("armed");
-    assert_eq!(backup.role, MarkRole::Forwarding);
-    assert!(backup.marks.iter().any(|m| m.kind == SavedMarkKind::AckedStale));
+        DuePolicy { after: Duration::from_secs(3), backoff_shift_cap: 1, min_anchor_advance: 2 };
+    let forward = tracker.arm_forwarding(policy);
+    let now = Instant::now();
+    forward.mark_forwarded([hash(1)], now, 0);
+    tracker.hold_dropped([(Address::ZERO, hash(1))]);
+
+    assert!(!forward.is_due(&hash(1), now + Duration::from_secs(10), 100), "held past the backoff");
+    // the hold is stamped after `now`, so allow it a second to lapse
+    let lapsed = now + DROPPED_HOLD + Duration::from_secs(1);
+    assert!(forward.is_due(&hash(1), lapsed, 100), "the hold window bounds it");
 }
 
-/// An unarmed tracker has no role whose marks mean anything: no snapshot.
+/// Re-dropping a held hash (another validator's batch carrying it executes locally) does not
+/// extend the hold, so a peer still re-sealing it cannot pin the hold open.
 #[test]
-fn snapshot_is_none_when_unarmed() {
-    let tracker = InFlightTracker::with_fresh_metrics();
-    tracker.mark_in_flight([hash(1)]);
-    assert!(tracker.snapshot().is_none());
+fn re_holding_a_held_hash_keeps_the_original_hold() {
+    let tracker = InFlightTracker::new();
+    let forward = tracker.arm_forwarding(DuePolicy::ttl(Duration::from_secs(3)));
+    let before = Instant::now();
+    forward.mark_forwarded([hash(1)], before, 0);
+    tracker.hold_dropped([(Address::ZERO, hash(1))]);
+    std::thread::sleep(Duration::from_millis(200));
+    tracker.hold_dropped([(Address::ZERO, hash(1))]);
+
+    let lapsed = before + DROPPED_HOLD + Duration::from_millis(100);
+    assert!(forward.is_due(&hash(1), lapsed, 100), "the second drop did not extend the hold");
 }
 
-/// A clear with nothing armed keeps the stash: the epoch that ended had no role armed, so the
-/// marks belong to the next role to arm. A validator boots CvvInactive and promotes to
-/// CvvActive through exactly this clear before its builder ever arms - dropping the stash
-/// there silently discards every restored seal mark.
 #[test]
-fn clear_with_nothing_armed_keeps_the_stash() {
+fn probe_reports_resend_attempts() {
     let tracker = InFlightTracker::with_fresh_metrics();
-    tracker.stash_restore(MarkBackup {
-        version: MARK_BACKUP_VERSION,
-        role: MarkRole::Sealing,
-        marks: vec![SavedMark { hash: hash(1), kind: SavedMarkKind::Sent { attempts: 0 } }],
-    });
-    tracker.clear();
-    let _seal = tracker.arm_sealing(DuePolicy::ttl(Duration::from_secs(60)));
-    assert!(
-        tracker.is_in_flight(&hash(1)),
-        "an actor-less clear must not eat the next actor's stash"
-    );
+    let forward = tracker.arm_forwarding(DuePolicy::ttl(Duration::from_secs(10)));
+    let now = Instant::now();
+
+    forward.mark_forwarded([hash(1)], now, 0);
+    assert_eq!(forward.probe(&hash(1), now, 0).attempts, 0, "first send is attempt 0");
+
+    // a re-send bumps the recorded attempt count the pruner keys on
+    forward.mark_forwarded([hash(1)], now, 0);
+    assert_eq!(forward.probe(&hash(1), now, 0).attempts, 1, "a re-send increments attempts");
+
+    // an untracked hash reports zero attempts
+    assert_eq!(forward.probe(&hash(2), now, 0).attempts, 0, "untracked hash has no attempts");
 }

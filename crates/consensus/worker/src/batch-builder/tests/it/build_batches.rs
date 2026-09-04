@@ -896,3 +896,79 @@ async fn test_failed_report_leaves_txs_selectable_and_seq_unconsumed() {
         "a failed report must not consume/persist the batch seq"
     );
 }
+
+/// A failed seal re-arms the retry for the next batching window only. Candidate ingress, mark
+/// releases, and the loop's own backlog drain must not restart the build sooner: a validator whose
+/// peers are unreachable otherwise spins a tight build/seal-fail loop.
+#[tokio::test]
+async fn test_failed_seal_retries_once_per_window() {
+    let tmp_dir = TempDir::new().expect("temp dir");
+    let task_manager = TaskManager::default();
+
+    let network_client = LocalNetwork::new_with_empty_id();
+    let store = open_db(tmp_dir.path().join("c-db"));
+
+    // every seal fails at the report, the same outcome as a quorum failure
+    let report = Arc::new(MockWorkerToPrimaryError::default());
+    let attempts = report.attempts.clone();
+    network_client.set_worker_to_primary_local_handler(report);
+
+    let mut batch_provider = Worker::new(
+        0,
+        Some(TestMakeBlockQuorumWaiter::new_test()),
+        Arc::new(WorkerMetrics::default()),
+        network_client,
+        store,
+        Duration::from_secs(5),
+        WorkerNetworkHandle::new_for_test(task_manager.get_spawner()),
+    );
+    batch_provider.spawn_batch_builder("test builder", &task_manager);
+
+    let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+    let reth_env = RethEnv::new_for_temp_chain(chain.clone(), tmp_dir.path(), &task_manager, None)
+        .await
+        .unwrap();
+    let txpool = reth_env.init_txn_pool().unwrap();
+
+    let window = Duration::from_millis(200);
+    let (_wm_tx, wm_rx) = watch::channel(None);
+    let batch_builder = BatchBuilder::new(
+        &reth_env,
+        txpool.clone(),
+        batch_provider.batches_tx(),
+        task_manager.get_spawner(),
+        BaseFeeContainer::default(),
+        OwnWatermarkReceiver::new(wm_rx),
+        BatchBuilderConfig {
+            address: Address::from(U160::from(333)),
+            worker_id: 0,
+            epoch: 0,
+            epoch_boundary: u64::MAX,
+            max_delay: window,
+            next_batch_seq: 0,
+            gas_limit: ETHEREUM_BLOCK_GAS_LIMIT_56BITS,
+        },
+    );
+
+    let mut tx_factory = TransactionFactory::new();
+    let tx = tx_factory.create_eip1559(
+        chain,
+        None,
+        reth_env.get_gas_price().unwrap(),
+        Some(Address::ZERO),
+        U256::from(1),
+        Bytes::new(),
+    );
+    tx_factory.submit_tx_to_pool(tx, txpool).await;
+
+    let _batch_builder = tokio::spawn(batch_builder.run());
+    let windows = 5;
+    tokio::time::sleep(window * windows + window / 2).await;
+
+    let attempts = attempts.load(std::sync::atomic::Ordering::SeqCst);
+    assert!(attempts >= 2, "the retry never fired: {attempts} attempts");
+    assert!(
+        attempts as u32 <= windows + 2,
+        "a failed seal must retry once per window, not spin: {attempts} attempts in {windows} windows"
+    );
+}

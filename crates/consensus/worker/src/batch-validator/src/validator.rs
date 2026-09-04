@@ -150,19 +150,35 @@ impl BatchValidation for BatchValidator {
             let parsed_txns = if txs_bytes.len() < 100 {
                 txs_bytes
                     .iter()
-                    .map(|tx_bytes| bytes_to_txn(tx_bytes))
-                    .collect::<Vec<Result<EthPooledTransaction, _>>>()
+                    .filter_map(|tx_bytes| bytes_to_txn(tx_bytes).ok())
+                    .collect::<Vec<EthPooledTransaction>>()
             } else {
                 txs_bytes
                     .par_iter()
-                    .map(|tx_bytes| bytes_to_txn(tx_bytes))
-                    .collect::<Vec<Result<EthPooledTransaction, _>>>()
+                    .filter_map(|tx_bytes| bytes_to_txn(tx_bytes).ok())
+                    .collect::<Vec<EthPooledTransaction>>()
             };
 
             let tx_pool = tx_pool.clone();
+            let handle = tokio::runtime::Handle::current();
             self.reth_env.get_task_spawner().spawn_task("submit-tx-batch", async move {
-                let txs: Vec<_> = parsed_txns.into_iter().flatten().collect();
-                for res in tx_pool.add_raw_transactions_external(txs).await {
+                // Admit off the async runtime: reth's `add_transactions` takes a blocking
+                // `parking_lot` write lock, so a flood of owner-submitted gossip batches would
+                // park every tokio worker on that lock and starve the runtime. Same hazard and
+                // fix as `submit_forwarded_txns`; run it on a blocking thread and drive the async
+                // submit with `block_on`.
+                let results = match tokio::task::spawn_blocking(move || {
+                    handle.block_on(tx_pool.add_raw_transactions_external(parsed_txns))
+                })
+                .await
+                {
+                    Ok(results) => results,
+                    Err(e) => {
+                        warn!(target: "worker::validator", ?e, "gossip-txn pool submit did not complete");
+                        return;
+                    }
+                };
+                for res in results {
                     match res {
                         Ok(_) => {}
                         // A hash this pool already holds is ordinary gossip dedup: multiple
@@ -173,7 +189,9 @@ impl BatchValidation for BatchValidator {
                             debug!(target: "worker::validator", "gossipped txn already in pool: {e}");
                         }
                         Err(e) => {
-                            warn!(target: "worker::validator", "failed to submit gossipped txn: {e}");
+                            // This can get pretty noisy hence setting it to debug level.
+                            // REVISIT: Expose metrics counting such failed txn submissions.
+                            debug!(target: "worker::validator", "failed to submit gossipped txn: {e}");
                         }
                     }
                 }
@@ -198,7 +216,25 @@ impl BatchValidation for BatchValidator {
                     return Vec::new();
                 }
             };
-        tx_pool.add_forwarded_txns(parsed).await
+        // Admit to the pool off the async runtime. reth's `add_transactions` takes a blocking
+        // `parking_lot` write lock; under a forwarded-txn flood, enough concurrent submits would
+        // park every tokio worker on that lock and starve the runtime (a network-wide freeze). Run
+        // it on a blocking thread so the lock wait never consumes a worker -- mirrors the signer
+        // recovery hop above and the task manager's blocking-future pattern. `add_forwarded_txns`
+        // is async, so drive it with `block_on` inside the blocking task.
+        let tx_pool = tx_pool.clone();
+        let handle = tokio::runtime::Handle::current();
+        match tokio::task::spawn_blocking(move || {
+            handle.block_on(tx_pool.add_forwarded_txns(parsed))
+        })
+        .await
+        {
+            Ok(stale) => stale,
+            Err(e) => {
+                warn!(target: "worker::validator", ?e, "forwarded-txn pool submit did not complete");
+                Vec::new()
+            }
+        }
     }
 }
 

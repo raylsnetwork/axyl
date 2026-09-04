@@ -1,7 +1,7 @@
 //! Worker-side wrapper around the reth transaction pool.
 //!
 //! Keeps reth pool internals out of the batch builder and RPC paths, and owns the pieces reth
-//! does not: the in-flight mark tracker and the shutdown backup in `backup`.
+//! does not: the in-flight mark tracker.
 
 use eyre::Error;
 use futures::StreamExt as _;
@@ -28,15 +28,12 @@ use reth_transaction_pool::{
     TransactionPool as _, TransactionPoolExt as _, ValidPoolTransaction,
 };
 use std::{
-    path::PathBuf,
     sync::Arc,
     time::{Duration, Instant},
 };
 use tracing::{debug, info};
 
 use crate::{error::RaylsRethResult, in_flight::InFlightTracker, traits::RaylsNode};
-
-mod backup;
 
 /// A pooled transaction id.
 pub type PoolTxnId = TransactionId;
@@ -122,9 +119,6 @@ pub struct WorkerTxPool {
     /// what it sealed so the next round skips it, the forwarder marks what it sent so it does not
     /// re-send before the mark is due. Handed out via [`WorkerTxPool::in_flight`].
     in_flight_tracker: InFlightTracker,
-    /// File the pending and queued transactions are snapshotted to on graceful shutdown and
-    /// reloaded from on boot.
-    backup_path: Arc<PathBuf>,
 }
 
 impl From<WorkerTxPool> for RaylsTransactionPool {
@@ -163,11 +157,7 @@ impl WorkerTxPool {
 
         info!(target: "rayls::execution", "Transaction pool initialized");
 
-        let this = Self {
-            pool: transaction_pool,
-            in_flight_tracker: in_flight,
-            backup_path: Arc::new(data_dir.txpool_transactions()),
-        };
+        let this = Self { pool: transaction_pool, in_flight_tracker: in_flight };
 
         // reth's maintenance future drains mined transactions, reloads changed accounts, and
         // updates the pending base fee on every commit. `no_local_exemptions` holds locally
@@ -178,6 +168,8 @@ impl WorkerTxPool {
             blockchain_provider.canonical_state_stream(),
             task_spawner.clone(),
             MaintainPoolConfig {
+                // bounds the queued (non-executable) sub-pool only; a pending tx is never
+                // lifetime-evicted, so this caps nonce-gapped stranding, not seal latency
                 max_tx_lifetime: Duration::from_mins(5),
                 no_local_exemptions: true,
                 ..Default::default()
@@ -191,8 +183,19 @@ impl WorkerTxPool {
         let mut release_stream = blockchain_provider.canonical_state_stream();
         let release_pool = this.clone();
         task_spawner.spawn_critical_task("in-flight release", async move {
-            while release_stream.next().await.is_some() {
-                release_pool.reconcile_in_flight();
+            while let Some(notification) = release_stream.next().await {
+                // Release marks for exactly the txns this commit mined, straight from the
+                // notification: O(mined), in-flight lock only, NO pool lock and no pending
+                // snapshot - so it can neither tax execution nor gap the heartbeat regardless of
+                // pool size. Move the committed chain into the blocking closure so the mined-hash
+                // iterator is built there, with no intermediate Vec.
+                let committed = notification.committed();
+                let pool = release_pool.clone();
+                let _ = tokio::task::spawn_blocking(move || {
+                    let (blocks, _) = committed.inner();
+                    pool.reconcile_in_flight(Some(blocks.transaction_hashes()));
+                })
+                .await;
             }
         });
         Ok(this)
@@ -223,20 +226,34 @@ impl WorkerTxPool {
         self.in_flight_tracker.clone()
     }
 
-    /// Releases in-flight marks for hashes no longer in the pending sub-pool.
+    /// Releases in-flight marks for hashes that have left the pending sub-pool.
     ///
     /// A sealed transaction stays pending (and RPC-visible) until it executes; once execution
     /// drops it from pending, its mark is stale and released so a later resubmission of the same
     /// nonce is not skipped.
-    pub fn reconcile_in_flight(&self) {
+    ///
+    /// `Some(mined)` — the cheap per-block path: release exactly the txns a commit mined (from the
+    /// canonical notification). Touches only the in-flight tracker's own lock, is O(mined), and
+    /// takes NO pool lock — so it can't tax execution or gap the execution heartbeat.
+    ///
+    /// `None` — the periodic backstop: snapshot the whole pending sub-pool under the pool lock and
+    /// release marks no longer pending. O(pending) and pool-locked, so keep it off any hot path;
+    /// it exists to reap marks for txns that left pending WITHOUT mining
+    /// (dropped/replaced/evicted), which the mined set can't see.
+    pub fn reconcile_in_flight(&self, mined: Option<impl IntoIterator<Item = TxHash>>) {
         if self.in_flight_tracker.is_empty() {
             return;
         }
-        let pending: B256Set =
-            self.pool.pending_transactions().iter().map(|tx| *tx.hash()).collect();
-        let released = self.in_flight_tracker.release_mined(&pending);
+        let released = match mined {
+            Some(hashes) => self.in_flight_tracker.release_hashes(hashes),
+            None => {
+                let pending: B256Set =
+                    self.pool.pending_transactions().iter().map(|tx| *tx.hash()).collect();
+                self.in_flight_tracker.release_mined(&pending)
+            }
+        };
         if released > 0 {
-            debug!(target: "rayls::txpool", released, "released in-flight marks against pending sub-pool");
+            debug!(target: "rayls::txpool", released, "released in-flight marks");
         }
     }
 

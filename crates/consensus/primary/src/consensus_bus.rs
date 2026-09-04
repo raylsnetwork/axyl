@@ -374,7 +374,7 @@ struct ConsensusBusEpochInner {
     /// Count of certificates currently suspended awaiting parents, owned by the certificate
     /// manager. The proposer's backpressure gate reads this, never the mirrored metrics gauge:
     /// control state lives in a component, a metric handle is write-only. Published on each
-    /// suspension, so a drained queue is reflected only at the next suspension.
+    /// suspension and each drain, so the gate releases as soon as the queue empties.
     suspended_cert_count: watch::Sender<usize>,
 
     /// Subscriber sends drain acknowledgment when all in-flight work is complete.

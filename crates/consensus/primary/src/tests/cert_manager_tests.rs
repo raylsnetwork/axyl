@@ -14,6 +14,8 @@ struct TestTypes<DB = MemDatabase> {
     manager: CertificateManager<DB>,
     /// The committee fixture.
     fixture: CommitteeFixture<DB>,
+    /// The bus the manager publishes on.
+    bus: ConsensusBus,
 }
 
 fn create_test_types() -> TestTypes<MemDatabase> {
@@ -26,9 +28,9 @@ fn create_test_types() -> TestTypes<MemDatabase> {
     let gc_round = AtomicRound::new(0);
     let highest_processed_round = AtomicRound::new(0);
 
-    let manager = CertificateManager::new(config, cb, gc_round, highest_processed_round);
+    let manager = CertificateManager::new(config, cb.clone(), gc_round, highest_processed_round);
 
-    TestTypes { manager, fixture }
+    TestTypes { manager, fixture, bus: cb }
 }
 
 #[tokio::test]
@@ -83,5 +85,43 @@ async fn test_accept_pending_certs() -> eyre::Result<()> {
 
     // later_rounds should be pending
     assert_eq!(expected_pending_len, manager.pending.num_pending());
+    Ok(())
+}
+
+/// The proposer's backpressure brake reads this watch, so a count left stale-high after the
+/// drain would throttle proposing forever.
+#[tokio::test]
+async fn suspended_cert_count_follows_the_drain() -> eyre::Result<()> {
+    let TestTypes { mut manager, fixture, bus } = create_test_types();
+    let committee = fixture.committee();
+    let num_authorities = fixture.num_authorities();
+
+    let genesis =
+        Certificate::genesis(&committee).iter().map(|x| x.digest()).collect::<BTreeSet<_>>();
+    let keys: Vec<_> = fixture.authorities().map(|a| (a.id(), a.keypair().copy())).collect();
+    let (certificates, _) =
+        make_optimal_signed_certificates(1..=3, &genesis, &committee, keys.as_slice());
+    let mut first_round: Vec<_> = certificates
+        .into_iter()
+        .map(|mut c| {
+            c.set_signature_verification_state(SignatureVerificationState::VerifiedDirectly(
+                c.aggregated_signature().expect("signature valid"),
+            ));
+            c
+        })
+        .collect();
+    let later_rounds = first_round.split_off(num_authorities);
+    let suspended = later_rounds.len();
+
+    let shutdown = Notifier::new();
+    let shutdown_rx = shutdown.subscribe();
+    let res = manager.process_verified_certificates(later_rounds, &shutdown_rx).await;
+    assert_matches!(res, Err(CertManagerError::Pending(_)));
+    assert_eq!(*bus.suspended_cert_count().borrow(), suspended, "suspension publishes the count");
+
+    // the first round unlocks everything above it
+    manager.process_verified_certificates(first_round, &shutdown_rx).await?;
+    assert_eq!(manager.pending.num_pending(), 0, "every pending cert drained");
+    assert_eq!(*bus.suspended_cert_count().borrow(), 0, "the drain publishes the count");
     Ok(())
 }

@@ -1,5 +1,5 @@
 use crate::in_flight::InFlightTracker;
-use alloy::primitives::TxHash;
+use alloy::primitives::{Address, TxHash};
 use std::time::{Duration, Instant};
 
 /// Governs when a mark becomes eligible for release: a base wait, an exponential backoff cap
@@ -23,14 +23,23 @@ impl DuePolicy {
     }
 }
 
-/// The state of one tracked hash: sent and awaiting a due check, or acknowledged stale by the
-/// forwarder. `AckedStale` is a terminal state outside the resend/expiry cycle - see `is_due`.
+/// Upper bound on how long a dropped hash stays held when its sender never advances, so a
+/// predecessor lost for good is still retried, just not every round.
+pub const DROPPED_HOLD: Duration = Duration::from_secs(60);
+
+/// The state of one tracked hash: sent and awaiting a due check, acknowledged stale by the
+/// forwarder, or held after execution dropped it as nonce-too-high. `AckedStale` is a terminal
+/// state outside the resend/expiry cycle - see `is_due`.
 #[derive(Copy, Clone, Debug)]
 pub(crate) enum Mark {
     /// Sent at `at` while the execution anchor was `anchor`, after `attempts` prior resends.
     Sent { at: Instant, anchor: u64, attempts: u32 },
     /// Confirmed no longer live by the forwarder; never due, released only by reconcile or clear.
     AckedStale,
+    /// Executed as nonce-too-high at `at`: pooled and unexecutable until `sender`'s state nonce
+    /// advances, which releases it ([`InFlightTracker::release_advanced`]); due only once
+    /// [`DROPPED_HOLD`] lapses, since a re-seal or re-send before that drops it again.
+    Held { at: Instant, sender: Address },
 }
 
 impl Mark {
@@ -46,16 +55,20 @@ impl Mark {
                 now.duration_since(at) >= wait
                     && anchor >= mark_anchor.saturating_add(policy.min_anchor_advance)
             }
+            Mark::Held { at, .. } => now.duration_since(at) >= DROPPED_HOLD,
             Mark::AckedStale => false,
         }
     }
 
-    /// Refreshes a `Sent` mark to the given time/anchor and bumps its attempt count; a no-op
-    /// on an `AckedStale` mark, which never resends.
+    /// Refreshes a `Sent` or `Held` mark to the given time/anchor and bumps its attempt count; a
+    /// no-op on an `AckedStale` mark, which never resends.
     pub(crate) fn resend(&mut self, now: Instant, anchor: u64) {
-        if let Self::Sent { attempts, .. } = self {
-            *self = Self::Sent { at: now, anchor, attempts: attempts.saturating_add(1) };
-        }
+        let attempts = match *self {
+            Self::Sent { attempts, .. } => attempts,
+            Self::Held { .. } => 0,
+            Self::AckedStale => return,
+        };
+        *self = Self::Sent { at: now, anchor, attempts: attempts.saturating_add(1) };
     }
 }
 
@@ -71,6 +84,7 @@ pub(crate) enum Armed {
 
 /// A capability handle scoping mark writes to the sealing role, returned by
 /// `InFlightTracker::arm_sealing` so a caller cannot mark hashes without first arming.
+#[must_use = "dropping the handle discards the sealing capability the arm just minted"]
 #[derive(Debug)]
 pub struct SealMarks {
     tracker: InFlightTracker,
@@ -96,10 +110,14 @@ pub struct ForwardProbe {
     pub forwarded: bool,
     /// Whether the hash is untracked or its mark is due for resend/release.
     pub due: bool,
+    /// Re-send attempts recorded for this hash (0 if untracked or not a `Sent` mark). Used to
+    /// decide when a repeatedly-forwarded transaction should be pruned as unmineable.
+    pub attempts: u32,
 }
 
 /// A capability handle scoping mark writes to the forwarding role, returned by
 /// `InFlightTracker::arm_forwarding` so a caller cannot mark hashes without first arming.
+#[must_use = "dropping the handle discards the forwarding capability the arm just minted"]
 #[derive(Debug, Clone)]
 pub struct ForwardMarks {
     tracker: InFlightTracker,
@@ -131,6 +149,10 @@ impl ForwardMarks {
         ForwardProbe {
             forwarded: mark.is_some(),
             due: mark.is_none_or(|m| m.is_due(now, anchor, &self.policy)),
+            attempts: match mark {
+                Some(Mark::Sent { attempts, .. }) => *attempts,
+                _ => 0,
+            },
         }
     }
 
@@ -167,48 +189,4 @@ impl ForwardMarks {
     pub fn mark_acked_stale(&self, hashes: impl IntoIterator<Item = TxHash>) {
         self.tracker.track_all(hashes, Mark::AckedStale);
     }
-}
-
-/// Schema version of `MarkBackup`, bumped whenever its serialized shape changes so a backup
-/// written by a prior version is rejected instead of misread.
-pub const MARK_BACKUP_VERSION: u32 = 1;
-
-/// A serializable snapshot of the marks tracked for one role, persisted across a restart and
-/// restored via `InFlightTracker::stash_restore` once re-armed for the matching role.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct MarkBackup {
-    /// Schema version this backup was written under; see `MARK_BACKUP_VERSION`.
-    pub version: u32,
-    /// The role the marks were captured under; a restore for a different role is discarded.
-    pub role: MarkRole,
-    /// The captured marks, sorted by hash for deterministic serialization.
-    pub marks: Vec<SavedMark>,
-}
-
-/// The role a captured `MarkBackup` belongs to, mirroring `Armed` in a serializable form.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub enum MarkRole {
-    /// Marks owned by the block builder.
-    Sealing,
-    /// Marks owned by the gossip forwarder.
-    Forwarding,
-}
-
-/// One tracked hash's mark, in the serializable form used by `MarkBackup`.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct SavedMark {
-    /// The tracked transaction hash.
-    pub hash: TxHash,
-    /// The mark state to restore for this hash.
-    pub kind: SavedMarkKind,
-}
-
-/// The serializable form of `Mark`, carrying only the state needed to resume tracking after a
-/// restart (the wall-clock `at`/`anchor` fields are re-stamped fresh on restore instead).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub enum SavedMarkKind {
-    /// A `Mark::Sent` reduced to its resend count; the clock and anchor are re-stamped on restore.
-    Sent { attempts: u32 },
-    /// A `Mark::AckedStale`.
-    AckedStale,
 }

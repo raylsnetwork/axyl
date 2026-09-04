@@ -4,7 +4,7 @@ use crate::{
 };
 use rayls_infrastructure_types::{
     batch_ordering::{AuthoritySeqState, BatchOrderingState, StoredBatchOrderingState},
-    decode, try_decode, B256Map, Batch, Database, DbTx, B256,
+    try_decode, B256Map, Batch, Database, DbTx, B256,
 };
 use std::{collections::BTreeMap, sync::Arc};
 use tracing::warn;
@@ -77,7 +77,7 @@ impl<DB: Database> BatchOrderingStore for DB {
 }
 
 /// Rebuilds each authority's parked map by pairing every reference with its reloaded body,
-/// dropping any entry whose body is absent from `Batches`.
+/// dropping any entry whose body is absent from `Batches` or no longer decodes.
 ///
 /// A dropped entry leaves a seq gap the ordering waits to refill; a committed parked batch's row
 /// always survives the reboot, so the drop is defensive.
@@ -89,11 +89,18 @@ fn reconstruct_parked(
     for (addr, auth) in stored.authorities {
         let mut parked = BTreeMap::new();
         for (seq, reference) in auth.parked {
-            match bodies.get(&reference.batch_digest) {
-                Some(bytes) => {
-                    let batch: Batch = decode(bytes);
+            match bodies.get(&reference.batch_digest).map(|bytes| try_decode::<Batch>(bytes)) {
+                Some(Ok(batch)) => {
                     parked.insert(seq, reference.into_prepared(Arc::new(batch)));
                 }
+                Some(Err(e)) => warn!(
+                    target: "engine",
+                    ?addr,
+                    seq,
+                    batch_digest = ?reference.batch_digest,
+                    %e,
+                    "dropping parked batch on restart: corrupt Batches row"
+                ),
                 None => warn!(
                     target: "engine",
                     ?addr,
@@ -107,4 +114,47 @@ fn reconstruct_parked(
             .insert(addr, AuthoritySeqState { last_executed_seq: auth.last_executed_seq, parked });
     }
     BatchOrderingState { epoch: stored.epoch, authorities }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rayls_infrastructure_types::{
+        batch_ordering::{ParkedRef, StoredAuthoritySeqState},
+        Address,
+    };
+
+    /// A parked body that no longer decodes is dropped like a missing one: boot-time recovery
+    /// must not abort the node on a corrupt row when the ordering can refill the seq gap.
+    #[test]
+    fn reconstruct_drops_a_parked_batch_whose_body_is_corrupt() {
+        let digest = B256::repeat_byte(1);
+        let reference = ParkedRef {
+            batch_digest: digest,
+            beneficiary: Address::ZERO,
+            output_digest: B256::ZERO,
+            output_nonce: 0,
+            timestamp: 0,
+            epoch: 0,
+            worker_id: 0,
+            batch_index: 0,
+            drained: false,
+            gas_limit: 0,
+        };
+        let stored = StoredBatchOrderingState {
+            epoch: 0,
+            authorities: BTreeMap::from([(
+                Address::ZERO,
+                StoredAuthoritySeqState {
+                    last_executed_seq: None,
+                    parked: BTreeMap::from([(1, reference)]),
+                },
+            )]),
+        };
+        let bodies = B256Map::from_iter([(digest, vec![0xff, 0xff, 0xff])]);
+
+        let state = reconstruct_parked(stored, &bodies);
+
+        assert!(state.authorities[&Address::ZERO].parked.is_empty(), "the corrupt body is dropped");
+    }
 }

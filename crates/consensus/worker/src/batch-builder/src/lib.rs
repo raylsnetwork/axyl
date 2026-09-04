@@ -265,9 +265,9 @@ impl BatchBuilder {
                     }
                 }
 
-                // Batching window tick.
+                // Batching window tick: the only wake that re-arms a failed seal's retry.
                 _ = interval.tick(), if !is_awaiting => {
-                    pipeline = self.try_start_build(pipeline, &mut interval);
+                    pipeline = self.try_start_build(pipeline.on_window(), &mut interval);
                 }
             }
         }
@@ -301,6 +301,7 @@ impl BatchBuilder {
                 PipelineState::AwaitingQuorum(backlog.start_building(rx))
             }
             PipelineState::AwaitingQuorum(p) => PipelineState::AwaitingQuorum(p),
+            PipelineState::QuorumRetry(p) => PipelineState::QuorumRetry(p),
         }
     }
 
@@ -319,7 +320,7 @@ impl BatchBuilder {
         };
 
         let current_seq = awaiting.current_seq();
-        let start_time = std::time::Instant::now();
+        let start_time = awaiting.state.started;
 
         let outcome = match res.map_err(BatchBuilderError::from).and_then(|r| r) {
             Ok(out) => out,
@@ -343,7 +344,7 @@ impl BatchBuilder {
                     elapsed_ms = start_time.elapsed().as_millis(),
                     "batch quorum failed; re-armed retry for next window"
                 );
-                Ok(Some(PipelineState::Accumulating(awaiting.into_accumulating())))
+                Ok(Some(PipelineState::QuorumRetry(awaiting.into_retry())))
             }
             TaskOutcome::QuorumSucceeded { selected, at_capacity } => {
                 debug!(

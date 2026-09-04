@@ -42,8 +42,9 @@
 //!
 //! A mark leaves the set through one of several paths, each counted under its own cause so TTL
 //! churn stays distinguishable from healthy execution-driven release: reconcile against the live
-//! pending set ([`InFlightTracker::release_mined`]), an explicit drop of pool-rejected hashes
-//! ([`InFlightTracker::release_dropped`]), the sealing TTL sweep, and the epoch-transition clear.
+//! pending set ([`InFlightTracker::release_mined`]), the release of hashes execution dropped as
+//! nonce-too-high once their sender's state nonce advances ([`InFlightTracker::hold_dropped`] then
+//! [`InFlightTracker::release_advanced`]), the sealing TTL sweep, and the epoch-transition clear.
 //! Every release that frees at least one mark ticks the release watch
 //! ([`InFlightTracker::release_events`]) exactly once - once per release *call*, not per hash -
 //! which is the builder's only wake-up signal that transactions are re-selectable again; a no-op
@@ -51,11 +52,9 @@
 //!
 //! # Restart survival
 //!
-//! Marks are captured to a versioned, serializable [`MarkBackup`] ([`InFlightTracker::snapshot`])
-//! and staged for the next boot ([`InFlightTracker::stash_restore`]). The stash is applied lazily
-//! at the next arm, and only when its role matches: a restore for the wrong role is discarded
-//! rather than corrupt the freshly armed state. Wall-clock fields are re-stamped fresh on restore,
-//! so only the resend and backoff state carries across, never a stale clock.
+//! In-flight marks are not persisted across a restart. The mempool itself is ephemeral (standard
+//! semantics: a client resubmits any transaction accepted but not yet mined), so a fresh boot
+//! starts with no marks and re-tracks transactions as they are re-forwarded or re-sealed.
 //!
 //! # Concurrency
 //!
@@ -69,14 +68,13 @@
 
 use crate::in_flight::metrics::{InFlightMetrics, IN_FLIGHT_METRICS};
 use alloy::primitives::{
-    map::{B256Map, B256Set},
-    TxHash,
+    map::{AddressSet, B256Map, B256Set},
+    Address, TxHash,
 };
 use parking_lot::RwLock;
 #[cfg(test)]
 use std::time::Duration;
 use std::{sync::Arc, time::Instant};
-use tracing::info;
 
 mod marks;
 mod metrics;
@@ -87,11 +85,6 @@ pub use marks::*;
 struct Inner {
     marks: B256Map<Mark>,
     armed: Option<Armed>,
-    // Staged by `stash_restore` ahead of the arm that will use it, since the caller
-    // (e.g. crash recovery) knows the saved role before the tracker is re-armed. Applied
-    // lazily in `consume_stash` so a restore for the wrong role is dropped instead of
-    // corrupting the freshly armed state.
-    pending_restore: Option<MarkBackup>,
 }
 
 /// Shared, cheaply cloned handle over the in-flight mark set; see the module header for the
@@ -125,24 +118,19 @@ impl InFlightTracker {
         let mut guard = self.inner.write();
         let previous_marks_len = guard.marks.len();
         // Wipe unconditionally: a new sealing round has no relation to whatever the prior
-        // arm tracked. Only `pending_restore`, staged separately, survives into the new round.
+        // arm tracked.
         guard.marks.clear();
         guard.armed = Some(Armed::Sealing(policy));
-        let restored = Self::consume_stash(&mut guard, MarkRole::Sealing);
         drop(guard);
         self.on_released(previous_marks_len, 0, &self.metrics.released_clear);
-        self.on_restored(restored, MarkRole::Sealing);
         SealMarks::new(self.clone())
     }
 
-    /// Arms the tracker for a forwarding round under the given expiry policy, restoring any
-    /// marks stashed for the forwarding role.
+    /// Arms the tracker for a forwarding round under the given expiry policy.
     pub fn arm_forwarding(&self, policy: DuePolicy) -> ForwardMarks {
         let mut guard = self.inner.write();
         guard.armed = Some(Armed::Forwarding);
-        let restored = Self::consume_stash(&mut guard, MarkRole::Forwarding);
         drop(guard);
-        self.on_restored(restored, MarkRole::Forwarding);
         ForwardMarks::new(self.clone(), policy)
     }
 }
@@ -204,25 +192,37 @@ impl InFlightTracker {
     fn release_due(&self, anchor: u64, policy: &DuePolicy) -> usize {
         let mut guard = self.inner.write();
         let previous_marks_len = guard.marks.len();
-        guard.marks.retain(|_, mark| !mark.is_due(Instant::now(), anchor, policy));
+        let now = Instant::now();
+        guard.marks.retain(|_, mark| !mark.is_due(now, anchor, policy));
         let current_marks_len = guard.marks.len();
         drop(guard);
         self.on_released(previous_marks_len, current_marks_len, &self.metrics.released_ttl);
         previous_marks_len - current_marks_len
     }
 
-    /// Releases the given hashes, e.g. transactions the pool dropped before mining.
-    pub fn release_dropped(&self, hashes: impl IntoIterator<Item = TxHash>) {
-        let mut hashes = hashes.into_iter().peekable();
-        if hashes.peek().is_none() {
-            return;
+    /// Holds tracked hashes execution dropped as nonce-too-high: each stays in flight (neither
+    /// re-sealed nor re-forwarded) until [`Self::release_advanced`] sees its sender's state nonce
+    /// move or [`DROPPED_HOLD`] lapses. Untracked hashes are ignored, and a hash already held keeps
+    /// its stamp, so a peer re-sealing it cannot extend the hold.
+    pub fn hold_dropped(&self, dropped: impl IntoIterator<Item = (Address, TxHash)>) {
+        let now = Instant::now();
+        let mut guard = self.inner.write();
+        for (sender, hash) in dropped {
+            if let Some(mark @ Mark::Sent { .. }) = guard.marks.get_mut(&hash) {
+                *mark = Mark::Held { at: now, sender };
+            }
         }
+    }
 
+    /// Releases every held hash of the given senders, whose state nonce a block just advanced:
+    /// their dropped successors may now execute, so they are re-sealable and re-forwardable.
+    pub fn release_advanced(&self, senders: impl IntoIterator<Item = Address>) {
+        let advanced: AddressSet = senders.into_iter().collect();
         let mut guard = self.inner.write();
         let previous_marks_len = guard.marks.len();
-        for hash in hashes {
-            guard.marks.remove(&hash);
-        }
+        guard.marks.retain(
+            |_, mark| !matches!(mark, Mark::Held { sender, .. } if advanced.contains(sender)),
+        );
         let current_marks_len = guard.marks.len();
         drop(guard);
         self.on_released(previous_marks_len, current_marks_len, &self.metrics.released_dropped);
@@ -233,6 +233,23 @@ impl InFlightTracker {
         let mut guard = self.inner.write();
         let previous_marks_len = guard.marks.len();
         guard.marks.retain(|hash, _| live.contains(hash));
+        let current_marks_len = guard.marks.len();
+        drop(guard);
+        self.on_released(previous_marks_len, current_marks_len, &self.metrics.released_reconcile)
+    }
+
+    /// Releases marks for exactly the given hashes - the txns a block just mined, taken straight
+    /// from the canonical notification. Touches only this tracker's own lock and is O(mined): no
+    /// pending snapshot and no pool lock, so it cannot tax execution or gap the execution
+    /// heartbeat. Complements [`Self::release_mined`], the periodic full-scan backstop that also
+    /// reaps marks for txns that left the pending sub-pool WITHOUT mining
+    /// (dropped/replaced/evicted).
+    pub fn release_hashes(&self, mined: impl IntoIterator<Item = TxHash>) -> usize {
+        let mut guard = self.inner.write();
+        let previous_marks_len = guard.marks.len();
+        for hash in mined {
+            guard.marks.remove(&hash);
+        }
         let current_marks_len = guard.marks.len();
         drop(guard);
         self.on_released(previous_marks_len, current_marks_len, &self.metrics.released_reconcile)
@@ -250,9 +267,8 @@ impl InFlightTracker {
                     previous_marks_len
                 }
                 // Forwarding marks (including AckedStale) outlive an epoch boundary by
-                // design: the forwarder tracks acknowledgement across restarts via
-                // stash/restore, so `clear` only disarms and leaves the marks for the
-                // next arm to inherit or explicitly release.
+                // design: `clear` only disarms, leaving the marks for the next forwarding
+                // arm to inherit or explicitly release rather than re-forwarding them.
                 Some(Armed::Forwarding) => 0,
                 None => {
                     let previous_marks_len = guard.marks.len();
@@ -296,75 +312,6 @@ impl InFlightTracker {
         }
         self.metrics.gauge.sub(delta as i64);
         delta
-    }
-}
-
-impl InFlightTracker {
-    /// Captures the current marks for the armed role, sorted for deterministic serialization.
-    /// Returns `None` if the tracker is unarmed.
-    pub fn snapshot(&self) -> Option<MarkBackup> {
-        let guard = self.inner.read();
-        let role = match guard.armed? {
-            Armed::Sealing(_) => MarkRole::Sealing,
-            Armed::Forwarding => MarkRole::Forwarding,
-        };
-        let mut marks: Vec<SavedMark> = guard
-            .marks
-            .iter()
-            .map(|(hash, mark)| SavedMark {
-                hash: *hash,
-                kind: match *mark {
-                    Mark::Sent { attempts, .. } => SavedMarkKind::Sent { attempts },
-                    Mark::AckedStale => SavedMarkKind::AckedStale,
-                },
-            })
-            .collect();
-        drop(guard);
-        marks.sort_unstable_by_key(|mark| mark.hash);
-        Some(MarkBackup { version: MARK_BACKUP_VERSION, role, marks })
-    }
-
-    /// Stages a previously captured snapshot to be restored on the next matching-role arm.
-    pub fn stash_restore(&self, backup: MarkBackup) {
-        self.inner.write().pending_restore = Some(backup);
-    }
-
-    fn consume_stash(guard: &mut Inner, role: MarkRole) -> usize {
-        let Some(backup) = guard.pending_restore.take() else { return 0 };
-        if backup.role != role {
-            info!(
-                target: "rayls::txpool",
-                discarded = backup.marks.len(),
-                saved_role = ?backup.role,
-                armed_role = ?role,
-                "discarded restored in-flight marks on role change"
-            );
-            return 0;
-        }
-        let now = Instant::now();
-        let before = guard.marks.len();
-        for mark in backup.marks {
-            let restored = match mark.kind {
-                SavedMarkKind::Sent { attempts } => Mark::Sent { at: now, anchor: 0, attempts },
-                // only the forwarder mints acked-stale marks; under a sealing arm one would
-                // strand its tx past the TTL (the sweep never releases acked-stale)
-                SavedMarkKind::AckedStale if role == MarkRole::Sealing => continue,
-                SavedMarkKind::AckedStale => Mark::AckedStale,
-            };
-            guard.marks.insert(mark.hash, restored);
-        }
-        guard.marks.len() - before
-    }
-
-    fn on_restored(&self, n: usize, role: MarkRole) {
-        if n > 0 {
-            self.metrics.marked.inc_by(n as u64);
-            self.metrics.restored.inc_by(n as u64);
-            info!(target: "rayls::txpool", restored = n, ?role, "restored in-flight marks");
-        }
-        // Add the restored count directly rather than re-reading `self.len()`, which would take
-        // the read lock a second time and could observe a length a concurrent writer already moved.
-        self.metrics.gauge.add(n as i64);
     }
 }
 

@@ -97,13 +97,22 @@ pub(crate) async fn engine_update_loop(
                 // pools are fetched per tick, not captured at spawn: worker components are
                 // created during the first epoch, after this node-scoped task starts
                 let anchor = consensus_bus.executed_anchor().borrow().number;
-                for pool in engine.get_all_worker_transaction_pools().await {
-                    // sealing marks age out via the sweep; forwarding marks have no sweep, so drive
-                    // the O(pending) membership reconcile here too: its only other trigger is
-                    // the canonical-stream task, which a burst can starve. both are idempotent
-                    pool.in_flight().sweep_due(anchor);
-                    pool.reconcile_in_flight();
-                }
+                let pools = engine.get_all_worker_transaction_pools().await;
+                // sealing marks age out via the sweep; forwarding marks have no sweep, so drive the
+                // O(pending) membership reconcile here too: its only other trigger is the
+                // canonical-stream task, which a burst can starve. both are idempotent. The
+                // reconcile scans the whole pending sub-pool under the pool read lock, so run it on
+                // a blocking thread rather than pinning a tokio worker on that lock.
+                let _ = tokio::task::spawn_blocking(move || {
+                    for pool in pools {
+                        pool.in_flight().sweep_due(anchor);
+                        // Backstop full-scan sweep (no mined set): reaps marks for txns that left
+                        // pending WITHOUT mining. The per-block mined-set release lives on the
+                        // canonical-stream task and never touches the pool lock.
+                        pool.reconcile_in_flight(None::<std::iter::Empty<_>>);
+                    }
+                })
+                .await;
             }
         )
     }

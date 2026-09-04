@@ -1909,14 +1909,15 @@ async fn test_batch_digest_v2_hardfork_transition() -> eyre::Result<()> {
     Ok(())
 }
 
-/// Marks of txs an executed batch dropped as nonce-too-high are released for re-sealing.
+/// Marks of txs an executed batch dropped as nonce-too-high stay held in flight.
 ///
 /// A commit-order inversion executes a successor batch before its predecessor: the successor's
-/// txs all drop nonce-too-high while staying pooled and marked in-flight from their seal. The
-/// spent marks must release on the drop, or the txs sit unselectable until the TTL sweep while
-/// every following batch of the sender drops in full.
+/// txs all drop nonce-too-high while staying pooled and marked in flight from their seal. A mark
+/// released on the drop re-seals the same unexecutable txs every round until the predecessor
+/// lands; the hold keeps them unselectable until the sender's state nonce advances or the hold
+/// window lapses.
 #[tokio::test]
-async fn test_dropped_txs_release_in_flight_marks() -> eyre::Result<()> {
+async fn test_dropped_txs_stay_held_in_flight() -> eyre::Result<()> {
     let tmp_dir = TempDir::new().expect("temp dir");
     let chain = test_chain_spec_arc();
     let mut batches = rayls_execution_evm::test_utils::batches(chain, 1);
@@ -2002,10 +2003,10 @@ async fn test_dropped_txs_release_in_flight_marks() -> eyre::Result<()> {
     )
     .await?;
 
-    assert_eq!(
-        in_flight.len(),
-        1,
-        "the dropped txs' marks must release on execution; only the unrelated mark remains"
+    assert_eq!(in_flight.len(), 3, "the dropped txs' marks are held, not released on the drop");
+    assert!(
+        gapped_hashes.iter().all(|hash| in_flight.is_in_flight(hash)),
+        "both dropped txs stay in flight"
     );
     Ok(())
 }

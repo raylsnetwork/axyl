@@ -415,48 +415,12 @@ where
         // notify), so it exits Ok via its shutdown path rather than faulting.
         drop(engine_input_keepalive);
 
-        // Safety-net txpool snapshot before the unbounded drain await below: a hung engine would
-        // otherwise reach the supervisor's SIGKILL with no backup, losing exactly the
-        // sealed-but-uncommitted txs the backup exists to protect. Both snapshots are idempotent
-        // tmp-then-rename, so the post-drain one wins on the healthy path; a tx executed during
-        // the drain is rejected nonce-too-low on reload and its restored mark is released by the
-        // first reconcile. Best-effort: a panic here must not skip the drain.
-        {
-            let pools = engine.get_all_worker_transaction_pools().await;
-            let _ = tokio::task::spawn_blocking(move || {
-                for pool in &pools {
-                    pool.save_backup();
-                    pool.save_mark_backup();
-                }
-            })
-            .await;
-        }
-
         match engine_done_rx.await {
             Ok(()) => info!(target: "engine", "engine drained before shutdown flush"),
             // Sender dropped without signalling: the engine task was torn down before its
             // drain completed (so no in-flight block was finalized) - safe to flush.
             Err(_) => {
                 warn!(target: "engine", "engine task ended without drain signal; flushing")
-            }
-        }
-
-        // Final txpool snapshot now that the engine has drained: pending and queued transactions
-        // (including sealed-but-uncommitted ones still marked in flight) reload on the next boot.
-        // Serialize and write are blocking work kept off the async workers, and a panic in one
-        // pool must not abort the DB flush below.
-        {
-            let pools = engine.get_all_worker_transaction_pools().await;
-            let saved = AssertUnwindSafe(tokio::task::spawn_blocking(move || {
-                for pool in &pools {
-                    pool.save_backup();
-                    pool.save_mark_backup();
-                }
-            }))
-            .catch_unwind()
-            .await;
-            if saved.is_err() {
-                error!(target: "engine", "txpool backup task panicked");
             }
         }
 
@@ -598,13 +562,8 @@ where
         }
         gas_accumulator.rewards_counter().set_committee(primary.current_committee().await);
 
-        // Reload each worker pool's transactions and in-flight marks saved by the previous
-        // graceful shutdown. Sealed-but-uncommitted transactions survive a restart as pending
-        // and marked in flight, so no batch has to be re-collected from `NodeBatchesCache`.
-        for pool in engine.get_all_worker_transaction_pools().await {
-            pool.load_backup().await;
-            pool.load_mark_backup().await;
-        }
+        // The txpool is intentionally not persisted across restarts (standard mempool semantics):
+        // a client resubmits any transaction that was accepted but not yet mined.
 
         // Check for incomplete epoch transition from a previous crash.
         self.recover_partial_transition(&primary, engine).await?;

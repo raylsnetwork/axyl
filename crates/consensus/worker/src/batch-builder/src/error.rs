@@ -35,7 +35,7 @@ pub enum BatchBuilderError {
     /// Error building batch because this transaction would case the batch to exceed max size (in
     /// bytes).
     #[error(
-        "The transaction was not included becuase it would exceed the max batch size. Tx size: {0} bytes - max size: {1} bytes."
+        "The transaction was not included because it would exceed the max batch size. Tx size: {0} bytes - max size: {1} bytes."
     )]
     MaxBatchSize(usize, usize),
     /// An operation that requires canonical state did not have it.

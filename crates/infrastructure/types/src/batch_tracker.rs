@@ -481,18 +481,24 @@ impl BatchTracker {
                     "nonce_range_for_sender"
                 );
             }
-            // log each nonce-too-high tx for full traceability
-            for (tx_hash, sender, tx_nonce, state_nonce) in &report.nonce_too_high_details {
-                warn!(
-                    target: "batch_tracker",
-                    digest = ?report.digest,
-                    ?tx_hash,
-                    ?sender,
-                    tx_nonce,
-                    state_nonce,
-                    nonce_gap = tx_nonce.saturating_sub(*state_nonce),
-                    "nonce_too_high_detail"
-                );
+
+            const NONCE_TOO_HIGH_DETAILS_THROTTLE: usize = 500;
+            // log some nonce-too-high txs to prevent logging storm.
+            for (i, (tx_hash, sender, tx_nonce, state_nonce)) in
+                report.nonce_too_high_details.iter().enumerate()
+            {
+                if i % NONCE_TOO_HIGH_DETAILS_THROTTLE == 0 {
+                    warn!(
+                        target: "batch_tracker",
+                        digest = ?report.digest,
+                        ?tx_hash,
+                        ?sender,
+                        tx_nonce,
+                        state_nonce,
+                        nonce_gap = tx_nonce.saturating_sub(*state_nonce),
+                        "nonce_too_high_detail"
+                    );
+                }
             }
         } else if report.other > 0 {
             trace!(
