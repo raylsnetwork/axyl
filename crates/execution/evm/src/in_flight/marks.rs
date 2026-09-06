@@ -110,8 +110,10 @@ pub struct ForwardProbe {
     pub forwarded: bool,
     /// Whether the hash is untracked or its mark is due for resend/release.
     pub due: bool,
-    /// Re-send attempts recorded for this hash (0 if untracked or not a `Sent` mark). Used to
-    /// decide when a repeatedly-forwarded transaction should be pruned as unmineable.
+    /// Re-send attempts recorded for this hash (0 if untracked or not a `Sent` mark), or
+    /// `u32::MAX` for a terminal `AckedStale` mark. Used to decide when a transaction should
+    /// be pruned as unmineable: the `u32::MAX` sentinel trips any prune cap so an acked-stale
+    /// transaction is dropped on the next scan rather than pinning its pending slot forever.
     pub attempts: u32,
 }
 
@@ -151,6 +153,11 @@ impl ForwardMarks {
             due: mark.is_none_or(|m| m.is_due(now, anchor, &self.policy)),
             attempts: match mark {
                 Some(Mark::Sent { attempts, .. }) => *attempts,
+                // `AckedStale` is terminal - the owner said the nonce is spent, so the transaction
+                // can never be mined. Report the maximum so it trips the forwarder's prune cap on
+                // the next scan and is dropped from the pool, instead of pinning its pending slot
+                // forever (it is never due, so nothing else releases it while it stays pending).
+                Some(Mark::AckedStale) => u32::MAX,
                 _ => 0,
             },
         }

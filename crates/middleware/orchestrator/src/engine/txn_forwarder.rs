@@ -360,9 +360,12 @@ impl TxnForwarder {
             // mined (each attempt already required the anchor to advance, so the chain moved on
             // without it). Drop it instead of forwarding it forever; the client resubmits if still
             // wanted. Removing it clears its in-flight mark on the next reconcile (it leaves
-            // pending). Checked before the send gate so a transaction that reached the cap while
-            // caught up is still pruned if the node has since fallen behind (`attempts` only climbs
-            // while caught up, so this cannot fire for one that has been lagging throughout).
+            // pending). An acked-stale mark reports `u32::MAX` attempts, so this same gate drops it
+            // here too: the owner said its nonce is spent, so it can never be mined and would
+            // otherwise pin its pending slot forever (it is terminal and never due). Checked before
+            // the send gate so a transaction that reached the cap while caught up is still pruned
+            // if the node has since fallen behind (`attempts` only climbs while caught
+            // up, so this cannot fire for one that has been lagging throughout).
             if probe.attempts >= FORWARD_PRUNE_ATTEMPTS {
                 prune_hashes.push(*txn.hash());
                 continue;

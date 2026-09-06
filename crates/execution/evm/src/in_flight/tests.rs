@@ -568,3 +568,21 @@ fn probe_reports_resend_attempts() {
     // an untracked hash reports zero attempts
     assert_eq!(forward.probe(&hash(2), now, 0).attempts, 0, "untracked hash has no attempts");
 }
+
+/// A terminal acked-stale mark surfaces as `u32::MAX` attempts through `probe`, so the forwarder's
+/// prune cap drops it on the next scan instead of pinning its pending slot forever. Fails if the
+/// ack is reported as zero attempts (the pre-fix behavior that leaked marks on a forwarding node).
+#[test]
+fn probe_reports_acked_stale_as_prune_eligible() {
+    let tracker = InFlightTracker::with_fresh_metrics();
+    let forward = tracker.arm_forwarding(DuePolicy::ttl(Duration::from_secs(10)));
+    let now = Instant::now();
+
+    forward.mark_forwarded([hash(1)], now, 0);
+    forward.mark_acked_stale([hash(1)]);
+    assert_eq!(
+        forward.probe(&hash(1), now, 0).attempts,
+        u32::MAX,
+        "an acked-stale mark reports the max so any prune cap trips"
+    );
+}
