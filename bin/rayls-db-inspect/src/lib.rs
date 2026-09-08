@@ -53,7 +53,12 @@ pub fn run(cli: &Cli) -> eyre::Result<Report> {
             Report::Epoch(report::epoch::epoch(&open(&nodes.dbs)?, *epoch, verbose)?)
         }
         Command::Epochs { from, to, all, nodes } => {
-            let range = if *all { None } else { Some((from.unwrap_or(0), to.unwrap_or(0))) };
+            // clap guarantees both bounds unless --all; guard direct callers of `run` too
+            let range = match (all, from, to) {
+                (true, _, _) => None,
+                (false, Some(from), Some(to)) => Some((*from, *to)),
+                _ => eyre::bail!("epochs: pass FROM_EPOCH and TO_EPOCH, or --all"),
+            };
             Report::Epochs(report::epoch::epochs(&open(&nodes.dbs)?, range)?)
         }
         Command::ChainCheck { from, to, nodes } => {

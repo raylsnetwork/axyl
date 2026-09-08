@@ -84,6 +84,27 @@ fn all_on_empty_nodes() {
 }
 
 #[test]
+fn run_rejects_epochs_without_bounds_or_all() {
+    use rayls_db_inspect::cli::{Cli, Command, NodeArgs};
+    let a = SeededNode::new(|_| {});
+    let cli = Cli {
+        json: false,
+        verbose: false,
+        exclusive: false,
+        require_stopped: false,
+        recover: false,
+        command: Command::Epochs {
+            from: None,
+            to: None,
+            all: false,
+            nodes: NodeArgs { dbs: vec![a.datadir()] },
+        },
+    };
+    let err = rayls_db_inspect::run(&cli).expect_err("no bounds and no --all");
+    assert!(err.to_string().contains("FROM_EPOCH and TO_EPOCH"), "{err}");
+}
+
+#[test]
 fn inverted_range_is_an_error() {
     let a = SeededNode::new(|_| {});
     assert!(epochs(&[a.open("a")], Some((5, 1))).is_err());
