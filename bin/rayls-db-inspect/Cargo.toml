@@ -1,0 +1,34 @@
+[package]
+name = "rayls-db-inspect"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license = "BUSL-1.1"
+homepage.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Read-only consensus-db inspection CLI for Rayls node operators."
+
+[[bin]]
+name = "rayls-db-inspect"
+path = "src/main.rs"
+
+[dependencies]
+rayls-infrastructure-storage = { workspace = true }
+rayls-infrastructure-types = { workspace = true }
+
+clap = { workspace = true, features = ["derive"] }
+const-hex = { workspace = true }
+eyre = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["env-filter", "fmt"] }
+
+[dev-dependencies]
+rayls-infrastructure-config = { workspace = true }
+rayls-testing-test-utils = { workspace = true }
+roaring = { workspace = true }
+tempfile = { workspace = true }
+
+[lints]
+workspace = true
