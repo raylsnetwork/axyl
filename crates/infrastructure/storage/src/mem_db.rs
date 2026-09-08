@@ -116,7 +116,7 @@ impl StoreEntry {
 pub(crate) type EvictionHeap = BinaryHeap<Reverse<(u64, &'static str, Vec<u8>)>>;
 
 /// Outcome of one eviction pass, for the layered writer's cache-pressure logs.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct EvictionStats {
     /// Total cached rows (live and tombstoned) when the pass started.
     pub before: usize,
@@ -124,6 +124,8 @@ pub struct EvictionStats {
     pub after: usize,
     /// Rows removed during the pass.
     pub evicted: usize,
+    /// Duration of the eviction pass.
+    pub eviction_time: Duration,
 }
 
 /// One cached table: the rows plus a flag set while the producer's clear is queued but not yet
@@ -477,19 +479,39 @@ impl MemDatabase {
         }
     }
 
-    /// Evicts settled keys (in-flight == 0) in recency order until the cache fits `max_size`.
+    /// Evicts settled keys (in-flight == 0) in recency order until the cache is at or below
+    /// `max_size / 8`, the trim target (see the relaxed bound in the fast path below).
     /// Candidates are validated at pop: a key re-inserted since its settle, or a row cleared
     /// away, is skipped. A key whose recency was refreshed by a read since it settled is
     /// re-pushed with the fresh clock so hot keys survive eviction. The heap stays writer-owned;
     /// producers never touch it. Every pop removes one entry, so the loop always terminates.
+    ///
+    /// Fast path: rows are pushed to the heap exactly when their in-flight count settles to zero
+    /// and entries leave it only through this pass's pops, so `heap.len()` is a lower bound on
+    /// the settled (evictable) rows. When it is below `max_size / 2` the pass could evict at most
+    /// that many rows, so the exclusive store lock is skipped entirely: the writer runs a pass
+    /// after every applied op and the heap grows by one per settled op, so any skipped eviction
+    /// is picked up on the next pass. The cache may therefore transiently exceed `max_size` by
+    /// less than `max_size / 2` settled rows while a writer backlog drains; in-flight rows are
+    /// never evictable, so this is a bounded relaxation of the cap, not a correctness issue.
     pub fn evict_if_needed(&self, heap: &mut EvictionHeap, max_size: usize) -> EvictionStats {
+        if heap.len() < max_size >> 1 {
+            return EvictionStats::default();
+        }
         let mut store = self.store.write();
+        let start = Instant::now();
         let mut total: usize = store.values().map(|table| table.rows.len()).sum();
         if total <= max_size {
-            return EvictionStats { before: total, after: total, evicted: 0 };
+            return EvictionStats {
+                before: total,
+                after: total,
+                evicted: 0,
+                eviction_time: start.elapsed(),
+            };
         }
+        let evict_until = max_size >> 3;
         let mut evicted = 0usize;
-        while total > max_size {
+        while total > evict_until {
             let Some(Reverse((heap_last_used, table, key))) = heap.pop() else { break };
             let Some(table_map) = store.get_mut(table) else { continue };
             let Some(entry) = table_map.rows.get(&key) else { continue };
@@ -508,11 +530,17 @@ impl MemDatabase {
             total -= 1;
             evicted += 1;
         }
-        EvictionStats { before: total + evicted, after: total, evicted }
+        EvictionStats {
+            before: total + evicted,
+            after: total,
+            evicted,
+            eviction_time: start.elapsed(),
+        }
     }
 
-    /// Total rows (live and tombstoned) held in the cache; the writer keeps this at or below the
-    /// configured max size.
+    /// Total rows (live and tombstoned) held in the cache; the writer trims it toward
+    /// `max_size / 8` on each pass, keeping it near the configured max size (see the relaxed
+    /// bound in [`MemDatabase::evict_if_needed`]).
     pub fn mem_size(&self) -> usize {
         self.store.read().values().map(|table| table.rows.len()).sum()
     }
@@ -902,9 +930,12 @@ fn record_prior_to_impl<T: Table>(store: &StoreType, key: &T::Key) -> Option<(T:
 
 #[cfg(test)]
 mod test {
-    use rayls_infrastructure_types::{Database, DbTx, DbTxMut};
+    use rayls_infrastructure_types::{encode_key, Database, DbTx, DbTxMut, Table};
 
-    use crate::{mem_db::MemDatabase, test::*};
+    use crate::{
+        mem_db::{EvictionHeap, EvictionStats, MemDatabase},
+        test::*,
+    };
 
     fn open_db() -> MemDatabase {
         let db = MemDatabase::new();
@@ -1226,6 +1257,80 @@ mod test {
             val_after_commit.unwrap(),
             "fifty".to_string(),
             "Value for key 50 should match reinserted value after commit"
+        );
+    }
+
+    /// The eviction fast path must skip the pass while fewer than `max_size / 2` rows are
+    /// settled — even when the cache is over its cap — and the next pass, once enough ops have
+    /// settled, trims the cache to the target.
+    #[test]
+    fn evict_fast_path_skips_when_few_settled_rows() {
+        let db = open_db();
+        let mut heap = EvictionHeap::new();
+        const MAX: usize = 10;
+
+        let mut txn = db.write_txn().unwrap();
+        for i in 0..12u64 {
+            txn.insert::<TestTable>(&i, &i.to_string()).expect("Failed to insert");
+        }
+        drop(txn);
+        assert_eq!(db.mem_size(), 12, "all rows must be cached, in flight");
+
+        // Settle two rows: heap.len() == 2 < MAX / 2, while the cache (12) exceeds MAX (10).
+        db.on_op_applied(TestTable::NAME, &encode_key(&0u64), &mut heap);
+        db.on_op_applied(TestTable::NAME, &encode_key(&1u64), &mut heap);
+
+        let stats = db.evict_if_needed(&mut heap, MAX);
+        assert_eq!(stats, EvictionStats::default(), "fast path must skip the pass");
+        assert_eq!(db.mem_size(), 12, "no row may be evicted on the fast path");
+
+        // Settle the rest: the heap now exceeds MAX / 2, so the pass runs and trims to MAX / 8.
+        for i in 2..12u64 {
+            db.on_op_applied(TestTable::NAME, &encode_key(&i), &mut heap);
+        }
+        let stats = db.evict_if_needed(&mut heap, MAX);
+        assert!(stats.evicted > 0, "the pass must run once enough rows have settled");
+        assert_eq!(db.mem_size(), MAX >> 3, "the cache must be trimmed to the eviction target");
+    }
+
+    /// Reading a hot key across the recency throttle window refreshes its clock, so an
+    /// eviction pass reorders candidates by recency: the stale heap entry is re-pushed with
+    /// the fresh clock and the unread settled siblings are evicted first, so the read key
+    /// survives down to the target with the newest row.
+    #[test]
+    fn read_recency_protects_a_hot_key() {
+        let db = open_db();
+        let mut heap = EvictionHeap::new();
+        const MAX: usize = 16; // eviction target MAX / 8 = 2
+
+        let mut txn = db.write_txn().unwrap();
+        for i in 1..=17u64 {
+            txn.insert::<TestTable>(&i, &i.to_string()).expect("Failed to insert");
+        }
+        drop(txn);
+        for i in 1..=17u64 {
+            db.on_op_applied(TestTable::NAME, &encode_key(&i), &mut heap);
+        }
+
+        // Cross the recency throttle window, then read key 9: its clock bumps past every
+        // other settle clock.
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        assert_eq!(db.get::<TestTable>(&9).unwrap(), Some("9".to_string()));
+
+        // Overflow the cap (17 > 16): the pass evicts in recency order down to the target.
+        let stats = db.evict_if_needed(&mut heap, MAX);
+        assert!(stats.evicted > 0, "the pass must evict the overflow");
+        assert_eq!(db.mem_size(), 2, "the cache must be trimmed to the target");
+        assert!(db.contains_key::<TestTable>(&9).unwrap(), "read key must stay hot");
+        assert!(db.contains_key::<TestTable>(&17).unwrap(), "newest key must stay hot");
+        assert!(!db.contains_key::<TestTable>(&1).unwrap(), "oldest sibling must be evicted");
+        assert!(
+            !db.contains_key::<TestTable>(&8).unwrap(),
+            "unread sibling below the read key must be evicted"
+        );
+        assert!(
+            !db.contains_key::<TestTable>(&16).unwrap(),
+            "unread sibling above the read key must be evicted"
         );
     }
 }
