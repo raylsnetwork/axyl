@@ -8218,6 +8218,7 @@ dependencies = [
  "rayls-infrastructure-types",
  "rayls-middleware-rewards",
  "rayls-testing-test-utils",
+ "serde_yaml",
  "tempfile",
  "tracing",
 ]
