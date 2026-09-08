@@ -23,7 +23,7 @@ use rayls_infrastructure_types::{
 };
 use serde::Serialize;
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap},
     path::{Path, PathBuf},
 };
 
@@ -129,6 +129,8 @@ pub struct NodeDb {
     pub live: LiveStatus,
     db: MdbxDatabase,
     cold: Option<ColdStore>,
+    /// Table presence, probed once per table: a read-only environment cannot gain tables.
+    tables: std::sync::Mutex<HashMap<&'static str, bool>>,
 }
 
 impl NodeDb {
@@ -195,7 +197,7 @@ impl NodeDb {
             None
         };
 
-        Ok(Self { label, path, live, db, cold })
+        Ok(Self { label, path, live, db, cold, tables: std::sync::Mutex::new(HashMap::new()) })
     }
 
     /// Whether the cold tier is attached.
@@ -205,12 +207,22 @@ impl NodeDb {
 
     /// Whether table `T` exists on disk.
     pub fn table_status<T: Table>(&self) -> eyre::Result<TableStatus> {
-        Ok(if self.db.has_table::<T>()? { TableStatus::Present } else { TableStatus::Absent })
+        Ok(if self.table_present::<T>()? { TableStatus::Present } else { TableStatus::Absent })
+    }
+
+    /// Whether table `T` exists, probing MDBX once per table and caching the answer.
+    fn table_present<T: Table>(&self) -> eyre::Result<bool> {
+        if let Some(present) = self.tables.lock().unwrap_or_else(|e| e.into_inner()).get(T::NAME) {
+            return Ok(*present);
+        }
+        let present = self.db.has_table::<T>()?;
+        self.tables.lock().unwrap_or_else(|e| e.into_inner()).insert(T::NAME, present);
+        Ok(present)
     }
 
     /// Point read that treats a never-created table as an empty one.
     fn get<T: Table>(&self, key: &T::Key) -> eyre::Result<Option<T::Value>> {
-        if !self.db.has_table::<T>()? {
+        if !self.table_present::<T>()? {
             return Ok(None);
         }
         self.db.get::<T>(key).wrap_err_with(|| format!("{}: read {}", self.label, T::NAME))
@@ -238,7 +250,7 @@ impl NodeDb {
 
     /// Every leftover transition checkpoint (there is at most one per interrupted transition).
     pub fn checkpoints(&self) -> eyre::Result<Vec<EpochTransitionCheckpoint>> {
-        if !self.db.has_table::<EpochTransitionCheckpoints>()? {
+        if !self.table_present::<EpochTransitionCheckpoints>()? {
             return Ok(Vec::new());
         }
         Ok(self.db.iter::<EpochTransitionCheckpoints>().map(|(_, cp)| cp).collect())
@@ -246,7 +258,7 @@ impl NodeDb {
 
     /// Every epoch number with a record, in ascending order. Keys only; values are not decoded.
     pub fn epoch_numbers(&self) -> eyre::Result<Vec<Epoch>> {
-        if !self.db.has_table::<EpochRecords>()? {
+        if !self.table_present::<EpochRecords>()? {
             return Ok(Vec::new());
         }
         Ok(self.db.raw_iter::<EpochRecords>().map(|(k, _)| decode_key::<Epoch>(&k)).collect())
@@ -275,7 +287,7 @@ impl NodeDb {
 
     /// Highest key in a `u64`-keyed table, without decoding values.
     fn last_u64_key<T: Table<Key = u64>>(&self) -> eyre::Result<Option<u64>> {
-        if !self.db.has_table::<T>()? {
+        if !self.table_present::<T>()? {
             return Ok(None);
         }
         Ok(self.db.reverse_raw_iter::<T>().next().map(|(k, _)| decode_key::<u64>(&k)))
@@ -283,7 +295,7 @@ impl NodeDb {
 
     /// Highest epoch with a record on disk. Keys only; values are not decoded.
     pub fn latest_epoch_record(&self) -> eyre::Result<Option<Epoch>> {
-        if !self.db.has_table::<EpochRecords>()? {
+        if !self.table_present::<EpochRecords>()? {
             return Ok(None);
         }
         Ok(self.db.reverse_raw_iter::<EpochRecords>().next().map(|(k, _)| decode_key::<Epoch>(&k)))
@@ -291,7 +303,7 @@ impl NodeDb {
 
     /// Epoch of the latest canonical consensus header, read from a projection of its raw bytes.
     pub fn current_epoch(&self) -> eyre::Result<Option<Epoch>> {
-        if !self.db.has_table::<ConsensusBlocks>()? {
+        if !self.table_present::<ConsensusBlocks>()? {
             return Ok(None);
         }
         let Some((_, bytes)) = self.db.reverse_raw_iter::<ConsensusBlocks>().next() else {
@@ -356,11 +368,15 @@ impl NodeDb {
     }
 }
 
-/// Whether `mdbx.lck` in `consensus_db` can be opened for writing. A missing file counts as
-/// writable: MDBX creates it.
+/// Whether `mdbx.lck` in `consensus_db` carries any write permission bit. A missing file counts
+/// as writable: MDBX creates it. Checked from metadata only, so the probe never opens the file for
+/// writing; a file writable by mode but not by this user still fails inside MDBX, with the
+/// `--exclusive` hint.
 fn lock_file_writable(consensus_db: &Path) -> bool {
-    let lck = consensus_db.join("mdbx.lck");
-    !lck.exists() || std::fs::OpenOptions::new().write(true).open(&lck).is_ok()
+    match std::fs::metadata(consensus_db.join("mdbx.lck")) {
+        Ok(meta) => !meta.permissions().readonly(),
+        Err(_) => true,
+    }
 }
 
 /// Splits `LABEL=PATH` into its parts; a bare path has no label.
