@@ -753,8 +753,11 @@ pub fn compact_in_place(store_path: &Path, config: &MdbxConfig) -> eyre::Result<
         db.compact_to(tmp_dir.join(MDBX_DAT))?;
         counts
     };
+    // Verify the copy through a read-only, exclusive open: nothing writes to it any more, and the
+    // read-write path's startup corruption log would tell the operator to delete a database when
+    // only this temporary copy is bad.
     let compacted_counts = {
-        let db = MdbxDatabase::open_with_config(&tmp_dir, config.clone())?;
+        let db = MdbxDatabase::open_read_only(&tmp_dir, true)?;
         table_entry_counts(&db.inner)?
     };
     eyre::ensure!(
