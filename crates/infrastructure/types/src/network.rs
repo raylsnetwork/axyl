@@ -32,3 +32,33 @@ impl std::fmt::Display for RaylsNetwork {
         }
     }
 }
+
+impl RaylsNetwork {
+    /// The chain-id a datadir for this network must carry.
+    ///
+    /// Mainnet is `72957`, testnet `7295799`, devnet `503` and local `487`.
+    /// The node verifies the datadir's genesis chain-id against this at boot,
+    /// so a datadir from the wrong network (or client) is refused before
+    /// anything runs.
+    pub const fn chain_id(self) -> u64 {
+        match self {
+            Self::Mainnet => 72957,
+            Self::Testnet => 7295799,
+            Self::Devnet => 503,
+            Self::Local => 487,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::RaylsNetwork;
+
+    #[test]
+    fn chain_id_values() {
+        assert_eq!(RaylsNetwork::Mainnet.chain_id(), 72957);
+        assert_eq!(RaylsNetwork::Testnet.chain_id(), 7295799);
+        assert_eq!(RaylsNetwork::Devnet.chain_id(), 503);
+        assert_eq!(RaylsNetwork::Local.chain_id(), 487);
+    }
+}

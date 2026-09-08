@@ -94,8 +94,15 @@ impl RethEnv {
     ) -> eyre::Result<Self> {
         let node_config = reth_config.0.clone();
         let mut builder = RaylsChainSpec::builder(Arc::clone(&node_config.chain));
-        if let Some(network) = network {
-            builder = builder.rayls_hardforks(network);
+        // A schedule resolved from an external network config file wins; without
+        // one the baked-in profile selected by `parameters.network` applies.
+        match crate::active_profile() {
+            Some(profile) => builder = builder.add_rayls_hardforks_by_schedule(profile.schedule()),
+            None => {
+                if let Some(network) = network {
+                    builder = builder.add_rayls_hardforks_by_type(network);
+                }
+            }
         }
         if let Some(min_fee) = min_base_fee {
             builder = builder.min_base_fee(min_fee);
