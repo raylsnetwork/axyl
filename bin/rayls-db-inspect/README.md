@@ -58,16 +58,16 @@ The examples below assume the binary is on `PATH`.
 
 ## Usage
 
-Every subcommand takes one or more `--db` arguments. Each is a node datadir (the directory
-holding `consensus-db/`) or the `consensus-db` directory itself, optionally prefixed with a
-label. One path per value: repeat the flag (`--db v1=/data/node1 --db v2=/data/node2`) or
-separate paths with commas (`--db v1=/data/node1,v2=/data/node2`). The flag therefore never
-swallows the positional arguments, so `epochs --db ... 0 5` and `epochs 0 5 --db ...` both
-work.
+Every command takes one or more `--db` arguments, before or after the command name. Each is a
+node datadir (the directory holding `consensus-db/`) or the `consensus-db` directory itself,
+optionally prefixed with a label. One path per value: repeat the flag
+(`--db v1=/data/node1 --db v2=/data/node2`) or separate paths with commas
+(`--db v1=/data/node1,v2=/data/node2`). The flag never swallows the arguments that follow it,
+so `--db ... epochs 0 5`, `epochs --db ... 0 5` and `epochs 0 5 --db ...` all work.
 
 ```sh
 # Is epoch 42's record on disk, and is its certificate present and valid, on each node?
-rayls-db-inspect epoch 42 --db v1=/data/node1 --db v2=/data/node2 --db v3=/data/node3
+rayls-db-inspect --db v1=/data/node1 --db v2=/data/node2 --db v3=/data/node3 epoch 42
 
 # Matrix of record / record+cert / missing for a range (or --all)
 rayls-db-inspect epochs 40 45 --db /data/node1,/data/node2
