@@ -93,12 +93,8 @@ fn run_rejects_epochs_without_bounds_or_all() {
         exclusive: false,
         require_stopped: false,
         recover: false,
-        command: Command::Epochs {
-            from: None,
-            to: None,
-            all: false,
-            nodes: NodeArgs { dbs: vec![a.datadir()] },
-        },
+        dbs: vec![a.datadir()],
+        command: Command::Epochs { from: None, to: None, all: false, nodes: NodeArgs::default() },
     };
     let err = rayls_db_inspect::run(&cli).expect_err("no bounds and no --all");
     assert!(err.to_string().contains("FROM_EPOCH and TO_EPOCH"), "{err}");
