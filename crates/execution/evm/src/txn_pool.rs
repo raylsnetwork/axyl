@@ -31,10 +31,8 @@ use tracing::{debug, info, trace, warn};
 use crate::{
     bypass_validator::{BypassHandle, BypassableValidator},
     error::RaylsRethResult,
-    in_flight::InFlightTracker,
     traits::RaylsNode,
 };
-use alloy::primitives::map::B256Set;
 
 /// Owned version of CanonicalStateUpdate for use in blocking tasks.
 ///
@@ -104,8 +102,6 @@ pub trait TxPool {
     fn get_pending_base_fee(&self) -> u64;
     /// Remove EIP-4844 blob transactions from the pool and delete the sidecars from blob store.
     fn remove_eip4844_txs(&mut self, blobs: Vec<TxHash>);
-    /// Return whether the hash is sealed into a batch still in flight, so the sealer skips it.
-    fn is_in_flight(&self, tx_hash: &TxHash) -> bool;
 }
 
 /// The reth EthTransactionValidator type used by this pool.
@@ -129,10 +125,6 @@ pub struct WorkerTxPool {
     task_spawner: TaskSpawner,
     bypass_handle: BypassHandle,
     blockchain_provider: BlockchainProvider<RaylsNode>,
-    /// Hashes sealed into a batch but not yet observed mined, so the sealer skips re-sealing
-    /// them while their batch is in flight; created here and shared with the batch builder via
-    /// [`WorkerTxPool::in_flight`].
-    in_flight_tracker: InFlightTracker,
 }
 
 impl From<WorkerTxPool> for RaylsTransactionPool {
@@ -178,7 +170,6 @@ impl WorkerTxPool {
             task_spawner: task_spawner.clone(),
             bypass_handle,
             blockchain_provider: blockchain_provider.clone(),
-            in_flight_tracker: InFlightTracker::new(),
         };
         let txn_pool_clone = this.clone();
         // Update the txn pool as the canonical tip changes.
@@ -298,7 +289,9 @@ impl WorkerTxPool {
         self.pool.queued_transactions()
     }
 
-    /// Applies a canonical state update to the pool so the next build sees the new tip.
+    /// This method is called when a canonical state update is received.
+    ///
+    /// Trigger the maintenance task to update pool before building the next block.
     fn process_canon_state_update(&self, update: Arc<Chain>) {
         trace!(target: "worker::block-builder", ?update, "canon state update from engine");
 
@@ -334,34 +327,6 @@ impl WorkerTxPool {
             mined_transactions,
             changed_accounts,
         );
-
-        self.reconcile_in_flight();
-    }
-
-    /// The in-flight tracker shared with this pool's batch builder.
-    ///
-    /// The builder marks a batch's hashes here on quorum so the next sealing round skips them
-    /// while the batch is in flight; the pool releases them again via [`Self::reconcile_in_flight`]
-    /// once execution removes them from the pending sub-pool.
-    pub fn in_flight(&self) -> InFlightTracker {
-        self.in_flight_tracker.clone()
-    }
-
-    /// Releases in-flight marks for hashes no longer in the pending sub-pool.
-    ///
-    /// A sealed transaction stays pending (and RPC-visible) until it executes; once execution
-    /// drops it from pending, its mark is stale and released so a later resubmission of the same
-    /// nonce is not skipped.
-    pub fn reconcile_in_flight(&self) {
-        if self.in_flight_tracker.is_empty() {
-            return;
-        }
-        let pending: B256Set =
-            self.pool.pending_transactions().iter().map(|tx| *tx.hash()).collect();
-        let released = self.in_flight_tracker.release_mined(&pending);
-        if released > 0 {
-            debug!(target: "rayls::txpool", released, "released in-flight marks against pending sub-pool");
-        }
     }
 
     /// Return the current status of the pool.
@@ -544,10 +509,6 @@ impl TxPool for WorkerTxPool {
         self.pool.remove_transactions_and_descendants(blobs.clone());
         self.pool.delete_blobs(blobs);
     }
-
-    fn is_in_flight(&self, tx_hash: &TxHash) -> bool {
-        self.in_flight_tracker.is_in_flight(tx_hash)
-    }
 }
 
 /// An iterator that produces the best transactions from a pool.
@@ -573,7 +534,7 @@ impl BestTxns {
     ///
     /// Without this, the iterator receives new pending transactions via a broadcast
     /// channel while iterating. If a transaction arrives whose predecessor is not in the
-    /// snapshot, it becomes a new independent chain, creating intra-sender nonce gaps
+    /// snapshot, it becomes a new independent chain — creating intra-sender nonce gaps
     /// that cause `nonce_too_high` at execution time.
     pub fn no_updates(&mut self) {
         self.inner.no_updates();
