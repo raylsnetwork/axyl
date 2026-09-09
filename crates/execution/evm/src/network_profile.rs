@@ -29,15 +29,7 @@ pub enum ForkActivation {
     Never,
 }
 
-impl ForkActivation {
-    fn from_str_lossy(value: &str) -> Option<Self> {
-        if value.eq_ignore_ascii_case("never") {
-            Some(Self::Never)
-        } else {
-            None
-        }
-    }
-}
+
 
 impl Serialize for ForkActivation {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
@@ -58,11 +50,15 @@ impl<'de> Deserialize<'de> for ForkActivation {
         }
         match Raw::deserialize(deserializer)? {
             Raw::Block(block) => Ok(Self::Block(block)),
-            Raw::Text(text) => Self::from_str_lossy(&text).ok_or_else(|| {
-                serde::de::Error::custom(format!(
-                    "invalid fork activation {text:?}; expected a block number or \"never\""
-                ))
-            }),
+            Raw::Text(text) => {
+                if text.eq_ignore_ascii_case("never") {
+                    Ok(Self::Never)
+                } else {
+                    Err(serde::de::Error::custom(format!(
+                        "invalid fork activation {text:?}; expected a block number or \"never\""
+                    )))
+                }
+            }
         }
     }
 }
