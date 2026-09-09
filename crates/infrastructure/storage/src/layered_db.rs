@@ -786,7 +786,15 @@ fn log_persist_latency(elapsed: Duration, depth: usize) {
 /// the number of rows evicted, plus the open write transactions observed at that moment.
 /// Eviction only runs once no producer txn is open, so `open_txns` is normally 0 except at a
 /// `CaughtUp` barrier.
-fn evict_and_log(mem_db: &MemDatabase, heap: &mut EvictionHeap, max_size: usize, open_txns: usize) {
+fn evict_and_log(
+    mem_db: &MemDatabase,
+    heap: &mut EvictionHeap,
+    max_size: usize,
+    has_open_txn: bool,
+) {
+    if has_open_txn {
+        return;
+    }
     let EvictionStats { before, after, evicted, eviction_time } =
         mem_db.evict_if_needed(heap, max_size);
     if evicted > 0 {
@@ -796,7 +804,7 @@ fn evict_and_log(mem_db: &MemDatabase, heap: &mut EvictionHeap, max_size: usize,
             after,
             evicted,
             eviction_time = ?eviction_time,
-            open_txns,
+            has_open_txn,
             "mem cache evicted"
         );
     }
