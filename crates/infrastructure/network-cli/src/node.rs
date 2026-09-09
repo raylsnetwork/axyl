@@ -167,7 +167,7 @@ pub struct NodeCommand<Ext: clap::Args + fmt::Debug = NoArgs> {
     /// Selects which baked-in hardfork schedule to use (devnet, testnet, mainnet).
     /// When set, overrides the `network` field in parameters.yaml without requiring
     /// a re-genesis. Useful for activating hardforks on existing networks.
-    #[arg(long, value_name = "RAYLS_NETWORK", global = true, env = "RAYLS_NETWORK")]
+    #[arg(long, value_name = "RAYLS_NETWORK", global = true, env = "RAYLS_NETWORK", conflicts_with = "config_file")]
     pub network: Option<RaylsNetwork>,
 
     /// The client's network config file (YAML).
@@ -178,7 +178,7 @@ pub struct NodeCommand<Ext: clap::Args + fmt::Debug = NoArgs> {
     /// into the binary. Everything else (genesis, parameters, committee, node
     /// identity) still comes from the datadir, exactly as without the file.
     /// Cannot be combined with `--network`.
-    #[arg(long, value_name = "PATH", value_hint = ValueHint::FilePath, requires = "subnet")]
+    #[arg(long, value_name = "PATH", value_hint = ValueHint::FilePath, requires = "subnet", conflicts_with = "network")]
     pub config_file: Option<PathBuf>,
 
     /// The subnet to run, as named in `--config-file`.
@@ -294,14 +294,6 @@ impl<Ext: clap::Args + fmt::Debug> NodeCommand<Ext> {
         // given — before touching the datadir, so a flag conflict or a broken
         // file fails fast with an actionable message.
         let file_schedule = if let Some(config_file) = &self.config_file {
-            // The file's `hardforks` section is the only schedule source; the
-            // baked-in `--network` profile cannot be combined with it.
-            if self.network.is_some() {
-                eyre::bail!(
-                    "--network cannot be combined with --config-file: the subnet's `hardforks` \
-                     section in the config file is the only schedule source"
-                );
-            }
             let subnet = self.subnet.as_deref().expect("clap requires --subnet with --config-file");
             Some((
                 config_file.clone(),
