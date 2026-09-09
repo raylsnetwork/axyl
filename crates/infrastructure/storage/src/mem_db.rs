@@ -204,10 +204,8 @@ impl<'a> DbTx for MemDbTx<'a> {
     }
 
     fn skip_to<T: Table>(&self, key: &T::Key) -> eyre::Result<DBIter<'_, T>> {
-        match skip_to_impl::<T>(&self.store, key) {
-            Some(items) => Ok(Box::new(items.into_iter())),
-            None => Err(eyre::eyre!("Invalid table {}", T::NAME)),
-        }
+        skip_to_borrowed::<T>(&self.store, key)
+            .ok_or_else(|| eyre::eyre!("Invalid table {}", T::NAME))
     }
 
     fn reverse_iter<T: Table>(&self) -> DBIter<'_, T> {
@@ -284,10 +282,8 @@ impl<'a> DbTx for MemDbTxMut<'a> {
     }
 
     fn skip_to<T: Table>(&self, key: &T::Key) -> eyre::Result<DBIter<'_, T>> {
-        match skip_to_impl::<T>(&self.store, key) {
-            Some(items) => Ok(Box::new(items.into_iter())),
-            None => Err(eyre::eyre!("Invalid table {}", T::NAME)),
-        }
+        skip_to_borrowed::<T>(&self.store, key)
+            .ok_or_else(|| eyre::eyre!("Invalid table {}", T::NAME))
     }
 
     fn reverse_iter<T: Table>(&self) -> DBIter<'_, T> {
@@ -839,10 +835,30 @@ fn raw_iter_owned_impl<T: Table>(
     Some(collect_raw_owned(table.rows.iter()))
 }
 
+/// Owned tail from `key` onward, for the non-txn [`MemDatabase::skip_to`] whose read guard is a
+/// temporary and so cannot back a borrowed iterator. Uses `range` for an O(log N) seek rather than
+/// scanning from the front, but still materializes the tail — prefer [`skip_to_borrowed`] on the
+/// txn paths, which is also lazy.
 fn skip_to_impl<T: Table>(store: &StoreType, key: &T::Key) -> Option<Vec<(T::Key, T::Value)>> {
     let table = store.get(T::NAME)?;
     let key_bytes = encode_key(key);
-    Some(collect_typed::<T, _>(table.rows.iter().skip_while(|(k, _)| **k < key_bytes)))
+    Some(collect_typed::<T, _>(table.rows.range(key_bytes..)))
+}
+
+/// Lazy tail from `key` onward, borrowing the read guard. `range` seeks in O(log N) instead of
+/// scanning from the front, and the iterator decodes only the entries the caller actually pulls —
+/// so a `skip_to(..).next()` touches one row, not the whole tail. Used by the txn paths whose guard
+/// outlives the returned iterator.
+fn skip_to_borrowed<'s, T: Table>(store: &'s StoreType, key: &T::Key) -> Option<DBIter<'s, T>> {
+    let table = store.get(T::NAME)?;
+    let key_bytes = encode_key(key);
+    Some(Box::new(
+        table
+            .rows
+            .range(key_bytes..)
+            .filter(|(_, entry)| !entry.tombstoned())
+            .map(|(k, entry)| (decode_key::<T::Key>(k), decode::<T::Value>(&entry.value))),
+    ))
 }
 
 fn reverse_iter_impl<T: Table>(store: &StoreType) -> Option<Vec<(T::Key, T::Value)>> {
@@ -935,6 +951,131 @@ mod test {
     fn test_memdb_remove() {
         let db = open_db();
         test_remove(db)
+    }
+
+    /// The pre-fix `skip_to` algorithm, kept as a behavioural oracle: scan from the front of the
+    /// map, then materialize the entire tail from `from` onward. The current code seeks with
+    /// `range(from..)` and yields lazily; both must produce the identical sequence.
+    fn old_skip_to_scan(
+        map: &std::collections::BTreeMap<u64, String>,
+        from: u64,
+    ) -> Vec<(u64, String)> {
+        map.iter().skip_while(|(k, _)| **k < from).map(|(k, v)| (*k, v.clone())).collect()
+    }
+
+    /// The lazy `range`-based `skip_to` must return exactly what the pre-fix scan-and-collect did,
+    /// for probes landing before the first key, on a key, in a gap, over a tombstone, and past the
+    /// last key.
+    #[test]
+    fn test_memdb_skip_to_matches_pre_fix_scan() {
+        use std::collections::BTreeMap;
+
+        let db = open_db();
+        let mut oracle: BTreeMap<u64, String> = BTreeMap::new();
+
+        // Sparse keys (step 3) so probes can fall before / on / between entries.
+        let inserted: Vec<u64> = (0..300).map(|i| i * 3).collect();
+        db.with_write_txn(|txn| {
+            for &k in &inserted {
+                txn.insert::<TestTable>(&k, &k.to_string()).unwrap();
+            }
+            Ok(())
+        })
+        .unwrap();
+
+        // Tombstone a few (interior and boundary) to exercise the tombstone filter on both paths.
+        let removed = [0u64, 3, 6, 300, 897];
+        db.with_write_txn(|txn| {
+            for &k in &removed {
+                txn.remove::<TestTable>(&k).unwrap();
+            }
+            Ok(())
+        })
+        .unwrap();
+        for &k in &inserted {
+            if !removed.contains(&k) {
+                oracle.insert(k, k.to_string());
+            }
+        }
+
+        // Probe every boundary: just below, exactly on, and just above each inserted key, plus a
+        // point before the first and well past the last.
+        let mut probes: Vec<u64> = vec![0, 1, 2];
+        for &k in &inserted {
+            probes.extend([k.saturating_sub(1), k, k + 1]);
+        }
+        probes.push(inserted.last().copied().unwrap() + 100);
+
+        db.with_read_txn(|txn| {
+            for &p in &probes {
+                let got: Vec<(u64, String)> = txn.skip_to::<TestTable>(&p).unwrap().collect();
+                let want = old_skip_to_scan(&oracle, p);
+                assert_eq!(got, want, "skip_to({p}) diverged from the pre-fix scan-and-collect");
+            }
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    /// The pre-fix `skip_to` materialized the whole tail on every call, so the
+    /// `skip_to(key).next()` pattern from `next_round_number` was O(N) per call. The lazy
+    /// `range` seek is O(log N). Over a large table with a front-anchored probe (worst case for
+    /// the old scan) the new path must be strictly faster; the margin is enormous (a full
+    /// 10k-row scan + clone vs a single seek), so the assertion is robust against timer noise.
+    #[test]
+    fn test_memdb_skip_to_faster_than_pre_fix_scan() {
+        use std::{collections::BTreeMap, time::Instant};
+
+        let db = open_db();
+        let n: u64 = 10_000;
+        let mut oracle: BTreeMap<u64, String> = BTreeMap::new();
+        db.with_write_txn(|txn| {
+            for i in 0..n {
+                txn.insert::<TestTable>(&i, &i.to_string()).unwrap();
+            }
+            Ok(())
+        })
+        .unwrap();
+        for i in 0..n {
+            oracle.insert(i, i.to_string());
+        }
+
+        // Anchor near the front so the pre-fix algorithm rescans/reclones almost the whole tail
+        // every call — the exact shape of the cert-collector's `find_next_round` walk.
+        let probe = 1u64;
+        let iters = 200u32;
+
+        // NEW: the real lazy path — seek then take one.
+        let new_start = Instant::now();
+        db.with_read_txn(|txn| {
+            for _ in 0..iters {
+                let first = txn.skip_to::<TestTable>(&probe).unwrap().next();
+                assert!(first.is_some());
+            }
+            Ok(())
+        })
+        .unwrap();
+        let new_elapsed = new_start.elapsed();
+
+        // OLD: front scan + collect the entire tail, then take one.
+        let old_start = Instant::now();
+        for _ in 0..iters {
+            let first = old_skip_to_scan(&oracle, probe).into_iter().next();
+            assert!(first.is_some());
+        }
+        let old_elapsed = old_start.elapsed();
+
+        println!(
+            "skip_to(front).next() x{iters} over {n} rows: new={new_elapsed:?}, old={old_elapsed:?} \
+             ({:.1}x faster)",
+            old_elapsed.as_secs_f64() / new_elapsed.as_secs_f64().max(f64::MIN_POSITIVE)
+        );
+
+        assert!(
+            new_elapsed < old_elapsed,
+            "expected the lazy range-based skip_to ({new_elapsed:?}) to beat the pre-fix \
+             scan-and-collect ({old_elapsed:?})"
+        );
     }
 
     #[test]
