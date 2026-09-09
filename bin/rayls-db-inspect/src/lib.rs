@@ -31,6 +31,10 @@ pub fn run(cli: &Cli) -> eyre::Result<Report> {
         recover: cli.recover,
     };
     let verbose = cli.verbose;
+    let dbs = cli.dbs();
+    if dbs.is_empty() {
+        eyre::bail!("no database given: pass --db <[LABEL=]DATADIR>, before or after the command");
+    }
     let open = |specs: &[String]| -> eyre::Result<Vec<NodeDb>> {
         // MDBX allows one handle per environment per process, so the same database twice would
         // fail on open with an unhelpful error; catch it here instead.
@@ -49,34 +53,32 @@ pub fn run(cli: &Cli) -> eyre::Result<Report> {
     };
 
     Ok(match &cli.command {
-        Command::Epoch { epoch, nodes } => {
-            Report::Epoch(report::epoch::epoch(&open(&nodes.dbs)?, *epoch, verbose)?)
+        Command::Epoch { epoch, .. } => {
+            Report::Epoch(report::epoch::epoch(&open(&dbs)?, *epoch, verbose)?)
         }
-        Command::Epochs { from, to, all, nodes } => {
+        Command::Epochs { from, to, all, .. } => {
             // clap guarantees both bounds unless --all; guard direct callers of `run` too
             let range = match (all, from, to) {
                 (true, _, _) => None,
                 (false, Some(from), Some(to)) => Some((*from, *to)),
                 _ => eyre::bail!("epochs: pass FROM_EPOCH and TO_EPOCH, or --all"),
             };
-            Report::Epochs(report::epoch::epochs(&open(&nodes.dbs)?, range)?)
+            Report::Epochs(report::epoch::epochs(&open(&dbs)?, range)?)
         }
-        Command::ChainCheck { from, to, nodes } => {
-            Report::ChainCheck(report::epoch::chain_check(&open(&nodes.dbs)?, *from, *to)?)
+        Command::ChainCheck { from, to, .. } => {
+            Report::ChainCheck(report::epoch::chain_check(&open(&dbs)?, *from, *to)?)
         }
-        Command::Header { number, nodes } => {
-            Report::Header(report::header::header(&open(&nodes.dbs)?, *number, verbose)?)
+        Command::Header { number, .. } => {
+            Report::Header(report::header::header(&open(&dbs)?, *number, verbose)?)
         }
-        Command::Cert { number, nodes } => {
-            Report::Cert(report::header::cert(&open(&nodes.dbs)?, *number, verbose)?)
+        Command::Cert { number, .. } => {
+            Report::Cert(report::header::cert(&open(&dbs)?, *number, verbose)?)
         }
         Command::Walk { target } => match target {
-            WalkTarget::Header { number, back, nodes } => {
-                Report::Walk(report::header::walk(&open(&nodes.dbs)?, *number, *back)?)
+            WalkTarget::Header { number, back, .. } => {
+                Report::Walk(report::header::walk(&open(&dbs)?, *number, *back)?)
             }
         },
-        Command::Summary { nodes } => {
-            Report::Summary(report::summary::summary(&open(&nodes.dbs)?)?)
-        }
+        Command::Summary { .. } => Report::Summary(report::summary::summary(&open(&dbs)?)?),
     })
 }
