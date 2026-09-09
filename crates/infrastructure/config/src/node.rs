@@ -3,8 +3,8 @@
 use crate::{ConfigFmt, ConfigTrait, NodeInfo, RaylsDirs};
 use rayls_infrastructure_types::{
     get_available_tcp_port, get_available_udp_port, test_genesis, Address, BlsPublicKey,
-    BlsSignature, Genesis, Multiaddr, NetworkPublicKey, RaylsNetwork, ETHEREUM_BLOCK_GAS_LIMIT_56BITS,
-    MIN_RAYLS_PROTOCOL_BASE_FEE,
+    BlsSignature, Genesis, Multiaddr, NetworkPublicKey, RaylsNetwork,
+    ETHEREUM_BLOCK_GAS_LIMIT_56BITS, MIN_RAYLS_PROTOCOL_BASE_FEE,
 };
 use reth_chainspec::ChainSpec;
 use serde::{Deserialize, Serialize};

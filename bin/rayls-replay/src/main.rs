@@ -432,10 +432,7 @@ fn copy_recursive(src: &Path, dst: &Path) -> eyre::Result<()> {
 /// `RaylsChainSpec::builder().rayls_hardforks`.
 fn base_chain_spec(genesis_path: &std::path::Path) -> eyre::Result<Arc<RethChainSpec>> {
     let yaml = std::fs::read_to_string(genesis_path).wrap_err_with(|| {
-        format!(
-            "read genesis YAML at {} (pass --genesis if it is absent)",
-            genesis_path.display()
-        )
+        format!("read genesis YAML at {} (pass --genesis if it is absent)", genesis_path.display())
     })?;
     let genesis: Genesis = serde_yaml::from_str(&yaml).wrap_err("parse genesis YAML")?;
     Ok(Arc::new(genesis.into()))
