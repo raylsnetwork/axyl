@@ -148,6 +148,9 @@ interface IFeeAggregator {
     /// @notice Emitted when the LayerZero destination endpoint ID is updated
     event DstEidUpdated(uint32 oldEid, uint32 newEid);
 
+    /// @notice Emitted when the revenue-reporting RewardCurve address is updated
+    event RevenueCurveUpdated(address indexed oldCurve, address indexed newCurve);
+
     // ========== FEE RECEPTION ==========
 
     /// @notice Receive ERC-20 stablecoin fees (direct transfer flow)
@@ -266,6 +269,18 @@ interface IFeeAggregator {
 
     /// @notice Set the LayerZero destination endpoint ID (e.g. Ethereum)
     function setDstEid(uint32 newDstEid) external;
+
+    /// @notice Get the RewardCurve that receives real validator-pool revenue reports
+    ///         (address(0) if disabled)
+    function revenueCurve() external view returns (address);
+
+    /// @notice Set the RewardCurve that receives real validator-pool revenue reports.
+    /// @dev address(0) disables reporting — distributeEpochFees() behaves exactly as before.
+    ///      The configured curve must separately grant this contract REVENUE_REPORTER_ROLE;
+    ///      until then (or if the curve reverts for any reason) reporting fails silently and
+    ///      never blocks distribution.
+    /// @param newCurve The new RewardCurve address
+    function setRevenueCurve(address newCurve) external;
 
     // ========== STATISTICS ==========
 

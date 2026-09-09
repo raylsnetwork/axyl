@@ -11,6 +11,7 @@ import {IRewardDistributor} from "../interfaces/IRewardDistributor.sol";
 import {IConsensusRegistry} from "../interfaces/IConsensusRegistry.sol";
 import {IStakeManager} from "../interfaces/IStakeManager.sol";
 import {IDelegationPool} from "../interfaces/IDelegationPool.sol";
+import {IRewardCurve} from "../interfaces/IRewardCurve.sol";
 import {SystemCallable} from "../consensus/SystemCallable.sol";
 
 /**
@@ -65,6 +66,12 @@ contract RewardDistributor is
         uint256 totalUnclaimedRewards;
         /// @notice Target APY in basis points for open-tier (Track B) stakers (e.g., 3000 = 30%)
         uint256 openTierTargetApyBps;
+        /// @notice RewardCurve driving Track A's target APY. address(0) = disabled, falls back
+        ///         to targetApyBps.
+        address rewardCurve;
+        /// @notice RewardCurve driving Track B's target APY. address(0) = disabled, falls back
+        ///         to openTierTargetApyBps.
+        address openTierRewardCurve;
     }
 
     // keccak256(abi.encode(uint256(keccak256("rewarddistributor.storage.v1")) - 1)) & ~bytes32(uint256(0xff))
@@ -168,10 +175,20 @@ contract RewardDistributor is
         if (len == 0) revert NoActiveValidators();
 
         uint256 epochSecs = $.consensusRegistry.getCurrentEpochInfo().epochDuration;
-        // Fetch all validator stakes in one pass
-        ValidatorStakes[] memory stakes = _fetchAllStakes(activeValidators);
+        // Fetch all validator stakes in one pass, plus network-wide totals per track
+        (ValidatorStakes[] memory stakes, uint256 totalTrackAStake, uint256 totalTrackBStake) =
+            _fetchAllStakes(activeValidators);
 
-        uint256 totalTarget = _computeTotalTarget(stakes, epochSecs);
+        // Resolve each track's effective APY once per epoch (not per validator, since the
+        // input is the same for every validator this epoch): RewardCurve if wired, else the
+        // static admin-set bps. Clamped and try/catch-guarded so a curve can never block this
+        // onlySystemCall path.
+        uint256 effectiveTargetApyBps = _resolveApyBps($.rewardCurve, totalTrackAStake, $.targetApyBps);
+        uint256 effectiveOpenTierApyBps =
+            _resolveApyBps($.openTierRewardCurve, totalTrackBStake, $.openTierTargetApyBps);
+
+        uint256 totalTarget =
+            _computeTotalTarget(stakes, epochSecs, effectiveTargetApyBps, effectiveOpenTierApyBps);
 
         uint256 totalRewards = $.totalPending;
         if (totalTarget > 0) {
@@ -184,35 +201,77 @@ contract RewardDistributor is
         }
 
         uint256 distributed = totalTarget > 0
-            ? _distributeByTarget(activeValidators, stakes, totalRewards, totalTarget, epochSecs)
+            ? _distributeByTarget(
+                activeValidators,
+                stakes,
+                totalRewards,
+                totalTarget,
+                epochSecs,
+                effectiveTargetApyBps,
+                effectiveOpenTierApyBps
+            )
             : _distributeByStake(activeValidators, stakes, totalRewards);
 
         $.totalPending -= totalRewards;
         emit RewardsDistributed(distributed, len);
     }
 
-    /// @dev Fetches ownStake/Track A/Track B for every active validator in one pass.
+    /// @dev Fetches ownStake/Track A/Track B for every active validator in one pass, summing
+    ///      the network-wide Track A (own + Track A delegated) and Track B totals for free in
+    ///      the same loop — the inputs `RewardCurve.getCurrentApyBps` needs.
     function _fetchAllStakes(
         IConsensusRegistry.ValidatorInfo[] memory activeValidators
-    ) internal view returns (ValidatorStakes[] memory stakes) {
+    )
+        internal
+        view
+        returns (ValidatorStakes[] memory stakes, uint256 totalTrackAStake, uint256 totalTrackBStake)
+    {
         uint256 len = activeValidators.length;
         stakes = new ValidatorStakes[](len);
         for (uint256 i; i < len; ++i) {
             (uint256 os, uint256 ta, uint256 tb) = _fetchValidatorStakes(activeValidators[i].validatorAddress);
             stakes[i] = ValidatorStakes(os, ta, tb);
+            totalTrackAStake += os + ta;
+            totalTrackBStake += tb;
         }
     }
 
-    /// @dev Sums each active validator's target reward (own stake + Track A at targetApyBps,
-    ///      Track B at openTierTargetApyBps) for the current epoch.
+    /// @dev Resolves a track's effective target APY bps: `curve`'s derived output if wired
+    ///      (address(0) disables it), clamped to MAX_APY_BPS since RewardCurve's honest output
+    ///      is uncapped, otherwise the static admin-set `staticBps`. try/catch so a broken or
+    ///      reverting curve can never block distribution on this onlySystemCall path — falls
+    ///      back to `staticBps` on any failure, mirroring `_pullAccumulatorTopUp`'s defensive
+    ///      idiom for external calls here.
+    function _resolveApyBps(
+        address curve,
+        uint256 totalStake,
+        uint256 staticBps
+    ) internal view returns (uint256) {
+        if (curve == address(0)) return staticBps;
+        try IRewardCurve(curve).getCurrentApyBps(totalStake) returns (uint256 curveBps) {
+            return curveBps > MAX_APY_BPS ? MAX_APY_BPS : curveBps;
+        } catch {
+            return staticBps;
+        }
+    }
+
+    /// @dev Sums each active validator's target reward (own stake + Track A at
+    ///      targetApyBpsValue, Track B at openTierTargetApyBpsValue) for the current epoch.
     function _computeTotalTarget(
         ValidatorStakes[] memory stakes,
-        uint256 epochSecs
-    ) internal view returns (uint256 totalTarget) {
+        uint256 epochSecs,
+        uint256 targetApyBpsValue,
+        uint256 openTierTargetApyBpsValue
+    ) internal pure returns (uint256 totalTarget) {
         uint256 len = stakes.length;
         for (uint256 i; i < len; ++i) {
             (uint256 priorityTarget, uint256 trackBTarget) = _splitTarget(
-                stakes[i].ownStake, stakes[i].trackADelegated, stakes[i].trackBDelegated, epochSecs
+                stakes[i].ownStake,
+                stakes[i].trackADelegated,
+                stakes[i].trackBDelegated,
+                epochSecs,
+                targetApyBpsValue,
+                openTierTargetApyBpsValue
             );
             totalTarget += priorityTarget + trackBTarget;
         }
@@ -225,13 +284,21 @@ contract RewardDistributor is
         ValidatorStakes[] memory stakes,
         uint256 totalRewards,
         uint256 totalTarget,
-        uint256 epochSecs
+        uint256 epochSecs,
+        uint256 targetApyBpsValue,
+        uint256 openTierTargetApyBpsValue
     ) internal returns (uint256 distributed) {
         uint256 len = activeValidators.length;
         for (uint256 i; i < len; ++i) {
             ValidatorStakes memory s = stakes[i];
-            (uint256 priorityTarget, uint256 trackBTarget) =
-                _splitTarget(s.ownStake, s.trackADelegated, s.trackBDelegated, epochSecs);
+            (uint256 priorityTarget, uint256 trackBTarget) = _splitTarget(
+                s.ownStake,
+                s.trackADelegated,
+                s.trackBDelegated,
+                epochSecs,
+                targetApyBpsValue,
+                openTierTargetApyBpsValue
+            );
 
             uint256 priorityReward = (totalRewards * priorityTarget) / totalTarget;
             uint256 trackBReward = (totalRewards * trackBTarget) / totalTarget;
@@ -309,16 +376,18 @@ contract RewardDistributor is
         return validatorShare + poolShare;
     }
 
-    /// @dev Splits a validator's stake into its priority (own + Track A) and Track B targets.
+    /// @dev Splits a validator's stake into its priority (own + Track A) and Track B targets,
+    ///      at the given (already-resolved) per-track APY bps.
     function _splitTarget(
         uint256 ownStake,
         uint256 trackADelegated,
         uint256 trackBDelegated,
-        uint256 epochSecs
-    ) internal view returns (uint256 priorityTarget, uint256 trackBTarget) {
-        RewardDistributorStorage storage $ = _getRewardDistributorStorage();
-        priorityTarget = ((ownStake + trackADelegated) * $.targetApyBps * epochSecs) / (365 days * 10_000);
-        trackBTarget = (trackBDelegated * $.openTierTargetApyBps * epochSecs) / (365 days * 10_000);
+        uint256 epochSecs,
+        uint256 targetApyBpsValue,
+        uint256 openTierTargetApyBpsValue
+    ) internal pure returns (uint256 priorityTarget, uint256 trackBTarget) {
+        priorityTarget = ((ownStake + trackADelegated) * targetApyBpsValue * epochSecs) / (365 days * 10_000);
+        trackBTarget = (trackBDelegated * openTierTargetApyBpsValue * epochSecs) / (365 days * 10_000);
     }
 
     /// @dev Fetches ownStake, Track A delegated, and Track B delegated for a validator in one call.
@@ -497,6 +566,36 @@ contract RewardDistributor is
         uint256 oldApyBps = $.openTierTargetApyBps;
         $.openTierTargetApyBps = newApyBps;
         emit OpenTierApyBpsUpdated(oldApyBps, newApyBps);
+    }
+
+    /// @inheritdoc IRewardDistributor
+    function rewardCurve() external view override returns (address) {
+        return _getRewardDistributorStorage().rewardCurve;
+    }
+
+    /// @inheritdoc IRewardDistributor
+    /// @dev No zero-address check — address(0) is the intentional "disabled" value, falling
+    ///      back to the static targetApyBps (see _resolveApyBps).
+    function setRewardCurve(address newCurve) external override onlyRole(DEFAULT_ADMIN_ROLE) {
+        RewardDistributorStorage storage $ = _getRewardDistributorStorage();
+        address oldCurve = $.rewardCurve;
+        $.rewardCurve = newCurve;
+        emit RewardCurveUpdated(oldCurve, newCurve);
+    }
+
+    /// @inheritdoc IRewardDistributor
+    function openTierRewardCurve() external view override returns (address) {
+        return _getRewardDistributorStorage().openTierRewardCurve;
+    }
+
+    /// @inheritdoc IRewardDistributor
+    /// @dev No zero-address check — address(0) is the intentional "disabled" value, falling
+    ///      back to the static openTierTargetApyBps (see _resolveApyBps).
+    function setOpenTierRewardCurve(address newCurve) external override onlyRole(DEFAULT_ADMIN_ROLE) {
+        RewardDistributorStorage storage $ = _getRewardDistributorStorage();
+        address oldCurve = $.openTierRewardCurve;
+        $.openTierRewardCurve = newCurve;
+        emit OpenTierRewardCurveUpdated(oldCurve, newCurve);
     }
 
     /// @dev Pull RLS from the RLSAccumulator to cover the shortfall between fees and the per-validator 
