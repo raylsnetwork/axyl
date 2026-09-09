@@ -58,10 +58,11 @@ impl<'de> Deserialize<'de> for ForkActivation {
         }
         match Raw::deserialize(deserializer)? {
             Raw::Block(block) => Ok(Self::Block(block)),
-            Raw::Text(text) => Self::from_str_lossy(&text)
-                .ok_or_else(|| serde::de::Error::custom(format!(
+            Raw::Text(text) => Self::from_str_lossy(&text).ok_or_else(|| {
+                serde::de::Error::custom(format!(
                     "invalid fork activation {text:?}; expected a block number or \"never\""
-                ))),
+                ))
+            }),
         }
     }
 }
@@ -105,7 +106,9 @@ impl NetworkProfile {
                     .map(|fork| fork.name())
                     .collect::<Vec<_>>()
                     .join(", ");
-                eyre::bail!("unknown hardfork '{name}' in network config; known forks: {known_forks}")
+                eyre::bail!(
+                    "unknown hardfork '{name}' in network config; known forks: {known_forks}"
+                )
             }
         }
         Ok(())
@@ -162,9 +165,7 @@ static ACTIVE_PROFILE: OnceLock<NetworkProfile> = OnceLock::new();
 /// Install the active hardfork schedule. Called exactly once, at node start,
 /// before the execution layer is built.
 pub fn set_active_profile(profile: NetworkProfile) -> eyre::Result<()> {
-    ACTIVE_PROFILE
-        .set(profile)
-        .map_err(|_| eyre::eyre!("active network profile is already set"))
+    ACTIVE_PROFILE.set(profile).map_err(|_| eyre::eyre!("active network profile is already set"))
 }
 
 /// The active hardfork schedule, if an external config file was provided.
@@ -200,7 +201,9 @@ hardforks:
 
     #[test]
     fn fork_activation_roundtrip() {
-        for activation in [ForkActivation::Block(0), ForkActivation::Block(999), ForkActivation::Never] {
+        for activation in
+            [ForkActivation::Block(0), ForkActivation::Block(999), ForkActivation::Never]
+        {
             let s = serde_yaml::to_string(&activation).unwrap();
             assert_eq!(serde_yaml::from_str::<ForkActivation>(&s).unwrap(), activation);
         }
@@ -234,10 +237,7 @@ hardforks:
         let schedule = profile.schedule();
         let by_name = |name: &str| schedule.iter().find(|(fork, _)| fork.name() == name);
         assert_eq!(by_name("Eip1559").map(|(_, c)| *c), Some(ForkCondition::Block(0)));
-        assert_eq!(
-            by_name("BatchDigestV2").map(|(_, c)| *c),
-            Some(ForkCondition::Block(100))
-        );
+        assert_eq!(by_name("BatchDigestV2").map(|(_, c)| *c), Some(ForkCondition::Block(100)));
         assert_eq!(by_name("AdminTransfer").map(|(_, c)| *c), Some(ForkCondition::Never));
         // Absent forks are omitted from the schedule (lookup yields Never).
         assert!(by_name("Tokenomics").is_none());
@@ -278,10 +278,7 @@ hardforks:
             p.schedule().iter().find(|(fork, _)| fork.name() == name).map(|(_, c)| *c)
         };
         assert_eq!(by(mainnet, "Eip1559"), Some(ForkCondition::Block(0)));
-        assert_eq!(
-            by(mainnet, "UsdrSupplyCorrection"),
-            Some(ForkCondition::Block(3_569_194))
-        );
+        assert_eq!(by(mainnet, "UsdrSupplyCorrection"), Some(ForkCondition::Block(3_569_194)));
         assert_eq!(by(testnet, "Tokenomics"), Some(ForkCondition::Block(1_879_000)));
         assert_eq!(by(testnet, "Erc20PrecompileBytecode"), Some(ForkCondition::Never));
     }
@@ -313,10 +310,6 @@ networks:
     }
 
     fn indent(block: &str) -> String {
-        block
-            .lines()
-            .map(|line| format!("    {line}"))
-            .collect::<Vec<_>>()
-            .join("\n")
+        block.lines().map(|line| format!("    {line}")).collect::<Vec<_>>().join("\n")
     }
 }

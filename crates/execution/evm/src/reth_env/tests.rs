@@ -1691,8 +1691,7 @@ hardforks:
     let chain = rayls_infrastructure_types::test_chain_spec_arc();
     let tmp_dir = TempDir::new()?;
     let task_manager = TaskManager::new("Test Task Manager");
-    let reth_env =
-        RethEnv::new_for_temp_chain(chain, tmp_dir.path(), &task_manager, None).await?;
+    let reth_env = RethEnv::new_for_temp_chain(chain, tmp_dir.path(), &task_manager, None).await?;
 
     let spec = reth_env.evm_config.chain_spec();
     assert_eq!(
@@ -1700,9 +1699,6 @@ hardforks:
         ForkCondition::Block(777777)
     );
     // A fork absent from the file's schedule stays `Never`.
-    assert_eq!(
-        spec.rayls_fork_activation(RaylsHardFork::Eip1559),
-        ForkCondition::Never
-    );
+    assert_eq!(spec.rayls_fork_activation(RaylsHardFork::Eip1559), ForkCondition::Never);
     Ok(())
 }

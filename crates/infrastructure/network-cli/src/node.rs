@@ -73,12 +73,7 @@ fn load_subnet_profile(config_file: &Path, subnet: &str) -> eyre::Result<Network
     let file: NetworkConfigFile = serde_yaml::from_str(&yaml)
         .wrap_err_with(|| format!("failed to parse network config file {config_file:?}"))?;
     let profile = file.subnet(subnet).cloned().ok_or_else(|| {
-        let known = file
-            .networks
-            .keys()
-            .cloned()
-            .collect::<Vec<_>>()
-            .join(", ");
+        let known = file.networks.keys().cloned().collect::<Vec<_>>().join(", ");
         eyre::eyre!("subnet '{subnet}' not found in {config_file:?}; available subnets: {known}")
     })?;
     profile.validate_hardforks()?;
@@ -307,8 +302,7 @@ impl<Ext: clap::Args + fmt::Debug> NodeCommand<Ext> {
                      section in the config file is the only schedule source"
                 );
             }
-            let subnet =
-                self.subnet.as_deref().expect("clap requires --subnet with --config-file");
+            let subnet = self.subnet.as_deref().expect("clap requires --subnet with --config-file");
             Some((
                 config_file.clone(),
                 subnet.to_string(),
@@ -330,10 +324,7 @@ impl<Ext: clap::Args + fmt::Debug> NodeCommand<Ext> {
         // and would run the wrong hardfork schedule.
         let (expected_chain_id, chain_id_source) =
             if let Some((config_file, subnet, profile)) = &file_schedule {
-                (
-                    profile.chain_id,
-                    format!("subnet '{subnet}' of {config_file:?}"),
-                )
+                (profile.chain_id, format!("subnet '{subnet}' of {config_file:?}"))
             } else if let Some(network) = self.network {
                 // override network hardfork profile if specified via CLI / env
                 info!(target: "cli", %network, "overriding network hardfork profile from CLI");
@@ -384,10 +375,10 @@ impl<Ext: clap::Args + fmt::Debug> NodeCommand<Ext> {
 
         // get the worker's transaction address from the config
         let Self {
-            observer: _, // Used above
-            network: _,  // Used above
+            observer: _,    // Used above
+            network: _,     // Used above
             config_file: _, // Used above
-            subnet: _,     // Used above
+            subnet: _,      // Used above
             #[cfg(feature = "dev-single-node-setup")]
                 dev: _, // Used above
             metrics,

@@ -1092,7 +1092,9 @@ mod tests {
         let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
         // Local activates SenderAffinityLoadBalancing at block 0.
         let rayls_chain_spec = Arc::new(
-            RaylsChainSpec::builder(chain.clone()).rayls_hardforks(RaylsNetwork::Local).build(),
+            RaylsChainSpec::builder(chain.clone())
+                .add_rayls_hardforks_by_type(RaylsNetwork::Local)
+                .build(),
         );
         let reth_env = RethEnv::new_for_temp_chain_with_rayls_spec(
             chain.clone(),
