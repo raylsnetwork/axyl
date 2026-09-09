@@ -89,16 +89,6 @@ pub fn testnet_genesis() -> Genesis {
     serde_yaml::from_str(TESTNET_GENESIS).expect("serde parse valid testnet yaml")
 }
 
-/// testnet chain spec parsed from genesis.
-fn _testnet_chain_spec() -> ChainSpec {
-    testnet_genesis().into()
-}
-
-/// testnet chain spec parsed from genesis and wrapped in [Arc].
-fn _testnet_chain_spec_arc() -> Arc<ChainSpec> {
-    Arc::new(_testnet_chain_spec())
-}
-
 // The raw string for the testnet genesis, kept as a test fixture.
 /// Static string for the (testnet) genesis used by the test fixtures above.
 ///
