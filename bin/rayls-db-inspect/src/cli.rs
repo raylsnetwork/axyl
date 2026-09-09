@@ -53,26 +53,59 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub recover: bool,
 
-    #[command(subcommand)]
-    pub command: Command,
-}
-
-/// The databases to inspect. Shared by every subcommand.
-#[derive(Debug, Clone, Args)]
-pub struct NodeArgs {
     /// Node to inspect: its datadir or its consensus-db directory. Repeat the flag or separate
     /// paths with commas to compare nodes. Prefix a path with `label=` to name the node in the
-    /// output, for example `v1=/data/node1`.
+    /// output, for example `v1=/data/node1`. Accepted before or after the command.
     #[arg(
         short = 'd',
         long = "db",
-        required = true,
         num_args = 1,
         value_delimiter = ',',
         action = clap::ArgAction::Append,
         value_name = "[LABEL=]DATADIR"
     )]
     pub dbs: Vec<String>,
+
+    #[command(subcommand)]
+    pub command: Command,
+}
+
+impl Cli {
+    /// Every `--db` given, before and after the command, in command-line order.
+    pub fn dbs(&self) -> Vec<String> {
+        self.dbs.iter().chain(&self.command.nodes().dbs).cloned().collect()
+    }
+}
+
+/// The `--db` values given after the command name. A plain global option cannot serve here:
+/// clap propagates a global from the command level upward by replacing the parent's values, so
+/// paths given before and after the command would not add up.
+#[derive(Debug, Clone, Default, Args)]
+pub struct NodeArgs {
+    /// Node to inspect, same as the top-level `--db`; may be repeated or comma-separated.
+    #[arg(
+        short = 'd',
+        long = "db",
+        num_args = 1,
+        value_delimiter = ',',
+        action = clap::ArgAction::Append,
+        value_name = "[LABEL=]DATADIR"
+    )]
+    pub dbs: Vec<String>,
+}
+
+impl Command {
+    fn nodes(&self) -> &NodeArgs {
+        match self {
+            Self::Epoch { nodes, .. }
+            | Self::Epochs { nodes, .. }
+            | Self::ChainCheck { nodes, .. }
+            | Self::Header { nodes, .. }
+            | Self::Cert { nodes, .. }
+            | Self::Summary { nodes } => nodes,
+            Self::Walk { target: WalkTarget::Header { nodes, .. } } => nodes,
+        }
+    }
 }
 
 #[derive(Debug, Subcommand)]
