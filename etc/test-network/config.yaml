@@ -78,3 +78,5 @@ networks:
       EmptyOutputBlock: 0
       DynamicCommitteeSizing: 0
       HybridRewards: 1
+      OutputSeqNormalization: 0
+      SenderAffinityLoadBalancing: 0
