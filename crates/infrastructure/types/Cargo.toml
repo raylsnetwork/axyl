@@ -11,6 +11,7 @@ publish = false
 async-trait = { workspace = true }
 bcs = { workspace = true }
 bincode = { workspace = true }
+rustc-hash = { workspace = true }
 # direct reth currently for circular deps
 reth = { workspace = true }
 reth-primitives = { workspace = true }

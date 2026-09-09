@@ -14,7 +14,7 @@ use alloy::{
 };
 use alloy_evm::{revm::context_interface::result::InvalidTransaction, Evm};
 use rayls_infrastructure_types::{
-    payload::RLPayload, BlockNumHash, RecoveredBlock, TransactionSigned, B256, U256,
+    payload::RLPayload, BlockNumHash, Bytes, RecoveredBlock, TransactionSigned, B256, U256,
 };
 use reth_chain_state::{
     ComputedTrieData, DeferredTrieData, ExecutedBlock, LazyOverlay, MemoryOverlayStateProvider,
@@ -45,27 +45,23 @@ use std::sync::Arc;
 use tracing::{debug, info, warn};
 
 impl RethEnv {
-    /// Whether every transaction in `transactions` is still pending against the latest state —
-    /// i.e. each tx's nonce is at or ahead of its sender's current account nonce.
+    /// Returns whether every transaction in `transactions` is still pending against the latest
+    /// state, i.e. `tx.nonce >= account.nonce` for its sender.
     ///
-    /// "Pending" here is `tx.nonce >= account.nonce` (at or ahead — the txn hasn't been mined yet);
-    /// the typical retryable case is strictly ahead (nonce-too-high), but a tx exactly at the
-    /// current nonce also counts as pending.
+    /// Restart dedup reconstruction uses this to tell two empty blocks apart: a batch whose
+    /// transactions are still pending produced an empty block only because they were not yet
+    /// executable and is retryable; a batch whose transactions are already mined (nonce too low)
+    /// is done and must stay deduped, or a restart re-executes it and forks the chain.
     ///
-    /// Used by restart dedup reconstruction to tell two empty blocks apart: a batch whose txns are
-    /// still pending produced an empty block only because they aren't yet executable and is
-    /// genuinely retryable; a batch whose txns are already mined (nonce-too-low) is done and must
-    /// stay deduped, else a restart re-executes it and forks the chain.
-    ///
-    /// Conservative: returns `false` for an empty input, if any tx is already mined, or on any
-    /// decode/state error — never reports "retryable" unless it can positively prove it.
-    pub fn batch_txns_all_pending(&self, transactions: &[Vec<u8>]) -> bool {
+    /// Conservative: `false` for an empty input, any already-mined transaction, or any decode or
+    /// state error, so "retryable" is only reported when it can be proven.
+    pub fn batch_txns_all_pending(&self, transactions: &[Bytes]) -> bool {
         if transactions.is_empty() {
             return false;
         }
         let Ok(state) = self.latest() else { return false };
-        // `None` batch_digest: recovery errors here won't carry the digest in their log context,
-        // which is fine — an undecodable tx just makes the batch non-retryable below.
+        // No batch digest for log context: an undecodable tx only makes the batch non-retryable
+        // below.
         for res in reth_recover_raw_transactions(None, transactions) {
             let Ok(recovered) = res else { return false };
             let sender = recovered.signer();
@@ -91,7 +87,7 @@ impl RethEnv {
     pub fn build_block_from_batch_payload(
         &self,
         payload: RLPayload,
-        transactions: &[Vec<u8>],
+        transactions: &[Bytes],
         local_chain: &[ExecutedBlock],
     ) -> RaylsRethResult<(ExecutedBlock, TxValidationCounts)> {
         let parent_header = payload.parent_header.clone();
@@ -133,7 +129,7 @@ impl RethEnv {
 
         // The cache uses get_canonical_block_number() (an atomic on
         // ChainInfoTracker) as its key.  update_chain() inserts blocks into
-        // CIM's maps but does NOT advance that atomic — set_canonical_head()
+        // CIM's maps but does NOT advance that atomic; set_canonical_head()
         // only runs later in finish_executing_output().  So for blocks 2..M
         // in a round the cache returns stale input missing prior blocks'
         // hashed_state + trie_updates.  Extend explicitly with local_chain.
@@ -213,7 +209,7 @@ impl RethEnv {
         let ctx_for_assembler = ctx.clone();
         let mut builder = self.evm_config.create_block_builder(evm, &parent_header, ctx);
 
-        // attach state_hook to the executor if Tier 1 is active — the hook
+        // attach state_hook to the executor if Tier 1 is active; the hook
         // sends per-transaction state diffs to the multiproof/sparse trie task
         let sparse_root_fn = if let Some((state_hook, sparse_root_fn)) = sparse_setup {
             builder.executor_mut().set_state_hook(Some(state_hook));
@@ -274,14 +270,13 @@ impl RethEnv {
 
             committed_txs.push(recovered.clone());
 
-            // update add to total fees
             let miner_fee = recovered
                 .effective_tip_per_gas(basefee)
                 .expect("fee is always valid; execution succeeded");
             total_fees += U256::from(miner_fee) * U256::from(gas_used);
         }
 
-        // Phase 2: finish the executor — runs post-execution system calls
+        // Phase 2: finish the executor: runs post-execution system calls
         // (epoch closing) and drops the state_hook, which signals the sparse
         // trie to begin finalizing
         let finish_start = std::time::Instant::now();
@@ -295,7 +290,7 @@ impl RethEnv {
         // Phase 4: compute hashed post state from bundle
         let hashed_state = state_provider.hashed_post_state(&db.bundle_state);
 
-        // Phase 5: compute state root — SDK handles sparse trie internally
+        // Phase 5: compute state root: SDK handles sparse trie internally
         let mut tier_label;
         let (state_root, trie_updates) = if let Some(sparse_root_fn) = sparse_root_fn {
             tier_label = "sparse";
@@ -362,7 +357,7 @@ impl RethEnv {
         let trie_updates_sorted = Arc::new(trie_updates.into_sorted());
 
         // compute trie changesets (old node values before this block) and cache
-        // them for the parallel state root overlay. This is cheap — just cursor
+        // them for the parallel state root overlay. This is cheap: just cursor
         // reads of old trie node values, no state root recomputation.
         {
             if let Ok(db_provider) = self.blockchain_provider.database_provider_ro() {
@@ -501,10 +496,10 @@ impl RethEnv {
             first=?blocks.first().map(|b| b.recovered_block.num_hash()),
             last=?blocks.last().map(|b| b.recovered_block.num_hash()),
             count = blocks.len(),
-            "finalizing output — updating head + notifications",
+            "finalizing output - updating head + notifications",
         );
 
-        // Build notification from blocks (cheap — blocks contain Arcs).
+        // Build notification from blocks (cheap: blocks contain Arcs).
         // Blocks are already in CIM from build_block_from_batch_payload.
         let notification = NewCanonicalChain::Commit { new: blocks }.to_chain_notification();
         canonical_in_memory_state.set_canonical_head(sealed_head.clone());

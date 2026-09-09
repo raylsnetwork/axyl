@@ -128,7 +128,7 @@ cd axyl
 cargo build --release
 ```
 
-The toolchain is pinned to Rust 1.91 via [`rust-toolchain.toml`](./rust-toolchain.toml). `make pr` runs the same fmt + clippy + test gate as CI (fmt and clippy require a nightly toolchain); `make test` runs the test suite alone.
+The toolchain is pinned to Rust 1.91 via [`rust-toolchain.toml`](./rust-toolchain.toml). `make pr` runs the same fmt + clippy + test gate as CI (fmt and clippy require a nightly toolchain; fmt is date-pinned via the `FMT_NIGHTLY` variable in the [`Makefile`](./Makefile) to match the CI check); `make test` runs the test suite alone.
 
 Documentation lives in [`doc/`](doc/):
 

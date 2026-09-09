@@ -23,12 +23,11 @@ pub use reth_provider::{AccountReader, CanonStateNotificationStream, ExecutionOu
 pub use reth_rpc_eth_types::EthApiError;
 pub use reth_tracing::FileWorkerGuard;
 pub use reth_transaction_pool::{
-    error::{InvalidPoolTransactionError, PoolError, PoolTransactionError},
+    error::{InvalidPoolTransactionError, PoolError, PoolErrorKind, PoolTransactionError},
     identifier::SenderIdentifiers,
     BestTransactions, EthPooledTransaction, PoolTransaction, TransactionPool as TransactionPoolT,
 };
 
-pub mod bypass_validator;
 pub mod chainspec;
 pub mod dirs;
 pub mod payload;
@@ -37,6 +36,7 @@ pub mod txn_pool;
 pub use txn_pool::*;
 pub mod error;
 mod evm;
+pub mod in_flight;
 pub mod native_erc20;
 pub(crate) mod persistence;
 pub mod reth_env;

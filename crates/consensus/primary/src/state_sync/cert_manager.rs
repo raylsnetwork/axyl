@@ -16,13 +16,10 @@ use rayls_infrastructure_config::ConsensusConfig;
 use rayls_infrastructure_storage::CertificateStore;
 use rayls_infrastructure_types::{
     error::{CertificateError, HeaderError},
-    Certificate, CertificateDigest, Database, Hash as _, Noticer, RaylsReceiver as _,
-    RaylsSender as _,
+    Certificate, CertificateDigest, CertificateDigestSet, Database, Hash as _, Noticer,
+    RaylsReceiver as _, RaylsSender as _,
 };
-use std::{
-    collections::{HashSet, VecDeque},
-    sync::Arc,
-};
+use std::{collections::VecDeque, sync::Arc};
 use tokio::sync::oneshot;
 use tracing::{debug, error, info, warn};
 
@@ -164,12 +161,6 @@ where
                         "certificate suspended - missing parents"
                     );
                     self.pending.insert_pending(cert, missing_parents)?;
-                    // metrics
-                    self.consensus_bus
-                        .primary_metrics()
-                        .node_metrics
-                        .certificates_currently_suspended
-                        .set(self.pending.num_pending() as i64);
 
                     // Cascade detection: warn when pending queue is growing large
                     let pending_count = self.pending.num_pending();
@@ -206,7 +197,7 @@ where
     async fn get_missing_parents(
         &self,
         certificate: &Certificate,
-    ) -> CertManagerResult<HashSet<CertificateDigest>> {
+    ) -> CertManagerResult<CertificateDigestSet> {
         let _scope = monitored_scope("primary::rayls-consensus-state-sync::get_missing_parents");
 
         // handle genesis cert
@@ -219,13 +210,13 @@ where
                     );
                 }
             }
-            return Ok(HashSet::new());
+            return Ok(CertificateDigestSet::default());
         }
 
         // check storage
         let existence =
             self.config.node_storage().multi_contains(certificate.header().parents().iter())?;
-        let missing_parents: HashSet<_> = certificate
+        let missing_parents: CertificateDigestSet = certificate
             .header()
             .parents()
             .iter()

@@ -1,7 +1,7 @@
 //! The receiving side of the execution layer's `BatchProvider`.
 //!
 //! Consensus `BatchProvider` takes a batch from the EL, stores it,
-//! and sends it to the quorum waiter for broadcasting to peers.
+//! and sends it to the quorum waiter for publishing to peers.
 
 use crate::{
     batch_fetcher::BatchFetcher,
@@ -14,13 +14,12 @@ use rayls_infrastructure_config::ConsensusConfig;
 use rayls_infrastructure_network_types::{
     local::LocalNetwork, WorkerOwnBatchMessage, WorkerToPrimaryClient,
 };
-use rayls_infrastructure_storage::tables::{
-    BatchSeqCounter, Batches, ConsensusBlocks, NodeBatchesCache,
-};
+use rayls_infrastructure_storage::tables::{BatchSeqCounter, Batches, ConsensusBlocks};
 use rayls_infrastructure_types::{
-    batch_tracker::BatchTracker, error::BlockSealError, AuthorityIdentifier, BatchReceiver,
-    BatchSender, BatchValidation, Database, Epoch, SealedBatch, SenderNonceRanges, TaskKind,
-    TaskManager, WorkerId,
+    batch_tracker::{BatchTracker, SealFailureReason},
+    error::BlockSealError,
+    AuthorityIdentifier, BatchReceiver, BatchSender, BatchValidation, Bytes, Database, Epoch,
+    SealedBatch, SenderNonceRanges, TaskKind, TaskManager, WorkerId,
 };
 use std::{sync::Arc, time::Duration};
 use tracing::{error, info, warn};
@@ -153,15 +152,15 @@ pub struct Worker<DB, QW> {
     id: WorkerId,
     /// Use `QuorumWaiter` to attest to batches.
     quorum_waiter: Option<QW>,
-    /// Metrics handler
+    /// Metrics handler.
     node_metrics: Arc<WorkerMetrics>,
     /// The network client to send our batches to the primary.
     client: LocalNetwork,
     /// The batch store to store our own batches.
     store: DB,
-    /// Channel sender for alternate batch submision if not calling seal directly.
+    /// Channel sender for alternate batch submission if not calling seal directly.
     tx_batches: BatchSender,
-    /// Channel receiver for alternate batch submision if not calling seal directly.
+    /// Channel receiver for alternate batch submission if not calling seal directly.
     /// This will be "taken" on batch spawn and become None.
     rx_batches: Option<BatchReceiver>,
     /// The amount of time to wait on a reply from peer before timing out.
@@ -172,9 +171,8 @@ pub struct Worker<DB, QW> {
     batch_tracker: Option<Arc<BatchTracker>>,
 }
 
-// Need to imlement clone directly because of the rx_batches field.
-// This field is a use once field when spawning the batch manager so this is fine.
-// Code will panic quickly if this is messed up.
+// Manual impl: `rx_batches` is consumed once by `spawn_batch_builder`, so a clone starts without
+// it; a clone that tries to spawn panics immediately on the `take`.
 impl<DB: Clone, QW: Clone> Clone for Worker<DB, QW> {
     fn clone(&self) -> Self {
         Self {
@@ -225,8 +223,8 @@ impl<DB: Database, QW: QuorumWaiterTrait> Worker<DB, QW> {
         }
     }
 
-    /// Spawn a little task to accept batches from a channel and seal them that way.
-    /// Allows the engine to remain removed from the worker.
+    /// Spawns the task that seals batches arriving on the submit channel, keeping the engine
+    /// decoupled from the worker.
     pub fn spawn_batch_builder(&mut self, prefix: &str, task_manager: &TaskManager) {
         let this_clone = self.clone();
         let mut rx_batches = self.rx_batches.take().expect("have batch receive");
@@ -236,6 +234,14 @@ impl<DB: Database, QW: QuorumWaiterTrait> Worker<DB, QW> {
             async move {
                 loop {
                     tokio::select! {
+                        // shutdown wins: a drained batch-builder must stop sealing promptly so
+                        // the epoch transition is not held by another seal round trip
+                        biased;
+
+                        _ = &rx_shutdown => {
+                            info!(target: "worker::batch_provider", "shutdown received, exiting batch-builder loop");
+                            break;
+                        }
                         batch = rx_batches.recv() => {
                             let Some((batch, sender_nonce_ranges, tx)) = batch else {
                                 break;
@@ -248,10 +254,6 @@ impl<DB: Database, QW: QuorumWaiterTrait> Worker<DB, QW> {
                             if tx.send(res).is_err() {
                                 error!(target: "worker::batch_provider", "Error sending result to channel caller!  Channel closed.");
                             }
-                        }
-                        _ = &rx_shutdown => {
-                            info!(target: "worker::batch_provider", "shutdown received, exiting batch-builder loop");
-                            break;
                         }
                     }
                 }
@@ -330,13 +332,14 @@ impl<DB: Database, QW: QuorumWaiterTrait> Worker<DB, QW> {
     /// Send all the txns in sealed_batch to CVVs so they can be included in blocks.
     /// Use this when not a CVV so that transactions you accept can be included in a block.
     pub async fn disburse_txns(&self, sealed_batch: SealedBatch) -> Result<(), BlockSealError> {
-        if let Err(err) = self.network_handle.publish_txn(sealed_batch.batch.transactions).await {
+        let payloads = sealed_batch.batch.transactions.into_iter().map(Bytes::from).collect();
+        if let Err(err) = self.network_handle.publish_txn(payloads).await {
             error!(target: "worker::batch_provider", "Error publishing transaction: {err}");
         }
         Ok(())
     }
 
-    /// Seal and broadcast the current batch.
+    /// Seals and publishes the current batch.
     pub async fn seal(
         &self,
         sealed_batch: SealedBatch,
@@ -360,12 +363,6 @@ impl<DB: Database, QW: QuorumWaiterTrait> Worker<DB, QW> {
         );
 
         let (batch, digest) = sealed_batch.split();
-        if let Err(e) = self.store.insert::<NodeBatchesCache>(&digest, &batch) {
-            // Cache the batch early, avoid race conditions.
-            // Note the cache should be cleared every epoch after processing.
-            error!(target: "worker::batch_provider", "Store failed (batch cache) with error: {:?}", e);
-            return Err(BlockSealError::FatalDBFailure);
-        }
         if let Some(tracker) = &self.batch_tracker {
             tracker.batch_sealed(digest, batch.transactions.len(), &sender_nonce_ranges);
         }
@@ -386,13 +383,14 @@ impl<DB: Database, QW: QuorumWaiterTrait> Worker<DB, QW> {
                             return Err(BlockSealError::FatalDBFailure);
                         }
 
-                        // Publish the digest for any nodes listening to this gossip (non-committee
-                        // members). Note, ignore error- this should not
-                        // happen and should not cause an issue (except the
-                        // underlying p2p network may be in trouble but that will manifest quickly).
+                        // Publish the digest for non-committee listeners. A publish error is
+                        // ignored: it only signals a p2p problem that surfaces elsewhere quickly.
                         let _ = self.network_handle.publish_batch(digest).await;
                     }
                     Err(e) => {
+                        if let Some(tracker) = &self.batch_tracker {
+                            tracker.batch_seal_failed(digest, SealFailureReason::Quorum);
+                        }
                         return Err(match e {
                             crate::quorum_waiter::QuorumWaiterError::QuorumRejected => {
                                 BlockSealError::QuorumRejected
@@ -414,18 +412,28 @@ impl<DB: Database, QW: QuorumWaiterTrait> Worker<DB, QW> {
             }
             Err(e) => {
                 error!(target: "worker::batch_provider", "Join error attempting batch quorum! {e}");
+                if let Some(tracker) = &self.batch_tracker {
+                    tracker.batch_seal_failed(digest, SealFailureReason::QuorumJoin);
+                }
                 return Err(BlockSealError::FailedQuorum);
             }
         }
 
-        // Send the batch to the primary.
+        // Report the batch to the primary. An unacknowledged report means the digest never
+        // entered the proposer's queue (the epoch-scoped proposer stops draining at teardown), so
+        // recording the batch as sealed would consume a seq no header ever carries: a permanent
+        // per-authority hole whose committed successors park until the boundary drain. Surface it
+        // as a seal failure instead, so the builder reuses the seq and the txs stay selectable.
+        // Reported as FailedQuorum: the batch reached availability but cannot be placed.
         let message = WorkerOwnBatchMessage { worker_id: self.id, digest };
         if let Err(err) = self.client.report_own_batch(message).await {
             error!(target: "worker::batch_provider", "Failed to report our batch: {err:?}");
-            // Should we return an error here?  Doing so complicates some tests but also the batch
-            // is sealed, etc. If we can not report our own batch is this a
-            // showstopper?
-        } else if let Some(tracker) = &self.batch_tracker {
+            if let Some(tracker) = &self.batch_tracker {
+                tracker.batch_seal_failed(digest, SealFailureReason::ReportUnacknowledged);
+            }
+            return Err(BlockSealError::FailedQuorum);
+        }
+        if let Some(tracker) = &self.batch_tracker {
             tracker.batch_reported_to_primary(digest);
         }
 

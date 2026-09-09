@@ -22,21 +22,17 @@ use std::{
 };
 use tempfile::TempDir;
 
+/// Create a temporary directory that is removed on drop.
 pub fn temp_dir() -> TempDir {
     tempfile::tempdir().expect("Failed to open temporary directory")
 }
 
-////////////////////////////////////////////////////////////////
-// Keys, Committee
-////////////////////////////////////////////////////////////////
-
+/// Generate a random BLS keypair.
 pub fn random_key() -> BlsKeypair {
     BlsKeypair::generate(&mut rand::rngs::StdRng::from_os_rng())
 }
 
-////////////////////////////////////////////////////////////////
-// Headers, Votes, Certificates
-////////////////////////////////////////////////////////////////
+/// Create a header payload of `number_of_batches` random batch digests for worker 0.
 pub fn fixture_payload(number_of_batches: u8) -> IndexMap<BlockHash, WorkerId> {
     let mut payload: IndexMap<BlockHash, WorkerId> = IndexMap::new();
 
@@ -50,6 +46,7 @@ pub fn fixture_payload(number_of_batches: u8) -> IndexMap<BlockHash, WorkerId> {
     payload
 }
 
+/// Create a header payload of `number_of_batches` batch digests drawn from `rand`.
 pub fn fixture_payload_with_rand<R: Rng + ?Sized>(
     number_of_batches: u8,
     rand: &mut R,
@@ -66,7 +63,7 @@ pub fn fixture_payload_with_rand<R: Rng + ?Sized>(
 }
 
 /// Create a transaction with a randomly generated keypair.
-pub fn transaction_with_rand<R: Rng + ?Sized>(rand: &mut R) -> Vec<u8> {
+pub fn transaction_with_rand<R: Rng + ?Sized>(rand: &mut R) -> Bytes {
     let mut tx_factory = TransactionFactory::new_random_from_seed(rand);
     let chain = test_chain_spec_arc();
     // TODO: this is excessively high, but very unlikely to ever fail
@@ -84,6 +81,7 @@ pub fn transaction_with_rand<R: Rng + ?Sized>(rand: &mut R) -> Vec<u8> {
     )
 }
 
+/// Create a two-transaction batch for `worker_id` with transactions drawn from `rand`.
 pub fn batch_with_rand<R: Rng + ?Sized>(rand: &mut R, worker_id: WorkerId) -> Batch {
     Batch::new_for_test(
         vec![transaction_with_rand(rand), transaction_with_rand(rand)],
@@ -93,10 +91,6 @@ pub fn batch_with_rand<R: Rng + ?Sized>(rand: &mut R, worker_id: WorkerId) -> Ba
         0,
     )
 }
-
-////////////////////////////////////////////////////////////////
-// Batches
-////////////////////////////////////////////////////////////////
 
 /// Creates one certificate per authority starting and finishing at the specified rounds
 /// (inclusive).
@@ -454,6 +448,7 @@ pub fn make_signed_certificates(
     rounds_of_certificates(range, initial_parents, &ids[..], failure_probability, generator)
 }
 
+/// Create an unsigned certificate whose header payload is drawn from `rand`.
 pub fn mock_certificate_with_rand<R: RngCore + ?Sized>(
     committee: &Committee,
     origin: AuthorityIdentifier,

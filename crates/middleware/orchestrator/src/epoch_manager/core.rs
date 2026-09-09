@@ -23,10 +23,10 @@ use rayls_execution_evm::{reth_env::RethEnv, system_calls::EpochState};
 use rayls_infrastructure_config::{KeyConfig, LibP2pConfig, NetworkConfig, RaylsDirs};
 use rayls_infrastructure_storage::{tables::ConsensusBlocks, EpochStore as _};
 use rayls_infrastructure_types::{
-    error::HeaderError, gas_accumulator::GasAccumulator, BlsAggregateSignature, BlsPublicKey,
-    BlsSignature, CameFrom, ConsensusOutput, Database as ReDatabase, Epoch, EpochCertificate,
-    EpochRecord, EpochVote, Noticer, Notifier, RaylsReceiver, RaylsSender, TaskJoinError, TaskKind,
-    TaskManager, VotesAggregator, B256,
+    error::HeaderError, gas_accumulator::GasAccumulator, B256Map, BlsAggregateSignature,
+    BlsPublicKey, BlsSignature, CameFrom, ConsensusOutput, Database as ReDatabase, Epoch,
+    EpochCertificate, EpochRecord, EpochVote, Noticer, Notifier, RaylsReceiver, RaylsSender,
+    TaskJoinError, TaskKind, TaskManager, VotesAggregator, B256,
 };
 use rayls_middleware_processor::{batch::BatchOrdering, reconstruct_batch_digests};
 use std::{
@@ -143,7 +143,9 @@ where
         let EpochState { epoch, .. } = engine.epoch_state_from_canonical_tip().await?;
 
         // load persisted BatchOrdering or reconstruct from chain history when missing
-        let batch_ordering = BatchOrdering::from_history(self.consensus_db.clone(), epoch);
+        let execution_address = self.builder.rayls_infrastructure_config.execution_address();
+        let batch_ordering =
+            BatchOrdering::from_history(self.consensus_db.clone(), epoch, execution_address);
 
         // The engine's dedup anchor MUST be the EL execution anchor (the consensus header the
         // highest executed EVM block commits to), NOT the consensus-chain tip. The anchor marks the
@@ -296,6 +298,7 @@ where
         self.spawn_engine_update_task(
             self.node_shutdown.subscribe(),
             engine.canonical_block_stream().await,
+            engine.clone(),
             &node_task_manager,
         );
 
@@ -306,7 +309,7 @@ where
         info!(target: "epoch-manager", tasks=?node_task_manager, "NODE TASKS\n");
 
         // Catch the termination signal ourselves so we can drive a graceful, ORDERED
-        // shutdown — rather than letting a task-manager join catch it (which would also fire
+        // shutdown - rather than letting a task-manager join catch it (which would also fire
         // its notifier and tear node tasks down). On SIGTERM/ctrl-c this listener fires ONLY
         // `sigterm_trigger`, never `node_shutdown`, so the tasks that subscribe to
         // `node_shutdown` directly (engine, network, vote collector) are NOT woken
@@ -332,7 +335,7 @@ where
         let sigterm_trigger = self.sigterm_trigger.clone();
         // Keep one `to_engine` sender alive past `run_epochs` so the engine's input does NOT close
         // until we say so. `run_epochs` owns the other senders, so its return would close the input
-        // BEFORE `node_shutdown.notify()` below sets the engine's `shutdown_requested` — and the
+        // BEFORE `node_shutdown.notify()` below sets the engine's `shutdown_requested` - and the
         // engine faults (`ConsensusOutputStreamClosed`) on an input close while that flag is false
         // (a TOCTOU on its shutdown check). We drop this only AFTER `notify()`, making notify()
         // strictly happen-before the close: the engine polls rx_shutdown before its input, so it
@@ -347,7 +350,7 @@ where
         let outcome = AssertUnwindSafe(async {
             let epochs = self.run_epochs(&engine, network_config, to_engine, gas_accumulator);
             tokio::pin!(epochs);
-            // `join` (do_exit=false) so this does NOT catch the termination signal — only a
+            // `join` (do_exit=false) so this does NOT catch the termination signal - only a
             // node-task crash (or `node_shutdown`) completes it. SIGTERM is handled by the
             // listener above; on SIGTERM this stays pending and is dropped via the `epochs`
             // branch, leaving node tasks (the engine) running until the post-teardown
@@ -399,9 +402,9 @@ where
         // returns fast on shutdown) while the engine task is still draining queued
         // outputs; flushing then persists a prefix and lets a later block land
         // post-flush (the serialize-replay fork). Signal shutdown (idempotent) so
-        // the engine begins its drain, then wait — UNBOUNDED — for it to report done.
+        // the engine begins its drain, then wait - UNBOUNDED - for it to report done.
         // A finite timeout that fired mid-drain (e.g. a large queued backlog, each output
-        // up to seconds) would flush a prefix and let a later block land post-flush — the
+        // up to seconds) would flush a prefix and let a later block land post-flush - the
         // exact serialize-replay fork. The engine is Drainable and exits cleanly on
         // shutdown, so engine_done fires in every case except a genuine execution deadlock;
         // that rare hang is bounded externally by the supervisor's SIGKILL and is fork-safe
@@ -411,10 +414,11 @@ where
         // observed by the engine only after `notify()` (program order: this drop is after the
         // notify), so it exits Ok via its shutdown path rather than faulting.
         drop(engine_input_keepalive);
+
         match engine_done_rx.await {
             Ok(()) => info!(target: "engine", "engine drained before shutdown flush"),
             // Sender dropped without signalling: the engine task was torn down before its
-            // drain completed (so no in-flight block was finalized) — safe to flush.
+            // drain completed (so no in-flight block was finalized) - safe to flush.
             Err(_) => {
                 warn!(target: "engine", "engine task ended without drain signal; flushing")
             }
@@ -558,7 +562,8 @@ where
         }
         gas_accumulator.rewards_counter().set_committee(primary.current_committee().await);
 
-        self.orphan_batches(engine.clone(), worker.clone()).await?;
+        // The txpool is intentionally not persisted across restarts (standard mempool semantics):
+        // a client resubmits any transaction that was accepted but not yet mined.
 
         // Check for incomplete epoch transition from a previous crash.
         self.recover_partial_transition(&primary, engine).await?;
@@ -578,34 +583,60 @@ where
         // starts feeding the engine (serialized, no dual delivery).
         let _ = execution_replay_completed_rx.changed().await;
 
-        // Only eligible nodes build batches, and not while a transition is pending - the outer
-        // select is about to tear this epoch down.
+        // Start nothing while a transition is pending - the outer select is about to tear this
+        // epoch down. Otherwise an active CVV builds batches and an observer forwards.
         let mode = *self.consensus_bus.node_mode().borrow();
         let transition_pending = self.consensus_bus.mode_transition().borrow().is_some();
-        if mode.is_batch_producing() && !transition_pending {
-            match self.resolve_initial_batch_seq(&worker, &primary, current_epoch).await {
-                InitialBatchSeq::Use(seq) => {
-                    // Spawn the worker-side consumer before the engine-side producer so the
-                    // batch channel has a receiver for the first sealed batch.
-                    let worker_task_manager_name = worker_task_manager_name(worker_node.id().await);
-                    worker.spawn_batch_builder(&worker_task_manager_name, &epoch_task_manager);
-                    engine
-                        .start_batch_builder(
-                            worker.id(),
-                            worker.batches_tx(),
-                            &epoch_task_manager.get_spawner(),
-                            gas_accumulator.base_fee(worker.id()),
-                            current_epoch,
-                            seq,
-                            epoch_boundary,
-                        )
-                        .await?;
-                }
-                InitialBatchSeq::Defer => {
-                    info!(target: "epoch-manager",
+        if !transition_pending {
+            if mode.is_batch_producing() {
+                match self.resolve_initial_batch_seq(&worker, &primary, current_epoch).await {
+                    InitialBatchSeq::Use(seq) => {
+                        // Spawn the worker-side consumer before the engine-side producer so the
+                        // batch channel has a receiver for the first sealed batch.
+                        let worker_task_manager_name =
+                            worker_task_manager_name(worker_node.id().await);
+                        worker.spawn_batch_builder(&worker_task_manager_name, &epoch_task_manager);
+                        engine
+                            .start_batch_builder(
+                                worker.id(),
+                                worker.batches_tx(),
+                                &epoch_task_manager.get_spawner(),
+                                gas_accumulator.base_fee(worker.id()),
+                                current_epoch,
+                                seq,
+                                epoch_boundary,
+                            )
+                            .await?;
+                    }
+                    InitialBatchSeq::Defer => {
+                        info!(target: "epoch-manager",
                         "execution replay incomplete; deferring batch builder to next epoch");
+                    }
+                    InitialBatchSeq::Shutdown => return Ok(()),
                 }
-                InitialBatchSeq::Shutdown => return Ok(()),
+            } else if mode.is_observer() {
+                // An observer cannot seal, so it forwards its RPC-accepted transactions to the
+                // committee instead of the batch builder.
+                engine
+                    .start_txn_forwarder(
+                        worker.id(),
+                        worker.network_handle(),
+                        self.consensus_bus.executed_anchor().subscribe(),
+                        // peer-derived latest header: the catch-up gate compares it against the
+                        // executed anchor so a lagging node never re-sends
+                        self.consensus_bus.last_consensus_header().subscribe(),
+                        // slot-ordered (authorities sorted by id), matching receiver-side dispatch
+                        primary
+                            .current_committee()
+                            .await
+                            .authorities()
+                            .iter()
+                            .map(|authority| *authority.protocol_key())
+                            .collect(),
+                        &epoch_task_manager.get_spawner(),
+                        network_config.libp2p_config().max_gossip_message_size,
+                    )
+                    .await?;
             }
         }
 
@@ -629,7 +660,7 @@ where
             self.collect_epoch_votes(&primary, epoch_rec, &epoch_task_manager).await;
         }
 
-        // biased: shutdown > boundary > mode_transition > task crash
+        // biased: node shutdown > consensus shutdown > boundary > mode_transition > task crash
         // snapshot before select: join() fires shutdown as side-effect
         let was_externally_shutdown = epoch_shutdown_rx.noticed();
 
@@ -637,6 +668,12 @@ where
             biased;
 
             _ = node_ended => RunningOutcome::NodeShutdown,
+
+            // An external consensus shutdown arriving during the select resolves here rather than
+            // through the join arm below, where a critical task exiting Ok in response to it would
+            // be misclassified as a crash and kill the node. `was_externally_shutdown` only
+            // samples the state before the select, so it cannot catch a notify that lands during.
+            _ = epoch_shutdown_rx => RunningOutcome::NodeShutdown,
 
             res = self.detect_epoch_boundary(epoch_boundary, to_engine, consensus_output) => {
                 match res {
@@ -704,7 +741,7 @@ where
                 result?;
             }
             RunningOutcome::NodeShutdown => {
-                // Ordered teardown — same producer→consumer sequencing as an epoch/mode
+                // Ordered teardown - same producer→consumer sequencing as an epoch/mode
                 // transition, instead of `abort_all_tasks()` (which hard-aborts Drainable
                 // consumers unordered, alongside producers, and never awaits their drop).
                 // `drain_round = None`: node shutdown doesn't run the subscriber drain
@@ -771,7 +808,7 @@ where
             return InitialBatchSeq::Use(seq);
         }
 
-        // Dev (single-node): no peers to replay from — the execution_replay_complete
+        // Dev (single-node): no peers to replay from - the execution_replay_complete
         // gate below waits on a signal that can be missed on the initial epoch, leaving
         // the batch builder unstarted and txs never mined. Resolve directly.
         #[cfg(feature = "dev-single-node-setup")]
@@ -788,7 +825,7 @@ where
             // Fresh subs so our observe doesn't consume the outer receiver's signal.
             self.consensus_bus.execution_replay_complete().subscribe(),
             self.consensus_bus.mode_transition().subscribe(),
-            // Abort the replay wait on graceful wind-down — the SAME signal run_epoch's outer
+            // Abort the replay wait on graceful wind-down - the SAME signal run_epoch's outer
             // select observes. Must be `sigterm_trigger`, not `node_shutdown`: `node_shutdown`
             // is deferred until after run_epoch returns, so a replay wait keyed to it would
             // deadlock a SIGTERM arriving during setup. Fresh Noticer so we don't consume the
@@ -895,7 +932,7 @@ where
                 "publishing epoch record {epoch_hash}",
             );
 
-            // Dev (single-node): self-certify and return — no peers to gossip to or
+            // Dev (single-node): self-certify and return - no peers to gossip to or
             // collect votes from. The sole vote already meets super_quorum(1)==1.
             // The `== 1` guard is kept (not redundant): it keeps the production
             // gossip/vote-collection path below reachable in dev builds and acts as a
@@ -934,7 +971,7 @@ where
         }
 
         let mut rx = self.consensus_bus.new_epoch_votes().subscribe();
-        // This is a Drainable consumer, so it drains on the task manager's `local_shutdown` —
+        // This is a Drainable consumer, so it drains on the task manager's `local_shutdown`  -
         // fired by `join_internal`'s consumer phase AFTER producers are reaped (or by `Drop`).
         // That makes wind-down graceful AND ordered for every teardown (epoch/mode transition
         // and SIGTERM). NOT `node_shutdown` (now deferred → this would be force-aborted) and
@@ -944,7 +981,7 @@ where
             let mut reached_quorum = false;
             let mut timeout = Duration::from_secs(5);
             let mut timeouts = 0;
-            let mut alt_recs: HashMap<B256, VotesAggregator<EpochVote>> = HashMap::default();
+            let mut alt_recs: B256Map<VotesAggregator<EpochVote>> = B256Map::default();
             loop {
                 // Break promptly when the consumer phase is signalled, rather than only
                 // noticing after the recv timeout. `biased` so shutdown wins over a vote arriving.
@@ -1219,7 +1256,7 @@ where
     /// Wait for the engine to execute the epoch-closing boundary output.
     ///
     /// Sends the boundary output to the engine, then subscribes to the `executed_anchor` watch and
-    /// waits until `anchor.number >= boundary_output.number` — a monotonic, drop-free completion
+    /// waits until `anchor.number >= boundary_output.number` - a monotonic, drop-free completion
     /// signal, immune to which block ends up the canonical tip (e.g. a drained parked batch, whose
     /// block anchors to a previous output). `target_hash` is used only for diagnostics, not
     /// matching. Consensus shutdown must already be complete before calling this.
@@ -1266,7 +1303,7 @@ where
                 gas_accumulator.clear();
                 return Ok(());
             }
-            // Wait for the next anchor advance. An error means the sender was dropped — the engine
+            // Wait for the next anchor advance. An error means the sender was dropped - the engine
             // task is gone, so execution can never complete.
             if anchor_rx.changed().await.is_err() {
                 error!(

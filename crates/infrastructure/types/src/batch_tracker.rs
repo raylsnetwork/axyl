@@ -10,7 +10,7 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
     time::Instant,
 };
-use tracing::{trace, warn};
+use tracing::{info, trace, warn};
 
 /// Lifecycle stages a batch passes through.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -40,6 +40,16 @@ pub enum BatchStage {
     Deduped = 1 << 10,
     /// Batch parked awaiting predecessor (may drain later).
     Parked = 1 << 11,
+    /// Seal failed after the batch was built (quorum or report); the builder retries the seq.
+    SealFailed = 1 << 12,
+    /// Parked batch discarded at the epoch boundary instead of force executed; its txs stay
+    /// pooled.
+    DiscardedAtBoundary = 1 << 13,
+    /// Proposer requeued the digest for re-proposal (GC eviction or a missed commit window).
+    RequeuedInProposer = 1 << 14,
+    /// Parked batch force-drained by the epoch-boundary reset (pre OutputSeqNormalization only;
+    /// the fork discards instead).
+    ForceDrained = 1 << 15,
 }
 
 impl fmt::Display for BatchStage {
@@ -57,6 +67,49 @@ impl fmt::Display for BatchStage {
             Self::Executed => "Executed",
             Self::Deduped => "Deduped",
             Self::Parked => "Parked",
+            Self::SealFailed => "SealFailed",
+            Self::DiscardedAtBoundary => "DiscardedAtBoundary",
+            Self::RequeuedInProposer => "RequeuedInProposer",
+            Self::ForceDrained => "ForceDrained",
+        })
+    }
+}
+
+/// Why a seal failed after the batch was built.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SealFailureReason {
+    /// The availability quorum was not reached (rejected, anti-quorum, timeout, or network).
+    Quorum,
+    /// The quorum-wait task ended without a result (typically aborted by the epoch teardown).
+    QuorumJoin,
+    /// The primary never acknowledged the batch report, so the digest never reached the proposer.
+    ReportUnacknowledged,
+}
+
+/// Why the proposer requeued a header's digests for re-proposal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RequeueReason {
+    /// GC evicted the proposed header past the committed-round horizon.
+    GcEvict,
+    /// The header missed its commit window while a later round committed.
+    CommitLag,
+}
+
+impl fmt::Display for RequeueReason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::GcEvict => "gc_evict",
+            Self::CommitLag => "commit_lag",
+        })
+    }
+}
+
+impl fmt::Display for SealFailureReason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Quorum => "quorum",
+            Self::QuorumJoin => "quorum_join",
+            Self::ReportUnacknowledged => "report_unacknowledged",
         })
     }
 }
@@ -82,10 +135,15 @@ impl fmt::Display for TxDropReason {
 /// Categorized transaction validation failures for a batch.
 #[derive(Debug)]
 pub struct TxValidationReport {
+    /// Digest of the batch the counts belong to.
     pub digest: crate::BlockHash,
+    /// Txs dropped because their nonce was above the sender's state nonce.
     pub nonce_too_high: u32,
+    /// Txs dropped because their nonce was below the sender's state nonce.
     pub nonce_too_low: u32,
+    /// Txs dropped for any other validation failure.
     pub other: u32,
+    /// Per-sender nonce range carried by the batch.
     pub sender_nonce_ranges: SenderNonceRanges,
     /// Per-tx diagnostic info: (tx_hash, sender, tx_nonce, state_nonce).
     pub nonce_too_high_details: Vec<(crate::BlockHash, crate::Address, u64, u64)>,
@@ -126,7 +184,7 @@ impl BatchEntry {
     }
 
     fn stages_str(&self) -> String {
-        const ALL: [BatchStage; 12] = [
+        const ALL: [BatchStage; 16] = [
             BatchStage::Sealed,
             BatchStage::QuorumReached,
             BatchStage::ReportedToPrimary,
@@ -139,6 +197,10 @@ impl BatchEntry {
             BatchStage::Executed,
             BatchStage::Deduped,
             BatchStage::Parked,
+            BatchStage::SealFailed,
+            BatchStage::DiscardedAtBoundary,
+            BatchStage::RequeuedInProposer,
+            BatchStage::ForceDrained,
         ];
         ALL.iter().filter(|s| self.has(**s)).map(|s| s.to_string()).collect::<Vec<_>>().join(",")
     }
@@ -150,10 +212,12 @@ struct OutputEntry {
 }
 
 /// Always-on batch lifecycle tracker shared via `ConsensusBus`.
+///
+/// The CL reports seal, quorum, proposer and commit events; the EL reports execution, dedup, park
+/// and discard events; `check_gaps` is the periodic stuck-batch sweep over both.
 pub struct BatchTracker {
     batches: DashMap<crate::BlockHash, BatchEntry>,
     outputs: DashMap<u64, OutputEntry>,
-    // counters
     total_tracked: AtomicU64,
     total_dropped_proposer: AtomicU64,
     total_txs_dropped: AtomicU64,
@@ -178,7 +242,7 @@ impl Default for BatchTracker {
 }
 
 impl BatchTracker {
-    /// Create a new tracker.
+    /// Creates an empty tracker.
     pub fn new() -> Self {
         Self {
             batches: DashMap::new(),
@@ -191,8 +255,6 @@ impl BatchTracker {
             total_other_invalid: AtomicU64::new(0),
         }
     }
-
-    // ── CL tracking calls ──
 
     /// Worker sealed a batch.
     pub fn batch_sealed(
@@ -219,10 +281,17 @@ impl BatchTracker {
                 ?sender,
                 nonce_min = range.min,
                 nonce_max = range.max,
-                nonce_span = range.max - range.min + 1,
+                nonce_span = range.span(),
                 "batch_sealed_sender_range"
             );
         }
+    }
+
+    /// Seal failed after the batch was built; the builder will retry the same seq.
+    pub fn batch_seal_failed(&self, digest: crate::BlockHash, reason: SealFailureReason) {
+        let mut entry = self.batches.entry(digest).or_default();
+        entry.mark(BatchStage::SealFailed);
+        warn!(target: "batch_tracker", ?digest, %reason, "batch_seal_failed");
     }
 
     /// Batch reached quorum.
@@ -237,6 +306,18 @@ impl BatchTracker {
         let mut entry = self.batches.entry(digest).or_default();
         entry.mark(BatchStage::ReportedToPrimary);
         trace!(target: "batch_tracker", ?digest, "batch_reported_to_primary");
+    }
+
+    /// Proposer requeued a header's digests for re-proposal.
+    pub fn digests_requeued_in_proposer(
+        &self,
+        digests: impl IntoIterator<Item = crate::BlockHash>,
+        reason: RequeueReason,
+    ) {
+        for digest in digests {
+            self.batches.entry(digest).or_default().mark(BatchStage::RequeuedInProposer);
+            trace!(target: "batch_tracker", ?digest, %reason, "digest_requeued_in_proposer");
+        }
     }
 
     /// Proposer received a digest.
@@ -284,8 +365,6 @@ impl BatchTracker {
         trace!(target: "batch_tracker", output_number, batch_count = digests.len(), "output_broadcast");
     }
 
-    // ── EL tracking calls ──
-
     /// Processor received an output (after dedup).
     pub fn output_received(&self, output_number: u64) {
         trace!(target: "batch_tracker", output_number, "output_received");
@@ -312,6 +391,16 @@ impl BatchTracker {
         trace!(target: "batch_tracker", ?digest, block_number, "batch_executed");
     }
 
+    /// EL block number the batch executed in, if any.
+    pub fn batch_executed_block(&self, digest: crate::BlockHash) -> Option<u64> {
+        self.batches.get(&digest).and_then(|entry| entry.block_number)
+    }
+
+    /// Returns whether the batch has passed through `stage`.
+    pub fn batch_reached(&self, digest: crate::BlockHash, stage: BatchStage) -> bool {
+        self.batches.get(&digest).is_some_and(|entry| entry.has(stage))
+    }
+
     /// Batch skipped by the dedup guard (already executed via a different output).
     pub fn batch_deduped(&self, digest: crate::BlockHash) {
         let mut entry = self.batches.entry(digest).or_default();
@@ -324,6 +413,23 @@ impl BatchTracker {
         let mut entry = self.batches.entry(digest).or_default();
         entry.mark(BatchStage::Parked);
         trace!(target: "batch_tracker", ?digest, "batch_parked");
+    }
+
+    /// Parked batch force-drained by the epoch-boundary reset: its predecessor seq never executed
+    /// in the batch's created epoch, so it executes out of order at the boundary. Pre
+    /// OutputSeqNormalization only; the fork discards instead.
+    pub fn batch_force_drained(&self, digest: crate::BlockHash, seq: u64) {
+        let mut entry = self.batches.entry(digest).or_default();
+        entry.mark(BatchStage::ForceDrained);
+        warn!(target: "batch_tracker", ?digest, seq, "batch_force_drained");
+    }
+
+    /// Parked batch discarded whole at the epoch boundary instead of force executed out of
+    /// order; its txs stay pooled and are re-sealed in the new epoch.
+    pub fn batch_discarded_at_boundary(&self, digest: crate::BlockHash, seq: u64) {
+        let mut entry = self.batches.entry(digest).or_default();
+        entry.mark(BatchStage::DiscardedAtBoundary);
+        info!(target: "batch_tracker", ?digest, seq, "batch_discarded_at_boundary");
     }
 
     /// Output fully executed (all its batches).
@@ -371,22 +477,28 @@ impl BatchTracker {
                     ?sender,
                     nonce_min = range.min,
                     nonce_max = range.max,
-                    nonce_span = range.max - range.min + 1,
+                    nonce_span = range.span(),
                     "nonce_range_for_sender"
                 );
             }
-            // log each nonce-too-high tx for full traceability
-            for (tx_hash, sender, tx_nonce, state_nonce) in &report.nonce_too_high_details {
-                warn!(
-                    target: "batch_tracker",
-                    digest = ?report.digest,
-                    ?tx_hash,
-                    ?sender,
-                    tx_nonce,
-                    state_nonce,
-                    nonce_gap = tx_nonce.saturating_sub(*state_nonce),
-                    "nonce_too_high_detail"
-                );
+
+            const NONCE_TOO_HIGH_DETAILS_THROTTLE: usize = 500;
+            // log some nonce-too-high txs to prevent logging storm.
+            for (i, (tx_hash, sender, tx_nonce, state_nonce)) in
+                report.nonce_too_high_details.iter().enumerate()
+            {
+                if i % NONCE_TOO_HIGH_DETAILS_THROTTLE == 0 {
+                    warn!(
+                        target: "batch_tracker",
+                        digest = ?report.digest,
+                        ?tx_hash,
+                        ?sender,
+                        tx_nonce,
+                        state_nonce,
+                        nonce_gap = tx_nonce.saturating_sub(*state_nonce),
+                        "nonce_too_high_detail"
+                    );
+                }
             }
         } else if report.other > 0 {
             trace!(
@@ -400,13 +512,10 @@ impl BatchTracker {
         }
     }
 
-    // ── Periodic reporting ──
-
-    /// Check for batches stuck at intermediate stages and log gaps.
+    /// Logs batches stuck at an intermediate stage and evicts stale entries.
     ///
-    /// Call periodically (e.g. every 30s or on each new block notification).
-    /// Combines stuck-batch detection and cleanup in a single `retain` pass
-    /// to avoid multiple O(n) iterations over the DashMap.
+    /// Call periodically. Detection and cleanup share one `retain` pass so the map is walked
+    /// once.
     pub fn check_gaps(&self) {
         let now = Instant::now();
         let stale_threshold = std::time::Duration::from_secs(60);
@@ -422,7 +531,9 @@ impl BatchTracker {
             if age >= stale_threshold {
                 let has_sealed = entry.has(BatchStage::Sealed);
                 let is_terminal = entry.has(BatchStage::Executed)
+                    || entry.has(BatchStage::DiscardedAtBoundary)
                     || entry.has(BatchStage::DroppedFromProposer)
+                    || entry.has(BatchStage::SealFailed)
                     || entry.has(BatchStage::Deduped);
                 if has_sealed && !is_terminal {
                     stuck_count += 1;
@@ -440,7 +551,6 @@ impl BatchTracker {
             true // keep
         });
 
-        // Always log periodic summary at info level so it's visible
         let total_tracked = self.total_tracked.load(Ordering::Relaxed);
         let total_dropped = self.total_dropped_proposer.load(Ordering::Relaxed);
         let total_txs_dropped = self.total_txs_dropped.load(Ordering::Relaxed);
@@ -474,7 +584,7 @@ impl BatchTracker {
         self.check_output_gaps();
     }
 
-    /// Detect gaps in output numbers.
+    /// Warns on gaps between tracked output numbers.
     fn check_output_gaps(&self) {
         let mut numbers: Vec<u64> = self.outputs.iter().map(|e| *e.key()).collect();
         if numbers.len() < 2 {
@@ -495,7 +605,7 @@ impl BatchTracker {
         }
     }
 
-    /// Log a summary of current tracking state.
+    /// Logs a summary of the current tracking state.
     pub fn summary(&self) {
         trace!(
             target: "batch_tracker",

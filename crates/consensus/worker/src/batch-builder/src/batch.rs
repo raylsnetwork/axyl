@@ -13,28 +13,43 @@ use rayls_infrastructure_types::{
 };
 use tracing::debug;
 
-/// The output from building the next block.
+/// The transactions selected into a sealed batch, to be marked in flight on quorum.
 ///
-/// Contains information needed to update the transaction pool.
+/// `#[must_use]` so a build's selection cannot be silently dropped: the caller either marks it in
+/// flight on quorum or explicitly discards it.
+#[must_use = "mark the selection in flight on quorum, or explicitly drop it"]
 #[derive(Debug)]
-pub struct BatchBuilderOutput {
-    /// The batch info for the worker to propose.
-    pub(crate) batch: Batch,
-    /// The transaction hashes mined in this worker's batch.
-    ///
-    /// NOTE: canonical changes update `ChangedAccount` and changed senders.
-    /// Only the mined transactions are removed from the pool. Account nonce and state
-    /// should only be updated on canonical changes so workers can validate
-    /// each other's blocks off the canonical tip.
-    ///
-    /// This is less efficient when accounts have lots of transactions in the pending
-    /// pool, but this approach is easier to implement in the short term.
-    pub(crate) mined_transactions: Vec<TxHash>,
-    /// Per-sender nonce ranges for all transactions in this batch.
-    pub sender_nonce_ranges: SenderNonceRanges,
+pub struct SelectedForSeal(Vec<TxHash>);
+
+impl SelectedForSeal {
+    /// Returns whether the batch selected no transactions.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// Consumes the selection into the hashes to mark in flight.
+    pub(crate) fn into_marks(self) -> Vec<TxHash> {
+        self.0
+    }
 }
 
-/// Construct an Rayls batch using the best transactions from the pool.
+/// The output from building the next batch.
+#[derive(Debug)]
+pub struct BatchBuilderOutput {
+    /// The batch for the worker to propose.
+    pub(crate) batch: Batch,
+    /// The transactions sealed into the batch, to mark in flight on quorum.
+    ///
+    /// The pool itself is left untouched: account nonce and state move only on canonical changes,
+    /// so workers validate each other's batches off the same canonical tip.
+    pub(crate) selected: SelectedForSeal,
+    /// Per-sender nonce ranges for all transactions in this batch.
+    pub sender_nonce_ranges: SenderNonceRanges,
+    /// Whether the batch filled to capacity (gas or bytes), so more candidates certainly remain.
+    pub(crate) at_capacity: bool,
+}
+
+/// Construct a Rayls batch using the best transactions from the pool.
 ///
 /// Returns the [`BatchBuilderOutput`] and cannot fail. The batch continues to add
 /// transactions to the proposed block until either:
@@ -63,32 +78,41 @@ pub fn build_batch<P: TxPool>(
     // Disable live transaction updates to prevent intra-sender nonce gaps.
     // The default BestTransactions iterator receives new pending transactions via a
     // broadcast channel during iteration. If a transaction arrives whose predecessor
-    // is not in the snapshot, it starts a new independent nonce chain — producing
+    // is not in the snapshot, it starts a new independent nonce chain, producing
     // batches with non-contiguous nonces that cause nonce_too_high at execution.
     best_txs.no_updates();
 
     // NOTE: batches always build off the latest finalized block
 
-    // collect data for successful transactions
-    // let mut sum_blob_gas_used = 0;
+    // collect data for selected transactions
     let mut total_bytes_size = 0;
     let mut total_possible_gas = 0;
+    let mut at_capacity = false;
     let mut transactions = Vec::new();
     let mut mined_transactions = Vec::new();
     let mut blob_transactions = Vec::new();
     let mut sender_nonce_ranges = SenderNonceRanges::new();
 
-    // begin loop through sorted "best" transactions in pending pool
-    // and execute them to build the block
+    // walk the sorted "best" transactions in the pending pool; they are selected, not executed
     while let Some(pool_tx) = best_txs.next() {
+        // skip a transaction already sealed into a batch still in flight, so a stuck inclusion
+        // backlog is not re-sealed batch after batch. The skip cannot open a nonce gap: an
+        // in-flight tx stays pending, so its descendants still trail it here, and same-authority
+        // batches execute in seq order, so the in-flight prefix and this batch stay
+        // nonce-contiguous at execution.
+        if pool.is_in_flight(pool_tx.hash()) {
+            continue;
+        }
+
         // ensure block has capacity (in gas) for this transaction
         if total_possible_gas + pool_tx.gas_limit() > gas_limit {
-            // the tx could exceed max gas limit for the block
-            // marking as invalid within the context of the `BestTransactions` pulled in this
-            // current iteration  all dependents for this transaction are now considered invalid
-            // before continuing loop
+            // the tx would exceed the batch's gas cap: it and all its dependents are invalid for
+            // the rest of this `BestTransactions` iteration
             best_txs.exceeds_gas_limit(&pool_tx, gas_limit);
             debug!(target: "worker::batch_builder", ?pool_tx, "marking tx invalid due to gas constraint");
+            // Only a non-empty batch is "at capacity": a tx whose own gas exceeds the whole cap can
+            // never fit any batch, so treating it as backlog would spin the builder on it forever.
+            at_capacity |= total_possible_gas > 0;
             continue;
         }
 
@@ -107,12 +131,12 @@ pub fn build_batch<P: TxPool>(
 
         // ensure block has capacity (in bytes) for this transaction
         if total_bytes_size + tx.size() > max_size {
-            // the tx could exceed max gas limit for the block
-            // marking as invalid within the context of the `BestTransactions` pulled in this
-            // current iteration  all dependents for this transaction are now considered invalid
-            // before continuing loop
+            // the tx would exceed the batch's byte cap: as with the gas branch, it and its
+            // dependents are invalid for the rest of this iteration
             best_txs.max_batch_size(&pool_tx, tx.size(), max_size);
             debug!(target: "worker::batch_builder", ?pool_tx, "marking tx invalid due to bytes constraint");
+            // As with the gas branch: a tx larger than the whole batch is unbatchable, not backlog.
+            at_capacity |= total_bytes_size > 0;
             continue;
         }
 
@@ -131,9 +155,9 @@ pub fn build_batch<P: TxPool>(
             })
             .or_insert(NonceRange { min: nonce, max: nonce });
 
-        // append transaction to the list of executed transactions
+        // append transaction to the batch
         mined_transactions.push(*pool_tx.hash());
-        transactions.push(tx.into_inner().encoded_2718());
+        transactions.push(tx.into_inner().encoded_2718().into());
     }
 
     // batch
@@ -151,5 +175,10 @@ pub fn build_batch<P: TxPool>(
     pool.remove_eip4844_txs(blob_transactions);
 
     // return output
-    BatchBuilderOutput { batch, mined_transactions, sender_nonce_ranges }
+    BatchBuilderOutput {
+        batch,
+        selected: SelectedForSeal(mined_transactions),
+        sender_nonce_ranges,
+        at_capacity,
+    }
 }

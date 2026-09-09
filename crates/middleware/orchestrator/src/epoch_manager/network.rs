@@ -48,10 +48,10 @@ pub(crate) fn decide_node_mode(
             NodeMode::CvvInactive => (NodeMode::CvvInactive, "prior-mode-inactive"),
             // Promote a dynamic observer just admitted to the committee, instead of leaving it
             // Observer forever. Reaching here means in_committee, !observer_flag, !initial_epoch,
-            // prior==Observer — the only path is "was not-in-committee last epoch, just staked in."
+            // prior==Observer - the only path is "was not-in-committee last epoch, just staked in."
             // Join as CvvInactive to catch up on the boundary without proposing/voting; the bridge
             // subscriber requests CvvActive once synced. (Staying Observer would leave a silent
-            // committee member — counted toward quorum but never certifying — stalling consensus.)
+            // committee member - counted toward quorum but never certifying - stalling consensus.)
             NodeMode::Observer => (NodeMode::CvvInactive, "joined-committee"),
         };
     }
@@ -60,6 +60,20 @@ pub(crate) fn decide_node_mode(
     } else {
         (NodeMode::CvvActive, "fresh-genesis")
     }
+}
+
+/// Returns whether the mode write must be skipped because the node is an explicitly-configured
+/// observer being promoted away from Observer.
+///
+/// Stickiness is an operator contract (`--observer`), not a property of the current mode: a
+/// staked node that merely booted into Observer (e.g. while catching up) must stay promotable,
+/// or it can never rejoin the committee.
+pub(crate) fn is_observer_sticky(
+    observer_flag: bool,
+    prior_mode: NodeMode,
+    target_mode: NodeMode,
+) -> bool {
+    observer_flag && prior_mode == NodeMode::Observer && target_mode != NodeMode::Observer
 }
 
 /// Returns whether the node has executed any consensus output in the chain's history.
@@ -206,10 +220,10 @@ where
         let explicit_target = *self.consensus_bus.mode_transition().borrow();
 
         // Single-validator dev chain: the sole member is always the canonical source
-        // of truth — it can never be "behind" with no peers to catch up from.
+        // of truth - it can never be "behind" with no peers to catch up from.
         // Resolve CvvActive directly without going through decide_node_mode, which
         // would otherwise apply the has-local-history -> CvvInactive branch and hang.
-        // An explicitly-configured observer is still honored (Observer is sticky) —
+        // An explicitly-configured observer is still honored (Observer is sticky)  -
         // decide_node_mode handles that below.
         #[cfg(feature = "dev-single-node-setup")]
         if in_committee && consensus_config.committee().size() == 1 && !observer_flag {
@@ -220,7 +234,7 @@ where
                 authority_id = ?consensus_config.authority_id(),
                 ?mode,
                 reason,
-                "identify_node_mode: sole committee member (dev) — boot active"
+                "identify_node_mode: sole committee member (dev) - boot active"
             );
             self.consensus_bus.node_mode().send_modify(|v| *v = mode);
             return Ok(mode);

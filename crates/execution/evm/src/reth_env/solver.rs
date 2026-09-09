@@ -25,18 +25,15 @@ use tracing::{debug, warn};
 pub type CanonicalRootOracle = Box<dyn Fn(u64) -> Option<B256> + Send + Sync>;
 
 impl RethEnv {
-    /// Return the sorted base ancestor overlay (the non-persisted window),
-    /// memoized by `(last_persisted, canonical_head)`. Mirrors
-    /// [`Self::cached_ancestor_trie_input`] over sorted types:
-    ///
-    /// 1. Exact hit: clone the two cached `Arc`s.
-    /// 2. Incremental extend: merge the newly-canonical blocks' deltas with `extend_ref_and_sort`
-    ///    (a linear merge) instead of re-sorting the window.
-    /// 3. Full recompute: sort the base overlay once when `last_persisted` changed.
+    /// Return the sorted base ancestor overlay (the non-persisted window), memoized by
+    /// `(last_persisted, canonical_head)`. Mirrors [`Self::cached_ancestor_trie_input`] over
+    /// sorted types in three tiers: (1) an exact hit clones the two cached `Arc`s; (2) a head
+    /// advance merges the newly-canonical blocks' deltas with `extend_ref_and_sort` (a linear
+    /// merge) instead of re-sorting the window; (3) a `last_persisted` change sorts the base
+    /// overlay once.
     ///
     /// Lock ordering: `persistence_state` is read before the sorted-cache lock, and
-    /// `cached_ancestor_trie_input` runs only on the recompute path with the lock
-    /// released.
+    /// `cached_ancestor_trie_input` runs only on the recompute path with the lock released.
     pub(super) fn cached_sorted_ancestor_input(
         &self,
     ) -> (Arc<HashedPostStateSorted>, Arc<TrieUpdatesSorted>) {
@@ -182,7 +179,7 @@ mod tests {
     use rayls_infrastructure_config::NodeInfo;
     use rayls_infrastructure_types::{
         generate_proof_of_possession_bls, payload::RLPayload, Address, BlsKeypair, BlsSignature,
-        Certificate, CommittedSubDag, ConsensusHeader, ConsensusOutput, GenesisAccount,
+        Bytes, Certificate, CommittedSubDag, ConsensusHeader, ConsensusOutput, GenesisAccount,
         NodeP2pInfo, ReputationScores, SealedHeader, SignatureVerificationState, TaskManager, B256,
         U256,
     };
@@ -226,7 +223,7 @@ mod tests {
     fn execute_and_advance_head(
         reth_env: &RethEnv,
         payload: RLPayload,
-        transactions: Vec<Vec<u8>>,
+        transactions: Vec<Bytes>,
     ) -> eyre::Result<ExecutedBlock> {
         let (block, _counts) =
             reth_env.build_block_from_batch_payload(payload, &transactions, &[])?;
