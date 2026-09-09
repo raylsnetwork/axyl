@@ -783,9 +783,9 @@ fn log_persist_latency(elapsed: Duration, depth: usize) {
 }
 
 /// Runs one eviction pass and logs its outcome at `info`: the cache size before and after and
-/// the number of rows evicted, plus the open write transactions observed at that moment.
-/// Eviction only runs once no producer txn is open, so `open_txns` is normally 0 except at a
-/// `CaughtUp` barrier.
+/// the number of rows evicted, plus whether a write transaction was open at that moment.
+/// Eviction runs only when the writer owns no write txn: while a txn is open, its producer holds
+/// the mem write lock, so the writer must not try to take that lock from the background thread.
 fn evict_and_log(
     mem_db: &MemDatabase,
     heap: &mut EvictionHeap,
