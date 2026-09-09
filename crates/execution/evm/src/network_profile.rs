@@ -174,6 +174,9 @@ pub fn active_profile() -> Option<&'static NetworkProfile> {
 }
 
 #[cfg(test)]
+const EXAMPLE_CLIENT1_YAML: &str = include_str!("testdata/client1.yaml");
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -261,9 +264,7 @@ hardforks:
 
     #[test]
     fn example_client1_yaml_parses() {
-        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../../examples/client1.yaml");
-        let text = std::fs::read_to_string(path).expect("examples/client1.yaml is committed");
-        let file: NetworkConfigFile = serde_yaml::from_str(&text).unwrap();
+        let file: NetworkConfigFile = serde_yaml::from_str(EXAMPLE_CLIENT1_YAML).unwrap();
         assert_eq!(file.networks.len(), 2);
 
         let mainnet = file.subnet("mainnet").unwrap();
