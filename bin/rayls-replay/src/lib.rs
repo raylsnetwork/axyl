@@ -76,7 +76,7 @@ impl Default for ReplayConfig {
 /// schedules match. Run this once before `run_replay`.
 ///
 /// Both `RethEnv` instances MUST be initialized with the same `RaylsChainSpec`
-/// (same `--chain` flag, same hardfork activation blocks, same per-fork pinned
+/// (same hardfork activation blocks, same per-fork pinned
 /// bytecode subdirectories). If they disagree on genesis state, block 1's
 /// execution diverges immediately; the explicit check here surfaces the cause
 /// up front rather than at the first state-root mismatch deep in replay.

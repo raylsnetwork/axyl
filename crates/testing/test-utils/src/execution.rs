@@ -21,7 +21,6 @@ pub type TestExecutionNode = ExecutionNode;
 /// Convenience function for creating engine node using tempdir and optional args.
 /// Defaults if params not provided:
 /// - opt_authority_identifier: `AuthorityIdentifier(1)`
-/// - opt_chain: `testnet`
 /// - opt_address: `0x1111111111111111111111111111111111111111`
 pub async fn default_test_execution_node(
     opt_chain: Option<Arc<RethChainSpec>>,
@@ -121,7 +120,6 @@ pub fn execution_builder_no_args(
 /// Convenience function for creating engine node using tempdir and optional args.
 /// Defaults if params not provided:
 /// - opt_authority_identifier: `AuthorityIdentifier(1)`
-/// - opt_chain: `testnet`
 /// - opt_address: `0x1111111111111111111111111111111111111111`
 // #[cfg(feature = "faucet")]
 pub async fn faucet_test_execution_node(
