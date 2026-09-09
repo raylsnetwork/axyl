@@ -268,7 +268,7 @@ jobs:
         if: steps.changes.outputs.contracts == 'true'
         uses: foundry-rs/foundry-toolchain@b00af27efadbc7b4ca8b82abbd903b17cc874d2a # v1.9.0
         with:
-          version: stable
+          version: v1.7.1
 
       - name: Run forge tests
         id: forge
