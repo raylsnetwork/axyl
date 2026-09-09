@@ -1661,12 +1661,3 @@ async fn test_fix_genesis_account_history_seeds_after_clear_and_skips_multishard
 
     Ok(())
 }
-
-// The active profile's hardfork schedule (installed at node start from
-// `--config-file` / `--subnet`) wins over the baked-in schedule in the chain
-// spec `RethEnv::new` builds.
-//
-// The active-profile test has been moved to `e2e-tests/tests/it/active_profile.rs`
-// to avoid process-wide `OnceLock` contamination across test binaries.
-// The active-profile test has been moved to `e2e-tests/tests/it/active_profile.rs`
-// to avoid process-wide `OnceLock` contamination across test binaries.

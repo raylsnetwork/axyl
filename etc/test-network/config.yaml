@@ -10,7 +10,7 @@
 #
 # Fork values are activation block numbers, or `never`. The value
 # `18446744073709551615` (u64::MAX) is the baked-in "not scheduled yet" block
-# for DynamicCommitteeSizing on devnet/testnet/mainnet and is intentionally
+# for DynamicCommitteeSizing on devnet/mainnet and is intentionally
 # NOT `never` — keep it a number to stay 1:1 with the baked schedule.
 
 networks:
@@ -44,7 +44,7 @@ networks:
       TransactionLoadBalancing: 4386290
       UsdrSupplyCorrection: never
       EmptyOutputBlock: 6663630
-      DynamicCommitteeSizing: 18446744073709551615
+      DynamicCommitteeSizing: 10934554
       HybridRewards: never
   mainnet:
     chain_id: 72957

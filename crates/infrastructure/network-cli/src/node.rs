@@ -428,24 +428,24 @@ mod tests {
 
     // Mainnet chain-id; must be one of `PROD_CHAIN_IDS`.
     const MAINNET_CHAIN_ID: u64 = 72957;
-    // Local (dev) chain-id; not a production chain-id.
-    const DEV_CHAIN_ID: u64 = 487;
+    // Local chain-id; not a production chain-id.
+    const LOCAL_CHAIN_ID: u64 = 487;
 
     #[test]
     fn single_validator_allowed() {
         // A dev build is single-node: a 1-of-1 committee is the expected case,
         // with or without the --dev auto-bootstrap flag.
-        assert!(check_dev_mode(true, 1, DEV_CHAIN_ID).is_ok());
-        assert!(check_dev_mode(false, 1, DEV_CHAIN_ID).is_ok());
+        assert!(check_dev_mode(true, 1, LOCAL_CHAIN_ID).is_ok());
+        assert!(check_dev_mode(false, 1, LOCAL_CHAIN_ID).is_ok());
     }
 
     #[test]
     fn multi_validator_rejected() {
         // Single-node only: a dev build refuses a multi-validator committee,
         // regardless of the --dev flag.
-        let err = check_dev_mode(true, 4, DEV_CHAIN_ID).unwrap_err();
+        let err = check_dev_mode(true, 4, LOCAL_CHAIN_ID).unwrap_err();
         assert!(err.to_string().contains("single-node only"), "{err}");
-        let err = check_dev_mode(false, 4, DEV_CHAIN_ID).unwrap_err();
+        let err = check_dev_mode(false, 4, LOCAL_CHAIN_ID).unwrap_err();
         assert!(err.to_string().contains("single-node only"), "{err}");
     }
 
@@ -457,7 +457,7 @@ mod tests {
 
     #[test]
     fn dev_allows_non_production_chain_id() {
-        assert!(check_dev_mode(true, 1, DEV_CHAIN_ID).is_ok());
+        assert!(check_dev_mode(true, 1, LOCAL_CHAIN_ID).is_ok());
     }
 
     #[test]
@@ -465,8 +465,8 @@ mod tests {
         // A missing/default committee deserializes to size 0; the single-node gate
         // targets `> 1`, so it must not fire here — the real "no committee" error
         // surfaces later when consensus loads it.
-        assert!(check_dev_mode(false, 0, DEV_CHAIN_ID).is_ok());
-        assert!(check_dev_mode(true, 0, DEV_CHAIN_ID).is_ok());
+        assert!(check_dev_mode(false, 0, LOCAL_CHAIN_ID).is_ok());
+        assert!(check_dev_mode(true, 0, LOCAL_CHAIN_ID).is_ok());
     }
 }
 
