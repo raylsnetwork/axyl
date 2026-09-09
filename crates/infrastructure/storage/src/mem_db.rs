@@ -487,7 +487,7 @@ impl MemDatabase {
     /// producers never touch it. Every pop removes one entry, so the loop always terminates.
     ///
     /// Fast path: rows are pushed to the heap exactly when their in-flight count settles to zero
-    /// and entries leave it only through this pass's pops, so `heap.len()` is a lower bound on
+    /// and entries leave it only through this pass's pops, so `heap.len()` is a upper bound on
     /// the settled (evictable) rows. When it is below `max_size / 2` the pass could evict at most
     /// that many rows, so the exclusive store lock is skipped entirely: the writer runs a pass
     /// after every applied op and the heap grows by one per settled op, so any skipped eviction
@@ -498,8 +498,8 @@ impl MemDatabase {
         if heap.len() < max_size >> 1 {
             return EvictionStats::default();
         }
-        let mut store = self.store.write();
         let start = Instant::now();
+        let mut store = self.store.write();
         let mut total: usize = store.values().map(|table| table.rows.len()).sum();
         if total <= max_size {
             return EvictionStats {
