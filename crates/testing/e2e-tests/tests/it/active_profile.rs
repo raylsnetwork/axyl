@@ -7,8 +7,9 @@
 //! test binaries.
 
 use rayls_execution_evm::{
-    network_profile::{set_active_profile, NetworkProfile}, reth_env::RethEnv, RaylsHardFork,
-    RaylsHardforks,
+    network_profile::{set_active_profile, NetworkProfile},
+    reth_env::RethEnv,
+    RaylsHardFork, RaylsHardforks,
 };
 use rayls_infrastructure_types::TaskManager;
 
@@ -36,6 +37,9 @@ hardforks:
         rayls_execution_evm::ForkCondition::Block(777777)
     );
     // A fork absent from the file's schedule stays `Never`.
-    assert_eq!(spec.rayls_fork_activation(RaylsHardFork::Eip1559), rayls_execution_evm::ForkCondition::Never);
+    assert_eq!(
+        spec.rayls_fork_activation(RaylsHardFork::Eip1559),
+        rayls_execution_evm::ForkCondition::Never
+    );
     Ok(())
 }

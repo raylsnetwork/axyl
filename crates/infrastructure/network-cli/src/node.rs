@@ -167,7 +167,13 @@ pub struct NodeCommand<Ext: clap::Args + fmt::Debug = NoArgs> {
     /// Selects which baked-in hardfork schedule to use (devnet, testnet, mainnet).
     /// When set, overrides the `network` field in parameters.yaml without requiring
     /// a re-genesis. Useful for activating hardforks on existing networks.
-    #[arg(long, value_name = "RAYLS_NETWORK", global = true, env = "RAYLS_NETWORK", conflicts_with = "config_file")]
+    #[arg(
+        long,
+        value_name = "RAYLS_NETWORK",
+        global = true,
+        env = "RAYLS_NETWORK",
+        conflicts_with = "config_file"
+    )]
     pub network: Option<RaylsNetwork>,
 
     /// The client's network config file (YAML).

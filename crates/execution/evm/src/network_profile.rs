@@ -29,8 +29,6 @@ pub enum ForkActivation {
     Never,
 }
 
-
-
 impl Serialize for ForkActivation {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         match self {
