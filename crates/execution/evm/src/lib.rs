@@ -28,6 +28,7 @@ pub use reth_transaction_pool::{
     BestTransactions, EthPooledTransaction, PoolTransaction, TransactionPool as TransactionPoolT,
 };
 
+pub mod bypass_validator;
 pub mod chainspec;
 pub mod dirs;
 pub mod payload;

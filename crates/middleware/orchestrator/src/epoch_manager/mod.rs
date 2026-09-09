@@ -1,3 +1,4 @@
+mod batches;
 #[cfg(feature = "cold-storage")]
 mod cold_archive;
 mod consensus;
