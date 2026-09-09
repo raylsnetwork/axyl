@@ -14,5 +14,6 @@ mod faucet;
 mod genesis_tests;
 #[cfg(not(feature = "dev-single-node-setup"))]
 mod restarts;
+mod active_profile;
 
 fn main() {}

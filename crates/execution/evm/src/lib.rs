@@ -45,10 +45,11 @@ pub mod rpc_server_args;
 pub mod system_calls;
 pub mod worker;
 
-pub use chainspec::RaylsChainSpec;
+pub use chainspec::{RaylsChainSpec, RaylsHardFork, RaylsHardforks};
 pub use network_profile::{
     active_profile, set_active_profile, ForkActivation, NetworkConfigFile, NetworkProfile,
 };
+pub use reth_chainspec::ForkCondition;
 
 #[cfg(any(feature = "test-utils", test))]
 pub mod test_utils;

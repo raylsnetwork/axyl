@@ -3371,6 +3371,7 @@ dependencies = [
  "reth",
  "secp256k1 0.31.1",
  "serde_json",
+ "serde_yaml",
  "tempfile",
  "tokio",
  "tonic 0.13.1",
