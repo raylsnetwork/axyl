@@ -25,6 +25,65 @@ use std::sync::Arc;
 use tempfile::TempDir;
 use tracing::debug;
 
+/// A freshly created execution database uses the 16 KiB default page size, `--db.page-size` wins
+/// over it, and a database created with the previous 4 KiB default keeps its page size, geometry
+/// header and rows when reopened with the new default.
+#[test]
+fn test_execution_db_default_page_size() -> eyre::Result<()> {
+    use crate::reth_env::{init::DEFAULT_MDBX_PAGE_SIZE, RethCommand};
+    use clap::Parser as _;
+    use reth::{args::DatabaseArgs, builder::NodeConfig};
+    use reth_db::{
+        tables,
+        transaction::{DbTx as _, DbTxMut as _},
+        Database as _,
+    };
+
+    let page_size = |db: &RethDb| db.stat().expect("stat").page_size() as usize;
+    let geometry_lower = |db: &RethDb| db.info().expect("info").geometry().min();
+    let default_config = RethConfig(NodeConfig::default());
+
+    // fresh database
+    {
+        let tmp_dir = TempDir::new()?;
+        let db = RethEnv::new_database(&default_config, tmp_dir.path())?;
+        assert_eq!(page_size(&db), DEFAULT_MDBX_PAGE_SIZE);
+    }
+
+    // `--db.page-size`, parsed the way the node CLI does, overrides the default
+    {
+        let cmd = RethCommand::try_parse_from(["rayls", "--db.page-size", "8KB"])?;
+        assert_eq!(cmd.db.page_size, Some(8 * 1024));
+        let cli_config = RethConfig(NodeConfig { db: cmd.db, ..NodeConfig::default() });
+        let tmp_dir = TempDir::new()?;
+        let db = RethEnv::new_database(&cli_config, tmp_dir.path())?;
+        assert_eq!(page_size(&db), 8 * 1024);
+    }
+
+    // legacy 4 KiB database: page size and rows survive a reopen with the default config
+    const LEGACY_PAGE_SIZE: usize = 4096;
+    let legacy_dir = TempDir::new()?;
+    let legacy_config = RethConfig(NodeConfig {
+        db: DatabaseArgs { page_size: Some(LEGACY_PAGE_SIZE), ..Default::default() },
+        ..NodeConfig::default()
+    });
+    let legacy_geometry_lower = {
+        let db = RethEnv::new_database(&legacy_config, legacy_dir.path())?;
+        assert_eq!(page_size(&db), LEGACY_PAGE_SIZE);
+        let tx = db.tx_mut()?;
+        tx.put::<tables::CanonicalHeaders>(7, B256::repeat_byte(0xab))?;
+        tx.commit()?;
+        geometry_lower(&db)
+    };
+    let db = RethEnv::new_database(&default_config, legacy_dir.path())?;
+    assert_eq!(page_size(&db), LEGACY_PAGE_SIZE);
+    // the datafile's geometry header is left alone
+    assert_eq!(geometry_lower(&db), legacy_geometry_lower);
+    let tx = db.tx()?;
+    assert_eq!(tx.get::<tables::CanonicalHeaders>(7)?, Some(B256::repeat_byte(0xab)));
+    Ok(())
+}
+
 /// Helper function for creating a consensus output for tests.
 fn consensus_output_for_tests(round: u32, epoch: u32, subdag_index: u64) -> ConsensusOutput {
     let mut leader = Certificate::default();
