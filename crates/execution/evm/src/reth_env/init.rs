@@ -34,6 +34,13 @@ use std::{path::Path, sync::Arc};
 use tokio::sync::{oneshot, watch};
 use tracing::{debug, error, info, warn};
 
+/// Page size for newly created execution databases (16 KiB), used unless `--db.page-size` is
+/// given. Reth's own default follows the OS page size (4 KiB on x86_64 Linux).
+///
+/// libmdbx fixes the page size when a datafile is created, so existing databases keep the page
+/// size they were created with.
+pub(crate) const DEFAULT_MDBX_PAGE_SIZE: usize = 16 * 1024;
+
 impl RethEnv {
     /// Create a new Reth DB.
     /// Break this out so this can be created upfront and used even on a
@@ -43,8 +50,24 @@ impl RethEnv {
         db_path: P,
     ) -> eyre::Result<RethDb> {
         let db_path = db_path.as_ref();
-        info!(target: "rayls::reth", path = ?db_path, "opening database");
-        Ok(Arc::new(init_db(db_path, reth_config.0.db.database_args())?))
+        let mut db_args = reth_config.0.db;
+        // Only a new datafile takes the default page size. An existing datafile keeps its own
+        // page size regardless, but libmdbx derives the pre-open geometry from the configured
+        // one, so passing 16 KiB for a 4 KiB datafile would rewrite that file's geometry header.
+        // Leaving it unset keeps reth's pre-16 KiB behaviour for existing datafiles.
+        if db_args.page_size.is_none() && !db_path.join("mdbx.dat").exists() {
+            db_args.page_size = Some(DEFAULT_MDBX_PAGE_SIZE);
+        }
+        let db = init_db(db_path, db_args.database_args())?;
+        match db.stat() {
+            Ok(stat) => {
+                info!(target: "rayls::reth", path = ?db_path, page_size = stat.page_size(), "opened database")
+            }
+            Err(err) => {
+                warn!(target: "rayls::reth", path = ?db_path, %err, "opened database, but reading its stats failed")
+            }
+        }
+        Ok(Arc::new(db))
     }
 
     /// Produce a new wrapped Reth environment with the network-specific settings (basefee
