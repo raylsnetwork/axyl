@@ -10,11 +10,13 @@ use std::{
         // Disabled with the MDBX metrics thread (removed in #54, f243308):
         // mpsc::{self, SyncSender},
         Arc,
+        OnceLock,
         RwLock,
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
+use prometheus::{Histogram, IntCounter, IntGauge};
 use rayls_infrastructure_types::{
     decode, decode_key, encode, encode_key, DBIter, DBRawIter, Database, DbTx, DbTxMut, KeyT,
     Table, ValueT,
@@ -24,7 +26,82 @@ use reth_libmdbx::{
     HandleSlowReadersReturnCode, MaxReadTransactionDuration, Mode, PageSize, SyncMode, Transaction,
     TransactionKind, WriteFlags, RO, RW,
 };
-use tracing::debug;
+use tracing::{debug, warn};
+
+/// Reader-table telemetry for the consensus MDBX env — the signals that expose the "read
+/// starvation" failure mode: concurrent reader slots held vs the cap, how often a read is
+/// rejected for a full reader table (`ReadersFull`) or environment contention (`Busy`), and how
+/// long read transactions stay open against the `max_read_transaction_duration` safety limit.
+///
+/// Sampled on the read path (no background thread, matching the post-#54 design). Each accessor
+/// registers once via [`crate::layered_db::register_metric_or_unscraped`], which falls back to a
+/// private unscraped registry when a second stack in one process (tests) collides on the name.
+fn readers_active_gauge() -> &'static IntGauge {
+    static GAUGE: OnceLock<IntGauge> = OnceLock::new();
+    GAUGE.get_or_init(|| {
+        crate::layered_db::register_metric_or_unscraped(|registry| {
+            prometheus::register_int_gauge_with_registry!(
+                "mdbx_readers_active",
+                "Consensus MDBX reader slots currently bound (concurrent read transactions).",
+                registry,
+            )
+        })
+    })
+}
+
+fn readers_max_gauge() -> &'static IntGauge {
+    static GAUGE: OnceLock<IntGauge> = OnceLock::new();
+    GAUGE.get_or_init(|| {
+        crate::layered_db::register_metric_or_unscraped(|registry| {
+            prometheus::register_int_gauge_with_registry!(
+                "mdbx_readers_max",
+                "Consensus MDBX reader-slot cap (max_readers).",
+                registry,
+            )
+        })
+    })
+}
+
+fn readers_full_total() -> &'static IntCounter {
+    static COUNTER: OnceLock<IntCounter> = OnceLock::new();
+    COUNTER.get_or_init(|| {
+        crate::layered_db::register_metric_or_unscraped(|registry| {
+            prometheus::register_int_counter_with_registry!(
+                "mdbx_readers_full_total",
+                "Read transactions rejected because the MDBX reader table was full (ReadersFull).",
+                registry,
+            )
+        })
+    })
+}
+
+fn busy_total() -> &'static IntCounter {
+    static COUNTER: OnceLock<IntCounter> = OnceLock::new();
+    COUNTER.get_or_init(|| {
+        crate::layered_db::register_metric_or_unscraped(|registry| {
+            prometheus::register_int_counter_with_registry!(
+                "mdbx_busy_total",
+                "Read transactions rejected with MDBX_BUSY (writer/environment contention).",
+                registry,
+            )
+        })
+    })
+}
+
+fn read_txn_open_seconds() -> &'static Histogram {
+    static HISTO: OnceLock<Histogram> = OnceLock::new();
+    HISTO.get_or_init(|| {
+        crate::layered_db::register_metric_or_unscraped(|registry| {
+            prometheus::register_histogram_with_registry!(
+                "mdbx_read_txn_open_seconds",
+                "How long an MDBX read transaction stayed open (handle lifetime), against the read-txn duration limit.",
+                // buckets out to the 30s default read-txn limit, then coarse for stragglers
+                vec![0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 5.0, 10.0, 30.0, 60.0, 120.0],
+                registry,
+            )
+        })
+    })
+}
 
 /// Maximum space (in bytes) that a slow reader can hold before triggering a warning.
 /// 50MB threshold for investigation purposes.
@@ -69,6 +146,8 @@ pub struct MdbxTx {
     inner: Transaction<RO>,
     /// Cached MDBX DBIs.
     dbis: DbiCache,
+    /// When the read transaction was created, for the open-duration metric.
+    started: Instant,
 }
 
 impl MdbxTx {
@@ -86,6 +165,15 @@ impl MdbxTx {
 
     fn cursor<T: Table>(&self) -> eyre::Result<Cursor<RO>> {
         Ok(self.inner.cursor_with_dbi(self.get_dbi::<T>()?)?)
+    }
+}
+
+impl Drop for MdbxTx {
+    /// Record how long the read transaction stayed open. Exact for point reads and the
+    /// `with_read_txn` closures; cursor-backed walks are timed to the handle (the cursor holds
+    /// the slot longer), which the reader-occupancy gauge captures instead.
+    fn drop(&mut self) {
+        read_txn_open_seconds().observe(self.started.elapsed().as_secs_f64());
     }
 }
 
@@ -577,6 +665,8 @@ impl MdbxDatabase {
         // Metrics-thread shutdown channel disabled (thread removed in #54, f243308):
         // let (shutdown_tx, _rx) = mpsc::sync_channel::<()>(0);
 
+        readers_max_gauge().set(config.max_readers as i64);
+
         Ok(MdbxDatabase {
             inner: env,
             // shutdown_tx: Arc::new(shutdown_tx),
@@ -711,7 +801,39 @@ impl Database for MdbxDatabase {
     }
 
     fn read_txn(&self) -> eyre::Result<Self::TX<'_>> {
-        Ok(MdbxTx { inner: self.inner.begin_ro_txn()?, dbis: Arc::clone(&self.dbis) })
+        let inner = match self.inner.begin_ro_txn() {
+            Ok(txn) => {
+                // Sample occupancy after binding so the gauge reflects this reader too.
+                if let Ok(info) = self.inner.info() {
+                    readers_active_gauge().set(info.num_readers() as i64);
+                }
+                txn
+            }
+            Err(e) => {
+                if matches!(e, reth_libmdbx::Error::ReadersFull) {
+                    readers_full_total().inc();
+                    let (active, max) = self
+                        .inner
+                        .info()
+                        .map(|i| (i.num_readers(), i.max_readers()))
+                        .unwrap_or((0, 0));
+                    warn!(
+                        target: "rayls::mdbx",
+                        ?active,
+                        ?max,
+                        "MDBX read rejected: reader table full (read starvation)"
+                    );
+                } else if matches!(e, reth_libmdbx::Error::Busy) {
+                    busy_total().inc();
+                    warn!(
+                        target: "rayls::mdbx",
+                        "MDBX read rejected: busy (writer/environment contention)"
+                    );
+                }
+                return Err(e.into());
+            }
+        };
+        Ok(MdbxTx { inner, dbis: Arc::clone(&self.dbis), started: Instant::now() })
     }
 
     fn write_txn(&self) -> eyre::Result<Self::TXMut<'_>> {
@@ -1320,5 +1442,92 @@ mod test {
         let temp_dir = tempdir().expect("failed to create temp dir");
         let db = open_db(temp_dir.path());
         db_simp_bench(db, "MDBX");
+    }
+
+    /// Reproduction of the validator "MDBX read starvation" incident.
+    ///
+    /// The consensus MDBX env caps concurrent readers (256 by default). Once that many read
+    /// transactions are held open concurrently (an inbound-request burst / long walks), any
+    /// further read is rejected with `ReadersFull`. Point reads surface that as an error, but the
+    /// scan/lookup helpers in this module swallow the same error and report an EMPTY table,
+    /// silently losing every row.
+    ///
+    /// The test requests a small reader cap, then holds the effective number of read txns open at
+    /// once to saturate the table and show the exhaustion. libmdbx sizes the reader table from the
+    /// page-rounded lockfile (a requested cap of 4 comes back larger), so the effective cap is read
+    /// back from `env.info()` rather than assumed.
+    #[test]
+    fn test_readers_full_exhausts_readers_and_scan_paths_silently_fail() {
+        const ROWS: u64 = 16;
+
+        let temp_dir = tempdir().expect("failed to create temp dir");
+        // Request a small reader table; the 30s read-txn timeout is kept (the test finishes long
+        // before the monitor thread could reset any reader).
+        let cfg = MdbxConfig::default().with_max_readers(4);
+        let db = MdbxDatabase::open_with_config(temp_dir.path(), cfg).expect("open mdbx");
+        db.open_table::<TestTable>().expect("open table");
+        for i in 0..ROWS {
+            db.insert::<TestTable>(&i, &i.to_string()).expect("seed row");
+        }
+
+        // Baseline: with no readers held, reads work and the table is not empty.
+        let key: u64 = 0;
+        assert_eq!(db.get::<TestTable>(&key).expect("baseline get"), Some("0".to_string()));
+        assert_eq!(db.iter::<TestTable>().count(), ROWS as usize, "baseline row count");
+
+        // The effective reader-table size, as libmdbx actually provisioned it (page-rounded).
+        let cap = db.inner.info().expect("env info").max_readers();
+        assert!(cap >= 4, "expected at least 4 reader slots, got {cap}");
+
+        // Saturate the reader table: hold `cap` read txns open at once (one per concurrent
+        // reader). With no sticky-thread config each read txn binds its own slot, so `cap` live
+        // txns consume every slot.
+        let holders =
+            (0..cap).map(|_| db.read_txn().expect("bind reader slot")).collect::<Vec<_>>();
+
+        // --- The reader table is now full. ---
+        // Point reads surface the exhaustion as an error (the "failed to read" in the logs).
+        let err = db.read_txn().expect_err("reader table is full");
+        assert!(
+            err.downcast_ref::<reth_libmdbx::Error>()
+                .is_some_and(|e| matches!(e, reth_libmdbx::Error::ReadersFull)),
+            "read_txn must fail with ReadersFull, got: {err:?}",
+        );
+        assert!(db.get::<TestTable>(&key).is_err(), "get must fail while the reader table is full");
+        assert!(
+            db.contains_key::<TestTable>(&key).is_err(),
+            "contains_key must fail while the reader table is full"
+        );
+        assert!(
+            db.multi_get::<TestTable>(std::iter::once(&key)).is_err(),
+            "multi_get must fail while the reader table is full"
+        );
+
+        // The scan/lookup paths swallow the SAME error and report an EMPTY table even though
+        // ROWS rows exist. This is the data-loss / wrong-decision failure mode.
+        assert_eq!(db.iter::<TestTable>().count(), 0, "iter must be silently truncated to empty");
+        assert_eq!(
+            db.reverse_iter::<TestTable>().next(),
+            None,
+            "reverse_iter must be silently empty"
+        );
+        assert_eq!(db.last_record::<TestTable>(), None, "last_record must be silently None");
+        assert_eq!(
+            db.record_prior_to::<TestTable>(&key),
+            None,
+            "record_prior_to must be silently None"
+        );
+        assert!(db.is_empty::<TestTable>(), "is_empty must be silently true");
+
+        // Release the readers; the slot table drains and reads work again (exhaustion, not
+        // corruption).
+        drop(holders);
+
+        assert_eq!(db.get::<TestTable>(&key).expect("post-release get"), Some("0".to_string()));
+        assert_eq!(
+            db.iter::<TestTable>().count(),
+            ROWS as usize,
+            "all rows visible again after release"
+        );
     }
 }
