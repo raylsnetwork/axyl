@@ -13,6 +13,9 @@ authors = [
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 tokio-stream = { workspace = true }
+# Health/readiness HTTP server (crates/middleware/orchestrator/src/types/health.rs). Same
+# feature set as consensus-metrics' Prometheus server for consistency.
+axum = { workspace = true, default-features = false, features = ["tokio", "http2"] }
 tracing = { workspace = true }
 rayls-middleware-bridge = { workspace = true }
 rayls-middleware-rewards = { workspace = true }
