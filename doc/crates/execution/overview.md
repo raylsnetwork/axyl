@@ -103,6 +103,9 @@ feed the parallel sparse trie computation.
 A dedicated OS thread runs reth's `PersistenceService` and is accessed through a
 `PersistenceHandle`. Blocks are flushed from CIM to MDBX asynchronously in the background.
 
+New execution databases are created with a 16 KiB MDBX page size unless `--db.page-size` is
+given (`RethEnv::new_database`); existing databases keep the page size they were created with.
+
 `PersistenceState`
 ([`evm/src/reth_env/persistence.rs`](../../../crates/execution/evm/src/reth_env/persistence.rs))
 tracks when to trigger a flush:
