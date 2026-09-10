@@ -13,6 +13,7 @@ use rayls_infrastructure_types::{
     DbTx, SealedBatch, WorkerId,
 };
 use std::sync::{Arc, LazyLock};
+use tokio::sync::Semaphore;
 use tracing::{debug, error};
 
 /// The minimal length of a single, encoded, default [Batch] used to set a local min for
@@ -31,6 +32,16 @@ static MESSAGE_OVERHEAD: LazyLock<usize> =
 /// bounds served bytes.
 const MAX_SERVED_DIGESTS: usize = 40_000;
 
+/// The maximum number of concurrent inbound batch-serving reads.
+///
+/// Each inbound batch request is served from one long-lived MDBX read txn (offloaded to
+/// `spawn_blocking`). Left unbounded, a burst of inbound requests opens that many read txns at
+/// once and can saturate the consensus env's reader table, so every other reader is rejected
+/// with `ReadersFull` (the "read starvation" incident). Capping concurrent serves keeps inbound
+/// reads well under the 256-reader cap, mirroring the outbound `MAX_CONCURRENT_BATCH_REQUESTS`
+/// bound.
+const MAX_CONCURRENT_BATCH_SERVES: usize = 32;
+
 /// The type that handles requests from peers.
 #[derive(Clone, Debug)]
 pub struct RequestHandler<DB> {
@@ -42,6 +53,9 @@ pub struct RequestHandler<DB> {
     consensus_config: ConsensusConfig<DB>,
     /// Network handle- so we can respond to gossip.
     network_handle: WorkerNetworkHandle,
+    /// Bounds concurrent inbound batch-serving read txns so a request burst cannot saturate the
+    /// MDBX reader table (see [`MAX_CONCURRENT_BATCH_SERVES`]).
+    batch_read_permits: Arc<Semaphore>,
 }
 
 impl<DB> RequestHandler<DB>
@@ -55,7 +69,13 @@ where
         consensus_config: ConsensusConfig<DB>,
         network_handle: WorkerNetworkHandle,
     ) -> Self {
-        Self { id, validator, consensus_config, network_handle }
+        Self {
+            id,
+            validator,
+            consensus_config,
+            network_handle,
+            batch_read_permits: Arc::new(Semaphore::new(MAX_CONCURRENT_BATCH_SERVES)),
+        }
     }
 
     /// Process gossip from the committee.
@@ -168,6 +188,12 @@ where
         max_response_size: usize,
     ) -> WorkerNetworkResult<Vec<Batch>> {
         let consensus_config = self.consensus_config.clone();
+        // Hold a read permit across the whole blocking serve so a burst of inbound requests cannot
+        // open more than [`MAX_CONCURRENT_BATCH_SERVES`] concurrent read txns and saturate the MDBX
+        // reader table. Mirrors the outbound `batch_request_permits` gate; the semaphore is never
+        // closed, so acquire cannot fail.
+        let _permit =
+            self.batch_read_permits.acquire().await.expect("batch-read semaphore never closed");
         tokio::task::spawn_blocking(move || {
             collect_requested_batches_blocking(batch_digests, max_response_size, consensus_config)
         })
@@ -296,6 +322,8 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rayls_batch_validator::NoopBatchValidator;
+    use rayls_consensus_network::types::NetworkHandle;
     use rayls_infrastructure_storage::{
         cold::{ColdConfig, ColdLocation, ColdStore},
         layered_db::LayeredDatabase,
@@ -303,13 +331,17 @@ mod tests {
         mem_db::MemDatabase,
         tables::ColdBatchLocations,
     };
-    use rayls_infrastructure_types::B256;
+    use rayls_infrastructure_types::{TaskManager, B256};
     use rayls_testing_test_utils::CommitteeFixture;
-    use std::sync::{
-        atomic::{AtomicUsize, Ordering},
-        Arc,
+    use std::{
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        },
+        time::Duration,
     };
     use tempfile::TempDir;
+    use tokio::sync::mpsc;
 
     /// The node storage stack under test for the cold cases: mem overlay -> mdbx -> cold jars.
     type ColdTieredDb = LayeredDatabase<MdbxDatabase>;
@@ -480,5 +512,55 @@ mod tests {
             batches.iter().all(|b| encode(b) == encode(&within_cap)),
             "a batch stored past the cap must never be read",
         );
+    }
+
+    /// Inbound batch serving is gated by [`MAX_CONCURRENT_BATCH_SERVES`] so a burst of requests
+    /// cannot open that many concurrent MDBX read txns and saturate the reader table. While every
+    /// read permit is held, a new serve cannot begin; freeing one permit lets it proceed.
+    #[tokio::test]
+    async fn process_request_batches_is_capped_by_read_permits() {
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let config = fixture.first_authority().consensus_config();
+        let store = config.node_storage().clone();
+
+        let digest = B256::random();
+        store.insert::<Batches>(&digest, &Batch::default()).expect("write batch to db");
+
+        let task_manager = TaskManager::default();
+        let (tx, _rx) = mpsc::channel(4);
+        let network_handle = WorkerNetworkHandle::new(
+            NetworkHandle::new(tx),
+            task_manager.get_spawner(),
+            config.network_config().libp2p_config().max_rpc_message_size,
+        );
+        let handler = RequestHandler::new(0, Arc::new(NoopBatchValidator), config, network_handle);
+
+        // Exhaust every read permit so no new serve can begin.
+        let mut held = (0..MAX_CONCURRENT_BATCH_SERVES)
+            .map(|_| handler.batch_read_permits.try_acquire().expect("take a read permit"))
+            .collect::<Vec<_>>();
+        assert_eq!(handler.batch_read_permits.available_permits(), 0);
+
+        // With every permit held, a serve is gated: it cannot finish within a short window.
+        let gated = tokio::time::timeout(
+            Duration::from_millis(150),
+            handler.process_request_batches(vec![digest], 1024 * 1024),
+        )
+        .await;
+        assert!(
+            gated.is_err(),
+            "serve must wait for a free read permit (it finished while every permit was held)"
+        );
+
+        // Free one permit by dropping its guard (a bare `let _` drops immediately; a named
+        // binding would keep it alive and the permit would stay taken), then the next serve
+        // proceeds and returns the stored batch.
+        let _ = held.pop().expect("a permit was held");
+        assert_eq!(handler.batch_read_permits.available_permits(), 1);
+        let served = handler
+            .process_request_batches(vec![digest], 1024 * 1024)
+            .await
+            .expect("a serve with a free permit succeeds");
+        assert_eq!(served.len(), 1, "the stored batch is served once a permit frees");
     }
 }
