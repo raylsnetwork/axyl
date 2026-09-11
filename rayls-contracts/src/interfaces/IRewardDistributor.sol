@@ -43,6 +43,8 @@ interface IRewardDistributor {
     event AccumulatorUpdated(address indexed oldAccumulator, address indexed newAccumulator);
     event TargetApyBpsUpdated(uint256 oldApyBps, uint256 newApyBps);
     event OpenTierApyBpsUpdated(uint256 oldApyBps, uint256 newApyBps);
+    event RewardCurveUpdated(address indexed oldCurve, address indexed newCurve);
+    event OpenTierRewardCurveUpdated(address indexed oldCurve, address indexed newCurve);
 
     /// @notice Receive ERC-20 RLS rewards from FeeAggregator
     /// @dev Called by FeeAggregator after swapping USDr to RLS
@@ -111,4 +113,20 @@ interface IRewardDistributor {
     /// @notice Set the target APY in basis points for open-tier (Track B) stakers
     /// @param newApyBps The new target APY
     function setOpenTierTargetApyBps(uint256 newApyBps) external;
+
+    /// @notice Get the RewardCurve driving Track A's target APY (address(0) if disabled)
+    function rewardCurve() external view returns (address);
+
+    /// @notice Set the RewardCurve driving Track A's target APY. address(0) disables it,
+    ///         falling back to the static targetApyBps.
+    /// @param newCurve The new RewardCurve address
+    function setRewardCurve(address newCurve) external;
+
+    /// @notice Get the RewardCurve driving Track B's target APY (address(0) if disabled)
+    function openTierRewardCurve() external view returns (address);
+
+    /// @notice Set the RewardCurve driving Track B's target APY. address(0) disables it,
+    ///         falling back to the static openTierTargetApyBps.
+    /// @param newCurve The new RewardCurve address
+    function setOpenTierRewardCurve(address newCurve) external;
 }
