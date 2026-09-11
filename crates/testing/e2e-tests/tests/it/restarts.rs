@@ -14,7 +14,7 @@ use nix::{
     unistd::Pid,
 };
 use rayls_infrastructure_types::{
-    get_available_tcp_port, keccak256, test_utils::init_test_tracing, Address,
+    get_available_tcp_port, keccak256, test_utils::init_test_tracing, Address, RaylsNetwork,
     MIN_RAYLS_PROTOCOL_BASE_FEE,
 };
 use secp256k1::{Keypair, Secp256k1, SecretKey};
@@ -953,8 +953,10 @@ fn send_rls(
     //const_hex::decode_to_slice(to_account, &mut to_addr[..])?;
     to_addr.copy_from_slice(to_account.as_slice());
     let (from_account, _, _) = decode_key(key)?;
+    // Must match the `--chain-id` passed to the genesis ceremony and the `--network local`
+    // the nodes boot with, or the RPC rejects the tx with "invalid chain ID".
     let new_transaction = LegacyTransaction {
-        chain: 0x7e1,
+        chain: RaylsNetwork::Local.chain_id(),
         nonce,
         to: Some(to_addr),
         value: amount,

@@ -56,7 +56,7 @@ pub fn spam_invalid_signatures(rpc_url: &str, count: usize) -> eyre::Result<Spam
 
 /// Generate and submit transactions with wrong chain ID.
 ///
-/// These should be rejected because chain ID doesn't match CHAIN_ID (0x7e1).
+/// These should be rejected because chain ID doesn't match the cluster's CHAIN_ID.
 pub fn spam_wrong_chain_id(rpc_url: &str, count: usize) -> eyre::Result<SpamResult> {
     info!(target: "chaos", count, "spamming wrong chain ID transactions");
     let mut result = SpamResult { submitted: 0, accepted: 0, rejected: 0 };
@@ -65,7 +65,7 @@ pub fn spam_wrong_chain_id(rpc_url: &str, count: usize) -> eyre::Result<SpamResu
     let to_account = rpc::address_from_word("spam-wrong-chain");
 
     for i in 0..count {
-        // Sign with wrong chain ID (0x1 = mainnet Ethereum instead of 0x7e1).
+        // Sign with wrong chain ID (0x1 = mainnet Ethereum instead of CHAIN_ID).
         result.submitted += 1;
         match send_tx_with_chain_id(rpc_url, &key, to_account, 1, i as u128) {
             Ok(_) => result.accepted += 1,

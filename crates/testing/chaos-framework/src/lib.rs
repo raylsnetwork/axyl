@@ -15,5 +15,5 @@ pub mod rpc;
 pub mod scenario;
 pub mod verify;
 
-/// Axyl chain ID (0x7e1 = 2017).
-pub const CHAIN_ID: u64 = 0x7e1;
+/// Chain ID of the chaos cluster: the `local` network profile (487 = 0x1e7).
+pub const CHAIN_ID: u64 = rayls_infrastructure_types::RaylsNetwork::Local.chain_id();
