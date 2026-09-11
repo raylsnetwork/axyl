@@ -164,8 +164,15 @@ pub fn spawn_local_testnet(
             faucet_contract_address,
         ]);
         #[cfg(not(feature = "faucet"))]
-        let command =
-            NodeCommand::parse_from(["rl", "--http", "--storage.v2", "--network", "local", "--instance", &instance]);
+        let command = NodeCommand::parse_from([
+            "rl",
+            "--http",
+            "--storage.v2",
+            "--network",
+            "local",
+            "--instance",
+            &instance,
+        ]);
 
         std::thread::spawn(|| {
             let err = command.execute(
