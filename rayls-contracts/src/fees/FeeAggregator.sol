@@ -17,7 +17,6 @@ import {IFeeAggregator} from "../interfaces/IFeeAggregator.sol";
 import {ISwapRouter} from "../interfaces/ISwapRouter.sol";
 import {IAlgebraPool} from "../interfaces/IAlgebraPool.sol";
 import {IRewardDistributor} from "../interfaces/IRewardDistributor.sol";
-import {IRewardCurve} from "../interfaces/IRewardCurve.sol";
 import {IOFT} from "../interfaces/IOFT.sol";
 
 /**
@@ -107,8 +106,6 @@ contract FeeAggregator is
         uint256 pendingValidatorRls;
         uint256 pendingEcosystemRls;
         uint256 pendingBurnRls;
-        // RewardCurve reporting real validator-pool revenue. address(0) = disabled.
-        address revenueCurve;
     }
 
     // WARN: This value does NOT derive from "feeaggregator.storage.v1" via the standard ERC-7201
@@ -419,13 +416,6 @@ contract FeeAggregator is
                 catch {
                     emit RecipientTransferFailed($.rewardDistributor, amount);
                 }
-                // Report the real amount that just funded the validator pool, if a
-                // RewardCurve is wired. try/catch so a missing REVENUE_REPORTER_ROLE grant
-                // or a broken curve can never block distribution — the RLS has already moved
-                // regardless of whether this reporting call succeeds.
-                if ($.revenueCurve != address(0)) {
-                    try IRewardCurve($.revenueCurve).recordRevenue(amount) {} catch {}
-                }
             } else {
                 emit RecipientTransferFailed($.rewardDistributor, amount);
             }
@@ -708,20 +698,6 @@ contract FeeAggregator is
         uint32 oldEid = $.dstEid;
         $.dstEid = newDstEid;
         emit DstEidUpdated(oldEid, newDstEid);
-    }
-
-    /// @inheritdoc IFeeAggregator
-    function revenueCurve() external view override returns (address) {
-        return _getStorage().revenueCurve;
-    }
-
-    /// @inheritdoc IFeeAggregator
-    /// @dev No zero-address check — address(0) is the intentional "disabled" value.
-    function setRevenueCurve(address newCurve) external override onlyRole(DEFAULT_ADMIN_ROLE) {
-        FeeAggregatorStorage storage $ = _getStorage();
-        address oldCurve = $.revenueCurve;
-        $.revenueCurve = newCurve;
-        emit RevenueCurveUpdated(oldCurve, newCurve);
     }
 
     // ========== STATISTICS ==========

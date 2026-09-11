@@ -105,25 +105,6 @@ contract RevertingRewardDistributor {
     }
 }
 
-/// @notice Mock RewardCurve for testing FeeAggregator's revenue-reporting hook
-contract MockRewardCurve {
-    uint256 public lastAmount;
-    uint256 public callCount;
-
-    function recordRevenue(uint256 amount) external {
-        lastAmount = amount;
-        callCount++;
-    }
-}
-
-/// @notice Mock RewardCurve that reverts on recordRevenue (e.g. REVENUE_REPORTER_ROLE not
-///         granted to FeeAggregator, or genuinely broken)
-contract RevertingRewardCurve {
-    function recordRevenue(uint256) external pure {
-        revert("not authorized");
-    }
-}
-
 /// @notice Mock Algebra Pool for testing
 contract MockAlgebraPool {
     uint160 public sqrtPriceX96 = 79228162514264337593543950336; // ~1:1 price
@@ -1194,68 +1175,6 @@ contract FeeAggregatorTest is Test {
         assertEq(rlsToken.balanceOf(address(bridge)), burnExpected);
         (, , , uint256 pendingBurn) = aggregator.getPendingDistribution();
         assertEq(pendingBurn, 0);
-    }
-
-    // =========================================================================
-    //                    RewardCurve Revenue Reporting Tests
-    // =========================================================================
-
-    function test_setRevenueCurve_updatesAddressAndEmits() public {
-        assertEq(aggregator.revenueCurve(), address(0), "unset by default");
-
-        MockRewardCurve curve = new MockRewardCurve();
-        vm.expectEmit(true, true, true, true);
-        emit IFeeAggregator.RevenueCurveUpdated(address(0), address(curve));
-
-        vm.prank(admin);
-        aggregator.setRevenueCurve(address(curve));
-
-        assertEq(aggregator.revenueCurve(), address(curve));
-    }
-
-    function test_setRevenueCurve_onlyAdmin() public {
-        vm.expectRevert(
-            abi.encodeWithSelector(IAccessControl.AccessControlUnauthorizedAccount.selector, keeper, bytes32(0))
-        );
-        vm.prank(keeper);
-        aggregator.setRevenueCurve(address(0x1234));
-    }
-
-    /// @notice When wired, distributeEpochFees() reports exactly the real amount that just
-    ///         funded the validator pool — not the pre-split total, not the ecosystem/burn slices.
-    function test_distributeEpochFees_reportsRevenueToRewardCurve() public {
-        MockRewardCurve curve = new MockRewardCurve();
-        vm.prank(admin);
-        aggregator.setRevenueCurve(address(curve));
-
-        uint256 rlsReceived = _swapToRls(10_000e6);
-        (uint256 validatorExpected, , ) = _split(rlsReceived);
-
-        vm.prank(keeper);
-        aggregator.distributeEpochFees();
-
-        assertEq(curve.lastAmount(), validatorExpected, "must report exactly the validator-pool slice");
-        assertEq(curve.callCount(), 1, "must report exactly once per distribution");
-    }
-
-    /// @notice A reverting RewardCurve (e.g. REVENUE_REPORTER_ROLE not yet granted to this
-    ///         contract) can never block distributeEpochFees() — the RLS still moves correctly.
-    function test_distributeEpochFees_revertingRevenueCurve_doesNotBlockDistribution() public {
-        RevertingRewardCurve broken = new RevertingRewardCurve();
-        vm.prank(admin);
-        aggregator.setRevenueCurve(address(broken));
-
-        uint256 rlsReceived = _swapToRls(10_000e6);
-        (uint256 validatorExpected, uint256 ecosystemExpected, ) = _split(rlsReceived);
-
-        vm.prank(keeper);
-        uint256 distributed = aggregator.distributeEpochFees();
-
-        // validator (50%) + ecosystem (30%) landed despite the broken curve; burn (20%) skipped
-        // as usual in this suite's default setUp (no bridge configured) — same as
-        // test_distributeEpochFees_success, just with a reverting revenueCurve wired in.
-        assertEq(distributed, validatorExpected + ecosystemExpected);
-        assertEq(rlsToken.balanceOf(address(rewardDistributor)), validatorExpected);
     }
 
     function test_burnBridge_insufficientNativeFee_retainsAndRetries() public {
