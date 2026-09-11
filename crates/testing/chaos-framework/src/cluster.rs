@@ -372,6 +372,8 @@ fn e2e_tests_config_local_testnet(
         "1000",
         "--min-header-delay-ms",
         "500",
+        "--chain-id",
+        "487",
     ]);
     create_committee_command.args.execute(shared_genesis_dir.clone())?;
 
