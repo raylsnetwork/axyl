@@ -6,7 +6,7 @@
 //! - Two identical batches always produce the same digest (determinism)
 //! - Modifying any field changes the digest (collision resistance sanity check)
 //!
-//! Run: cargo +nightly fuzz run batch_digest
+//! Run: cargo +nightly-2026-06-24 fuzz run batch_digest
 
 #![no_main]
 use libfuzzer_sys::fuzz_target;

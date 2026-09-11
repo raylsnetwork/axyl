@@ -61,8 +61,12 @@ if [ -n "$MODIFIED_TRACKED_FILES" ]; then
     exit 1
 fi
 
+# Date-pinned nightly for fmt/clippy — keep in sync with the Makefile NIGHTLY
+# variable and the fmt job in .github/workflows/pr.yaml.
+NIGHTLY="nightly-2026-06-24"
+
 # check cargo fmt first
-cargo +nightly-2025-11-04 fmt -- --check
+cargo +"${NIGHTLY}" fmt -- --check
 
 echo "fmt passed"
 
@@ -70,9 +74,9 @@ echo "fmt passed"
 # check clippy
 #
 # default features
-cargo +nightly-2025-11-04 clippy --workspace -- -D warnings
+cargo +"${NIGHTLY}" clippy --workspace -- -D warnings
 # all features
-cargo +nightly-2025-11-04 clippy --workspace --all-features -- -D warnings
+cargo +"${NIGHTLY}" clippy --workspace --all-features -- -D warnings
 
 echo "clippy for workspace: default and all features passed"
 
