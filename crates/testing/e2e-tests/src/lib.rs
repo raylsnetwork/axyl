@@ -95,6 +95,8 @@ pub fn config_local_testnet(
         "1000",
         "--min-header-delay-ms",
         "500",
+        "--chain-id",
+        "487",
     ]);
     create_committee_command.args.execute(shared_genesis_dir.clone())?;
     // If provided optional accounts then hack them into genesis now...
@@ -153,6 +155,8 @@ pub fn spawn_local_testnet(
             "rl",
             "--http",
             "--storage.v2",
+            "--network",
+            "local",
             "--instance",
             &instance,
             "--google-kms",
@@ -161,7 +165,7 @@ pub fn spawn_local_testnet(
         ]);
         #[cfg(not(feature = "faucet"))]
         let command =
-            NodeCommand::parse_from(["rl", "--http", "--storage.v2", "--instance", &instance]);
+            NodeCommand::parse_from(["rl", "--http", "--storage.v2", "--network", "local", "--instance", &instance]);
 
         std::thread::spawn(|| {
             let err = command.execute(
