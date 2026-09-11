@@ -5,7 +5,7 @@
 //! This catches inconsistencies in serde implementations that could
 //! cause validators to disagree on certificate/batch digests.
 //!
-//! Run: `cargo +nightly fuzz run bcs_roundtrip -- -max_total_time=300`
+//! Run: `cargo +nightly-2026-06-24 fuzz run bcs_roundtrip -- -max_total_time=300`
 
 #![no_main]
 use libfuzzer_sys::fuzz_target;

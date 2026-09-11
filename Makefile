@@ -9,10 +9,12 @@ BASE_DIR:=$(shell basename $(ROOT_DIR))
 # Default tag is latest if not specified
 TAG ?= latest
 
-# Date-pinned nightly for rustfmt — unstable-option behavior drifts between
-# nightlies, so fmt must match CI (.github/workflows/pr.yaml fmt job).
-# Install with: rustup toolchain install $(FMT_NIGHTLY) --profile minimal --component rustfmt
-FMT_NIGHTLY := nightly-2026-06-24
+# Date-pinned nightly for every nightly-only tool (rustfmt, clippy --fix, udeps).
+# Unstable-option behavior drifts between nightlies, so this must match CI: the
+# fmt job in .github/workflows/pr.yaml and nightly-fuzz.yml, plus rustfmt.toml
+# and etc/test/test-and-attest.sh. Bump every pin together (reformat commit).
+# Install with: rustup toolchain install $(NIGHTLY) --profile minimal --component rustfmt,clippy
+NIGHTLY := nightly-2026-06-24
 
 help:
 	@echo ;
@@ -22,7 +24,7 @@ help:
 	@echo "make udeps" ;
 	@echo "    :::> Check unused dependencies in the entire project by package." ;
 	@echo "    :::> Dev needs 'cargo-udeps' installed." ;
-	@echo "    :::> Dev also needs rust nightly and protobuf (on mac). ";
+	@echo "    :::> Dev also needs rust $(NIGHTLY) and protobuf (on mac). ";
 	@echo "    :::> To install run: 'cargo install cargo-udeps --locked'." ;
 	@echo ;
 	@echo "make check" ;
@@ -38,10 +40,10 @@ help:
 	@echo "    :::> Test restart integration tests." ;
 	@echo ;
 	@echo "make fmt" ;
-	@echo "    :::> cargo +$(FMT_NIGHTLY) fmt (date-pinned to match the CI fmt check)" ;
+	@echo "    :::> cargo +$(NIGHTLY) fmt (date-pinned to match the CI fmt check)" ;
 	@echo ;
 	@echo "make clippy" ;
-	@echo "    :::> Cargo +nightly clippy for all features with fix enabled." ;
+	@echo "    :::> cargo +$(NIGHTLY) clippy for all features with fix enabled." ;
 	@echo ;
 	@echo "make docker-login" ;
 	@echo "    :::> Setup docker registry using gcloud artifacts." ;
@@ -74,7 +76,7 @@ attest:
 
 # check for unused dependencies
 udeps:
-	find . -type f -name Cargo.toml -exec sed -rne 's/^name = "(.*)"/\1/p' {} + | xargs -I {} sh -c "echo '\n\n{}:' && cargo +nightly udeps --package {}" ;
+	find . -type f -name Cargo.toml -exec sed -rne 's/^name = "(.*)"/\1/p' {} + | xargs -I {} sh -c "echo '\n\n{}:' && cargo +$(NIGHTLY) udeps --package {}" ;
 
 check:
 	cargo check --workspace --all-features --all-targets ;
@@ -93,11 +95,11 @@ test-restarts:
 
 # format using the pinned nightly toolchain (same as the CI fmt check)
 fmt:
-	cargo +$(FMT_NIGHTLY) fmt ;
+	cargo +$(NIGHTLY) fmt ;
 
-# clippy formatter + try to fix problems
+# clippy on the pinned nightly + try to fix problems
 clippy:
-	cargo +nightly clippy --workspace --all-features --fix ;
+	cargo +$(NIGHTLY) clippy --workspace --all-features --fix ;
 
 # login to gcloud artifact registry for managing docker images
 docker-login:

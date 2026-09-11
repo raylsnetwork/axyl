@@ -19,7 +19,7 @@
 //! XOR section was removed: XORing two values derived from `difficulty` and then
 //! recovering them is a pure tautology that cannot fail.
 //!
-//! Run: cargo +nightly fuzz run difficulty_field_encoding
+//! Run: cargo +nightly-2026-06-24 fuzz run difficulty_field_encoding
 
 #![no_main]
 use libfuzzer_sys::fuzz_target;
