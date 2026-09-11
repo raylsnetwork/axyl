@@ -25,6 +25,13 @@ pub type VotingPower = u64;
 #[derive(Clone, Serialize, Deserialize, Debug, Eq, PartialEq)]
 pub struct P2pNode {
     /// The network address of the node.
+    ///
+    /// This is the single address the node both ADVERTISES (its published `NodeRecord`, and its
+    /// entry in `committee.yaml`) and, when no `*_LISTENER_MULTIADDR` env overrides it, LISTENS
+    /// on. It is therefore whatever peers should dial: a routable ip, a `/dnsaddr`, a relay
+    /// circuit -- or, for an outbound-only node (observer), a bare `/p2p/<peer-id>` (undialable
+    /// identity). That last form is not listenable, so such a node MUST set `*_LISTENER_MULTIADDR`
+    /// to bind (startup errors otherwise).
     pub network_address: Multiaddr,
     /// Network key of the node.
     pub network_key: NetworkPublicKey,

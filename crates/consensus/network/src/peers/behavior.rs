@@ -3,7 +3,7 @@
 use super::{manager::PeerManager, types::DialRequest, PeerEvent};
 use crate::peers::types::ConnectionType;
 use libp2p::{
-    core::{transport::PortUse, ConnectedPoint, Endpoint},
+    core::{multiaddr::Protocol, transport::PortUse, ConnectedPoint, Endpoint},
     swarm::{
         behaviour::ConnectionEstablished,
         dial_opts::{DialOpts, PeerCondition},
@@ -64,10 +64,17 @@ impl NetworkBehaviour for PeerManager {
     fn handle_pending_inbound_connection(
         &mut self,
         _connection_id: ConnectionId,
-        _local_addr: &Multiaddr,
+        local_addr: &Multiaddr,
         remote_addr: &Multiaddr,
     ) -> Result<(), ConnectionDenied> {
-        debug!(target: "network", ?remote_addr, "handle pending inbound connection");
+        debug!(target: "network", ?remote_addr, ?local_addr, "handle pending inbound connection");
+        // Relayed inbound connections arrive over a `/p2p-circuit`: the local address carries the
+        // circuit marker and the remote (send-back) address is just `/p2p/<src>` with no IP. There
+        // is no peer IP to validate or ban, so accept them without IP sanitization - otherwise the
+        // destination resets the relay's STOP stream and the circuit never completes.
+        if local_addr.iter().any(|p| matches!(p, Protocol::P2pCircuit)) {
+            return Ok(());
+        }
         self.sanitize_ip_addr(remote_addr)
     }
 
@@ -200,6 +207,10 @@ impl PeerManager {
     /// Logic to ensure a pending connection supports ipv4 or ipv6, and that the ip address isn't
     /// banned.
     fn sanitize_ip_addr(&self, remote_addr: &Multiaddr) -> Result<(), ConnectionDenied> {
+        // Relayed (`/p2p-circuit`) addresses have no IP of their own to validate or ban.
+        if remote_addr.iter().any(|p| matches!(p, Protocol::P2pCircuit)) {
+            return Ok(());
+        }
         // only support ipv4 and ipv6
         if !self.has_valid_unbanned_ips(std::slice::from_ref(remote_addr)) {
             return Err(ConnectionDenied::new(

@@ -2,3 +2,12 @@
 
 # update after mainnet fixes
 GHSA-82j2-j2ch-gfr8
+
+# yamux 0.12.1 is linked transitively via libp2p-yamux 0.47 (dual 0.12/0.13 backend) but is never
+# instantiated: both yamux::Config::default() call sites (network constructor + relay bin) resolve to
+# the 0.13.10 backend (Either::Right(Config013)). The 0.12 impl is dead code on our paths and cannot
+# be negotiated by a remote peer (both speak the same /yamux/1.0.0 wire protocol; the impl is chosen
+# locally). No yamux-only fix exists (libp2p-yamux 0.47 requires ^0.12.1); removal needs a libp2p
+# bump. Re-check this when bumping libp2p, or if any code starts using Config::client()/::server()/
+# WindowUpdateMode (the Config012 paths).
+CVE-2026-32314

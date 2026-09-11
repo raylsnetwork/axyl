@@ -1,4 +1,4 @@
-.PHONY: help attest udeps check test test-faucet fmt clippy docker-login docker-testnet docker-push docker-builder docker-builder-init up down validators pr init-submodules update-rayls-contracts revert-submodule
+.PHONY: help attest udeps check test test-faucet fmt clippy docker-login docker-testnet docker-push docker-builder docker-builder-init up down relay-up relay-down validators pr init-submodules update-rayls-contracts revert-submodule
 
 # full path for the Makefile
 ROOT_DIR:=$(shell dirname $(realpath $(firstword $(MAKEFILE_LIST))))
@@ -64,6 +64,12 @@ help:
 	@echo "make down" ;
 	@echo "    :::> Bring the docker compose containers down and remove orphans and volumes." ;
 	@echo ;
+	@echo "make relay-up" ;
+	@echo "    :::> Launch 4 validators isolated in private networks, connected only via relays (etc/relay-network)." ;
+	@echo ;
+	@echo "make relay-down" ;
+	@echo "    :::> Bring the relay isolation testnet down and remove orphans and volumes." ;
+	@echo ;
 	@echo "make validators" ;
 	@echo "    :::> Run 4 validators locally (outside of docker)." ;
 	@echo ;
@@ -127,6 +133,19 @@ up:
 # bring docker compose down
 down:
 	docker compose -f ./etc/docker-network/compose.yaml down --remove-orphans -v ;
+
+# relay isolation testnet: validators in private networks, reachable only via relays
+relay-up:
+	VERGEN_GIT_SHA=$$(git rev-parse HEAD) docker compose -f ./etc/relay-network/compose.yaml up --build --remove-orphans --detach ;
+
+relay-down:
+	docker compose -f ./etc/relay-network/compose.yaml down --remove-orphans -v ;
+
+relay-failover-up:
+	VERGEN_GIT_SHA=$$(git rev-parse HEAD) docker --context desktop-linux compose -f ./etc/relay-network/compose.failover.yaml up --build --remove-orphans --detach ;
+
+relay-failover-down:
+	docker --context desktop-linux compose -f ./etc/relay-network/compose.failover.yaml down --remove-orphans -v ;
 
 # alternative approach to run 4 local validator nodes outside of docker on local machine
 validators:
