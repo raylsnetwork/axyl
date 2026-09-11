@@ -1,5 +1,5 @@
 # This config uses nightly-only options whose behavior drifts between nightlies,
-# so formatting is pinned to nightly-2026-06-24 (see the Makefile FMT_NIGHTLY
+# so formatting is pinned to nightly-2026-06-24 (see the Makefile NIGHTLY
 # variable and the fmt job in .github/workflows/pr.yaml). Bump all pins together
 # with a reformat commit.
 
