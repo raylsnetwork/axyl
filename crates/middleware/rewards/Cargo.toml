@@ -23,7 +23,6 @@ rand = { workspace = true }
 rayls-infrastructure-types = { workspace = true, features = ["test-utils"] }
 rayls-middleware-rewards = { workspace = true, features = ["test-utils"] }
 rayls-testing-test-utils = { workspace = true }
-serde_yaml = { workspace = true }
 tempfile = { workspace = true }
 
 [features]
