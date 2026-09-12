@@ -3,6 +3,7 @@ members = [
     # common
     "bin/rayls-network",
     "bin/rayls-replay",
+    "bin/rayls-db-inspect",
 
     # consensus
     "crates/consensus/state-sync",
