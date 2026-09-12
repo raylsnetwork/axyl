@@ -12,7 +12,13 @@ name: Build & Push Docker Image
 #   * workflow_call         -> reusable: promote-docker.yml calls this to
 #                             REBUILD for a hard fork (new chainspec.rs block).
 #
-# Every image is stamped with the source commit via the OCI label
+# Every tag is a MULTI-ARCH manifest list (linux/amd64 + linux/arm64). Each
+# arch compiles natively on its own runner — a Rust release build under QEMU
+# emulation takes hours — pushes by digest, and a final job merges both
+# digests into one manifest list under the tag. Promotion still re-tags by
+# digest: the manifest-list digest is what ECR reports for the tag.
+#
+# Every per-arch image is stamped with the source commit via the OCI label
 # `org.opencontainers.image.revision`. promote-docker.yml reads it back to
 # decide whether a re-tag is safe or a rebuild is required.
 
@@ -47,10 +53,12 @@ env:
 
 jobs:
   # ===========================================================================
-  # BUILD - Build Docker image and push to private ECR
+  # META - resolve the image tag/environment once, and make sure the ECR repo
+  # exists before the per-arch legs fan out (so they don't race on
+  # create-repository).
   # ===========================================================================
-  build-and-push:
-    name: Build and Push to ECR
+  meta:
+    name: Resolve tag
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -59,8 +67,6 @@ jobs:
       image-tag: ${{ steps.meta.outputs.version }}
       environment: ${{ steps.meta.outputs.environment }}
       commit: ${{ steps.meta.outputs.sha }}
-    env:
-      ECR_PRIVATE_REGISTRY: ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ vars.AWS_REGION_PRIVATE }}.amazonaws.com
     steps:
       - name: Checkout code
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -111,7 +117,52 @@ jobs:
             echo ""
             echo "**Image tag:** \`$TAG\`"
             echo "**Built from commit:** \`$SHORT\` ($SHA)"
+            echo "**Platforms:** \`linux/amd64\`, \`linux/arm64\`"
           } >> $GITHUB_STEP_SUMMARY
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@e7f100cf4c008499ea8adda475de1042d6975c7b # v6.2.0
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION_PRIVATE }}
+
+      - name: Create ECR repository if not exists
+        run: |
+          if ! aws ecr describe-repositories --repository-names "${{ env.IMAGE_NAME }}" 2>/dev/null; then
+            aws ecr create-repository --repository-name "${{ env.IMAGE_NAME }}"
+          fi
+
+  # ===========================================================================
+  # BUILD - one native leg per arch (no QEMU). Each leg pushes its image by
+  # digest only; the merge job below stitches the digests into the final tag.
+  # ===========================================================================
+  build:
+    name: Build ${{ matrix.platform }}
+    runs-on: ${{ matrix.runner }}
+    needs: meta
+    permissions:
+      contents: read
+      id-token: write
+    strategy:
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-latest
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+    env:
+      ECR_PRIVATE_REGISTRY: ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ vars.AWS_REGION_PRIVATE }}.amazonaws.com
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          fetch-depth: 1
+
+      - name: Prepare platform slug
+        run: |
+          platform="${{ matrix.platform }}"
+          echo "PLATFORM_PAIR=${platform//\//-}" >> $GITHUB_ENV
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
@@ -126,41 +177,109 @@ jobs:
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@fa648b43de3d4d023bcb3f89ed6940096949c419 # v2.1.5
 
-      - name: Create ECR repository if not exists
-        run: |
-          if ! aws ecr describe-repositories --repository-names "${{ env.IMAGE_NAME }}" 2>/dev/null; then
-            aws ecr create-repository --repository-name "${{ env.IMAGE_NAME }}"
-          fi
-
-      - name: Build and push
+      - name: Build and push by digest
+        id: build
         uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
         with:
           context: .
           file: ./${{ env.DOCKERFILE }}
-          push: true
-          tags: ${{ env.ECR_PRIVATE_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.version }}
+          platforms: ${{ matrix.platform }}
           build-args: |
-            VERGEN_GIT_SHA=${{ steps.meta.outputs.sha }}
+            VERGEN_GIT_SHA=${{ needs.meta.outputs.commit }}
           # Stamp the source commit so promote-docker.yml can verify provenance
           # and decide re-tag vs rebuild for hard forks.
           labels: |
-            org.opencontainers.image.revision=${{ steps.meta.outputs.sha }}
-            org.opencontainers.image.version=${{ steps.meta.outputs.version }}
+            org.opencontainers.image.revision=${{ needs.meta.outputs.commit }}
+            org.opencontainers.image.version=${{ needs.meta.outputs.image-tag }}
           provenance: false
+          # No tag here on purpose: push the arch image by digest only, so the
+          # tag always points at the merged multi-arch manifest list.
+          outputs: type=image,name=${{ env.ECR_PRIVATE_REGISTRY }}/${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
           # Cache might be risky, we might re-use cached layer when we should not
           # cache-from: type=gha
           # cache-to: type=gha,mode=max
 
+      - name: Export digest
+        run: |
+          mkdir -p "${{ runner.temp }}/digests"
+          digest="${{ steps.build.outputs.digest }}"
+          touch "${{ runner.temp }}/digests/${digest#sha256:}"
+
+      - name: Upload digest
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5.0.0
+        with:
+          name: digest-${{ env.PLATFORM_PAIR }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
   # ===========================================================================
-  # SECURITY SCAN - Trivy vulnerability scanning on the built image
+  # MERGE - combine the per-arch digests into one manifest list and push it
+  # under the final tag. This manifest list is what promotion re-tags.
   # ===========================================================================
-  security-scan:
-    name: Security Scan
+  merge:
+    name: Merge manifest list
     runs-on: ubuntu-latest
-    needs: build-and-push
+    needs: [meta, build]
     permissions:
       contents: read
       id-token: write
+    env:
+      ECR_PRIVATE_REGISTRY: ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ vars.AWS_REGION_PRIVATE }}.amazonaws.com
+    steps:
+      - name: Download digests
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
+        with:
+          path: ${{ runner.temp }}/digests
+          pattern: digest-*
+          merge-multiple: true
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@e7f100cf4c008499ea8adda475de1042d6975c7b # v6.2.0
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION_PRIVATE }}
+
+      - name: Login to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@fa648b43de3d4d023bcb3f89ed6940096949c419 # v2.1.5
+
+      - name: Create manifest list and push tag
+        working-directory: ${{ runner.temp }}/digests
+        env:
+          TAG: ${{ needs.meta.outputs.image-tag }}
+        run: |
+          docker buildx imagetools create \
+            --tag "$ECR_PRIVATE_REGISTRY/$IMAGE_NAME:$TAG" \
+            $(printf -- "$ECR_PRIVATE_REGISTRY/$IMAGE_NAME@sha256:%s " *)
+
+      - name: Inspect pushed manifest
+        env:
+          TAG: ${{ needs.meta.outputs.image-tag }}
+        run: |
+          docker buildx imagetools inspect "$ECR_PRIVATE_REGISTRY/$IMAGE_NAME:$TAG"
+
+  # ===========================================================================
+  # SECURITY SCAN - Trivy vulnerability scanning, once per arch (each leg runs
+  # on a native runner so the registry resolves its own platform's image).
+  # ===========================================================================
+  security-scan:
+    name: Security Scan ${{ matrix.platform }}
+    runs-on: ${{ matrix.runner }}
+    needs: [meta, merge]
+    permissions:
+      contents: read
+      id-token: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-latest
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
     env:
       ECR_PRIVATE_REGISTRY: ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ vars.AWS_REGION_PRIVATE }}.amazonaws.com
     steps:
@@ -176,7 +295,7 @@ jobs:
       - name: Run Trivy vulnerability scanner
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
-          image-ref: ${{ env.ECR_PRIVATE_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.build-and-push.outputs.image-tag }}
+          image-ref: ${{ env.ECR_PRIVATE_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.meta.outputs.image-tag }}
           format: 'table'
           exit-code: '1'
           ignore-unfixed: true
@@ -186,9 +305,9 @@ jobs:
       - name: Summary
         if: always()
         run: |
-          echo "## Docker Image Build" >> $GITHUB_STEP_SUMMARY
+          echo "## Docker Image Build (${{ matrix.platform }})" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**Image:** \`${{ env.ECR_PRIVATE_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.build-and-push.outputs.image-tag }}\`" >> $GITHUB_STEP_SUMMARY
-          echo "**Environment:** ${{ needs.build-and-push.outputs.environment }}" >> $GITHUB_STEP_SUMMARY
-          echo "**Built from commit:** \`${{ needs.build-and-push.outputs.commit }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "**Image:** \`${{ env.ECR_PRIVATE_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.meta.outputs.image-tag }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "**Environment:** ${{ needs.meta.outputs.environment }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Built from commit:** \`${{ needs.meta.outputs.commit }}\`" >> $GITHUB_STEP_SUMMARY
           echo "**Security scan:** ${{ job.status }}" >> $GITHUB_STEP_SUMMARY
