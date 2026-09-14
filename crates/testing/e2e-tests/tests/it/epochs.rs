@@ -6,7 +6,7 @@ use alloy::{
     sol_types::SolCall,
 };
 use clap::Parser as _;
-use e2e_tests::{create_validator_info, retry_until, IT_TEST_MUTEX};
+use e2e_tests::{create_validator_info, retry_until, IT_TEST_MUTEX, TEST_NETWORK};
 use nix::{
     sys::signal::{self, Signal},
     unistd::Pid,
@@ -553,7 +553,9 @@ fn config_committee(
     Config::write_to_path(&rls_accounts_path, &rls_accounts, ConfigFmt::YAML)?;
     let rls_accounts_str = rls_accounts_path.to_str().expect("rls-accounts path is valid utf8");
 
-    // create committee from shared genesis dir
+    // create committee from shared genesis dir. The chain-id must match the `--network`
+    // flag the nodes are started with (see start_nodes / TEST_NETWORK).
+    let chain_id = TEST_NETWORK.chain_id().to_string();
     let create_committee_command = CommandParser::<GenesisArgs>::parse_from([
         "rl",
         "--basefee-address",
@@ -574,6 +576,8 @@ fn config_committee(
         "1000",
         "--min-header-delay-ms",
         "500",
+        "--chain-id",
+        &chain_id,
     ]);
     create_committee_command.args.execute(shared_genesis_dir.to_path_buf())?;
 
@@ -634,8 +638,9 @@ fn start_nodes(temp_path: &Path, validators: &[(&str, Address)]) -> eyre::Result
             // Use the Local hardfork schedule so HybridRewards activates at block 1: genesis
             // deploys the pre-hybrid ConsensusRegistry and the in-place migration swaps it to the
             // hybrid contract at the first block, exercising the full rollout end-to-end.
+            // TEST_NETWORK's chain-id must equal the ceremony's `--chain-id` above.
             .arg("--network")
-            .arg("local");
+            .arg(TEST_NETWORK.to_string());
 
         #[cfg(feature = "faucet")]
         command
