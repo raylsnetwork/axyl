@@ -8,7 +8,7 @@
 //! - the high 32 bits recover `epoch` and the low 32 bits recover `round`
 //!   (this is exactly what `RethEnv::deconstruct_nonce()` does on the EL side)
 //!
-//! Run: cargo +nightly fuzz run header_nonce_roundtrip
+//! Run: cargo +nightly-2026-06-24 fuzz run header_nonce_roundtrip
 
 #![no_main]
 use indexmap::IndexMap;

@@ -12,7 +12,7 @@
 //! value of this target is panic-safety: `signed_by` must never crash on
 //! malformed bitmaps with out-of-range indices, gaps, or duplicates.
 //!
-//! Run: cargo +nightly fuzz run certificate_signed_by
+//! Run: cargo +nightly-2026-06-24 fuzz run certificate_signed_by
 
 #![no_main]
 use libfuzzer_sys::fuzz_target;

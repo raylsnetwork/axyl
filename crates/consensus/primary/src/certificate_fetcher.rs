@@ -12,7 +12,7 @@ use rand::{rngs::ThreadRng, seq::SliceRandom};
 use rayls_consensus_primary_metrics::PrimaryMetrics;
 use rayls_infrastructure_config::ConsensusConfig;
 use rayls_infrastructure_network_types::FetchCertificatesResponse;
-use rayls_infrastructure_storage::CertificateStore;
+use rayls_infrastructure_storage::{CertificateStore, ReadTimeout};
 use rayls_infrastructure_types::{
     validate_received_certificate, AuthorityIdentifier, BlsPublicKey, Certificate, Committee,
     Database, Epoch, Hash as _, Noticer, RaylsReceiver, RaylsSender, Round, TaskManager,
@@ -390,7 +390,7 @@ impl<DB: Database> CertificateFetcher<DB> {
             written_rounds.insert(authority.id(), BTreeSet::new());
         }
         // NOTE: origins_after_round() is inclusive.
-        match self.certificate_store.origins_after_round(gc_round + 1) {
+        match self.certificate_store.origins_after_round(gc_round + 1, ReadTimeout::Exempt) {
             Ok(origins) => {
                 for (round, origins) in origins {
                     for origin in origins {

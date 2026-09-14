@@ -3,7 +3,7 @@ name: Nightly Fuzz
 # Runs the cargo-fuzz harnesses for Axyl protocol types. Each target runs for a
 # bounded wall-clock budget (libFuzzer -max_total_time). On a crash, the failing
 # input is uploaded as an artifact for local reproduction:
-#   cd crates/testing/fuzz-targets && cargo +nightly fuzz run <target> <artifact>
+#   cd crates/testing/fuzz-targets && cargo +nightly-2026-06-24 fuzz run <target> <artifact>
 #
 # Not part of PR checks: fuzzing is time-boxed exploration, not a pass/fail gate.
 
@@ -43,6 +43,7 @@ env:
   RUST_BACKTRACE: 1
   # Scheduled runs use a longer budget than the manual default.
   FUZZ_SECONDS: ${{ github.event.inputs.max_total_time || '300' }}
+  NIGHTLY: nightly-2026-06-24
 
 jobs:
   fuzz:
@@ -69,12 +70,12 @@ jobs:
       - name: Install nightly Rust
         uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
         with:
-          toolchain: nightly
+          toolchain: ${{ env.NIGHTLY }}
 
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
-          shared-key: nightly-fuzz
+          shared-key: nightly-fuzz-${{ env.NIGHTLY }}
           workspaces: crates/testing/fuzz-targets/fuzz
           cache-on-failure: true
 
@@ -94,7 +95,7 @@ jobs:
           github.event.inputs.target == matrix.target
         working-directory: crates/testing/fuzz-targets
         run: |
-          cargo +nightly fuzz run ${{ matrix.target }} -- \
+          cargo +"$NIGHTLY" fuzz run ${{ matrix.target }} -- \
             -max_total_time=${{ env.FUZZ_SECONDS }} -print_final_stats=1
 
       - name: Upload crash artifacts
