@@ -334,7 +334,6 @@ Returns the `TxHash` of the submitted transfer transaction.
 |---|---|---|
 | `--wait-period` | `86400` (24 h) | Minimum seconds between drips per address |
 | `--faucet-contract` | `0x0…0` | On-chain faucet contract |
-| `--chain-id` | `2017` | Chain ID for transaction signing |
 | `--public-key` | test key | Faucet wallet public key (hex or PEM) |
 | `--google-kms` | off | Enable the faucet and KMS signing |
 | `--project-id` | — | GCP project ID |

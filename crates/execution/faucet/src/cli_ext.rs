@@ -30,10 +30,6 @@ pub struct FaucetArgs {
     #[clap(long, default_value_t = Address::ZERO, value_parser = Address::from_str, value_name = "FAUCET_CONTRACT_ADDRESS")]
     pub(crate) faucet_contract: Address,
 
-    /// The chain id for the faucet to use when creating transactions.
-    #[clap(long, default_value_t = 2017, value_name = "CHAIN_ID")]
-    pub(crate) chain_id: u64,
-
     /// The public key for the wallet.
     ///
     /// Currently supports pem format or hex (without leading 0x)
@@ -135,9 +131,11 @@ impl FaucetArgs {
             );
 
             let wallet = FaucetWallet { address, public_key_bytes, name };
+            // Derive the chain-id from the node's chain spec so the faucet always signs
+            // for the chain it is actually serving (no separate --chain-id to drift).
             let config = FaucetConfig {
                 wait_period: self.wait_period,
-                chain_id: self.chain_id,
+                chain_id: reth_env.chainspec().chain_id(),
                 wallet,
                 contract_address: self.faucet_contract,
             };

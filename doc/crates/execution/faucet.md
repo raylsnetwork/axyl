@@ -102,7 +102,6 @@ the flag is absent the `faucet` RPC namespace is not registered.
 |----------|---------|---------|-------------|
 | `--wait-period` | — | `86400` (24 h) | Seconds a recipient must wait between drips |
 | `--faucet-contract` | — | `0x0…0` | On-chain faucet contract managing drip amounts and enabled tokens |
-| `--chain-id` | — | `2017` | Chain ID used when signing transactions |
 | `--public-key` | `FAUCET_PUBLIC_KEY` | (test key) | Faucet wallet public key — hex or PEM format |
 | `--google-kms` | — | off | Enable faucet and use Google KMS for signing |
 | `--project-id` | `PROJECT_ID` | — | GCP project ID |
