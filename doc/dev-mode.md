@@ -61,7 +61,7 @@ The page has an editable RPC field, so if you ran with a non-default RPC port
 
 | Setting | Value |
 |---|---|
-| Chain ID | `2017` (`0x7e1`) |
+| Chain ID | `487` (`0x1e3`, `local`) |
 | RPC (HTTP) | `http://127.0.0.1:8545` |
 | RPC (WS) | `ws://127.0.0.1:8546` |
 | Gas / fees | gasless (base fee `0`, no floor) |
@@ -90,7 +90,7 @@ Account 0 is also the validator's fee recipient, so block rewards accrue there.
 Add a custom network:
 
 - **RPC URL:** `http://127.0.0.1:8545`
-- **Chain ID:** `2017`
+- **Chain ID:** `487`
 - **Currency symbol:** `USDr`
 
 Then import one of the private keys above.

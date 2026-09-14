@@ -19,8 +19,10 @@ mod dashboard;
 
 use crate::{genesis::GenesisArgs, node::NodeCommand, NoArgs};
 use core::fmt;
-use rayls_infrastructure_config::{Config, ConfigFmt, ConfigTrait as _, RaylsDirs as _};
-use rayls_infrastructure_types::{Address, Genesis, GenesisAccount, U256};
+use rayls_infrastructure_config::{
+    Config, ConfigFmt, ConfigTrait as _, Parameters, RaylsDirs as _,
+};
+use rayls_infrastructure_types::{Address, Genesis, GenesisAccount, RaylsNetwork, U256};
 use rayls_middleware_orchestrator::engine::RaylsBuilder;
 use std::path::{Path, PathBuf};
 use tracing::{info, warn};
@@ -103,9 +105,16 @@ pub fn bootstrap_dev_datadir_if_empty(datadir: &Path, passphrase: &str) -> eyre:
     std::fs::create_dir_all(&validators_dir)?;
     std::fs::copy(datadir.node_info_path(), validators_dir.join("validator.yaml"))?;
 
-    // 3. Run the single-validator dev genesis ceremony (gasless, chain-id 2017, fast headers).
+    // 3. Run the single-validator dev genesis ceremony (gasless, local chain-id, fast headers).
     //    Writes genesis.yaml, committee.yaml, parameters.yaml.
     GenesisArgs::dev().execute(datadir.clone())?;
+
+    // 3b. The ceremony leaves `parameters.yaml` with no built-in network ("external"); stamp
+    //     `local` so the node boots without a `--network` flag.
+    let params_path = datadir.node_config_parameters_path();
+    let mut parameters: Parameters = Config::load_from_path(&params_path, ConfigFmt::YAML)?;
+    parameters.network = Some(RaylsNetwork::Local);
+    Config::write_to_path(&params_path, parameters, ConfigFmt::YAML)?;
 
     // 4. Pre-fund the well-known dev accounts so txs can be sent immediately.
     fund_dev_accounts(&datadir)?;
@@ -116,7 +125,8 @@ pub fn bootstrap_dev_datadir_if_empty(datadir: &Path, passphrase: &str) -> eyre:
 
     warn!(
         target: "rl::dev",
-        "DEV chain bootstrapped (chain-id 2017, gasless, 1-of-1 committee) — NOT FOR PRODUCTION"
+        "DEV chain bootstrapped (chain-id {}, gasless, 1-of-1 committee) — NOT FOR PRODUCTION",
+        RaylsNetwork::Local.chain_id()
     );
     Ok(true)
 }
@@ -192,6 +202,12 @@ impl<Ext: clap::Args + fmt::Debug> DevCommand<Ext> {
         // Disable IPC so repeated/parallel dev nodes don't collide on the socket path.
         rpc.ipcdisable = true;
 
+        // V1 (plain) storage is banned at boot, and the e2e harness passes the flag
+        // explicitly — apply the default here so a plain `rayls-network dev` works
+        // out of the box (there is no CLI way to select V1, so this can't override
+        // an explicit choice).
+        self.node.reth.storage.v2 = true;
+
         // Serve the embedded dashboard (block explorer + chain status) so the user
         // can see the chain is live. Runs on background threads; the node launch
         // below blocks for the process lifetime.
@@ -221,7 +237,7 @@ mod tests {
     #[test]
     fn dev_genesis_is_gasless_local() {
         let g = GenesisArgs::dev();
-        assert_eq!(g.chain_id, 2017, "dev must use the local chain-id");
+        assert_eq!(g.chain_id, RaylsNetwork::Local.chain_id(), "dev must use the local chain-id");
         assert_eq!(g.base_fee, 0, "dev chain is gasless");
         assert_eq!(g.min_base_fee, 0, "dev chain has no base-fee floor");
     }

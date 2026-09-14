@@ -60,7 +60,7 @@ cargo build --bin rayls-network --release --features dev-single-node-setup
 target/release/rayls-network dev --datadir /tmp/rayls-dev
 ```
 
-This bootstraps an empty datadir into a single-validator, gasless chain (chain-id `2017`) with HTTP RPC on `http://127.0.0.1:8545` and a status/explorer dashboard at `http://127.0.0.1:8550`. Dev mode lives behind the `dev-single-node-setup` Cargo feature (off by default, so production builds exclude it). See [`doc/dev-mode.md`](doc/dev-mode.md) for pre-funded accounts and wallet setup. For local development only — not for production.
+This bootstraps an empty datadir into a single-validator, gasless chain (the `local` network, chain-id `487`) with HTTP RPC on `http://127.0.0.1:8545` and a status/explorer dashboard at `http://127.0.0.1:8550`. Dev mode lives behind the `dev-single-node-setup` Cargo feature (off by default, so production builds exclude it). See [`doc/dev-mode.md`](doc/dev-mode.md) for pre-funded accounts and wallet setup. For local development only — not for production.
 
 ### Run an observer against testnet
 

@@ -14,8 +14,8 @@ use rayls_infrastructure_config::{
     NATIVE_TOKEN_CONTROLLER_ADDRESS, REWARD_DISTRIBUTOR_ADDRESS, RLS_ACCUMULATOR_ADDRESS,
 };
 use rayls_infrastructure_types::{
-    keccak256, set_genesis_defaults, Address, GenesisAccount, ETHEREUM_BLOCK_GAS_LIMIT_56BITS,
-    MIN_RAYLS_PROTOCOL_BASE_FEE, U256,
+    keccak256, set_genesis_defaults, Address, GenesisAccount, RaylsNetwork,
+    ETHEREUM_BLOCK_GAS_LIMIT_56BITS, MIN_RAYLS_PROTOCOL_BASE_FEE, U256,
 };
 use secp256k1::{
     rand::{rngs::StdRng, SeedableRng},
@@ -138,8 +138,11 @@ pub struct GenesisArgs {
     #[arg(long)]
     pub min_header_delay_ms: Option<u64>,
     /// Numeric chain id that will go in the genesis.
-    /// Default is 0x7e1 (2017).
-    #[arg(long, default_value_t = 2017, value_parser=maybe_hex)]
+    /// Defaults to the `local` network's chain-id (487). Any value is accepted: the resulting
+    /// datadir carries no baked-in network profile ("external"), so nodes must be started with
+    /// a schedule matching this chain-id — either `--network <devnet|testnet|mainnet|local>`
+    /// (when the chain-id matches that network) or `--config-file <path> --subnet <name>`.
+    #[arg(long, default_value_t = RaylsNetwork::Local.chain_id(), value_parser=maybe_hex)]
     pub chain_id: u64,
     /// YAML file containing accounts to merge into genesis.
     /// This is intended for dev and test nets.
@@ -186,7 +189,7 @@ pub(crate) fn account_from_word(key_word: &str) -> Address {
 impl GenesisArgs {
     /// Genesis arguments preset for a local `--dev` chain.
     ///
-    /// Non-production chain-id (2017), gasless (base fee and floor both 0), fast
+    /// The `local` network's chain-id, gasless (base fee and floor both 0), fast
     /// header timing for quick local iteration, and otherwise the standard
     /// precompile / governance-safe defaults. Pre-funded dev accounts are added
     /// separately (see [`crate::dev`]) after the ceremony runs.
@@ -205,7 +208,7 @@ impl GenesisArgs {
             // Fast headers so a single dev node produces blocks quickly.
             max_header_delay_ms: Some(250),
             min_header_delay_ms: Some(125),
-            chain_id: 2017,
+            chain_id: RaylsNetwork::Local.chain_id(),
             accounts: None,
             // Gasless local chain: no base fee and no floor, so dev txs cost nothing.
             base_fee: 0,
