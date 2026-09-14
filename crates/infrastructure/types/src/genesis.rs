@@ -2,7 +2,7 @@
 //!
 //! The yaml, chainspec, and Genesis struct are used for all
 //! testing purposes.
-use crate::{now, Genesis, ETHEREUM_BLOCK_GAS_LIMIT_56BITS, MIN_PROTOCOL_BASE_FEE};
+use crate::{now, Genesis, RaylsNetwork, ETHEREUM_BLOCK_GAS_LIMIT_56BITS, MIN_PROTOCOL_BASE_FEE};
 use alloy::{
     genesis::GenesisAccount,
     primitives::{address, U256},
@@ -19,7 +19,7 @@ use std::sync::Arc;
 pub fn test_genesis() -> Genesis {
     let mut genesis = Genesis { timestamp: now(), ..Default::default() };
     set_genesis_defaults(&mut genesis);
-    genesis.config.chain_id = 2017;
+    genesis.config.chain_id = RaylsNetwork::Local.chain_id();
     let default_factory_accounts = vec![
         (
             // Default transaction factory

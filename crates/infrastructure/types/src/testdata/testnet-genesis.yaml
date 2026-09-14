@@ -1,6 +1,6 @@
 ---
 config:
-  chainId: 2017
+  chainId: 487
   homesteadBlock: 0
   daoForkSupport: false
   eip150Block: 0

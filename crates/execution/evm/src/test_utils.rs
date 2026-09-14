@@ -27,7 +27,7 @@ use rayls_infrastructure_types::{
     address, calculate_transaction_root, keccak256, now, test_chain_spec_arc, test_genesis,
     AccessList, Address, Batch, BlobTransactionSidecar, Block, BlockBody, BlockHash, BlsPublicKey,
     Bytes, Committee, CommitteeBuilder, Encodable2718, EthSignature, ExecHeader, ExecutionKeypair,
-    Genesis, GenesisAccount, RecoveredBlock, SealedHeader, TaskManager, Transaction,
+    Genesis, GenesisAccount, RaylsNetwork, RecoveredBlock, SealedHeader, TaskManager, Transaction,
     TransactionSigned, TxEip1559, TxHash, TxKind, WorkerId, B256, EMPTY_OMMER_ROOT_HASH,
     EMPTY_TRANSACTIONS, EMPTY_WITHDRAWALS, ETHEREUM_BLOCK_GAS_LIMIT_56BITS, MIN_PROTOCOL_BASE_FEE,
     U256,
@@ -466,7 +466,7 @@ impl TransactionFactory {
     /// Create and sign an EIP1559 transaction with all possible parameters passed.
     ///
     /// All arguments are optional and default to:
-    /// - chain_id: 2017 (testnet)
+    /// - chain_id: the `local` network chain-id (487)
     /// - nonce: `Self::nonce` (correctly incremented)
     /// - max_priority_fee_per_gas: 0 (no tip)
     /// - max_fee_per_gas: basefee minimum (7 wei)
@@ -497,7 +497,7 @@ impl TransactionFactory {
 
         // Eip1559
         let transaction = Transaction::Eip1559(TxEip1559 {
-            chain_id: chain_id.unwrap_or(2017),
+            chain_id: chain_id.unwrap_or(RaylsNetwork::Local.chain_id()),
             nonce: nonce.unwrap_or(self.nonce),
             max_priority_fee_per_gas: max_priority_fee_per_gas.unwrap_or(0),
             max_fee_per_gas: max_fee_per_gas.unwrap_or(MIN_PROTOCOL_BASE_FEE.into()),
