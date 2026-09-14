@@ -4,8 +4,10 @@ use crate::{
 };
 use eyre::OptionExt;
 use rayls_consensus_worker::{WorkerNetwork, WorkerNetworkHandle};
-use rayls_execution_evm::active_profile;
-use rayls_execution_evm::chainspec::{RaylsChainHardforks, RaylsHardforks};
+use rayls_execution_evm::{
+    active_profile,
+    chainspec::{RaylsChainHardforks, RaylsHardforks},
+};
 use rayls_infrastructure_config::{ConsensusConfig, LibP2pConfig, RaylsDirs};
 use rayls_infrastructure_types::{
     gas_accumulator::GasAccumulator, BatchValidation, BlsPublicKey, Database as ReDatabase,
