@@ -70,7 +70,7 @@ impl RethEnv {
             parameters.basefee_address,
             rewards_counter,
             build_metadata,
-            Some(parameters.network),
+            parameters.network,
             Some(parameters.min_base_fee),
             allow_v1,
         )

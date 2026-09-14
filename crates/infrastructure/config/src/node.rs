@@ -203,9 +203,12 @@ pub struct Parameters {
     /// Should be a governance multisig in production.
     pub fee_aggregator_admin: Option<Address>,
     /// Rayls network profile that selects the baked-in hardfork schedule.
-    /// Default: `testnet`.
+    /// `None` (the default, serialized as `network: null`) means "external": the
+    /// datadir carries no baked-in profile, so the node must be started with a
+    /// `--config-file`/`--subnet` schedule (or an explicit `--network` whose chain-id
+    /// matches the genesis).
     #[serde(default)]
-    pub network: RaylsNetwork,
+    pub network: Option<RaylsNetwork>,
     /// Minimum EIP-1559 base fee floor (in wei).
     /// The base fee can never drop below this value.
     /// Set to 0 for a gasless (feeless) network.
@@ -313,7 +316,9 @@ impl Default for Parameters {
             batch_vote_timeout: Parameters::default_batch_vote_timeout(),
             basefee_address: None,
             fee_aggregator_admin: None,
-            network: RaylsNetwork::default(),
+            // Default to "external" (no baked-in profile) so a fresh ceremony's datadir
+            // doesn't silently assume testnet and refuse to boot on a chain-id mismatch.
+            network: None,
             min_base_fee: Parameters::default_min_base_fee(),
             gas_limit: Parameters::default_gas_limit(),
             metrics_address: None,
@@ -334,7 +339,9 @@ impl Parameters {
         info!("Sync retry nodes set to {} nodes", self.sync_retry_nodes);
         info!("Max batch delay set to {} ms", self.max_batch_delay.as_millis());
         info!("Max concurrent requests set to {}", self.max_concurrent_requests);
-        info!(network = %self.network, "Rayls network hardfork profile");
+        // `None` renders as "external" (no baked-in profile) rather than "None".
+        let network = self.network.map(|n| n.to_string()).unwrap_or_else(|| "external".into());
+        info!(%network, "Rayls network hardfork profile");
         info!("Minimum base fee set to {} wei", self.min_base_fee);
         info!("Block gas limit set to {}", self.gas_limit);
         if let Some(addr) = self.metrics_address {

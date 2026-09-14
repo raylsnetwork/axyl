@@ -4,6 +4,7 @@ use crate::{
 };
 use eyre::OptionExt;
 use rayls_consensus_worker::{WorkerNetwork, WorkerNetworkHandle};
+use rayls_execution_evm::active_profile;
 use rayls_execution_evm::chainspec::{RaylsChainHardforks, RaylsHardforks};
 use rayls_infrastructure_config::{ConsensusConfig, LibP2pConfig, RaylsDirs};
 use rayls_infrastructure_types::{
@@ -202,7 +203,17 @@ where
     /// Before the fork: currently a no-op stub (unchanged from main).
     pub(super) fn adjust_base_fees(&self, gas_accumulator: &GasAccumulator, block_number: u64) {
         let network = self.builder.rayls_infrastructure_config.parameters.network;
-        let hardforks = RaylsChainHardforks::for_network(network);
+        // Prefer an externally-resolved schedule (from `--config-file`); without one, the
+        // baked-in profile selected by `parameters.network` applies. An "external" datadir
+        // with no file schedule cannot boot, so the final arm is unreachable at runtime and
+        // falls back to an all-`Never` schedule.
+        let hardforks = match active_profile() {
+            Some(profile) => RaylsChainHardforks::new(profile.schedule()),
+            None => match network {
+                Some(network) => RaylsChainHardforks::for_network(network),
+                None => RaylsChainHardforks::new(Vec::new()),
+            },
+        };
         if hardforks.is_eip1559_active_at_block(block_number) {
             // per-block EIP-1559 active — base fee is updated per-block by the payload builder
             return;
