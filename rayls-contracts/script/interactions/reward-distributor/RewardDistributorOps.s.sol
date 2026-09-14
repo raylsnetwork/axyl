@@ -17,6 +17,10 @@ import {RewardDistributor} from "../../../src/fees/RewardDistributor.sol";
 ///     forge script .../RewardDistributorOps.s.sol:RewardDistributorOps --sig "setConfig()" \
 ///     --rpc-url $RPC_URL --broadcast --private-key $ADMIN_PK -vvvv
 ///
+///   REWARD_CURVE=0x... OPEN_TIER_REWARD_CURVE=0x... \
+///     forge script .../RewardDistributorOps.s.sol:RewardDistributorOps --sig "setConfig()" \
+///     --rpc-url $RPC_URL --broadcast --private-key $ADMIN_PK -vvvv
+///
 /// Anyone:
 ///   VALIDATOR=0x... \
 ///     forge script .../RewardDistributorOps.s.sol:RewardDistributorOps --sig "claim()" \
@@ -59,7 +63,10 @@ contract RewardDistributorOps is InteractionScript {
         console2.log("  UPGRADER:     ", rd.hasRole(rd.UPGRADER_ROLE(), admin));
 
         logSection("APY Config");
-        console2.log("Target APY BPS:", rd.targetApyBps());
+        console2.log("Target APY BPS (Track A):    ", rd.targetApyBps());
+        console2.log("Open-tier APY BPS (Track B):", rd.openTierTargetApyBps());
+        console2.log("RewardCurve (Track A):       ", rd.rewardCurve());
+        console2.log("Open-tier RewardCurve (B):   ", rd.openTierRewardCurve());
 
         logSection("Balances");
         console2.log("Native:", address(rd).balance);
@@ -85,36 +92,53 @@ contract RewardDistributorOps is InteractionScript {
         address consensusRegistry;
         address accumulator;
         uint256 targetApyBps;
+        uint256 openTierTargetApyBps;
+        address rewardCurve;
+        address openTierRewardCurve;
         bool updateFeeAggregator;
         bool updateDelegationPool;
         bool updateConsensusRegistry;
         bool updateAccumulator;
         bool updateApy;
+        bool updateOpenTierApy;
+        bool updateRewardCurve;
+        bool updateOpenTierRewardCurve;
     }
 
-    /// @notice Update wiring + APY target. Pass any subset of env vars.
-    /// Env vars: FEE_AGGREGATOR, DELEGATION_POOL, CONSENSUS_REGISTRY, ACCUMULATOR, TARGET_APY_BPS
-    /// (ACCUMULATOR uses 0xdEaD as "not provided" sentinel since address(0) disables top-ups.)
+    /// @notice Update wiring + APY target(s) + RewardCurve(s). Pass any subset of env vars.
+    /// Env vars: FEE_AGGREGATOR, DELEGATION_POOL, CONSENSUS_REGISTRY, ACCUMULATOR, TARGET_APY_BPS,
+    ///           OPEN_TIER_TARGET_APY_BPS, REWARD_CURVE, OPEN_TIER_REWARD_CURVE
+    /// (ACCUMULATOR uses 0xdEaD as "not provided" sentinel since address(0) disables top-ups.
+    ///  REWARD_CURVE / OPEN_TIER_REWARD_CURVE: address(0) is a valid input meaning "disable the
+    ///  curve, fall back to the static bps" -- pass NOT_SET_ADDR (0xdEaD) to leave unchanged.)
     function setConfig() public {
         ConfigInputs memory inp = _readConfigInputs();
         require(
             inp.updateFeeAggregator || inp.updateDelegationPool || inp.updateConsensusRegistry
-                || inp.updateAccumulator || inp.updateApy,
-            "Set FEE_AGGREGATOR / DELEGATION_POOL / CONSENSUS_REGISTRY / ACCUMULATOR / TARGET_APY_BPS"
+                || inp.updateAccumulator || inp.updateApy || inp.updateOpenTierApy
+                || inp.updateRewardCurve || inp.updateOpenTierRewardCurve,
+            "Set FEE_AGGREGATOR / DELEGATION_POOL / CONSENSUS_REGISTRY / ACCUMULATOR / "
+            "TARGET_APY_BPS / OPEN_TIER_TARGET_APY_BPS / REWARD_CURVE / OPEN_TIER_REWARD_CURVE"
         );
 
         logSection("Current");
-        console2.log("FeeAggregator:    ", rd.feeAggregator());
-        console2.log("DelegationPool:   ", rd.delegationPool());
-        console2.log("ConsensusRegistry:", rd.consensusRegistry());
-        console2.log("Accumulator:      ", rd.accumulator());
-        console2.log("Target APY BPS:   ", rd.targetApyBps());
+        console2.log("FeeAggregator:        ", rd.feeAggregator());
+        console2.log("DelegationPool:       ", rd.delegationPool());
+        console2.log("ConsensusRegistry:    ", rd.consensusRegistry());
+        console2.log("Accumulator:          ", rd.accumulator());
+        console2.log("Target APY BPS:       ", rd.targetApyBps());
+        console2.log("Open-tier APY BPS:    ", rd.openTierTargetApyBps());
+        console2.log("RewardCurve:          ", rd.rewardCurve());
+        console2.log("Open-tier RewardCurve:", rd.openTierRewardCurve());
 
-        if (inp.updateFeeAggregator) console2.log("New FeeAggregator:    ", inp.feeAggregator);
-        if (inp.updateDelegationPool) console2.log("New DelegationPool:   ", inp.delegationPool);
-        if (inp.updateConsensusRegistry) console2.log("New ConsensusRegistry:", inp.consensusRegistry);
-        if (inp.updateAccumulator) console2.log("New Accumulator:      ", inp.accumulator);
-        if (inp.updateApy) console2.log("New Target APY BPS:   ", inp.targetApyBps);
+        if (inp.updateFeeAggregator) console2.log("New FeeAggregator:        ", inp.feeAggregator);
+        if (inp.updateDelegationPool) console2.log("New DelegationPool:       ", inp.delegationPool);
+        if (inp.updateConsensusRegistry) console2.log("New ConsensusRegistry:    ", inp.consensusRegistry);
+        if (inp.updateAccumulator) console2.log("New Accumulator:          ", inp.accumulator);
+        if (inp.updateApy) console2.log("New Target APY BPS:       ", inp.targetApyBps);
+        if (inp.updateOpenTierApy) console2.log("New Open-tier APY BPS:    ", inp.openTierTargetApyBps);
+        if (inp.updateRewardCurve) console2.log("New RewardCurve:          ", inp.rewardCurve);
+        if (inp.updateOpenTierRewardCurve) console2.log("New Open-tier RewardCurve:", inp.openTierRewardCurve);
 
         vm.startBroadcast();
         if (inp.updateFeeAggregator) rd.setFeeAggregator(inp.feeAggregator);
@@ -122,6 +146,9 @@ contract RewardDistributorOps is InteractionScript {
         if (inp.updateConsensusRegistry) rd.setConsensusRegistry(inp.consensusRegistry);
         if (inp.updateAccumulator) rd.setAccumulator(inp.accumulator);
         if (inp.updateApy) rd.setTargetApyBps(inp.targetApyBps);
+        if (inp.updateOpenTierApy) rd.setOpenTierTargetApyBps(inp.openTierTargetApyBps);
+        if (inp.updateRewardCurve) rd.setRewardCurve(inp.rewardCurve);
+        if (inp.updateOpenTierRewardCurve) rd.setOpenTierRewardCurve(inp.openTierRewardCurve);
         vm.stopBroadcast();
 
         if (inp.updateFeeAggregator) require(rd.feeAggregator() == inp.feeAggregator, "fa mismatch");
@@ -129,25 +156,39 @@ contract RewardDistributorOps is InteractionScript {
         if (inp.updateConsensusRegistry) require(rd.consensusRegistry() == inp.consensusRegistry, "cr mismatch");
         if (inp.updateAccumulator) require(rd.accumulator() == inp.accumulator, "acc mismatch");
         if (inp.updateApy) require(rd.targetApyBps() == inp.targetApyBps, "apy mismatch");
+        if (inp.updateOpenTierApy) {
+            require(rd.openTierTargetApyBps() == inp.openTierTargetApyBps, "open-tier apy mismatch");
+        }
+        if (inp.updateRewardCurve) require(rd.rewardCurve() == inp.rewardCurve, "reward curve mismatch");
+        if (inp.updateOpenTierRewardCurve) {
+            require(rd.openTierRewardCurve() == inp.openTierRewardCurve, "open-tier reward curve mismatch");
+        }
 
         console2.log("");
         console2.log("Done.");
     }
 
     function _readConfigInputs() internal view returns (ConfigInputs memory inp) {
-        address NOT_SET = 0x000000000000000000000000000000000000dEaD;
+        address NOT_SET_ADDR = 0x000000000000000000000000000000000000dEaD;
+        uint256 NOT_SET_UINT = type(uint256).max;
 
         inp.feeAggregator = vm.envOr("FEE_AGGREGATOR", address(0));
         inp.delegationPool = vm.envOr("DELEGATION_POOL", address(0));
         inp.consensusRegistry = vm.envOr("CONSENSUS_REGISTRY", address(0));
-        inp.accumulator = vm.envOr("ACCUMULATOR", NOT_SET);
-        inp.targetApyBps = vm.envOr("TARGET_APY_BPS", type(uint256).max);
+        inp.accumulator = vm.envOr("ACCUMULATOR", NOT_SET_ADDR);
+        inp.targetApyBps = vm.envOr("TARGET_APY_BPS", NOT_SET_UINT);
+        inp.openTierTargetApyBps = vm.envOr("OPEN_TIER_TARGET_APY_BPS", NOT_SET_UINT);
+        inp.rewardCurve = vm.envOr("REWARD_CURVE", NOT_SET_ADDR);
+        inp.openTierRewardCurve = vm.envOr("OPEN_TIER_REWARD_CURVE", NOT_SET_ADDR);
 
         inp.updateFeeAggregator = inp.feeAggregator != address(0);
         inp.updateDelegationPool = inp.delegationPool != address(0);
         inp.updateConsensusRegistry = inp.consensusRegistry != address(0);
-        inp.updateAccumulator = inp.accumulator != NOT_SET;
-        inp.updateApy = inp.targetApyBps != type(uint256).max;
+        inp.updateAccumulator = inp.accumulator != NOT_SET_ADDR;
+        inp.updateApy = inp.targetApyBps != NOT_SET_UINT;
+        inp.updateOpenTierApy = inp.openTierTargetApyBps != NOT_SET_UINT;
+        inp.updateRewardCurve = inp.rewardCurve != NOT_SET_ADDR;
+        inp.updateOpenTierRewardCurve = inp.openTierRewardCurve != NOT_SET_ADDR;
     }
 
     // ── ANYONE / VALIDATOR ──────────────────────────────────────────────
