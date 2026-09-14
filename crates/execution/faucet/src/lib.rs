@@ -356,6 +356,7 @@ mod tests {
                     // v is found when the recovered key matches the known public key
                     //
                     // calculate v based on EIP-155
+                    // recovery_id is 0 or 1; widened to u64 to match chain_id's type (no data lost)
                     let v = recovery_id as u64 + chain_id * 2 + 35;
                     let y_odd_parity = v % 2 == 0;
                     tx.send(y_odd_parity).expect("tx sent odd_y_parity");

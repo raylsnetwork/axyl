@@ -24,7 +24,7 @@ use rayls_infrastructure_config::{
     fetch_file_content_relative_to_manifest, Config, ConfigFmt, ConfigTrait,
 };
 use rayls_infrastructure_types::{
-    hex, public_key_to_address, sol, testnet_genesis, Address, BlockHash, ConsensusHeader,
+    hex, public_key_to_address, sol, test_genesis_yaml, Address, BlockHash, ConsensusHeader,
     Encodable2718 as _, Epoch, EpochCertificate, EpochRecord, Genesis, GenesisAccount, SolValue,
     TaskManager, B256, U256,
 };
@@ -661,7 +661,7 @@ async fn prepare_google_kms_env() -> eyre::Result<(Arc<RethChainSpec>, Address)>
     let kms_address = public_key_to_address(public_key);
 
     // create genesis and fund relevant accounts
-    let genesis = testnet_genesis();
+    let genesis = test_genesis_yaml();
     let faucet_account = vec![(kms_address, GenesisAccount::default().with_balance(U256::MAX))];
     let default_deployer_address = TransactionFactory::default().address();
     let default_deployer_account =

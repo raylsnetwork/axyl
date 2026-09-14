@@ -44,9 +44,9 @@ pub fn test_genesis() -> Genesis {
             GenesisAccount::default().with_balance(U256::MAX),
         ),
     ];
-    // use testnet pre-compiles
+    // use the test-genesis fixture's pre-compiles
     let precompiles: Genesis =
-        serde_yaml::from_str(TESTNET_GENESIS).expect("bad testnet genesis yaml data");
+        serde_yaml::from_str(TEST_GENESIS_YAML).expect("bad test genesis yaml data");
     let genesis = genesis.extend_accounts(precompiles.alloc);
     // overwrite any conflicting accounts with specified values
     genesis.extend_accounts(default_factory_accounts)
@@ -84,17 +84,21 @@ pub fn test_chain_spec_arc() -> Arc<ChainSpec> {
     Arc::new(chain)
 }
 
-/// testnet genesis
-pub fn testnet_genesis() -> Genesis {
-    serde_yaml::from_str(TESTNET_GENESIS).expect("serde parse valid testnet yaml")
+/// Test genesis, parsed from the raw YAML fixture.
+///
+/// This is a test fixture, not a real network's genesis: it carries the `local`
+/// network's chain-id (487) so it matches `test_genesis()`/`test_chain_spec_arc()`,
+/// which are used to sign the batches it executes against.
+pub fn test_genesis_yaml() -> Genesis {
+    serde_yaml::from_str(TEST_GENESIS_YAML).expect("serde parse valid test yaml")
 }
 
-// The raw string for the testnet genesis, kept as a test fixture.
-/// Static string for the (testnet) genesis used by the test fixtures above.
+// The raw string for the test genesis, kept as a test fixture.
+/// Static string for the test genesis used by the test fixtures above.
 ///
 /// Faucet addresses:
 /// - 0xe626ce81714cb7777b1bf8ad2323963fb3398ad5
 /// - 0xb3fabbd1d2edde4d9ced3ce352859ce1bebf7907
 /// - 0xa3478861957661b2d8974d9309646a71271d98b9
 /// - 0xe69151677e5aec0b4fc0a94bfcaf20f6f0f975eb
-pub const TESTNET_GENESIS: &str = include_str!("./testdata/testnet-genesis.yaml");
+pub const TEST_GENESIS_YAML: &str = include_str!("./testdata/test-genesis.yaml");

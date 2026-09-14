@@ -21,7 +21,7 @@ use rayls_infrastructure_storage::{
     tables::{ConsensusBlockNumbersByDigest, ConsensusBlocks},
 };
 use rayls_infrastructure_types::{
-    gas_accumulator::GasAccumulator, testnet_genesis, B256Map, Batch, CommittedSubDag,
+    gas_accumulator::GasAccumulator, test_genesis_yaml, B256Map, Batch, CommittedSubDag,
     ConsensusHeader, ConsensusOutput, Database, DbTxMut, ExecHeader, Notifier, RaylsReceiver as _,
     RaylsSender as _, ReputationScores, SealedHeader, TaskManager, B256,
     DEFAULT_BAD_NODES_STAKE_THRESHOLD, ETHEREUM_BLOCK_GAS_LIMIT_56BITS,
@@ -64,7 +64,7 @@ async fn test_catchup_accumulator() -> eyre::Result<()> {
         create_signed_certificates_for_rounds(1..=max_round, &fixture);
 
     // fund accounts in genesis so txs execute
-    let genesis = testnet_genesis();
+    let genesis = test_genesis_yaml();
     let all_batches: Vec<_> = batches.values().cloned().collect();
     let (genesis, _, _) = seeded_genesis_from_random_batches(genesis, all_batches.iter());
     let chain: Arc<RethChainSpec> = Arc::new(genesis.into());

@@ -413,7 +413,7 @@ mod tests {
 
     #[test]
     fn test_validate_genesis_fails() {
-        // this uses `testnet_genesis`
+        // this uses `test_genesis_yaml`
         let mut network_genesis = NetworkGenesis::new_for_test();
         // create keys and information for validators
         for v in 0..4 {

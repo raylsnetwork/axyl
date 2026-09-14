@@ -207,13 +207,21 @@ where
         let network = self.builder.rayls_infrastructure_config.parameters.network;
         // Prefer an externally-resolved schedule (from `--config-file`); without one, the
         // baked-in profile selected by `parameters.network` applies. An "external" datadir
-        // with no file schedule cannot boot, so the final arm is unreachable at runtime and
-        // falls back to an all-`Never` schedule.
+        // with no file schedule cannot boot (enforced in `network-cli` at startup), so the
+        // final arm is unreachable at runtime. If a future refactor ever lets a node reach
+        // it, `debug_assert!` surfaces that loudly in tests instead of silently applying an
+        // all-`Never` schedule (which would leave EIP-1559 permanently inactive).
         let hardforks = match active_profile() {
             Some(profile) => RaylsChainHardforks::new(profile.schedule()),
             None => match network {
                 Some(network) => RaylsChainHardforks::for_network(network),
-                None => RaylsChainHardforks::new(Vec::new()),
+                None => {
+                    debug_assert!(
+                        false,
+                        "external datadir with no schedule must be refused at boot"
+                    );
+                    RaylsChainHardforks::new(Vec::new())
+                }
             },
         };
         if hardforks.is_eip1559_active_at_block(block_number) {
