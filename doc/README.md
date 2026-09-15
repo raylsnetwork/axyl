@@ -81,6 +81,9 @@ back here):
   the invariants the registry contract is intended to maintain.
 - [`../rayls-contracts/script/interactions/README.md`](../rayls-contracts/script/interactions/README.md) —
   Foundry scripts for operating the deployed contracts.
+- [`../docs/contract-upgrades/README.md`](../docs/contract-upgrades/README.md) —
+  deciding whether a contract change needs a normal proxy upgrade or a hardfork, and the
+  step-by-step runbook for each.
 
 ### "I want to contribute"
 

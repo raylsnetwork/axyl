@@ -48,3 +48,7 @@ gha-creds-*.json
 
 # profiling
 heaptrack
+
+# rendered doc exports (docs/audits/ PDFs are legitimate committed source, this is scoped to
+# docs/ only, where exported previews of the markdown runbooks land)
+docs/**/*.pdf
