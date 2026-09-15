@@ -9,6 +9,7 @@ For a system-level overview (transaction flow, architecture, database tables, RP
 ## Common
 
 - [`bin/rayls-network`](crates/rayls-network.md)
+- [`bin/rayls-db-inspect`](../../bin/rayls-db-inspect/README.md) — read-only consensus-db inspection CLI for operators
 
 ## Consensus
 
