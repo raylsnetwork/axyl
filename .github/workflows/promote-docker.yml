@@ -130,9 +130,18 @@ jobs:
           fi
 
           # Read the commit the source image was built from (stamped at build time).
+          # Multi-arch tags are manifest lists, where inspect exposes .Image as a
+          # map keyed by platform — read the label off the amd64 child. Fall back
+          # to the single-arch shape for images built before multi-arch support.
           COMMIT=$(docker buildx imagetools inspect \
             "$ECR_PRIVATE_REGISTRY/$IMAGE_NAME:$SOURCE_TAG" \
-            --format '{{ index .Image.Config.Labels "org.opencontainers.image.revision" }}' 2>/dev/null || true)
+            --format '{{ index (index .Image "linux/amd64").Config.Labels "org.opencontainers.image.revision" }}' 2>/dev/null || true)
+          if [ -z "$COMMIT" ] || [ "$COMMIT" = "<no value>" ]; then
+            COMMIT=$(docker buildx imagetools inspect \
+              "$ECR_PRIVATE_REGISTRY/$IMAGE_NAME:$SOURCE_TAG" \
+              --format '{{ index .Image.Config.Labels "org.opencontainers.image.revision" }}' 2>/dev/null || true)
+          fi
+          if [ "$COMMIT" = "<no value>" ]; then COMMIT=""; fi
 
           echo "digest=$DIGEST" >> $GITHUB_OUTPUT
           echo "commit=$COMMIT" >> $GITHUB_OUTPUT
@@ -255,6 +264,8 @@ jobs:
       - name: Login to Amazon ECR
         uses: aws-actions/amazon-ecr-login@fa648b43de3d4d023bcb3f89ed6940096949c419 # v2.1.5
 
+      # Also correct for multi-arch tags: the copied manifest is the index
+      # (manifest list) and its per-arch children already live in this repo.
       - name: Re-tag image (digest-preserving ECR manifest copy)
         env:
           SOURCE_TAG: ${{ needs.plan.outputs.source_tag }}
