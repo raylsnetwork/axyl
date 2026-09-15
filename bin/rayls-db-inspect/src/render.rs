@@ -43,7 +43,7 @@ impl Table {
         }
         // A cell is padded one space either side, which is what puts two spaces between columns.
         // Drop the padding at both ends so rows start in column zero and the rule ends with them.
-        let last = table.column_iter_mut().count().saturating_sub(1);
+        let last = table.column_count().saturating_sub(1);
         for (i, column) in table.column_iter_mut().enumerate() {
             column.set_padding((u16::from(i != 0), u16::from(i != last)));
         }
