@@ -10,6 +10,10 @@ use crate::report::{
 use std::fmt::Write as _;
 
 /// Minimal aligned-column table.
+///
+/// Borderless on purpose: two spaces between columns, a rule under the header, nothing else. The
+/// output is meant to be piped, grepped and diffed, so there is no styling and no line that
+/// depends on the terminal's width.
 #[derive(Debug, Default)]
 pub struct Table {
     headers: Vec<String>,
@@ -26,30 +30,27 @@ impl Table {
     }
 
     pub fn render(&self) -> String {
-        let cols = self.headers.len().max(self.rows.iter().map(Vec::len).max().unwrap_or(0));
-        let mut widths = vec![0usize; cols];
-        for row in std::iter::once(&self.headers).chain(&self.rows) {
-            for (i, cell) in row.iter().enumerate() {
-                widths[i] = widths[i].max(cell.chars().count());
-            }
+        let mut table = comfy_table::Table::new();
+        table
+            .load_preset(comfy_table::presets::NOTHING)
+            .set_style(comfy_table::TableComponent::HeaderLines, '-')
+            // Size columns to their contents. The alternative consults the terminal width, which
+            // would make the output change between a pipe and a tty.
+            .set_content_arrangement(comfy_table::ContentArrangement::Disabled)
+            .set_header(self.headers.clone());
+        for row in &self.rows {
+            table.add_row(row.clone());
+        }
+        // A cell is padded one space either side, which is what puts two spaces between columns.
+        // Drop the padding at both ends so rows start in column zero and the rule ends with them.
+        let last = table.column_iter_mut().count().saturating_sub(1);
+        for (i, column) in table.column_iter_mut().enumerate() {
+            column.set_padding((u16::from(i != 0), u16::from(i != last)));
         }
         let mut out = String::new();
-        let line = |cells: &[String], out: &mut String| {
-            let mut parts = Vec::with_capacity(cells.len());
-            for (i, cell) in cells.iter().enumerate() {
-                let pad = if i + 1 == cells.len() { 0 } else { widths[i] - cell.chars().count() };
-                parts.push(format!("{cell}{}", " ".repeat(pad)));
-            }
-            let _ = writeln!(out, "{}", parts.join("  ").trim_end());
-        };
-        line(&self.headers, &mut out);
-        let _ = writeln!(
-            out,
-            "{}",
-            widths.iter().map(|w| "-".repeat(*w)).collect::<Vec<_>>().join("  ")
-        );
-        for row in &self.rows {
-            line(row, &mut out);
+        for line in table.to_string().lines() {
+            // Short rows are padded out to the column width; nothing downstream wants the spaces.
+            let _ = writeln!(out, "{}", line.trim_end());
         }
         out
     }
@@ -517,7 +518,18 @@ mod tests {
         let mut t = Table::new(&["a", "bbb"]);
         t.row(vec!["xxxx".into(), "y".into()]);
         let s = t.render();
-        assert_eq!(s, "a     bbb\n----  ---\nxxxx  y\n");
+        assert_eq!(s, "a     bbb\n---------\nxxxx  y\n");
+    }
+
+    /// A row shorter than the header is how an absent record is reported; the missing cells must
+    /// not push the row out of line or leave padding behind.
+    #[test]
+    fn short_rows_keep_their_columns() {
+        let mut t = Table::new(&["a", "bbb", "cc"]);
+        t.row(vec!["xxxx".into(), "y".into(), "zz".into()]);
+        t.row(vec!["w".into()]);
+        let s = t.render();
+        assert_eq!(s, "a     bbb  cc\n-------------\nxxxx  y    zz\nw\n");
     }
 
     #[test]
