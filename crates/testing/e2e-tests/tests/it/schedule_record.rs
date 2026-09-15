@@ -107,7 +107,7 @@ async fn wait_for_rpc(url: &str) -> eyre::Result<()> {
 /// Wait for the boot to be refused: the process must exit non-zero on its own
 /// (a refusal happens pre-launch, so the node never serves RPC). Returns the
 /// captured stderr.
-fn wait_for_refusal(
+async fn wait_for_refusal(
     mut child: Child,
     mut stderr: ChildStderr,
 ) -> eyre::Result<(std::process::ExitStatus, String)> {
@@ -123,7 +123,7 @@ fn wait_for_refusal(
                          (the gate should have refused it pre-launch)"
                     ));
                 }
-                std::thread::sleep(Duration::from_millis(250));
+                tokio::time::sleep(Duration::from_millis(250)).await;
             }
             Err(e) => return Err(e.into()),
         }
@@ -189,7 +189,7 @@ async fn schedule_record_gate_on_real_boots() -> eyre::Result<()> {
     let port = get_available_tcp_port("127.0.0.1")
         .ok_or_else(|| eyre::eyre!("no free tcp port for port"))?;
     let (child, stderr) = start_node(&datadir, port, Some(&tampered));
-    let (status, output) = wait_for_refusal(child, stderr)?;
+    let (status, output) = wait_for_refusal(child, stderr).await?;
     assert!(!status.success(), "boot under a tampered schedule must be refused");
     assert!(output.contains("Eip1559"), "the refusal should name the moved fork: {output}");
     assert!(

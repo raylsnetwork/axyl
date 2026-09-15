@@ -129,6 +129,17 @@ fn resolve_expected_chain_id(
     }
 }
 
+/// The hardfork schedule selected from a `--config-file`: the file path, the
+/// subnet chosen with `--subnet`, and the subnet's resolved profile.
+struct FileSchedule {
+    /// Path of the network config file.
+    path: PathBuf,
+    /// The subnet selected from it.
+    subnet: String,
+    /// The subnet's resolved profile.
+    profile: NetworkProfile,
+}
+
 /// Verify the hardfork schedule selected for this boot against the datadir's
 /// schedule record, then update the record for this boot.
 ///
@@ -141,14 +152,14 @@ fn resolve_expected_chain_id(
 fn verify_schedule_record<P: RaylsDirs>(
     datadir: &P,
     node_config: &RethConfig,
-    file_schedule: Option<&(PathBuf, String, NetworkProfile)>,
+    file_schedule: Option<&FileSchedule>,
     network: Option<RaylsNetwork>,
 ) -> eyre::Result<()> {
     // The schedule selected for this boot: the file profile wins, else the
     // built-in profile (an "external" datadir without either is already
     // refused by `resolve_expected_chain_id`).
     let (schedule, chain_id) = match file_schedule {
-        Some((_, _, profile)) => (profile.schedule(), profile.chain_id),
+        Some(file_schedule) => (file_schedule.profile.schedule(), file_schedule.profile.chain_id),
         None => {
             let network =
                 network.expect("an external datadir without a file schedule is refused at boot");
@@ -199,8 +210,15 @@ fn verify_schedule_record<P: RaylsDirs>(
     let record = ScheduleRecord::from_schedule(chain_id, head, &schedule);
     let yaml =
         serde_yaml::to_string(&record).wrap_err("failed to serialize the schedule record")?;
-    std::fs::write(&path, yaml)
-        .with_context(|| format!("failed to write schedule record {path:?}"))?;
+    // Write to a sibling temp file and rename into place (atomic on POSIX): a
+    // crash mid-write must leave the previous, still-parseable record — never
+    // a torn file that bricks the next boot. A leftover temp file after a
+    // crash is harmless; the next write overwrites it.
+    let tmp = path.with_file_name("schedule-record.yaml.tmp");
+    std::fs::write(&tmp, yaml)
+        .with_context(|| format!("failed to write schedule record temp file {tmp:?}"))?;
+    std::fs::rename(&tmp, &path)
+        .with_context(|| format!("failed to move schedule record into place at {path:?}"))?;
     info!(
         target: "cli",
         ?path,
@@ -412,11 +430,11 @@ impl<Ext: clap::Args + fmt::Debug> NodeCommand<Ext> {
         // file fails fast with an actionable message.
         let file_schedule = if let Some(config_file) = &self.config_file {
             let subnet = self.subnet.as_deref().expect("clap requires --subnet with --config-file");
-            Some((
-                config_file.clone(),
-                subnet.to_string(),
-                load_subnet_profile(config_file, subnet)?,
-            ))
+            Some(FileSchedule {
+                path: config_file.clone(),
+                subnet: subnet.to_string(),
+                profile: load_subnet_profile(config_file, subnet)?,
+            })
         } else {
             None
         };
@@ -438,8 +456,11 @@ impl<Ext: clap::Args + fmt::Debug> NodeCommand<Ext> {
         // The datadir must carry the chain-id of the schedule source selected
         // for this boot, otherwise it belongs to a different network or client
         // and would run the wrong hardfork schedule.
-        let file_schedule_desc = file_schedule.as_ref().map(|(config_file, subnet, profile)| {
-            (profile.chain_id, format!("subnet '{subnet}' of {config_file:?}"))
+        let file_schedule_desc = file_schedule.as_ref().map(|file_schedule| {
+            (
+                file_schedule.profile.chain_id,
+                format!("subnet '{}' of {:?}", file_schedule.subnet, file_schedule.path),
+            )
         });
         let (expected_chain_id, chain_id_source) = resolve_expected_chain_id(
             file_schedule_desc,
@@ -449,15 +470,15 @@ impl<Ext: clap::Args + fmt::Debug> NodeCommand<Ext> {
         verify_datadir_chain_id(actual_chain_id, expected_chain_id, &chain_id_source)?;
 
         // Borrowed: the schedule record gate below still needs the selected profile.
-        if let Some((config_file, subnet, profile)) = &file_schedule {
+        if let Some(file_schedule) = &file_schedule {
             info!(
                 target: "cli",
-                ?config_file,
-                subnet,
+                config_file = ?file_schedule.path,
+                subnet = %file_schedule.subnet,
                 chain_id = actual_chain_id,
                 "loading hardfork schedule from file"
             );
-            set_active_profile(profile.clone())?;
+            set_active_profile(file_schedule.profile.clone())?;
         }
 
         debug!(target: "cli", validator = ?rayls_infrastructure_config.node_info.name, "rl datadir for node command: {rl_datadir:?}");
@@ -656,7 +677,7 @@ mod chain_id_tests {
 
 #[cfg(test)]
 mod schedule_record_tests {
-    use super::verify_schedule_record;
+    use super::{verify_schedule_record, FileSchedule};
     use clap::Parser;
     use rayls_execution_evm::{
         network_profile::{ForkActivation, NetworkProfile},
@@ -739,11 +760,11 @@ mod schedule_record_tests {
         boot(dir.path(), &config, Some(RaylsNetwork::Local)).expect("first boot passes");
         set_head(&config, dir.path(), 10);
         let profile = local_profile_moving("Eip1559", 20);
-        let file_schedule = (
-            std::path::PathBuf::from("/x/y.yaml"),
-            "subnet 'local' of \"/x/y.yaml\"".to_string(),
+        let file_schedule = FileSchedule {
+            path: std::path::PathBuf::from("/x/y.yaml"),
+            subnet: "local".to_string(),
             profile,
-        );
+        };
         let err = {
             let dir = dir.path().to_path_buf();
             verify_schedule_record(&dir, &config, Some(&file_schedule), None)
@@ -762,11 +783,11 @@ mod schedule_record_tests {
         boot(dir.path(), &config, Some(RaylsNetwork::Local)).expect("first boot passes");
         set_head(&config, dir.path(), 10);
         let profile = local_profile_moving("UsdrSupplyCorrection", 200);
-        let file_schedule = (
-            std::path::PathBuf::from("/x/y.yaml"),
-            "subnet 'local' of \"/x/y.yaml\"".to_string(),
+        let file_schedule = FileSchedule {
+            path: std::path::PathBuf::from("/x/y.yaml"),
+            subnet: "local".to_string(),
             profile,
-        );
+        };
         {
             let dir = dir.path().to_path_buf();
             verify_schedule_record(&dir, &config, Some(&file_schedule), None)
@@ -800,11 +821,11 @@ mod schedule_record_tests {
         boot(dir.path(), &config, Some(RaylsNetwork::Local)).expect("first boot passes");
         let mut profile = local_profile_moving("Eip1559", 0);
         profile.chain_id = 99999;
-        let file_schedule = (
-            std::path::PathBuf::from("/x/y.yaml"),
-            "subnet 'local' of \"/x/y.yaml\"".to_string(),
+        let file_schedule = FileSchedule {
+            path: std::path::PathBuf::from("/x/y.yaml"),
+            subnet: "local".to_string(),
             profile,
-        );
+        };
         let err = {
             let dir = dir.path().to_path_buf();
             verify_schedule_record(&dir, &config, Some(&file_schedule), None)

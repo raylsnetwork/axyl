@@ -207,6 +207,7 @@ impl ScheduleRecord {
         as_of_block: u64,
         schedule: &[(RaylsHardFork, ForkCondition)],
     ) -> Self {
+        assert_block_based(schedule);
         let hardforks = schedule
             .iter()
             .filter_map(|(fork, condition)| match condition {
@@ -214,7 +215,8 @@ impl ScheduleRecord {
                     Some((fork.name().to_string(), ForkActivation::Block(*block)))
                 }
                 ForkCondition::Never => None,
-                // Rayls schedules only use block-based (or absent) activations.
+                // Rayls schedules only use block-based (or absent) activations;
+                // `assert_block_based` above fires in dev builds otherwise.
                 ForkCondition::TTD { .. } | ForkCondition::Timestamp(_) => None,
             })
             .collect();
@@ -284,7 +286,12 @@ pub fn verify_schedule(
         if recorded == selected_block {
             continue;
         }
-        let first_disagreement = [recorded, selected_block].into_iter().flatten().min().unwrap();
+        // `recorded != selected_block`, so at least one of the two is `Some`.
+        let first_disagreement = [recorded, selected_block]
+            .into_iter()
+            .flatten()
+            .min()
+            .expect("at least one boundary is Some when the schedules differ");
         if first_disagreement <= head {
             eyre::bail!(
                 "hardfork '{}' boundary changed from {} to {} but the chain has already \
@@ -301,12 +308,29 @@ pub fn verify_schedule(
     Ok(moves)
 }
 
+/// Rayls schedules only use block-based (or absent) activations. Fire in dev
+/// builds if a TTD- or timestamp-based fork is ever added: the record format
+/// (and its verification) must learn to represent it first.
+fn assert_block_based(schedule: &[(RaylsHardFork, ForkCondition)]) {
+    debug_assert!(
+        schedule
+            .iter()
+            .all(|(_, condition)| matches!(condition, ForkCondition::Block(_) | ForkCondition::Never)),
+        "Rayls schedules are block-based only; extend ScheduleRecord before adding TTD/timestamp forks"
+    );
+}
+
 /// The activation block of a fork condition; `None` for `Never`.
 fn block_of(condition: &ForkCondition) -> Option<u64> {
+    debug_assert!(
+        matches!(condition, ForkCondition::Block(_) | ForkCondition::Never),
+        "Rayls schedules are block-based only; extend ScheduleRecord before adding TTD/timestamp forks"
+    );
     match condition {
         ForkCondition::Block(block) => Some(*block),
         ForkCondition::Never => None,
-        // Rayls schedules only use block-based (or absent) activations.
+        // Rayls schedules only use block-based (or absent) activations; the
+        // debug assert above fires in dev builds otherwise.
         ForkCondition::TTD { .. } | ForkCondition::Timestamp(_) => None,
     }
 }
