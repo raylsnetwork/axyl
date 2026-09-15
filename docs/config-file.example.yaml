@@ -15,6 +15,16 @@
 # At boot the datadir's genesis chain-id is checked against the subnet's
 # `chain_id` and the node refuses to start on a mismatch (wrong datadir for
 # this subnet).
+#
+# The datadir also keeps a `schedule-record.yaml` pinning the hardfork
+# schedule its executed blocks ran under. At boot the selected schedule is
+# verified against that record: a fork that has ALREADY activated (boundary at
+# or below the current head) cannot be moved, removed, or back-dated - the
+# node refuses to start, because that schedule would re-interpret the chain's
+# history. A boundary still in the future MAY be changed - that is how agreed
+# schedule updates ship - and the node warns about the change and re-records
+# the new schedule. A datadir without a record (a fresh chain, or one created
+# before this feature) is trusted as-is and starts recording from that boot.
 
 networks:
   <subnet-name>:
@@ -41,3 +51,5 @@ networks:
       EmptyOutputBlock: never
       DynamicCommitteeSizing: never
       HybridRewards: never
+      OutputSeqNormalization: never
+      SenderAffinityLoadBalancing: never

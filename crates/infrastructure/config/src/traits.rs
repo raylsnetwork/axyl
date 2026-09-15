@@ -145,6 +145,9 @@ pub trait RaylsDirs: std::fmt::Debug + Send + Sync + 'static {
     /// Return the path to `network_config` file.
     fn network_config_path(&self) -> PathBuf;
 
+    /// Return the path to the hardfork schedule record file.
+    fn schedule_record_path(&self) -> PathBuf;
+
     /// Return the path to consensus's epoch storage for a specific epoch.
     fn epoch_db_path(&self, epoch: Epoch) -> PathBuf {
         let extension = format!("epoch_{epoch}");
@@ -190,5 +193,9 @@ where
 
     fn network_config_path(&self) -> PathBuf {
         self.as_ref().join("network-config")
+    }
+
+    fn schedule_record_path(&self) -> PathBuf {
+        self.as_ref().join("schedule-record.yaml")
     }
 }

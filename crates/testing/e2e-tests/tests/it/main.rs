@@ -4,6 +4,8 @@
 
 #[cfg(feature = "dev-single-node-setup")]
 mod dev;
+#[cfg(feature = "dev-single-node-setup")]
+mod schedule_record;
 // Multi-validator e2e suites: they spawn 4-validator local testnets, so they cannot run
 // against a single-node-only dev build. Compiled/run in non-feature (production) builds only.
 mod active_profile;
