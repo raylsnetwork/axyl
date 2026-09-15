@@ -1,0 +1,42 @@
+[package]
+name = "rayls-relay"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license = "BUSL-1.1"
+homepage.workspace = true
+repository.workspace = true
+authors.workspace = true
+description.workspace = true
+exclude.workspace = true
+
+[dependencies]
+libp2p = { workspace = true, features = [
+    "tokio",
+    "quic",
+    "relay",
+    "ping",
+    "identify",
+    "macros",
+] }
+# single source of the QUIC transport limits shared with the node swarms (QuicConfig::apply)
+rayls-infrastructure-config = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "signal"] }
+futures = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
+eyre = { workspace = true }
+hex = { workspace = true }
+
+[dev-dependencies]
+# only to construct the `web_time::Instant` that `relay::RateLimiter::try_next` takes, in tests
+web-time = "1"
+# the end-to-end reservation test spins up a real relay *client* to request a reservation over QUIC
+# (same transport as production). The relay client secures+muxes the relayed leg with noise+yamux --
+# nothing to do with TCP; the relay *server* only forwards bytes so needs neither. Test-only:
+# features union with the normal dep in test builds, the shipped binary stays QUIC-only.
+libp2p = { workspace = true, features = ["noise", "yamux"] }
+tokio = { workspace = true, features = ["time", "rt", "macros"] }
+
+[lints]
+workspace = true

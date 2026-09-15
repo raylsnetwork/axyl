@@ -71,6 +71,9 @@ pub enum NetworkError {
     /// Failed to build swarm with behavior.
     #[error("SwarmBuilder::with_behaviour failed somehow.")]
     BuildSwarm,
+    /// Failed to build the DNS resolver configuration.
+    #[error("DNS resolver config error: {0}")]
+    DnsConfig(String),
     /// Request/response RPC Error
     #[error("{0}")]
     RPCError(String),
