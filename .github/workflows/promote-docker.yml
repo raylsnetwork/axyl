@@ -22,11 +22,14 @@ name: Promote Docker Image
 # The build commit is stamped into every image (org.opencontainers.image.revision)
 # and surfaced here so you can double-check the right code was promoted.
 #
-# APPROVAL GATE: gated by trstringer/manual-approval (issue-comment based) while
-# we are a private/non-enterprise repo where GitHub Environment protection rules
-# are unavailable. Toggle with repo variable ENABLE_MANUAL_APPROVAL ('true'/'false').
-# When we go public: delete the `approval` job and add `environment: <stage>`
-# (with required reviewers / CODEOWNERS) to the `retag` and `rebuild` jobs.
+# APPROVAL GATE: gated by trstringer/manual-approval (issue-comment based).
+# Toggle with repo variable ENABLE_MANUAL_APPROVAL ('true'/'false').
+#
+# NOTE: this workaround existed because Environment protection rules are not
+# available on private non-enterprise repos. This repo is public now, so they
+# are — the `approval` job can be replaced by `environment: <stage>` with
+# required reviewers on the `retag` and `rebuild` jobs. Left as-is here to keep
+# this change to the registry move; worth doing as a follow-up.
 
 on:
   workflow_dispatch:
@@ -47,7 +50,13 @@ on:
         default: ''
 
 env:
-  IMAGE_NAME: rayls-stack-node-client
+  IMAGE_NAME: sovereign-axyl
+  # ECR Public lives in the professional-services account and is only reachable
+  # through us-east-1, whatever region anything else here uses. That registry
+  # has two aliases — v9x7l0q0 (auto-generated) and rayls (custom, primary);
+  # rayls is the one to publish under.
+  ECR_PUBLIC_REGISTRY: public.ecr.aws/rayls
+  AWS_REGION_PUBLIC: us-east-1
   CHAINSPEC: crates/execution/evm/src/chainspec.rs
 
 jobs:
@@ -68,8 +77,6 @@ jobs:
       source_commit: ${{ steps.source.outputs.commit }}
       source_digest: ${{ steps.source.outputs.digest }}
       rebuild_commit: ${{ steps.plan.outputs.rebuild_commit }}
-    env:
-      ECR_PRIVATE_REGISTRY: ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ vars.AWS_REGION_PRIVATE }}.amazonaws.com
     steps:
       - name: Checkout (full history for chainspec diff)
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -108,17 +115,19 @@ jobs:
         uses: aws-actions/configure-aws-credentials@e7f100cf4c008499ea8adda475de1042d6975c7b # v6.2.0
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
-          aws-region: ${{ vars.AWS_REGION_PRIVATE }}
+          aws-region: ${{ env.AWS_REGION_PUBLIC }}
 
       - name: Login to Amazon ECR
         uses: aws-actions/amazon-ecr-login@fa648b43de3d4d023bcb3f89ed6940096949c419 # v2.1.5
+        with:
+          registry-type: public
 
       - name: Verify source image exists, capture digest and build commit
         id: source
         env:
           SOURCE_TAG: ${{ steps.tags.outputs.source_tag }}
         run: |
-          DIGEST=$(aws ecr describe-images \
+          DIGEST=$(aws ecr-public describe-images \
             --repository-name "$IMAGE_NAME" \
             --image-ids "imageTag=$SOURCE_TAG" \
             --query 'imageDetails[0].imageDigest' \
@@ -131,7 +140,7 @@ jobs:
 
           # Read the commit the source image was built from (stamped at build time).
           COMMIT=$(docker buildx imagetools inspect \
-            "$ECR_PRIVATE_REGISTRY/$IMAGE_NAME:$SOURCE_TAG" \
+            "$ECR_PUBLIC_REGISTRY/$IMAGE_NAME:$SOURCE_TAG" \
             --format '{{ index .Image.Config.Labels "org.opencontainers.image.revision" }}' 2>/dev/null || true)
 
           echo "digest=$DIGEST" >> $GITHUB_OUTPUT
@@ -145,7 +154,7 @@ jobs:
           #  env:
           #    TARGET_TAG: ${{ steps.tags.outputs.target_tag }}
           #  run: |
-          #    if aws ecr describe-images \
+          #    if aws ecr-public describe-images \
           #        --repository-name "$IMAGE_NAME" \
           #        --image-ids "imageTag=$TARGET_TAG" \
           #        --query 'imageDetails[0].imageDigest' \
@@ -205,7 +214,8 @@ jobs:
           fi
 
   # ===========================================================================
-  # APPROVAL GATE - issue-comment based, for private/non-enterprise repos.
+  # APPROVAL GATE - issue-comment based. Replaceable by a GitHub Environment
+  # now that this repo is public; see the note at the top of this file.
   # Remove this whole job and use `environment:` protection once public.
   # ===========================================================================
   approval:
@@ -243,46 +253,38 @@ jobs:
     permissions:
       contents: read
       id-token: write
-    env:
-      ECR_PRIVATE_REGISTRY: ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ vars.AWS_REGION_PRIVATE }}.amazonaws.com
     steps:
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@e7f100cf4c008499ea8adda475de1042d6975c7b # v6.2.0
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
-          aws-region: ${{ vars.AWS_REGION_PRIVATE }}
+          aws-region: ${{ env.AWS_REGION_PUBLIC }}
 
       - name: Login to Amazon ECR
         uses: aws-actions/amazon-ecr-login@fa648b43de3d4d023bcb3f89ed6940096949c419 # v2.1.5
+        with:
+          registry-type: public
 
       - name: Re-tag image (digest-preserving ECR manifest copy)
         env:
           SOURCE_TAG: ${{ needs.plan.outputs.source_tag }}
           TARGET_TAG: ${{ needs.plan.outputs.target_tag }}
         run: |
-          MANIFEST=$(aws ecr batch-get-image \
-            --repository-name "$IMAGE_NAME" \
-            --image-ids "imageTag=$SOURCE_TAG" \
-            --query 'images[0].imageManifest' \
-            --output text)
-          MEDIA_TYPE=$(aws ecr batch-get-image \
-            --repository-name "$IMAGE_NAME" \
-            --image-ids "imageTag=$SOURCE_TAG" \
-            --query 'images[0].imageManifestMediaType' \
-            --output text)
-
-          aws ecr put-image \
-            --repository-name "$IMAGE_NAME" \
-            --image-tag "$TARGET_TAG" \
-            --image-manifest "$MANIFEST" \
-            --image-manifest-media-type "$MEDIA_TYPE"
+          # ECR Public has no batch-get-image, so the old read-manifest /
+          # put-image pair does not port. `imagetools create` does the same job
+          # one level up: it copies the manifest registry-side, without pulling
+          # any layers, and keeps a multi-arch manifest list intact. Identical
+          # content means an identical digest, which the next step asserts.
+          docker buildx imagetools create \
+            --tag "${ECR_PUBLIC_REGISTRY}/${IMAGE_NAME}:${TARGET_TAG}" \
+            "${ECR_PUBLIC_REGISTRY}/${IMAGE_NAME}:${SOURCE_TAG}"
 
       - name: Verify target digest matches source
         env:
           SOURCE_DIGEST: ${{ needs.plan.outputs.source_digest }}
           TARGET_TAG: ${{ needs.plan.outputs.target_tag }}
         run: |
-          TARGET_DIGEST=$(aws ecr describe-images \
+          TARGET_DIGEST=$(aws ecr-public describe-images \
             --repository-name "$IMAGE_NAME" \
             --image-ids "imageTag=$TARGET_TAG" \
             --query 'imageDetails[0].imageDigest' \
