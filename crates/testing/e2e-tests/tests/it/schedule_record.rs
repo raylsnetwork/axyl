@@ -148,12 +148,23 @@ async fn schedule_record_gate_on_real_boots() -> eyre::Result<()> {
     let datadir = temp.path().join("datadir");
     std::fs::create_dir_all(&datadir)?;
 
-    // 1. Boot the dev node on an empty datadir and let the chain execute.
+    // 1. Boot the dev node on an empty datadir and let the chain execute. The RPC port comes from a
+    //    free port (and the dashboard is off, freeing its fixed port too), so a stale dev node
+    //    holding the defaults cannot break this step. The dev node's other ports (consensus, P2P,
+    //    metrics) remain fixed — only the HTTP surface is made collision-proof here.
+    let port = get_available_tcp_port("127.0.0.1")
+        .ok_or_else(|| eyre::eyre!("no free tcp port for the dev node"))?;
     let mut command = get_rayls_network_binary().command();
-    command.arg("dev").arg("--datadir").arg(&*datadir.to_string_lossy());
+    command
+        .arg("dev")
+        .arg("--datadir")
+        .arg(&*datadir.to_string_lossy())
+        .arg("--no-dashboard")
+        .arg("--http.port")
+        .arg(port.to_string());
     let mut dev_node = command.spawn().expect("dev node spawns");
-    let rpc_url = "http://127.0.0.1:8545";
-    wait_for_rpc(rpc_url).await?;
+    let rpc_url = format!("http://127.0.0.1:{port}");
+    wait_for_rpc(&rpc_url).await?;
     let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
     timeout(Duration::from_secs(60), async {
         loop {

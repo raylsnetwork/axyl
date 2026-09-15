@@ -171,25 +171,29 @@ fn verify_schedule_record<P: RaylsDirs>(
     // (the node re-opens the DB right after).
     let head = RethEnv::best_block_number(node_config, datadir.reth_db_path())?;
 
+    // Read (rather than `exists()`-then-read): a record deleted concurrently
+    // is treated as "no record" — the trust-and-record path — not a hard error.
     let path = datadir.schedule_record_path();
-    let existing: Option<ScheduleRecord> = if path.exists() {
-        let raw = std::fs::read_to_string(&path)
-            .with_context(|| format!("failed to read schedule record {path:?}"))?;
-        Some(
+    let existing: Option<ScheduleRecord> = match std::fs::read_to_string(&path) {
+        Ok(raw) => Some(
             serde_yaml::from_str::<ScheduleRecord>(&raw)
                 .with_context(|| format!("failed to parse schedule record {path:?}"))?,
-        )
-    } else {
-        if head > 0 {
-            warn!(
-                target: "cli",
-                ?path,
-                %head,
-                "datadir has no schedule record; trusting the selected schedule and \
-                 recording it (the executed-history check starts from now)"
-            );
+        ),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            if head > 0 {
+                warn!(
+                    target: "cli",
+                    ?path,
+                    %head,
+                    "datadir has no schedule record; trusting the selected schedule and \
+                     recording it (the executed-history check starts from now)"
+                );
+            }
+            None
         }
-        None
+        Err(e) => {
+            return Err(e).with_context(|| format!("failed to read schedule record {path:?}"))
+        }
     };
 
     let moves = match &existing {
@@ -469,18 +473,6 @@ impl<Ext: clap::Args + fmt::Debug> NodeCommand<Ext> {
         let actual_chain_id = rayls_infrastructure_config.genesis().config.chain_id;
         verify_datadir_chain_id(actual_chain_id, expected_chain_id, &chain_id_source)?;
 
-        // Borrowed: the schedule record gate below still needs the selected profile.
-        if let Some(file_schedule) = &file_schedule {
-            info!(
-                target: "cli",
-                config_file = ?file_schedule.path,
-                subnet = %file_schedule.subnet,
-                chain_id = actual_chain_id,
-                "loading hardfork schedule from file"
-            );
-            set_active_profile(file_schedule.profile.clone())?;
-        }
-
         debug!(target: "cli", validator = ?rayls_infrastructure_config.node_info.name, "rl datadir for node command: {rl_datadir:?}");
         info!(target: "cli", validator = ?rayls_infrastructure_config.node_info.name, "config loaded");
 
@@ -560,6 +552,20 @@ impl<Ext: clap::Args + fmt::Debug> NodeCommand<Ext> {
             file_schedule.as_ref(),
             rayls_infrastructure_config.parameters.network,
         )?;
+
+        // Commit the selected profile only once the gate has passed: the active
+        // profile is process-global (a OnceLock), so a refused boot must not
+        // leave it set for anything that runs afterwards in this process.
+        if let Some(file_schedule) = &file_schedule {
+            info!(
+                target: "cli",
+                config_file = ?file_schedule.path,
+                subnet = %file_schedule.subnet,
+                chain_id = actual_chain_id,
+                "loading hardfork schedule from file"
+            );
+            set_active_profile(file_schedule.profile.clone())?;
+        }
 
         let build_metadata = BuildMetadata {
             version: env!("CARGO_PKG_VERSION"),
