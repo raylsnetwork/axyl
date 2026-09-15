@@ -37,8 +37,9 @@ use tracing::{debug, error, info, warn};
 /// Page size for newly created execution databases (16 KiB), used unless `--db.page-size` is
 /// given. Reth's own default follows the OS page size (4 KiB on x86_64 Linux).
 ///
-/// libmdbx fixes the page size when a datafile is created, so existing databases keep the page
-/// size they were created with.
+/// libmdbx fixes the page size when a datafile is created and ignores this setting when opening an
+/// existing one, so existing databases keep the page size they were created with. The consensus
+/// database uses the same default (`DEFAULT_MDBX_PAGE_SIZE` in `rayls-infrastructure-storage`).
 pub(crate) const DEFAULT_MDBX_PAGE_SIZE: usize = 16 * 1024;
 
 impl RethEnv {

@@ -488,12 +488,12 @@ impl MdbxConfig {
     }
 }
 
-/// Page size for newly created databases (16 KiB), used unless `--consensus-db.page-size` is given.
+/// Page size for newly created consensus databases (16 KiB), used unless
+/// `--consensus-db.page-size` is given.
 ///
 /// libmdbx fixes the page size when a datafile is created and ignores this setting when opening an
-/// existing one, so databases created with the previous default (the OS page size, 4 KiB on
-/// x86_64 Linux) keep their page size. Override per database with
-/// [`MdbxConfig::with_page_size`]. The execution database uses the same default
+/// existing one, so existing databases keep the page size they were created with. Override per
+/// database with [`MdbxConfig::with_page_size`]. The execution database uses the same default
 /// (`DEFAULT_MDBX_PAGE_SIZE` in `rayls-execution-evm`).
 pub const DEFAULT_MDBX_PAGE_SIZE: usize = 16 * KILOBYTE;
 

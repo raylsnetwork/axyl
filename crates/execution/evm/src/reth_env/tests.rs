@@ -60,7 +60,9 @@ fn test_execution_db_default_page_size() -> eyre::Result<()> {
         assert_eq!(page_size(&db), 8 * 1024);
     }
 
-    // legacy 4 KiB database: page size and rows survive a reopen with the default config
+    // legacy 4 KiB database: page size and rows survive a reopen with the default config.
+    // Unlike the blocks above, `legacy_dir` is held for the rest of the function on purpose: the
+    // datafile has to outlive the first `new_database` call so the reopen below finds it.
     const LEGACY_PAGE_SIZE: usize = 4096;
     let legacy_dir = TempDir::new()?;
     let legacy_config = RethConfig(NodeConfig {
