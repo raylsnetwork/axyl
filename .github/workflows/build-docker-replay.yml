@@ -1,7 +1,7 @@
 name: Build & Push Replay Docker Image
 
 # Builds the historical-replay image (etc/docker-replay/Dockerfile) and pushes it
-# to the SAME private ECR repository as build-docker.yml, distinguished by a
+# to the SAME public ECR repository as build-docker.yml, distinguished by a
 # `replay-<tag>` image tag.
 #
 # Manual only: this is an on-demand / debugging build with no automatic triggers.
@@ -20,12 +20,18 @@ on:
         default: ''
 
 env:
-  IMAGE_NAME: rayls-stack-node-client
+  IMAGE_NAME: sovereign-axyl
+  # ECR Public lives in the professional-services account and is only reachable
+  # through us-east-1, whatever region anything else here uses. That registry
+  # has two aliases — v9x7l0q0 (auto-generated) and rayls (custom, primary);
+  # rayls is the one to publish under.
+  ECR_PUBLIC_REGISTRY: public.ecr.aws/rayls
+  AWS_REGION_PUBLIC: us-east-1
   DOCKERFILE: etc/docker-replay/Dockerfile
 
 jobs:
   # ===========================================================================
-  # BUILD - Build replay Docker image and push to private ECR
+  # BUILD - Build replay Docker image and push to public ECR
   # ===========================================================================
   build-and-push:
     name: Build and Push to ECR
@@ -36,8 +42,6 @@ jobs:
     outputs:
       image-tag: ${{ steps.meta.outputs.version }}
       commit: ${{ steps.meta.outputs.sha }}
-    env:
-      ECR_PRIVATE_REGISTRY: ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ vars.AWS_REGION_PRIVATE }}.amazonaws.com
     steps:
       - name: Checkout code
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -51,7 +55,7 @@ jobs:
           INPUT_TAG: ${{ inputs.tag }}
         run: |
           # Always prefix with `replay-` so the replay image is unambiguous even
-          # though it shares the ECR repository with the node-client build.
+          # though it shares the ECR repository with the node build.
           TAG="replay-${INPUT_TAG}"
 
           SHA="$(git rev-parse HEAD)"
@@ -75,16 +79,18 @@ jobs:
         uses: aws-actions/configure-aws-credentials@e7f100cf4c008499ea8adda475de1042d6975c7b # v6.2.0
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
-          aws-region: ${{ vars.AWS_REGION_PRIVATE }}
+          aws-region: ${{ env.AWS_REGION_PUBLIC }}
 
       - name: Login to Amazon ECR
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@fa648b43de3d4d023bcb3f89ed6940096949c419 # v2.1.5
+        with:
+          registry-type: public
 
       - name: Create ECR repository if not exists
         run: |
-          if ! aws ecr describe-repositories --repository-names "${{ env.IMAGE_NAME }}" 2>/dev/null; then
-            aws ecr create-repository --repository-name "${{ env.IMAGE_NAME }}"
+          if ! aws ecr-public describe-repositories --repository-names "${{ env.IMAGE_NAME }}" 2>/dev/null; then
+            aws ecr-public create-repository --repository-name "${{ env.IMAGE_NAME }}"
           fi
 
       - name: Build and push
@@ -93,7 +99,7 @@ jobs:
           context: .
           file: ./${{ env.DOCKERFILE }}
           push: true
-          tags: ${{ env.ECR_PRIVATE_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.version }}
+          tags: ${{ env.ECR_PUBLIC_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.version }}
           build-args: |
             VERGEN_GIT_SHA=${{ steps.meta.outputs.sha }}
           labels: |
@@ -111,22 +117,22 @@ jobs:
     permissions:
       contents: read
       id-token: write
-    env:
-      ECR_PRIVATE_REGISTRY: ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ vars.AWS_REGION_PRIVATE }}.amazonaws.com
     steps:
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@e7f100cf4c008499ea8adda475de1042d6975c7b # v6.2.0
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
-          aws-region: ${{ vars.AWS_REGION_PRIVATE }}
+          aws-region: ${{ env.AWS_REGION_PUBLIC }}
 
       - name: Login to Amazon ECR
         uses: aws-actions/amazon-ecr-login@fa648b43de3d4d023bcb3f89ed6940096949c419 # v2.1.5
+        with:
+          registry-type: public
 
       - name: Run Trivy vulnerability scanner
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
-          image-ref: ${{ env.ECR_PRIVATE_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.build-and-push.outputs.image-tag }}
+          image-ref: ${{ env.ECR_PUBLIC_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.build-and-push.outputs.image-tag }}
           format: 'table'
           exit-code: '1'
           ignore-unfixed: true
@@ -138,6 +144,6 @@ jobs:
         run: |
           echo "## Replay Docker Image Build" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**Image:** \`${{ env.ECR_PRIVATE_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.build-and-push.outputs.image-tag }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "**Image:** \`${{ env.ECR_PUBLIC_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.build-and-push.outputs.image-tag }}\`" >> $GITHUB_STEP_SUMMARY
           echo "**Built from commit:** \`${{ needs.build-and-push.outputs.commit }}\`" >> $GITHUB_STEP_SUMMARY
           echo "**Security scan:** ${{ job.status }}" >> $GITHUB_STEP_SUMMARY
