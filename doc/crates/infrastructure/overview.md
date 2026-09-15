@@ -102,8 +102,8 @@ Execution state (the EVM chain) is stored separately by Reth.
 
 | Backend | When used |
 |---|---|
-| `ReDB` (`redb::database`) | Default; always built. Stores consensus data as a key-value store backed by [redb](https://github.com/cberner/redb). |
-| `MdbxDatabase` (`mdbx::database`) | Optional; enabled by the `reth-libmdbx` feature. Uses LMDB-derived MDBX. |
+| `ReDB` (`redb::database`) | Always built; selected by the `redb` feature. Stores consensus data as a key-value store backed by [redb](https://github.com/cberner/redb). |
+| `MdbxDatabase` (`mdbx::database`) | Default consensus backend (`reth-libmdbx` feature, on by default). Uses LMDB-derived MDBX. New databases are created with a 16 KiB page size (`DEFAULT_MDBX_PAGE_SIZE`) unless `--consensus-db.page-size` is given; existing databases keep the page size they were created with. |
 | `MemDb` (`mem_db`) | In-memory; used in tests. |
 | `LayeredDatabase` (`layered_db`) | Wraps two databases; reads fall through from the first to the second. Used for cache-over-persistent patterns. |
 
