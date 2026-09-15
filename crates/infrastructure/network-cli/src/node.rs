@@ -8,13 +8,14 @@ use eyre::Context;
 use fdlimit::raise_fd_limit;
 use rayls_execution_evm::{
     parse_socket_address,
-    reth_env::{RethCommand, RethConfig},
-    set_active_profile, NetworkConfigFile, NetworkProfile,
+    reth_env::{RethCommand, RethConfig, RethEnv},
+    set_active_profile, verify_schedule, NetworkConfigFile, NetworkProfile, RaylsHardFork,
+    ScheduleRecord,
 };
-use rayls_infrastructure_config::Config;
+use rayls_infrastructure_config::{Config, RaylsDirs};
 // dev-only: reading the committee file for the single-validator gating check
 #[cfg(feature = "dev-single-node-setup")]
-use rayls_infrastructure_config::{ConfigFmt, ConfigTrait as _, RaylsDirs};
+use rayls_infrastructure_config::{ConfigFmt, ConfigTrait as _};
 #[cfg(feature = "dev-single-node-setup")]
 use rayls_infrastructure_types::Committee;
 use rayls_infrastructure_types::{BuildMetadata, RaylsNetwork};
@@ -126,6 +127,88 @@ fn resolve_expected_chain_id(
              genesis) or `--config-file <path> --subnet <name>`"
         ),
     }
+}
+
+/// Verify the hardfork schedule selected for this boot against the datadir's
+/// schedule record, then update the record for this boot.
+///
+/// The record (see [`ScheduleRecord`]) pins the schedule this chain's blocks
+/// were produced under: a selected schedule that disagrees with the record on
+/// an already-executed fork is refused (it would re-interpret the chain's
+/// history), while a differing fork boundary still in the future is allowed —
+/// that is how agreed schedule updates ship — but warned about. A datadir
+/// without a record (a fresh chain) gets one written for the selected schedule.
+fn verify_schedule_record<P: RaylsDirs>(
+    datadir: &P,
+    node_config: &RethConfig,
+    file_schedule: Option<&(PathBuf, String, NetworkProfile)>,
+    network: Option<RaylsNetwork>,
+) -> eyre::Result<()> {
+    // The schedule selected for this boot: the file profile wins, else the
+    // built-in profile (an "external" datadir without either is already
+    // refused by `resolve_expected_chain_id`).
+    let (schedule, chain_id) = match file_schedule {
+        Some((_, _, profile)) => (profile.schedule(), profile.chain_id),
+        None => {
+            let network =
+                network.expect("an external datadir without a file schedule is refused at boot");
+            (RaylsHardFork::for_network(network).to_vec(), network.chain_id())
+        }
+    };
+
+    // The chain's highest executed block: reth's `Finish` stage checkpoint
+    // (the node re-opens the DB right after).
+    let head = RethEnv::best_block_number(node_config, datadir.reth_db_path())?;
+
+    let path = datadir.schedule_record_path();
+    let existing: Option<ScheduleRecord> = if path.exists() {
+        let raw = std::fs::read_to_string(&path)
+            .with_context(|| format!("failed to read schedule record {path:?}"))?;
+        Some(
+            serde_yaml::from_str::<ScheduleRecord>(&raw)
+                .with_context(|| format!("failed to parse schedule record {path:?}"))?,
+        )
+    } else {
+        if head > 0 {
+            warn!(
+                target: "cli",
+                ?path,
+                %head,
+                "datadir has no schedule record; trusting the selected schedule and \
+                 recording it (the executed-history check starts from now)"
+            );
+        }
+        None
+    };
+
+    let moves = match &existing {
+        Some(record) => verify_schedule(record, &schedule, chain_id, head)?,
+        None => Vec::new(),
+    };
+    for move_ in &moves {
+        warn!(
+            target: "cli",
+            fork = move_.fork.name(),
+            ?move_.recorded,
+            ?move_.selected,
+            %head,
+            "future hardfork boundary changed; verify this matches the network-agreed schedule"
+        );
+    }
+
+    let record = ScheduleRecord::from_schedule(chain_id, head, &schedule);
+    let yaml =
+        serde_yaml::to_string(&record).wrap_err("failed to serialize the schedule record")?;
+    std::fs::write(&path, yaml)
+        .with_context(|| format!("failed to write schedule record {path:?}"))?;
+    info!(
+        target: "cli",
+        ?path,
+        %chain_id,
+        %head,
+        "hardfork schedule verified against the chain's executed history"
+    );
+    Ok(())
 }
 
 /// Start the node
@@ -365,7 +448,8 @@ impl<Ext: clap::Args + fmt::Debug> NodeCommand<Ext> {
         let actual_chain_id = rayls_infrastructure_config.genesis().config.chain_id;
         verify_datadir_chain_id(actual_chain_id, expected_chain_id, &chain_id_source)?;
 
-        if let Some((config_file, subnet, profile)) = file_schedule {
+        // Borrowed: the schedule record gate below still needs the selected profile.
+        if let Some((config_file, subnet, profile)) = &file_schedule {
             info!(
                 target: "cli",
                 ?config_file,
@@ -373,7 +457,7 @@ impl<Ext: clap::Args + fmt::Debug> NodeCommand<Ext> {
                 chain_id = actual_chain_id,
                 "loading hardfork schedule from file"
             );
-            set_active_profile(profile)?;
+            set_active_profile(profile.clone())?;
         }
 
         debug!(target: "cli", validator = ?rayls_infrastructure_config.node_info.name, "rl datadir for node command: {rl_datadir:?}");
@@ -444,6 +528,17 @@ impl<Ext: clap::Args + fmt::Debug> NodeCommand<Ext> {
             with_unused_ports,
             Arc::new(rayls_infrastructure_config.chain_spec()),
         );
+
+        // The datadir's genesis chain-id must match the schedule source (checked above); so
+        // must the hardfork schedule itself: a schedule that moves an already-activated fork
+        // (or back-dates a new one into the executed history) would re-interpret the blocks
+        // this chain has already run. The datadir's schedule record pins what was executed.
+        verify_schedule_record(
+            &rl_datadir,
+            &node_config,
+            file_schedule.as_ref(),
+            rayls_infrastructure_config.parameters.network,
+        )?;
 
         let build_metadata = BuildMetadata {
             version: env!("CARGO_PKG_VERSION"),
@@ -556,5 +651,177 @@ mod chain_id_tests {
         assert!(msg.contains("external"), "{msg}");
         assert!(msg.contains("--network"), "{msg}");
         assert!(msg.contains("--config-file"), "{msg}");
+    }
+}
+
+#[cfg(test)]
+mod schedule_record_tests {
+    use super::verify_schedule_record;
+    use clap::Parser;
+    use rayls_execution_evm::{
+        network_profile::{ForkActivation, NetworkProfile},
+        reth_env::{RethCommand, RethConfig, RethEnv},
+        ForkCondition, RaylsHardFork, RethChainSpec, ScheduleRecord,
+    };
+    use rayls_infrastructure_types::RaylsNetwork;
+    use reth_db::{tables::StageCheckpoints, transaction::DbTxMut, Database};
+    use reth_stages::{StageCheckpoint, StageId};
+    use std::{collections::BTreeMap, path::Path, sync::Arc};
+
+    fn node_config(datadir: &Path) -> RethConfig {
+        let reth = RethCommand::parse_from(["rayls-test"]);
+        RethConfig::new(reth, None, datadir, false, Arc::new(RethChainSpec::default()))
+    }
+
+    /// Fake the chain head the way a real node records it: commit the `Finish`
+    /// stage checkpoint at `block` (reth tracks the executed head there, not in
+    /// `CanonicalHeaders`).
+    fn set_head(node_config: &RethConfig, datadir: &Path, block: u64) {
+        let db = RethEnv::new_database(node_config, datadir.join("db")).expect("db opens");
+        db.update(|tx| {
+            tx.put::<StageCheckpoints>(
+                StageId::Finish.as_str().to_string(),
+                StageCheckpoint::new(block),
+            )
+            .expect("head checkpoint written");
+        })
+        .expect("db update");
+    }
+
+    /// The full local schedule with one fork's activation replaced.
+    fn local_profile_moving(fork: &str, to: u64) -> NetworkProfile {
+        let mut hardforks = BTreeMap::new();
+        for (fork, condition) in RaylsHardFork::for_network(RaylsNetwork::Local) {
+            if let ForkCondition::Block(block) = condition {
+                hardforks.insert(fork.name().to_string(), ForkActivation::Block(block));
+            }
+        }
+        hardforks.insert(fork.to_string(), ForkActivation::Block(to));
+        NetworkProfile { chain_id: 487, hardforks }
+    }
+
+    fn boot(dir: &Path, config: &RethConfig, network: Option<RaylsNetwork>) -> eyre::Result<()> {
+        let dir = dir.to_path_buf();
+        verify_schedule_record(&dir, config, None, network)
+    }
+
+    #[test]
+    fn fresh_datadir_records_selected_schedule() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = node_config(dir.path());
+        boot(dir.path(), &config, Some(RaylsNetwork::Local)).expect("first boot passes");
+        let raw = std::fs::read_to_string(dir.path().join("schedule-record.yaml"))
+            .expect("record written");
+        let record: ScheduleRecord = serde_yaml::from_str(&raw).expect("record parses");
+        assert_eq!(record.chain_id, 487);
+        assert_eq!(record.as_of_block, 0);
+        assert_eq!(record.hardforks.get("Eip1559"), Some(&ForkActivation::Block(0)));
+        assert_eq!(record.hardforks.get("UsdrSupplyCorrection"), Some(&ForkActivation::Block(100)));
+    }
+
+    #[test]
+    fn second_boot_records_the_chain_head() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = node_config(dir.path());
+        boot(dir.path(), &config, Some(RaylsNetwork::Local)).expect("first boot passes");
+        set_head(&config, dir.path(), 10);
+        boot(dir.path(), &config, Some(RaylsNetwork::Local)).expect("second boot passes");
+        let raw = std::fs::read_to_string(dir.path().join("schedule-record.yaml"))
+            .expect("record re-written");
+        let record: ScheduleRecord = serde_yaml::from_str(&raw).expect("record parses");
+        assert_eq!(record.as_of_block, 10);
+    }
+
+    #[test]
+    fn executed_fork_move_is_refused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = node_config(dir.path());
+        boot(dir.path(), &config, Some(RaylsNetwork::Local)).expect("first boot passes");
+        set_head(&config, dir.path(), 10);
+        let profile = local_profile_moving("Eip1559", 20);
+        let file_schedule = (
+            std::path::PathBuf::from("/x/y.yaml"),
+            "subnet 'local' of \"/x/y.yaml\"".to_string(),
+            profile,
+        );
+        let err = {
+            let dir = dir.path().to_path_buf();
+            verify_schedule_record(&dir, &config, Some(&file_schedule), None)
+        }
+        .expect_err("moving an executed fork is refused");
+        let msg = err.to_string();
+        assert!(msg.contains("Eip1559"), "{msg}");
+        assert!(msg.contains("0"), "{msg}");
+        assert!(msg.contains("20"), "{msg}");
+    }
+
+    #[test]
+    fn future_fork_move_is_allowed_and_re_recorded() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = node_config(dir.path());
+        boot(dir.path(), &config, Some(RaylsNetwork::Local)).expect("first boot passes");
+        set_head(&config, dir.path(), 10);
+        let profile = local_profile_moving("UsdrSupplyCorrection", 200);
+        let file_schedule = (
+            std::path::PathBuf::from("/x/y.yaml"),
+            "subnet 'local' of \"/x/y.yaml\"".to_string(),
+            profile,
+        );
+        {
+            let dir = dir.path().to_path_buf();
+            verify_schedule_record(&dir, &config, Some(&file_schedule), None)
+        }
+        .expect("moving a future fork is allowed");
+        let raw = std::fs::read_to_string(dir.path().join("schedule-record.yaml"))
+            .expect("record re-written");
+        let record: ScheduleRecord = serde_yaml::from_str(&raw).expect("record parses");
+        assert_eq!(record.hardforks.get("UsdrSupplyCorrection"), Some(&ForkActivation::Block(200)));
+    }
+
+    #[test]
+    fn deleted_record_is_rewritten() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = node_config(dir.path());
+        boot(dir.path(), &config, Some(RaylsNetwork::Local)).expect("first boot passes");
+        set_head(&config, dir.path(), 10);
+        std::fs::remove_file(dir.path().join("schedule-record.yaml")).expect("record removed");
+        boot(dir.path(), &config, Some(RaylsNetwork::Local)).expect("boot passes");
+        let record: ScheduleRecord = serde_yaml::from_str(
+            &std::fs::read_to_string(dir.path().join("schedule-record.yaml")).expect("record"),
+        )
+        .expect("record parses");
+        assert_eq!(record.as_of_block, 10);
+    }
+
+    #[test]
+    fn chain_id_mismatch_in_record_is_refused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = node_config(dir.path());
+        boot(dir.path(), &config, Some(RaylsNetwork::Local)).expect("first boot passes");
+        let mut profile = local_profile_moving("Eip1559", 0);
+        profile.chain_id = 99999;
+        let file_schedule = (
+            std::path::PathBuf::from("/x/y.yaml"),
+            "subnet 'local' of \"/x/y.yaml\"".to_string(),
+            profile,
+        );
+        let err = {
+            let dir = dir.path().to_path_buf();
+            verify_schedule_record(&dir, &config, Some(&file_schedule), None)
+        }
+        .expect_err("chain-id mismatch is refused");
+        let msg = err.to_string();
+        assert!(msg.contains("chain-id"), "{msg}");
+    }
+
+    #[test]
+    fn unparseable_record_is_refused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = node_config(dir.path());
+        std::fs::write(dir.path().join("schedule-record.yaml"), "not: [yaml").expect("garbage");
+        let err = boot(dir.path(), &config, Some(RaylsNetwork::Local))
+            .expect_err("unparseable record is refused");
+        let msg = err.to_string();
+        assert!(msg.contains("schedule-record.yaml"), "{msg}");
     }
 }

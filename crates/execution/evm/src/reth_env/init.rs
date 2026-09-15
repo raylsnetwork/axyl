@@ -15,7 +15,7 @@ use reth::{args::DatadirArgs, builder::NodeConfig, dirs::MaybePlatformPath};
 use reth_chainspec::{ChainSpec as RethChainSpec, EthChainSpec};
 use reth_config::config::StageConfig;
 use reth_consensus::noop::NoopConsensus;
-use reth_db::{init_db, DatabaseEnv};
+use reth_db::{init_db, tables::StageCheckpoints, transaction::DbTx, Database, DatabaseEnv};
 use reth_db_common::init::init_genesis_with_settings;
 use reth_downloaders::{bodies::noop::NoopBodiesDownloader, headers::noop::NoopHeaderDownloader};
 use reth_engine_primitives::DEFAULT_PERSISTENCE_THRESHOLD;
@@ -27,7 +27,7 @@ use reth_provider::{
     RocksDBProviderFactory, StorageSettingsCache,
 };
 use reth_prune_types::PruneModes;
-use reth_stages::{sets::DefaultStages, PipelineBuilder, PipelineTarget};
+use reth_stages::{sets::DefaultStages, PipelineBuilder, PipelineTarget, StageId};
 use reth_static_file::StaticFileProducer;
 use reth_trie_db::ChangesetCache;
 use std::{path::Path, sync::Arc};
@@ -45,6 +45,22 @@ impl RethEnv {
         let db_path = db_path.as_ref();
         info!(target: "rayls::reth", path = ?db_path, "opening database");
         Ok(Arc::new(init_db(db_path, reth_config.0.db.database_args())?))
+    }
+
+    /// Read the chain's executed head the same way reth tracks it: the
+    /// `Finish` stage checkpoint, which the execution writer commits in the
+    /// same transaction as each executed block.
+    ///
+    /// A single keyed read; opens the database env but builds no provider, so
+    /// it is cheap enough for boot-time validation.
+    pub fn best_block_number<P: AsRef<Path>>(
+        reth_config: &RethConfig,
+        db_path: P,
+    ) -> eyre::Result<u64> {
+        let db = Self::new_database(reth_config, db_path)?;
+        let tx = db.tx()?;
+        let finish = tx.get::<StageCheckpoints>(StageId::Finish.as_str().to_string())?;
+        Ok(finish.map(|checkpoint| checkpoint.block_number).unwrap_or(0))
     }
 
     /// Produce a new wrapped Reth environment with the network-specific settings (basefee
