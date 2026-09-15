@@ -8249,7 +8249,6 @@ dependencies = [
  "eyre",
  "lru",
  "ouroboros",
- "page_size",
  "parking_lot",
  "prometheus",
  "rayls-infrastructure-types",
