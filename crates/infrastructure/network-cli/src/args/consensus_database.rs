@@ -18,11 +18,12 @@ pub struct ConsensusDatabaseArgs {
     pub consensus_db_growth_step: Option<usize>,
     /// Database page size (e.g., 4KB, 8KB, 16KB).
     ///
-    /// Specifies the page size used by the MDBX database. The default is 16KB.
+    /// Specifies the page size used by the MDBX database. The default is 16KB. Must be a
+    /// power of two between 256B and 64KB, the range libmdbx accepts.
     ///
     /// WARNING: This setting is only used when creating a new database; an existing
     /// database keeps the page size it was created with.
-    #[arg(long = "consensus-db.page-size", value_parser = parse_byte_size)]
+    #[arg(long = "consensus-db.page-size", value_parser = parse_page_size)]
     pub consensus_db_page_size: Option<usize>,
     /// Read transaction timeout in seconds, 0 means no timeout.
     #[arg(long = "consensus-db.read-transaction-timeout")]
@@ -142,6 +143,29 @@ fn parse_byte_size(s: &str) -> Result<usize, String> {
     s.parse::<ByteSize>().map(Into::into)
 }
 
+/// Smallest page size libmdbx accepts (`MDBX_MIN_PAGESIZE`).
+const MIN_MDBX_PAGE_SIZE: usize = 256;
+/// Largest page size libmdbx accepts (`MDBX_MAX_PAGESIZE`).
+const MAX_MDBX_PAGE_SIZE: usize = 64 * 1024;
+
+/// Value parser for page sizes, accepting the same formats as [`parse_byte_size`].
+///
+/// libmdbx only accepts a power of two between [`MIN_MDBX_PAGE_SIZE`] and
+/// [`MAX_MDBX_PAGE_SIZE`], and rejects anything else when the datafile is created. Validating
+/// here turns that into a clap error at parse time rather than a node startup failure.
+fn parse_page_size(s: &str) -> Result<usize, String> {
+    let page_size = parse_byte_size(s)?;
+    if !(MIN_MDBX_PAGE_SIZE..=MAX_MDBX_PAGE_SIZE).contains(&page_size) {
+        return Err(format!(
+            "page size must be between {MIN_MDBX_PAGE_SIZE} and {MAX_MDBX_PAGE_SIZE} bytes, got {page_size}"
+        ));
+    }
+    if !page_size.is_power_of_two() {
+        return Err(format!("page size must be a power of two, got {page_size} bytes"));
+    }
+    Ok(page_size)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -212,6 +236,7 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(cmd.args.consensus_db_page_size, Some(KILOBYTE * 16));
+        assert_eq!(cmd.args.database_args().page_size, Some(KILOBYTE * 16));
     }
 
     /// The flag (or its absence) decides the page size of a newly created consensus datafile.
@@ -234,8 +259,10 @@ mod tests {
         assert_eq!(page_size, DEFAULT_MDBX_PAGE_SIZE);
     }
 
+    /// Without the flag the page size stays `None` all the way through `database_args()`; the
+    /// 16 KiB default is applied one layer deeper, by the storage crate's `open_with_config`.
     #[test]
-    fn test_command_parser_without_page_size_leaves_default() {
+    fn test_command_parser_without_page_size_defers_to_storage_crate() {
         let cmd = CommandParser::<ConsensusDatabaseArgs>::try_parse_from(["reth"]).unwrap();
         assert_eq!(cmd.args.consensus_db_page_size, None);
         assert_eq!(cmd.args.database_args().page_size, None);
@@ -249,6 +276,34 @@ mod tests {
             "invalid",
         ]);
         assert!(result.is_err());
+    }
+
+    /// libmdbx only accepts a power of two from 256B to 64KB. A value outside that range, or one
+    /// that parses but is not a power of two, is rejected by clap rather than by `env.open()`
+    /// once the node is already starting up.
+    #[test]
+    fn test_command_parser_rejects_page_size_outside_libmdbx_range() {
+        for value in ["5KB", "128B", "128KB", "0"] {
+            let result = CommandParser::<ConsensusDatabaseArgs>::try_parse_from([
+                "reth",
+                "--consensus-db.page-size",
+                value,
+            ]);
+            assert!(result.is_err(), "page size {value} should be rejected");
+        }
+    }
+
+    #[test]
+    fn test_command_parser_accepts_page_size_range_bounds() {
+        for (value, expected) in [("256B", MIN_MDBX_PAGE_SIZE), ("64KB", MAX_MDBX_PAGE_SIZE)] {
+            let cmd = CommandParser::<ConsensusDatabaseArgs>::try_parse_from([
+                "reth",
+                "--consensus-db.page-size",
+                value,
+            ])
+            .unwrap();
+            assert_eq!(cmd.args.consensus_db_page_size, Some(expected), "page size {value}");
+        }
     }
 
     #[test]
