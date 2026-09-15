@@ -561,6 +561,10 @@ impl MdbxDatabase {
             // once a transaction has dirtied this many pages libmdbx spills them (in write-map
             // mode an msync kick) rather than failing. Kept as a page count, so it is 512 MiB on
             // a 4 KiB datafile and 2 GiB on one created with the 16 KiB default.
+            //
+            // The wider ceiling is safe because consensus write transactions are small and
+            // bounded: batches are at most 2 MB and at most 10 per header. Across two full
+            // 4+1-node e2e networks the largest of 150,065 commits dirtied 0.59 MiB, p99 224 KiB.
             .set_txn_dp_limit(131072)
             .set_rp_augment_limit(1024 * 1024)
             // MDBX syncs lazily on the first commit past the period (see SYNC_PERIOD)

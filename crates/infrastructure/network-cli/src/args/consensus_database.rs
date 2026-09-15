@@ -58,7 +58,7 @@ impl ConsensusDatabaseArgs {
             Some(readers) => readers,
         };
 
-        let config = MdbxConfig::new()
+        let config = config
             .with_max_read_transaction_duration(max_read_transaction_duration)
             .with_max_db_size(consensus_db_max_size)
             .with_growth_step(consensus_db_growth_step)
@@ -157,7 +157,7 @@ fn parse_page_size(s: &str) -> Result<usize, String> {
     let page_size = parse_byte_size(s)?;
     if !(MIN_MDBX_PAGE_SIZE..=MAX_MDBX_PAGE_SIZE).contains(&page_size) {
         return Err(format!(
-            "page size must be between {MIN_MDBX_PAGE_SIZE} and {MAX_MDBX_PAGE_SIZE} bytes, got {page_size}"
+            "page size must be between {MIN_MDBX_PAGE_SIZE} and {MAX_MDBX_PAGE_SIZE} bytes, got {page_size} bytes"
         ));
     }
     if !page_size.is_power_of_two() {
