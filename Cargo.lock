@@ -2282,7 +2282,7 @@ checksum = "613afe47fcd5fac7ccf1db93babcb082c5994d996f20b8b159f2ad1658eb5724"
 
 [[package]]
 name = "chaos-framework"
-version = "1.4.0"
+version = "1.4.1"
 dependencies = [
  "clap",
  "const-hex",
@@ -2545,7 +2545,7 @@ dependencies = [
 
 [[package]]
 name = "consensus-metrics"
-version = "1.4.0"
+version = "1.4.1"
 dependencies = [
  "axum 0.8.8",
  "futures",
@@ -3346,7 +3346,7 @@ dependencies = [
 
 [[package]]
 name = "e2e-tests"
-version = "1.4.0"
+version = "1.4.1"
 dependencies = [
  "alloy",
  "clap",
@@ -7739,7 +7739,7 @@ dependencies = [
 
 [[package]]
 name = "rayls-batch-builder"
-version = "1.4.0"
+version = "1.4.1"
 dependencies = [
  "assert_matches",
  "futures-util",
@@ -7759,7 +7759,7 @@ dependencies = [
 
 [[package]]
 name = "rayls-batch-validator"
-version = "1.4.0"
+version = "1.4.1"
 dependencies = [
  "assert_matches",
  "async-trait",
@@ -7775,7 +7775,7 @@ dependencies = [
 
 [[package]]
 name = "rayls-consensus-network"
-version = "1.4.0"
+version = "1.4.1"
 dependencies = [
  "assert_matches",
  "async-trait",
@@ -7802,7 +7802,7 @@ dependencies = [
 
 [[package]]
 name = "rayls-consensus-primary"
-version = "1.4.0"
+version = "1.4.1"
 dependencies = [
  "assert_matches",
  "async-trait",
@@ -7834,7 +7834,7 @@ dependencies = [
 
 [[package]]
 name = "rayls-consensus-primary-metrics"
-version = "1.4.0"
+version = "1.4.1"
 dependencies = [
  "consensus-metrics",
  "prometheus",
@@ -7843,7 +7843,7 @@ dependencies = [
 
 [[package]]
 name = "rayls-consensus-state-sync"
-version = "1.4.0"
+version = "1.4.1"
 dependencies = [
  "consensus-metrics",
  "eyre",
@@ -7860,7 +7860,7 @@ dependencies = [
 
 [[package]]
 name = "rayls-consensus-worker"
-version = "1.4.0"
+version = "1.4.1"
 dependencies = [
  "assert_matches",
  "async-trait",
@@ -7887,7 +7887,7 @@ dependencies = [
 
 [[package]]
 name = "rayls-execution-evm"
-version = "1.4.0"
+version = "1.4.1"
 dependencies = [
  "alloy",
  "alloy-evm",
@@ -7962,7 +7962,7 @@ dependencies = [
 
 [[package]]
 name = "rayls-execution-faucet"
-version = "1.4.0"
+version = "1.4.1"
 dependencies = [
  "async-trait",
  "clap",
@@ -7996,7 +7996,7 @@ dependencies = [
 
 [[package]]
 name = "rayls-execution-metrics"
-version = "1.4.0"
+version = "1.4.1"
 dependencies = [
  "eyre",
  "rayls-infrastructure-types",
@@ -8011,7 +8011,7 @@ dependencies = [
 
 [[package]]
 name = "rayls-execution-rpc"
-version = "1.4.0"
+version = "1.4.1"
 dependencies = [
  "async-trait",
  "jsonrpsee",
@@ -8024,7 +8024,7 @@ dependencies = [
 
 [[package]]
 name = "rayls-infrastructure-config"
-version = "1.4.0"
+version = "1.4.1"
 dependencies = [
  "aes-gcm-siv",
  "backoff",
@@ -8048,7 +8048,7 @@ dependencies = [
 
 [[package]]
 name = "rayls-infrastructure-network-types"
-version = "1.4.0"
+version = "1.4.1"
 dependencies = [
  "async-trait",
  "eyre",
@@ -8061,7 +8061,7 @@ dependencies = [
 
 [[package]]
 name = "rayls-infrastructure-storage"
-version = "1.4.0"
+version = "1.4.1"
 dependencies = [
  "criterion",
  "eyre",
@@ -8084,7 +8084,7 @@ dependencies = [
 
 [[package]]
 name = "rayls-infrastructure-types"
-version = "1.4.0"
+version = "1.4.1"
 dependencies = [
  "alloy",
  "async-trait",
@@ -8123,7 +8123,7 @@ dependencies = [
 
 [[package]]
 name = "rayls-infrastructure-utils"
-version = "1.4.0"
+version = "1.4.1"
 dependencies = [
  "futures",
  "parking_lot",
@@ -8132,7 +8132,7 @@ dependencies = [
 
 [[package]]
 name = "rayls-middleware-bridge"
-version = "1.4.0"
+version = "1.4.1"
 dependencies = [
  "consensus-metrics",
  "eyre",
@@ -8153,7 +8153,7 @@ dependencies = [
 
 [[package]]
 name = "rayls-middleware-orchestrator"
-version = "1.4.0"
+version = "1.4.1"
 dependencies = [
  "alloy",
  "axum 0.8.8",
@@ -8195,7 +8195,7 @@ dependencies = [
 
 [[package]]
 name = "rayls-middleware-processor"
-version = "1.4.0"
+version = "1.4.1"
 dependencies = [
  "assert_matches",
  "eyre",
@@ -8221,7 +8221,7 @@ dependencies = [
 
 [[package]]
 name = "rayls-middleware-rewards"
-version = "1.4.0"
+version = "1.4.1"
 dependencies = [
  "alloy",
  "eyre",
@@ -8238,7 +8238,7 @@ dependencies = [
 
 [[package]]
 name = "rayls-network"
-version = "1.4.0"
+version = "1.4.1"
 dependencies = [
  "clap",
  "rayls-execution-faucet",
@@ -8250,7 +8250,7 @@ dependencies = [
 
 [[package]]
 name = "rayls-network-cli"
-version = "1.4.0"
+version = "1.4.1"
 dependencies = [
  "alloy",
  "bs58",
@@ -8277,7 +8277,7 @@ dependencies = [
 
 [[package]]
 name = "rayls-replay"
-version = "1.4.0"
+version = "1.4.1"
 dependencies = [
  "clap",
  "eyre",
@@ -8299,7 +8299,7 @@ dependencies = [
 
 [[package]]
 name = "rayls-testing-test-utils"
-version = "1.4.0"
+version = "1.4.1"
 dependencies = [
  "clap",
  "eyre",
@@ -8316,7 +8316,7 @@ dependencies = [
 
 [[package]]
 name = "rayls-testing-test-utils-committee"
-version = "1.4.0"
+version = "1.4.1"
 dependencies = [
  "rand 0.9.3",
  "rayls-execution-evm",
