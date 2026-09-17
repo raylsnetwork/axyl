@@ -28,6 +28,7 @@ interface IRewardDistributor {
     error NotAuthorized();
     error InsufficientBalance(uint256 requested, uint256 available);
     error InvalidApyBps();
+    error InvalidPerformanceWeightBps();
 
     // events
     event RewardsReceived(uint256 amount);
@@ -46,6 +47,7 @@ interface IRewardDistributor {
     event RewardCurveUpdated(address indexed oldCurve, address indexed newCurve);
     event OpenTierRewardCurveUpdated(address indexed oldCurve, address indexed newCurve);
     event PerformanceWeightBpsUpdated(uint256 oldBps, uint256 newBps);
+    event PerformanceWeightFetchFailed();
 
     /// @notice Receive ERC-20 RLS rewards from FeeAggregator
     /// @dev Called by FeeAggregator after swapping USDr to RLS

@@ -440,7 +440,7 @@ contract TokenomicsAccessControlTest is Test {
     // 10c. Setting performanceWeightBps above 100% reverts
     function test_rewardDistributor_setPerformanceWeightBps_boundsCheck() public {
         vm.prank(admin);
-        vm.expectRevert(IRewardDistributor.InvalidApyBps.selector);
+        vm.expectRevert(IRewardDistributor.InvalidPerformanceWeightBps.selector);
         distributor.setPerformanceWeightBps(10_001);
     }
 

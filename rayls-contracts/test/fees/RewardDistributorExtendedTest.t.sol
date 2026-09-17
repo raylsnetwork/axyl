@@ -84,7 +84,14 @@ contract MockConsensusRegistryExt {
         });
     }
 
+    bool public revertOnGetPerformanceWeights;
+
+    function setRevertOnGetPerformanceWeights(bool shouldRevert) external {
+        revertOnGetPerformanceWeights = shouldRevert;
+    }
+
     function getEpochPerformanceWeights() external view returns (IConsensusRegistry.PerformanceWeights memory) {
+        if (revertOnGetPerformanceWeights) revert("MockConsensusRegistryExt: forced revert");
         return _performanceWeights;
     }
 
@@ -620,6 +627,48 @@ contract RewardDistributorExtendedTest is Test {
         assertTrue(
             distributor.getPendingRewards(validator1) != distributor.getPendingRewards(validator2),
             "equal stake no longer implies equal reward once performanceWeightBps is fully on"
+        );
+    }
+
+    // =========================================================================
+    //  7e. performanceWeightBps > 0 but getEpochPerformanceWeights() reverts: falls back to
+    //      pure stake, and emits PerformanceWeightFetchFailed so it's not silent on-chain.
+    // =========================================================================
+
+    function test_distributeRewards_performanceWeightFetchReverts_fallsBackToStakeAndEmits() public {
+        registry.clearValidators();
+        registry.addActiveValidator(validator1, 500e18);
+        registry.addActiveValidator(validator2, 500e18);
+
+        address[] memory validators = new address[](2);
+        uint256[] memory weights = new uint256[](2);
+        validators[0] = validator1;
+        validators[1] = validator2;
+        weights[0] = 3000;
+        weights[1] = 7000;
+        registry.setPerformanceWeights(validators, weights, weights[0] + weights[1]);
+        registry.setRevertOnGetPerformanceWeights(true);
+
+        RLSAccumulator acc = _setupAccumulator(1_000_000e18);
+        vm.prank(owner);
+        distributor.setPerformanceWeightBps(10_000);
+
+        uint256 totalStaked = 1000e18;
+        uint256 apyBps = 5000;
+        uint256 epochSecs = 86400;
+        uint256 expectedTarget = (totalStaked * apyBps * epochSecs) / (365 days * 10_000);
+        uint256 accBalanceBefore = rls.balanceOf(address(acc));
+
+        vm.expectEmit(address(distributor));
+        emit IRewardDistributor.PerformanceWeightFetchFailed();
+        vm.prank(SYSTEM_ADDRESS);
+        distributor.distributeRewards();
+
+        assertEq(accBalanceBefore - rls.balanceOf(address(acc)), expectedTarget, "target unaffected by the failed fetch");
+        assertEq(
+            distributor.getPendingRewards(validator1),
+            distributor.getPendingRewards(validator2),
+            "equal stake -> equal reward: falls back to pure stake despite performanceWeightBps=10000 and a real weight skew, because the fetch reverted"
         );
     }
 

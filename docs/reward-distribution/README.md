@@ -44,8 +44,9 @@ Reward distribution happens in two stages that run on a different schedule:
 │         └─ Burn (20%)      → LayerZero OFT bridge to Ethereum       │
 │                                                                     │
 │  Step 2: RewardDistributor.distributeRewards()                      │
-│    ├─ Reads performance weights from ConsensusRegistry              │
-│    ├─ Distributes RLS proportionally to the recorded weights        │
+│    ├─ Distributes RLS by stake / target-APY (default)               │
+│    ├─ If performanceWeightBps > 0 (opt-in): blends in               │
+│    │    ConsensusRegistry's performance weights                     │
 │    └─ Splits between validator own stake and delegation pool        │
 │                                                                     │
 │  Step 3: Validators call claimRewards() (permissionless)            │
@@ -182,7 +183,7 @@ The contract must hold native tokens to pay LayerZero messaging fees.
 
 ## Timing Considerations
 
-- The keeper should call `distributeRewards()` **before** the next epoch's `applyIncentives()`, which clears `_performanceWeights`. If missed, RewardDistributor falls back to stake-based distribution — no funds are lost.
+- `distributeRewards()` is not keeper-triggered — it's `onlySystemCall`, invoked automatically once per epoch close in the fixed syscall sequence `applyIncentives` → `concludeEpoch` → `distributeRewards` (`evm/block.rs`). It always runs after `applyIncentives` has set that epoch's performance weights (when `performanceWeightBps > 0`), never before.
 - `distributeEpochFees()` can be called at any time — fees accumulate if skipped.
 - If the USDr balance is below the minimum swap amount, distribution is silently skipped and fees accumulate to the next call.
 

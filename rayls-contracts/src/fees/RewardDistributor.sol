@@ -263,7 +263,9 @@ contract RewardDistributor is
                 IConsensusRegistry.PerformanceWeights memory p
             ) {
                 perf = p;
-            } catch {}
+            } catch {
+                emit PerformanceWeightFetchFailed();
+            }
         }
 
         return _distributeByTarget(activeValidators, stakes, totalRewards, totalTarget, perf, cfg);
@@ -413,6 +415,10 @@ contract RewardDistributor is
         uint256 blendedTarget = ((MAX_APY_BPS - influenceBps) * stakeTarget + influenceBps * perfTarget)
             / MAX_APY_BPS;
 
+        // Intentional: computing newPriorityTarget by division and newTrackBTarget by subtraction
+        // (rather than dividing both) guarantees newPriorityTarget + newTrackBTarget ==
+        // blendedTarget exactly, at the cost of any 1-wei rounding remainder landing on Track B
+        // rather than Track A. Track A is treated as the more sensitive path.
         newPriorityTarget = (blendedTarget * priorityTarget) / stakeTarget;
         newTrackBTarget = blendedTarget - newPriorityTarget;
     }
@@ -730,7 +736,7 @@ contract RewardDistributor is
     ///      before this field existed. 10_000 = fully performance-proportional. See
     ///      _applyPerformanceWeight for the blend formula.
     function setPerformanceWeightBps(uint256 newBps) external override onlyRole(DEFAULT_ADMIN_ROLE) {
-        if (newBps > MAX_APY_BPS) revert InvalidApyBps();
+        if (newBps > MAX_APY_BPS) revert InvalidPerformanceWeightBps();
         RewardDistributorStorage storage $ = _getRewardDistributorStorage();
         uint256 oldBps = $.performanceWeightBps;
         $.performanceWeightBps = newBps;
