@@ -255,8 +255,86 @@ impl PartialEq for Committee {
 impl Eq for Committee {}
 
 /// Unique identifier of an authority: the hash of its BLS key, so it is stable across epochs.
-#[derive(Eq, PartialEq, Ord, PartialOrd, Clone, Hash, Serialize, Deserialize)]
+///
+/// Serde: base58 string in JSON/YAML (usable as a map key), derived newtype bytes in binary, so
+/// stored rows and digests are unchanged. The branch is chosen by `is_human_readable`, which a
+/// `flatten`/`untagged`/tagged wrapper forces to true even in binary; none wraps this type.
+#[derive(Eq, PartialEq, Ord, PartialOrd, Clone, Hash)]
 pub struct AuthorityIdentifier(Arc<[u8; 32]>);
+
+/// Longest base58 rendering of 32 bytes; anything longer is rejected before decoding.
+const AUTHORITY_IDENTIFIER_BASE58_MAX: usize = 44;
+
+const AUTHORITY_IDENTIFIER_NAME: &str = "AuthorityIdentifier";
+
+impl Serialize for AuthorityIdentifier {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        if serializer.is_human_readable() {
+            serializer.serialize_str(&self.to_string())
+        } else {
+            // byte-identical to the derived newtype
+            serializer.serialize_newtype_struct(AUTHORITY_IDENTIFIER_NAME, &*self.0)
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for AuthorityIdentifier {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        use serde::de::{Error as _, SeqAccess, Unexpected, Visitor};
+
+        struct IdVisitor;
+
+        impl<'de> Visitor<'de> for IdVisitor {
+            type Value = AuthorityIdentifier;
+
+            fn expecting(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a base58 string or 32 bytes")
+            }
+
+            fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Self::Value, E> {
+                if v.len() > AUTHORITY_IDENTIFIER_BASE58_MAX {
+                    return Err(E::invalid_length(v.len(), &self));
+                }
+                let bytes = bs58::decode(v)
+                    .into_vec()
+                    .map_err(|_| E::invalid_value(Unexpected::Str(v), &self))?;
+                self.visit_bytes(&bytes)
+            }
+
+            fn visit_bytes<E: serde::de::Error>(self, v: &[u8]) -> Result<Self::Value, E> {
+                <[u8; 32]>::try_from(v)
+                    .map(AuthorityIdentifier::from)
+                    .map_err(|_| E::invalid_length(v.len(), &"32 bytes"))
+            }
+
+            /// The derived array form, for documents written before the string form.
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+                let mut bytes = [0u8; 32];
+                for (i, slot) in bytes.iter_mut().enumerate() {
+                    *slot =
+                        seq.next_element()?.ok_or_else(|| A::Error::invalid_length(i, &self))?;
+                }
+                if seq.next_element::<u8>()?.is_some() {
+                    return Err(A::Error::invalid_length(33, &self));
+                }
+                Ok(AuthorityIdentifier::from(bytes))
+            }
+
+            fn visit_newtype_struct<D: serde::Deserializer<'de>>(
+                self,
+                deserializer: D,
+            ) -> Result<Self::Value, D::Error> {
+                <[u8; 32]>::deserialize(deserializer).map(AuthorityIdentifier::from)
+            }
+        }
+
+        if deserializer.is_human_readable() {
+            deserializer.deserialize_any(IdVisitor)
+        } else {
+            deserializer.deserialize_newtype_struct(AUTHORITY_IDENTIFIER_NAME, IdVisitor)
+        }
+    }
+}
 
 impl AuthorityIdentifier {
     /// Builds an identifier from a repeated byte, for tests that need distinct ids.
@@ -631,11 +709,107 @@ pub fn quorum_threshold(committee_members: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use crate::{
-        Address, Authority, BlsKeypair, BlsPublicKey, BootstrapServer, Committee, Multiaddr,
-        NetworkKeypair,
+        decode_key, encode_key, Address, Authority, AuthorityIdentifier, BlsKeypair, BlsPublicKey,
+        BootstrapServer, Committee, Multiaddr, NetworkKeypair,
     };
     use rand::{rng, Rng};
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, HashMap};
+
+    /// Binary encoding matches the derived newtype: stored rows and digests unchanged.
+    #[test]
+    fn authority_identifier_bcs_encoding_is_the_derived_newtype() {
+        #[derive(serde::Serialize)]
+        struct Derived(std::sync::Arc<[u8; 32]>);
+
+        let bytes = [7u8; 32];
+        let id = AuthorityIdentifier::from(bytes);
+        let encoded = bcs::to_bytes(&id).unwrap();
+        assert_eq!(encoded, bcs::to_bytes(&Derived(std::sync::Arc::new(bytes))).unwrap());
+        assert_eq!(encoded, bytes.to_vec(), "32 raw bytes, no length prefix");
+        assert_eq!(bcs::from_bytes::<AuthorityIdentifier>(&encoded).unwrap(), id);
+        assert!(bcs::from_bytes::<AuthorityIdentifier>(&encoded[..31]).is_err());
+
+        // DB key codec: same 32 bytes, same sort order
+        assert_eq!(encode_key(&id), bytes.to_vec());
+        assert_eq!(decode_key::<AuthorityIdentifier>(&encode_key(&id)), id);
+    }
+
+    /// Leading zero bytes survive the round trip; the all-zero id is the extreme case.
+    #[test]
+    fn authority_identifier_leading_zero_bytes_round_trip() {
+        let mut one_leading = [0u8; 32];
+        one_leading[1] = 9;
+        one_leading[31] = 255;
+        let mut many_leading = [0u8; 32];
+        many_leading[30] = 1;
+
+        for bytes in [[0u8; 32], one_leading, many_leading, [255u8; 32]] {
+            let id = AuthorityIdentifier::from(bytes);
+            let json = serde_json::to_string(&id).unwrap();
+            assert_eq!(
+                serde_json::from_str::<AuthorityIdentifier>(&json).unwrap(),
+                id,
+                "JSON round trip lost leading zeros for {bytes:?}"
+            );
+            // as a JSON map key, this impl's reason to exist
+            let map = std::collections::HashMap::from([(id.clone(), 1u64)]);
+            let text = serde_json::to_string(&map).unwrap();
+            assert_eq!(
+                serde_json::from_str::<std::collections::HashMap<AuthorityIdentifier, u64>>(&text)
+                    .unwrap(),
+                map
+            );
+            // binary path unchanged
+            assert_eq!(bcs::from_bytes::<AuthorityIdentifier>(&bcs::to_bytes(&id).unwrap()).unwrap(), id);
+            assert_eq!(decode_key::<AuthorityIdentifier>(&encode_key(&id)), id);
+        }
+
+        // 32 '1's is the zero id; 31 is 31 bytes
+        let zero = AuthorityIdentifier::from([0u8; 32]);
+        assert_eq!(serde_json::to_string(&zero).unwrap(), format!("\"{}\"", "1".repeat(32)));
+        assert!(serde_json::from_str::<AuthorityIdentifier>(&format!("\"{}\"", "1".repeat(31)))
+            .is_err());
+    }
+
+    #[test]
+    fn authority_identifier_json_is_base58_and_reads_the_old_array_form() {
+        let id = AuthorityIdentifier::from([7u8; 32]);
+        let json = serde_json::to_string(&id).unwrap();
+        assert_eq!(json, format!("\"{id}\""));
+        assert_eq!(serde_json::from_str::<AuthorityIdentifier>(&json).unwrap(), id);
+
+        // old array form still reads
+        let legacy = serde_json::to_string(&[7u8; 32]).unwrap();
+        assert_eq!(serde_json::from_str::<AuthorityIdentifier>(&legacy).unwrap(), id);
+        assert!(serde_json::from_str::<AuthorityIdentifier>("\"not base58!\"").is_err());
+        assert!(serde_json::from_str::<AuthorityIdentifier>("[1,2,3]").is_err());
+        let long = serde_json::to_string(&vec![7u8; 33]).unwrap();
+        assert!(serde_json::from_str::<AuthorityIdentifier>(&long).is_err(), "33 bytes");
+        assert!(
+            serde_json::from_str::<AuthorityIdentifier>("\"11\"").is_err(),
+            "valid base58, 2 bytes"
+        );
+        let huge = format!("\"{}\"", "1".repeat(1 << 16));
+        assert!(
+            serde_json::from_str::<AuthorityIdentifier>(&huge).is_err(),
+            "bounded before decoding"
+        );
+
+        // as a JSON object key, which `ReputationScores` needs
+        let scores: HashMap<AuthorityIdentifier, u64> = [(id.clone(), 3)].into_iter().collect();
+        let text = serde_json::to_string(&scores).unwrap();
+        assert_eq!(text, format!("{{\"{id}\":3}}"));
+        assert_eq!(
+            serde_json::from_str::<HashMap<AuthorityIdentifier, u64>>(&text).unwrap(),
+            scores
+        );
+        let value = serde_json::to_value(&scores).unwrap();
+        assert_eq!(value[id.to_string()], 3);
+        assert_eq!(
+            serde_json::from_value::<HashMap<AuthorityIdentifier, u64>>(value).unwrap(),
+            scores
+        );
+    }
 
     #[test]
     fn committee_load() {

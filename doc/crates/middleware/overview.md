@@ -145,10 +145,11 @@ execution RPC layer to consensus data:
 
 | Method | Source |
 |---|---|
-| `get_latest_consensus_block` | `ConsensusBus` (in-memory, latest header broadcast) |
+| `get_latest_consensus_block` | consensus `DB` (highest `consensus_block` row) |
 | `consensus_block_by_number` | consensus `DB` (historical lookup) |
 | `consensus_block_by_hash` | consensus `DB` (historical lookup) |
 | `epoch` (by number or hash) | consensus `DB` |
+| `node_status` | consensus `DB` for `epoch` and the observer's `is_caught_up`; `ConsensusBus` for the round watermarks |
 
 ### Supporting subtasks
 

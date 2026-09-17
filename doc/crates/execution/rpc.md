@@ -29,7 +29,8 @@ variants:
 
 ### `rayls_latestHeader`
 
-Returns the `ConsensusHeader` at the tip of the consensus chain.
+Returns the `ConsensusHeader` at the tip of the consensus chain: the highest canonical header
+in the node's database, on every role.
 
 **Parameters:** none
 
@@ -45,7 +46,52 @@ Returns the `ConsensusHeader` at the tip of the consensus chain.
 The `ConsensusHeader` digest is `keccak256(parent_hash ‖ sub_dag.digest() ‖ number)` and is
 stored in the `parent_beacon_block_root` field of every EVM block produced from this header.
 
-> **Note:** JSON serialisation of `ConsensusHeader` is tracked in issue #375.
+> **Note:** identifiers inside the header (authority ids, BLS keys, digests) are base58
+> strings in JSON and raw bytes in the binary (BCS/bincode) encodings the network and the
+> database use.
+
+---
+
+### `rayls_nodeStatus`
+
+Returns a snapshot of the local node's role and sync state. Every field describes **this** node;
+nothing here is a network-wide view.
+
+**Parameters:** none
+
+**Returns:** `NodeStatus`
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `role` | `"active_cvv" \| "inactive_cvv" \| "observer"` | This node's role in the current committee |
+| `is_caught_up` | `bool` | Whether the node has finished catching up (see below) |
+| `epoch` | `u32` | The consensus epoch this node is operating in |
+| `committed_round` | `u32` | Last round committed by the local DAG |
+| `primary_round` | `u32` | Current primary round of the local DAG |
+| `gc_round` | `u32` | Garbage-collection round boundary of the local DAG |
+| `last_canonical_block` | `u64` | Number of the latest executed (EVM) block |
+
+`is_caught_up` is decided per role: an `active_cvv` is caught up by construction, because the
+promotion gate is what made it active; an `inactive_cvv` is catching up by definition, so it is
+always `false`; an `observer` is caught up once its highest canonical consensus header reaches the
+highest header gossiped by the network. An observer that has *seen* a header but not yet processed
+it is not caught up.
+
+`epoch` is the later of the tip header's leader epoch and the epoch after the last **certified**
+epoch record. Only certified records count: an unsigned placeholder record is written for epoch 0
+at startup and does not mean epoch 0 has closed.
+
+Two consequences worth knowing before alerting on this field:
+
+- Through an epoch transition both inputs lag by seconds — the closing epoch's record lands only
+  once the next epoch collects its vote quorum, and the tip header stays in the old epoch until
+  the new epoch's first commit — while `committed_round`, `primary_round` and `gc_round` come from
+  in-memory state that resets at the boundary. A single response can therefore pair the old
+  `epoch` with new-epoch rounds.
+- A node that is far behind but has already fetched certified epoch records from its peers reports
+  the **network's** epoch rather than the one it is executing. Use `is_caught_up`, or
+  `last_canonical_block` against a known-good node, to judge sync progress; `epoch` alone is not a
+  lag signal.
 
 ---
 
