@@ -75,7 +75,7 @@ impl<'de, const DIGEST_LEN: usize> Deserialize<'de> for Digest<DIGEST_LEN> {
                     digest.copy_from_slice(v);
                     Ok(Digest { digest })
                 } else {
-                    let exp = format!(" {DIGEST_LEN} bytes");
+                    let exp = format!("{DIGEST_LEN} bytes");
                     let e: &str = &exp;
                     Err(Error::invalid_length(v.len(), &e))
                 }
@@ -92,7 +92,7 @@ impl<'de, const DIGEST_LEN: usize> Deserialize<'de> for Digest<DIGEST_LEN> {
                     .onto(&mut bytes)
                     .map_err(|_| Error::invalid_value(Unexpected::Str(v), &self))?;
                 if written != DIGEST_LEN {
-                    let exp = format!(" {DIGEST_LEN} bytes");
+                    let exp = format!("{DIGEST_LEN} bytes");
                     let e: &str = &exp;
                     return Err(Error::invalid_length(written, &e));
                 }
@@ -295,7 +295,9 @@ mod digest_serde_tests {
         let json = serde_json::to_string(&full).unwrap();
         assert_eq!(serde_json::from_str::<Digest<32>>(&json).unwrap().digest, [7u8; 32]);
         // decodes to one byte, not 32
-        assert!(serde_json::from_str::<Digest<32>>("\"2\"").is_err());
+        let err = serde_json::from_str::<Digest<32>>("\"2\"").unwrap_err().to_string();
+        assert!(err.contains("expected 32 bytes"), "{err}");
+        assert!(!err.contains("  "), "no double space in the message: {err}");
         // one zero byte, not the zero digest
         assert!(serde_json::from_str::<Digest<32>>("\"1\"").is_err());
         assert!(serde_json::from_str::<Digest<32>>(&format!("\"{}\"", "1".repeat(200))).is_err());
@@ -323,7 +325,10 @@ mod digest_serde_tests {
                 "JSON round trip lost leading zeros for {digest:?}"
             );
             // binary path unchanged
-            assert_eq!(bcs::from_bytes::<Digest<32>>(&bcs::to_bytes(&value).unwrap()).unwrap().digest, digest);
+            assert_eq!(
+                bcs::from_bytes::<Digest<32>>(&bcs::to_bytes(&value).unwrap()).unwrap().digest,
+                digest
+            );
         }
 
         // 32 '1's is the zero digest; 31 is a 31-byte value

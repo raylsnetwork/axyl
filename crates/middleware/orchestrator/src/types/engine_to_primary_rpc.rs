@@ -1,8 +1,11 @@
 use rayls_consensus_primary::{ConsensusBus, NodeMode};
 use rayls_execution_rpc::{EngineToPrimary, NodeRole, NodeStatus};
-use rayls_infrastructure_storage::{tables::EpochRecords, ConsensusStore, EpochStore};
+use rayls_infrastructure_storage::{
+    tables::{EpochCerts, EpochRecords},
+    ConsensusStore, EpochStore,
+};
 use rayls_infrastructure_types::{
-    BlockHash, ConsensusHeader, Database, Epoch, EpochCertificate, EpochRecord,
+    BlockHash, ConsensusHeader, Database, DbTx, Epoch, EpochCertificate, EpochRecord,
 };
 
 #[derive(Debug)]
@@ -105,14 +108,22 @@ impl<DB: Database> EngineToPrimary for EngineToPrimaryRpc<DB> {
 
 /// Highest epoch with a certified record. The epoch-0 placeholder is unsigned and does not count.
 fn last_closed_epoch<DB: Database>(db: &DB) -> Option<Epoch> {
-    let (epoch, _) = db.last_record::<EpochRecords>()?;
-    matches!(db.get_epoch_by_number(epoch), Some((_, Some(_)))).then_some(epoch)
+    // one read snapshot: the highest record, and whether it is certified (the epoch-0
+    // placeholder is unsigned)
+    db.with_read_txn(|txn| {
+        let Some((epoch, record)) = txn.last_record::<EpochRecords>() else {
+            return Ok(None);
+        };
+        Ok(txn.get::<EpochCerts>(&record.digest())?.is_some().then_some(epoch))
+    })
+    .ok()
+    .flatten()
 }
 
 /// One after the last closed epoch, or the tip's epoch if higher.
 fn current_epoch(tip: Option<&ConsensusHeader>, last_closed: Option<Epoch>) -> Epoch {
     let from_tip = tip.map(|h| h.sub_dag.leader_epoch()).unwrap_or(0);
-    let from_records = last_closed.map(|epoch| epoch + 1).unwrap_or(0);
+    let from_records = last_closed.map(|epoch| epoch.saturating_add(1)).unwrap_or(0);
     from_tip.max(from_records)
 }
 

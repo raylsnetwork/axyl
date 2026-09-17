@@ -262,9 +262,6 @@ impl Eq for Committee {}
 #[derive(Eq, PartialEq, Ord, PartialOrd, Clone, Hash)]
 pub struct AuthorityIdentifier(Arc<[u8; 32]>);
 
-/// Longest base58 rendering of 32 bytes; anything longer is rejected before decoding.
-const AUTHORITY_IDENTIFIER_BASE58_MAX: usize = 44;
-
 const AUTHORITY_IDENTIFIER_NAME: &str = "AuthorityIdentifier";
 
 impl Serialize for AuthorityIdentifier {
@@ -292,19 +289,16 @@ impl<'de> Deserialize<'de> for AuthorityIdentifier {
             }
 
             fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Self::Value, E> {
-                if v.len() > AUTHORITY_IDENTIFIER_BASE58_MAX {
-                    return Err(E::invalid_length(v.len(), &self));
-                }
-                let bytes = bs58::decode(v)
-                    .into_vec()
+                // exact-length decode onto a stack buffer; `onto` rejects an over-long string, a
+                // short one leaves `written` below 32
+                let mut bytes = [0u8; 32];
+                let written = bs58::decode(v)
+                    .onto(&mut bytes)
                     .map_err(|_| E::invalid_value(Unexpected::Str(v), &self))?;
-                self.visit_bytes(&bytes)
-            }
-
-            fn visit_bytes<E: serde::de::Error>(self, v: &[u8]) -> Result<Self::Value, E> {
-                <[u8; 32]>::try_from(v)
-                    .map(AuthorityIdentifier::from)
-                    .map_err(|_| E::invalid_length(v.len(), &"32 bytes"))
+                if written != 32 {
+                    return Err(E::invalid_length(written, &"32 bytes"));
+                }
+                Ok(AuthorityIdentifier::from(bytes))
             }
 
             /// The derived array form, for documents written before the string form.
@@ -760,7 +754,10 @@ mod tests {
                 map
             );
             // binary path unchanged
-            assert_eq!(bcs::from_bytes::<AuthorityIdentifier>(&bcs::to_bytes(&id).unwrap()).unwrap(), id);
+            assert_eq!(
+                bcs::from_bytes::<AuthorityIdentifier>(&bcs::to_bytes(&id).unwrap()).unwrap(),
+                id
+            );
             assert_eq!(decode_key::<AuthorityIdentifier>(&encode_key(&id)), id);
         }
 
