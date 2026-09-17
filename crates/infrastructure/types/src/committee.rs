@@ -789,7 +789,7 @@ mod tests {
         let huge = format!("\"{}\"", "1".repeat(1 << 16));
         assert!(
             serde_json::from_str::<AuthorityIdentifier>(&huge).is_err(),
-            "bounded before decoding"
+            "over-long input decodes past 32 bytes and is rejected"
         );
 
         // as a JSON object key, which `ReputationScores` needs
