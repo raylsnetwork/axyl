@@ -416,6 +416,34 @@ contract TokenomicsAccessControlTest is Test {
         delegationPool.applyPoolSlash(validator1, 50e18);
     }
 
+    // 10b. Non-admin calling setPerformanceWeightBps reverts; admin succeeds; disabled by
+    //      default and pausing (tested elsewhere, see #6/#486-514) does not gate this setter.
+    function test_rewardDistributor_setPerformanceWeightBps_onlyAdmin() public {
+        bytes32 defaultAdminRole = 0x00;
+        assertEq(distributor.performanceWeightBps(), 0, "disabled by default");
+
+        vm.prank(nobody);
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                IAccessControl.AccessControlUnauthorizedAccount.selector,
+                nobody,
+                defaultAdminRole
+            )
+        );
+        distributor.setPerformanceWeightBps(10_000);
+
+        vm.prank(admin);
+        distributor.setPerformanceWeightBps(10_000);
+        assertEq(distributor.performanceWeightBps(), 10_000);
+    }
+
+    // 10c. Setting performanceWeightBps above 100% reverts
+    function test_rewardDistributor_setPerformanceWeightBps_boundsCheck() public {
+        vm.prank(admin);
+        vm.expectRevert(IRewardDistributor.InvalidApyBps.selector);
+        distributor.setPerformanceWeightBps(10_001);
+    }
+
     // =========================================================================
     //  Section 12: Emergency & Recovery
     // =========================================================================

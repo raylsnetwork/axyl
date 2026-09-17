@@ -124,9 +124,12 @@ Each recipient transfer is isolated via try/catch — a failing recipient does n
 **`RewardDistributor.distributeRewards()`** — Automatic, system-call only:
 - `onlySystemCall` (no `KEEPER_ROLE` involvement); the EVM invokes it once per epoch from
   `RaylsBlockExecutor` (`evm/block.rs:277`) after `concludeEpoch`.
-- Reads `getEpochPerformanceWeights()` from `ConsensusRegistry`.
-- If performance data exists: distributes proportionally by `stake × headerCount`.
-- If no performance data: falls back to pure stake-based distribution.
+- Distribution is stake- and target-APY-derived by default (`performanceWeightBps == 0`).
+- If `performanceWeightBps > 0` (opt-in, admin-set, default disabled): blends in
+  `ConsensusRegistry.getEpochPerformanceWeights()` — a hybrid participation/anchor/stake-tier
+  weight, not the old raw `stake × headerCount` this doc previously (incorrectly) described. See
+  `RewardDistributor._applyPerformanceWeight`. This was removed entirely in #85 and reintroduced
+  as an off-by-default knob rather than automatic behavior.
 - For each validator, splits between own stake and the delegation pool.
 
 There is no `startDistribution()` / `continueDistribution(batchSize)` batched alternative

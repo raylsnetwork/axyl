@@ -45,6 +45,7 @@ interface IRewardDistributor {
     event OpenTierApyBpsUpdated(uint256 oldApyBps, uint256 newApyBps);
     event RewardCurveUpdated(address indexed oldCurve, address indexed newCurve);
     event OpenTierRewardCurveUpdated(address indexed oldCurve, address indexed newCurve);
+    event PerformanceWeightBpsUpdated(uint256 oldBps, uint256 newBps);
 
     /// @notice Receive ERC-20 RLS rewards from FeeAggregator
     /// @dev Called by FeeAggregator after swapping USDr to RLS
@@ -53,7 +54,8 @@ interface IRewardDistributor {
     function receiveRewards(uint256 amount) external;
 
     /// @notice Distribute all pending rewards to active validators and their delegation pools
-    /// @dev Calculates distribution based on performance weights or stake
+    /// @dev Purely stake- and target-APY-derived by default. When performanceWeightBps > 0,
+    ///      blends in ConsensusRegistry's hybrid performance weights (opt-in, default disabled).
     function distributeRewards() external;
 
     /// @notice Get pending rewards for a specific validator
@@ -129,4 +131,14 @@ interface IRewardDistributor {
     ///         falling back to the static openTierTargetApyBps.
     /// @param newCurve The new RewardCurve address
     function setOpenTierRewardCurve(address newCurve) external;
+
+    /// @notice Get the influence of ConsensusRegistry's hybrid performance weights on the
+    ///         target split, in basis points (0 = disabled/pure stake, the default).
+    function performanceWeightBps() external view returns (uint256);
+
+    /// @notice Set the influence of ConsensusRegistry's hybrid performance weights on the
+    ///         target split. 0 disables it (pure stake, byte-identical to prior behavior);
+    ///         10_000 makes distribution fully performance-proportional.
+    /// @param newBps The new performance-weight influence, in basis points (0-10_000)
+    function setPerformanceWeightBps(uint256 newBps) external;
 }
