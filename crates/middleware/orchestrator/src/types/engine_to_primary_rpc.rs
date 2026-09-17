@@ -116,8 +116,11 @@ fn last_closed_epoch<DB: Database>(db: &DB) -> Option<Epoch> {
         };
         Ok(txn.get::<EpochCerts>(&record.digest())?.is_some().then_some(epoch))
     })
-    .ok()
-    .flatten()
+    .unwrap_or_else(|e| {
+        // a read failure is not "epoch 0"; surface it rather than swallow it
+        tracing::warn!(target: "engine-rpc", error = %e, "last_closed_epoch read failed");
+        None
+    })
 }
 
 /// One after the last closed epoch, or the tip's epoch if higher.
