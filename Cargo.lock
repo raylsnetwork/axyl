@@ -7886,6 +7886,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "rayls-db-inspect"
+version = "1.4.1"
+dependencies = [
+ "clap",
+ "comfy-table",
+ "const-hex",
+ "eyre",
+ "indexmap 2.13.0",
+ "jsonrpsee",
+ "rayls-execution-evm",
+ "rayls-infrastructure-config",
+ "rayls-infrastructure-storage",
+ "rayls-infrastructure-types",
+ "rayls-testing-test-utils",
+ "roaring 0.10.12",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing-subscriber 0.3.23",
+]
+
+[[package]]
 name = "rayls-execution-evm"
 version = "1.4.1"
 dependencies = [

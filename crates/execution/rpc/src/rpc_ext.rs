@@ -19,6 +19,18 @@ pub trait RaylsNetworkRpcExtApi {
     /// Return the latest consensus header.
     #[method(name = "latestHeader")]
     async fn latest_header(&self) -> RaylsNetworkRpcResult<ConsensusHeader>;
+    /// Return the consensus header at `number` (canonical, or verified but not yet processed).
+    #[method(name = "consensusHeaderByNumber")]
+    async fn consensus_header_by_number(
+        &self,
+        number: u64,
+    ) -> RaylsNetworkRpcResult<ConsensusHeader>;
+    /// Return the consensus header with digest `hash`.
+    #[method(name = "consensusHeaderByHash")]
+    async fn consensus_header_by_hash(
+        &self,
+        hash: BlockHash,
+    ) -> RaylsNetworkRpcResult<ConsensusHeader>;
     /// Return the chain genesis.
     #[method(name = "genesis")]
     async fn genesis(&self) -> RaylsNetworkRpcResult<Genesis>;
@@ -57,6 +69,20 @@ where
 {
     async fn latest_header(&self) -> RaylsNetworkRpcResult<ConsensusHeader> {
         Ok(self.inner_node_network.get_latest_consensus_block())
+    }
+
+    async fn consensus_header_by_number(
+        &self,
+        number: u64,
+    ) -> RaylsNetworkRpcResult<ConsensusHeader> {
+        self.inner_node_network.consensus_block_by_number(number).ok_or(RaylsRpcError::NotFound)
+    }
+
+    async fn consensus_header_by_hash(
+        &self,
+        hash: BlockHash,
+    ) -> RaylsNetworkRpcResult<ConsensusHeader> {
+        self.inner_node_network.consensus_block_by_hash(hash).ok_or(RaylsRpcError::NotFound)
     }
 
     async fn genesis(&self) -> RaylsNetworkRpcResult<Genesis> {
