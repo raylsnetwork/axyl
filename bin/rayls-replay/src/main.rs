@@ -5,15 +5,14 @@
 
 use clap::Parser;
 use eyre::{eyre, Context};
-use rayls_execution_evm::reth_env::RethEnv;
+use rayls_execution_evm::{reth_env::RethEnv, set_active_profile, NetworkConfigFile};
 use rayls_infrastructure_config::Parameters;
 use rayls_infrastructure_storage::open_db;
 use rayls_infrastructure_types::{
     rewards::RewardsCounter, Address, Genesis, RaylsNetwork, TaskManager,
 };
-use rayls_middleware_rewards::ConsensusRewardsCounter;
 use rayls_replay::{
-    rewards::{HybridTallySource, SnapshotRewardsBackend, SnapshotTallyStore},
+    rewards::{BoundedHybridWalker, HybridTallySource, SnapshotRewardsBackend, SnapshotTallyStore},
     run_replay, verify_chainspec_compatibility, ReplayConfig,
 };
 use reth_chainspec::ChainSpec as RethChainSpec;
@@ -25,6 +24,7 @@ use tokio::sync::watch;
 use tracing::{error, info, warn};
 
 use parking_lot as _;
+use rayls_middleware_rewards as _;
 use thiserror as _;
 
 /// Scripted historical replay from a Rayls snapshot.
@@ -68,6 +68,19 @@ struct Cli {
     /// node's `--network`); it no longer selects a genesis/parameters source.
     #[arg(long, value_enum, default_value_t = RaylsNetwork::Mainnet)]
     chain: RaylsNetwork,
+
+    /// Network config file (YAML) holding named subnets, each with a `chain_id` and a
+    /// `hardforks` schedule (the same format the node takes via `--config-file`).
+    /// With `--subnet`, that subnet's schedule replaces the baked-in `--chain` profile
+    /// for both the snapshot and the archive env. Use it when a network historically
+    /// ran a schedule that differs from its baked-in profile; the image ships one at
+    /// `/etc/rayls/networks.yaml`. The subnet's `chain_id` must match the genesis.
+    #[arg(long, value_name = "PATH", requires = "subnet", conflicts_with = "chain")]
+    config_file: Option<PathBuf>,
+
+    /// Subnet name to select inside `--config-file`.
+    #[arg(long, value_name = "NAME", requires = "config_file")]
+    subnet: Option<String>,
 
     /// First block to replay (inclusive).
     #[arg(long, default_value_t = 1)]
@@ -135,6 +148,8 @@ fn main() -> eyre::Result<()> {
         snapshot_datadir = %cli.snapshot_datadir.display(),
         archive_out = %cli.archive_out.display(),
         chain = %cli.chain,
+        config_file = ?cli.config_file,
+        subnet = ?cli.subnet,
         "rayls-replay starting"
     );
 
@@ -156,6 +171,20 @@ async fn run(cli: Cli) -> eyre::Result<()> {
         cli.parameters.clone().unwrap_or_else(|| cli.snapshot_datadir.join("parameters.yaml"));
 
     let base_chain = base_chain_spec(&genesis_path)?;
+
+    // An external schedule wins over the baked-in `--chain` profile: `RethEnv::new`
+    // consults the active profile first, so install it before either env is built.
+    if let (Some(path), Some(subnet)) = (&cli.config_file, &cli.subnet) {
+        let profile = load_subnet_profile(path, subnet, base_chain.chain().id())?;
+        info!(
+            target: "rayls_replay::main",
+            config_file = %path.display(),
+            subnet,
+            hardforks = ?profile.hardforks,
+            "using hardfork schedule from network config file (overrides --chain)"
+        );
+        set_active_profile(profile).map_err(|e| eyre!("install network profile: {e}"))?;
+    }
     let NetworkParams { basefee_address, min_base_fee } = network_params(&parameters_path)?;
     info!(
         target: "rayls_replay::main",
@@ -227,13 +256,15 @@ async fn run(cli: Cli) -> eyre::Result<()> {
     // maintenance modes).
     let consensus_store = open_db(&consensus_db);
 
-    // hybrid-reward close blocks recompute participation rounds with the same
-    // ConsensusBlocks walk the live node runs, over the snapshot's consensus DB.
+    // hybrid-reward close blocks recompute participation rounds over the snapshot's
+    // consensus DB with a forward, cursor-bounded walk that credits exactly like the
+    // live node's walker but reads each epoch's rows once (see `rewards.rs`; the live
+    // reverse walk scans the whole tail of the table per epoch against a snapshot).
     // ORDERING: this attach must precede `run_replay` below, whose first
     // `install_committee_from_contract` forwards the committee to the walker;
     // `set_committee` only reaches a walker that is already attached.
     if !hybrid_source
-        .attach(RewardsCounter::from_impl(ConsensusRewardsCounter::new(consensus_store.clone())))
+        .attach(RewardsCounter::from_impl(BoundedHybridWalker::new(consensus_store.clone())))
     {
         return Err(eyre!("hybrid tally source attached twice"));
     }
@@ -523,4 +554,41 @@ fn init_tracing(
 
     tracing_subscriber::registry().with(stdout_layer).with(file_layer).init();
     Ok((stdout_guard, file_guard))
+}
+
+/// Load `subnet` from the network config file at `path` and check it against the
+/// genesis chain-id, mirroring the node's own `--config-file`/`--subnet` validation.
+///
+/// Every key in `hardforks` must be a known Rayls fork, the schedule must not be
+/// empty, and the subnet's `chain_id` must equal the genesis chain-id: a schedule
+/// for another network would silently diverge state at its first differing fork.
+fn load_subnet_profile(
+    path: &Path,
+    subnet: &str,
+    genesis_chain_id: u64,
+) -> eyre::Result<rayls_execution_evm::NetworkProfile> {
+    let yaml = std::fs::read_to_string(path)
+        .wrap_err_with(|| format!("read network config file {}", path.display()))?;
+    let file: NetworkConfigFile = serde_yaml::from_str(&yaml)
+        .wrap_err_with(|| format!("parse network config file {}", path.display()))?;
+    let profile = file.subnet(subnet).cloned().ok_or_else(|| {
+        let known = file.networks.keys().cloned().collect::<Vec<_>>().join(", ");
+        eyre!("subnet '{subnet}' not found in {}; available subnets: {known}", path.display())
+    })?;
+    profile.validate_hardforks()?;
+    if profile.hardforks.is_empty() {
+        eyre::bail!(
+            "subnet '{subnet}' in {} defines no `hardforks`; a replay schedule must list \
+             every fork as a block number or \"never\"",
+            path.display()
+        );
+    }
+    if profile.chain_id != genesis_chain_id {
+        eyre::bail!(
+            "subnet '{subnet}' has chain_id {} but the snapshot genesis has chain-id \
+             {genesis_chain_id}; pick the subnet that matches the snapshot",
+            profile.chain_id
+        );
+    }
+    Ok(profile)
 }
