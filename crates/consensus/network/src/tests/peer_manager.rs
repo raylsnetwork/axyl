@@ -23,7 +23,7 @@ fn create_test_peer_manager(network_config: Option<NetworkConfig>) -> PeerManage
     let mut authorities = all_nodes.authorities();
     let authority_1 = authorities.next().expect("first authority");
     let config = authority_1.consensus_config();
-    PeerManager::new(config.network_config().peer_config())
+    PeerManager::new(config.network_config().peer_config(), PeerId::random())
 }
 
 /// Helper function to extract events of a certain type
@@ -544,7 +544,8 @@ async fn test_is_validator() {
     let mut authorities = all_nodes.authorities();
     let authority_1 = authorities.next().expect("first authority");
     let config = authority_1.consensus_config();
-    let mut peer_manager = PeerManager::new(config.network_config().peer_config());
+    let mut peer_manager =
+        PeerManager::new(config.network_config().peer_config(), PeerId::random());
     let validator = *authority_1.authority().protocol_key();
     let random_peer_id = PeerId::random();
 
@@ -581,7 +582,8 @@ async fn test_committee_member_resolved_mid_epoch_is_absolved_immediately() {
     let authority_1 = authorities.next().expect("first authority");
     let authority_2 = authorities.next().expect("second authority");
     let config = authority_1.consensus_config();
-    let mut peer_manager = PeerManager::new(config.network_config().peer_config());
+    let mut peer_manager =
+        PeerManager::new(config.network_config().peer_config(), PeerId::random());
 
     // this node resolved itself but not authority_2, the ordinary state on a fresh start or a
     // restart before discovery has caught up
@@ -634,7 +636,8 @@ async fn resolving_a_banned_committee_member_releases_its_ban() {
     let authority_1 = authorities.next().expect("first authority");
     let authority_2 = authorities.next().expect("second authority");
     let config = authority_1.consensus_config();
-    let mut peer_manager = PeerManager::new(config.network_config().peer_config());
+    let mut peer_manager =
+        PeerManager::new(config.network_config().peer_config(), PeerId::random());
 
     // this node resolves itself, then installs a committee whose second member it cannot yet
     // resolve
@@ -692,7 +695,8 @@ async fn test_admitted_connection_is_registered_under_the_same_ban_predicate() {
     let mut authorities = all_nodes.authorities();
     let authority_1 = authorities.next().expect("first authority");
     let config = authority_1.consensus_config();
-    let mut peer_manager = PeerManager::new(config.network_config().peer_config());
+    let mut peer_manager =
+        PeerManager::new(config.network_config().peer_config(), PeerId::random());
 
     let blocklisted = create_multiaddr(Some(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 200))));
     let clean = create_multiaddr(Some(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 201))));
@@ -747,6 +751,103 @@ async fn test_admitted_connection_is_registered_under_the_same_ban_predicate() {
         ),
         "the swarm admitted this connection but the peer manager refused to register it"
     );
+}
+
+/// "Does not speak gossipsub" (the `GossipsubNotSupported` path) confers NO privilege: from a bare
+/// peer id a relay is indistinguishable from a hostile or misconfigured peer, so noting one must
+/// waive only the gossip penalty -- it must NOT make the peer relay infrastructure. A `Fatal`
+/// penalty (some other misbehavior) must still ban it. This is the inverse of the earlier
+/// behavior, which let any non-gossip peer opt out of the ban system.
+#[tokio::test]
+async fn test_non_gossip_peer_not_exempt_from_ban() {
+    let mut peer_manager = create_test_peer_manager(None);
+    let peer = register_peer(&mut peer_manager, None); // random peer id -> not a validator
+
+    // the GossipsubNotSupported handler may waive the gossip penalty for a non-validator
+    assert!(
+        peer_manager.should_skip_gossip_penalty(&peer),
+        "a non-validator peer's gossip penalty may be waived"
+    );
+    // waiving must NOT promote it to protected relay infrastructure
+    assert!(!peer_manager.is_relay(&peer), "a non-gossip peer must not become a relay");
+
+    // a fatal penalty must still take effect: the peer is disconnected and banned (the ban path
+    // surfaces as a `DisconnectPeer` event, as in `test_process_penalty_fatal`)
+    peer_manager.process_penalty(peer, Penalty::Fatal);
+    let events = collect_all_events(&mut peer_manager);
+    let disconnects = extract_events(&events, |e| matches!(e, PeerEvent::DisconnectPeer(_)));
+    assert!(
+        matches!(disconnects.first(), Some(PeerEvent::DisconnectPeer(id)) if *id == peer),
+        "a non-gossip peer must still be disconnected by a consensus-layer fatal penalty"
+    );
+    assert!(peer_manager.peer_banned(&peer), "non-gossip peer must be banned");
+}
+
+/// Relay registration is granted by construction, from the hop of a `/p2p-circuit` we use
+/// (`register_relays_from_addrs` -- fed by `StartListening` for every relay we reserve on and by
+/// a peer's advertised circuit address for every relay we dial through). Registration makes the
+/// hop `is_relay` (prune-exempt, kept out of kad) but confers NO penalty exemption: scoring is
+/// behaviour-based, and no penalty fires for merely being a relay, so a `Fatal` on a registered hop
+/// must still disconnect and ban it. Guards against re-adding a blanket relay carve-out that would
+/// let a planted peer id become immune.
+#[tokio::test]
+async fn test_registered_relay_hop_is_still_banned_by_fatal() {
+    let mut peer_manager = create_test_peer_manager(None);
+    let relay = register_peer(&mut peer_manager, None);
+    let dst = PeerId::random();
+    let circuit: Multiaddr =
+        format!("/ip4/127.0.0.1/udp/50000/quic-v1/p2p/{relay}/p2p-circuit/p2p/{dst}")
+            .parse()
+            .expect("valid circuit multiaddr");
+
+    peer_manager.register_relays_from_addrs(std::slice::from_ref(&circuit));
+    assert!(peer_manager.is_relay(&relay), "the circuit's hop must be registered as a relay");
+    assert!(!peer_manager.is_relay(&dst), "the circuit's destination is a peer, not a relay");
+
+    // a fatal penalty on the hop is NOT waived: disconnect + ban like any other peer
+    peer_manager.process_penalty(relay, Penalty::Fatal);
+    let events = collect_all_events(&mut peer_manager);
+    let disconnects = extract_events(&events, |e| matches!(e, PeerEvent::DisconnectPeer(_)));
+    assert!(
+        matches!(disconnects.first(), Some(PeerEvent::DisconnectPeer(id)) if *id == relay),
+        "a registered relay must be disconnected by a Fatal penalty"
+    );
+    assert!(
+        peer_manager.peer_banned(&relay),
+        "a registered relay must be banned by a Fatal penalty"
+    );
+    // registration itself is untouched: the hop stays prune-exempt while banned
+    assert!(peer_manager.is_relay(&relay));
+}
+
+/// `should_skip_gossip_penalty` must refuse a committee validator: a validator that fails gossipsub
+/// negotiation is a real protocol/version fault to surface, not a peer to quietly reclassify.
+#[tokio::test]
+async fn test_should_skip_gossip_penalty_refuses_validator() {
+    let all_nodes = CommitteeFixture::builder(MemDatabase::default).build();
+    let mut authorities = all_nodes.authorities();
+    let authority_1 = authorities.next().expect("first authority");
+    let config = authority_1.consensus_config();
+    let mut peer_manager =
+        PeerManager::new(config.network_config().peer_config(), PeerId::random());
+
+    let validator_bls = *authority_1.authority().protocol_key();
+    let netkey = config.key_config().primary_network_public_key();
+    let validator_peer_id: PeerId = netkey.clone().into();
+    let info = NetworkInfo {
+        pubkey: netkey,
+        multiaddrs: vec![config.primary_address()],
+        timestamp: now(),
+    };
+    peer_manager.add_known_peer(validator_bls, info);
+    peer_manager.new_epoch(config.committee_pub_keys());
+
+    // sanity: the derived peer id is recognized as a committee validator
+    assert!(peer_manager.is_peer_validator(&validator_peer_id));
+
+    // the guard: a validator's gossip penalty is never waived, and it never becomes a relay
+    assert!(!peer_manager.should_skip_gossip_penalty(&validator_peer_id));
+    assert!(!peer_manager.is_relay(&validator_peer_id));
 }
 
 #[tokio::test]
@@ -1289,5 +1390,71 @@ async fn test_refused_registration_disconnects_instead_of_announcing_the_peer() 
     assert!(
         events.iter().any(|e| matches!(e, PeerEvent::DisconnectPeer(id) if *id == peer_id)),
         "refused registration left the connection open"
+    );
+}
+
+/// Heartbeat must re-dial a committee member that is neither connected nor dialing: outside this
+/// path, committee dials happen only at the epoch boundary or when the node is fully isolated
+/// (discovery seeding), so a member whose relay or host recovers mid-epoch would otherwise stay
+/// partitioned until the next epoch.
+#[tokio::test]
+async fn test_heartbeat_redials_missing_committee_member() {
+    let all_nodes = CommitteeFixture::builder(MemDatabase::default)
+        .with_network_config(NetworkConfig::default())
+        .build();
+    let mut authorities = all_nodes.authorities();
+    let config = authorities.next().expect("first authority").consensus_config();
+
+    let mut rng = StdRng::seed_from_u64(33);
+
+    // this node's own identity, itself a committee member (observers must not pester committee)
+    let self_bls = *BlsKeypair::generate(&mut rng).public();
+    let self_netkey: NetworkPublicKey = NetworkKeypair::generate_ed25519().public().into();
+    let self_peer_id: PeerId = self_netkey.clone().into();
+    let mut peer_manager = PeerManager::new(config.network_config().peer_config(), self_peer_id);
+    peer_manager.add_known_peer(
+        self_bls,
+        NetworkInfo {
+            pubkey: self_netkey,
+            multiaddrs: vec![create_multiaddr(None)],
+            timestamp: now(),
+        },
+    );
+
+    // a fellow committee member, known but not connected
+    let member_bls = *BlsKeypair::generate(&mut rng).public();
+    let member_netkey: NetworkPublicKey = NetworkKeypair::generate_ed25519().public().into();
+    peer_manager.add_known_peer(
+        member_bls,
+        NetworkInfo {
+            pubkey: member_netkey,
+            multiaddrs: vec![create_multiaddr(None)],
+            timestamp: now(),
+        },
+    );
+
+    peer_manager.new_epoch(HashSet::from([self_bls, member_bls]));
+
+    // an unrelated peer is connected, so the node is not isolated (discovery seeding stays off)
+    register_peer(&mut peer_manager, None);
+    // drain anything setup may have queued
+    while peer_manager.next_dial_request().is_some() {}
+
+    peer_manager.heartbeat();
+
+    // the redial must route through the DialBls flow, which resolves `/dnsaddr` members to
+    // concrete circuits off-loop - dialing raw known_peers addresses installs the wrong
+    // relay-client handler for `/dnsaddr`-advertised members
+    let redials: Vec<_> = collect_all_events(&mut peer_manager)
+        .iter()
+        .filter_map(|e| match e {
+            PeerEvent::RedialCommittee(bls) => Some(*bls),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(redials, vec![member_bls], "one redial for the missing member, none for self");
+    assert!(
+        peer_manager.next_dial_request().is_none(),
+        "no raw dial may bypass the resolving dial path"
     );
 }

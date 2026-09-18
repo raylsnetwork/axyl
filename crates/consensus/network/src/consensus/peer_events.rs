@@ -5,7 +5,7 @@ use crate::{
     types::{NetworkEvent, NetworkResult},
     ConsensusNetwork,
 };
-use libp2p::{kad, PeerId};
+use libp2p::{core::multiaddr::Protocol, kad, PeerId};
 use rayls_infrastructure_types::{Database, RaylsSender};
 use tokio::sync::oneshot;
 use tracing::{debug, info, warn};
@@ -156,9 +156,50 @@ where
                 // register peer for request-response behaviour
                 // NOTE: gossipsub handles `FromSwarm::ConnectionEstablished`
                 self.swarm.add_peer_address(peer_id, addr.clone());
-                // add as a kademlia peer
-                self.swarm.behaviour_mut().kademlia.add_address(&peer_id, addr);
-                self.publish_our_data_to_peer(peer_id);
+                // Do NOT add relays to kademlia or share our record with them: relays only speak
+                // the circuit protocol, so putting them in the DHT makes other nodes discover and
+                // dial them as if they were peers. Those nodes then penalize/ban the relay for not
+                // speaking consensus protocols -- and on a shared IP (local testnet, everything on
+                // 127.0.0.1) an IP-level ban then knocks out every real peer behind that IP.
+                if self.swarm.behaviour().peer_manager.is_relay(&peer_id) {
+                    debug!(target: "network-kad", ?peer_id, "skipping kad add/publish for relay peer");
+                } else {
+                    // A relayed inbound connection's send-back address is a bare `/p2p/<src>` with
+                    // no transport (see `handle_pending_inbound_connection`). It is undialable, and
+                    // if seeded into kad it propagates via FIND_NODE as a `/p2p/<peer>` that every
+                    // discoverer then fails to dial forever. Only add a concrete, dialable address
+                    // (one carrying an ip/dns transport) to the routing table; a relay-only peer's
+                    // real reachability comes from its published record (get_record -> DialBls),
+                    // not from this send-back. `add_address` is the sole
+                    // populator of the kbuckets (BucketInserts::Manual), so
+                    // filtering here keeps FIND_NODE responses clean.
+                    //
+                    // The one thing a relayed connection's address is normally
+                    // good for is DCUtR (upgrading a relayed connection to a
+                    // direct one). That does not apply here: there is no `dcutr`
+                    // behaviour in this swarm, and even with one DCUtR drives off
+                    // the live relayed connection via the relay client, not this
+                    // kad entry -- so dropping the send-back from kad costs
+                    // nothing.
+                    let dialable = addr.iter().any(|p| {
+                        matches!(
+                            p,
+                            Protocol::Ip4(_)
+                                | Protocol::Ip6(_)
+                                | Protocol::Dns(_)
+                                | Protocol::Dns4(_)
+                                | Protocol::Dns6(_)
+                                | Protocol::Dnsaddr(_)
+                        )
+                    });
+                    if dialable {
+                        // add as a kademlia peer
+                        self.swarm.behaviour_mut().kademlia.add_address(&peer_id, addr);
+                    } else {
+                        debug!(target: "network-kad", ?peer_id, ?addr, "skipping kad add for transport-less address (bare /p2p send-back)");
+                    }
+                    self.publish_our_data_to_peer(peer_id);
+                }
 
                 // manage connected peers - avoid duplicates from rapid reconnects
                 if !self.connected_peers.contains(&peer_id) {
@@ -225,6 +266,13 @@ where
                     let query_id = self.swarm.behaviour_mut().kademlia.get_record(key);
                     self.kad_record_queries.insert(query_id, bls_key.into());
                 }
+            }
+            PeerEvent::RedialCommittee(bls_key) => {
+                // route through DialBls so a `/dnsaddr`-advertised member is resolved to
+                // concrete circuits off-loop before dialing; the outcome is fire-and-forget
+                // (a failed attempt is retried on the next heartbeat)
+                let (reply, _outcome) = oneshot::channel();
+                self.process_command(crate::types::NetworkCommand::DialBls { bls_key, reply })?;
             }
             PeerEvent::Discovery => {
                 let peer_id = PeerId::random();

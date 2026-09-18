@@ -1,0 +1,500 @@
+# Blue-green relay failover harness (sibling of compose.yaml; the base 1:1 isolation harness is
+# untouched). One validator (validator1) sits behind a WARM POOL of relays and advertises a
+# /dnsaddr name whose TXT record points at exactly ONE pool member (the ACTIVE relay). A DoS on the
+# active relay is auto-detected by the dns-failover box, which flips the TXT to the next warm
+# standby; peers re-resolve /dnsaddr on their next redial and follow, so the chain never stalls.
+#
+# Two design choices make this work and are load-bearing:
+#   - Relays are PURE front-doors here (reservation endpoints only). The gateway/NAT role the base
+#     harness fused into the relay is a SEPARATE box (egress1), so a DoS on the active relay cannot
+#     take out validator1's egress or its warm standby reservations.
+#   - The TXT names only the active relay (blue-green), not all of them (active/active). validator1
+#     holds warm reservations on ALL pool relays (PRIMARY/WORKER_RELAY_MULTIADDRS, comma-separated),
+#     so a cutover is a pure advertisement change with no reservation setup on the hot path.
+#
+# validator2..4 keep the base 1:1 relay-as-gateway shape; they are the peers that must re-resolve
+# validator1's /dnsaddr and follow it to the standby (so they carry RAYLS_DNS_SERVER + a DNS egress
+# allowance). Replicating the pool to them is mechanical: give each its own egress + pool + /dnsaddr,
+# exactly as validator1 has here ("and so on").
+#
+#   vpc1 (internal 10.10.1.0/24): validator1 (.10) --default route--> egress1 DMZ leg (.2)
+#   vpc2..4 (internal 10.10.N.0/24): validatorN (.10) --default route--> relayN DMZ leg (.3)
+#   public (10.20.0.0/24): relay1a (.11) relay1b (.41) relay1c (.42)  <- validator1's warm pool
+#                          relay2 (.12) relay3 (.13) relay4 (.14)     <- validator2..4 single relays
+#                          egress1 public leg (.61), dns-failover (.53)
+#                          observer1 (.21, host RPC 7545) + observer2 (.22, host RPC 7544)
+#
+# NOTE (as in the base harness): Docker enumerates a dual-homed box's legs as eth0/eth1 in an order
+# that is not stable across containers, so every firewall rule matches on IP/subnet, never on
+# interface. Do not add an interface-scoped (-i/-o) rule.
+
+# Distinct project name so this harness's containers/volumes/networks do not collide with the base
+# compose.yaml (same directory). The two reuse the same subnets, so only one runs at a time: bring
+# the base down (frees the subnets) before bringing this up. Base volumes are preserved either way.
+name: relay-failover
+
+x-relay-pool-common: &relay-pool-common
+  image: local-rayls-relay-network:latest
+  depends_on:
+    rayls-base:
+      condition: service_started
+  user: "root"
+  # NET_ADMIN so dos.sh can blackhole the relay at runtime (it installs no rules at boot).
+  cap_add:
+    - NET_ADMIN
+
+x-gateway-common: &gateway-common
+  image: local-rayls-relay-network:latest
+  depends_on:
+    rayls-base:
+      condition: service_started
+  user: "root"
+  cap_add:
+    - NET_ADMIN
+  sysctls:
+    - net.ipv4.ip_forward=1
+
+x-setup-common: &setup-common
+  image: local-rayls-relay-network:latest
+  depends_on:
+    rayls-base:
+      condition: service_started
+  user: "root"
+  command: ["bash", "/setup_validator.sh"]
+
+x-validator-common: &validator-common
+  image: local-rayls-relay-network:latest
+  user: "root"
+  cap_add:
+    - NET_ADMIN
+  depends_on:
+    committee:
+      condition: service_completed_successfully
+
+x-observer-common: &observer-common
+  image: local-rayls-relay-network:latest
+  user: "1101:1101"
+  depends_on:
+    committee:
+      condition: service_completed_successfully
+    dns:
+      condition: service_started
+
+services:
+  rayls-base:
+    image: local-rayls-relay-network:latest
+    build:
+      context: ../../
+      dockerfile: etc/relay-network/Dockerfile
+      args:
+        VERGEN_GIT_SHA: ${VERGEN_GIT_SHA:-}
+
+  # --- validator1's warm relay pool: pure front-doors on the public net (no gateway duties). -----
+  # validator1 holds a warm reservation on all three; the dns-failover TXT advertises exactly one.
+  relay1a:
+    <<: *relay-pool-common
+    environment:
+      - RELAY_SEED_HEX=0101010101010101010101010101010101010101010101010101010101010101
+      - RELAY_PORT=4001
+    command: ["rayls-relay"]
+    networks:
+      public:
+        ipv4_address: 10.20.0.11
+  relay1b:
+    <<: *relay-pool-common
+    environment:
+      - RELAY_SEED_HEX=b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1
+      - RELAY_PORT=4001
+    command: ["rayls-relay"]
+    networks:
+      public:
+        ipv4_address: 10.20.0.41
+  relay1c:
+    <<: *relay-pool-common
+    environment:
+      - RELAY_SEED_HEX=c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1
+      - RELAY_PORT=4001
+    command: ["rayls-relay"]
+    networks:
+      public:
+        ipv4_address: 10.20.0.42
+
+  # --- egress1: validator1's dedicated NAT gateway, decoupled from the relays. Forwards ONLY
+  # --- udp/4001 to relay public legs + udp/53 to dns, masquerades on its public leg, drops the
+  # --- rest. This is what lets validator1 keep its warm standby reservations while its active relay
+  # --- is under DoS. -----------------------------------------------------------------------------
+  egress1:
+    <<: *gateway-common
+    environment:
+      - SUBNET=10.10.1.0/24
+      - VIP=10.10.1.10
+      - RELAY_PUBLICS=10.20.0.11 10.20.0.41 10.20.0.42 10.20.0.12 10.20.0.13 10.20.0.14
+      - DNS_SERVER=10.20.0.53
+    command: ["sh", "/failover-gateway.sh"]
+    volumes:
+      - ./failover/failover-gateway.sh:/failover-gateway.sh:ro
+    networks:
+      public:
+        ipv4_address: 10.20.0.61
+      vpc1:
+        ipv4_address: 10.10.1.2
+
+  # --- validator2..4 relays: base-style, each is BOTH its validator's relay and its egress gateway
+  # --- (RUN_RELAY=1). Dual-homed: public leg (advertised) + DMZ leg inside its VPC. --------------
+  relay2:
+    <<: *gateway-common
+    environment:
+      - RELAY_SEED_HEX=0202020202020202020202020202020202020202020202020202020202020202
+      - RELAY_PORT=4001
+      - RUN_RELAY=1
+      - SUBNET=10.10.2.0/24
+      - VIP=10.10.2.10
+      - RELAY_PUBLICS=10.20.0.11 10.20.0.41 10.20.0.42 10.20.0.13 10.20.0.14
+      - DNS_SERVER=10.20.0.53
+    command: ["sh", "/failover-gateway.sh"]
+    volumes:
+      - ./failover/failover-gateway.sh:/failover-gateway.sh:ro
+    networks:
+      public:
+        ipv4_address: 10.20.0.12
+      vpc2:
+        ipv4_address: 10.10.2.3
+  relay3:
+    <<: *gateway-common
+    environment:
+      - RELAY_SEED_HEX=0303030303030303030303030303030303030303030303030303030303030303
+      - RELAY_PORT=4001
+      - RUN_RELAY=1
+      - SUBNET=10.10.3.0/24
+      - VIP=10.10.3.10
+      - RELAY_PUBLICS=10.20.0.11 10.20.0.41 10.20.0.42 10.20.0.12 10.20.0.14
+      - DNS_SERVER=10.20.0.53
+    command: ["sh", "/failover-gateway.sh"]
+    volumes:
+      - ./failover/failover-gateway.sh:/failover-gateway.sh:ro
+    networks:
+      public:
+        ipv4_address: 10.20.0.13
+      vpc3:
+        ipv4_address: 10.10.3.3
+  relay4:
+    <<: *gateway-common
+    environment:
+      - RELAY_SEED_HEX=0404040404040404040404040404040404040404040404040404040404040404
+      - RELAY_PORT=4001
+      - RUN_RELAY=1
+      - SUBNET=10.10.4.0/24
+      - VIP=10.10.4.10
+      - RELAY_PUBLICS=10.20.0.11 10.20.0.41 10.20.0.42 10.20.0.12 10.20.0.13
+      - DNS_SERVER=10.20.0.53
+    command: ["sh", "/failover-gateway.sh"]
+    volumes:
+      - ./failover/failover-gateway.sh:/failover-gateway.sh:ro
+    networks:
+      public:
+        ipv4_address: 10.20.0.14
+      vpc4:
+        ipv4_address: 10.10.4.3
+
+  # --- dns-failover: dnsmasq + the auto health-flip loop. Serves validator1's /dnsaddr TXT for the
+  # --- ACTIVE pool relay; pings it and flips to the next warm standby on a DoS. -------------------
+  dns:
+    image: local-rayls-relay-network:latest
+    depends_on:
+      committee:
+        condition: service_completed_successfully
+      relay1a:
+        condition: service_started
+      relay1b:
+        condition: service_started
+      relay1c:
+        condition: service_started
+    user: "root"
+    environment:
+      - V1_HOST=v1.rayls.test
+      - V1_NODEINFO_DIR=/v1data
+      # pool = "ip:relay_peer_id" per warm relay; the first is the initial ACTIVE
+      - "POOL=10.20.0.11:12D3KooWK99VoVxNE7XzyBwXEzW7xhK7Gpv85r9F3V3fyKSUKPH5 10.20.0.41:12D3KooWEc2vof8sLPPd5TGpebsWm99b57WSHDA34zdsuucTjTky 10.20.0.42:12D3KooWMT9Z5UaS1QWjzP9NMtTVmbZfv95aTVyDGQjP2TezQ8gF"
+      - STATIC_ARGS=--host-record=observer1.rayls.test,10.20.0.21 --host-record=observer2.rayls.test,10.20.0.22 --host-record=rpc.rayls.test,10.20.0.21 --host-record=rpc.rayls.test,10.20.0.22
+    command: ["sh", "/dns-failover.sh"]
+    volumes:
+      - ./failover/dns-failover.sh:/dns-failover.sh:ro
+      - validator1-data:/v1data:ro
+    networks:
+      public:
+        ipv4_address: 10.20.0.53
+
+  # --- key/node-info generation. validator1 advertises /dnsaddr (RL_ADVERTISE_DNSADDR, which beats
+  # --- RL_RELAY_ADDR in keytool); validator2..4 bake a concrete /ip4 relay circuit as in the base
+  # --- harness. setup_validator.sh is reused unchanged. -----------------------------------------
+  setup1:
+    <<: *setup-common
+    environment:
+      - RL_ADVERTISE_DNSADDR=v1.rayls.test
+      - EXECUTION_ADDRESS=0x1111111111111111111111111111111111111111
+      - RL_BLS_PASSPHRASE=local
+    volumes:
+      - ../docker-network/setup_validator.sh:/setup_validator.sh
+      - validator1-data:/home/nonroot/data
+  setup2:
+    <<: *setup-common
+    environment:
+      - RL_RELAY_ADDR=/ip4/10.20.0.12/udp/4001/quic-v1/p2p/12D3KooWJWoaqZhDaoEFshF7Rh1bpY9ohihFhzcW6d69Lr2NASuq
+      - EXECUTION_ADDRESS=0x2222222222222222222222222222222222222222
+      - RL_BLS_PASSPHRASE=local
+    volumes:
+      - ../docker-network/setup_validator.sh:/setup_validator.sh
+      - validator2-data:/home/nonroot/data
+  setup3:
+    <<: *setup-common
+    environment:
+      - RL_RELAY_ADDR=/ip4/10.20.0.13/udp/4001/quic-v1/p2p/12D3KooWRndVhVZPCiQwHBBBdg769GyrPUW13zxwqQyf9r3ANaba
+      - EXECUTION_ADDRESS=0x3333333333333333333333333333333333333333
+      - RL_BLS_PASSPHRASE=local
+    volumes:
+      - ../docker-network/setup_validator.sh:/setup_validator.sh
+      - validator3-data:/home/nonroot/data
+  setup4:
+    <<: *setup-common
+    environment:
+      - RL_RELAY_ADDR=/ip4/10.20.0.14/udp/4001/quic-v1/p2p/12D3KooWPT98FXMfDQYavZm66EeVjTqP9Nnehn1gyaydqV8L8BQw
+      - EXECUTION_ADDRESS=0x4444444444444444444444444444444444444444
+      - RL_BLS_PASSPHRASE=local
+    volumes:
+      - ../docker-network/setup_validator.sh:/setup_validator.sh
+      - validator4-data:/home/nonroot/data
+
+  committee:
+    image: local-rayls-relay-network:latest
+    environment:
+      - RL_BLS_PASSPHRASE=local
+      - GASLESS=${GASLESS:-}
+      - GAS_LIMIT=${GAS_LIMIT:-}
+    user: "root"
+    command: ["bash", "/genesis.sh"]
+    depends_on:
+      setup1:
+        condition: service_completed_successfully
+      setup2:
+        condition: service_completed_successfully
+      setup3:
+        condition: service_completed_successfully
+      setup4:
+        condition: service_completed_successfully
+    volumes:
+      - ./failover/genesis-failover.sh:/genesis.sh
+      - sharedgenesisdir:/home/nonroot/data/genesis
+      - validator1-data:/home/nonroot/data/validator-1
+      - validator2-data:/home/nonroot/data/validator-2
+      - validator3-data:/home/nonroot/data/validator-3
+      - validator4-data:/home/nonroot/data/validator-4
+      - observer1-data:/home/nonroot/data/observer1
+      - observer2-data:/home/nonroot/data/observer2
+
+  # --- validators -------------------------------------------------------------------------------
+  # validator1: /dnsaddr-advertised, egress via its dedicated NAT (egress1), warm-reserves on the
+  # 3-relay pool. No DNS (it dials only /ip4 peers).
+  validator1:
+    <<: *validator-common
+    depends_on:
+      committee:
+        condition: service_completed_successfully
+      egress1:
+        condition: service_started
+      relay1a:
+        condition: service_started
+      relay1b:
+        condition: service_started
+      relay1c:
+        condition: service_started
+    environment:
+      # network=debug surfaces the connection-path classification and per-request via-path
+      # tracing that proves every peer flow transits a relay circuit (never a direct link).
+      - RUST_LOG=info,execution=debug,network=debug
+      - RL_BLS_PASSPHRASE=local
+      - RAYLS_NETWORK=local
+      - GW=10.10.1.2
+      - RELAY_PUBLICS=10.20.0.11 10.20.0.41 10.20.0.42 10.20.0.12 10.20.0.13 10.20.0.14
+      - PRIMARY_RELAY_MULTIADDRS=/ip4/10.20.0.11/udp/4001/quic-v1/p2p/12D3KooWK99VoVxNE7XzyBwXEzW7xhK7Gpv85r9F3V3fyKSUKPH5,/ip4/10.20.0.41/udp/4001/quic-v1/p2p/12D3KooWEc2vof8sLPPd5TGpebsWm99b57WSHDA34zdsuucTjTky,/ip4/10.20.0.42/udp/4001/quic-v1/p2p/12D3KooWMT9Z5UaS1QWjzP9NMtTVmbZfv95aTVyDGQjP2TezQ8gF
+      - WORKER_RELAY_MULTIADDRS=/ip4/10.20.0.11/udp/4001/quic-v1/p2p/12D3KooWK99VoVxNE7XzyBwXEzW7xhK7Gpv85r9F3V3fyKSUKPH5,/ip4/10.20.0.41/udp/4001/quic-v1/p2p/12D3KooWEc2vof8sLPPd5TGpebsWm99b57WSHDA34zdsuucTjTky,/ip4/10.20.0.42/udp/4001/quic-v1/p2p/12D3KooWMT9Z5UaS1QWjzP9NMtTVmbZfv95aTVyDGQjP2TezQ8gF
+    command: ["sh", "/failover-validator.sh"]
+    volumes:
+      - ./failover/failover-validator.sh:/failover-validator.sh:ro
+      - validator1-data:/home/nonroot/data
+    networks:
+      vpc1:
+        ipv4_address: 10.10.1.10
+  validator2:
+    <<: *validator-common
+    depends_on:
+      committee:
+        condition: service_completed_successfully
+      relay2:
+        condition: service_started
+      dns:
+        condition: service_started
+    environment:
+      # network=debug surfaces the connection-path classification and per-request via-path
+      # tracing that proves every peer flow transits a relay circuit (never a direct link).
+      - RUST_LOG=info,execution=debug,network=debug
+      - RL_BLS_PASSPHRASE=local
+      - RAYLS_NETWORK=local
+      - RAYLS_DNS_SERVER=10.20.0.53:53
+      - GW=10.10.2.3
+      - RELAY_PUBLICS=10.20.0.11 10.20.0.41 10.20.0.42 10.20.0.13 10.20.0.14
+      - DNS_SERVER=10.20.0.53
+      - PRIMARY_RELAY_MULTIADDRS=/ip4/10.10.2.3/udp/4001/quic-v1/p2p/12D3KooWJWoaqZhDaoEFshF7Rh1bpY9ohihFhzcW6d69Lr2NASuq
+      - WORKER_RELAY_MULTIADDRS=/ip4/10.10.2.3/udp/4001/quic-v1/p2p/12D3KooWJWoaqZhDaoEFshF7Rh1bpY9ohihFhzcW6d69Lr2NASuq
+    command: ["sh", "/failover-validator.sh"]
+    volumes:
+      - ./failover/failover-validator.sh:/failover-validator.sh:ro
+      - validator2-data:/home/nonroot/data
+    networks:
+      vpc2:
+        ipv4_address: 10.10.2.10
+  validator3:
+    <<: *validator-common
+    depends_on:
+      committee:
+        condition: service_completed_successfully
+      relay3:
+        condition: service_started
+      dns:
+        condition: service_started
+    environment:
+      # network=debug surfaces the connection-path classification and per-request via-path
+      # tracing that proves every peer flow transits a relay circuit (never a direct link).
+      - RUST_LOG=info,execution=debug,network=debug
+      - RL_BLS_PASSPHRASE=local
+      - RAYLS_NETWORK=local
+      - RAYLS_DNS_SERVER=10.20.0.53:53
+      - GW=10.10.3.3
+      - RELAY_PUBLICS=10.20.0.11 10.20.0.41 10.20.0.42 10.20.0.12 10.20.0.14
+      - DNS_SERVER=10.20.0.53
+      - PRIMARY_RELAY_MULTIADDRS=/ip4/10.10.3.3/udp/4001/quic-v1/p2p/12D3KooWRndVhVZPCiQwHBBBdg769GyrPUW13zxwqQyf9r3ANaba
+      - WORKER_RELAY_MULTIADDRS=/ip4/10.10.3.3/udp/4001/quic-v1/p2p/12D3KooWRndVhVZPCiQwHBBBdg769GyrPUW13zxwqQyf9r3ANaba
+    command: ["sh", "/failover-validator.sh"]
+    volumes:
+      - ./failover/failover-validator.sh:/failover-validator.sh:ro
+      - validator3-data:/home/nonroot/data
+    networks:
+      vpc3:
+        ipv4_address: 10.10.3.10
+  validator4:
+    <<: *validator-common
+    depends_on:
+      committee:
+        condition: service_completed_successfully
+      relay4:
+        condition: service_started
+      dns:
+        condition: service_started
+    environment:
+      # network=debug surfaces the connection-path classification and per-request via-path
+      # tracing that proves every peer flow transits a relay circuit (never a direct link).
+      - RUST_LOG=info,execution=debug,network=debug
+      - RL_BLS_PASSPHRASE=local
+      - RAYLS_NETWORK=local
+      - RAYLS_DNS_SERVER=10.20.0.53:53
+      - GW=10.10.4.3
+      - RELAY_PUBLICS=10.20.0.11 10.20.0.41 10.20.0.42 10.20.0.12 10.20.0.13
+      - DNS_SERVER=10.20.0.53
+      - PRIMARY_RELAY_MULTIADDRS=/ip4/10.10.4.3/udp/4001/quic-v1/p2p/12D3KooWPT98FXMfDQYavZm66EeVjTqP9Nnehn1gyaydqV8L8BQw
+      - WORKER_RELAY_MULTIADDRS=/ip4/10.10.4.3/udp/4001/quic-v1/p2p/12D3KooWPT98FXMfDQYavZm66EeVjTqP9Nnehn1gyaydqV8L8BQw
+    command: ["sh", "/failover-validator.sh"]
+    volumes:
+      - ./failover/failover-validator.sh:/failover-validator.sh:ro
+      - validator4-data:/home/nonroot/data
+    networks:
+      vpc4:
+        ipv4_address: 10.10.4.10
+
+  # --- observers: dial-out-only followers; resolve validator1's /dnsaddr (and follow its cutovers)
+  # --- via the dns service. A progressing chain here is the end-to-end failover proof. -----------
+  observer1:
+    <<: *observer-common
+    environment:
+      # network=debug surfaces the connection-path classification and per-request via-path
+      # tracing that proves every peer flow transits a relay circuit (never a direct link).
+      - RUST_LOG=info,network=debug
+      - RL_BLS_PASSPHRASE=local
+      - RAYLS_NETWORK=local
+      - RAYLS_DNS_SERVER=10.20.0.53:53
+      - PRIMARY_LISTENER_MULTIADDR=/ip4/0.0.0.0/udp/49590/quic-v1
+      - WORKER_LISTENER_MULTIADDR=/ip4/0.0.0.0/udp/49595/quic-v1
+    command: >
+      /usr/local/bin/rayls node --observer --datadir /home/nonroot/data --metrics 127.0.0.1:9101
+      --log.stdout.format terminal -vvvv --full --storage.v2
+      --txpool.pending-max-count 1000000 --txpool.pending-max-size 20971120000
+      --txpool.basefee-max-count 1000000 --txpool.basefee-max-size 20971120000
+      --txpool.queued-max-count 1000000 --txpool.queued-max-size 20971120000
+      --txpool.max-pending-txns 1000000 --txpool.max-new-txns 1000000
+      --txpool.minimal-protocol-fee 0 --txpool.max-tx-input-bytes 999999999999
+      --txpool.max-account-slots 1000000 --gpo.default-suggested-fee 0
+      --http --http.addr 0.0.0.0 --http.api all
+    ports:
+      - 7545:8545
+    volumes:
+      - observer1-data:/home/nonroot/data
+    networks:
+      public:
+        ipv4_address: 10.20.0.21
+  observer2:
+    <<: *observer-common
+    environment:
+      # network=debug surfaces the connection-path classification and per-request via-path
+      # tracing that proves every peer flow transits a relay circuit (never a direct link).
+      - RUST_LOG=info,network=debug
+      - RL_BLS_PASSPHRASE=local
+      - RAYLS_NETWORK=local
+      - RAYLS_DNS_SERVER=10.20.0.53:53
+      - PRIMARY_LISTENER_MULTIADDR=/ip4/0.0.0.0/udp/49590/quic-v1
+      - WORKER_LISTENER_MULTIADDR=/ip4/0.0.0.0/udp/49595/quic-v1
+    command: >
+      /usr/local/bin/rayls node --observer --datadir /home/nonroot/data --metrics 127.0.0.1:9101
+      --log.stdout.format terminal -vvvv --full --storage.v2
+      --txpool.pending-max-count 1000000 --txpool.pending-max-size 20971120000
+      --txpool.basefee-max-count 1000000 --txpool.basefee-max-size 20971120000
+      --txpool.queued-max-count 1000000 --txpool.queued-max-size 20971120000
+      --txpool.max-pending-txns 1000000 --txpool.max-new-txns 1000000
+      --txpool.minimal-protocol-fee 0 --txpool.max-tx-input-bytes 999999999999
+      --txpool.max-account-slots 1000000 --gpo.default-suggested-fee 0
+      --http --http.addr 0.0.0.0 --http.api all
+    ports:
+      - 7544:8545
+    volumes:
+      - observer2-data:/home/nonroot/data
+    networks:
+      public:
+        ipv4_address: 10.20.0.22
+
+volumes:
+  validator1-data:
+  validator2-data:
+  validator3-data:
+  validator4-data:
+  observer1-data:
+  observer2-data:
+  sharedgenesisdir:
+
+networks:
+  vpc1:
+    ipam:
+      config:
+        - subnet: 10.10.1.0/24
+  vpc2:
+    ipam:
+      config:
+        - subnet: 10.10.2.0/24
+  vpc3:
+    ipam:
+      config:
+        - subnet: 10.10.3.0/24
+  vpc4:
+    ipam:
+      config:
+        - subnet: 10.10.4.0/24
+  public:
+    ipam:
+      config:
+        - subnet: 10.20.0.0/24

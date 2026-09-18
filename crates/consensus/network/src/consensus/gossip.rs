@@ -108,9 +108,25 @@ where
                 );
             }
             GossipEvent::GossipsubNotSupported { peer_id } => {
-                trace!(target: "network", topics=?self.authorized_publishers.keys(), ?peer_id, "gossipsub event - not supported");
-
-                self.swarm.behaviour_mut().peer_manager.process_penalty(peer_id, Penalty::Fatal);
+                // `GossipsubNotSupported` is authoritative: gossipsub negotiated with this peer and
+                // it runs none of our gossip protocols. Fatally banning it (the original behavior)
+                // severed every circuit routed through a relay, stranding relayed nodes -- so we
+                // must not ban. This arm MUST stay penalty-free: relays are not exempt from
+                // penalties (scoring is behaviour-based, see `PeerManager::process_penalty`), and
+                // "does not speak gossipsub" is the one signal an honest relay emits by nature --
+                // the only one it must never be scored for. Conversely, "no gossipsub" is NOT proof
+                // of being a relay: from a bare peer id a relay is indistinguishable from a
+                // misconfigured or hostile peer, so this signal confers no privilege either. The
+                // peer remains subject to every other penalty and to pruning. Keep it out of the
+                // DHT so it is never propagated as a peer. A committee validator reaching here is a
+                // real protocol/version fault -- surface it loudly rather than reclassifying it.
+                if self.swarm.behaviour().peer_manager.should_skip_gossip_penalty(&peer_id) {
+                    // stop treating it as a DHT peer (mirrors the kad cleanup the ban path did)
+                    self.swarm.behaviour_mut().kademlia.remove_peer(&peer_id);
+                    info!(target: "network", ?peer_id, "peer does not support gossipsub - skipping gossip penalty and keeping it out of kad (other penalties and pruning still apply)");
+                } else {
+                    warn!(target: "network", ?peer_id, "committee member does not support gossipsub - possible protocol/version mismatch");
+                }
             }
             GossipEvent::SlowPeer { peer_id, failed_messages } => {
                 trace!(target: "network", topics=?self.authorized_publishers.keys(), ?peer_id, ?failed_messages, "gossipsub event - slow peer");
