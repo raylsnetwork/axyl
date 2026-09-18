@@ -19,6 +19,8 @@ networks:
       EmptyOutputBlock: 3569194
       DynamicCommitteeSizing: 18446744073709551615
       HybridRewards: never
+      OutputSeqNormalization: never
+      SenderAffinityLoadBalancing: never
   testnet:
     chain_id: 7295799
     hardforks:
@@ -35,3 +37,5 @@ networks:
       EmptyOutputBlock: 6663630
       DynamicCommitteeSizing: 18446744073709551615
       HybridRewards: never
+      OutputSeqNormalization: never
+      SenderAffinityLoadBalancing: never

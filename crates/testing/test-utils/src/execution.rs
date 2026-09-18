@@ -165,7 +165,6 @@ pub async fn faucet_test_execution_node(
             RewardsCounter::default(),
             &BuildMetadata::default(),
             None,
-            None,
             false,
         )
         .await?,

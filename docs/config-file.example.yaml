@@ -17,11 +17,15 @@
 # this subnet).
 #
 # The datadir also keeps a `schedule-record.yaml` pinning the hardfork
-# schedule its executed blocks ran under. At boot the selected schedule is
-# verified against that record: a fork that has ALREADY activated (boundary at
-# or below the current head) cannot be moved, removed, or back-dated - the
-# node refuses to start, because that schedule would re-interpret the chain's
-# history. A boundary still in the future MAY be changed - that is how agreed
+# schedule its executed blocks ran under (including forks pinned to `never`,
+# so only a record written before a fork existed lacks it). At boot the
+# selected schedule is verified against that record: a fork that has ALREADY
+# activated (boundary at or below the current head) cannot be moved, removed,
+# or back-dated - the node refuses to start, because that schedule would
+# re-interpret the chain's history. The refusal names the record and its
+# remedy: add or fix the fork's entry in the record, or delete the record to
+# re-record the selected schedule (the check then starts from the current
+# head). A boundary still in the future MAY be changed - that is how agreed
 # schedule updates ship - and the node warns about the change and re-records
 # the new schedule. A datadir without a record (a fresh chain, or one created
 # before this feature) is trusted as-is and starts recording from that boot.
@@ -32,7 +36,9 @@ networks:
     # genesis at boot). Mainnet is 72957; testnet 7295799, devnet 503, local 487.
     chain_id: <chain-id>
     # Hardfork schedule: Rayls hardfork name -> activation block, or `never`.
-    # Forks absent from this map stay `never`. Names (case-insensitive):
+    # Every known fork must be defined: a fork missing from this map refuses
+    # the boot (a binary upgrade that adds a fork must not leave it silently
+    # `never` here while the network activates it). Names (case-insensitive):
     # Eip1559, BatchDigestV2, AdminTransfer, PrecompileGasFix, RlsStorage,
     # Tokenomics, Uups, Erc20PrecompileBytecode, TransactionLoadBalancing,
     # UsdrSupplyCorrection, EmptyOutputBlock, DynamicCommitteeSizing,

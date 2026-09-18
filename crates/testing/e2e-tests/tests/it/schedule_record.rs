@@ -6,8 +6,12 @@
 //! those blocks ran under. This test verifies the gate end-to-end: moving an
 //! already-activated fork in a `--config-file` schedule is refused at boot,
 //! activating a fork that was absent from the record (still in the future) is
-//! allowed and re-recorded, and a deleted record is re-established on the next
-//! boot (trust-on-first-use).
+//! allowed and re-recorded, a deleted record is re-established on the next
+//! boot (trust-on-first-use), a record that predates a fork the schedule
+//! activates within the executed history is refused with its remedy (delete
+//! the record to re-record), and the config-file checks themselves run through
+//! real boots: a file whose `chain_id` mismatches the datadir's genesis and a
+//! `--subnet` the file does not define are both refused at boot.
 //!
 //! Needs the `dev-single-node-setup` feature: the `dev` subcommand and the
 //! single-validator `--dev` gate only exist in dev builds.
@@ -32,17 +36,31 @@ use tokio::time::timeout;
 
 const DEV_CHAIN_ID: u64 = RaylsNetwork::Local.chain_id();
 
-/// The full built-in local schedule as a config-file profile, with one fork's
-/// activation replaced (a `Never` fork becomes `Block(to)`).
-fn local_profile_moving(fork: &str, to: u64) -> NetworkProfile {
-    let mut hardforks = BTreeMap::new();
-    for (fork, condition) in RaylsHardFork::for_network(RaylsNetwork::Local) {
-        if let ForkCondition::Block(block) = condition {
-            hardforks.insert(fork.name().to_string(), ForkActivation::Block(block));
-        }
-    }
-    hardforks.insert(fork.to_string(), ForkActivation::Block(to));
+/// The full built-in local schedule as a config-file profile. Every fork is
+/// listed (including `never` ones): a config file must define all known forks
+/// or the boot is refused before the schedule gate even runs.
+fn local_profile_complete() -> NetworkProfile {
+    let hardforks = RaylsHardFork::for_network(RaylsNetwork::Local)
+        .into_iter()
+        .map(|(fork, condition)| {
+            (
+                fork.name().to_string(),
+                match condition {
+                    ForkCondition::Block(block) => ForkActivation::Block(block),
+                    _ => ForkActivation::Never,
+                },
+            )
+        })
+        .collect();
     NetworkProfile { chain_id: DEV_CHAIN_ID, hardforks }
+}
+
+/// `local_profile_complete` with one fork's activation replaced (a `Never`
+/// fork becomes `Block(to)`).
+fn local_profile_moving(fork: &str, to: u64) -> NetworkProfile {
+    let mut profile = local_profile_complete();
+    profile.hardforks.insert(fork.to_string(), ForkActivation::Block(to));
+    profile
 }
 
 fn write_config_file(base: &Path, name: &str, profile: &NetworkProfile) -> PathBuf {
@@ -61,8 +79,10 @@ fn read_record(datadir: &Path) -> ScheduleRecord {
 }
 
 /// Boot `rayls-network node` against a dev-bootstrapped datadir. Instance 1
-/// shifts reth's ports by zero, so the RPC listens on `port` exactly.
-fn start_node(datadir: &Path, port: u16, config_file: Option<&Path>) -> (Child, ChildStderr) {
+/// shifts reth's ports by zero, so the RPC listens on `port` exactly. With a
+/// `(config_file, subnet)` pair the schedule comes from the file; otherwise
+/// the built-in local profile applies.
+fn start_node(datadir: &Path, port: u16, config: Option<(&Path, &str)>) -> (Child, ChildStderr) {
     let mut command = get_rayls_network_binary().command();
     command
         .env("RL_BLS_PASSPHRASE", rayls_network_cli::dev::DEV_PASSPHRASE)
@@ -75,10 +95,13 @@ fn start_node(datadir: &Path, port: u16, config_file: Option<&Path>) -> (Child, 
         .arg("--http.port")
         .arg(port.to_string())
         .arg("--storage.v2");
-    if let Some(file) = config_file {
-        command.arg("--config-file").arg(&*file.to_string_lossy()).arg("--subnet").arg("local");
-    } else {
-        command.arg("--network").arg(RaylsNetwork::Local.to_string());
+    match config {
+        Some((file, subnet)) => {
+            command.arg("--config-file").arg(&*file.to_string_lossy()).arg("--subnet").arg(subnet);
+        }
+        None => {
+            command.arg("--network").arg(RaylsNetwork::Local.to_string());
+        }
     }
     let mut child =
         command.stdout(Stdio::null()).stderr(Stdio::piped()).spawn().expect("node spawns");
@@ -199,7 +222,7 @@ async fn schedule_record_gate_on_real_boots() -> eyre::Result<()> {
     );
     let port = get_available_tcp_port("127.0.0.1")
         .ok_or_else(|| eyre::eyre!("no free tcp port for port"))?;
-    let (child, stderr) = start_node(&datadir, port, Some(&tampered));
+    let (child, stderr) = start_node(&datadir, port, Some((&tampered, "local")));
     let (status, output) = wait_for_refusal(child, stderr).await?;
     assert!(!status.success(), "boot under a tampered schedule must be refused");
     assert!(output.contains("Eip1559"), "the refusal should name the moved fork: {output}");
@@ -215,7 +238,7 @@ async fn schedule_record_gate_on_real_boots() -> eyre::Result<()> {
         write_config_file(temp.path(), "future.yaml", &local_profile_moving("Uups", 2_000_000));
     let port2 = get_available_tcp_port("127.0.0.1")
         .ok_or_else(|| eyre::eyre!("no free tcp port for port2"))?;
-    let (mut child, mut stderr) = start_node(&datadir, port2, Some(&future));
+    let (mut child, mut stderr) = start_node(&datadir, port2, Some((&future, "local")));
     wait_for_rpc(&format!("http://127.0.0.1:{port2}")).await.inspect_err(|e| {
         kill_quietly(&mut child);
         let mut out = String::new();
@@ -244,6 +267,63 @@ async fn schedule_record_gate_on_real_boots() -> eyre::Result<()> {
     let record = read_record(&datadir);
     assert_eq!(record.chain_id, DEV_CHAIN_ID);
     assert!(record.as_of_block > 0, "re-established record must pin the head");
+
+    // 6. The datadir predates a fork: strip a fork the built-in local schedule activates within the
+    //    executed history (EmptyOutputBlock, block 0) from the record. The gate must refuse the
+    //    boot pre-launch and state the remedy (re-record).
+    let mut record = read_record(&datadir);
+    record.hardforks.remove("EmptyOutputBlock");
+    std::fs::write(
+        datadir.join("schedule-record.yaml"),
+        serde_yaml::to_string(&record).expect("record serializes"),
+    )
+    .expect("record rewritten");
+    let port4 = get_available_tcp_port("127.0.0.1")
+        .ok_or_else(|| eyre::eyre!("no free tcp port for port4"))?;
+    let (child, stderr) = start_node(&datadir, port4, None);
+    let (status, output) = wait_for_refusal(child, stderr).await?;
+    assert!(!status.success(), "a boot whose record predates an executed fork must be refused");
+    assert!(
+        output.contains("EmptyOutputBlock"),
+        "the refusal should name the predated fork: {output}"
+    );
+    assert!(
+        output.contains("predates"),
+        "the refusal should say the datadir predates the fork: {output}"
+    );
+    assert!(
+        output.contains("schedule-record.yaml"),
+        "the refusal should name the record in its remedy: {output}"
+    );
+
+    // 7. The config file's chain-id must match the datadir's genesis: a file targeting a different
+    //    chain-id is refused at boot, before the schedule gate, and the refusal names both
+    //    chain-ids.
+    let mut wrong_id = local_profile_complete();
+    wrong_id.chain_id = 99_999;
+    let wrong_id_file = write_config_file(temp.path(), "wrong-chain-id.yaml", &wrong_id);
+    let port5 = get_available_tcp_port("127.0.0.1")
+        .ok_or_else(|| eyre::eyre!("no free tcp port for port5"))?;
+    let (child, stderr) = start_node(&datadir, port5, Some((&wrong_id_file, "local")));
+    let (status, output) = wait_for_refusal(child, stderr).await?;
+    assert!(!status.success(), "a config-file chain-id mismatch must be refused");
+    assert!(output.contains("487"), "the refusal should name the datadir's chain-id: {output}");
+    assert!(output.contains("99999"), "the refusal should name the file's chain-id: {output}");
+    assert!(
+        output.contains("chain-id"),
+        "the refusal should mention the chain-id mismatch: {output}"
+    );
+
+    // 8. A --subnet the config file does not define is refused at boot, and the refusal lists the
+    //    file's subnets.
+    let one_subnet = write_config_file(temp.path(), "one-subnet.yaml", &local_profile_complete());
+    let port6 = get_available_tcp_port("127.0.0.1")
+        .ok_or_else(|| eyre::eyre!("no free tcp port for port6"))?;
+    let (child, stderr) = start_node(&datadir, port6, Some((&one_subnet, "stagenet")));
+    let (status, output) = wait_for_refusal(child, stderr).await?;
+    assert!(!status.success(), "an unknown --subnet must be refused");
+    assert!(output.contains("stagenet"), "the refusal should name the requested subnet: {output}");
+    assert!(output.contains("local"), "the refusal should list the file's subnets: {output}");
 
     Ok(())
 }

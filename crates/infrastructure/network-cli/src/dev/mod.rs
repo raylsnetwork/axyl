@@ -19,9 +19,7 @@ mod dashboard;
 
 use crate::{genesis::GenesisArgs, node::NodeCommand, NoArgs};
 use core::fmt;
-use rayls_infrastructure_config::{
-    Config, ConfigFmt, ConfigTrait as _, Parameters, RaylsDirs as _,
-};
+use rayls_infrastructure_config::{Config, ConfigFmt, ConfigTrait as _, RaylsDirs as _};
 use rayls_infrastructure_types::{Address, Genesis, GenesisAccount, RaylsNetwork, U256};
 use rayls_middleware_orchestrator::engine::RaylsBuilder;
 use std::path::{Path, PathBuf};
@@ -106,15 +104,9 @@ pub fn bootstrap_dev_datadir_if_empty(datadir: &Path, passphrase: &str) -> eyre:
     std::fs::copy(datadir.node_info_path(), validators_dir.join("validator.yaml"))?;
 
     // 3. Run the single-validator dev genesis ceremony (gasless, local chain-id, fast headers).
-    //    Writes genesis.yaml, committee.yaml, parameters.yaml.
+    //    Writes genesis.yaml, committee.yaml, parameters.yaml. The node boot selects the schedule
+    //    explicitly (`--dev` implies `--network local`), so no stamping is needed.
     GenesisArgs::dev().execute(datadir.clone())?;
-
-    // 3b. The ceremony leaves `parameters.yaml` with no built-in network ("external"); stamp
-    //     `local` so the node boots without a `--network` flag.
-    let params_path = datadir.node_config_parameters_path();
-    let mut parameters: Parameters = Config::load_from_path(&params_path, ConfigFmt::YAML)?;
-    parameters.network = Some(RaylsNetwork::Local);
-    Config::write_to_path(&params_path, parameters, ConfigFmt::YAML)?;
 
     // 4. Pre-fund the well-known dev accounts so txs can be sent immediately.
     fund_dev_accounts(&datadir)?;
