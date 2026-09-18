@@ -295,7 +295,7 @@ impl NodeDb {
         .map_err(|e| {
             let text = format!("{e:#}");
             if text.contains("should be recovered") {
-                eyre!(
+                eyre::Report::new(NeedsRecovery(format!(
                     "{label}: {}: MDBX refuses to read it until it is recovered: its last commit \
                      was never synced (the node was killed or crashed, or the files were copied \
                      from a running node), or the file is damaged (for example truncated). \
@@ -305,7 +305,7 @@ impl NodeDb {
                      reboot or on another host it drops up to a few seconds of unsynced writes). \
                      Neither repairs damage",
                     path.display()
-                )
+                )))
             } else if text.contains("opened in read-only") {
                 eyre!(
                     "{label}: cannot register as a reader of {}: mdbx.lck is not writable; \
@@ -371,7 +371,7 @@ impl NodeDb {
     /// Whether an open failed because the database needs recovery (its last commit was never
     /// synced), judged from the error text `open` produces.
     pub fn needs_recovery(err: &eyre::Report) -> bool {
-        format!("{err:#}").contains("refuses to read it until it is recovered")
+        err.chain().any(|e| e.is::<NeedsRecovery>())
     }
 
     /// Whether the cold tier exists.
@@ -946,3 +946,15 @@ mod tests {
         assert_eq!(split_dev(0x0000_0103_0000_1201), (0x12, 0x1030_0001));
     }
 }
+
+/// Typed marker on the open error when the datafile needs recovery; detected by type, not message.
+#[derive(Debug)]
+pub struct NeedsRecovery(String);
+
+impl std::fmt::Display for NeedsRecovery {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for NeedsRecovery {}
