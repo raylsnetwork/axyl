@@ -4,19 +4,24 @@
 //! `withdrawals`, delegating committee and address resolution to
 //! [`NoopRewardsBackend`]. Hybrid-reward epochs (post `HybridRewards` fork)
 //! need per-validator participation rounds, which a block does not preserve;
-//! those are recomputed by the live consensus-DB walk over the snapshot's
-//! `ConsensusBlocks` and cross-checked against the withdrawals. Injected only
-//! by `rayls-replay`.
+//! those are recomputed over the snapshot's `ConsensusBlocks` by
+//! [`BoundedHybridWalker`] and cross-checked against the withdrawals. Injected
+//! only by `rayls-replay`.
 
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
+use rayls_infrastructure_storage::tables::ConsensusBlocks;
 use rayls_infrastructure_types::{
-    rewards::{HybridEpochTally, NoopRewardsBackend, RewardsBackend, RewardsCounter, RewardsError},
-    Address, AuthorityIdentifier, Committee, Epoch,
+    rewards::{
+        HybridEpochTally, NoopRewardsBackend, RewardsBackend, RewardsCounter, RewardsError,
+        ValidatorRoundTally,
+    },
+    Address, AuthorityIdentifier, Committee, ConsensusHeaderParticipation, Database, DbTx, Epoch,
 };
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     sync::{Arc, OnceLock},
 };
+use tracing::info;
 
 /// Shared epoch -> committed-tally store.
 ///
@@ -152,10 +157,219 @@ impl RewardsBackend for SnapshotRewardsBackend {
     }
 }
 
+/// Rows of a later epoch tolerated past an epoch boundary before the walk stops.
+/// Leader epochs are non-decreasing in consensus block number, so this only guards
+/// against a boundary that interleaves by a handful of rows.
+const BOUNDARY_LOOKAHEAD: u32 = 16;
+
+/// Forward, cursor-based hybrid tally over the snapshot's `ConsensusBlocks`.
+///
+/// The live walker (`rayls_middleware_rewards::ConsensusRewardsCounter::tally_hybrid`)
+/// iterates the table in reverse from its newest row until it drops below the closing
+/// epoch. On a live node that is one epoch of rows. Against a snapshot whose consensus
+/// DB runs millions of rows past the epoch being replayed it is a full tail scan per
+/// epoch close (about 50s per epoch on a 5.7M-block devnet dump), which made
+/// post-`HybridRewards` replay two orders of magnitude slower than the blocks before
+/// the fork. Replay closes epochs in ascending order, so this walker keeps a cursor at
+/// the first row of the next epoch and reads each epoch's rows exactly once with keyed
+/// point lookups (`ConsensusBlocks` is keyed by the dense consensus block number). The
+/// first call positions the cursor by binary search on the leader epoch.
+///
+/// Crediting is identical to the live walker: rounds `1..=last_executed_round` of the
+/// epoch, one leader credit per row, one participation credit per distinct execution
+/// address per row. [`SnapshotRewardsBackend::tally_hybrid`] cross-checks the leader
+/// rounds against the block's committed withdrawals, so any deviation aborts the
+/// replay instead of diverging silently.
+pub struct BoundedHybridWalker<DB: Database> {
+    db: DB,
+    committee: RwLock<Option<Committee>>,
+    /// Consensus block number at which the next epoch's rows start; `None` until the
+    /// first tally positions it.
+    cursor: Mutex<Option<u64>>,
+}
+
+impl<DB: Database> std::fmt::Debug for BoundedHybridWalker<DB> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BoundedHybridWalker")
+            .field("cursor", &*self.cursor.lock())
+            .finish_non_exhaustive()
+    }
+}
+
+impl<DB: Database> BoundedHybridWalker<DB> {
+    /// Walk `db`'s `ConsensusBlocks`. Committee starts uninstalled.
+    pub fn new(db: DB) -> Self {
+        Self { db, committee: RwLock::new(None), cursor: Mutex::new(None) }
+    }
+
+    /// Leader epoch of the row at `key`, or of the first existing row after it up to
+    /// `last_key` (keys are dense, so a miss is a gap or the end of the table).
+    fn epoch_at(txn: &impl DbTx, key: u64, last_key: u64) -> eyre::Result<Option<Epoch>> {
+        let mut k = key;
+        while k <= last_key {
+            if let Some(bytes) = txn.raw_get::<ConsensusBlocks>(&k)? {
+                return Ok(Some(ConsensusHeaderParticipation::from_bytes(&bytes)?.leader_epoch));
+            }
+            k += 1;
+        }
+        Ok(None)
+    }
+
+    /// Smallest key in `first_key..=last_key + 1` whose leader epoch is `>= epoch`
+    /// (binary search; leader epochs are non-decreasing in consensus block number).
+    fn position(txn: &impl DbTx, epoch: Epoch, first_key: u64, last_key: u64) -> eyre::Result<u64> {
+        let (mut lo, mut hi) = (first_key, last_key + 1);
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            match Self::epoch_at(txn, mid, last_key)? {
+                Some(e) if e >= epoch => hi = mid,
+                Some(_) => lo = mid + 1,
+                None => hi = mid,
+            }
+        }
+        Ok(lo)
+    }
+}
+
+impl<DB: Database> RewardsBackend for BoundedHybridWalker<DB> {
+    fn tally(
+        &self,
+        _epoch: Epoch,
+        _last_executed_round: u32,
+    ) -> Result<BTreeMap<Address, u32>, RewardsError> {
+        Err(RewardsError::Unsupported(
+            "legacy (leader-only) tally is withdrawal-backed in replay; the bounded walker \
+             only serves hybrid tallies"
+                .into(),
+        ))
+    }
+
+    fn tally_hybrid(
+        &self,
+        epoch: Epoch,
+        last_executed_round: u32,
+    ) -> Result<HybridEpochTally, RewardsError> {
+        let committee = self
+            .committee
+            .read()
+            .as_ref()
+            .cloned()
+            .ok_or(RewardsError::MissingCommittee { epoch })?;
+        let mut cursor = self.cursor.lock();
+
+        self.db
+            .with_read_txn(|txn| {
+                // Bounded to one epoch of keyed reads over immutable rows, like the live
+                // walk, so opting out of the read-txn safety window is acceptable here too.
+                txn.disable_long_read_safety();
+                let Some((last_key, _)) = txn.last_record::<ConsensusBlocks>() else {
+                    return Ok(HybridEpochTally::default());
+                };
+                let start = match *cursor {
+                    Some(k) => k,
+                    None => {
+                        let first_key =
+                            txn.iter::<ConsensusBlocks>().next().map(|(k, _)| k).unwrap_or(0);
+                        let k = Self::position(txn, epoch, first_key, last_key)?;
+                        info!(
+                            target: "rayls_replay::rewards",
+                            epoch, first_key, last_key, start = k,
+                            "hybrid walk positioned by binary search"
+                        );
+                        k
+                    }
+                };
+
+                let mut per_address: BTreeMap<Address, ValidatorRoundTally> = BTreeMap::new();
+                let mut total_rounds: u32 = 0;
+                let mut walked: u64 = 0;
+                let mut seen: BTreeSet<Address> = BTreeSet::new();
+                let mut next_epoch_start: Option<u64> = None;
+                let mut lookahead: u32 = 0;
+                let mut k = start;
+                while k <= last_key {
+                    let Some(bytes) = txn.raw_get::<ConsensusBlocks>(&k)? else {
+                        k += 1;
+                        continue;
+                    };
+                    walked += 1;
+                    let meta = ConsensusHeaderParticipation::from_bytes(&bytes)?;
+                    k += 1;
+
+                    if meta.leader_epoch > epoch {
+                        // first row of a later epoch is where the next close starts; keep
+                        // reading a few rows in case the boundary interleaves, then stop.
+                        next_epoch_start.get_or_insert(k - 1);
+                        lookahead += 1;
+                        if lookahead > BOUNDARY_LOOKAHEAD {
+                            break;
+                        }
+                        continue;
+                    }
+                    if meta.leader_epoch < epoch {
+                        continue;
+                    }
+                    // round not yet executed by the engine at the close block, or genesis.
+                    if meta.leader_round > last_executed_round || meta.leader_round == 0 {
+                        continue;
+                    }
+
+                    total_rounds = total_rounds.saturating_add(1);
+
+                    if let Some(authority) = committee.authority(&meta.leader_author) {
+                        let tally = per_address.entry(authority.execution_address()).or_default();
+                        tally.leader_rounds = tally.leader_rounds.saturating_add(1);
+                    }
+
+                    // Dedup on the resolved execution address (one participation credit per
+                    // address per committed round), exactly as the live walker does.
+                    seen.clear();
+                    for author in &meta.participants {
+                        if let Some(authority) = committee.authority(author) {
+                            let address = authority.execution_address();
+                            if seen.insert(address) {
+                                let tally = per_address.entry(address).or_default();
+                                tally.participation_rounds =
+                                    tally.participation_rounds.saturating_add(1);
+                            }
+                        }
+                    }
+                }
+
+                let next = next_epoch_start.unwrap_or(k);
+                *cursor = Some(next);
+                info!(
+                    target: "rayls_replay::rewards",
+                    epoch, start, next_start = next, walked, total_rounds,
+                    "hybrid walk done"
+                );
+                Ok(HybridEpochTally { per_address, total_rounds })
+            })
+            .map_err(RewardsError::Database)
+    }
+
+    fn get_authority_address(&self, id: &AuthorityIdentifier) -> Option<Address> {
+        self.committee.read().as_ref().and_then(|c| c.authority(id).map(|a| a.execution_address()))
+    }
+
+    fn set_committee(&self, committee: Committee) {
+        *self.committee.write() = Some(committee);
+    }
+
+    fn get_address_counts(&self) -> BTreeMap<Address, u32> {
+        BTreeMap::new()
+    }
+
+    fn set_leader_counts(&self, _leader_counts: BTreeMap<AuthorityIdentifier, u32>) {}
+
+    fn inc_leader_count(&self, _leader: &AuthorityIdentifier) {}
+
+    fn clear(&self) {}
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rayls_infrastructure_types::rewards::ValidatorRoundTally;
 
     fn addr(n: u8) -> Address {
         Address::with_last_byte(n)
