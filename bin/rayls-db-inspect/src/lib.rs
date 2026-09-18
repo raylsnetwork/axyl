@@ -86,7 +86,8 @@ pub fn run(cli: &Cli) -> eyre::Result<Report> {
         }
         for spec in &rpcs {
             let (label, url) = source::split_label(spec);
-            if !urls.insert(url.to_owned()) {
+            // Dedup on the URL without a trailing slash
+            if !urls.insert(url.trim_end_matches('/').to_owned()) {
                 eyre::bail!("RPC endpoint {url} given twice");
             }
             if !labels.insert(label.clone()) {

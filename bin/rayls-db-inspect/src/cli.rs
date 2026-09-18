@@ -300,7 +300,7 @@ pub enum Command {
 
     /// Copy one node's consensus database into DIR as one committed state, with its sealed cold
     /// jars. MDBX copies inside a read transaction, so the copy is consistent even from a running
-    /// node and opens without --recover; a SNAPSHOT.json in DIR records what it holds. DIR must
+    /// node and opens without --recover. DIR must
     /// not exist, or be an empty directory, outside the source. Exactly one --db.
     Snapshot {
         /// Destination directory.
