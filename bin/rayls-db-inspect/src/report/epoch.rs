@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: BUSL-1.1
-//! Epoch-record reports: `epoch`, `epochs`, `chain-check`.
+//! Epoch-record reports: `epoch`, `epochs`, `epoch-check`.
 
 use super::{code, Verdict};
 use crate::{
-    node_db::{LiveStatus, NodeDb, Position, TableStatus, Tier},
+    node_db::{LiveStatus, Position, Tier},
+    source::Source,
     view::{b256, pubkey, signature, CheckpointView},
 };
-use rayls_infrastructure_storage::tables::EpochRecords;
 use rayls_infrastructure_types::{BlsPublicKey, Epoch, EpochCertificate, EpochRecord, B256};
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
@@ -154,7 +154,7 @@ impl EpochCertView {
 }
 
 fn record_view(
-    node: &NodeDb,
+    node: &Source,
     record: &EpochRecord,
     prev: Option<&EpochRecord>,
     verbose: bool,
@@ -196,15 +196,15 @@ fn record_view(
     })
 }
 
-pub fn epoch(nodes: &[NodeDb], epoch: Epoch, verbose: bool) -> eyre::Result<EpochReport> {
+pub fn epoch(nodes: &[Source], epoch: Epoch, verbose: bool) -> eyre::Result<EpochReport> {
     let mut views = Vec::with_capacity(nodes.len());
     let mut digests: BTreeSet<B256> = BTreeSet::new();
 
     for node in nodes {
         let position = node.position()?;
         let mut view = EpochNodeView {
-            node: node.label.clone(),
-            live: node.live,
+            node: node.label().to_owned(),
+            live: node.live(),
             status: if position.has_closed_epoch(epoch) {
                 EpochStatus::Missing
             } else {
@@ -215,7 +215,7 @@ pub fn epoch(nodes: &[NodeDb], epoch: Epoch, verbose: bool) -> eyre::Result<Epoc
             cert: None,
             checkpoint: node.checkpoint(epoch)?.as_ref().map(CheckpointView::of),
         };
-        if node.table_status::<EpochRecords>()? == TableStatus::Absent {
+        if node.epoch_table_absent()? {
             view.status = EpochStatus::TableAbsent;
             views.push(view);
             continue;
@@ -242,8 +242,13 @@ fn epoch_verdict(epoch: Epoch, views: &[EpochNodeView], distinct_digests: usize)
     let total = views.len();
     let count = |st: EpochStatus| views.iter().filter(|v| v.status == st).count();
     let certified = count(EpochStatus::Certified);
-    // epoch 0 is written unsigned, so record-only is its complete state
-    let genesis = if epoch == 0 { count(EpochStatus::RecordOnly) } else { 0 };
+    // epoch 0 is written unsigned, so record-only is its complete state; a certificate that is
+    // present but invalid is not
+    let genesis = if epoch == 0 {
+        views.iter().filter(|v| v.status == EpochStatus::RecordOnly && v.cert.is_none()).count()
+    } else {
+        0
+    };
     let record_only = count(EpochStatus::RecordOnly) - genesis;
     let not_reached = count(EpochStatus::NotReached);
     let missing = count(EpochStatus::Missing) + count(EpochStatus::TableAbsent);
@@ -284,16 +289,23 @@ pub fn describe_position(p: Position) -> String {
 // epochs <FROM> <TO>
 // ---------------------------------------------------------------------------------------------
 
+/// A column of the epoch matrix.
+#[derive(Debug, Clone, Serialize)]
+pub struct EpochsNode {
+    pub node: String,
+    pub live: LiveStatus,
+}
+
 #[derive(Debug, Serialize)]
 pub struct EpochsReport {
     pub from: Epoch,
     pub to: Epoch,
-    pub nodes: Vec<String>,
+    pub nodes: Vec<EpochsNode>,
     pub rows: Vec<EpochsRow>,
     pub verdict: Verdict,
 }
 
-/// A cell of the epoch matrix: presence only, no signature verification (see `chain-check`).
+/// A cell of the epoch matrix: presence only, no signature verification (see `epoch-check`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Cell {
@@ -328,8 +340,9 @@ pub struct EpochsRow {
 }
 
 /// `range` is `Some((from, to))` or `None` for every epoch any node has a record for.
-pub fn epochs(nodes: &[NodeDb], range: Option<(Epoch, Epoch)>) -> eyre::Result<EpochsReport> {
-    let labels: Vec<String> = nodes.iter().map(|n| n.label.clone()).collect();
+pub fn epochs(nodes: &[Source], range: Option<(Epoch, Epoch)>) -> eyre::Result<EpochsReport> {
+    let labels: Vec<EpochsNode> =
+        nodes.iter().map(|n| EpochsNode { node: n.label().to_owned(), live: n.live() }).collect();
     let (from, to) = match range {
         Some((from, to)) => {
             if from > to {
@@ -357,12 +370,10 @@ pub fn epochs(nodes: &[NodeDb], range: Option<(Epoch, Epoch)>) -> eyre::Result<E
         }
     };
 
-    let table_absent: Vec<bool> = nodes
-        .iter()
-        .map(|n| n.table_status::<EpochRecords>().map(|s| s == TableStatus::Absent))
-        .collect::<eyre::Result<_>>()?;
+    let table_absent: Vec<bool> =
+        nodes.iter().map(Source::epoch_table_absent).collect::<eyre::Result<_>>()?;
     let positions: Vec<Position> =
-        nodes.iter().map(NodeDb::position).collect::<eyre::Result<_>>()?;
+        nodes.iter().map(Source::position).collect::<eyre::Result<_>>()?;
 
     let mut rows = Vec::new();
     for epoch in from..=to {
@@ -393,7 +404,6 @@ pub fn epochs(nodes: &[NodeDb], range: Option<(Epoch, Epoch)>) -> eyre::Result<E
     let tally = |st: &str| rows.iter().filter(|r| r.status == st).count();
     let (ok, partial, missing, divergent, not_reached) =
         (tally("ok"), tally("partial"), tally("missing"), tally("divergent"), tally("not-reached"));
-    let first = rows.iter().find(|r| matches!(r.status, "partial" | "missing" | "divergent"));
     let nr_range = {
         let nr: Vec<Epoch> =
             rows.iter().filter(|r| r.status == "not-reached").map(|r| r.epoch).collect();
@@ -419,7 +429,15 @@ pub fn epochs(nodes: &[NodeDb], range: Option<(Epoch, Epoch)>) -> eyre::Result<E
     if let Some((a, b)) = nr_range {
         verdict = verdict.range("not_reached", a, b);
     }
-    verdict = verdict.opt("first", first.map(|r| r.epoch));
+    // the first row with the status the code names, so `first` is the row to look at
+    let first_with = |status: &str| rows.iter().find(|r| r.status == status).map(|r| r.epoch);
+    let first = match code {
+        code::DIVERGENT => first_with("divergent"),
+        code::MISSING => first_with("missing"),
+        code::PARTIAL => first_with("partial"),
+        _ => None,
+    };
+    verdict = verdict.opt("first", first);
     Ok(EpochsReport { from, to, nodes: labels, rows, verdict })
 }
 
@@ -431,7 +449,9 @@ fn row_status(epoch: Epoch, cells: &[Cell], distinct_digests: usize) -> &'static
     let with_record =
         cells.iter().filter(|c| matches!(c, Cell::RecordAndCert | Cell::RecordOnly)).count();
     if with_record == 0 {
-        if cells.iter().all(|c| matches!(c, Cell::NotReached | Cell::TableAbsent)) {
+        // a never-created table is an anomaly, not a position: only "not reached" cells make
+        // the row not reached
+        if cells.iter().all(|c| *c == Cell::NotReached) {
             return "not-reached";
         }
         return "missing";
@@ -447,12 +467,12 @@ fn row_status(epoch: Epoch, cells: &[Cell], distinct_digests: usize) -> &'static
 }
 
 // ---------------------------------------------------------------------------------------------
-// chain-check
+// epoch-check
 // ---------------------------------------------------------------------------------------------
 
 #[derive(Debug, Serialize)]
-pub struct ChainCheckReport {
-    pub nodes: Vec<ChainCheckNodeView>,
+pub struct EpochCheckReport {
+    pub nodes: Vec<EpochCheckNodeView>,
     pub verdict: Verdict,
 }
 
@@ -463,11 +483,28 @@ pub struct BrokenLink {
     pub expected: String,
 }
 
+/// One record of the checked range (`-v`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct EpochCheckRecord {
+    pub epoch: Epoch,
+    pub digest: String,
+    pub parent_hash: String,
+    /// `certified`, `record-only`, `INVALID` (certificate present but does not verify), or
+    /// `genesis` (epoch 0's unsigned record).
+    pub cert: &'static str,
+    /// The digest index maps this record's digest back to its epoch.
+    pub index_ok: bool,
+    pub link: LinkCheck,
+    /// Whether the previous record's `next_committee` equals this record's `committee`.
+    pub committee_handoff_ok: Option<bool>,
+    pub committee_size: usize,
+}
+
 #[derive(Debug, Serialize)]
-pub struct ChainCheckNodeView {
+pub struct EpochCheckNodeView {
     pub node: String,
     pub live: LiveStatus,
-    /// Range actually walked (defaults to the node's first and last record).
+    /// Range actually checked (defaults to the node's first and last record).
     pub from: Option<Epoch>,
     pub to: Option<Epoch>,
     pub checked: usize,
@@ -482,26 +519,43 @@ pub struct ChainCheckNodeView {
     pub invalid_certs: Vec<Epoch>,
     /// Records where the previous record's `next_committee` differs from this `committee`.
     pub committee_handoff_mismatch: Vec<Epoch>,
+    /// Records whose digest the index maps to another epoch, or to none.
+    pub index_mismatch: Vec<Epoch>,
+    /// The node holds no records although its position says epochs have closed.
+    pub records_missing: bool,
     pub ok: bool,
     /// Set when the requested range was adjusted, e.g. `--to` beyond the latest record.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
+    /// Every record in range (`-v`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub records: Option<Vec<EpochCheckRecord>>,
 }
 
-pub fn chain_check(
-    nodes: &[NodeDb],
+fn cert_state(record: &EpochRecord, cert: Option<&EpochCertificate>) -> &'static str {
+    match cert {
+        Some(c) if record.verify_with_cert(c) => "certified",
+        Some(_) => "INVALID",
+        None if record.epoch == 0 => "genesis",
+        None => "record-only",
+    }
+}
+
+pub fn epoch_check(
+    nodes: &[Source],
     from: Option<Epoch>,
     to: Option<Epoch>,
-) -> eyre::Result<ChainCheckReport> {
+    verbose: bool,
+) -> eyre::Result<EpochCheckReport> {
     let mut views = Vec::with_capacity(nodes.len());
     // digest per epoch per node, to detect cross-node divergence
     let mut digests: BTreeMap<Epoch, BTreeSet<B256>> = BTreeMap::new();
 
     for node in nodes {
         let keys = node.epoch_numbers()?;
-        let mut view = ChainCheckNodeView {
-            node: node.label.clone(),
-            live: node.live,
+        let mut view = EpochCheckNodeView {
+            node: node.label().to_owned(),
+            live: node.live(),
             from: None,
             to: None,
             checked: 0,
@@ -511,18 +565,28 @@ pub fn chain_check(
             uncertified: Vec::new(),
             invalid_certs: Vec::new(),
             committee_handoff_mismatch: Vec::new(),
+            index_mismatch: Vec::new(),
+            records_missing: false,
             ok: false,
             note: None,
+            records: verbose.then(Vec::new),
         };
         let (Some(&first), Some(&last)) = (keys.first(), keys.last()) else {
-            view.note = Some("no epoch records".to_owned());
+            // a node past epoch 0 should hold records; one still in epoch 0, or an RPC node in a
+            // network that has not certified a record yet, need not
+            view.records_missing = node.position()?.has_closed_epoch(0);
+            view.note = Some(if view.records_missing {
+                "no epoch records although epochs have closed".to_owned()
+            } else {
+                "no epoch records".to_owned()
+            });
             views.push(view);
             continue;
         };
         // an explicit inverted range is an argument error; everything else is reported
         if let (Some(f), Some(t)) = (from, to) {
             if f > t {
-                return Err(eyre::eyre!("chain-check: --from ({f}) is greater than --to ({t})"));
+                return Err(eyre::eyre!("epoch-check: --from ({f}) is greater than --to ({t})"));
             }
         }
         let from = from.unwrap_or(first);
@@ -548,26 +612,52 @@ pub fn chain_check(
                 continue;
             };
             view.checked += 1;
-            digests.entry(epoch).or_default().insert(record.digest());
-            match cert {
-                Some(cert) if record.verify_with_cert(&cert) => view.certified += 1,
-                Some(_) => view.invalid_certs.push(epoch),
-                None if epoch == 0 => {}
-                None => view.uncertified.push(epoch),
+            let digest = record.digest();
+            digests.entry(epoch).or_default().insert(digest);
+            let cert_state = cert_state(&record, cert.as_ref());
+            match cert_state {
+                "certified" => view.certified += 1,
+                "INVALID" => view.invalid_certs.push(epoch),
+                "record-only" => view.uncertified.push(epoch),
+                _ => {}
             }
-            if epoch > 0 {
-                if let Some(p) = &prev {
-                    if p.digest() != record.parent_hash {
-                        view.broken_links.push(BrokenLink {
-                            epoch,
-                            parent_hash: b256(&record.parent_hash),
-                            expected: b256(&p.digest()),
-                        });
-                    }
-                    if p.next_committee != record.committee {
-                        view.committee_handoff_mismatch.push(epoch);
-                    }
+            let index_ok = node.epoch_by_digest(digest)? == Some(epoch);
+            if !index_ok {
+                view.index_mismatch.push(epoch);
+            }
+            let link = if epoch == 0 {
+                LinkCheck::Genesis
+            } else {
+                match &prev {
+                    None => LinkCheck::PrevMissing,
+                    Some(p) if p.digest() == record.parent_hash => LinkCheck::Ok,
+                    Some(p) => LinkCheck::Broken { expected: b256(&p.digest()) },
                 }
+            };
+            if let LinkCheck::Broken { expected } = &link {
+                view.broken_links.push(BrokenLink {
+                    epoch,
+                    parent_hash: b256(&record.parent_hash),
+                    expected: expected.clone(),
+                });
+            }
+            let committee_handoff_ok = (epoch > 0)
+                .then(|| prev.as_ref().map(|p| p.next_committee == record.committee))
+                .flatten();
+            if committee_handoff_ok == Some(false) {
+                view.committee_handoff_mismatch.push(epoch);
+            }
+            if let Some(records) = &mut view.records {
+                records.push(EpochCheckRecord {
+                    epoch,
+                    digest: b256(&digest),
+                    parent_hash: b256(&record.parent_hash),
+                    cert: cert_state,
+                    index_ok,
+                    link,
+                    committee_handoff_ok,
+                    committee_size: record.committee.len(),
+                });
             }
             prev = Some(record);
         }
@@ -576,6 +666,7 @@ pub fn chain_check(
             && view.uncertified.is_empty()
             && view.invalid_certs.is_empty()
             && view.committee_handoff_mismatch.is_empty()
+            && view.index_mismatch.is_empty()
             && view.checked > 0;
         views.push(view);
     }
@@ -583,12 +674,14 @@ pub fn chain_check(
     let divergent: Vec<Epoch> =
         digests.iter().filter(|(_, d)| d.len() > 1).map(|(e, _)| *e).collect();
     let checked = views.iter().map(|v| v.checked).max().unwrap_or(0);
-    let sum = |f: fn(&ChainCheckNodeView) -> usize| views.iter().map(f).sum::<usize>();
+    let sum = |f: fn(&EpochCheckNodeView) -> usize| views.iter().map(f).sum::<usize>();
     let gaps = sum(|v| v.gaps.len());
     let broken = sum(|v| v.broken_links.len());
     let uncertified = sum(|v| v.uncertified.len());
     let invalid = sum(|v| v.invalid_certs.len());
     let handoff = sum(|v| v.committee_handoff_mismatch.len());
+    let index = sum(|v| v.index_mismatch.len());
+    let no_records = views.iter().filter(|v| v.records_missing).count();
     let first_issue = views
         .iter()
         .flat_map(|v| {
@@ -598,6 +691,7 @@ pub fn chain_check(
                 .chain(&v.uncertified)
                 .chain(&v.invalid_certs)
                 .chain(&v.committee_handoff_mismatch)
+                .chain(&v.index_mismatch)
         })
         .min()
         .copied();
@@ -606,23 +700,28 @@ pub fn chain_check(
         code::DIVERGENT
     } else if views.iter().all(|v| v.checked == 0) {
         code::EMPTY
-    } else if gaps + broken + uncertified + invalid + handoff > 0 {
+    } else if gaps + broken + uncertified + invalid + handoff + index > 0 {
         code::BROKEN
+    } else if no_records > 0 {
+        code::PARTIAL
     } else {
         code::OK
     };
     let mut verdict = Verdict::new(code)
+        .num("nodes", views.len())
         .num("checked", checked)
         .count("divergent", divergent.len())
         .count("gaps", gaps)
         .count("broken", broken)
         .count("uncertified", uncertified)
         .count("invalid", invalid)
-        .count("handoff", handoff);
+        .count("handoff", handoff)
+        .count("index", index)
+        .count("no_records", no_records);
     verdict = match code {
         code::DIVERGENT => verdict.opt("first", divergent.first().copied()),
         code::BROKEN => verdict.opt("first", first_issue),
         _ => verdict,
     };
-    Ok(ChainCheckReport { nodes: views, verdict })
+    Ok(EpochCheckReport { nodes: views, verdict })
 }

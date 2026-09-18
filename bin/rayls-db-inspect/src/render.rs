@@ -1,11 +1,17 @@
 // SPDX-License-Identifier: BUSL-1.1
 //! Plain-text rendering: aligned columns, one table per report, one-line verdict last.
 
-use crate::report::{
-    epoch::{describe_position, ChainCheckReport, EpochReport, EpochStatus, EpochsReport},
-    header::{describe_absent, CertReport, HeaderReport, WalkReport},
-    summary::SummaryReport,
-    Report,
+use crate::{
+    node_db::Tier,
+    report::{
+        batch::{describe_absent_batch, BatchReport, TxReport},
+        epoch::{describe_position, EpochCheckReport, EpochReport, EpochStatus, EpochsReport},
+        header::{describe_absent, CertReport, HeaderCheckReport, HeaderReport, SignatureCheck},
+        snapshot::SnapshotReport,
+        summary::SummaryReport,
+        Report,
+    },
+    view::{authority, b256, cert_digest, CertificateSummary, TransactionView},
 };
 use std::fmt::Write as _;
 
@@ -72,17 +78,25 @@ fn opt_yes_no(b: Option<bool>) -> String {
     b.map(|b| yes_no(b).to_owned()).unwrap_or_else(|| "-".to_owned())
 }
 
+/// One word for the `verify` column.
+fn verify_word(check: Option<&SignatureCheck>) -> String {
+    check.map(|c| c.word()).unwrap_or("-").to_owned()
+}
+
 /// Renders `report` as text.
 pub fn render(report: &Report) -> String {
     let mut out = String::new();
     match report {
         Report::Epoch(r) => render_epoch(r, &mut out),
         Report::Epochs(r) => render_epochs(r, &mut out),
-        Report::ChainCheck(r) => render_chain_check(r, &mut out),
+        Report::EpochCheck(r) => render_epoch_check(r, &mut out),
         Report::Header(r) => render_header(r, &mut out),
         Report::Cert(r) => render_cert(r, &mut out),
-        Report::Walk(r) => render_walk(r, &mut out),
+        Report::GetBatch(r) => render_batch(r, &mut out),
+        Report::GetTx(r) => render_tx(r, &mut out),
+        Report::HeaderCheck(r) => render_header_check(r, &mut out),
         Report::Summary(r) => render_summary(r, &mut out),
+        Report::Snapshot(r) => render_snapshot(r, &mut out),
     }
     if let Some(v) = report.verdict() {
         let _ = writeln!(out, "\nverdict: {v}");
@@ -138,9 +152,11 @@ fn render_epoch(r: &EpochReport, out: &mut String) {
             cert.map(|c| yes_no(c.signature_ok).to_owned()).unwrap_or_else(|| "-".to_owned()),
             rec.map(|r| r.parent_link.to_string()).unwrap_or_else(|| "-".to_owned()),
             rec.map(|r| opt_yes_no(r.committee_handoff_ok)).unwrap_or_else(|| "-".to_owned()),
-            rec.map(|r| match (r.parent_consensus_number, r.parent_consensus_tier) {
+            rec.map(|rec| match (rec.parent_consensus_number, rec.parent_consensus_tier) {
                 (Some(n), Some(tier)) => format!("{n} ({tier})"),
                 (Some(n), None) => format!("{n} (indexed, header missing)"),
+                // the genesis record's boundary is the zero hash by construction
+                (None, _) if r.epoch == 0 => "n/a (genesis)".to_owned(),
                 (None, _) => "unresolved".to_owned(),
             })
             .unwrap_or_else(|| "-".to_owned()),
@@ -168,7 +184,7 @@ fn render_epoch(r: &EpochReport, out: &mut String) {
         );
         if let Some(c) = &n.cert {
             let _ = writeln!(out, "  cert epoch_hash   {}", c.epoch_hash);
-            let _ = writeln!(out, "  cert signers      {:?}", c.signers);
+            let _ = writeln!(out, "  cert signers      {}", list(&c.signers));
             let _ = writeln!(out, "  cert signature    {}", c.signature);
         }
         if let Some(cp) = &n.checkpoint {
@@ -200,9 +216,13 @@ fn render_epochs(r: &EpochsReport, out: &mut String) {
         r.from, r.to
     );
     let mut headers = vec!["epoch"];
-    headers.extend(r.nodes.iter().map(String::as_str));
+    headers.extend(r.nodes.iter().map(|n| n.node.as_str()));
     headers.push("status");
     let mut t = Table::new(&headers);
+    let mut live = vec!["live".to_owned()];
+    live.extend(r.nodes.iter().map(|n| n.live.to_string()));
+    live.push(String::new());
+    t.row(live);
     for row in &r.rows {
         let mut cells = vec![row.epoch.to_string()];
         cells.extend(row.cells.iter().map(|c| c.glyph().to_owned()));
@@ -212,8 +232,8 @@ fn render_epochs(r: &EpochsReport, out: &mut String) {
     out.push_str(&t.render());
 }
 
-fn render_chain_check(r: &ChainCheckReport, out: &mut String) {
-    let _ = writeln!(out, "epoch chain check");
+fn render_epoch_check(r: &EpochCheckReport, out: &mut String) {
+    let _ = writeln!(out, "epoch check");
     let mut t = Table::new(&[
         "node",
         "live",
@@ -225,6 +245,7 @@ fn render_chain_check(r: &ChainCheckReport, out: &mut String) {
         "uncertified",
         "invalid certs",
         "handoff mismatch",
+        "index mismatch",
         "ok",
     ]);
     for n in &r.nodes {
@@ -243,6 +264,7 @@ fn render_chain_check(r: &ChainCheckReport, out: &mut String) {
             list(&n.uncertified),
             list(&n.invalid_certs),
             list(&n.committee_handoff_mismatch),
+            list(&n.index_mismatch),
             if n.checked == 0 { "-".to_owned() } else { yes_no(n.ok).to_owned() },
         ]);
     }
@@ -257,6 +279,33 @@ fn render_chain_check(r: &ChainCheckReport, out: &mut String) {
                 "\n[{}] epoch {}: parent_hash {} expected {}",
                 n.node, b.epoch, b.parent_hash, b.expected
             );
+        }
+        let Some(records) = &n.records else { continue };
+        let _ = writeln!(out, "\n[{}]", n.node);
+        let mut t = Table::new(&[
+            "epoch",
+            "digest",
+            "parent_hash",
+            "cert",
+            "index",
+            "link",
+            "handoff",
+            "committee",
+        ]);
+        for rec in records {
+            t.row(vec![
+                rec.epoch.to_string(),
+                rec.digest.clone(),
+                rec.parent_hash.clone(),
+                rec.cert.to_owned(),
+                yes_no(rec.index_ok).to_owned(),
+                rec.link.to_string(),
+                opt_yes_no(rec.committee_handoff_ok),
+                rec.committee_size.to_string(),
+            ]);
+        }
+        for line in t.render().lines() {
+            let _ = writeln!(out, "  {line}");
         }
     }
 }
@@ -287,6 +336,7 @@ fn render_header(r: &HeaderReport, out: &mut String) {
         "certs",
         "batches",
         "commit ts",
+        "verify",
     ]);
     for n in &r.nodes {
         match &n.header {
@@ -301,6 +351,7 @@ fn render_header(r: &HeaderReport, out: &mut String) {
                 h.certificate_count.to_string(),
                 h.batch_count.to_string(),
                 h.commit_timestamp.to_string(),
+                verify_word(n.signature_check.as_ref()),
             ]),
             None => {
                 t.row(vec![n.node.clone(), n.live.to_string(), describe_absent(n.lookup, n.tip)])
@@ -311,39 +362,57 @@ fn render_header(r: &HeaderReport, out: &mut String) {
     for n in &r.nodes {
         let Some(h) = &n.header else { continue };
         let _ = writeln!(out, "\n[{}]", n.node);
+        if let Some(check) = &n.signature_check {
+            let _ = writeln!(out, "  verify        {check}");
+        }
         let _ = writeln!(out, "  leader        {} by {}", h.leader.digest, h.leader.author);
         let _ = writeln!(out, "  extra         {}", h.extra);
         let _ =
             writeln!(out, "  reputation    final_of_schedule={}", h.reputation_final_of_schedule);
-        if let Some(certs) = &h.certificates {
+        if let Some(raw) = &h.raw {
             let _ = writeln!(out, "  sub-dag certificates:");
-            for c in certs {
+            if raw.sub_dag.certificates.is_empty() {
+                let _ = writeln!(out, "    none");
+            }
+            for c in &raw.sub_dag.certificates {
+                let s = CertificateSummary::of(c);
                 let _ = writeln!(
                     out,
                     "    {} r{} e{} by {} signers={}",
-                    c.summary.digest,
-                    c.summary.round,
-                    c.summary.epoch,
-                    c.summary.author,
-                    c.signer_count
+                    s.digest,
+                    s.round,
+                    s.epoch,
+                    s.author,
+                    c.signed_authorities().len()
                 );
             }
         }
         if let Some(batches) = &h.batches {
-            let _ = writeln!(out, "  batches:");
+            if batches.is_empty() {
+                let _ = writeln!(out, "  batches       none");
+            } else {
+                let _ = writeln!(out, "  batches:");
+            }
             for b in batches {
-                let _ = writeln!(
-                    out,
-                    "    {} {}",
-                    b.digest,
-                    b.tier.map(|t| t.to_string()).unwrap_or_else(|| "MISSING".to_owned())
-                );
+                let state = match (b.tier, b.dangling) {
+                    (Some(tier), _) => tier.to_string(),
+                    (None, true) => "DANGLING (cold index, no jar row)".to_owned(),
+                    // a cached header has not been executed, so its batches need not be here yet
+                    (None, false) if n.tier == Some(Tier::Cache) => {
+                        "not held (header not processed yet)".to_owned()
+                    }
+                    (None, false) => "MISSING".to_owned(),
+                };
+                let _ = writeln!(out, "    {} {state}", b.digest);
             }
         }
-        if let Some(rep) = &h.reputation {
+        if let Some(raw) = &h.raw {
             let _ = writeln!(out, "  reputation scores:");
-            for (id, score) in rep {
-                let _ = writeln!(out, "    {id} {score}");
+            if raw.sub_dag.reputation_score.scores_per_authority.is_empty() {
+                let _ = writeln!(out, "    none");
+            }
+            for (id, score) in raw.sub_dag.reputation_score.authorities_by_score_desc() {
+                let _ = writeln!(out, "    {} {score}", authority(&id));
             }
         }
     }
@@ -355,6 +424,7 @@ fn render_cert(r: &CertReport, out: &mut String) {
         "node",
         "live",
         "tier",
+        "header digest",
         "cert digest",
         "author",
         "round",
@@ -362,6 +432,7 @@ fn render_cert(r: &CertReport, out: &mut String) {
         "signers",
         "state",
         "signature",
+        "verify",
     ]);
     for n in &r.nodes {
         match &n.leader {
@@ -369,13 +440,15 @@ fn render_cert(r: &CertReport, out: &mut String) {
                 n.node.clone(),
                 n.live.to_string(),
                 opt(&n.tier),
+                n.header_digest.clone().unwrap_or_else(|| "-".to_owned()),
                 c.summary.digest.clone(),
                 c.summary.author.clone(),
                 c.summary.round.to_string(),
                 c.summary.epoch.to_string(),
-                format!("{:?}", c.signers),
+                list(&c.signers),
                 c.verification_state.to_owned(),
                 c.signature.clone().unwrap_or_else(|| "-".to_owned()),
+                verify_word(n.signature_check.as_ref()),
             ]),
             None => {
                 t.row(vec![n.node.clone(), n.live.to_string(), describe_absent(n.lookup, n.tip)])
@@ -385,41 +458,215 @@ fn render_cert(r: &CertReport, out: &mut String) {
     out.push_str(&t.render());
     for n in &r.nodes {
         let Some(c) = &n.leader else { continue };
-        if c.parents.is_none() && c.payload.is_none() {
-            continue;
+        if let Some(check) = &n.signature_check {
+            let _ = writeln!(out, "\n[{}] verify {check}", n.node);
         }
+        let Some(raw) = &c.raw else { continue };
         let _ = writeln!(
             out,
-            "\n[{}] header digest {} created_at {}",
+            "
+[{}] leader header digest {} created_at {}",
             n.node, c.header_digest, c.created_at
         );
-        if let Some(parents) = &c.parents {
-            let _ = writeln!(out, "  parents:");
-            for p in parents {
-                let _ = writeln!(out, "    {p}");
-            }
+        let _ = writeln!(out, "  parents:");
+        if raw.header().parents().is_empty() {
+            let _ = writeln!(out, "    none");
         }
-        if let Some(payload) = &c.payload {
-            let _ = writeln!(out, "  payload:");
-            for p in payload {
-                let _ = writeln!(out, "    {} worker {}", p.batch, p.worker);
+        for p in raw.header().parents() {
+            let _ = writeln!(out, "    {}", cert_digest(*p));
+        }
+        let _ = writeln!(out, "  payload:");
+        if raw.header().payload().is_empty() {
+            let _ = writeln!(out, "    none");
+        }
+        for (batch, worker) in raw.header().payload() {
+            let _ = writeln!(out, "    {} worker {worker}", b256(batch));
+        }
+    }
+}
+
+fn render_batch(r: &BatchReport, out: &mut String) {
+    let _ = writeln!(out, "batch {}", r.digest);
+    let mut t = Table::new(&[
+        "node",
+        "live",
+        "tier",
+        "epoch",
+        "worker",
+        "seq",
+        "txs",
+        "bytes",
+        "beneficiary",
+        "base fee",
+        "digest ok",
+    ]);
+    for n in &r.nodes {
+        match (&n.batch, &n.dangling) {
+            (Some(b), _) => t.row(vec![
+                n.node.clone(),
+                n.live.to_string(),
+                opt(&n.tier),
+                b.epoch.to_string(),
+                b.worker_id.to_string(),
+                b.seq.to_string(),
+                b.transaction_count.to_string(),
+                b.transaction_bytes.to_string(),
+                b.beneficiary.clone(),
+                b.base_fee_per_gas.to_string(),
+                yes_no(b.digest_ok).to_owned(),
+            ]),
+            (None, Some(loc)) => t.row(vec![
+                n.node.clone(),
+                n.live.to_string(),
+                format!("DANGLING (cold index epoch {} row {}, no jar row)", loc.epoch, loc.row),
+            ]),
+            (None, None) => t.row(vec![
+                n.node.clone(),
+                n.live.to_string(),
+                describe_absent_batch(n.lookup, n.tip, r.committed_at),
+            ]),
+        }
+    }
+    out.push_str(&t.render());
+    for n in &r.nodes {
+        let Some(b) = &n.batch else { continue };
+        if !b.digest_ok {
+            let _ = writeln!(out, "\n[{}] stored bytes hash to {}", n.node, b.computed_digest);
+        }
+        if b.committed_in.is_none() && b.transactions.is_none() {
+            continue;
+        }
+        let _ = writeln!(out, "\n[{}]", n.node);
+        if let Some(commit) = &b.committed_in {
+            let _ = writeln!(out, "  committed in  {commit}");
+        }
+        if let Some(txs) = &b.transactions {
+            if txs.is_empty() {
+                let _ = writeln!(out, "  transactions  none");
+            } else {
+                let _ = writeln!(out, "  transactions:");
+                for tx in txs {
+                    let _ = writeln!(out, "    [{}] {}", tx.index, tx.line());
+                }
             }
         }
     }
 }
 
-fn render_walk(r: &WalkReport, out: &mut String) {
-    let _ = writeln!(out, "walk headers from {} back {}", r.start, r.back);
+fn render_tx(r: &TxReport, out: &mut String) {
+    match r.epoch {
+        Some(e) => {
+            let _ = writeln!(out, "transaction {} (batches of epoch {e})", r.hash);
+        }
+        None => {
+            let _ = writeln!(out, "transaction {}", r.hash);
+        }
+    }
+    let mut t = Table::new(&[
+        "node",
+        "live",
+        "batch",
+        "tier",
+        "index",
+        "epoch",
+        "worker",
+        "seq",
+        "digest ok",
+        "committed in",
+        "scanned",
+    ]);
     for n in &r.nodes {
-        let state = if n.ok {
+        if n.matches.is_empty() {
+            let absence = if n.skipped {
+                format!("not reached (node in epoch {}), not scanned", opt(&n.current_epoch))
+            } else {
+                format!(
+                    "{}; scanned {}",
+                    describe_absent_batch(n.lookup, n.tip, r.committed_at),
+                    n.scanned
+                )
+            };
+            t.row(vec![n.node.clone(), n.live.to_string(), absence]);
+            continue;
+        }
+        // one row per batch that carries the transaction; the scan total once per node
+        for (i, m) in n.matches.iter().enumerate() {
+            t.row(vec![
+                n.node.clone(),
+                n.live.to_string(),
+                m.digest.clone(),
+                m.tier.to_string(),
+                format!("{}/{}", m.index, m.transaction_count),
+                m.epoch.to_string(),
+                m.worker_id.to_string(),
+                m.seq.to_string(),
+                yes_no(m.digest_ok).to_owned(),
+                m.committed_in.to_string(),
+                if i == 0 { n.scanned.to_string() } else { String::new() },
+            ]);
+        }
+    }
+    out.push_str(&t.render());
+    for n in &r.nodes {
+        let Some(tx) = &n.transaction else { continue };
+        let _ = writeln!(out, "\n[{}]", n.node);
+        render_transaction(tx, out);
+    }
+}
+
+fn render_transaction(tx: &TransactionView, out: &mut String) {
+    let _ = writeln!(out, "  hash      {}", tx.hash);
+    let _ = writeln!(out, "  bytes     {}", tx.bytes);
+    if let Some(err) = &tx.error {
+        let _ = writeln!(out, "  UNDECODABLE: {err}");
+        return;
+    }
+    let _ = writeln!(out, "  type      {}", opt(&tx.tx_type));
+    let _ = writeln!(out, "  chain id  {}", opt(&tx.chain_id));
+    let _ = writeln!(out, "  nonce     {}", opt(&tx.nonce));
+    let _ = writeln!(out, "  from      {}", tx.from.as_deref().unwrap_or("UNRECOVERABLE"));
+    let _ = writeln!(out, "  to        {}", opt(&tx.to));
+    let _ = writeln!(out, "  value     {}", opt(&tx.value));
+    let _ = writeln!(out, "  gas limit {}", opt(&tx.gas_limit));
+    let _ = writeln!(out, "  max fee   {}", opt(&tx.max_fee_per_gas));
+}
+
+fn render_header_check(r: &HeaderCheckReport, out: &mut String) {
+    let _ = writeln!(out, "header check from {} back {}", r.start, r.back);
+    for n in &r.nodes {
+        let unverifiable: usize = n.unverifiable.iter().map(|u| u.hops).sum();
+        let mut state = if let Some(err) = &n.error {
+            format!("UNREADABLE ({err})")
+        } else if n.ok {
             format!("ok ({})", n.stopped)
         } else if n.start_not_reached {
             format!("not reached (tip {})", opt(&n.tip))
+        } else if n.start_missing {
+            format!("MISSING ({})", n.stopped)
         } else {
             format!("BROKEN ({})", n.stopped)
         };
-        let _ = writeln!(out, "\n[{}] live={} {state}", n.node, n.live);
-        let mut t = Table::new(&["number", "tier", "digest", "parent_hash", "leader r/e", "link"]);
+        if unverifiable > 0 {
+            state.push_str(&format!("; {unverifiable} unverifiable"));
+        }
+        let _ = writeln!(
+            out,
+            "
+[{}] live={} {state}",
+            n.node, n.live
+        );
+        if n.hops.is_empty() {
+            continue;
+        }
+        let mut t = Table::new(&[
+            "number",
+            "tier",
+            "digest",
+            "parent_hash",
+            "leader r/e",
+            "link",
+            "verify",
+        ]);
         for h in &n.hops {
             t.row(vec![
                 h.number.to_string(),
@@ -428,10 +675,90 @@ fn render_walk(r: &WalkReport, out: &mut String) {
                 h.parent_hash.clone(),
                 format!("{}/{}", h.leader_round, h.leader_epoch),
                 h.link.to_string(),
+                h.verify.word().to_owned(),
             ]);
         }
         out.push_str(&t.render());
+        // the column says ok/genesis/FAILED/no keys; spell out anything that is not ok, with the
+        // unverifiable hops summed per epoch (they come in whole epochs)
+        for h in n.hops.iter().filter(|h| {
+            !matches!(h.verify, SignatureCheck::Verified { .. } | SignatureCheck::NoKeys { .. })
+        }) {
+            let _ = writeln!(out, "  header {} verify {}", h.number, h.verify);
+        }
+        for u in &n.unverifiable {
+            let records =
+                u.missing_records.iter().map(|e| e.to_string()).collect::<Vec<_>>().join(" or ");
+            let _ = writeln!(
+                out,
+                "  {} header{} of epoch {} cannot be verified: this node holds no record for epoch \
+                 {records}; check its epoch records (epoch-check)",
+                u.hops,
+                if u.hops == 1 { "" } else { "s" },
+                u.epoch
+            );
+        }
     }
+}
+
+fn render_snapshot(r: &SnapshotReport, out: &mut String) {
+    let _ = writeln!(
+        out,
+        "snapshot of {} ({}, live {}) -> {}",
+        r.source, r.source_path, r.source_live, r.destination
+    );
+    let _ = writeln!(
+        out,
+        "  mdbx.dat  {} on disk (compacted, one committed state)",
+        human_bytes(r.mdbx_bytes)
+    );
+    let _ = writeln!(
+        out,
+        "  cold      {} sealed epoch{} ({} files, {})",
+        r.cold_epochs.len(),
+        if r.cold_epochs.len() == 1 { "" } else { "s" },
+        r.cold_files,
+        human_bytes(r.cold_bytes)
+    );
+    let c = &r.copy;
+    let _ = writeln!(
+        out,
+        "  holds     consensus tip {}, epochs {}, {} records, {} certs, cold hwm {}",
+        opt(&c.latest_consensus_number),
+        match (c.first_epoch, c.last_epoch) {
+            (Some(a), Some(b)) => format!("{a}..={b}"),
+            _ => "-".to_owned(),
+        },
+        c.epoch_records,
+        c.epoch_certs,
+        opt(&c.cold_high_water_mark)
+    );
+    if r.recovered_copy {
+        let _ = writeln!(
+            out,
+            "  the source was stopped with an unsynced last commit: its files were copied as they \
+             were and the copy was recovered; the source was not modified"
+        );
+    } else {
+        let _ = writeln!(out, "  the copy opens read-only without --recover");
+    }
+}
+
+/// `YYYY-MM-DD HH:MM:SS UTC` for unix seconds (proleptic Gregorian, days-from-civil inverse).
+pub fn utc(secs: u64) -> String {
+    let days = (secs / 86_400) as i64;
+    let rem = secs % 86_400;
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    format!("{y:04}-{m:02}-{d:02} {:02}:{:02}:{:02} UTC", rem / 3600, rem % 3600 / 60, rem % 60)
 }
 
 fn render_summary(r: &SummaryReport, out: &mut String) {
@@ -444,7 +771,8 @@ fn render_summary(r: &SummaryReport, out: &mut String) {
         "records",
         "certs",
         "consensus #",
-        "cache #",
+        "tip at",
+        "cache tip",
         "cold",
         "checkpoints",
     ]);
@@ -460,6 +788,7 @@ fn render_summary(r: &SummaryReport, out: &mut String) {
             n.epoch_records.to_string(),
             n.epoch_certs.to_string(),
             opt(&n.latest_consensus_number),
+            n.latest_consensus_timestamp.map_or_else(|| "-".to_owned(), utc),
             opt(&n.latest_cached_consensus_number),
             if n.cold_tier {
                 format!("yes (hwm {})", opt(&n.cold_high_water_mark))

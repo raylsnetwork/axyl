@@ -7,7 +7,7 @@
 
 use eyre::{eyre, WrapErr};
 use rayls_infrastructure_storage::{
-    cold::{ColdLocation, ARCHIVE_HIGH_WATER_MARK_KEY},
+    cold::{ColdLocation, ColdResult, ARCHIVE_HIGH_WATER_MARK_KEY},
     mdbx::MdbxDatabase,
     tables::{
         Batches, Certificates, ColdArchiveHighWaterMark, ColdBatchLocations,
@@ -17,15 +17,19 @@ use rayls_infrastructure_storage::{
     ColdConfig, ColdStore,
 };
 use rayls_infrastructure_types::{
-    decode, decode_key, AuthorityIdentifier, BlockHash, CertificateDigest, ConsensusHeader,
-    ConsensusHeaderMeta, Database, Epoch, EpochCertificate, EpochRecord, EpochTransitionCheckpoint,
-    Table, B256,
+    leader_epoch_and_batch_digests, try_decode, try_decode_key, AuthorityIdentifier, Batch,
+    BlockHash, CertificateDigest, ConsensusHeader, ConsensusHeaderMeta, Database, DbTx as _, Epoch,
+    EpochCertificate, EpochRecord, EpochTransitionCheckpoint, Table, B256,
 };
 use serde::Serialize;
 use std::{
     collections::{BTreeMap, HashMap},
     path::{Path, PathBuf},
+    sync::OnceLock,
 };
+
+/// A raw key/value iterator over one table, as the storage layer hands it out.
+type DBRawIterBox<'i> = rayls_infrastructure_types::DBRawIter<'i>;
 
 /// Options shared by every database open.
 #[derive(Debug, Clone, Copy, Default)]
@@ -46,8 +50,13 @@ pub enum LiveStatus {
     Stopped,
     /// A process holds `mdbx.lck`; `pid` when the lock table reveals it.
     Live { pid: Option<u32> },
-    /// Cannot be determined on this platform.
+    /// Cannot be determined: not Linux, or `/proc/locks` or the lock file unreadable.
     Unknown,
+    /// Not a directory at all: the node answered over RPC, so it is running.
+    Rpc,
+    /// A copy `--recover` opened read-write once this run; its newest commit may have been
+    /// rolled back (see the README).
+    Recovered,
 }
 
 impl std::fmt::Display for LiveStatus {
@@ -56,6 +65,8 @@ impl std::fmt::Display for LiveStatus {
             Self::Stopped => "no",
             Self::Live { .. } => "yes",
             Self::Unknown => "?",
+            Self::Rpc => "rpc",
+            Self::Recovered => "recovered",
         })
     }
 }
@@ -70,6 +81,8 @@ pub enum Tier {
     Cache,
     /// The append-only cold archive under `cold/`.
     Cold,
+    /// Served by a node over RPC; which of its tiers answered is not visible.
+    Rpc,
 }
 
 impl std::fmt::Display for Tier {
@@ -78,6 +91,7 @@ impl std::fmt::Display for Tier {
             Self::Hot => "hot",
             Self::Cache => "cache",
             Self::Cold => "cold",
+            Self::Rpc => "rpc",
         })
     }
 }
@@ -116,6 +130,53 @@ impl Position {
     pub fn has_reached_header(&self, number: u64) -> bool {
         self.consensus_tip.is_some_and(|tip| tip >= number)
     }
+
+    /// Whether the node's latest consensus header is in `epoch` or a later one, so batches sealed
+    /// in `epoch` can exist on it (workers reject batches from another epoch).
+    pub fn has_reached_epoch(&self, epoch: Epoch) -> bool {
+        self.current_epoch.is_some_and(|current| current >= epoch)
+    }
+}
+
+/// How much a batch scan covered.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct ScanStats {
+    /// Hot rows read (the whole table; an epoch filter is applied after reading).
+    pub hot_batches: usize,
+    /// Rows the hot table reports holding, so a scan cut short by a read error is visible.
+    pub hot_table_rows: usize,
+    /// Batches read from cold jars.
+    pub cold_batches: usize,
+    /// Cold epochs whose jar was read.
+    pub cold_epochs: usize,
+    /// The hot pass read fewer rows than the table reports; on a stopped node that is an error,
+    /// on a live one it is reported here.
+    pub short: bool,
+}
+
+impl std::fmt::Display for ScanStats {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}/{} hot, {} cold ({} {})",
+            self.hot_batches,
+            self.hot_table_rows,
+            self.cold_batches,
+            self.cold_epochs,
+            if self.cold_epochs == 1 { "epoch" } else { "epochs" }
+        )
+    }
+}
+
+/// Outcome of looking a batch up by digest.
+#[derive(Debug)]
+pub enum BatchLookup {
+    /// Stored, in this tier.
+    Found(Batch, Tier),
+    /// The cold location index names a jar row that does not exist: a corrupt index.
+    Dangling(ColdLocation),
+    /// Neither the hot table nor the cold index knows the digest.
+    Absent,
 }
 
 /// One node's consensus database, opened read-only.
@@ -128,7 +189,9 @@ pub struct NodeDb {
     /// Whether a node process holds this directory.
     pub live: LiveStatus,
     db: MdbxDatabase,
-    cold: Option<ColdStore>,
+    /// The cold archive under `cold/`, attached at the open or on first use (a live node creates
+    /// it at its first archival).
+    cold: OnceLock<ColdStore>,
     /// Table presence, probed once per table: a read-only environment cannot gain tables.
     tables: std::sync::Mutex<HashMap<&'static str, bool>>,
 }
@@ -148,31 +211,99 @@ impl NodeDb {
     pub fn open(spec: &str, opts: &OpenOptions) -> eyre::Result<Self> {
         let (label, path) = Self::resolve(spec)?;
 
-        let live = probe_live(&path);
+        let dat_len = std::fs::metadata(path.join("mdbx.dat")).map(|m| m.len()).unwrap_or(0);
+        if dat_len < 4096 {
+            return Err(eyre!(
+                "{label}: {} is {dat_len} bytes long: not even one page; the file is empty or \
+                 truncated beyond what MDBX can read",
+                path.join("mdbx.dat").display()
+            ));
+        }
+        let mut live = probe_live(&path);
         if opts.require_stopped {
-            if let LiveStatus::Live { pid } = live {
-                let holder = pid.map(|p| format!(" by pid {p}")).unwrap_or_default();
-                return Err(eyre!(
-                    "{label}: consensus-db at {} is in use{holder} (--require-stopped)",
-                    path.display()
-                ));
+            match live {
+                LiveStatus::Live { pid } => {
+                    let holder = pid.map(|p| format!(" by pid {p}")).unwrap_or_default();
+                    return Err(eyre!(
+                        "{label}: consensus-db at {} is in use{holder} (--require-stopped)",
+                        path.display()
+                    ));
+                }
+                // the flag promises a stopped database; an unknown state cannot promise that
+                LiveStatus::Unknown => {
+                    return Err(eyre!(
+                        "{label}: cannot tell whether a process holds {} (--require-stopped \
+                         needs Linux with a readable /proc)",
+                        path.display()
+                    ));
+                }
+                _ => {}
             }
         }
 
         if opts.recover {
+            // recovery opens read-write; a running node owns its directory, so never even try.
+            // MDBX's own file locks refuse that case too; this check is for the message.
+            if let LiveStatus::Live { pid } = live {
+                let holder = pid.map(|p| format!(" (pid {p})")).unwrap_or_default();
+                return Err(eyre!(
+                    "{label}: refusing --recover on {}: a running process holds it{holder}; \
+                     take a snapshot of it instead",
+                    path.display()
+                ));
+            }
             MdbxDatabase::recover(&path)
                 .wrap_err_with(|| format!("{label}: recover {}", path.display()))?;
+            eprintln!(
+                "{label}: recovered {}: its meta pages were rewritten, and if the copy was taken \
+                 on another host or before a reboot MDBX rolled it back to the last steady \
+                 commit, losing up to a few seconds of writes",
+                path.display()
+            );
+            live = LiveStatus::Recovered;
         }
         // MDBX registers every reader in mdbx.lck, so a read-only open still needs to write that
         // file. A lock file nobody can write cannot be held by a running node either, so open it
         // exclusively, which skips the reader table.
         let exclusive = opts.exclusive || !lock_file_writable(&path);
-        let db = MdbxDatabase::open_read_only(&path, exclusive).map_err(|e| {
+        let db = match MdbxDatabase::open_read_only(&path, exclusive) {
+            Ok(db) => Ok(db),
+            // MDBX finds its three meta pages by guessing offsets from the system page size
+            // until a valid first page tells it the real one: with larger pages and a destroyed
+            // first page it sees "not an MDBX file" although meta pages 1 and 2 may be intact
+            Err(e) if format!("{e:#}").contains("not an MDBX file") => {
+                let mut found = None;
+                for page_size in [8192, 16384, 32768, 65536] {
+                    if let Ok(db) = MdbxDatabase::open_read_only_with_page_size(
+                        &path,
+                        exclusive,
+                        Some(page_size),
+                    ) {
+                        eprintln!(
+                            "{label}: the first page of {} is unreadable; opened from a surviving \
+                             meta page with page size {page_size}",
+                            path.display()
+                        );
+                        found = Some(db);
+                        break;
+                    }
+                }
+                found.ok_or(e)
+            }
+            Err(e) => Err(e),
+        }
+        .map_err(|e| {
             let text = format!("{e:#}");
             if text.contains("should be recovered") {
                 eyre!(
-                    "{label}: {} needs recovery, it was copied from a running node or left by a \
-                     killed one; rerun with --recover, or copy from a stopped node",
+                    "{label}: {}: MDBX refuses to read it until it is recovered: its last commit \
+                     was never synced (the node was killed or crashed, or the files were copied \
+                     from a running node), or the file is damaged (for example truncated). \
+                     `snapshot --to DIR` copies it and recovers the copy, leaving this directory \
+                     as it is; `--recover` recovers it in place, which is what the node itself \
+                     does when it next starts (on this boot it keeps the last commit; after a \
+                     reboot or on another host it drops up to a few seconds of unsynced writes). \
+                     Neither repairs damage",
                     path.display()
                 )
             } else if text.contains("opened in read-only") {
@@ -186,23 +317,87 @@ impl NodeDb {
             }
         })?;
 
-        // Opening the cold store creates its directories, so only attach one that already exists.
-        let cold_dir = path.join("cold");
-        let cold = if cold_dir.is_dir() {
-            Some(
-                ColdStore::open(&ColdConfig { dir: cold_dir.clone() })
-                    .map_err(|e| eyre!("{label}: open cold tier {}: {e}", cold_dir.display()))?,
-            )
-        } else {
-            None
-        };
+        let cold = OnceLock::new();
+        if let Some(store) = Self::open_cold(&label, &path)? {
+            let _ = cold.set(store);
+        }
 
         Ok(Self { label, path, live, db, cold, tables: std::sync::Mutex::new(HashMap::new()) })
     }
 
-    /// Whether the cold tier is attached.
+    /// Opens the cold tier under `path` if it exists. Opening a cold store creates its
+    /// directories, so a missing one is never opened.
+    fn open_cold(label: &str, path: &Path) -> eyre::Result<Option<ColdStore>> {
+        let cold_dir = path.join("cold");
+        // opening a store creates any missing segment directory, so attach only a complete one:
+        // the tool must not create directories inside a node's datadir
+        if !(cold_dir.join("consensus_blocks").is_dir() && cold_dir.join("batches").is_dir()) {
+            return Ok(None);
+        }
+        match ColdStore::open(&ColdConfig { dir: cold_dir.clone() }) {
+            Ok(store) => Ok(Some(store)),
+            // a damaged jar index must not hide the hot tables: go on without the cold tier
+            Err(e) => {
+                eprintln!(
+                    "{label}: cold tier at {} cannot be opened ({e}); reading the hot tables \
+                     only, so archived headers and batches will read as missing",
+                    cold_dir.display()
+                );
+                Ok(None)
+            }
+        }
+    }
+
+    /// The cold tier, attached on first use when a live node created it after the open.
+    fn cold(&self) -> eyre::Result<Option<&ColdStore>> {
+        if self.cold.get().is_none() {
+            if let Some(store) = Self::open_cold(&self.label, &self.path)? {
+                let _ = self.cold.set(store);
+            }
+        }
+        Ok(self.cold.get())
+    }
+
+    /// The cold tier, for callers that copy its jars.
+    pub fn cold_store(&self) -> eyre::Result<Option<&ColdStore>> {
+        self.cold()
+    }
+
+    /// Copies the MDBX environment to the file `dest` as one committed state (compacted).
+    pub fn copy_mdbx_to(&self, dest: &Path) -> eyre::Result<()> {
+        self.db.compact_to(dest)
+    }
+
+    /// Whether an open failed because the database needs recovery (its last commit was never
+    /// synced), judged from the error text `open` produces.
+    pub fn needs_recovery(err: &eyre::Report) -> bool {
+        format!("{err:#}").contains("refuses to read it until it is recovered")
+    }
+
+    /// Whether the cold tier exists.
     pub fn has_cold(&self) -> bool {
-        self.cold.is_some()
+        self.cold().ok().flatten().is_some()
+    }
+
+    /// Reads from the cold tier. On a miss the jar index is re-read from disk once and the read
+    /// retried: a live node seals epochs while the tool runs, and an index built when the
+    /// database was opened does not know the jars sealed since. Without a cold tier, `None`.
+    fn cold_read<T>(
+        &self,
+        what: &str,
+        read: impl Fn(&ColdStore) -> ColdResult<Option<T>>,
+    ) -> eyre::Result<Option<T>> {
+        let Some(cold) = self.cold()? else { return Ok(None) };
+        let failed = |e| eyre!("{}: cold {what}: {e}", self.label);
+        if let Some(found) = read(cold).map_err(failed)? {
+            return Ok(Some(found));
+        }
+        self.refresh_cold(cold)?;
+        read(cold).map_err(failed)
+    }
+
+    fn refresh_cold(&self, cold: &ColdStore) -> eyre::Result<()> {
+        cold.refresh().map_err(|e| eyre!("{}: re-read the cold jar index: {e}", self.label))
     }
 
     /// Whether table `T` exists on disk.
@@ -220,12 +415,23 @@ impl NodeDb {
         Ok(present)
     }
 
-    /// Point read that treats a never-created table as an empty one.
+    /// Point read that treats a never-created table as an empty one. Decodes fallibly: a corrupt
+    /// row is reported, not a panic, on the databases this tool exists to inspect.
     fn get<T: Table>(&self, key: &T::Key) -> eyre::Result<Option<T::Value>> {
         if !self.table_present::<T>()? {
             return Ok(None);
         }
-        self.db.get::<T>(key).wrap_err_with(|| format!("{}: read {}", self.label, T::NAME))
+        let bytes = self
+            .db
+            .with_read_txn(|tx| tx.raw_get::<T>(key).map(|b| b.map(|b| b.into_owned())))
+            .wrap_err_with(|| format!("{}: read {}", self.label, T::NAME))?;
+        match bytes {
+            Some(bytes) => Ok(Some(
+                try_decode::<T::Value>(&bytes)
+                    .map_err(|e| eyre!("{}: decode a {} row: {e}", self.label, T::NAME))?,
+            )),
+            None => Ok(None),
+        }
     }
 
     /// The epoch record for `epoch` and, if present, its certificate (keyed by record digest).
@@ -261,23 +467,32 @@ impl NodeDb {
         if !self.table_present::<EpochRecords>()? {
             return Ok(Vec::new());
         }
-        Ok(self.db.raw_iter::<EpochRecords>().map(|(k, _)| decode_key::<Epoch>(&k)).collect())
+        self.db
+            .raw_iter::<EpochRecords>()
+            .map(|(k, _)| {
+                try_decode_key::<Epoch>(&k)
+                    .map_err(|e| eyre!("{}: decode an epoch record key: {e}", self.label))
+            })
+            .collect()
     }
 
-    /// The consensus header at `number`, with the tier that held it: hot table, then the cache
-    /// table, then the cold archive.
+    /// The consensus header at `number`, with the tier that held it: the hot table, then the
+    /// cold archive, then the verified-but-unprocessed cache. The canonical tiers come first
+    /// because a cache row can outlive its header's promotion (a late gossip copy); such a row
+    /// must not make an archived header look unprocessed.
     pub fn header(&self, number: u64) -> eyre::Result<Option<(ConsensusHeader, Tier)>> {
         if let Some(h) = self.get::<ConsensusBlocks>(&number)? {
             return Ok(Some((h, Tier::Hot)));
         }
-        if let Some(h) = self.get::<ConsensusBlocksCache>(&number)? {
-            return Ok(Some((h, Tier::Cache)));
+        let bytes = self.cold_read(&format!("read of consensus block {number}"), |cold| {
+            cold.read_consensus_block_checked(number)
+        })?;
+        if let Some(b) = bytes {
+            let header = try_decode::<ConsensusHeader>(&b)
+                .map_err(|e| eyre!("{}: decode cold consensus block {number}: {e}", self.label))?;
+            return Ok(Some((header, Tier::Cold)));
         }
-        let Some(cold) = &self.cold else { return Ok(None) };
-        let bytes = cold
-            .read_consensus_block_checked(number)
-            .map_err(|e| eyre!("{}: cold read of consensus block {number}: {e}", self.label))?;
-        Ok(bytes.map(|b| (decode::<ConsensusHeader>(&b), Tier::Cold)))
+        Ok(self.get::<ConsensusBlocksCache>(&number)?.map(|h| (h, Tier::Cache)))
     }
 
     /// The consensus number the digest index maps `digest` to, if any.
@@ -290,7 +505,14 @@ impl NodeDb {
         if !self.table_present::<T>()? {
             return Ok(None);
         }
-        Ok(self.db.reverse_raw_iter::<T>().next().map(|(k, _)| decode_key::<u64>(&k)))
+        self.db
+            .reverse_raw_iter::<T>()
+            .next()
+            .map(|(k, _)| {
+                try_decode_key::<u64>(&k)
+                    .map_err(|e| eyre!("{}: decode a {} key: {e}", self.label, T::NAME))
+            })
+            .transpose()
     }
 
     /// Highest epoch with a record on disk. Keys only; values are not decoded.
@@ -298,20 +520,48 @@ impl NodeDb {
         if !self.table_present::<EpochRecords>()? {
             return Ok(None);
         }
-        Ok(self.db.reverse_raw_iter::<EpochRecords>().next().map(|(k, _)| decode_key::<Epoch>(&k)))
+        self.db
+            .reverse_raw_iter::<EpochRecords>()
+            .next()
+            .map(|(k, _)| {
+                try_decode_key::<Epoch>(&k)
+                    .map_err(|e| eyre!("{}: decode an epoch record key: {e}", self.label))
+            })
+            .transpose()
     }
 
     /// Epoch of the latest canonical consensus header, read from a projection of its raw bytes.
+    /// Falls back to the newest archived header when the hot table is empty.
     pub fn current_epoch(&self) -> eyre::Result<Option<Epoch>> {
-        if !self.table_present::<ConsensusBlocks>()? {
-            return Ok(None);
-        }
-        let Some((_, bytes)) = self.db.reverse_raw_iter::<ConsensusBlocks>().next() else {
-            return Ok(None);
+        let bytes = if self.table_present::<ConsensusBlocks>()? {
+            self.db.reverse_raw_iter::<ConsensusBlocks>().next().map(|(_, v)| v.into_owned())
+        } else {
+            None
+        };
+        let bytes = match bytes {
+            Some(bytes) => bytes,
+            None => {
+                let Some((cold, number)) = self.cold_tip()? else { return Ok(None) };
+                let Some(bytes) = cold.read_consensus_block_checked(number).map_err(|e| {
+                    eyre!("{}: cold read of consensus block {number}: {e}", self.label)
+                })?
+                else {
+                    return Ok(None);
+                };
+                bytes
+            }
         };
         let meta = ConsensusHeaderMeta::from_bytes(&bytes)
             .map_err(|e| eyre!("{}: project latest consensus header: {e}", self.label))?;
         Ok(Some(meta.leader_epoch))
+    }
+
+    /// The cold tier and the number of its newest archived consensus header, if any.
+    fn cold_tip(&self) -> eyre::Result<Option<(&ColdStore, u64)>> {
+        let Some(cold) = self.cold()? else { return Ok(None) };
+        // read when nothing is hot, typically right after an archival pass: re-read the index
+        self.refresh_cold(cold)?;
+        Ok(cold.consensus_blocks().key_span().map(|span| (cold, *span.end())))
     }
 
     /// The node's [`Position`].
@@ -323,9 +573,19 @@ impl NodeDb {
         })
     }
 
-    /// Highest canonical consensus header number on disk.
+    /// The canonical tip header itself, from whichever tier holds it.
+    pub fn latest_consensus_header(&self) -> eyre::Result<Option<ConsensusHeader>> {
+        let Some(number) = self.latest_consensus_number()? else { return Ok(None) };
+        Ok(self.header(number)?.map(|(h, _)| h))
+    }
+
+    /// Highest canonical consensus header number on disk: the hot table's, or the cold tier's
+    /// when nothing is hot.
     pub fn latest_consensus_number(&self) -> eyre::Result<Option<u64>> {
-        self.last_u64_key::<ConsensusBlocks>()
+        if let Some(number) = self.last_u64_key::<ConsensusBlocks>()? {
+            return Ok(Some(number));
+        }
+        Ok(self.cold_tip()?.map(|(_, number)| number))
     }
 
     /// Highest consensus header number in the verified-but-unprocessed cache.
@@ -338,12 +598,180 @@ impl NodeDb {
         Ok(self.get::<Certificates>(&digest)?.is_some())
     }
 
-    /// Where a batch lives, if anywhere: hot table or the cold tier's location index.
-    pub fn batch_tier(&self, digest: BlockHash) -> eyre::Result<Option<Tier>> {
-        if self.get::<Batches>(&digest)?.is_some() {
-            return Ok(Some(Tier::Hot));
+    /// The batch with `digest`: the hot table, then the cold archive through its location index.
+    /// An index entry whose jar row cannot be read (or with no cold tier attached) is
+    /// [`BatchLookup::Dangling`].
+    pub fn batch(&self, digest: BlockHash) -> eyre::Result<BatchLookup> {
+        if let Some(batch) = self.get::<Batches>(&digest)? {
+            return Ok(BatchLookup::Found(batch, Tier::Hot));
         }
-        Ok(self.get::<ColdBatchLocations>(&digest)?.map(|_: ColdLocation| Tier::Cold))
+        let Some(location) = self.get::<ColdBatchLocations>(&digest)? else {
+            return Ok(BatchLookup::Absent);
+        };
+        let bytes = self.cold_read(&format!("read of batch {digest}"), |cold| {
+            cold.read_batch_checked(digest, location)
+        })?;
+        Ok(match bytes {
+            Some(bytes) => BatchLookup::Found(
+                try_decode(&bytes)
+                    .map_err(|e| eyre!("{}: decode cold batch {digest}: {e}", self.label))?,
+                Tier::Cold,
+            ),
+            None => BatchLookup::Dangling(location),
+        })
+    }
+
+    /// Visits every stored batch: the hot table first, then each sealed cold epoch in ascending
+    /// order. With `epoch`, hot batches sealed in other epochs are skipped after being read (the
+    /// table is keyed by digest, so it is always read end to end) and only that epoch's cold jar
+    /// is opened. `visit` returns `Ok(false)` to stop. The hot pass holds one read transaction
+    /// for the whole table. Fails when the hot pass ends short of the rows the table reports on a
+    /// stopped node: the cursor swallows read errors, and a short scan must not read as absence.
+    pub fn scan_batches(
+        &self,
+        epoch: Option<Epoch>,
+        mut visit: impl FnMut(BlockHash, &Batch, Tier) -> eyre::Result<bool>,
+    ) -> eyre::Result<ScanStats> {
+        let mut stats = ScanStats::default();
+        if self.table_present::<Batches>()? {
+            stats.hot_table_rows =
+                self.table_counts()?.get(<Batches as Table>::NAME).copied().unwrap_or(0);
+            for (key, value) in self.db.raw_iter::<Batches>() {
+                stats.hot_batches += 1;
+                let digest = try_decode_key::<BlockHash>(&key)
+                    .map_err(|e| eyre!("{}: decode a batch key: {e}", self.label))?;
+                let batch: Batch = try_decode(&value)
+                    .map_err(|e| eyre!("{}: decode hot batch {digest}: {e}", self.label))?;
+                if epoch.is_some_and(|e| batch.epoch != e) {
+                    continue;
+                }
+                if !visit(digest, &batch, Tier::Hot)? {
+                    return Ok(stats);
+                }
+            }
+            stats.short = stats.hot_batches < stats.hot_table_rows;
+            // a stopped database cannot change under the scan, so a shortfall is a read error; a
+            // live one can (archival prunes, workers seal), so the shortfall is reported instead
+            if stats.short && matches!(self.live, LiveStatus::Stopped | LiveStatus::Recovered) {
+                return Err(eyre!(
+                    "{}: hot batch scan ended after {} of {} rows; the table could not be read \
+                     to the end",
+                    self.label,
+                    stats.hot_batches,
+                    stats.hot_table_rows
+                ));
+            }
+        }
+        let Some(cold) = self.cold()? else { return Ok(stats) };
+        // the jars sealed since the open must be scanned too
+        self.refresh_cold(cold)?;
+        let epochs: Vec<Epoch> = match epoch {
+            Some(e) => vec![e],
+            None => cold.batches().sealed_epochs().into_iter().collect(),
+        };
+        for e in epochs {
+            let mut stop = false;
+            let mut visited = 0usize;
+            let mut failure = None;
+            cold.for_each_batch_in_epoch(e, |row, digest, bytes| {
+                let batch: Batch = match try_decode(bytes) {
+                    Ok(batch) => batch,
+                    Err(err) => {
+                        failure = Some(eyre!(
+                            "{}: decode cold batch {digest} (epoch {e} row {row}): {err}",
+                            self.label
+                        ));
+                        return Ok(false);
+                    }
+                };
+                visited += 1;
+                match visit(digest, &batch, Tier::Cold) {
+                    Ok(next) => {
+                        stop = !next;
+                        Ok(next)
+                    }
+                    Err(err) => {
+                        failure = Some(err);
+                        Ok(false)
+                    }
+                }
+            })
+            .map_err(|err| eyre!("{}: scan cold batches of epoch {e}: {err}", self.label))?;
+            if visited > 0 {
+                stats.cold_epochs += 1;
+                stats.cold_batches += visited;
+            }
+            if let Some(err) = failure {
+                return Err(err);
+            }
+            if stop {
+                break;
+            }
+        }
+        Ok(stats)
+    }
+
+    /// The consensus header of `epoch` whose sub-dag commits `batch`, as (number, tier), if one
+    /// is stored. Hot and cache rows are projected (leader epoch and payload digests) without
+    /// decoding the rest of the header; the cold tier is read for that epoch's jar only.
+    pub fn header_committing_batch(
+        &self,
+        batch: BlockHash,
+        epoch: Epoch,
+    ) -> eyre::Result<Option<(u64, Tier)>> {
+        let commits = |number: u64, bytes: &[u8]| -> eyre::Result<bool> {
+            let (leader_epoch, digests) = leader_epoch_and_batch_digests(bytes)
+                .map_err(|e| eyre!("{}: project consensus header {number}: {e}", self.label))?;
+            Ok(leader_epoch == epoch && digests.contains(&batch))
+        };
+        let scan = |iter: DBRawIterBox<'_>, stop_below_epoch: bool| -> eyre::Result<Option<u64>> {
+            for (key, value) in iter {
+                let number = try_decode_key::<u64>(&key)
+                    .map_err(|e| eyre!("{}: decode a consensus header key: {e}", self.label))?;
+                if stop_below_epoch {
+                    // newest first: once the leaders are from an earlier epoch, nothing older can
+                    // commit a batch of this one
+                    let meta = ConsensusHeaderMeta::from_bytes(&value).map_err(|e| {
+                        eyre!("{}: project consensus header {number}: {e}", self.label)
+                    })?;
+                    if meta.leader_epoch < epoch {
+                        return Ok(None);
+                    }
+                }
+                if commits(number, &value)? {
+                    return Ok(Some(number));
+                }
+            }
+            Ok(None)
+        };
+        if self.table_present::<ConsensusBlocks>()? {
+            if let Some(n) = scan(self.db.reverse_raw_iter::<ConsensusBlocks>(), true)? {
+                return Ok(Some((n, Tier::Hot)));
+            }
+        }
+        // the cold archive before the cache, for the same reason as in `header`
+        if let Some(cold) = self.cold()? {
+            // a jar sealed since the open must be searched too
+            self.refresh_cold(cold)?;
+            if let Some(range) = cold.consensus_blocks().key_range_for_epoch(epoch) {
+                for number in range {
+                    let bytes = cold.read_consensus_block_checked(number).map_err(|e| {
+                        eyre!("{}: cold read of consensus block {number}: {e}", self.label)
+                    })?;
+                    if let Some(bytes) = bytes {
+                        if commits(number, &bytes)? {
+                            return Ok(Some((number, Tier::Cold)));
+                        }
+                    }
+                }
+            }
+        }
+        if self.table_present::<ConsensusBlocksCache>()? {
+            if let Some(n) = scan(self.db.raw_iter::<ConsensusBlocksCache>(), false)? {
+                return Ok(Some((n, Tier::Cache)));
+            }
+        }
+        Ok(None)
     }
 
     /// Last fully archived epoch, if the cold tier has committed one.
@@ -420,13 +848,16 @@ fn default_label(path: &Path) -> String {
 /// Whether some process holds an OS lock on the directory's `mdbx.lck`, which every MDBX handle
 /// (reader or writer) takes while the environment is open. Read from `/proc/locks` by inode, so a
 /// datadir copied from elsewhere reads as stopped even if its files came from a running node.
-/// MDBX places its writer lock at byte offset `pid`, which is how the PID is recovered when the
-/// lock table itself does not name one (OFD locks report -1).
-fn probe_live(consensus_db: &Path) -> LiveStatus {
-    let Ok(meta) = std::fs::metadata(consensus_db.join("mdbx.lck")) else {
-        return LiveStatus::Stopped;
-    };
-    probe_live_linux(&meta).unwrap_or(LiveStatus::Unknown)
+/// Every handle also takes a byte lock at offset `pid`, which is how the PID is recovered when
+/// the lock table itself does not name one (OFD locks report -1). Anything short of a clear
+/// answer is `Unknown`. MDBX's own file locks are what make a wrong answer harmless (a
+/// read-write open against a live environment fails); this is for the message.
+pub fn probe_live(consensus_db: &Path) -> LiveStatus {
+    match std::fs::metadata(consensus_db.join("mdbx.lck")) {
+        Ok(meta) => probe_live_linux(&meta).unwrap_or(LiveStatus::Unknown),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => LiveStatus::Stopped,
+        Err(_) => LiveStatus::Unknown,
+    }
 }
 
 #[cfg(target_os = "linux")]

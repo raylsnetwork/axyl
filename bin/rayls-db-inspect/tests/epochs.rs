@@ -1,13 +1,16 @@
 // SPDX-License-Identifier: BUSL-1.1
-//! `epochs <FROM> <TO>` and `chain-check`.
+//! `epochs <FROM> <TO>` and `epoch-check`.
 
 #![allow(unused_crate_dependencies)]
 
 mod common;
 
 use common::*;
-use rayls_db_inspect::report::epoch::{chain_check, epochs, Cell};
-use rayls_infrastructure_types::B256;
+use rayls_db_inspect::{
+    report::epoch::{epoch_check, epochs, Cell, LinkCheck},
+    source::Source,
+};
+use rayls_infrastructure_types::{Database as _, B256};
 
 #[test]
 fn matrix_cells_and_row_verdicts() {
@@ -22,10 +25,10 @@ fn matrix_cells_and_row_verdicts() {
         let r1 = fx.record(1, Some(&r0), h1.digest());
         write_epoch(db, &r1, Some(&fx.certify(&r1, &[0, 1, 2])));
     });
-    let nodes = [a.open("a"), b.open("b")];
+    let nodes = [Source::Db(a.open("a")), Source::Db(b.open("b"))];
 
     let report = epochs(&nodes, Some((0, 3))).unwrap();
-    assert_eq!(report.nodes, vec!["a", "b"]);
+    assert_eq!(report.nodes.iter().map(|n| n.node.as_str()).collect::<Vec<_>>(), ["a", "b"]);
     assert_eq!(report.rows.len(), 4);
     assert_eq!(report.rows[0].cells, vec![Cell::RecordOnly, Cell::RecordOnly]);
     assert_eq!(report.rows[0].status, "ok");
@@ -46,12 +49,12 @@ fn matrix_cells_and_row_verdicts() {
 fn range_beyond_the_tip_is_not_reached() {
     let fx = Fixture::new();
     let a = SeededNode::new(|db| drop(seed_healthy(&fx, db)));
-    let report = epochs(&[a.open("a")], Some((10, 12))).unwrap();
+    let report = epochs(&[Source::Db(a.open("a"))], Some((10, 12))).unwrap();
     assert!(report.rows.iter().all(|r| r.status == "not-reached"));
     assert_eq!(report.verdict.to_string(), "NOT_REACHED epochs=3 not_reached=10..=12");
 
     // a range that extends past the tip is healthy for the part that exists
-    let report = epochs(&[a.open("a")], Some((0, 5))).unwrap();
+    let report = epochs(&[Source::Db(a.open("a"))], Some((0, 5))).unwrap();
     assert_eq!(report.verdict.to_string(), "OK epochs=6 ok=3 not_reached=3..=5");
 }
 
@@ -59,7 +62,7 @@ fn range_beyond_the_tip_is_not_reached() {
 fn true_gap_in_the_matrix_is_missing() {
     let fx = Fixture::with_epoch(5);
     let a = SeededNode::new(|db| drop(seed_healthy(&fx, db)));
-    let report = epochs(&[a.open("a")], Some((0, 4))).unwrap();
+    let report = epochs(&[Source::Db(a.open("a"))], Some((0, 4))).unwrap();
     assert_eq!(report.rows[3].cells, vec![Cell::Missing]);
     assert_eq!(report.rows[3].status, "missing");
     assert_eq!(report.verdict.to_string(), "MISSING epochs=5 ok=3 missing=2 first=3");
@@ -69,7 +72,7 @@ fn true_gap_in_the_matrix_is_missing() {
 fn all_range_is_the_union_of_nodes() {
     let fx = Fixture::new();
     let a = SeededNode::new(|db| drop(seed_healthy(&fx, db)));
-    let report = epochs(&[a.open("a")], None).unwrap();
+    let report = epochs(&[Source::Db(a.open("a"))], None).unwrap();
     assert_eq!((report.from, report.to), (0, 2));
     assert_eq!(report.verdict.to_string(), "OK epochs=3 ok=3");
     assert!(report.verdict.healthy);
@@ -78,7 +81,7 @@ fn all_range_is_the_union_of_nodes() {
 #[test]
 fn all_on_empty_nodes() {
     let a = SeededNode::new(|_| {});
-    let report = epochs(&[a.open("a")], None).unwrap();
+    let report = epochs(&[Source::Db(a.open("a"))], None).unwrap();
     assert!(report.rows.is_empty());
     assert_eq!(report.verdict.to_string(), "EMPTY epochs=0");
 }
@@ -93,6 +96,8 @@ fn run_rejects_epochs_without_bounds_or_all() {
         exclusive: false,
         require_stopped: false,
         recover: false,
+        rpc_rate: 0,
+        rpcs: Vec::new(),
         dbs: vec![a.datadir()],
         command: Command::Epochs { from: None, to: None, all: false, nodes: NodeArgs::default() },
     };
@@ -103,16 +108,18 @@ fn run_rejects_epochs_without_bounds_or_all() {
 #[test]
 fn inverted_range_is_an_error() {
     let a = SeededNode::new(|_| {});
-    assert!(epochs(&[a.open("a")], Some((5, 1))).is_err());
+    assert!(epochs(&[Source::Db(a.open("a"))], Some((5, 1))).is_err());
 }
 
 #[test]
-fn chain_check_healthy() {
+fn epoch_check_healthy() {
     let fx = Fixture::new();
     let a = SeededNode::new(|db| drop(seed_healthy(&fx, db)));
     let b = SeededNode::new(|db| drop(seed_healthy(&fx, db)));
-    let report = chain_check(&[a.open("a"), b.open("b")], None, None).unwrap();
-    assert_eq!(report.verdict.to_string(), "OK checked=3");
+    let report =
+        epoch_check(&[Source::Db(a.open("a")), Source::Db(b.open("b"))], None, None, false)
+            .unwrap();
+    assert_eq!(report.verdict.to_string(), "OK nodes=2 checked=3");
     for n in &report.nodes {
         assert_eq!((n.from, n.to), (Some(0), Some(2)));
         assert_eq!(n.checked, 3);
@@ -122,7 +129,7 @@ fn chain_check_healthy() {
 }
 
 #[test]
-fn chain_check_finds_broken_link_gap_and_uncertified() {
+fn epoch_check_finds_broken_link_gap_and_uncertified() {
     let fx = Fixture::new();
     let a = SeededNode::new(|db| {
         let (records, headers) = seed_healthy(&fx, db);
@@ -133,7 +140,7 @@ fn chain_check_finds_broken_link_gap_and_uncertified() {
         r5.parent_hash = B256::repeat_byte(0x55);
         write_epoch(db, &r5, Some(&fx.certify(&r5, &[0, 1, 2])));
     });
-    let report = chain_check(&[a.open("a")], None, None).unwrap();
+    let report = epoch_check(&[Source::Db(a.open("a"))], None, None, false).unwrap();
     let n = &report.nodes[0];
     assert_eq!((n.from, n.to), (Some(0), Some(5)));
     assert_eq!(n.gaps, vec![4]);
@@ -141,30 +148,30 @@ fn chain_check_finds_broken_link_gap_and_uncertified() {
     // the record after a gap has no previous record to link against, so no broken-link entry
     assert!(n.broken_links.is_empty());
     assert!(!n.ok);
-    assert_eq!(report.verdict.to_string(), "BROKEN checked=5 gaps=1 uncertified=1 first=3");
+    assert_eq!(report.verdict.to_string(), "BROKEN nodes=1 checked=5 gaps=1 uncertified=1 first=3");
 }
 
 #[test]
-fn chain_check_range_beyond_the_latest_record() {
+fn epoch_check_range_beyond_the_latest_record() {
     let fx = Fixture::new();
     let a = SeededNode::new(|db| drop(seed_healthy(&fx, db)));
     // --to past the last record is clamped and noted, not reported as gaps
-    let report = chain_check(&[a.open("a")], None, Some(50)).unwrap();
+    let report = epoch_check(&[Source::Db(a.open("a"))], None, Some(50), false).unwrap();
     let n = &report.nodes[0];
     assert_eq!(n.to, Some(2));
     assert!(n.gaps.is_empty());
     assert!(n.ok);
     assert!(n.note.as_deref().unwrap().contains("--to 50 > latest record 2"), "{:?}", n.note);
-    assert_eq!(report.verdict.to_string(), "OK checked=3");
+    assert_eq!(report.verdict.to_string(), "OK nodes=1 checked=3");
     // --from past the last record: nothing to check
-    let report = chain_check(&[a.open("a")], Some(50), None).unwrap();
+    let report = epoch_check(&[Source::Db(a.open("a"))], Some(50), None, false).unwrap();
     assert_eq!(report.nodes[0].checked, 0);
-    assert_eq!(report.verdict.to_string(), "EMPTY checked=0");
+    assert_eq!(report.verdict.to_string(), "EMPTY nodes=1 checked=0");
     assert!(report.nodes[0].note.as_deref().unwrap().contains("--from 50 > latest record 2"));
 }
 
 #[test]
-fn chain_check_broken_parent_hash() {
+fn epoch_check_broken_parent_hash() {
     let fx = Fixture::new();
     let a = SeededNode::new(|db| {
         let (records, _) = seed_healthy(&fx, db);
@@ -172,15 +179,15 @@ fn chain_check_broken_parent_hash() {
         r2.parent_hash = B256::repeat_byte(0x22);
         write_epoch(db, &r2, Some(&fx.certify(&r2, &[0, 1, 2])));
     });
-    let report = chain_check(&[a.open("a")], Some(1), Some(2)).unwrap();
+    let report = epoch_check(&[Source::Db(a.open("a"))], Some(1), Some(2), false).unwrap();
     let n = &report.nodes[0];
     assert_eq!(n.broken_links.len(), 1);
     assert_eq!(n.broken_links[0].epoch, 2);
-    assert_eq!(report.verdict.to_string(), "BROKEN checked=2 broken=1 first=2");
+    assert_eq!(report.verdict.to_string(), "BROKEN nodes=1 checked=2 broken=1 first=2");
 }
 
 #[test]
-fn chain_check_divergent_nodes() {
+fn epoch_check_divergent_nodes() {
     let fx = Fixture::new();
     let a = SeededNode::new(|db| drop(seed_healthy(&fx, db)));
     let b = SeededNode::new(|db| {
@@ -188,6 +195,48 @@ fn chain_check_divergent_nodes() {
         let other = fx.record(2, Some(&records[1]), B256::repeat_byte(0xab));
         write_epoch(db, &other, Some(&fx.certify(&other, &[0, 1, 2])));
     });
-    let report = chain_check(&[a.open("a"), b.open("b")], None, None).unwrap();
-    assert_eq!(report.verdict.to_string(), "DIVERGENT checked=3 divergent=1 first=2");
+    let report =
+        epoch_check(&[Source::Db(a.open("a")), Source::Db(b.open("b"))], None, None, false)
+            .unwrap();
+    assert_eq!(report.verdict.to_string(), "DIVERGENT nodes=2 checked=3 divergent=1 first=2");
+}
+
+/// The digest index is part of the chain: a record whose digest maps elsewhere is reported.
+#[test]
+fn epoch_check_reports_index_mismatches() {
+    let fx = Fixture::new();
+    let a = SeededNode::new(|db| {
+        let (records, _) = seed_healthy(&fx, db);
+        db.with_write_txn(|txn| {
+            rayls_infrastructure_types::DbTxMut::insert::<
+                rayls_infrastructure_storage::tables::EpochRecordsIndex,
+            >(txn, &records[1].digest(), &5)
+        })
+        .unwrap();
+    });
+    let report = epoch_check(&[Source::Db(a.open("a"))], None, None, false).unwrap();
+    assert_eq!(report.nodes[0].index_mismatch, vec![1]);
+    assert!(!report.nodes[0].ok);
+    assert_eq!(report.verdict.to_string(), "BROKEN nodes=1 checked=3 index=1 first=1");
+}
+
+/// `-v` lists every record of the range: the focused view around one epoch.
+#[test]
+fn epoch_check_verbose_lists_records() {
+    let fx = Fixture::new();
+    let a = SeededNode::new(|db| drop(seed_healthy(&fx, db)));
+    let report = epoch_check(&[Source::Db(a.open("a"))], Some(1), Some(2), true).unwrap();
+    let records = report.nodes[0].records.as_ref().unwrap();
+    assert_eq!(records.iter().map(|r| r.epoch).collect::<Vec<_>>(), vec![1, 2]);
+    assert!(records.iter().all(|r| r.cert == "certified" && r.index_ok && r.link == LinkCheck::Ok));
+    assert_eq!(records[1].committee_handoff_ok, Some(true));
+    assert_eq!(records[1].parent_hash, records[0].digest);
+    assert_eq!(report.verdict.to_string(), "OK nodes=1 checked=2");
+
+    // without -v there is no record list, and epoch 0 shows as genesis when included
+    let plain = epoch_check(&[Source::Db(a.open("a"))], None, None, false).unwrap();
+    assert!(plain.nodes[0].records.is_none());
+    let all = epoch_check(&[Source::Db(a.open("a"))], None, None, true).unwrap();
+    assert_eq!(all.nodes[0].records.as_ref().unwrap()[0].cert, "genesis");
+    assert_eq!(all.nodes[0].records.as_ref().unwrap()[0].link, LinkCheck::Genesis);
 }

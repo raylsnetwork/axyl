@@ -245,7 +245,7 @@ fn require_stopped_refuses_a_held_database_and_a_copy_is_not_live() {
         &OpenOptions { exclusive: false, require_stopped: true, recover: true },
     )
     .expect("copy opens with --require-stopped");
-    assert_eq!(copied.live, LiveStatus::Stopped);
+    assert_eq!(copied.live, LiveStatus::Recovered, "a recovered copy says so in every report");
 
     drop(stdin);
     assert!(child.wait().unwrap().success());
@@ -273,4 +273,54 @@ fn summary_reports_tips_tables_and_checkpoints() {
     assert!(n.datafile_bytes > 0);
     assert_eq!(n.tables.get("consensus_block"), Some(&4));
     assert!(n.tables.contains_key("epoch_record_by_number"));
+}
+
+/// A live node seals epochs while the tool runs. A header and a batch that were already pruned
+/// from the hot tables when the database was opened, and reach the cold tier afterwards, are
+/// still found: the jar index is re-read on a miss.
+#[test]
+fn rows_archived_after_the_open_are_found_in_the_cold_tier() {
+    use rayls_db_inspect::node_db::{BatchLookup, Tier};
+    use rayls_infrastructure_storage::{
+        cold::ColdLocation, tables::ColdBatchLocations, ColdConfig, ColdStore,
+    };
+    use rayls_infrastructure_types::{encode, DbTxMut as _};
+
+    let fx = Fixture::new();
+    let batch = fx.batch(0, 1, signed_transactions(1));
+    let digest = batch.digest();
+    let mut headers = Vec::new();
+    let mut parent = rayls_db_inspect::report::header::genesis_anchor();
+    for n in 1..=3u64 {
+        let h = fx.header(n, parent);
+        parent = h.digest();
+        headers.push(h);
+    }
+    let a = SeededNode::new(|db| {
+        // header 1 and the batch are gone from the hot tables; the batch's location index
+        // already points at epoch 0's jar, which does not exist yet
+        write_header(db, &headers[1]);
+        write_header(db, &headers[2]);
+        db.with_write_txn(|txn| {
+            txn.insert::<ColdBatchLocations>(&digest, &ColdLocation { epoch: 0, row: 0 })
+        })
+        .unwrap();
+    });
+    let node = a.open("a");
+    assert!(node.header(1).unwrap().is_none());
+    assert!(matches!(node.batch(digest).unwrap(), BatchLookup::Dangling(_)));
+
+    // the node seals epoch 0 through its own store; the tool's index knows nothing of it
+    let cold_dir = std::path::PathBuf::from(a.consensus_db()).join("cold");
+    let cold = ColdStore::open(&ColdConfig { dir: cold_dir }).unwrap();
+    cold.consensus_blocks().begin_epoch(0, 1).unwrap();
+    cold.consensus_blocks().append_row(&[&encode(&headers[0])]).unwrap();
+    cold.consensus_blocks().commit().unwrap();
+    cold.batches().begin_epoch(0, 0).unwrap();
+    cold.batches().append_row(&[digest.as_slice(), &encode(&batch)]).unwrap();
+    cold.batches().commit().unwrap();
+
+    let (h, tier) = node.header(1).unwrap().expect("found once the epoch is sealed");
+    assert_eq!((h.digest(), tier), (headers[0].digest(), Tier::Cold));
+    assert!(matches!(node.batch(digest).unwrap(), BatchLookup::Found(_, Tier::Cold)));
 }

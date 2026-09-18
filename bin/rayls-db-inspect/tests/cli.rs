@@ -5,9 +5,10 @@
 
 use clap::{CommandFactory, Parser};
 use rayls_db_inspect::{
-    cli::{Cli, Command, WalkTarget},
+    cli::{Cli, Command},
     run,
 };
+use rayls_infrastructure_types::B256;
 
 #[test]
 fn parses_every_subcommand() {
@@ -24,8 +25,8 @@ fn parses_every_subcommand() {
     assert!(cli.exclusive);
     assert!(matches!(cli.command, Command::Epochs { from: None, to: None, all: true, .. }));
 
-    let cli = Cli::try_parse_from(["x", "chain-check", "--from", "2", "-d", "a"]).unwrap();
-    assert!(matches!(cli.command, Command::ChainCheck { from: Some(2), to: None, .. }));
+    let cli = Cli::try_parse_from(["x", "epoch-check", "--from", "2", "-d", "a"]).unwrap();
+    assert!(matches!(cli.command, Command::EpochCheck { from: Some(2), to: None, .. }));
 
     assert!(matches!(
         Cli::try_parse_from(["x", "header", "3", "-d", "a"]).unwrap().command,
@@ -36,15 +37,35 @@ fn parses_every_subcommand() {
         Command::Cert { number: 3, .. }
     ));
     assert!(matches!(
-        Cli::try_parse_from(["x", "walk", "header", "9", "--back", "3", "-d", "a"])
-            .unwrap()
-            .command,
-        Command::Walk { target: WalkTarget::Header { number: 9, back: 3, .. } }
+        Cli::try_parse_from(["x", "header-check", "9", "--back", "3", "-d", "a"]).unwrap().command,
+        Command::HeaderCheck { number: 9, back: 3, .. }
+    ));
+    let digest = format!("0x{}", "ab".repeat(32));
+    let cli = Cli::try_parse_from(["x", "get-batch", &digest, "-d", "a"]).unwrap();
+    assert!(matches!(
+        cli.command,
+        Command::GetBatch { digest, .. } if digest == B256::repeat_byte(0xab)
+    ));
+    let bare = "ab".repeat(32);
+    let cli = Cli::try_parse_from(["x", "get-tx", &bare, "--epoch", "4", "-d", "a"]).unwrap();
+    assert!(matches!(
+        cli.command,
+        Command::GetTx { hash, epoch: Some(4), .. } if hash == B256::repeat_byte(0xab)
     ));
     let cli =
         Cli::try_parse_from(["x", "summary", "--require-stopped", "--recover", "-d", "a"]).unwrap();
     assert!(cli.require_stopped && cli.recover);
     assert!(matches!(cli.command, Command::Summary { .. }));
+}
+
+#[test]
+fn a_bad_hash_explains_itself() {
+    let err = Cli::try_parse_from(["x", "get-batch", "0x1234", "--db", "a"]).unwrap_err();
+    assert!(err.to_string().contains("is 2 bytes, a hash is 32"), "{err}");
+    let err = Cli::try_parse_from(["x", "get-tx", "zz", "--db", "a"]).unwrap_err();
+    assert!(err.to_string().contains("is not a hex hash"), "{err}");
+    let err = Cli::try_parse_from(["x", "get-tx", "/data/node1", "--db", "a"]).unwrap_err();
+    assert!(err.to_string().contains("is a path, not a hash"), "{err}");
 }
 
 #[test]
@@ -105,5 +126,5 @@ fn help_renders_for_every_subcommand() {
             assert!(!nested.render_long_help().to_string().trim().is_empty());
         }
     }
-    assert_eq!(seen, 7);
+    assert_eq!(seen, 10);
 }

@@ -272,15 +272,18 @@ All standard `eth_*` methods are available.
 
 ### Rayls namespace (`rayls_*`)
 
-Four additional endpoints expose consensus state that is not covered by the standard Ethereum API.
+Seven additional endpoints expose consensus state that is not covered by the standard Ethereum API.
 Provided by `rayls-execution-rpc`; details in [crates/execution/rpc.md](crates/execution/rpc.md).
 
 | Endpoint | Parameters | Returns | Description |
 |---|---|---|---|
 | `rayls_latestHeader` | — | `ConsensusHeader` | The consensus chain tip: parent hash, committed sub-DAG, block number |
+| `rayls_consensusHeaderByNumber` | `number: u64` | `ConsensusHeader` | The consensus header at that number, if the node holds it |
+| `rayls_consensusHeaderByHash` | `hash: B256` | `ConsensusHeader` | The consensus header with that digest, if the node holds it |
 | `rayls_genesis` | — | `Genesis` | Full chain genesis configuration (chain id, alloc, config) |
 | `rayls_epochRecord` | `epoch: u64` | `(EpochRecord, EpochCertificate)` | Committee snapshot and BLS certificate for the given epoch number |
 | `rayls_epochRecordByHash` | `hash: B256` | `(EpochRecord, EpochCertificate)` | Same lookup keyed by the record's hash instead of epoch number |
+| `rayls_nodeStatus` | — | `NodeStatus` | The node's role (active or inactive validator, observer), whether it is caught up, its epoch, DAG rounds and last canonical block |
 
 **`EpochRecord`** is the trust anchor for light clients and syncing nodes. It records the active
 committee, the next committee, the last execution block of the epoch, and the last consensus header
