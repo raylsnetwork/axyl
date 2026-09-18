@@ -177,7 +177,12 @@ pub fn spawn_state_sync<DB: Database>(
         }
     }
 }
-/// Write the consensus header and its component transaction batches to the consensus DB.
+/// Write the consensus header and its component transaction batches to the consensus DB, and
+/// return the saved header.
+///
+/// This is the only production writer of `ConsensusBlocks`. Callers must publish the returned
+/// header to `ConsensusBus::local_consensus_tip` so the RPC tip stays exact; the subscriber does
+/// this in one place, so any new caller should go through it or publish itself.
 ///
 /// An error here indicates a critical node failure.
 /// Note, if this returns an error then the DB could not be written to- this is probably fatal.
@@ -185,7 +190,7 @@ pub fn save_consensus<DB: Database>(
     db: &DB,
     consensus_output: ConsensusOutput,
     _authority_id: &Option<AuthorityIdentifier>,
-) -> eyre::Result<()> {
+) -> eyre::Result<ConsensusHeader> {
     let batches_to_insert: Vec<_> = consensus_output
         .batches
         .iter()
@@ -243,7 +248,7 @@ pub fn save_consensus<DB: Database>(
         Ok(())
     })?;
 
-    Ok(())
+    Ok(header)
 }
 
 /// The canonical consensus-chain tip, used to seed the live subscriber's header *numbering* so a

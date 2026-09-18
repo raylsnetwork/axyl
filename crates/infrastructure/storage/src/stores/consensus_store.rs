@@ -45,8 +45,6 @@ pub trait ConsensusStore: Clone {
     fn get_consensus_by_hash(&self, hash: BlockHash) -> Option<ConsensusHeader>;
     /// Get a ConsensusHeader by number (canonical or cache).
     fn get_consensus_by_number(&self, number: u64) -> Option<ConsensusHeader>;
-    /// Get the highest `ConsensusBlocks` row.
-    fn get_latest_consensus_header(&self) -> Option<ConsensusHeader>;
 }
 
 impl<DB: Database> ConsensusStore for DB {
@@ -96,7 +94,7 @@ impl<DB: Database> ConsensusStore for DB {
     }
 
     fn get_latest_sub_dag(&self) -> Option<CommittedSubDag> {
-        self.get_latest_consensus_header().map(|block| block.sub_dag)
+        self.last_record::<ConsensusBlocks>().map(|(_, block)| block.sub_dag)
     }
 
     fn read_latest_commit_with_final_reputation_scores(
@@ -157,10 +155,6 @@ impl<DB: Database> ConsensusStore for DB {
             .ok()
             .flatten()
             .or_else(|| self.get::<ConsensusBlocksCache>(&number).ok().flatten())
-    }
-
-    fn get_latest_consensus_header(&self) -> Option<ConsensusHeader> {
-        self.last_record::<ConsensusBlocks>().map(|(_, block)| block)
     }
 }
 

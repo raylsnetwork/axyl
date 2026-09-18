@@ -1,11 +1,8 @@
 use rayls_consensus_primary::{ConsensusBus, NodeMode};
 use rayls_execution_rpc::{EngineToPrimary, NodeRole, NodeStatus};
-use rayls_infrastructure_storage::{
-    tables::{EpochCerts, EpochRecords},
-    ConsensusStore, EpochStore,
-};
+use rayls_infrastructure_storage::{ConsensusStore, EpochStore};
 use rayls_infrastructure_types::{
-    BlockHash, ConsensusHeader, Database, DbTx, Epoch, EpochCertificate, EpochRecord,
+    BlockHash, ConsensusHeader, Database, Epoch, EpochCertificate, EpochRecord,
 };
 
 #[derive(Debug)]
@@ -42,8 +39,9 @@ impl<DB: Database> EngineToPrimaryRpc<DB> {
 
 impl<DB: Database> EngineToPrimary for EngineToPrimaryRpc<DB> {
     fn get_latest_consensus_block(&self) -> ConsensusHeader {
-        // from the DB; the watch resets every epoch and a validator never advances it
-        self.db.get_latest_consensus_header().unwrap_or_default()
+        // the node's own durable tip, kept by the subscriber on every role; `last_consensus_header`
+        // is a peer-derived signal that a validator never advances and every epoch resets
+        (**self.consensus_bus.local_consensus_tip().borrow()).clone()
     }
 
     fn consensus_block_by_number(&self, number: u64) -> Option<ConsensusHeader> {
@@ -72,27 +70,25 @@ impl<DB: Database> EngineToPrimary for EngineToPrimaryRpc<DB> {
             NodeMode::CvvInactive => NodeRole::InactiveCvv,
             NodeMode::Observer => NodeRole::Observer,
         };
+        // one Arc clone; every field below reads the same snapshot
+        let tip = self.consensus_bus.local_consensus_tip().borrow().clone();
         // CvvActive: caught up by construction (promotion gate).
         // CvvInactive: still catching up by definition; promotion to CvvActive is the readiness
-        // signal. Observer: never participates in consensus, so compare DB tip vs gossipped
-        // network tip. `network == 0` guard avoids a false "caught up" before any peer
+        // signal. Observer: never participates in consensus, so compare the saved tip vs the
+        // gossipped network tip. `network == 0` guard avoids a false "caught up" before any peer
         // gossip has arrived.
-        // read the tip once for both fields
-        let tip = self.db.get_latest_consensus_header();
         let is_caught_up = match role {
             NodeRole::ActiveCvv => true,
             NodeRole::InactiveCvv => false,
             NodeRole::Observer => {
                 let (network, _) = *self.consensus_bus.last_published_consensus_num_hash().borrow();
-                // stored tip, not the last header seen
-                let local = tip.as_ref().map(|h| h.number).unwrap_or(0);
-                network > 0 && local >= network
+                network > 0 && tip.number >= network
             }
         };
         NodeStatus {
             role,
             is_caught_up,
-            epoch: current_epoch(tip.as_ref(), last_closed_epoch(&self.db)),
+            epoch: tip.sub_dag.leader_epoch(),
             committed_round: *self.consensus_bus.committed_round_updates().borrow(),
             primary_round: *self.consensus_bus.primary_round_updates().borrow(),
             gc_round: *self.consensus_bus.gc_round_updates().borrow(),
@@ -106,95 +102,59 @@ impl<DB: Database> EngineToPrimary for EngineToPrimaryRpc<DB> {
     }
 }
 
-/// Highest epoch with a certified record. The epoch-0 placeholder is unsigned and does not count.
-fn last_closed_epoch<DB: Database>(db: &DB) -> Option<Epoch> {
-    // one read snapshot: the highest record, and whether it is certified (the epoch-0
-    // placeholder is unsigned)
-    db.with_read_txn(|txn| {
-        let Some((epoch, record)) = txn.last_record::<EpochRecords>() else {
-            return Ok(None);
-        };
-        Ok(txn.get::<EpochCerts>(&record.digest())?.is_some().then_some(epoch))
-    })
-    .unwrap_or_else(|e| {
-        // a read failure is not "epoch 0"; surface it rather than swallow it
-        tracing::warn!(target: "engine-rpc", error = %e, "last_closed_epoch read failed");
-        None
-    })
-}
-
-/// One after the last closed epoch, or the tip's epoch if higher.
-fn current_epoch(tip: Option<&ConsensusHeader>, last_closed: Option<Epoch>) -> Epoch {
-    let from_tip = tip.map(|h| h.sub_dag.leader_epoch()).unwrap_or(0);
-    let from_records = last_closed.map(|epoch| epoch.saturating_add(1)).unwrap_or(0);
-    from_tip.max(from_records)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use rayls_infrastructure_storage::mem_db::MemDatabase;
     use rayls_infrastructure_types::{Certificate, CommittedSubDag, Header, ReputationScores};
+    use std::sync::Arc;
 
-    fn sub_dag(epoch: Epoch) -> CommittedSubDag {
+    fn header(number: u64, epoch: Epoch) -> ConsensusHeader {
         let mut leader = Certificate::default();
         leader.header = Header { epoch, ..Default::default() };
-        CommittedSubDag::new(vec![], leader, 0, ReputationScores::default(), None)
+        let sub_dag = CommittedSubDag::new(vec![], leader, 0, ReputationScores::default(), None);
+        ConsensusHeader { number, sub_dag, ..Default::default() }
     }
 
-    /// Tip and epoch come from the database, not the watch (which a validator never advances).
+    /// Tip and epoch come from the node's own tip watch, not from the peer-derived header watch
+    /// (which a validator never advances) and not from the DB.
     // the bus registers metrics histograms that need a runtime handle
     #[tokio::test]
-    async fn latest_header_and_epoch_come_from_the_database() {
+    async fn latest_header_and_epoch_come_from_the_local_tip_watch() {
         let db = MemDatabase::default();
         let rpc = EngineToPrimaryRpc::new(ConsensusBus::new(), db.clone());
         assert_eq!(rpc.get_latest_consensus_block().number, 0);
         assert_eq!(rpc.node_status().epoch, 0);
 
-        for number in 1..=3 {
-            db.write_subdag_for_test(number, sub_dag(0));
-        }
-        // watch still at the default header
+        // rows in the DB alone change nothing: the RPC never reads them
+        db.write_subdag_for_test(3, header(3, 2).sub_dag);
+        assert_eq!(rpc.get_latest_consensus_block().number, 0);
+
+        rpc.consensus_bus.local_consensus_tip().send_replace(Arc::new(header(3, 2)));
+        // peer-derived watch still at the default header
         assert_eq!(rpc.consensus_bus.last_consensus_header().borrow().number, 0);
         assert_eq!(rpc.get_latest_consensus_block().number, 3);
-        assert_eq!(rpc.node_status().epoch, 0);
+        assert_eq!(rpc.node_status().epoch, 2);
 
-        // unsigned epoch-0 placeholder does not close it
-        let record = EpochRecord { epoch: 0, ..Default::default() };
-        db.save_epoch_record(&record).unwrap();
-        assert_eq!(rpc.node_status().epoch, 0);
+        // the transition resets the peer-derived watch, not this one
+        rpc.consensus_bus.last_consensus_header().send_replace(ConsensusHeader::default());
+        assert_eq!(rpc.get_latest_consensus_block().number, 3);
+        assert_eq!(rpc.node_status().epoch, 2);
 
-        // epoch 0 closes with its certificate
-        let cert = EpochCertificate {
-            epoch_hash: record.digest(),
-            signature: Default::default(),
-            signed_authorities: Default::default(),
-        };
-        db.save_epoch_record_with_cert(&record, &cert).unwrap();
-        assert_eq!(rpc.node_status().epoch, 1);
-        db.write_subdag_for_test(4, sub_dag(1));
+        // first commit of the next epoch moves both
+        rpc.consensus_bus.local_consensus_tip().send_replace(Arc::new(header(4, 3)));
         assert_eq!(rpc.get_latest_consensus_block().number, 4);
-        assert_eq!(rpc.node_status().epoch, 1);
-
-        // tip wins when ahead of the records
-        db.write_subdag_for_test(5, sub_dag(3));
         assert_eq!(rpc.node_status().epoch, 3);
-
-        // highest row by number, not by write order or string sort
-        db.write_subdag_for_test(256, sub_dag(3));
-        db.write_subdag_for_test(255, sub_dag(3));
-        assert_eq!(rpc.get_latest_consensus_block().number, 256);
     }
 
-    /// An observer is caught up once its tip reaches the gossiped network tip.
+    /// An observer is caught up once its saved tip reaches the gossiped network tip.
     #[tokio::test]
-    async fn observer_is_caught_up_compares_the_canonical_tip() {
-        let db = MemDatabase::default();
-        let rpc = EngineToPrimaryRpc::new(ConsensusBus::new(), db.clone());
+    async fn observer_is_caught_up_compares_the_local_tip() {
+        let rpc = EngineToPrimaryRpc::new(ConsensusBus::new(), MemDatabase::default());
         rpc.consensus_bus.node_mode().send_replace(NodeMode::Observer);
 
         // no gossip yet
-        db.write_subdag_for_test(7, sub_dag(0));
+        rpc.consensus_bus.local_consensus_tip().send_replace(Arc::new(header(7, 0)));
         assert!(!rpc.node_status().is_caught_up, "network tip 0 means no peer gossip yet");
 
         // gossip ahead of the tip
@@ -202,8 +162,7 @@ mod tests {
         assert!(!rpc.node_status().is_caught_up);
 
         // tip reaches it
-        db.write_subdag_for_test(8, sub_dag(0));
-        db.write_subdag_for_test(9, sub_dag(0));
+        rpc.consensus_bus.local_consensus_tip().send_replace(Arc::new(header(9, 0)));
         assert!(rpc.node_status().is_caught_up);
     }
 }

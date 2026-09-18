@@ -74,6 +74,11 @@ pub fn spawn_subscriber<DB: Database>(
     let committee = config.committee().clone();
     let client = config.local_network().clone();
     let mode = *consensus_bus.node_mode().borrow();
+    // Seed the node's own tip watch from the canonical chain tip. This runs at every spawn, so it
+    // also re-anchors after an epoch transition: a header saved during the boundary drain race is
+    // not the tip once the checkpoint is certified (see `consensus_chain_tip`).
+    let tip = consensus_chain_tip(&config).unwrap_or_default();
+    consensus_bus.local_consensus_tip().send_replace(Arc::new(tip));
     let subscriber = Subscriber {
         consensus_bus,
         config,
@@ -414,7 +419,7 @@ impl<DB: Database> Subscriber<DB> {
             .unwrap_or_else(|| output.sub_dag.leader.round());
 
         // promote to canonical ConsensusBlocks table
-        save_consensus(self.config.node_storage(), output.clone(), &self.inner.authority_id)?;
+        self.save_and_publish(output.clone())?;
 
         let last_round = output.leader_round();
 
@@ -763,6 +768,24 @@ impl<DB: Database> Subscriber<DB> {
         }
     }
 
+    /// Persist a consensus output to the canonical `ConsensusBlocks` chain and publish the saved
+    /// header as the node's own tip.
+    ///
+    /// The publish is monotonic by number, so an out-of-order re-save cannot regress the tip; a
+    /// re-commit at the same number replaces it, since that is the header now on disk.
+    fn save_and_publish(&self, output: ConsensusOutput) -> SubscriberResult<()> {
+        let header = save_consensus(self.config.node_storage(), output, &self.inner.authority_id)?;
+        self.consensus_bus.local_consensus_tip().send_if_modified(|tip| {
+            if header.number >= tip.number {
+                *tip = Arc::new(header);
+                true
+            } else {
+                false
+            }
+        });
+        Ok(())
+    }
+
     /// Return the `(digest, number)` seed for the live consensus-header chain - the parent the
     /// next committed `ConsensusHeader` chains from, read once on startup before `run()`'s loop.
     ///
@@ -946,7 +969,7 @@ impl<DB: Database> Subscriber<DB> {
                             }
 
                             debug!(target: "subscriber", output=?output.digest(), "saving next output");
-                            save_consensus(self.config.node_storage(), output.clone(), &self.inner.authority_id)?;
+                            self.save_and_publish(output.clone())?;
                             {
                                 let digests: Vec<_> = output.batch_digests.iter().copied().collect();
                                 self.consensus_bus.batch_tracker().output_broadcast(output.number, &digests);

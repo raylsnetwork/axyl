@@ -29,8 +29,9 @@ variants:
 
 ### `rayls_latestHeader`
 
-Returns the `ConsensusHeader` at the tip of the consensus chain: the highest canonical header
-in the node's database, on every role.
+Returns the `ConsensusHeader` at the tip of the consensus chain: the highest header this node
+has saved to its consensus database, on every role. Served from memory; the node publishes the
+tip as it saves each header and re-seeds it from the canonical chain tip at every epoch start.
 
 **Parameters:** none
 
@@ -77,21 +78,15 @@ always `false`; an `observer` is caught up once its highest canonical consensus 
 highest header gossiped by the network. An observer that has *seen* a header but not yet processed
 it is not caught up.
 
-`epoch` is the later of the tip header's leader epoch and the epoch after the last **certified**
-epoch record. Only certified records count: an unsigned placeholder record is written for epoch 0
-at startup and does not mean epoch 0 has closed.
+`epoch` is the leader epoch of the same saved tip header that `rayls_latestHeader` returns, so the
+two methods always agree and a syncing node reports the epoch it has actually reached, not the
+network's.
 
-Two consequences worth knowing before alerting on this field:
-
-- Through an epoch transition both inputs lag by seconds — the closing epoch's record lands only
-  once the next epoch collects its vote quorum, and the tip header stays in the old epoch until
-  the new epoch's first commit — while `committed_round`, `primary_round` and `gc_round` come from
-  in-memory state that resets at the boundary. A single response can therefore pair the old
-  `epoch` with new-epoch rounds.
-- A node that is far behind but has already fetched certified epoch records from its peers reports
-  the **network's** epoch rather than the one it is executing. Use `is_caught_up`, or
-  `last_canonical_block` against a known-good node, to judge sync progress; `epoch` alone is not a
-  lag signal.
+One consequence worth knowing before alerting on this field: through an epoch transition the tip
+header stays in the closing epoch until the new epoch's first commit lands, a few rounds, while
+`committed_round`, `primary_round` and `gc_round` come from in-memory state that resets at the
+boundary. A single response can therefore pair the old `epoch` with new-epoch rounds for a few
+seconds.
 
 ---
 

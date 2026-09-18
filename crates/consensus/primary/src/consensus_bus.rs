@@ -216,6 +216,10 @@ struct ConsensusBusAppInner {
     tx_last_consensus_header: watch::Sender<ConsensusHeader>,
     /// Watch tracking the last gossipped consensus block number and hash.
     tx_last_published_consensus_num_hash: watch::Sender<(u64, BlockHash)>,
+    /// The node's own durable consensus tip: the highest header it has saved to
+    /// `ConsensusBlocks`, on every role. Unlike `tx_last_consensus_header` this is not a
+    /// peer-derived signal and the epoch transition does not reset it.
+    tx_local_consensus_tip: watch::Sender<Arc<ConsensusHeader>>,
 
     /// Consensus output with a consensus header.
     consensus_output: broadcast::Sender<ConsensusOutput>,
@@ -270,6 +274,7 @@ impl ConsensusBusAppInner {
         let (tx_primary_round_updates, _) = watch::channel(0u32);
         let (tx_last_consensus_header, _) = watch::channel(ConsensusHeader::default());
         let (tx_last_published_consensus_num_hash, _) = watch::channel((0, BlockHash::default()));
+        let (tx_local_consensus_tip, _) = watch::channel(Arc::new(ConsensusHeader::default()));
         let (tx_recently_executed_blocks, _) =
             watch::channel(RecentlyExecutedBlocks::new(recently_executed_blocks as usize));
         let (tx_executed_anchor, _) = watch::channel(ConsensusHeader::default());
@@ -295,6 +300,7 @@ impl ConsensusBusAppInner {
             tx_engine_idle,
             tx_last_consensus_header,
             tx_last_published_consensus_num_hash,
+            tx_local_consensus_tip,
             consensus_output,
             consensus_header,
             tx_sync_status,
@@ -668,6 +674,15 @@ impl ConsensusBus {
     /// for block number.  DO NOT send unverified values to this watch.
     pub fn last_published_consensus_num_hash(&self) -> &watch::Sender<(u64, BlockHash)> {
         &self.inner_app.tx_last_published_consensus_num_hash
+    }
+
+    /// The node's own durable consensus tip: the highest header it has saved to
+    /// `ConsensusBlocks`, on every role. The subscriber seeds it from the canonical chain tip at
+    /// every spawn (so it re-anchors after an epoch transition) and publishes each header it
+    /// saves. It is never reset, so the RPC can serve `latestHeader` and the current epoch from
+    /// memory without touching the DB.
+    pub fn local_consensus_tip(&self) -> &watch::Sender<Arc<ConsensusHeader>> {
+        &self.inner_app.tx_local_consensus_tip
     }
 
     /// Broadcast channel with consensus output (includes the consensus chain block).

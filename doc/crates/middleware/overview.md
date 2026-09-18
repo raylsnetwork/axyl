@@ -145,11 +145,11 @@ execution RPC layer to consensus data:
 
 | Method | Source |
 |---|---|
-| `get_latest_consensus_block` | consensus `DB` (highest `consensus_block` row) |
+| `get_latest_consensus_block` | `ConsensusBus::local_consensus_tip` (in-memory; the subscriber publishes each header it saves and re-seeds it from the canonical tip at every epoch start) |
 | `consensus_block_by_number` | consensus `DB` (historical lookup) |
 | `consensus_block_by_hash` | consensus `DB` (historical lookup) |
 | `epoch` (by number or hash) | consensus `DB` |
-| `node_status` | consensus `DB` for `epoch` and the observer's `is_caught_up`; `ConsensusBus` for the round watermarks |
+| `node_status` | `ConsensusBus` only: the local tip for `epoch` and the observer's `is_caught_up`, the watches for the round watermarks |
 
 ### Supporting subtasks
 
