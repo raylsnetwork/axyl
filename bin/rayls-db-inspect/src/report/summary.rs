@@ -27,6 +27,8 @@ pub struct SummaryNodeView {
     pub epoch_records: usize,
     pub epoch_certs: usize,
     pub latest_consensus_number: Option<u64>,
+    /// Commit timestamp (unix seconds) of the tip header: when the data ends, for any directory.
+    pub latest_consensus_timestamp: Option<u64>,
     pub latest_cached_consensus_number: Option<u64>,
     pub cold_tier: bool,
     pub cold_high_water_mark: Option<Epoch>,
@@ -56,6 +58,9 @@ pub fn summary(nodes: &[NodeDb]) -> eyre::Result<SummaryReport> {
                 .copied()
                 .unwrap_or(0),
             latest_consensus_number: node.latest_consensus_number()?,
+            latest_consensus_timestamp: node
+                .latest_consensus_header()?
+                .map(|h| h.sub_dag.commit_timestamp()),
             latest_cached_consensus_number: node.latest_cached_consensus_number()?,
             cold_tier: node.has_cold(),
             cold_high_water_mark: node.cold_high_water_mark()?,

@@ -11,9 +11,11 @@ use tracing_subscriber::EnvFilter;
 use comfy_table as _;
 use const_hex as _;
 use eyre as _;
+use jsonrpsee as _;
 use rayls_infrastructure_storage as _;
 use rayls_infrastructure_types as _;
 use serde as _;
+use tokio as _;
 
 fn main() {
     let cli = Cli::parse();

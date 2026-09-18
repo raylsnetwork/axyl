@@ -46,14 +46,15 @@ pub use alloy::{
     consensus::{
         constants::{EMPTY_OMMER_ROOT_HASH, EMPTY_RECEIPTS, EMPTY_TRANSACTIONS, EMPTY_WITHDRAWALS},
         proofs::calculate_transaction_root,
+        transaction::SignerRecoverable,
         BlockHeader, Header as ExecHeader, SignableTransaction, Transaction as TransactionTrait,
         TxEip1559,
     },
     eips::{
         eip1559::MIN_PROTOCOL_BASE_FEE,
-        eip2718::Encodable2718,
+        eip2718::{Decodable2718, Encodable2718},
         eip4844::{env_settings::EnvKzgSettings, BlobAndProofV1, BlobTransactionSidecar},
-        BlockHashOrNumber, BlockNumHash,
+        BlockHashOrNumber, BlockNumHash, Typed2718,
     },
     genesis::{Genesis, GenesisAccount},
     hex::{self, FromHex},

@@ -21,13 +21,18 @@ clap = { workspace = true, features = ["derive"] }
 comfy-table = { workspace = true }
 const-hex = { workspace = true }
 eyre = { workspace = true }
+jsonrpsee = { workspace = true, features = ["http-client"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
+tokio = { workspace = true, features = ["rt", "net", "time"] }
 tracing-subscriber = { workspace = true, features = ["env-filter", "fmt"] }
 
 [dev-dependencies]
+rayls-execution-evm = { workspace = true, features = ["test-utils"] }
 rayls-infrastructure-config = { workspace = true }
 rayls-testing-test-utils = { workspace = true }
+indexmap = { workspace = true }
+jsonrpsee = { workspace = true, features = ["server"] }
 roaring = { workspace = true }
 tempfile = { workspace = true }
 

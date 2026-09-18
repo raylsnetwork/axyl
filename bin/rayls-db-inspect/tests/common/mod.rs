@@ -3,18 +3,24 @@
 
 #![allow(dead_code, unreachable_pub)]
 
+pub mod rpc;
+
+use indexmap::IndexMap;
 use rayls_db_inspect::node_db::{NodeDb, OpenOptions};
+use rayls_execution_evm::test_utils::TransactionFactory;
 use rayls_infrastructure_config::RaylsDirs as _;
 use rayls_infrastructure_storage::{
+    cold::archive_below_epoch,
     mem_db::MemDatabase,
     open_db,
-    tables::{ConsensusBlockNumbersByDigest, ConsensusBlocks, ConsensusBlocksCache},
+    tables::{Batches, ConsensusBlockNumbersByDigest, ConsensusBlocks, ConsensusBlocksCache},
     CheckpointStore, DatabaseType, EpochStore,
 };
 use rayls_infrastructure_types::{
-    BlsAggregateSignature, BlsPublicKey, BlsSignature, Certificate, CommittedSubDag,
-    ConsensusHeader, Database, DbTxMut, Epoch, EpochCertificate, EpochRecord,
-    EpochTransitionCheckpoint, EpochTransitionPhase, ReputationScores, B256,
+    test_chain_spec_arc, Address, Batch, BlockHash, BlsAggregateSignature, BlsPublicKey,
+    BlsSignature, Bytes, Certificate, CommittedSubDag, ConsensusHeader, Database, DbTxMut, Epoch,
+    EpochCertificate, EpochRecord, EpochTransitionCheckpoint, EpochTransitionPhase,
+    ReputationScores, WorkerId, B256, MIN_PROTOCOL_BASE_FEE, U256,
 };
 use rayls_testing_test_utils::{AuthorityFixture, CommitteeFixture, RaylsTempDirs};
 use std::num::NonZeroUsize;
@@ -119,6 +125,39 @@ impl Fixture {
         ConsensusHeader { parent_hash, sub_dag, number, extra: B256::default() }
     }
 
+    /// A consensus header at `number` whose leader certificate commits `batches` (by digest).
+    pub fn header_with_batches(
+        &self,
+        number: u64,
+        parent_hash: B256,
+        batches: &[BlockHash],
+    ) -> ConsensusHeader {
+        let committee = self.committee.committee();
+        let payload: IndexMap<BlockHash, WorkerId> = batches.iter().map(|d| (*d, 0)).collect();
+        let dag_header = self
+            .committee
+            .first_authority()
+            .header_builder(&committee)
+            .payload(payload)
+            .round(number as u32 + 1)
+            .build();
+        let leader = self.committee.certificate(&dag_header);
+        self.header_with_leader(number, parent_hash, leader)
+    }
+
+    /// A batch of `transactions` sealed in `epoch` by worker 0 with sequence number `seq`.
+    pub fn batch(&self, epoch: Epoch, seq: u64, transactions: Vec<Bytes>) -> Batch {
+        Batch {
+            transactions,
+            epoch,
+            beneficiary: Address::repeat_byte(0xbe),
+            base_fee_per_gas: MIN_PROTOCOL_BASE_FEE,
+            worker_id: 0,
+            seq,
+            received_at: None,
+        }
+    }
+
     /// Two leader certificates for the same DAG header signed by different quorums: identical
     /// digests, different signer sets.
     pub fn forked_leaders(&self, round: u32) -> (Certificate, Certificate) {
@@ -171,6 +210,47 @@ impl SeededNode {
     }
 }
 
+/// `count` signed EIP-1559 transfers from one fresh key, nonces 0.., encoded as a worker stores
+/// them in a batch.
+pub fn signed_transactions(count: usize) -> Vec<Bytes> {
+    let chain = test_chain_spec_arc();
+    let mut factory = TransactionFactory::new_random();
+    (0..count)
+        .map(|i| {
+            factory.create_eip1559_encoded(
+                chain.clone(),
+                None,
+                u128::from(MIN_PROTOCOL_BASE_FEE) * 2,
+                Some(Address::repeat_byte(0x10 + i as u8)),
+                U256::from(1_000 + i as u64),
+                Bytes::new(),
+            )
+        })
+        .collect()
+}
+
+/// Writes `batch` under its digest, as a worker does after sealing; returns the digest.
+pub fn write_batch(db: &DatabaseType, batch: &Batch) -> BlockHash {
+    let digest = batch.digest();
+    db.with_write_txn(|txn| txn.insert::<Batches>(&digest, batch)).unwrap();
+    digest
+}
+
+/// Moves every epoch below `cutoff` to the cold tier, as the node's archiver does. The headers
+/// of those epochs must be dense from 0 and every batch they commit must be stored.
+pub fn archive_below(db: &DatabaseType, cutoff: Epoch) {
+    db.sync_persist().unwrap();
+    let stats = archive_below_epoch(
+        &db.without_cold(),
+        db.cold().expect("cold tier attached"),
+        cutoff,
+        None,
+    )
+    .expect("archive");
+    assert!(stats.epochs_sealed > 0, "nothing was archived below epoch {cutoff}");
+    db.sync_persist().unwrap();
+}
+
 /// Seeding helpers mirroring the node's own write paths.
 pub fn write_epoch(db: &DatabaseType, record: &EpochRecord, cert: Option<&EpochCertificate>) {
     match cert {
@@ -210,19 +290,31 @@ pub fn write_checkpoint(db: &DatabaseType, epoch: Epoch) {
 /// Three certified epochs (0 unsigned dummy, 1 and 2 certified) chained together, plus
 /// consensus headers 0..=3 chained by parent hash. Returns the records and headers written.
 pub fn seed_healthy(fx: &Fixture, db: &DatabaseType) -> (Vec<EpochRecord>, Vec<ConsensusHeader>) {
+    let (epochs, headers) = healthy_chain(fx);
+    for h in &headers {
+        write_header(db, h);
+    }
+    for (record, cert) in &epochs {
+        write_epoch(db, record, cert.as_ref());
+    }
+    (epochs.into_iter().map(|(r, _)| r).collect(), headers)
+}
+
+/// The data `seed_healthy` writes, without a database: what a mock RPC node serves.
+pub fn healthy_chain(
+    fx: &Fixture,
+) -> (Vec<(EpochRecord, Option<EpochCertificate>)>, Vec<ConsensusHeader>) {
     let mut headers = Vec::new();
     let mut parent = B256::default();
     for n in 0..=3u64 {
         let h = fx.header(n, parent);
         parent = h.digest();
-        write_header(db, &h);
         headers.push(h);
     }
     let r0 = fx.record(0, None, headers[0].digest());
-    write_epoch(db, &r0, None);
     let r1 = fx.record(1, Some(&r0), headers[1].digest());
-    write_epoch(db, &r1, Some(&fx.certify(&r1, &[0, 1, 2])));
+    let c1 = fx.certify(&r1, &[0, 1, 2]);
     let r2 = fx.record(2, Some(&r1), headers[2].digest());
-    write_epoch(db, &r2, Some(&fx.certify(&r2, &[0, 1, 2, 3])));
-    (vec![r0, r1, r2], headers)
+    let c2 = fx.certify(&r2, &[0, 1, 2, 3]);
+    (vec![(r0, None), (r1, Some(c1)), (r2, Some(c2))], headers)
 }
