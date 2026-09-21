@@ -8426,6 +8426,8 @@ dependencies = [
  "rayls-infrastructure-types",
  "rayls-middleware-orchestrator",
  "rayon",
+ "reth-db",
+ "reth-stages",
  "rpassword",
  "secp256k1 0.31.1",
  "serde_yaml",

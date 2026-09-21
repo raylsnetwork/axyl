@@ -45,9 +45,10 @@ pub mod rpc_server_args;
 pub mod system_calls;
 pub mod worker;
 
-pub use chainspec::{RaylsChainSpec, RaylsHardFork, RaylsHardforks};
+pub use chainspec::{RaylsChainSpec, RaylsHardFork, RaylsHardforks, ScheduledFork};
 pub use network_profile::{
-    active_profile, set_active_profile, ForkActivation, NetworkConfigFile, NetworkProfile,
+    active_profile, set_active_profile, verify_schedule, ForkActivation, FutureForkMove,
+    NetworkConfigFile, NetworkProfile, ScheduleRecord,
 };
 pub use reth_chainspec::ForkCondition;
 

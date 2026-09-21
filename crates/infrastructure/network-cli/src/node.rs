@@ -1,15 +1,19 @@
 //! Main node command
 //!
 //! Starts the client
-use crate::{args::ConsensusDatabaseArgs, version::SHORT_VERSION, NoArgs};
+use crate::{
+    args::ConsensusDatabaseArgs,
+    schedule::{verify_datadir_chain_id, verify_schedule_record, FileSchedule, SelectedSchedule},
+    version::SHORT_VERSION,
+    NoArgs,
+};
 use clap::{value_parser, Parser, ValueHint};
 use core::fmt;
-use eyre::Context;
 use fdlimit::raise_fd_limit;
 use rayls_execution_evm::{
     parse_socket_address,
     reth_env::{RethCommand, RethConfig},
-    set_active_profile, NetworkConfigFile, NetworkProfile,
+    set_active_profile,
 };
 use rayls_infrastructure_config::Config;
 // dev-only: reading the committee file for the single-validator gating check
@@ -20,12 +24,7 @@ use rayls_infrastructure_types::Committee;
 use rayls_infrastructure_types::{BuildMetadata, RaylsNetwork};
 use rayls_middleware_orchestrator::engine::RaylsBuilder;
 use rayon::ThreadPoolBuilder;
-use std::{
-    net::SocketAddr,
-    path::{Path, PathBuf},
-    sync::Arc,
-    thread::available_parallelism,
-};
+use std::{net::SocketAddr, path::PathBuf, sync::Arc, thread::available_parallelism};
 use tracing::*;
 
 /// Chain-ids that must never be paired with `--dev`. Mainnet only (`72957`) —
@@ -61,71 +60,6 @@ fn check_dev_mode(dev: bool, committee_size: usize, chain_id: u64) -> eyre::Resu
         );
     }
     Ok(())
-}
-
-/// Load the client's network config file and select the requested subnet.
-///
-/// Validates the profile (known hardforks, non-empty schedule) before the node
-/// starts, so a broken file fails fast with an actionable message.
-fn load_subnet_profile(config_file: &Path, subnet: &str) -> eyre::Result<NetworkProfile> {
-    let yaml = std::fs::read_to_string(config_file)
-        .wrap_err_with(|| format!("failed to read network config file {config_file:?}"))?;
-    let file: NetworkConfigFile = serde_yaml::from_str(&yaml)
-        .wrap_err_with(|| format!("failed to parse network config file {config_file:?}"))?;
-    let profile = file.subnet(subnet).cloned().ok_or_else(|| {
-        let known = file.networks.keys().cloned().collect::<Vec<_>>().join(", ");
-        eyre::eyre!("subnet '{subnet}' not found in {config_file:?}; available subnets: {known}")
-    })?;
-    profile.validate_hardforks()?;
-    if profile.hardforks.is_empty() {
-        eyre::bail!(
-            "subnet '{subnet}' in {config_file:?} defines no `hardforks`; every subnet must \
-             define its hardfork schedule (a block number or \"never\" per fork)"
-        );
-    }
-    Ok(profile)
-}
-
-/// Verify that the datadir's genesis chain-id matches the chain-id of the
-/// selected schedule source (a config-file subnet, or the baked-in network
-/// profile). A mismatch means the datadir belongs to a different network or
-/// client, and running it would apply the wrong hardfork schedule — refuse to
-/// boot.
-fn verify_datadir_chain_id(actual: u64, expected: u64, source: &str) -> eyre::Result<()> {
-    if actual != expected {
-        eyre::bail!(
-            "datadir chain-id {actual} does not match the expected chain-id {expected} \
-             from {source}. The datadir appears to belong to a different network or client. \
-             Use a datadir whose genesis chain-id is {expected}, or select a schedule source \
-             whose chain-id is {actual}."
-        );
-    }
-    Ok(())
-}
-
-/// Resolve the chain-id the datadir must carry, given the schedule source selected
-/// for this boot.
-///
-/// Precedence: a `--config-file`/`--subnet` profile (already loaded and validated)
-/// wins, then the effective built-in `network` (the `--network` CLI/env override
-/// already merged over `parameters.yaml`). Bails when the datadir is "external"
-/// (`network: null`) and no file schedule was provided — such a datadir has no
-/// baked-in profile, so a schedule must be supplied explicitly.
-fn resolve_expected_chain_id(
-    file_schedule: Option<(u64, String)>,
-    network: Option<RaylsNetwork>,
-) -> eyre::Result<(u64, String)> {
-    if let Some((chain_id, source)) = file_schedule {
-        return Ok((chain_id, source));
-    }
-    match network {
-        Some(network) => Ok((network.chain_id(), format!("network '{network}'"))),
-        None => eyre::bail!(
-            "datadir has no built-in network profile (external): start with \
-             `--network <devnet|testnet|mainnet|local>` (the chain-id must match the \
-             genesis) or `--config-file <path> --subnet <name>`"
-        ),
-    }
 }
 
 /// Start the node
@@ -188,13 +122,11 @@ pub struct NodeCommand<Ext: clap::Args + fmt::Debug = NoArgs> {
     #[arg(long, value_name = "HEALTHCHECK_TCP_PORT", global = true, env = "HEALTHCHECK_TCP_PORT")]
     pub healthcheck: Option<u16>,
 
-    /// Override the Rayls network hardfork profile from parameters.yaml.
-    ///
-    /// Selects which baked-in hardfork schedule to use (devnet, testnet, mainnet,
-    /// local). When set, overrides the `network` field in parameters.yaml without
-    /// requiring a re-genesis. Useful for activating hardforks on existing networks.
-    /// Required (or a `--config-file`/`--subnet` pair) when the datadir's `network`
-    /// is unset ("external"), since such a datadir carries no baked-in schedule.
+    /// Select the built-in hardfork schedule for this boot (the network's
+    /// chain-id plus its baked-in schedule: devnet, testnet, mainnet, local).
+    /// One of `--network` or a `--config-file`/`--subnet` pair must be given —
+    /// a datadir carries no schedule of its own. In dev mode `local` is
+    /// implied when neither is given.
     #[arg(
         long,
         value_name = "RAYLS_NETWORK",
@@ -329,52 +261,40 @@ impl<Ext: clap::Args + fmt::Debug> NodeCommand<Ext> {
         // file fails fast with an actionable message.
         let file_schedule = if let Some(config_file) = &self.config_file {
             let subnet = self.subnet.as_deref().expect("clap requires --subnet with --config-file");
-            Some((
-                config_file.clone(),
-                subnet.to_string(),
-                load_subnet_profile(config_file, subnet)?,
-            ))
+            Some(FileSchedule::load(config_file, subnet)?)
         } else {
             None
         };
 
-        // Load the node config from the datadir (genesis, parameters, committee,
-        // node identity), as before. The hardfork schedule then either comes
-        // from the config file resolved above or is selected by
-        // `parameters.network` / `--network` as before.
-        let mut rayls_infrastructure_config =
-            Config::load(&rl_datadir, self.observer, SHORT_VERSION)?;
+        // Dev mode implies `local` when no schedule source is given: dev
+        // datadirs are local-chain-id chains, and this keeps `rayls-network
+        // dev` one-command. An explicit `--network`/`--config-file` still
+        // wins; a datadir with any other chain-id is refused by the check
+        // below.
+        #[cfg(feature = "dev-single-node-setup")]
+        let network = if self.dev && file_schedule.is_none() && self.network.is_none() {
+            Some(RaylsNetwork::Local)
+        } else {
+            self.network
+        };
+        #[cfg(not(feature = "dev-single-node-setup"))]
+        let network = self.network;
 
-        // Apply the `--network` CLI/env override to the config so the execution layer
-        // picks up the same schedule source we validate below.
-        if let Some(network) = self.network {
-            info!(target: "cli", %network, "overriding network hardfork profile from CLI");
-            rayls_infrastructure_config.parameters.network = Some(network);
-        }
+        // Load the node config from the datadir (genesis, parameters, committee,
+        // node identity). The hardfork schedule comes from the config file
+        // resolved above or from the built-in schedule selected by `--network`.
+        let rayls_infrastructure_config = Config::load(&rl_datadir, self.observer, SHORT_VERSION)?;
 
         // The datadir must carry the chain-id of the schedule source selected
         // for this boot, otherwise it belongs to a different network or client
         // and would run the wrong hardfork schedule.
-        let file_schedule_desc = file_schedule.as_ref().map(|(config_file, subnet, profile)| {
-            (profile.chain_id, format!("subnet '{subnet}' of {config_file:?}"))
-        });
-        let (expected_chain_id, chain_id_source) = resolve_expected_chain_id(
-            file_schedule_desc,
-            rayls_infrastructure_config.parameters.network,
-        )?;
+        let selected = SelectedSchedule::select(file_schedule.as_ref(), network)?;
         let actual_chain_id = rayls_infrastructure_config.genesis().config.chain_id;
-        verify_datadir_chain_id(actual_chain_id, expected_chain_id, &chain_id_source)?;
-
-        if let Some((config_file, subnet, profile)) = file_schedule {
-            info!(
-                target: "cli",
-                ?config_file,
-                subnet,
-                chain_id = actual_chain_id,
-                "loading hardfork schedule from file"
-            );
-            set_active_profile(profile)?;
-        }
+        verify_datadir_chain_id(
+            actual_chain_id,
+            selected.profile.chain_id,
+            &selected.source,
+        )?;
 
         debug!(target: "cli", validator = ?rayls_infrastructure_config.node_info.name, "rl datadir for node command: {rl_datadir:?}");
         info!(target: "cli", validator = ?rayls_infrastructure_config.node_info.name, "config loaded");
@@ -445,6 +365,23 @@ impl<Ext: clap::Args + fmt::Debug> NodeCommand<Ext> {
             Arc::new(rayls_infrastructure_config.chain_spec()),
         );
 
+        // The datadir's genesis chain-id must match the schedule source (checked above); so
+        // must the hardfork schedule itself: a schedule that moves an already-activated fork
+        // (or back-dates a new one into the executed history) would re-interpret the blocks
+        // this chain has already run. The datadir's schedule record pins what was executed.
+        verify_schedule_record(&rl_datadir, &node_config, &selected.profile)?;
+
+        // Commit the selected profile only once the gate has passed: the active
+        // profile is process-global (a OnceLock), so a refused boot must not
+        // leave it set for anything that runs afterwards in this process.
+        info!(
+            target: "cli",
+            source = %selected.source,
+            chain_id = actual_chain_id,
+            "hardfork schedule selected"
+        );
+        set_active_profile(selected.profile)?;
+
         let build_metadata = BuildMetadata {
             version: env!("CARGO_PKG_VERSION"),
             build_timestamp: env!("VERGEN_BUILD_TIMESTAMP"),
@@ -513,48 +450,5 @@ mod tests {
         // surfaces later when consensus loads it.
         assert!(check_dev_mode(false, 0, LOCAL_CHAIN_ID).is_ok());
         assert!(check_dev_mode(true, 0, LOCAL_CHAIN_ID).is_ok());
-    }
-}
-
-#[cfg(test)]
-mod chain_id_tests {
-    use super::{resolve_expected_chain_id, verify_datadir_chain_id};
-    use rayls_infrastructure_types::RaylsNetwork;
-
-    #[test]
-    fn matching_chain_id_passes() {
-        assert!(verify_datadir_chain_id(7295799, 7295799, "network 'testnet'").is_ok());
-        assert!(verify_datadir_chain_id(72957, 72957, "subnet 'mainnet' of \"/x/y.yaml\"").is_ok());
-    }
-
-    #[test]
-    fn mismatched_chain_id_is_refused() {
-        let err = verify_datadir_chain_id(487, 72957, "network 'mainnet'").unwrap_err();
-        let msg = err.to_string();
-        assert!(msg.contains("487"), "{msg}");
-        assert!(msg.contains("72957"), "{msg}");
-        assert!(msg.contains("network 'mainnet'"), "{msg}");
-    }
-
-    #[test]
-    fn file_schedule_wins_over_network() {
-        let file = (72957, "subnet 'mainnet' of \"/x/y.yaml\"".to_string());
-        let resolved = resolve_expected_chain_id(Some(file), Some(RaylsNetwork::Testnet)).unwrap();
-        assert_eq!(resolved, (72957, "subnet 'mainnet' of \"/x/y.yaml\"".to_string()));
-    }
-
-    #[test]
-    fn network_flag_resolves_to_its_chain_id() {
-        let resolved = resolve_expected_chain_id(None, Some(RaylsNetwork::Local)).unwrap();
-        assert_eq!(resolved, (487, "network 'local'".to_string()));
-    }
-
-    #[test]
-    fn external_without_schedule_is_refused() {
-        let err = resolve_expected_chain_id(None, None).unwrap_err();
-        let msg = err.to_string();
-        assert!(msg.contains("external"), "{msg}");
-        assert!(msg.contains("--network"), "{msg}");
-        assert!(msg.contains("--config-file"), "{msg}");
     }
 }

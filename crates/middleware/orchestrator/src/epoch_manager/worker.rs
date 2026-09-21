@@ -216,25 +216,16 @@ where
     /// After the EIP-1559 per-block fork: no-op (each block self-adjusts via payload builder).
     /// Before the fork: currently a no-op stub (unchanged from main).
     pub(super) fn adjust_base_fees(&self, gas_accumulator: &GasAccumulator, block_number: u64) {
-        let network = self.builder.rayls_infrastructure_config.parameters.network;
-        // Prefer an externally-resolved schedule (from `--config-file`); without one, the
-        // baked-in profile selected by `parameters.network` applies. An "external" datadir
-        // with no file schedule cannot boot (enforced in `network-cli` at startup), so the
-        // final arm is unreachable at runtime. If a future refactor ever lets a node reach
-        // it, `debug_assert!` surfaces that loudly in tests instead of silently applying an
-        // all-`Never` schedule (which would leave EIP-1559 permanently inactive).
+        // The schedule the CLI boot gate selected (a `--config-file` subnet or the
+        // `--network` built-in). A booted node always has one installed; an engine
+        // that skipped the gate (test utilities) has no schedule and trips the
+        // `debug_assert!` below if it reaches this path.
         let hardforks = match active_profile() {
             Some(profile) => RaylsChainHardforks::new(profile.schedule()),
-            None => match network {
-                Some(network) => RaylsChainHardforks::for_network(network),
-                None => {
-                    debug_assert!(
-                        false,
-                        "external datadir with no schedule must be refused at boot"
-                    );
-                    RaylsChainHardforks::new(Vec::new())
-                }
-            },
+            None => {
+                debug_assert!(false, "a booted node always has the selected schedule installed");
+                RaylsChainHardforks::new(Vec::new())
+            }
         };
         if hardforks.is_eip1559_active_at_block(block_number) {
             // per-block EIP-1559 active — base fee is updated per-block by the payload builder

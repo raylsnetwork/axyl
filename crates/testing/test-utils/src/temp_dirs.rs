@@ -47,4 +47,8 @@ impl RaylsDirs for RaylsTempDirs {
     fn network_config_path(&self) -> PathBuf {
         self.0.path().join("network-config")
     }
+
+    fn schedule_record_path(&self) -> PathBuf {
+        self.0.path().join("schedule-record.yaml")
+    }
 }
