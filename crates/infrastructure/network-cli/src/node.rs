@@ -290,11 +290,7 @@ impl<Ext: clap::Args + fmt::Debug> NodeCommand<Ext> {
         // and would run the wrong hardfork schedule.
         let selected = SelectedSchedule::select(file_schedule.as_ref(), network)?;
         let actual_chain_id = rayls_infrastructure_config.genesis().config.chain_id;
-        verify_datadir_chain_id(
-            actual_chain_id,
-            selected.profile.chain_id,
-            &selected.source,
-        )?;
+        verify_datadir_chain_id(actual_chain_id, selected.profile.chain_id, &selected.source)?;
 
         debug!(target: "cli", validator = ?rayls_infrastructure_config.node_info.name, "rl datadir for node command: {rl_datadir:?}");
         info!(target: "cli", validator = ?rayls_infrastructure_config.node_info.name, "config loaded");
