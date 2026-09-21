@@ -240,13 +240,17 @@ mod schedule_record_tests {
         .expect("db update");
     }
 
-    /// The full local schedule with one fork's activation replaced.
+    /// The full local schedule with one fork's activation replaced. `never`
+    /// forks are kept (as `Never`), so the result is a complete profile that
+    /// also passes `validate_hardforks`.
     fn local_profile_moving(fork: &str, to: u64) -> NetworkProfile {
         let mut hardforks = BTreeMap::new();
         for entry in RaylsHardFork::for_network(RaylsNetwork::Local) {
-            if let ForkCondition::Block(block) = entry.condition {
-                hardforks.insert(ForkName::from(entry.fork.name()), ForkActivation::Block(block));
-            }
+            let activation = match entry.condition {
+                ForkCondition::Block(block) => ForkActivation::Block(block),
+                _ => ForkActivation::Never,
+            };
+            hardforks.insert(ForkName::from(entry.fork.name()), activation);
         }
         hardforks.insert(ForkName::from(fork), ForkActivation::Block(to));
         NetworkProfile { chain_id: 487, hardforks }

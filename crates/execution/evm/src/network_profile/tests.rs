@@ -318,6 +318,36 @@ fn verify_executed_move_is_refused() {
 }
 
 #[test]
+fn verify_reports_all_executed_moves_together() {
+    // Two forks whose boundaries moved within the executed history must both
+    // appear in the single refusal, not just the first (one fix, one restart).
+    let record = record(
+        487,
+        0,
+        &[("Eip1559", ForkActivation::Block(100)), ("BatchDigestV2", ForkActivation::Block(200))],
+    );
+    let err = verify_schedule(
+        &record,
+        &profile(
+            487,
+            &[
+                ("Eip1559", ForkActivation::Block(300)),
+                ("BatchDigestV2", ForkActivation::Block(400)),
+            ],
+        ),
+        500,
+        Path::new(RECORD_PATH),
+    )
+    .unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("schedule inconsistencies"), "{msg}");
+    assert!(msg.contains("Eip1559"), "{msg}");
+    assert!(msg.contains("BatchDigestV2"), "{msg}");
+    assert!(msg.contains(RECORD_PATH), "{msg}");
+    assert!(msg.contains("delete"), "{msg}");
+}
+
+#[test]
 fn verify_boundary_at_head_is_refused() {
     // A fork boundary exactly at the head has already affected block `head`.
     let record = record(487, 0, &[("Eip1559", ForkActivation::Block(500))]);

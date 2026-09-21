@@ -25,9 +25,10 @@ pub struct FutureForkMove {
 /// `head` is the chain's current highest block. For every fork whose boundary
 /// differs between record and selection, the lower of the two boundaries is the
 /// first block the two schedules disagree about: `<= head` means the executed
-/// history would be re-interpreted, so this returns an error; `> head` is a
-/// future move, allowed and reported in the returned list for the caller to
-/// warn about.
+/// history would be re-interpreted, so this collects an error for it; `> head`
+/// is a future move, allowed and reported in the returned list for the caller
+/// to warn about. All executed-history disagreements are reported together in
+/// a single error, so one refusal lists every fork that must be fixed.
 ///
 /// `record_path` is named in the error so the refusal carries its remedy (fix
 /// the fork's entry in the record, or delete it to re-record).
@@ -52,6 +53,7 @@ pub fn verify_schedule(
         }
     }
     let mut moves = Vec::new();
+    let mut refused = Vec::new();
     for fork in RaylsHardFork::VARIANTS {
         let recorded = record.activation(fork.name());
         let selected_block =
@@ -98,20 +100,27 @@ pub fn verify_schedule(
                      {head}",
                     fork.name()
                 ),
-                // `activation()` reads both as `None`, so these cannot differ.
+                // `activation()` reads both as `None`, so these cannot differ. Reached only
+                // when `recorded != selected_block`, so `None == None` is impossible here.
                 (None, None) | (Some(ForkActivation::Never), None) => {
                     unreachable!("a never-activating selection cannot disagree with the record")
                 }
             };
-            eyre::bail!(
-                "{detail}; an executed fork's activation block cannot change and a new fork \
-                 cannot be back-dated into the executed history. Refusing to start with a \
-                 schedule inconsistent with the chain's history. Remedy: add or fix the fork's \
-                 entry in {record_path:?}, or delete {record_path:?} to re-record the selected \
-                 schedule (the executed-history check then starts from the current head)",
-            );
+            refused.push(detail);
+            continue;
         }
         moves.push(FutureForkMove { fork: *fork, recorded, selected: selected_block });
+    }
+    if !refused.is_empty() {
+        eyre::bail!(
+            "schedule inconsistencies:\n{}\n\
+             An executed fork's activation block cannot change and a new fork cannot be \
+             back-dated into the executed history. Refusing to start with a schedule \
+             inconsistent with the chain's history. Remedy: add or fix the fork's entry in \
+             {record_path:?}, or delete {record_path:?} to re-record the selected schedule \
+             (the executed-history check then starts from the current head)",
+            refused.join("\n\n")
+        );
     }
     Ok(moves)
 }

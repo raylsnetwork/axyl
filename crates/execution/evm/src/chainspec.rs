@@ -224,9 +224,6 @@ pub const MAINNET_EMPTY_OUTPUT_BLOCK_BLOCK: u64 = 3_569_194;
 /// EmptyOutputBlock activation block on the local sandbox network.
 pub const LOCAL_EMPTY_OUTPUT_BLOCK_BLOCK: u64 = 0;
 
-/// DynamicCommitteeSizing activation block on the Rayls devnet
-pub const DEVNET_DYNAMIC_COMMITTEE_SIZING_BLOCK: u64 = u64::MAX;
-
 /// DynamicCommitteeSizing activation block on the Rayls testnet
 pub const TESTNET_DYNAMIC_COMMITTEE_SIZING_BLOCK: u64 = 10_934_554;
 
@@ -302,10 +299,8 @@ impl RaylsHardFork {
                 Self::EmptyOutputBlock,
                 ForkCondition::Block(DEVNET_EMPTY_OUTPUT_BLOCK_BLOCK),
             ),
-            ScheduledFork::new(
-                Self::DynamicCommitteeSizing,
-                ForkCondition::Block(DEVNET_DYNAMIC_COMMITTEE_SIZING_BLOCK),
-            ),
+            // Never until SRE schedules a concrete devnet activation block.
+            ScheduledFork::new(Self::DynamicCommitteeSizing, ForkCondition::Never),
             // Never until SRE schedules a concrete devnet activation block.
             ScheduledFork::new(Self::HybridRewards, ForkCondition::Never),
             ScheduledFork::new(Self::OutputSeqNormalization, ForkCondition::Never),
