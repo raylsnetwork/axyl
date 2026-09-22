@@ -146,13 +146,14 @@ impl<DB: Database> EpochStore for DB {
     }
 
     fn clear_pending_epoch_record(&self, epoch: Epoch) -> StoreResult<()> {
+        // Keyed removal, not read-then-remove: DbTx::get() is not callable on a write
+        // transaction on the layered backend (panics - "DbTx get() should not be called on a
+        // DbTxMut!"). Removing a non-existent key is already a safe no-op (see
+        // save_epoch_record's own defensive `tx.remove` above), and since the key IS the epoch
+        // number, this naturally only ever touches this epoch's entry - a stale caller for an
+        // epoch a newer close already superseded still can't clobber it.
         self.with_write_txn(|tx| {
-            // Only remove if the stored entry is still the one for `epoch` - a stale caller
-            // (e.g. a slow backfill for an epoch superseded by a newer close) must never clobber
-            // a more recent pending write.
-            if tx.get::<PendingEpochRecord>(&epoch)?.is_some() {
-                tx.remove::<PendingEpochRecord>(&epoch)?;
-            }
+            tx.remove::<PendingEpochRecord>(&epoch)?;
             Ok(())
         })
     }
