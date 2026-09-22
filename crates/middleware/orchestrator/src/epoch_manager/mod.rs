@@ -9,6 +9,7 @@ mod state;
 mod transition;
 mod types;
 mod utils;
+mod vote_triage;
 mod worker;
 
 #[cfg(feature = "cold-storage")]

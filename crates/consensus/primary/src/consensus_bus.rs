@@ -92,6 +92,20 @@ impl<T> QueChannel<T> {
         let receiver = Arc::new(Mutex::new(Some(rx)));
         Self { channel: tx, receiver }
     }
+
+    /// Subscribe only if no other subscription is in use.
+    ///
+    /// [`RaylsSender::subscribe`] panics when the receiver is already taken, which is right for
+    /// the owner of the queue but not for a caller that only wants to opportunistically drain it
+    /// (the epoch manager drops stale epoch votes after a fast-path fetch). Such a caller gets
+    /// `None` and does nothing while the owner holds the receiver.
+    pub fn try_subscribe(&self) -> Option<impl RaylsReceiver<T> + 'static>
+    where
+        T: Send + 'static,
+    {
+        let receiver = self.receiver.lock().take();
+        receiver.map(|rx| QueChanReceiver { receiver: Some(rx), container: self.receiver.clone() })
+    }
 }
 
 impl<T> Default for QueChannel<T> {
@@ -793,6 +807,17 @@ impl ConsensusBus {
         &self.inner_app.new_epoch_votes
     }
 
+    /// Subscribe to the epoch vote queue only if no other subscription is in use.
+    ///
+    /// Returns `None` while the receiver is held (a running vote collection owns it), so a caller
+    /// that only wants to drop stale queued votes can no-op instead of panicking.
+    pub fn try_subscribe_epoch_votes(
+        &self,
+    ) -> Option<impl RaylsReceiver<(EpochVote, oneshot::Sender<Result<(), HeaderError>>)> + 'static>
+    {
+        self.inner_app.new_epoch_votes.try_subscribe()
+    }
+
     /// Update consensus round watch channels.
     ///
     /// This sends both the gc round and the committed round to the respective watch channels after
@@ -941,8 +966,10 @@ impl From<RecvError> for WaitForExecutionError {
 
 #[cfg(test)]
 mod tests {
-    use super::{ConsensusBus, PromotionBarrier};
-    use rayls_infrastructure_types::CertificateDigest;
+    use super::{ConsensusBus, PromotionBarrier, QueChannel};
+    use rayls_infrastructure_types::{
+        CertificateDigest, RaylsReceiver as _, RaylsSender as _, TryRecvError,
+    };
 
     // MissingParentRound (digest=None) must gate on committed_round, not a max-round cert-store
     // watermark: a far-behind node fetches high-round certs out of order, so the max is already
@@ -969,6 +996,28 @@ mod tests {
         let barrier = PromotionBarrier { epoch: 5, round: 100, digest: Some(digest) };
         assert!(barrier.is_cleared(5, 0, |d| *d == digest), "clears when parent digest present");
         assert!(!barrier.is_cleared(5, 0, |_| false), "blocks while parent digest absent");
+    }
+
+    // `try_subscribe` must yield the receiver only while nobody else holds it, so an
+    // opportunistic drainer cannot panic or steal votes from a running collection.
+    #[tokio::test]
+    async fn try_subscribe_yields_the_receiver_only_when_free() {
+        let que: QueChannel<u8> = QueChannel::new();
+        que.send(1).await.expect("send");
+
+        let owner = que.subscribe();
+        assert!(que.try_subscribe().is_none(), "must not hand out a second receiver");
+        drop(owner);
+
+        let mut drainer = que.try_subscribe().expect("receiver is free again");
+        assert_eq!(drainer.try_recv().expect("queued value"), 1);
+        assert!(matches!(drainer.try_recv(), Err(TryRecvError::Empty)));
+        drop(drainer);
+
+        // Dropping the opportunistic receiver returns it, so the next owner can subscribe.
+        let mut owner = que.subscribe();
+        que.send(2).await.expect("send");
+        assert_eq!(owner.recv().await, Some(2));
     }
 
     // The barrier is node-lifetime intent: it must survive the same-epoch mode-change restart the
