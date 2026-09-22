@@ -8,6 +8,10 @@ use crate::{
     epoch_manager::{
         types::{EpochManager, ENGINE_TASK_MANAGER, EPOCH_TASK_MANAGER, NODE_TASK_MANAGER},
         utils::{catchup_accumulator, recover_executed_anchor},
+        vote_triage::{
+            backfill_candidate, classify_fetched_record, split_settled_votes, triage_vote,
+            ForeignVote, QueuedVote, VoteAction,
+        },
     },
     primary::PrimaryNode,
     types::{HealthcheckServer, InitialBatchSeq, RunningOutcome, TransitionCtx},
@@ -16,8 +20,10 @@ use crate::{
 use consensus_metrics::start_prometheus_server;
 use eyre::eyre;
 use futures::FutureExt;
-use rayls_consensus_primary::{ConsensusBus, NodeMode, QueChannel};
-use rayls_consensus_state_sync::{epoch_committee_valid, spawn_epoch_record_collector};
+use rayls_consensus_primary::{network::PrimaryNetworkHandle, ConsensusBus, NodeMode, QueChannel};
+use rayls_consensus_state_sync::{
+    epoch_committee_valid, epoch_record_valid, spawn_epoch_record_collector,
+};
 use rayls_consensus_worker::{quorum_waiter::QuorumWaiterTrait, Worker};
 use rayls_execution_evm::{reth_env::RethEnv, system_calls::EpochState};
 use rayls_infrastructure_config::{KeyConfig, LibP2pConfig, NetworkConfig, RaylsDirs};
@@ -30,12 +36,31 @@ use rayls_infrastructure_types::{
 };
 use rayls_middleware_processor::{batch::BatchOrdering, reconstruct_batch_digests};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     panic::AssertUnwindSafe,
     time::Duration,
 };
 use tokio::sync::{mpsc, oneshot, watch};
 use tracing::{debug, error, info, warn};
+
+/// Wall-clock budget for fetching an epoch record from peers after a failed vote collection.
+///
+/// The active validators certify the record a fraction of a second after this node detects the
+/// boundary, so a single round of requests regularly arrives too early. Retrying for half a
+/// minute costs nothing on a healthy network and removes the one-epoch wait that follows a
+/// failed fetch.
+const EPOCH_FETCH_RETRY_BUDGET: Duration = Duration::from_secs(30);
+
+/// Delay between the fetch attempts made inside [`EPOCH_FETCH_RETRY_BUDGET`].
+const EPOCH_FETCH_RETRY_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Time allowed for placing one unknown epoch record digest seen in a vote.
+const DIGEST_RESOLVE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How many unknown digests one collection may ask peers about. Beyond this, unknown digests take
+/// the alternate-record path (bounded by `MAX_ALT_RECS`), so a peer flooding fresh digests cannot
+/// turn a collection into an unbounded series of network requests.
+const MAX_DIGEST_RESOLUTIONS: usize = 8;
 
 impl<P, DB> EpochManager<P, DB>
 where
@@ -886,6 +911,109 @@ where
         true
     }
 
+    /// Ack and drop queued epoch votes whose record is already certified locally.
+    ///
+    /// The vote queue is only read while a "Collect Epoch Signatures" task runs. On the catch-up
+    /// fast path no such task runs, so that close's votes would stay queued and be read by a
+    /// later collection as votes for a different record. Returns the number of votes dropped.
+    async fn drain_settled_epoch_votes(&self) -> usize {
+        // Only drain when the receiver is free: a running collection owns the queue and drains
+        // it itself.
+        let Some(mut rx) = self.consensus_bus.try_subscribe_epoch_votes() else {
+            return 0;
+        };
+        let (dropped, kept) = split_settled_votes(&mut rx, &self.consensus_db);
+        // Anything we could not settle goes back on the now-empty queue, in order, for the next
+        // collection to read.
+        for item in kept {
+            if let Err(err) = self.consensus_bus.new_epoch_votes().try_send(item) {
+                let (_, vote_tx) = match err {
+                    rayls_infrastructure_types::TrySendError::Full(item)
+                    | rayls_infrastructure_types::TrySendError::Closed(item)
+                    | rayls_infrastructure_types::TrySendError::Broadcast(item) => item,
+                };
+                let _ = vote_tx.send(Ok(()));
+            }
+        }
+        if dropped > 0 {
+            debug!(target: "epoch-manager", dropped, "dropped settled epoch votes from the queue");
+        }
+        dropped
+    }
+
+    /// Log a bad epoch vote and answer the gossip handler, so it can penalise the sender.
+    fn reject_epoch_vote(
+        vote: &EpochVote,
+        vote_tx: oneshot::Sender<Result<(), HeaderError>>,
+        err: HeaderError,
+    ) {
+        error!(
+            target: "epoch-manager",
+            ?err,
+            "Received an invalid epoch cert from {} for {}.",
+            vote.public_key,
+            vote.epoch_hash,
+        );
+        if let Err(err) = vote_tx.send(Err(err)) {
+            error!(
+                target: "epoch-manager",
+                ?err,
+                "Failed to send error for invalid epoch cert from {} for {}.",
+                vote.public_key,
+                vote.epoch_hash,
+            );
+        }
+    }
+
+    /// Resolve a foreign epoch record digest seen in a vote by asking a peer for that record.
+    ///
+    /// A record for an epoch *older* than the one being collected is stale gossip, and if we do
+    /// not hold that record it is also a hole in our record chain: save it while we have it.
+    /// A record for the epoch being collected is a genuine competing record. A digest that
+    /// cannot be resolved stays `Unknown` and the caller falls back to the alternate-record
+    /// quorum it used before.
+    async fn resolve_foreign_digest(
+        primary_network: &PrimaryNetworkHandle,
+        consensus_db: &DB,
+        digest: B256,
+        current_epoch: Epoch,
+    ) -> ForeignVote {
+        let Ok((record, cert)) = primary_network.request_epoch_cert(None, Some(digest)).await
+        else {
+            return ForeignVote::Unknown;
+        };
+        if record.digest() != digest {
+            return ForeignVote::Unknown;
+        }
+        // Same validation the epoch record collector applies before it writes a record: anchored
+        // to the parent when we hold it, certificate-only (with a real committee) when we do not.
+        if !epoch_record_valid(consensus_db, record.epoch, &record, &cert) {
+            return ForeignVote::Unknown;
+        }
+        let class = classify_fetched_record(record.epoch, current_epoch);
+        if matches!(class, ForeignVote::Stale { .. }) {
+            let already_certified = consensus_db
+                .get_epoch_by_number(record.epoch)
+                .is_some_and(|(_, cert)| cert.is_some());
+            if backfill_candidate(record.epoch, current_epoch, already_certified) {
+                match consensus_db.save_epoch_record_with_cert(&record, &cert) {
+                    Ok(()) => info!(
+                        target: "epoch-manager",
+                        epoch = record.epoch,
+                        "backfilled a missing epoch record found through a stale vote",
+                    ),
+                    Err(err) => error!(
+                        target: "epoch-manager",
+                        ?err,
+                        epoch = record.epoch,
+                        "failed to save a backfilled epoch record",
+                    ),
+                }
+            }
+        }
+        class
+    }
+
     /// Start a task to collect the epoch record votes previous epochs record.
     /// This should run quickly at epoch start and make epoch records/certs available to syncing
     /// nodes.
@@ -915,6 +1043,10 @@ where
                 }
             });
             if self.try_fetch_epoch_cert(primary, &epoch_rec, epoch_hash, &committee).await {
+                // The record is certified locally now and no collection task will run for this
+                // close, so nothing would ever read the votes the committee gossiped for it.
+                // Drop them (acked) before they can be read as votes for an alternate record.
+                self.drain_settled_epoch_votes().await;
                 return;
             }
         }
@@ -982,6 +1114,20 @@ where
         }
 
         let mut rx = self.consensus_bus.new_epoch_votes().subscribe();
+        // Votes left over from closes this node did not collect for are settled: their record is
+        // already certified here, so they can only confuse this collection. Ack and drop them,
+        // and hand the rest to the task to process before it waits on the queue.
+        let (settled_votes, mut pending): (usize, VecDeque<QueuedVote>) =
+            split_settled_votes(&mut rx, &self.consensus_db);
+        if settled_votes > 0 {
+            debug!(
+                target: "epoch-manager",
+                settled_votes,
+                epoch = epoch_rec.epoch,
+                "dropped settled epoch votes before collecting",
+            );
+        }
+        let consensus_bus = self.consensus_bus.clone();
         // This is a Drainable consumer, so it drains on the task manager's `local_shutdown`  -
         // fired by `join_internal`'s consumer phase AFTER producers are reaped (or by `Drop`).
         // That makes wind-down graceful AND ordered for every teardown (epoch/mode transition
@@ -993,97 +1139,161 @@ where
             let mut timeout = Duration::from_secs(5);
             let mut timeouts = 0;
             let mut alt_recs: B256Map<VotesAggregator<EpochVote>> = B256Map::default();
+            // Digests resolved over the network, so one unknown digest costs one request, and a
+            // hard cap on how many such requests one collection may make.
+            let mut resolved_digests: B256Map<ForeignVote> = B256Map::default();
+            let mut resolutions = 0usize;
             loop {
                 // Break promptly when the consumer phase is signalled, rather than only
                 // noticing after the recv timeout. `biased` so shutdown wins over a vote arriving.
-                let result = tokio::select! {
-                    biased;
-                    _ = &vote_shutdown => break,
-                    res = tokio::time::timeout(timeout, rx.recv()) => res,
+                let result = if let Some(queued) = pending.pop_front() {
+                    // Votes in hand must not outrank the shutdown the transition waits on.
+                    if vote_shutdown.noticed() {
+                        let _ = queued.1.send(Ok(()));
+                        break;
+                    }
+                    Ok(Some(queued))
+                } else {
+                    tokio::select! {
+                        biased;
+                        _ = &vote_shutdown => break,
+                        res = tokio::time::timeout(timeout, rx.recv()) => res,
+                    }
                 };
                 match result {
                     Ok(Some((vote, vote_tx))) => {
-                        if let Some(source) =
-                            Self::signed_by_committee(&committee, &vote, epoch_hash)
-                        {
-                            let _ = vote_tx.send(Ok(())); // If we lost this channel somehow then no big deal.
-                            if committee_keys.remove(&source) {
-                                sigs.push(vote.signature);
-                                if let Some(idx) = committee_index.get(&source) {
-                                    signed_authorities.insert(*idx as u32);
-                                }
-                                if signed_authorities.len() >= quorum as u64 {
-                                    reached_quorum = true;
-                                    // We have quorum so just wait a sec longer for new certs then
-                                    // move on.
-                                    timeout = Duration::from_secs(1);
-                                }
-                                if signed_authorities.len() >= committee_size {
-                                    break;
-                                }
-                            }
-                        } else {
-                            // Send an error back to punish the peer that sent a bad epoch vote.
-                            let err = if vote.epoch_hash != epoch_hash {
-                                if committee.contains(&vote.public_key)
-                                    && vote.check_signature()
-                                {
-                                    // track votes on alternate epoch records per-validator;
-                                    // break on quorum. per-validator tracking prevents inflation.
-                                    const MAX_ALT_RECS: usize = 100;
-                                    let reached_alt_quorum = if alt_recs.len() < MAX_ALT_RECS
-                                        || alt_recs.contains_key(&vote.epoch_hash)
-                                    {
-                                        let agg = alt_recs.entry(vote.epoch_hash).or_insert_with(
-                                            || VotesAggregator::new(quorum as u64),
-                                        );
-                                        agg.append(vote, 1).unwrap_or(false)
-                                    } else {
-                                        false
-                                    };
-                                    if reached_alt_quorum {
-                                        error!(
-                                            target: "epoch-manager",
-                                            "Reached quorum on epoch record {} instead of {}.",
+                        // Place the vote before it can feed any aggregator: stale gossip from an
+                        // earlier close must not look like a competing record for this epoch.
+                        let local_record = |digest| {
+                            consensus_db
+                                .get_epoch_by_hash(digest)
+                                .map(|(rec, cert)| (rec.epoch, cert.is_some()))
+                        };
+                        let mut action = triage_vote(
+                            &vote,
+                            epoch_hash,
+                            epoch_rec.epoch,
+                            &committee,
+                            local_record(vote.epoch_hash),
+                            resolved_digests.get(&vote.epoch_hash).copied(),
+                        );
+                        if action == VoteAction::NeedsResolve {
+                            // Bounded on every axis: one request per digest, a few per
+                            // collection, a short timeout each, and a shutdown always wins.
+                            let resolved = if resolutions >= MAX_DIGEST_RESOLUTIONS {
+                                ForeignVote::Unknown
+                            } else {
+                                resolutions += 1;
+                                tokio::select! {
+                                    biased;
+                                    _ = &vote_shutdown => {
+                                        let _ = vote_tx.send(Ok(()));
+                                        break;
+                                    }
+                                    resolved = tokio::time::timeout(
+                                        DIGEST_RESOLVE_TIMEOUT,
+                                        Self::resolve_foreign_digest(
+                                            &primary_network,
+                                            &consensus_db,
                                             vote.epoch_hash,
-                                            epoch_hash,
-                                        );
-                                        if let Err(err) = vote_tx.send(Err(HeaderError::InvalidHeaderDigest)) {
-                                            error!(
-                                                target: "epoch-manager",
-                                                ?err,
-                                                "Failed to send error for invalid epoch record {} from {}.",
-                                                vote.epoch_hash,
-                                                vote.public_key,
-                                            );
-                                        }
+                                            epoch_rec.epoch,
+                                        ),
+                                    ) => resolved.unwrap_or(ForeignVote::Unknown),
+                                }
+                            };
+                            resolved_digests.insert(vote.epoch_hash, resolved);
+                            action = triage_vote(
+                                &vote,
+                                epoch_hash,
+                                epoch_rec.epoch,
+                                &committee,
+                                local_record(vote.epoch_hash),
+                                Some(resolved),
+                            );
+                        }
+
+                        match action {
+                            VoteAction::Count => {
+                                let _ = vote_tx.send(Ok(())); // If we lost this channel somehow then no big deal.
+                                if committee_keys.remove(&vote.public_key) {
+                                    sigs.push(vote.signature);
+                                    if let Some(idx) = committee_index.get(&vote.public_key) {
+                                        signed_authorities.insert(*idx as u32);
+                                    }
+                                    if signed_authorities.len() >= quorum as u64 {
+                                        reached_quorum = true;
+                                        // We have quorum so just wait a sec longer for new certs
+                                        // then move on.
+                                        timeout = Duration::from_secs(1);
+                                    }
+                                    if signed_authorities.len() >= committee_size {
                                         break;
                                     }
                                 }
-                                HeaderError::InvalidHeaderDigest
-                            } else if committee.contains(&vote.public_key) {
-                                HeaderError::UnknownAuthority(format!(
-                                    "{} not in the committee for epoch {epoch_hash}",
-                                    vote.public_key
-                                ))
-                            } else {
-                                HeaderError::PeerNotAuthor
-                            };
-                            error!(
-                                target: "epoch-manager",
-                                ?err,
-                                "Received an invalid epoch cert from {} for {}.",
-                                vote.public_key,
-                                vote.epoch_hash,
-                            );
-                            if let Err(err) = vote_tx.send(Err(err)) {
-                                error!(
+                            }
+                            VoteAction::IgnoreStale { epoch: stale_epoch } => {
+                                debug!(
                                     target: "epoch-manager",
-                                    ?err,
-                                    "Failed to send error for invalid epoch cert from {} for {}.",
-                                    vote.public_key,
-                                    vote.epoch_hash,
+                                    stale_epoch,
+                                    epoch = epoch_rec.epoch,
+                                    digest = %vote.epoch_hash,
+                                    "ignoring a stale epoch vote from an earlier close",
                                 );
+                                // Honest gossip: ack it so the peer is not punished.
+                                let _ = vote_tx.send(Ok(()));
+                            }
+                            VoteAction::Alternate | VoteAction::NeedsResolve => {
+                                // track votes on alternate epoch records per-validator;
+                                // break on quorum. per-validator tracking prevents inflation.
+                                const MAX_ALT_RECS: usize = 100;
+                                let reached_alt_quorum = if alt_recs.len() < MAX_ALT_RECS
+                                    || alt_recs.contains_key(&vote.epoch_hash)
+                                {
+                                    let agg = alt_recs
+                                        .entry(vote.epoch_hash)
+                                        .or_insert_with(|| VotesAggregator::new(quorum as u64));
+                                    agg.append(vote, 1).unwrap_or(false)
+                                } else {
+                                    false
+                                };
+                                if reached_alt_quorum {
+                                    error!(
+                                        target: "epoch-manager",
+                                        "Reached quorum on epoch record {} instead of {}.",
+                                        vote.epoch_hash,
+                                        epoch_hash,
+                                    );
+                                    if let Err(err) = vote_tx.send(Err(HeaderError::InvalidHeaderDigest)) {
+                                        error!(
+                                            target: "epoch-manager",
+                                            ?err,
+                                            "Failed to send error for invalid epoch record {} from {}.",
+                                            vote.epoch_hash,
+                                            vote.public_key,
+                                        );
+                                    }
+                                    break;
+                                }
+                                Self::reject_epoch_vote(
+                                    &vote,
+                                    vote_tx,
+                                    HeaderError::InvalidHeaderDigest,
+                                );
+                            }
+                            VoteAction::Reject => {
+                                // Send an error back to punish the peer that sent a bad epoch
+                                // vote.
+                                let err = if vote.epoch_hash != epoch_hash {
+                                    HeaderError::InvalidHeaderDigest
+                                } else if committee.contains(&vote.public_key) {
+                                    HeaderError::UnknownAuthority(format!(
+                                        "{} not in the committee for epoch {epoch_hash}",
+                                        vote.public_key
+                                    ))
+                                } else {
+                                    HeaderError::PeerNotAuthor
+                                };
+                                Self::reject_epoch_vote(&vote, vote_tx, err);
                             }
                         }
                     }
@@ -1159,68 +1369,104 @@ where
                 );
                 let epoch = epoch_rec.epoch;
 
-                // ask up to peer count in the case we get a different hash
-                let connected_peers_count = primary_network.connected_peers_count().await.unwrap_or(0);
-                for _ in 0..connected_peers_count.min(3) {
-                    // Request by epoch number in case we had a bad hash...
-                    let Ok((new_epoch_rec, cert)) =
-                        primary_network.request_epoch_cert(Some(epoch), None).await else {
-                        error!(
-                            target: "epoch-manager",
-                            ?epoch_hash,
-                            "failed to retrieve epoch from a peer",
-                        );
-
-                        continue;
-                    };
-
-                    // invalid epoch record or cert, skip
-                    if !new_epoch_rec.verify_with_cert(&cert)
-                        || !epoch_committee_valid(&new_epoch_rec, &committee)
-                        || new_epoch_rec.parent_hash != epoch_rec.parent_hash {
-                        continue;
+                // Wake the epoch record collector as a background fallback in case every attempt
+                // below fails.
+                consensus_bus.requested_missing_epoch().send_if_modified(|current| {
+                    if epoch > *current {
+                        *current = epoch;
+                        true
+                    } else {
+                        false
                     }
+                });
 
-                    let new_epoch_hash = new_epoch_rec.digest();
-
-                    // if we found the correct hash, save it and RETURN here
-                    if new_epoch_hash == epoch_hash {
+                // Peers certify the record a fraction of a second after we detect the boundary,
+                // so one round of requests often arrives too early. Retry on a bounded budget,
+                // checking the DB between rounds in case the record collector landed it first.
+                let deadline = tokio::time::Instant::now() + EPOCH_FETCH_RETRY_BUDGET;
+                let mut attempts = 0;
+                'retry: loop {
+                    attempts += 1;
+                    if consensus_db.get_epoch_by_number(epoch).is_some_and(|(_, c)| c.is_some()) {
                         info!(
                             target: "epoch-manager",
-                            "retrieved cert for epoch {new_epoch_hash} from a peer",
+                            epoch,
+                            "epoch record appeared in the DB while retrying the fetch",
                         );
-                        if let Err(err) = consensus_db.save_epoch_record_with_cert(&new_epoch_rec, &cert) {
-                            error!(
-                                target: "epoch-manager",
-                                ?err,
-                                "Failed to insert epoch record and cert for {new_epoch_hash}",
-                            );
-                        }
                         return;
                     }
+                    // ask up to peer count in the case we get a different hash
+                    let connected_peers_count = primary_network.connected_peers_count().await.unwrap_or(0);
+                    for _ in 0..connected_peers_count.min(3) {
+                        // Request by epoch number in case we had a bad hash...
+                        let Ok((new_epoch_rec, cert)) =
+                            primary_network.request_epoch_cert(Some(epoch), None).await else {
+                            error!(
+                                target: "epoch-manager",
+                                ?epoch_hash,
+                                "failed to retrieve epoch from a peer",
+                            );
 
-                    // Humm, we got another epoch record than the one we expected...
-                    // The network came to quorum on this one so lets go with it...
-                    warn!(
-                        target: "epoch-manager",
-                        "Received wrong epoch record: {new_epoch_hash}, expected {epoch_hash}",
-                    );
+                            continue;
+                        };
 
-                    // if most of the peers return this, probably we got the wrong hash
-                    // save it and return here
-                    if let Err(e) = consensus_db.save_epoch_record_with_cert(&new_epoch_rec, &cert) {
-                        error!(
+                        // invalid epoch record or cert, skip
+                        if !new_epoch_rec.verify_with_cert(&cert)
+                            || !epoch_committee_valid(&new_epoch_rec, &committee)
+                            || new_epoch_rec.parent_hash != epoch_rec.parent_hash {
+                            continue;
+                        }
+
+                        let new_epoch_hash = new_epoch_rec.digest();
+
+                        // if we found the correct hash, save it and RETURN here
+                        if new_epoch_hash == epoch_hash {
+                            info!(
+                                target: "epoch-manager",
+                                "retrieved cert for epoch {new_epoch_hash} from a peer",
+                            );
+                            if let Err(err) = consensus_db.save_epoch_record_with_cert(&new_epoch_rec, &cert) {
+                                error!(
+                                    target: "epoch-manager",
+                                    ?err,
+                                    "Failed to insert epoch record and cert for {new_epoch_hash}",
+                                );
+                            }
+                            return;
+                        }
+
+                        // Humm, we got another epoch record than the one we expected...
+                        // The network came to quorum on this one so lets go with it...
+                        warn!(
                             target: "epoch-manager",
-                            "failed to save epoch record with cert: {e}",
+                            "Received wrong epoch record: {new_epoch_hash}, expected {epoch_hash}",
                         );
-                    }
 
-                    return;
+                        // if most of the peers return this, probably we got the wrong hash
+                        // save it and return here
+                        if let Err(e) = consensus_db.save_epoch_record_with_cert(&new_epoch_rec, &cert) {
+                            error!(
+                                target: "epoch-manager",
+                                "failed to save epoch record with cert: {e}",
+                            );
+                        }
+
+                        return;
+                    }
+                    if tokio::time::Instant::now() >= deadline {
+                        break 'retry;
+                    }
+                    tokio::select! {
+                        biased;
+                        _ = &vote_shutdown => return,
+                        _ = tokio::time::sleep(EPOCH_FETCH_RETRY_INTERVAL) => {}
+                    }
                 }
 
                 // if we didn't return before, means we didn't find it
                 error!(
                     target: "epoch-manager",
+                    attempts,
                     "Failed to retrieve an epoch record for epoch {}", epoch_rec.epoch,
                 );
             }

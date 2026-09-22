@@ -20,7 +20,7 @@ use rayls_infrastructure_types::{
 use tracing::{debug, error, info, trace, warn};
 
 mod epoch;
-pub use epoch::{epoch_committee_valid, spawn_epoch_record_collector};
+pub use epoch::{epoch_committee_valid, epoch_record_valid, spawn_epoch_record_collector};
 mod consensus;
 
 use consensus::spawn_track_recent_consensus;
