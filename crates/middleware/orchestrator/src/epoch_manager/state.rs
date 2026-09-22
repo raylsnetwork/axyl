@@ -113,6 +113,11 @@ where
                             {
                                 error!(target: "epoch-manager", "failed to persist peer-fetched previous epoch record: {e}");
                             }
+                            if let Err(e) =
+                                self.consensus_db.clear_pending_epoch_record(peer_rec.epoch)
+                            {
+                                error!(target: "epoch-manager", ?e, epoch = peer_rec.epoch, "failed to clear pending epoch record after peer-fetched parent");
+                            }
                             prev = Some(peer_rec);
                         }
                     }
@@ -162,10 +167,26 @@ where
             parent_consensus: boundary_consensus_hash,
         };
 
-        // Intentionally not persisted here: EpochRecord and EpochCertificate must be
-        // written in a single txn (save_epoch_record_with_cert). Writing the record
-        // alone would leave an unrecoverable half-state if the process dies before
-        // the cert write that happens after vote quorum.
+        // The certified (EpochRecord, EpochCertificate) pair is still only ever written
+        // together in one txn (save_epoch_record_with_cert) - that guarantee, and everything
+        // that relies on EpochRecords holding certified data only, is unchanged.
+        //
+        // Separately, persist this uncertified record as a resume hint (PendingEpochRecord):
+        // if certification never completes in this process's lifetime (a stall, a restart),
+        // there is otherwise nothing durable anywhere for this epoch to resume from - see #142.
+        // This is deliberately not the eager write #470 removed: that write went into
+        // EpochRecords itself, so bootstrap had no way to tell a certified record from an
+        // uncertified one and got stuck (#465). This write goes into a distinct table that
+        // bootstrap treats only as "resume certification for this epoch", never as a
+        // substitute for a certified record.
+        if let Err(e) = self.consensus_db.save_pending_epoch_record(&epoch_rec) {
+            error!(
+                target: "epoch-manager",
+                ?e, epoch,
+                "failed to persist pending epoch record; certification will still be attempted \
+                 this run, but cannot resume it if this process restarts first",
+            );
+        }
         self.epoch_record = Some(epoch_rec);
         Ok(())
     }
