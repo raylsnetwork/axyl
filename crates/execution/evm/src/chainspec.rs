@@ -152,8 +152,10 @@ pub const MAINNET_LOAD_BALANCING_BLOCK: u64 = 893_558;
 /// Load Balancing activation block on local network.
 pub const LOCAL_LOAD_BALANCING_BLOCK: u64 = 0;
 
-/// Sender-affinity load balancing activation block on local network. Real networks stay `Never`
-/// until an activation block is chosen operationally.
+/// Sender-affinity load balancing activation block on Rayls testnet.
+pub const TESTNET_SENDER_AFFINITY_LOAD_BALANCING_BLOCK: u64 = 17_300_000;
+/// Sender-affinity load balancing activation block on local network. Devnet and mainnet stay
+/// `Never` until an activation block is chosen operationally.
 pub const LOCAL_SENDER_AFFINITY_LOAD_BALANCING_BLOCK: u64 = 0;
 
 // NOTE: UsdrSupplyCorrection is active on local and mainnet; testnet/devnet
@@ -203,6 +205,9 @@ pub const LOCAL_DYNAMIC_COMMITTEE_SIZING_BLOCK: u64 = 0;
 /// deploys the pre-hybrid ConsensusRegistry, and the in-place bytecode-swap migration runs at
 /// the first post-genesis block, after which epoch closes use the hybrid `applyIncentives` ABI.
 pub const LOCAL_HYBRID_REWARDS_BLOCK: u64 = 1;
+
+/// OutputSeqNormalization activation block on the Rayls testnet.
+pub const TESTNET_OUTPUT_SEQ_NORMALIZATION_BLOCK: u64 = 17_300_000;
 
 /// OutputSeqNormalization activation block on the local network.
 pub const LOCAL_OUTPUT_SEQ_NORMALIZATION_BLOCK: u64 = 0;
@@ -279,9 +284,14 @@ impl RaylsHardFork {
             ),
             // Never until SRE schedules a concrete testnet activation block.
             (Self::HybridRewards, ForkCondition::Never),
-            (Self::OutputSeqNormalization, ForkCondition::Never),
-            // Never until an operational activation block is chosen; the mechanism ships dormant.
-            (Self::SenderAffinityLoadBalancing, ForkCondition::Never),
+            (
+                Self::OutputSeqNormalization,
+                ForkCondition::Block(TESTNET_OUTPUT_SEQ_NORMALIZATION_BLOCK),
+            ),
+            (
+                Self::SenderAffinityLoadBalancing,
+                ForkCondition::Block(TESTNET_SENDER_AFFINITY_LOAD_BALANCING_BLOCK),
+            ),
         ]
     }
 
