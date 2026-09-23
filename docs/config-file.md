@@ -29,8 +29,9 @@ networks:
       Eip1559: 0                # active from genesis
       BatchDigestV2: 0
       PrecompileGasFix: 0
-      OutputSeqNormalization: 0
-      SenderAffinityLoadBalancing: 0
+      EmptyOutputBlock: 0
+      DynamicCommitteeSizing: 0
+      HybridRewards: 1          # activates at block 1 (see section 5 for why not 0)
       AdminTransfer: never      # never activates
       # ... one line per fork, see the template for the full list
 ```
@@ -85,7 +86,9 @@ with `--config-file ./config.yaml --subnet local`.
   datadir has `network: null` in `parameters.yaml` ("external", no built-in schedule), so the
   node will not start until you give it a schedule. The config file is the intended way to do
   that. Start from the template, set `chain_id` to the value you passed to `genesis`, and keep
-  the fork values the template ships with unless you have a reason to change them.
+  the fork values the template ships with unless you have a reason to change them. The
+  template behaves like the baked-in `local` schedule: every current protocol feature is on
+  from the start, and the one-off fixes written for the public networks are off.
 - **You need to activate a hardfork on a running private chain.** Edit the file, set the fork
   to a future block number, distribute the file to every node operator, and have everyone
   restart before that block. No new binary and no re-genesis needed, as long as the binary
@@ -172,13 +175,29 @@ One detail matters for the *migration* forks (`AdminTransfer`, `RlsStorage`, `To
 `Uups`, `Erc20PrecompileBytecode`, `UsdrSupplyCorrection`, `HybridRewards`). These run a
 one-time state change when the chain crosses their activation block. A migration set to `0`
 is considered already active at genesis, so its state change **never runs**. If you want a
-migration to actually execute on a fresh chain, set it to `1` or later. The baked-in `local`
-schedule does exactly this for `Erc20PrecompileBytecode` and `HybridRewards`.
+migration to actually execute on a fresh chain, set it to `1` or later. This is why the
+template sets `HybridRewards: 1` and not `0`: genesis deploys the old reward contract, and
+the swap to the hybrid-reward contract only happens if the migration runs.
 
 The remaining forks (`Eip1559`, `BatchDigestV2`, `PrecompileGasFix`,
 `TransactionLoadBalancing`, `EmptyOutputBlock`, `DynamicCommitteeSizing`,
 `OutputSeqNormalization`, `SenderAffinityLoadBalancing`) are behavior switches. `0` is safe
 for them.
+
+### Template vs. the baked-in `local` schedule
+
+The template is not a byte-for-byte copy of `local`, but on a fresh chain it behaves the
+same. The values that differ have no effect on a new chain:
+
+| Fork | `local` | template | Why the template value is fine |
+|---|---|---|---|
+| `AdminTransfer` | 0 | never | migration at block 0 never runs anyway |
+| `TransactionLoadBalancing` | 0 | never | ignored while `SenderAffinityLoadBalancing` is active |
+| `UsdrSupplyCorrection` | 100 | never | fixes historical supply drift; nothing to fix on a new chain |
+| `Erc20PrecompileBytecode` | 1 | never | the node re-seeds the precompile bytecode itself on every call into it |
+
+Everything else matches, including the three forks that do change behavior:
+`EmptyOutputBlock: 0`, `DynamicCommitteeSizing: 0` and `HybridRewards: 1`.
 
 Once the chain has produced blocks, treat the file as append-only: change `never` to a future
 block to activate a fork, but never move an activation into the past or change a fork that is

@@ -39,8 +39,9 @@ networks:
       Erc20PrecompileBytecode: never
       TransactionLoadBalancing: never
       UsdrSupplyCorrection: never
-      EmptyOutputBlock: never
-      DynamicCommitteeSizing: never
+      EmptyOutputBlock: 0
+      DynamicCommitteeSizing: 0
+      # Reward Distribution is only for public chain.
       HybridRewards: never
       OutputSeqNormalization: 0
       SenderAffinityLoadBalancing: 0
