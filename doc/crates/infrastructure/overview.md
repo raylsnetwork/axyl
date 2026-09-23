@@ -263,8 +263,11 @@ the repository root. With `--config-file`:
 - the selected subnet's `chain_id` and `hardforks` section are the single
   source of truth (installed in a process-wide profile the execution layer
   reads); fork names are case-insensitive, an absent fork stays `never`, every
-  given fork name must be a real one, and `chain_id` is required (all validated
-  before startup);
+  given fork name must be a real one, `chain_id` is required, and a subnet may
+  not declare the chain-id of a baked-in network (mainnet `72957`, testnet
+  `7295799` — those networks always run on their baked-in schedule and are
+  started with `--network`; a subnet declaring one of those chain-ids is
+  refused) (all validated before startup);
 - everything else — genesis, parameters, committee, node identity — comes from
   the datadir, exactly as without the file, so the datadir must be fully
   provisioned as before. At boot the datadir's genesis chain-id is verified

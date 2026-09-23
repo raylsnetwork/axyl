@@ -34,6 +34,10 @@ networks:
   <subnet-name>:
     # Chain-id of this subnet's datadir (verified against the datadir's
     # genesis at boot). Mainnet is 72957; testnet 7295799, devnet 503, local 487.
+    # A subnet may NOT declare the mainnet (72957) or testnet (7295799)
+    # chain-id: those networks always run on their baked-in schedule and are
+    # started with `--network <name>`; a subnet declaring one of those
+    # chain-ids is refused at boot.
     chain_id: <chain-id>
     # Hardfork schedule: Rayls hardfork name -> activation block, or `never`.
     # Every known fork must be defined: a fork missing from this map refuses

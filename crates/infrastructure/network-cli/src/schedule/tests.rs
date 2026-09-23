@@ -1,7 +1,17 @@
 use super::*;
 
+/// Chain-ids for the tests, taken from `RaylsNetwork::chain_id` (the same
+/// source the boot gate compares against) so a changed id updates the tests
+/// instead of leaving a stale literal.
+const MAINNET_CHAIN_ID: u64 = RaylsNetwork::Mainnet.chain_id();
+const TESTNET_CHAIN_ID: u64 = RaylsNetwork::Testnet.chain_id();
+const LOCAL_CHAIN_ID: u64 = RaylsNetwork::Local.chain_id();
+
 mod chain_id_tests {
-    use super::{verify_datadir_chain_id, FileSchedule, SelectedSchedule};
+    use super::{
+        verify_datadir_chain_id, FileSchedule, SelectedSchedule, LOCAL_CHAIN_ID, MAINNET_CHAIN_ID,
+        TESTNET_CHAIN_ID,
+    };
     use rayls_execution_evm::NetworkProfile;
     use rayls_infrastructure_types::RaylsNetwork;
     use std::{collections::BTreeMap, path::PathBuf};
@@ -17,16 +27,23 @@ mod chain_id_tests {
 
     #[test]
     fn matching_chain_id_passes() {
-        assert!(verify_datadir_chain_id(7295799, 7295799, "network 'testnet'").is_ok());
-        assert!(verify_datadir_chain_id(72957, 72957, "subnet 'mainnet' of \"/x/y.yaml\"").is_ok());
+        assert!(verify_datadir_chain_id(TESTNET_CHAIN_ID, TESTNET_CHAIN_ID, "network 'testnet'")
+            .is_ok());
+        assert!(verify_datadir_chain_id(
+            MAINNET_CHAIN_ID,
+            MAINNET_CHAIN_ID,
+            "subnet 'mainnet' of \"/x/y.yaml\"",
+        )
+        .is_ok());
     }
 
     #[test]
     fn mismatched_chain_id_is_refused() {
-        let err = verify_datadir_chain_id(487, 72957, "network 'mainnet'").unwrap_err();
+        let err = verify_datadir_chain_id(LOCAL_CHAIN_ID, MAINNET_CHAIN_ID, "network 'mainnet'")
+            .unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("487"), "{msg}");
-        assert!(msg.contains("72957"), "{msg}");
+        assert!(msg.contains(&LOCAL_CHAIN_ID.to_string()), "{msg}");
+        assert!(msg.contains(&MAINNET_CHAIN_ID.to_string()), "{msg}");
         assert!(msg.contains("network 'mainnet'"), "{msg}");
     }
 
@@ -34,27 +51,31 @@ mod chain_id_tests {
     fn mismatched_chain_id_names_the_config_file() {
         // A file-schedule source names the subnet and the file, so the refusal
         // tells the operator which config file carries the wrong chain-id.
-        let err = verify_datadir_chain_id(487, 72957, "subnet 'mainnet' of \"/x/client.yaml\"")
-            .unwrap_err();
+        let err = verify_datadir_chain_id(
+            LOCAL_CHAIN_ID,
+            MAINNET_CHAIN_ID,
+            "subnet 'mainnet' of \"/x/client.yaml\"",
+        )
+        .unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("487"), "{msg}");
-        assert!(msg.contains("72957"), "{msg}");
+        assert!(msg.contains(&LOCAL_CHAIN_ID.to_string()), "{msg}");
+        assert!(msg.contains(&MAINNET_CHAIN_ID.to_string()), "{msg}");
         assert!(msg.contains("subnet 'mainnet'"), "{msg}");
         assert!(msg.contains("client.yaml"), "{msg}");
     }
 
     #[test]
     fn file_schedule_wins_over_network() {
-        let file = file_schedule(72957);
+        let file = file_schedule(MAINNET_CHAIN_ID);
         let selected = SelectedSchedule::select(Some(&file), Some(RaylsNetwork::Testnet)).unwrap();
-        assert_eq!(selected.profile.chain_id, 72957);
+        assert_eq!(selected.profile.chain_id, MAINNET_CHAIN_ID);
         assert_eq!(selected.source, "subnet 'mainnet' of \"/x/y.yaml\"");
     }
 
     #[test]
     fn network_flag_resolves_to_the_builtin_profile() {
         let selected = SelectedSchedule::select(None, Some(RaylsNetwork::Local)).unwrap();
-        assert_eq!(selected.profile.chain_id, 487);
+        assert_eq!(selected.profile.chain_id, LOCAL_CHAIN_ID);
         assert_eq!(selected.source, "network 'local'");
         // The built-in profile is a complete schedule (passes the completeness gate).
         selected.profile.validate_hardforks().unwrap();
@@ -71,11 +92,12 @@ mod chain_id_tests {
 }
 
 mod config_file_tests {
-    use super::FileSchedule;
+    use super::{FileSchedule, LOCAL_CHAIN_ID, MAINNET_CHAIN_ID, TESTNET_CHAIN_ID};
     use rayls_execution_evm::{
         network_profile::{ForkActivation, ForkName, NetworkConfigFile, NetworkProfile},
         RaylsHardFork,
     };
+    use rayls_infrastructure_types::RaylsNetwork;
     use std::collections::BTreeMap;
 
     /// A valid profile: every known fork pinned, so only the case under test
@@ -85,7 +107,7 @@ mod config_file_tests {
             .iter()
             .map(|fork| (ForkName::from(fork.name()), ForkActivation::Never))
             .collect();
-        NetworkProfile { chain_id: 487, hardforks }
+        NetworkProfile { chain_id: LOCAL_CHAIN_ID, hardforks }
     }
 
     fn write_config(dir: &std::path::Path, name: &str, yaml: &str) -> std::path::PathBuf {
@@ -111,8 +133,51 @@ mod config_file_tests {
         let path = write_profile(dir.path(), "client.yaml", &complete_local_profile());
         let file = FileSchedule::load(&path, "local").expect("complete file loads");
         let profile = file.profile;
-        assert_eq!(profile.chain_id, 487);
+        assert_eq!(profile.chain_id, LOCAL_CHAIN_ID);
         assert_eq!(profile.hardforks.len(), RaylsHardFork::VARIANTS.len());
+    }
+
+    #[test]
+    fn config_file_mainnet_chain_id_is_refused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut profile = complete_local_profile();
+        profile.chain_id = RaylsNetwork::Mainnet.chain_id();
+        let path = write_profile(dir.path(), "client.yaml", &profile);
+        let err = FileSchedule::load(&path, "local").unwrap_err();
+        let msg = err.to_string();
+        // The refusal names the baked-in network and its remedy.
+        assert!(msg.contains(&MAINNET_CHAIN_ID.to_string()), "{msg}");
+        assert!(msg.contains("mainnet"), "{msg}");
+        assert!(msg.contains("--network mainnet"), "{msg}");
+        assert!(msg.contains("subnet 'local'"), "{msg}");
+        assert!(msg.contains("client.yaml"), "{msg}");
+    }
+
+    #[test]
+    fn config_file_testnet_chain_id_is_refused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut profile = complete_local_profile();
+        profile.chain_id = RaylsNetwork::Testnet.chain_id();
+        let path = write_profile(dir.path(), "client.yaml", &profile);
+        let err = FileSchedule::load(&path, "local").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains(&TESTNET_CHAIN_ID.to_string()), "{msg}");
+        assert!(msg.contains("testnet"), "{msg}");
+        assert!(msg.contains("--network testnet"), "{msg}");
+        assert!(msg.contains("subnet 'local'"), "{msg}");
+        assert!(msg.contains("client.yaml"), "{msg}");
+    }
+
+    #[test]
+    fn config_file_devnet_chain_id_still_loads() {
+        // Only the baked-in mainnet/testnet chain-ids are protected; a devnet
+        // (or local) subnet keeps working from a config file.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut profile = complete_local_profile();
+        profile.chain_id = RaylsNetwork::Devnet.chain_id();
+        let path = write_profile(dir.path(), "client.yaml", &profile);
+        let file = FileSchedule::load(&path, "local").expect("devnet chain-id loads");
+        assert_eq!(file.profile.chain_id, RaylsNetwork::Devnet.chain_id());
     }
 
     #[test]
@@ -155,8 +220,11 @@ mod config_file_tests {
     #[test]
     fn config_file_empty_hardforks_is_refused() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let path =
-            write_config(dir.path(), "empty.yaml", "networks:\n  local:\n    chain_id: 487\n");
+        let path = write_config(
+            dir.path(),
+            "empty.yaml",
+            &format!("networks:\n  local:\n    chain_id: {LOCAL_CHAIN_ID}\n"),
+        );
         let err = FileSchedule::load(&path, "local").unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("defines no `hardforks`"), "{msg}");
@@ -198,7 +266,7 @@ mod config_file_tests {
         let path = write_config(
             dir.path(),
             "bad.yaml",
-            "networks:\n  local:\n    chain_id: 487\n    hardforks:\n      Eip1559: someday\n",
+            &format!("networks:\n  local:\n    chain_id: {LOCAL_CHAIN_ID}\n    hardforks:\n      Eip1559: someday\n"),
         );
         let err = FileSchedule::load(&path, "local").unwrap_err();
         let msg = format!("{err:#}");
@@ -208,7 +276,7 @@ mod config_file_tests {
 }
 
 mod schedule_record_tests {
-    use super::verify_schedule_record;
+    use super::{verify_schedule_record, LOCAL_CHAIN_ID};
     use clap::Parser;
     use rayls_execution_evm::{
         network_profile::{ForkActivation, ForkName, NetworkProfile},
@@ -253,7 +321,7 @@ mod schedule_record_tests {
             hardforks.insert(ForkName::from(entry.fork.name()), activation);
         }
         hardforks.insert(ForkName::from(fork), ForkActivation::Block(to));
-        NetworkProfile { chain_id: 487, hardforks }
+        NetworkProfile { chain_id: LOCAL_CHAIN_ID, hardforks }
     }
 
     fn boot(dir: &Path, config: &RethConfig, network: RaylsNetwork) -> eyre::Result<()> {
@@ -269,7 +337,7 @@ mod schedule_record_tests {
         let raw = std::fs::read_to_string(dir.path().join("schedule-record.yaml"))
             .expect("record written");
         let record: ScheduleRecord = serde_yaml::from_str(&raw).expect("record parses");
-        assert_eq!(record.chain_id, 487);
+        assert_eq!(record.chain_id, LOCAL_CHAIN_ID);
         assert_eq!(record.as_of_block, 0);
         assert_eq!(
             record.hardforks.get(&ForkName::from("Eip1559")),
@@ -337,8 +405,12 @@ mod schedule_record_tests {
         }
         std::fs::write(
             dir.path().join("schedule-record.yaml"),
-            serde_yaml::to_string(&ScheduleRecord { chain_id: 487, as_of_block: 0, hardforks })
-                .expect("record serializes"),
+            serde_yaml::to_string(&ScheduleRecord {
+                chain_id: LOCAL_CHAIN_ID,
+                as_of_block: 0,
+                hardforks,
+            })
+            .expect("record serializes"),
         )
         .expect("record written");
         set_head(&config, dir.path(), 10);
@@ -377,8 +449,12 @@ mod schedule_record_tests {
         }
         std::fs::write(
             dir.path().join("schedule-record.yaml"),
-            serde_yaml::to_string(&ScheduleRecord { chain_id: 487, as_of_block: 0, hardforks })
-                .expect("record serializes"),
+            serde_yaml::to_string(&ScheduleRecord {
+                chain_id: LOCAL_CHAIN_ID,
+                as_of_block: 0,
+                hardforks,
+            })
+            .expect("record serializes"),
         )
         .expect("record written");
         set_head(&config, dir.path(), 10);

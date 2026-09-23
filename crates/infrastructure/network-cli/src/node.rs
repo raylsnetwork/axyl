@@ -143,7 +143,10 @@ pub struct NodeCommand<Ext: clap::Args + fmt::Debug = NoArgs> {
     /// this node runs, and its `hardforks` section replaces the schedule baked
     /// into the binary. Everything else (genesis, parameters, committee, node
     /// identity) still comes from the datadir, exactly as without the file.
-    /// Cannot be combined with `--network`.
+    /// A subnet may not declare the chain-id of a baked-in network (mainnet
+    /// `72957`, testnet `7295799`) — those networks always run on their
+    /// baked-in schedule and are started with `--network`. Cannot be combined
+    /// with `--network`.
     #[arg(long, value_name = "PATH", value_hint = ValueHint::FilePath, requires = "subnet", conflicts_with = "network")]
     pub config_file: Option<PathBuf>,
 

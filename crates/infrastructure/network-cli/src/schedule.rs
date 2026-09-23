@@ -87,13 +87,29 @@ pub struct FileSchedule {
     profile: NetworkProfile,
 }
 
+/// The built-in network whose chain-id is `id`, when `id` is one of the
+/// networks a config file may never redefine.
+///
+/// Mainnet and testnet always run on the schedule baked into the binary
+/// (started with `--network mainnet|testnet`); letting a client config file
+/// carry their chain-id would let a per-client file redefine a shared
+/// network's schedule, so a subnet declaring one of these chain-ids is
+/// refused at load time.
+fn baked_in_network(id: u64) -> Option<RaylsNetwork> {
+    [RaylsNetwork::Mainnet, RaylsNetwork::Testnet]
+        .into_iter()
+        .find(|network| network.chain_id() == id)
+}
+
 impl FileSchedule {
     /// Load the client's network config file and select the requested subnet.
     ///
-    /// Validates the profile's `hardforks` map before the node starts: every entry
-    /// must be a known fork and every known fork must be defined (a stale file
-    /// that omits a newly added fork would otherwise run that fork as `never`). A
-    /// broken or stale file fails fast with an actionable message.
+    /// Validates the profile before the node starts: the subnet's `chain_id`
+    /// must not be a baked-in network's (mainnet/testnet run on `--network`,
+    /// never a config file), and its `hardforks` map must name only known
+    /// forks with every known fork defined (a stale file that omits a newly
+    /// added fork would otherwise run that fork as `never`). A broken or
+    /// stale file fails fast with an actionable message.
     pub fn load(config_file: &Path, subnet: &str) -> eyre::Result<Self> {
         let yaml = std::fs::read_to_string(config_file)
             .wrap_err_with(|| format!("failed to read network config file {config_file:?}"))?;
@@ -105,6 +121,14 @@ impl FileSchedule {
                 "subnet '{subnet}' not found in {config_file:?}; available subnets: {known}"
             )
         })?;
+        if let Some(network) = baked_in_network(profile.chain_id) {
+            eyre::bail!(
+                "subnet '{subnet}' in {config_file:?} declares chain-id {}, the chain-id of the \
+                 baked-in {network} network; {network} must be started with `--network {network}`, \
+                 not `--config-file`",
+                profile.chain_id
+            );
+        }
         if profile.hardforks.is_empty() {
             eyre::bail!(
                 "subnet '{subnet}' in {config_file:?} defines no `hardforks`; every subnet must \
