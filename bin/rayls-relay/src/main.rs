@@ -473,6 +473,10 @@ mod tests {
         SwarmBuilder::with_existing_identity(key)
             .with_tokio()
             .with_quic_config(|c| QuicConfig::default().apply(c))
+            // YAMUX BACKEND GUARD (CVE-2026-32314): pass a bare `yamux::Config::default` with no
+            // setters. Any setter (or `yamux::Config::client()/server()`) would flip libp2p-yamux
+            // 0.47's dual backend from the patched yamux 0.13.10 to yamux 0.12.1. See .trivyignore
+            // (CVE-2026-32314).
             .with_relay_client(noise::Config::new, yamux::Config::default)
             .expect("relay client transport")
             .with_behaviour(|_key, relay| RelayClient { relay })
