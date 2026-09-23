@@ -6,9 +6,15 @@ Thanks for contributing to Axyl. A few notes before you file:
 - The CI runs `cargo fmt --check`, `cargo clippy`, and the workspace tests on every push.
 -->
 
+## The problem
+
+<!-- What is broken, missing, or painful today, and who hits it? A short paragraph in plain words, before any mention of the fix. Link the issue or incident if there is one. -->
+
+
+
 ## Summary
 
-<!-- 1–3 bullets describing what this PR changes and why. Link to the issue it closes or references. -->
+<!-- 1–3 bullets describing what this PR changes to solve the problem above. Link to the issue it closes or references. -->
 
 -
 
