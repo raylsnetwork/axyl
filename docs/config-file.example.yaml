@@ -1,4 +1,5 @@
 # Template for a new client's network configuration file.
+# Full guide (how, when, chain-id checks): docs/config-file.md
 #
 # Copy to <client>.yaml, fill in one entry per subnet this client operates.
 # The number of subnets is not fixed - each client defines its own.
@@ -38,6 +39,9 @@ networks:
       Erc20PrecompileBytecode: never
       TransactionLoadBalancing: never
       UsdrSupplyCorrection: never
-      EmptyOutputBlock: never
-      DynamicCommitteeSizing: never
+      EmptyOutputBlock: 0
+      DynamicCommitteeSizing: 0
+      # Reward Distribution is only for public chain.
       HybridRewards: never
+      OutputSeqNormalization: 0
+      SenderAffinityLoadBalancing: 0

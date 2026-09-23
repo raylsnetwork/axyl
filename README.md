@@ -132,6 +132,7 @@ Documentation lives in [`doc/`](doc/):
 - [System overview](doc/index.md) — architecture, transaction flow, database tables, RPC.
 - [Crate index](doc/crates/index.md) — every workspace crate with per-domain overviews.
 - [Dev mode](doc/dev-mode.md), [gasless mode](doc/gasless-mode.md), [node lifecycle](doc/node-lifecycle.md).
+- [Hardfork config file](docs/config-file.md) — run a private chain or schedule a hardfork with `--config-file` / `--subnet`.
 
 Contributions are welcome — see [CONTRIBUTING.md](./CONTRIBUTING.md) and our [Code of Conduct](./CODE_OF_CONDUCT.md).
 
