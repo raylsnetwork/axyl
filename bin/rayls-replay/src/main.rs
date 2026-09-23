@@ -152,7 +152,11 @@ fn main() -> eyre::Result<()> {
         target: "rayls_replay::main",
         snapshot_datadir = %cli.snapshot_datadir.display(),
         archive_out = %cli.archive_out.display(),
-        network = %cli.network,
+        network = if cli.config_file.is_some() {
+            "overridden by --config-file".to_string()
+        } else {
+            cli.network.to_string()
+        },
         config_file = ?cli.config_file,
         subnet = ?cli.subnet,
         "rayls-replay starting"
@@ -580,7 +584,7 @@ fn init_tracing(
 /// record (taken before the feature) is trusted, like the node's no-record
 /// path, minus the write.
 fn verify_snapshot_schedule_record(
-    snapshot_datadir: &PathBuf,
+    snapshot_datadir: &Path,
     chain: &Arc<RethChainSpec>,
     profile: &NetworkProfile,
 ) -> eyre::Result<()> {

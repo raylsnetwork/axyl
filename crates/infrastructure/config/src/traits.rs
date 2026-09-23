@@ -155,7 +155,7 @@ pub trait RaylsDirs: std::fmt::Debug + Send + Sync + 'static {
     }
 }
 
-impl<P> RaylsDirs for P
+impl<P: ?Sized> RaylsDirs for P
 where
     P: AsRef<Path> + std::fmt::Debug + Send + Sync + 'static,
 {

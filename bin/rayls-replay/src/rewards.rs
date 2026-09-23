@@ -21,7 +21,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     sync::{Arc, OnceLock},
 };
-use tracing::info;
+use tracing::{info, warn};
 
 /// Shared epoch -> committed-tally store.
 ///
@@ -158,8 +158,11 @@ impl RewardsBackend for SnapshotRewardsBackend {
 }
 
 /// Rows of a later epoch tolerated past an epoch boundary before the walk stops.
-/// Leader epochs are non-decreasing in consensus block number, so this only guards
-/// against a boundary that interleaves by a handful of rows.
+/// Leader epochs are non-decreasing in consensus block number, so a well-formed
+/// boundary interleaves by at most a handful of rows; 16 was chosen well above
+/// any observed interleave depth. The cap should therefore almost never fire —
+/// it is a safety net against interleaved or corrupt rows, not a functional
+/// bound, so the exact value is not load-bearing. A firing cap is logged.
 const BOUNDARY_LOOKAHEAD: u32 = 16;
 
 /// Forward, cursor-based hybrid tally over the snapshot's `ConsensusBlocks`.
@@ -215,10 +218,11 @@ impl<DB: Database> BoundedHybridWalker<DB> {
         Ok(None)
     }
 
-    /// Smallest key in `first_key..=last_key + 1` whose leader epoch is `>= epoch`
-    /// (binary search; leader epochs are non-decreasing in consensus block number).
+    /// Smallest key in `first_key..=last_key + 1` (saturating at `u64::MAX`) whose
+    /// leader epoch is `>= epoch` (binary search; leader epochs are non-decreasing
+    /// in consensus block number).
     fn position(txn: &impl DbTx, epoch: Epoch, first_key: u64, last_key: u64) -> eyre::Result<u64> {
-        let (mut lo, mut hi) = (first_key, last_key + 1);
+        let (mut lo, mut hi) = (first_key, last_key.saturating_add(1));
         while lo < hi {
             let mid = lo + (hi - lo) / 2;
             match Self::epoch_at(txn, mid, last_key)? {
@@ -282,17 +286,17 @@ impl<DB: Database> RewardsBackend for BoundedHybridWalker<DB> {
 
                 let mut per_address: BTreeMap<Address, ValidatorRoundTally> = BTreeMap::new();
                 let mut total_rounds: u32 = 0;
-                let mut walked: u64 = 0;
+                let mut rows_read: u64 = 0;
                 let mut seen: BTreeSet<Address> = BTreeSet::new();
                 let mut next_epoch_start: Option<u64> = None;
-                let mut lookahead: u32 = 0;
+                let mut lookahead_rows: u32 = 0;
                 let mut k = start;
                 while k <= last_key {
                     let Some(bytes) = txn.raw_get::<ConsensusBlocks>(&k)? else {
                         k += 1;
                         continue;
                     };
-                    walked += 1;
+                    rows_read += 1;
                     let meta = ConsensusHeaderParticipation::from_bytes(&bytes)?;
                     k += 1;
 
@@ -300,8 +304,14 @@ impl<DB: Database> RewardsBackend for BoundedHybridWalker<DB> {
                         // first row of a later epoch is where the next close starts; keep
                         // reading a few rows in case the boundary interleaves, then stop.
                         next_epoch_start.get_or_insert(k - 1);
-                        lookahead += 1;
-                        if lookahead > BOUNDARY_LOOKAHEAD {
+                        lookahead_rows += 1;
+                        if lookahead_rows > BOUNDARY_LOOKAHEAD {
+                            warn!(
+                                target: "rayls_replay::rewards",
+                                epoch, key = k - 1, lookahead_rows,
+                                "epoch boundary lookahead cap exceeded; stopping the walk \
+                                 (rows of this epoch past the cap were not credited)"
+                            );
                             break;
                         }
                         continue;
@@ -340,7 +350,7 @@ impl<DB: Database> RewardsBackend for BoundedHybridWalker<DB> {
                 *cursor = Some(next);
                 info!(
                     target: "rayls_replay::rewards",
-                    epoch, start, next_start = next, walked, total_rounds,
+                    epoch, start, next_start = next, rows_read, lookahead_rows, total_rounds,
                     "hybrid walk done"
                 );
                 Ok(HybridEpochTally { per_address, total_rounds })
