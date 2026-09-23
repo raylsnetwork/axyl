@@ -87,9 +87,13 @@ sequenceDiagram
    with the snapshot's committed leader tally, read from that block's withdrawals
    and staged into a snapshot-backed `RewardsBackend`. Post-fork close blocks need
    per-validator participation rounds, which a block does not preserve; those are
-   recomputed with the live node's `ConsensusBlocks` walk over the snapshot's
-   consensus DB and held to the block's withdrawals (leader rounds must agree, or
-   the replay aborts as a consensus/execution divergence).
+   recomputed by a forward, cursor-bounded walk over the snapshot's consensus DB
+   (`BoundedHybridWalker`, same crediting as the live node's walker) and held to the
+   block's withdrawals (leader rounds must agree, or the replay aborts as a
+   consensus/execution divergence). The live walker iterates `ConsensusBlocks` in
+   reverse from the newest row; against a snapshot that runs millions of rows past
+   the closing epoch that is a full tail scan per epoch close, so the replay reads
+   each epoch's rows exactly once by keyed lookup instead.
 
 ## Usage
 
@@ -121,6 +125,16 @@ It must match the network the snapshot came from; with a local or devnet snapsho
 pass the matching `--chain` so the hardfork activation blocks line up with the
 on-disk genesis.
 
+### Historical schedules (`--config-file`)
+
+A replay has to apply the schedule the network *actually executed*, block by block.
+A baked-in `--chain` profile describes a network's intended schedule, which is not
+always what it ran: devnet, for example, was launched with `RAYLS_NETWORK=local` and
+followed the local schedule from genesis, so `--chain devnet` diverges at block 1.
+`etc/docker-replay/networks.yaml` (shipped in the image at `/etc/rayls/networks.yaml`)
+records the historical schedules; select one with
+`--config-file /etc/rayls/networks.yaml --subnet devnet` instead of `--chain`.
+
 ### Resuming
 
 `--unwind-to <BLOCK>` reverts the archive datadir (MDBX, static files, RocksDB)
@@ -137,6 +151,8 @@ resume from the unwound tip. Use this to retry a run that diverged partway.
 | `--genesis <PATH>` | `<snapshot>/genesis/genesis.yaml` | Override genesis YAML. Must exist (no embedded fallback). |
 | `--parameters <PATH>` | `<snapshot>/parameters.yaml` | Override parameters YAML. Must exist (no embedded fallback). Sets `basefee_address`, critical for state parity. |
 | `--chain <CHAIN>` | `mainnet` | `mainnet`, `testnet`, `local`, `devnet`. Selects the hardfork schedule. |
+| `--config-file <PATH>` | off | Network config YAML (node `--config-file` format). With `--subnet`, that subnet's `hardforks` replace the baked-in `--chain` schedule for both envs. The image ships `/etc/rayls/networks.yaml` with the schedules networks historically ran. |
+| `--subnet <NAME>` | off | Subnet to select inside `--config-file`. Its `chain_id` must match the snapshot genesis. |
 | `--from-block <N>` | `1` | First block to replay (inclusive). |
 | `--to-block <N>` | snapshot tip | Last block to replay (inclusive). Clamped to the tip. |
 | `--unwind-to <BLOCK>` | off | Unwind the archive to this block and exit. |
