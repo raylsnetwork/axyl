@@ -5,12 +5,16 @@
 
 use clap::Parser;
 use eyre::{eyre, Context};
-use rayls_execution_evm::{reth_env::RethEnv, set_active_profile, NetworkConfigFile};
-use rayls_infrastructure_config::Parameters;
+use rayls_execution_evm::{
+    reth_env::{RethCommand, RethConfig, RethEnv},
+    set_active_profile, verify_schedule, NetworkProfile, ScheduleRecord,
+};
+use rayls_infrastructure_config::{Parameters, RaylsDirs};
 use rayls_infrastructure_storage::open_db;
 use rayls_infrastructure_types::{
     rewards::RewardsCounter, Address, Genesis, RaylsNetwork, TaskManager,
 };
+use rayls_network_cli::schedule::{verify_datadir_chain_id, FileSchedule, SelectedSchedule};
 use rayls_replay::{
     rewards::{BoundedHybridWalker, HybridTallySource, SnapshotRewardsBackend, SnapshotTallyStore},
     run_replay, verify_chainspec_compatibility, ReplayConfig,
@@ -63,19 +67,20 @@ struct Cli {
     #[arg(long, value_name = "PATH")]
     parameters: Option<PathBuf>,
 
-    /// Rayls network hardfork profile: `mainnet`, `testnet`, `local`, `devnet`.
-    /// Selects which baked-in hardfork schedule to apply (the replay analogue of the
-    /// node's `--network`); it no longer selects a genesis/parameters source.
+    /// Rayls network: `mainnet`, `testnet`, `local`, `devnet` — the same flag as the
+    /// node's `--network`. Selects the baked-in hardfork schedule applied to both envs;
+    /// the network's chain-id must match the snapshot genesis or the boot refuses.
     #[arg(long, value_enum, default_value_t = RaylsNetwork::Mainnet)]
-    chain: RaylsNetwork,
+    network: RaylsNetwork,
 
     /// Network config file (YAML) holding named subnets, each with a `chain_id` and a
     /// `hardforks` schedule (the same format the node takes via `--config-file`).
-    /// With `--subnet`, that subnet's schedule replaces the baked-in `--chain` profile
+    /// With `--subnet`, that subnet's schedule replaces the baked-in `--network` profile
     /// for both the snapshot and the archive env. Use it when a network historically
-    /// ran a schedule that differs from its baked-in profile; the image ships one at
-    /// `/etc/rayls/networks.yaml`. The subnet's `chain_id` must match the genesis.
-    #[arg(long, value_name = "PATH", requires = "subnet", conflicts_with = "chain")]
+    /// ran a schedule that differs from its baked-in profile. The subnet's
+    /// `chain_id` must match the genesis, and a subnet may not declare a baked-in
+    /// network's chain-id (mainnet/testnet run on `--network`, never a config file).
+    #[arg(long, value_name = "PATH", requires = "subnet", conflicts_with = "network")]
     config_file: Option<PathBuf>,
 
     /// Subnet name to select inside `--config-file`.
@@ -147,7 +152,7 @@ fn main() -> eyre::Result<()> {
         target: "rayls_replay::main",
         snapshot_datadir = %cli.snapshot_datadir.display(),
         archive_out = %cli.archive_out.display(),
-        chain = %cli.chain,
+        network = %cli.network,
         config_file = ?cli.config_file,
         subnet = ?cli.subnet,
         "rayls-replay starting"
@@ -172,19 +177,25 @@ async fn run(cli: Cli) -> eyre::Result<()> {
 
     let base_chain = base_chain_spec(&genesis_path)?;
 
-    // An external schedule wins over the baked-in `--chain` profile: `RethEnv::new`
-    // consults the active profile first, so install it before either env is built.
-    if let (Some(path), Some(subnet)) = (&cli.config_file, &cli.subnet) {
-        let profile = load_subnet_profile(path, subnet, base_chain.chain().id())?;
-        info!(
-            target: "rayls_replay::main",
-            config_file = %path.display(),
-            subnet,
-            hardforks = ?profile.hardforks,
-            "using hardfork schedule from network config file (overrides --chain)"
-        );
-        set_active_profile(profile).map_err(|e| eyre!("install network profile: {e}"))?;
-    }
+    // Select and verify the hardfork schedule exactly like the node's boot gate,
+    // then install it: `RethEnv::new` consults the active profile first, so the
+    // profile must be set before either env is built. The profile is process-global,
+    // so a refused gate (any check above the install) must not leave it set.
+    let file_schedule = match (&cli.config_file, &cli.subnet) {
+        (Some(path), Some(subnet)) => Some(FileSchedule::load(path, subnet)?),
+        _ => None,
+    };
+    let selected = SelectedSchedule::select(file_schedule.as_ref(), Some(cli.network))?;
+    verify_datadir_chain_id(base_chain.chain().id(), selected.profile.chain_id, &selected.source)?;
+    verify_snapshot_schedule_record(&cli.snapshot_datadir, &base_chain, &selected.profile)?;
+    info!(
+        target: "rayls_replay::main",
+        source = %selected.source,
+        chain_id = selected.profile.chain_id,
+        hardforks = ?selected.profile.hardforks,
+        "hardfork schedule selected"
+    );
+    set_active_profile(selected.profile)?;
     let NetworkParams { basefee_address, min_base_fee } = network_params(&parameters_path)?;
     info!(
         target: "rayls_replay::main",
@@ -212,7 +223,7 @@ async fn run(cli: Cli) -> eyre::Result<()> {
         Arc::clone(&base_chain),
         &cli.archive_out,
         &archive_task_manager,
-        cli.chain,
+        cli.network,
         basefee_address,
         Some(min_base_fee),
         cli.storage_v2,
@@ -273,7 +284,7 @@ async fn run(cli: Cli) -> eyre::Result<()> {
         Arc::clone(&base_chain),
         &cli.snapshot_datadir,
         &snapshot_task_manager,
-        cli.chain,
+        cli.network,
         basefee_address,
         Some(min_base_fee),
         cli.storage_v2,
@@ -556,39 +567,62 @@ fn init_tracing(
     Ok((stdout_guard, file_guard))
 }
 
-/// Load `subnet` from the network config file at `path` and check it against the
-/// genesis chain-id, mirroring the node's own `--config-file`/`--subnet` validation.
+/// Verify the selected hardfork schedule against the snapshot's schedule record,
+/// when the snapshot carries one.
 ///
-/// Every key in `hardforks` must be a known Rayls fork, the schedule must not be
-/// empty, and the subnet's `chain_id` must equal the genesis chain-id: a schedule
-/// for another network would silently diverge state at its first differing fork.
-fn load_subnet_profile(
-    path: &Path,
-    subnet: &str,
-    genesis_chain_id: u64,
-) -> eyre::Result<rayls_execution_evm::NetworkProfile> {
-    let yaml = std::fs::read_to_string(path)
-        .wrap_err_with(|| format!("read network config file {}", path.display()))?;
-    let file: NetworkConfigFile = serde_yaml::from_str(&yaml)
-        .wrap_err_with(|| format!("parse network config file {}", path.display()))?;
-    let profile = file.subnet(subnet).cloned().ok_or_else(|| {
-        let known = file.networks.keys().cloned().collect::<Vec<_>>().join(", ");
-        eyre!("subnet '{subnet}' not found in {}; available subnets: {known}", path.display())
-    })?;
-    profile.validate_hardforks()?;
-    if profile.hardforks.is_empty() {
-        eyre::bail!(
-            "subnet '{subnet}' in {} defines no `hardforks`; a replay schedule must list \
-             every fork as a block number or \"never\"",
-            path.display()
+/// A snapshot taken from a node running the schedule-record boot gate carries
+/// `schedule-record.yaml`, pinning the schedule its executed blocks ran under.
+/// A selection that moves an already-executed fork (or back-dates one into the
+/// executed history) would re-interpret the snapshot's blocks and silently
+/// diverge state, so this refuses it; future boundary moves are reported.
+/// Read-only: replay never writes into the snapshot datadir — the node's gate
+/// re-records, and there is no record here to update. A snapshot without a
+/// record (taken before the feature) is trusted, like the node's no-record
+/// path, minus the write.
+fn verify_snapshot_schedule_record(
+    snapshot_datadir: &PathBuf,
+    chain: &Arc<RethChainSpec>,
+    profile: &NetworkProfile,
+) -> eyre::Result<()> {
+    let path = snapshot_datadir.schedule_record_path();
+    let raw = match std::fs::read_to_string(&path) {
+        Ok(raw) => raw,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            warn!(
+                target: "rayls_replay::main",
+                ?path,
+                "snapshot has no schedule record; trusting the selected schedule (the \
+                 executed-history check is unavailable)"
+            );
+            return Ok(());
+        }
+        Err(e) => {
+            return Err(e).wrap_err_with(|| format!("read schedule record {}", path.display()))
+        }
+    };
+    let record: ScheduleRecord = serde_yaml::from_str(&raw)
+        .wrap_err_with(|| format!("parse schedule record {}", path.display()))?;
+    // The executed head reth tracks: the `Finish` stage checkpoint. A single keyed
+    // read over a fresh db handle — the snapshot env is not built yet.
+    let reth = RethCommand::parse_from(["rayls-replay"]);
+    let node_config = RethConfig::new(reth, None, snapshot_datadir, false, Arc::clone(chain));
+    let head = RethEnv::best_block_number(&node_config, snapshot_datadir.reth_db_path())
+        .wrap_err_with(|| format!("read the snapshot's executed head for {}", path.display()))?;
+    for move_ in verify_schedule(&record, profile, head, &path)? {
+        warn!(
+            target: "rayls_replay::main",
+            fork = move_.fork.name(),
+            ?move_.recorded,
+            ?move_.selected,
+            %head,
+            "selected schedule moves a future hardfork boundary recorded in the snapshot"
         );
     }
-    if profile.chain_id != genesis_chain_id {
-        eyre::bail!(
-            "subnet '{subnet}' has chain_id {} but the snapshot genesis has chain-id \
-             {genesis_chain_id}; pick the subnet that matches the snapshot",
-            profile.chain_id
-        );
-    }
-    Ok(profile)
+    info!(
+        target: "rayls_replay::main",
+        ?path,
+        %head,
+        "snapshot schedule record verified against the selected schedule"
+    );
+    Ok(())
 }
