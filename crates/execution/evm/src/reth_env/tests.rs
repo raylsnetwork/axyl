@@ -1276,7 +1276,7 @@ async fn test_hybrid_rewards_fork_boundary() -> eyre::Result<()> {
         epochDuration: epoch_duration,
     };
 
-    let mut governance_multisig =
+    let governance_multisig =
         TransactionFactory::new_random_from_seed(&mut StdRng::seed_from_u64(33));
     let governance = governance_multisig.address();
     let tmp_genesis = rayls_infrastructure_types::test_genesis().extend_accounts([(

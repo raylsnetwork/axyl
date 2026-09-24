@@ -174,6 +174,9 @@ pub fn open_db_with_consensus_config<Path: AsRef<std::path::Path> + Send>(
     // set.
     #[cfg(all(feature = "reth-libmdbx", not(feature = "redb")))]
     return _open_mdbx(store_path, consensus_db_config);
+    // redb has no MDBX config to consume.
+    #[cfg(feature = "redb")]
+    let _ = consensus_db_config;
     #[cfg(feature = "redb")]
     return _open_redb(store_path);
     panic!("No DB configured!")
@@ -667,4 +670,9 @@ mod test {
             assert_eq!(Some(v), val);
         }
     }
+}
+
+#[cfg(test)]
+mod clippy {
+    use criterion as _;
 }

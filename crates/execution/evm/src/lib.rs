@@ -59,3 +59,9 @@ pub use reth_chainspec::ForkCondition;
 
 #[cfg(any(feature = "test-utils", test))]
 pub mod test_utils;
+
+#[cfg(test)]
+mod clippy {
+    use criterion as _;
+    use rayls_execution_evm as _;
+}
