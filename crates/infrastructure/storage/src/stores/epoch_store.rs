@@ -21,7 +21,8 @@ pub trait EpochStore {
     /// record-without-cert half-state on disk.
     fn save_epoch_record(&self, epoch_rec: &EpochRecord) -> StoreResult<()>;
 
-    /// Save an epoch record with its certificate.
+    /// Save an epoch record with its certificate. Also removes the epoch's
+    /// [`PendingEpochRecord`] row, if any, in the same transaction.
     fn save_epoch_record_with_cert(
         &self,
         epoch_rec: &EpochRecord,
@@ -36,19 +37,22 @@ pub trait EpochStore {
         -> Option<(EpochRecord, Option<EpochCertificate>)>;
 
     /// Persist the record for a just-closed epoch before it is certified, as a resume hint for
-    /// bootstrap/retry. Overwrites any previously pending record - only the newest closed epoch
-    /// still awaiting a cert is ever meaningful. Never read as a substitute for a certified
-    /// record: callers still only trust [`EpochStore::get_epoch_by_number`]'s cert-bearing result
-    /// for `parent_hash`/committee derivation.
+    /// bootstrap/retry. Keyed by epoch: a later close never displaces an earlier epoch that is
+    /// still awaiting its cert, since the chain can advance past an uncertified epoch (#142) and
+    /// each one must be resumable independently. Re-saving the same epoch overwrites in place.
+    /// Never read as a substitute for a certified record: callers still only trust
+    /// [`EpochStore::get_epoch_by_number`]'s cert-bearing result for `parent_hash`/committee
+    /// derivation.
     fn save_pending_epoch_record(&self, epoch_rec: &EpochRecord) -> StoreResult<()>;
 
-    /// Retrieve the pending (not yet certified) epoch record, if one is stored.
-    fn get_pending_epoch_record(&self) -> Option<EpochRecord>;
+    /// Retrieve every pending (not yet certified) epoch record, oldest epoch first.
+    fn pending_epoch_records(&self) -> Vec<EpochRecord>;
 
-    /// Remove the pending epoch record, but only if it is still the one for `epoch`.
+    /// Remove the pending epoch record for `epoch`. A no-op if none is stored; other epochs'
+    /// pending entries are never touched.
     ///
-    /// A no-op if the stored pending entry belongs to a different (newer) epoch, so a stale
-    /// caller can never clobber a more recent pending write.
+    /// Normally unnecessary: [`EpochStore::save_epoch_record_with_cert`] removes the row itself.
+    /// Kept for the defensive sweep of rows whose epoch turns out to be certified already.
     fn clear_pending_epoch_record(&self, epoch: Epoch) -> StoreResult<()>;
 }
 
@@ -91,6 +95,11 @@ impl<DB: Database> EpochStore for DB {
             tx.insert::<EpochRecordsIndex>(&epoch_hash, &epoch)?;
             tx.insert::<EpochRecords>(&epoch, epoch_rec)?;
             tx.insert::<EpochCerts>(&epoch_hash, cert)?;
+            // A certified epoch is by definition no longer pending. Removing the resume hint in
+            // the same txn as the cert means a pending row can never outlive its cert, whichever
+            // path produced the cert (own quorum, peer fetch, state-sync backfill). Removing a
+            // missing key is a no-op.
+            tx.remove::<PendingEpochRecord>(&epoch)?;
             Ok(())
         })
     }
@@ -132,17 +141,21 @@ impl<DB: Database> EpochStore for DB {
     fn save_pending_epoch_record(&self, epoch_rec: &EpochRecord) -> StoreResult<()> {
         let epoch = epoch_rec.epoch;
         self.with_write_txn(|tx| {
-            // At most one entry ever: clear before inserting so a re-run (recovery replaying
-            // write_epoch_record for the same epoch, or a later epoch superseding an older
-            // pending one) can never leave more than the newest behind.
-            tx.clear_table::<PendingEpochRecord>()?;
+            // Keyed insert: a re-run for the same epoch (recovery replaying write_epoch_record)
+            // overwrites in place; a later epoch's close adds a row rather than evicting an
+            // older epoch that is still waiting on its cert.
             tx.insert::<PendingEpochRecord>(&epoch, epoch_rec)?;
             Ok(())
         })
     }
 
-    fn get_pending_epoch_record(&self) -> Option<EpochRecord> {
-        self.iter::<PendingEpochRecord>().next().map(|(_, rec)| rec)
+    fn pending_epoch_records(&self) -> Vec<EpochRecord> {
+        // Sort explicitly rather than relying on the backend's key order, which depends on the
+        // key encoding.
+        let mut recs: Vec<EpochRecord> =
+            self.iter::<PendingEpochRecord>().map(|(_, rec)| rec).collect();
+        recs.sort_by_key(|rec| rec.epoch);
+        recs
     }
 
     fn clear_pending_epoch_record(&self, epoch: Epoch) -> StoreResult<()> {
@@ -150,8 +163,7 @@ impl<DB: Database> EpochStore for DB {
         // transaction on the layered backend (panics - "DbTx get() should not be called on a
         // DbTxMut!"). Removing a non-existent key is already a safe no-op (see
         // save_epoch_record's own defensive `tx.remove` above), and since the key IS the epoch
-        // number, this naturally only ever touches this epoch's entry - a stale caller for an
-        // epoch a newer close already superseded still can't clobber it.
+        // number, this only ever touches this epoch's entry.
         self.with_write_txn(|tx| {
             tx.remove::<PendingEpochRecord>(&epoch)?;
             Ok(())
@@ -168,34 +180,58 @@ mod pending_epoch_record_tests {
         EpochRecord { epoch, ..Default::default() }
     }
 
-    #[test]
-    fn round_trips_a_pending_record() {
-        let db = MemDatabase::default();
-        assert!(db.get_pending_epoch_record().is_none());
+    fn pending_epochs(db: &MemDatabase) -> Vec<Epoch> {
+        db.pending_epoch_records().into_iter().map(|rec| rec.epoch).collect()
+    }
 
-        db.save_pending_epoch_record(&record(5)).unwrap();
-
-        assert_eq!(db.get_pending_epoch_record().unwrap().epoch, 5);
+    /// An unsigned cert for `rec`: the store does not verify signatures, only the digest link.
+    fn cert_for(rec: &EpochRecord) -> EpochCertificate {
+        EpochCertificate {
+            epoch_hash: rec.digest(),
+            signature: Default::default(),
+            signed_authorities: Default::default(),
+        }
     }
 
     #[test]
-    fn a_newer_pending_record_replaces_the_older_one() {
+    fn round_trips_a_pending_record() {
+        let db = MemDatabase::default();
+        assert!(db.pending_epoch_records().is_empty());
+
+        db.save_pending_epoch_record(&record(5)).unwrap();
+
+        assert_eq!(pending_epochs(&db), vec![5]);
+    }
+
+    #[test]
+    fn a_later_close_keeps_an_earlier_uncertified_epoch_pending() {
+        let db = MemDatabase::default();
+        db.save_pending_epoch_record(&record(6)).unwrap();
+        db.save_pending_epoch_record(&record(5)).unwrap();
+
+        // The chain can advance past an uncertified epoch (#142); both must stay resumable,
+        // and the listing is ordered by epoch regardless of insertion order.
+        assert_eq!(pending_epochs(&db), vec![5, 6]);
+    }
+
+    #[test]
+    fn re_saving_the_same_epoch_overwrites_in_place() {
+        let db = MemDatabase::default();
+        db.save_pending_epoch_record(&record(5)).unwrap();
+        db.save_pending_epoch_record(&record(5)).unwrap();
+
+        assert_eq!(pending_epochs(&db), vec![5]);
+    }
+
+    #[test]
+    fn clear_removes_only_the_matching_pending_record() {
         let db = MemDatabase::default();
         db.save_pending_epoch_record(&record(5)).unwrap();
         db.save_pending_epoch_record(&record(6)).unwrap();
 
-        // At most one entry ever - the newer closed epoch is the only one that can still matter.
-        assert_eq!(db.get_pending_epoch_record().unwrap().epoch, 6);
-    }
-
-    #[test]
-    fn clear_removes_a_matching_pending_record() {
-        let db = MemDatabase::default();
-        db.save_pending_epoch_record(&record(5)).unwrap();
-
         db.clear_pending_epoch_record(5).unwrap();
 
-        assert!(db.get_pending_epoch_record().is_none());
+        assert_eq!(pending_epochs(&db), vec![6]);
     }
 
     #[test]
@@ -203,10 +239,9 @@ mod pending_epoch_record_tests {
         let db = MemDatabase::default();
         db.save_pending_epoch_record(&record(6)).unwrap();
 
-        // A stale caller for an epoch a newer close already superseded must not clobber it.
         db.clear_pending_epoch_record(5).unwrap();
 
-        assert_eq!(db.get_pending_epoch_record().unwrap().epoch, 6);
+        assert_eq!(pending_epochs(&db), vec![6]);
     }
 
     #[test]
@@ -215,19 +250,37 @@ mod pending_epoch_record_tests {
 
         db.clear_pending_epoch_record(5).unwrap();
 
-        assert!(db.get_pending_epoch_record().is_none());
+        assert!(db.pending_epoch_records().is_empty());
     }
 
     #[test]
-    fn pending_and_certified_records_are_independent_tables() {
+    fn a_pending_record_does_not_count_as_a_certified_one() {
         let db = MemDatabase::default();
-        let rec = record(5);
-        db.save_pending_epoch_record(&rec).unwrap();
+        db.save_pending_epoch_record(&record(5)).unwrap();
 
-        // Certifying elsewhere does not implicitly clear the pending hint - callers are
-        // responsible for calling clear_pending_epoch_record alongside every
-        // save_epoch_record_with_cert call site (see core.rs / epoch.rs).
-        assert!(db.get_pending_epoch_record().is_some());
+        assert_eq!(pending_epochs(&db), vec![5]);
         assert!(db.get_epoch_by_number(5).is_none());
+    }
+
+    #[test]
+    fn saving_a_cert_removes_only_that_epochs_pending_record() {
+        let db = MemDatabase::default();
+        db.save_pending_epoch_record(&record(5)).unwrap();
+        db.save_pending_epoch_record(&record(6)).unwrap();
+
+        db.save_epoch_record_with_cert(&record(5), &cert_for(&record(5))).unwrap();
+
+        // The invariant the table relies on: a row exists iff the epoch has no cert on disk.
+        assert_eq!(pending_epochs(&db), vec![6]);
+        assert!(db.get_epoch_by_number(5).is_some_and(|(_, cert)| cert.is_some()));
+    }
+
+    #[test]
+    fn saving_a_cert_with_no_pending_record_is_fine() {
+        let db = MemDatabase::default();
+
+        db.save_epoch_record_with_cert(&record(5), &cert_for(&record(5))).unwrap();
+
+        assert!(db.pending_epoch_records().is_empty());
     }
 }

@@ -113,11 +113,6 @@ where
                             {
                                 error!(target: "epoch-manager", "failed to persist peer-fetched previous epoch record: {e}");
                             }
-                            if let Err(e) =
-                                self.consensus_db.clear_pending_epoch_record(peer_rec.epoch)
-                            {
-                                error!(target: "epoch-manager", ?e, epoch = peer_rec.epoch, "failed to clear pending epoch record after peer-fetched parent");
-                            }
                             prev = Some(peer_rec);
                         }
                     }
