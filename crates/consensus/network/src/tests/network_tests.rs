@@ -78,7 +78,6 @@ fn create_test_peers<Req: RLMessage, Res: RLMessage>(
                 _network_events: network_events,
                 network_handle,
                 network: Some(network),
-                network_metrics: metrics,
             }
         })
         .collect();
@@ -104,8 +103,6 @@ where
     /// The network task.
     #[allow(clippy::type_complexity)]
     network: Option<ConsensusNetwork<Req, Res, MemDatabase, mpsc::Sender<NetworkEvent<Req, Res>>>>,
-    /// Network metrics shared with the spawned task.
-    network_metrics: Arc<NetworkMetrics>,
 }
 /// A peer on RL.
 struct NetworkPeer<Req, Res, DB = MemDatabase>

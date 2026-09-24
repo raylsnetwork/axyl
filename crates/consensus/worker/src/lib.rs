@@ -23,3 +23,8 @@ pub const NUM_SHUTDOWN_RECEIVERS: u64 = 26;
 
 #[cfg(any(test, feature = "test-utils"))]
 pub mod test_utils;
+
+#[cfg(test)]
+mod clippy {
+    use rayls_consensus_worker as _;
+}

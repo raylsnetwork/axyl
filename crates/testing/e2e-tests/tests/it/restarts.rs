@@ -3,7 +3,6 @@ use e2e_tests::{config_local_testnet, IT_TEST_MUTEX, TEST_NETWORK};
 use escargot::CargoRun;
 use ethereum_tx_sign::{LegacyTransaction, Transaction};
 use eyre::Report;
-use gcloud_sdk::google::cloud::kms::v1::key_operation_attestation;
 use jsonrpsee::{
     core::{client::ClientT, DeserializeOwned},
     http_client::HttpClientBuilder,
