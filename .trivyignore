@@ -12,10 +12,11 @@ GHSA-82j2-j2ch-gfr8
 # length BEFORE creating the stream, so the create-then-drop -> `expect("stream not found")`
 # path is unreachable. The vulnerable window was the 0.13.0-0.13.9
 # rewrite; we run the patched 0.13.10.
-# NOTE: any yamux Config setter (set_max_num_streams / set_receive_window_size / ...) or
-# Config::client()/::server() would silently switch the backend to 0.12.1. The call sites carry a
+# NOTE: any yamux Config setter (set_max_num_streams / set_receive_window_size /
+# set_window_update_mode) or Config::client()/::server() would silently switch the backend to 0.12.1.
+# The call sites carry a
 # "YAMUX BACKEND GUARD" comment -- keep them setter-free.
-# Removal is not possible today: libp2p is at latest 0.56.0 and its libp2p-yamux 0.47 hard-requires
+# Removal is not possible today: we currently pin libp2p 0.56.0 and its libp2p-yamux 0.47 hard-requires
 # both backends. Re-check this when libp2p releases a version whose libp2p-yamux drops the 0.12
 # backend, or if any code starts using Config::client()/::server()/WindowUpdateMode (the 012 paths).
 CVE-2026-32314
