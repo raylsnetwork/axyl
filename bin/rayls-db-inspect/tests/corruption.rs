@@ -21,7 +21,7 @@ use rayls_db_inspect::{
         summary::summary,
     },
 };
-use rayls_infrastructure_types::{keccak256, Bytes, Database as _};
+use rayls_infrastructure_types::{keccak256, Bytes};
 use std::{
     fs::{self, OpenOptions as FileOptions},
     io::{Seek as _, SeekFrom, Write as _},
@@ -145,11 +145,11 @@ fn exercise(
         return out;
     }
     out.push(run("summary", &|| summary(&[open()?]).map(|_| ())));
-    out.push(run("epoch 0", &|| epoch(&[(open()?)], 0, true).map(|_| ())));
-    out.push(run("epoch-check", &|| epoch_check(&[(open()?)], None, None, true).map(|_| ())));
-    out.push(run("header 5", &|| header(&[(open()?)], 5, true).map(|_| ())));
-    out.push(run("header 2 (cold)", &|| header(&[(open()?)], 2, true).map(|_| ())));
-    out.push(run("header-check", &|| header_check(&[(open()?)], 5, 100).map(|_| ())));
+    out.push(run("epoch 0", &|| epoch(&[open()?], 0, true).map(|_| ())));
+    out.push(run("epoch-check", &|| epoch_check(&[open()?], None, None, true).map(|_| ())));
+    out.push(run("header 5", &|| header(&[open()?], 5, true).map(|_| ())));
+    out.push(run("header 2 (cold)", &|| header(&[open()?], 2, true).map(|_| ())));
+    out.push(run("header-check", &|| header_check(&[open()?], 5, 100).map(|_| ())));
     out.push(run("get-tx", &|| get_tx(&[open()?], tx_hash, None).map(|_| ())));
     out.push(run("get-batch (absent)", &|| {
         get_batch(&[open()?], rayls_infrastructure_types::B256::ZERO).map(|_| ())
@@ -353,11 +353,11 @@ fn damaged_databases_never_panic_and_stay_readable_where_mdbx_allows() {
         truncate(&jar, 100);
     }
     let open = |p: &Path| {
-        (NodeDb::open(
+        NodeDb::open(
             &format!("{}={}", p.file_name().unwrap().to_string_lossy(), p.display()),
             &OpenOptions::default(),
         )
-        .unwrap(),)
+        .unwrap()
     };
     let r = header_check(&[open(&good), open(&bad)], 5, 100).unwrap();
     assert!(r.nodes[0].ok, "the intact node is checked: {}", r.nodes[0].stopped);
