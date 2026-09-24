@@ -70,8 +70,9 @@ where
                 self.prev_epoch_record.as_ref(),
                 epoch,
             );
-            // Neither memory nor disk has it - e.g. a restart before vote quorum
-            // persisted this node's copy. Peers closed the previous epoch and hold
+            // No local copy at all: this node never closed the previous epoch itself
+            // (it was down across that boundary, or its data dir is fresh), so there
+            // is nothing in memory or in PendingEpochRecord. Peers closed it and hold
             // its certified record, so fetch it directly instead of failing and
             // waiting for the async collector to backfill (which may not win the
             // race against this boundary). Trusted because it carries a valid cert
@@ -574,13 +575,15 @@ where
 /// Resolve the previous epoch's record (`epoch - 1`) from local state when
 /// building the record for the closing `epoch`.
 ///
-/// The record is not eagerly persisted; it lands on disk atomically with its
-/// cert once vote quorum is reached. Prefer a certified on-disk record (it is
-/// what the committee agreed on, which may differ from the one built locally).
-/// Otherwise reuse the in-memory record from the previous transition, falling
-/// back to an uncertified/absent disk record only as a last resort (the epoch-0
-/// dummy, or a restart before the peer-fetch backfill has restored it).
-/// Returns `None` when neither source has it - the caller must fetch from a peer.
+/// A certified record lands in `EpochRecords` atomically with its cert once
+/// vote quorum is reached. Prefer that (it is what the committee agreed on,
+/// which may differ from the one built locally). Otherwise reuse the in-memory
+/// record this node built itself - set by the previous transition in this
+/// process, or seeded from `PendingEpochRecord` at startup by
+/// [`hydrate_prev_epoch_record`] so a restart does not lose it. Last resort is
+/// an uncertified disk row in `EpochRecords`, which only ever holds the
+/// epoch-0 dummy. Returns `None` when no local source has it - the node never
+/// closed `epoch - 1` itself and the caller must fetch it from a peer.
 pub(crate) fn resolve_local_prev_epoch_record<DB: ReDatabase>(
     consensus_db: &DB,
     prev_in_mem: Option<&EpochRecord>,
@@ -607,4 +610,16 @@ pub(crate) fn resolve_local_prev_epoch_record<DB: ReDatabase>(
             .cloned()
             .or_else(|| uncertified.map(|(rec, _)| rec)),
     }
+}
+
+/// Seed `prev_epoch_record` at process start from `PendingEpochRecord`.
+///
+/// In a running process `prev_epoch_record` holds the record this node built for the most
+/// recently closed epoch, so a boundary that arrives before that epoch is certified can still
+/// chain its `parent_hash`. A restart discards it; the pending table holds the same self-built
+/// record durably, so the newest pending row is exactly what the field would have contained.
+/// `None` when nothing is pending: the newest close is certified and on disk, or this node never
+/// closed an epoch, and [`resolve_local_prev_epoch_record`] handles both.
+pub(crate) fn hydrate_prev_epoch_record<DB: ReDatabase>(consensus_db: &DB) -> Option<EpochRecord> {
+    consensus_db.pending_epoch_records().pop()
 }

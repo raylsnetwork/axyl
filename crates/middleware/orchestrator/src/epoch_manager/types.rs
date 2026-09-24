@@ -70,9 +70,9 @@ pub(crate) struct EpochManager<P, DB> {
 
     /// The previous epoch's record, retained in memory for the next transition's
     /// `parent_hash`/committee lookup. Set when `epoch_record` is taken and handed
-    /// to `collect_epoch_votes`, so the record chain can advance even though the
-    /// record is no longer eagerly persisted (it now lands on disk only with its
-    /// cert at quorum).
+    /// to `collect_epoch_votes`, so the record chain can advance before the record
+    /// is certified (it lands in `EpochRecords` only with its cert at quorum).
+    /// Seeded at startup from `PendingEpochRecord` so a restart keeps it.
     pub(super) prev_epoch_record: Option<EpochRecord>,
 
     /// Indicates first epoch since process start
