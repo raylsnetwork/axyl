@@ -55,15 +55,30 @@ const EPOCH_FETCH_RETRY_BUDGET: Duration = Duration::from_secs(30);
 /// Delay between the fetch attempts made inside [`EPOCH_FETCH_RETRY_BUDGET`].
 const EPOCH_FETCH_RETRY_INTERVAL: Duration = Duration::from_secs(1);
 
-/// Backoff between full certification attempts (publish vote, collect quorum, fetch from a peer)
-/// once one attempt has exhausted [`EPOCH_FETCH_RETRY_BUDGET`] without success.
+/// Initial backoff between full certification attempts (publish vote, collect quorum, fetch from
+/// a peer) once one attempt has exhausted [`EPOCH_FETCH_RETRY_BUDGET`] without success.
 ///
 /// Unlike the fetch retry above (which only helps once *some* peer has already certified the
 /// record), this covers the case where nobody has - a genuine network-wide stall, not a slow
 /// peer (#142). There is no bound on the number of attempts: giving up here means the record is
-/// never persisted anywhere, permanently, since a node's own in-memory vote-collection state is
-/// the only thing that can ever complete this specific epoch's certification.
+/// never persisted anywhere, permanently, since the committee members' own votes are the only
+/// thing that can ever complete this specific epoch's certification.
 const CERTIFICATION_RETRY_BACKOFF: Duration = Duration::from_secs(30);
+
+/// Ceiling for the certification backoff. The backoff doubles per attempt up to this, so an
+/// epoch whose committee can never reach quorum again (its members left for good) costs a few
+/// requests per hour instead of a hundred every two minutes, while the retry itself never stops.
+const MAX_CERTIFICATION_RETRY_BACKOFF: Duration = Duration::from_secs(15 * 60);
+
+/// Backoff before certification attempt `attempt + 1`, after `attempt` (1-based) failed:
+/// [`CERTIFICATION_RETRY_BACKOFF`] doubled per failed attempt, capped at
+/// [`MAX_CERTIFICATION_RETRY_BACKOFF`].
+pub(crate) fn certification_retry_backoff(attempt: u32) -> Duration {
+    let doubled = CERTIFICATION_RETRY_BACKOFF
+        .checked_mul(1u32 << attempt.saturating_sub(1).min(31))
+        .unwrap_or(MAX_CERTIFICATION_RETRY_BACKOFF);
+    doubled.min(MAX_CERTIFICATION_RETRY_BACKOFF)
+}
 
 /// Time allowed for placing one unknown epoch record digest seen in a vote.
 const DIGEST_RESOLVE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -1694,14 +1709,14 @@ where
                 "Failed to retrieve epoch records from peers",
             );
 
-            // Neither quorum nor a peer's cert. Back off and try the whole sequence again -
-            // the records are only in PendingEpochRecord now, and only this loop (or an identical
-            // one resumed by the next run_epoch, see resume_pending_certification) can ever
-            // finish certifying them.
+            // Neither quorum nor a peer's cert. Back off (doubling per attempt, capped) and try
+            // the whole sequence again - the records are only in PendingEpochRecord now, and only
+            // this loop (or an identical one resumed by the next run_epoch, see
+            // resume_pending_certification) can ever finish certifying them.
             tokio::select! {
                 biased;
                 _ = &vote_shutdown => return,
-                _ = tokio::time::sleep(CERTIFICATION_RETRY_BACKOFF) => {}
+                _ = tokio::time::sleep(certification_retry_backoff(attempt)) => {}
             }
         }
     }
