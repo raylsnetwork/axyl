@@ -1,8 +1,7 @@
 # rayls-db-inspect
 
 Read-only inspection of a node's `consensus-db`, comparing several nodes side by side. A node is
-a database directory (`--db`) or, for the epoch and header commands, a running node's RPC
-endpoint (`--rpc`); the two mix freely in one run.
+a database directory (`--db`).
 
 When an epoch boundary fails to certify, or nodes stop agreeing on consensus headers, the
 question is "what does each node actually have on disk?". `rayls-db-inspect` answers it
@@ -41,8 +40,8 @@ Caveats when the node is running:
   in-memory cache and syncs lazily, so very recent rows (seconds) may not be visible yet.
   Every report shows each node's `live` state (a column, or the first row of the `epochs`
   matrix): `yes` when a process holds an OS lock on `mdbx.lck` (read from `/proc/locks` by
-  inode), `no` when none does, `?` when that cannot be determined (not Linux), `rpc` for an RPC
-  node, `recovered` for a copy `--recover` just opened.
+  inode), `no` when none does, `?` when that cannot be determined (not Linux), `recovered` for
+  a copy `--recover` just opened.
 - A read transaction pins the pages it sees until it ends, and the node cannot evict a reader
   in another process. The tool keeps transactions to one short query each; do not wrap it in
   something that holds it open for long against a busy node. The exceptions are the scans and
@@ -111,34 +110,10 @@ The examples below assume the binary is on `PATH`.
 ## Usage
 
 Every command takes one or more nodes, before or after the command name. `--db` names a node
-datadir (the directory holding `consensus-db/`) or the `consensus-db` directory itself; `--rpc`
-names a node's JSON-RPC URL. Either may carry a label (`v1=/data/node1`, `v2=http://10.0.0.2:8545`).
-One value per flag: repeat it or separate values with commas. The flags never swallow the
-arguments that follow them, so `--db ... epochs 0 5`, `epochs --db ... 0 5` and
-`epochs 0 5 --db ...` all work.
-
-An RPC node answers what the `rayls` namespace serves: certified epoch records
-(`rayls_epochRecord`, `rayls_epochRecordByHash`) and consensus headers (`rayls_latestHeader`,
-plus `rayls_consensusHeaderByNumber` and `rayls_consensusHeaderByHash`, added with this tool so
-that a given header can be fetched over RPC at all). So `epoch`, `epochs`,
-`epoch-check`, `header`, `cert` and `header-check` accept RPC nodes; `get-batch`,
-`get-tx` and `summary` need databases. Two limits follow from what the RPC serves: a record
-stored without its certificate (epoch 0 until the first transition, or the incident case) is
-reported absent by an RPC node, and `header -v` cannot list batch presence for one. Nodes older
-than this change serve only `rayls_latestHeader`: their tip is what it reports, and the tool says
-so when it needs another header.
-A header served over RPC may come from the node's verified-but-unprocessed cache; since every
-certificate is re-checked, a cached header that was never verified fails the check instead of
-passing as canonical. An RPC node's tip is found by probing `rayls_consensusHeaderByNumber`
-upward from the number `rayls_latestHeader` reports, about two calls per doubling plus a
-bisection; this also finds the headers a node holds above its canonical tip. The RPC has no
-record listing, so `epochs --all` and `epoch-check` probe one epoch per call from 0 to the node's
-current epoch; `header-check` makes two calls per hop (the parent by number, the digest index
-by hash) plus one per epoch for the committee; the other commands make a handful of calls per
-node. Nodes are queried in parallel, each one sequentially, and `--rpc-rate` (default 10
-requests per second per node, `0` to lift it) spaces the requests so a check cannot flood a
-node; a long `header-check` over RPC is therefore slow by design, and databases are the right
-source for whole-chain checks.
+datadir (the directory holding `consensus-db/`) or the `consensus-db` directory itself, and may
+carry a label (`v1=/data/node1`). One value per flag: repeat it or separate values with commas.
+The flag never swallows the arguments that follow it, so `--db ... epochs 0 5`,
+`epochs --db ... 0 5` and `epochs 0 5 --db ...` all work.
 
 Certificate signatures are always re-checked: `cert`, `header` and `header-check` verify the
 quorum and aggregate BLS signature of every certificate they show against the committee the
@@ -154,7 +129,6 @@ core and two to three times that on a busy machine. `header` and `cert` are unaf
 a long check costs roughly one certificate check per core per hop: 2000 archived hops took 7 s
 for one node and 27 s for five nodes on a 22-core machine already running those five nodes.
 For checks of 1000 hops or more it prints a progress line per node on stderr every 1000 hops.
-The `live` column reads `rpc` for RPC nodes.
 
 ```sh
 # Is epoch 42's record on disk, and is its certificate present and valid, on each node?
@@ -187,10 +161,6 @@ rayls-db-inspect get-tx 0x8a1e... --epoch 42 --db /data/node1     # scan only ep
 
 # Per-node overview
 rayls-db-inspect summary --db /data/node1
-
-# Compare a local database with two other operators' running nodes
-rayls-db-inspect cert 1234 --db v1=/data/node1 \
-    --rpc org2=http://org2.example:8545 --rpc org3=http://org3.example:8545
 
 # Machine-readable output for scripts / jq
 rayls-db-inspect --json epoch 42 --db /data/node1 | jq .verdict
@@ -329,11 +299,10 @@ objects use the wire types' encoding described above.
 | Path | Role |
 |---|---|
 | `src/main.rs` | entry point: parses arguments, prints the report as text or JSON, sets the exit code |
-| `src/lib.rs` | `run`: opens the nodes (databases or RPC endpoints) and dispatches to a report |
+| `src/lib.rs` | `run`: opens the nodes' databases and dispatches to a report |
 | `src/cli.rs` | clap definitions and `--help` text |
 | `src/report/mod.rs` | verdict type and codes; lookup and chain-link helpers shared by the reports |
 | `src/node_db.rs` | read-only open, live-process probe, tier-aware reads |
-| `src/source.rs` | a node to inspect: a database, or an RPC endpoint with memoized `rayls_*` calls |
 | `src/report/epoch.rs` | `epoch`, `epochs`, `epoch-check` |
 | `src/report/header.rs` | `header`, `cert`, `header-check` |
 | `src/report/batch.rs` | `get-batch`, `get-tx` |
@@ -341,7 +310,7 @@ objects use the wire types' encoding described above.
 | `src/report/snapshot.rs` | `snapshot`: consistent copy of one node (MDBX copy in a read transaction, sealed cold jars, marker) |
 | `src/view.rs` | serializable hex views of consensus types |
 | `src/render.rs` | text tables |
-| `tests/` | integration tests against seeded MDBX fixtures and an in-process mock RPC node |
+| `tests/` | integration tests against seeded MDBX fixtures |
 
 The read-only opener itself lives in the storage crate (`MdbxDatabase::open_read_only`,
 `has_table`, `table_entry_counts`), as does the sequential cold-batch iterator the `get-tx` scan uses

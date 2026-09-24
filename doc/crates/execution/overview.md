@@ -287,8 +287,6 @@ Adds a `rayls` JSON-RPC namespace with Rayls-specific endpoints not covered by `
 | Method | Description |
 |--------|-------------|
 | `rayls_latestHeader` | Latest `ConsensusHeader` |
-| `rayls_consensusHeaderByNumber` | `ConsensusHeader` by consensus number |
-| `rayls_consensusHeaderByHash` | `ConsensusHeader` by digest |
 | `rayls_genesis` | Chain genesis |
 | `rayls_epochRecord` | `EpochRecord` + `EpochCertificate` by epoch number |
 | `rayls_epochRecordByHash` | `EpochRecord` + `EpochCertificate` by epoch hash |

@@ -53,29 +53,6 @@ stored in the `parent_beacon_block_root` field of every EVM block produced from 
 
 ---
 
-### `rayls_consensusHeaderByNumber`
-
-Returns the `ConsensusHeader` at a consensus chain number: the canonical header, or one this node
-has received and cached but not yet executed. A cached header may not have been verified yet and
-can later be discarded, so a caller that needs certainty re-verifies its certificates (as
-`rayls-db-inspect` does). `NotFound` when the node holds neither.
-
-**Parameters:** `number: u64`
-
-**Returns:** `ConsensusHeader` (same encoding as `rayls_latestHeader`)
-
----
-
-### `rayls_consensusHeaderByHash`
-
-Returns the `ConsensusHeader` whose digest is `hash`, canonical or cached as above, or `NotFound`.
-
-**Parameters:** `hash: B256`
-
-**Returns:** `ConsensusHeader`
-
----
-
 ### `rayls_nodeStatus`
 
 Returns a snapshot of the local node's role and sync state. Every field describes **this** node;

@@ -37,12 +37,11 @@ fn hash(s: &str) -> Result<B256, String> {
         .map_err(|_| format!("`{s}` is {} bytes, a hash is 32", bytes.len()))
 }
 
-/// Read-only inspection of Rayls consensus databases, on disk (--db) or through a running
-/// node's RPC (--rpc), comparing what the nodes hold.
+/// Read-only inspection of Rayls consensus databases, comparing what the nodes hold on disk.
 ///
 /// Each --db is opened read-only: nothing is written and no lock is taken, so it is safe against
 /// a running node. Results show what the node has flushed to disk, which can lag its memory by a
-/// few seconds. An --rpc node answers the epoch and header commands from its live state.
+/// few seconds.
 ///
 /// Exit status: 0 the verdict is OK, 1 any other verdict (including "not reached" and "not
 /// found"), 2 a node could not be opened or an argument was invalid.
@@ -73,10 +72,6 @@ pub struct Cli {
     /// to its last steady commit. Prefer `snapshot`, which needs no recovery.
     #[arg(long, global = true)]
     pub recover: bool,
-    /// Maximum requests per second sent to each RPC node; 0 lifts the limit. Nodes are queried
-    /// in parallel but each one sequentially, so this bounds the load one node sees.
-    #[arg(long, global = true, default_value_t = 10, value_name = "PER_SECOND")]
-    pub rpc_rate: u32,
 
     /// Node to inspect: its datadir or its consensus-db directory. Repeat the flag or separate
     /// paths with commas to compare nodes. Prefix a path with `label=` to name the node in the
@@ -91,19 +86,6 @@ pub struct Cli {
     )]
     pub dbs: Vec<String>,
 
-    /// Node to inspect through its JSON-RPC endpoint, for example `v2=http://10.0.0.2:8545`.
-    /// Repeat or comma-separate to add more; mix freely with --db. A running node answers the
-    /// epoch and header commands (only certified epoch records are served); batches, `summary`
-    /// and node-local state need a database.
-    #[arg(
-        long = "rpc",
-        num_args = 1,
-        value_delimiter = ',',
-        action = clap::ArgAction::Append,
-        value_name = "[LABEL=]URL"
-    )]
-    pub rpcs: Vec<String>,
-
     #[command(subcommand)]
     pub command: Command,
 }
@@ -112,11 +94,6 @@ impl Cli {
     /// Every `--db` given, before and after the command, in command-line order.
     pub fn dbs(&self) -> Vec<String> {
         self.dbs.iter().chain(&self.command.nodes().dbs).cloned().collect()
-    }
-
-    /// Every `--rpc` given, before and after the command, in command-line order.
-    pub fn rpcs(&self) -> Vec<String> {
-        self.rpcs.iter().chain(&self.command.nodes().rpcs).cloned().collect()
     }
 }
 
@@ -135,16 +112,6 @@ pub struct NodeArgs {
         value_name = "[LABEL=]DATADIR"
     )]
     pub dbs: Vec<String>,
-    /// Node to inspect over RPC, same as the top-level `--rpc`; may be repeated or
-    /// comma-separated.
-    #[arg(
-        long = "rpc",
-        num_args = 1,
-        value_delimiter = ',',
-        action = clap::ArgAction::Append,
-        value_name = "[LABEL=]URL"
-    )]
-    pub rpcs: Vec<String>,
 }
 
 impl Command {

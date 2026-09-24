@@ -4,8 +4,7 @@
 use super::{absence_verdict, chain_verdict, code, content_verdict, recode, ChainOutcome, Verdict};
 pub use super::{describe_absent, Link, Lookup};
 use crate::{
-    node_db::{BatchLookup, LiveStatus, Position, Tier},
-    source::Source,
+    node_db::{BatchLookup, LiveStatus, NodeDb, Position, Tier},
     view::{b256, CertificateSummary, CertificateView},
 };
 use rayls_infrastructure_types::{
@@ -97,7 +96,7 @@ impl std::fmt::Display for SignatureCheck {
 /// The committee that served `epoch`, from the source's own epoch records: the record of that
 /// epoch, or the `next_committee` of the one before (the current epoch has no record yet).
 fn committee_keys(
-    node: &Source,
+    node: &NodeDb,
     epoch: Epoch,
 ) -> eyre::Result<Option<(Vec<BlsPublicKey>, &'static str)>> {
     if let Some((record, _)) = node.epoch(epoch)? {
@@ -112,7 +111,7 @@ fn committee_keys(
 }
 
 /// Re-checks one certificate's quorum and aggregate signature.
-pub fn check_certificate(node: &Source, cert: &Certificate) -> eyre::Result<SignatureCheck> {
+pub fn check_certificate(node: &NodeDb, cert: &Certificate) -> eyre::Result<SignatureCheck> {
     if matches!(cert.signature_verification_state(), SignatureVerificationState::Genesis) {
         return Ok(SignatureCheck::Genesis);
     }
@@ -132,7 +131,7 @@ type KeysByEpoch = BTreeMap<Epoch, Option<(Vec<BlsPublicKey>, &'static str)>>;
 
 /// Re-checks every certificate of a header's sub-dag the way the node does on receipt: the
 /// leader directly, the rest directly unless the leader's parents vouch for them.
-pub fn check_header(node: &Source, header: &ConsensusHeader) -> eyre::Result<SignatureCheck> {
+pub fn check_header(node: &NodeDb, header: &ConsensusHeader) -> eyre::Result<SignatureCheck> {
     let leader = &header.sub_dag.leader;
     if matches!(leader.signature_verification_state(), SignatureVerificationState::Genesis) {
         return Ok(SignatureCheck::Genesis);
@@ -261,14 +260,14 @@ pub struct HeaderView {
 }
 
 impl HeaderView {
-    fn of(node: &Source, header: &ConsensusHeader, verbose: bool) -> eyre::Result<Self> {
+    fn of(node: &NodeDb, header: &ConsensusHeader, verbose: bool) -> eyre::Result<Self> {
         let sub_dag = &header.sub_dag;
         let batch_digests: Vec<B256> = sub_dag
             .certificates
             .iter()
             .flat_map(|c| c.header().payload().keys().copied())
             .collect();
-        let batches = match (verbose, node.db()) {
+        let batches = match (verbose, Some(node)) {
             (true, Some(db)) => {
                 let mut out = Vec::with_capacity(batch_digests.len());
                 for d in &batch_digests {
@@ -299,7 +298,7 @@ impl HeaderView {
     }
 }
 
-pub fn header(nodes: &[Source], number: u64, verbose: bool) -> eyre::Result<HeaderReport> {
+pub fn header(nodes: &[NodeDb], number: u64, verbose: bool) -> eyre::Result<HeaderReport> {
     let mut views = Vec::with_capacity(nodes.len());
     let mut digests = BTreeSet::new();
     for node in nodes {
@@ -315,8 +314,8 @@ pub fn header(nodes: &[Source], number: u64, verbose: bool) -> eyre::Result<Head
             None => (None, None, None),
         };
         views.push(HeaderNodeView {
-            node: node.label().to_owned(),
-            live: node.live(),
+            node: node.label.clone(),
+            live: node.live,
             lookup,
             tip: position.consensus_tip,
             tier,
@@ -358,7 +357,7 @@ pub struct CertNodeView {
     pub signature_check: Option<SignatureCheck>,
 }
 
-pub fn cert(nodes: &[Source], number: u64, verbose: bool) -> eyre::Result<CertReport> {
+pub fn cert(nodes: &[NodeDb], number: u64, verbose: bool) -> eyre::Result<CertReport> {
     let mut views = Vec::with_capacity(nodes.len());
     let mut header_digests = BTreeSet::new();
     let mut cert_digests = BTreeSet::new();
@@ -380,8 +379,8 @@ pub fn cert(nodes: &[Source], number: u64, verbose: bool) -> eyre::Result<CertRe
             None => (None, None, None, None),
         };
         views.push(CertNodeView {
-            node: node.label().to_owned(),
-            live: node.live(),
+            node: node.label.clone(),
+            live: node.live,
             lookup,
             tip: position.consensus_tip,
             tier,
@@ -449,7 +448,7 @@ pub struct HeaderCheckNodeView {
     /// epoch's record nor the one before, so it has no committee for them.
     pub unverifiable: Vec<Unverifiable>,
     /// The read that failed on this node, when its database could not be checked (damaged rows
-    /// or jars, an RPC gone away). The other nodes are still checked.
+    /// or jars). The other nodes are still checked.
     pub error: Option<String>,
 }
 
@@ -468,7 +467,7 @@ const VERIFY_BATCH: usize = 256;
 /// Hops between progress lines on stderr, for checks at least this long.
 const PROGRESS_EVERY: u64 = 1000;
 
-pub fn header_check(nodes: &[Source], start: u64, back: u64) -> eyre::Result<HeaderCheckReport> {
+pub fn header_check(nodes: &[NodeDb], start: u64, back: u64) -> eyre::Result<HeaderCheckReport> {
     // one thread per node: the nodes are independent, so five cost the time of one
     let views: Vec<HeaderCheckNodeView> = std::thread::scope(|scope| {
         let handles: Vec<_> =
@@ -480,8 +479,8 @@ pub fn header_check(nodes: &[Source], start: u64, back: u64) -> eyre::Result<Hea
                 // a node that cannot be read is reported as such; the others still count
                 let result = h.join().unwrap_or_else(|_| Err(eyre::eyre!("the check panicked")));
                 result.unwrap_or_else(|err| HeaderCheckNodeView {
-                    node: node.label().to_owned(),
-                    live: node.live(),
+                    node: node.label.clone(),
+                    live: node.live,
                     tip: None,
                     hops: Vec::new(),
                     ok: false,
@@ -519,11 +518,11 @@ pub fn header_check(nodes: &[Source], start: u64, back: u64) -> eyre::Result<Hea
 }
 
 /// Walks one node's chain back from `start`, verifying certificates a batch at a time.
-fn check_node(node: &Source, start: u64, back: u64) -> eyre::Result<HeaderCheckNodeView> {
+fn check_node(node: &NodeDb, start: u64, back: u64) -> eyre::Result<HeaderCheckNodeView> {
     let position = node.position()?;
     let mut view = HeaderCheckNodeView {
-        node: node.label().to_owned(),
-        live: node.live(),
+        node: node.label.clone(),
+        live: node.live,
         tip: position.consensus_tip,
         hops: Vec::new(),
         ok: false,
@@ -645,7 +644,7 @@ fn check_node(node: &Source, start: u64, back: u64) -> eyre::Result<HeaderCheckN
 /// Looks up the committees the pending headers need (once per epoch, on this thread, which owns
 /// the source), verifies the headers on every core, and moves the hops into `hops` in order.
 fn verify_pending(
-    node: &Source,
+    node: &NodeDb,
     keys: &mut KeysByEpoch,
     pending: &mut Vec<(Hop, ConsensusHeader)>,
     hops: &mut Vec<Hop>,

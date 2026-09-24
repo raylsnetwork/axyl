@@ -3,8 +3,6 @@
 
 #![allow(dead_code, unreachable_pub)]
 
-pub mod rpc;
-
 use indexmap::IndexMap;
 use rayls_db_inspect::node_db::{NodeDb, OpenOptions};
 use rayls_execution_evm::test_utils::TransactionFactory;

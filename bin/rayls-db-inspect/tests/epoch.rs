@@ -6,10 +6,7 @@
 mod common;
 
 use common::*;
-use rayls_db_inspect::{
-    report::epoch::{epoch, EpochStatus, LinkCheck},
-    source::Source,
-};
+use rayls_db_inspect::report::epoch::{epoch, EpochStatus, LinkCheck};
 use rayls_infrastructure_types::{Database as _, B256};
 
 #[test]
@@ -17,7 +14,7 @@ fn certified_everywhere() {
     let fx = Fixture::new();
     let a = SeededNode::new(|db| drop(seed_healthy(&fx, db)));
     let b = SeededNode::new(|db| drop(seed_healthy(&fx, db)));
-    let nodes = [Source::Db(a.open("a")), Source::Db(b.open("b"))];
+    let nodes = [(a.open("a")), (b.open("b"))];
 
     let report = epoch(&nodes, 2, true).unwrap();
     assert_eq!(report.verdict.code, "OK");
@@ -41,7 +38,7 @@ fn certified_everywhere() {
 fn genesis_record_is_expected_to_be_unsigned() {
     let fx = Fixture::new();
     let a = SeededNode::new(|db| drop(seed_healthy(&fx, db)));
-    let report = epoch(&[Source::Db(a.open("a"))], 0, false).unwrap();
+    let report = epoch(&[(a.open("a"))], 0, false).unwrap();
     assert_eq!(report.nodes[0].status, EpochStatus::RecordOnly);
     assert_eq!(report.nodes[0].record.as_ref().unwrap().parent_link, LinkCheck::Genesis);
     assert_eq!(report.verdict.to_string(), "OK nodes=1 genesis=1");
@@ -62,7 +59,7 @@ fn record_only_on_one_node_is_partial() {
         })
         .unwrap();
     });
-    let report = epoch(&[Source::Db(a.open("a")), Source::Db(b.open("b"))], 2, false).unwrap();
+    let report = epoch(&[(a.open("a")), (b.open("b"))], 2, false).unwrap();
     assert_eq!(report.nodes[0].status, EpochStatus::Certified);
     assert_eq!(report.nodes[1].status, EpochStatus::RecordOnly);
     assert!(report.nodes[1].cert.is_none());
@@ -77,7 +74,7 @@ fn missing_everywhere_is_the_incident_case() {
     let fx = Fixture::with_epoch(5);
     let a = SeededNode::new(|db| drop(seed_healthy(&fx, db)));
     let b = SeededNode::new(|db| drop(seed_healthy(&fx, db)));
-    let report = epoch(&[Source::Db(a.open("a")), Source::Db(b.open("b"))], 3, false).unwrap();
+    let report = epoch(&[(a.open("a")), (b.open("b"))], 3, false).unwrap();
     assert!(report.nodes.iter().all(|n| n.status == EpochStatus::Missing));
     assert_eq!(report.nodes[0].position.current_epoch, Some(5));
     assert_eq!(report.verdict.to_string(), "MISSING nodes=2 missing=2");
@@ -90,7 +87,7 @@ fn epoch_beyond_the_tip_is_not_reached_not_missing() {
     let fx = Fixture::new();
     let a = SeededNode::new(|db| drop(seed_healthy(&fx, db)));
     let b = SeededNode::new(|db| drop(seed_healthy(&fx, db)));
-    let nodes = [Source::Db(a.open("a")), Source::Db(b.open("b"))];
+    let nodes = [(a.open("a")), (b.open("b"))];
     for e in [3, 900] {
         let report = epoch(&nodes, e, false).unwrap();
         assert!(report.nodes.iter().all(|n| n.status == EpochStatus::NotReached), "epoch {e}");
@@ -105,7 +102,9 @@ fn epoch_beyond_the_tip_is_not_reached_not_missing() {
     );
 }
 
-fn report_position(nodes: &[Source]) -> rayls_db_inspect::node_db::Position {
+fn report_position(
+    nodes: &[rayls_db_inspect::node_db::NodeDb],
+) -> rayls_db_inspect::node_db::Position {
     nodes[0].position().unwrap()
 }
 
@@ -124,12 +123,7 @@ fn missing_on_one_node_names_it() {
         let r1 = fx.record(1, Some(&r0), B256::default());
         write_epoch(db, &r1, Some(&fx.certify(&r1, &[0, 1, 2])));
     });
-    let report = epoch(
-        &[Source::Db(a.open("a")), Source::Db(b.open("b")), Source::Db(c.open("c"))],
-        2,
-        false,
-    )
-    .unwrap();
+    let report = epoch(&[(a.open("a")), (b.open("b")), (c.open("c"))], 2, false).unwrap();
     // c has no headers past epoch 1 and no record 2: it is behind, not holding a gap
     assert_eq!(report.nodes[2].status, EpochStatus::NotReached);
     assert_eq!(report.verdict.code, "PARTIAL");
@@ -152,7 +146,7 @@ fn node_that_closed_the_epoch_but_lacks_the_record_is_missing() {
         })
         .unwrap();
     });
-    let report = epoch(&[Source::Db(a.open("a")), Source::Db(c.open("c"))], 2, false).unwrap();
+    let report = epoch(&[(a.open("a")), (c.open("c"))], 2, false).unwrap();
     assert_eq!(report.nodes[1].status, EpochStatus::Missing);
     assert_eq!(report.verdict.code, "PARTIAL");
     assert_eq!(report.verdict.to_string(), "PARTIAL nodes=2 certified=1 missing=1");
@@ -168,7 +162,7 @@ fn divergent_records_are_detected() {
         let other = fx.record(2, Some(&records[1]), B256::repeat_byte(0xab));
         write_epoch(db, &other, Some(&fx.certify(&other, &[0, 1, 2])));
     });
-    let report = epoch(&[Source::Db(a.open("a")), Source::Db(b.open("b"))], 2, false).unwrap();
+    let report = epoch(&[(a.open("a")), (b.open("b"))], 2, false).unwrap();
     assert_eq!(report.verdict.to_string(), "DIVERGENT nodes=2 variants=2 certified=2");
     assert_ne!(
         report.nodes[0].record.as_ref().unwrap().digest,
@@ -187,7 +181,7 @@ fn cert_below_quorum_is_record_only_with_reasons() {
         let weak = fx.certify(&records[2], &[0, 1]);
         write_epoch(db, &records[2], Some(&weak));
     });
-    let report = epoch(&[Source::Db(a.open("a"))], 2, false).unwrap();
+    let report = epoch(&[(a.open("a"))], 2, false).unwrap();
     let n = &report.nodes[0];
     assert_eq!(n.status, EpochStatus::RecordOnly);
     let cert = n.cert.as_ref().unwrap();
@@ -208,7 +202,7 @@ fn cert_with_wrong_signature_is_flagged() {
         bad.signed_authorities.push(3);
         write_epoch(db, &records[2], Some(&bad));
     });
-    let report = epoch(&[Source::Db(a.open("a"))], 2, false).unwrap();
+    let report = epoch(&[(a.open("a"))], 2, false).unwrap();
     let cert = report.nodes[0].cert.as_ref().unwrap();
     assert!(cert.quorum_ok);
     assert!(!cert.signature_ok);
@@ -223,7 +217,7 @@ fn leftover_checkpoint_is_reported() {
         drop(seed_healthy(&fx, db));
         write_checkpoint(db, 2);
     });
-    let report = epoch(&[Source::Db(a.open("a"))], 2, false).unwrap();
+    let report = epoch(&[(a.open("a"))], 2, false).unwrap();
     let cp = report.nodes[0].checkpoint.as_ref().expect("checkpoint reported");
     assert_eq!(cp.epoch, 2);
     assert_eq!(cp.completed_phase, "Draining");
@@ -241,7 +235,7 @@ fn broken_parent_link_is_reported() {
         let _ = headers;
         write_epoch(db, &r2, Some(&fx.certify(&r2, &[0, 1, 2])));
     });
-    let report = epoch(&[Source::Db(a.open("a"))], 2, false).unwrap();
+    let report = epoch(&[(a.open("a"))], 2, false).unwrap();
     match &report.nodes[0].record.as_ref().unwrap().parent_link {
         LinkCheck::Broken { expected } => assert!(expected.starts_with("0x")),
         other => panic!("expected broken link, got {other:?}"),
@@ -254,7 +248,7 @@ fn empty_database_reports_table_absent() {
     let _ = &fx;
     let a = SeededNode::new(|_db| {});
     // open_db creates every table, so an empty node is "not reached", not "table absent"
-    let report = epoch(&[Source::Db(a.open("a"))], 1, false).unwrap();
+    let report = epoch(&[(a.open("a"))], 1, false).unwrap();
     assert_eq!(report.nodes[0].status, EpochStatus::NotReached);
     assert_eq!(report.verdict.code, "NOT_REACHED");
     assert_eq!(report.nodes[0].position.current_epoch, None);

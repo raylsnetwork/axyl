@@ -3,8 +3,7 @@
 
 use super::{code, Verdict};
 use crate::{
-    node_db::{LiveStatus, Position, Tier},
-    source::Source,
+    node_db::{LiveStatus, NodeDb, Position, Tier},
     view::{b256, pubkey, signature, CheckpointView},
 };
 use rayls_infrastructure_types::{BlsPublicKey, Epoch, EpochCertificate, EpochRecord, B256};
@@ -154,7 +153,7 @@ impl EpochCertView {
 }
 
 fn record_view(
-    node: &Source,
+    node: &NodeDb,
     record: &EpochRecord,
     prev: Option<&EpochRecord>,
     verbose: bool,
@@ -196,15 +195,15 @@ fn record_view(
     })
 }
 
-pub fn epoch(nodes: &[Source], epoch: Epoch, verbose: bool) -> eyre::Result<EpochReport> {
+pub fn epoch(nodes: &[NodeDb], epoch: Epoch, verbose: bool) -> eyre::Result<EpochReport> {
     let mut views = Vec::with_capacity(nodes.len());
     let mut digests: BTreeSet<B256> = BTreeSet::new();
 
     for node in nodes {
         let position = node.position()?;
         let mut view = EpochNodeView {
-            node: node.label().to_owned(),
-            live: node.live(),
+            node: node.label.clone(),
+            live: node.live,
             status: if position.has_closed_epoch(epoch) {
                 EpochStatus::Missing
             } else {
@@ -340,9 +339,9 @@ pub struct EpochsRow {
 }
 
 /// `range` is `Some((from, to))` or `None` for every epoch any node has a record for.
-pub fn epochs(nodes: &[Source], range: Option<(Epoch, Epoch)>) -> eyre::Result<EpochsReport> {
+pub fn epochs(nodes: &[NodeDb], range: Option<(Epoch, Epoch)>) -> eyre::Result<EpochsReport> {
     let labels: Vec<EpochsNode> =
-        nodes.iter().map(|n| EpochsNode { node: n.label().to_owned(), live: n.live() }).collect();
+        nodes.iter().map(|n| EpochsNode { node: n.label.clone(), live: n.live }).collect();
     let (from, to) = match range {
         Some((from, to)) => {
             if from > to {
@@ -371,9 +370,9 @@ pub fn epochs(nodes: &[Source], range: Option<(Epoch, Epoch)>) -> eyre::Result<E
     };
 
     let table_absent: Vec<bool> =
-        nodes.iter().map(Source::epoch_table_absent).collect::<eyre::Result<_>>()?;
+        nodes.iter().map(NodeDb::epoch_table_absent).collect::<eyre::Result<_>>()?;
     let positions: Vec<Position> =
-        nodes.iter().map(Source::position).collect::<eyre::Result<_>>()?;
+        nodes.iter().map(NodeDb::position).collect::<eyre::Result<_>>()?;
 
     let mut rows = Vec::new();
     for epoch in from..=to {
@@ -542,7 +541,7 @@ fn cert_state(record: &EpochRecord, cert: Option<&EpochCertificate>) -> &'static
 }
 
 pub fn epoch_check(
-    nodes: &[Source],
+    nodes: &[NodeDb],
     from: Option<Epoch>,
     to: Option<Epoch>,
     verbose: bool,
@@ -554,8 +553,8 @@ pub fn epoch_check(
     for node in nodes {
         let keys = node.epoch_numbers()?;
         let mut view = EpochCheckNodeView {
-            node: node.label().to_owned(),
-            live: node.live(),
+            node: node.label.clone(),
+            live: node.live,
             from: None,
             to: None,
             checked: 0,
@@ -572,8 +571,7 @@ pub fn epoch_check(
             records: verbose.then(Vec::new),
         };
         let (Some(&first), Some(&last)) = (keys.first(), keys.last()) else {
-            // a node past epoch 0 should hold records; one still in epoch 0, or an RPC node in a
-            // network that has not certified a record yet, need not
+            // a node past epoch 0 should hold records; one still in epoch 0 need not
             view.records_missing = node.position()?.has_closed_epoch(0);
             view.note = Some(if view.records_missing {
                 "no epoch records although epochs have closed".to_owned()

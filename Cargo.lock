@@ -8053,7 +8053,6 @@ dependencies = [
  "const-hex",
  "eyre",
  "indexmap 2.13.0",
- "jsonrpsee",
  "rayls-execution-evm",
  "rayls-infrastructure-config",
  "rayls-infrastructure-storage",
@@ -8063,7 +8062,6 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
- "tokio",
  "tracing-subscriber 0.3.23",
 ]
 

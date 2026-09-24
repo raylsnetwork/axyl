@@ -537,7 +537,7 @@ fn render_batch(r: &BatchReport, out: &mut String) {
             section(out, "stored bytes hash to", &b.computed_digest);
         }
         section(out, "authority", &b.authority);
-        section(out, "committed in", &b.committed_in);
+        section(out, "committed in", b.committed_in);
         if let Some(path) = &b.path {
             render_commit_path(path, out);
         }
@@ -691,7 +691,7 @@ fn render_tx(r: &TxReport, out: &mut String) {
             field(out, "worker", m.worker_id);
             field(out, "seq", m.seq);
             field(out, "authority", &m.authority);
-            field(out, "committed", &m.committed_in);
+            field(out, "committed", m.committed_in);
             if let Some(path) = &m.path {
                 render_commit_path(path, out);
             }

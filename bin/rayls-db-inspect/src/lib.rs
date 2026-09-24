@@ -1,22 +1,20 @@
 // SPDX-License-Identifier: BUSL-1.1
 //! `rayls-db-inspect`: read-only inspection of a node's `consensus-db`.
 //!
-//! Every subcommand opens one or more nodes ([`source::Source`]: a consensus database read-only,
-//! or a node's RPC endpoint), gathers a per-node view, and folds the views into a network-wide
-//! [`report::Verdict`]. The library returns plain report structs; `main.rs` decides between text
-//! and JSON rendering, so the same reports are unit-testable without a terminal.
+//! Every subcommand opens one or more nodes' consensus databases read-only ([`node_db::NodeDb`]),
+//! gathers a per-node view, and folds the views into a network-wide [`report::Verdict`]. The
+//! library returns plain report structs; `main.rs` decides between text and JSON rendering, so
+//! the same reports are unit-testable without a terminal.
 
 pub mod cli;
 pub mod node_db;
 pub mod render;
 pub mod report;
-pub mod source;
 pub mod view;
 
 use cli::{Cli, Command};
 use node_db::{LiveStatus, NodeDb, OpenOptions};
 use report::Report;
-use source::Source;
 
 // Used by the binary target only.
 use serde_json as _;
@@ -24,8 +22,8 @@ use tracing_subscriber as _;
 
 /// Runs `cli` against every requested node and returns the resulting report.
 ///
-/// Fails (rather than reporting) when a database cannot be opened or a command needs a database
-/// and got an RPC node, so a wrong path is never mistaken for a missing row.
+/// Fails (rather than reporting) when a database cannot be opened, so a wrong path is never
+/// mistaken for a missing row.
 pub fn run(cli: &Cli) -> eyre::Result<Report> {
     let opts = OpenOptions {
         exclusive: cli.exclusive,
@@ -34,22 +32,23 @@ pub fn run(cli: &Cli) -> eyre::Result<Report> {
     };
     let verbose = cli.verbose;
     let dbs = cli.dbs();
-    let rpcs = cli.rpcs();
-    if dbs.is_empty() && rpcs.is_empty() {
-        eyre::bail!(
-            "no node given: pass --db <[LABEL=]DATADIR> or --rpc <[LABEL=]URL>, before or after \
-             the command"
-        );
+    if dbs.is_empty() {
+        eyre::bail!("no node given: pass --db <[LABEL=]DATADIR>, before or after the command");
     }
     if cli.recover && matches!(cli.command, Command::Snapshot { .. }) {
         eyre::bail!("--recover does not combine with snapshot: the source is copied as it is");
     }
-    let open_dbs = || -> eyre::Result<Vec<NodeDb>> {
-        // MDBX allows one handle per environment per process, so the same database twice would
-        // fail on open with an unhelpful error; catch it here instead.
+    // Every command opens every node the same way: one column per node, so a label used twice
+    // would show one node as two agreeing ones, and MDBX allows one handle per environment per
+    // process, so the same database twice would fail on open with an unhelpful error.
+    let open_all = || -> eyre::Result<Vec<NodeDb>> {
+        let mut labels = std::collections::HashSet::new();
         let mut seen = std::collections::HashMap::new();
         for spec in &dbs {
             let (label, path) = NodeDb::resolve(spec)?;
+            if !labels.insert(label.clone()) {
+                eyre::bail!("node label {label} used twice; give each node a distinct label");
+            }
             let canonical = std::fs::canonicalize(&path).unwrap_or(path);
             if let Some(first) = seen.insert(canonical.clone(), label.clone()) {
                 return Err(eyre::eyre!(
@@ -59,50 +58,6 @@ pub fn run(cli: &Cli) -> eyre::Result<Report> {
             }
         }
         dbs.iter().map(|spec| NodeDb::open(spec, &opts)).collect()
-    };
-    // commands that read batches or node-local state: databases only
-    let open_dbs_only = |what: &str| -> eyre::Result<Vec<NodeDb>> {
-        if !rpcs.is_empty() {
-            let labels: Vec<String> = rpcs.iter().map(|spec| source::split_label(spec).0).collect();
-            eyre::bail!(
-                "{what} needs database nodes (--db): {} {} an RPC node, which does not serve \
-                 batches or node-local state",
-                labels.join(", "),
-                if labels.len() == 1 { "is" } else { "are each" }
-            );
-        }
-        open_dbs()
-    };
-    // one column per node: a label used twice, or one endpoint given twice, would show one node
-    // as two agreeing ones
-    let check_labels = || -> eyre::Result<()> {
-        let mut labels = std::collections::HashSet::new();
-        let mut urls = std::collections::HashSet::new();
-        for spec in &dbs {
-            let (label, _) = NodeDb::resolve(spec)?;
-            if !labels.insert(label.clone()) {
-                eyre::bail!("node label {label} used twice; give each node a distinct label");
-            }
-        }
-        for spec in &rpcs {
-            let (label, url) = source::split_label(spec);
-            // Dedup on the URL without a trailing slash
-            if !urls.insert(url.trim_end_matches('/').to_owned()) {
-                eyre::bail!("RPC endpoint {url} given twice");
-            }
-            if !labels.insert(label.clone()) {
-                eyre::bail!("node label {label} used twice; give each node a distinct label");
-            }
-        }
-        Ok(())
-    };
-    let open_all = || -> eyre::Result<Vec<Source>> {
-        check_labels()?;
-        let mut sources: Vec<Source> = open_dbs()?.into_iter().map(Source::Db).collect();
-        for spec in &rpcs {
-            sources.push(Source::open_rpc(spec, cli.rpc_rate)?);
-        }
-        Ok(sources)
     };
 
     Ok(match &cli.command {
@@ -128,24 +83,18 @@ pub fn run(cli: &Cli) -> eyre::Result<Report> {
             Report::Cert(report::header::cert(&open_all()?, *number, verbose)?)
         }
         Command::GetBatch { digest, .. } => {
-            Report::GetBatch(report::batch::get_batch(&open_dbs_only("get-batch")?, *digest)?)
+            Report::GetBatch(report::batch::get_batch(&open_all()?, *digest)?)
         }
         Command::GetTx { hash, epoch, .. } => {
-            Report::GetTx(report::batch::get_tx(&open_dbs_only("get-tx")?, *hash, *epoch)?)
+            Report::GetTx(report::batch::get_tx(&open_all()?, *hash, *epoch)?)
         }
         Command::HeaderCheck { number, back, .. } => {
             Report::HeaderCheck(report::header::header_check(&open_all()?, *number, *back)?)
         }
-        Command::Summary { .. } => {
-            Report::Summary(report::summary::summary(&open_dbs_only("summary")?)?)
-        }
+        Command::Summary { .. } => Report::Summary(report::summary::summary(&open_all()?)?),
         Command::Snapshot { to, .. } => {
-            if !rpcs.is_empty() || dbs.len() != 1 {
-                eyre::bail!(
-                    "snapshot copies one node: give exactly one --db and no --rpc (got {} --db, {} --rpc)",
-                    dbs.len(),
-                    rpcs.len()
-                );
+            if dbs.len() != 1 {
+                eyre::bail!("snapshot copies one node: give exactly one --db (got {})", dbs.len());
             }
             match NodeDb::open(&dbs[0], &opts) {
                 Ok(db) => Report::Snapshot(report::snapshot::snapshot(&db, to)?),

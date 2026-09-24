@@ -277,7 +277,7 @@ fn dangling_cold_index_is_broken_not_absent() {
     assert!(n.batch.is_none());
     assert_eq!(report.verdict.to_string(), "BROKEN nodes=1 missing=1 dangling=1");
 
-    let h = header(&[rayls_db_inspect::source::Source::Db(a.open("a"))], 4, true).unwrap();
+    let h = header(&[(a.open("a"))], 4, true).unwrap();
     let presence = &h.nodes[0].header.as_ref().unwrap().batches.as_ref().unwrap()[0];
     assert!(presence.dangling && presence.tier.is_none());
 }

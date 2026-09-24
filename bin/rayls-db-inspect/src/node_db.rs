@@ -52,8 +52,6 @@ pub enum LiveStatus {
     Live { pid: Option<u32> },
     /// Cannot be determined: not Linux, or `/proc/locks` or the lock file unreadable.
     Unknown,
-    /// Not a directory at all: the node answered over RPC, so it is running.
-    Rpc,
     /// A copy `--recover` opened read-write once this run; its newest commit may have been
     /// rolled back (see the README).
     Recovered,
@@ -65,7 +63,6 @@ impl std::fmt::Display for LiveStatus {
             Self::Stopped => "no",
             Self::Live { .. } => "yes",
             Self::Unknown => "?",
-            Self::Rpc => "rpc",
             Self::Recovered => "recovered",
         })
     }
@@ -81,8 +78,6 @@ pub enum Tier {
     Cache,
     /// The append-only cold archive under `cold/`.
     Cold,
-    /// Served by a node over RPC; which of its tiers answered is not visible.
-    Rpc,
 }
 
 impl std::fmt::Display for Tier {
@@ -91,7 +86,6 @@ impl std::fmt::Display for Tier {
             Self::Hot => "hot",
             Self::Cache => "cache",
             Self::Cold => "cold",
-            Self::Rpc => "rpc",
         })
     }
 }
@@ -401,6 +395,11 @@ impl NodeDb {
     }
 
     /// Whether table `T` exists on disk.
+    /// Whether the epoch-record table was never created.
+    pub fn epoch_table_absent(&self) -> eyre::Result<bool> {
+        Ok(self.table_status::<EpochRecords>()? == TableStatus::Absent)
+    }
+
     pub fn table_status<T: Table>(&self) -> eyre::Result<TableStatus> {
         Ok(if self.table_present::<T>()? { TableStatus::Present } else { TableStatus::Absent })
     }
