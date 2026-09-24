@@ -38,37 +38,31 @@ To inspect a node, stop it first, or work on a copy:
 # stopped node: point at its datadir (or its consensus-db directory)
 rayls-db-inspect epoch 42 --db n1=/data/node1
 
-# evidence, or inspection elsewhere: a consistent copy of a stopped node
-rayls-db-inspect snapshot --to /var/tmp/node1-snap --db n1=/data/node1
-rayls-db-inspect epoch 42 --db n1=/var/tmp/node1-snap
+# evidence, or inspection elsewhere: copy the stopped node's files, then inspect the copy
+cp -a --sparse=always /data/node1/consensus-db /var/tmp/node1-copy
+rayls-db-inspect epoch 42 --db n1=/var/tmp/node1-copy
 ```
 
-`snapshot` lets MDBX copy the environment inside one read transaction (`MDBX_CP_COMPACT`: every
-page is walked and validated, only used pages are written, and the copy's head meta is steady),
-then copies the sealed cold jars, verifies them and reads the copy back. The result opens
-read-only with no recovery step, and `summary` dates any directory by its tip header's commit
-time. When the source is a node whose last commit was never synced (killed or crashed), MDBX
-refuses to read it until it is recovered and recovery writes, so `snapshot` copies its files as
-they are and recovers the copy, leaving the original untouched for the node's own restart. The
-`mdbx.dat` it writes is sparse: its length stays at the geometry's floor (1 GiB by default)
-while it occupies only the used pages, so copy it onward with `cp --sparse=always` or
-`rsync -S`. MDBX writes the copy with `O_DIRECT`, which tmpfs (a `/tmp` on many hosts) refuses;
-use a disk-backed destination. The destination must not exist, or be an empty directory,
-outside the source; a second run racing for the same destination fails instead of touching the
-first. MDBX writes the copy's meta pages last, so an interrupted copy has no valid head and is
-reported as unreadable rather than mistaken for a whole one.
+A stopped node's files are already one consistent state, so a plain copy is all a copy needs.
+`mdbx.dat` is sparse (its length sits at the geometry's floor, 1 GiB by default, while it
+occupies only the used pages), so copy it with `cp --sparse=always` or `rsync -S`. Leave the
+node's `lock` file behind. `summary` dates any directory by its tip header's commit time, so a
+copy needs no marker to say what it holds and as of when.
 
-A raw file copy (`cp`, `rsync`) of a **running** node's `mdbx.dat` is not a snapshot: MDBX
-reuses the pages that earlier commits freed while the copy is still reading, so the copy can
-pair one commit's meta page with later data pages, and neither MDBX's meta pages nor its data
-pages carry checksums that would reveal it. Such a copy also has an unsynced ("weak") head that
-a read-only open refuses. `--recover` makes it openable: one read-write, exclusive open that
-settles the head, the same recovery the node itself performs when it restarts. It marks the
-node `recovered` in `summary` and rewrites the copy's meta pages (hash the copy first if it is
-evidence), and **on any host other than the one that took the copy, or after that host reboots,
-MDBX rolls the copy back to its last steady commit, silently dropping up to a few seconds of
-writes**. It never makes a torn copy consistent. Never run `--recover` on a node's own
-directory. Reserve raw copies for stopped nodes, and even then prefer `snapshot`.
+A node that was killed or crashed may have a last commit that was never synced. MDBX refuses to
+read such a database until it is recovered, and recovery writes, so recover a copy, not the
+node's own directory: `--recover` performs one read-write, exclusive open that settles the head,
+the same recovery the node itself performs when it restarts, and marks the node `recovered` in
+`summary`. It rewrites the copy's meta pages (hash the copy first if it is evidence), and **on
+any host other than the one that took the copy, or after that host reboots, MDBX rolls the copy
+back to its last steady commit, silently dropping up to a few seconds of writes**. It never
+repairs damage.
+
+A raw file copy of a **running** node's `mdbx.dat` is not a consistent state: MDBX reuses the
+pages that earlier commits freed while the copy is still reading, so the copy can pair one
+commit's meta page with later data pages, and neither MDBX's meta pages nor its data pages carry
+checksums that would reveal it. `--recover` will make such a copy openable, but not correct.
+Stop the node before copying.
 
 A copy whose files are not writable (a read-only mount) opens too: the exclusive open never
 registers in `mdbx.lck`. The scans (`get-tx`, and the header walks of `get-batch`) read a whole
@@ -157,7 +151,6 @@ rayls-db-inspect --json epoch 42 --db /data/node1 | jq .verdict
 | `get-tx <TX_HASH> [--epoch EPOCH]` | every batch holding the transaction on the node (digest, tier, position, epoch, worker, sequence number, sealing authority, DAG round of the carrying certificate; a transaction can be sealed more than once: `copies`), each with its committing header or `not committed` and, when committed, the same stored path as `get-batch` (carrying certificate, then header); the decoded transaction; and how many batches were read (`read/total hot, cold (epochs)`); absence is `not reached` / `missing` / `not found` as for `get-batch`; `DIVERGENT what=batch` only when nodes name different batches for the same committing header | `nodes found missing not_reached not_found what variants bad_digest copies uncommitted` |
 | `header-check <HEADER_NUMBER> [--back COUNT]` | one row per hop: number, digest, parent, tier, link status (`ok`, `genesis`, `end of range` for the last row, parent missing, digest mismatch, index mismatch), and the hop's certificates re-checked (`verify`); links decide where the check stops, a start header absent below the tip is `missing`, a failed signature makes the verdict `BROKEN` | `nodes hops divergent broken missing not_reached first sig_failed unverifiable` |
 | `summary` | datafile size, epoch range and counts, consensus tip and its commit time, cache tip, cold tier high-water mark, node identity, leftover checkpoints, entry count of every table | none |
-| `snapshot --to DIR` | copies one node's consensus database into `DIR` as one committed state (MDBX copies inside a read transaction, compacted) with its sealed cold jars; the copy opens without `--recover`; a stopped node with an unsynced last commit is copied file by file and the copy recovered; no verdict |
 
 ## Verdict
 
@@ -280,7 +273,6 @@ objects use the wire types' encoding described above.
 | `src/report/header.rs` | `header`, `cert`, `header-check` |
 | `src/report/batch.rs` | `get-batch`, `get-tx` |
 | `src/report/summary.rs` | `summary` |
-| `src/report/snapshot.rs` | `snapshot`: consistent copy of one node (MDBX copy in a read transaction, sealed cold jars, marker) |
 | `src/view.rs` | serializable hex views of consensus types |
 | `src/render.rs` | text tables |
 | `tests/` | integration tests against seeded MDBX fixtures |

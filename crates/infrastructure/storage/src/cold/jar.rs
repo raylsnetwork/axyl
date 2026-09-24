@@ -389,13 +389,6 @@ impl ColdSegment {
         Ok(cursor.row_by_number(row)?.map(|cols| cols.iter().map(|c| c.to_vec()).collect()))
     }
 
-    /// The three files of `epoch`'s jar: data, offsets and config. They exist and are immutable
-    /// once the epoch is sealed; callers check [`is_epoch_sealed`](Self::is_epoch_sealed).
-    pub fn jar_files(&self, epoch: Epoch) -> [PathBuf; 3] {
-        let data = self.jar_data_path(epoch);
-        [data.with_extension("off"), data.with_extension(CONFIG_FILE_EXTENSION), data]
-    }
-
     /// Returns the data-file path for `epoch`'s jar (satellites share this stem).
     ///
     /// The epoch is zero-padded so the on-disk listing sorts in archival order.

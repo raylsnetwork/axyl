@@ -7,7 +7,6 @@ use crate::{
         batch::{describe_absent_batch, BatchReport, CommitPath, TxReport},
         epoch::{describe_position, EpochCheckReport, EpochReport, EpochStatus, EpochsReport},
         header::{describe_absent, CertReport, HeaderCheckReport, HeaderReport, SignatureCheck},
-        snapshot::SnapshotReport,
         summary::SummaryReport,
         Report,
     },
@@ -96,7 +95,6 @@ pub fn render(report: &Report) -> String {
         Report::GetTx(r) => render_tx(r, &mut out),
         Report::HeaderCheck(r) => render_header_check(r, &mut out),
         Report::Summary(r) => render_summary(r, &mut out),
-        Report::Snapshot(r) => render_snapshot(r, &mut out),
     }
     if let Some(v) = report.verdict() {
         let _ = writeln!(out, "\nverdict: {v}");
@@ -760,45 +758,6 @@ fn render_header_check(r: &HeaderCheckReport, out: &mut String) {
                 u.epoch
             );
         }
-    }
-}
-
-fn render_snapshot(r: &SnapshotReport, out: &mut String) {
-    let _ = writeln!(out, "snapshot of {} ({}) -> {}", r.source, r.source_path, r.destination);
-    let _ = writeln!(
-        out,
-        "  mdbx.dat  {} on disk (compacted, one committed state)",
-        human_bytes(r.mdbx_bytes)
-    );
-    let _ = writeln!(
-        out,
-        "  cold      {} sealed epoch{} ({} files, {})",
-        r.cold_epochs.len(),
-        if r.cold_epochs.len() == 1 { "" } else { "s" },
-        r.cold_files,
-        human_bytes(r.cold_bytes)
-    );
-    let c = &r.copy;
-    let _ = writeln!(
-        out,
-        "  holds     consensus tip {}, epochs {}, {} records, {} certs, cold hwm {}",
-        opt(&c.latest_consensus_number),
-        match (c.first_epoch, c.last_epoch) {
-            (Some(a), Some(b)) => format!("{a}..={b}"),
-            _ => "-".to_owned(),
-        },
-        c.epoch_records,
-        c.epoch_certs,
-        opt(&c.cold_high_water_mark)
-    );
-    if r.recovered_copy {
-        let _ = writeln!(
-            out,
-            "  the source was stopped with an unsynced last commit: its files were copied as they \
-             were and the copy was recovered; the source was not modified"
-        );
-    } else {
-        let _ = writeln!(out, "  the copy opens read-only without --recover");
     }
 }
 

@@ -221,11 +221,10 @@ impl NodeDb {
                     "{label}: {}: MDBX refuses to read it until it is recovered: its last commit \
                      was never synced (the node was killed or crashed, or the files were copied \
                      from a running node), or the file is damaged (for example truncated). \
-                     `snapshot --to DIR` copies it and recovers the copy, leaving this directory \
-                     as it is; `--recover` recovers it in place, which is what the node itself \
-                     does when it next starts (on this boot it keeps the last commit; after a \
-                     reboot or on another host it drops up to a few seconds of unsynced writes). \
-                     Neither repairs damage",
+                     Copy the directory (`cp --sparse=always`) and run `--recover` on the copy, \
+                     which is the recovery the node itself performs when it next starts (on this \
+                     boot it keeps the last commit; after a reboot or on another host it drops up \
+                     to a few seconds of unsynced writes). Recovery never repairs damage",
                     path.display()
                 )))
             } else {
@@ -270,22 +269,6 @@ impl NodeDb {
     /// The cold tier, when one was attached at the open.
     fn cold(&self) -> Option<&ColdStore> {
         self.cold.as_ref()
-    }
-
-    /// The cold tier, for callers that copy its jars.
-    pub fn cold_store(&self) -> Option<&ColdStore> {
-        self.cold()
-    }
-
-    /// Copies the MDBX environment to the file `dest` as one committed state (compacted).
-    pub fn copy_mdbx_to(&self, dest: &Path) -> eyre::Result<()> {
-        self.db.compact_to(dest)
-    }
-
-    /// Whether an open failed because the database needs recovery (its last commit was never
-    /// synced), judged from the error text `open` produces.
-    pub fn needs_recovery(err: &eyre::Report) -> bool {
-        err.chain().any(|e| e.is::<NeedsRecovery>())
     }
 
     /// Whether the cold tier exists.

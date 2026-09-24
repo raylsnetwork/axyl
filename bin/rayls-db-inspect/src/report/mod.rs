@@ -4,7 +4,6 @@
 pub mod batch;
 pub mod epoch;
 pub mod header;
-pub mod snapshot;
 pub mod summary;
 
 use serde::{ser::SerializeMap as _, Serialize, Serializer};
@@ -330,11 +329,10 @@ pub enum Report {
     GetTx(batch::TxReport),
     HeaderCheck(header::HeaderCheckReport),
     Summary(summary::SummaryReport),
-    Snapshot(snapshot::SnapshotReport),
 }
 
 impl Report {
-    /// The verdict, if the subcommand produces one (`summary` and `snapshot` do not).
+    /// The verdict, if the subcommand produces one (`summary` does not).
     pub fn verdict(&self) -> Option<&Verdict> {
         match self {
             Self::Epoch(r) => Some(&r.verdict),
@@ -345,7 +343,7 @@ impl Report {
             Self::GetBatch(r) => Some(&r.verdict),
             Self::GetTx(r) => Some(&r.verdict),
             Self::HeaderCheck(r) => Some(&r.verdict),
-            Self::Summary(_) | Self::Snapshot(_) => None,
+            Self::Summary(_) => None,
         }
     }
 

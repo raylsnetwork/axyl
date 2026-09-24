@@ -661,7 +661,7 @@ impl MdbxDatabase {
     /// Runs against a consistent read snapshot, so the source may stay open; the copy omits
     /// freelist pages, shrinking a heavily pruned datafile to its live size. `dest` must not
     /// already exist.
-    pub fn compact_to<P: AsRef<Path>>(&self, dest: P) -> eyre::Result<()> {
+    fn compact_to<P: AsRef<Path>>(&self, dest: P) -> eyre::Result<()> {
         let dest = dest.as_ref();
         let dest_c = CString::new(
             dest.to_str().ok_or_else(|| eyre::eyre!("non-UTF-8 destination path: {dest:?}"))?,

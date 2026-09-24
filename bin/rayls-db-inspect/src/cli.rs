@@ -115,7 +115,6 @@ impl Command {
             | Self::GetBatch { nodes, .. }
             | Self::GetTx { nodes, .. }
             | Self::Summary { nodes }
-            | Self::Snapshot { nodes, .. }
             | Self::HeaderCheck { nodes, .. } => nodes,
         }
     }
@@ -251,18 +250,6 @@ pub enum Command {
 
     /// Overview of each node's database: epochs, consensus tip, table sizes.
     Summary {
-        #[command(flatten)]
-        nodes: NodeArgs,
-    },
-
-    /// Copy one node's consensus database into DIR as one committed state, with its sealed cold
-    /// jars. MDBX copies inside a read transaction, so the copy is consistent even from a running
-    /// node and opens without --recover. DIR must
-    /// not exist, or be an empty directory, outside the source. Exactly one --db.
-    Snapshot {
-        /// Destination directory.
-        #[arg(long, value_name = "DIR")]
-        to: std::path::PathBuf,
         #[command(flatten)]
         nodes: NodeArgs,
     },

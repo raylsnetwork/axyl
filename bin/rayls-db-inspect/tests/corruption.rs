@@ -325,8 +325,8 @@ fn damaged_databases_never_panic_and_stay_readable_where_mdbx_allows() {
             if let Outcome::Error(e) = &outcomes[0].1 {
                 if e.contains("refuses to read it until it is recovered") {
                     // a destroyed meta page can leave the newest surviving one unsynced; the
-                    // recovery `snapshot` and `--recover` perform on a copy must then make it
-                    // readable (MDBX keeps the last commit on the same boot)
+                    // recovery `--recover` performs on a copy must then make it readable (MDBX
+                    // keeps the last commit on the same boot)
                     outcomes = exercise(&copy, tx_hash, true);
                 }
             }

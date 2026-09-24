@@ -124,5 +124,5 @@ fn help_renders_for_every_subcommand() {
             assert!(!nested.render_long_help().to_string().trim().is_empty());
         }
     }
-    assert_eq!(seen, 10);
+    assert_eq!(seen, 9);
 }

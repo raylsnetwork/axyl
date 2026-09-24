@@ -31,9 +31,6 @@ pub fn run(cli: &Cli) -> eyre::Result<Report> {
     if dbs.is_empty() {
         eyre::bail!("no node given: pass --db <[LABEL=]DATADIR>, before or after the command");
     }
-    if cli.recover && matches!(cli.command, Command::Snapshot { .. }) {
-        eyre::bail!("--recover does not combine with snapshot: the source is copied as it is");
-    }
     // Every command opens every node the same way: one column per node, so a label used twice
     // would show one node as two agreeing ones, and MDBX allows one handle per environment per
     // process, so the same database twice would fail on open with an unhelpful error.
@@ -88,27 +85,5 @@ pub fn run(cli: &Cli) -> eyre::Result<Report> {
             Report::HeaderCheck(report::header::header_check(&open_all()?, *number, *back)?)
         }
         Command::Summary { .. } => Report::Summary(report::summary::summary(&open_all()?)?),
-        Command::Snapshot { to, .. } => {
-            if dbs.len() != 1 {
-                eyre::bail!("snapshot copies one node: give exactly one --db (got {})", dbs.len());
-            }
-            match NodeDb::open(&dbs[0], &opts) {
-                Ok(db) => Report::Snapshot(report::snapshot::snapshot(&db, to)?),
-                // a stopped node whose last commit was never synced cannot be read until it is
-                // recovered: copy its files as they are and recover the copy instead
-                Err(err) if NodeDb::needs_recovery(&err) => {
-                    let (label, path) = NodeDb::resolve(&dbs[0])?;
-                    eprintln!(
-                        "{label}: {} is stopped with an unsynced last commit: copying its files as \
-                         they are and recovering the copy",
-                        path.display()
-                    );
-                    Report::Snapshot(report::snapshot::snapshot_stopped_unsynced(
-                        &label, &path, to,
-                    )?)
-                }
-                Err(err) => return Err(err),
-            }
-        }
     })
 }
