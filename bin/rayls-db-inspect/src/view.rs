@@ -9,7 +9,7 @@
 
 use rayls_infrastructure_types::{
     encode, keccak256, AuthorityIdentifier, BlockHash, BlsPublicKey, BlsSignature, Certificate,
-    CertificateDigest, Decodable2718 as _, EpochTransitionCheckpoint, Hash as _,
+    CertificateDigest, ConsensusHeader, Decodable2718 as _, EpochTransitionCheckpoint, Hash as _,
     SignatureVerificationState, SignerRecoverable as _, TransactionSigned, TransactionTrait as _,
     TxKind, Typed2718 as _, B256,
 };
@@ -104,6 +104,33 @@ impl CertificateView {
     }
 }
 
+/// Compact identification of a stored consensus header: its own fields and its sub-dag's counts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct HeaderSummary {
+    pub number: u64,
+    pub digest: String,
+    pub parent_hash: String,
+    pub leader: CertificateSummary,
+    pub certificate_count: usize,
+    pub batch_count: usize,
+    pub commit_timestamp: u64,
+}
+
+impl HeaderSummary {
+    pub fn of(header: &ConsensusHeader) -> Self {
+        let sub_dag = &header.sub_dag;
+        Self {
+            number: header.number,
+            digest: b256(&header.digest()),
+            parent_hash: b256(&header.parent_hash),
+            leader: CertificateSummary::of(&sub_dag.leader),
+            certificate_count: sub_dag.certificates.len(),
+            batch_count: sub_dag.certificates.iter().map(|c| c.header().payload().len()).sum(),
+            commit_timestamp: sub_dag.commit_timestamp(),
+        }
+    }
+}
+
 #[allow(deprecated)]
 fn verification_state_name(state: &SignatureVerificationState) -> &'static str {
     match state {
@@ -191,23 +218,5 @@ impl TransactionView {
             Err(err) => view.error = Some(err.to_string()),
         }
         view
-    }
-
-    /// One-line text form: hash, then either the decoded fields or the decode error.
-    pub fn line(&self) -> String {
-        match &self.error {
-            Some(err) => format!("{} {} bytes UNDECODABLE: {err}", self.hash, self.bytes),
-            None => format!(
-                "{} type={} nonce={} from={} to={} value={} gas={} {} bytes",
-                self.hash,
-                self.tx_type.unwrap_or_default(),
-                self.nonce.unwrap_or_default(),
-                self.from.as_deref().unwrap_or("UNRECOVERABLE"),
-                self.to.as_deref().unwrap_or("-"),
-                self.value.as_deref().unwrap_or("-"),
-                self.gas_limit.unwrap_or_default(),
-                self.bytes
-            ),
-        }
     }
 }

@@ -4,7 +4,7 @@
 use crate::{
     node_db::Tier,
     report::{
-        batch::{describe_absent_batch, BatchReport, TxReport},
+        batch::{describe_absent_batch, BatchReport, CommitPath, TxReport},
         epoch::{describe_position, EpochCheckReport, EpochReport, EpochStatus, EpochsReport},
         header::{describe_absent, CertReport, HeaderCheckReport, HeaderReport, SignatureCheck},
         snapshot::SnapshotReport,
@@ -496,9 +496,10 @@ fn render_batch(r: &BatchReport, out: &mut String) {
         "seq",
         "txs",
         "bytes",
-        "beneficiary",
         "base fee",
         "digest ok",
+        "round",
+        "committed in",
     ]);
     for n in &r.nodes {
         match (&n.batch, &n.dangling) {
@@ -511,9 +512,10 @@ fn render_batch(r: &BatchReport, out: &mut String) {
                 b.seq.to_string(),
                 b.transaction_count.to_string(),
                 b.transaction_bytes.to_string(),
-                b.beneficiary.clone(),
                 b.base_fee_per_gas.to_string(),
                 yes_no(b.digest_ok).to_owned(),
+                carrier_round(b.path.as_ref()),
+                b.committed_in.to_string(),
             ]),
             (None, Some(loc)) => t.row(vec![
                 n.node.clone(),
@@ -530,27 +532,95 @@ fn render_batch(r: &BatchReport, out: &mut String) {
     out.push_str(&t.render());
     for n in &r.nodes {
         let Some(b) = &n.batch else { continue };
-        if !b.digest_ok {
-            let _ = writeln!(out, "\n[{}] stored bytes hash to {}", n.node, b.computed_digest);
-        }
-        if b.committed_in.is_none() && b.transactions.is_none() {
-            continue;
-        }
         let _ = writeln!(out, "\n[{}]", n.node);
-        if let Some(commit) = &b.committed_in {
-            let _ = writeln!(out, "  committed in  {commit}");
+        if !b.digest_ok {
+            section(out, "stored bytes hash to", &b.computed_digest);
         }
-        if let Some(txs) = &b.transactions {
-            if txs.is_empty() {
-                let _ = writeln!(out, "  transactions  none");
-            } else {
-                let _ = writeln!(out, "  transactions:");
-                for tx in txs {
-                    let _ = writeln!(out, "    [{}] {}", tx.index, tx.line());
-                }
+        section(out, "authority", &b.authority);
+        section(out, "committed in", &b.committed_in);
+        if let Some(path) = &b.path {
+            render_commit_path(path, out);
+        }
+        if b.transactions.is_empty() {
+            section(out, "transactions", "none");
+        } else {
+            section(out, "transactions", b.transactions.len());
+            for tx in &b.transactions {
+                render_transaction_entry(tx, out);
             }
         }
     }
+}
+
+/// A detail-block heading: two-space indent, the key padded so values line up.
+fn section(out: &mut String, key: &str, value: impl std::fmt::Display) {
+    let _ = writeln!(out, "  {key:<13} {value}");
+}
+
+/// A field under a [`section`]: four-space indent, the key padded so values line up. One value
+/// per line, so a 32-byte hash never shares a line with another.
+fn field(out: &mut String, key: &str, value: impl std::fmt::Display) {
+    let _ = writeln!(out, "    {key:<11} {value}");
+}
+
+/// One transaction of a batch listing: its position and hash, then the decoded fields. Four
+/// lines, none carrying more than one address or hash.
+fn render_transaction_entry(tx: &TransactionView, out: &mut String) {
+    let _ = writeln!(out, "    [{}] {}", tx.index, tx.hash);
+    if let Some(err) = &tx.error {
+        let _ = writeln!(out, "        {} bytes UNDECODABLE: {err}", tx.bytes);
+        return;
+    }
+    let _ = writeln!(out, "        from {}", tx.from.as_deref().unwrap_or("UNRECOVERABLE"));
+    let _ = writeln!(out, "        to   {}", opt(&tx.to));
+    let _ = writeln!(
+        out,
+        "        type {} nonce {} value {} gas {} {} bytes",
+        opt(&tx.tx_type),
+        opt(&tx.nonce),
+        opt(&tx.value),
+        opt(&tx.gas_limit),
+        tx.bytes
+    );
+}
+
+/// The DAG round of the certificate that carried the batch into its commit; `-` when nothing
+/// committed it or no certificate of the sub-dag lists it.
+fn carrier_round(path: Option<&CommitPath>) -> String {
+    path.and_then(|p| p.certificate.as_ref())
+        .map(|c| c.certificate.summary.round.to_string())
+        .unwrap_or_else(|| "-".to_owned())
+}
+
+/// The stored rows between a batch and its commit: the sub-dag certificate whose payload lists
+/// the batch, then the consensus header carrying that sub-dag.
+fn render_commit_path(path: &CommitPath, out: &mut String) {
+    match &path.certificate {
+        Some(c) => {
+            let s = &c.certificate.summary;
+            section(out, "certificate", &s.digest);
+            field(out, "author", &s.author);
+            field(out, "round", s.round);
+            field(out, "epoch", s.epoch);
+            field(out, "worker", c.worker_id);
+            field(out, "header", &c.certificate.header_digest);
+            field(out, "created at", c.certificate.created_at);
+            field(out, "signers", list(&c.certificate.signers));
+            field(out, "state", c.certificate.verification_state);
+        }
+        None => section(out, "certificate", "NONE of the sub-dag lists this batch"),
+    }
+    let h = &path.header;
+    section(out, "header", h.number);
+    field(out, "digest", &h.digest);
+    field(out, "parent", &h.parent_hash);
+    field(out, "leader", &h.leader.digest);
+    field(out, "author", &h.leader.author);
+    field(out, "round", h.leader.round);
+    field(out, "epoch", h.leader.epoch);
+    field(out, "certs", h.certificate_count);
+    field(out, "batches", h.batch_count);
+    field(out, "committed", h.commit_timestamp);
 }
 
 fn render_tx(r: &TxReport, out: &mut String) {
@@ -565,13 +635,13 @@ fn render_tx(r: &TxReport, out: &mut String) {
     let mut t = Table::new(&[
         "node",
         "live",
-        "batch",
         "tier",
         "index",
         "epoch",
         "worker",
         "seq",
         "digest ok",
+        "round",
         "committed in",
         "scanned",
     ]);
@@ -589,18 +659,19 @@ fn render_tx(r: &TxReport, out: &mut String) {
             t.row(vec![n.node.clone(), n.live.to_string(), absence]);
             continue;
         }
-        // one row per batch that carries the transaction; the scan total once per node
+        // one row per batch that carries the transaction, in the order of the detail blocks
+        // below (which carry the digests); the scan total once per node
         for (i, m) in n.matches.iter().enumerate() {
             t.row(vec![
                 n.node.clone(),
                 n.live.to_string(),
-                m.digest.clone(),
                 m.tier.to_string(),
                 format!("{}/{}", m.index, m.transaction_count),
                 m.epoch.to_string(),
                 m.worker_id.to_string(),
                 m.seq.to_string(),
                 yes_no(m.digest_ok).to_owned(),
+                carrier_round(m.path.as_ref()),
                 m.committed_in.to_string(),
                 if i == 0 { n.scanned.to_string() } else { String::new() },
             ]);
@@ -611,6 +682,20 @@ fn render_tx(r: &TxReport, out: &mut String) {
         let Some(tx) = &n.transaction else { continue };
         let _ = writeln!(out, "\n[{}]", n.node);
         render_transaction(tx, out);
+        // the stored rows from the transaction up to its commit, once per batch holding it
+        for m in &n.matches {
+            section(out, "batch", &m.digest);
+            field(out, "tier", m.tier);
+            field(out, "index", format!("{}/{}", m.index, m.transaction_count));
+            field(out, "epoch", m.epoch);
+            field(out, "worker", m.worker_id);
+            field(out, "seq", m.seq);
+            field(out, "authority", &m.authority);
+            field(out, "committed", &m.committed_in);
+            if let Some(path) = &m.path {
+                render_commit_path(path, out);
+            }
+        }
     }
 }
 

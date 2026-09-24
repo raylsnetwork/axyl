@@ -12,7 +12,7 @@
 use super::{absence_verdict, code, recode, Lookup, Verdict};
 use crate::{
     node_db::{BatchLookup, LiveStatus, NodeDb, Position, ScanStats, Tier},
-    view::{b256, TransactionView},
+    view::{b256, CertificateView, HeaderSummary, TransactionView},
 };
 use rayls_infrastructure_storage::cold::ColdLocation;
 use rayls_infrastructure_types::{keccak256, Batch, BlockHash, Epoch, WorkerId, B256};
@@ -95,6 +95,53 @@ fn commit_of(node: &NodeDb, digest: BlockHash, epoch: Epoch) -> eyre::Result<Com
     Ok(Commit::of(node.header_committing_batch(digest, epoch)?))
 }
 
+/// The stored rows between a batch and its commit: the sub-dag certificate whose payload lists
+/// the batch, and the consensus header that carries that sub-dag. Every field is read from the
+/// header as the node stored it.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct CommitPath {
+    /// The certificate of the committing header's sub-dag that lists the batch in its payload,
+    /// with the worker id the payload pairs it with. `None` when the header's own bytes name the
+    /// batch (that is how it was found) but no certificate's payload does, which means the row
+    /// is inconsistent with itself.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub certificate: Option<CarryingCertificate>,
+    pub header: HeaderSummary,
+}
+
+/// A sub-dag certificate that carries a batch.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct CarryingCertificate {
+    #[serde(flatten)]
+    pub certificate: CertificateView,
+    /// The worker the certificate's payload attributes the batch to.
+    pub worker_id: WorkerId,
+}
+
+/// Reads the committing header `commit` names and picks out the certificate carrying `batch`.
+/// `None` when nothing committed the batch.
+fn commit_path(
+    node: &NodeDb,
+    batch: BlockHash,
+    commit: &Commit,
+) -> eyre::Result<Option<CommitPath>> {
+    let Some(number) = commit.number() else { return Ok(None) };
+    // the same tier order the commit lookup used; a header archived between the two reads is
+    // still found, in its new tier
+    let Some((header, _)) = node.header(number)? else {
+        eyre::bail!("{}: consensus header {number} named the batch but is gone", node.label);
+    };
+    let sub_dag = &header.sub_dag;
+    let certificate =
+        sub_dag.certificates.iter().chain(std::iter::once(&sub_dag.leader)).find_map(|c| {
+            c.header().payload().get(&batch).map(|worker_id| CarryingCertificate {
+                certificate: CertificateView::of(c, false),
+                worker_id: *worker_id,
+            })
+        });
+    Ok(Some(CommitPath { certificate, header: HeaderSummary::of(&header) }))
+}
+
 // ---------------------------------------------------------------------------------------------
 // get-batch <DIGEST>
 // ---------------------------------------------------------------------------------------------
@@ -131,20 +178,28 @@ pub struct BatchView {
     pub epoch: Epoch,
     pub worker_id: WorkerId,
     pub seq: u64,
-    pub beneficiary: String,
+    /// The authority that sealed the batch, by the execution address stored in the batch (its
+    /// BLS identity is not stored there).
+    pub authority: String,
     pub base_fee_per_gas: u64,
     pub transaction_count: usize,
     /// Encoded size of all transactions together, in bytes.
     pub transaction_bytes: usize,
-    /// The consensus header whose sub-dag commits this batch (`-v`).
+    /// The consensus header whose sub-dag commits this batch.
+    pub committed_in: Commit,
+    /// The carrying certificate and committing header as stored; absent when not committed.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub committed_in: Option<Commit>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub transactions: Option<Vec<TransactionView>>,
+    pub path: Option<CommitPath>,
+    pub transactions: Vec<TransactionView>,
 }
 
 impl BatchView {
-    fn of(digest: BlockHash, batch: &Batch, committed_in: Option<Commit>, verbose: bool) -> Self {
+    fn of(
+        digest: BlockHash,
+        batch: &Batch,
+        committed_in: Commit,
+        path: Option<CommitPath>,
+    ) -> Self {
         let computed = batch.digest();
         Self {
             computed_digest: b256(&computed),
@@ -152,41 +207,35 @@ impl BatchView {
             epoch: batch.epoch,
             worker_id: batch.worker_id,
             seq: batch.seq,
-            beneficiary: batch.beneficiary.to_string(),
+            authority: batch.beneficiary.to_string(),
             base_fee_per_gas: batch.base_fee_per_gas,
             transaction_count: batch.transactions.len(),
             transaction_bytes: batch.transactions.iter().map(|t| t.len()).sum(),
             committed_in,
-            transactions: verbose.then(|| {
-                batch
-                    .transactions
-                    .iter()
-                    .enumerate()
-                    .map(|(i, t)| TransactionView::of(i, t))
-                    .collect()
-            }),
+            path,
+            transactions: batch
+                .transactions
+                .iter()
+                .enumerate()
+                .map(|(i, t)| TransactionView::of(i, t))
+                .collect(),
         }
     }
 }
 
-pub fn get_batch(nodes: &[NodeDb], digest: B256, verbose: bool) -> eyre::Result<BatchReport> {
+pub fn get_batch(nodes: &[NodeDb], digest: B256) -> eyre::Result<BatchReport> {
     let mut hits = Vec::with_capacity(nodes.len());
     for node in nodes {
         hits.push((node.position()?, node.batch(digest)?));
     }
     let held = hits.iter().any(|(_, hit)| matches!(hit, BatchLookup::Found(..)));
-    let absent = hits.iter().any(|(_, hit)| !matches!(hit, BatchLookup::Found(..)));
 
-    // The committing header is what absences are judged against: the lowest number any holding
-    // node saw. It is looked up on every node that holds the batch whenever some node lacks it
-    // or under -v, and not at all when every node holds it (the lookup scans the hot header
-    // tables).
+    // The committing header is looked up on every node that holds the batch: it is reported,
+    // and the lowest number any node saw is what absences are judged against.
     let mut commits: Vec<Option<Commit>> = vec![None; nodes.len()];
-    if verbose || absent {
-        for (i, (node, (_, hit))) in nodes.iter().zip(&hits).enumerate() {
-            let BatchLookup::Found(batch, _) = hit else { continue };
-            commits[i] = Some(commit_of(node, digest, batch.epoch)?);
-        }
+    for (i, (node, (_, hit))) in nodes.iter().zip(&hits).enumerate() {
+        let BatchLookup::Found(batch, _) = hit else { continue };
+        commits[i] = Some(commit_of(node, digest, batch.epoch)?);
     }
     let committed_at = commits.iter().flatten().filter_map(Commit::number).min();
 
@@ -204,12 +253,9 @@ pub fn get_batch(nodes: &[NodeDb], digest: B256, verbose: bool) -> eyre::Result<
         match hit {
             BatchLookup::Found(batch, tier) => {
                 view.tier = Some(tier);
-                view.batch = Some(BatchView::of(
-                    digest,
-                    &batch,
-                    if verbose { commit } else { None },
-                    verbose,
-                ));
+                let commit = commit.unwrap_or(Commit::NotCommitted);
+                let path = commit_path(node, digest, &commit)?;
+                view.batch = Some(BatchView::of(digest, &batch, commit, path));
             }
             BatchLookup::Dangling(location) => {
                 view.lookup = Lookup::Missing;
@@ -270,7 +316,7 @@ pub struct TxNodeView {
 }
 
 /// One batch holding the transaction.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct TxMatch {
     pub digest: String,
     pub tier: Tier,
@@ -279,10 +325,15 @@ pub struct TxMatch {
     pub epoch: Epoch,
     pub worker_id: WorkerId,
     pub seq: u64,
+    /// The authority that sealed the batch, by the execution address stored in the batch.
+    pub authority: String,
     pub transaction_count: usize,
     /// The stored bytes hash to the digest they are stored under.
     pub digest_ok: bool,
     pub committed_in: Commit,
+    /// The carrying certificate and committing header as stored; absent when not committed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<CommitPath>,
 }
 
 struct Hit {
@@ -325,6 +376,8 @@ pub fn get_tx(nodes: &[NodeDb], hash: B256, epoch: Option<Epoch>) -> eyre::Resul
     for (node, scan) in nodes.iter().zip(&scans) {
         let mut found = Vec::with_capacity(scan.hits.len());
         for hit in &scan.hits {
+            let committed_in = commit_of(node, hit.digest, hit.batch.epoch)?;
+            let path = commit_path(node, hit.digest, &committed_in)?;
             found.push(TxMatch {
                 digest: b256(&hit.digest),
                 tier: hit.tier,
@@ -332,9 +385,11 @@ pub fn get_tx(nodes: &[NodeDb], hash: B256, epoch: Option<Epoch>) -> eyre::Resul
                 epoch: hit.batch.epoch,
                 worker_id: hit.batch.worker_id,
                 seq: hit.batch.seq,
+                authority: hit.batch.beneficiary.to_string(),
                 transaction_count: hit.batch.transactions.len(),
                 digest_ok: hit.batch.digest() == hit.digest,
-                committed_in: commit_of(node, hit.digest, hit.batch.epoch)?,
+                committed_in,
+                path,
             });
         }
         matches.push(found);

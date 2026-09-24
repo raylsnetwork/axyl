@@ -50,7 +50,7 @@ fn batch_found_hot_on_every_node_with_its_transactions() {
     });
     let digest = fx.batch(0, 1, txs.clone()).digest();
 
-    let report = get_batch(&[a.open("a"), b.open("b")], digest, true).unwrap();
+    let report = get_batch(&[a.open("a"), b.open("b")], digest).unwrap();
     assert_eq!(report.verdict.to_string(), "OK nodes=2");
     assert!(report.verdict.healthy);
     assert_eq!(report.committed_at, Some(4));
@@ -60,8 +60,13 @@ fn batch_found_hot_on_every_node_with_its_transactions() {
         let v = n.batch.as_ref().unwrap();
         assert!(v.digest_ok);
         assert_eq!((v.epoch, v.worker_id, v.seq, v.transaction_count), (0, 0, 1, 3));
-        assert_eq!(v.committed_in, Some(Commit::Committed { number: 4, tier: Tier::Hot }));
-        let list = v.transactions.as_ref().unwrap();
+        assert_eq!(
+            v.authority,
+            rayls_infrastructure_types::Address::repeat_byte(0xbe).to_string(),
+            "the sealing authority's execution address, as stored in the batch"
+        );
+        assert_eq!(v.committed_in, Commit::Committed { number: 4, tier: Tier::Hot });
+        let list = &v.transactions;
         assert_eq!(list.len(), 3);
         let second = &list[1];
         assert_eq!(second.hash, b256(&keccak256(&txs[1])));
@@ -78,19 +83,57 @@ fn batch_found_hot_on_every_node_with_its_transactions() {
     }
 }
 
+/// The path from a batch to its commit is read from the stored header: the sub-dag certificate
+/// whose payload lists the batch, and the header's own fields.
 #[test]
-fn batch_without_verbose_skips_the_commit_lookup_when_every_node_holds_it() {
+fn batch_reports_its_carrying_certificate_and_committing_header() {
     let fx = Fixture::new();
     let txs = signed_transactions(1);
     let a = SeededNode::new(|db| {
         seed_with_batch(&fx, db, &txs);
     });
     let digest = fx.batch(0, 1, txs).digest();
-    let report = get_batch(&[a.open("a")], digest, false).unwrap();
+    let (h4, _) = {
+        let node = a.open("a");
+        node.header(4).unwrap().unwrap()
+    };
+
+    let report = get_batch(&[a.open("a")], digest).unwrap();
     let v = report.nodes[0].batch.as_ref().unwrap();
-    assert!(v.committed_in.is_none() && v.transactions.is_none());
-    assert_eq!(report.committed_at, None, "not looked up: nothing to judge");
-    assert_eq!(v.transaction_count, 1);
+    assert_eq!(v.committed_in, Commit::Committed { number: 4, tier: Tier::Hot });
+    let path = v.path.as_ref().expect("committed: path present");
+    assert_eq!(path.header.number, 4);
+    assert_eq!(path.header.digest, b256(&h4.digest()));
+    assert_eq!(path.header.parent_hash, b256(&h4.parent_hash));
+    assert_eq!(path.header.leader.round, h4.sub_dag.leader.round());
+    assert_eq!((path.header.certificate_count, path.header.batch_count), (1, 1));
+    assert_eq!(path.header.commit_timestamp, h4.sub_dag.commit_timestamp());
+    let carrier = path.certificate.as_ref().expect("the leader's payload lists the batch");
+    assert_eq!(carrier.worker_id, 0);
+    assert_eq!(carrier.certificate.summary, path.header.leader, "the fixture's leader carries it");
+    assert_eq!(
+        carrier.certificate.signers.len() as u64,
+        h4.sub_dag.leader.signed_authorities().len(),
+        "the signer set as stored"
+    );
+    assert!(carrier.certificate.raw.is_none(), "the stored certificate is not echoed");
+}
+
+/// A batch nothing committed has no path and nothing is invented for it.
+#[test]
+fn uncommitted_batch_has_no_path() {
+    let fx = Fixture::new();
+    let txs = signed_transactions(1);
+    let sealed = fx.batch(0, 9, txs);
+    let a = SeededNode::new(|db| {
+        drop(seed_healthy(&fx, db));
+        write_batch(db, &sealed);
+    });
+    let report = get_batch(&[a.open("a")], sealed.digest()).unwrap();
+    let v = report.nodes[0].batch.as_ref().unwrap();
+    assert_eq!(v.committed_in, Commit::NotCommitted);
+    assert!(v.path.is_none());
+    assert_eq!(v.transactions.len(), 1, "transactions are always listed");
 }
 
 /// Absence is judged against the header that committed the batch, not the epoch: a node whose tip
@@ -112,8 +155,7 @@ fn absent_batch_is_not_reached_below_the_committing_header_and_missing_above_it(
     // c: tip 3, in the same epoch, no batch: not reached
     let c = SeededNode::new(|db| drop(seed_healthy(&fx, db)));
 
-    let report =
-        get_batch(&[a.open("a"), b.open("b"), c.open("c")], sealed.digest(), false).unwrap();
+    let report = get_batch(&[a.open("a"), b.open("b"), c.open("c")], sealed.digest()).unwrap();
     assert_eq!(report.committed_at, Some(4));
     assert_eq!(report.nodes[0].lookup, Lookup::Found);
     assert_eq!(report.nodes[1].lookup, Lookup::Missing);
@@ -134,13 +176,13 @@ fn batch_committed_nowhere_is_not_expected_anywhere() {
         write_batch(db, &sealed);
     });
     let b = SeededNode::new(|db| drop(seed_healthy(&fx, db)));
-    let report = get_batch(&[a.open("a"), b.open("b")], sealed.digest(), false).unwrap();
+    let report = get_batch(&[a.open("a"), b.open("b")], sealed.digest()).unwrap();
     assert_eq!(report.committed_at, None);
     assert_eq!(report.nodes[1].lookup, Lookup::NotReached);
     assert_eq!(report.verdict.to_string(), "PARTIAL nodes=2 found=1 not_reached=1");
 
     // a digest nobody holds says nothing about any node
-    let nowhere = get_batch(&[b.open("b")], B256::repeat_byte(0x42), false).unwrap();
+    let nowhere = get_batch(&[b.open("b")], B256::repeat_byte(0x42)).unwrap();
     assert_eq!(nowhere.nodes[0].lookup, Lookup::NotFound);
     assert_eq!(nowhere.verdict.to_string(), "EMPTY nodes=1 not_found=1");
     assert!(!nowhere.verdict.healthy);
@@ -158,7 +200,7 @@ fn batch_stored_under_the_wrong_digest_is_broken_even_when_others_lack_it() {
     });
     let b = SeededNode::new(|db| drop(seed_healthy(&fx, db)));
 
-    let report = get_batch(&[a.open("a")], wrong, false).unwrap();
+    let report = get_batch(&[a.open("a")], wrong).unwrap();
     let v = report.nodes[0].batch.as_ref().unwrap();
     assert!(!v.digest_ok);
     assert_eq!(v.computed_digest, b256(&fx.batch(0, 1, txs).digest()));
@@ -166,7 +208,7 @@ fn batch_stored_under_the_wrong_digest_is_broken_even_when_others_lack_it() {
     assert!(!report.verdict.healthy);
 
     // corruption outranks partial absence
-    let report = get_batch(&[a.open("a"), b.open("b")], wrong, false).unwrap();
+    let report = get_batch(&[a.open("a"), b.open("b")], wrong).unwrap();
     assert_eq!(report.verdict.to_string(), "BROKEN nodes=2 found=1 not_reached=1 bad_digest=1");
 }
 
@@ -181,12 +223,15 @@ fn archived_batch_is_found_in_the_cold_tier_with_its_cold_header() {
     let node = a.open("a");
     assert_eq!(node.header(4).unwrap().map(|(_, t)| t), Some(Tier::Cold), "epoch 0 archived");
     assert_eq!(node.header(5).unwrap().map(|(_, t)| t), Some(Tier::Hot), "epoch 1 stays hot");
-    let report = get_batch(&[node], digest, true).unwrap();
+    let report = get_batch(&[node], digest).unwrap();
     assert_eq!(report.nodes[0].tier, Some(Tier::Cold));
     let v = report.nodes[0].batch.as_ref().unwrap();
     assert!(v.digest_ok);
     assert_eq!(v.transaction_count, 2);
-    assert_eq!(v.committed_in, Some(Commit::Committed { number: 4, tier: Tier::Cold }));
+    assert_eq!(v.committed_in, Commit::Committed { number: 4, tier: Tier::Cold });
+    let path = v.path.as_ref().expect("the cold header is read for the path too");
+    assert_eq!(path.header.number, 4);
+    assert!(path.certificate.is_some());
     assert_eq!(report.verdict.to_string(), "OK nodes=1");
 
     // and the transaction scan reaches the cold jar too, with or without the epoch filter
@@ -198,6 +243,7 @@ fn archived_batch_is_found_in_the_cold_tier_with_its_cold_header() {
         let m = &n.matches[0];
         assert_eq!((m.tier, m.index, m.epoch), (Tier::Cold, 1, 0));
         assert_eq!(m.committed_in, Commit::Committed { number: 4, tier: Tier::Cold });
+        assert_eq!(m.path.as_ref().map(|p| p.header.number), Some(4));
         assert!(m.digest_ok);
         assert_eq!(
             (n.scanned.hot_batches, n.scanned.cold_batches, n.scanned.cold_epochs),
@@ -224,7 +270,7 @@ fn dangling_cold_index_is_broken_not_absent() {
     }
     assert!(removed > 0, "epoch 0 jar files existed");
 
-    let report = get_batch(&[a.open("a")], digest, false).unwrap();
+    let report = get_batch(&[a.open("a")], digest).unwrap();
     let n = &report.nodes[0];
     assert_eq!(n.lookup, Lookup::Missing);
     assert_eq!(n.dangling.map(|l| l.epoch), Some(0));
@@ -247,6 +293,7 @@ fn tx_is_found_in_its_batch_with_the_committing_header() {
         seed_with_batch(&fx, db, &txs);
     });
     let digest = fx.batch(0, 1, txs.clone()).digest();
+    let (h4, _) = a.open("a").header(4).unwrap().unwrap();
 
     let report = get_tx(&[a.open("a"), b.open("b")], keccak256(&txs[2]), None).unwrap();
     assert_eq!(report.verdict.to_string(), "OK nodes=2");
@@ -258,7 +305,15 @@ fn tx_is_found_in_its_batch_with_the_committing_header() {
         let m = &n.matches[0];
         assert_eq!(m.digest, b256(&digest));
         assert_eq!((m.tier, m.index, m.epoch, m.transaction_count), (Tier::Hot, 2, 0, 3));
+        assert_eq!(m.authority, rayls_infrastructure_types::Address::repeat_byte(0xbe).to_string());
         assert_eq!(m.committed_in, Commit::Committed { number: 4, tier: Tier::Hot });
+        // the whole stored path: batch -> carrying certificate -> committing header
+        let path = m.path.as_ref().expect("committed: path present");
+        assert_eq!(path.header.number, 4);
+        assert_eq!(path.header.digest, b256(&h4.digest()));
+        let carrier = path.certificate.as_ref().expect("a sub-dag certificate lists the batch");
+        assert_eq!(carrier.certificate.summary, path.header.leader);
+        assert_eq!(carrier.worker_id, 0);
         let t = n.transaction.as_ref().unwrap();
         assert_eq!(t.nonce, Some(2));
         assert_eq!(t.hash, b256(&keccak256(&txs[2])));
@@ -353,6 +408,10 @@ fn tx_committed_by_a_cached_header_is_verified_not_processed() {
     });
     let report = get_tx(&[a.open("a")], keccak256(&txs[0]), None).unwrap();
     assert_eq!(report.nodes[0].matches[0].committed_in, Commit::Verified { number: 4 });
+    // the cached header is read for the path like a canonical one
+    let path = report.nodes[0].matches[0].path.as_ref().unwrap();
+    assert_eq!(path.header.number, 4);
+    assert!(path.certificate.is_some());
     assert_eq!(report.committed_at, Some(4));
     assert_eq!(report.verdict.to_string(), "OK nodes=1");
 }
@@ -371,6 +430,7 @@ fn tx_on_a_node_without_headers_is_still_scanned() {
     assert_eq!(n.current_epoch, None);
     assert_eq!(n.lookup, Lookup::Found);
     assert_eq!(n.matches[0].committed_in, Commit::NotCommitted);
+    assert!(n.matches[0].path.is_none(), "nothing committed it: no path");
     assert_eq!(report.verdict.to_string(), "OK nodes=1 uncommitted=1");
 }
 

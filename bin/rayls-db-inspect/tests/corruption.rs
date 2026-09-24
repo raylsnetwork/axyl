@@ -156,7 +156,7 @@ fn exercise(
     out.push(run("header-check", &|| header_check(&[Source::Db(open()?)], 5, 100).map(|_| ())));
     out.push(run("get-tx", &|| get_tx(&[open()?], tx_hash, None).map(|_| ())));
     out.push(run("get-batch (absent)", &|| {
-        get_batch(&[open()?], rayls_infrastructure_types::B256::ZERO, true).map(|_| ())
+        get_batch(&[open()?], rayls_infrastructure_types::B256::ZERO).map(|_| ())
     }));
     out
 }

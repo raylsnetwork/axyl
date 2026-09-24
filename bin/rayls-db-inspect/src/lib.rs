@@ -127,11 +127,9 @@ pub fn run(cli: &Cli) -> eyre::Result<Report> {
         Command::Cert { number, .. } => {
             Report::Cert(report::header::cert(&open_all()?, *number, verbose)?)
         }
-        Command::GetBatch { digest, .. } => Report::GetBatch(report::batch::get_batch(
-            &open_dbs_only("get-batch")?,
-            *digest,
-            verbose,
-        )?),
+        Command::GetBatch { digest, .. } => {
+            Report::GetBatch(report::batch::get_batch(&open_dbs_only("get-batch")?, *digest)?)
+        }
         Command::GetTx { hash, epoch, .. } => {
             Report::GetTx(report::batch::get_tx(&open_dbs_only("get-tx")?, *hash, *epoch)?)
         }

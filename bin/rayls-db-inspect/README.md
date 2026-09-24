@@ -18,9 +18,10 @@ epoch record / certificate / header state per node.
   signatures).
 - Triage after an incident: `summary` and `epoch-check` give a quick health picture of every
   node's consensus database.
-- A block's transactions are in question: `get-tx <TX_HASH>` finds the batch that carries a
-  transaction and the consensus header that committed it; `get-batch <DIGEST>` shows the batch
-  itself, hot or archived.
+- A block's transactions are in question: `get-tx <TX_HASH>` follows a transaction through the
+  stored rows: the batch that carries it, the sub-dag certificate whose payload lists that batch,
+  and the consensus header that committed it; `get-batch <DIGEST>` shows the batch itself, hot or
+  archived, with the same path.
 
 ## Safety: live nodes, stopped nodes, copies
 
@@ -47,8 +48,8 @@ Caveats when the node is running:
   something that holds it open for long against a busy node. The exceptions are the scans and
   the snapshot: `get-tx` reads the whole hot batch table in one transaction (`--epoch` filters
   what it looks at but the hot table is still read end to end; it does bound the cold tier to
-  one epoch's jar); `get-tx`, and `get-batch` whenever some node lacks the batch or under `-v`,
-  read the hot header tables in one transaction each; `snapshot` copies the whole database
+  one epoch's jar); `get-tx` and `get-batch` read the hot header tables in one transaction each
+  to find the committing header; `snapshot` copies the whole database
   inside one read transaction (well under a second per hundred megabytes of used pages). On a
   busy node, run the scans against a snapshot.
 - A run consumes one MDBX reader slot per node per concurrent read (the node has 256); a check
@@ -176,11 +177,11 @@ rayls-db-inspect header-check 1234 --back 20 --db /data/node1 --db /data/node2
 # The record chain around one epoch, record by record
 rayls-db-inspect epoch-check --from 40 --to 45 -v --db /data/node1 --db /data/node2
 
-# One batch: where it is (hot or cold), what it holds; -v lists the transactions and the
-# consensus header that committed it (`header -v` lists the digests a header commits)
-rayls-db-inspect get-batch 0x3f9c... -v --db /data/node1 --db /data/node2
+# One batch: where it is (hot or cold), its transactions, the certificate that carried it and
+# the consensus header that committed it (`header -v` lists the digests a header commits)
+rayls-db-inspect get-batch 0x3f9c... --db /data/node1 --db /data/node2
 
-# Which batch carries a transaction, and which header committed that batch
+# A transaction's stored path: batch, carrying certificate, committing header
 rayls-db-inspect get-tx 0x8a1e... --db /data/node1 --db /data/node2
 rayls-db-inspect get-tx 0x8a1e... --epoch 42 --db /data/node1     # scan only epoch 42's batches
 
@@ -206,8 +207,8 @@ rayls-db-inspect --json epoch 42 --db /data/node1 | jq .verdict
 | `epoch-check [--from EPOCH] [--to EPOCH]` | gaps, broken `parent_hash` links, uncertified epochs, invalid certificates, committee hand-off mismatches, digest-index mismatches, nodes with no records although epochs have closed; `-v` lists every record in range (digest, parent, certificate state, index, link, hand-off, committee size); a range past the latest record is clamped and noted; issue counts are summed over nodes, `checked` is the fullest node's count | `nodes checked divergent gaps broken uncertified invalid handoff index no_records first` |
 | `header <HEADER_NUMBER>` | digest, parent, tier (hot / cold / cache), leader, certificate and batch counts, commit timestamp; `-v` adds where each committed batch is stored and, in text, the sub-dag certificates and reputation scores; in JSON those come inside `raw`, the stored header itself; every certificate of the sub-dag is re-checked against the epoch's committee (`verify` column) | `nodes found missing not_reached what variants sig_failed unverifiable` |
 | `cert <HEADER_NUMBER>` | leader certificate of header N: the consensus header's digest (what a `what=header` divergence refers to), certificate digest, author, round, epoch, signer indices, aggregate signature, verification state; `-v` adds parents and payload in text; in JSON they come inside `raw`, the stored certificate itself; the leader certificate's quorum and BLS signature are re-checked (`verify` column: `ok`, `genesis`, `FAILED`, `no keys`) | `nodes found missing not_reached what variants sig_failed unverifiable` |
-| `get-batch <DIGEST>` | tier (hot / cold), epoch, worker, sequence number, transaction count and bytes, beneficiary, base fee, whether the stored bytes hash to the digest; a node without it is judged against the header that committed the batch (found on the nodes that hold it): `not reached` while its tip is below that header, `missing` once its tip is at or past it, `not reached (not committed on any node)` when no header commits it yet, and `not found` when no node holds the batch at all; a cold index entry whose jar row is gone is `dangling` (and counted in `missing` too); `-v` lists each transaction (hash, type, nonce, sender, recipient, value, gas) and the committing header (`hot`/`cold`, or `cache, not processed`) | `nodes found missing not_reached not_found bad_digest dangling` |
-| `get-tx <TX_HASH> [--epoch EPOCH]` | the batch holding the transaction (digest, tier, position, epoch, worker, sequence number), the consensus header that committed that batch or `not committed`, every batch holding the transaction on the node (a transaction can be sealed more than once: `copies`), each with its committing header or `not committed`, the decoded transaction, and how many batches were read (`read/total hot, cold (epochs)`); absence is `not reached` / `missing` / `not found` as for `get-batch`; `DIVERGENT what=batch` only when nodes name different batches for the same committing header | `nodes found missing not_reached not_found what variants bad_digest copies uncommitted` |
+| `get-batch <DIGEST>` | tier (hot / cold), epoch, worker, sequence number, transaction count and bytes, the sealing authority (by the execution address stored in the batch), base fee, whether the stored bytes hash to the digest, the DAG round of the certificate that carried it; each transaction (hash, type, nonce, sender, recipient, value, gas); the committing header (`hot`/`cold`, or `cache, not processed`) or `not committed`; when committed, the stored path: the sub-dag certificate whose payload lists the batch (digest, author, round, epoch, worker, header digest, created_at, signer indices, stored verification state) and the header's own fields (digest, parent, leader, certificate and batch counts, commit timestamp); a node without it is judged against the header that committed the batch (found on the nodes that hold it): `not reached` while its tip is below that header, `missing` once its tip is at or past it, `not reached (not committed on any node)` when no header commits it yet, and `not found` when no node holds the batch at all; a cold index entry whose jar row is gone is `dangling` (and counted in `missing` too) | `nodes found missing not_reached not_found bad_digest dangling` |
+| `get-tx <TX_HASH> [--epoch EPOCH]` | every batch holding the transaction on the node (digest, tier, position, epoch, worker, sequence number, sealing authority, DAG round of the carrying certificate; a transaction can be sealed more than once: `copies`), each with its committing header or `not committed` and, when committed, the same stored path as `get-batch` (carrying certificate, then header); the decoded transaction; and how many batches were read (`read/total hot, cold (epochs)`); absence is `not reached` / `missing` / `not found` as for `get-batch`; `DIVERGENT what=batch` only when nodes name different batches for the same committing header | `nodes found missing not_reached not_found what variants bad_digest copies uncommitted` |
 | `header-check <HEADER_NUMBER> [--back COUNT]` | one row per hop: number, digest, parent, tier, link status (`ok`, `genesis`, `end of range` for the last row, parent missing, digest mismatch, index mismatch), and the hop's certificates re-checked (`verify`); links decide where the check stops, a start header absent below the tip is `missing`, a failed signature makes the verdict `BROKEN` | `nodes hops divergent broken missing not_reached first sig_failed unverifiable` |
 | `summary` | live status, datafile size, epoch range and counts, consensus tip and its commit time, cache tip, cold tier high-water mark, node identity, leftover checkpoints, entry count of every table | none |
 | `snapshot --to DIR` | copies one node's consensus database into `DIR` as one committed state (MDBX copies inside a read transaction, compacted) with its sealed cold jars; the copy opens without `--recover`; a stopped node with an unsynced last commit is copied file by file and the copy recovered; no verdict |
