@@ -18,7 +18,7 @@ secp256k1 = { workspace = true, features = [
     "global-context",
     "rand",
     "recovery",
-] }
+]}
 tracing = { workspace = true }
 rpassword = { workspace = true }
 rayls-infrastructure-types = { workspace = true, features = ["cli"] }
