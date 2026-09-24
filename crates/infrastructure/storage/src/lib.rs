@@ -672,6 +672,8 @@ mod test {
     }
 }
 
+/// Anchor for the dev-dependencies that only this crate's own test and bench
+/// targets consume; without it, lib-test builds warn that they are unused.
 #[cfg(test)]
 mod clippy {
     use criterion as _;
