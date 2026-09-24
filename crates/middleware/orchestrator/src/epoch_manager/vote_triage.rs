@@ -496,7 +496,8 @@ mod tests {
         );
         // The dropped votes are acked, so the peers that gossiped them are not punished.
         assert!(matches!(acks.remove(0).await, Ok(Ok(()))));
-        acks.remove(1); // the second `older` vote, same ack
+        // The second `older` vote (index 1 after the removal above) is acked the same way.
+        assert!(matches!(acks.remove(1).await, Ok(Ok(()))));
     }
 
     #[tokio::test]

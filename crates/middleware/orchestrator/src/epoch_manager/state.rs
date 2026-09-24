@@ -8,7 +8,7 @@ use rayls_infrastructure_storage::{
         BatchSeqCounter, CertificateDigestByOrigin, CertificateDigestByRound, Certificates,
         ConsensusBlocks, EpochTransitionCheckpoints, KadProviderRecords, KadRecords,
         KadWorkerProviderRecords, KadWorkerRecords, LastProposed, LastProposedByAuthority,
-        NodeBatchesCache, NodeIdentity, Payload, Votes,
+        NodeBatchesCache, NodeIdentity, Payload, PendingEpochRecord, Votes,
     },
     CertificateStore as _, EpochStore as _, ProposerStore as _, LAST_PROPOSAL_KEY,
 };
@@ -175,14 +175,13 @@ where
         // uncertified one and got stuck (#465). This write goes into a distinct table that
         // bootstrap treats only as "resume certification for this epoch", never as a
         // substitute for a certified record.
-        if let Err(e) = self.consensus_db.save_pending_epoch_record(&epoch_rec) {
-            error!(
-                target: "epoch-manager",
-                ?e, epoch,
-                "failed to persist pending epoch record; certification will still be attempted \
-                 this run, but cannot resume it if this process restarts first",
-            );
-        }
+        //
+        // The pending table is the collector's only work set, so a record that is not in it is
+        // never voted on or fetched by this node. A consensus-DB write failing at an epoch close
+        // is fatal for the transition, like every other write in it.
+        self.consensus_db
+            .save_pending_epoch_record(&epoch_rec)
+            .map_err(|e| eyre!("failed to persist pending epoch record for epoch {epoch}: {e}"))?;
         self.epoch_record = Some(epoch_rec);
         Ok(())
     }
@@ -270,6 +269,9 @@ where
             txn.clear_table::<NodeBatchesCache>()?;
             txn.clear_table::<EpochTransitionCheckpoints>()?;
             txn.clear_table::<BatchSeqCounter>()?;
+            // The previous owner's closed-but-uncertified records: this node is not a signer for
+            // them and must not spend a collection task trying to certify them.
+            txn.clear_table::<PendingEpochRecord>()?;
             // KAD record tables: cleared on snapshot recovery so find_authorities
             // re-queries fresh records, avoiding stale addresses from the snapshot epoch.
             txn.clear_table::<KadRecords>()?;
