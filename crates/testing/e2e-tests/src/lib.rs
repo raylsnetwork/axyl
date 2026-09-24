@@ -9,11 +9,11 @@ use rayls_infrastructure_config::{Config, ConfigFmt, ConfigTrait};
 use rayls_infrastructure_types::{
     test_utils::CommandParser, Address, Genesis, GenesisAccount, RaylsNetwork,
 };
-use rayls_middleware_orchestrator::launch_node;
-use rayls_network_cli::{genesis::GenesisArgs, keytool::KeyArgs, node::NodeCommand};
+use rayls_network_cli::{genesis::GenesisArgs, keytool::KeyArgs};
 use std::{
     future::Future,
     path::{Path, PathBuf},
+    process::Child,
     sync::OnceLock,
     time::{Duration, Instant},
 };
@@ -145,60 +145,102 @@ pub fn config_local_testnet(
     Ok(())
 }
 
-/// Create validator info, genesis ceremony, and spawn node command with faucet active.
+/// A local four-validator testnet, each validator a `rayls-network node` child process.
+///
+/// Validators run as separate processes, never as in-process threads, so no process-global
+/// state a node installs at boot (the active hardfork profile, the tracing subscriber, the
+/// rayon pool) can leak between validators or into the test process. The processes are
+/// killed when the value is dropped, so a test keeps it alive for as long as it needs the
+/// network.
+#[derive(Debug)]
+pub struct LocalTestnet {
+    children: Vec<Child>,
+}
+
+impl Drop for LocalTestnet {
+    fn drop(&mut self) {
+        for child in &mut self.children {
+            // Test teardown: no graceful shutdown needed, just release the ports and the
+            // datadir before the next test starts.
+            if let Err(e) = child.kill() {
+                error!(target: "e2e", ?e, "error killing validator process");
+            }
+            if let Err(e) = child.wait() {
+                error!(target: "e2e", ?e, "error waiting for validator process to exit");
+            }
+        }
+    }
+}
+
+/// Start one validator of a local testnet as a `rayls-network node` child process.
+///
+/// Mirrors the flags the restart and epoch suites use: the BLS passphrase comes from the
+/// environment, `--instance` derives the node's ports (instance 1 serves HTTP on 8545) and
+/// `--network` selects the hardfork schedule matching the ceremony's chain-id.
+fn start_validator_process(
+    bin: &CargoRun,
+    datadir: &Path,
+    instance: &str,
+    #[cfg(feature = "faucet")] faucet_contract_address: &str,
+) -> eyre::Result<Child> {
+    let mut command = bin.command();
+    command
+        .env("RL_BLS_PASSPHRASE", NODE_PASSWORD)
+        .arg("--bls-passphrase-source")
+        .arg("env")
+        .arg("node")
+        .arg("--datadir")
+        .arg(datadir)
+        .arg("--instance")
+        .arg(instance)
+        .arg("--http")
+        // v1 (plain) storage is no longer supported -- the node refuses to start without this
+        .arg("--storage.v2")
+        // Must match the ceremony's `--chain-id` (TEST_NETWORK): a datadir carries no hardfork
+        // schedule, so every boot selects one explicitly.
+        .arg("--network")
+        .arg(TEST_NETWORK.to_string());
+
+    #[cfg(feature = "faucet")]
+    command
+        .arg("--public-key") // If the binary is built with the faucet need this to start...
+        .arg("0223382261d641424b8d8b63497a811c56f85ee89574f9853474c3e9ab0d690d99")
+        .arg("--google-kms")
+        .arg("--faucet-contract")
+        .arg(faucet_contract_address);
+
+    Ok(command.spawn()?)
+}
+
+/// Create validator info, run the genesis ceremony, and start the four validators as
+/// `rayls-network node` child processes (with the faucet active when built with it).
+///
+/// The returned [`LocalTestnet`] kills the validators when dropped: bind it to a named
+/// variable (`let _testnet = ...`) for as long as the test needs the network.
 pub fn spawn_local_testnet(
     temp_path: &Path,
     #[cfg(feature = "faucet")] faucet_contract_address: &str,
     accounts: Option<Vec<(Address, GenesisAccount)>>,
-) -> eyre::Result<()> {
+) -> eyre::Result<LocalTestnet> {
     config_local_testnet(temp_path, NODE_PASSWORD.to_owned(), accounts)?;
 
-    // Must match the `--chain-id` the ceremony ran with (TEST_NETWORK), or the RPC
-    // rejects txs and the node refuses to boot on a chain-id mismatch.
-    let network = TEST_NETWORK.to_string();
+    let bin = get_rayls_network_binary();
     let validators = ["validator-1", "validator-2", "validator-3", "validator-4"];
-    for v in validators.into_iter() {
+    let mut testnet = LocalTestnet { children: Vec::with_capacity(validators.len()) };
+    for v in validators {
         let dir = temp_path.join(v);
         let instance = v.chars().last().expect("validator instance").to_string();
-
-        #[cfg(feature = "faucet")]
-        let command = NodeCommand::<rayls_execution_faucet::FaucetArgs>::parse_from([
-            "rl",
-            "--http",
-            "--storage.v2",
-            "--network",
-            &network,
-            "--instance",
+        let child = start_validator_process(
+            bin,
+            &dir,
             &instance,
-            "--google-kms",
-            "--faucet-contract",
+            #[cfg(feature = "faucet")]
             faucet_contract_address,
-        ]);
-        #[cfg(not(feature = "faucet"))]
-        let command = NodeCommand::parse_from([
-            "rl",
-            "--http",
-            "--storage.v2",
-            "--network",
-            &network,
-            "--instance",
-            &instance,
-        ]);
-
-        std::thread::spawn(|| {
-            let err = command.execute(
-                dir,
-                NODE_PASSWORD.to_string(),
-                |mut builder, faucet_args, rl_datadir, passphrase| {
-                    builder.opt_faucet_args = Some(faucet_args);
-                    launch_node(builder, rl_datadir, passphrase)
-                },
-            );
-            error!("{:?}", err);
-        });
+        )?;
+        testnet.children.push(child);
     }
 
-    Ok(())
+    Ok(testnet)
 }
 
 /// Helper to retrieve and build the main project binary.
@@ -229,6 +271,10 @@ pub fn get_rayls_network_binary() -> &'static CargoRun {
         // crate is itself built with `--features dev`.
         #[cfg(feature = "dev-single-node-setup")]
         let build = build.features("dev-single-node-setup");
+        // The faucet e2e test starts validators with the faucet flags, so the binary has to
+        // carry the `faucet` feature whenever this crate does.
+        #[cfg(feature = "faucet")]
+        let build = build.features("faucet");
         build.run().expect("Failed to build rayls-network binary")
     })
 }

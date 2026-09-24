@@ -32,7 +32,7 @@ async fn test_genesis_with_precompiles() -> eyre::Result<()> {
     // spawn testnet for RPC calls
     let temp_path =
         tempfile::TempDir::with_suffix("genesis_with_precompiles").expect("tempdir is okay");
-    spawn_local_testnet(
+    let _testnet = spawn_local_testnet(
         temp_path.path(),
         #[cfg(feature = "faucet")]
         "0x0000000000000000000000000000000000000000",
@@ -121,7 +121,7 @@ async fn test_genesis_with_consensus_registry() -> eyre::Result<()> {
     // spawn testnet for RPC calls
     let temp_path =
         tempfile::TempDir::with_suffix("genesis_with_consensus_registry").expect("tempdir is okay");
-    spawn_local_testnet(
+    let _testnet = spawn_local_testnet(
         temp_path.path(),
         #[cfg(feature = "faucet")]
         "0x0000000000000000000000000000000000000000",
