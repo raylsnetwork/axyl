@@ -132,13 +132,14 @@ fn commit_path(
         eyre::bail!("{}: consensus header {number} named the batch but is gone", node.label);
     };
     let sub_dag = &header.sub_dag;
-    let certificate =
-        sub_dag.certificates.iter().chain(std::iter::once(&sub_dag.leader)).find_map(|c| {
-            c.header().payload().get(&batch).map(|worker_id| CarryingCertificate {
-                certificate: CertificateView::of(c, false),
-                worker_id: *worker_id,
-            })
-        });
+    // `certificates` is the whole ordered sub-dag, leader included (bullshark builds it from
+    // `order_dag`, which sequences the leader first), so it is the only list to search
+    let certificate = sub_dag.certificates.iter().find_map(|c| {
+        c.header().payload().get(&batch).map(|worker_id| CarryingCertificate {
+            certificate: CertificateView::of(c, false),
+            worker_id: *worker_id,
+        })
+    });
     Ok(Some(CommitPath { certificate, header: HeaderSummary::of(&header) }))
 }
 
