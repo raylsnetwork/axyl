@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: BUSL-1.1
 //! `rayls-replay`: rebuild a Rayls archive datadir from a pruned snapshot.
 
-#![cfg_attr(not(test), warn(unused_crate_dependencies))]
+#![cfg_attr(test, allow(unused_crate_dependencies))]
 
 use clap::Parser;
 use eyre::{eyre, Context};
