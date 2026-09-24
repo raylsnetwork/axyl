@@ -3,7 +3,7 @@
 
 use super::{code, Verdict};
 use crate::{
-    node_db::{LiveStatus, NodeDb, Position, Tier},
+    node_db::{NodeDb, Position, Tier},
     view::{b256, pubkey, signature, CheckpointView},
 };
 use rayls_infrastructure_types::{BlsPublicKey, Epoch, EpochCertificate, EpochRecord, B256};
@@ -77,7 +77,6 @@ impl std::fmt::Display for LinkCheck {
 #[derive(Debug, Serialize)]
 pub struct EpochNodeView {
     pub node: String,
-    pub live: LiveStatus,
     pub status: EpochStatus,
     /// Where the node stands, to tell "not reached" from "missing".
     pub position: Position,
@@ -203,7 +202,6 @@ pub fn epoch(nodes: &[NodeDb], epoch: Epoch, verbose: bool) -> eyre::Result<Epoc
         let position = node.position()?;
         let mut view = EpochNodeView {
             node: node.label.clone(),
-            live: node.live,
             status: if position.has_closed_epoch(epoch) {
                 EpochStatus::Missing
             } else {
@@ -292,7 +290,6 @@ pub fn describe_position(p: Position) -> String {
 #[derive(Debug, Clone, Serialize)]
 pub struct EpochsNode {
     pub node: String,
-    pub live: LiveStatus,
 }
 
 #[derive(Debug, Serialize)]
@@ -341,7 +338,7 @@ pub struct EpochsRow {
 /// `range` is `Some((from, to))` or `None` for every epoch any node has a record for.
 pub fn epochs(nodes: &[NodeDb], range: Option<(Epoch, Epoch)>) -> eyre::Result<EpochsReport> {
     let labels: Vec<EpochsNode> =
-        nodes.iter().map(|n| EpochsNode { node: n.label.clone(), live: n.live }).collect();
+        nodes.iter().map(|n| EpochsNode { node: n.label.clone() }).collect();
     let (from, to) = match range {
         Some((from, to)) => {
             if from > to {
@@ -502,7 +499,6 @@ pub struct EpochCheckRecord {
 #[derive(Debug, Serialize)]
 pub struct EpochCheckNodeView {
     pub node: String,
-    pub live: LiveStatus,
     /// Range actually checked (defaults to the node's first and last record).
     pub from: Option<Epoch>,
     pub to: Option<Epoch>,
@@ -554,7 +550,6 @@ pub fn epoch_check(
         let keys = node.epoch_numbers()?;
         let mut view = EpochCheckNodeView {
             node: node.label.clone(),
-            live: node.live,
             from: None,
             to: None,
             checked: 0,

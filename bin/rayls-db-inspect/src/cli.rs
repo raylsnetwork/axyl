@@ -39,9 +39,9 @@ fn hash(s: &str) -> Result<B256, String> {
 
 /// Read-only inspection of Rayls consensus databases, comparing what the nodes hold on disk.
 ///
-/// Each --db is opened read-only: nothing is written and no lock is taken, so it is safe against
-/// a running node. Results show what the node has flushed to disk, which can lag its memory by a
-/// few seconds.
+/// Each --db is opened read-only and exclusively: nothing is written, and a database another
+/// process holds open (a running node) is refused, so a report never mixes moments of a moving
+/// database. Stop the node first, or copy its files and inspect the copy.
 ///
 /// Exit status: 0 the verdict is OK, 1 any other verdict (including "not reached" and "not
 /// found"), 2 a node could not be opened or an argument was invalid.
@@ -56,20 +56,10 @@ pub struct Cli {
     #[arg(short, long, global = true)]
     pub verbose: bool,
 
-    /// Open the database exclusively. Fails if any other process has it open. Use on copies to
-    /// make sure you are not reading a live node.
-    #[arg(long, global = true)]
-    pub exclusive: bool,
-
-    /// Refuse to inspect a database that a running process holds open (or whose liveness cannot
-    /// be determined).
-    #[arg(long, global = true)]
-    pub require_stopped: bool,
-
-    /// Make a raw file copy taken from a running node openable: one read-write, exclusive open
-    /// that settles its unsynced head. Refuses a directory a running process holds. The copy's
-    /// meta pages are rewritten, and on another host or after a reboot MDBX rolls the copy back
-    /// to its last steady commit. Prefer `snapshot`, which needs no recovery.
+    /// Make a copy whose last commit was never synced (a killed or crashed node, or files copied
+    /// from a running one) openable: one read-write, exclusive open that settles its head. The
+    /// copy's meta pages are rewritten, and on another host or after a reboot MDBX rolls the copy
+    /// back to its last steady commit. Never run it on a node's own directory.
     #[arg(long, global = true)]
     pub recover: bool,
 
@@ -259,7 +249,7 @@ pub enum Command {
         nodes: NodeArgs,
     },
 
-    /// Overview of each node's database: live status, epochs, consensus tip, table sizes.
+    /// Overview of each node's database: epochs, consensus tip, table sizes.
     Summary {
         #[command(flatten)]
         nodes: NodeArgs,

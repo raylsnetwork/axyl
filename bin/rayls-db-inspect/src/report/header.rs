@@ -4,7 +4,7 @@
 use super::{absence_verdict, chain_verdict, code, content_verdict, recode, ChainOutcome, Verdict};
 pub use super::{describe_absent, Link, Lookup};
 use crate::{
-    node_db::{BatchLookup, LiveStatus, NodeDb, Position, Tier},
+    node_db::{BatchLookup, NodeDb, Position, Tier},
     view::{b256, CertificateSummary, CertificateView},
 };
 use rayls_infrastructure_types::{
@@ -215,7 +215,6 @@ pub struct HeaderReport {
 #[derive(Debug, Serialize)]
 pub struct HeaderNodeView {
     pub node: String,
-    pub live: LiveStatus,
     pub lookup: Lookup,
     /// The node's latest canonical consensus number.
     pub tip: Option<u64>,
@@ -315,7 +314,6 @@ pub fn header(nodes: &[NodeDb], number: u64, verbose: bool) -> eyre::Result<Head
         };
         views.push(HeaderNodeView {
             node: node.label.clone(),
-            live: node.live,
             lookup,
             tip: position.consensus_tip,
             tier,
@@ -344,7 +342,6 @@ pub struct CertReport {
 #[derive(Debug, Serialize)]
 pub struct CertNodeView {
     pub node: String,
-    pub live: LiveStatus,
     pub lookup: Lookup,
     pub tip: Option<u64>,
     pub tier: Option<Tier>,
@@ -380,7 +377,6 @@ pub fn cert(nodes: &[NodeDb], number: u64, verbose: bool) -> eyre::Result<CertRe
         };
         views.push(CertNodeView {
             node: node.label.clone(),
-            live: node.live,
             lookup,
             tip: position.consensus_tip,
             tier,
@@ -434,7 +430,6 @@ pub struct Hop {
 #[derive(Debug, Serialize)]
 pub struct HeaderCheckNodeView {
     pub node: String,
-    pub live: LiveStatus,
     pub tip: Option<u64>,
     pub hops: Vec<Hop>,
     pub ok: bool,
@@ -480,7 +475,6 @@ pub fn header_check(nodes: &[NodeDb], start: u64, back: u64) -> eyre::Result<Hea
                 let result = h.join().unwrap_or_else(|_| Err(eyre::eyre!("the check panicked")));
                 result.unwrap_or_else(|err| HeaderCheckNodeView {
                     node: node.label.clone(),
-                    live: node.live,
                     tip: None,
                     hops: Vec::new(),
                     ok: false,
@@ -522,7 +516,6 @@ fn check_node(node: &NodeDb, start: u64, back: u64) -> eyre::Result<HeaderCheckN
     let position = node.position()?;
     let mut view = HeaderCheckNodeView {
         node: node.label.clone(),
-        live: node.live,
         tip: position.consensus_tip,
         hops: Vec::new(),
         ok: false,

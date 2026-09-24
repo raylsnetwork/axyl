@@ -15,14 +15,13 @@ fn parses_every_subcommand() {
     let cli = Cli::try_parse_from(["x", "epoch", "7", "--db", "a", "--db", "b=/p"]).unwrap();
     assert!(matches!(cli.command, Command::Epoch { epoch: 7, .. }));
     assert_eq!(cli.dbs(), vec!["a", "b=/p"]);
-    assert!(!cli.json && !cli.verbose && !cli.exclusive && !cli.require_stopped);
+    assert!(!cli.json && !cli.verbose);
 
     let cli = Cli::try_parse_from(["x", "--json", "-v", "epochs", "1", "5", "-d", "a"]).unwrap();
     assert!(cli.json && cli.verbose);
     assert!(matches!(cli.command, Command::Epochs { from: Some(1), to: Some(5), all: false, .. }));
 
-    let cli = Cli::try_parse_from(["x", "epochs", "--all", "-d", "a", "--exclusive"]).unwrap();
-    assert!(cli.exclusive);
+    let cli = Cli::try_parse_from(["x", "epochs", "--all", "-d", "a"]).unwrap();
     assert!(matches!(cli.command, Command::Epochs { from: None, to: None, all: true, .. }));
 
     let cli = Cli::try_parse_from(["x", "epoch-check", "--from", "2", "-d", "a"]).unwrap();
@@ -52,9 +51,8 @@ fn parses_every_subcommand() {
         cli.command,
         Command::GetTx { hash, epoch: Some(4), .. } if hash == B256::repeat_byte(0xab)
     ));
-    let cli =
-        Cli::try_parse_from(["x", "summary", "--require-stopped", "--recover", "-d", "a"]).unwrap();
-    assert!(cli.require_stopped && cli.recover);
+    let cli = Cli::try_parse_from(["x", "summary", "--recover", "-d", "a"]).unwrap();
+    assert!(cli.recover);
     assert!(matches!(cli.command, Command::Summary { .. }));
 }
 

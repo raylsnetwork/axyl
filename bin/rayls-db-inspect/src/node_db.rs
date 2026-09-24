@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: BUSL-1.1
 //! Read-only access to one node's consensus database.
 //!
-//! [`NodeDb`] opens the MDBX environment read-only (never creating tables), attaches the cold
-//! tier when its directory exists, and answers point queries through short read transactions so
-//! a running node's page reclamation is never pinned for long.
+//! [`NodeDb`] opens the MDBX environment read-only and exclusively (never creating tables, and
+//! refusing a database another process holds open), attaches the cold tier when its directory
+//! exists, and answers point queries through short read transactions.
 
 use eyre::{eyre, WrapErr};
 use rayls_infrastructure_storage::{
@@ -25,47 +25,16 @@ use serde::Serialize;
 use std::{
     collections::{BTreeMap, HashMap},
     path::{Path, PathBuf},
-    sync::OnceLock,
 };
 
 /// A raw key/value iterator over one table, as the storage layer hands it out.
 type DBRawIterBox<'i> = rayls_infrastructure_types::DBRawIter<'i>;
 
-/// Options shared by every database open.
+/// Options shared by every database open. Every open is read-only and exclusive.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct OpenOptions {
-    /// Open with `MDBX_EXCLUSIVE` (copies only).
-    pub exclusive: bool,
-    /// Refuse a database whose lock file names a live process.
-    pub require_stopped: bool,
-    /// Open read-write once first so MDBX can recover a copy taken from a running node.
+    /// Open read-write once first so MDBX can recover a copy whose last commit was never synced.
     pub recover: bool,
-}
-
-/// Whether a process currently holds the consensus-db directory open.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(tag = "state", rename_all = "kebab-case")]
-pub enum LiveStatus {
-    /// No process holds an OS lock on the directory's `mdbx.lck`.
-    Stopped,
-    /// A process holds `mdbx.lck`; `pid` when the lock table reveals it.
-    Live { pid: Option<u32> },
-    /// Cannot be determined: not Linux, or `/proc/locks` or the lock file unreadable.
-    Unknown,
-    /// A copy `--recover` opened read-write once this run; its newest commit may have been
-    /// rolled back (see the README).
-    Recovered,
-}
-
-impl std::fmt::Display for LiveStatus {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(match self {
-            Self::Stopped => "no",
-            Self::Live { .. } => "yes",
-            Self::Unknown => "?",
-            Self::Recovered => "recovered",
-        })
-    }
 }
 
 /// Which storage tier answered a consensus-header or batch lookup.
@@ -143,9 +112,6 @@ pub struct ScanStats {
     pub cold_batches: usize,
     /// Cold epochs whose jar was read.
     pub cold_epochs: usize,
-    /// The hot pass read fewer rows than the table reports; on a stopped node that is an error,
-    /// on a live one it is reported here.
-    pub short: bool,
 }
 
 impl std::fmt::Display for ScanStats {
@@ -173,19 +139,19 @@ pub enum BatchLookup {
     Absent,
 }
 
-/// One node's consensus database, opened read-only.
+/// One node's consensus database, opened read-only and exclusively.
 #[derive(Debug)]
 pub struct NodeDb {
     /// Display label (user-supplied or derived from the path).
     pub label: String,
     /// Resolved `consensus-db` directory.
     pub path: PathBuf,
-    /// Whether a node process holds this directory.
-    pub live: LiveStatus,
+    /// `--recover` opened this copy read-write once this run; its newest commit may have been
+    /// rolled back (see the README).
+    pub recovered: bool,
     db: MdbxDatabase,
-    /// The cold archive under `cold/`, attached at the open or on first use (a live node creates
-    /// it at its first archival).
-    cold: OnceLock<ColdStore>,
+    /// The cold archive under `cold/`, when the directory existed at the open.
+    cold: Option<ColdStore>,
     /// Table presence, probed once per table: a read-only environment cannot gain tables.
     tables: std::sync::Mutex<HashMap<&'static str, bool>>,
 }
@@ -213,53 +179,39 @@ impl NodeDb {
                 path.join("mdbx.dat").display()
             ));
         }
-        let mut live = probe_live(&path);
-        if opts.require_stopped {
-            match live {
-                LiveStatus::Live { pid } => {
-                    let holder = pid.map(|p| format!(" by pid {p}")).unwrap_or_default();
-                    return Err(eyre!(
-                        "{label}: consensus-db at {} is in use{holder} (--require-stopped)",
-                        path.display()
-                    ));
-                }
-                // the flag promises a stopped database; an unknown state cannot promise that
-                LiveStatus::Unknown => {
-                    return Err(eyre!(
-                        "{label}: cannot tell whether a process holds {} (--require-stopped \
-                         needs Linux with a readable /proc)",
-                        path.display()
-                    ));
-                }
-                _ => {}
-            }
-        }
-
-        if opts.recover {
-            // recovery opens read-write; a running node owns its directory, so never even try.
-            // MDBX's own file locks refuse that case too; this check is for the message.
-            if let LiveStatus::Live { pid } = live {
-                let holder = pid.map(|p| format!(" (pid {p})")).unwrap_or_default();
-                return Err(eyre!(
-                    "{label}: refusing --recover on {}: a running process holds it{holder}; \
-                     take a snapshot of it instead",
+        // Held by another process: MDBX_EXCLUSIVE fails, and the recovery open (read-write,
+        // exclusive) fails the same way, so a running node is refused on every path.
+        let in_use = |e: &eyre::Report| -> Option<eyre::Report> {
+            // MDBX_BUSY, which reth-libmdbx renders as "another write transaction is running",
+            // or EAGAIN from the file lock when the holder is in this process
+            let text = format!("{e:#}");
+            (text.contains("another write transaction is running")
+                || text.contains("Resource temporarily unavailable")
+                || text.contains("Busy")
+                || text.contains("MDBX_BUSY"))
+            .then(|| {
+                eyre!(
+                    "{label}: {} is open in another process (a running node?); this tool never \
+                     reads a running node: stop it first, or copy its files and inspect the copy",
                     path.display()
-                ));
-            }
-            MdbxDatabase::recover(&path)
-                .wrap_err_with(|| format!("{label}: recover {}", path.display()))?;
+                )
+            })
+        };
+        if opts.recover {
+            MdbxDatabase::recover(&path).map_err(|e| {
+                in_use(&e)
+                    .unwrap_or_else(|| e.wrap_err(format!("{label}: recover {}", path.display())))
+            })?;
             eprintln!(
                 "{label}: recovered {}: its meta pages were rewritten, and if the copy was taken \
                  on another host or before a reboot MDBX rolled it back to the last steady \
                  commit, losing up to a few seconds of writes",
                 path.display()
             );
-            live = LiveStatus::Recovered;
         }
-        // MDBX registers every reader in mdbx.lck, so a read-only open still needs to write that
-        // file. A lock file nobody can write cannot be held by a running node either, so open it
-        // exclusively, which skips the reader table.
-        let exclusive = opts.exclusive || !lock_file_writable(&path);
+        // Exclusive: refuses a database another process holds and skips MDBX's reader table, so
+        // a copy whose mdbx.lck is not writable opens too.
+        let exclusive = true;
         let db = match MdbxDatabase::open_read_only(&path, exclusive) {
             Ok(db) => Ok(db),
             // MDBX finds its three meta pages by guessing offsets from the system page size
@@ -287,6 +239,9 @@ impl NodeDb {
             Err(e) => Err(e),
         }
         .map_err(|e| {
+            if let Some(in_use) = in_use(&e) {
+                return in_use;
+            }
             let text = format!("{e:#}");
             if text.contains("should be recovered") {
                 eyre::Report::new(NeedsRecovery(format!(
@@ -300,23 +255,20 @@ impl NodeDb {
                      Neither repairs damage",
                     path.display()
                 )))
-            } else if text.contains("opened in read-only") {
-                eyre!(
-                    "{label}: cannot register as a reader of {}: mdbx.lck is not writable; \
-                     rerun with --exclusive",
-                    path.display()
-                )
             } else {
                 eyre!("{label}: open {} read-only: {text}", path.display())
             }
         })?;
 
-        let cold = OnceLock::new();
-        if let Some(store) = Self::open_cold(&label, &path)? {
-            let _ = cold.set(store);
-        }
-
-        Ok(Self { label, path, live, db, cold, tables: std::sync::Mutex::new(HashMap::new()) })
+        let cold = Self::open_cold(&label, &path)?;
+        Ok(Self {
+            label,
+            path,
+            recovered: opts.recover,
+            db,
+            cold,
+            tables: std::sync::Mutex::new(HashMap::new()),
+        })
     }
 
     /// Opens the cold tier under `path` if it exists. Opening a cold store creates its
@@ -342,18 +294,13 @@ impl NodeDb {
         }
     }
 
-    /// The cold tier, attached on first use when a live node created it after the open.
-    fn cold(&self) -> eyre::Result<Option<&ColdStore>> {
-        if self.cold.get().is_none() {
-            if let Some(store) = Self::open_cold(&self.label, &self.path)? {
-                let _ = self.cold.set(store);
-            }
-        }
-        Ok(self.cold.get())
+    /// The cold tier, when one was attached at the open.
+    fn cold(&self) -> Option<&ColdStore> {
+        self.cold.as_ref()
     }
 
     /// The cold tier, for callers that copy its jars.
-    pub fn cold_store(&self) -> eyre::Result<Option<&ColdStore>> {
+    pub fn cold_store(&self) -> Option<&ColdStore> {
         self.cold()
     }
 
@@ -370,31 +317,19 @@ impl NodeDb {
 
     /// Whether the cold tier exists.
     pub fn has_cold(&self) -> bool {
-        self.cold().ok().flatten().is_some()
+        self.cold().is_some()
     }
 
-    /// Reads from the cold tier. On a miss the jar index is re-read from disk once and the read
-    /// retried: a live node seals epochs while the tool runs, and an index built when the
-    /// database was opened does not know the jars sealed since. Without a cold tier, `None`.
+    /// Reads from the cold tier; without one, `None`.
     fn cold_read<T>(
         &self,
         what: &str,
         read: impl Fn(&ColdStore) -> ColdResult<Option<T>>,
     ) -> eyre::Result<Option<T>> {
-        let Some(cold) = self.cold()? else { return Ok(None) };
-        let failed = |e| eyre!("{}: cold {what}: {e}", self.label);
-        if let Some(found) = read(cold).map_err(failed)? {
-            return Ok(Some(found));
-        }
-        self.refresh_cold(cold)?;
-        read(cold).map_err(failed)
+        let Some(cold) = self.cold() else { return Ok(None) };
+        read(cold).map_err(|e| eyre!("{}: cold {what}: {e}", self.label))
     }
 
-    fn refresh_cold(&self, cold: &ColdStore) -> eyre::Result<()> {
-        cold.refresh().map_err(|e| eyre!("{}: re-read the cold jar index: {e}", self.label))
-    }
-
-    /// Whether table `T` exists on disk.
     /// Whether the epoch-record table was never created.
     pub fn epoch_table_absent(&self) -> eyre::Result<bool> {
         Ok(self.table_status::<EpochRecords>()? == TableStatus::Absent)
@@ -557,9 +492,7 @@ impl NodeDb {
 
     /// The cold tier and the number of its newest archived consensus header, if any.
     fn cold_tip(&self) -> eyre::Result<Option<(&ColdStore, u64)>> {
-        let Some(cold) = self.cold()? else { return Ok(None) };
-        // read when nothing is hot, typically right after an archival pass: re-read the index
-        self.refresh_cold(cold)?;
+        let Some(cold) = self.cold() else { return Ok(None) };
         Ok(cold.consensus_blocks().key_span().map(|span| (cold, *span.end())))
     }
 
@@ -624,8 +557,8 @@ impl NodeDb {
     /// order. With `epoch`, hot batches sealed in other epochs are skipped after being read (the
     /// table is keyed by digest, so it is always read end to end) and only that epoch's cold jar
     /// is opened. `visit` returns `Ok(false)` to stop. The hot pass holds one read transaction
-    /// for the whole table. Fails when the hot pass ends short of the rows the table reports on a
-    /// stopped node: the cursor swallows read errors, and a short scan must not read as absence.
+    /// for the whole table. Fails when the hot pass ends short of the rows the table reports:
+    /// the cursor swallows read errors, and a short scan must not read as absence.
     pub fn scan_batches(
         &self,
         epoch: Option<Epoch>,
@@ -648,10 +581,9 @@ impl NodeDb {
                     return Ok(stats);
                 }
             }
-            stats.short = stats.hot_batches < stats.hot_table_rows;
-            // a stopped database cannot change under the scan, so a shortfall is a read error; a
-            // live one can (archival prunes, workers seal), so the shortfall is reported instead
-            if stats.short && matches!(self.live, LiveStatus::Stopped | LiveStatus::Recovered) {
+            // nothing else holds the database, so it cannot change under the scan: a shortfall
+            // is a read error
+            if stats.hot_batches < stats.hot_table_rows {
                 return Err(eyre!(
                     "{}: hot batch scan ended after {} of {} rows; the table could not be read \
                      to the end",
@@ -661,9 +593,7 @@ impl NodeDb {
                 ));
             }
         }
-        let Some(cold) = self.cold()? else { return Ok(stats) };
-        // the jars sealed since the open must be scanned too
-        self.refresh_cold(cold)?;
+        let Some(cold) = self.cold() else { return Ok(stats) };
         let epochs: Vec<Epoch> = match epoch {
             Some(e) => vec![e],
             None => cold.batches().sealed_epochs().into_iter().collect(),
@@ -749,9 +679,7 @@ impl NodeDb {
             }
         }
         // the cold archive before the cache, for the same reason as in `header`
-        if let Some(cold) = self.cold()? {
-            // a jar sealed since the open must be searched too
-            self.refresh_cold(cold)?;
+        if let Some(cold) = self.cold() {
             if let Some(range) = cold.consensus_blocks().key_range_for_epoch(epoch) {
                 for number in range {
                     let bytes = cold.read_consensus_block_checked(number).map_err(|e| {
@@ -795,17 +723,6 @@ impl NodeDb {
     }
 }
 
-/// Whether `mdbx.lck` in `consensus_db` carries any write permission bit. A missing file counts
-/// as writable: MDBX creates it. Checked from metadata only, so the probe never opens the file for
-/// writing; a file writable by mode but not by this user still fails inside MDBX, with the
-/// `--exclusive` hint.
-fn lock_file_writable(consensus_db: &Path) -> bool {
-    match std::fs::metadata(consensus_db.join("mdbx.lck")) {
-        Ok(meta) => !meta.permissions().readonly(),
-        Err(_) => true,
-    }
-}
-
 /// Splits `LABEL=PATH` into its parts; a bare path has no label.
 ///
 /// Only splits on a `=` that comes before any path separator, so paths containing `=` still work.
@@ -844,57 +761,6 @@ fn default_label(path: &Path) -> String {
     }
 }
 
-/// Whether some process holds an OS lock on the directory's `mdbx.lck`, which every MDBX handle
-/// (reader or writer) takes while the environment is open. Read from `/proc/locks` by inode, so a
-/// datadir copied from elsewhere reads as stopped even if its files came from a running node.
-/// Every handle also takes a byte lock at offset `pid`, which is how the PID is recovered when
-/// the lock table itself does not name one (OFD locks report -1). Anything short of a clear
-/// answer is `Unknown`. MDBX's own file locks are what make a wrong answer harmless (a
-/// read-write open against a live environment fails); this is for the message.
-pub fn probe_live(consensus_db: &Path) -> LiveStatus {
-    match std::fs::metadata(consensus_db.join("mdbx.lck")) {
-        Ok(meta) => probe_live_linux(&meta).unwrap_or(LiveStatus::Unknown),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => LiveStatus::Stopped,
-        Err(_) => LiveStatus::Unknown,
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn probe_live_linux(meta: &std::fs::Metadata) -> Option<LiveStatus> {
-    use std::os::unix::fs::MetadataExt as _;
-    let (major, minor) = split_dev(meta.dev());
-    let target = format!("{major:02x}:{minor:02x}:{}", meta.ino());
-    let locks = std::fs::read_to_string("/proc/locks").ok()?;
-    let mut held = false;
-    let mut pid = None;
-    for line in locks.lines() {
-        // "<id>: <OFDLCK|POSIX|FLOCK> <ADVISORY|MANDATORY> <READ|WRITE> <pid> MAJ:MIN:INO <start>
-        // <end>"
-        let f: Vec<&str> = line.split_whitespace().collect();
-        if f.len() < 8 || f[5] != target {
-            continue;
-        }
-        held = true;
-        if f[3] == "WRITE" {
-            pid = f[4].parse::<u32>().ok().filter(|p| *p > 0).or_else(|| f[6].parse().ok());
-        }
-    }
-    Some(if held { LiveStatus::Live { pid } } else { LiveStatus::Stopped })
-}
-
-#[cfg(not(target_os = "linux"))]
-fn probe_live_linux(_meta: &std::fs::Metadata) -> Option<LiveStatus> {
-    None
-}
-
-/// Linux `dev_t` -> (major, minor), matching the `MAJ:MIN` columns of `/proc/locks`.
-#[cfg(target_os = "linux")]
-fn split_dev(dev: u64) -> (u64, u64) {
-    let major = ((dev >> 8) & 0xfff) | ((dev >> 32) & !0xfff);
-    let minor = (dev & 0xff) | ((dev >> 12) & !0xff);
-    (major, minor)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -925,24 +791,6 @@ mod tests {
             resolve_consensus_db(&dir.path().join("consensus-db")).unwrap(),
             dir.path().join("consensus-db")
         );
-    }
-
-    #[test]
-    fn live_probe_needs_a_held_lock_file() {
-        let dir = tempfile::tempdir().unwrap();
-        assert_eq!(probe_live(dir.path()), LiveStatus::Stopped);
-        // an mdbx.lck nobody holds (a copy) is not live
-        std::fs::write(dir.path().join("mdbx.lck"), [0u8; 64]).unwrap();
-        if cfg!(target_os = "linux") {
-            assert_eq!(probe_live(dir.path()), LiveStatus::Stopped);
-        }
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn dev_t_splits_into_major_minor() {
-        assert_eq!(split_dev(0xfc01), (0xfc, 0x01));
-        assert_eq!(split_dev(0x0000_0103_0000_1201), (0x12, 0x1030_0001));
     }
 }
 

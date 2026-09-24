@@ -13,7 +13,7 @@ pub mod report;
 pub mod view;
 
 use cli::{Cli, Command};
-use node_db::{LiveStatus, NodeDb, OpenOptions};
+use node_db::{NodeDb, OpenOptions};
 use report::Report;
 
 // Used by the binary target only.
@@ -25,11 +25,7 @@ use tracing_subscriber as _;
 /// Fails (rather than reporting) when a database cannot be opened, so a wrong path is never
 /// mistaken for a missing row.
 pub fn run(cli: &Cli) -> eyre::Result<Report> {
-    let opts = OpenOptions {
-        exclusive: cli.exclusive,
-        require_stopped: cli.require_stopped,
-        recover: cli.recover,
-    };
+    let opts = OpenOptions { recover: cli.recover };
     let verbose = cli.verbose;
     let dbs = cli.dbs();
     if dbs.is_empty() {
@@ -102,9 +98,6 @@ pub fn run(cli: &Cli) -> eyre::Result<Report> {
                 // recovered: copy its files as they are and recover the copy instead
                 Err(err) if NodeDb::needs_recovery(&err) => {
                     let (label, path) = NodeDb::resolve(&dbs[0])?;
-                    if let LiveStatus::Live { .. } = node_db::probe_live(&path) {
-                        return Err(err);
-                    }
                     eprintln!(
                         "{label}: {} is stopped with an unsynced last commit: copying its files as \
                          they are and recovering the copy",

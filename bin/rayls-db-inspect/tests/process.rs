@@ -101,7 +101,6 @@ fn text_output_for_each_subcommand() {
     let tx_hash = rayls_db_inspect::view::b256(&rayls_infrastructure_types::keccak256(&txs[0]));
     for (args, needle) in [
         (vec!["epoch", "1"], "verdict: OK nodes=1 certified=1"),
-        (vec!["epochs", "--all"], "live   no"),
         (vec!["epochs", "--all"], "\n1      RC"),
         (vec!["epoch-check"], "0..=2  3        2"),
         (vec!["header", "2"], "consensus header 2"),
@@ -116,7 +115,7 @@ fn text_output_for_each_subcommand() {
         (vec!["cert", "2"], "verify verified (epoch 0, 4 keys from its record)"),
         (vec!["header", "2"], "  verify        verified (epoch 0, 4 keys from its record)"),
         (vec!["header-check", "3", "--back", "1"], "end of range  ok"),
-        (vec!["header-check", "4"], "live=no ok (reached genesis)"),
+        (vec!["header-check", "4"], "ok (reached genesis)"),
         (vec!["epoch-check", "-v"], "  0      0x"),
         (vec!["summary"], "0..=2   3        2"),
     ] {
@@ -141,7 +140,7 @@ fn text_output_for_each_subcommand() {
         (vec!["epoch", "900"], "not reached (epoch 0, record 2)"),
         (vec!["header", "900"], "not reached (tip 4)"),
         (vec!["cert", "900"], "not reached (tip 4)"),
-        (vec!["header-check", "900"], "[a] live=no not reached (tip 4)"),
+        (vec!["header-check", "900"], "[a] not reached (tip 4)"),
         (vec!["get-batch", unknown.as_str()], "not found"),
         (vec!["get-batch", unknown.as_str()], "verdict: EMPTY nodes=1 not_found=1"),
         (vec!["get-tx", unknown.as_str()], "not found; scanned 1/1 hot, 0 cold (0 epochs)"),

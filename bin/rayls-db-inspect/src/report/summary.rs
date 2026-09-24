@@ -2,7 +2,7 @@
 //! `summary`: a per-node overview with no cross-node verdict.
 
 use crate::{
-    node_db::{LiveStatus, NodeDb},
+    node_db::NodeDb,
     view::{authority, CheckpointView},
 };
 use rayls_infrastructure_storage::tables::{EpochCerts, EpochRecords};
@@ -19,7 +19,9 @@ pub struct SummaryReport {
 pub struct SummaryNodeView {
     pub node: String,
     pub path: String,
-    pub live: LiveStatus,
+    /// `--recover` opened this copy read-write once this run; its newest commit may have been
+    /// rolled back (see the README).
+    pub recovered: bool,
     pub datafile_bytes: u64,
     pub node_identity: Option<String>,
     pub first_epoch: Option<Epoch>,
@@ -44,7 +46,7 @@ pub fn summary(nodes: &[NodeDb]) -> eyre::Result<SummaryReport> {
         views.push(SummaryNodeView {
             node: node.label.clone(),
             path: node.path.display().to_string(),
-            live: node.live,
+            recovered: node.recovered,
             datafile_bytes: node.datafile_size()?,
             node_identity: node.node_identity()?.as_ref().map(authority),
             first_epoch: epochs.first().copied(),

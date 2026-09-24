@@ -22,81 +22,57 @@ epoch record / certificate / header state per node.
   and the consensus header that committed it; `get-batch <DIGEST>` shows the batch itself, hot or
   archived, with the same path.
 
-## Safety: live nodes, stopped nodes, copies
+## Safety: stopped nodes only
 
-The tool never modifies a database's contents and never takes the node's `lock` file. It opens
-MDBX with `MDBX_RDONLY`, never creates tables, and holds one short read transaction per query.
-MDBX allows one writer and many readers across processes, so **it is safe to run against a
-running node**. What it does write, so the promise is exact:
+**The tool never reads a running node.** Every database is opened with `MDBX_RDONLY` and
+`MDBX_EXCLUSIVE`: nothing is written, no table is created, and the open fails if any other
+process holds the environment, with a message saying so. That is deliberate. A running node
+writes through an in-memory cache and syncs lazily, so its files lag its state by seconds, and
+every command reads in several short transactions, so a report taken from a moving database
+would mix moments and its verdict would mean nothing. Refusing is the only reading that cannot
+mislead.
 
-- MDBX registers every reader in `mdbx.lck` (creating the file if it is missing) and takes
-  advisory `fcntl` locks on `mdbx.lck` and `mdbx.dat` for the run. Run the tool as the node's
-  user, so a file it creates is one the node can use.
-- `--recover` performs one read-write open (below). Nothing else writes.
-
-Caveats when the node is running:
-
-- Results reflect what the node has flushed to MDBX. The node batches writes through an
-  in-memory cache and syncs lazily, so very recent rows (seconds) may not be visible yet.
-  Every report shows each node's `live` state (a column, or the first row of the `epochs`
-  matrix): `yes` when a process holds an OS lock on `mdbx.lck` (read from `/proc/locks` by
-  inode), `no` when none does, `?` when that cannot be determined (not Linux), `recovered` for
-  a copy `--recover` just opened.
-- A read transaction pins the pages it sees until it ends, and the node cannot evict a reader
-  in another process. The tool keeps transactions to one short query each; do not wrap it in
-  something that holds it open for long against a busy node. The exceptions are the scans and
-  the snapshot: `get-tx` reads the whole hot batch table in one transaction (`--epoch` filters
-  what it looks at but the hot table is still read end to end; it does bound the cold tier to
-  one epoch's jar); `get-tx` and `get-batch` read the hot header tables in one transaction each
-  to find the committing header; `snapshot` copies the whole database
-  inside one read transaction (well under a second per hundred megabytes of used pages). On a
-  busy node, run the scans against a snapshot.
-- A run consumes one MDBX reader slot per node per concurrent read (the node has 256); a check
-  never uses more than one per node.
-
-For a **stopped node** nothing special is needed. `--exclusive` opens with `MDBX_EXCLUSIVE`: it
-fails if any other process has the database open, a useful guard against pointing at the live
-node by mistake. A copy whose `mdbx.lck` is not writable (for example on a read-only mount) is
-opened exclusively on its own. `--require-stopped` refuses to inspect a database that a running
-process holds open, and one whose liveness it cannot determine. MDBX's own file locks are what
-keep a wrong liveness answer harmless: a read-write open against a live environment fails with
-`MDBX_BUSY`. The tool's probe exists to refuse early with a clear message.
-
-Copies. To inspect offline, or to keep evidence, take a snapshot rather than copying files:
+To inspect a node, stop it first, or work on a copy:
 
 ```sh
-rayls-db-inspect snapshot --to /var/tmp/node1-snap --db n1=/data/node1   # works on a running node
+# stopped node: point at its datadir (or its consensus-db directory)
+rayls-db-inspect epoch 42 --db n1=/data/node1
+
+# evidence, or inspection elsewhere: a consistent copy of a stopped node
+rayls-db-inspect snapshot --to /var/tmp/node1-snap --db n1=/data/node1
 rayls-db-inspect epoch 42 --db n1=/var/tmp/node1-snap
 ```
 
 `snapshot` lets MDBX copy the environment inside one read transaction (`MDBX_CP_COMPACT`: every
 page is walked and validated, only used pages are written, and the copy's head meta is steady),
-then copies the sealed cold jars, verifies them and reads the copy back. The result is one
-committed hot state plus a cold tier at or after it (a row can appear in both tiers, never in
-neither) and opens read-only with no recovery step. `summary` dates any directory by its tip
-header's commit time, so a copy needs no marker to say what it holds and as of when. When the
-source is a stopped node whose last commit was never synced (killed or crashed), MDBX refuses to
-read it until it is recovered and recovery writes, so `snapshot` copies its files as they are
-(nothing else writes to a stopped node) and recovers the copy, leaving the original untouched
-for the node's own restart. The `mdbx.dat` it writes is sparse: its length stays at the geometry's
-floor (1 GiB by default) while it occupies only the used pages, so copy it onward with
-`cp --sparse=always` or `rsync -S`. MDBX writes the copy with `O_DIRECT`, which tmpfs (a
-`/tmp` on many hosts) refuses; use a disk-backed destination. The destination must not exist,
-or be an empty directory, outside the source; a second run racing for the same destination
-fails instead of touching the first. MDBX writes the copy's meta pages last, so an interrupted
-copy has no valid head and is reported as unreadable rather than mistaken for a whole one.
+then copies the sealed cold jars, verifies them and reads the copy back. The result opens
+read-only with no recovery step, and `summary` dates any directory by its tip header's commit
+time. When the source is a node whose last commit was never synced (killed or crashed), MDBX
+refuses to read it until it is recovered and recovery writes, so `snapshot` copies its files as
+they are and recovers the copy, leaving the original untouched for the node's own restart. The
+`mdbx.dat` it writes is sparse: its length stays at the geometry's floor (1 GiB by default)
+while it occupies only the used pages, so copy it onward with `cp --sparse=always` or
+`rsync -S`. MDBX writes the copy with `O_DIRECT`, which tmpfs (a `/tmp` on many hosts) refuses;
+use a disk-backed destination. The destination must not exist, or be an empty directory,
+outside the source; a second run racing for the same destination fails instead of touching the
+first. MDBX writes the copy's meta pages last, so an interrupted copy has no valid head and is
+reported as unreadable rather than mistaken for a whole one.
 
 A raw file copy (`cp`, `rsync`) of a **running** node's `mdbx.dat` is not a snapshot: MDBX
 reuses the pages that earlier commits freed while the copy is still reading, so the copy can
 pair one commit's meta page with later data pages, and neither MDBX's meta pages nor its data
 pages carry checksums that would reveal it. Such a copy also has an unsynced ("weak") head that
 a read-only open refuses. `--recover` makes it openable: one read-write, exclusive open that
-settles the head, the same recovery the node itself performs when it restarts; it refuses a
-directory a running process holds and marks the node `recovered` in the report. It rewrites the copy's meta pages (hash the copy first if it is evidence), and
-**on any host other
-than the one that took the copy, or after that host reboots, MDBX rolls the copy back to its
-last steady commit, silently dropping up to a few seconds of writes**. It never makes a torn copy
-consistent. Reserve raw copies for stopped nodes, and even then prefer `snapshot`.
+settles the head, the same recovery the node itself performs when it restarts. It marks the
+node `recovered` in `summary` and rewrites the copy's meta pages (hash the copy first if it is
+evidence), and **on any host other than the one that took the copy, or after that host reboots,
+MDBX rolls the copy back to its last steady commit, silently dropping up to a few seconds of
+writes**. It never makes a torn copy consistent. Never run `--recover` on a node's own
+directory. Reserve raw copies for stopped nodes, and even then prefer `snapshot`.
+
+A copy whose files are not writable (a read-only mount) opens too: the exclusive open never
+registers in `mdbx.lck`. The scans (`get-tx`, and the header walks of `get-batch`) read a whole
+hot table in one transaction; on a stopped database that is harmless.
 
 ## Build
 
@@ -173,14 +149,14 @@ rayls-db-inspect --json epoch 42 --db /data/node1 | jq .verdict
 | Command | Per node | Verdict fields |
 |---|---|---|
 | `epoch <EPOCH>` | record present, digest index consistent, certificate present; `epoch_hash` matches the record; signer count vs. super-quorum; BLS aggregate verifies; `parent_hash` links to record N-1; committee hand-off matches; boundary header resolves (and in which tier); leftover transition checkpoint | `nodes variants certified genesis record_only missing not_reached` |
-| `epochs <FROM_EPOCH> <TO_EPOCH>` / `--all` | first row: each node's `live` state; then per epoch `RC` record+cert, `R-` record only, `--` missing, `..` not reached yet, `??` table absent (presence only, no BLS check); row status `ok` / `partial` / `missing` / `not-reached` / `divergent` | `epochs ok partial missing divergent not_reached first` |
+| `epochs <FROM_EPOCH> <TO_EPOCH>` / `--all` | per epoch `RC` record+cert, `R-` record only, `--` missing, `..` not reached yet, `??` table absent (presence only, no BLS check); row status `ok` / `partial` / `missing` / `not-reached` / `divergent` | `epochs ok partial missing divergent not_reached first` |
 | `epoch-check [--from EPOCH] [--to EPOCH]` | gaps, broken `parent_hash` links, uncertified epochs, invalid certificates, committee hand-off mismatches, digest-index mismatches, nodes with no records although epochs have closed; `-v` lists every record in range (digest, parent, certificate state, index, link, hand-off, committee size); a range past the latest record is clamped and noted; issue counts are summed over nodes, `checked` is the fullest node's count | `nodes checked divergent gaps broken uncertified invalid handoff index no_records first` |
 | `header <HEADER_NUMBER>` | digest, parent, tier (hot / cold / cache), leader, certificate and batch counts, commit timestamp; `-v` adds where each committed batch is stored and, in text, the sub-dag certificates and reputation scores; in JSON those come inside `raw`, the stored header itself; every certificate of the sub-dag is re-checked against the epoch's committee (`verify` column) | `nodes found missing not_reached what variants sig_failed unverifiable` |
 | `cert <HEADER_NUMBER>` | leader certificate of header N: the consensus header's digest (what a `what=header` divergence refers to), certificate digest, author, round, epoch, signer indices, aggregate signature, verification state; `-v` adds parents and payload in text; in JSON they come inside `raw`, the stored certificate itself; the leader certificate's quorum and BLS signature are re-checked (`verify` column: `ok`, `genesis`, `FAILED`, `no keys`) | `nodes found missing not_reached what variants sig_failed unverifiable` |
 | `get-batch <DIGEST>` | tier (hot / cold), epoch, worker, sequence number, transaction count and bytes, the sealing authority (by the execution address stored in the batch), base fee, whether the stored bytes hash to the digest, the DAG round of the certificate that carried it; each transaction (hash, type, nonce, sender, recipient, value, gas); the committing header (`hot`/`cold`, or `cache, not processed`) or `not committed`; when committed, the stored path: the sub-dag certificate whose payload lists the batch (digest, author, round, epoch, worker, header digest, created_at, signer indices, stored verification state) and the header's own fields (digest, parent, leader, certificate and batch counts, commit timestamp); a node without it is judged against the header that committed the batch (found on the nodes that hold it): `not reached` while its tip is below that header, `missing` once its tip is at or past it, `not reached (not committed on any node)` when no header commits it yet, and `not found` when no node holds the batch at all; a cold index entry whose jar row is gone is `dangling` (and counted in `missing` too) | `nodes found missing not_reached not_found bad_digest dangling` |
 | `get-tx <TX_HASH> [--epoch EPOCH]` | every batch holding the transaction on the node (digest, tier, position, epoch, worker, sequence number, sealing authority, DAG round of the carrying certificate; a transaction can be sealed more than once: `copies`), each with its committing header or `not committed` and, when committed, the same stored path as `get-batch` (carrying certificate, then header); the decoded transaction; and how many batches were read (`read/total hot, cold (epochs)`); absence is `not reached` / `missing` / `not found` as for `get-batch`; `DIVERGENT what=batch` only when nodes name different batches for the same committing header | `nodes found missing not_reached not_found what variants bad_digest copies uncommitted` |
 | `header-check <HEADER_NUMBER> [--back COUNT]` | one row per hop: number, digest, parent, tier, link status (`ok`, `genesis`, `end of range` for the last row, parent missing, digest mismatch, index mismatch), and the hop's certificates re-checked (`verify`); links decide where the check stops, a start header absent below the tip is `missing`, a failed signature makes the verdict `BROKEN` | `nodes hops divergent broken missing not_reached first sig_failed unverifiable` |
-| `summary` | live status, datafile size, epoch range and counts, consensus tip and its commit time, cache tip, cold tier high-water mark, node identity, leftover checkpoints, entry count of every table | none |
+| `summary` | datafile size, epoch range and counts, consensus tip and its commit time, cache tip, cold tier high-water mark, node identity, leftover checkpoints, entry count of every table | none |
 | `snapshot --to DIR` | copies one node's consensus database into `DIR` as one committed state (MDBX copies inside a read transaction, compacted) with its sealed cold jars; the copy opens without `--recover`; a stopped node with an unsynced last commit is copied file by file and the copy recovered; no verdict |
 
 ## Verdict
@@ -242,11 +218,7 @@ Notes on what the data means:
   certificate therefore do not resolve there; the only surviving copies are inside
   `consensus_block` rows.
 - Consensus headers and batches of archived epochs move to the cold tier under `cold/`. The
-  tool reads that tier when the directory exists and reports the tier for every hit. A live
-  node keeps sealing epochs while the tool runs, so the tool attaches a cold tier created after
-  the open and, when a header or batch is in no tier, re-reads the jar index from disk once
-  before reporting it absent; a check that spans an epoch transition does not misreport the
-  headers that moved.
+  tool reads that tier when the directory exists and reports the tier for every hit.
 - Damaged databases are read as far as MDBX and the jars allow, and never crash the tool
   (a test suite damages copies in twenty ways: truncated, zeroed and bit-flipped pages, missing
   or garbled jar files, garbled lock files). What damage looks like: a flipped byte in a header
@@ -302,7 +274,7 @@ objects use the wire types' encoding described above.
 | `src/lib.rs` | `run`: opens the nodes' databases and dispatches to a report |
 | `src/cli.rs` | clap definitions and `--help` text |
 | `src/report/mod.rs` | verdict type and codes; lookup and chain-link helpers shared by the reports |
-| `src/node_db.rs` | read-only open, live-process probe, tier-aware reads |
+| `src/node_db.rs` | exclusive read-only open, recovery of copies, tier-aware reads |
 | `src/report/epoch.rs` | `epoch`, `epochs`, `epoch-check` |
 | `src/report/header.rs` | `header`, `cert`, `header-check` |
 | `src/report/batch.rs` | `get-batch`, `get-tx` |

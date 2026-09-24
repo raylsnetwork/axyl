@@ -90,8 +90,6 @@ fn run_rejects_epochs_without_bounds_or_all() {
     let cli = Cli {
         json: false,
         verbose: false,
-        exclusive: false,
-        require_stopped: false,
         recover: false,
         dbs: vec![a.datadir()],
         command: Command::Epochs { from: None, to: None, all: false, nodes: NodeArgs::default() },

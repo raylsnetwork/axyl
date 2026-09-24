@@ -446,7 +446,6 @@ fn tx_epoch_filter_without_a_cold_jar_scans_nothing_cold() {
     let n = &report.nodes[0];
     assert!(!n.skipped);
     assert_eq!((n.scanned.hot_batches, n.scanned.cold_batches, n.scanned.cold_epochs), (0, 0, 0));
-    assert!(!n.scanned.short);
     assert_eq!(n.lookup, Lookup::NotFound);
     assert_eq!(report.verdict.to_string(), "EMPTY nodes=1 not_found=1");
 }

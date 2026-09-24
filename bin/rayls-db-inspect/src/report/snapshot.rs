@@ -1,23 +1,21 @@
 // SPDX-License-Identifier: BUSL-1.1
-//! `snapshot --to DIR`: one node's consensus database copied as a single committed hot state,
-//! plus the sealed cold jars as they stand right after that copy, for offline inspection.
+//! `snapshot --to DIR`: one stopped node's consensus database copied as a single committed hot
+//! state, plus its sealed cold jars, for inspection elsewhere or as evidence.
 //!
-//! From a readable database (running or stopped), MDBX performs the copy inside a read
-//! transaction (`MDBX_CP_COMPACT`: it walks every page through cursors, which also validates
-//! them, and writes only used pages; the file stays sparse at the geometry's floor), so the copy
-//! is consistent even when taken from a running node, its head meta is steady, and it opens
-//! read-only with no recovery step. A raw file copy of a running node cannot promise that: MDBX
-//! reuses pages freed by earlier commits while the copy runs. The node cannot evict the copy's
-//! read transaction, so it holds the node's retired pages for the copy's duration (well under a
-//! second per hundred megabytes of used pages).
+//! From a readable database, MDBX performs the copy inside a read transaction (`MDBX_CP_COMPACT`:
+//! it walks every page through cursors, which also validates them, and writes only used pages;
+//! the file stays sparse at the geometry's floor), so the copy's head meta is steady and it opens
+//! read-only with no recovery step.
 //!
-//! From a stopped database whose last commit was never synced (a killed or crashed node), MDBX
-//! refuses to read until it is recovered, and recovery writes. Nothing else writes to a stopped
-//! node, so its files are copied as they are and the copy is recovered, leaving the original
-//! untouched for the node's own restart.
+//! From a database whose last commit was never synced (a killed or crashed node), MDBX refuses
+//! to read until it is recovered, and recovery writes. Nothing else writes to a stopped node, so
+//! its files are copied as they are and the copy is recovered, leaving the original untouched
+//! for the node's own restart.
+//!
+//! Like every command, this refuses a database another process holds open.
 
 use crate::{
-    node_db::{LiveStatus, NodeDb, OpenOptions},
+    node_db::{NodeDb, OpenOptions},
     report::summary::{summary, SummaryNodeView},
 };
 use eyre::{bail, eyre, WrapErr as _};
@@ -41,8 +39,6 @@ pub struct SnapshotReport {
     pub source: String,
     /// The consensus-db directory that was copied.
     pub source_path: String,
-    /// Whether a process held the source, as seen when it was opened.
-    pub source_live: LiveStatus,
     pub destination: String,
     /// Unix time (seconds) when the copy started.
     pub taken_at_unix: u64,
@@ -154,17 +150,15 @@ fn copy_all(db: &NodeDb, source: &Path, to: &Path) -> eyre::Result<SnapshotRepor
         }
     })?;
     let mdbx_bytes = allocated_bytes(&fs::metadata(&dat)?);
-    // 2. the sealed cold jars, listed after the database copy: an epoch the copy has already pruned
-    //    from its hot tables was sealed before the copy started, so its jar is present
+    // 2. the sealed cold jars
     let (mut cold_epochs, mut cold_files, mut cold_bytes) = (Vec::new(), 0usize, 0u64);
-    if let Some(cold) = db.cold_store()? {
-        cold.refresh().map_err(|e| eyre!("{}: re-read the cold jar index: {e}", db.label))?;
+    if let Some(cold) = db.cold_store() {
         for epoch in cold.consensus_blocks().sealed_epochs() {
             for (segment, name) in
                 [(cold.consensus_blocks(), "consensus_blocks"), (cold.batches(), "batches")]
             {
-                // a batches jar without its consensus_blocks jar is a torn seal the archiver may
-                // rewrite; the consensus_blocks segment decides what is sealed
+                // a batches jar without its consensus_blocks jar is a torn seal left by an
+                // interrupted archival; the consensus_blocks segment decides what is sealed
                 if !segment.is_epoch_sealed(epoch) {
                     continue;
                 }
@@ -182,8 +176,8 @@ fn copy_all(db: &NodeDb, source: &Path, to: &Path) -> eyre::Result<SnapshotRepor
             cold_epochs.push(epoch);
         }
     }
-    // 3. the copied jars, read back: a jar the archiver re-sealed under the copy would be truncated
-    //    or short, which the reopened index (rows > 0) and a read at each end reveal
+    // 3. the copied jars, read back: a torn or short jar is revealed by the reopened index (rows >
+    //    0) and a read at each end
     if !cold_epochs.is_empty() {
         let copied = ColdStore::open(&ColdConfig { dir: to.join("cold") })
             .map_err(|e| eyre!("reopen the copied cold tier: {e}"))?;
@@ -214,7 +208,6 @@ fn copy_all(db: &NodeDb, source: &Path, to: &Path) -> eyre::Result<SnapshotRepor
         recovered_copy: false,
         source: db.label.clone(),
         source_path: source.display().to_string(),
-        source_live: db.live,
         destination: to.display().to_string(),
         taken_at_unix,
         mdbx_bytes,
@@ -225,13 +218,10 @@ fn copy_all(db: &NodeDb, source: &Path, to: &Path) -> eyre::Result<SnapshotRepor
     })
 }
 
-/// Opens the finished copy exclusively and summarises it.
+/// Opens the finished copy and summarises it.
 fn read_back(to: &Path) -> eyre::Result<SummaryNodeView> {
-    let copy_db = NodeDb::open(
-        &format!("snapshot={}", to.display()),
-        &OpenOptions { exclusive: true, ..Default::default() },
-    )
-    .wrap_err("open the finished copy")?;
+    let copy_db = NodeDb::open(&format!("snapshot={}", to.display()), &OpenOptions::default())
+        .wrap_err("open the finished copy")?;
     let mut copies = summary(std::slice::from_ref(&copy_db))?.nodes;
     copies.pop().ok_or_else(|| eyre!("the copy produced no summary"))
 }
@@ -274,7 +264,6 @@ fn copy_raw_and_recover(label: &str, source: &Path, to: &Path) -> eyre::Result<S
         recovered_copy: true,
         source: label.to_owned(),
         source_path: source.display().to_string(),
-        source_live: LiveStatus::Stopped,
         destination: to.display().to_string(),
         taken_at_unix,
         mdbx_bytes,

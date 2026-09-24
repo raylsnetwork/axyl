@@ -6,7 +6,7 @@ mod common;
 
 use common::*;
 use rayls_db_inspect::{
-    node_db::{BatchLookup, LiveStatus, NodeDb, OpenOptions, Tier},
+    node_db::{BatchLookup, NodeDb, OpenOptions, Tier},
     report::snapshot::snapshot,
 };
 use rayls_infrastructure_types::Database as _;
@@ -35,17 +35,14 @@ fn snapshot_copies_a_consistent_database_with_its_sealed_jars() {
     let r = snapshot(&source, &to).unwrap();
     assert!(!r.recovered_copy, "a readable source is copied by MDBX itself");
     assert_eq!(r.copy.latest_consensus_number, Some(5));
-    assert_eq!(r.copy.live, LiveStatus::Stopped);
+    assert!(!r.copy.recovered);
     assert_eq!(r.cold_epochs, vec![0]);
     assert_eq!(r.cold_files, 6, "data, offsets and config of both segments' jars");
     assert!(r.mdbx_bytes > 0 && r.cold_bytes > 0);
     assert!(!to.join("lock").exists(), "the node's lock file is never copied");
 
-    let copy = NodeDb::open(
-        &format!("c={}", to.display()),
-        &OpenOptions { exclusive: true, ..Default::default() },
-    )
-    .expect("a snapshot opens without --recover");
+    let copy = NodeDb::open(&format!("c={}", to.display()), &OpenOptions::default())
+        .expect("a snapshot opens without --recover");
     assert_eq!(copy.header(2).unwrap().map(|(_, t)| t), Some(Tier::Cold));
     assert_eq!(copy.header(5).unwrap().map(|(_, t)| t), Some(Tier::Hot));
     assert_eq!(copy.latest_consensus_number().unwrap(), Some(5));

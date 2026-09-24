@@ -108,7 +108,6 @@ fn render_epoch(r: &EpochReport, out: &mut String) {
     let _ = writeln!(out, "epoch {}", r.epoch);
     let mut t = Table::new(&[
         "node",
-        "live",
         "status",
         "record digest",
         "index",
@@ -126,7 +125,6 @@ fn render_epoch(r: &EpochReport, out: &mut String) {
         let cert = n.cert.as_ref();
         t.row(vec![
             n.node.clone(),
-            n.live.to_string(),
             if n.status == EpochStatus::NotReached {
                 format!("not reached ({})", describe_position(n.position))
             } else {
@@ -219,10 +217,6 @@ fn render_epochs(r: &EpochsReport, out: &mut String) {
     headers.extend(r.nodes.iter().map(|n| n.node.as_str()));
     headers.push("status");
     let mut t = Table::new(&headers);
-    let mut live = vec!["live".to_owned()];
-    live.extend(r.nodes.iter().map(|n| n.live.to_string()));
-    live.push(String::new());
-    t.row(live);
     for row in &r.rows {
         let mut cells = vec![row.epoch.to_string()];
         cells.extend(row.cells.iter().map(|c| c.glyph().to_owned()));
@@ -236,7 +230,6 @@ fn render_epoch_check(r: &EpochCheckReport, out: &mut String) {
     let _ = writeln!(out, "epoch check");
     let mut t = Table::new(&[
         "node",
-        "live",
         "range",
         "checked",
         "certified",
@@ -251,7 +244,6 @@ fn render_epoch_check(r: &EpochCheckReport, out: &mut String) {
     for n in &r.nodes {
         t.row(vec![
             n.node.clone(),
-            n.live.to_string(),
             match (n.from, n.to) {
                 (Some(f), Some(t)) => format!("{f}..={t}"),
                 _ if n.note.is_some() => "n/a".to_owned(),
@@ -327,7 +319,6 @@ fn render_header(r: &HeaderReport, out: &mut String) {
     let _ = writeln!(out, "consensus header {}", r.number);
     let mut t = Table::new(&[
         "node",
-        "live",
         "tier",
         "digest",
         "parent_hash",
@@ -342,7 +333,6 @@ fn render_header(r: &HeaderReport, out: &mut String) {
         match &n.header {
             Some(h) => t.row(vec![
                 n.node.clone(),
-                n.live.to_string(),
                 opt(&n.tier),
                 h.digest.clone(),
                 h.parent_hash.clone(),
@@ -353,9 +343,7 @@ fn render_header(r: &HeaderReport, out: &mut String) {
                 h.commit_timestamp.to_string(),
                 verify_word(n.signature_check.as_ref()),
             ]),
-            None => {
-                t.row(vec![n.node.clone(), n.live.to_string(), describe_absent(n.lookup, n.tip)])
-            }
+            None => t.row(vec![n.node.clone(), describe_absent(n.lookup, n.tip)]),
         }
     }
     out.push_str(&t.render());
@@ -422,7 +410,6 @@ fn render_cert(r: &CertReport, out: &mut String) {
     let _ = writeln!(out, "leader cert of header {}", r.number);
     let mut t = Table::new(&[
         "node",
-        "live",
         "tier",
         "header digest",
         "cert digest",
@@ -438,7 +425,6 @@ fn render_cert(r: &CertReport, out: &mut String) {
         match &n.leader {
             Some(c) => t.row(vec![
                 n.node.clone(),
-                n.live.to_string(),
                 opt(&n.tier),
                 n.header_digest.clone().unwrap_or_else(|| "-".to_owned()),
                 c.summary.digest.clone(),
@@ -450,9 +436,7 @@ fn render_cert(r: &CertReport, out: &mut String) {
                 c.signature.clone().unwrap_or_else(|| "-".to_owned()),
                 verify_word(n.signature_check.as_ref()),
             ]),
-            None => {
-                t.row(vec![n.node.clone(), n.live.to_string(), describe_absent(n.lookup, n.tip)])
-            }
+            None => t.row(vec![n.node.clone(), describe_absent(n.lookup, n.tip)]),
         }
     }
     out.push_str(&t.render());
@@ -489,7 +473,6 @@ fn render_batch(r: &BatchReport, out: &mut String) {
     let _ = writeln!(out, "batch {}", r.digest);
     let mut t = Table::new(&[
         "node",
-        "live",
         "tier",
         "epoch",
         "worker",
@@ -505,7 +488,6 @@ fn render_batch(r: &BatchReport, out: &mut String) {
         match (&n.batch, &n.dangling) {
             (Some(b), _) => t.row(vec![
                 n.node.clone(),
-                n.live.to_string(),
                 opt(&n.tier),
                 b.epoch.to_string(),
                 b.worker_id.to_string(),
@@ -519,14 +501,11 @@ fn render_batch(r: &BatchReport, out: &mut String) {
             ]),
             (None, Some(loc)) => t.row(vec![
                 n.node.clone(),
-                n.live.to_string(),
                 format!("DANGLING (cold index epoch {} row {}, no jar row)", loc.epoch, loc.row),
             ]),
-            (None, None) => t.row(vec![
-                n.node.clone(),
-                n.live.to_string(),
-                describe_absent_batch(n.lookup, n.tip, r.committed_at),
-            ]),
+            (None, None) => {
+                t.row(vec![n.node.clone(), describe_absent_batch(n.lookup, n.tip, r.committed_at)])
+            }
         }
     }
     out.push_str(&t.render());
@@ -634,7 +613,6 @@ fn render_tx(r: &TxReport, out: &mut String) {
     }
     let mut t = Table::new(&[
         "node",
-        "live",
         "tier",
         "index",
         "epoch",
@@ -656,7 +634,7 @@ fn render_tx(r: &TxReport, out: &mut String) {
                     n.scanned
                 )
             };
-            t.row(vec![n.node.clone(), n.live.to_string(), absence]);
+            t.row(vec![n.node.clone(), absence]);
             continue;
         }
         // one row per batch that carries the transaction, in the order of the detail blocks
@@ -664,7 +642,6 @@ fn render_tx(r: &TxReport, out: &mut String) {
         for (i, m) in n.matches.iter().enumerate() {
             t.row(vec![
                 n.node.clone(),
-                n.live.to_string(),
                 m.tier.to_string(),
                 format!("{}/{}", m.index, m.transaction_count),
                 m.epoch.to_string(),
@@ -737,8 +714,8 @@ fn render_header_check(r: &HeaderCheckReport, out: &mut String) {
         let _ = writeln!(
             out,
             "
-[{}] live={} {state}",
-            n.node, n.live
+[{}] {state}",
+            n.node
         );
         if n.hops.is_empty() {
             continue;
@@ -787,11 +764,7 @@ fn render_header_check(r: &HeaderCheckReport, out: &mut String) {
 }
 
 fn render_snapshot(r: &SnapshotReport, out: &mut String) {
-    let _ = writeln!(
-        out,
-        "snapshot of {} ({}, live {}) -> {}",
-        r.source, r.source_path, r.source_live, r.destination
-    );
+    let _ = writeln!(out, "snapshot of {} ({}) -> {}", r.source, r.source_path, r.destination);
     let _ = writeln!(
         out,
         "  mdbx.dat  {} on disk (compacted, one committed state)",
@@ -850,7 +823,7 @@ fn render_summary(r: &SummaryReport, out: &mut String) {
     let _ = writeln!(out, "summary");
     let mut t = Table::new(&[
         "node",
-        "live",
+        "recovered",
         "mdbx.dat",
         "epochs",
         "records",
@@ -864,7 +837,7 @@ fn render_summary(r: &SummaryReport, out: &mut String) {
     for n in &r.nodes {
         t.row(vec![
             n.node.clone(),
-            n.live.to_string(),
+            yes_no(n.recovered).to_owned(),
             human_bytes(n.datafile_bytes),
             match (n.first_epoch, n.last_epoch) {
                 (Some(f), Some(l)) => format!("{f}..={l}"),

@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: BUSL-1.1
-//! Opening behaviour: read-only, live writers, copies, bad paths, `summary`.
+//! Opening behaviour: read-only and exclusive, held databases refused, copies, bad paths,
+//! `summary`.
 
 #![allow(unused_crate_dependencies)]
 
@@ -7,13 +8,13 @@ mod common;
 
 use common::*;
 use rayls_db_inspect::{
-    node_db::{LiveStatus, NodeDb, OpenOptions},
+    node_db::{NodeDb, OpenOptions},
     report::summary::summary,
 };
 use rayls_infrastructure_config::RaylsDirs as _;
 use rayls_infrastructure_storage::{open_db, EpochStore as _};
 use rayls_infrastructure_types::{Database as _, B256};
-use std::io::{BufRead as _, BufReader, Write as _};
+use std::io::{BufRead as _, BufReader};
 
 #[test]
 fn opens_by_datadir_and_by_consensus_db_dir() {
@@ -21,7 +22,7 @@ fn opens_by_datadir_and_by_consensus_db_dir() {
     let a = SeededNode::new(|db| drop(seed_healthy(&fx, db)));
     // one handle per environment per process: open them one after the other
     let by_datadir = NodeDb::open(&a.datadir(), &OpenOptions::default()).unwrap();
-    assert_eq!(by_datadir.live, LiveStatus::Stopped);
+    assert!(!by_datadir.recovered);
     assert!(by_datadir.epoch(1).unwrap().is_some());
     assert!(by_datadir.has_cold(), "open_db creates the cold/ directory");
     let path = by_datadir.path.clone();
@@ -78,10 +79,9 @@ fn read_only_open_does_not_write() {
 const HOLD_ENV: &str = "RAYLS_DB_INSPECT_TEST_HOLD_DB";
 
 /// Not a test on its own: when `HOLD_ENV` names a consensus-db directory, this re-executed test
-/// binary opens it read-write the way a node does, prints `ready`, and then for every line read on
-/// stdin writes an (uncertified) epoch-7 record, flushes, and prints `written`. It exits when stdin
-/// closes. Used by [`reads_while_a_writer_holds_the_database`] to stand in for a running node,
-/// because MDBX only allows one handle per environment within a process.
+/// binary opens it read-write the way a node does, prints `ready`, and exits when stdin closes.
+/// Used to stand in for a running node, because MDBX only allows one handle per environment
+/// within a process.
 #[test]
 fn hold_db_helper() {
     let Ok(path) = std::env::var(HOLD_ENV) else { return };
@@ -126,53 +126,42 @@ fn spawn_holder(
     (child, stdin, stdout)
 }
 
+/// The tool never reads a running node: a database another process holds open is refused, with
+/// and without `--recover`, and the message says what to do instead.
 #[test]
-fn reads_while_a_writer_holds_the_database() {
+fn refuses_a_database_another_process_holds() {
     let fx = Fixture::new();
     let a = SeededNode::new(|db| drop(seed_healthy(&fx, db)));
 
     // A second process opens the database read-write and keeps it open, like a running node.
-    let (mut child, mut stdin, mut stdout) = spawn_holder(&a.consensus_db());
+    let (mut child, stdin, _stdout) = spawn_holder(&a.consensus_db());
 
-    let node = NodeDb::open(&a.datadir(), &OpenOptions::default())
-        .expect("read-only open beside a live writer");
-    assert!(matches!(node.live, LiveStatus::Live { .. }), "{:?}", node.live);
-    assert!(node.epoch(2).unwrap().is_some());
-    assert!(node.epoch(7).unwrap().is_none());
-
-    // A row the writer flushes becomes visible to the read-only handle.
-    writeln!(stdin, "write").unwrap();
-    let mut line = String::new();
-    while !line.contains("written") {
-        line.clear();
-        assert!(stdout.read_line(&mut line).unwrap() > 0, "helper exited before writing");
+    for opts in [OpenOptions::default(), OpenOptions { recover: true }] {
+        let err = NodeDb::open(&a.datadir(), &opts).expect_err("a held database must be refused");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("open in another process"), "{opts:?}: {msg}");
+        assert!(msg.contains("stop it first"), "{opts:?}: {msg}");
     }
-    assert!(node.epoch(7).unwrap().is_some(), "flushed row visible to the read-only handle");
-
-    // Exclusive mode must refuse while another process holds the environment.
-    drop(node);
-    let exclusive = NodeDb::open(
-        &a.datadir(),
-        &OpenOptions { exclusive: true, require_stopped: false, recover: false },
-    );
-    assert!(exclusive.is_err(), "MDBX_EXCLUSIVE must fail while another process has the db open");
 
     drop(stdin);
     assert!(child.wait().unwrap().success());
+    // once the holder is gone the same directory opens
+    assert!(a.open("a").epoch(2).unwrap().is_some());
 }
 
 #[test]
 fn recover_is_a_noop_on_a_clean_database_and_refused_while_held() {
     let fx = Fixture::new();
     let a = SeededNode::new(|db| drop(seed_healthy(&fx, db)));
-    let opts = OpenOptions { exclusive: false, require_stopped: false, recover: true };
+    let opts = OpenOptions { recover: true };
     let node = NodeDb::open(&a.datadir(), &opts).expect("recover then open");
+    assert!(node.recovered, "a recovered copy says so in summary");
     assert!(node.epoch(2).unwrap().is_some());
     drop(node);
     // while another handle holds the environment, the exclusive recovery open must fail
     let held = open_db(a.dirs.consensus_db_path());
     let err = NodeDb::open(&a.datadir(), &opts).expect_err("recover must refuse a held db");
-    assert!(format!("{err:#}").contains("recover"), "{err:#}");
+    assert!(format!("{err:#}").contains("another process"), "{err:#}");
     drop(held);
 }
 
@@ -180,7 +169,8 @@ fn recover_is_a_noop_on_a_clean_database_and_refused_while_held() {
 fn read_only_copy_opens_without_flags() {
     let fx = Fixture::new();
     let a = SeededNode::new(|db| drop(seed_healthy(&fx, db)));
-    // a copy made without write permission: MDBX cannot register a reader in mdbx.lck
+    // a copy made without write permission: MDBX cannot register a reader in mdbx.lck, which the
+    // exclusive open never needs
     let copy = tempfile::tempdir().unwrap();
     let dst = copy.path().join("consensus-db");
     std::fs::create_dir(&dst).unwrap();
@@ -198,38 +188,17 @@ fn read_only_copy_opens_without_flags() {
     let node = NodeDb::open(&copy.path().display().to_string(), &OpenOptions::default())
         .expect("read-only copy opens with no flags");
     assert!(node.epoch(2).unwrap().is_some());
-    assert_eq!(node.live, LiveStatus::Stopped);
+    assert!(!node.recovered);
 }
 
+/// Files copied from a database while another process held it are a separate environment:
+/// nobody holds the copy, so it opens (recovered when its head was unsynced).
 #[test]
-fn exclusive_open_works_on_a_stopped_copy() {
+fn copy_of_a_held_database_opens_on_its_own() {
     let fx = Fixture::new();
     let a = SeededNode::new(|db| drop(seed_healthy(&fx, db)));
-    let node = NodeDb::open(
-        &a.datadir(),
-        &OpenOptions { exclusive: true, require_stopped: false, recover: false },
-    )
-    .expect("exclusive open on a closed database");
-    assert!(node.epoch(1).unwrap().is_some());
-}
-
-#[test]
-fn require_stopped_refuses_a_held_database_and_a_copy_is_not_live() {
-    let fx = Fixture::new();
-    let a = SeededNode::new(|db| drop(seed_healthy(&fx, db)));
-    assert_eq!(a.open("a").live, LiveStatus::Stopped);
-
     let (mut child, stdin, _stdout) = spawn_holder(&a.consensus_db());
-    let live = NodeDb::open(&a.datadir(), &OpenOptions::default()).unwrap();
-    assert!(matches!(live.live, LiveStatus::Live { pid: Some(_) }), "{:?}", live.live);
-    let err = NodeDb::open(
-        &a.datadir(),
-        &OpenOptions { exclusive: false, require_stopped: true, recover: false },
-    )
-    .expect_err("must refuse");
-    assert!(format!("{err}").contains("--require-stopped"), "{err}");
 
-    // a copy of the held directory carries the same lock files but nobody holds them
     let copy = tempfile::tempdir().unwrap();
     let dst = copy.path().join("consensus-db");
     std::fs::create_dir(&dst).unwrap();
@@ -239,13 +208,10 @@ fn require_stopped_refuses_a_held_database_and_a_copy_is_not_live() {
             std::fs::copy(src, dst.join(f)).unwrap();
         }
     }
-    // a copy of a live database may need recovery before it opens read-only
-    let copied = NodeDb::open(
-        &copy.path().display().to_string(),
-        &OpenOptions { exclusive: false, require_stopped: true, recover: true },
-    )
-    .expect("copy opens with --require-stopped");
-    assert_eq!(copied.live, LiveStatus::Recovered, "a recovered copy says so in every report");
+    let copied = NodeDb::open(&copy.path().display().to_string(), &OpenOptions { recover: true })
+        .expect("the copy opens while the original is held");
+    assert!(copied.recovered);
+    assert!(copied.epoch(2).unwrap().is_some());
 
     drop(stdin);
     assert!(child.wait().unwrap().success());
@@ -262,6 +228,7 @@ fn summary_reports_tips_tables_and_checkpoints() {
     let report = summary(&[a.open("a")]).unwrap();
     let n = &report.nodes[0];
     assert_eq!(n.node, "a");
+    assert!(!n.recovered);
     assert_eq!((n.first_epoch, n.last_epoch), (Some(0), Some(2)));
     assert_eq!(n.epoch_records, 3);
     assert_eq!(n.epoch_certs, 2);
@@ -273,54 +240,4 @@ fn summary_reports_tips_tables_and_checkpoints() {
     assert!(n.datafile_bytes > 0);
     assert_eq!(n.tables.get("consensus_block"), Some(&4));
     assert!(n.tables.contains_key("epoch_record_by_number"));
-}
-
-/// A live node seals epochs while the tool runs. A header and a batch that were already pruned
-/// from the hot tables when the database was opened, and reach the cold tier afterwards, are
-/// still found: the jar index is re-read on a miss.
-#[test]
-fn rows_archived_after_the_open_are_found_in_the_cold_tier() {
-    use rayls_db_inspect::node_db::{BatchLookup, Tier};
-    use rayls_infrastructure_storage::{
-        cold::ColdLocation, tables::ColdBatchLocations, ColdConfig, ColdStore,
-    };
-    use rayls_infrastructure_types::{encode, DbTxMut as _};
-
-    let fx = Fixture::new();
-    let batch = fx.batch(0, 1, signed_transactions(1));
-    let digest = batch.digest();
-    let mut headers = Vec::new();
-    let mut parent = rayls_db_inspect::report::header::genesis_anchor();
-    for n in 1..=3u64 {
-        let h = fx.header(n, parent);
-        parent = h.digest();
-        headers.push(h);
-    }
-    let a = SeededNode::new(|db| {
-        // header 1 and the batch are gone from the hot tables; the batch's location index
-        // already points at epoch 0's jar, which does not exist yet
-        write_header(db, &headers[1]);
-        write_header(db, &headers[2]);
-        db.with_write_txn(|txn| {
-            txn.insert::<ColdBatchLocations>(&digest, &ColdLocation { epoch: 0, row: 0 })
-        })
-        .unwrap();
-    });
-    let node = a.open("a");
-    assert!(node.header(1).unwrap().is_none());
-    assert!(matches!(node.batch(digest).unwrap(), BatchLookup::Dangling(_)));
-
-    // the node seals epoch 0 through its own store; the tool's index knows nothing of it
-    let cold_dir = std::path::PathBuf::from(a.consensus_db()).join("cold");
-    let cold = ColdStore::open(&ColdConfig { dir: cold_dir }).unwrap();
-    cold.consensus_blocks().begin_epoch(0, 1).unwrap();
-    cold.consensus_blocks().append_row(&[&encode(&headers[0])]).unwrap();
-    cold.consensus_blocks().commit().unwrap();
-    cold.batches().begin_epoch(0, 0).unwrap();
-    cold.batches().append_row(&[digest.as_slice(), &encode(&batch)]).unwrap();
-    cold.batches().commit().unwrap();
-
-    let (h, tier) = node.header(1).unwrap().expect("found once the epoch is sealed");
-    assert_eq!((h.digest(), tier), (headers[0].digest(), Tier::Cold));
-    assert!(matches!(node.batch(digest).unwrap(), BatchLookup::Found(_, Tier::Cold)));
 }

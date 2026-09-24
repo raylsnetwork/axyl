@@ -137,8 +137,7 @@ fn exercise(
             }
         }
     };
-    let open =
-        || NodeDb::open(&spec, &OpenOptions { exclusive: true, recover, ..Default::default() });
+    let open = || NodeDb::open(&spec, &OpenOptions { recover });
     let mut out = Vec::new();
     out.push(run(if recover { "open (recovered)" } else { "open" }, &|| open().map(|_| ())));
     if matches!(out[0].1, Outcome::Error(_)) {
@@ -356,7 +355,7 @@ fn damaged_databases_never_panic_and_stay_readable_where_mdbx_allows() {
     let open = |p: &Path| {
         (NodeDb::open(
             &format!("{}={}", p.file_name().unwrap().to_string_lossy(), p.display()),
-            &OpenOptions { exclusive: true, ..Default::default() },
+            &OpenOptions::default(),
         )
         .unwrap(),)
     };
@@ -397,10 +396,9 @@ fn a_16k_page_database_with_its_first_page_destroyed_still_opens() {
         sparse_copy(&source, &copy);
         zero_range(&copy.join("mdbx.dat"), 0, (zeroed_pages * 16384) as usize);
         let spec = format!("d={}", copy.display());
-        let opened = catch_unwind(AssertUnwindSafe(|| {
-            NodeDb::open(&spec, &OpenOptions { exclusive: true, ..Default::default() })
-        }))
-        .expect("no panic");
+        let opened =
+            catch_unwind(AssertUnwindSafe(|| NodeDb::open(&spec, &OpenOptions::default())))
+                .expect("no panic");
         match (must_open, opened) {
             (true, Ok(db)) => {
                 // the newest surviving meta page decides the state: the three pages hold the
@@ -412,11 +410,8 @@ fn a_16k_page_database_with_its_first_page_destroyed_still_opens() {
             (true, Err(e)) => {
                 // the surviving meta may be unsynced: recovery of the copy must then do it
                 assert!(NodeDb::needs_recovery(&e), "{zeroed_pages} pages zeroed: {e:#}");
-                let db = NodeDb::open(
-                    &spec,
-                    &OpenOptions { exclusive: true, recover: true, ..Default::default() },
-                )
-                .expect("recovered copy opens");
+                let db = NodeDb::open(&spec, &OpenOptions { recover: true })
+                    .expect("recovered copy opens");
                 let tip = db.latest_consensus_number().unwrap();
                 assert!(tip.is_none_or(|t| t <= 3), "{zeroed_pages} pages zeroed: tip {tip:?}");
             }

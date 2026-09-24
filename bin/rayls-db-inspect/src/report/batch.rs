@@ -11,7 +11,7 @@
 
 use super::{absence_verdict, code, recode, Lookup, Verdict};
 use crate::{
-    node_db::{BatchLookup, LiveStatus, NodeDb, Position, ScanStats, Tier},
+    node_db::{BatchLookup, NodeDb, Position, ScanStats, Tier},
     view::{b256, CertificateView, HeaderSummary, TransactionView},
 };
 use rayls_infrastructure_storage::cold::ColdLocation;
@@ -158,7 +158,6 @@ pub struct BatchReport {
 #[derive(Debug, Serialize)]
 pub struct BatchNodeView {
     pub node: String,
-    pub live: LiveStatus,
     pub lookup: Lookup,
     /// The node's consensus tip, read against `committed_at`.
     pub tip: Option<u64>,
@@ -243,7 +242,6 @@ pub fn get_batch(nodes: &[NodeDb], digest: B256) -> eyre::Result<BatchReport> {
     for ((node, (position, hit)), commit) in nodes.iter().zip(hits).zip(commits) {
         let mut view = BatchNodeView {
             node: node.label.clone(),
-            live: node.live,
             lookup: Lookup::Found,
             tip: position.consensus_tip,
             tier: None,
@@ -299,7 +297,6 @@ pub struct TxReport {
 #[derive(Debug, Serialize)]
 pub struct TxNodeView {
     pub node: String,
-    pub live: LiveStatus,
     pub lookup: Lookup,
     pub tip: Option<u64>,
     pub current_epoch: Option<Epoch>,
@@ -435,7 +432,6 @@ pub fn get_tx(nodes: &[NodeDb], hash: B256, epoch: Option<Epoch>) -> eyre::Resul
             .map(|hit| TransactionView::of(hit.index, &hit.batch.transactions[hit.index]));
         views.push(TxNodeView {
             node: node.label.clone(),
-            live: node.live,
             lookup,
             tip: scan.position.consensus_tip,
             current_epoch: scan.position.current_epoch,
@@ -457,7 +453,6 @@ pub fn get_tx(nodes: &[NodeDb], hash: B256, epoch: Option<Epoch>) -> eyre::Resul
     }
     verdict = verdict
         .count("copies", if copies > 1 { copies } else { 0 })
-        .count("uncommitted", uncommitted)
-        .count("short_scan", views.iter().filter(|v| v.scanned.short).count());
+        .count("uncommitted", uncommitted);
     Ok(TxReport { hash: b256(&hash), epoch, committed_at, nodes: views, verdict })
 }

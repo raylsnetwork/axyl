@@ -194,17 +194,6 @@ impl ColdSegment {
         Ok(index)
     }
 
-    /// Rebuilds the index from the jars on disk, so a reader in another process sees the epochs
-    /// the writer sealed after this segment was opened. The writer's own index is kept current
-    /// by [`commit`](Self::commit) and never needs this. Loaded jars are dropped too, in case an
-    /// epoch was re-sealed into a different file.
-    pub fn refresh(&self) -> ColdResult<()> {
-        let index = Self::rebuild_index(&self.dir, self.kind)?;
-        *self.index.write() = index;
-        self.cache.lock().clear();
-        Ok(())
-    }
-
     /// Returns true if the given epoch already has a sealed jar in the index (idempotent re-run).
     ///
     /// On the served-batch read path (`read_batch_checked`), so it must not scan every jar.
@@ -484,12 +473,6 @@ impl ColdStore {
             ColdSegment::open(cfg.dir.join("consensus_blocks"), ColdSegmentKind::ConsensusBlocks)?;
         let batches = ColdSegment::open(cfg.dir.join("batches"), ColdSegmentKind::Batches)?;
         Ok(Self { consensus_blocks, batches })
-    }
-
-    /// Re-reads both segments' jar indexes from disk (see [`ColdSegment::refresh`]).
-    pub fn refresh(&self) -> ColdResult<()> {
-        self.consensus_blocks.refresh()?;
-        self.batches.refresh()
     }
 
     /// Returns the consensus_blocks segment.
