@@ -120,9 +120,14 @@ pub(crate) enum VoteAction {
         /// Epoch of the record the vote is for.
         epoch: Epoch,
     },
-    /// A different digest for the same epoch (or one that could not be placed): it may reach the
-    /// alternate-record quorum.
+    /// A different digest for the same epoch, proven by a record we hold or fetched: a genuine
+    /// competing record. Tracked for the alternate-record quorum and rejected.
     Alternate,
+    /// A committee signature over a digest nobody can place - not held locally and not served by
+    /// any peer. That is exactly what an honest re-vote for an earlier, still uncertified epoch
+    /// looks like to a node that never built that record (#142), so it is acked rather than
+    /// punished. Still tracked, so a quorum of them is at least visible in the logs.
+    Unresolvable,
     /// The digest is unknown locally: resolve it over the network and decide again with the
     /// result.
     NeedsResolve,
@@ -158,9 +163,11 @@ pub(crate) fn triage_vote(
     };
     match class {
         ForeignVote::Stale { epoch } => VoteAction::IgnoreStale { epoch },
-        // A competing record for this epoch, or a digest nobody could place: treat it as the
-        // collection always did, so a genuine fork is still detected.
-        ForeignVote::Competing | ForeignVote::Unknown => VoteAction::Alternate,
+        // A proven competing record for this epoch: a genuine fork signal.
+        ForeignVote::Competing => VoteAction::Alternate,
+        // Nobody could place the digest. A valid committee signature is not evidence of
+        // misbehaviour on its own, so the sender is not punished.
+        ForeignVote::Unknown => VoteAction::Unresolvable,
     }
 }
 
@@ -335,7 +342,9 @@ mod tests {
             ),
             VoteAction::IgnoreStale { epoch: 36 },
         );
-        // Unresolvable: the old alternate-record path, so a real fork is still detected.
+        // Unresolvable: a committee signature over a digest nobody can place. To a node that
+        // never built the older record this is what an honest re-vote for an uncertified epoch
+        // looks like, so it is not the punished alternate path.
         assert_eq!(
             triage_vote(
                 &stale_vote,
@@ -345,13 +354,62 @@ mod tests {
                 None,
                 Some(ForeignVote::Unknown)
             ),
-            VoteAction::Alternate,
+            VoteAction::Unresolvable,
         );
         // A competing record for this very epoch always reaches the alternate path.
         let competing = record_for(38, &committee, B256::repeat_byte(1));
         let competing_vote = competing.sign_vote(&signer);
         assert_eq!(
             triage_vote(&competing_vote, current.digest(), 38, &committee, Some((38, false)), None),
+            VoteAction::Alternate,
+        );
+    }
+
+    /// A validator that joined after epoch 36 closed receives the older validators' re-votes for
+    /// the still-uncertified 36 while collecting 38. It cannot place the digest and no peer can
+    /// serve it. The votes must be acked (not rejected), or the newcomer penalises every honest
+    /// validator on every re-vote for as long as 36 stays uncertified (#142).
+    #[test]
+    fn re_votes_for_an_uncertified_older_epoch_are_not_punished_by_a_newcomer() {
+        let mut rng = StdRng::seed_from_u64(12);
+        let signers: Vec<TestSigner> = (0..4).map(|_| TestSigner::new(&mut rng)).collect();
+        let mut committee: Vec<BlsPublicKey> = signers.iter().map(|s| s.public_key()).collect();
+        committee.sort_unstable();
+
+        let older = record_for(36, &committee, B256::ZERO);
+        let current = record_for(38, &committee, B256::repeat_byte(2));
+
+        for signer in &signers {
+            let re_vote = older.sign_vote(signer);
+            // Nothing local, and the network resolution came back empty.
+            assert_eq!(
+                triage_vote(&re_vote, current.digest(), 38, &committee, None, None),
+                VoteAction::NeedsResolve,
+            );
+            assert_eq!(
+                triage_vote(
+                    &re_vote,
+                    current.digest(),
+                    38,
+                    &committee,
+                    None,
+                    Some(ForeignVote::Unknown),
+                ),
+                VoteAction::Unresolvable,
+            );
+        }
+
+        // A record we can place as a different digest for 38 is still a competing record.
+        let competing = record_for(38, &committee, B256::repeat_byte(1));
+        assert_eq!(
+            triage_vote(
+                &competing.sign_vote(&signers[0]),
+                current.digest(),
+                38,
+                &committee,
+                None,
+                Some(ForeignVote::Competing),
+            ),
             VoteAction::Alternate,
         );
     }

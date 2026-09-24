@@ -1342,6 +1342,8 @@ where
             let mut timeout = Duration::from_secs(5);
             let mut timeouts = 0;
             let mut alt_recs: B256Map<VotesAggregator<EpochVote>> = B256Map::default();
+            // Unplaceable digests already warned about this attempt (once per digest).
+            let mut warned_unresolvable: HashSet<B256> = HashSet::new();
             // Digests resolved over the network, so one unknown digest costs one request, and a
             // hard cap on how many such requests one collection may make.
             let mut resolved_digests: B256Map<ForeignVote> = B256Map::default();
@@ -1469,7 +1471,12 @@ where
                                 // Honest gossip: ack it so the peer is not punished.
                                 let _ = vote_tx.send(Ok(()));
                             }
-                            VoteAction::Alternate | VoteAction::NeedsResolve => {
+                            VoteAction::Alternate
+                            | VoteAction::Unresolvable
+                            | VoteAction::NeedsResolve => {
+                                // `NeedsResolve` cannot survive the resolution above; if it
+                                // did, nothing was proven, so treat it as unresolvable.
+                                let competing = action == VoteAction::Alternate;
                                 // track votes on alternate epoch records per-validator;
                                 // break on quorum. per-validator tracking prevents inflation.
                                 const MAX_ALT_RECS: usize = 100;
@@ -1484,30 +1491,51 @@ where
                                     false
                                 };
                                 if reached_alt_quorum {
-                                    error!(
-                                        target: "epoch-manager",
-                                        "Reached quorum on epoch record {} instead of {}.",
-                                        vote.epoch_hash,
-                                        reference_hash,
-                                    );
-                                    if let Err(err) =
-                                        vote_tx.send(Err(HeaderError::InvalidHeaderDigest))
-                                    {
+                                    if competing {
                                         error!(
                                             target: "epoch-manager",
-                                            ?err,
-                                            "Failed to send error for invalid epoch record {} from {}.",
+                                            "Reached quorum on epoch record {} instead of {}.",
                                             vote.epoch_hash,
-                                            vote.public_key,
+                                            reference_hash,
+                                        );
+                                        if let Err(err) =
+                                            vote_tx.send(Err(HeaderError::InvalidHeaderDigest))
+                                        {
+                                            error!(
+                                                target: "epoch-manager",
+                                                ?err,
+                                                "Failed to send error for invalid epoch record {} from {}.",
+                                                vote.epoch_hash,
+                                                vote.public_key,
+                                            );
+                                        }
+                                        break;
+                                    }
+                                    // Not a fork signal we can act on: a quorum of committee
+                                    // members signing a digest nobody can place is what their
+                                    // re-votes for an uncertified earlier epoch look like to a
+                                    // node that never built that record. Keep collecting; the
+                                    // fetch fallback covers a real competing record anyway.
+                                    if warned_unresolvable.insert(vote.epoch_hash) {
+                                        warn!(
+                                            target: "epoch-manager",
+                                            digest = %vote.epoch_hash,
+                                            "a quorum of committee members signed an epoch record digest this node cannot place",
                                         );
                                     }
-                                    break;
                                 }
-                                Self::reject_epoch_vote(
-                                    &vote,
-                                    vote_tx,
-                                    HeaderError::InvalidHeaderDigest,
-                                );
+                                if competing {
+                                    Self::reject_epoch_vote(
+                                        &vote,
+                                        vote_tx,
+                                        HeaderError::InvalidHeaderDigest,
+                                    );
+                                } else {
+                                    // A valid committee signature over a digest nobody can
+                                    // explain is not evidence of misbehaviour: ack it so the
+                                    // sender is not punished (#142).
+                                    let _ = vote_tx.send(Ok(()));
+                                }
                             }
                             VoteAction::Reject => {
                                 Self::reject_epoch_vote(
