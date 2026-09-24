@@ -198,7 +198,7 @@ impl NodeDb {
             })
         };
         if opts.recover {
-            MdbxDatabase::recover(&path).map_err(|e| {
+            recover(&path).map_err(|e| {
                 in_use(&e)
                     .unwrap_or_else(|| e.wrap_err(format!("{label}: recover {}", path.display())))
             })?;
@@ -211,34 +211,7 @@ impl NodeDb {
         }
         // Exclusive: refuses a database another process holds and skips MDBX's reader table, so
         // a copy whose mdbx.lck is not writable opens too.
-        let exclusive = true;
-        let db = match MdbxDatabase::open_read_only(&path, exclusive) {
-            Ok(db) => Ok(db),
-            // MDBX finds its three meta pages by guessing offsets from the system page size
-            // until a valid first page tells it the real one: with larger pages and a destroyed
-            // first page it sees "not an MDBX file" although meta pages 1 and 2 may be intact
-            Err(e) if format!("{e:#}").contains("not an MDBX file") => {
-                let mut found = None;
-                for page_size in [8192, 16384, 32768, 65536] {
-                    if let Ok(db) = MdbxDatabase::open_read_only_with_page_size(
-                        &path,
-                        exclusive,
-                        Some(page_size),
-                    ) {
-                        eprintln!(
-                            "{label}: the first page of {} is unreadable; opened from a surviving \
-                             meta page with page size {page_size}",
-                            path.display()
-                        );
-                        found = Some(db);
-                        break;
-                    }
-                }
-                found.ok_or(e)
-            }
-            Err(e) => Err(e),
-        }
-        .map_err(|e| {
+        let db = MdbxDatabase::open_read_only(&path, true).map_err(|e| {
             if let Some(in_use) = in_use(&e) {
                 return in_use;
             }
@@ -599,42 +572,38 @@ impl NodeDb {
             None => cold.batches().sealed_epochs().into_iter().collect(),
         };
         for e in epochs {
-            let mut stop = false;
-            let mut visited = 0usize;
-            let mut failure = None;
-            cold.for_each_batch_in_epoch(e, |row, digest, bytes| {
-                let batch: Batch = match try_decode(bytes) {
-                    Ok(batch) => batch,
-                    Err(err) => {
-                        failure = Some(eyre!(
-                            "{}: decode cold batch {digest} (epoch {e} row {row}): {err}",
-                            self.label
-                        ));
-                        return Ok(false);
-                    }
-                };
-                visited += 1;
-                match visit(digest, &batch, Tier::Cold) {
-                    Ok(next) => {
-                        stop = !next;
-                        Ok(next)
-                    }
-                    Err(err) => {
-                        failure = Some(err);
-                        Ok(false)
-                    }
-                }
+            // the jar's (row, digest) pairs first, then each payload through the checked read
+            // that serves the node's own lookups (one cursor per batch: fine for an offline scan)
+            let mut rows: Vec<(u64, BlockHash)> = Vec::new();
+            cold.for_each_batch_digest_in_epoch(e, |row, digest| {
+                rows.push((row, digest));
+                Ok(())
             })
             .map_err(|err| eyre!("{}: scan cold batches of epoch {e}: {err}", self.label))?;
-            if visited > 0 {
+            if !rows.is_empty() {
                 stats.cold_epochs += 1;
-                stats.cold_batches += visited;
             }
-            if let Some(err) = failure {
-                return Err(err);
-            }
-            if stop {
-                break;
+            for (row, digest) in rows {
+                let location = ColdLocation { epoch: e, row };
+                let bytes = cold.read_batch_checked(digest, location).map_err(|err| {
+                    eyre!(
+                        "{}: cold read of batch {digest} (epoch {e} row {row}): {err}",
+                        self.label
+                    )
+                })?;
+                let Some(bytes) = bytes else {
+                    return Err(eyre!(
+                        "{}: cold batch {digest} listed at epoch {e} row {row} has no payload",
+                        self.label
+                    ));
+                };
+                let batch: Batch = try_decode(&bytes).map_err(|err| {
+                    eyre!("{}: decode cold batch {digest} (epoch {e} row {row}): {err}", self.label)
+                })?;
+                stats.cold_batches += 1;
+                if !visit(digest, &batch, Tier::Cold)? {
+                    return Ok(stats);
+                }
             }
         }
         Ok(stats)
@@ -718,9 +687,31 @@ impl NodeDb {
 
     /// Size of `mdbx.dat` in bytes.
     pub fn datafile_size(&self) -> eyre::Result<u64> {
-        MdbxDatabase::datafile_size(&self.path)
+        std::fs::metadata(self.path.join("mdbx.dat"))
+            .map(|m| m.len())
             .wrap_err_with(|| format!("{}: stat mdbx.dat", self.label))
     }
+}
+
+/// Makes a copy whose last commit was never synced openable: one read-write, exclusive open,
+/// during which MDBX settles the head meta page, then closed without touching any table. Fails
+/// if any other process has the database open. The same recovery the node performs on start.
+pub fn recover(consensus_db: &Path) -> eyre::Result<()> {
+    use reth_libmdbx::{Environment, EnvironmentFlags, Mode, SyncMode};
+    if !consensus_db.join("mdbx.dat").is_file() {
+        return Err(eyre!("no MDBX database at {} (expected mdbx.dat)", consensus_db.display()));
+    }
+    let flags = EnvironmentFlags {
+        mode: Mode::ReadWrite { sync_mode: SyncMode::Durable },
+        exclusive: true,
+        ..Default::default()
+    };
+    let env = Environment::builder().set_max_dbs(32).set_flags(flags).open(consensus_db)?;
+    env.stat().map_err(|e| {
+        eyre!("MDBX database at {} failed its integrity check: {e}", consensus_db.display())
+    })?;
+    drop(env);
+    Ok(())
 }
 
 /// Splits `LABEL=PATH` into its parts; a bare path has no label.

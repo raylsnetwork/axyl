@@ -225,8 +225,9 @@ Notes on what the data means:
   is a `BROKEN` link or a failed signature; a damaged row or jar row is an error naming the node,
   the table or jar and the row; a cold tier whose index cannot be read is skipped with a note,
   the hot tables still answer; MDBX keeps three copies of its meta page at the start of the
-  datafile and opens with the newest intact one, so a damaged first page or two still opens,
-  while a file that lost all three cannot be opened at all. `header-check` reports an
+  datafile and opens with the newest intact one it can locate (with the default 4 KiB pages a
+  damaged first page or two still opens; with larger pages MDBX cannot find the others once the
+  first is gone), while a file that lost all three cannot be opened at all. `header-check` reports an
   unreadable node as such and checks the others (`BROKEN unreadable=N`); the other commands stop
   at the first unreadable node, whose label the error names, so drop that node and rerun.
 - Node roles and archive modes do not change what the tool reads. Validators (active or
@@ -285,8 +286,9 @@ objects use the wire types' encoding described above.
 | `tests/` | integration tests against seeded MDBX fixtures |
 
 The read-only opener itself lives in the storage crate (`MdbxDatabase::open_read_only`,
-`has_table`, `table_entry_counts`), as does the sequential cold-batch iterator the `get-tx` scan uses
-(`ColdStore::for_each_batch_in_epoch`).
+`has_table`, `table_entry_counts`); the `get-tx` cold scan walks each jar's `(row, digest)` pairs
+(`ColdStore::for_each_batch_digest_in_epoch`) and reads every payload through the same checked
+lookup the node uses (`read_batch_checked`).
 
 ## Ideas for later
 

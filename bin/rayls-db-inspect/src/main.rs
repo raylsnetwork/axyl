@@ -8,11 +8,13 @@ use rayls_db_inspect::{cli::Cli, render, run};
 use tracing_subscriber::EnvFilter;
 
 // Used by the library target only.
+use alloy as _;
 use comfy_table as _;
 use const_hex as _;
 use eyre as _;
 use rayls_infrastructure_storage as _;
 use rayls_infrastructure_types as _;
+use reth_libmdbx as _;
 use serde as _;
 
 fn main() {

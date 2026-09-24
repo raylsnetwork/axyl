@@ -7,11 +7,14 @@
 //! signatures, authority identifiers). Verbose reports embed the wire type itself as `raw`, which
 //! for a consensus header is the object the `rayls_latestHeader` RPC returns.
 
+use alloy::{
+    consensus::transaction::SignerRecoverable as _,
+    eips::{eip2718::Decodable2718 as _, Typed2718 as _},
+};
 use rayls_infrastructure_types::{
     encode, keccak256, AuthorityIdentifier, BlockHash, BlsPublicKey, BlsSignature, Certificate,
-    CertificateDigest, ConsensusHeader, Decodable2718 as _, EpochTransitionCheckpoint, Hash as _,
-    SignatureVerificationState, SignerRecoverable as _, TransactionSigned, TransactionTrait as _,
-    TxKind, Typed2718 as _, B256,
+    CertificateDigest, ConsensusHeader, EpochTransitionCheckpoint, Hash as _,
+    SignatureVerificationState, TransactionSigned, TransactionTrait as _, TxKind, B256,
 };
 use serde::Serialize;
 

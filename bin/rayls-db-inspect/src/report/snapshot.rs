@@ -19,7 +19,7 @@ use crate::{
     report::summary::{summary, SummaryNodeView},
 };
 use eyre::{bail, eyre, WrapErr as _};
-use rayls_infrastructure_storage::{mdbx::MdbxDatabase, ColdConfig, ColdStore};
+use rayls_infrastructure_storage::{ColdConfig, ColdStore};
 use rayls_infrastructure_types::Epoch;
 use serde::Serialize;
 use std::{
@@ -257,7 +257,8 @@ fn copy_raw_and_recover(label: &str, source: &Path, to: &Path) -> eyre::Result<S
         }
     }
     // the copy, not the source, gets the recovery pass
-    MdbxDatabase::recover(to).wrap_err_with(|| format!("recover the copy at {}", to.display()))?;
+    crate::node_db::recover(to)
+        .wrap_err_with(|| format!("recover the copy at {}", to.display()))?;
     let mdbx_bytes = allocated_bytes(&fs::metadata(&dat)?);
     let copy = read_back(to)?;
     Ok(SnapshotReport {

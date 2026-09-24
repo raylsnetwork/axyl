@@ -313,24 +313,6 @@ impl ColdSegment {
         epoch: Epoch,
         mut visit: impl FnMut(u64, &[u8]) -> ColdResult<()>,
     ) -> ColdResult<()> {
-        self.for_each_full_row_in_epoch(epoch, |row, columns| {
-            let value = columns.first().copied().ok_or_else(|| {
-                ColdError::Corruption(format!("epoch {epoch} jar row {row} has no columns"))
-            })?;
-            visit(row, value)?;
-            Ok(true)
-        })
-    }
-
-    /// Visits every row of `epoch`'s jar in ascending row order with all of its columns, reusing
-    /// one cursor. `visit` returns `Ok(false)` to stop early. A missing jar visits nothing. The
-    /// caller must not race `begin_epoch` for the same epoch: the jar index and cache are only
-    /// refreshed at `commit`, so a re-seal in progress reads as a stale or missing row.
-    pub(crate) fn for_each_full_row_in_epoch(
-        &self,
-        epoch: Epoch,
-        mut visit: impl FnMut(u64, &[&[u8]]) -> ColdResult<bool>,
-    ) -> ColdResult<()> {
         let Some(jar) = self.index.read().jar_for_epoch(epoch).cloned() else {
             return Ok(());
         };
@@ -340,9 +322,10 @@ impl ColdSegment {
             let columns = cursor.row_by_number(row as usize)?.ok_or_else(|| {
                 ColdError::Corruption(format!("cold row {row} missing from epoch {epoch} jar"))
             })?;
-            if !visit(row, &columns)? {
-                break;
-            }
+            let value = columns.first().copied().ok_or_else(|| {
+                ColdError::Corruption(format!("epoch {epoch} jar row {row} has no columns"))
+            })?;
+            visit(row, value)?;
         }
         Ok(())
     }
@@ -541,40 +524,6 @@ impl ColdStore {
             .then(|| columns.swap_remove(BATCH_PAYLOAD_COLUMN)))
     }
 
-    /// Visits every archived batch of `epoch` as `(row, digest, bcs bytes)` in row order, or
-    /// nothing when the epoch has no sealed batches jar. `visit` returns `Ok(false)` to stop.
-    ///
-    /// Sequential over one cursor, for whole-tier scans; a lookup by digest goes through the
-    /// auxiliary index and [`Self::read_batch_checked`] instead.
-    ///
-    /// # Errors
-    ///
-    /// [`ColdError::Corruption`] if a row's digest column is not a 32-byte hash or its payload
-    /// column is absent.
-    pub fn for_each_batch_in_epoch(
-        &self,
-        epoch: Epoch,
-        mut visit: impl FnMut(u64, BlockHash, &[u8]) -> ColdResult<bool>,
-    ) -> ColdResult<()> {
-        self.batches.for_each_full_row_in_epoch(epoch, |row, columns| {
-            let column = columns.first().ok_or_else(|| {
-                ColdError::Corruption(format!("batches epoch {epoch} row {row} has no columns"))
-            })?;
-            let digest = BlockHash::try_from(*column).map_err(|_| {
-                ColdError::Corruption(format!(
-                    "batches epoch {epoch} row {row} digest column is {} bytes",
-                    column.len()
-                ))
-            })?;
-            let payload = columns.get(BATCH_PAYLOAD_COLUMN).copied().ok_or_else(|| {
-                ColdError::Corruption(format!(
-                    "batches epoch {epoch} row {row} has no payload column"
-                ))
-            })?;
-            visit(row, digest, payload)
-        })
-    }
-
     /// Visits a single epoch's archived batches as `(row, digest)`, `row` being exactly the
     /// [`ColdLocation::row`] the batch is served from, so the auxiliary index can be rebuilt from
     /// the jar itself rather than re-derived from another segment.
@@ -582,7 +531,7 @@ impl ColdStore {
     /// # Errors
     ///
     /// [`ColdError::Corruption`] if a row's digest column is not a 32-byte hash.
-    pub(crate) fn for_each_batch_digest_in_epoch(
+    pub fn for_each_batch_digest_in_epoch(
         &self,
         epoch: Epoch,
         mut visit: impl FnMut(u64, BlockHash) -> ColdResult<()>,

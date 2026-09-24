@@ -17,10 +17,12 @@ path = "src/main.rs"
 rayls-infrastructure-storage = { workspace = true }
 rayls-infrastructure-types = { workspace = true }
 
+alloy = { workspace = true }
 clap = { workspace = true, features = ["derive"] }
 comfy-table = { workspace = true }
 const-hex = { workspace = true }
 eyre = { workspace = true }
+reth-libmdbx = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["env-filter", "fmt"] }

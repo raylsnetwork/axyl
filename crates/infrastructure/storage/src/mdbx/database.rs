@@ -431,9 +431,6 @@ pub struct MdbxConfig {
     pub max_db_size: usize,
     /// Database growth step in bytes.
     pub growth_step: usize,
-    /// MDBX page size for a database created by this open; `None` picks
-    /// [`default_page_size`]. An existing database keeps the page size it was created with.
-    pub page_size: Option<usize>,
 }
 
 impl Default for MdbxConfig {
@@ -445,7 +442,6 @@ impl Default for MdbxConfig {
             max_readers: DEFAULT_MAX_READERS,
             max_db_size: 100 * GIGABYTE,
             growth_step: GIGABYTE,
-            page_size: None,
         }
     }
 }
@@ -468,11 +464,6 @@ impl MdbxConfig {
         self
     }
 
-    /// Set the page size for a database created by this open.
-    pub fn with_page_size(mut self, page_size: usize) -> Self {
-        self.page_size = Some(page_size);
-        self
-    }
     /// Set the maximum database size in bytes.
     pub fn with_max_db_size(mut self, max_db_size: usize) -> Self {
         self.max_db_size = max_db_size;
@@ -538,7 +529,7 @@ impl MdbxDatabase {
                 growth_step: Some(config.growth_step as isize),
                 // The database never shrinks
                 shrink_threshold: Some((2 * config.growth_step) as isize),
-                page_size: Some(PageSize::Set(config.page_size.unwrap_or_else(default_page_size))),
+                page_size: Some(PageSize::Set(default_page_size())),
             })
             .write_map()
             .set_dp_reserve_limit(512)
@@ -601,29 +592,13 @@ impl MdbxDatabase {
     ///
     /// Unlike [`Self::open_with_config`] this never writes: the environment is opened with
     /// `MDBX_RDONLY`, no sub-database is created, and the datafile geometry is left untouched.
-    /// MDBX permits one writer plus many readers across processes, so a running node may keep
-    /// the database open while this handle reads it. Each read transaction pins the pages it
-    /// sees until it ends, so callers should keep read transactions short when a writer is live.
     ///
     /// `exclusive` requests `MDBX_EXCLUSIVE`: the open fails with `Busy` if any other process has
-    /// the environment open, and a read-only lock file becomes acceptable. Use it for copies.
+    /// the environment open, and a read-only lock file becomes acceptable.
     ///
     /// Tables are opened lazily by each transaction (see `get_dbi`); a table that does not exist
     /// surfaces as a `NotFound` error from the read, never as a created sub-database.
     pub fn open_read_only<P: AsRef<Path>>(path: P, exclusive: bool) -> eyre::Result<Self> {
-        Self::open_read_only_with_page_size(path, exclusive, None)
-    }
-
-    /// [`open_read_only`](Self::open_read_only) with a page-size hint. MDBX locates its meta
-    /// pages by guessing their offsets from the system page size until a valid meta page tells
-    /// it the real one; a database with larger pages whose first page is destroyed therefore
-    /// reads as "not an MDBX file" although meta pages 1 and 2 may be intact. The hint makes MDBX
-    /// look at the right offsets.
-    pub fn open_read_only_with_page_size<P: AsRef<Path>>(
-        path: P,
-        exclusive: bool,
-        page_size: Option<usize>,
-    ) -> eyre::Result<Self> {
         let path = path.as_ref();
         let dat = path.join(MDBX_DAT);
         if !dat.is_file() {
@@ -640,25 +615,16 @@ impl MdbxDatabase {
             ..Default::default()
         };
 
-        let mut builder = Environment::builder();
-        builder
+        // No geometry: a read-only environment never grows, and MDBX takes the page size from
+        // the datafile's meta page.
+        let env = Environment::builder()
             .set_max_dbs(32)
             .set_flags(flags)
             // Inspection scans may legitimately outlast the node's read-transaction cap; the
             // cap protects the writer in *this* process, of which there is none.
             .set_max_read_transaction_duration(MaxReadTransactionDuration::Unbounded)
-            .set_max_readers(DEFAULT_MAX_READERS.into());
-        // No geometry otherwise: a read-only environment never grows, and MDBX takes the page
-        // size from the datafile's meta page when it can read one.
-        if let Some(page_size) = page_size {
-            builder.set_geometry(Geometry::<std::ops::Range<usize>> {
-                size: None,
-                growth_step: None,
-                shrink_threshold: None,
-                page_size: Some(PageSize::Set(page_size)),
-            });
-        }
-        let env = builder.open(path)?;
+            .set_max_readers(DEFAULT_MAX_READERS.into())
+            .open(path)?;
 
         // Surface corruption plainly; unlike the node startup path, do not suggest deleting the
         // database, since an inspector may well be pointed at the only remaining copy.
@@ -677,33 +643,6 @@ impl MdbxDatabase {
         table_entry_counts(&self.inner)
     }
 
-    /// Repairs a datafile copied from a running node by opening it read-write once.
-    ///
-    /// A copy taken while a node was writing carries a meta page MDBX must roll back before use,
-    /// which a read-only open refuses to do ("database should be recovered"). This opens the
-    /// environment read-write and exclusive, so MDBX performs that recovery and the open fails if
-    /// any other process has the database open, then closes it without touching any table.
-    pub fn recover<P: AsRef<Path>>(path: P) -> eyre::Result<()> {
-        let path = path.as_ref();
-        if !path.join(MDBX_DAT).is_file() {
-            return Err(eyre::eyre!(
-                "no MDBX database at {} (expected {MDBX_DAT})",
-                path.display()
-            ));
-        }
-        let flags = EnvironmentFlags {
-            mode: Mode::ReadWrite { sync_mode: SyncMode::Durable },
-            exclusive: true,
-            ..Default::default()
-        };
-        let env = Environment::builder().set_max_dbs(32).set_flags(flags).open(path)?;
-        env.stat().map_err(|e| {
-            eyre::eyre!("MDBX database at {} failed its integrity check: {e}", path.display())
-        })?;
-        drop(env);
-        Ok(())
-    }
-
     /// Returns whether the sub-database for `T` exists, without creating it.
     ///
     /// The regular read path opens tables lazily and reports a missing one as an error; a
@@ -717,19 +656,11 @@ impl MdbxDatabase {
         }
     }
 
-    /// Size in bytes of the datafile backing this environment, if it can be read.
-    pub fn datafile_size(path: &Path) -> std::io::Result<u64> {
-        std::fs::metadata(path.join(MDBX_DAT)).map(|m| m.len())
-    }
-
     /// Copy-compacts the environment into the `dest` file, writing only live pages.
     ///
     /// Runs against a consistent read snapshot, so the source may stay open; the copy omits
     /// freelist pages, shrinking a heavily pruned datafile to its live size. `dest` must not
     /// already exist.
-    /// Copies the environment to the file `dest` as one committed state, compacted (only used
-    /// pages), through `mdbx_env_copy` inside a read transaction: safe on an environment another
-    /// process is writing. The copy opens without recovery.
     pub fn compact_to<P: AsRef<Path>>(&self, dest: P) -> eyre::Result<()> {
         let dest = dest.as_ref();
         let dest_c = CString::new(
@@ -787,11 +718,8 @@ pub fn compact_in_place(store_path: &Path, config: &MdbxConfig) -> eyre::Result<
         db.compact_to(tmp_dir.join(MDBX_DAT))?;
         counts
     };
-    // Verify the copy through a read-only, exclusive open: nothing writes to it any more, and the
-    // read-write path's startup corruption log would tell the operator to delete a database when
-    // only this temporary copy is bad.
     let compacted_counts = {
-        let db = MdbxDatabase::open_read_only(&tmp_dir, true)?;
+        let db = MdbxDatabase::open_with_config(&tmp_dir, config.clone())?;
         table_entry_counts(&db.inner)?
     };
     eyre::ensure!(
