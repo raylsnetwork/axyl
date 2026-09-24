@@ -24,6 +24,8 @@ pub const NUM_SHUTDOWN_RECEIVERS: u64 = 26;
 #[cfg(any(test, feature = "test-utils"))]
 pub mod test_utils;
 
+/// Anchor for the dev-dependencies that only this crate's own test and bench
+/// targets consume; without it, lib-test builds warn that they are unused.
 #[cfg(test)]
 mod clippy {
     use rayls_consensus_worker as _;
