@@ -923,9 +923,6 @@ where
         if let Err(e) = self.consensus_db.save_epoch_record_with_cert(&peer_rec, &cert) {
             error!(target: "epoch-manager", "failed to save fast-path epoch record and cert: {e}");
         }
-        if let Err(e) = self.consensus_db.clear_pending_epoch_record(peer_rec.epoch) {
-            error!(target: "epoch-manager", ?e, epoch = peer_rec.epoch, "failed to clear pending epoch record after fast-path fetch");
-        }
         true
     }
 
@@ -1015,16 +1012,11 @@ where
                 .is_some_and(|(_, cert)| cert.is_some());
             if backfill_candidate(record.epoch, current_epoch, already_certified) {
                 match consensus_db.save_epoch_record_with_cert(&record, &cert) {
-                    Ok(()) => {
-                        info!(
-                            target: "epoch-manager",
-                            epoch = record.epoch,
-                            "backfilled a missing epoch record found through a stale vote",
-                        );
-                        if let Err(e) = consensus_db.clear_pending_epoch_record(record.epoch) {
-                            error!(target: "epoch-manager", ?e, epoch = record.epoch, "failed to clear pending epoch record after stale-vote backfill");
-                        }
-                    }
+                    Ok(()) => info!(
+                        target: "epoch-manager",
+                        epoch = record.epoch,
+                        "backfilled a missing epoch record found through a stale vote",
+                    ),
                     Err(err) => error!(
                         target: "epoch-manager",
                         ?err,
@@ -1037,37 +1029,45 @@ where
         class
     }
 
-    /// Resume certification of a closed epoch whose record was built but never certified -
-    /// PendingEpochRecord holding an entry means either this process is starting fresh after a
-    /// restart that interrupted certification, or a previous `collect_epoch_votes` call in this
-    /// same run backed off (see [`CERTIFICATION_RETRY_BACKOFF`]) and this is a second signal
-    /// (e.g. a mode transition) reaching it before that loop's own timer does - harmless, since
-    /// `collect_epoch_votes` checks whether the epoch is already certified before doing anything.
+    /// Resume certification of every closed epoch whose record was built but never certified.
+    /// A PendingEpochRecord row means either this process is starting fresh after a restart that
+    /// interrupted certification, or an earlier close's collector was drained at an epoch
+    /// transition before it reached quorum (the chain can advance past an uncertified epoch,
+    /// #142), so each row is resumed independently.
     ///
-    /// A no-op on the (overwhelmingly common) case that nothing is pending. See #142.
+    /// The epoch that `self.epoch_record` currently holds is skipped: `run_epoch` hands that one
+    /// to `collect_epoch_votes` itself right after this, and spawning a second collector for it
+    /// here would duplicate the vote publish and aggregation on every ordinary boundary.
+    ///
+    /// A no-op on the (overwhelmingly common) case that nothing is pending.
     pub(super) async fn resume_pending_certification(
         &self,
         primary: &PrimaryNode<DB>,
         epoch_task_manager: &TaskManager,
     ) {
-        let Some(pending_rec) = self.consensus_db.get_pending_epoch_record() else {
-            return;
-        };
-        let epoch = pending_rec.epoch;
-        if self.consensus_db.get_epoch_by_number(epoch).is_some_and(|(_, c)| c.is_some()) {
-            // Certified since the pending record was written (e.g. by a peer's backfill);
-            // nothing to resume. Tidy up the now-stale pending entry.
-            if let Err(e) = self.consensus_db.clear_pending_epoch_record(epoch) {
-                error!(target: "epoch-manager", ?e, epoch, "failed to clear stale pending epoch record");
+        let current = self.epoch_record.as_ref().map(|rec| rec.epoch);
+        // Deliberately unbounded: every uncertified epoch is resumed. Skipping any of them would
+        // reintroduce the permanent hole this table exists to prevent.
+        for pending_rec in self.consensus_db.pending_epoch_records() {
+            let epoch = pending_rec.epoch;
+            if self.consensus_db.get_epoch_by_number(epoch).is_some_and(|(_, c)| c.is_some()) {
+                // Certified since the pending record was written (e.g. by a peer's backfill);
+                // nothing to resume. Tidy up the now-stale pending entry.
+                if let Err(e) = self.consensus_db.clear_pending_epoch_record(epoch) {
+                    error!(target: "epoch-manager", ?e, epoch, "failed to clear stale pending epoch record");
+                }
+                continue;
             }
-            return;
+            if current == Some(epoch) {
+                continue;
+            }
+            info!(
+                target: "epoch-manager",
+                epoch,
+                "resuming certification for a closed epoch with no cert on disk",
+            );
+            self.collect_epoch_votes(primary, pending_rec, epoch_task_manager).await;
         }
-        info!(
-            target: "epoch-manager",
-            epoch,
-            "resuming certification for a closed epoch with no cert on disk",
-        );
-        self.collect_epoch_votes(primary, pending_rec, epoch_task_manager).await;
     }
 
     /// Start a task to collect the epoch record votes previous epochs record.
@@ -1160,10 +1160,7 @@ where
 
                 match self.consensus_db.save_epoch_record_with_cert(&epoch_rec, &cert) {
                     Ok(_) => {
-                        info!(target: "epoch-manager", epoch = epoch_rec.epoch, %epoch_hash, "self-certified epoch (single-node)");
-                        if let Err(e) = self.consensus_db.clear_pending_epoch_record(epoch_rec.epoch) {
-                            error!(target: "epoch-manager", ?e, epoch = epoch_rec.epoch, "failed to clear pending epoch record after self-cert");
-                        }
+                        info!(target: "epoch-manager", epoch = epoch_rec.epoch, %epoch_hash, "self-certified epoch (single-node)")
                     }
                     Err(err) => {
                         error!(target: "epoch-manager", ?err, epoch = epoch_rec.epoch, %epoch_hash, "failed to save epoch cert")
@@ -1456,9 +1453,6 @@ where
                         "Failed to insert epoch record and cert for {epoch_hash}",
                     );
                 }
-                if let Err(e) = consensus_db.clear_pending_epoch_record(epoch_rec.epoch) {
-                    error!(target: "epoch-manager", ?e, epoch = epoch_rec.epoch, "failed to clear pending epoch record after reaching quorum");
-                }
             } else {
                 error!(
                     target: "epoch-manager",
@@ -1529,9 +1523,6 @@ where
                                     "Failed to insert epoch record and cert for {new_epoch_hash}",
                                 );
                             }
-                            if let Err(e) = consensus_db.clear_pending_epoch_record(epoch_rec.epoch) {
-                                error!(target: "epoch-manager", ?e, epoch = epoch_rec.epoch, "failed to clear pending epoch record after peer-fetch retry");
-                            }
                             return;
                         }
 
@@ -1549,9 +1540,6 @@ where
                                 target: "epoch-manager",
                                 "failed to save epoch record with cert: {e}",
                             );
-                        }
-                        if let Err(e) = consensus_db.clear_pending_epoch_record(epoch_rec.epoch) {
-                            error!(target: "epoch-manager", ?e, epoch = epoch_rec.epoch, "failed to clear pending epoch record after peer-fetch retry (alternate hash)");
                         }
 
                         return;

@@ -128,7 +128,8 @@ pub mod tables {
         // A closed epoch's record, saved as soon as it is built, before certification. Distinct
         // from EpochRecords (certified-only, see save_epoch_record_with_cert): this is a resume
         // hint for bootstrap/retry, never trusted as a substitute for a certified record. Keyed
-        // by epoch, stores at most one entry (the newest closed-but-uncertified epoch).
+        // by epoch, one row per closed-but-uncertified epoch; a later close never evicts an
+        // earlier epoch that is still awaiting its cert (#142).
         PendingEpochRecord;crate::PENDING_EPOCH_RECORD_CF;<Epoch, EpochRecord>,
         // These are used for network storage and separate from consensus
         KadRecords;crate::KAD_RECORD_CF;<BlockHash, Vec<u8>>,

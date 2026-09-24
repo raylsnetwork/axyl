@@ -176,13 +176,6 @@ where
                 );
                 return FetchOutcome::Rejected;
             }
-            if let Err(e) = db.clear_pending_epoch_record(epoch) {
-                tracing::error!(
-                    target: "epoch-manager",
-                    ?e, epoch,
-                    "failed to clear pending epoch record after collector fetch",
-                );
-            }
             info!(
                 target: "epoch-manager",
                 "retrieved cert for epoch {epoch}: {epoch_hash} from a peer",
