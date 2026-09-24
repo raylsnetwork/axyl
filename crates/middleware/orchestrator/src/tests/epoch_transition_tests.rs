@@ -1482,6 +1482,28 @@ fn test_hydrate_prev_record_from_pending_after_restart() {
     assert_eq!(hydrate_prev_epoch_record(&db).map(|rec| rec.epoch), Some(303));
 }
 
+/// The certification retry never stops, but its backoff doubles per failed attempt up to a
+/// ceiling, so an epoch whose committee can never reach quorum again costs a few requests per
+/// hour rather than a burst every two minutes.
+#[test]
+fn test_certification_retry_backoff_doubles_to_a_ceiling() {
+    use crate::epoch_manager::certification_retry_backoff;
+    use std::time::Duration;
+
+    let base = certification_retry_backoff(1);
+    assert_eq!(base, Duration::from_secs(30));
+    assert_eq!(certification_retry_backoff(2), base * 2);
+    assert_eq!(certification_retry_backoff(3), base * 4);
+    assert_eq!(certification_retry_backoff(4), base * 8);
+
+    let ceiling = Duration::from_secs(15 * 60);
+    assert_eq!(certification_retry_backoff(6), ceiling, "30s * 2^5 = 16 min is capped");
+    assert_eq!(certification_retry_backoff(40), ceiling, "no overflow past the shift width");
+    assert_eq!(certification_retry_backoff(u32::MAX), ceiling);
+    // Attempt 0 never happens (attempts are 1-based) but must not underflow.
+    assert_eq!(certification_retry_backoff(0), base);
+}
+
 // ---------------------------------------------------------------------------
 // Manager-impl: select! branch classification
 // ---------------------------------------------------------------------------
