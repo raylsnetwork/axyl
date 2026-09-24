@@ -6,6 +6,7 @@ use super::cold_archive::ColdArchival;
 use crate::{
     engine::{ExecutionNode, RaylsBuilder},
     epoch_manager::{
+        state::hydrate_prev_epoch_record,
         types::{EpochManager, ENGINE_TASK_MANAGER, EPOCH_TASK_MANAGER, NODE_TASK_MANAGER},
         utils::{catchup_accumulator, recover_executed_anchor},
         vote_triage::{
@@ -109,6 +110,11 @@ where
         // create dbs to survive between sync state transitions
         let reth_db = RethEnv::new_database(&builder.node_config, rayls_datadir.reth_db_path())?;
 
+        // The previous process may have closed an epoch that is not certified yet; its record
+        // survives in PendingEpochRecord and is what prev_epoch_record would hold had we not
+        // restarted (#142).
+        let prev_epoch_record = hydrate_prev_epoch_record(&consensus_db);
+
         Ok(Self {
             builder,
             rayls_datadir,
@@ -123,7 +129,7 @@ where
             consensus_bus,
             worker_event_stream,
             epoch_record: None,
-            prev_epoch_record: None,
+            prev_epoch_record,
             initial_epoch: true,
             #[cfg(feature = "cold-storage")]
             cold_archival,

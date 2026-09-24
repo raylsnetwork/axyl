@@ -1433,6 +1433,55 @@ fn test_resolve_prev_record_prefers_certified_disk_over_memory() {
     assert_eq!(resolved.digest(), disk_record.digest(), "certified record must win");
 }
 
+/// A restart discards the in-memory previous record. If the newest closed epoch is still
+/// uncertified, the record this node built for it survives in `PendingEpochRecord`, and
+/// `hydrate_prev_epoch_record` must seed the field with it so the next boundary chains its
+/// `parent_hash` locally instead of dead-ending in a peer fetch nobody can serve (#142).
+/// A certified record, once it lands, still wins over the hydrated copy.
+#[test]
+fn test_hydrate_prev_record_from_pending_after_restart() {
+    use crate::epoch_manager::{hydrate_prev_epoch_record, resolve_local_prev_epoch_record};
+    use rayls_infrastructure_storage::EpochStore as _;
+    use rayls_infrastructure_types::{BlsSignature, EpochCertificate, EpochRecord};
+
+    let db = MemDatabase::default();
+
+    // Nothing pending: the newest close is certified, or this node never closed an epoch.
+    assert!(hydrate_prev_epoch_record(&db).is_none());
+
+    // Two consecutive uncertified closes, then a restart. The newest is what the field held.
+    let rec_303 = EpochRecord { epoch: 303, parent_hash: B256::random(), ..Default::default() };
+    let rec_304 = EpochRecord { epoch: 304, parent_hash: rec_303.digest(), ..Default::default() };
+    db.save_pending_epoch_record(&rec_304).unwrap();
+    db.save_pending_epoch_record(&rec_303).unwrap();
+    let hydrated = hydrate_prev_epoch_record(&db).expect("newest pending row must hydrate");
+    assert_eq!(hydrated.digest(), rec_304.digest());
+
+    // Closing 305 resolves its parent from the hydrated copy, exactly as the live path would.
+    let resolved = resolve_local_prev_epoch_record(&db, Some(&hydrated), 305)
+        .expect("hydrated record must back-fill a missing certified record");
+    assert_eq!(resolved.digest(), rec_304.digest());
+
+    // The hydrated copy is only a parent for 305; a boundary further ahead still dead-ends
+    // locally and must fetch from a peer.
+    assert!(resolve_local_prev_epoch_record(&db, Some(&hydrated), 306).is_none());
+
+    // Certification lands for 304 (possibly on a divergent digest): certified wins.
+    let certified = EpochRecord { epoch: 304, parent_hash: B256::random(), ..Default::default() };
+    let cert = EpochCertificate {
+        epoch_hash: certified.digest(),
+        signature: BlsSignature::default(),
+        signed_authorities: roaring::RoaringBitmap::new(),
+    };
+    db.save_epoch_record_with_cert(&certified, &cert).unwrap();
+    let resolved = resolve_local_prev_epoch_record(&db, Some(&hydrated), 305)
+        .expect("certified disk record must resolve");
+    assert_eq!(resolved.digest(), certified.digest(), "certified record must win");
+
+    // Only 303 is pending now, so a fresh process would hydrate that one.
+    assert_eq!(hydrate_prev_epoch_record(&db).map(|rec| rec.epoch), Some(303));
+}
+
 // ---------------------------------------------------------------------------
 // Manager-impl: select! branch classification
 // ---------------------------------------------------------------------------
