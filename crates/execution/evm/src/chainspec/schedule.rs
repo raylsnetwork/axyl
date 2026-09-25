@@ -11,8 +11,8 @@ use reth_chainspec::ForkCondition;
 
 /// One entry of a Rayls hardfork schedule: a fork and its activation condition.
 ///
-/// `Ord` compares fork-first, so sorting a schedule yields fork order
-/// regardless of the conditions.
+/// Sorted by `fork` first; since schedules never list the same fork twice,
+/// `condition` is never a tiebreaker, so sorting yields canonical fork order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ScheduledFork {
     pub fork: RaylsHardFork,
@@ -22,11 +22,6 @@ pub struct ScheduledFork {
 impl ScheduledFork {
     pub const fn new(fork: RaylsHardFork, condition: ForkCondition) -> Self {
         Self { fork, condition }
-    }
-
-    /// Return true if the fork is active at `block`.
-    pub fn is_active_at(&self, block: u64) -> bool {
-        self.condition.active_at_block(block)
     }
 }
 
