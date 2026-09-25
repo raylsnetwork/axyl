@@ -1,6 +1,12 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-use crate::chainspec::RaylsHardFork;
+use rayls_infrastructure_config::RaylsDirs;
+use tracing::warn;
+
+use crate::{
+    chainspec::RaylsHardFork,
+    reth_env::{RethConfig, RethEnv},
+};
 
 use super::{
     activation::ForkActivation, fork_name::ForkName, profile::NetworkProfile,
@@ -123,4 +129,64 @@ pub fn verify_schedule(
         );
     }
     Ok(moves)
+}
+
+/// The outcome of a read-only schedule-record gate: where the datadir's
+/// executed history ends, what its record pins (if it carries one), and the
+/// future boundary moves the selected schedule makes relative to it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScheduleRecordVerification {
+    /// The chain's executed head: reth's `Finish` stage checkpoint.
+    pub head: u64,
+    /// The datadir's schedule-record file: the path the record was read from,
+    /// and where a caller's re-record lands.
+    pub path: PathBuf,
+    /// The datadir's parsed schedule record, or `None` when it carries none
+    /// (a datadir that predates the record — the caller's "trust the selected
+    /// schedule" path).
+    pub record: Option<ScheduleRecord>,
+    /// Future hardfork boundary moves the selected schedule makes relative to
+    /// the record; empty when there was no record or the schedules agree on
+    /// every future boundary.
+    pub moves: Vec<FutureForkMove>,
+}
+
+/// Verify the selected hardfork schedule against the datadir's
+/// [`ScheduleRecord`], read-only.
+///
+/// Reads the record at [`RaylsDirs::schedule_record_path`] and the chain's
+/// executed head (a single keyed read over a fresh db handle — no provider
+/// built), then runs [`verify_schedule`] when a record exists. A datadir
+/// without a record yields `record: None` and no moves; what "trust" means is
+/// the caller's decision — the node's boot gate re-records the selected
+/// schedule afterwards, the offline replay only reports and never writes into
+/// the snapshot datadir. Each future boundary move is warned about here
+/// (target `rayls::reth`); callers log the no-record decision and the final
+/// confirmation with their own target.
+pub fn verify_datadir_schedule_record<P: RaylsDirs + ?Sized>(
+    datadir: &P,
+    reth_config: &RethConfig,
+    profile: &NetworkProfile,
+) -> eyre::Result<ScheduleRecordVerification> {
+    // The chain's executed head: reth's `Finish` stage checkpoint.
+    let head = RethEnv::best_block_number(reth_config, datadir.reth_db_path())?;
+
+    let path = datadir.schedule_record_path();
+    let record = ScheduleRecord::load(&path)?;
+    let moves = match &record {
+        Some(record) => verify_schedule(record, profile, head, &path)?,
+        None => Vec::new(),
+    };
+    for move_ in &moves {
+        warn!(
+            target: "rayls::reth",
+            fork = move_.fork.name(),
+            ?move_.recorded,
+            ?move_.selected,
+            head,
+            "selected schedule moves a future hardfork boundary recorded in the datadir; \
+             verify this matches the network-agreed schedule"
+        );
+    }
+    Ok(ScheduleRecordVerification { head, path, record, moves })
 }

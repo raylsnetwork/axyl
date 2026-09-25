@@ -27,4 +27,6 @@ pub use config_file::NetworkConfigFile;
 pub use fork_name::ForkName;
 pub use profile::NetworkProfile;
 pub use record::ScheduleRecord;
-pub use verify::{verify_schedule, FutureForkMove};
+pub use verify::{
+    verify_datadir_schedule_record, verify_schedule, FutureForkMove, ScheduleRecordVerification,
+};

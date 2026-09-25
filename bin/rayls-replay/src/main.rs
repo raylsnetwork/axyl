@@ -7,10 +7,10 @@ use clap::Parser;
 use eyre::{eyre, Context};
 use rayls_execution_evm::{
     reth_env::{RethCommand, RethConfig, RethEnv},
-    set_active_profile, verify_datadir_chain_id, verify_schedule, FileSchedule, NetworkProfile,
-    ScheduleRecord, SelectedSchedule,
+    set_active_profile, verify_datadir_chain_id, verify_datadir_schedule_record, FileSchedule,
+    NetworkProfile, SelectedSchedule,
 };
-use rayls_infrastructure_config::{Parameters, RaylsDirs};
+use rayls_infrastructure_config::Parameters;
 use rayls_infrastructure_storage::open_db;
 use rayls_infrastructure_types::{
     rewards::RewardsCounter, Address, Genesis, RaylsNetwork, TaskManager,
@@ -588,44 +588,25 @@ fn verify_snapshot_schedule_record(
     chain: &Arc<RethChainSpec>,
     profile: &NetworkProfile,
 ) -> eyre::Result<()> {
-    let path = snapshot_datadir.schedule_record_path();
-    let raw = match std::fs::read_to_string(&path) {
-        Ok(raw) => raw,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            warn!(
-                target: "rayls_replay::main",
-                ?path,
-                "snapshot has no schedule record; trusting the selected schedule (the \
-                 executed-history check is unavailable)"
-            );
-            return Ok(());
-        }
-        Err(e) => {
-            return Err(e).wrap_err_with(|| format!("read schedule record {}", path.display()))
-        }
-    };
-    let record: ScheduleRecord = serde_yaml::from_str(&raw)
-        .wrap_err_with(|| format!("parse schedule record {}", path.display()))?;
-    // The executed head reth tracks: the `Finish` stage checkpoint. A single keyed
-    // read over a fresh db handle — the snapshot env is not built yet.
+    // The read/verify is shared with the node's boot gate; the throwaway
+    // `RethConfig` exists only for the executed-head read — the snapshot env
+    // is not built yet.
     let reth = RethCommand::parse_from(["rayls-replay"]);
     let node_config = RethConfig::new(reth, None, snapshot_datadir, false, Arc::clone(chain));
-    let head = RethEnv::best_block_number(&node_config, snapshot_datadir.reth_db_path())
-        .wrap_err_with(|| format!("read the snapshot's executed head for {}", path.display()))?;
-    for move_ in verify_schedule(&record, profile, head, &path)? {
+    let verification = verify_datadir_schedule_record(snapshot_datadir, &node_config, profile)?;
+    if verification.record.is_none() {
         warn!(
             target: "rayls_replay::main",
-            fork = move_.fork.name(),
-            ?move_.recorded,
-            ?move_.selected,
-            %head,
-            "selected schedule moves a future hardfork boundary recorded in the snapshot"
+            path = tracing::field::debug(&verification.path),
+            head = verification.head,
+            "snapshot has no schedule record; trusting the selected schedule (the \
+             executed-history check is unavailable)"
         );
     }
     info!(
         target: "rayls_replay::main",
-        ?path,
-        %head,
+        path = tracing::field::debug(&verification.path),
+        head = verification.head,
         "snapshot schedule record verified against the selected schedule"
     );
     Ok(())

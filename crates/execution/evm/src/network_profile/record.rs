@@ -1,5 +1,6 @@
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, path::Path};
 
+use eyre::Context;
 use serde::{Deserialize, Serialize};
 
 use super::{activation::ForkActivation, fork_name::ForkName, profile::NetworkProfile};
@@ -27,6 +28,26 @@ impl ScheduleRecord {
     /// the complete snapshot, never-activating forks included.
     pub fn from_profile(profile: &NetworkProfile, as_of_block: u64) -> Self {
         Self { chain_id: profile.chain_id, as_of_block, hardforks: profile.hardforks.clone() }
+    }
+
+    /// Read and parse the schedule record at `path`.
+    ///
+    /// Reads directly (rather than `exists()`-then-read): a record deleted
+    /// concurrently is treated as "no record" — the caller's "trust the
+    /// selected schedule" path — not a hard error. A present record that
+    /// fails to parse is a hard error naming the path.
+    pub fn load(path: &Path) -> eyre::Result<Option<Self>> {
+        let raw = match std::fs::read_to_string(path) {
+            Ok(raw) => raw,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => {
+                return Err(e).wrap_err_with(|| format!("read schedule record {}", path.display()))
+            }
+        };
+        Ok(Some(
+            serde_yaml::from_str(&raw)
+                .wrap_err_with(|| format!("parse schedule record {}", path.display()))?,
+        ))
     }
 
     /// The recorded activation of a fork: its block number, or `None` when the

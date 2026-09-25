@@ -495,3 +495,146 @@ fn verify_future_activation_from_never_is_allowed() {
     assert_eq!(moves[0].recorded, None);
     assert_eq!(moves[0].selected, Some(2000));
 }
+
+mod datadir_gate_tests {
+    //! The read-only datadir gate (`verify_datadir_schedule_record`): record
+    //! read/absence, the executed-head read, and the refusal/move outcomes.
+
+    use super::*;
+    use crate::reth_env::{RethCommand, RethConfig, RethEnv};
+    use clap::Parser;
+    use reth_chainspec::ChainSpec;
+    use reth_db::{tables::StageCheckpoints, transaction::DbTxMut, Database};
+    use reth_stages::{StageCheckpoint, StageId};
+    use std::sync::Arc;
+
+    fn datadir_config(dir: &Path) -> RethConfig {
+        let reth = RethCommand::parse_from(["rayls-test"]);
+        RethConfig::new(reth, None, dir, false, Arc::new(ChainSpec::default()))
+    }
+
+    /// Fake the chain head the way a real node records it: commit the `Finish`
+    /// stage checkpoint at `block` (reth tracks the executed head there, not in
+    /// `CanonicalHeaders`).
+    fn set_head(node_config: &RethConfig, datadir: &Path, block: u64) {
+        let db = RethEnv::new_database(node_config, datadir.join("db")).expect("db opens");
+        db.update(|tx| {
+            tx.put::<StageCheckpoints>(
+                StageId::Finish.as_str().to_string(),
+                StageCheckpoint::new(block),
+            )
+            .expect("head checkpoint written");
+        })
+        .expect("db update");
+    }
+
+    fn write_record(dir: &Path, record: &ScheduleRecord) {
+        std::fs::write(
+            dir.join("schedule-record.yaml"),
+            serde_yaml::to_string(record).expect("record serializes"),
+        )
+        .expect("record written");
+    }
+
+    fn gate(
+        dir: &Path,
+        config: &RethConfig,
+        profile: &NetworkProfile,
+    ) -> eyre::Result<ScheduleRecordVerification> {
+        verify_datadir_schedule_record(dir, config, profile)
+    }
+
+    #[test]
+    fn datadir_without_record_is_trusted() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = datadir_config(dir.path());
+        set_head(&config, dir.path(), 10);
+        let verification =
+            gate(dir.path(), &config, &profile(487, &[("Eip1559", ForkActivation::Block(0))]))
+                .expect("a datadir without a record is trusted");
+        assert_eq!(verification.head, 10);
+        assert!(verification.record.is_none());
+        assert!(verification.moves.is_empty());
+    }
+
+    #[test]
+    fn datadir_with_matching_record_verifies() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = datadir_config(dir.path());
+        set_head(&config, dir.path(), 100);
+        write_record(
+            dir.path(),
+            &record(
+                487,
+                0,
+                &[("Eip1559", ForkActivation::Block(5)), ("Tokenomics", ForkActivation::Never)],
+            ),
+        );
+        let verification = gate(
+            dir.path(),
+            &config,
+            &profile(
+                487,
+                &[("Eip1559", ForkActivation::Block(5)), ("Tokenomics", ForkActivation::Never)],
+            ),
+        )
+        .expect("a matching record verifies");
+        assert_eq!(verification.head, 100);
+        assert!(verification.record.is_some());
+        assert!(verification.moves.is_empty());
+    }
+
+    #[test]
+    fn datadir_future_move_is_reported() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = datadir_config(dir.path());
+        set_head(&config, dir.path(), 500);
+        write_record(dir.path(), &record(487, 0, &[("Eip1559", ForkActivation::Block(1000))]));
+        let verification =
+            gate(dir.path(), &config, &profile(487, &[("Eip1559", ForkActivation::Block(2000))]))
+                .expect("a future move is allowed");
+        assert_eq!(verification.moves.len(), 1);
+        assert_eq!(verification.moves[0].fork, RaylsHardFork::Eip1559);
+        assert_eq!(verification.moves[0].recorded, Some(1000));
+        assert_eq!(verification.moves[0].selected, Some(2000));
+    }
+
+    #[test]
+    fn datadir_executed_move_is_refused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = datadir_config(dir.path());
+        set_head(&config, dir.path(), 1500);
+        write_record(dir.path(), &record(487, 0, &[("Eip1559", ForkActivation::Block(1000))]));
+        let err =
+            gate(dir.path(), &config, &profile(487, &[("Eip1559", ForkActivation::Block(2000))]))
+                .expect_err("moving an executed fork is refused");
+        let msg = err.to_string();
+        assert!(msg.contains("Eip1559"), "{msg}");
+        assert!(msg.contains(RECORD_PATH), "{msg}");
+        assert!(msg.contains("delete"), "{msg}");
+    }
+
+    #[test]
+    fn datadir_unparseable_record_is_refused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = datadir_config(dir.path());
+        set_head(&config, dir.path(), 10);
+        std::fs::write(dir.path().join("schedule-record.yaml"), "not: [yaml").expect("garbage");
+        let err =
+            gate(dir.path(), &config, &profile(487, &[("Eip1559", ForkActivation::Block(0))]))
+                .expect_err("an unparseable record is refused");
+        assert!(err.to_string().contains(RECORD_PATH), "{err}");
+    }
+
+    #[test]
+    fn datadir_chain_id_mismatch_is_refused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = datadir_config(dir.path());
+        set_head(&config, dir.path(), 10);
+        write_record(dir.path(), &record(487, 0, &[("Eip1559", ForkActivation::Block(0))]));
+        let err =
+            gate(dir.path(), &config, &profile(99999, &[("Eip1559", ForkActivation::Block(0))]))
+                .expect_err("a chain-id mismatch is refused");
+        assert!(err.to_string().contains("chain-id"), "{err}");
+    }
+}

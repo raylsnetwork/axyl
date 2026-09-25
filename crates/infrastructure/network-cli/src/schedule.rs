@@ -7,8 +7,7 @@
 //! `schedule export` subcommand.
 use eyre::Context;
 use rayls_execution_evm::{
-    reth_env::{RethConfig, RethEnv},
-    verify_schedule, NetworkProfile, ScheduleRecord,
+    reth_env::RethConfig, verify_datadir_schedule_record, NetworkProfile, ScheduleRecord,
 };
 use rayls_infrastructure_config::RaylsDirs;
 use tracing::{info, warn};
@@ -23,47 +22,19 @@ pub fn verify_schedule_record<P: RaylsDirs>(
     profile: &NetworkProfile,
 ) -> eyre::Result<()> {
     let chain_id = profile.chain_id;
-
-    // The chain's executed head: reth's `Finish` stage checkpoint.
-    let head = RethEnv::best_block_number(node_config, datadir.reth_db_path())?;
-
-    // Read (rather than `exists()`-then-read): a record deleted concurrently
-    // is treated as "no record" — the trust-and-record path — not a hard error.
-    let path = datadir.schedule_record_path();
-    let existing: Option<ScheduleRecord> = match std::fs::read_to_string(&path) {
-        Ok(raw) => Some(
-            serde_yaml::from_str::<ScheduleRecord>(&raw)
-                .with_context(|| format!("failed to parse schedule record {path:?}"))?,
-        ),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            if head > 0 {
-                warn!(
-                    target: "cli",
-                    ?path,
-                    %head,
-                    "datadir has no schedule record; trusting the selected schedule and \
-                     recording it (the executed-history check starts from now)"
-                );
-            }
-            None
-        }
-        Err(e) => {
-            return Err(e).with_context(|| format!("failed to read schedule record {path:?}"))
-        }
-    };
-
-    let moves = match &existing {
-        Some(record) => verify_schedule(record, profile, head, &path)?,
-        None => Vec::new(),
-    };
-    for move_ in &moves {
+    let verification = verify_datadir_schedule_record(datadir, node_config, profile)?;
+    let head = verification.head;
+    // No record: a fresh datadir (head 0) is the normal first-boot case. A
+    // datadir with executed history and no record (predating the feature, or
+    // deleted) is trusted — and re-recorded below, so the executed-history
+    // check starts from now.
+    if verification.record.is_none() && head > 0 {
         warn!(
             target: "cli",
-            fork = move_.fork.name(),
-            ?move_.recorded,
-            ?move_.selected,
+            path = tracing::field::debug(&verification.path),
             %head,
-            "future hardfork boundary changed; verify this matches the network-agreed schedule"
+            "datadir has no schedule record; trusting the selected schedule and \
+             recording it (the executed-history check starts from now)"
         );
     }
 
@@ -74,14 +45,15 @@ pub fn verify_schedule_record<P: RaylsDirs>(
     // crash mid-write must leave the previous, still-parseable record — never
     // a torn file that bricks the next boot. A leftover temp file after a
     // crash is harmless; the next write overwrites it.
-    let tmp = path.with_file_name("schedule-record.yaml.tmp");
+    let tmp = verification.path.with_file_name("schedule-record.yaml.tmp");
     std::fs::write(&tmp, yaml)
         .with_context(|| format!("failed to write schedule record temp file {tmp:?}"))?;
-    std::fs::rename(&tmp, &path)
-        .with_context(|| format!("failed to move schedule record into place at {path:?}"))?;
+    std::fs::rename(&tmp, &verification.path).with_context(|| {
+        format!("failed to move schedule record into place at {:?}", verification.path)
+    })?;
     info!(
         target: "cli",
-        ?path,
+        path = tracing::field::debug(&verification.path),
         %chain_id,
         %head,
         "hardfork schedule verified against the chain's executed history"
