@@ -350,7 +350,7 @@ impl<DB: Database> RewardsBackend for BoundedHybridWalker<DB> {
                 *cursor = Some(next);
                 info!(
                     target: "rayls_replay::rewards",
-                    epoch, start, next_start = next, rows_read, lookahead_rows, total_rounds,
+                    epoch, start, next_start = next, rows_read, lookahead_rows, rows_walked = total_rounds,
                     "hybrid walk done"
                 );
                 Ok(HybridEpochTally { per_address, total_rounds })
@@ -383,7 +383,7 @@ mod tests {
     use rand::{rngs::StdRng, SeedableRng};
     use rayls_infrastructure_storage::mem_db::MemDatabase;
     use rayls_infrastructure_types::{
-        BlsKeypair, Certificate, CommittedSubDag, ConsensusHeader, CommitteeBuilder, Header,
+        BlsKeypair, Certificate, CommittedSubDag, CommitteeBuilder, ConsensusHeader, Header,
         ReputationScores,
     };
     use rayls_middleware_rewards::ConsensusRewardsCounter;
@@ -431,7 +431,8 @@ mod tests {
             .iter()
             .map(|author| cert(author, leader_round.saturating_sub(1)))
             .collect();
-        let sub_dag = CommittedSubDag::new(certificates, leader, 0, ReputationScores::default(), None);
+        let sub_dag =
+            CommittedSubDag::new(certificates, leader, 0, ReputationScores::default(), None);
         let row = ConsensusHeader { sub_dag, number, ..Default::default() };
         db.insert::<ConsensusBlocks>(&number, &row).expect("seed row");
     }
@@ -557,7 +558,7 @@ mod tests {
 
         let db = MemDatabase::default();
         insert(&db, 0, id_a, 0, 0, &[]); // genesis round 0: never credited
-        // epoch 1: rounds 1..=4
+                                         // epoch 1: rounds 1..=4
         insert(&db, 1, id_a, 1, 1, &[id_a, id_b, id_c]);
         insert(&db, 2, id_c, 2, 1, &[id_b]);
         insert(&db, 3, id_a, 3, 1, &[id_a, id_b, id_c]);
@@ -574,21 +575,47 @@ mod tests {
 
         // Replay closes epochs ascending; each close must equal the live walk.
         let e1 = bounded.tally_hybrid(1, u32::MAX).unwrap();
-        assert_eq!(e1, live.tally_hybrid(1, u32::MAX).unwrap(), "epoch 1 must match the live walker");
+        assert_eq!(
+            e1,
+            live.tally_hybrid(1, u32::MAX).unwrap(),
+            "epoch 1 must match the live walker"
+        );
         let e2 = bounded.tally_hybrid(2, u32::MAX).unwrap();
-        assert_eq!(e2, live.tally_hybrid(2, u32::MAX).unwrap(), "epoch 2 must match the live walker");
+        assert_eq!(
+            e2,
+            live.tally_hybrid(2, u32::MAX).unwrap(),
+            "epoch 2 must match the live walker"
+        );
 
         // Ground truth (guards against both walkers sharing a bug).
         assert_eq!(e1.total_rounds, 4);
-        assert_eq!(e1.per_address[&addr(1)], ValidatorRoundTally { participation_rounds: 2, leader_rounds: 2 });
-        assert_eq!(e1.per_address[addr_b], ValidatorRoundTally { participation_rounds: 4, leader_rounds: 0 });
-        assert_eq!(e1.per_address[&addr(3)], ValidatorRoundTally { participation_rounds: 2, leader_rounds: 2 });
+        assert_eq!(
+            e1.per_address[&addr(1)],
+            ValidatorRoundTally { participation_rounds: 2, leader_rounds: 2 }
+        );
+        assert_eq!(
+            e1.per_address[addr_b],
+            ValidatorRoundTally { participation_rounds: 4, leader_rounds: 0 }
+        );
+        assert_eq!(
+            e1.per_address[&addr(3)],
+            ValidatorRoundTally { participation_rounds: 2, leader_rounds: 2 }
+        );
         assert_eq!(e2.total_rounds, 3);
-        assert_eq!(e2.per_address[&addr(1)], ValidatorRoundTally { participation_rounds: 2, leader_rounds: 1 });
-        assert_eq!(e2.per_address[addr_b], ValidatorRoundTally { participation_rounds: 3, leader_rounds: 0 });
+        assert_eq!(
+            e2.per_address[&addr(1)],
+            ValidatorRoundTally { participation_rounds: 2, leader_rounds: 1 }
+        );
+        assert_eq!(
+            e2.per_address[addr_b],
+            ValidatorRoundTally { participation_rounds: 3, leader_rounds: 0 }
+        );
         // id_c leads rounds 1 and 3 but its certificate is only included in
         // round 3's sub-dag (round 1's participants are a and b).
-        assert_eq!(e2.per_address[&addr(3)], ValidatorRoundTally { participation_rounds: 1, leader_rounds: 2 });
+        assert_eq!(
+            e2.per_address[&addr(3)],
+            ValidatorRoundTally { participation_rounds: 1, leader_rounds: 2 }
+        );
     }
 
     #[test]
@@ -607,8 +634,14 @@ mod tests {
         let tally = walker.tally_hybrid(0, 10).unwrap();
 
         assert_eq!(tally.total_rounds, 1);
-        assert_eq!(tally.per_address[addr_a], ValidatorRoundTally { participation_rounds: 1, leader_rounds: 0 });
-        assert_eq!(tally.per_address[addr_b], ValidatorRoundTally { participation_rounds: 1, leader_rounds: 1 });
+        assert_eq!(
+            tally.per_address[addr_a],
+            ValidatorRoundTally { participation_rounds: 1, leader_rounds: 0 }
+        );
+        assert_eq!(
+            tally.per_address[addr_b],
+            ValidatorRoundTally { participation_rounds: 1, leader_rounds: 1 }
+        );
         assert_eq!(tally.per_address.len(), 2);
     }
 
@@ -618,8 +651,11 @@ mod tests {
     #[test]
     fn bounded_hybrid_dedupes_participation_by_execution_address() {
         let mut rng = StdRng::seed_from_u64(0x634);
-        let (key1, key2, key3) =
-            (BlsKeypair::generate(&mut rng), BlsKeypair::generate(&mut rng), BlsKeypair::generate(&mut rng));
+        let (key1, key2, key3) = (
+            BlsKeypair::generate(&mut rng),
+            BlsKeypair::generate(&mut rng),
+            BlsKeypair::generate(&mut rng),
+        );
         let id_1 = AuthorityIdentifier::from(*key1.public());
         let id_2 = AuthorityIdentifier::from(*key2.public());
         let id_3 = AuthorityIdentifier::from(*key3.public());
@@ -640,8 +676,14 @@ mod tests {
         let tally = walker.tally_hybrid(0, u32::MAX).unwrap();
 
         assert_eq!(tally.total_rounds, 1);
-        assert_eq!(tally.per_address[&shared], ValidatorRoundTally { participation_rounds: 1, leader_rounds: 0 });
-        assert_eq!(tally.per_address[&other], ValidatorRoundTally { participation_rounds: 0, leader_rounds: 1 });
+        assert_eq!(
+            tally.per_address[&shared],
+            ValidatorRoundTally { participation_rounds: 1, leader_rounds: 0 }
+        );
+        assert_eq!(
+            tally.per_address[&other],
+            ValidatorRoundTally { participation_rounds: 0, leader_rounds: 1 }
+        );
     }
 
     /// The table has epochs 0 and 2; closing absent epoch 1 must position at the
@@ -667,8 +709,14 @@ mod tests {
 
         let next = walker.tally_hybrid(2, u32::MAX).unwrap();
         assert_eq!(next.total_rounds, 2);
-        assert_eq!(next.per_address[addr_a], ValidatorRoundTally { participation_rounds: 1, leader_rounds: 1 });
-        assert_eq!(next.per_address[addr_b], ValidatorRoundTally { participation_rounds: 1, leader_rounds: 1 });
+        assert_eq!(
+            next.per_address[addr_a],
+            ValidatorRoundTally { participation_rounds: 1, leader_rounds: 1 }
+        );
+        assert_eq!(
+            next.per_address[addr_b],
+            ValidatorRoundTally { participation_rounds: 1, leader_rounds: 1 }
+        );
     }
 
     /// Every row older than the target epoch: positioning saturates past the
@@ -842,8 +890,14 @@ mod tests {
         store.insert(1, [(*addr_a, 1), (*addr_b, 1)].into_iter().collect());
         let tally = backend.tally_hybrid(1, u32::MAX).unwrap();
         assert_eq!(tally.total_rounds, 2);
-        assert_eq!(tally.per_address[addr_a], ValidatorRoundTally { participation_rounds: 2, leader_rounds: 1 });
-        assert_eq!(tally.per_address[addr_b], ValidatorRoundTally { participation_rounds: 2, leader_rounds: 1 });
+        assert_eq!(
+            tally.per_address[addr_a],
+            ValidatorRoundTally { participation_rounds: 2, leader_rounds: 1 }
+        );
+        assert_eq!(
+            tally.per_address[addr_b],
+            ValidatorRoundTally { participation_rounds: 2, leader_rounds: 1 }
+        );
     }
 
     /// Same wiring, but the committed withdrawals credit a round the walk does

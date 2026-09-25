@@ -602,12 +602,13 @@ fn verify_snapshot_schedule_record(
             "snapshot has no schedule record; trusting the selected schedule (the \
              executed-history check is unavailable)"
         );
+    } else {
+        info!(
+            target: "rayls_replay::main",
+            path = tracing::field::debug(&verification.path),
+            head = verification.head,
+            "snapshot schedule record verified against the selected schedule"
+        );
     }
-    info!(
-        target: "rayls_replay::main",
-        path = tracing::field::debug(&verification.path),
-        head = verification.head,
-        "snapshot schedule record verified against the selected schedule"
-    );
     Ok(())
 }
