@@ -2,10 +2,7 @@
 //!
 //! Starts the client
 use crate::{
-    args::ConsensusDatabaseArgs,
-    schedule::{verify_datadir_chain_id, verify_schedule_record, FileSchedule, SelectedSchedule},
-    version::SHORT_VERSION,
-    NoArgs,
+    args::ConsensusDatabaseArgs, schedule::verify_schedule_record, version::SHORT_VERSION, NoArgs,
 };
 use clap::{value_parser, Parser, ValueHint};
 use core::fmt;
@@ -13,7 +10,7 @@ use fdlimit::raise_fd_limit;
 use rayls_execution_evm::{
     parse_socket_address,
     reth_env::{RethCommand, RethConfig},
-    set_active_profile,
+    set_active_profile, verify_datadir_chain_id, FileSchedule, SelectedSchedule,
 };
 use rayls_infrastructure_config::Config;
 // dev-only: reading the committee file for the single-validator gating check

@@ -6,7 +6,7 @@
 //! set its `chain_id`, adjust the activation blocks.
 use clap::{Args, Subcommand};
 use rayls_execution_evm::{
-    network_profile::ForkName, ForkActivation, NetworkProfile, RaylsHardFork,
+    baked_in_network, network_profile::ForkName, ForkActivation, NetworkProfile, RaylsHardFork,
 };
 use rayls_infrastructure_types::RaylsNetwork;
 
@@ -95,7 +95,7 @@ pub(crate) fn render_config_file(network: RaylsNetwork, subnet: &str) -> String 
         profile.chain_id,
         env!("CARGO_PKG_VERSION"),
     ));
-    if super::baked_in_network(profile.chain_id).is_some() {
+    if baked_in_network(profile.chain_id).is_some() {
         // Mainnet and testnet always run their baked-in schedule: `node --config-file`
         // refuses a subnet declaring their chain-id, so this file is a template only.
         out.push_str(&format!(
@@ -142,8 +142,7 @@ pub(crate) fn render_config_file(network: RaylsNetwork, subnet: &str) -> String 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::schedule::FileSchedule;
-    use rayls_execution_evm::ForkCondition;
+    use rayls_execution_evm::{FileSchedule, ForkCondition};
 
     const ALL_NETWORKS: [RaylsNetwork; 4] =
         [RaylsNetwork::Devnet, RaylsNetwork::Testnet, RaylsNetwork::Mainnet, RaylsNetwork::Local];
@@ -161,9 +160,9 @@ mod tests {
             let loaded = FileSchedule::load(&path, &subnet)
                 .unwrap_or_else(|e| panic!("{network}: exported file must load: {e:#}"));
             let builtin = NetworkProfile::from_builtin(network);
-            assert_eq!(loaded.profile.chain_id, builtin.chain_id, "{network}");
-            assert_eq!(loaded.profile.hardforks, builtin.hardforks, "{network}");
-            assert!(!loaded.profile.hardforks.is_empty(), "{network}");
+            assert_eq!(loaded.profile().chain_id, builtin.chain_id, "{network}");
+            assert_eq!(loaded.profile().hardforks, builtin.hardforks, "{network}");
+            assert!(!loaded.profile().hardforks.is_empty(), "{network}");
         }
     }
 
@@ -198,9 +197,9 @@ mod tests {
         let path = dir.path().join("client-main.yaml");
         std::fs::write(&path, yaml).expect("written");
         let loaded = FileSchedule::load(&path, "client-main").expect("re-keyed template loads");
-        assert_eq!(loaded.profile.chain_id, 424242);
+        assert_eq!(loaded.profile().chain_id, 424242);
         assert_eq!(
-            loaded.profile.hardforks,
+            loaded.profile().hardforks,
             NetworkProfile::from_builtin(RaylsNetwork::Mainnet).hardforks
         );
     }

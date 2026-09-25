@@ -11,7 +11,6 @@ use clap as _;
 use eyre as _;
 use rayls_infrastructure_config as _;
 use rayls_middleware_rewards as _;
-use rayls_network_cli as _;
 use reth_chainspec as _;
 use serde_yaml as _;
 use tracing_appender as _;

@@ -1,146 +1,17 @@
-//! Hardfork schedule selection and datadir verification at boot.
+//! Hardfork-schedule record verification at node boot.
 //!
-//! A datadir carries no hardfork schedule: every `node` boot selects one
-//! explicitly (a `--config-file`/`--subnet` profile, or the built-in schedule
-//! behind `--network`), and these gates verify the selection against the
-//! datadir before the node starts — refusing to boot when the datadir and the
-//! selected schedule disagree.
-use std::path::{Path, PathBuf};
-
+//! The selection of *which* profile to run lives in
+//! `rayls_execution_evm::network_schedule`. This module verifies the selected
+//! schedule against the datadir's recorded history (refusing executed-fork
+//! disagreements, reporting future moves) and re-records it, plus the CLI
+//! `schedule export` subcommand.
 use eyre::Context;
 use rayls_execution_evm::{
     reth_env::{RethConfig, RethEnv},
-    verify_schedule, NetworkConfigFile, NetworkProfile, ScheduleRecord,
+    verify_schedule, NetworkProfile, ScheduleRecord,
 };
 use rayls_infrastructure_config::RaylsDirs;
-use rayls_infrastructure_types::RaylsNetwork;
 use tracing::{info, warn};
-
-/// Verify that the datadir's genesis chain-id matches the chain-id of the
-/// selected schedule source (a config-file subnet, or the baked-in network
-/// profile). A mismatch means the datadir belongs to a different network or
-/// client, and running it would apply the wrong hardfork schedule — refuse to
-/// boot.
-pub fn verify_datadir_chain_id(actual: u64, expected: u64, source: &str) -> eyre::Result<()> {
-    if actual != expected {
-        eyre::bail!(
-            "datadir chain-id {actual} does not match the expected chain-id {expected} \
-             from {source}. The datadir appears to belong to a different network or client. \
-             Use a datadir whose genesis chain-id is {expected}, or select a schedule source \
-             whose chain-id is {actual}."
-        );
-    }
-    Ok(())
-}
-
-/// The hardfork schedule selected for this boot: the resolved profile plus a
-/// human-readable description of where it came from (used in refusal messages
-/// and the boot log).
-#[derive(Debug)]
-pub struct SelectedSchedule {
-    /// The selected profile (chain-id + hardfork schedule).
-    pub profile: NetworkProfile,
-    /// Description of the schedule source, e.g. `subnet 'mainnet' of
-    /// "/x/client.yaml"` or `network 'local'`.
-    pub source: String,
-}
-
-impl SelectedSchedule {
-    /// Select the hardfork schedule for this boot.
-    ///
-    /// Precedence: the `--config-file`/`--subnet` profile (already loaded and
-    /// validated) wins, then the built-in schedule selected by `--network`.
-    /// Bails when neither is given — a datadir carries no schedule, so the source
-    /// must be explicit at every boot.
-    pub fn select(
-        file_schedule: Option<&FileSchedule>,
-        network: Option<RaylsNetwork>,
-    ) -> eyre::Result<Self> {
-        if let Some(file_schedule) = file_schedule {
-            return Ok(Self {
-                profile: file_schedule.profile.clone(),
-                source: format!("subnet '{}' of {:?}", file_schedule.subnet, file_schedule.path),
-            });
-        }
-        match network {
-            Some(network) => Ok(Self {
-                profile: NetworkProfile::from_builtin(network),
-                source: format!("network '{network}'"),
-            }),
-            None => eyre::bail!(
-                "no hardfork schedule source: start with `--network <devnet|testnet|mainnet|local>` \
-                 (the chain-id must match the genesis) or `--config-file <path> --subnet <name>`"
-            ),
-        }
-    }
-}
-
-/// The hardfork schedule selected from a `--config-file`: the file path, the
-/// subnet chosen with `--subnet`, and the subnet's resolved profile.
-#[derive(Debug)]
-pub struct FileSchedule {
-    /// Path of the network config file.
-    path: PathBuf,
-    /// The subnet selected from it.
-    subnet: String,
-    /// The subnet's resolved profile.
-    profile: NetworkProfile,
-}
-
-/// The built-in network whose chain-id is `id`, when `id` is one of the
-/// networks a config file may never redefine.
-///
-/// Mainnet and testnet always run on the schedule baked into the binary
-/// (started with `--network mainnet|testnet`); letting a client config file
-/// carry their chain-id would let a per-client file redefine a shared
-/// network's schedule, so a subnet declaring one of these chain-ids is
-/// refused at load time.
-fn baked_in_network(id: u64) -> Option<RaylsNetwork> {
-    [RaylsNetwork::Mainnet, RaylsNetwork::Testnet]
-        .into_iter()
-        .find(|network| network.chain_id() == id)
-}
-
-impl FileSchedule {
-    /// Load the client's network config file and select the requested subnet.
-    ///
-    /// Validates the profile before the node starts: the subnet's `chain_id`
-    /// must not be a baked-in network's (mainnet/testnet run on `--network`,
-    /// never a config file), and its `hardforks` map must name only known
-    /// forks with every known fork defined (a stale file that omits a newly
-    /// added fork would otherwise run that fork as `never`). A broken or
-    /// stale file fails fast with an actionable message.
-    pub fn load(config_file: &Path, subnet: &str) -> eyre::Result<Self> {
-        let yaml = std::fs::read_to_string(config_file)
-            .wrap_err_with(|| format!("failed to read network config file {config_file:?}"))?;
-        let file: NetworkConfigFile = serde_yaml::from_str(&yaml)
-            .wrap_err_with(|| format!("failed to parse network config file {config_file:?}"))?;
-        let profile = file.subnet(subnet).cloned().ok_or_else(|| {
-            let known = file.networks.keys().cloned().collect::<Vec<_>>().join(", ");
-            eyre::eyre!(
-                "subnet '{subnet}' not found in {config_file:?}; available subnets: {known}"
-            )
-        })?;
-        if let Some(network) = baked_in_network(profile.chain_id) {
-            eyre::bail!(
-                "subnet '{subnet}' in {config_file:?} declares chain-id {}, the chain-id of the \
-                 baked-in {network} network; {network} must be started with `--network {network}`, \
-                 not `--config-file`",
-                profile.chain_id
-            );
-        }
-        if profile.hardforks.is_empty() {
-            eyre::bail!(
-                "subnet '{subnet}' in {config_file:?} defines no `hardforks`; every subnet must \
-                 define its hardfork schedule (a block number or \"never\" per fork)"
-            );
-        }
-        profile
-            .validate_hardforks()
-            .wrap_err_with(|| format!("subnet '{subnet}' in {config_file:?}"))?;
-        Ok(Self { path: config_file.to_path_buf(), subnet: subnet.to_string(), profile })
-    }
-}
 
 /// Verify the schedule selected for this boot against the datadir's
 /// [`ScheduleRecord`] (refusing executed-fork disagreements, reporting future

@@ -19,7 +19,6 @@ rayls-infrastructure-config = { workspace = true }
 rayls-infrastructure-storage = { workspace = true, features = ["archive-replay"] }
 rayls-infrastructure-types = { workspace = true, features = ["cli"] }
 rayls-middleware-rewards = { workspace = true }
-rayls-network-cli = { workspace = true }
 
 clap = { workspace = true, features = ["derive"] }
 eyre = { workspace = true }

@@ -8488,7 +8488,6 @@ dependencies = [
  "rayls-infrastructure-storage",
  "rayls-infrastructure-types",
  "rayls-middleware-rewards",
- "rayls-network-cli",
  "reth-chainspec",
  "serde_yaml",
  "thiserror 1.0.69",

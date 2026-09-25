@@ -7,14 +7,14 @@ use clap::Parser;
 use eyre::{eyre, Context};
 use rayls_execution_evm::{
     reth_env::{RethCommand, RethConfig, RethEnv},
-    set_active_profile, verify_schedule, NetworkProfile, ScheduleRecord,
+    set_active_profile, verify_datadir_chain_id, verify_schedule, FileSchedule, NetworkProfile,
+    ScheduleRecord, SelectedSchedule,
 };
 use rayls_infrastructure_config::{Parameters, RaylsDirs};
 use rayls_infrastructure_storage::open_db;
 use rayls_infrastructure_types::{
     rewards::RewardsCounter, Address, Genesis, RaylsNetwork, TaskManager,
 };
-use rayls_network_cli::schedule::{verify_datadir_chain_id, FileSchedule, SelectedSchedule};
 use rayls_replay::{
     rewards::{BoundedHybridWalker, HybridTallySource, SnapshotRewardsBackend, SnapshotTallyStore},
     run_replay, verify_chainspec_compatibility, ReplayConfig,
