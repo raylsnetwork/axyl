@@ -11,6 +11,7 @@ use rayls_infrastructure_storage::{
         NodeBatchesCache, NodeIdentity, Payload, PendingEpochRecord, Votes,
     },
     CertificateStore as _, EpochStore as _, ProposerStore as _, LAST_PROPOSAL_KEY,
+    PENDING_RECORD_LOG_TARGET,
 };
 use rayls_infrastructure_types::{
     AuthorityIdentifier, BlsPublicKey, Committee, CommitteeBuilder, ConsensusHeader,
@@ -272,6 +273,10 @@ where
             // The previous owner's closed-but-uncertified records: this node is not a signer for
             // them and must not spend a collection task trying to certify them.
             txn.clear_table::<PendingEpochRecord>()?;
+            info!(
+                target: PENDING_RECORD_LOG_TARGET,
+                "pending epoch records cleared: a foreign consensus-db was adopted"
+            );
             // KAD record tables: cleared on snapshot recovery so find_authorities
             // re-queries fresh records, avoiding stale addresses from the snapshot epoch.
             txn.clear_table::<KadRecords>()?;
@@ -623,5 +628,18 @@ pub(crate) fn resolve_local_prev_epoch_record<DB: ReDatabase>(
 /// `None` when nothing is pending: the newest close is certified and on disk, or this node never
 /// closed an epoch, and [`resolve_local_prev_epoch_record`] handles both.
 pub(crate) fn hydrate_prev_epoch_record<DB: ReDatabase>(consensus_db: &DB) -> Option<EpochRecord> {
-    consensus_db.pending_epoch_records().pop()
+    let newest = consensus_db.pending_epoch_records().pop();
+    match &newest {
+        Some(rec) => info!(
+            target: PENDING_RECORD_LOG_TARGET,
+            epoch = rec.epoch,
+            digest = %rec.digest(),
+            "prev_epoch_record seeded from the newest pending epoch record at startup"
+        ),
+        None => info!(
+            target: PENDING_RECORD_LOG_TARGET,
+            "no pending epoch record at startup: nothing to resume, prev_epoch_record unseeded"
+        ),
+    }
+    newest
 }

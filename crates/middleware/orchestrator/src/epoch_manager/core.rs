@@ -28,7 +28,9 @@ use rayls_consensus_state_sync::{
 use rayls_consensus_worker::{quorum_waiter::QuorumWaiterTrait, Worker};
 use rayls_execution_evm::{reth_env::RethEnv, system_calls::EpochState};
 use rayls_infrastructure_config::{KeyConfig, LibP2pConfig, NetworkConfig, RaylsDirs};
-use rayls_infrastructure_storage::{tables::ConsensusBlocks, EpochStore as _};
+use rayls_infrastructure_storage::{
+    tables::ConsensusBlocks, EpochStore as _, PENDING_RECORD_LOG_TARGET,
+};
 use rayls_infrastructure_types::{
     error::HeaderError, gas_accumulator::GasAccumulator, B256Map, BlsAggregateSignature,
     BlsPublicKey, BlsSignature, CameFrom, ConsensusOutput, Database as ReDatabase, Epoch,
@@ -1182,12 +1184,20 @@ where
                 // built. Its cert verified above, so adopt it: this also deletes our pending row
                 // and ends our collection for the epoch.
                 match consensus_db.save_epoch_record_with_cert(&record, &cert) {
-                    Ok(()) => warn!(
-                        target: "epoch-manager",
-                        epoch = record.epoch,
-                        %digest,
-                        "network certified a different record for the epoch being collected; adopted it",
-                    ),
+                    Ok(()) => {
+                        warn!(
+                            target: "epoch-manager",
+                            epoch = record.epoch,
+                            %digest,
+                            "network certified a different record for the epoch being collected; adopted it",
+                        );
+                        info!(
+                            target: PENDING_RECORD_LOG_TARGET,
+                            epoch = record.epoch,
+                            adopted = %digest,
+                            "pending record replaced: the network's certified record was adopted and our pending row removed"
+                        );
+                    }
                     Err(err) => error!(
                         target: "epoch-manager",
                         ?err,
@@ -1228,12 +1238,25 @@ where
 
         let pending = self.consensus_db.pending_epoch_records();
         let newest_pending = pending.last().map(|record| record.epoch);
+        if !pending.is_empty() {
+            info!(
+                target: PENDING_RECORD_LOG_TARGET,
+                epochs = ?pending.iter().map(|record| record.epoch).collect::<Vec<_>>(),
+                catching_up,
+                "resuming certification of every pending epoch in one collector task"
+            );
+        }
         let mut states: Vec<PendingCertification> = Vec::new();
         let mut fast_pathed = false;
         for record in pending {
             let epoch = record.epoch;
             if certified(epoch) {
                 // Certified since the row was written (e.g. by a peer's backfill); tidy up.
+                info!(
+                    target: PENDING_RECORD_LOG_TARGET,
+                    epoch,
+                    "pending row is stale: the epoch is already certified on disk, clearing it"
+                );
                 if let Err(e) = self.consensus_db.clear_pending_epoch_record(epoch) {
                     error!(target: "epoch-manager", ?e, epoch, "failed to clear stale pending epoch record");
                 }
@@ -1256,12 +1279,25 @@ where
                 });
                 if self.try_fetch_epoch_cert(primary, &record, epoch_hash, &record.committee).await
                 {
+                    info!(
+                        target: PENDING_RECORD_LOG_TARGET,
+                        epoch,
+                        %epoch_hash,
+                        "pending epoch certified from a peer's certificate; no vote collection needed"
+                    );
                     fast_pathed = true;
                     continue;
                 }
             }
 
             let mut state = PendingCertification::new(record);
+            info!(
+                target: PENDING_RECORD_LOG_TARGET,
+                epoch,
+                %epoch_hash,
+                in_committee = state.committee_keys.contains(me),
+                "pending epoch enters vote collection"
+            );
             // We are in the committee so sign and gossip the epoch record.
             if state.committee_keys.contains(me) {
                 let vote = state.sign(me, &self.key_config);
