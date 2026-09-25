@@ -114,9 +114,6 @@ where
                 })?;
 
                 self.process_next_round().await?;
-
-                // reset timer - the happy path
-                max_round_timeout.reset();
             }
         }
 
