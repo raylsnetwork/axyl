@@ -24,6 +24,7 @@ async fn gc_timeout_kicks_certificate_fetcher() -> eyre::Result<()> {
 
     let cb = ConsensusBus::new();
     let mut cert_fetcher_rx = cb.certificate_fetcher().subscribe();
+    let metrics = cb.primary_metrics();
 
     let mut gc = GarbageCollector::new(config, cb, AtomicRound::new(0));
 
@@ -40,6 +41,11 @@ async fn gc_timeout_kicks_certificate_fetcher() -> eyre::Result<()> {
         .expect("kick must be sent before the guard bound")
         .expect("certificate fetcher channel closed");
     assert_matches!(command, CertificateFetcherCommand::Kick);
+
+    assert_eq!(
+        metrics.node_metrics.synchronizer_gc_timeout.get(),
+        1
+    );
 
     Ok(())
 }
