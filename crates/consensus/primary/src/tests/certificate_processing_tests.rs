@@ -559,7 +559,8 @@ async fn test_restart_with_partial_round_reports_last_complete_round() -> eyre::
     // crash
     task_manager.abort();
 
-    // recover - only round 1 is complete in the store, so only its parents are reported
+    // recover - round 2 is in the store but below quorum (2/4); recovery reports
+    // only the parents of the last round with a full quorum (round 1).
     let (recovered_manager, _validator, cb, task_manager) =
         create_core_test_types_with_tasks(primary, task_manager);
     task_manager.spawn_critical_task("recovered manager", recovered_manager.run());
