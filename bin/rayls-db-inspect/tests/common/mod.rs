@@ -257,6 +257,12 @@ pub fn write_epoch(db: &DatabaseType, record: &EpochRecord, cert: Option<&EpochC
     }
 }
 
+/// The record a node builds when it closes an epoch, saved before certification the way
+/// `write_epoch_record` does: a `pending_epoch_record` row and nothing else.
+pub fn write_pending(db: &DatabaseType, record: &EpochRecord) {
+    db.save_pending_epoch_record(record).unwrap();
+}
+
 pub fn write_header(db: &DatabaseType, header: &ConsensusHeader) {
     db.with_write_txn(|txn| {
         txn.insert::<ConsensusBlocks>(&header.number, header)?;
