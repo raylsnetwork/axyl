@@ -259,7 +259,8 @@ impl EthChainSpec for RaylsChainSpec {
         self.inner.paris_block_and_final_difficulty.map(|(_, final_difficulty)| final_difficulty)
     }
 
-    /// Compute next block base fee. Post-fork: per-block EIP-1559. Pre-fork: epoch-scoped.
+    /// Compute next block base fee. Post-fork: per-block EIP-1559 from the parent.
+    /// Pre-fork: fixed at `MIN_PROTOCOL_BASE_FEE`.
     fn next_block_base_fee(&self, parent: &Self::Header, _target_timestamp: u64) -> Option<u64> {
         let next_block = parent.number() + 1;
         if self.is_eip1559_active_at_block(next_block) {

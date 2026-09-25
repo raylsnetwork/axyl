@@ -118,7 +118,7 @@ mod schedule {
     }
 
     #[test]
-    fn schedule_contains_both_hardforks_for_all_networks() {
+    fn schedule_matches_declaration_order_for_all_networks() {
         for network in [
             RaylsNetwork::Devnet,
             RaylsNetwork::Testnet,
@@ -126,7 +126,11 @@ mod schedule {
             RaylsNetwork::Local,
         ] {
             let schedule = RaylsHardFork::for_network(network);
-            assert_eq!(schedule.len(), 15, "expected 15 hardforks for {network}");
+            assert_eq!(
+                schedule.len(),
+                RaylsHardFork::VARIANTS.len(),
+                "expected one entry per hardfork for {network}"
+            );
             assert_eq!(schedule[0].fork, RaylsHardFork::Eip1559);
             assert_eq!(schedule[1].fork, RaylsHardFork::BatchDigestV2);
             assert_eq!(schedule[2].fork, RaylsHardFork::AdminTransfer);
