@@ -96,7 +96,7 @@ where
                 info!(
                     target: "engine",
                     block_number,
-                    "Applying UUPS hardfork: deploying RLSAccumulator, wiring reward distribution"
+                    "Applying UUPS hardfork: patching __self immutables and disabling initializers on the 6 UUPS implementation contracts"
                 );
                 uups::uups_state()
             }

@@ -1,10 +1,9 @@
 //! Per-network Rayls hardfork schedules: which fork activates at which block.
 //!
-//! NOTE: `UsdrSupplyCorrection` is active on local and mainnet; testnet/devnet
-//! stay `Never` until an activation block is chosen operationally. Flip the
-//! relevant network entry in a schedule below from `ForkCondition::Never` to
-//! `ForkCondition::Block(<chosen block>)` when ready. See
-//! `crates/execution/evm/src/evm/hardforks/usdr_supply_correction.rs`.
+//! NOTE: `UsdrSupplyCorrection` is scheduled (`Block(...)`) on mainnet and local;
+//! testnet/devnet stay `Never` until an activation block is chosen operationally.
+//! Flip a `Never` entry in a schedule below to `ForkCondition::Block(<chosen block>)`
+//! when ready. See `crates/execution/evm/src/evm/hardforks/usdr_supply_correction.rs`.
 
 use super::fork::RaylsHardFork;
 use rayls_infrastructure_types::RaylsNetwork;
@@ -30,10 +29,12 @@ impl ScheduledFork {
         self.condition.active_at_block(block)
     }
 
-    /// The activation block; `None` for a fork that never activates.
+    /// The activation block; `None` for a fork that never activates or for a
+    /// non-block (TTD/timestamp) condition.
     ///
-    /// Rayls schedules are block-based only; a TTD- or timestamp-based
-    /// condition fires the debug assert.
+    /// Rayls schedules are block-based only; a TTD- or timestamp-based condition
+    /// fires the debug assert in debug builds and is silently reported as `None`
+    /// in release builds.
     pub fn block_of(&self) -> Option<u64> {
         debug_assert!(
             matches!(self.condition, ForkCondition::Block(_) | ForkCondition::Never),
@@ -49,7 +50,7 @@ impl ScheduledFork {
 
 impl RaylsHardFork {
     /// Devnet hardfork schedule.
-    pub const fn devnet() -> [ScheduledFork; 15] {
+    pub const fn devnet() -> [ScheduledFork; RaylsHardFork::VARIANTS.len()] {
         [
             ScheduledFork::new(Self::Eip1559, ForkCondition::Block(50)),
             ScheduledFork::new(Self::BatchDigestV2, ForkCondition::Block(100)),
@@ -78,7 +79,7 @@ impl RaylsHardFork {
     }
 
     /// Testnet hardfork schedule.
-    pub const fn testnet() -> [ScheduledFork; 15] {
+    pub const fn testnet() -> [ScheduledFork; RaylsHardFork::VARIANTS.len()] {
         [
             ScheduledFork::new(Self::Eip1559, ForkCondition::Block(281_800)),
             ScheduledFork::new(Self::BatchDigestV2, ForkCondition::Block(560_539)),
@@ -102,7 +103,7 @@ impl RaylsHardFork {
     }
 
     /// Mainnet hardfork schedule.
-    pub const fn mainnet() -> [ScheduledFork; 15] {
+    pub const fn mainnet() -> [ScheduledFork; RaylsHardFork::VARIANTS.len()] {
         [
             ScheduledFork::new(Self::Eip1559, ForkCondition::Block(0)),
             ScheduledFork::new(Self::BatchDigestV2, ForkCondition::Block(0)),
@@ -127,7 +128,7 @@ impl RaylsHardFork {
     }
 
     /// Local network hardfork schedule (first four hardforks active at genesis).
-    pub const fn local() -> [ScheduledFork; 15] {
+    pub const fn local() -> [ScheduledFork; RaylsHardFork::VARIANTS.len()] {
         [
             ScheduledFork::new(Self::Eip1559, ForkCondition::Block(0)),
             ScheduledFork::new(Self::BatchDigestV2, ForkCondition::Block(0)),
@@ -162,7 +163,9 @@ impl RaylsHardFork {
     }
 
     /// Return the hardfork schedule for the given network.
-    pub const fn for_network(network: RaylsNetwork) -> [ScheduledFork; 15] {
+    pub const fn for_network(
+        network: RaylsNetwork,
+    ) -> [ScheduledFork; RaylsHardFork::VARIANTS.len()] {
         match network {
             RaylsNetwork::Devnet => Self::devnet(),
             RaylsNetwork::Testnet => Self::testnet(),
