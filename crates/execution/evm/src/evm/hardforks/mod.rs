@@ -209,7 +209,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::chainspec::{RaylsChainHardforks, ScheduledFork, TESTNET_ADMIN_TRANSFER_BLOCK};
+    use crate::chainspec::{RaylsChainHardforks, ScheduledFork};
     use rayls_infrastructure_types::{address, Address, RaylsNetwork, U256};
     use reth_revm::{db::EmptyDBTyped, State};
 
@@ -217,6 +217,11 @@ mod tests {
 
     fn build_state() -> State<TestDb> {
         State::builder().with_database(EmptyDBTyped::new()).with_bundle_update().build()
+    }
+
+    /// The activation block of `fork` on testnet, read from the testnet schedule.
+    fn testnet_activation_block(spec: &RaylsChainHardforks, fork: RaylsHardFork) -> u64 {
+        spec.rayls_fork_activation(fork).block_number().expect("fork is block-scheduled on testnet")
     }
 
     /// Addresses from admin_transfer.rs
@@ -237,18 +242,12 @@ mod tests {
     #[test]
     fn admin_transfer_applies_at_activation_block() {
         let spec = RaylsChainHardforks::for_network(RaylsNetwork::Testnet);
+        let block = testnet_activation_block(&spec, RaylsHardFork::AdminTransfer);
         let mut db = build_state();
         let mut hook: Option<Box<dyn reth_evm::OnStateHook>> = None;
 
-        apply_activated_migrations(
-            &spec,
-            &mut db,
-            &mut hook,
-            0,
-            TESTNET_ADMIN_TRANSFER_BLOCK - 1,
-            TESTNET_ADMIN_TRANSFER_BLOCK,
-        )
-        .expect("migration should succeed");
+        apply_activated_migrations(&spec, &mut db, &mut hook, 0, block - 1, block)
+            .expect("migration should succeed");
 
         // Verify DelegationPool proxy has ERC1967 impl slot set.
         let dp = db.cache.accounts.get(&DELEGATION_POOL).expect("DP should be in cache");
@@ -286,21 +285,15 @@ mod tests {
 
     #[test]
     fn admin_transfer_does_not_apply_before_activation() {
-        // Use testnet where AdminTransfer activates at a high block (560539),
+        // Use testnet where AdminTransfer activates at a high block,
         // so we can test blocks before activation without underflow.
         let spec = RaylsChainHardforks::for_network(RaylsNetwork::Testnet);
+        let block = testnet_activation_block(&spec, RaylsHardFork::AdminTransfer);
         let mut db = build_state();
         let mut hook: Option<Box<dyn reth_evm::OnStateHook>> = None;
 
-        apply_activated_migrations(
-            &spec,
-            &mut db,
-            &mut hook,
-            0,
-            crate::chainspec::TESTNET_ADMIN_TRANSFER_BLOCK - 2,
-            crate::chainspec::TESTNET_ADMIN_TRANSFER_BLOCK - 1,
-        )
-        .expect("migration should succeed");
+        apply_activated_migrations(&spec, &mut db, &mut hook, 0, block - 2, block - 1)
+            .expect("migration should succeed");
 
         // No accounts should be in cache - migration didn't run.
         assert!(db.cache.accounts.is_empty(), "AdminTransfer should not apply before activation");
@@ -310,18 +303,12 @@ mod tests {
     fn admin_transfer_does_not_reapply_after_activation() {
         // Use testnet where AdminTransfer activates at a high block.
         let spec = RaylsChainHardforks::for_network(RaylsNetwork::Testnet);
+        let block = testnet_activation_block(&spec, RaylsHardFork::AdminTransfer);
         let mut db = build_state();
         let mut hook: Option<Box<dyn reth_evm::OnStateHook>> = None;
 
-        apply_activated_migrations(
-            &spec,
-            &mut db,
-            &mut hook,
-            0,
-            crate::chainspec::TESTNET_ADMIN_TRANSFER_BLOCK,
-            crate::chainspec::TESTNET_ADMIN_TRANSFER_BLOCK + 1,
-        )
-        .expect("should succeed");
+        apply_activated_migrations(&spec, &mut db, &mut hook, 0, block, block + 1)
+            .expect("should succeed");
 
         assert!(
             db.cache.accounts.is_empty(),
@@ -333,18 +320,12 @@ mod tests {
     fn admin_transfer_preserves_bytecode_for_existing_proxies() {
         // Use testnet where AdminTransfer activates at a non-zero block.
         let spec = RaylsChainHardforks::for_network(RaylsNetwork::Testnet);
+        let block = testnet_activation_block(&spec, RaylsHardFork::AdminTransfer);
         let mut db = build_state();
         let mut hook: Option<Box<dyn reth_evm::OnStateHook>> = None;
 
-        apply_activated_migrations(
-            &spec,
-            &mut db,
-            &mut hook,
-            0,
-            TESTNET_ADMIN_TRANSFER_BLOCK - 1,
-            TESTNET_ADMIN_TRANSFER_BLOCK,
-        )
-        .expect("migration should succeed");
+        apply_activated_migrations(&spec, &mut db, &mut hook, 0, block - 1, block)
+            .expect("migration should succeed");
 
         // NativeTokenController and FeeAggregator should have proxy bytecode preserved.
         for (name, addr) in [("NTC", NATIVE_TOKEN_CONTROLLER), ("FeeAggregator", FEE_AGGREGATOR)] {
@@ -380,38 +361,26 @@ mod tests {
     fn eip1559_activation_produces_no_state_changes() {
         // Use testnet where Eip1559 activates at a non-zero block.
         let spec = RaylsChainHardforks::for_network(RaylsNetwork::Testnet);
+        let block = testnet_activation_block(&spec, RaylsHardFork::Eip1559);
         let mut db = build_state();
         let mut hook: Option<Box<dyn reth_evm::OnStateHook>> = None;
 
-        apply_activated_migrations(
-            &spec,
-            &mut db,
-            &mut hook,
-            0,
-            crate::chainspec::TESTNET_EIP1559_BLOCK - 1,
-            crate::chainspec::TESTNET_EIP1559_BLOCK,
-        )
-        .expect("should succeed");
+        apply_activated_migrations(&spec, &mut db, &mut hook, 0, block - 1, block)
+            .expect("should succeed");
 
         assert!(db.cache.accounts.is_empty(), "Eip1559 should not modify any accounts");
     }
 
     #[test]
     fn multiple_forks_at_same_block_only_applies_state_migrations() {
-        // On testnet, BatchDigestV2 and AdminTransfer both activate at block 500.
+        // On testnet, BatchDigestV2 and AdminTransfer both activate at the same block.
         let spec = RaylsChainHardforks::for_network(RaylsNetwork::Testnet);
+        let block = testnet_activation_block(&spec, RaylsHardFork::AdminTransfer);
         let mut db = build_state();
         let mut hook: Option<Box<dyn reth_evm::OnStateHook>> = None;
 
-        apply_activated_migrations(
-            &spec,
-            &mut db,
-            &mut hook,
-            0,
-            crate::chainspec::TESTNET_ADMIN_TRANSFER_BLOCK - 1,
-            crate::chainspec::TESTNET_ADMIN_TRANSFER_BLOCK,
-        )
-        .expect("should succeed");
+        apply_activated_migrations(&spec, &mut db, &mut hook, 0, block - 1, block)
+            .expect("should succeed");
 
         // AdminTransfer should have applied (state migration).
         assert!(
