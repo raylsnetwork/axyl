@@ -14,7 +14,6 @@ exclude.workspace = true
 rayls-network-cli = { workspace = true }
 clap = { workspace = true, features = ["derive", "env"] }
 eyre = { workspace = true }
-rayls-middleware-orchestrator = { workspace = true }
 rayls-infrastructure-config = { workspace = true, features = ["test-utils"]}
 rayls-infrastructure-types = { workspace = true, features = ["test-utils"] }
 tracing = { workspace = true }

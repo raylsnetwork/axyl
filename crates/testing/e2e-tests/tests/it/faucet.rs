@@ -357,7 +357,7 @@ async fn test_faucet_transfers_rls_and_xyz_with_google_kms_e2e() -> eyre::Result
     // create and launch validator nodes on local network,
     // use expected faucet contract address from `TransactionFactory::default` with nonce == 0
     let faucet_tmp_dir = tempfile::TempDir::new().unwrap();
-    spawn_local_testnet(
+    let _testnet = spawn_local_testnet(
         faucet_tmp_dir.path(),
         &faucet_proxy_address.to_string(),
         Some(genesis_accounts),

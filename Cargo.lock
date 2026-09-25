@@ -3400,7 +3400,6 @@ dependencies = [
  "rayls-execution-rpc",
  "rayls-infrastructure-config",
  "rayls-infrastructure-types",
- "rayls-middleware-orchestrator",
  "rayls-network-cli",
  "reth",
  "secp256k1 0.31.1",
