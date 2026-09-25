@@ -123,8 +123,6 @@ impl PendingCertificateManager {
 
     /// When a certificate is accepted, returns all of its children that are now ready to be
     /// verified.
-    // TODO: remove after tests
-    // synchronizer::state::accept_children
     pub(super) fn update_pending(
         &mut self,
         round: Round,

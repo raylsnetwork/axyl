@@ -253,7 +253,6 @@ where
     ///
     /// NOTE: `self::process_verified_certificates` checks the verification status, so all
     /// certificates managed here are verified.
-    // synchronizer::accept_certificate_internal
     async fn accept_verified_certificates(
         &mut self,
         certificates: VecDeque<Certificate>,
