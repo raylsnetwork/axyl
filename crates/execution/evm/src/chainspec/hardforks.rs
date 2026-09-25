@@ -116,22 +116,22 @@ pub trait RaylsHardforks {
     ///
     /// A misconfigured tokenomics activation left rewards off for this block range
     /// on the live testnet, so archive replay skips on-chain reward distribution
-    /// here to match canonical state. Mainnet/devnet never match (tokenomics is not
-    /// scheduled at the testnet block), so they distribute unconditionally.
+    /// here to match canonical state. The guard compares this schedule's Tokenomics
+    /// activation against the baked-in testnet's, so no other network or synthetic
+    /// schedule ever matches.
     #[cfg(feature = "archive-replay")]
     fn is_tokenomics_outage_block(&self, block: u64) -> bool {
-        // Only the live testnet matches: its Tokenomics fork activates at block 1_879_000.
-        matches!(
-            self.rayls_fork_activation(RaylsHardFork::Tokenomics),
-            ForkCondition::Block(1_879_000)
-        ) && (
-            // First testnet block whose epoch close skipped on-chain reward distribution;
-            // the exclusive upper bound is the first block where distribution resumed.
-            // Spans the epoch closes the live network produced with rewards disabled;
-            // extend if a later epoch close still diverges on re-execution.
-            2_879_900..2_949_655
-        )
-            .contains(&block)
+        // Identity check: only the live testnet schedule matches.
+        self.rayls_fork_activation(RaylsHardFork::Tokenomics)
+            == RaylsChainHardforks::testnet().rayls_fork_activation(RaylsHardFork::Tokenomics)
+            && (
+                // First testnet block whose epoch close skipped on-chain reward distribution;
+                // the exclusive upper bound is the first block where distribution resumed.
+                // Spans the epoch closes the live network produced with rewards disabled;
+                // extend if a later epoch close still diverges on re-execution.
+                2_879_900..2_949_655
+            )
+                .contains(&block)
     }
 
     /// Return true if the UUPS fork is active at `block`.
