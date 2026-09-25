@@ -11,7 +11,7 @@ use rayls_testing_test_utils_committee::CommitteeFixture;
 use std::time::Duration;
 use tokio::time::timeout;
 
-/// When no consensus round update arrives within `max_consenus_round_timeout`, the
+/// When no consensus round update arrives within `max_consensus_round_timeout`, the
 /// garbage collector must kick the certificate fetcher so the node can recover by
 /// requesting missing certificates from peers.
 ///
@@ -27,7 +27,7 @@ async fn gc_timeout_kicks_certificate_fetcher() -> eyre::Result<()> {
 
     let mut gc = GarbageCollector::new(config, cb, AtomicRound::new(0));
 
-    // guard bound must exceed max_consenus_round_timeout (30s) so the fallback
+    // guard bound must exceed max_consensus_round_timeout (30s) so the fallback
     // interval wins the race on the paused clock
     let result = timeout(Duration::from_secs(60), gc.ready())
         .await
