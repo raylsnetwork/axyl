@@ -12,7 +12,7 @@ use alloy::{
     primitives::{B256, U256},
 };
 use alloy_evm::eth::spec::EthExecutorSpec;
-use core::{convert::AsRef, fmt::Display};
+use core::fmt::Display;
 use rayls_infrastructure_types::{
     Address, RaylsNetwork, MIN_PROTOCOL_BASE_FEE, MIN_RAYLS_PROTOCOL_BASE_FEE,
 };
