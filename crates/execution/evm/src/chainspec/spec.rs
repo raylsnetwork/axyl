@@ -12,7 +12,7 @@ use alloy::{
     primitives::{B256, U256},
 };
 use alloy_evm::eth::spec::EthExecutorSpec;
-use core::fmt::Display;
+use core::{convert::AsRef, fmt::Display};
 use rayls_infrastructure_types::{
     Address, RaylsNetwork, MIN_PROTOCOL_BASE_FEE, MIN_RAYLS_PROTOCOL_BASE_FEE,
 };
@@ -207,7 +207,7 @@ impl RaylsChainSpecBuilder {
 impl core::ops::Deref for RaylsChainSpec {
     type Target = ChainSpec;
     fn deref(&self) -> &Self::Target {
-        &self.inner
+        self.inner.as_ref()
     }
 }
 
@@ -255,7 +255,6 @@ impl EthChainSpec for RaylsChainSpec {
     }
 
     fn is_optimism(&self) -> bool {
-        // Rayls is a standard EVM chain, not on Optimism's OP stack.
         false
     }
 
