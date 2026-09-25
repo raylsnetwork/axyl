@@ -51,6 +51,8 @@ impl RaylsChainHardforks {
 
 impl RaylsHardforks for RaylsChainHardforks {
     fn rayls_fork_activation(&self, fork: RaylsHardFork) -> ForkCondition {
+        // Compares on `fork` only: correct because a schedule never lists the same fork
+        // twice (sorting would be ambiguous for duplicates).
         self.forks
             .binary_search_by(|entry| entry.fork.cmp(&fork))
             .ok()
@@ -79,6 +81,11 @@ pub trait RaylsHardforks {
         self.is_rayls_fork_active_at_block(RaylsHardFork::BatchDigestV2, block)
     }
 
+    /// Return true if the AdminTransfer fork is active at `block`.
+    fn is_admin_transfer_active_at_block(&self, block: u64) -> bool {
+        self.is_rayls_fork_active_at_block(RaylsHardFork::AdminTransfer, block)
+    }
+
     /// Return true if the PrecompileGasFix fork is active at `block`.
     fn is_precompile_gas_fix_active_at_block(&self, block: u64) -> bool {
         self.is_rayls_fork_active_at_block(RaylsHardFork::PrecompileGasFix, block)
@@ -87,6 +94,11 @@ pub trait RaylsHardforks {
     /// Return true if the Erc20PrecompileBytecode fork is active at `block`.
     fn is_erc20_precompile_bytecode_active_at_block(&self, block: u64) -> bool {
         self.is_rayls_fork_active_at_block(RaylsHardFork::Erc20PrecompileBytecode, block)
+    }
+
+    /// Return true if the RlsStorage fork is active at `block`.
+    fn is_rls_storage_active_at_block(&self, block: u64) -> bool {
+        self.is_rayls_fork_active_at_block(RaylsHardFork::RlsStorage, block)
     }
 
     /// Return true if the Tokenomics fork is active at `block`.
@@ -126,6 +138,11 @@ pub trait RaylsHardforks {
         self.is_rayls_fork_active_at_block(RaylsHardFork::TransactionLoadBalancing, block)
     }
 
+    /// Return true if the UsdrSupplyCorrection fork is active at `block`.
+    fn is_usdr_supply_correction_active_at_block(&self, block: u64) -> bool {
+        self.is_rayls_fork_active_at_block(RaylsHardFork::UsdrSupplyCorrection, block)
+    }
+
     /// Return true if the SenderAffinityLoadBalancing fork is active at `block`.
     fn is_sender_affinity_load_balancing_active_at_block(&self, block: u64) -> bool {
         self.is_rayls_fork_active_at_block(RaylsHardFork::SenderAffinityLoadBalancing, block)
@@ -155,13 +172,13 @@ pub trait RaylsHardforks {
         self.is_rayls_fork_active_at_block(RaylsHardFork::OutputSeqNormalization, block)
     }
 
-    /// Return the active version byte at `block`, if any.
+    /// Return the max version byte among the forks active at `block`, if any.
     fn version_byte_at_block(&self, block: u64) -> Option<u8> {
         RaylsHardFork::VARIANTS
             .iter()
-            .rev()
-            .find(|fork| self.rayls_fork_activation(**fork).active_at_block(block))
+            .filter(|fork| self.rayls_fork_activation(**fork).active_at_block(block))
             .map(|fork| fork.version_byte())
+            .max()
     }
 
     /// Return forks that activated between `prev_block` (exclusive) and `block` (inclusive).
