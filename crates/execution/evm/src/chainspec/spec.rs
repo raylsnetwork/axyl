@@ -58,8 +58,8 @@ impl RaylsChainSpec {
     }
 
     /// Return a reference to the inner chain spec.
-    pub fn inner(&self) -> &Arc<ChainSpec> {
-        &self.inner
+    pub fn inner(&self) -> &ChainSpec {
+        self.inner.as_ref()
     }
 
     /// Compute the next block's base fee from parent header fields.
