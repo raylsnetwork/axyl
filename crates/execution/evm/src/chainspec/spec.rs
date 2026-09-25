@@ -86,6 +86,14 @@ impl RaylsChainSpec {
 }
 
 /// Builder for [`RaylsChainSpec`].
+///
+/// Forks are configured either as a whole via `add_rayls_hardforks_by_type` /
+/// `add_rayls_hardforks_by_schedule`, or individually through the per-fork
+/// `block` methods — which exist only for the forks whose synthetic-schedule
+/// tests need a single-fork override. The remaining forks (RlsStorage, Tokenomics,
+/// Uups, UsdrSupplyCorrection, TransactionLoadBalancing,
+/// SenderAffinityLoadBalancing) are set only through the schedule methods; add a
+/// per-fork method when an individual override is needed.
 #[derive(Debug)]
 pub struct RaylsChainSpecBuilder {
     inner: ChainSpec,
