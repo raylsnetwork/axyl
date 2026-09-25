@@ -567,12 +567,18 @@ async fn test_restart_with_partial_round_reports_last_complete_round() -> eyre::
     let mut rx_parents = cb.parents().subscribe();
 
     // skip all round-0 emissions from the recovery flow
-    let received = loop {
-        let msg = rx_parents.recv().await.unwrap();
-        if msg.1 >= 1 {
-            break msg;
+    let received = timeout(Duration::from_secs(3), async {
+        loop {
+            let msg = rx_parents
+                .recv()
+                .await
+                .expect("parents channel closed before a round >= 1 emission");
+            if msg.1 >= 1 {
+                break msg;
+            }
         }
-    };
+    })
+    .await?;
 
     assert_eq!(received.1, 1);
     assert_eq!(received.0.len(), round_1_certificates.len());
