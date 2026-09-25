@@ -201,3 +201,29 @@ mod spec {
         assert!(spec.is_batch_digest_v2_active_at_block(999));
     }
 }
+
+#[cfg(feature = "archive-replay")]
+mod tokenomics_outage {
+    use super::*;
+
+    #[test]
+    fn testnet_outage_window_matches_only_the_documented_range() {
+        let testnet = RaylsChainHardforks::testnet();
+        assert!(!testnet.is_tokenomics_outage_block(2_879_899));
+        assert!(testnet.is_tokenomics_outage_block(2_879_900));
+        assert!(testnet.is_tokenomics_outage_block(2_949_654));
+        assert!(!testnet.is_tokenomics_outage_block(2_949_655));
+        assert!(!testnet.is_tokenomics_outage_block(3_000_000));
+    }
+
+    #[test]
+    fn outage_window_never_matches_non_testnet_schedules() {
+        for network in [RaylsNetwork::Devnet, RaylsNetwork::Mainnet, RaylsNetwork::Local] {
+            let spec = RaylsChainHardforks::for_network(network);
+            assert!(
+                !spec.is_tokenomics_outage_block(2_879_900),
+                "{network} must not match the testnet outage window"
+            );
+        }
+    }
+}
