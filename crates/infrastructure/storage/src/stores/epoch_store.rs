@@ -7,6 +7,13 @@ use crate::{
     tables::{EpochCerts, EpochRecords, EpochRecordsIndex, PendingEpochRecord},
     StoreResult,
 };
+use tracing::{debug, info};
+
+/// Log target for the lifecycle of `PendingEpochRecord` rows: saved at an epoch close, removed
+/// with the certificate or by a sweep, resumed or adopted. Transitions log at `info` (a handful
+/// per epoch); the raw table listing logs at `debug`. `RUST_LOG=epoch-manager::pending-record=info`
+/// shows only these.
+pub const PENDING_RECORD_LOG_TARGET: &str = "epoch-manager::pending-record";
 
 /// Helpers for Epoch DB access.
 pub trait EpochStore {
@@ -101,7 +108,14 @@ impl<DB: Database> EpochStore for DB {
             // missing key is a no-op.
             tx.remove::<PendingEpochRecord>(&epoch)?;
             Ok(())
-        })
+        })?;
+        info!(
+            target: PENDING_RECORD_LOG_TARGET,
+            epoch,
+            digest = %epoch_hash,
+            "epoch certified: its pending record, if any, was removed with the certificate"
+        );
+        Ok(())
     }
 
     fn get_epoch_by_number(&self, epoch: Epoch) -> Option<(EpochRecord, Option<EpochCertificate>)> {
@@ -146,7 +160,16 @@ impl<DB: Database> EpochStore for DB {
             // older epoch that is still waiting on its cert.
             tx.insert::<PendingEpochRecord>(&epoch, epoch_rec)?;
             Ok(())
-        })
+        })?;
+        info!(
+            target: PENDING_RECORD_LOG_TARGET,
+            epoch,
+            digest = %epoch_rec.digest(),
+            parent_hash = %epoch_rec.parent_hash,
+            committee = epoch_rec.committee.len(),
+            "pending epoch record saved: epoch closed here, certificate not on disk yet"
+        );
+        Ok(())
     }
 
     fn pending_epoch_records(&self) -> Vec<EpochRecord> {
@@ -155,6 +178,11 @@ impl<DB: Database> EpochStore for DB {
         let mut recs: Vec<EpochRecord> =
             self.iter::<PendingEpochRecord>().map(|(_, rec)| rec).collect();
         recs.sort_by_key(|rec| rec.epoch);
+        debug!(
+            target: PENDING_RECORD_LOG_TARGET,
+            epochs = ?recs.iter().map(|rec| rec.epoch).collect::<Vec<_>>(),
+            "pending epoch records listed"
+        );
         recs
     }
 
@@ -167,7 +195,13 @@ impl<DB: Database> EpochStore for DB {
         self.with_write_txn(|tx| {
             tx.remove::<PendingEpochRecord>(&epoch)?;
             Ok(())
-        })
+        })?;
+        info!(
+            target: PENDING_RECORD_LOG_TARGET,
+            epoch,
+            "pending epoch record cleared without a certificate write (already certified elsewhere)"
+        );
+        Ok(())
     }
 }
 
