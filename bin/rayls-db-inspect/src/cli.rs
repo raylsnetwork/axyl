@@ -126,7 +126,8 @@ pub enum Command {
     ///
     /// Reports whether the record and its certificate exist, whether the certificate is valid
     /// (signer count, super-quorum, BLS signature), whether the record links to the previous
-    /// one, and whether a transition checkpoint was left behind.
+    /// one, whether the node still holds a pending record for the epoch (closed here,
+    /// certificate not on disk yet), and whether a transition checkpoint was left behind.
     Epoch {
         /// The epoch to inspect.
         #[arg(value_name = "EPOCH", value_parser = number::<u32>)]
@@ -135,7 +136,8 @@ pub enum Command {
         nodes: NodeArgs,
     },
 
-    /// Show which epochs each node has a record and certificate for, as a table.
+    /// Show which epochs each node has a record and certificate for (or only a pending record),
+    /// as a table.
     Epochs {
         /// First epoch of the range, inclusive. Omit both bounds when using --all.
         #[arg(
@@ -248,7 +250,7 @@ pub enum Command {
         nodes: NodeArgs,
     },
 
-    /// Overview of each node's database: epochs, consensus tip, table sizes.
+    /// Overview of each node's database: epochs, pending epochs, consensus tip, table sizes.
     Summary {
         #[command(flatten)]
         nodes: NodeArgs,

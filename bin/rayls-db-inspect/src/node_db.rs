@@ -13,6 +13,7 @@ use rayls_infrastructure_storage::{
         Batches, Certificates, ColdArchiveHighWaterMark, ColdBatchLocations,
         ConsensusBlockNumbersByDigest, ConsensusBlocks, ConsensusBlocksCache, EpochCerts,
         EpochRecords, EpochRecordsIndex, EpochTransitionCheckpoints, NodeIdentity,
+        PendingEpochRecord,
     },
     ColdConfig, ColdStore,
 };
@@ -71,8 +72,10 @@ pub enum TableStatus {
 /// the tip's number. Used to tell "not reached yet" apart from "should be there but is not".
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct Position {
-    /// Highest epoch with a record on disk.
+    /// Highest epoch with a certified record on disk.
     pub latest_epoch_record: Option<Epoch>,
+    /// Highest epoch with a pending record: closed by this node, certificate not yet on disk.
+    pub latest_pending_record: Option<Epoch>,
     /// Epoch of the latest canonical consensus header.
     pub current_epoch: Option<Epoch>,
     /// Number of the latest canonical consensus header.
@@ -83,9 +86,11 @@ impl Position {
     /// Whether the node has closed epoch `epoch`, so its record is expected on disk.
     ///
     /// An epoch's record is written when the epoch ends, so it is expected once the node either
-    /// holds that record (or a later one) or its consensus tip is already in a later epoch.
+    /// holds that record (certified or pending, or a later one) or its consensus tip is already
+    /// in a later epoch.
     pub fn has_closed_epoch(&self, epoch: Epoch) -> bool {
         self.latest_epoch_record.is_some_and(|latest| latest >= epoch)
+            || self.latest_pending_record.is_some_and(|latest| latest >= epoch)
             || self.current_epoch.is_some_and(|current| current > epoch)
     }
 
@@ -339,6 +344,31 @@ impl NodeDb {
         self.get::<EpochRecordsIndex>(&digest)
     }
 
+    /// The pending record for `epoch`: the record this node built when it closed the epoch,
+    /// saved before certification and removed in the same transaction as the certificate. A row
+    /// therefore means "closed here, certificate not on disk yet"; one that survives next to a
+    /// certified record is a leftover the node's sweep should have cleared.
+    pub fn pending_epoch(&self, epoch: Epoch) -> eyre::Result<Option<EpochRecord>> {
+        self.get::<PendingEpochRecord>(&epoch)
+    }
+
+    /// Every epoch with a pending record, ascending. Keys only; values are not decoded.
+    pub fn pending_epochs(&self) -> eyre::Result<Vec<Epoch>> {
+        if !self.table_present::<PendingEpochRecord>()? {
+            return Ok(Vec::new());
+        }
+        let mut epochs: Vec<Epoch> = self
+            .db
+            .raw_iter::<PendingEpochRecord>()
+            .map(|(k, _)| {
+                try_decode_key::<Epoch>(&k)
+                    .map_err(|e| eyre!("{}: decode a pending epoch record key: {e}", self.label))
+            })
+            .collect::<eyre::Result<_>>()?;
+        epochs.sort_unstable();
+        Ok(epochs)
+    }
+
     /// Leftover transition checkpoint for `epoch` (present only after an interrupted transition).
     pub fn checkpoint(&self, epoch: Epoch) -> eyre::Result<Option<EpochTransitionCheckpoint>> {
         self.get::<EpochTransitionCheckpoints>(&epoch)
@@ -456,6 +486,7 @@ impl NodeDb {
     pub fn position(&self) -> eyre::Result<Position> {
         Ok(Position {
             latest_epoch_record: self.latest_epoch_record()?,
+            latest_pending_record: self.pending_epochs()?.last().copied(),
             current_epoch: self.current_epoch()?,
             consensus_tip: self.latest_consensus_number()?,
         })

@@ -29,6 +29,9 @@ pub enum EpochStatus {
     Certified,
     /// Record present; certificate missing or invalid.
     RecordOnly,
+    /// No certified record, but the node closed the epoch and holds the record it built, waiting
+    /// for the certificate (the `pending_epoch_record` table).
+    Pending,
     /// No record although the node has closed this epoch: a real gap.
     Missing,
     /// The node has not closed this epoch yet, so no record is expected.
@@ -42,6 +45,7 @@ impl std::fmt::Display for EpochStatus {
         f.write_str(match self {
             Self::Certified => "record+cert",
             Self::RecordOnly => "record-only",
+            Self::Pending => "pending",
             Self::Missing => "missing",
             Self::NotReached => "not-reached",
             Self::TableAbsent => "table-absent",
@@ -84,8 +88,43 @@ pub struct EpochNodeView {
     pub record: Option<RecordView>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cert: Option<EpochCertView>,
+    /// The record this node built at the epoch's close, still awaiting its certificate.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pending: Option<PendingView>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub checkpoint: Option<CheckpointView>,
+}
+
+/// A row of the `pending_epoch_record` table: the record the node built when it closed the
+/// epoch, kept until the certificate lands (the certificate's write removes it).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PendingView {
+    pub digest: String,
+    pub parent_hash: String,
+    pub parent_consensus: String,
+    pub committee_size: usize,
+    pub next_committee_size: usize,
+    /// A certified record for the epoch exists too. The certificate's write clears the pending
+    /// row in the same transaction, so this row should not be here; the node's startup sweep
+    /// removes such leftovers.
+    pub stale: bool,
+    /// When stale: whether the leftover row is the same record as the certified one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub matches_record: Option<bool>,
+}
+
+impl PendingView {
+    fn of(pending: &EpochRecord, certified: Option<&EpochRecord>) -> Self {
+        Self {
+            digest: b256(&pending.digest()),
+            parent_hash: b256(&pending.parent_hash),
+            parent_consensus: b256(&pending.parent_consensus),
+            committee_size: pending.committee.len(),
+            next_committee_size: pending.next_committee.len(),
+            stale: certified.is_some(),
+            matches_record: certified.map(|c| c.digest() == pending.digest()),
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -210,6 +249,7 @@ pub fn epoch(nodes: &[NodeDb], epoch: Epoch, verbose: bool) -> eyre::Result<Epoc
             position,
             record: None,
             cert: None,
+            pending: None,
             checkpoint: node.checkpoint(epoch)?.as_ref().map(CheckpointView::of),
         };
         if node.epoch_table_absent()? {
@@ -217,17 +257,23 @@ pub fn epoch(nodes: &[NodeDb], epoch: Epoch, verbose: bool) -> eyre::Result<Epoc
             views.push(view);
             continue;
         }
-        if let Some((record, cert)) = node.epoch(epoch)? {
+        let certified = node.epoch(epoch)?;
+        let pending = node.pending_epoch(epoch)?;
+        if let Some((record, cert)) = &certified {
             digests.insert(record.digest());
             let prev = if epoch == 0 { None } else { node.epoch(epoch - 1)?.map(|(r, _)| r) };
-            view.record = Some(record_view(node, &record, prev.as_ref(), verbose)?);
-            let cert = cert.map(|c| EpochCertView::of(&record, &c));
+            view.record = Some(record_view(node, record, prev.as_ref(), verbose)?);
+            let cert = cert.as_ref().map(|c| EpochCertView::of(record, c));
             view.status = match &cert {
                 Some(c) if c.valid => EpochStatus::Certified,
                 _ => EpochStatus::RecordOnly,
             };
             view.cert = cert;
+        } else if pending.is_some() {
+            view.status = EpochStatus::Pending;
         }
+        view.pending =
+            pending.as_ref().map(|p| PendingView::of(p, certified.as_ref().map(|(r, _)| r)));
         views.push(view);
     }
 
@@ -247,8 +293,11 @@ fn epoch_verdict(epoch: Epoch, views: &[EpochNodeView], distinct_digests: usize)
         0
     };
     let record_only = count(EpochStatus::RecordOnly) - genesis;
+    let pending = count(EpochStatus::Pending);
     let not_reached = count(EpochStatus::NotReached);
     let missing = count(EpochStatus::Missing) + count(EpochStatus::TableAbsent);
+    let stale_pending =
+        views.iter().filter(|v| v.pending.as_ref().is_some_and(|p| p.stale)).count();
 
     let code = if distinct_digests > 1 {
         code::DIVERGENT
@@ -267,11 +316,14 @@ fn epoch_verdict(epoch: Epoch, views: &[EpochNodeView], distinct_digests: usize)
         .count("certified", certified)
         .count("genesis", genesis)
         .count("record_only", record_only)
+        .count("pending", pending)
         .count("missing", missing)
         .count("not_reached", not_reached)
+        .count("stale_pending", stale_pending)
 }
 
-/// `epoch 1, record 0`: the epoch a node is in and its latest epoch record.
+/// `epoch 1, record 0`: the epoch a node is in and its latest epoch record (and its latest
+/// pending record, when it holds one).
 pub fn describe_position(p: Position) -> String {
     let current =
         p.current_epoch.map(|e| format!("epoch {e}")).unwrap_or_else(|| "no headers".to_owned());
@@ -279,7 +331,10 @@ pub fn describe_position(p: Position) -> String {
         .latest_epoch_record
         .map(|e| format!("record {e}"))
         .unwrap_or_else(|| "no records".to_owned());
-    format!("{current}, {latest}")
+    match p.latest_pending_record {
+        Some(e) => format!("{current}, {latest}, pending {e}"),
+        None => format!("{current}, {latest}"),
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -307,6 +362,8 @@ pub struct EpochsReport {
 pub enum Cell {
     RecordAndCert,
     RecordOnly,
+    /// No certified record; the node closed the epoch and holds its pending record.
+    Pending,
     /// No record although the node has closed the epoch.
     Missing,
     /// The node has not closed the epoch yet.
@@ -320,6 +377,7 @@ impl Cell {
         match self {
             Self::RecordAndCert => "RC",
             Self::RecordOnly => "R-",
+            Self::Pending => "P-",
             Self::Missing => "--",
             Self::NotReached => "..",
             Self::TableAbsent => "??",
@@ -389,6 +447,7 @@ pub fn epochs(nodes: &[NodeDb], range: Option<(Epoch, Epoch)>) -> eyre::Result<E
                         Cell::RecordOnly
                     }
                 }
+                None if node.pending_epoch(epoch)?.is_some() => Cell::Pending,
                 None if position.has_closed_epoch(epoch) => Cell::Missing,
                 None => Cell::NotReached,
             });
@@ -442,8 +501,10 @@ fn row_status(epoch: Epoch, cells: &[Cell], distinct_digests: usize) -> &'static
     if distinct_digests > 1 {
         return "divergent";
     }
-    let with_record =
-        cells.iter().filter(|c| matches!(c, Cell::RecordAndCert | Cell::RecordOnly)).count();
+    let with_record = cells
+        .iter()
+        .filter(|c| matches!(c, Cell::RecordAndCert | Cell::RecordOnly | Cell::Pending))
+        .count();
     if with_record == 0 {
         // a never-created table is an anomaly, not a position: only "not reached" cells make
         // the row not reached
@@ -485,10 +546,12 @@ pub struct EpochCheckRecord {
     pub epoch: Epoch,
     pub digest: String,
     pub parent_hash: String,
-    /// `certified`, `record-only`, `INVALID` (certificate present but does not verify), or
-    /// `genesis` (epoch 0's unsigned record).
+    /// `certified`, `record-only`, `INVALID` (certificate present but does not verify),
+    /// `genesis` (epoch 0's unsigned record), or `pending` (only the record the node built at
+    /// the close, no certificate yet).
     pub cert: &'static str,
-    /// The digest index maps this record's digest back to its epoch.
+    /// The digest index maps this record's digest back to its epoch. A pending record is not
+    /// indexed until it is certified, so it reads `false` there.
     pub index_ok: bool,
     pub link: LinkCheck,
     /// Whether the previous record's `next_committee` equals this record's `committee`.
@@ -510,6 +573,12 @@ pub struct EpochCheckNodeView {
     pub broken_links: Vec<BrokenLink>,
     /// Records with no certificate (epoch 0 excluded: it is an unsigned dummy).
     pub uncertified: Vec<Epoch>,
+    /// Epochs the node closed and holds a pending record for, still awaiting the certificate
+    /// (every such epoch on the node, in or out of the checked range).
+    pub pending: Vec<Epoch>,
+    /// Pending rows that survive next to a certified record: leftovers the certificate's write
+    /// should have removed.
+    pub stale_pending: Vec<Epoch>,
     /// Records whose certificate is present but does not verify.
     pub invalid_certs: Vec<Epoch>,
     /// Records where the previous record's `next_committee` differs from this `committee`.
@@ -525,6 +594,18 @@ pub struct EpochCheckNodeView {
     /// Every record in range (`-v`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub records: Option<Vec<EpochCheckRecord>>,
+}
+
+/// `record`'s `parent_hash` against the previous epoch's record, when one is at hand.
+fn link_check(epoch: Epoch, prev: Option<&EpochRecord>, record: &EpochRecord) -> LinkCheck {
+    if epoch == 0 {
+        return LinkCheck::Genesis;
+    }
+    match prev {
+        None => LinkCheck::PrevMissing,
+        Some(p) if p.digest() == record.parent_hash => LinkCheck::Ok,
+        Some(p) => LinkCheck::Broken { expected: b256(&p.digest()) },
+    }
 }
 
 fn cert_state(record: &EpochRecord, cert: Option<&EpochCertificate>) -> &'static str {
@@ -548,6 +629,7 @@ pub fn epoch_check(
 
     for node in nodes {
         let keys = node.epoch_numbers()?;
+        let pending = node.pending_epochs()?;
         let mut view = EpochCheckNodeView {
             node: node.label.clone(),
             from: None,
@@ -557,6 +639,8 @@ pub fn epoch_check(
             gaps: Vec::new(),
             broken_links: Vec::new(),
             uncertified: Vec::new(),
+            stale_pending: pending.iter().copied().filter(|e| keys.contains(e)).collect(),
+            pending,
             invalid_certs: Vec::new(),
             committee_handoff_mismatch: Vec::new(),
             index_mismatch: Vec::new(),
@@ -565,7 +649,11 @@ pub fn epoch_check(
             note: None,
             records: verbose.then(Vec::new),
         };
-        let (Some(&first), Some(&last)) = (keys.first(), keys.last()) else {
+        // the default range spans certified and pending records alike: a pending epoch is one
+        // the node closed, so it belongs to the chain being checked
+        let first = keys.first().copied().into_iter().chain(view.pending.first().copied()).min();
+        let last = keys.last().copied().into_iter().chain(view.pending.last().copied()).max();
+        let (Some(first), Some(last)) = (first, last) else {
             // a node past epoch 0 should hold records; one still in epoch 0 need not
             view.records_missing = node.position()?.has_closed_epoch(0);
             view.note = Some(if view.records_missing {
@@ -600,8 +688,33 @@ pub fn epoch_check(
             if from == 0 { None } else { node.epoch(from - 1)?.map(|(r, _)| r) };
         for epoch in from..=to {
             let Some((record, cert)) = node.epoch(epoch)? else {
-                view.gaps.push(epoch);
-                prev = None;
+                // a pending record is the record this node built for the epoch: not a gap, and
+                // the next record's parent_hash is expected to chain to it
+                match node.pending_epoch(epoch)? {
+                    Some(pending) => {
+                        if let Some(records) = &mut view.records {
+                            records.push(EpochCheckRecord {
+                                epoch,
+                                digest: b256(&pending.digest()),
+                                parent_hash: b256(&pending.parent_hash),
+                                cert: "pending",
+                                index_ok: false,
+                                link: link_check(epoch, prev.as_ref(), &pending),
+                                committee_handoff_ok: (epoch > 0)
+                                    .then(|| {
+                                        prev.as_ref().map(|p| p.next_committee == pending.committee)
+                                    })
+                                    .flatten(),
+                                committee_size: pending.committee.len(),
+                            });
+                        }
+                        prev = Some(pending);
+                    }
+                    None => {
+                        view.gaps.push(epoch);
+                        prev = None;
+                    }
+                }
                 continue;
             };
             view.checked += 1;
@@ -618,15 +731,7 @@ pub fn epoch_check(
             if !index_ok {
                 view.index_mismatch.push(epoch);
             }
-            let link = if epoch == 0 {
-                LinkCheck::Genesis
-            } else {
-                match &prev {
-                    None => LinkCheck::PrevMissing,
-                    Some(p) if p.digest() == record.parent_hash => LinkCheck::Ok,
-                    Some(p) => LinkCheck::Broken { expected: b256(&p.digest()) },
-                }
-            };
+            let link = link_check(epoch, prev.as_ref(), &record);
             if let LinkCheck::Broken { expected } = &link {
                 view.broken_links.push(BrokenLink {
                     epoch,
@@ -657,6 +762,7 @@ pub fn epoch_check(
         view.ok = view.gaps.is_empty()
             && view.broken_links.is_empty()
             && view.uncertified.is_empty()
+            && view.pending.is_empty()
             && view.invalid_certs.is_empty()
             && view.committee_handoff_mismatch.is_empty()
             && view.index_mismatch.is_empty()
@@ -671,6 +777,8 @@ pub fn epoch_check(
     let gaps = sum(|v| v.gaps.len());
     let broken = sum(|v| v.broken_links.len());
     let uncertified = sum(|v| v.uncertified.len());
+    let pending = sum(|v| v.pending.len());
+    let stale_pending = sum(|v| v.stale_pending.len());
     let invalid = sum(|v| v.invalid_certs.len());
     let handoff = sum(|v| v.committee_handoff_mismatch.len());
     let index = sum(|v| v.index_mismatch.len());
@@ -682,6 +790,7 @@ pub fn epoch_check(
                 .iter()
                 .chain(v.broken_links.iter().map(|b| &b.epoch))
                 .chain(&v.uncertified)
+                .chain(&v.pending)
                 .chain(&v.invalid_certs)
                 .chain(&v.committee_handoff_mismatch)
                 .chain(&v.index_mismatch)
@@ -689,11 +798,12 @@ pub fn epoch_check(
         .min()
         .copied();
 
+    // a pending epoch is an uncertified one: the chain is not complete until its cert lands
     let code = if !divergent.is_empty() {
         code::DIVERGENT
-    } else if views.iter().all(|v| v.checked == 0) {
+    } else if views.iter().all(|v| v.checked == 0) && pending == 0 {
         code::EMPTY
-    } else if gaps + broken + uncertified + invalid + handoff + index > 0 {
+    } else if gaps + broken + uncertified + pending + invalid + handoff + index > 0 {
         code::BROKEN
     } else if no_records > 0 {
         code::PARTIAL
@@ -707,10 +817,12 @@ pub fn epoch_check(
         .count("gaps", gaps)
         .count("broken", broken)
         .count("uncertified", uncertified)
+        .count("pending", pending)
         .count("invalid", invalid)
         .count("handoff", handoff)
         .count("index", index)
-        .count("no_records", no_records);
+        .count("no_records", no_records)
+        .count("stale_pending", stale_pending);
     verdict = match code {
         code::DIVERGENT => verdict.opt("first", divergent.first().copied()),
         code::BROKEN => verdict.opt("first", first_issue),
