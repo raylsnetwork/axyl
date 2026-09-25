@@ -80,8 +80,8 @@ mod schedule {
     #[test]
     fn local_network_first_four_hardforks_active_at_block_0() {
         let hardforks = RaylsChainHardforks::local();
-        // Only first 4 hardforks are active for local network (RlsStorage, Tokenomics, Uups are
-        // Never)
+        // First four forks in declaration order are genesis-active on local (9 of 15 are;
+        // this pins the leading four).
         let active_forks = [
             RaylsHardFork::Eip1559,
             RaylsHardFork::BatchDigestV2,
@@ -98,9 +98,10 @@ mod schedule {
     }
 
     #[test]
-    fn local_network_last_three_hardforks_never_activate() {
+    fn local_network_migration_forks_never_activate() {
         let hardforks = RaylsChainHardforks::local();
-        // Last 3 hardforks are set to Never for local network
+        // Three migration-only forks that are Never on local (local genesis already carries
+        // the migrated state); declaration indices 4-6, not the last three.
         let never_forks =
             [RaylsHardFork::RlsStorage, RaylsHardFork::Tokenomics, RaylsHardFork::Uups];
         for fork in never_forks {
