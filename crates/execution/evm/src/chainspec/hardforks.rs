@@ -5,9 +5,7 @@ use std::sync::Arc;
 use rayls_infrastructure_types::RaylsNetwork;
 use reth_chainspec::ForkCondition;
 
-use super::fork::RaylsHardFork;
-use super::schedule::ScheduledFork;
-use super::spec::RaylsChainSpec;
+use super::{fork::RaylsHardFork, schedule::ScheduledFork, spec::RaylsChainSpec};
 
 /// Sorted hardfork schedule usable without a full [`RaylsChainSpec`].
 #[derive(Debug, Clone)]
@@ -20,6 +18,11 @@ impl RaylsChainHardforks {
     pub fn new(forks: impl IntoIterator<Item = ScheduledFork>) -> Self {
         let mut forks = forks.into_iter().collect::<Vec<_>>();
         forks.sort();
+        debug_assert!(
+            forks.windows(2).all(|w| w[0].fork != w[1].fork),
+            "RaylsChainHardforks: schedule contains duplicate fork {:?}",
+            forks.windows(2).find(|w| w[0].fork == w[1].fork).map(|w| w[0].fork)
+        );
         Self { forks }
     }
 
