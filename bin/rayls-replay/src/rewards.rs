@@ -380,9 +380,60 @@ impl<DB: Database> RewardsBackend for BoundedHybridWalker<DB> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rand::{rngs::StdRng, SeedableRng};
+    use rayls_infrastructure_storage::mem_db::MemDatabase;
+    use rayls_infrastructure_types::{
+        BlsKeypair, Certificate, CommittedSubDag, ConsensusHeader, CommitteeBuilder, Header,
+        ReputationScores,
+    };
+    use rayls_middleware_rewards::ConsensusRewardsCounter;
 
     fn addr(n: u8) -> Address {
         Address::with_last_byte(n)
+    }
+
+    /// Build an `n`-authority committee with real BLS-derived identifiers
+    /// (`Committee::authority` resolves by id hash, so dummy ids never match).
+    /// Returns the committee plus each authority's id and execution address,
+    /// in the order added (address = `addr(i + 1)`).
+    fn test_committee(n: u8) -> (Committee, Vec<(AuthorityIdentifier, Address)>) {
+        let mut rng = StdRng::seed_from_u64(0x633);
+        let mut builder = CommitteeBuilder::new(0);
+        let mut ids = Vec::with_capacity(n as usize);
+        for i in 0..n {
+            let keypair = BlsKeypair::generate(&mut rng);
+            let address = addr(i + 1);
+            builder.add_authority(*keypair.public(), 1, address);
+            ids.push((AuthorityIdentifier::from(*keypair.public()), address));
+        }
+        (builder.build(), ids)
+    }
+
+    /// One `ConsensusBlocks` row: `leader_author` leads `leader_round` of
+    /// `epoch`, and every id in `participants` holds a certificate in the
+    /// committed sub-dag (participants never include the leader implicitly —
+    /// pass it explicitly to credit it with participation).
+    fn insert(
+        db: &MemDatabase,
+        number: u64,
+        leader_author: &AuthorityIdentifier,
+        leader_round: u32,
+        epoch: u32,
+        participants: &[&AuthorityIdentifier],
+    ) {
+        let cert = |author: &AuthorityIdentifier, round: u32| {
+            let mut c = Certificate::default();
+            c.header = Header { author: author.clone(), round, epoch, ..Default::default() };
+            c
+        };
+        let leader = cert(leader_author, leader_round);
+        let certificates = participants
+            .iter()
+            .map(|author| cert(author, leader_round.saturating_sub(1)))
+            .collect();
+        let sub_dag = CommittedSubDag::new(certificates, leader, 0, ReputationScores::default(), None);
+        let row = ConsensusHeader { sub_dag, number, ..Default::default() };
+        db.insert::<ConsensusBlocks>(&number, &row).expect("seed row");
     }
 
     /// Stand-in for the consensus-DB walk: serves a fixed hybrid tally.
@@ -491,5 +542,332 @@ mod tests {
         store.insert(1, [(addr(1), 1)].into_iter().collect());
         store.insert(1, [(addr(1), 5)].into_iter().collect());
         assert_eq!(backend.tally(1, 0).unwrap().get(&addr(1)), Some(&5));
+    }
+
+    /// The bounded walker must credit exactly like the live node's walker
+    /// (`ConsensusRewardsCounter::tally_hybrid`) on identical rows: that is the
+    /// design contract behind replacing the reverse full-tail scan with the
+    /// forward cursor-bounded walk.
+    #[test]
+    fn bounded_hybrid_matches_live_walker_per_epoch() {
+        let (committee, ids) = test_committee(3);
+        let (id_a, _) = &ids[0];
+        let (id_b, addr_b) = &ids[1]; // participates in every round, never leads
+        let (id_c, _) = &ids[2];
+
+        let db = MemDatabase::default();
+        insert(&db, 0, id_a, 0, 0, &[]); // genesis round 0: never credited
+        // epoch 1: rounds 1..=4
+        insert(&db, 1, id_a, 1, 1, &[id_a, id_b, id_c]);
+        insert(&db, 2, id_c, 2, 1, &[id_b]);
+        insert(&db, 3, id_a, 3, 1, &[id_a, id_b, id_c]);
+        insert(&db, 4, id_c, 4, 1, &[id_b]);
+        // epoch 2: rounds 1..=3
+        insert(&db, 5, id_c, 1, 2, &[id_a, id_b]);
+        insert(&db, 6, id_a, 2, 2, &[id_b]);
+        insert(&db, 7, id_c, 3, 2, &[id_a, id_b, id_c]);
+
+        let live = ConsensusRewardsCounter::new(db.clone());
+        let bounded = BoundedHybridWalker::new(db.clone());
+        live.set_committee(committee.clone());
+        bounded.set_committee(committee);
+
+        // Replay closes epochs ascending; each close must equal the live walk.
+        let e1 = bounded.tally_hybrid(1, u32::MAX).unwrap();
+        assert_eq!(e1, live.tally_hybrid(1, u32::MAX).unwrap(), "epoch 1 must match the live walker");
+        let e2 = bounded.tally_hybrid(2, u32::MAX).unwrap();
+        assert_eq!(e2, live.tally_hybrid(2, u32::MAX).unwrap(), "epoch 2 must match the live walker");
+
+        // Ground truth (guards against both walkers sharing a bug).
+        assert_eq!(e1.total_rounds, 4);
+        assert_eq!(e1.per_address[&addr(1)], ValidatorRoundTally { participation_rounds: 2, leader_rounds: 2 });
+        assert_eq!(e1.per_address[addr_b], ValidatorRoundTally { participation_rounds: 4, leader_rounds: 0 });
+        assert_eq!(e1.per_address[&addr(3)], ValidatorRoundTally { participation_rounds: 2, leader_rounds: 2 });
+        assert_eq!(e2.total_rounds, 3);
+        assert_eq!(e2.per_address[&addr(1)], ValidatorRoundTally { participation_rounds: 2, leader_rounds: 1 });
+        assert_eq!(e2.per_address[addr_b], ValidatorRoundTally { participation_rounds: 3, leader_rounds: 0 });
+        // id_c leads rounds 1 and 3 but its certificate is only included in
+        // round 3's sub-dag (round 1's participants are a and b).
+        assert_eq!(e2.per_address[&addr(3)], ValidatorRoundTally { participation_rounds: 1, leader_rounds: 2 });
+    }
+
+    #[test]
+    fn bounded_hybrid_excludes_genesis_and_unexecuted_rounds() {
+        let (committee, ids) = test_committee(2);
+        let (id_a, addr_a) = &ids[0];
+        let (id_b, addr_b) = &ids[1];
+
+        let db = MemDatabase::default();
+        insert(&db, 0, id_a, 0, 0, &[]); // genesis: leader_round == 0
+        insert(&db, 1, id_b, 1, 0, &[id_a, id_b]);
+        insert(&db, 2, id_a, 100, 0, &[id_a, id_b]); // 100 > last_executed_round 10
+
+        let walker = BoundedHybridWalker::new(db);
+        walker.set_committee(committee);
+        let tally = walker.tally_hybrid(0, 10).unwrap();
+
+        assert_eq!(tally.total_rounds, 1);
+        assert_eq!(tally.per_address[addr_a], ValidatorRoundTally { participation_rounds: 1, leader_rounds: 0 });
+        assert_eq!(tally.per_address[addr_b], ValidatorRoundTally { participation_rounds: 1, leader_rounds: 1 });
+        assert_eq!(tally.per_address.len(), 2);
+    }
+
+    /// Two distinct protocol keys resolving to one execution address must earn
+    /// at most one participation credit per round: the walk dedupes on the
+    /// resolved address, exactly like the live walker.
+    #[test]
+    fn bounded_hybrid_dedupes_participation_by_execution_address() {
+        let mut rng = StdRng::seed_from_u64(0x634);
+        let (key1, key2, key3) =
+            (BlsKeypair::generate(&mut rng), BlsKeypair::generate(&mut rng), BlsKeypair::generate(&mut rng));
+        let id_1 = AuthorityIdentifier::from(*key1.public());
+        let id_2 = AuthorityIdentifier::from(*key2.public());
+        let id_3 = AuthorityIdentifier::from(*key3.public());
+        let shared = addr(1);
+        let other = addr(2);
+
+        let mut builder = CommitteeBuilder::new(0);
+        builder.add_authority(*key1.public(), 1, shared);
+        builder.add_authority(*key2.public(), 1, shared);
+        builder.add_authority(*key3.public(), 1, other);
+        let committee = builder.build();
+
+        let db = MemDatabase::default();
+        insert(&db, 0, &id_3, 1, 0, &[&id_1, &id_2]); // both shared-address ids in one sub-dag
+
+        let walker = BoundedHybridWalker::new(db);
+        walker.set_committee(committee);
+        let tally = walker.tally_hybrid(0, u32::MAX).unwrap();
+
+        assert_eq!(tally.total_rounds, 1);
+        assert_eq!(tally.per_address[&shared], ValidatorRoundTally { participation_rounds: 1, leader_rounds: 0 });
+        assert_eq!(tally.per_address[&other], ValidatorRoundTally { participation_rounds: 0, leader_rounds: 1 });
+    }
+
+    /// The table has epochs 0 and 2; closing absent epoch 1 must position at the
+    /// first epoch-2 row and tally empty — and the parked cursor must be exactly
+    /// where the epoch-2 close resumes.
+    #[test]
+    fn positioning_epoch_absent_from_table_yields_empty_tally() {
+        let (committee, ids) = test_committee(2);
+        let (id_a, addr_a) = &ids[0];
+        let (id_b, addr_b) = &ids[1];
+
+        let db = MemDatabase::default();
+        insert(&db, 0, id_a, 1, 0, &[id_a]);
+        insert(&db, 1, id_b, 1, 2, &[id_b]);
+        insert(&db, 2, id_a, 2, 2, &[id_a]);
+
+        let walker = BoundedHybridWalker::new(db);
+        walker.set_committee(committee);
+
+        let missing = walker.tally_hybrid(1, u32::MAX).unwrap();
+        assert_eq!(missing, HybridEpochTally::default());
+        assert_eq!(*walker.cursor.lock(), Some(1), "cursor parks at the first epoch-2 row");
+
+        let next = walker.tally_hybrid(2, u32::MAX).unwrap();
+        assert_eq!(next.total_rounds, 2);
+        assert_eq!(next.per_address[addr_a], ValidatorRoundTally { participation_rounds: 1, leader_rounds: 1 });
+        assert_eq!(next.per_address[addr_b], ValidatorRoundTally { participation_rounds: 1, leader_rounds: 1 });
+    }
+
+    /// Every row older than the target epoch: positioning saturates past the
+    /// last key, the walk body never runs, and the tally is empty.
+    #[test]
+    fn positioning_all_rows_before_epoch_yields_empty_tally() {
+        let (committee, ids) = test_committee(2);
+        let (id_a, _) = &ids[0];
+
+        let db = MemDatabase::default();
+        for round in 1..=3u32 {
+            insert(&db, (round - 1) as u64, id_a, round, 0, &[id_a]);
+        }
+
+        let walker = BoundedHybridWalker::new(db);
+        walker.set_committee(committee);
+        let tally = walker.tally_hybrid(5, u32::MAX).unwrap();
+        assert_eq!(tally, HybridEpochTally::default());
+        assert_eq!(*walker.cursor.lock(), Some(3), "cursor parks past the last key");
+    }
+
+    /// The consensus table is dense in production, but both `epoch_at` and the
+    /// walk advance over missing keys; a gap mid-epoch must still credit every
+    /// present row exactly once.
+    #[test]
+    fn positioning_walks_past_key_gaps() {
+        let (committee, ids) = test_committee(2);
+        let (id_a, addr_a) = &ids[0];
+        let (id_b, addr_b) = &ids[1];
+
+        let db = MemDatabase::default();
+        insert(&db, 0, id_a, 1, 0, &[id_a]); // keys 1,2 absent
+        insert(&db, 3, id_b, 2, 0, &[id_b]); // key 4 absent
+        insert(&db, 5, id_a, 3, 0, &[id_a, id_b]);
+
+        let walker = BoundedHybridWalker::new(db);
+        walker.set_committee(committee);
+        let tally = walker.tally_hybrid(0, u32::MAX).unwrap();
+
+        assert_eq!(tally.total_rounds, 3);
+        assert_eq!(tally.per_address[addr_a].leader_rounds, 2);
+        assert_eq!(tally.per_address[addr_b].leader_rounds, 1);
+        assert_eq!(tally.per_address[addr_a].participation_rounds, 2);
+        assert_eq!(tally.per_address[addr_b].participation_rounds, 2);
+    }
+
+    /// A snapshot table need not start at key 0; positioning must use the
+    /// table's actual first key, not assume genesis is present.
+    #[test]
+    fn positioning_first_key_not_zero() {
+        let (committee, ids) = test_committee(2);
+        let (id_a, addr_a) = &ids[0];
+
+        let db = MemDatabase::default();
+        insert(&db, 10, id_a, 1, 1, &[id_a]);
+        insert(&db, 11, id_a, 2, 1, &[id_a]);
+
+        let walker = BoundedHybridWalker::new(db);
+        walker.set_committee(committee);
+        let tally = walker.tally_hybrid(1, u32::MAX).unwrap();
+
+        assert_eq!(tally.total_rounds, 2);
+        assert_eq!(tally.per_address[addr_a].leader_rounds, 2);
+    }
+
+    /// Ascending closes: the second tally resumes at the parked cursor and reads
+    /// only the next epoch's rows. Re-tallying an already-consumed epoch in the
+    /// same process reads nothing (each replay run builds a fresh walker, so this
+    /// is not a replay path — it pins the cursor semantics).
+    #[test]
+    fn cursor_advances_ascending_and_repeat_tally_is_empty() {
+        let (committee, ids) = test_committee(2);
+        let (id_a, _) = &ids[0];
+        let (id_b, _) = &ids[1];
+
+        let db = MemDatabase::default();
+        insert(&db, 0, id_a, 1, 0, &[id_a]);
+        insert(&db, 1, id_a, 1, 1, &[id_a]);
+        insert(&db, 2, id_b, 2, 1, &[id_b]);
+        insert(&db, 3, id_a, 1, 2, &[id_a]);
+        insert(&db, 4, id_b, 2, 2, &[id_b]);
+
+        let walker = BoundedHybridWalker::new(db);
+        walker.set_committee(committee);
+
+        let e1 = walker.tally_hybrid(1, u32::MAX).unwrap();
+        assert_eq!(e1.total_rounds, 2);
+        assert_eq!(*walker.cursor.lock(), Some(3), "cursor parks at the first epoch-2 row");
+
+        let repeat = walker.tally_hybrid(1, u32::MAX).unwrap();
+        assert_eq!(repeat, HybridEpochTally::default());
+
+        let e2 = walker.tally_hybrid(2, u32::MAX).unwrap();
+        assert_eq!(e2.total_rounds, 2);
+        assert_eq!(*walker.cursor.lock(), Some(5));
+    }
+
+    /// Leader epochs are non-decreasing in production, so a same-epoch row after
+    /// `BOUNDARY_LOOKAHEAD` next-epoch rows is corrupt data: the walk must stop
+    /// at the cap (dropping the trailing row) rather than loop, and log a warn.
+    #[test]
+    fn lookahead_cap_stops_past_a_corrupted_boundary() {
+        let (committee, ids) = test_committee(2);
+        let (id_a, addr_a) = &ids[0];
+        let (id_b, _) = &ids[1];
+
+        let db = MemDatabase::default();
+        insert(&db, 0, id_a, 1, 1, &[id_a]);
+        insert(&db, 1, id_a, 2, 1, &[id_a]);
+        for i in 0..=BOUNDARY_LOOKAHEAD {
+            insert(&db, 2 + i as u64, id_b, 1 + i, 2, &[id_b]);
+        }
+        insert(&db, 2 + BOUNDARY_LOOKAHEAD as u64 + 1, id_a, 3, 1, &[id_a]);
+
+        let walker = BoundedHybridWalker::new(db);
+        walker.set_committee(committee);
+        let tally = walker.tally_hybrid(1, u32::MAX).unwrap();
+
+        assert_eq!(tally.total_rounds, 2, "rows past the lookahead cap are not credited");
+        assert_eq!(tally.per_address[addr_a].leader_rounds, 2);
+    }
+
+    #[test]
+    fn bounded_hybrid_requires_committee() {
+        let walker = BoundedHybridWalker::new(MemDatabase::default());
+        let err = walker.tally_hybrid(0, u32::MAX).expect_err("no committee installed");
+        assert!(!err.is_transient());
+        assert!(matches!(err, RewardsError::MissingCommittee { .. }), "{err}");
+    }
+
+    #[test]
+    fn bounded_hybrid_empty_db_yields_default_tally() {
+        let (committee, _) = test_committee(2);
+        let walker = BoundedHybridWalker::new(MemDatabase::default());
+        walker.set_committee(committee);
+        assert_eq!(walker.tally_hybrid(0, u32::MAX).unwrap(), HybridEpochTally::default());
+    }
+
+    #[test]
+    fn bounded_hybrid_legacy_tally_is_unsupported() {
+        let (committee, _) = test_committee(2);
+        let walker = BoundedHybridWalker::new(MemDatabase::default());
+        walker.set_committee(committee);
+        let err = walker.tally(0, u32::MAX).expect_err("legacy tally is withdrawal-backed");
+        assert!(!err.is_transient());
+        assert!(err.to_string().contains("withdrawal-backed"), "{err}");
+    }
+
+    /// End-to-end wiring as in `main`: the walker attaches to the
+    /// `HybridTallySource` before any committee install, then the committee
+    /// reaches it through `SnapshotRewardsBackend::set_committee`. The walk
+    /// result is returned only when it matches the committed withdrawals.
+    #[test]
+    fn backend_serves_hybrid_tally_from_bounded_walker() {
+        let (committee, ids) = test_committee(2);
+        let (id_a, addr_a) = &ids[0];
+        let (id_b, addr_b) = &ids[1];
+
+        let db = MemDatabase::default();
+        insert(&db, 0, id_a, 0, 0, &[]);
+        insert(&db, 1, id_b, 1, 1, &[id_a, id_b]);
+        insert(&db, 2, id_a, 2, 1, &[id_a, id_b]);
+
+        let store = SnapshotTallyStore::default();
+        let source = HybridTallySource::default();
+        let walker = BoundedHybridWalker::new(db);
+        assert!(source.attach(RewardsCounter::from_impl(walker)));
+        let backend = SnapshotRewardsBackend::new(store.clone(), source);
+        backend.set_committee(committee);
+
+        store.insert(1, [(*addr_a, 1), (*addr_b, 1)].into_iter().collect());
+        let tally = backend.tally_hybrid(1, u32::MAX).unwrap();
+        assert_eq!(tally.total_rounds, 2);
+        assert_eq!(tally.per_address[addr_a], ValidatorRoundTally { participation_rounds: 2, leader_rounds: 1 });
+        assert_eq!(tally.per_address[addr_b], ValidatorRoundTally { participation_rounds: 2, leader_rounds: 1 });
+    }
+
+    /// Same wiring, but the committed withdrawals credit a round the walk does
+    /// not: the backend must abort (non-transient) instead of diverging.
+    #[test]
+    fn backend_aborts_when_bounded_walker_disagrees_with_withdrawals() {
+        let (committee, ids) = test_committee(2);
+        let (id_a, _) = &ids[0];
+        let (id_b, addr_b) = &ids[1];
+
+        let db = MemDatabase::default();
+        insert(&db, 1, id_b, 1, 1, &[id_a, id_b]);
+        insert(&db, 2, id_b, 2, 1, &[id_a, id_b]); // b leads both rounds
+
+        let store = SnapshotTallyStore::default();
+        let source = HybridTallySource::default();
+        let walker = BoundedHybridWalker::new(db);
+        assert!(source.attach(RewardsCounter::from_impl(walker)));
+        let backend = SnapshotRewardsBackend::new(store.clone(), source);
+        backend.set_committee(committee);
+
+        store.insert(1, [(addr(1), 1), (*addr_b, 2)].into_iter().collect());
+        let err = backend.tally_hybrid(1, u32::MAX).expect_err("walk must not match");
+        assert!(!err.is_transient());
+        assert!(err.to_string().contains("disagrees"), "{err}");
     }
 }
