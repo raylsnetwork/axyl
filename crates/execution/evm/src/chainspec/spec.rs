@@ -22,9 +22,7 @@ use reth_chainspec::{
 };
 use reth_network_peers::NodeRecord;
 
-use super::fork::RaylsHardFork;
-use super::hardforks::RaylsHardforks;
-use super::schedule::ScheduledFork;
+use super::{fork::RaylsHardFork, hardforks::RaylsHardforks, schedule::ScheduledFork};
 
 /// Rayls ChainSpec wrapper with dynamic base fee and custom hardforks.
 #[derive(Debug, Clone)]
@@ -231,9 +229,11 @@ impl EthChainSpec for RaylsChainSpec {
     fn deposit_contract(&self) -> Option<&DepositContract> {
         self.inner.deposit_contract.as_ref()
     }
+
     fn genesis_hash(&self) -> B256 {
         self.inner.genesis_hash()
     }
+
     fn prune_delete_limit(&self) -> usize {
         self.inner.prune_delete_limit
     }
@@ -245,13 +245,17 @@ impl EthChainSpec for RaylsChainSpec {
     fn genesis_header(&self) -> &Self::Header {
         self.inner.genesis_header()
     }
+
     fn genesis(&self) -> &Genesis {
         self.inner.genesis()
     }
+
     fn bootnodes(&self) -> Option<Vec<NodeRecord>> {
         self.inner.bootnodes()
     }
+
     fn is_optimism(&self) -> bool {
+        // Rayls is a standard EVM chain, not on Optimism's OP stack.
         false
     }
 
@@ -262,21 +266,12 @@ impl EthChainSpec for RaylsChainSpec {
     /// Compute next block base fee. Post-fork: per-block EIP-1559 from the parent.
     /// Pre-fork: fixed at `MIN_PROTOCOL_BASE_FEE`.
     fn next_block_base_fee(&self, parent: &Self::Header, _target_timestamp: u64) -> Option<u64> {
-        let next_block = parent.number() + 1;
-        if self.is_eip1559_active_at_block(next_block) {
-            let parent_base_fee = parent.base_fee_per_gas().unwrap_or(self.min_base_fee);
-            Some(
-                calc_next_block_base_fee(
-                    parent.gas_used(),
-                    parent.gas_limit(),
-                    parent_base_fee,
-                    self.base_fee_params,
-                )
-                .max(self.min_base_fee),
-            )
-        } else {
-            Some(MIN_PROTOCOL_BASE_FEE)
-        }
+        Some(self.compute_next_base_fee(
+            parent.gas_used(),
+            parent.gas_limit(),
+            parent.base_fee_per_gas(),
+            parent.number() + 1,
+        ))
     }
 }
 
@@ -292,9 +287,11 @@ impl Hardforks for RaylsChainSpec {
     fn fork_id(&self, head: &Head) -> ForkId {
         self.inner.fork_id(head)
     }
+
     fn latest_fork_id(&self) -> ForkId {
         self.inner.latest_fork_id()
     }
+
     fn fork_filter(&self, head: Head) -> ForkFilter {
         self.inner.fork_filter(head)
     }
