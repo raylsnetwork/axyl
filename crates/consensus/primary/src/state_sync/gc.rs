@@ -15,6 +15,10 @@ use std::sync::{
 use tokio::{sync::watch, time::interval};
 use tracing::{error, warn};
 
+#[cfg(test)]
+#[path = "../tests/gc_tests.rs"]
+mod gc_tests;
+
 /// Long running task that manages the garbage collection events from consensus.
 ///
 /// When the DAG advances the GC round, this task updates the [AtomicRound] and notifies
