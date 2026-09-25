@@ -19,53 +19,18 @@ use gcloud_sdk::{
 use jsonrpsee::{core::client::ClientT, http_client::HttpClientBuilder, rpc_params};
 use k256::{elliptic_curve::sec1::ToEncodedPoint, pkcs8::DecodePublicKey, PublicKey as PubKey};
 use rayls_execution_evm::{reth_env::RethEnv, test_utils::TransactionFactory, RethChainSpec};
-use rayls_execution_rpc::{EngineToPrimary, NodeRole, NodeStatus};
 use rayls_infrastructure_config::{
     fetch_file_content_relative_to_manifest, Config, ConfigFmt, ConfigTrait,
 };
 use rayls_infrastructure_types::{
-    hex, public_key_to_address, sol, test_genesis_yaml, Address, BlockHash, ConsensusHeader,
-    Encodable2718 as _, Epoch, EpochCertificate, EpochRecord, Genesis, GenesisAccount, SolValue,
-    TaskManager, B256, U256,
+    hex, public_key_to_address, sol, test_genesis_yaml, Address, Encodable2718 as _, Genesis,
+    GenesisAccount, SolValue, TaskManager, B256, U256,
 };
 
 use secp256k1::PublicKey;
 use std::{str::FromStr, sync::Arc, time::Duration};
 use tokio::{task::JoinHandle, time::timeout};
 use tracing::{debug, info};
-
-struct EmptyEngToPrimary();
-impl EngineToPrimary for EmptyEngToPrimary {
-    fn get_latest_consensus_block(&self) -> ConsensusHeader {
-        ConsensusHeader::default()
-    }
-    fn consensus_block_by_number(&self, _number: u64) -> Option<ConsensusHeader> {
-        None
-    }
-    fn consensus_block_by_hash(&self, _hash: BlockHash) -> Option<ConsensusHeader> {
-        None
-    }
-
-    fn epoch(
-        &self,
-        _epoch: Option<Epoch>,
-        _hash: Option<BlockHash>,
-    ) -> Option<(EpochRecord, EpochCertificate)> {
-        None
-    }
-
-    fn node_status(&self) -> NodeStatus {
-        NodeStatus {
-            role: NodeRole::Observer,
-            is_caught_up: true,
-            epoch: 0,
-            committed_round: 0,
-            primary_round: 0,
-            gc_round: 0,
-            last_canonical_block: 0,
-        }
-    }
-}
 
 #[ignore = "internal test for devops - credentials required"]
 #[tokio::test]

@@ -59,3 +59,11 @@ pub use reth_chainspec::ForkCondition;
 
 #[cfg(any(feature = "test-utils", test))]
 pub mod test_utils;
+
+/// Anchor for the dev-dependencies that only this crate's own test and bench
+/// targets consume; without it, lib-test builds warn that they are unused.
+#[cfg(test)]
+mod clippy {
+    use criterion as _;
+    use rayls_execution_evm as _;
+}
