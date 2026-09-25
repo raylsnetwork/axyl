@@ -210,7 +210,8 @@ pub struct SyncConfig {
     ///
     /// On the happy path, this duration should never be reached. It is a safety measure for the
     /// node to try and recover after enough parents weren't received for a round within time.
-    pub max_consenus_round_timeout: Duration,
+    #[serde(alias = "max_consenus_round_timeout")]
+    pub max_consensus_round_timeout: Duration,
     /// The maximum number of rounds that a proposed header can be behind the node's local round.
     pub max_proposed_header_age_limit: Round,
     /// The tolerable amount of time to wait if a header is proposed before the current time.
@@ -239,7 +240,7 @@ impl Default for SyncConfig {
             max_skip_rounds_for_missing_certs: 1_000,
             max_db_read_time_for_fetching_certificates: Duration::from_secs(3),
             max_diff_between_external_cert_round_and_highest_local_round: 1_000,
-            max_consenus_round_timeout: Duration::from_secs(30),
+            max_consensus_round_timeout: Duration::from_secs(30),
             max_proposed_header_age_limit: 3,
             max_header_time_drift_tolerance: 1,
             max_num_missing_certs_within_gc_round: 50,

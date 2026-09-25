@@ -189,7 +189,7 @@ pub struct ChannelMetrics {
     /// * tx_committed_certificates in primary, where the committed certificates from `Consensus`
     ///   are sent to `primary::StateHandler`
     /// * tx_new_certificates where the newly accepted certificates are sent from
-    ///   `primary::Synchronizer` to `Consensus`
+    ///   `primary::StateSynchronizer` to `Consensus`
     pub tx_sequence: IntGauge,
 }
 

@@ -352,11 +352,11 @@ struct ConsensusBusEpochInner {
     committed_certificates: MeteredMpscChannel<(Round, Vec<Certificate>)>,
 
     /// Sends missing certificates to the `CertificateFetcher`.
-    /// Receives certificates with missing parents from the `Synchronizer`.
+    /// Receives certificates with missing parents from the `StateSynchronizer`.
     certificate_fetcher: MeteredMpscChannel<CertificateFetcherCommand>,
     /// Send valid a quorum of certificates' ids to the `Proposer` (along with their round).
     /// Receives the parents to include in the next header (along with their round number) from
-    /// `Synchronizer`.
+    /// `StateSynchronizer`.
     parents: MeteredMpscChannel<(Vec<Certificate>, Round)>,
     /// Receives the batches' digests from our workers.
     our_digests: MeteredMpscChannel<OurDigestMessage>,
@@ -526,7 +526,7 @@ impl ConsensusBus {
     /// Missing certificates.
     ///
     /// Sends missing certificates to the `CertificateFetcher`.
-    /// Receives certificates with missing parents from the `Synchronizer`.
+    /// Receives certificates with missing parents from the `StateSynchronizer`.
     /// Can only be subscribed to once.
     pub fn certificate_fetcher(&self) -> &impl RaylsSender<CertificateFetcherCommand> {
         &self.inner_epoch.certificate_fetcher
@@ -536,7 +536,7 @@ impl ConsensusBus {
     ///
     /// Sends a valid quorum of certificates' ids to the `Proposer` (along with their round).
     /// Receives the parents to include in the next header (along with their round number) from
-    /// `Synchronizer`.
+    /// `StateSynchronizer`.
     /// Can only be subscribed to once.
     pub fn parents(&self) -> &impl RaylsSender<(Vec<Certificate>, Round)> {
         &self.inner_epoch.parents
