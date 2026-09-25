@@ -28,24 +28,6 @@ impl ScheduledFork {
     pub fn is_active_at(&self, block: u64) -> bool {
         self.condition.active_at_block(block)
     }
-
-    /// The activation block; `None` for a fork that never activates or for a
-    /// non-block (TTD/timestamp) condition.
-    ///
-    /// Rayls schedules are block-based only; a TTD- or timestamp-based condition
-    /// fires the debug assert in debug builds and is silently reported as `None`
-    /// in release builds.
-    pub fn block_of(&self) -> Option<u64> {
-        debug_assert!(
-            matches!(self.condition, ForkCondition::Block(_) | ForkCondition::Never),
-            "Rayls schedules are block-based only; extend ScheduleRecord before adding \
-             TTD/timestamp forks"
-        );
-        match self.condition {
-            ForkCondition::Block(block) => Some(block),
-            ForkCondition::Never | ForkCondition::TTD { .. } | ForkCondition::Timestamp(_) => None,
-        }
-    }
 }
 
 impl RaylsHardFork {
