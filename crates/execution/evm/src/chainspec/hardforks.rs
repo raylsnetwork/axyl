@@ -1,11 +1,16 @@
 //! Rayls hardfork queries and the schedule-backed [`RaylsChainHardforks`] implementation.
 
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use rayls_infrastructure_types::RaylsNetwork;
 use reth_chainspec::ForkCondition;
 
 use super::{fork::RaylsHardFork, schedule::ScheduledFork, spec::RaylsChainSpec};
+
+/// The baked-in testnet schedule, built once: the identity reference for
+/// `is_tokenomics_outage_block`.
+#[cfg(feature = "archive-replay")]
+static TESTNET: LazyLock<RaylsChainHardforks> = LazyLock::new(|| RaylsChainHardforks::testnet());
 
 /// Sorted hardfork schedule usable without a full [`RaylsChainSpec`].
 #[derive(Debug, Clone)]
@@ -123,7 +128,7 @@ pub trait RaylsHardforks {
     fn is_tokenomics_outage_block(&self, block: u64) -> bool {
         // Identity check: only the live testnet schedule matches.
         self.rayls_fork_activation(RaylsHardFork::Tokenomics)
-            == RaylsChainHardforks::testnet().rayls_fork_activation(RaylsHardFork::Tokenomics)
+            == TESTNET.rayls_fork_activation(RaylsHardFork::Tokenomics)
             && (
                 // First testnet block whose epoch close skipped on-chain reward distribution;
                 // the exclusive upper bound is the first block where distribution resumed.
