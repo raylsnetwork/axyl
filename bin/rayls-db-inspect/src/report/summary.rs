@@ -28,6 +28,8 @@ pub struct SummaryNodeView {
     pub last_epoch: Option<Epoch>,
     pub epoch_records: usize,
     pub epoch_certs: usize,
+    /// Epochs the node closed and is still waiting to certify (`pending_epoch_record` rows).
+    pub pending_epochs: Vec<Epoch>,
     pub latest_consensus_number: Option<u64>,
     /// Commit timestamp (unix seconds) of the tip header: when the data ends, for any directory.
     pub latest_consensus_timestamp: Option<u64>,
@@ -59,6 +61,7 @@ pub fn summary(nodes: &[NodeDb]) -> eyre::Result<SummaryReport> {
                 .get(<EpochCerts as rayls_infrastructure_types::Table>::NAME)
                 .copied()
                 .unwrap_or(0),
+            pending_epochs: node.pending_epochs()?,
             latest_consensus_number: node.latest_consensus_number()?,
             latest_consensus_timestamp: node
                 .latest_consensus_header()?

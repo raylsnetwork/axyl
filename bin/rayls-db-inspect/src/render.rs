@@ -164,8 +164,26 @@ fn render_epoch(r: &EpochReport, out: &mut String) {
     }
     out.push_str(&t.render());
     for n in &r.nodes {
-        let Some(rec) = &n.record else { continue };
+        if n.record.is_none() && n.pending.is_none() {
+            continue;
+        }
         let _ = writeln!(out, "\n[{}]", n.node);
+        if let Some(p) = &n.pending {
+            let note = match (p.stale, p.matches_record) {
+                (true, Some(true)) => " (STALE: the epoch is certified; same record)",
+                (true, _) => " (STALE: the epoch is certified; a DIFFERENT record)",
+                (false, _) => " (closed here, certificate not on disk yet)",
+            };
+            let _ = writeln!(out, "  pending record    {}{note}", p.digest);
+            let _ = writeln!(out, "  pending parent    {}", p.parent_hash);
+            let _ = writeln!(out, "  pending boundary  {}", p.parent_consensus);
+            let _ = writeln!(
+                out,
+                "  pending committee {} keys, next {} keys",
+                p.committee_size, p.next_committee_size
+            );
+        }
+        let Some(rec) = &n.record else { continue };
         let _ = writeln!(out, "  parent_hash       {}", rec.parent_hash);
         let _ = writeln!(out, "  parent_consensus  {}", rec.parent_consensus);
         let _ = writeln!(
@@ -208,7 +226,8 @@ fn render_epoch(r: &EpochReport, out: &mut String) {
 fn render_epochs(r: &EpochsReport, out: &mut String) {
     let _ = writeln!(
         out,
-        "epochs {}..={}  RC record+cert  R- record only  -- missing  .. not reached  ?? no table",
+        "epochs {}..={}  RC record+cert  R- record only  P- pending (closed, no cert yet)  \
+         -- missing  .. not reached  ?? no table",
         r.from, r.to
     );
     let mut headers = vec!["epoch"];
@@ -234,6 +253,7 @@ fn render_epoch_check(r: &EpochCheckReport, out: &mut String) {
         "gaps",
         "broken links",
         "uncertified",
+        "pending",
         "invalid certs",
         "handoff mismatch",
         "index mismatch",
@@ -252,6 +272,7 @@ fn render_epoch_check(r: &EpochCheckReport, out: &mut String) {
             list(&n.gaps),
             list(&n.broken_links.iter().map(|b| b.epoch).collect::<Vec<_>>()),
             list(&n.uncertified),
+            list(&n.pending),
             list(&n.invalid_certs),
             list(&n.committee_handoff_mismatch),
             list(&n.index_mismatch),
@@ -262,6 +283,14 @@ fn render_epoch_check(r: &EpochCheckReport, out: &mut String) {
     for n in &r.nodes {
         if let Some(note) = &n.note {
             let _ = writeln!(out, "\n[{}] {note}", n.node);
+        }
+        if !n.stale_pending.is_empty() {
+            let _ = writeln!(
+                out,
+                "\n[{}] STALE pending rows for certified epochs: {}",
+                n.node,
+                list(&n.stale_pending)
+            );
         }
         for b in &n.broken_links {
             let _ = writeln!(
@@ -787,6 +816,7 @@ fn render_summary(r: &SummaryReport, out: &mut String) {
         "epochs",
         "records",
         "certs",
+        "pending",
         "consensus #",
         "tip at",
         "cache tip",
@@ -804,6 +834,7 @@ fn render_summary(r: &SummaryReport, out: &mut String) {
             },
             n.epoch_records.to_string(),
             n.epoch_certs.to_string(),
+            list(&n.pending_epochs),
             opt(&n.latest_consensus_number),
             n.latest_consensus_timestamp.map_or_else(|| "-".to_owned(), utc),
             opt(&n.latest_cached_consensus_number),

@@ -224,10 +224,12 @@ fn summary_reports_tips_tables_and_checkpoints() {
         drop(seed_healthy(&fx, db));
         write_cached_header(db, &fx.header(9, B256::default()));
         write_checkpoint(db, 2);
+        write_pending(db, &fx.record(3, None, B256::default()));
     });
     let report = summary(&[a.open("a")]).unwrap();
     let n = &report.nodes[0];
     assert_eq!(n.node, "a");
+    assert_eq!(n.pending_epochs, vec![3]);
     assert!(!n.recovered);
     assert_eq!((n.first_epoch, n.last_epoch), (Some(0), Some(2)));
     assert_eq!(n.epoch_records, 3);

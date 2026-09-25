@@ -253,3 +253,67 @@ fn empty_database_reports_table_absent() {
     assert_eq!(report.verdict.code, "NOT_REACHED");
     assert_eq!(report.nodes[0].position.current_epoch, None);
 }
+
+/// A node that closed the epoch but has not certified it yet holds the record it built in
+/// `pending_epoch_record`: reported as `pending`, never as missing or not reached.
+#[test]
+fn pending_record_is_closed_but_uncertified() {
+    let fx = Fixture::new();
+    let a = SeededNode::new(|db| drop(seed_healthy(&fx, db)));
+    let b = SeededNode::new(|db| {
+        let (records, headers) = healthy_chain(&fx);
+        for h in &headers {
+            write_header(db, h);
+        }
+        for (record, cert) in &records[..2] {
+            write_epoch(db, record, cert.as_ref());
+        }
+        write_pending(db, &records[2].0);
+    });
+    let expected = healthy_chain(&fx).0[2].0.digest();
+
+    let report = epoch(&[a.open("a"), b.open("b")], 2, false).unwrap();
+    assert_eq!(report.verdict.to_string(), "PARTIAL nodes=2 certified=1 pending=1");
+    assert!(!report.verdict.healthy);
+    assert_eq!(report.nodes[0].status, EpochStatus::Certified);
+    assert!(report.nodes[0].pending.is_none());
+    let b_view = &report.nodes[1];
+    assert_eq!(b_view.status, EpochStatus::Pending);
+    assert!(b_view.record.is_none() && b_view.cert.is_none());
+    let pending = b_view.pending.as_ref().unwrap();
+    assert_eq!(
+        pending.digest,
+        rayls_db_inspect::view::b256(&expected),
+        "the same record a certified"
+    );
+    assert!(!pending.stale);
+    assert_eq!(pending.matches_record, None);
+    assert_eq!(pending.committee_size, fx.keys().len());
+    // a pending record proves the node closed the epoch
+    assert_eq!(b_view.position.latest_epoch_record, Some(1));
+    assert_eq!(b_view.position.latest_pending_record, Some(2));
+    assert!(b_view.position.has_closed_epoch(2));
+    assert!(!b_view.position.has_closed_epoch(3));
+
+    // the epoch after it is not reached, not missing
+    let next = epoch(&[b.open("b")], 3, false).unwrap();
+    assert_eq!(next.nodes[0].status, EpochStatus::NotReached);
+    assert_eq!(next.verdict.to_string(), "NOT_REACHED nodes=1 not_reached=1");
+}
+
+/// The certificate's write removes the pending row in the same transaction, so a pending row
+/// next to a certified record is a leftover and is flagged as such.
+#[test]
+fn stale_pending_row_next_to_a_certified_record_is_flagged() {
+    let fx = Fixture::new();
+    let a = SeededNode::new(|db| {
+        let (records, _) = seed_healthy(&fx, db);
+        write_pending(db, &records[2]);
+    });
+    let report = epoch(&[a.open("a")], 2, false).unwrap();
+    assert_eq!(report.nodes[0].status, EpochStatus::Certified);
+    let pending = report.nodes[0].pending.as_ref().unwrap();
+    assert!(pending.stale);
+    assert_eq!(pending.matches_record, Some(true));
+    assert_eq!(report.verdict.to_string(), "OK nodes=1 certified=1 stale_pending=1");
+}

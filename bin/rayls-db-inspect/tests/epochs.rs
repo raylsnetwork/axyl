@@ -229,3 +229,42 @@ fn epoch_check_verbose_lists_records() {
     assert_eq!(all.nodes[0].records.as_ref().unwrap()[0].cert, "genesis");
     assert_eq!(all.nodes[0].records.as_ref().unwrap()[0].link, LinkCheck::Genesis);
 }
+
+/// A pending epoch shows as `P-` in the matrix and keeps the row partial, and `epoch-check`
+/// lists it as pending rather than as a gap, chaining the next record to it.
+#[test]
+fn pending_epoch_in_the_matrix_and_the_chain_check() {
+    let fx = Fixture::new();
+    let a = SeededNode::new(|db| drop(seed_healthy(&fx, db)));
+    let b = SeededNode::new(|db| {
+        let (records, headers) = healthy_chain(&fx);
+        for h in &headers {
+            write_header(db, h);
+        }
+        for (record, cert) in &records[..2] {
+            write_epoch(db, record, cert.as_ref());
+        }
+        write_pending(db, &records[2].0);
+    });
+
+    let matrix = epochs(&[a.open("a"), b.open("b")], Some((0, 2))).unwrap();
+    assert_eq!(matrix.rows[2].cells, vec![Cell::RecordAndCert, Cell::Pending]);
+    assert_eq!(matrix.rows[2].status, "partial");
+    assert_eq!(matrix.verdict.to_string(), "PARTIAL epochs=3 ok=2 partial=1 first=2");
+
+    let check = epoch_check(&[b.open("b")], None, None, true).unwrap();
+    let n = &check.nodes[0];
+    assert_eq!((n.from, n.to), (Some(0), Some(2)), "the pending epoch is in the default range");
+    assert_eq!(n.checked, 2);
+    assert!(n.gaps.is_empty(), "a pending epoch is not a gap");
+    assert_eq!(n.pending, vec![2]);
+    assert!(n.stale_pending.is_empty());
+    assert!(n.uncertified.is_empty());
+    assert!(!n.ok);
+    let records = n.records.as_ref().unwrap();
+    assert_eq!(records.len(), 3);
+    assert_eq!(records[2].cert, "pending");
+    assert_eq!(records[2].link, LinkCheck::Ok, "the pending record chains to record 1");
+    assert!(!records[2].index_ok, "not indexed until certified");
+    assert_eq!(check.verdict.to_string(), "BROKEN nodes=1 checked=2 pending=1 first=2");
+}
