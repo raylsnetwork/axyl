@@ -84,7 +84,14 @@ contract MockConsensusRegistryExt {
         });
     }
 
+    bool public revertOnGetPerformanceWeights;
+
+    function setRevertOnGetPerformanceWeights(bool shouldRevert) external {
+        revertOnGetPerformanceWeights = shouldRevert;
+    }
+
     function getEpochPerformanceWeights() external view returns (IConsensusRegistry.PerformanceWeights memory) {
+        if (revertOnGetPerformanceWeights) revert("MockConsensusRegistryExt: forced revert");
         return _performanceWeights;
     }
 
@@ -531,6 +538,138 @@ contract RewardDistributorExtendedTest is Test {
         assertEq(pulled, priorityTarget + trackBTarget, "accumulator pulls the combined Track A + Track B target");
         assertEq(delegationPool.trackAReceived(validator1), priorityTarget, "Track A share of the top-up matches its own rate");
         assertEq(delegationPool.trackBReceived(validator1), trackBTarget, "Track B share of the top-up matches its own rate, sourced from the accumulator");
+    }
+
+    // =========================================================================
+    //  7c. performanceWeightBps = 0 (default): recorded performance data stays inert on the
+    //      target-APY path too, exactly as it already was on the stake-fallback path (test 1).
+    // =========================================================================
+
+    function test_distributeRewards_performanceWeightBps_defaultZero_ignoresRecordedWeights() public {
+        registry.clearValidators();
+        registry.addActiveValidator(validator1, 500e18);
+        registry.addActiveValidator(validator2, 500e18);
+
+        // Wildly skewed weights recorded on-chain, exactly as ConsensusRegistry's hybrid model
+        // would after a real participation/latency gap — but performanceWeightBps defaults to 0,
+        // so this must have zero effect on the target-APY path, matching
+        // test_accumulatorTopUp_exactTargetAPYFormula's numbers exactly.
+        address[] memory validators = new address[](2);
+        uint256[] memory weights = new uint256[](2);
+        validators[0] = validator1;
+        validators[1] = validator2;
+        weights[0] = 500e18; // ~5% share
+        weights[1] = 9500e18; // ~95% share
+        registry.setPerformanceWeights(validators, weights, weights[0] + weights[1]);
+
+        assertEq(distributor.performanceWeightBps(), 0, "precondition: disabled by default");
+
+        RLSAccumulator acc = _setupAccumulator(1_000_000e18);
+        uint256 accBalanceBefore = rls.balanceOf(address(acc));
+
+        vm.prank(SYSTEM_ADDRESS);
+        distributor.distributeRewards();
+
+        uint256 totalStaked = 1000e18;
+        uint256 apyBps = 5000;
+        uint256 epochSecs = 86400;
+        uint256 expectedTarget = (totalStaked * apyBps * epochSecs) / (365 days * 10_000);
+        assertEq(accBalanceBefore - rls.balanceOf(address(acc)), expectedTarget, "pull unaffected by recorded weights");
+        assertEq(
+            distributor.getPendingRewards(validator1),
+            distributor.getPendingRewards(validator2),
+            "equal stake still yields equal reward despite a 5/95 performance skew being recorded"
+        );
+    }
+
+    // =========================================================================
+    //  7d. performanceWeightBps = 10_000 (fully performance-proportional): equal-stake
+    //      validators now split the SAME total target by their performance weight instead.
+    // =========================================================================
+
+    function test_distributeRewards_performanceWeightBps_full_splitsByWeightNotStake() public {
+        registry.clearValidators();
+        registry.addActiveValidator(validator1, 500e18);
+        registry.addActiveValidator(validator2, 500e18);
+
+        address[] memory validators = new address[](2);
+        uint256[] memory weights = new uint256[](2);
+        validators[0] = validator1;
+        validators[1] = validator2;
+        weights[0] = 3000; // 30% share
+        weights[1] = 7000; // 70% share
+        uint256 totalWeight = weights[0] + weights[1];
+        registry.setPerformanceWeights(validators, weights, totalWeight);
+
+        RLSAccumulator acc = _setupAccumulator(1_000_000e18); // targetApyBps 5000, epoch 1 day
+        vm.prank(owner);
+        distributor.setPerformanceWeightBps(10_000);
+
+        uint256 accBalanceBefore = rls.balanceOf(address(acc));
+
+        vm.prank(SYSTEM_ADDRESS);
+        distributor.distributeRewards();
+
+        uint256 totalStaked = 1000e18;
+        uint256 apyBps = 5000;
+        uint256 epochSecs = 86400;
+        uint256 expectedTotalTarget = (totalStaked * apyBps * epochSecs) / (365 days * 10_000);
+        uint256 pulled = accBalanceBefore - rls.balanceOf(address(acc));
+        assertEq(pulled, expectedTotalTarget, "totalTarget (the pot size / accumulator pull) is unchanged by the weight blend");
+
+        // Each validator's share is computed independently by the contract (its own truncating
+        // division), not by subtracting one from the total, so allow a few wei of dust rather
+        // than asserting exact conservation between the two.
+        uint256 expectedV1 = (expectedTotalTarget * weights[0]) / totalWeight;
+        uint256 expectedV2 = (expectedTotalTarget * weights[1]) / totalWeight;
+        assertEq(distributor.getPendingRewards(validator1), expectedV1, "validator1 gets its 30% weight share, not 50% stake share");
+        assertApproxEqAbs(distributor.getPendingRewards(validator2), expectedV2, 2, "validator2 gets its 70% weight share, not 50% stake share");
+        assertTrue(
+            distributor.getPendingRewards(validator1) != distributor.getPendingRewards(validator2),
+            "equal stake no longer implies equal reward once performanceWeightBps is fully on"
+        );
+    }
+
+    // =========================================================================
+    //  7e. performanceWeightBps > 0 but getEpochPerformanceWeights() reverts: falls back to
+    //      pure stake, and emits PerformanceWeightFetchFailed so it's not silent on-chain.
+    // =========================================================================
+
+    function test_distributeRewards_performanceWeightFetchReverts_fallsBackToStakeAndEmits() public {
+        registry.clearValidators();
+        registry.addActiveValidator(validator1, 500e18);
+        registry.addActiveValidator(validator2, 500e18);
+
+        address[] memory validators = new address[](2);
+        uint256[] memory weights = new uint256[](2);
+        validators[0] = validator1;
+        validators[1] = validator2;
+        weights[0] = 3000;
+        weights[1] = 7000;
+        registry.setPerformanceWeights(validators, weights, weights[0] + weights[1]);
+        registry.setRevertOnGetPerformanceWeights(true);
+
+        RLSAccumulator acc = _setupAccumulator(1_000_000e18);
+        vm.prank(owner);
+        distributor.setPerformanceWeightBps(10_000);
+
+        uint256 totalStaked = 1000e18;
+        uint256 apyBps = 5000;
+        uint256 epochSecs = 86400;
+        uint256 expectedTarget = (totalStaked * apyBps * epochSecs) / (365 days * 10_000);
+        uint256 accBalanceBefore = rls.balanceOf(address(acc));
+
+        vm.expectEmit(address(distributor));
+        emit IRewardDistributor.PerformanceWeightFetchFailed();
+        vm.prank(SYSTEM_ADDRESS);
+        distributor.distributeRewards();
+
+        assertEq(accBalanceBefore - rls.balanceOf(address(acc)), expectedTarget, "target unaffected by the failed fetch");
+        assertEq(
+            distributor.getPendingRewards(validator1),
+            distributor.getPendingRewards(validator2),
+            "equal stake -> equal reward: falls back to pure stake despite performanceWeightBps=10000 and a real weight skew, because the fetch reverted"
+        );
     }
 
     // =========================================================================
