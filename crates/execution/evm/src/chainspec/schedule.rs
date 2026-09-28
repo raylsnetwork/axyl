@@ -1,5 +1,12 @@
 //! Per-network Rayls hardfork schedules: which fork activates at which block.
 //!
+//! # Invariant
+//!
+//! Each schedule array must contain exactly one entry per [`RaylsHardFork`] variant,
+//! in declaration order. Adding a new variant to the enum requires updating all four
+//! schedule arrays (`devnet`, `testnet`, `mainnet`, `local`). The test
+//! `schedule_matches_declaration_order_for_all_networks` enforces this at runtime.
+//!
 //! NOTE: `UsdrSupplyCorrection` is scheduled (`Block(...)`) on mainnet and local;
 //! testnet/devnet stay `Never` until an activation block is chosen operationally.
 //! Flip a `Never` entry in a schedule below to `ForkCondition::Block(<chosen block>)`
