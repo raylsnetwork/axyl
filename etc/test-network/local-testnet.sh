@@ -659,7 +659,7 @@ fi
 if [[ "$RELAY_MODE" == "true" ]]; then
     BUILD_ARGS+=( "--bin" "rayls-relay" )
 fi
-RUSTFLAGS="-C target-cpu=native" cargo build "${BUILD_ARGS[@]}"
+cargo build "${BUILD_ARGS[@]}"
 # Example of using redb for the consensus DB
 # cargo build --bin rayls-network --features redb --release
 
