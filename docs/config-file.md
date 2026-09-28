@@ -41,11 +41,16 @@ Rules the node enforces when it reads the file:
 | Rule | What happens if broken |
 |---|---|
 | `chain_id` is required | file fails to parse, node does not start |
+| `chain_id` must not be mainnet (72957) or testnet (7295799) | node refuses to start; those networks always run their baked-in schedule via `--network` |
 | `hardforks` must not be empty | node refuses to start with a clear message |
 | Every fork name must be a real Rayls hardfork | node refuses to start and lists the known names |
+| Every fork the binary knows must be defined | node refuses to start and names the missing fork |
 | Fork names are case-insensitive | `eip1559` and `Eip1559` both work |
 | A value is a block number or `never` | anything else is a parse error |
-| A fork missing from the map | treated as `never` |
+
+Because every known fork must be listed, a binary upgrade that adds a fork makes an old file
+stale: the node will not start until the new fork has a line. Section 2 shows how to get the
+full, current fork list out of the binary you are deploying.
 
 ---
 
@@ -75,6 +80,47 @@ Flag rules:
 A working example is the local test network: `etc/test-network/config.yaml` holds all four
 public schedules, and `etc/test-network/start-local-validator-config.sh` starts a validator
 with `--config-file ./config.yaml --subnet local`.
+
+### Getting a starting file from the binary: `schedule export`
+
+Every `rayls-network` binary can print the hardfork schedule it has built in for a public
+network, already shaped as a config file:
+
+```sh
+rayls-network schedule export --network <mainnet|testnet|devnet|local> [--subnet-name <name>]
+```
+
+It writes one subnet to stdout, with that network's `chain_id` and **every** fork this binary
+knows, under its canonical name, in activation-table order. `--subnet-name` sets the key under
+`networks:` (default: the network name; letters, digits, `-` and `_` only). The header
+comment records the binary version that produced the file.
+
+```sh
+# Start a private chain from the local schedule of the binary you are about to ship
+rayls-network schedule export --network local --subnet-name my-chain > networks.yaml
+# then set chain_id to your genesis chain-id and review the fork values
+```
+
+This is useful at deployment time:
+
+- **The fork list always matches the binary.** The template in this repo can fall behind the
+  code. The export comes from the binary itself, so it cannot miss a fork or use an unknown
+  name. Run it with the exact binary (or image) you are deploying.
+- **Upgrading the binary.** Export again with the new binary and diff it against your file.
+  Any new fork shows up as a new line. Add it to your file with the value you want (usually
+  `never`, or a future block agreed with the other operators) before you restart the nodes.
+- **Checking what a public network runs.** For example, to see the devnet schedule of a given
+  release without reading the source, run `schedule export --network devnet`.
+
+What the export can be used for, per network:
+
+| `--network` | Output |
+|---|---|
+| `devnet`, `local` | Loads as it is: `--config-file <file> --subnet <name>`. For a private chain, change `chain_id` to your genesis chain-id. |
+| `mainnet`, `testnet` | **Template only.** The node refuses a subnet with these chain-ids (see section 1), and the header says so. Change `chain_id` before you use it. Mainnet and testnet nodes are started with `--network`, not with a file. |
+
+For `mainnet`/`testnet`, the fork values are the real historical activation blocks. On a
+new private chain, `0`/`never` usually fits better (see section 5).
 
 ---
 
@@ -177,7 +223,9 @@ one-time state change when the chain crosses their activation block. A migration
 is considered already active at genesis, so its state change **never runs**. If you want a
 migration to actually execute on a fresh chain, set it to `1` or later. This is why the
 template sets `HybridRewards: 1` and not `0`: genesis deploys the old reward contract, and
-the swap to the hybrid-reward contract only happens if the migration runs.
+the swap to the hybrid-reward contract only happens if the migration runs. Reward distribution
+matters mostly on the public networks, but the template keeps it on so that a private chain
+has the same active forks as mainnet.
 
 The remaining forks (`Eip1559`, `BatchDigestV2`, `PrecompileGasFix`,
 `TransactionLoadBalancing`, `EmptyOutputBlock`, `DynamicCommitteeSizing`,
@@ -208,9 +256,12 @@ already active.
 ## 6. Checklist for a private deployment
 
 1. Run the `genesis` ceremony with your `--chain-id`.
-2. Copy `docs/config-file.example.yaml` to a real file, rename the subnet, set `chain_id` to
-   the same value.
+2. Create the file. Either copy `docs/config-file.example.yaml`, or run
+   `rayls-network schedule export --network local --subnet-name <name> > <file>` with the
+   binary you will deploy (see section 2). Set `chain_id` to the same value.
 3. Ship the datadir and the config file to every validator and observer.
 4. Start every node with `--config-file <file> --subnet <name>`. Do not set `RAYLS_NETWORK`.
 5. To activate a fork later: agree on a block number, update the file everywhere, restart all
    nodes before that block.
+6. Before a binary upgrade: run `schedule export` with the new binary and diff it against your
+   file. Add any new fork to the file first, or the upgraded nodes will not start.

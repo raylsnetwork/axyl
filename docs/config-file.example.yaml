@@ -66,7 +66,9 @@ networks:
       UsdrSupplyCorrection: never
       EmptyOutputBlock: 0
       DynamicCommitteeSizing: 0
-      # Reward Distribution is only for public chain.
-      HybridRewards: never
+      # Kept active to stay consistent with mainnet's fork set. Block 1, not 0:
+      # this is a migration (swaps genesis's reward contract for the hybrid one),
+      # and a migration at block 0 counts as already active, so it never runs.
+      HybridRewards: 1
       OutputSeqNormalization: 0
       SenderAffinityLoadBalancing: 0
