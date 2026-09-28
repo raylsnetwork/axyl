@@ -4,10 +4,19 @@
 GHSA-82j2-j2ch-gfr8
 
 # yamux 0.12.1 is linked transitively via libp2p-yamux 0.47 (dual 0.12/0.13 backend) but is never
-# instantiated: both yamux::Config::default() call sites (network constructor + relay bin) resolve to
-# the 0.13.10 backend (Either::Right(Config013)). The 0.12 impl is dead code on our paths and cannot
-# be negotiated by a remote peer (both speak the same /yamux/1.0.0 wire protocol; the impl is chosen
-# locally). No yamux-only fix exists (libp2p-yamux 0.47 requires ^0.12.1); removal needs a libp2p
-# bump. Re-check this when bumping libp2p, or if any code starts using Config::client()/::server()/
-# WindowUpdateMode (the Config012 paths).
+# instantiated: both yamux Config call sites (consensus network constructor + rayls-relay test client)
+# use a bare Config::default() with no setters, which selects the 0.13.10 backend
+# (Either::Right(Config013)). The 0.12 impl is dead code on our paths and cannot be negotiated by a
+# remote peer (both speak the same /yamux/1.0.0 wire protocol; the impl is chosen locally).
+# 0.12.1 is also not itself vulnerable to this panic: its inbound-SYN path validates the body
+# length BEFORE creating the stream, so the create-then-drop -> `expect("stream not found")`
+# path is unreachable. The vulnerable window was the 0.13.0-0.13.9
+# rewrite; we run the patched 0.13.10.
+# NOTE: any yamux Config setter (set_max_num_streams / set_receive_window_size /
+# set_window_update_mode) or Config::client()/::server() would silently switch the backend to 0.12.1.
+# The call sites carry a
+# "YAMUX BACKEND GUARD" comment -- keep them setter-free.
+# Removal is not possible today: we currently pin libp2p 0.56.0 and its libp2p-yamux 0.47 hard-requires
+# both backends. Re-check this when libp2p releases a version whose libp2p-yamux drops the 0.12
+# backend, or if any code starts using Config::client()/::server()/WindowUpdateMode (the 012 paths).
 CVE-2026-32314

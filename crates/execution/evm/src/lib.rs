@@ -31,6 +31,7 @@ pub use reth_transaction_pool::{
 pub mod chainspec;
 pub mod dirs;
 pub mod network_profile;
+pub mod network_schedule;
 pub mod payload;
 pub mod traits;
 pub mod txn_pool;
@@ -45,9 +46,13 @@ pub mod rpc_server_args;
 pub mod system_calls;
 pub mod worker;
 
-pub use chainspec::{RaylsChainSpec, RaylsHardFork, RaylsHardforks};
+pub use chainspec::{RaylsChainSpec, RaylsHardFork, RaylsHardforks, ScheduledFork};
 pub use network_profile::{
-    active_profile, set_active_profile, ForkActivation, NetworkConfigFile, NetworkProfile,
+    verify_datadir_schedule_record, verify_schedule, ForkActivation, FutureForkMove,
+    NetworkConfigFile, NetworkProfile, ScheduleRecord, ScheduleRecordVerification,
+};
+pub use network_schedule::{
+    baked_in_network, verify_datadir_chain_id, FileSchedule, SelectedSchedule,
 };
 pub use reth_chainspec::ForkCondition;
 

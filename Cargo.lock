@@ -8045,6 +8045,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "rayls-db-inspect"
+version = "1.4.1"
+dependencies = [
+ "alloy",
+ "clap",
+ "comfy-table",
+ "const-hex",
+ "eyre",
+ "indexmap 2.13.0",
+ "rayls-execution-evm",
+ "rayls-infrastructure-config",
+ "rayls-infrastructure-storage",
+ "rayls-infrastructure-types",
+ "rayls-testing-test-utils",
+ "reth-libmdbx",
+ "roaring 0.10.12",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tracing-subscriber 0.3.23",
+]
+
+[[package]]
 name = "rayls-execution-evm"
 version = "1.4.1"
 dependencies = [
@@ -8426,6 +8449,8 @@ dependencies = [
  "rayls-infrastructure-types",
  "rayls-middleware-orchestrator",
  "rayon",
+ "reth-db",
+ "reth-stages",
  "rpassword",
  "secp256k1 0.31.1",
  "serde_yaml",

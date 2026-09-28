@@ -1,17 +1,18 @@
-# Network configuration: all four Rayls networks, each a 1:1 mirror of the
-# schedule baked into the binary for that network (see
-# crates/execution/evm/src/chainspec.rs: RaylsHardFork::{devnet,testnet,mainnet,local}).
+# Network configuration: the devnet and local networks, each a 1:1 mirror of
+# the schedule baked into the binary for that network (see
+# crates/execution/evm/src/chainspec.rs: RaylsHardFork::{devnet,local}).
 #
 # Use in place of the baked-in `--network` profile:
 #   rayls-network node --config-file examples/client.yaml --subnet <name>
 #
+# testnet and mainnet have no entry here: a config-file subnet may not
+# declare a baked-in network's chain-id (testnet 7295799, mainnet 72957), so
+# those networks are started with `--network testnet|mainnet` instead.
+#
 # At boot the datadir's genesis chain-id is checked against the subnet's
 # `chain_id`; a mismatch (wrong datadir for this subnet) refuses to start.
 #
-# Fork values are activation block numbers, or `never`. The value
-# `18446744073709551615` (u64::MAX) is the baked-in "not scheduled yet" block
-# for DynamicCommitteeSizing on devnet/mainnet and is intentionally
-# NOT `never` — keep it a number to stay 1:1 with the baked schedule.
+# Fork values are activation block numbers, or `never`.
 
 networks:
   devnet:
@@ -28,43 +29,7 @@ networks:
       TransactionLoadBalancing: 1542796
       UsdrSupplyCorrection: never
       EmptyOutputBlock: 0
-      DynamicCommitteeSizing: 18446744073709551615
-      HybridRewards: never
-      OutputSeqNormalization: never
-      SenderAffinityLoadBalancing: never
-  testnet:
-    chain_id: 7295799
-    hardforks:
-      Eip1559: 281800
-      BatchDigestV2: 560539
-      AdminTransfer: 560539
-      PrecompileGasFix: 900000
-      RlsStorage: 900000
-      Tokenomics: 1879000
-      Uups: 2872000
-      Erc20PrecompileBytecode: never
-      TransactionLoadBalancing: 4386290
-      UsdrSupplyCorrection: never
-      EmptyOutputBlock: 6663630
-      DynamicCommitteeSizing: 10934554
-      HybridRewards: never
-      OutputSeqNormalization: never
-      SenderAffinityLoadBalancing: never
-  mainnet:
-    chain_id: 72957
-    hardforks:
-      Eip1559: 0
-      BatchDigestV2: 0
-      AdminTransfer: never
-      PrecompileGasFix: 0
-      RlsStorage: never
-      Tokenomics: never
-      Uups: never
-      Erc20PrecompileBytecode: 893558
-      TransactionLoadBalancing: 893558
-      UsdrSupplyCorrection: 3569194
-      EmptyOutputBlock: 3569194
-      DynamicCommitteeSizing: 18446744073709551615
+      DynamicCommitteeSizing: never
       HybridRewards: never
       OutputSeqNormalization: never
       SenderAffinityLoadBalancing: never

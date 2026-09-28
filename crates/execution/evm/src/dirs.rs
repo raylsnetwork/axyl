@@ -143,6 +143,10 @@ impl RaylsDirs for DataDirChainPath {
     fn network_config_path(&self) -> PathBuf {
         self.0.as_ref().join("network-config")
     }
+
+    fn schedule_record_path(&self) -> PathBuf {
+        self.0.as_ref().join("schedule-record.yaml")
+    }
 }
 
 /// Returns the path to the rayls network data dir.

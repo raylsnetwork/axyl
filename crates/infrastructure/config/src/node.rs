@@ -3,7 +3,7 @@
 use crate::{ConfigFmt, ConfigTrait, NodeInfo, RaylsDirs};
 use rayls_infrastructure_types::{
     get_available_udp_port, test_genesis, Address, BlsPublicKey, BlsSignature, Genesis,
-    NetworkPublicKey, RaylsNetwork, ETHEREUM_BLOCK_GAS_LIMIT_56BITS, MIN_RAYLS_PROTOCOL_BASE_FEE,
+    NetworkPublicKey, ETHEREUM_BLOCK_GAS_LIMIT_56BITS, MIN_RAYLS_PROTOCOL_BASE_FEE,
 };
 use reth_chainspec::ChainSpec;
 use serde::{Deserialize, Serialize};
@@ -202,13 +202,6 @@ pub struct Parameters {
     /// The admin address for the FeeAggregator contract (controls upgrades, config, emergency).
     /// Should be a governance multisig in production.
     pub fee_aggregator_admin: Option<Address>,
-    /// Rayls network profile that selects the baked-in hardfork schedule.
-    /// `None` (the default, serialized as `network: null`) means "external": the
-    /// datadir carries no baked-in profile, so the node must be started with a
-    /// `--config-file`/`--subnet` schedule (or an explicit `--network` whose chain-id
-    /// matches the genesis).
-    #[serde(default)]
-    pub network: Option<RaylsNetwork>,
     /// Minimum EIP-1559 base fee floor (in wei).
     /// The base fee can never drop below this value.
     /// Set to 0 for a gasless (feeless) network.
@@ -316,9 +309,6 @@ impl Default for Parameters {
             batch_vote_timeout: Parameters::default_batch_vote_timeout(),
             basefee_address: None,
             fee_aggregator_admin: None,
-            // Default to "external" (no baked-in profile) so a fresh ceremony's datadir
-            // doesn't silently assume testnet and refuse to boot on a chain-id mismatch.
-            network: None,
             min_base_fee: Parameters::default_min_base_fee(),
             gas_limit: Parameters::default_gas_limit(),
             metrics_address: None,
@@ -339,9 +329,6 @@ impl Parameters {
         info!("Sync retry nodes set to {} nodes", self.sync_retry_nodes);
         info!("Max batch delay set to {} ms", self.max_batch_delay.as_millis());
         info!("Max concurrent requests set to {}", self.max_concurrent_requests);
-        // `None` renders as "external" (no baked-in profile) rather than "None".
-        let network = self.network.map(|n| n.to_string()).unwrap_or_else(|| "external".into());
-        info!(%network, "Rayls network hardfork profile");
         info!("Minimum base fee set to {} wei", self.min_base_fee);
         info!("Block gas limit set to {}", self.gas_limit);
         if let Some(addr) = self.metrics_address {
@@ -364,6 +351,19 @@ mod tests {
         let params: Parameters =
             serde_yaml::from_str("gc_depth: 50\n").expect("parses without metrics_address");
         assert_eq!(params.metrics_address, None);
+        assert_eq!(params.gc_depth, 50);
+    }
+
+    #[test]
+    fn parameters_ignore_the_legacy_network_field() {
+        // Backward compatibility: a pre-removal parameters.yaml may still carry the
+        // `network` key (e.g. `network: local` stamped by an old `rayls-network dev`).
+        // It must parse and be ignored — the schedule source is now the CLI flag.
+        let params: Parameters =
+            serde_yaml::from_str("gc_depth: 50\nnetwork: local\n").expect("parses legacy file");
+        assert_eq!(params.gc_depth, 50);
+        let params: Parameters =
+            serde_yaml::from_str("gc_depth: 50\nnetwork: null\n").expect("parses legacy file");
         assert_eq!(params.gc_depth, 50);
     }
 

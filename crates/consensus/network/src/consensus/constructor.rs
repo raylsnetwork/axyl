@@ -181,6 +181,15 @@ where
                     relay_transport
                         .upgrade(Version::V1Lazy)
                         .authenticate(libp2p::noise::Config::new(keypair)?)
+                        // YAMUX BACKEND GUARD (CVE-2026-32314): keep this a bare
+                        // `Config::default()` with NO setters
+                        // (set_max_num_streams / set_receive_window_size /
+                        // set_window_update_mode) and NO `Config::client()`/`::server()`.
+                        // libp2p-yamux 0.47 is dual-backend: a bare default selects the patched
+                        // yamux 0.13.10 (Either::Right); any setter silently switches the
+                        // connection to the yamux 0.12.1 backend
+                        // (Either::Left). Re-review before adding yamux
+                        // config here. See .trivyignore (CVE-2026-32314).
                         .multiplex(libp2p::yamux::Config::default()),
                 )
             })

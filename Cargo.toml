@@ -4,6 +4,7 @@ members = [
     "bin/rayls-network",
     "bin/rayls-replay",
     "bin/rayls-relay",
+    "bin/rayls-db-inspect",
 
     # consensus
     "crates/consensus/state-sync",
@@ -84,6 +85,7 @@ all = "warn"
 [workspace.dependencies]
 # misc
 clap = "4.5"
+comfy-table = "7.2"
 eyre = "0.6"
 futures = "0.3"
 tokio = { version = "1.44", default-features = false }

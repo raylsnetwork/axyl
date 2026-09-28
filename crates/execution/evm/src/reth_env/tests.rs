@@ -72,6 +72,40 @@ async fn execute_payload_and_update_canonical_chain(
     Ok(block)
 }
 
+/// A `--config-file` profile handed to the constructor reaches the chain spec:
+/// its forks activate at the configured blocks and everything else stays `Never`.
+#[tokio::test]
+async fn profile_schedule_reaches_chain_spec() -> eyre::Result<()> {
+    use crate::{ForkCondition, NetworkProfile, RaylsHardFork, RaylsHardforks};
+
+    // The test genesis carries the local network's chain-id, which the profile must match.
+    let chain_id = rayls_infrastructure_types::RaylsNetwork::Local.chain_id();
+    let profile: NetworkProfile = serde_yaml::from_str(&format!(
+        "chain_id: {chain_id}\nhardforks:\n  TransactionLoadBalancing: 777777\n"
+    ))?;
+
+    let chain = rayls_infrastructure_types::test_chain_spec_arc();
+    let tmp_dir = TempDir::new()?;
+    let task_manager = TaskManager::new("Test Task Manager");
+    let reth_env = RethEnv::new_for_temp_chain_with_profile(
+        chain,
+        tmp_dir.path(),
+        &task_manager,
+        None,
+        &profile,
+    )
+    .await?;
+
+    let spec = reth_env.rayls_chain_spec();
+    assert_eq!(
+        spec.rayls_fork_activation(RaylsHardFork::TransactionLoadBalancing),
+        ForkCondition::Block(777777)
+    );
+    // A fork absent from the file's schedule stays `Never`.
+    assert_eq!(spec.rayls_fork_activation(RaylsHardFork::Eip1559), ForkCondition::Never);
+    Ok(())
+}
+
 /// `batch_txns_all_pending` underpins restart dedup: an empty block's batch is only
 /// re-enabled for retry when its txns are STILL pending (nonce-too-high); txns already
 /// mined (nonce-too-low) must read as not-retryable so the batch stays deduped and a

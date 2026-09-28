@@ -524,7 +524,7 @@ impl ColdStore {
     /// # Errors
     ///
     /// [`ColdError::Corruption`] if a row's digest column is not a 32-byte hash.
-    pub(crate) fn for_each_batch_digest_in_epoch(
+    pub fn for_each_batch_digest_in_epoch(
         &self,
         epoch: Epoch,
         mut visit: impl FnMut(u64, BlockHash) -> ColdResult<()>,

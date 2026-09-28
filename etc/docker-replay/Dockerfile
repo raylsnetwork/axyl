@@ -11,7 +11,7 @@
 #     -v /data/snapshot:/snapshot:ro \
 #     -v /data/archive:/archive \
 #     rayls-replay:latest \
-#       --snapshot-datadir /snapshot --archive-out /archive --chain mainnet
+#       --snapshot-datadir /snapshot --archive-out /archive --network mainnet
 #
 # The mounted volumes must be writable by uid 1101 (the nonroot user); the output
 # datadir and its parent need write access. Run `rayls-replay --help` for the full
