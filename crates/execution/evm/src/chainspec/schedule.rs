@@ -17,9 +17,6 @@ use rayls_infrastructure_types::RaylsNetwork;
 use reth_chainspec::ForkCondition;
 
 /// One entry of a Rayls hardfork schedule: a fork and its activation condition.
-///
-/// Sorted by `fork` first; since schedules never list the same fork twice,
-/// `condition` is never a tiebreaker, so sorting yields canonical fork order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ScheduledFork {
     pub fork: RaylsHardFork,
