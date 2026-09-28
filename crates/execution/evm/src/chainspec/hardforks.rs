@@ -113,8 +113,10 @@ pub trait RaylsHardforks {
     /// A misconfigured tokenomics activation left rewards off for this block range
     /// on the live testnet, so archive replay skips on-chain reward distribution
     /// here to match canonical state. The guard compares this schedule's Tokenomics
-    /// activation against the baked-in testnet's, so no other network or synthetic
-    /// schedule ever matches.
+    /// activation against the baked-in testnet's (`1_879_000`); any schedule with
+    /// Tokenomics at that block would also match. This is acceptable because the
+    /// method is gated behind `archive-replay`, which only runs against canonical
+    /// historical state where no such synthetic schedule would ever be used.
     #[cfg(feature = "archive-replay")]
     fn is_tokenomics_outage_block(&self, block: u64) -> bool {
         // Identity check: only the live testnet schedule matches.
