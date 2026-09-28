@@ -132,21 +132,12 @@ mod schedule {
                 RaylsHardFork::VARIANTS.len(),
                 "expected one entry per hardfork for {network}"
             );
-            assert_eq!(schedule[0].fork, RaylsHardFork::Eip1559);
-            assert_eq!(schedule[1].fork, RaylsHardFork::BatchDigestV2);
-            assert_eq!(schedule[2].fork, RaylsHardFork::AdminTransfer);
-            assert_eq!(schedule[3].fork, RaylsHardFork::PrecompileGasFix);
-            assert_eq!(schedule[4].fork, RaylsHardFork::RlsStorage);
-            assert_eq!(schedule[5].fork, RaylsHardFork::Tokenomics);
-            assert_eq!(schedule[6].fork, RaylsHardFork::Uups);
-            assert_eq!(schedule[7].fork, RaylsHardFork::Erc20PrecompileBytecode);
-            assert_eq!(schedule[8].fork, RaylsHardFork::TransactionLoadBalancing);
-            assert_eq!(schedule[9].fork, RaylsHardFork::UsdrSupplyCorrection);
-            assert_eq!(schedule[10].fork, RaylsHardFork::EmptyOutputBlock);
-            assert_eq!(schedule[11].fork, RaylsHardFork::DynamicCommitteeSizing);
-            assert_eq!(schedule[12].fork, RaylsHardFork::HybridRewards);
-            assert_eq!(schedule[13].fork, RaylsHardFork::OutputSeqNormalization);
-            assert_eq!(schedule[14].fork, RaylsHardFork::SenderAffinityLoadBalancing);
+            for (i, variant) in RaylsHardFork::VARIANTS.iter().enumerate() {
+                assert_eq!(
+                    schedule[i].fork, *variant,
+                    "network {network}: schedule[{i}] fork mismatch"
+                );
+            }
         }
     }
 
