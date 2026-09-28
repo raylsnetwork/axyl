@@ -7,7 +7,10 @@ use crate::{
     engine::{ExecutionNode, RaylsBuilder},
     epoch_manager::{
         state::hydrate_prev_epoch_record,
-        types::{EpochManager, ENGINE_TASK_MANAGER, EPOCH_TASK_MANAGER, NODE_TASK_MANAGER},
+        types::{
+            CertificationAttempts, EpochManager, ENGINE_TASK_MANAGER, EPOCH_TASK_MANAGER,
+            NODE_TASK_MANAGER,
+        },
         utils::{catchup_accumulator, recover_executed_anchor},
         vote_triage::{
             backfill_candidate, classify_fetched_record, split_settled_votes, triage_vote,
@@ -80,6 +83,39 @@ pub(crate) fn certification_retry_backoff(attempt: u32) -> Duration {
         .checked_mul(1u32 << attempt.saturating_sub(1).min(31))
         .unwrap_or(MAX_CERTIFICATION_RETRY_BACKOFF);
     doubled.min(MAX_CERTIFICATION_RETRY_BACKOFF)
+}
+
+/// The 1-based number of the certification attempt about to start for `epochs`: one more than
+/// the most attempts any of them has already failed. Collected together, they share one backoff,
+/// so the most-retried epoch sets the pace rather than a newly closed one resetting it.
+pub(crate) fn next_certification_attempt(
+    attempts: &CertificationAttempts,
+    epochs: impl Iterator<Item = Epoch>,
+) -> u32 {
+    let attempts = attempts.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    epochs.map(|epoch| attempts.get(&epoch).copied().unwrap_or(0)).max().unwrap_or(0) + 1
+}
+
+/// Remember that attempt `attempt` failed for every epoch in `epochs`.
+pub(crate) fn record_failed_certification_attempt(
+    attempts: &CertificationAttempts,
+    epochs: impl Iterator<Item = Epoch>,
+    attempt: u32,
+) {
+    let mut attempts = attempts.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    for epoch in epochs {
+        attempts.insert(epoch, attempt);
+    }
+}
+
+/// Drop the attempt counts of epochs that are certified now, so the map only ever holds the
+/// epochs still being retried.
+pub(crate) fn forget_certified_attempts(
+    attempts: &CertificationAttempts,
+    certified: &impl Fn(Epoch) -> bool,
+) {
+    let mut attempts = attempts.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    attempts.retain(|epoch, _| !certified(*epoch));
 }
 
 /// Time allowed for placing one unknown epoch record digest seen in a vote.
@@ -229,6 +265,7 @@ where
             worker_event_stream,
             epoch_record: None,
             prev_epoch_record,
+            certification_attempts: Default::default(),
             initial_epoch: true,
             #[cfg(feature = "cold-storage")]
             cold_archival,
@@ -1182,7 +1219,9 @@ where
             ForeignVote::Competing if !already_certified => {
                 // The network came to quorum on a record for this epoch that is not the one we
                 // built. Its cert verified above, so adopt it: this also deletes our pending row
-                // and ends our collection for the epoch.
+                // and ends our collection for the epoch. Reported as `Adopted` so the vote that
+                // led here, and every later vote for the digest, is acked rather than rejected
+                // as a competing record now that the record is on disk.
                 match consensus_db.save_epoch_record_with_cert(&record, &cert) {
                     Ok(()) => {
                         warn!(
@@ -1197,6 +1236,7 @@ where
                             adopted = %digest,
                             "pending record replaced: the network's certified record was adopted and our pending row removed"
                         );
+                        return ForeignVote::Adopted;
                     }
                     Err(err) => error!(
                         target: "epoch-manager",
@@ -1206,7 +1246,10 @@ where
                     ),
                 }
             }
-            ForeignVote::Competing | ForeignVote::Unknown => {}
+            // Competing and already certified here: the collector landed the network's record
+            // in the background. `triage_vote` sees it certified on disk and adopts it from the
+            // local lookup, so nothing to do.
+            ForeignVote::Competing | ForeignVote::Adopted | ForeignVote::Unknown => {}
         }
         class
     }
@@ -1355,6 +1398,7 @@ where
 
         let consensus_db = self.consensus_db.clone();
         let consensus_bus = self.consensus_bus.clone();
+        let certification_attempts = self.certification_attempts.clone();
         // This is a Drainable consumer, so it drains on the task manager's `local_shutdown`  -
         // fired by `join_internal`'s consumer phase AFTER producers are reaped (or by `Drop`).
         // That makes wind-down graceful AND ordered for every teardown (epoch/mode transition
@@ -1369,6 +1413,7 @@ where
                     consensus_db,
                     consensus_bus,
                     primary_network,
+                    certification_attempts,
                     vote_shutdown,
                 )
                 .await
@@ -1391,21 +1436,27 @@ where
         consensus_db: DB,
         consensus_bus: ConsensusBus,
         primary_network: PrimaryNetworkHandle,
+        certification_attempts: CertificationAttempts,
         vote_shutdown: Noticer,
     ) {
         let certified = |epoch: Epoch| {
             consensus_db.get_epoch_by_number(epoch).is_some_and(|(_, c)| c.is_some())
         };
-        // `attempt` is for logging only.
-        let mut attempt: u32 = 0;
         loop {
-            attempt += 1;
             // Certified by someone else while we were backing off (a peer's backfill/fetch, or a
             // previous attempt's peer fetch landing late): nothing left to do for those.
             states.retain(|s| !certified(s.record.epoch));
+            forget_certified_attempts(&certification_attempts, &certified);
             if states.is_empty() {
                 return;
             }
+            // The attempt number drives the backoff and continues from where the previous
+            // collector task for these epochs left off: the task is respawned at every epoch
+            // close, the stall it is retrying is not.
+            let attempt = next_certification_attempt(
+                &certification_attempts,
+                states.iter().map(|s| s.record.epoch),
+            );
             if attempt > 1 {
                 for state in &states {
                     info!(
@@ -1587,6 +1638,29 @@ where
                                 );
                                 // Honest gossip: ack it so the peer is not punished.
                                 let _ = vote_tx.send(Ok(()));
+                            }
+                            VoteAction::Adopted => {
+                                // The network's certified record for the epoch being collected,
+                                // not ours: adopted while resolving this digest, or landed by
+                                // the record collector. The vote is honest, and the collection
+                                // for that epoch is over now that its certificate is on disk.
+                                let _ = vote_tx.send(Ok(()));
+                                for state in states
+                                    .iter_mut()
+                                    .filter(|s| !s.done && s.record.epoch == reference_epoch)
+                                {
+                                    info!(
+                                        target: PENDING_RECORD_LOG_TARGET,
+                                        epoch = reference_epoch,
+                                        ours = %state.epoch_hash,
+                                        adopted = %vote.epoch_hash,
+                                        "collection ended: the network certified a different record for the epoch"
+                                    );
+                                    state.done = true;
+                                }
+                                if states.iter().all(|s| s.done) {
+                                    break;
+                                }
                             }
                             VoteAction::Alternate
                             | VoteAction::Unresolvable
@@ -1808,7 +1882,14 @@ where
             // Neither quorum nor a peer's cert. Back off (doubling per attempt, capped) and try
             // the whole sequence again - the records are only in PendingEpochRecord now, and only
             // this loop (or an identical one resumed by the next run_epoch, see
-            // resume_pending_certification) can ever finish certifying them.
+            // resume_pending_certification) can ever finish certifying them. The attempt is
+            // recorded first so a collector resumed by the next run_epoch backs off from here
+            // instead of from the base.
+            record_failed_certification_attempt(
+                &certification_attempts,
+                states.iter().map(|s| s.record.epoch),
+                attempt,
+            );
             tokio::select! {
                 biased;
                 _ = &vote_shutdown => return,

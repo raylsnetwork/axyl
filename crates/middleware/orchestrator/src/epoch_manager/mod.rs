@@ -26,7 +26,10 @@ pub(crate) use core::{await_execution_replay, ReplayWaitOutcome};
 pub(crate) use network::{decide_node_mode, node_has_local_history};
 
 #[cfg(test)]
-pub(crate) use core::certification_retry_backoff;
+pub(crate) use core::{
+    certification_retry_backoff, forget_certified_attempts, next_certification_attempt,
+    record_failed_certification_attempt,
+};
 #[cfg(test)]
 pub(crate) use state::{hydrate_prev_epoch_record, resolve_local_prev_epoch_record};
 

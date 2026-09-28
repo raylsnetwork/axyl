@@ -1504,6 +1504,38 @@ fn test_certification_retry_backoff_doubles_to_a_ceiling() {
     assert_eq!(certification_retry_backoff(0), base);
 }
 
+/// The attempt count lives on the epoch manager, not in the collector task: the task is
+/// respawned at every epoch close, so a task-local counter restarted the backoff from its base
+/// whenever any epoch closed and the ceiling only held within one epoch. A resumed collector
+/// continues from the most-retried epoch it holds, and a certified epoch is forgotten.
+#[test]
+fn test_certification_attempts_survive_the_collector_being_respawned() {
+    use crate::epoch_manager::{
+        forget_certified_attempts, next_certification_attempt, record_failed_certification_attempt,
+        CertificationAttempts,
+    };
+
+    let attempts = CertificationAttempts::default();
+
+    // First collector life: epoch 40 fails three attempts.
+    for attempt in 1..=3 {
+        assert_eq!(next_certification_attempt(&attempts, [40].into_iter()), attempt);
+        record_failed_certification_attempt(&attempts, [40].into_iter(), attempt);
+    }
+
+    // Epoch 41 closes: a new collector holds 40 and 41 together and backs off from attempt 4,
+    // not from 1.
+    assert_eq!(next_certification_attempt(&attempts, [40, 41].into_iter()), 4);
+    record_failed_certification_attempt(&attempts, [40, 41].into_iter(), 4);
+    assert_eq!(next_certification_attempt(&attempts, [41].into_iter()), 5);
+
+    // 40 certifies: its count goes, 41 keeps its own, and a fresh epoch starts from 1.
+    forget_certified_attempts(&attempts, &|epoch| epoch == 40);
+    assert_eq!(next_certification_attempt(&attempts, [40].into_iter()), 1);
+    assert_eq!(next_certification_attempt(&attempts, [41].into_iter()), 5);
+    assert_eq!(next_certification_attempt(&attempts, std::iter::empty()), 1);
+}
+
 // ---------------------------------------------------------------------------
 // Manager-impl: select! branch classification
 // ---------------------------------------------------------------------------

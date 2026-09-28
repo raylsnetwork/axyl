@@ -29,6 +29,11 @@ pub(crate) enum ForeignVote {
     /// The digest belongs to *this* epoch: a genuine competing record, which may reach an
     /// alternate quorum and abort the collection.
     Competing,
+    /// The digest is *this* epoch's record as the network certified it, and it is not the one
+    /// being collected: either fetched and saved while resolving a vote for it, or landed by
+    /// the epoch record collector in the background. Our record lost, the collection for the
+    /// epoch is over, and every vote for the digest is an honest vote for the certified record.
+    Adopted,
     /// The digest is unknown locally; the caller has to resolve it (ask a peer) to decide.
     Unknown,
 }
@@ -44,8 +49,11 @@ pub(crate) fn classify_foreign_digest(
     match local {
         // A record of another epoch: stale, whether or not we also hold its certificate.
         Some((epoch, _)) if epoch != current_epoch => ForeignVote::Stale { epoch },
-        // Same epoch, different digest: a real fork candidate.
-        Some(_) => ForeignVote::Competing,
+        // Same epoch, different digest, and it is the certified record on disk: the network
+        // settled the epoch on that record, not ours.
+        Some((_, true)) => ForeignVote::Adopted,
+        // Same epoch, different digest, no certificate: a real fork candidate.
+        Some((_, false)) => ForeignVote::Competing,
         None => ForeignVote::Unknown,
     }
 }
@@ -123,6 +131,10 @@ pub(crate) enum VoteAction {
     /// A different digest for the same epoch, proven by a record we hold or fetched: a genuine
     /// competing record. Tracked for the alternate-record quorum and rejected.
     Alternate,
+    /// A vote for the record the network certified for the epoch being collected, which is not
+    /// ours (see [`ForeignVote::Adopted`]). Honest: acked, and the collection for that epoch
+    /// ends, since its certificate is already on disk.
+    Adopted,
     /// A committee signature over a digest nobody can place - not held locally and not served by
     /// any peer. That is exactly what an honest re-vote for an earlier, still uncertified epoch
     /// looks like to a node that never built that record (#142), so it is acked rather than
@@ -153,18 +165,22 @@ pub(crate) fn triage_vote(
     if vote.epoch_hash == epoch_hash {
         return VoteAction::Count;
     }
-    let class = match classify_foreign_digest(local, current_epoch) {
+    let class = match (classify_foreign_digest(local, current_epoch), resolved) {
+        // Adopted during this collection: the record is now on disk certified, so the local
+        // lookup would call it competing. The resolution outcome is the truth here.
+        (_, Some(ForeignVote::Adopted)) => ForeignVote::Adopted,
         // Nothing local to go on: use the network answer if we have one.
-        ForeignVote::Unknown => match resolved {
-            Some(resolved) => resolved,
-            None => return VoteAction::NeedsResolve,
-        },
-        known => known,
+        (ForeignVote::Unknown, Some(resolved)) => resolved,
+        (ForeignVote::Unknown, None) => return VoteAction::NeedsResolve,
+        (known, _) => known,
     };
     match class {
         ForeignVote::Stale { epoch } => VoteAction::IgnoreStale { epoch },
         // A proven competing record for this epoch: a genuine fork signal.
         ForeignVote::Competing => VoteAction::Alternate,
+        // The network's certified record for this epoch: an honest vote, and the end of the
+        // collection for the epoch.
+        ForeignVote::Adopted => VoteAction::Adopted,
         // Nobody could place the digest. A valid committee signature is not evidence of
         // misbehaviour on its own, so the sender is not punished.
         ForeignVote::Unknown => VoteAction::Unresolvable,
@@ -241,8 +257,14 @@ mod tests {
     // A different digest for the SAME epoch is the only case an alternate quorum may fire on.
     #[test]
     fn same_epoch_digest_is_competing() {
-        assert_eq!(classify_foreign_digest(Some((38, true)), 38), ForeignVote::Competing);
         assert_eq!(classify_foreign_digest(Some((38, false)), 38), ForeignVote::Competing);
+    }
+
+    // A certified record for the epoch being collected with a digest other than ours is the
+    // network's decision, not a fork candidate: votes for it are honest.
+    #[test]
+    fn same_epoch_certified_digest_is_adopted() {
+        assert_eq!(classify_foreign_digest(Some((38, true)), 38), ForeignVote::Adopted);
     }
 
     #[test]
@@ -361,6 +383,51 @@ mod tests {
         let competing_vote = competing.sign_vote(&signer);
         assert_eq!(
             triage_vote(&competing_vote, current.digest(), 38, &committee, Some((38, false)), None),
+            VoteAction::Alternate,
+        );
+    }
+
+    /// The vote that led the collector to fetch and adopt the network's record must not be the
+    /// one punished for it: once the resolution says `Adopted`, the vote is acked even though
+    /// the record is now on disk and the local lookup alone would call it competing. The same
+    /// holds for every later vote for that digest, and for a digest the record collector
+    /// certified in the background.
+    #[test]
+    fn votes_for_the_adopted_record_are_not_punished() {
+        let mut rng = StdRng::seed_from_u64(21);
+        let signer = TestSigner::new(&mut rng);
+        let committee = vec![signer.public_key()];
+        let ours = record_for(38, &committee, B256::ZERO);
+        let theirs = record_for(38, &committee, B256::repeat_byte(1));
+        let vote = theirs.sign_vote(&signer);
+
+        // Resolved and adopted: the record is certified locally now.
+        assert_eq!(
+            triage_vote(
+                &vote,
+                ours.digest(),
+                38,
+                &committee,
+                Some((38, true)),
+                Some(ForeignVote::Adopted),
+            ),
+            VoteAction::Adopted,
+        );
+        // Certified in the background before any resolution was needed.
+        assert_eq!(
+            triage_vote(&vote, ours.digest(), 38, &committee, Some((38, true)), None),
+            VoteAction::Adopted,
+        );
+        // A resolution that fetched nothing does not turn a competing record into an adopted one.
+        assert_eq!(
+            triage_vote(
+                &vote,
+                ours.digest(),
+                38,
+                &committee,
+                Some((38, false)),
+                Some(ForeignVote::Unknown),
+            ),
             VoteAction::Alternate,
         );
     }
