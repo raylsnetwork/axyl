@@ -1,6 +1,9 @@
 //! Rayls hardfork queries and the schedule-backed [`RaylsChainHardforks`] implementation.
 
-use std::sync::{Arc, LazyLock};
+use std::sync::Arc;
+
+#[cfg(feature = "archive-replay")]
+use std::sync::LazyLock;
 
 use rayls_infrastructure_types::RaylsNetwork;
 use reth_chainspec::ForkCondition;
@@ -49,7 +52,7 @@ impl RaylsChainHardforks {
         Self::new(RaylsHardFork::mainnet())
     }
 
-    /// Create with local schedule (first four hardforks active at genesis).
+    /// Create with local schedule.
     pub fn local() -> Self {
         Self::new(RaylsHardFork::local())
     }
