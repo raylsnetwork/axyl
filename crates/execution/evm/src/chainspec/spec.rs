@@ -111,6 +111,7 @@ impl RaylsChainSpecBuilder {
     }
 
     /// Apply the baked-in hardfork schedule for the given network.
+    #[must_use = "builder method result must be used"]
     pub fn add_rayls_hardforks_by_type(mut self, network: RaylsNetwork) -> Self {
         for entry in RaylsHardFork::for_network(network) {
             self.inner.hardforks.insert(entry.fork, entry.condition);
@@ -121,6 +122,7 @@ impl RaylsChainSpecBuilder {
     /// Apply an explicit hardfork schedule, as resolved from an external
     /// network config file. Each fork in the iterator is inserted into the
     /// inner ChainSpec, overriding any previously-set condition for that fork.
+    #[must_use = "builder method result must be used"]
     pub fn add_rayls_hardforks_by_schedule(
         mut self,
         schedule: impl IntoIterator<Item = ScheduledFork>,
@@ -132,36 +134,42 @@ impl RaylsChainSpecBuilder {
     }
 
     /// Activate EIP-1559 dynamic base fee at `block`.
+    #[must_use = "builder method result must be used"]
     pub fn eip1559(mut self, block: u64) -> Self {
         self.inner.hardforks.insert(RaylsHardFork::Eip1559, ForkCondition::Block(block));
         self
     }
 
     /// Activate BatchDigestV2 at `block`.
+    #[must_use = "builder method result must be used"]
     pub fn batch_digest_v2(mut self, block: u64) -> Self {
         self.inner.hardforks.insert(RaylsHardFork::BatchDigestV2, ForkCondition::Block(block));
         self
     }
 
     /// Activate EmptyOutputBlock at `block`.
+    #[must_use = "builder method result must be used"]
     pub fn empty_output_block(mut self, block: u64) -> Self {
         self.inner.hardforks.insert(RaylsHardFork::EmptyOutputBlock, ForkCondition::Block(block));
         self
     }
 
     /// Activate AdminTransfer at `block`.
+    #[must_use = "builder method result must be used"]
     pub fn admin_transfer(mut self, block: u64) -> Self {
         self.inner.hardforks.insert(RaylsHardFork::AdminTransfer, ForkCondition::Block(block));
         self
     }
 
     /// Activate PrecompileGasFix at `block`.
+    #[must_use = "builder method result must be used"]
     pub fn precompile_gas_fix(mut self, block: u64) -> Self {
         self.inner.hardforks.insert(RaylsHardFork::PrecompileGasFix, ForkCondition::Block(block));
         self
     }
 
     /// Activate Erc20PrecompileBytecode at `block`.
+    #[must_use = "builder method result must be used"]
     pub fn erc20_precompile_bytecode(mut self, block: u64) -> Self {
         self.inner
             .hardforks
@@ -170,6 +178,7 @@ impl RaylsChainSpecBuilder {
     }
 
     /// Activate DynamicCommitteeSizing at `block`.
+    #[must_use = "builder method result must be used"]
     pub fn dynamic_committee_sizing(mut self, block: u64) -> Self {
         self.inner
             .hardforks
@@ -178,12 +187,14 @@ impl RaylsChainSpecBuilder {
     }
 
     /// Activate HybridRewards at `block` (synthetic schedules / fork-boundary tests).
+    #[must_use = "builder method result must be used"]
     pub fn hybrid_rewards(mut self, block: u64) -> Self {
         self.inner.hardforks.insert(RaylsHardFork::HybridRewards, ForkCondition::Block(block));
         self
     }
 
     /// Activate OutputSeqNormalization at `block`.
+    #[must_use = "builder method result must be used"]
     pub fn output_seq_normalization(mut self, block: u64) -> Self {
         self.inner
             .hardforks
@@ -192,12 +203,14 @@ impl RaylsChainSpecBuilder {
     }
 
     /// Set the minimum EIP-1559 base fee floor.
+    #[must_use = "builder method result must be used"]
     pub fn min_base_fee(mut self, min_base_fee: u64) -> Self {
         self.min_base_fee = min_base_fee;
         self
     }
 
     /// Set the EIP-1559 base fee parameters.
+    #[must_use = "builder method result must be used"]
     pub fn base_fee_params(mut self, params: BaseFeeParams) -> Self {
         self.base_fee_params = params;
         self
