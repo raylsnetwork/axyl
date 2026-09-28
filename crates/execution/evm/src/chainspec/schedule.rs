@@ -104,7 +104,7 @@ impl RaylsHardFork {
         ]
     }
 
-    /// Local network hardfork schedule (first four hardforks active at genesis).
+    /// Local network hardfork schedule
     pub const fn local() -> [ScheduledFork; RaylsHardFork::VARIANTS.len()] {
         [
             ScheduledFork::new(Self::Eip1559, ForkCondition::Block(0)),
