@@ -63,18 +63,6 @@ impl RaylsChainHardforks {
     }
 }
 
-impl RaylsHardforks for RaylsChainHardforks {
-    fn rayls_fork_activation(&self, fork: RaylsHardFork) -> ForkCondition {
-        // Compares on `fork` only: correct because a schedule never lists the same fork
-        // twice (sorting would be ambiguous for duplicates).
-        self.forks
-            .binary_search_by(|entry| entry.fork.cmp(&fork))
-            .ok()
-            .map(|idx| self.forks[idx].condition)
-            .unwrap_or(ForkCondition::Never)
-    }
-}
-
 /// Rayls hardfork queries, mirroring [`reth_chainspec::EthereumHardforks`].
 pub trait RaylsHardforks {
     /// Return the activation condition for a Rayls hardfork.
@@ -205,6 +193,18 @@ pub trait RaylsHardforks {
             })
             .copied()
             .collect()
+    }
+}
+
+impl RaylsHardforks for RaylsChainHardforks {
+    fn rayls_fork_activation(&self, fork: RaylsHardFork) -> ForkCondition {
+        // Compares on `fork` only: correct because a schedule never lists the same fork
+        // twice (sorting would be ambiguous for duplicates).
+        self.forks
+            .binary_search_by(|entry| entry.fork.cmp(&fork))
+            .ok()
+            .map(|idx| self.forks[idx].condition)
+            .unwrap_or(ForkCondition::Never)
     }
 }
 
