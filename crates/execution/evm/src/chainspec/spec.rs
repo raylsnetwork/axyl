@@ -119,7 +119,8 @@ impl RaylsChainSpecBuilder {
     }
 
     /// Apply an explicit hardfork schedule, as resolved from an external
-    /// network config file. Forks absent from the schedule stay `Never`.
+    /// network config file. Each fork in the iterator is inserted into the
+    /// inner ChainSpec, overriding any previously-set condition for that fork.
     pub fn add_rayls_hardforks_by_schedule(
         mut self,
         schedule: impl IntoIterator<Item = ScheduledFork>,
