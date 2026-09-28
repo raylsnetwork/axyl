@@ -217,6 +217,7 @@ impl RaylsChainSpecBuilder {
     }
 
     /// Finalize into a [`RaylsChainSpec`].
+    #[must_use = "builder method result must be used"]
     pub fn build(self) -> RaylsChainSpec {
         RaylsChainSpec {
             inner: Arc::new(self.inner),
