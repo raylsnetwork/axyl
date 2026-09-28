@@ -227,8 +227,10 @@ impl EthChainSpec for RaylsChainSpec {
         self.inner.chain
     }
 
-    fn base_fee_params_at_timestamp(&self, timestamp: u64) -> BaseFeeParams {
-        self.inner.base_fee_params_at_timestamp(timestamp)
+    fn base_fee_params_at_timestamp(&self, _timestamp: u64) -> BaseFeeParams {
+        // Rayls uses a single fixed BaseFeeParams across all timestamps;
+        // timestamp-gated switching is unused.
+        self.base_fee_params
     }
 
     fn blob_params_at_timestamp(&self, timestamp: u64) -> Option<BlobParams> {
