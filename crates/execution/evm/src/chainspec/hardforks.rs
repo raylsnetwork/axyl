@@ -24,8 +24,9 @@ pub struct RaylsChainHardforks {
 impl RaylsChainHardforks {
     /// Create from an iterator of schedule entries, sorted by fork.
     ///
-    /// Duplicate forks are rejected by a debug assert; release builds rely on the
-    /// schedules being the trusted const arrays in `schedule.rs`.
+    /// `ScheduledFork::Ord` compares `fork` first; since schedules never list
+    /// the same fork twice, `condition` is never a tiebreaker, so sorting yields
+    /// canonical fork order. Duplicate forks are rejected by a debug assert.
     pub fn new(forks: impl IntoIterator<Item = ScheduledFork>) -> Self {
         let mut forks = forks.into_iter().collect::<Vec<_>>();
         forks.sort();
