@@ -44,8 +44,9 @@ Reward distribution happens in two stages that run on a different schedule:
 │         └─ Burn (20%)      → LayerZero OFT bridge to Ethereum       │
 │                                                                     │
 │  Step 2: RewardDistributor.distributeRewards()                      │
-│    ├─ Reads performance weights from ConsensusRegistry              │
-│    ├─ Distributes RLS proportionally to the recorded weights        │
+│    ├─ Distributes RLS by stake / target-APY (default)               │
+│    ├─ If performanceWeightBps > 0 (opt-in): blends in               │
+│    │    ConsensusRegistry's performance weights                     │
 │    └─ Splits between validator own stake and delegation pool        │
 │                                                                     │
 │  Step 3: Validators call claimRewards() (permissionless)            │
@@ -124,9 +125,12 @@ Each recipient transfer is isolated via try/catch — a failing recipient does n
 **`RewardDistributor.distributeRewards()`** — Automatic, system-call only:
 - `onlySystemCall` (no `KEEPER_ROLE` involvement); the EVM invokes it once per epoch from
   `RaylsBlockExecutor` (`evm/block.rs:277`) after `concludeEpoch`.
-- Reads `getEpochPerformanceWeights()` from `ConsensusRegistry`.
-- If performance data exists: distributes proportionally by `stake × headerCount`.
-- If no performance data: falls back to pure stake-based distribution.
+- Distribution is stake- and target-APY-derived by default (`performanceWeightBps == 0`).
+- If `performanceWeightBps > 0` (opt-in, admin-set, default disabled): blends in
+  `ConsensusRegistry.getEpochPerformanceWeights()` — a hybrid participation/anchor/stake-tier
+  weight, not the old raw `stake × headerCount` this doc previously (incorrectly) described. See
+  `RewardDistributor._applyPerformanceWeight`. This was removed entirely in #85 and reintroduced
+  as an off-by-default knob rather than automatic behavior.
 - For each validator, splits between own stake and the delegation pool.
 
 There is no `startDistribution()` / `continueDistribution(batchSize)` batched alternative
@@ -179,7 +183,7 @@ The contract must hold native tokens to pay LayerZero messaging fees.
 
 ## Timing Considerations
 
-- The keeper should call `distributeRewards()` **before** the next epoch's `applyIncentives()`, which clears `_performanceWeights`. If missed, RewardDistributor falls back to stake-based distribution — no funds are lost.
+- `distributeRewards()` is not keeper-triggered — it's `onlySystemCall`, invoked automatically once per epoch close in the fixed syscall sequence `applyIncentives` → `concludeEpoch` → `distributeRewards` (`evm/block.rs`). It always runs after `applyIncentives` has set that epoch's performance weights (when `performanceWeightBps > 0`), never before.
 - `distributeEpochFees()` can be called at any time — fees accumulate if skipped.
 - If the USDr balance is below the minimum swap amount, distribution is silently skipped and fees accumulate to the next call.
 
