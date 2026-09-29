@@ -122,6 +122,31 @@ contract DelegationPoolHandler is Test {
         pool.requestUndelegation(validator, amount);
     }
 
+    function transferStake(uint256 seed, uint256 fromSeed, uint256 toSeed, uint256 amount) external {
+        address d = _actor(seed);
+        address from = _validator(fromSeed);
+        address to = _validator(toSeed);
+        if (from == to) return;
+
+        IDelegationPool.DelegatorPosition memory fromPos = pool.getDelegatorPosition(from, d);
+        if (fromPos.amount == 0) return;
+        // lastTransferEpoch is stored 1-based; already used this epoch if it equals current+1
+        if (fromPos.lastTransferEpoch == registry.getCurrentEpoch() + 1) return;
+
+        IDelegationPool.ValidatorPool memory toPool = pool.getValidatorPool(to);
+        IDelegationPool.DelegatorPosition memory toPos = pool.getDelegatorPosition(to, d);
+
+        uint256 poolRoom = MAX_VALIDATOR_DELEGATION - (toPool.totalDelegated + toPool.openTierDelegated);
+        uint256 actorRoom = MAX_DELEGATION - toPos.amount;
+        uint256 cap = poolRoom < actorRoom ? poolRoom : actorRoom;
+        if (cap > fromPos.amount) cap = fromPos.amount;
+        if (cap == 0) return;
+
+        amount = bound(amount, 1, cap);
+        vm.prank(d);
+        pool.transferStake(from, to, amount);
+    }
+
     function completeUndelegation(uint256 seed, uint256 vSeed) external {
         address d = _actor(seed);
         address validator = _validator(vSeed);
@@ -236,7 +261,7 @@ contract DelegationPoolSolvencyInvariant is Test {
         vals[1] = validator2;
         handler = new DelegationPoolHandler(pool, rls, registry, vals, rewardDistributor, delegators);
 
-        bytes4[] memory selectors = new bytes4[](8);
+        bytes4[] memory selectors = new bytes4[](9);
         selectors[0] = handler.delegate.selector;
         selectors[1] = handler.requestUndelegation.selector;
         selectors[2] = handler.completeUndelegation.selector;
@@ -245,6 +270,7 @@ contract DelegationPoolSolvencyInvariant is Test {
         selectors[5] = handler.distributeRewards.selector;
         selectors[6] = handler.advanceEpoch.selector;
         selectors[7] = handler.slash.selector;
+        selectors[8] = handler.transferStake.selector;
         targetSelector(FuzzSelector({addr: address(handler), selectors: selectors}));
         targetContract(address(handler));
         // only the handler is fuzzed; exclude the rest (defensive vs Forge target-selection changes)
