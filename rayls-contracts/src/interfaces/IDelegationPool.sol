@@ -34,6 +34,7 @@ interface IDelegationPool {
         uint256 slashDebt;
         uint64 lastDelegateEpoch; // epoch of most recent delegation — same-epoch rewards excluded (DP-NEW-002)
         bool openTier; // immutable after entry; true = Track B (open-tier), false = Track A (whitelisted)
+        uint64 lastTransferEpoch; // 1-based: (epoch of most recent transferStake OUT of this position) + 1; 0 = never (#164)
     }
 
     /// @notice Pending commission increase awaiting activation
@@ -78,6 +79,8 @@ interface IDelegationPool {
     error InvalidConfig();
     error ZeroAddress();
     error ZeroAmount();
+    error SameValidator();
+    error TransferAlreadyUsedThisEpoch(uint32 currentEpoch);
 
     // events
     event PoolRegistered(address indexed validator, uint256 commissionBps);
@@ -100,6 +103,12 @@ interface IDelegationPool {
     );
     event UndelegationCompleted(
         address indexed validator,
+        address indexed delegator,
+        uint256 amount
+    );
+    event StakeTransferred(
+        address indexed fromValidator,
+        address indexed toValidator,
         address indexed delegator,
         uint256 amount
     );
@@ -201,6 +210,22 @@ interface IDelegationPool {
     /// @notice Complete undelegation after the unbonding period has elapsed
     /// @param validatorAddress The validator to complete undelegation from
     function completeUndelegation(address validatorAddress) external;
+
+    /// @notice Move stake from one validator's pool to another, once per epoch per source
+    ///         position, without starting the unbonding period
+    /// @dev Pure internal accounting move — no RLS ever leaves the contract, so the unbonding
+    ///      lock on `requestUndelegation`/`completeUndelegation` is completely unaffected: it
+    ///      still governs actual withdrawal exactly as before. Rate-limited per SOURCE position
+    ///      (`fromValidator`, caller), so a delegator with positions at several validators may
+    ///      transfer out of each of them once in the same epoch.
+    /// @param fromValidator The validator to move stake away from
+    /// @param toValidator The validator to move stake to
+    /// @param amount The amount of already-delegated RLS to move
+    function transferStake(
+        address fromValidator,
+        address toValidator,
+        uint256 amount
+    ) external;
 
     /// @notice Claim accumulated delegation rewards from a validator's pool
     /// @param validatorAddress The validator whose pool to claim from
