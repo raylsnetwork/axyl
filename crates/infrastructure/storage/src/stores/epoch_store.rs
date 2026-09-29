@@ -36,6 +36,10 @@ pub trait EpochStore {
         cert: &EpochCertificate,
     ) -> StoreResult<()>;
 
+    /// Remove an epoch record, its digest index entry, and its certificate atomically. No-op if
+    /// absent.
+    fn remove_epoch_record(&self, epoch: Epoch) -> StoreResult<()>;
+
     /// Retrieve the epoch record and certificate (if available) by number.
     fn get_epoch_by_number(&self, epoch: Epoch) -> Option<(EpochRecord, Option<EpochCertificate>)>;
 
@@ -116,6 +120,19 @@ impl<DB: Database> EpochStore for DB {
             "epoch certified: its pending record, if any, was removed with the certificate"
         );
         Ok(())
+    }
+
+    fn remove_epoch_record(&self, epoch: Epoch) -> StoreResult<()> {
+        // Read the digest outside the write txn: get() panics inside one.
+        let epoch_hash = self.get::<EpochRecords>(&epoch).ok().flatten().map(|rec| rec.digest());
+        self.with_write_txn(|tx| {
+            if let Some(hash) = epoch_hash {
+                tx.remove::<EpochCerts>(&hash)?;
+                tx.remove::<EpochRecordsIndex>(&hash)?;
+            }
+            tx.remove::<EpochRecords>(&epoch)?;
+            Ok(())
+        })
     }
 
     fn get_epoch_by_number(&self, epoch: Epoch) -> Option<(EpochRecord, Option<EpochCertificate>)> {

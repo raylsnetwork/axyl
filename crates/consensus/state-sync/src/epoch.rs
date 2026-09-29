@@ -1,24 +1,22 @@
 //! Tasks and helpers for collecting epoch records trustlessly.
 
 use eyre::OptionExt;
+use futures::{stream::FuturesUnordered, StreamExt};
 use rayls_consensus_primary::{network::PrimaryNetworkHandle, ConsensusBus};
 use rayls_infrastructure_storage::{tables::EpochRecords, EpochStore as _};
 use rayls_infrastructure_types::{
-    BlsPublicKey, Database as ReDatabase, Epoch, EpochCertificate, EpochRecord, Noticer,
-    TaskSpawner, B256,
+    quorum_threshold, BlsPublicKey, Database as ReDatabase, Epoch, EpochCertificate, EpochRecord,
+    Noticer, TaskSpawner, B256,
 };
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::{BTreeSet, HashMap, HashSet},
     time::Duration,
 };
 use tracing::info;
 
-/// Maximum number of consecutive orphaned epoch records to skip past during catch-up.
-/// When an epoch record is unavailable network-wide, we probe up to this many successors
-/// to decide whether it is a hole below the tip (skip it) or simply the chain tip (stop).
-/// Bounds how far a rare run of consecutive holes can be crossed, and how many probes the
-/// tip check costs.
-const MAX_GAP_SKIP: Epoch = 8;
+/// How long a committee attestation waits for each validator's answer. The requests run
+/// concurrently, so this bounds the whole attestation, not each member.
+const ATTESTATION_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// How long the collector waits before trying again while it is still behind the epoch it was
 /// asked for. Without it the only wake-up is the `requested_missing_epoch` watch, which changes
@@ -33,9 +31,6 @@ const COLLECTOR_RETRY_BUDGET: Duration = Duration::from_secs(60);
 /// How many times the same epoch may be pursued with [`COLLECTOR_RETRY_BUDGET`] before it is left
 /// to the periodic passes, so an epoch nobody can serve cannot hold the collector forever.
 const MAX_RETRY_ROUNDS: u32 = 3;
-
-/// Committee-size floor for accepting a record on its certificate alone (no parent to anchor to).
-const MIN_CERT_ONLY_COMMITTEE: usize = 4;
 
 /// How often the collector rescans the record table for holes below the tip while caught up.
 const COLLECTOR_BACKFILL_INTERVAL: Duration = Duration::from_secs(30);
@@ -54,7 +49,7 @@ const MAX_BACKFILL_ATTEMPTS: u32 = 10;
 /// Retry period, in backfill passes, for a hole that exhausted [`MAX_BACKFILL_ATTEMPTS`].
 const BACKFILL_COOLDOWN_PASSES: u64 = 20;
 
-/// Return true if committee is compatable with epoch_rec_committee.
+/// Return true if committee is compatible with epoch_rec_committee.
 /// These will usually be equal but it is possible for a validator to be
 /// booted and still in committee but not in epoch_rec.committee.
 /// This is very unlikely, but check for it just in case.
@@ -66,17 +61,14 @@ pub fn epoch_committee_valid(epoch_rec: &EpochRecord, committee: &[BlsPublicKey]
         std::cmp::Ordering::Equal => committee == epoch_rec.committee,
         std::cmp::Ordering::Greater => {
             let required = (committee_len * 2).div_ceil(3);
-            if epoch_committee_len < 4 || epoch_committee_len < required {
-                // Make sure we have a reasonable committe size, i.e. don't let
-                // a bogus record with one signer through, etc.
+            if epoch_committee_len < required {
+                // A record may omit a few members that were booted, never most of them: its
+                // committee must still be a super-majority of the one we derived, or a
+                // bogus record with a handful of signers would pass the subset check below.
                 false
             } else {
-                for k in &epoch_rec.committee {
-                    if !committee.contains(k) {
-                        return false;
-                    }
-                }
-                true
+                let derived: HashSet<&BlsPublicKey> = committee.iter().collect();
+                epoch_rec.committee.iter().all(|k| derived.contains(k))
             }
         }
     }
@@ -87,7 +79,6 @@ fn get_committee(
     db: &impl ReDatabase,
     epoch: u32,
 ) -> Result<(B256, Vec<BlsPublicKey>), eyre::Error> {
-    // Try to recover by downloading the epoch record and cert from a peer.
     if epoch == 0 {
         // If we can't find the genesis committee something is very wrong.
         let committee =
@@ -104,13 +95,14 @@ fn get_committee(
 
 /// Validate an epoch record and its certificate against what this node already knows.
 ///
-/// Normally the record is anchored to its parent (parent digest + the committee the parent names
-/// for this epoch) and the certificate is verified against that committee; epoch 0 is anchored to
-/// the genesis committee. If the parent record is missing - a permanent hole, orphaned
-/// network-wide, that can never be fetched or rebuilt here - fall back to trusting the
-/// certificate alone: it proves 2f+1 of the committee named in the record signed it, and the next
-/// epoch re-anchors the chain against this one (its `parent_hash` must match). That fallback is
-/// guarded by a committee-size floor so a record naming a tiny committee cannot slip through.
+/// A record is accepted only when anchored: its `parent_hash` is the digest of the record this
+/// node holds for the previous epoch, its committee is the one that parent names for this epoch,
+/// and the certificate verifies against that committee (epoch 0 is anchored to the genesis
+/// committee). A record whose parent is not held is rejected, whatever certificate it carries: a
+/// certificate only proves that a super-quorum of *the keys the record itself lists* signed it,
+/// which is exactly what a planted record forges (#14). It is never a permanent loss to reject
+/// one: a genuine hole below the tip is certified by the nodes that closed it (they hold it
+/// pending), and the collector fetches the next record once its parent is on disk.
 pub fn epoch_record_valid<DB>(
     db: &DB,
     epoch: Epoch,
@@ -123,24 +115,17 @@ where
     if epoch_rec.epoch != epoch {
         return false;
     }
-    match get_committee(db, epoch) {
-        Ok((parent_hash, committee)) => {
-            parent_hash == epoch_rec.parent_hash
-                && epoch_committee_valid(epoch_rec, &committee)
-                && epoch_rec.verify_with_cert(cert)
-        }
-        Err(_) => {
-            let ok = epoch_rec.committee.len() >= MIN_CERT_ONLY_COMMITTEE
-                && epoch_rec.verify_with_cert(cert);
-            if ok {
-                tracing::warn!(
-                    target: "epoch-manager",
-                    "epoch {epoch} parent record is orphaned; accepting cert-verified record to skip the gap",
-                );
-            }
-            ok
-        }
-    }
+    let Ok((parent_hash, committee)) = get_committee(db, epoch) else {
+        tracing::debug!(
+            target: "epoch-manager",
+            epoch,
+            "parent record not held: the record cannot be anchored, not storing it",
+        );
+        return false;
+    };
+    parent_hash == epoch_rec.parent_hash
+        && epoch_committee_valid(epoch_rec, &committee)
+        && epoch_rec.verify_with_cert(cert)
 }
 
 /// Outcome of asking peers for one epoch record.
@@ -193,8 +178,69 @@ where
     }
 }
 
-/// Asks peers for records from last_epoch to requested_epoch.
-/// Returns the Epoch that was last retrieved.
+/// Asks the validators of `committee` for `epoch`'s certified record, each by name, and returns
+/// it when a super-quorum of them serve the same one.
+///
+/// This is how a record is anchored when its parent cannot be: not by its certificate, which
+/// only proves that the keys the record lists signed it, but by the validators this node already
+/// trusts vouching for it. Every one of them serves only records it holds certified, and it holds
+/// them only if they anchored on its side, so a super-quorum agreeing is the honest majority's
+/// view. At most `f` of them can lie, which is why fewer than `2f+1` identical answers prove
+/// nothing. Answers are matched by digest; each must carry its own certificate and the requested
+/// epoch. Members that are offline, slow, or hold no such record simply do not count.
+async fn committee_attested_record(
+    epoch: Epoch,
+    committee: &[BlsPublicKey],
+    primary_handle: &PrimaryNetworkHandle,
+) -> Option<(EpochRecord, EpochCertificate)> {
+    let needed = quorum_threshold(committee.len() as u64) as usize;
+    let mut asks: FuturesUnordered<_> = committee
+        .iter()
+        .map(|member| async move {
+            tokio::time::timeout(
+                ATTESTATION_TIMEOUT,
+                primary_handle.request_epoch_cert_from_peer(*member, epoch),
+            )
+            .await
+            .ok()?
+            .ok()
+        })
+        .collect();
+
+    // Return as soon as one record has enough matching answers; don't wait for slow peers.
+    let mut votes: HashMap<B256, usize> = HashMap::new();
+    while let Some(answer) = asks.next().await {
+        let Some((record, cert)) = answer else { continue };
+        if record.epoch != epoch || !record.verify_with_cert(&cert) {
+            continue;
+        }
+        let count = votes.entry(record.digest()).or_insert(0);
+        *count += 1;
+        if *count >= needed {
+            info!(
+                target: "epoch-manager",
+                epoch,
+                attested_by = *count,
+                committee = committee.len(),
+                "epoch record attested by a super-quorum of the previous committee",
+            );
+            return Some((record, cert));
+        }
+    }
+    None
+}
+
+/// Asks peers for records from last_epoch upward, one at a time. Returns the Epoch that was
+/// last retrieved.
+///
+/// Every record is anchored to the one before it. When an epoch does not land - the tip, a hole
+/// nobody has certified yet, or a record that does not anchor - the walk does not probe ahead on
+/// its own: a fetchable later record proves nothing, and following it is what let a planted
+/// future record in (#14). Instead it asks the validators of the missing epoch, the last committee
+/// it has anchored, for the epoch after it; only a super-quorum of them serving the same record
+/// ([`committee_attested_record`]) lets the walk continue past the hole. The hole itself stays
+/// queued: the nodes that closed it hold it pending and certify it, and the backfill passes keep
+/// asking until it lands.
 async fn collect_epoch_records<DB>(
     last_epoch: Epoch,
     db: &DB,
@@ -211,34 +257,31 @@ where
         }
         match fetch_and_save_epoch(epoch, db, primary_handle).await {
             FetchOutcome::Saved => result_epoch = epoch,
-            FetchOutcome::Rejected => {}
-            FetchOutcome::Unavailable => {
-                // `epoch` may simply be past the tip (nothing to fetch), or it may be a
-                // record that is orphaned network-wide while later epochs still exist -
-                // possibly across a short run of consecutive holes. Probe up to
-                // MAX_GAP_SKIP successors: if any is fetchable, `epoch` is a hole below the
-                // tip and we skip it so catch-up can continue; if none are, we are at the
-                // tip and stop.
-                let mut later_epoch_exists = false;
-                for ahead in 1..=MAX_GAP_SKIP {
-                    if primary_handle.request_epoch_cert(Some(epoch + ahead), None).await.is_ok() {
-                        later_epoch_exists = true;
-                        break;
-                    }
-                }
-                if later_epoch_exists {
-                    tracing::warn!(
+            FetchOutcome::Rejected | FetchOutcome::Unavailable => {
+                // the committee of the missing epoch: what its parent, which we hold, names
+                let Ok((_, committee)) = get_committee(db, epoch) else { break };
+                let Some((record, cert)) =
+                    committee_attested_record(epoch + 1, &committee, primary_handle).await
+                else {
+                    break;
+                };
+                // No parent check: we don't hold it. The committee's votes are the check.
+                if let Err(e) = db.save_epoch_record_with_cert(&record, &cert) {
+                    tracing::error!(
                         target: "epoch-manager",
-                        "epoch {epoch} is unavailable network-wide but a later epoch exists; skipping the gap",
+                        "failed to save attested epoch record for epoch {}: {e}",
+                        epoch + 1,
                     );
-                    // Mark progress so the loop advances past the hole instead of breaking.
-                    result_epoch = epoch;
-                    continue;
+                    break;
                 }
+                tracing::warn!(
+                    target: "epoch-manager",
+                    "epoch {epoch} is not served by any peer but its committee attests epoch {}; \
+                     continuing past the hole, which stays queued for backfill",
+                    epoch + 1,
+                );
+                result_epoch = epoch + 1;
             }
-        }
-        if result_epoch != epoch {
-            break;
         }
     }
     result_epoch
@@ -488,22 +531,37 @@ mod tests {
         PrimaryNetworkHandle::new_for_test(tx)
     }
 
-    /// A network handle that answers `EpochRecord` requests from an in-memory chain.
-    fn serving_network(
+    /// A network handle that answers `EpochRecord` requests from an in-memory chain: requests to
+    /// any peer from `records`, requests to a named peer from that peer's own map in `by_peer`
+    /// (a peer not listed there answers nothing, like a validator that does not hold the record).
+    fn attesting_network(
         records: BTreeMap<Epoch, (EpochRecord, EpochCertificate)>,
+        by_peer: BTreeMap<BlsPublicKey, BTreeMap<Epoch, (EpochRecord, EpochCertificate)>>,
     ) -> PrimaryNetworkHandle {
         let (tx, mut rx) =
             tokio::sync::mpsc::channel::<NetworkCommand<PrimaryRequest, PrimaryResponse>>(64);
         tokio::spawn(async move {
+            let lookup = |records: &BTreeMap<Epoch, (EpochRecord, EpochCertificate)>,
+                          epoch: Option<Epoch>,
+                          hash: Option<B256>| match (epoch, hash) {
+                (Some(epoch), _) => records.get(&epoch).cloned(),
+                (None, Some(hash)) => {
+                    records.values().find(|(rec, _)| rec.digest() == hash).cloned()
+                }
+                (None, None) => None,
+            };
             while let Some(cmd) = rx.recv().await {
-                let NetworkCommand::SendRequestAny { request, reply } = cmd else { continue };
-                let PrimaryRequest::EpochRecord { epoch, hash } = request else { continue };
-                let found = match (epoch, hash) {
-                    (Some(epoch), _) => records.get(&epoch).cloned(),
-                    (None, Some(hash)) => {
-                        records.values().find(|(rec, _)| rec.digest() == hash).cloned()
-                    }
-                    (None, None) => None,
+                let (found, reply) = match cmd {
+                    NetworkCommand::SendRequestAny {
+                        request: PrimaryRequest::EpochRecord { epoch, hash },
+                        reply,
+                    } => (lookup(&records, epoch, hash), reply),
+                    NetworkCommand::SendRequest {
+                        peer,
+                        request: PrimaryRequest::EpochRecord { epoch, hash },
+                        reply,
+                    } => (by_peer.get(&peer).and_then(|r| lookup(r, epoch, hash)), reply),
+                    _ => continue,
                 };
                 let response = match found {
                     Some((record, certificate)) => {
@@ -515,6 +573,14 @@ mod tests {
             }
         });
         PrimaryNetworkHandle::new_for_test(tx)
+    }
+
+    /// A network handle that answers `EpochRecord` requests to any peer from an in-memory chain
+    /// and answers named peers nothing.
+    fn serving_network(
+        records: BTreeMap<Epoch, (EpochRecord, EpochCertificate)>,
+    ) -> PrimaryNetworkHandle {
+        attesting_network(records, BTreeMap::new())
     }
 
     /// Like [`serving_network`], but the first `fail_first` requests are refused. Models the
@@ -557,8 +623,8 @@ mod tests {
         (PrimaryNetworkHandle::new_for_test(tx), requests)
     }
 
-    /// A record signed by a super quorum of `signers`, for the cert-only path (committee of four
-    /// or more, no parent record to anchor against).
+    /// A record whose committee is exactly `signers`, certified by a super quorum of them: what
+    /// a planted record looks like (the keys that vouch for it are the keys it lists).
     fn multi_signed_record<S: BlsSigner>(
         signers: &[&S],
         epoch: Epoch,
@@ -588,6 +654,22 @@ mod tests {
             signed_authorities,
         };
         (record, cert)
+    }
+
+    /// A chain of records with `signers` as the committee of every epoch, each certified by a
+    /// super-quorum of them and anchored to the previous one.
+    fn multi_signed_chain<S: BlsSigner>(
+        signers: &[&S],
+        len: Epoch,
+    ) -> Vec<(EpochRecord, EpochCertificate)> {
+        let mut parent_hash = B256::default();
+        (0..len)
+            .map(|epoch| {
+                let (record, cert) = multi_signed_record(signers, epoch, parent_hash);
+                parent_hash = record.digest();
+                (record, cert)
+            })
+            .collect()
     }
 
     /// A chain of single-signer epoch records, each anchored to the previous one, so the
@@ -727,6 +809,35 @@ mod tests {
         assert_eq!(attempts.get(&2), Some(&1));
     }
 
+    /// A self-certified forgery for a hole below the tip is refused even though its parent is held.
+    #[tokio::test]
+    async fn backfill_rejects_a_forged_past_record_signed_by_made_up_keys() {
+        let (db, chain) = test_db_and_chain(4);
+        // Hold 0, 1 and 3: a hole at 2 whose parent, record 1, is on disk.
+        for epoch in [0, 1, 3] {
+            let (record, cert) = &chain[epoch as usize];
+            db.save_epoch_record_with_cert(record, cert).unwrap();
+        }
+        // A forgery for epoch 2 with a made-up committee, self-certified, but carrying the real
+        // parent hash, so only its committee and cert betray it.
+        let forger = CommitteeFixture::builder(MemDatabase::default)
+            .randomize_ports(true)
+            .committee_size(NonZeroUsize::new(4).unwrap())
+            .build();
+        let forger_configs: Vec<_> = forger.authorities().map(|a| a.consensus_config()).collect();
+        let forger_keys: Vec<_> = forger_configs.iter().map(|c| c.key_config()).collect();
+        let (forged, forged_cert) = multi_signed_record(&forger_keys, 2, chain[1].0.digest());
+        assert!(forged.verify_with_cert(&forged_cert), "the forgery is internally self-consistent");
+        let network = serving_network([(2, (forged, forged_cert))].into_iter().collect());
+
+        let mut attempts = HashMap::new();
+        assert_eq!(backfill_missing_records(&db, &network, &mut attempts, 1).await, 0);
+        assert!(
+            db.get_epoch_by_number(2).is_none(),
+            "a self-certified past forgery must not be stored",
+        );
+    }
+
     /// The record of an epoch the upward walk could not reach must land on a retry, without
     /// anything changing the `requested_missing_epoch` watch (the boundary-driven wake-up is
     /// exactly what used to make this wait a whole epoch).
@@ -810,15 +921,14 @@ mod tests {
         shutdown.notify();
 
         assert!(matches!(db.get_epoch_by_number(2), Some((_, Some(_)))), "epoch 2 must land");
-        // One walk costs three tries for epoch 2 plus three tries per tip probe; the retry adds
-        // one request. A second walk would add another `walk`.
-        let walk = 3 + 3 * MAX_GAP_SKIP as usize;
+        // One walk costs three tries for epoch 2 and stops there; the retry adds one request. A
+        // second walk would add another `walk`.
+        let walk = 3;
         let seen = requests.load(Ordering::SeqCst);
         assert!(seen < 2 * walk, "collector kept walking after the record landed: {seen} requests");
     }
 
-    /// Validation used by every path that writes a fetched record: anchored to the parent when we
-    /// hold it, certificate-only (with a real committee) when we do not.
+    /// Validation used by every path that writes a fetched record: anchored to the parent, always.
     #[test]
     fn record_validation_anchors_to_the_parent_when_it_is_held() {
         let (db, chain) = test_db_and_chain(3);
@@ -835,8 +945,12 @@ mod tests {
         assert!(!epoch_record_valid(&db, 3, &record, &cert), "epoch number must match");
     }
 
+    /// A record whose parent is not held cannot be anchored and is rejected however well it is
+    /// signed: its certificate only proves that the keys it lists itself signed it. This is the
+    /// planted-record attack of #14: a forged future epoch, self-certified by made-up keys, whose
+    /// parent legitimately does not exist anywhere yet.
     #[test]
-    fn record_validation_falls_back_to_the_cert_only_for_an_orphaned_parent() {
+    fn record_validation_rejects_a_record_whose_parent_is_not_held() {
         let fixture = CommitteeFixture::builder(MemDatabase::default)
             .randomize_ports(true)
             .committee_size(NonZeroUsize::new(4).unwrap())
@@ -845,15 +959,102 @@ mod tests {
         let signers: Vec<_> = configs.iter().map(|c| c.key_config()).collect();
         let db = MemDatabase::default();
 
-        // No record for epoch 4 or its parent: only the certificate can carry it.
+        // Four keys, a super-quorum of signatures, an epoch far ahead of anything on disk.
         let (record, cert) = multi_signed_record(&signers, 5, B256::repeat_byte(3));
-        assert!(epoch_record_valid(&db, 5, &record, &cert), "a four-key committee is acceptable");
+        assert!(record.verify_with_cert(&cert), "the certificate itself is sound");
+        assert!(!epoch_record_valid(&db, 5, &record, &cert), "no parent, no anchor, rejected");
 
-        // The same record with a committee too small to mean anything is not.
-        let (small, small_cert) = multi_signed_record(&signers[..1], 5, B256::repeat_byte(3));
-        assert!(
-            !epoch_record_valid(&db, 5, &small, &small_cert),
-            "a one-key committee must not pass the cert-only path",
-        );
+        // The same keys and epoch, once record 4 is held and names them as epoch 5's committee,
+        // are accepted: the anchor is the parent, not the certificate.
+        let (chain_db, chain) = test_db_and_chain(6);
+        for (r, c) in &chain[..5] {
+            chain_db.save_epoch_record_with_cert(r, c).unwrap();
+        }
+        let (r5, c5) = &chain[5];
+        assert!(epoch_record_valid(&chain_db, 5, r5, c5));
+    }
+
+    /// A four-validator record chain with records 0 and 1 on disk and a hole at 2 that no peer
+    /// serves; `serve` names the validators that hold record 3 and answer for it by name.
+    fn hole_at_two(
+        serve: &[usize],
+    ) -> (MemDatabase, Vec<(EpochRecord, EpochCertificate)>, PrimaryNetworkHandle) {
+        let fixture = CommitteeFixture::builder(MemDatabase::default)
+            .randomize_ports(true)
+            .committee_size(NonZeroUsize::new(4).unwrap())
+            .build();
+        let configs: Vec<_> = fixture.authorities().map(|a| a.consensus_config()).collect();
+        let signers: Vec<_> = configs.iter().map(|c| c.key_config()).collect();
+        let chain = multi_signed_chain(&signers, 6);
+        let db = MemDatabase::default();
+        for (r, c) in &chain[..2] {
+            db.save_epoch_record_with_cert(r, c).unwrap();
+        }
+        let any: BTreeMap<Epoch, (EpochRecord, EpochCertificate)> =
+            chain.iter().filter(|(r, _)| r.epoch != 2).map(|rc| (rc.0.epoch, rc.clone())).collect();
+        let by_peer = serve
+            .iter()
+            .map(|i| (signers[*i].public_key(), BTreeMap::from([(3, chain[3].clone())])))
+            .collect();
+        (db, chain, attesting_network(any, by_peer))
+    }
+
+    /// The upward walk does not follow a fetchable later record on its own: at a hole it asks
+    /// the hole's committee by name, and fewer than a super-quorum of identical answers leaves
+    /// it stopped at the hole with nothing stored.
+    #[tokio::test]
+    async fn walk_stops_at_a_hole_when_the_committee_does_not_attest_the_next_record() {
+        // two of four serve record 3: below the super-quorum of three
+        let (db, _, network) = hole_at_two(&[0, 1]);
+
+        let reached = collect_epoch_records(1, &db, &network).await;
+
+        assert_eq!(reached, 1, "the walk stops at the hole");
+        for epoch in 2..6 {
+            assert!(db.get_epoch_by_number(epoch).is_none(), "epoch {epoch} must not be stored");
+        }
+    }
+
+    /// A super-quorum of the hole's committee serving the same record for the epoch after it
+    /// lets the walk continue past the hole; later records anchor to that one normally, and the
+    /// hole itself stays open for backfill.
+    #[tokio::test]
+    async fn walk_continues_past_a_hole_the_committee_attests_across() {
+        let (db, chain, network) = hole_at_two(&[0, 1, 2]);
+
+        let reached = collect_epoch_records(1, &db, &network).await;
+
+        assert_eq!(reached, 5, "records 3, 4 and 5 land");
+        assert!(db.get_epoch_by_number(2).is_none(), "the hole is not invented");
+        for epoch in 3..6 {
+            let (stored, cert) = db.get_epoch_by_number(epoch).expect("stored");
+            assert!(cert.is_some());
+            assert_eq!(stored.digest(), chain[epoch as usize].0.digest());
+        }
+        assert_eq!(missing_epochs(&(0..6).filter(|e| *e != 2).collect(), 8), vec![2]);
+    }
+
+    /// The #14 attack against the attestation: one peer serves a self-certified record for a
+    /// future epoch, the real validators hold nothing for it. One answer is not a super-quorum.
+    #[tokio::test]
+    async fn walk_rejects_a_planted_future_record_nobody_in_the_committee_holds() {
+        let (db, _, _) = hole_at_two(&[]);
+        let forger = CommitteeFixture::builder(MemDatabase::default)
+            .randomize_ports(true)
+            .committee_size(NonZeroUsize::new(4).unwrap())
+            .build();
+        let forger_configs: Vec<_> = forger.authorities().map(|a| a.consensus_config()).collect();
+        let forger_keys: Vec<_> = forger_configs.iter().map(|c| c.key_config()).collect();
+        let (forged, forged_cert) = multi_signed_record(&forger_keys, 3, B256::repeat_byte(7));
+        assert!(forged.verify_with_cert(&forged_cert), "self-certified, as in the attack");
+        // any-peer requests reach the attacker, who serves the forgery; named validators hold
+        // nothing for epoch 3
+        let network =
+            attesting_network(BTreeMap::from([(3, (forged, forged_cert))]), BTreeMap::new());
+
+        let reached = collect_epoch_records(1, &db, &network).await;
+
+        assert_eq!(reached, 1);
+        assert!(db.get_epoch_by_number(3).is_none(), "the forgery is never stored");
     }
 }

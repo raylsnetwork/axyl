@@ -52,51 +52,92 @@ where
         epoch: Epoch,
         boundary_consensus_hash: B256,
     ) -> eyre::Result<()> {
+        // Reuse the committee derived below so the registry is read only once.
+        let mut derived_committee: Option<Vec<BlsPublicKey>> = None;
         if epoch == 0 {
             if let Some((epoch_rec, Some(_))) = self.consensus_db.get_epoch_by_number(epoch) {
                 self.epoch_record = Some(epoch_rec);
                 return Ok(());
             }
-        } else if let Some((epoch_rec, _)) = self.consensus_db.get_epoch_by_number(epoch) {
-            self.epoch_record = Some(epoch_rec);
-            return Ok(());
+        } else if let Some((stored, _)) = self.consensus_db.get_epoch_by_number(epoch) {
+            // Cross-check a stored record against the chain committee before reusing it; rebuild on
+            // mismatch. If the chain cannot answer (out-of-window re-entry), reuse it unverified.
+            match engine.validators_for_epoch(epoch).await {
+                Ok(chain_committee) if stored.committee == chain_committee => {
+                    self.epoch_record = Some(stored);
+                    return Ok(());
+                }
+                Ok(chain_committee) => {
+                    warn!(
+                        target: "epoch-manager",
+                        epoch,
+                        "stored epoch record committee does not match chain-derived committee; \
+                         discarding it and rebuilding",
+                    );
+                    if let Err(e) = self.consensus_db.remove_epoch_record(epoch) {
+                        error!(target: "epoch-manager", epoch, "failed to remove invalid epoch record: {e}");
+                    }
+                    // Reuse the committee just derived instead of reading the registry again below.
+                    derived_committee = Some(chain_committee);
+                }
+                Err(e) => {
+                    // Registry cannot answer (out-of-window re-entry); reuse the stored record
+                    // unverified.
+                    warn!(
+                        target: "epoch-manager",
+                        epoch, ?e,
+                        "cannot re-derive committee to revalidate stored epoch record; reusing it unverified",
+                    );
+                    self.epoch_record = Some(stored);
+                    return Ok(());
+                }
+            }
         }
-        let committee_keys = engine.validators_for_epoch(epoch).await?;
+        let committee_keys = match derived_committee {
+            Some(committee) => committee,
+            None => engine.validators_for_epoch(epoch).await?,
+        };
         let next_committee_keys = engine.validators_for_epoch(epoch + 1).await?;
         let parent_hash = if epoch == 0 {
             B256::default()
         } else {
+            // Chain committee for the previous epoch, used to anchor the prev record; None if the
+            // chain cannot answer, in which case the anchor checks below are skipped.
+            let prev_chain_committee = engine.validators_for_epoch(epoch - 1).await.ok();
+
             let mut prev = resolve_local_prev_epoch_record(
                 &self.consensus_db,
                 self.prev_epoch_record.as_ref(),
                 epoch,
             );
-            // No local copy at all: this node never closed the previous epoch itself
-            // (it was down across that boundary, or its data dir is fresh), so there
-            // is nothing in memory or in PendingEpochRecord. Peers closed it and hold
-            // its certified record, so fetch it directly instead of failing and
-            // waiting for the async collector to backfill (which may not win the
-            // race against this boundary). Trusted because it carries a valid cert
-            // and its next_committee matches the committee we derived for this epoch
-            // from chain state.
+            // If the resolved prev record disagrees with the chain committee, discard it and fall
+            // through to the peer-fetch path below.
+            if let (Some(p), Some(chain_committee)) = (prev.as_ref(), prev_chain_committee.as_ref())
+            {
+                if &p.committee != chain_committee {
+                    warn!(
+                        target: "epoch-manager",
+                        epoch = epoch - 1,
+                        "previous epoch record committee does not match chain-derived committee; \
+                         discarding it",
+                    );
+                    if let Err(e) = self.consensus_db.remove_epoch_record(epoch - 1) {
+                        error!(target: "epoch-manager", epoch = epoch - 1, "failed to remove invalid previous epoch record: {e}");
+                    }
+                    prev = None;
+                }
+            }
+            // No valid prev locally: fetch it from a peer, but trust it only after anchoring to
+            // the chain committee for epoch-1 (committee, next_committee, and cert must all match).
             if prev.is_none() {
                 let network = primary.network_handle().await;
                 match network.request_epoch_cert(Some(epoch - 1), None).await {
                     Ok((peer_rec, cert)) => {
-                        // Validate before trusting; log the specific reason on
-                        // rejection so a live incident can tell bad peer data apart
-                        // from no data.
                         if peer_rec.epoch != epoch - 1 {
                             warn!(
                                 target: "epoch-manager",
                                 want = epoch - 1, got = peer_rec.epoch,
                                 "peer returned wrong epoch for previous epoch record; ignoring",
-                            );
-                        } else if !peer_rec.verify_with_cert(&cert) {
-                            warn!(
-                                target: "epoch-manager",
-                                epoch = epoch - 1,
-                                "peer-provided previous epoch record failed cert verification; ignoring",
                             );
                         } else if committee_keys != peer_rec.next_committee {
                             warn!(
@@ -104,18 +145,32 @@ where
                                 epoch = epoch - 1,
                                 "peer-provided previous epoch record next_committee does not match this epoch's committee; ignoring",
                             );
+                        } else if let Some(chain_committee) = prev_chain_committee.as_ref() {
+                            if !peer_rec.verify_against_committee(chain_committee, &cert) {
+                                warn!(
+                                    target: "epoch-manager",
+                                    epoch = epoch - 1,
+                                    "peer-provided previous epoch record failed cert verification against chain-derived committee; ignoring",
+                                );
+                            } else {
+                                info!(
+                                    target: "epoch-manager",
+                                    epoch = epoch - 1,
+                                    "fetched previous epoch record from a peer for parent_hash",
+                                );
+                                if let Err(e) =
+                                    self.consensus_db.save_epoch_record_with_cert(&peer_rec, &cert)
+                                {
+                                    error!(target: "epoch-manager", "failed to persist peer-fetched previous epoch record: {e}");
+                                }
+                                prev = Some(peer_rec);
+                            }
                         } else {
-                            info!(
+                            warn!(
                                 target: "epoch-manager",
                                 epoch = epoch - 1,
-                                "fetched previous epoch record from a peer for parent_hash",
+                                "cannot derive chain committee for the previous epoch to anchor the peer record; ignoring",
                             );
-                            if let Err(e) =
-                                self.consensus_db.save_epoch_record_with_cert(&peer_rec, &cert)
-                            {
-                                error!(target: "epoch-manager", "failed to persist peer-fetched previous epoch record: {e}");
-                            }
-                            prev = Some(peer_rec);
                         }
                     }
                     Err(e) => {
@@ -128,22 +183,31 @@ where
                 }
             }
             let Some(prev) = prev else {
+                // No valid previous record: demote to CvvInactive instead of crashing, so the node
+                // can recover once a genuine record is backfilled.
                 error!(
                     target: "epoch-manager",
-                    "failed to find previous epoch record when starting epoch",
+                    epoch,
+                    "no valid previous epoch record available when starting epoch; \
+                     demoting instead of halting",
                 );
-                return Err(eyre!("failed to find previous epoch record when starting epoch"));
+                self.force_cvv_inactive("epoch-record-missing-prev");
+                self.epoch_record = None;
+                return Ok(());
             };
             if committee_keys != prev.next_committee {
+                // prev was already validated against the chain above, so this is unexpected;
+                // demote gracefully rather than crash if it still happens.
                 error!(
                     target: "epoch-manager",
-                    "Last epochs next committee not equal to this epochs committee! previous {:?}, current {:?}",
+                    "Last epochs next committee not equal to this epochs committee! previous {:?}, current {:?}; \
+                     demoting instead of halting",
                     prev.next_committee,
                     committee_keys
                 );
-                return Err(eyre!(
-                    "Last epochs next committee not equal to this epochs committee!"
-                ));
+                self.force_cvv_inactive("epoch-record-next-committee-mismatch");
+                self.epoch_record = None;
+                return Ok(());
             }
             prev.digest()
         };

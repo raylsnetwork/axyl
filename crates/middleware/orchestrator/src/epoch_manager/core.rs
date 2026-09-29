@@ -1190,8 +1190,7 @@ where
         if record.digest() != digest {
             return ForeignVote::Unknown;
         }
-        // Same validation the epoch record collector applies before it writes a record: anchored
-        // to the parent when we hold it, certificate-only (with a real committee) when we do not.
+        // Same validation the collector applies: the record must anchor to the parent we hold.
         if !epoch_record_valid(consensus_db, record.epoch, &record, &cert) {
             return ForeignVote::Unknown;
         }

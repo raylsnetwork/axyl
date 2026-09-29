@@ -259,6 +259,24 @@ impl PrimaryNetworkHandle {
         Err(NetworkError::RPCError("Could not get the consensus header!".to_string()))
     }
 
+    /// Request the certified epoch record for `epoch` from one specific peer.
+    ///
+    /// Unlike [`Self::request_epoch_cert`] this names the authority, so the answer is that
+    /// validator's own view: what an attestation across a committee needs, where any peer
+    /// answering would let one node vote several times.
+    pub async fn request_epoch_cert_from_peer(
+        &self,
+        peer: BlsPublicKey,
+        epoch: Epoch,
+    ) -> NetworkResult<(EpochRecord, EpochCertificate)> {
+        let request = PrimaryRequest::EpochRecord { epoch: Some(epoch), hash: None };
+        let res = self.handle.send_request(request, peer).await?;
+        match res.await?? {
+            PrimaryResponse::EpochRecord { record, certificate } => Ok((record, certificate)),
+            _ => Err(NetworkError::RPCError("Peer did not return an epoch record!".to_string())),
+        }
+    }
+
     /// Request consensus header from a random peer up to three times from three different peers.
     pub async fn request_epoch_cert(
         &self,
@@ -479,7 +497,7 @@ where
         // clone for spawned tasks
         let request_handler = self.request_handler.clone();
         let network_handle = self.network_handle.clone();
-        let task_name = format!("ConsensusOutputReq-{peer}");
+        let task_name = format!("EpochRecordReq-{peer}");
         self.task_spawner.spawn_task(task_name, async move {
             tokio::select! {
                 header =
