@@ -55,7 +55,7 @@ exclude = ["crates/testing/fuzz-targets"]
 resolver = "2"
 
 [workspace.package]
-version = "1.4.1"
+version = "1.5.0"
 edition = "2021"
 # Remember to update:
 # - .clippy.toml
