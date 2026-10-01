@@ -87,6 +87,7 @@ fn test_execution_db_default_page_size() -> eyre::Result<()> {
 }
 
 /// A zeroed meta page 0 still opens: `new_database` detects the page size and reopens.
+/// Covers the 16 KiB default and ARM's 64 KiB page size.
 #[test]
 fn test_execution_db_recovers_zeroed_meta_page_0() -> eyre::Result<()> {
     use crate::reth_env::init::DEFAULT_MDBX_PAGE_SIZE;
@@ -99,28 +100,33 @@ fn test_execution_db_recovers_zeroed_meta_page_0() -> eyre::Result<()> {
     use std::io::{Seek as _, SeekFrom, Write as _};
 
     let default_config = RethConfig(NodeConfig::default());
-    let dir = TempDir::new()?;
 
-    // A fresh 16 KiB datafile with one row.
-    {
+    for page_size in [DEFAULT_MDBX_PAGE_SIZE, 64 * 1024] {
+        let dir = TempDir::new()?;
+
+        // A fresh datafile at this page size with one row.
+        {
+            let mut node_config = NodeConfig::default();
+            node_config.db.page_size = Some(page_size);
+            let db = RethEnv::new_database(&RethConfig(node_config), dir.path())?;
+            assert_eq!(db.stat().expect("stat").page_size() as usize, page_size);
+            let tx = db.tx_mut()?;
+            tx.put::<tables::CanonicalHeaders>(7, B256::repeat_byte(0xab))?;
+            tx.commit()?;
+        }
+
+        // Zero meta page 0, leaving the two backup meta pages intact.
+        let mut f = std::fs::OpenOptions::new().write(true).open(dir.path().join("mdbx.dat"))?;
+        f.seek(SeekFrom::Start(0))?;
+        f.write_all(&vec![0u8; page_size])?;
+        f.sync_all()?;
+        drop(f);
+
+        // Reopen with no page-size hint: detect the size, recover, and keep the row.
         let db = RethEnv::new_database(&default_config, dir.path())?;
-        assert_eq!(db.stat().expect("stat").page_size() as usize, DEFAULT_MDBX_PAGE_SIZE);
-        let tx = db.tx_mut()?;
-        tx.put::<tables::CanonicalHeaders>(7, B256::repeat_byte(0xab))?;
-        tx.commit()?;
+        let tx = db.tx()?;
+        assert_eq!(tx.get::<tables::CanonicalHeaders>(7)?, Some(B256::repeat_byte(0xab)));
     }
-
-    // Zero meta page 0 (the first 16 KiB), leaving the two backup meta pages intact.
-    let mut f = std::fs::OpenOptions::new().write(true).open(dir.path().join("mdbx.dat"))?;
-    f.seek(SeekFrom::Start(0))?;
-    f.write_all(&vec![0u8; DEFAULT_MDBX_PAGE_SIZE])?;
-    f.sync_all()?;
-    drop(f);
-
-    // Reopen with the default config: the open must detect the size, recover, and keep the row.
-    let db = RethEnv::new_database(&default_config, dir.path())?;
-    let tx = db.tx()?;
-    assert_eq!(tx.get::<tables::CanonicalHeaders>(7)?, Some(B256::repeat_byte(0xab)));
     Ok(())
 }
 

@@ -181,7 +181,13 @@ If the node was `Active` when it crashed, it will typically come back as
 `CvvInactive` and catch up from peers (Section 5) before re-promoting
 itself.
 
-## 10. Retiring
+## 10. Moving a node to another host
+
+A node can be moved to a host with a different default page size, for example
+from x86 to ARM. Stop the node, copy the whole data directory, and start it on
+the new host. Its databases open as they are, so no conversion is needed.
+
+## 11. Retiring
 
 A validator retires by submitting `beginExit()` (see Section 3); the
 on-chain finalisation takes two epochs of committee exclusion. After

@@ -180,7 +180,7 @@ fn damaged_databases_never_panic_and_stay_readable_where_mdbx_allows() {
     // (name, damage, must the database still open?)
     let variants: Vec<Variant<'_>> = vec![
         ("intact copy", Box::new(|_| {}), true),
-        // A zeroed meta page 0 is past MDBX's OS-page-size scan at 16 KiB, so it won't reopen.
+        // db-inspect does not detect the page size, so a zeroed meta page 0 won't open at 16 KiB.
         (
             "meta page 0 zeroed",
             Box::new(move |d| zero_range(&d.join("mdbx.dat"), 0, page as usize)),
