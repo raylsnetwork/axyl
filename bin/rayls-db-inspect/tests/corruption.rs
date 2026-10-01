@@ -4,8 +4,8 @@
 //! Every variant is a sparse copy of one seeded node (headers 0..=5 with epoch 0 archived, one
 //! batch) damaged in a specific way: truncated, zeroed or bit-flipped pages, missing or garbled
 //! cold-jar files, garbled lock file. Each command is run under `catch_unwind`; a panic fails the
-//! test, an error or a report is acceptable. Where MDBX itself tolerates the damage (one meta
-//! page zeroed: it falls back to another), the report must still be right.
+//! test, an error or a report is acceptable. Where MDBX itself tolerates the damage (e.g. a single
+//! zeroed or bit-flipped data page), the report must still be right.
 #![allow(unused_crate_dependencies)]
 #![cfg(target_os = "linux")]
 
@@ -19,6 +19,7 @@ use rayls_db_inspect::{
         epoch::{epoch, epoch_check},
         header::{header, header_check},
         summary::summary,
+        Lookup,
     },
 };
 use rayls_infrastructure_types::{keccak256, Bytes};
@@ -104,8 +105,7 @@ fn first_cold_jar(consensus_db: &Path, segment: &str) -> Option<PathBuf> {
     names.into_iter().next()
 }
 
-/// One damage case: name, how to damage the copy, whether it must still open (directly, or after
-/// recovering the copy when a destroyed meta page left the newest surviving one unsynced).
+/// One damage case: name, how to damage the copy, whether it must still open.
 type Variant<'a> = (&'a str, Box<dyn Fn(&Path)>, bool);
 
 #[derive(Debug)]
@@ -120,7 +120,6 @@ enum Outcome {
 fn exercise(
     copy: &Path,
     tx_hash: rayls_infrastructure_types::B256,
-    recover: bool,
 ) -> Vec<(&'static str, Outcome)> {
     let spec = format!("d={}", copy.display());
     let run = |name: &'static str, f: &dyn Fn() -> eyre::Result<()>| -> (&'static str, Outcome) {
@@ -137,9 +136,9 @@ fn exercise(
             }
         }
     };
-    let open = || NodeDb::open(&spec, &OpenOptions { recover });
+    let open = || NodeDb::open(&spec, &OpenOptions::default());
     let mut out = Vec::new();
-    out.push(run(if recover { "open (recovered)" } else { "open" }, &|| open().map(|_| ())));
+    out.push(run("open", &|| open().map(|_| ())));
     if matches!(out[0].1, Outcome::Error(_)) {
         // an unopenable database is an error, not a crash; nothing more to check
         return out;
@@ -181,17 +180,16 @@ fn damaged_databases_never_panic_and_stay_readable_where_mdbx_allows() {
     // (name, damage, must the database still open?)
     let variants: Vec<Variant<'_>> = vec![
         ("intact copy", Box::new(|_| {}), true),
-        // MDBX keeps three copies of its meta page at the start of the file and opens with the
-        // newest intact one, so losing one or two of them is survivable; losing all three is not
+        // A zeroed meta page 0 is past MDBX's OS-page-size scan at 16 KiB, so it won't reopen.
         (
             "meta page 0 zeroed",
             Box::new(move |d| zero_range(&d.join("mdbx.dat"), 0, page as usize)),
-            true,
+            false,
         ),
         (
             "meta pages 0 and 1 zeroed",
             Box::new(move |d| zero_range(&d.join("mdbx.dat"), 0, 2 * page as usize)),
-            true,
+            false,
         ),
         (
             "all three meta pages zeroed",
@@ -315,22 +313,13 @@ fn damaged_databases_never_panic_and_stay_readable_where_mdbx_allows() {
 
     let mut panics = Vec::new();
     let mut unexpected_unopenable = Vec::new();
+    let mut bad_meta_errors = Vec::new();
     let mut table = String::new();
     for (i, (name, damage, must_open)) in variants.iter().enumerate() {
         let copy = root.path().join(format!("v{i:02}"));
         sparse_copy(&source, &copy);
         damage(&copy);
-        let mut outcomes = exercise(&copy, tx_hash, false);
-        if *must_open {
-            if let Outcome::Error(e) = &outcomes[0].1 {
-                if e.contains("refuses to read it until it is recovered") {
-                    // a destroyed meta page can leave the newest surviving one unsynced; the
-                    // recovery `--recover` performs on a copy must then make it readable (MDBX
-                    // keeps the last commit on the same boot)
-                    outcomes = exercise(&copy, tx_hash, true);
-                }
-            }
-        }
+        let outcomes = exercise(&copy, tx_hash);
         for (cmd, outcome) in &outcomes {
             table.push_str(&format!("{name:45} {cmd:20} {outcome:?}\n"));
             if let Outcome::Panic(msg) = outcome {
@@ -339,6 +328,14 @@ fn damaged_databases_never_panic_and_stay_readable_where_mdbx_allows() {
         }
         if *must_open && matches!(outcomes[0].1, Outcome::Error(_)) {
             unexpected_unopenable.push(format!("{name}: {:?}", outcomes[0].1));
+        }
+        // Meta-page damage must fail to open with a clean, specific error, never a panic.
+        if name.contains("meta page") {
+            let clean =
+                matches!(&outcomes[0].1, Outcome::Error(e) if e.contains("not an MDBX file"));
+            if !clean {
+                bad_meta_errors.push(format!("{name}: {:?}", outcomes[0].1));
+            }
         }
     }
     eprintln!("{table}");
@@ -369,4 +366,57 @@ fn damaged_databases_never_panic_and_stay_readable_where_mdbx_allows() {
         "databases MDBX should still open:\n{}",
         unexpected_unopenable.join("\n")
     );
+    assert!(
+        bad_meta_errors.is_empty(),
+        "meta-page damage should report a clean 'not an MDBX file' error:\n{}",
+        bad_meta_errors.join("\n")
+    );
+}
+
+/// db-inspect reads a healthy DB across the common page sizes (4 to 64 KiB).
+/// The corruption test above fuzzes bytes so it stays at one size; this one only reads intact DBs.
+#[test]
+fn reads_healthy_databases_at_every_page_size() {
+    let fx = Fixture::new();
+    let txs = signed_transactions(2);
+    let tx_hash = keccak256(&txs[0]);
+    let batch = fx.batch(0, 1, txs.clone());
+    let digest = batch.digest();
+    for page_bytes in [4096usize, 8192, 16384, 32768, 65536] {
+        let node = SeededNode::new_with_page_size(page_bytes, |db| {
+            let (_, headers) = seed_healthy(&fx, db);
+            write_batch(db, &batch);
+            let h4 = fx.header_with_batches(4, headers[3].digest(), &[digest]);
+            write_header(db, &h4);
+            archive_below(db, 1);
+            write_header(db, &fx.header(5, h4.digest()));
+        });
+
+        // Open a fresh handle per command, like the CLI does.
+        let db = || [node.open("d")];
+        summary(&db()).unwrap_or_else(|e| panic!("summary at {page_bytes}B page: {e:#}"));
+        epoch(&db(), 0, true).unwrap_or_else(|e| panic!("epoch 0 at {page_bytes}B page: {e:#}"));
+        epoch_check(&db(), None, None, true)
+            .unwrap_or_else(|e| panic!("epoch-check at {page_bytes}B page: {e:#}"));
+        header_check(&db(), 5, 100)
+            .unwrap_or_else(|e| panic!("header-check at {page_bytes}B page: {e:#}"));
+
+        // The reads must find the seeded data, not just run without error.
+        let h2 = header(&db(), 2, true)
+            .unwrap_or_else(|e| panic!("header 2 (cold) at {page_bytes}B page: {e:#}"));
+        assert_eq!(
+            h2.nodes[0].lookup,
+            Lookup::Found,
+            "cold header 2 missing at {page_bytes}B page"
+        );
+        let h5 = header(&db(), 5, true)
+            .unwrap_or_else(|e| panic!("header 5 at {page_bytes}B page: {e:#}"));
+        assert_eq!(h5.nodes[0].lookup, Lookup::Found, "header 5 missing at {page_bytes}B page");
+        let tx = get_tx(&db(), tx_hash, None)
+            .unwrap_or_else(|e| panic!("get-tx at {page_bytes}B page: {e:#}"));
+        assert_eq!(tx.nodes[0].lookup, Lookup::Found, "tx missing at {page_bytes}B page");
+        let seen = get_batch(&db(), digest)
+            .unwrap_or_else(|e| panic!("get-batch at {page_bytes}B page: {e:#}"));
+        assert_eq!(seen.nodes[0].lookup, Lookup::Found, "batch missing at {page_bytes}B page");
+    }
 }

@@ -40,6 +40,37 @@ use tracing::{debug, error, info, warn};
 /// database uses the same default (`DEFAULT_MDBX_PAGE_SIZE` in `rayls-infrastructure-storage`).
 pub(crate) const DEFAULT_MDBX_PAGE_SIZE: usize = 16 * 1024;
 
+/// Reads the datafile's page size from the spacing of its meta pages; `None` if under two survive.
+/// The consensus database keeps a copy of this in `rayls-infrastructure-storage`.
+fn detect_page_size(dat: &Path) -> Option<usize> {
+    detect_page_size_in(std::fs::File::open(dat).ok()?)
+}
+
+/// Finds the page size from a reader over the datafile head, split out so a test can bound its
+/// reads.
+fn detect_page_size_in(reader: impl std::io::Read) -> Option<usize> {
+    use std::io::Read as _;
+    // libmdbx writes this 56-bit magic little-endian in every meta page header.
+    const MDBX_MAGIC: u64 = 0x59659DBDEF4C11;
+    // The meta pages sit at the datafile start, so this head covers every page size up to the max.
+    const HEAD_BYTES: u64 = 1 << 18;
+    // libmdbx's supported page-size range in bytes.
+    const MIN_PAGE_SIZE: usize = 256;
+    const MAX_PAGE_SIZE: usize = 64 * 1024;
+
+    let magic = MDBX_MAGIC.to_le_bytes();
+    // Drop the trailing byte so the match ignores the version byte libmdbx packs beside the magic.
+    let magic = &magic[..7];
+    let mut head = Vec::new();
+    reader.take(HEAD_BYTES).read_to_end(&mut head).ok()?;
+    let mut hits =
+        head.windows(magic.len()).enumerate().filter(|(_, w)| *w == magic).map(|(i, _)| i);
+    let first = hits.next()?;
+    let second = hits.next()?;
+    let ps = second - first;
+    (ps.is_power_of_two() && (MIN_PAGE_SIZE..=MAX_PAGE_SIZE).contains(&ps)).then_some(ps)
+}
+
 impl RethEnv {
     /// Create a new Reth DB.
     /// Break this out so this can be created upfront and used even on a
@@ -54,10 +85,27 @@ impl RethEnv {
         // page size regardless, but libmdbx derives the pre-open geometry from the configured
         // one, so passing 16 KiB for a 4 KiB datafile would rewrite that file's geometry header.
         // Leaving it unset keeps reth's pre-16 KiB behaviour for existing datafiles.
-        if db_args.page_size.is_none() && !db_path.join("mdbx.dat").exists() {
-            db_args.page_size = Some(DEFAULT_MDBX_PAGE_SIZE);
-        }
-        let db = init_db(db_path, db_args.database_args())?;
+        let configured_page_size = db_args.page_size;
+        db_args.page_size = (!db_path.join("mdbx.dat").exists())
+            .then(|| configured_page_size.unwrap_or(DEFAULT_MDBX_PAGE_SIZE));
+        // init_db returns a type-erased error, so match the message rather than the typed variant.
+        // A zeroed meta page 0 reads as "not an MDBX file"; detect the real page size and reopen.
+        let db = match init_db(db_path, db_args.database_args()) {
+            Ok(db) => db,
+            Err(e)
+                if db_args.page_size.is_none() && format!("{e:#}").contains("not an MDBX file") =>
+            {
+                match detect_page_size(&db_path.join("mdbx.dat")) {
+                    Some(ps) => {
+                        warn!(target: "rayls::reth", path = ?db_path, page_size = ps, "execution DB meta page 0 unreadable; reopening at the detected page size");
+                        db_args.page_size = Some(ps);
+                        init_db(db_path, db_args.database_args())?
+                    }
+                    None => return Err(e),
+                }
+            }
+            Err(e) => return Err(e),
+        };
         match db.stat() {
             Ok(stat) => {
                 info!(target: "rayls::reth", path = ?db_path, page_size = stat.page_size(), "opened database")
