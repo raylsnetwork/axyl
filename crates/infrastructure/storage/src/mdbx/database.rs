@@ -488,45 +488,9 @@ impl MdbxConfig {
     }
 }
 
-/// Page size for newly created consensus databases (16 KiB), used unless
-/// `--consensus-db.page-size` is given.
-///
-/// libmdbx fixes the page size when a datafile is created and ignores this setting when opening an
-/// existing one, so existing databases keep the page size they were created with. Override per
-/// database with [`MdbxConfig::with_page_size`]. The execution database uses the same default
-/// (`DEFAULT_MDBX_PAGE_SIZE` in `rayls-execution-evm`).
-pub const DEFAULT_MDBX_PAGE_SIZE: usize = 16 * KILOBYTE;
-
-/// Reads the datafile's page size from the spacing of its meta pages; `None` if under two survive.
-/// The execution database keeps a copy of this in `rayls-execution-evm`.
-fn detect_page_size(dat: &Path) -> Option<usize> {
-    detect_page_size_in(std::fs::File::open(dat).ok()?)
-}
-
-/// Finds the page size from a reader over the datafile head, split out so a test can bound its
-/// reads.
-fn detect_page_size_in(reader: impl std::io::Read) -> Option<usize> {
-    use std::io::Read as _;
-    // libmdbx writes this 56-bit magic little-endian in every meta page header.
-    const MDBX_MAGIC: u64 = 0x59659DBDEF4C11;
-    // The meta pages sit at the datafile start, so this head covers every page size up to the max.
-    const HEAD_BYTES: u64 = 1 << 18;
-    // libmdbx's supported page-size range in bytes.
-    const MIN_PAGE_SIZE: usize = 256;
-    const MAX_PAGE_SIZE: usize = 64 * 1024;
-
-    let magic = MDBX_MAGIC.to_le_bytes();
-    // Drop the trailing byte so the match ignores the version byte libmdbx packs beside the magic.
-    let magic = &magic[..7];
-    let mut head = Vec::new();
-    reader.take(HEAD_BYTES).read_to_end(&mut head).ok()?;
-    let mut hits =
-        head.windows(magic.len()).enumerate().filter(|(_, w)| *w == magic).map(|(i, _)| i);
-    let first = hits.next()?;
-    let second = hits.next()?;
-    let ps = second - first;
-    (ps.is_power_of_two() && (MIN_PAGE_SIZE..=MAX_PAGE_SIZE).contains(&ps)).then_some(ps)
-}
+// Page-size default and detection shared with the other node database so both stay in sync.
+use rayls_infrastructure_utils::mdbx::detect_page_size;
+pub use rayls_infrastructure_utils::mdbx::DEFAULT_MDBX_PAGE_SIZE;
 
 impl MdbxDatabase {
     /// Page size of the opened datafile in bytes.
@@ -1382,47 +1346,6 @@ mod test {
                 "row lost recovering a {ps}-byte-page datafile"
             );
         }
-    }
-
-    /// Page-size detection reads only the datafile's head, so a huge file is never loaded whole.
-    #[test]
-    fn detect_page_size_reads_only_the_head() {
-        let temp = tempdir().expect("failed to create temp dir");
-        let cfg = MdbxConfig::default().with_page_size(16384).with_growth_step(super::MEGABYTE);
-        {
-            let db = MdbxDatabase::open_with_config(temp.path(), cfg).expect("create database");
-            db.open_table::<TestTable>().expect("open table");
-            db.with_write_txn(|txn| txn.insert::<TestTable>(&1, &"x".to_owned())).expect("insert");
-        }
-        let dat = temp.path().join(super::MDBX_DAT);
-        // Grow the file well past the bounded head so a whole-file read would be visible.
-        let file = std::fs::OpenOptions::new().write(true).open(&dat).expect("open dat");
-        let len = file.metadata().expect("metadata").len();
-        file.set_len(len + 8 * 1024 * 1024).expect("set_len");
-
-        // Count the bytes pulled from the file, so the bound holds regardless of host memory.
-        struct Counting<R> {
-            inner: R,
-            read: std::rc::Rc<std::cell::Cell<usize>>,
-        }
-        impl<R: std::io::Read> std::io::Read for Counting<R> {
-            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-                let n = self.inner.read(buf)?;
-                self.read.set(self.read.get() + n);
-                Ok(n)
-            }
-        }
-        let read = std::rc::Rc::new(std::cell::Cell::new(0usize));
-        let counted =
-            Counting { inner: std::fs::File::open(&dat).expect("open dat"), read: read.clone() };
-        assert_eq!(super::detect_page_size_in(counted), Some(16384));
-        assert!(read.get() <= 1 << 18, "read {} bytes, expected at most 256 KiB", read.get());
-    }
-
-    /// Detection returns `None` when fewer than two meta pages survive.
-    #[test]
-    fn detect_page_size_rejects_a_file_without_two_meta_pages() {
-        assert_eq!(super::detect_page_size_in(&b"not an MDBX datafile"[..]), None);
     }
 
     /// A database created with the previous 4 KiB default keeps its page size, its geometry

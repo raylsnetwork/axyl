@@ -5,6 +5,7 @@ use std::{fmt, str::FromStr, time::Duration};
 // use crate::version::default_client_version;
 use clap::Args;
 use rayls_infrastructure_storage::mdbx::MdbxConfig;
+use rayls_infrastructure_utils::mdbx::{MAX_MDBX_PAGE_SIZE, MIN_MDBX_PAGE_SIZE};
 
 /// Parameters for database configuration
 #[derive(Debug, Args, PartialEq, Eq, Default, Clone, Copy)]
@@ -142,11 +143,6 @@ impl fmt::Display for ByteSize {
 fn parse_byte_size(s: &str) -> Result<usize, String> {
     s.parse::<ByteSize>().map(Into::into)
 }
-
-/// Smallest page size libmdbx accepts (`MDBX_MIN_PAGESIZE`).
-const MIN_MDBX_PAGE_SIZE: usize = 256;
-/// Largest page size libmdbx accepts (`MDBX_MAX_PAGESIZE`).
-const MAX_MDBX_PAGE_SIZE: usize = 64 * 1024;
 
 /// Value parser for page sizes, accepting the same formats as [`parse_byte_size`].
 ///
