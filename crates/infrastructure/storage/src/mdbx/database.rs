@@ -497,6 +497,37 @@ impl MdbxConfig {
 /// (`DEFAULT_MDBX_PAGE_SIZE` in `rayls-execution-evm`).
 pub const DEFAULT_MDBX_PAGE_SIZE: usize = 16 * KILOBYTE;
 
+/// Reads the datafile's page size from the spacing of its meta pages; `None` if under two survive.
+/// The execution database keeps a copy of this in `rayls-execution-evm`.
+fn detect_page_size(dat: &Path) -> Option<usize> {
+    detect_page_size_in(std::fs::File::open(dat).ok()?)
+}
+
+/// Finds the page size from a reader over the datafile head, split out so a test can bound its
+/// reads.
+fn detect_page_size_in(reader: impl std::io::Read) -> Option<usize> {
+    use std::io::Read as _;
+    // libmdbx writes this 56-bit magic little-endian in every meta page header.
+    const MDBX_MAGIC: u64 = 0x59659DBDEF4C11;
+    // The meta pages sit at the datafile start, so this head covers every page size up to the max.
+    const HEAD_BYTES: u64 = 1 << 18;
+    // libmdbx's supported page-size range in bytes.
+    const MIN_PAGE_SIZE: usize = 256;
+    const MAX_PAGE_SIZE: usize = 64 * 1024;
+
+    let magic = MDBX_MAGIC.to_le_bytes();
+    // Drop the trailing byte so the match ignores the version byte libmdbx packs beside the magic.
+    let magic = &magic[..7];
+    let mut head = Vec::new();
+    reader.take(HEAD_BYTES).read_to_end(&mut head).ok()?;
+    let mut hits =
+        head.windows(magic.len()).enumerate().filter(|(_, w)| *w == magic).map(|(i, _)| i);
+    let first = hits.next()?;
+    let second = hits.next()?;
+    let ps = second - first;
+    (ps.is_power_of_two() && (MIN_PAGE_SIZE..=MAX_PAGE_SIZE).contains(&ps)).then_some(ps)
+}
+
 impl MdbxDatabase {
     /// Page size of the opened datafile in bytes.
     pub fn page_size(&self) -> eyre::Result<usize> {
@@ -516,20 +547,6 @@ impl MdbxDatabase {
 
     /// Create a new database at the specified path with custom configuration.
     pub fn open_with_config<P: AsRef<Path>>(path: P, config: MdbxConfig) -> eyre::Result<Self> {
-        let flags = EnvironmentFlags {
-            mode: Mode::ReadWrite { sync_mode: SyncMode::SafeNoSync },
-            liforeclaim: true,
-            no_rdahead: true,
-            coalesce: true,
-            ..Default::default()
-        };
-
-        // Convert config to MDBX settings
-        let max_read_txn_duration = match config.max_read_transaction_duration {
-            Some(duration) => MaxReadTransactionDuration::Set(duration),
-            None => MaxReadTransactionDuration::Unbounded,
-        };
-
         // Only a new datafile takes the configured page size. An existing datafile keeps its own
         // page size regardless, but libmdbx derives the pre-open geometry from the configured one,
         // so passing 16 KiB for a 4 KiB datafile would rewrite that file's geometry header.
@@ -545,38 +562,72 @@ impl MdbxDatabase {
             page_size
         );
 
-        let env = Environment::builder()
-            .set_max_dbs(32)
-            .set_flags(flags)
-            .set_geometry(Geometry {
-                size: Some(0..config.max_db_size),
-                growth_step: Some(config.growth_step as isize),
-                // The database never shrinks
-                shrink_threshold: Some((2 * config.growth_step) as isize),
-                page_size: page_size.map(PageSize::Set),
-            })
-            .write_map()
-            .set_dp_reserve_limit(512)
-            // Spill threshold for a write transaction, in pages (libmdbx MDBX_opt_txn_dp_limit):
-            // once a transaction has dirtied this many pages libmdbx spills them (in write-map
-            // mode an msync kick) rather than failing. Kept as a page count, so it is 512 MiB on
-            // a 4 KiB datafile and 2 GiB on one created with the 16 KiB default.
-            //
-            // The wider ceiling is safe because consensus write transactions are small and
-            // bounded: batches are at most 2 MB and at most 10 per header. Across two full
-            // 4+1-node e2e networks the largest of 150,065 commits dirtied 0.59 MiB, p99 224 KiB.
-            .set_txn_dp_limit(131072)
-            .set_rp_augment_limit(1024 * 1024)
-            // MDBX syncs lazily on the first commit past the period (see SYNC_PERIOD)
-            .set_sync_period(SYNC_PERIOD)
-            // Prevent writer starvation from long-held read transactions which can cause
-            // consensus delays. Configurable via MdbxConfig.
-            .set_max_read_transaction_duration(max_read_txn_duration)
-            // Configurable concurrent readers limit for high-throughput consensus operations
-            .set_max_readers(config.max_readers.into())
-            // Detect slow readers that may be causing memory growth by holding pages
-            .set_handle_slow_readers(handle_slow_readers)
-            .open(path.as_ref())?;
+        // Opens at `ps`, so a failed open can be retried at a detected page size.
+        let open_at = |ps: Option<usize>| {
+            let max_read_txn_duration = match config.max_read_transaction_duration {
+                Some(duration) => MaxReadTransactionDuration::Set(duration),
+                None => MaxReadTransactionDuration::Unbounded,
+            };
+            Environment::builder()
+                .set_max_dbs(32)
+                .set_flags(EnvironmentFlags {
+                    mode: Mode::ReadWrite { sync_mode: SyncMode::SafeNoSync },
+                    liforeclaim: true,
+                    no_rdahead: true,
+                    coalesce: true,
+                    ..Default::default()
+                })
+                .set_geometry(Geometry {
+                    size: Some(0..config.max_db_size),
+                    growth_step: Some(config.growth_step as isize),
+                    // The database never shrinks
+                    shrink_threshold: Some((2 * config.growth_step) as isize),
+                    page_size: ps.map(PageSize::Set),
+                })
+                .write_map()
+                .set_dp_reserve_limit(512)
+                // Spill threshold for a write transaction, in pages (libmdbx
+                // MDBX_opt_txn_dp_limit): once a transaction has dirtied this many
+                // pages libmdbx spills them (in write-map mode an msync kick)
+                // rather than failing. Kept as a page count, so it is 512 MiB on
+                // a 4 KiB datafile and 2 GiB on one created with the 16 KiB default.
+                //
+                // The wider ceiling is safe because consensus write transactions are small and
+                // bounded: batches are at most 2 MB and at most 10 per header. Across two full
+                // 4+1-node e2e networks the largest of 150,065 commits dirtied 0.59 MiB, p99 224
+                // KiB.
+                .set_txn_dp_limit(131072)
+                .set_rp_augment_limit(1024 * 1024)
+                // MDBX syncs lazily on the first commit past the period (see SYNC_PERIOD)
+                .set_sync_period(SYNC_PERIOD)
+                // Prevent writer starvation from long-held read transactions which can cause
+                // consensus delays. Configurable via MdbxConfig.
+                .set_max_read_transaction_duration(max_read_txn_duration)
+                // Configurable concurrent readers limit for high-throughput consensus operations
+                .set_max_readers(config.max_readers.into())
+                // Detect slow readers that may be causing memory growth by holding pages
+                .set_handle_slow_readers(handle_slow_readers)
+                .open(path.as_ref())
+        };
+
+        // A zeroed meta page 0 reads as "not an MDBX file"; detect the real page size and reopen.
+        let env = match open_at(page_size) {
+            Ok(env) => env,
+            Err(e @ reth_libmdbx::Error::Invalid) if page_size.is_none() => {
+                match detect_page_size(&path.as_ref().join(MDBX_DAT)) {
+                    Some(ps) => {
+                        tracing::warn!(
+                            target: "rayls::mdbx",
+                            page_size = ps,
+                            "consensus DB meta page 0 unreadable; reopening at the detected page size"
+                        );
+                        open_at(Some(ps))?
+                    }
+                    None => return Err(e.into()),
+                }
+            }
+            Err(e) => return Err(e.into()),
+        };
 
         // Startup corruption detection
         // Check database integrity immediately after opening to catch corruption early
@@ -1297,6 +1348,81 @@ mod test {
         let temp_dir = tempdir().expect("failed to create temp dir");
         let db = open_db(temp_dir.path());
         assert_eq!(db.page_size().expect("page size"), DEFAULT_MDBX_PAGE_SIZE);
+    }
+
+    /// A zeroed meta page 0 still opens: `open_with_config` detects the page size and reopens.
+    #[test]
+    fn recovers_a_zeroed_meta_page_0_at_every_page_size() {
+        use std::io::{Seek as _, SeekFrom, Write as _};
+        for ps in [4096usize, 8192, 16384, 32768, 65536] {
+            let temp = tempdir().expect("failed to create temp dir");
+            let cfg = MdbxConfig::default().with_page_size(ps).with_growth_step(super::MEGABYTE);
+            {
+                let db = MdbxDatabase::open_with_config(temp.path(), cfg).expect("create database");
+                db.open_table::<TestTable>().expect("open table");
+                db.with_write_txn(|txn| txn.insert::<TestTable>(&1, &"kept".to_owned()))
+                    .expect("insert");
+            }
+            // Zero meta page 0 (the first `ps` bytes), leaving the two backup meta pages intact.
+            let dat = temp.path().join(super::MDBX_DAT);
+            let mut f = std::fs::OpenOptions::new().write(true).open(&dat).expect("open dat");
+            f.seek(SeekFrom::Start(0)).expect("seek");
+            f.write_all(&vec![0u8; ps]).expect("zero meta 0");
+            f.sync_all().expect("sync");
+            drop(f);
+
+            // Reopen with the default config: the open must detect the size and keep the row.
+            let recover_cfg = MdbxConfig::default().with_growth_step(super::MEGABYTE);
+            let db = MdbxDatabase::open_with_config(temp.path(), recover_cfg)
+                .unwrap_or_else(|e| panic!("recover a {ps}-byte-page datafile: {e:#}"));
+            db.open_table::<TestTable>().expect("open table after recover");
+            assert_eq!(
+                db.get::<TestTable>(&1).expect("get"),
+                Some("kept".to_owned()),
+                "row lost recovering a {ps}-byte-page datafile"
+            );
+        }
+    }
+
+    /// Page-size detection reads only the datafile's head, so a huge file is never loaded whole.
+    #[test]
+    fn detect_page_size_reads_only_the_head() {
+        let temp = tempdir().expect("failed to create temp dir");
+        let cfg = MdbxConfig::default().with_page_size(16384).with_growth_step(super::MEGABYTE);
+        {
+            let db = MdbxDatabase::open_with_config(temp.path(), cfg).expect("create database");
+            db.open_table::<TestTable>().expect("open table");
+            db.with_write_txn(|txn| txn.insert::<TestTable>(&1, &"x".to_owned())).expect("insert");
+        }
+        let dat = temp.path().join(super::MDBX_DAT);
+        // Grow the file well past the bounded head so a whole-file read would be visible.
+        let file = std::fs::OpenOptions::new().write(true).open(&dat).expect("open dat");
+        let len = file.metadata().expect("metadata").len();
+        file.set_len(len + 8 * 1024 * 1024).expect("set_len");
+
+        // Count the bytes pulled from the file, so the bound holds regardless of host memory.
+        struct Counting<R> {
+            inner: R,
+            read: std::rc::Rc<std::cell::Cell<usize>>,
+        }
+        impl<R: std::io::Read> std::io::Read for Counting<R> {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                let n = self.inner.read(buf)?;
+                self.read.set(self.read.get() + n);
+                Ok(n)
+            }
+        }
+        let read = std::rc::Rc::new(std::cell::Cell::new(0usize));
+        let counted =
+            Counting { inner: std::fs::File::open(&dat).expect("open dat"), read: read.clone() };
+        assert_eq!(super::detect_page_size_in(counted), Some(16384));
+        assert!(read.get() <= 1 << 18, "read {} bytes, expected at most 256 KiB", read.get());
+    }
+
+    /// Detection returns `None` when fewer than two meta pages survive.
+    #[test]
+    fn detect_page_size_rejects_a_file_without_two_meta_pages() {
+        assert_eq!(super::detect_page_size_in(&b"not an MDBX datafile"[..]), None);
     }
 
     /// A database created with the previous 4 KiB default keeps its page size, its geometry
