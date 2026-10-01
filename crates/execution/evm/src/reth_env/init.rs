@@ -88,7 +88,7 @@ impl RethEnv {
         let configured_page_size = db_args.page_size;
         db_args.page_size = (!db_path.join("mdbx.dat").exists())
             .then(|| configured_page_size.unwrap_or(DEFAULT_MDBX_PAGE_SIZE));
-        // init_db returns a type-erased error, so match the message rather than the typed variant.
+        // Match libmdbx's message since init_db erases the type; if it changes this retry stops.
         // A zeroed meta page 0 reads as "not an MDBX file"; detect the real page size and reopen.
         let db = match init_db(db_path, db_args.database_args()) {
             Ok(db) => db,
