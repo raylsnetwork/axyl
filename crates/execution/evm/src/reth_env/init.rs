@@ -32,44 +32,9 @@ use std::{path::Path, sync::Arc};
 use tokio::sync::{oneshot, watch};
 use tracing::{debug, error, info, warn};
 
-/// Page size for newly created execution databases (16 KiB), used unless `--db.page-size` is
-/// given. Reth's own default follows the OS page size (4 KiB on x86_64 Linux).
-///
-/// libmdbx fixes the page size when a datafile is created and ignores this setting when opening an
-/// existing one, so existing databases keep the page size they were created with. The consensus
-/// database uses the same default (`DEFAULT_MDBX_PAGE_SIZE` in `rayls-infrastructure-storage`).
-pub(crate) const DEFAULT_MDBX_PAGE_SIZE: usize = 16 * 1024;
-
-/// Reads the datafile's page size from the spacing of its meta pages; `None` if under two survive.
-/// The consensus database keeps a copy of this in `rayls-infrastructure-storage`.
-fn detect_page_size(dat: &Path) -> Option<usize> {
-    detect_page_size_in(std::fs::File::open(dat).ok()?)
-}
-
-/// Finds the page size from a reader over the datafile head, split out so a test can bound its
-/// reads.
-fn detect_page_size_in(reader: impl std::io::Read) -> Option<usize> {
-    use std::io::Read as _;
-    // libmdbx writes this 56-bit magic little-endian in every meta page header.
-    const MDBX_MAGIC: u64 = 0x59659DBDEF4C11;
-    // The meta pages sit at the datafile start, so this head covers every page size up to the max.
-    const HEAD_BYTES: u64 = 1 << 18;
-    // libmdbx's supported page-size range in bytes.
-    const MIN_PAGE_SIZE: usize = 256;
-    const MAX_PAGE_SIZE: usize = 64 * 1024;
-
-    let magic = MDBX_MAGIC.to_le_bytes();
-    // Drop the trailing byte so the match ignores the version byte libmdbx packs beside the magic.
-    let magic = &magic[..7];
-    let mut head = Vec::new();
-    reader.take(HEAD_BYTES).read_to_end(&mut head).ok()?;
-    let mut hits =
-        head.windows(magic.len()).enumerate().filter(|(_, w)| *w == magic).map(|(i, _)| i);
-    let first = hits.next()?;
-    let second = hits.next()?;
-    let ps = second - first;
-    (ps.is_power_of_two() && (MIN_PAGE_SIZE..=MAX_PAGE_SIZE).contains(&ps)).then_some(ps)
-}
+// Page-size default and detection shared with the other node database so both stay in sync.
+use rayls_infrastructure_utils::mdbx::detect_page_size;
+pub(crate) use rayls_infrastructure_utils::mdbx::DEFAULT_MDBX_PAGE_SIZE;
 
 impl RethEnv {
     /// Create a new Reth DB.
