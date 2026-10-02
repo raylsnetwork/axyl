@@ -32,6 +32,10 @@ use std::{path::Path, sync::Arc};
 use tokio::sync::{oneshot, watch};
 use tracing::{debug, error, info, warn};
 
+// Page-size default and detection shared with the other node database so both stay in sync.
+use rayls_infrastructure_utils::mdbx::detect_page_size;
+pub(crate) use rayls_infrastructure_utils::mdbx::DEFAULT_MDBX_PAGE_SIZE;
+
 impl RethEnv {
     /// Create a new Reth DB.
     /// Break this out so this can be created upfront and used even on a
@@ -41,8 +45,41 @@ impl RethEnv {
         db_path: P,
     ) -> eyre::Result<RethDb> {
         let db_path = db_path.as_ref();
-        info!(target: "rayls::reth", path = ?db_path, "opening database");
-        Ok(Arc::new(init_db(db_path, reth_config.0.db.database_args())?))
+        let mut db_args = reth_config.0.db;
+        // Only a new datafile takes the default page size. An existing datafile keeps its own
+        // page size regardless, but libmdbx derives the pre-open geometry from the configured
+        // one, so passing 16 KiB for a 4 KiB datafile would rewrite that file's geometry header.
+        // Leaving it unset keeps reth's pre-16 KiB behaviour for existing datafiles.
+        let configured_page_size = db_args.page_size;
+        db_args.page_size = (!db_path.join("mdbx.dat").exists())
+            .then(|| configured_page_size.unwrap_or(DEFAULT_MDBX_PAGE_SIZE));
+        // Match libmdbx's message since init_db erases the type; if it changes this retry stops.
+        // A zeroed meta page 0 reads as "not an MDBX file"; detect the real page size and reopen.
+        let db = match init_db(db_path, db_args.database_args()) {
+            Ok(db) => db,
+            Err(e)
+                if db_args.page_size.is_none() && format!("{e:#}").contains("not an MDBX file") =>
+            {
+                match detect_page_size(&db_path.join("mdbx.dat")) {
+                    Some(ps) => {
+                        warn!(target: "rayls::reth", path = ?db_path, page_size = ps, "execution DB meta page 0 unreadable; reopening at the detected page size");
+                        db_args.page_size = Some(ps);
+                        init_db(db_path, db_args.database_args())?
+                    }
+                    None => return Err(e),
+                }
+            }
+            Err(e) => return Err(e),
+        };
+        match db.stat() {
+            Ok(stat) => {
+                info!(target: "rayls::reth", path = ?db_path, page_size = stat.page_size(), "opened database")
+            }
+            Err(err) => {
+                warn!(target: "rayls::reth", path = ?db_path, %err, "opened database, but reading its stats failed")
+            }
+        }
+        Ok(Arc::new(db))
     }
 
     /// Read the chain's executed head the way reth tracks it: the `Finish`

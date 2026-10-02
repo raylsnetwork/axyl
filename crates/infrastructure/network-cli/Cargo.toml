@@ -30,6 +30,7 @@ rpassword = { workspace = true }
 rayls-infrastructure-types = { workspace = true, features = ["cli"] }
 rayls-infrastructure-storage = { workspace = true }
 rayls-infrastructure-config = { workspace = true }
+rayls-infrastructure-utils = { workspace = true }
 rayon = { workspace = true }
 dirs-next = { workspace = true }
 bs58 = { workspace = true }

@@ -9,8 +9,9 @@ use rayls_execution_evm::test_utils::TransactionFactory;
 use rayls_infrastructure_config::RaylsDirs as _;
 use rayls_infrastructure_storage::{
     cold::archive_below_epoch,
+    mdbx::MdbxConfig,
     mem_db::MemDatabase,
-    open_db,
+    open_db_with_consensus_config,
     tables::{Batches, ConsensusBlockNumbersByDigest, ConsensusBlocks, ConsensusBlocksCache},
     CheckpointStore, DatabaseType, EpochStore,
 };
@@ -186,9 +187,19 @@ pub struct SeededNode {
 impl SeededNode {
     /// Runs `seed` against a read-write database at a fresh datadir, flushes, and closes it.
     pub fn new(seed: impl FnOnce(&DatabaseType)) -> Self {
+        Self::seeded(&MdbxConfig::default(), seed)
+    }
+
+    /// Like `new` but creates the datafile at the given MDBX page size.
+    pub fn new_with_page_size(page_size: usize, seed: impl FnOnce(&DatabaseType)) -> Self {
+        Self::seeded(&MdbxConfig::default().with_page_size(page_size), seed)
+    }
+
+    /// Seeds a fresh datadir with a consensus DB opened under `cfg`, then flushes and closes it.
+    fn seeded(cfg: &MdbxConfig, seed: impl FnOnce(&DatabaseType)) -> Self {
         let dirs = RaylsTempDirs::default();
         {
-            let db = open_db(dirs.consensus_db_path());
+            let db = open_db_with_consensus_config(dirs.consensus_db_path(), cfg);
             seed(&db);
             db.sync_persist().unwrap();
         }
