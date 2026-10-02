@@ -588,6 +588,74 @@ impl MdbxDatabase {
         })
     }
 
+    /// Opens an existing database read-only, for out-of-process inspection.
+    ///
+    /// Unlike [`Self::open_with_config`] this never writes: the environment is opened with
+    /// `MDBX_RDONLY`, no sub-database is created, and the datafile geometry is left untouched.
+    ///
+    /// `exclusive` requests `MDBX_EXCLUSIVE`: the open fails with `Busy` if any other process has
+    /// the environment open, and a read-only lock file becomes acceptable.
+    ///
+    /// Tables are opened lazily by each transaction (see `get_dbi`); a table that does not exist
+    /// surfaces as a `NotFound` error from the read, never as a created sub-database.
+    pub fn open_read_only<P: AsRef<Path>>(path: P, exclusive: bool) -> eyre::Result<Self> {
+        let path = path.as_ref();
+        let dat = path.join(MDBX_DAT);
+        if !dat.is_file() {
+            return Err(eyre::eyre!(
+                "no MDBX database at {} (expected {MDBX_DAT})",
+                path.display()
+            ));
+        }
+
+        let flags = EnvironmentFlags {
+            mode: Mode::ReadOnly,
+            exclusive,
+            no_rdahead: true,
+            ..Default::default()
+        };
+
+        // No geometry: a read-only environment never grows, and MDBX takes the page size from
+        // the datafile's meta page.
+        let env = Environment::builder()
+            .set_max_dbs(32)
+            .set_flags(flags)
+            // Inspection scans may legitimately outlast the node's read-transaction cap; the
+            // cap protects the writer in *this* process, of which there is none.
+            .set_max_read_transaction_duration(MaxReadTransactionDuration::Unbounded)
+            .set_max_readers(DEFAULT_MAX_READERS.into())
+            .open(path)?;
+
+        // Surface corruption plainly; unlike the node startup path, do not suggest deleting the
+        // database, since an inspector may well be pointed at the only remaining copy.
+        env.stat().map_err(|e| {
+            eyre::eyre!("MDBX database at {} failed its integrity check: {e}", path.display())
+        })?;
+
+        Ok(MdbxDatabase { inner: env, dbis: Arc::new(RwLock::new(HashMap::new())) })
+    }
+
+    /// Returns every named table's entry count, keyed by table name.
+    ///
+    /// Reads the MDBX MAIN database, whose keys are the sub-database names, so it needs no
+    /// schema and also reports tables this build does not know about.
+    pub fn table_entry_counts(&self) -> eyre::Result<BTreeMap<String, usize>> {
+        table_entry_counts(&self.inner)
+    }
+
+    /// Returns whether the sub-database for `T` exists, without creating it.
+    ///
+    /// The regular read path opens tables lazily and reports a missing one as an error; a
+    /// read-only inspector uses this to tell "table never created" apart from "row absent".
+    pub fn has_table<T: Table>(&self) -> eyre::Result<bool> {
+        let txn = self.inner.begin_ro_txn()?;
+        match txn.open_db(Some(T::NAME)) {
+            Ok(_) => Ok(true),
+            Err(reth_libmdbx::Error::NotFound) => Ok(false),
+            Err(e) => Err(e.into()),
+        }
+    }
+
     /// Copy-compacts the environment into the `dest` file, writing only live pages.
     ///
     /// Runs against a consistent read snapshot, so the source may stay open; the copy omits
@@ -1146,6 +1214,44 @@ mod test {
         let db = MdbxDatabase::open(path).expect("Cannot open database");
         db.open_table::<TestTable>().expect("failed to open table!");
         db
+    }
+
+    /// A table no test ever creates, to probe `has_table` on a read-only handle.
+    #[derive(Debug)]
+    struct TestTable2 {}
+    impl rayls_infrastructure_types::Table for TestTable2 {
+        type Key = u64;
+        type Value = String;
+
+        const NAME: &'static str = "TestTable2";
+    }
+
+    /// A read-only handle sees rows written by a closed read-write handle, reports absent tables
+    /// without creating them, and refuses a directory without a datafile.
+    #[test]
+    fn open_read_only_reads_without_creating_tables() {
+        let temp_dir = tempdir().expect("failed to create temp dir");
+        {
+            let db = open_db(temp_dir.path());
+            db.with_write_txn(|txn| txn.insert::<TestTable>(&7, &"seven".to_owned()))
+                .expect("seed row");
+        }
+
+        let ro = MdbxDatabase::open_read_only(temp_dir.path(), false).expect("open read-only");
+        assert!(ro.has_table::<TestTable>().expect("has_table"));
+        assert_eq!(ro.get::<TestTable>(&7).expect("get"), Some("seven".to_owned()));
+        assert_eq!(ro.get::<TestTable>(&8).expect("get absent"), None);
+
+        // a table this handle never opened is reported absent, not created
+        assert!(!ro.has_table::<TestTable2>().expect("has_table"));
+        assert_eq!(ro.table_entry_counts().expect("counts").len(), 1);
+        drop(ro);
+        let ro = MdbxDatabase::open_read_only(temp_dir.path(), true).expect("exclusive read-only");
+        assert!(!ro.has_table::<TestTable2>().expect("still absent after a read-only session"));
+
+        let empty = tempdir().expect("failed to create temp dir");
+        let err = MdbxDatabase::open_read_only(empty.path(), false).expect_err("no datafile");
+        assert!(err.to_string().contains("mdbx.dat"), "{err}");
     }
 
     /// Seeds a table, prunes most of it, then compacts in place: the survivors must be

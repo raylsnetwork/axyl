@@ -290,6 +290,24 @@ impl Default for QuicConfig {
     }
 }
 
+impl QuicConfig {
+    /// Applies these limits to a libp2p QUIC transport config.
+    ///
+    /// The single source of the QuicConfig-to-transport field MAPPING; the values still come
+    /// from the caller's instance. The test relay applies `QuicConfig::default()` and does not
+    /// read a node's config file, so an operator tuning `quic_config` above the defaults must
+    /// retune the relay too or it becomes the flow-control bottleneck for circuit traffic.
+    pub fn apply(&self, mut config: libp2p::quic::Config) -> libp2p::quic::Config {
+        config.handshake_timeout = self.handshake_timeout;
+        config.max_idle_timeout = self.max_idle_timeout;
+        config.keep_alive_interval = self.keep_alive_interval;
+        config.max_concurrent_stream_limit = self.max_concurrent_stream_limit;
+        config.max_stream_data = self.max_stream_data;
+        config.max_connection_data = self.max_connection_data;
+        config
+    }
+}
+
 /// Configurations for network peers.
 #[derive(Serialize, Deserialize, Debug, Clone, Copy)]
 pub struct PeerConfig {

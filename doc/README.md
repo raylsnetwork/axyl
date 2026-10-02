@@ -17,6 +17,9 @@ Start with one of the pages below depending on what you are trying to do.
   development.
 - [`../README.md`](../README.md) — top-level project README with quick-start
   build/run instructions.
+- [`../bin/rayls-db-inspect/README.md`](../bin/rayls-db-inspect/README.md) — inspect a
+  node's `consensus-db` read-only (epoch records, certificates, consensus headers) and
+  compare several nodes when a transition or sync stalls.
 - [`../etc/validator/README.md`](../etc/validator/README.md) — provision a
   validator from scratch (keys, fund, allowlist, stake, activate, exit).
 - [`../etc/observer/README.md`](../etc/observer/README.md) — provision an

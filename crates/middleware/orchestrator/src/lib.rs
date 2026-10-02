@@ -139,6 +139,7 @@ where
         let reth_env = RethEnv::new_from_parameters(
             &builder.node_config,
             &builder.rayls_infrastructure_config.parameters,
+            &builder.profile,
             &task_manager,
             reth_db,
             rayls_middleware_rewards::from_db(consensus_db.clone()),

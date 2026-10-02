@@ -1,7 +1,7 @@
 use crate::{
     codec::RLMessage,
     peers::Penalty,
-    types::{NetworkEvent, NetworkResult},
+    types::{NetworkEvent, NetworkResult, NexthopFmt},
     ConsensusNetwork, PeerExchangeMap,
 };
 use libp2p::request_response::{
@@ -24,10 +24,14 @@ where
         event: ReqResEvent<Req, Res>,
     ) -> NetworkResult<()> {
         match event {
-            ReqResEvent::Message { peer, message, connection_id: _ } => {
+            ReqResEvent::Message { peer, message, connection_id } => {
+                // the transport path this message actually traveled, for the relayed-topology
+                // audit trail. Cheap Copy wrapper; formatted lazily by the log macro only when the
+                // event is enabled ("closed" if the connection already closed).
+                let via = NexthopFmt(self.connection_paths.get(&connection_id).copied());
                 match message {
                     request_response::Message::Request { request_id, request, channel } => {
-                        debug!(target: "network", ?peer, ?request, "request received");
+                        debug!(target: "network", peer_id = %peer, ?via, ?request, "request received");
                         // intercept peer exchange messages
                         if let Some(peers) = request.peer_exchange_msg() {
                             debug!(target: "network", ?peers, "processing peer exchange");
@@ -85,6 +89,7 @@ where
                         }
                     }
                     request_response::Message::Response { request_id, response } => {
+                        debug!(target: "network", peer_id = %peer, ?via, ?request_id, "response received");
                         // check if response associated with PX disconnect
                         if self.pending_px_disconnects.remove(&request_id).is_some() {
                             let _ = self.swarm.disconnect_peer_id(peer);
@@ -150,19 +155,33 @@ where
 
 /// Classifies an outbound request-response failure into the penalty owed to the target peer.
 ///
-/// Returns `None` for failures not the peer's fault. "max sub-streams reached" is local outbound
-/// exhaustion, not the target, so penalizing there would let a self-inflicted flood ban innocents.
+/// Penalties are behaviour-based: a peer is scored only for what *it* did to us. An outbound
+/// request is an operation *we* initiated against a target *we* chose, so most of its failure
+/// modes are not the peer's fault and return `None`. "max sub-streams reached" is local outbound
+/// exhaustion, so penalizing there would let a self-inflicted flood ban innocents.
 fn outbound_failure_penalty(error: &OutboundFailure) -> Option<Penalty> {
     match error {
         OutboundFailure::ConnectionClosed
         | OutboundFailure::Timeout
         | OutboundFailure::DialFailure => None,
+        // The target does not speak the protocol we asked for. That is our targeting mistake, not
+        // the peer's behaviour: `SendRequestAny` round-robins over every connected peer, which can
+        // include a relay, a worker-side identity that landed on the primary port, or a node on a
+        // different protocol version. Scoring it here banned exactly those peers (two hits reach
+        // the disconnect threshold, five the ban) for requests they never asked to receive. The
+        // rotation already moves on to the next peer, so the cost of not scoring is one wasted
+        // request per rotation.
+        OutboundFailure::UnsupportedProtocols => None,
         // brittle string match: the libp2p handler exposes local exhaustion only as an opaque
         // `io::Error::other("max sub-streams reached")`, so an SDK bump changing this literal must
         // re-check the arm (a miss only over-penalizes, never under-penalizes a real fault).
         OutboundFailure::Io(e) if e.to_string().contains("max sub-streams reached") => None,
-        OutboundFailure::Io(_) => Some(Penalty::Medium),
-        OutboundFailure::UnsupportedProtocols => Some(Penalty::Severe),
+        // `Io` is ambiguous: an undecodable response (the peer's fault) and a connection reset or
+        // read error mid-response (nobody's fault; routine on relayed circuits, which have no
+        // transport keep-alive) surface as the same variant. Mild keeps a peer that keeps sending
+        // garbage scorable (~20 hits to disconnect) without letting link flakiness alone reach the
+        // disconnect threshold, which Medium (4 hits) did.
+        OutboundFailure::Io(_) => Some(Penalty::Mild),
     }
 }
 
@@ -173,8 +192,14 @@ fn outbound_failure_penalty(error: &OutboundFailure) -> Option<Penalty> {
 /// requester for this node's own write failure.
 fn inbound_failure_penalty(error: &ReqResInboundFailure) -> Option<Penalty> {
     match error {
-        // The requester spoke a protocol set this node does not accept.
-        ReqResInboundFailure::UnsupportedProtocols => Some(Penalty::Fatal),
+        // The requester opened a stream on a protocol set this node does not accept. That is the
+        // peer's own action, so it is scored -- but as Severe, not Fatal: a single stray
+        // negotiation is far more often a misconfigured swarm (a worker dialing the primary port)
+        // or a version skew during a rolling upgrade than an attack. Severe still disconnects
+        // after two and bans after five sustained attempts, and the ban decays once the peer is
+        // fixed (`banned_before_decay_secs`, then the score half-life) with no restart on our side;
+        // Fatal banned the id on the first stream for the full freeze period.
+        ReqResInboundFailure::UnsupportedProtocols => Some(Penalty::Severe),
         ReqResInboundFailure::Io(_)
         | ReqResInboundFailure::Timeout
         | ReqResInboundFailure::ConnectionClosed
@@ -198,7 +223,9 @@ mod tests {
         );
     }
 
-    /// Connection-level and local inbound failures earn nothing; only a protocol mismatch does.
+    /// Connection-level and local inbound failures earn nothing; only a protocol mismatch does,
+    /// and it accumulates (Severe) rather than banning on the first stray stream (Fatal), so a
+    /// misconfigured or version-skewed peer is disconnected/banned only while the fault persists.
     #[test]
     fn inbound_failure_penalties_match_fault() {
         assert!(inbound_failure_penalty(&ReqResInboundFailure::Timeout).is_none());
@@ -206,7 +233,7 @@ mod tests {
         assert!(inbound_failure_penalty(&ReqResInboundFailure::ResponseOmission).is_none());
         assert!(matches!(
             inbound_failure_penalty(&ReqResInboundFailure::UnsupportedProtocols),
-            Some(Penalty::Fatal)
+            Some(Penalty::Severe)
         ));
     }
 
@@ -220,16 +247,19 @@ mod tests {
         );
     }
 
-    /// Other outbound failure classes keep their existing penalties.
+    /// Outbound failures are operations we initiated: only an `Io` failure (possibly a garbage
+    /// response) is scored, and only Mild; a target that does not speak the requested protocol is
+    /// our targeting mistake and must never be scored -- that path banned relays and worker
+    /// identities picked up by `SendRequestAny`.
     #[test]
-    fn other_outbound_failures_keep_penalties() {
+    fn outbound_failures_are_not_the_targets_fault() {
         let decode_failure = OutboundFailure::Io(io::Error::other("invalid value"));
-        assert!(matches!(outbound_failure_penalty(&decode_failure), Some(Penalty::Medium)));
+        assert!(matches!(outbound_failure_penalty(&decode_failure), Some(Penalty::Mild)));
 
-        assert!(matches!(
-            outbound_failure_penalty(&OutboundFailure::UnsupportedProtocols),
-            Some(Penalty::Severe)
-        ));
+        assert!(
+            outbound_failure_penalty(&OutboundFailure::UnsupportedProtocols).is_none(),
+            "a target we picked that lacks the protocol did nothing to us"
+        );
 
         assert!(outbound_failure_penalty(&OutboundFailure::Timeout).is_none());
         assert!(outbound_failure_penalty(&OutboundFailure::ConnectionClosed).is_none());

@@ -66,6 +66,7 @@ reth-tokio-util = { workspace = true }
 rand = { workspace = true }
 futures = { workspace = true }
 serde = { workspace = true }
+serde_yaml = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 eyre = { workspace = true }
@@ -79,7 +80,6 @@ prometheus = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
-serde_yaml = { workspace = true }
 rayls-infrastructure-types = { workspace = true, features = ["test-utils"] }
 rayls-execution-evm = { path = ".", features = ["test-utils"] }
 secp256k1 = { workspace = true }

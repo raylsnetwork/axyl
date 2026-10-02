@@ -11,8 +11,16 @@ use rayls_execution_evm::reth_env::RethDb;
 #[cfg(feature = "cold-storage")]
 use super::cold_archive::ColdArchival;
 use rayls_infrastructure_config::KeyConfig;
-use rayls_infrastructure_types::{EpochRecord, Notifier};
+use rayls_infrastructure_types::{Epoch, EpochRecord, Notifier};
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex},
+};
 use tokio::sync::watch;
+
+/// Failed certification attempts per pending epoch, shared between the manager and the
+/// collector task it spawns each epoch (see `EpochManager::certification_attempts`).
+pub(crate) type CertificationAttempts = Arc<Mutex<HashMap<Epoch, u32>>>;
 
 use crate::engine::RaylsBuilder;
 
@@ -70,10 +78,15 @@ pub(crate) struct EpochManager<P, DB> {
 
     /// The previous epoch's record, retained in memory for the next transition's
     /// `parent_hash`/committee lookup. Set when `epoch_record` is taken and handed
-    /// to `collect_epoch_votes`, so the record chain can advance even though the
-    /// record is no longer eagerly persisted (it now lands on disk only with its
-    /// cert at quorum).
+    /// to `collect_epoch_votes`, so the record chain can advance before the record
+    /// is certified (it lands in `EpochRecords` only with its cert at quorum).
+    /// Seeded at startup from `PendingEpochRecord` so a restart keeps it.
     pub(super) prev_epoch_record: Option<EpochRecord>,
+    /// Failed certification attempts per pending epoch. Kept here rather than in the collector
+    /// task because that task is respawned at every epoch close while a stalled epoch is not:
+    /// with a task-local counter the retry backoff restarted from its base every time any epoch
+    /// closed, so the ceiling only ever held within one epoch.
+    pub(super) certification_attempts: CertificationAttempts,
 
     /// Indicates first epoch since process start
     pub(super) initial_epoch: bool,

@@ -4,10 +4,7 @@ use crate::{
 };
 use eyre::OptionExt;
 use rayls_consensus_worker::{WorkerNetwork, WorkerNetworkHandle};
-use rayls_execution_evm::{
-    active_profile,
-    chainspec::{RaylsChainHardforks, RaylsHardforks},
-};
+use rayls_execution_evm::chainspec::{RaylsChainHardforks, RaylsHardforks};
 use rayls_infrastructure_config::{ConsensusConfig, LibP2pConfig, RaylsDirs};
 use rayls_infrastructure_types::{
     gas_accumulator::GasAccumulator, BatchValidation, BlsPublicKey, Database as ReDatabase,
@@ -112,7 +109,19 @@ where
                 consensus_config.primary_networkkey(),
                 consensus_config.worker_address(),
             )?;
-            network_handle.inner_handle().start_listening(worker_address).await?;
+            // Explicit relay reservations, using the worker's own network key for the circuit
+            // listen addresses (see the primary's equivalent block).
+            let relay_reservations = Self::relay_listen_addresses(
+                "WORKER_RELAY_MULTIADDRS",
+                consensus_config.worker_networkkey(),
+            )?;
+            super::network::start_swarm_listeners(
+                network_handle.inner_handle(),
+                worker_address,
+                relay_reservations,
+                "WORKER_RELAY_MULTIADDRS",
+            )
+            .await?;
         }
 
         // Rayls: Always rebuild identity mappings (known_peers, known_peerids) every epoch.
@@ -204,26 +213,9 @@ where
     /// After the EIP-1559 per-block fork: no-op (each block self-adjusts via payload builder).
     /// Before the fork: currently a no-op stub (unchanged from main).
     pub(super) fn adjust_base_fees(&self, gas_accumulator: &GasAccumulator, block_number: u64) {
-        let network = self.builder.rayls_infrastructure_config.parameters.network;
-        // Prefer an externally-resolved schedule (from `--config-file`); without one, the
-        // baked-in profile selected by `parameters.network` applies. An "external" datadir
-        // with no file schedule cannot boot (enforced in `network-cli` at startup), so the
-        // final arm is unreachable at runtime. If a future refactor ever lets a node reach
-        // it, `debug_assert!` surfaces that loudly in tests instead of silently applying an
-        // all-`Never` schedule (which would leave EIP-1559 permanently inactive).
-        let hardforks = match active_profile() {
-            Some(profile) => RaylsChainHardforks::new(profile.schedule()),
-            None => match network {
-                Some(network) => RaylsChainHardforks::for_network(network),
-                None => {
-                    debug_assert!(
-                        false,
-                        "external datadir with no schedule must be refused at boot"
-                    );
-                    RaylsChainHardforks::new(Vec::new())
-                }
-            },
-        };
+        // The schedule the CLI boot gate selected (a `--config-file` subnet or the
+        // `--network` built-in), carried by the builder.
+        let hardforks = RaylsChainHardforks::new(self.builder.profile.schedule());
         if hardforks.is_eip1559_active_at_block(block_number) {
             // per-block EIP-1559 active — base fee is updated per-block by the payload builder
             return;

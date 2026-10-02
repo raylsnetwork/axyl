@@ -2,7 +2,7 @@
 #[cfg(feature = "dev-single-node-setup")]
 use crate::dev;
 use crate::{
-    genesis, keytool, node,
+    genesis, keytool, node, schedule,
     version::{LONG_VERSION, SHORT_VERSION},
     NoArgs,
 };
@@ -150,6 +150,9 @@ impl<Ext: clap::Args + fmt::Debug> Cli<Ext> {
                 })
             }
             Commands::Keytool(command) => command.execute(datadir, passphrase),
+            // Reads nothing from the datadir and touches no keys: pure serialization
+            // of the built-in schedule.
+            Commands::Schedule(command) => command.execute(),
             #[cfg(feature = "dev-single-node-setup")]
             Commands::Dev(command) => command.execute(datadir, passphrase, launcher),
         }
@@ -181,6 +184,13 @@ pub enum Commands<Ext: clap::Args + fmt::Debug = NoArgs> {
     #[command(name = "node")]
     Node(Box<node::NodeCommand<Ext>>),
 
+    /// Hardfork schedule tooling.
+    ///
+    /// `schedule export --network <name>` dumps the schedule built into this
+    /// binary as a loadable `--config-file`, the template for a client subnet.
+    #[command(name = "schedule")]
+    Schedule(schedule::export::ScheduleArgs),
+
     /// Run the boot-time cold-storage migration and exit without starting the node.
     ///
     /// Accepts the same arguments as `node`, needs no BLS passphrase, and is idempotent: it
@@ -205,13 +215,14 @@ impl<Ext: clap::Args + fmt::Debug> Commands<Ext> {
     /// The per-command policy lives here, next to the variant declarations, so the binary's
     /// passphrase gate stays free of feature-gated variant knowledge.
     pub fn needs_bls_passphrase(&self) -> bool {
-        // The migration never opens the BLS key; every other command keeps the requirement so a
-        // missing passphrase fails closed before any real work starts.
+        // The migration and the schedule tooling never open the BLS key; every other command
+        // keeps the requirement so a missing passphrase fails closed before any real work
+        // starts.
         #[cfg(feature = "cold-storage")]
         if matches!(self, Commands::ColdMigrate(_)) {
             return false;
         }
-        true
+        !matches!(self, Commands::Schedule(_))
     }
 }
 
@@ -308,6 +319,35 @@ mod tests {
             Commands::ColdMigrate(cmd) => assert!(cmd.compact),
             _ => panic!("expected ColdMigrate command"),
         }
+    }
+
+    /// `schedule export` parses and needs no passphrase.
+    #[test]
+    fn parse_schedule_export() {
+        let rl =
+            Cli::try_parse_args_from(["rl", "schedule", "export", "--network", "testnet"]).unwrap();
+        assert!(!rl.command.needs_bls_passphrase(), "export must not require a passphrase");
+        match rl.command {
+            Commands::Schedule(cmd) => match cmd.command {
+                schedule::export::ScheduleCommand::Export(args) => {
+                    assert_eq!(args.network, rayls_infrastructure_types::RaylsNetwork::Testnet);
+                    assert!(args.subnet_name.is_none());
+                }
+            },
+            _ => panic!("expected Schedule command"),
+        }
+
+        // A subnet name that would not be a plain YAML key is refused at parse time.
+        assert!(Cli::try_parse_args_from([
+            "rl",
+            "schedule",
+            "export",
+            "--network",
+            "local",
+            "--subnet-name",
+            "my:net"
+        ])
+        .is_err());
     }
 
     #[cfg(feature = "dev-single-node-setup")]
