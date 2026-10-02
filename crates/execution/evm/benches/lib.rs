@@ -1,3 +1,6 @@
+// A bench deliberately exercises only a slice of the crate's dependency surface.
+#![allow(unused_crate_dependencies)]
+
 use alloy::primitives::Address;
 pub use alloy::primitives::FixedBytes;
 use criterion::{criterion_group, criterion_main, Criterion};
