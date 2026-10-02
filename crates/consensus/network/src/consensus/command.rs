@@ -366,7 +366,9 @@ where
             }
             NetworkCommand::ReportPenalty { peer, penalty } => {
                 debug!(target: "network", "penalty reported for peer {peer}");
-                if let Some((peer, _)) = self.swarm.behaviour().peer_manager.auth_to_peer(peer) {
+                // Resolve through the bound mapping only: a third-party record may name any
+                // network key for this BLS key, and a penalty must not land on the peer it named.
+                if let Some(peer) = self.swarm.behaviour().peer_manager.bound_auth_to_peer(peer) {
                     self.swarm.behaviour_mut().peer_manager.process_penalty(peer, penalty);
                 } else {
                     warn!(target: "peer-manager", ?peer, "unable to assess penalty for peer");

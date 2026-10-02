@@ -8,7 +8,7 @@ use crate::{
     },
     error::NetworkError,
     kad::KadStoreType,
-    types::NetworkHandle,
+    types::{NetworkHandle, NetworkInfo},
     NetworkMetrics, Penalty,
 };
 use assert_matches::assert_matches;
@@ -2057,6 +2057,93 @@ async fn test_kad_put_request_refreshes_known_peers_on_duplicate() -> eyre::Resu
     let known = network.swarm.behaviour().peer_manager.auth_to_peer(peer2_bls_key);
     assert!(known.is_some(), "OldRecord branch must refresh known_peers after restart");
 
+    Ok(())
+}
+
+/// A record put by anyone other than the peer it is about is stored and yields dial addresses,
+/// but binds no peer id: the put's connection proves who delivered it, not who owns the network
+/// key inside. The peer's own put over its own connection is what binds. Against the re-mapping
+/// attack this means an attacker's record naming the victim's network key, however valid, can
+/// neither bind the victim's peer id to the attacker's BLS key nor make the victim the target of
+/// the attacker's penalties.
+#[tokio::test]
+async fn test_kad_put_binds_peer_id_only_when_delivered_by_its_owner() -> eyre::Result<()> {
+    let TestTypes { peer1, peer2, .. } =
+        create_test_types::<TestWorkerRequest, TestWorkerResponse>();
+    let mut network = peer1.network;
+
+    let peer2_record = peer2.network.get_peer_record();
+    let peer2_id = *peer2.network.swarm.local_peer_id();
+    let peer2_bls = peer2.config.key_config().primary_public_key();
+    let relayer = PeerId::random();
+
+    // peer2's genuine record, replicated by a third node: addresses yes, binding no
+    network.process_kad_put_request(relayer, peer2_record.clone());
+    assert!(network.swarm.behaviour().peer_manager.auth_to_peer(peer2_bls).is_some());
+    assert_eq!(network.swarm.behaviour().peer_manager.peer_to_bls(&peer2_id), None);
+    assert_eq!(network.swarm.behaviour().peer_manager.bound_auth_to_peer(peer2_bls), None);
+
+    // the same record pushed by peer2 itself (a duplicate, so via the refresh branch): bound
+    network.process_kad_put_request(peer2_id, peer2_record);
+    assert_eq!(network.swarm.behaviour().peer_manager.peer_to_bls(&peer2_id), Some(peer2_bls));
+    assert_eq!(
+        network.swarm.behaviour().peer_manager.bound_auth_to_peer(peer2_bls),
+        Some(peer2_id)
+    );
+
+    // the attack: a record under the attacker's BLS key naming peer2's network key, delivered
+    // by the attacker with the publisher field set to peer2 (libp2p does not authenticate it)
+    let attacker = rayls_infrastructure_config::KeyConfig::new_with_testing_key(
+        rayls_infrastructure_types::BlsKeypair::generate(&mut rand::rng()),
+    );
+    let attacker_id: PeerId = attacker.primary_network_public_key().into();
+    let mut forged_info = peer2.network.node_record.info.clone();
+    forged_info.timestamp = now() + 1;
+    let signature = attacker.request_signature_direct(&encode(&forged_info));
+    let forged = kad::Record {
+        key: RecordKey::new(&attacker.primary_public_key()),
+        value: encode(&NodeRecord { info: forged_info, signature }),
+        publisher: Some(peer2_id),
+        expires: None,
+    };
+    network.process_kad_put_request(attacker_id, forged);
+    assert_eq!(
+        network.swarm.behaviour().peer_manager.peer_to_bls(&peer2_id),
+        Some(peer2_bls),
+        "peer2's binding must survive a third-party record naming its network key"
+    );
+    // the attacker never connected as itself, so nothing of its was ever attributed to its key
+    // and there is no connection to punish; it certainly must not resolve to peer2
+    assert_eq!(
+        network.swarm.behaviour().peer_manager.bound_auth_to_peer(attacker.primary_public_key()),
+        None,
+    );
+
+    // once the attacker has pushed its genuine record over its own connection, a penalty for
+    // its key lands there, however many records it publishes naming other peers. It has to be
+    // newer than the forgery: the attacker's own newer forged record shadows an older genuine
+    // one in the store, which is the attacker's problem, not ours.
+    let genuine_info = NetworkInfo {
+        pubkey: attacker.primary_network_public_key(),
+        multiaddrs: vec![create_multiaddr(None)],
+        timestamp: now() + 2,
+    };
+    let signature = attacker.request_signature_direct(&encode(&genuine_info));
+    let genuine = NodeRecord { info: genuine_info, signature };
+    network.process_kad_put_request(
+        attacker_id,
+        kad::Record {
+            key: RecordKey::new(&attacker.primary_public_key()),
+            value: encode(&genuine),
+            publisher: Some(attacker_id),
+            expires: None,
+        },
+    );
+    assert_eq!(
+        network.swarm.behaviour().peer_manager.bound_auth_to_peer(attacker.primary_public_key()),
+        Some(attacker_id),
+        "a penalty for the attacker's key must land on the attacker's own connection"
+    );
     Ok(())
 }
 
