@@ -78,6 +78,14 @@ pub struct NetworkMetrics {
     /// Worker swarm's desired relay reservations; see
     /// [`Self::node_peer_addr_reservation_primary`].
     pub node_peer_addr_reservation_worker: IntGaugeVec,
+    /// Sizes of the peer manager's relay peer addr sets, one series per `set`: `registered`
+    /// (prune-exempt, kept out of kad, skipped by fan-out), `configured` (from this node's own
+    /// configuration, registered for life), `pending` (hops of circuits being dialed through,
+    /// awaiting a circuit), `circuits` (live circuits through registered relays). Refreshed
+    /// each tick. `registered` should track `configured` plus the relays this node is connected
+    /// to and has had a circuit through; a `registered` that grows on its own is the signature
+    /// of a peer id being granted relay status without a circuit.
+    pub relay_peer_addr_set_size: IntGaugeVec,
 }
 
 impl NetworkMetrics {
@@ -195,6 +203,12 @@ impl NetworkMetrics {
                 "node_peer_addr_reservation_worker",
                 "Worker swarm desired relay reservations (1 = active, 0 = desired but currently down)",
                 &["multiaddr"],
+                registry
+            )?,
+            relay_peer_addr_set_size: register_int_gauge_vec_with_registry!(
+                "relay_peer_addr_set_size",
+                "Size of the peer manager's relay peer addr sets (registered, configured, pending, circuits)",
+                &["set", "swarm"],
                 registry
             )?,
         })

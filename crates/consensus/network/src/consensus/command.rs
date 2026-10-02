@@ -344,11 +344,13 @@ where
 
                 // find first non-banned peer that can actually serve a request. Relays are in
                 // `connected_peers` (the direct leg we route circuits over) but only speak the
-                // circuit protocol, so picking one as a request target always fails with
-                // `UnsupportedProtocols` -- skip them.
+                // circuit protocol, so picking one as a request target always fails, as
+                // `UnsupportedProtocols` or as a reset stream that costs the relay a penalty.
+                // Skip registered relays and the hops of circuits still being dialed alike: a
+                // hop cannot serve a request whether or not its circuit has confirmed yet.
                 if let Some(peer) = self.connected_peers.iter().find(|p| {
                     let pm = &self.swarm.behaviour().peer_manager;
-                    !pm.peer_banned(p) && !pm.is_relay(p)
+                    !pm.peer_banned(p) && !pm.is_relay_hop_candidate(p)
                 }) {
                     let request_id = self.swarm.behaviour_mut().req_res.send_request(peer, request);
                     self.outbound_requests.insert((*peer, request_id), reply);

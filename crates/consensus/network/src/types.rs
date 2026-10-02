@@ -65,8 +65,10 @@ pub fn circuit_relay_peer_id(addr: &Multiaddr) -> Option<PeerId> {
 /// other than the one intended. Direct entries are deliberately allowed -- a split-horizon zone
 /// serves them to co-located nodes (`MULTI_LISTEN`), noise authenticates the destination anyway,
 /// and a non-circuit yields no relay hop to protect. It does NOT authenticate the relay hop
-/// itself -- nothing signed names it; granting the hop protection only once a circuit through it
-/// actually succeeds is the stronger follow-up.
+/// itself -- nothing signed names it. Hops learned this way are registered as configured relays
+/// because the zone is anchored to the committee config; hops learned from peers' records are
+/// only registered once a circuit through them is actually established (see
+/// `PeerManager::relay_circuit_established`).
 pub fn dnsaddr_entry_matches(candidate: &Multiaddr, expected_dst: &PeerId) -> bool {
     matches!(candidate.iter().last(), Some(Protocol::P2p(id)) if id == *expected_dst)
 }

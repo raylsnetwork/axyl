@@ -468,9 +468,11 @@ async fn test_outbound_failure_malicious_request() -> eyre::Result<()> {
     // sleep for heartbeat
     tokio::time::sleep(Duration::from_secs(TEST_HEARTBEAT_INTERVAL)).await;
 
-    let peer_score_before_msg = honest_peer.peer_score(malicious_peer_id).await?.unwrap();
+    let honest_score_before = malicious_peer.peer_score(honest_peer_id).await?.unwrap();
+    let _malicious_score_before = honest_peer.peer_score(malicious_peer_id).await?.unwrap();
 
-    // honest peer returns `OutboundFailure` error
+    // honest peer cannot decode the request and closes the stream, which the requester sees as
+    // an `OutboundFailure::Io`
     let response_from_peer = malicious_peer.send_request(malicious_msg, honest_bls).await?;
     let res = timeout(Duration::from_secs(2), response_from_peer)
         .await?
@@ -478,15 +480,22 @@ async fn test_outbound_failure_malicious_request() -> eyre::Result<()> {
 
     assert_matches!(res, Err(NetworkError::Outbound(_)));
 
-    // Allow time for penalty to be applied
+    // Allow time for any penalty to be applied
     tokio::time::sleep(Duration::from_millis(500)).await;
 
-    // TODO: the honest peer penalize the malicious requestor. see Issue #250
-    //
-    // assert honest peer's score is lower - penalties are applied immediately
-    // however, it should be the case that honest peer penalizes the malicious peer
-    let peer_score_after_msg = malicious_peer.peer_score(honest_peer_id).await?.unwrap();
-    assert!(peer_score_before_msg > peer_score_after_msg);
+    // The requester must not score the honest responder for its own bad request: an outbound
+    // `Io` failure is indistinguishable from a reset link and is not the target's fault. This
+    // assertion used to be inverted (the requester lowered the honest peer's score), which is the
+    // misattribution that let a lagging validator disconnect innocent observers.
+    let honest_score_after = malicious_peer.peer_score(honest_peer_id).await?.unwrap();
+    assert_eq!(
+        honest_score_before, honest_score_after,
+        "an outbound Io failure must not lower the target's score"
+    );
+
+    // TODO: the honest peer should penalize the malicious requester for the undecodable request.
+    // See Issue #250. Not asserted here: an inbound `Io` is also not scored today because it is
+    // ambiguous with this node's own failure to write a response.
 
     Ok(())
 }
