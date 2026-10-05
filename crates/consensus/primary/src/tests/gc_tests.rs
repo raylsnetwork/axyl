@@ -42,10 +42,7 @@ async fn gc_timeout_kicks_certificate_fetcher() -> eyre::Result<()> {
         .expect("certificate fetcher channel closed");
     assert_matches!(command, CertificateFetcherCommand::Kick);
 
-    assert_eq!(
-        metrics.node_metrics.synchronizer_gc_timeout.get(),
-        1
-    );
+    assert_eq!(metrics.node_metrics.synchronizer_gc_timeout.get(), 1);
 
     Ok(())
 }
