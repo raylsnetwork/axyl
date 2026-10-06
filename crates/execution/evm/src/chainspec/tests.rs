@@ -80,7 +80,7 @@ mod schedule {
     #[test]
     fn local_network_first_four_hardforks_active_at_block_0() {
         let hardforks = RaylsChainHardforks::local();
-        // First four forks in declaration order are genesis-active on local (9 of 15 are;
+        // First four forks in declaration order are genesis-active on local (9 of 16 are;
         // this pins the leading four).
         let active_forks = [
             RaylsHardFork::Eip1559,
@@ -158,22 +158,22 @@ mod hardforks {
     fn local_network_version_byte_at_block_0() {
         let hardforks = RaylsChainHardforks::local();
         let version = hardforks.version_byte_at_block(0);
-        // SenderAffinityLoadBalancing (0x0f) activates at block 0 on local and is the highest
+        // EpochCloseSeedV2 (0x10) activates at block 0 on local and is the highest
         // such fork, so it owns the version byte from block 0.
-        assert_eq!(version, Some(0x0f));
+        assert_eq!(version, Some(0x10));
     }
 
     #[test]
     fn local_network_version_byte_is_the_max_active_code() {
-        // SenderAffinityLoadBalancing (0x0f) is genesis-active on local, so it owns the version
+        // EpochCloseSeedV2 (0x10) is genesis-active on local, so it owns the version
         // byte across every later activation (HybridRewards at 0x0d included): the byte reports
         // the max active code, not the most recently crossed block. On real networks it is Never,
         // so there the highest active fork still advances the byte normally.
         let hardforks = RaylsChainHardforks::local();
         let hybrid_rewards_block = activation_block(&hardforks, RaylsHardFork::HybridRewards);
-        assert_eq!(hardforks.version_byte_at_block(hybrid_rewards_block - 1), Some(0x0f));
-        assert_eq!(hardforks.version_byte_at_block(hybrid_rewards_block), Some(0x0f));
-        assert_eq!(hardforks.version_byte_at_block(1_000_000), Some(0x0f));
+        assert_eq!(hardforks.version_byte_at_block(hybrid_rewards_block - 1), Some(0x10));
+        assert_eq!(hardforks.version_byte_at_block(hybrid_rewards_block), Some(0x10));
+        assert_eq!(hardforks.version_byte_at_block(1_000_000), Some(0x10));
     }
 }
 

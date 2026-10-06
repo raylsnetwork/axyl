@@ -115,7 +115,8 @@ impl Command {
             | Self::GetBatch { nodes, .. }
             | Self::GetTx { nodes, .. }
             | Self::Summary { nodes }
-            | Self::HeaderCheck { nodes, .. } => nodes,
+            | Self::HeaderCheck { nodes, .. }
+            | Self::Participation { nodes, .. } => nodes,
         }
     }
 }
@@ -246,6 +247,23 @@ pub enum Command {
         /// How many headers to check back.
         #[arg(long, default_value_t = 10, value_name = "COUNT", value_parser = number::<u64>)]
         back: u64,
+        #[command(flatten)]
+        nodes: NodeArgs,
+    },
+
+    /// Count what each validator did in one epoch from the committed sub-dags on disk, in the
+    /// shape the node hands to the ConsensusRegistry at the epoch's close.
+    ///
+    /// Per authority: `participation` (headers whose sub-dag holds one of its certificates),
+    /// `anchor` (headers it led), the participation share in basis points, and its certificate,
+    /// batch and signature counts; per node, the tallied header count (`totalRounds`). Counts
+    /// only, nothing inferred. Genesis headers (leader round 0) and cache rows (not processed) are
+    /// listed and not counted, as the node's own tally skips them. An open epoch's running tally
+    /// is printed but not compared; a closed epoch's tally is what the close block was built from.
+    Participation {
+        /// The epoch to tally.
+        #[arg(value_name = "EPOCH", value_parser = number::<u32>)]
+        epoch: u32,
         #[command(flatten)]
         nodes: NodeArgs,
     },

@@ -33,6 +33,7 @@ networks:
       HybridRewards: never
       OutputSeqNormalization: never
       SenderAffinityLoadBalancing: never
+      EpochCloseSeedV2: never
   local:
     chain_id: 487
     hardforks:
@@ -51,3 +52,4 @@ networks:
       HybridRewards: 1
       OutputSeqNormalization: 0
       SenderAffinityLoadBalancing: 0
+      EpochCloseSeedV2: 0

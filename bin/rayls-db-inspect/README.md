@@ -21,6 +21,11 @@ epoch record / certificate / header state per node.
   stored rows: the batch that carries it, the sub-dag certificate whose payload lists that batch,
   and the consensus header that committed it; `get-batch <DIGEST>` shows the batch itself, hot or
   archived, with the same path.
+- A validator's reward share is in question: `participation <EPOCH>` counts, per validator, the
+  headers whose sub-dag holds one of its certificates and the headers it led, which are the
+  `participationRounds` and `anchorRounds` the node hands to the ConsensusRegistry when it closes
+  the epoch, plus its certificate, batch and signature counts, so "earned nothing" can be traced
+  to "no certificate ever reached a commit".
 
 ## Safety: stopped nodes only
 
@@ -65,8 +70,9 @@ checksums that would reveal it. `--recover` will make such a copy openable, but 
 Stop the node before copying.
 
 A copy whose files are not writable (a read-only mount) opens too: the exclusive open never
-registers in `mdbx.lck`. The scans (`get-tx`, and the header walks of `get-batch`) read a whole
-hot table in one transaction; on a stopped database that is harmless.
+registers in `mdbx.lck`. The scans (`get-tx`, the header walks of `get-batch`, and the
+epoch walk of `participation`) read a whole hot table in one transaction; on a stopped database
+that is harmless.
 
 ## Build
 
@@ -129,6 +135,10 @@ rayls-db-inspect get-batch 0x3f9c... --db /data/node1 --db /data/node2
 rayls-db-inspect get-tx 0x8a1e... --db /data/node1 --db /data/node2
 rayls-db-inspect get-tx 0x8a1e... --epoch 42 --db /data/node1     # scan only epoch 42's batches
 
+# What each validator did in epoch 42: participation and anchor rounds, as the close block
+# reported them, plus certificate, batch and signature counts
+rayls-db-inspect participation 42 --db /data/node1 --db /data/node2
+
 # Per-node overview
 rayls-db-inspect summary --db /data/node1
 
@@ -150,6 +160,7 @@ rayls-db-inspect --json epoch 42 --db /data/node1 | jq .verdict
 | `get-batch <DIGEST>` | tier (hot / cold), epoch, worker, sequence number, transaction count and bytes, the sealing authority (by the execution address stored in the batch), base fee, whether the stored bytes hash to the digest, the DAG round of the certificate that carried it; each transaction (hash, type, nonce, sender, recipient, value, gas); the committing header (`hot`/`cold`, or `cache, not processed`) or `not committed`; when committed, the stored path: the sub-dag certificate whose payload lists the batch (digest, author, round, epoch, worker, header digest, created_at, signer indices, stored verification state) and the header's own fields (digest, parent, leader, certificate and batch counts, commit timestamp); a node without it is judged against the header that committed the batch (found on the nodes that hold it): `not reached` while its tip is below that header, `missing` once its tip is at or past it, `not reached (not committed on any node)` when no header commits it yet, and `not found` when no node holds the batch at all; a cold index entry whose jar row is gone is `dangling` (and counted in `missing` too) | `nodes found missing not_reached not_found bad_digest dangling` |
 | `get-tx <TX_HASH> [--epoch EPOCH]` | every batch holding the transaction on the node (digest, tier, position, epoch, worker, sequence number, sealing authority, DAG round of the carrying certificate; a transaction can be sealed more than once: `copies`), each with its committing header or `not committed` and, when committed, the same stored path as `get-batch` (carrying certificate, then header); the decoded transaction; and how many batches were read (`read/total hot, cold (epochs)`); absence is `not reached` / `missing` / `not found` as for `get-batch`; `DIVERGENT what=batch` only when nodes name different batches for the same committing header | `nodes found missing not_reached not_found what variants bad_digest copies uncommitted` |
 | `header-check <HEADER_NUMBER> [--back COUNT]` | one row per hop: number, digest, parent, tier, link status (`ok`, `genesis`, `end of range` for the last row, parent missing, digest mismatch, index mismatch), and the hop's certificates re-checked (`verify`); links decide where the check stops, a start header absent below the tip is `missing`, a failed signature makes the verdict `BROKEN` | `nodes hops divergent broken missing not_reached first sig_failed unverifiable` |
+| `participation <EPOCH>` | per node: whether the epoch is `closed` (the tally is what the close block was built from), `open` (a running tally, printed but not compared) or not reached; headers tallied (the epoch's `totalRounds`), their number and leader-round ranges, hot/cold split, certificate, batch and signature totals, the committee the authors are resolved against (its record, or the previous record's `next_committee`); the boundary header and round the close block's tally stopped at (from the epoch record), with any stored header past it listed under `beyond` and not counted; genesis headers (leader round 0) and cache rows (not processed) listed and not counted, as the node's own tally skips them; per authority, committee members first in committee order then authors outside it (`NO`): `participation` (headers whose sub-dag holds one of its certificates, once per header), `anchor` (headers it led), `share` (participation over tallied headers, in basis points, what the contract's participation floor is measured against), `certs`, `batches`, `signed` (certificates whose signer set includes it; `-` without a committee); signer bits beyond the committee are counted as `unknown sig` | `nodes closed open not_reached what variants headers certs cached after_boundary outsiders no_committee unknown_signers` |
 | `summary` | datafile size, epoch range and counts, pending epochs, consensus tip and its commit time, cache tip, cold tier high-water mark, node identity, leftover checkpoints, entry count of every table | none |
 
 ## Verdict
@@ -168,7 +179,7 @@ verdict: <CODE> [<key>=<value> ...]
 | `NOT_REACHED` | no node has reached it yet | 1 |
 | `PARTIAL` | some nodes lack it, are behind, or are uncertified (`header-check`: some nodes have not reached the start); or a node holds no committee to re-check a certificate (`unverifiable`) | 1 |
 | `MISSING` | no node has it although all should | 1 |
-| `DIVERGENT` | nodes disagree on content (`what=header`; `leader` or `signers` for `cert`; `batch` for `get-tx`) | 1 |
+| `DIVERGENT` | nodes disagree on content (`what=header`; `leader` or `signers` for `cert`; `batch` for `get-tx`; `tally` or `signers` for `participation`) | 1 |
 | `BROKEN` | a chain link check failed, or stored data is inconsistent (`bad_digest`, `dangling`), or a re-checked signature failed (`sig_failed`) | 1 |
 | `EMPTY` | nothing to check; for `get-batch` / `get-tx`, no node holds it and nothing says one should | 1 |
 
@@ -247,6 +258,25 @@ Notes on what the data means:
   a quorum has it), so absence is judged against that header's number and the node's tip. When
   no node holds the batch (or transaction) at all, nothing says any of them should: it is
   `not found` and the verdict is `EMPTY`, not `MISSING`.
+- `participation` repeats the walk the node performs when it closes an epoch
+  (`ConsensusRewardsCounter::tally_hybrid`): every stored consensus header of the epoch whose
+  leader round is not 0 is one round; the leader's author earns an anchor round, every distinct
+  certificate author in the sub-dag earns a participation round. On a closed epoch the per-author
+  counts are the `RewardInfo` values of the close block's `applyIncentives` call and the header
+  count its `totalRounds`. The node's tally stops at the round in the close block's nonce, the
+  leader round of the boundary output, whose header the epoch record names as its
+  `parent_consensus`; the tool resolves that header on each node, stops at its round, and lists
+  any stored header of the epoch past it (`beyond`), which the node never counted. Without a
+  record for the epoch the bound is unknown and every stored header is tallied (said so in the
+  output). One difference remains: the node resolves authors to execution addresses through the
+  committee and drops authorities outside it, while the consensus database holds no execution
+  addresses, so the tool prints every author by identifier and flags the outsiders; the stake
+  weight and the floor value live only on-chain. Only certificates physically in a
+  committed sub-dag count: a validator whose certificates were never referenced by the leader's
+  causal history, or fell past the garbage-collection depth, shows `0` even though it was
+  running. The `share` column is participation over tallied headers in basis points, the same
+  ratio the contract's `participationFloorBps` gate uses; the reward blend itself (participation,
+  anchor and stake weights) lives in the contract and is not computed here.
 - In JSON, the `raw` field of `header -v` and `cert -v` is the wire type in its own JSON form,
   the same object the `rayls_latestHeader` RPC returns: `B256` hashes as `0x` hex; digests,
   signatures and authority identifiers as base58 strings; `signed_authorities` as the base58 of
@@ -281,6 +311,7 @@ objects use the wire types' encoding described above.
 | `src/report/epoch.rs` | `epoch`, `epochs`, `epoch-check` |
 | `src/report/header.rs` | `header`, `cert`, `header-check` |
 | `src/report/batch.rs` | `get-batch`, `get-tx` |
+| `src/report/participation.rs` | `participation` |
 | `src/report/summary.rs` | `summary` |
 | `src/view.rs` | serializable hex views of consensus types |
 | `src/render.rs` | text tables |

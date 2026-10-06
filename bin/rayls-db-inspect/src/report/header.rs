@@ -95,7 +95,7 @@ impl std::fmt::Display for SignatureCheck {
 
 /// The committee that served `epoch`, from the source's own epoch records: the record of that
 /// epoch, or the `next_committee` of the one before (the current epoch has no record yet).
-fn committee_keys(
+pub(crate) fn committee_keys(
     node: &NodeDb,
     epoch: Epoch,
 ) -> eyre::Result<Option<(Vec<BlsPublicKey>, &'static str)>> {

@@ -5,6 +5,7 @@
 #![allow(unused_crate_dependencies)]
 
 mod batch_ordering_restart;
+mod epoch_close_seed;
 mod executed_anchor;
 mod history_recovery;
 
@@ -858,7 +859,9 @@ async fn test_happy_path_full_execution_even_after_sending_channel_closed() -> e
         // difficulty should match the batch's index within consensus output
         // and default worker id 0
         assert_eq!(block.difficulty, U256::from(expected_batch_index << 16));
-        // assert closing epoch randomness matches extra data field in last block
+        // assert closing epoch randomness matches extra data field in last block. Temp chains run
+        // without Rayls hardforks (`RethEnv::new_for_temp_chain`), so EpochCloseSeedV2 is inactive
+        // and the block carries the legacy seed.
         let expected_extra = if idx == 7 {
             Bytes::from(expected_output.keccak_leader_sigs().0)
         } else {
@@ -1383,7 +1386,9 @@ async fn test_execution_succeeds_with_duplicate_transactions() -> eyre::Result<(
         // difficulty should match the batch's index within consensus output
         // and default worker id 0
         assert_eq!(block.difficulty, U256::from(expected_batch_index << 16));
-        // assert closing epoch randomness matches extra data field in last block
+        // assert closing epoch randomness matches extra data field in last block. Temp chains run
+        // without Rayls hardforks (`RethEnv::new_for_temp_chain`), so EpochCloseSeedV2 is inactive
+        // and the block carries the legacy seed.
         let expected_extra = if idx == 7 {
             Bytes::from(expected_output.keccak_leader_sigs().0)
         } else {

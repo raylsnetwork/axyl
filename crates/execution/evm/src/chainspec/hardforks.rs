@@ -177,6 +177,14 @@ pub trait RaylsHardforks {
         self.is_rayls_fork_active_at_block(RaylsHardFork::OutputSeqNormalization, block)
     }
 
+    /// Return true if the EpochCloseSeedV2 fork is active at `block`.
+    ///
+    /// Gates the seed stamped into the epoch-closing block's `extra_data`: the consensus header
+    /// hash once active, the keccak of the leader certificate's aggregate BLS signature before.
+    fn is_epoch_close_seed_v2_active_at_block(&self, block: u64) -> bool {
+        self.is_rayls_fork_active_at_block(RaylsHardFork::EpochCloseSeedV2, block)
+    }
+
     /// Return the max version byte among the forks active at `block`, if any.
     fn version_byte_at_block(&self, block: u64) -> Option<u8> {
         RaylsHardFork::VARIANTS

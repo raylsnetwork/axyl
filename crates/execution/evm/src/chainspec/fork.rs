@@ -45,6 +45,11 @@ hardfork!(
         /// sender's whole nonce chain instead of consecutive ranges scattering across pools and
         /// parking nonce-gapped. Also enables live-successor failover for a down slot owner.
         SenderAffinityLoadBalancing,
+        /// Stamp the consensus header hash into the epoch-closing block's `extra_data` instead of
+        /// the keccak of the leader certificate's aggregate BLS signature. The aggregate varies
+        /// with the 2f+1 signer subset, so two honest nodes holding different certificates for
+        /// the same leader header produced different block hashes for identical state (#233).
+        EpochCloseSeedV2,
     }
 );
 
@@ -67,6 +72,7 @@ impl RaylsHardFork {
             Self::HybridRewards => 0x0d,
             Self::OutputSeqNormalization => 0x0e,
             Self::SenderAffinityLoadBalancing => 0x0f,
+            Self::EpochCloseSeedV2 => 0x10,
         }
     }
 

@@ -56,6 +56,8 @@ impl RaylsHardFork {
             ScheduledFork::new(Self::OutputSeqNormalization, ForkCondition::Never),
             // Never until an operational activation block is chosen; the mechanism ships dormant.
             ScheduledFork::new(Self::SenderAffinityLoadBalancing, ForkCondition::Never),
+            // Never until SRE schedules an activation block: changes epoch-closing block hashes.
+            ScheduledFork::new(Self::EpochCloseSeedV2, ForkCondition::Never),
         ]
     }
 
@@ -80,6 +82,8 @@ impl RaylsHardFork {
             ScheduledFork::new(Self::OutputSeqNormalization, ForkCondition::Never),
             // Never until an operational activation block is chosen; the mechanism ships dormant.
             ScheduledFork::new(Self::SenderAffinityLoadBalancing, ForkCondition::Never),
+            // Never until SRE schedules an activation block: changes epoch-closing block hashes.
+            ScheduledFork::new(Self::EpochCloseSeedV2, ForkCondition::Never),
         ]
     }
 
@@ -105,6 +109,8 @@ impl RaylsHardFork {
             ScheduledFork::new(Self::OutputSeqNormalization, ForkCondition::Never),
             // Never until an operational activation block is chosen; the mechanism ships dormant.
             ScheduledFork::new(Self::SenderAffinityLoadBalancing, ForkCondition::Never),
+            // Never until SRE schedules an activation block: changes epoch-closing block hashes.
+            ScheduledFork::new(Self::EpochCloseSeedV2, ForkCondition::Never),
         ]
     }
 
@@ -140,6 +146,7 @@ impl RaylsHardFork {
             ScheduledFork::new(Self::OutputSeqNormalization, ForkCondition::Block(0)),
             // Real networks stay `Never` until an activation block is chosen operationally.
             ScheduledFork::new(Self::SenderAffinityLoadBalancing, ForkCondition::Block(0)),
+            ScheduledFork::new(Self::EpochCloseSeedV2, ForkCondition::Block(0)),
         ]
     }
 

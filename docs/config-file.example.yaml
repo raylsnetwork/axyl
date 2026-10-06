@@ -52,7 +52,7 @@ networks:
     # Eip1559, BatchDigestV2, AdminTransfer, PrecompileGasFix, RlsStorage,
     # Tokenomics, Uups, Erc20PrecompileBytecode, TransactionLoadBalancing,
     # UsdrSupplyCorrection, EmptyOutputBlock, DynamicCommitteeSizing,
-    # HybridRewards, OutputSeqNormalization, SenderAffinityLoadBalancing.
+    # HybridRewards, OutputSeqNormalization, SenderAffinityLoadBalancing, EpochCloseSeedV2.
     hardforks:
       Eip1559: 0
       BatchDigestV2: 0
@@ -72,3 +72,4 @@ networks:
       HybridRewards: 1
       OutputSeqNormalization: 0
       SenderAffinityLoadBalancing: 0
+      EpochCloseSeedV2: 0

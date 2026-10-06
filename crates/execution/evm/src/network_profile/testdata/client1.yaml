@@ -21,6 +21,7 @@ networks:
       HybridRewards: never
       OutputSeqNormalization: never
       SenderAffinityLoadBalancing: never
+      EpochCloseSeedV2: never
   testnet:
     chain_id: 7295799
     hardforks:
@@ -39,3 +40,4 @@ networks:
       HybridRewards: never
       OutputSeqNormalization: never
       SenderAffinityLoadBalancing: never
+      EpochCloseSeedV2: never
