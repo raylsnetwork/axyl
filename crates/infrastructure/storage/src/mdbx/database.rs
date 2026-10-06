@@ -492,6 +492,32 @@ impl MdbxConfig {
 use rayls_infrastructure_utils::mdbx::detect_page_size;
 pub use rayls_infrastructure_utils::mdbx::DEFAULT_MDBX_PAGE_SIZE;
 
+/// Runs `open` without a page size and, if meta page 0 is unreadable, again at the detected one.
+///
+/// libmdbx falls back to the host page size when meta page 0 is unreadable, so without this a
+/// datafile whose page size differs from the host's reads as "not an MDBX file".
+pub fn open_detecting_page_size<T>(
+    consensus_db: &Path,
+    open: impl Fn(Option<usize>) -> reth_libmdbx::Result<T>,
+) -> reth_libmdbx::Result<T> {
+    match open(None) {
+        Err(e @ reth_libmdbx::Error::Invalid) => {
+            match detect_page_size(&consensus_db.join(MDBX_DAT)) {
+                Some(ps) => {
+                    tracing::warn!(
+                        target: "rayls::mdbx",
+                        page_size = ps,
+                        "consensus DB meta page 0 unreadable; reopening at the detected page size"
+                    );
+                    open(Some(ps))
+                }
+                None => Err(e),
+            }
+        }
+        other => other,
+    }
+}
+
 impl MdbxDatabase {
     /// Page size of the opened datafile in bytes.
     pub fn page_size(&self) -> eyre::Result<usize> {
@@ -574,23 +600,10 @@ impl MdbxDatabase {
                 .open(path.as_ref())
         };
 
-        // A zeroed meta page 0 reads as "not an MDBX file"; detect the real page size and reopen.
-        let env = match open_at(page_size) {
-            Ok(env) => env,
-            Err(e @ reth_libmdbx::Error::Invalid) if page_size.is_none() => {
-                match detect_page_size(&path.as_ref().join(MDBX_DAT)) {
-                    Some(ps) => {
-                        tracing::warn!(
-                            target: "rayls::mdbx",
-                            page_size = ps,
-                            "consensus DB meta page 0 unreadable; reopening at the detected page size"
-                        );
-                        open_at(Some(ps))?
-                    }
-                    None => return Err(e.into()),
-                }
-            }
-            Err(e) => return Err(e.into()),
+        // Only an existing datafile can have an unreadable meta page 0.
+        let env = match page_size {
+            Some(_) => open_at(page_size)?,
+            None => open_detecting_page_size(path.as_ref(), open_at)?,
         };
 
         // Startup corruption detection
@@ -667,16 +680,25 @@ impl MdbxDatabase {
             ..Default::default()
         };
 
-        // No geometry: a read-only environment never grows, and MDBX takes the page size from
-        // the datafile's meta page.
-        let env = Environment::builder()
-            .set_max_dbs(32)
-            .set_flags(flags)
-            // Inspection scans may legitimately outlast the node's read-transaction cap; the
-            // cap protects the writer in *this* process, of which there is none.
-            .set_max_read_transaction_duration(MaxReadTransactionDuration::Unbounded)
-            .set_max_readers(DEFAULT_MAX_READERS.into())
-            .open(path)?;
+        // A read-only environment never grows, so the geometry only carries a detected page size.
+        let open_at = |ps: Option<usize>| {
+            let mut builder = Environment::builder();
+            builder
+                .set_max_dbs(32)
+                .set_flags(flags)
+                // Inspection scans may legitimately outlast the node's read-transaction cap; the
+                // cap protects the writer in *this* process, of which there is none.
+                .set_max_read_transaction_duration(MaxReadTransactionDuration::Unbounded)
+                .set_max_readers(DEFAULT_MAX_READERS.into());
+            if let Some(ps) = ps {
+                builder.set_geometry(Geometry::<std::ops::Range<usize>> {
+                    page_size: Some(PageSize::Set(ps)),
+                    ..Default::default()
+                });
+            }
+            builder.open(path)
+        };
+        let env = open_detecting_page_size(path, open_at)?;
 
         // Surface corruption plainly; unlike the node startup path, do not suggest deleting the
         // database, since an inspector may well be pointed at the only remaining copy.
@@ -1314,38 +1336,70 @@ mod test {
         assert_eq!(db.page_size().expect("page size"), DEFAULT_MDBX_PAGE_SIZE);
     }
 
-    /// A zeroed meta page 0 still opens: `open_with_config` detects the page size and reopens.
+    /// Zeroed leading meta pages still open: `open_with_config` detects the page size and reopens.
     #[test]
-    fn recovers_a_zeroed_meta_page_0_at_every_page_size() {
-        use std::io::{Seek as _, SeekFrom, Write as _};
-        for ps in [4096usize, 8192, 16384, 32768, 65536] {
-            let temp = tempdir().expect("failed to create temp dir");
-            let cfg = MdbxConfig::default().with_page_size(ps).with_growth_step(super::MEGABYTE);
-            {
-                let db = MdbxDatabase::open_with_config(temp.path(), cfg).expect("create database");
-                db.open_table::<TestTable>().expect("open table");
-                db.with_write_txn(|txn| txn.insert::<TestTable>(&1, &"kept".to_owned()))
-                    .expect("insert");
-            }
-            // Zero meta page 0 (the first `ps` bytes), leaving the two backup meta pages intact.
-            let dat = temp.path().join(super::MDBX_DAT);
-            let mut f = std::fs::OpenOptions::new().write(true).open(&dat).expect("open dat");
-            f.seek(SeekFrom::Start(0)).expect("seek");
-            f.write_all(&vec![0u8; ps]).expect("zero meta 0");
-            f.sync_all().expect("sync");
-            drop(f);
+    fn recovers_zeroed_meta_pages_at_every_page_size() {
+        for zeroed in [1, 2] {
+            for ps in [4096usize, 8192, 16384, 32768, 65536] {
+                let temp = db_with_zeroed_meta_pages(ps, zeroed);
 
-            // Reopen with the default config: the open must detect the size and keep the row.
-            let recover_cfg = MdbxConfig::default().with_growth_step(super::MEGABYTE);
-            let db = MdbxDatabase::open_with_config(temp.path(), recover_cfg)
-                .unwrap_or_else(|e| panic!("recover a {ps}-byte-page datafile: {e:#}"));
-            db.open_table::<TestTable>().expect("open table after recover");
+                // Reopen with the default config: the open must detect the size.
+                let recover_cfg = MdbxConfig::default().with_growth_step(super::MEGABYTE);
+                let db =
+                    MdbxDatabase::open_with_config(temp.path(), recover_cfg).unwrap_or_else(|e| {
+                        panic!("recover a {ps}-byte-page datafile, {zeroed} metas zeroed: {e:#}")
+                    });
+                assert_eq!(db.page_size().expect("page size"), ps);
+                db.open_table::<TestTable>().expect("open table after recover");
+                assert_row_kept_if_latest_meta_survives(&db, ps, zeroed);
+            }
+        }
+    }
+
+    /// The read-only open used by db-inspect detects the page size the same way.
+    #[test]
+    fn read_only_open_detects_page_size_after_zeroed_meta_pages() {
+        for zeroed in [1, 2] {
+            for ps in [4096usize, 8192, 16384, 32768, 65536] {
+                let temp = db_with_zeroed_meta_pages(ps, zeroed);
+                let db = MdbxDatabase::open_read_only(temp.path(), true).unwrap_or_else(|e| {
+                    panic!("read-only open of a {ps}-byte-page datafile, {zeroed} zeroed: {e:#}")
+                });
+                assert_eq!(db.page_size().expect("page size"), ps);
+                assert_row_kept_if_latest_meta_survives(&db, ps, zeroed);
+            }
+        }
+    }
+
+    /// The row's commit is in meta page 1, so it survives only while that page does; with meta
+    /// page 2 alone libmdbx rolls back to the older commit stored there.
+    fn assert_row_kept_if_latest_meta_survives(db: &MdbxDatabase, ps: usize, zeroed: usize) {
+        if zeroed == 1 {
             assert_eq!(
                 db.get::<TestTable>(&1).expect("get"),
                 Some("kept".to_owned()),
-                "row lost recovering a {ps}-byte-page datafile"
+                "row lost in a {ps}-byte-page datafile with meta page 0 zeroed"
             );
         }
+    }
+
+    /// A database with one row, created at `ps` bytes per page, whose first `zeroed` meta pages
+    /// are then zeroed.
+    fn db_with_zeroed_meta_pages(ps: usize, zeroed: usize) -> tempfile::TempDir {
+        use std::io::Write as _;
+        let temp = tempdir().expect("failed to create temp dir");
+        let cfg = MdbxConfig::default().with_page_size(ps).with_growth_step(super::MEGABYTE);
+        {
+            let db = MdbxDatabase::open_with_config(temp.path(), cfg).expect("create database");
+            db.open_table::<TestTable>().expect("open table");
+            db.with_write_txn(|txn| txn.insert::<TestTable>(&1, &"kept".to_owned()))
+                .expect("insert");
+        }
+        let dat = temp.path().join(super::MDBX_DAT);
+        let mut f = std::fs::OpenOptions::new().write(true).open(&dat).expect("open dat");
+        f.write_all(&vec![0u8; zeroed * ps]).expect("zero meta pages");
+        f.sync_all().expect("sync");
+        temp
     }
 
     /// A database created with the previous 4 KiB default keeps its page size, its geometry

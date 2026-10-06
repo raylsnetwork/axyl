@@ -8,7 +8,7 @@
 use eyre::{eyre, WrapErr};
 use rayls_infrastructure_storage::{
     cold::{ColdLocation, ColdResult, ARCHIVE_HIGH_WATER_MARK_KEY},
-    mdbx::MdbxDatabase,
+    mdbx::{open_detecting_page_size, MdbxDatabase},
     tables::{
         Batches, Certificates, ColdArchiveHighWaterMark, ColdBatchLocations,
         ConsensusBlockNumbersByDigest, ConsensusBlocks, ConsensusBlocksCache, EpochCerts,
@@ -22,6 +22,7 @@ use rayls_infrastructure_types::{
     BlockHash, CertificateDigest, ConsensusHeader, ConsensusHeaderMeta, Database, DbTx as _, Epoch,
     EpochCertificate, EpochRecord, EpochTransitionCheckpoint, Table, B256,
 };
+use rayls_infrastructure_utils::mdbx::MIN_MDBX_PAGE_SIZE;
 use serde::Serialize;
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
@@ -186,7 +187,7 @@ impl NodeDb {
         let (label, path) = Self::resolve(spec)?;
 
         let dat_len = std::fs::metadata(path.join("mdbx.dat")).map(|m| m.len()).unwrap_or(0);
-        if dat_len < 4096 {
+        if dat_len < MIN_MDBX_PAGE_SIZE as u64 {
             return Err(eyre!(
                 "{label}: {} is {dat_len} bytes long: not even one page; the file is empty or \
                  truncated beyond what MDBX can read",
@@ -767,7 +768,7 @@ impl NodeDb {
 /// during which MDBX settles the head meta page, then closed without touching any table. Fails
 /// if any other process has the database open. The same recovery the node performs on start.
 pub fn recover(consensus_db: &Path) -> eyre::Result<()> {
-    use reth_libmdbx::{Environment, EnvironmentFlags, Mode, SyncMode};
+    use reth_libmdbx::{Environment, EnvironmentFlags, Geometry, Mode, PageSize, SyncMode};
     if !consensus_db.join("mdbx.dat").is_file() {
         return Err(eyre!("no MDBX database at {} (expected mdbx.dat)", consensus_db.display()));
     }
@@ -776,7 +777,19 @@ pub fn recover(consensus_db: &Path) -> eyre::Result<()> {
         exclusive: true,
         ..Default::default()
     };
-    let env = Environment::builder().set_max_dbs(32).set_flags(flags).open(consensus_db)?;
+    // Detects the page size like the node does, so a datafile from another host recovers too.
+    let open_at = |ps: Option<usize>| {
+        let mut builder = Environment::builder();
+        builder.set_max_dbs(32).set_flags(flags);
+        if let Some(ps) = ps {
+            builder.set_geometry(Geometry::<std::ops::Range<usize>> {
+                page_size: Some(PageSize::Set(ps)),
+                ..Default::default()
+            });
+        }
+        builder.open(consensus_db)
+    };
+    let env = open_detecting_page_size(consensus_db, open_at)?;
     env.stat().map_err(|e| {
         eyre!("MDBX database at {} failed its integrity check: {e}", consensus_db.display())
     })?;

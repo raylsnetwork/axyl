@@ -8059,6 +8059,7 @@ dependencies = [
  "rayls-infrastructure-config",
  "rayls-infrastructure-storage",
  "rayls-infrastructure-types",
+ "rayls-infrastructure-utils",
  "rayls-testing-test-utils",
  "reth-libmdbx",
  "roaring 0.10.12",

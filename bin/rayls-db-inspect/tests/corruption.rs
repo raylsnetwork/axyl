@@ -180,16 +180,16 @@ fn damaged_databases_never_panic_and_stay_readable_where_mdbx_allows() {
     // (name, damage, must the database still open?)
     let variants: Vec<Variant<'_>> = vec![
         ("intact copy", Box::new(|_| {}), true),
-        // db-inspect does not detect the page size, so a zeroed meta page 0 won't open at 16 KiB.
+        // The page size is detected from a surviving backup meta page, so these open on any host.
         (
             "meta page 0 zeroed",
             Box::new(move |d| zero_range(&d.join("mdbx.dat"), 0, page as usize)),
-            false,
+            true,
         ),
         (
             "meta pages 0 and 1 zeroed",
             Box::new(move |d| zero_range(&d.join("mdbx.dat"), 0, 2 * page as usize)),
-            false,
+            true,
         ),
         (
             "all three meta pages zeroed",
@@ -329,10 +329,14 @@ fn damaged_databases_never_panic_and_stay_readable_where_mdbx_allows() {
         if *must_open && matches!(outcomes[0].1, Outcome::Error(_)) {
             unexpected_unopenable.push(format!("{name}: {:?}", outcomes[0].1));
         }
-        // Meta-page damage must fail to open with a clean, specific error, never a panic.
+        // Each meta-page case must open, or fail with a clean "not an MDBX file", as expected.
         if name.contains("meta page") {
-            let clean =
-                matches!(&outcomes[0].1, Outcome::Error(e) if e.contains("not an MDBX file"));
+            let opens = !name.starts_with("all");
+            let clean = match &outcomes[0].1 {
+                Outcome::Report => opens,
+                Outcome::Error(e) => !opens && e.contains("not an MDBX file"),
+                Outcome::Panic(_) => false,
+            };
             if !clean {
                 bad_meta_errors.push(format!("{name}: {:?}", outcomes[0].1));
             }
@@ -368,7 +372,7 @@ fn damaged_databases_never_panic_and_stay_readable_where_mdbx_allows() {
     );
     assert!(
         bad_meta_errors.is_empty(),
-        "meta-page damage should report a clean 'not an MDBX file' error:\n{}",
+        "meta-page damage should open from a backup meta page, else fail with 'not an MDBX file':\n{}",
         bad_meta_errors.join("\n")
     );
 }
