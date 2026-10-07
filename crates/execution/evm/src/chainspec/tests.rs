@@ -66,6 +66,7 @@ mod schedule {
         let hardforks = RaylsChainHardforks::for_network(RaylsNetwork::Testnet);
         let block = activation_block(&hardforks, RaylsHardFork::AdminTransfer);
         assert!(!hardforks.is_rayls_fork_active_at_block(RaylsHardFork::AdminTransfer, block - 1,));
+        assert!(hardforks.is_rayls_fork_active_at_block(RaylsHardFork::AdminTransfer, block,));
         assert!(hardforks.is_rayls_fork_active_at_block(RaylsHardFork::AdminTransfer, block + 1,));
     }
 
