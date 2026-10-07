@@ -11,12 +11,13 @@ use rayls_execution_evm::test_utils::fixture_batch_with_transactions;
 use rayls_infrastructure_network_types::MockPrimaryToWorkerClient;
 use rayls_infrastructure_storage::{mem_db::MemDatabase, CertificateStore, PayloadStore};
 use rayls_infrastructure_types::{
-    encode, error::HeaderError, now, AuthorityIdentifier, BlockNumHash, Certificate, Committee,
-    ExecHeader, Hash as _, SealedHeader, SignatureVerificationState, TaskManager,
+    encode, error::HeaderError, now, AuthorityIdentifier, BlockNumHash, BlsKeypair, BlsPublicKey,
+    Certificate, Committee, ExecHeader, Hash as _, SealedHeader, SignatureVerificationState,
+    TaskManager,
 };
 use rayls_testing_test_utils_committee::CommitteeFixture;
 use std::{
-    collections::{BTreeSet, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     num::NonZeroUsize,
     sync::Arc,
     time::Duration,
@@ -862,4 +863,131 @@ async fn test_request_vote_created_at_in_future() {
         panic!("not a vote!");
     };
     assert!(created_at <= now());
+}
+
+/// A request naming more than twice the committee, and at least 64 authorities, is refused.
+#[tokio::test]
+async fn test_missing_certs_request_with_too_many_authorities_is_rejected() {
+    let fixture = CommitteeFixture::builder(MemDatabase::default)
+        .randomize_ports(true)
+        .committee_size(NonZeroUsize::new(4).unwrap())
+        .build();
+    let primary = fixture.authorities().next().unwrap();
+    let cb = ConsensusBus::new();
+    let task_manager = TaskManager::default();
+    let synchronizer =
+        StateSynchronizer::new(primary.consensus_config(), cb.clone(), task_manager.get_spawner());
+    let handler = RequestHandler::new(primary.consensus_config(), cb.clone(), synchronizer);
+
+    // Invented authorities, none in the committee.
+    let invented = |count: u8| -> BTreeMap<AuthorityIdentifier, BTreeSet<u32>> {
+        (0..count).map(|i| (AuthorityIdentifier::dummy_for_test(i), BTreeSet::new())).collect()
+    };
+    let request = |count: u8| {
+        MissingCertificatesRequest::default()
+            .set_bounds(0, invented(count))
+            .expect("bounds")
+            .set_max_response_size(1024 * 1024)
+    };
+
+    // At the limit, unknown authorities are skipped and nothing is returned.
+    let resp = handler.retrieve_missing_certs(request(64)).await.expect("within limit");
+    assert!(matches!(resp, PrimaryResponse::RequestedCertificates(certs) if certs.is_empty()));
+
+    // One more is refused, with a penalty.
+    let err = handler.retrieve_missing_certs(request(65)).await.expect_err("over limit");
+    assert!(Option::<rayls_consensus_network::Penalty>::from(&err).is_some());
+}
+
+/// A valid request that asks for no authorities.
+fn empty_request() -> MissingCertificatesRequest {
+    MissingCertificatesRequest::default()
+        .set_bounds(0, BTreeMap::new())
+        .expect("bounds")
+        .set_max_response_size(1024 * 1024)
+}
+
+/// Start a missing-certificates request and cancel it after a short wait.
+///
+/// Returns `None` when the request was still waiting for its job, and the result otherwise.
+async fn start_then_cancel(
+    handler: &RequestHandler<MemDatabase>,
+    _peer: BlsPublicKey,
+) -> Option<Result<PrimaryResponse, PrimaryNetworkError>> {
+    tokio::time::timeout(Duration::from_millis(50), handler.retrieve_missing_certs(empty_request()))
+        .await
+        .ok()
+}
+
+/// A cancelled request keeps its slot until its job ends, and each pool is limited on its own.
+///
+/// One committee member may run 2 jobs, and all peers outside the committee share 4.
+/// The runtime has one blocking thread and the test keeps it busy, so every job stays queued.
+#[test]
+fn test_missing_cert_slots_outlive_cancelled_requests() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .max_blocking_threads(1)
+        .enable_all()
+        .build()
+        .expect("runtime");
+    runtime.block_on(async {
+        let fixture = CommitteeFixture::builder(MemDatabase::default)
+            .committee_size(NonZeroUsize::new(4).unwrap())
+            .build();
+        let primary = fixture.authorities().next().unwrap();
+        let cb = ConsensusBus::new();
+        let task_manager = TaskManager::default();
+        let synchronizer = StateSynchronizer::new(
+            primary.consensus_config(),
+            cb.clone(),
+            task_manager.get_spawner(),
+        );
+        let handler = RequestHandler::new(primary.consensus_config(), cb.clone(), synchronizer);
+        let member = |i: usize| fixture.authorities().nth(i).unwrap().primary_public_key();
+        let outsider = || {
+            *BlsKeypair::generate(&mut <rand::rngs::StdRng as rand::SeedableRng>::from_os_rng())
+                .public()
+        };
+
+        // Keep the only blocking thread busy.
+        let (release, hold) = std::sync::mpsc::channel::<()>();
+        let blocker = tokio::task::spawn_blocking(move || {
+            let _ = hold.recv();
+        });
+
+        // Two cancelled requests from one member still hold both of its slots.
+        let busy_member = member(1);
+        assert!(start_then_cancel(&handler, busy_member).await.is_none());
+        assert!(start_then_cancel(&handler, busy_member).await.is_none());
+        let third = start_then_cancel(&handler, busy_member).await;
+        assert!(matches!(third, Some(Err(_))), "third request was not refused: {third:?}");
+
+        // Another member has its own slots.
+        assert!(start_then_cancel(&handler, member(2)).await.is_none());
+
+        // Peers outside the committee share four slots.
+        for _ in 0..4 {
+            assert!(start_then_cancel(&handler, outsider()).await.is_none());
+        }
+        let fifth = start_then_cancel(&handler, outsider()).await;
+        assert!(matches!(fifth, Some(Err(_))), "fifth outsider was not refused: {fifth:?}");
+
+        // A full outsider pool does not affect members.
+        assert!(start_then_cancel(&handler, member(3)).await.is_none());
+
+        // Once the queued jobs run, the slots are free again.
+        release.send(()).expect("release the blocking thread");
+        blocker.await.expect("blocker");
+        let freed = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                match handler.retrieve_missing_certs(empty_request()).await {
+                    Ok(response) => break response,
+                    Err(_) => tokio::time::sleep(Duration::from_millis(10)).await,
+                }
+            }
+        })
+        .await
+        .expect("slots freed after the jobs ran");
+        assert!(matches!(freed, PrimaryResponse::RequestedCertificates(_)), "got {freed:?}");
+    });
 }

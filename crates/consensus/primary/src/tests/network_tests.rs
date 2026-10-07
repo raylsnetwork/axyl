@@ -396,3 +396,111 @@ async fn test_primary_batch_gossip_topics() {
     let bad_msg = GossipMessage { source: None, data: data.clone(), sequence_number: None, topic };
     assert!(handler.process_gossip(&bad_msg).await.is_err());
 }
+
+/// Decoding refuses a skip-round list longer than 1,024 entries.
+#[test]
+fn test_missing_certs_request_decode_bounds_authority_list() {
+    use rayls_infrastructure_types::try_decode;
+
+    let request = |count: usize| MissingCertificatesRequest {
+        skip_rounds: (0..count)
+            .map(|i| {
+                let mut bytes = [0u8; 32];
+                bytes[..8].copy_from_slice(&(i as u64).to_le_bytes());
+                (try_decode::<AuthorityIdentifier>(&bytes).expect("id"), vec![])
+            })
+            .collect(),
+        ..Default::default()
+    };
+
+    let at_limit = encode(&request(1_024));
+    let decoded: MissingCertificatesRequest = try_decode(&at_limit).expect("at the limit decodes");
+    assert_eq!(decoded.skip_rounds.len(), 1_024);
+
+    let over = encode(&request(1_025));
+    assert!(try_decode::<MissingCertificatesRequest>(&over).is_err());
+
+    // A list of 50,000 entries fits under the 2 MiB message limit.
+    let attack = encode(&request(50_000));
+    assert!(attack.len() < 2 * 1024 * 1024);
+    assert!(try_decode::<MissingCertificatesRequest>(&attack).is_err());
+
+    // A list that only declares a huge length is refused.
+    let empty = encode(&request(0));
+    // the list length follows the 4-byte lower bound
+    assert_eq!(empty[4], 0);
+    let mut declared = empty[..4].to_vec();
+    declared.extend_from_slice(&[0xFF, 0xFF, 0xFF, 0xFF, 0x07]); // 2^31 - 1 entries
+    declared.extend_from_slice(&empty[5..]);
+    assert!(try_decode::<MissingCertificatesRequest>(&declared).is_err());
+}
+
+/// Serialized roaring bitmap made of `containers` full run containers.
+///
+/// Each container holds 65,536 values in 14 bytes, using the portable run-container format.
+fn full_run_bitmap(containers: u16) -> Vec<u8> {
+    const SERIAL_COOKIE: u32 = 12347;
+    let n = containers as usize;
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&(SERIAL_COOKIE | ((containers as u32 - 1) << 16)).to_le_bytes());
+    // every container is a run container
+    bytes.extend(std::iter::repeat_n(0xFF_u8, n.div_ceil(8)));
+    for key in 0..containers {
+        bytes.extend_from_slice(&key.to_le_bytes());
+        bytes.extend_from_slice(&u16::MAX.to_le_bytes());
+    }
+    if n >= 4 {
+        let start = bytes.len() + 4 * n;
+        for i in 0..n {
+            bytes.extend_from_slice(&((start + 6 * i) as u32).to_le_bytes());
+        }
+    }
+    for _ in 0..containers {
+        // one run from 0 covering 65,536 values
+        bytes.extend_from_slice(&1_u16.to_le_bytes());
+        bytes.extend_from_slice(&0_u16.to_le_bytes());
+        bytes.extend_from_slice(&u16::MAX.to_le_bytes());
+    }
+    bytes
+}
+
+/// A skip bitmap that declares more than 16 containers is refused before it is decoded.
+///
+/// A few hundred bytes can stand for over a million rounds, so the container count is checked
+/// first.
+#[test]
+fn test_skip_bitmap_is_refused_before_decoding() {
+    use crate::state_sync::CertificateCollector;
+
+    let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+    let config = fixture.authorities().next().unwrap().consensus_config();
+    let request = |bitmap: Vec<u8>| MissingCertificatesRequest {
+        skip_rounds: vec![(AuthorityIdentifier::dummy_for_test(1), bitmap)],
+        max_response_size: 1024 * 1024,
+        ..Default::default()
+    };
+    let refusal =
+        |bitmap: Vec<u8>| CertificateCollector::new(request(bitmap), config.clone()).err();
+
+    // One container over the limit stands for over a million rounds.
+    let over = full_run_bitmap(17);
+    let bitmap = roaring::RoaringBitmap::deserialize_from(&over[..]).expect("valid bitmap");
+    assert_eq!(bitmap.len(), 17 * 65_536);
+    assert_matches!(refusal(over), Some(PrimaryNetworkError::StdIo(_)));
+
+    // Within the container limit, a bitmap over 1,000 rounds is refused.
+    assert_matches!(refusal(full_run_bitmap(16)), Some(PrimaryNetworkError::InvalidRequest(_)));
+
+    // An unknown header is refused.
+    assert_matches!(refusal(vec![1, 2, 3]), Some(PrimaryNetworkError::StdIo(_)));
+
+    // An honest bitmap is accepted.
+    let honest = MissingCertificatesRequest::default()
+        .set_bounds(
+            10,
+            [(AuthorityIdentifier::dummy_for_test(1), (11..=510).collect())].into_iter().collect(),
+        )
+        .expect("bounds")
+        .set_max_response_size(1024 * 1024);
+    assert!(CertificateCollector::new(honest, config.clone()).is_ok());
+}
