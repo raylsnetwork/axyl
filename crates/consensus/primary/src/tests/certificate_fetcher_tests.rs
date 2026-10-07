@@ -20,6 +20,11 @@ use tokio::{
     time::sleep,
 };
 
+/// Most skip rounds a request may carry per authority, as configured by default.
+fn max_skip_rounds() -> usize {
+    rayls_infrastructure_config::SyncConfig::default().max_skip_rounds_for_missing_certs
+}
+
 async fn verify_certificates_in_store<DB: CertificateStore>(
     certificate_store: &DB,
     certificates: &[Certificate],
@@ -161,7 +166,7 @@ async fn fetch_certificates_basic() {
         reply,
     }) = fake_receiver.recv().await
     {
-        let (lower_bound, skip_rounds) = inner.get_bounds().unwrap();
+        let (lower_bound, skip_rounds) = inner.get_bounds(max_skip_rounds()).unwrap();
         // Every authority has a contiguous prefix up through round 1, so the fetcher
         // tightens exclusive_lower_bound to 1 and prunes the now-redundant skip entries.
         assert_eq!(lower_bound, 1);
@@ -200,7 +205,7 @@ async fn fetch_certificates_basic() {
                 request: PrimaryRequest::MissingCertificates { inner },
                 reply,
             }) => {
-                let (lower_bound, skip_rounds) = inner.get_bounds().unwrap();
+                let (lower_bound, skip_rounds) = inner.get_bounds(max_skip_rounds()).unwrap();
                 if lower_bound < 16 {
                     // Drain the fetch requests sent out before the fetcher finished processing
                     // the first batch (their tightened lower_bound is still below round 16).
@@ -260,7 +265,7 @@ async fn fetch_certificates_basic() {
                 request: PrimaryRequest::MissingCertificates { inner },
                 reply,
             }) => {
-                let (lower_bound, skip_rounds) = inner.get_bounds().unwrap();
+                let (lower_bound, skip_rounds) = inner.get_bounds(max_skip_rounds()).unwrap();
                 let all_empty = skip_rounds.values().all(|r| r.is_empty());
                 if lower_bound < 31 || all_empty {
                     // Drain the fetch requests sent out before the fetcher finished processing
@@ -290,7 +295,7 @@ async fn fetch_certificates_basic() {
         match req {
             NetworkCommand::SendRequest { peer: _, request, reply } => match request {
                 PrimaryRequest::MissingCertificates { inner } => {
-                    let (lower_bound, skip_rounds) = inner.get_bounds().unwrap();
+                    let (lower_bound, skip_rounds) = inner.get_bounds(max_skip_rounds()).unwrap();
                     // All authorities have a contiguous {1..=31} prefix so the tightened
                     // exclusive_lower_bound is 31 and skip_rounds is pruned to empty.
                     assert_eq!(lower_bound, 31);
@@ -339,7 +344,7 @@ async fn fetch_certificates_basic() {
         match req {
             NetworkCommand::SendRequest { peer: _, request, reply } => match request {
                 PrimaryRequest::MissingCertificates { inner } => {
-                    let (lower_bound, skip_rounds) = inner.get_bounds().unwrap();
+                    let (lower_bound, skip_rounds) = inner.get_bounds(max_skip_rounds()).unwrap();
                     // All authorities have a contiguous {1..=31} prefix so the tightened
                     // exclusive_lower_bound is 31 and skip_rounds is pruned to empty.
                     assert_eq!(lower_bound, 31);
@@ -381,7 +386,7 @@ async fn fetch_certificates_basic() {
         match req {
             NetworkCommand::SendRequest { peer: _, request, reply } => match request {
                 PrimaryRequest::MissingCertificates { inner } => {
-                    let (lower_bound, skip_rounds) = inner.get_bounds().unwrap();
+                    let (lower_bound, skip_rounds) = inner.get_bounds(max_skip_rounds()).unwrap();
                     // All authorities have a contiguous {1..=31} prefix so the tightened
                     // exclusive_lower_bound is 31 and skip_rounds is pruned to empty.
                     assert_eq!(lower_bound, 31);

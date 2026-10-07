@@ -148,6 +148,9 @@ pub struct MissingCertificatesRequest {
     pub exclusive_lower_bound: Round,
     /// Rounds that should be skipped while processing this request (by authority). The rounds are
     /// serialized as [RoaringBitmap]s.
+    ///
+    /// Decoding fails as soon as the list is longer than [MAX_SKIP_ROUND_AUTHORITIES].
+    #[serde(deserialize_with = "deserialize_skip_rounds")]
     pub skip_rounds: Vec<(AuthorityIdentifier, Vec<u8>)>,
     /// The maximum size of the uncompressed response message (in bytes). The caller shares this so
     /// the response doesn't get rejected by the request_response codec.
@@ -160,16 +163,102 @@ pub struct MissingCertificatesRequest {
     pub exclusive_upper_bound: Option<Round>,
 }
 
+/// Most authorities a missing-certificates request may list on the wire.
+///
+/// Honest requests list about one committee, and the handler applies a committee-based limit.
+/// This bound only stops a peer from making the node decode a huge list.
+pub(crate) const MAX_SKIP_ROUND_AUTHORITIES: usize = 1024;
+
+/// Decode the skip-round list, refusing a list longer than [MAX_SKIP_ROUND_AUTHORITIES].
+///
+/// The length is checked before any entry is decoded.
+fn deserialize_skip_rounds<'de, D>(
+    deserializer: D,
+) -> Result<Vec<(AuthorityIdentifier, Vec<u8>)>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct BoundedList;
+
+    impl<'de> serde::de::Visitor<'de> for BoundedList {
+        type Value = Vec<(AuthorityIdentifier, Vec<u8>)>;
+
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "at most {MAX_SKIP_ROUND_AUTHORITIES} skip-round entries")
+        }
+
+        fn visit_seq<A: serde::de::SeqAccess<'de>>(
+            self,
+            mut seq: A,
+        ) -> Result<Self::Value, A::Error> {
+            let len = seq.size_hint().unwrap_or(0);
+            if len > MAX_SKIP_ROUND_AUTHORITIES {
+                return Err(serde::de::Error::invalid_length(len, &self));
+            }
+            let mut list = Vec::with_capacity(len.min(MAX_SKIP_ROUND_AUTHORITIES));
+            while let Some(entry) = seq.next_element()? {
+                if list.len() == MAX_SKIP_ROUND_AUTHORITIES {
+                    return Err(serde::de::Error::invalid_length(list.len() + 1, &self));
+                }
+                list.push(entry);
+            }
+            Ok(list)
+        }
+    }
+
+    deserializer.deserialize_seq(BoundedList)
+}
+
+/// Most containers a skip-round bitmap may declare.
+///
+/// One container covers 65,536 rounds from the requester's GC round, so honest bitmaps use one.
+/// A container can stand for 65,536 rounds in 14 bytes, so the count is checked before decoding.
+pub(crate) const MAX_SKIP_ROUND_CONTAINERS: usize = 16;
+
+/// Number of containers a serialized roaring bitmap declares, or `None` for an unknown header.
+fn roaring_container_count(bytes: &[u8]) -> Option<usize> {
+    // Header of a bitmap without run containers: this cookie, then the container count.
+    const SERIAL_COOKIE_NO_RUNCONTAINER: u32 = 12346;
+    // Header of a bitmap with run containers: this cookie, then the container count minus one.
+    const SERIAL_COOKIE: u16 = 12347;
+    const WORD: usize = size_of::<u32>();
+    let word = |at: usize| -> Option<u32> {
+        Some(u32::from_le_bytes(bytes.get(at..at + WORD)?.try_into().ok()?))
+    };
+    let cookie = word(0)?;
+    if cookie as u16 == SERIAL_COOKIE {
+        Some((cookie >> u16::BITS) as usize + 1)
+    } else if cookie == SERIAL_COOKIE_NO_RUNCONTAINER {
+        Some(word(WORD)? as usize)
+    } else {
+        None
+    }
+}
+
 impl MissingCertificatesRequest {
     /// Deserialize the [RoaringBitmap] representing the difference between the requesting peer's
     /// lower boundary and their GC round.
+    ///
+    /// Each bitmap is checked for size before it is decoded, and for `max_rounds` before it is
+    /// expanded, so a small bitmap cannot stand for billions of rounds.
     pub(crate) fn get_bounds(
         &self,
+        max_rounds: usize,
     ) -> PrimaryNetworkResult<(Round, BTreeMap<AuthorityIdentifier, BTreeSet<Round>>)> {
         let skip_rounds: BTreeMap<AuthorityIdentifier, BTreeSet<Round>> = self
             .skip_rounds
             .iter()
             .map(|(k, serialized)| {
+                let containers = roaring_container_count(serialized).ok_or_else(|| {
+                    std::io::Error::new(std::io::ErrorKind::InvalidData, "unknown skip bitmap")
+                })?;
+                if containers > MAX_SKIP_ROUND_CONTAINERS {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "skip bitmap declares too many containers",
+                    )
+                    .into());
+                }
                 // Normalize on read: this bitmap comes from a peer request. It is
                 // only iterated today (so the empty-container re-serialize panic
                 // can't fire here), but routing every untrusted roaring
@@ -178,18 +267,24 @@ impl MissingCertificatesRequest {
                 // Both operands are peer-supplied. A plain `+` overflows `Round` on a crafted
                 // request and, with `overflow-checks = true` and `panic = "abort"` in release,
                 // takes the whole node down. Reject instead; the io error maps to a penalty.
-                let rounds =
-                    rayls_infrastructure_types::serde::deserialize_normalized(&serialized[..])?
-                        .into_iter()
-                        .map(|r| {
-                            self.exclusive_lower_bound.checked_add(r as Round).ok_or_else(|| {
-                                std::io::Error::new(
-                                    std::io::ErrorKind::InvalidData,
-                                    "skip round overflows the round range",
-                                )
-                            })
+                let bitmap =
+                    rayls_infrastructure_types::serde::deserialize_normalized(&serialized[..])?;
+                if bitmap.len() > max_rounds as u64 {
+                    return Err(PrimaryNetworkError::InvalidRequest(
+                        "Request for rounds out of bounds".into(),
+                    ));
+                }
+                let rounds = bitmap
+                    .into_iter()
+                    .map(|r| {
+                        self.exclusive_lower_bound.checked_add(r as Round).ok_or_else(|| {
+                            std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                "skip round overflows the round range",
+                            )
                         })
-                        .collect::<std::io::Result<BTreeSet<Round>>>()?;
+                    })
+                    .collect::<std::io::Result<BTreeSet<Round>>>()?;
                 Ok((k.clone(), rounds))
             })
             .collect::<PrimaryNetworkResult<BTreeMap<_, _>>>()?;
@@ -349,9 +444,9 @@ impl PrimaryResponse {
             | PrimaryNetworkError::UnknownConsensusHeaderNumber(_)
             | PrimaryNetworkError::UnknownConsensusHeaderDigest(_)
             | PrimaryNetworkError::UnknownConsensusHeaderCert(_)
-            | PrimaryNetworkError::InvalidEpochRequest => {
-                Self::Error(PrimaryRPCError(error.to_string()))
-            }
+            | PrimaryNetworkError::InvalidEpochRequest
+            | PrimaryNetworkError::TooManyAuthorities(..)
+            | PrimaryNetworkError::Busy => Self::Error(PrimaryRPCError(error.to_string())),
         }
     }
 }

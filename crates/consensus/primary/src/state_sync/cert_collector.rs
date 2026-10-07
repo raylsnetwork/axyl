@@ -99,12 +99,20 @@ where
         let local_max =
             config.network_config().libp2p_config().max_rpc_message_size - *MESSAGE_OVERHEAD;
         let max_message_size = request.max_response_size.min(local_max);
-        let (lower_bound, skip_rounds) = request.get_bounds()?;
+        let max_skip_rounds =
+            config.network_config().sync_config().max_skip_rounds_for_missing_certs;
+        let (lower_bound, skip_rounds) = request.get_bounds(max_skip_rounds)?;
         let exclusive_upper_bound = request.exclusive_upper_bound;
 
         // initialize the fetch queue with the first round for each authority
         let mut fetch_queue = BinaryHeap::new();
+        let committee = config.committee();
         for (origin, rounds) in &skip_rounds {
+            // only committee members have certificates this node can serve
+            if committee.authority(origin).is_none() {
+                continue;
+            }
+
             // validate skip rounds count
             if rounds.len()
                 > config.network_config().sync_config().max_skip_rounds_for_missing_certs

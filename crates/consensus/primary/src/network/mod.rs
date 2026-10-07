@@ -440,7 +440,7 @@ where
         let task_name = format!("MissingCertsReq-{peer}");
         self.task_spawner.spawn_task(task_name, async move {
             tokio::select! {
-                result = request_handler.retrieve_missing_certs(request) => {
+                result = request_handler.retrieve_missing_certs(peer, request) => {
                     // report penalty if any
                     if let Err(ref e) = result {
                         if let Some(penalty) = e.into() {

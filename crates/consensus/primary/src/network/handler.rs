@@ -28,11 +28,14 @@ use rayls_infrastructure_types::{
     SignatureVerificationState, Vote, VotesAggregator,
 };
 use std::{
-    collections::{BTreeMap, BTreeSet},
-    sync::Arc,
+    collections::{BTreeMap, BTreeSet, HashMap},
+    sync::{Arc, LazyLock},
     time::Duration,
 };
-use tokio::{sync::oneshot, time::Instant};
+use tokio::{
+    sync::{oneshot, OwnedSemaphorePermit, Semaphore},
+    time::Instant,
+};
 use tracing::{debug, error, info, trace, warn};
 
 const MAX_AUTH_LAST_VOTE_ENTRIES: usize = 1000;
@@ -802,12 +805,26 @@ where
 
     /// Retrieve missing certificates, bounded by time and chunk size.
     /// MDBX reads are offloaded to `spawn_blocking`.
+    ///
+    /// The request is checked for size before any decoding or storage read.
+    /// A permit limits how many of these jobs run at once, per peer and in total.
+    /// The blocking job holds its permit until it ends, even if the request is cancelled.
     pub(crate) async fn retrieve_missing_certs(
         &self,
+        peer: BlsPublicKey,
         request: MissingCertificatesRequest,
     ) -> PrimaryNetworkResult<PrimaryResponse> {
+        let committee = self.consensus_config.committee();
+        let limit = max_requested_authorities(committee.size());
+        if request.skip_rounds.len() > limit {
+            return Err(PrimaryNetworkError::TooManyAuthorities(request.skip_rounds.len(), limit));
+        }
+        let from_committee = committee.authority(&AuthorityIdentifier::from(peer)).is_some();
+        let permits = MISSING_CERT_LIMITS.acquire(peer, from_committee)?;
+
         let consensus_config = self.consensus_config.clone();
         tokio::task::spawn_blocking(move || {
+            let _permits = permits;
             collect_missing_certs_blocking(request, consensus_config)
         })
         .await
@@ -926,6 +943,74 @@ where
             }
             None => Err(PrimaryNetworkError::UnavailableEpochDigest(hash)),
         }
+    }
+}
+
+/// How many times the committee size a request may name, as a margin for committee changes.
+const REQUESTED_AUTHORITIES_PER_MEMBER: usize = 2;
+/// Smallest limit on the authorities a request may name, so small committees can still grow.
+const MIN_REQUESTED_AUTHORITIES: usize = 64;
+
+/// Most authorities a missing-certificates request may name.
+///
+/// An honest request names each committee member once.
+pub(crate) fn max_requested_authorities(committee_size: usize) -> usize {
+    (REQUESTED_AUTHORITIES_PER_MEMBER * committee_size).max(MIN_REQUESTED_AUTHORITIES)
+}
+
+/// Missing-certificate jobs one committee peer may have running at once.
+pub(crate) const MISSING_CERT_JOBS_PER_PEER: usize = 2;
+/// Missing-certificate jobs that committee peers may have running at once, in total.
+const MISSING_CERT_JOBS_COMMITTEE: usize = 64;
+/// Missing-certificate jobs that other peers may have running at once, in total.
+pub(crate) const MISSING_CERT_JOBS_OTHERS: usize = 4;
+
+/// Limits shared by every epoch, so jobs left over from an earlier epoch still count.
+static MISSING_CERT_LIMITS: LazyLock<MissingCertLimits> = LazyLock::new(MissingCertLimits::new);
+
+/// Concurrency limits for missing-certificate jobs.
+pub(crate) struct MissingCertLimits {
+    /// Pool for committee peers.
+    committee: Arc<Semaphore>,
+    /// Smaller pool for every other peer, so observers cannot starve committee catch-up.
+    others: Arc<Semaphore>,
+    /// One small pool per committee peer.
+    per_peer: Mutex<HashMap<BlsPublicKey, Arc<Semaphore>>>,
+}
+
+impl MissingCertLimits {
+    pub(crate) fn new() -> Self {
+        Self {
+            committee: Arc::new(Semaphore::new(MISSING_CERT_JOBS_COMMITTEE)),
+            others: Arc::new(Semaphore::new(MISSING_CERT_JOBS_OTHERS)),
+            per_peer: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Take the permits for one job, or fail with `Busy` without waiting.
+    ///
+    /// A committee peer takes a permit from its own pool and from the committee pool.
+    /// Any other peer takes a permit from the shared pool, so unknown peers add no state.
+    pub(crate) fn acquire(
+        &self,
+        peer: BlsPublicKey,
+        from_committee: bool,
+    ) -> PrimaryNetworkResult<Vec<OwnedSemaphorePermit>> {
+        if !from_committee {
+            let permit =
+                self.others.clone().try_acquire_owned().map_err(|_| PrimaryNetworkError::Busy)?;
+            return Ok(vec![permit]);
+        }
+        let peer_pool = self
+            .per_peer
+            .lock()
+            .entry(peer)
+            .or_insert_with(|| Arc::new(Semaphore::new(MISSING_CERT_JOBS_PER_PEER)))
+            .clone();
+        let peer_permit = peer_pool.try_acquire_owned().map_err(|_| PrimaryNetworkError::Busy)?;
+        let pool_permit =
+            self.committee.clone().try_acquire_owned().map_err(|_| PrimaryNetworkError::Busy)?;
+        Ok(vec![peer_permit, pool_permit])
     }
 }
 
