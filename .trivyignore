@@ -20,3 +20,19 @@ GHSA-82j2-j2ch-gfr8
 # both backends. Re-check this when libp2p releases a version whose libp2p-yamux drops the 0.12
 # backend, or if any code starts using Config::client()/::server()/WindowUpdateMode (the 012 paths).
 CVE-2026-32314
+
+# hickory-resolver 0.25.2 is pulled in on two edges: libp2p-dns 0.44 (via libp2p 0.56) and
+# reth-dns-discovery (via reth v1.11.0).
+# GHSA-5j98-2g5x-46v6 (HIGH): with DNSSEC validation ENABLED, Resolver::lookup()/lookup_ip()
+# return Ok() for responses that failed DNSSEC validation (bogus), instead of an error.
+# Accepted risk for now:
+#   - The vulnerable path is unreachable in our stack. Neither consumer enables DNSSEC
+#     validation: both build their resolvers from system configuration with NO trust anchors,
+#     so no validation runs and a bogus response can never be returned as validated.
+#   - A clean fix needs reth >= v2.3.0 (its hickory-resolver requirement moves to ^0.26.1,
+#     which unifies with a 0.26.3 direct dep), which in turn lets us bump libp2p 0.56 -> 0.57
+#     (libp2p-dns 0.45 -> hickory ^0.26) to keep the single-copy lockstep invariant.
+# Resolution: land the reth v1.11.0 -> v2.3.0+ bump (tracked as a separate task), then bump
+# libp2p + the direct hickory-resolver dep to 0.26.x, verify hickory-resolver 0.25.x is gone
+# from Cargo.lock, and remove this entry.
+GHSA-5j98-2g5x-46v6
