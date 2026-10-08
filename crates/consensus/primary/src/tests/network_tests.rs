@@ -504,6 +504,7 @@ fn full_run_bitmap(containers: u16) -> Vec<u8> {
 ///
 /// Decoding inserts each run at the front, so the work grows with the square of `runs`.
 fn descending_runs_bitmap(runs: u16) -> Vec<u8> {
+    assert!(runs > 0, "a container needs at least one run");
     // header cookie of a bitmap with run containers, for one container
     const SERIAL_COOKIE: u32 = 12347;
     let mut bytes = SERIAL_COOKIE.to_le_bytes().to_vec();

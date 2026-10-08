@@ -165,7 +165,7 @@ pub struct MissingCertificatesRequest {
 
 /// Most authorities a missing-certificates request may list on the wire.
 ///
-/// Honest requests list about one committee, so this bound is far above normal use.
+/// Honest requests name only committee members, so only a faulty or hostile peer reaches it.
 /// This bound only stops a peer from making the node decode a huge list.
 pub(crate) const MAX_SKIP_ROUND_AUTHORITIES: usize = 1024;
 
@@ -465,8 +465,11 @@ impl PrimaryResponse {
             | PrimaryNetworkError::UnknownConsensusHeaderDigest(_)
             | PrimaryNetworkError::UnknownConsensusHeaderCert(_)
             | PrimaryNetworkError::InvalidEpochRequest
-            | PrimaryNetworkError::TooManyAuthorities(..)
-            | PrimaryNetworkError::Busy => Self::Error(PrimaryRPCError(error.to_string())),
+            | PrimaryNetworkError::TooManyAuthorities(..) => {
+                Self::Error(PrimaryRPCError(error.to_string()))
+            }
+            // A busy node asks the requester to try another peer, and to retry later.
+            PrimaryNetworkError::Busy => Self::RecoverableError(PrimaryRPCError(error.to_string())),
         }
     }
 }

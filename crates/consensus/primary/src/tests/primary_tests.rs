@@ -1005,6 +1005,10 @@ fn test_missing_cert_slots_outlive_cancelled_requests() {
             Option::<rayls_consensus_network::Penalty>::from(&PrimaryNetworkError::Busy).is_none()
         );
 
+        // A busy answer tells the requester to retry later, so it can tell busy from failed.
+        let answer = PrimaryResponse::into_error_ref(&PrimaryNetworkError::Busy);
+        assert!(matches!(answer, PrimaryResponse::RecoverableError(_)), "got {answer:?}");
+
         // Another member has its own slots.
         assert!(start_then_cancel(&handler, member(2)).await.is_none());
 
@@ -1035,12 +1039,14 @@ fn test_missing_cert_slots_outlive_cancelled_requests() {
     });
 }
 
-/// Pools of former members are dropped when there are more pools than committee members.
+/// Each epoch gives its committee members their own pools, and shares the other pools.
 ///
-/// A former member whose job is still running keeps its pool.
+/// A former member counts as an outsider, and jobs from an earlier epoch still hold their slots.
 #[test]
-fn test_missing_cert_limits_forget_former_members() {
-    use crate::network::handler::MissingCertLimits;
+fn test_missing_cert_slots_follow_the_epoch_committee() {
+    use crate::network::handler::{
+        MissingCertLimits, MISSING_CERT_JOBS_OTHERS, MISSING_CERT_JOBS_PER_PEER,
+    };
 
     let committee_size = 4;
     let fixture = || {
@@ -1051,28 +1057,33 @@ fn test_missing_cert_limits_forget_former_members() {
     let old = fixture();
     let new = fixture();
     let limits = MissingCertLimits::new();
+    let free_at_start = limits.free_committee_slots();
+    let old_slots = limits.for_committee(&old.committee());
 
-    // Every old member runs a job, and one of them is still running.
-    let mut old_members = old.authorities().map(|authority| authority.primary_public_key());
-    let busy = old_members.next().unwrap();
-    let job = limits.acquire(busy, &old.committee()).expect("job in the old committee");
-    for member in old_members {
-        limits.acquire(member, &old.committee()).expect("job in the old committee");
-    }
-    assert_eq!(limits.tracked_peers(), committee_size);
+    // A member of the old committee uses all of its slots.
+    let former = old.authorities().next().unwrap().primary_public_key();
+    let old_jobs: Vec<_> = (0..MISSING_CERT_JOBS_PER_PEER)
+        .map(|_| old_slots.acquire(former).expect("slot in the old epoch"))
+        .collect();
+    let next = old_slots.acquire(former);
+    assert!(matches!(next, Err(PrimaryNetworkError::Busy)), "got {next:?}");
 
-    // While the pools fit the committee, nothing is scanned.
-    let current = new.authorities().next().unwrap().primary_public_key();
-    limits.acquire(current, &new.committee()).expect("job in the new committee");
-    assert_eq!(limits.tracked_peers(), committee_size + 1);
+    // The next epoch's committee pool still counts the old jobs.
+    let new_slots = limits.for_committee(&new.committee());
+    assert_eq!(limits.free_committee_slots(), free_at_start - MISSING_CERT_JOBS_PER_PEER);
 
-    // Once there are more pools than members, idle former members are dropped.
-    limits.acquire(current, &new.committee()).expect("job in the new committee");
-    assert_eq!(limits.tracked_peers(), 2);
+    // In the new epoch the former member is an outsider, so it uses the shared pool.
+    let outsider_jobs: Vec<_> = (0..MISSING_CERT_JOBS_OTHERS)
+        .map(|_| new_slots.acquire(former).expect("slot in the shared pool"))
+        .collect();
+    let next = new_slots.acquire(former);
+    assert!(matches!(next, Err(PrimaryNetworkError::Busy)), "got {next:?}");
 
-    // The busy member kept its pool, so its slot limit still holds.
-    let second = limits.acquire(busy, &old.committee()).expect("second slot");
-    let third = limits.acquire(busy, &old.committee());
-    assert!(matches!(third, Err(PrimaryNetworkError::Busy)), "got {third:?}");
-    drop((job, second));
+    // New members have their own slots.
+    let member = new.authorities().next().unwrap().primary_public_key();
+    let member_job = new_slots.acquire(member).expect("slot for a new member");
+
+    // Slots come back once the jobs end.
+    drop((old_jobs, outsider_jobs, member_job));
+    assert_eq!(limits.free_committee_slots(), free_at_start);
 }

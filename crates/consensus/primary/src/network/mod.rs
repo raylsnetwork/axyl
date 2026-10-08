@@ -178,6 +178,8 @@ impl PrimaryNetworkHandle {
         let res = res.await??;
         match res {
             PrimaryResponse::RequestedCertificates(certs) => Ok(certs),
+            // Only a busy node answers a certificate request with a recoverable error.
+            PrimaryResponse::RecoverableError(PrimaryRPCError(s)) => Err(NetworkError::PeerBusy(s)),
             PrimaryResponse::Error(PrimaryRPCError(s)) => Err(NetworkError::RPCError(s)),
             _ => Err(NetworkError::RPCError("Got wrong response, not a certificate!".to_string())),
         }

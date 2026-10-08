@@ -112,6 +112,8 @@ pub(crate) struct RequestHandler<DB> {
     consensus_certs: Arc<Mutex<B256Map<VotesAggregator<ConsensusResult>>>>,
     /// Commit-progress tracker gating demotion to `CvvInactive` (see [`behind_consensus`]).
     behind_tracker: Arc<Mutex<BehindTracker>>,
+    /// Missing-certificate job slots for this epoch's committee.
+    missing_cert_slots: Arc<MissingCertSlots>,
 }
 
 impl<DB> RequestHandler<DB>
@@ -124,6 +126,9 @@ where
         consensus_bus: ConsensusBus,
         rayls_consensus_state_sync: StateSynchronizer<DB>,
     ) -> Self {
+        let missing_cert_slots = Arc::new(
+            consensus_bus.missing_cert_limits().for_committee(consensus_config.committee()),
+        );
         Self {
             consensus_config,
             consensus_bus,
@@ -132,6 +137,7 @@ where
             auth_last_vote: Default::default(),
             consensus_certs: Default::default(),
             behind_tracker: Default::default(),
+            missing_cert_slots,
         }
     }
 
@@ -820,10 +826,9 @@ where
             debug!(target: "primary::handler", %peer, authorities = request.skip_rounds.len(), limit, "missing-certificates request names too many authorities");
             return Err(PrimaryNetworkError::TooManyAuthorities(request.skip_rounds.len(), limit));
         }
-        let permits =
-            self.consensus_bus.missing_cert_limits().acquire(peer, committee).inspect_err(|_| {
-                debug!(target: "primary::handler", %peer, "too many missing-certificates requests in progress");
-            })?;
+        let permits = self.missing_cert_slots.acquire(peer).inspect_err(|_| {
+            debug!(target: "primary::handler", %peer, "too many missing-certificates requests in progress");
+        })?;
 
         let consensus_config = self.consensus_config.clone();
         tokio::task::spawn_blocking(move || {
@@ -968,7 +973,7 @@ const MISSING_CERT_JOBS_COMMITTEE: usize = 64;
 /// Missing-certificate jobs that other peers may have running at once, in total.
 pub(crate) const MISSING_CERT_JOBS_OTHERS: usize = 4;
 
-/// Concurrency limits for missing-certificate jobs.
+/// Concurrency limits for missing-certificate jobs, shared by every epoch.
 ///
 /// The node keeps one for its whole life, so jobs left over from an earlier epoch still count.
 #[derive(Debug)]
@@ -977,8 +982,6 @@ pub(crate) struct MissingCertLimits {
     committee: Arc<Semaphore>,
     /// Smaller pool for every other peer, so observers cannot starve committee catch-up.
     others: Arc<Semaphore>,
-    /// A pool per member, also kept for former members until the map outgrows the committee.
-    per_peer: Mutex<HashMap<AuthorityIdentifier, Arc<Semaphore>>>,
 }
 
 impl MissingCertLimits {
@@ -986,52 +989,64 @@ impl MissingCertLimits {
         Self {
             committee: Arc::new(Semaphore::new(MISSING_CERT_JOBS_COMMITTEE)),
             others: Arc::new(Semaphore::new(MISSING_CERT_JOBS_OTHERS)),
-            per_peer: Mutex::new(HashMap::new()),
         }
     }
 
+    /// Job slots for one epoch, with a pool for each member of its committee.
+    ///
+    /// A member that stays in the next committee gets a new pool there.
+    /// For one epoch change it may run twice its share, still within the committee pool.
+    pub(crate) fn for_committee(&self, committee: &Committee) -> MissingCertSlots {
+        let per_peer = committee
+            .authorities()
+            .iter()
+            .map(|authority| (authority.id(), Arc::new(Semaphore::new(MISSING_CERT_JOBS_PER_PEER))))
+            .collect();
+        MissingCertSlots {
+            committee: self.committee.clone(),
+            others: self.others.clone(),
+            per_peer,
+        }
+    }
+
+    /// Free slots in the committee pool.
+    #[cfg(test)]
+    pub(crate) fn free_committee_slots(&self) -> usize {
+        self.committee.available_permits()
+    }
+}
+
+/// Missing-certificate job slots for one epoch.
+///
+/// The committee is fixed for the epoch, so the pools are made once and read without a lock.
+#[derive(Debug)]
+pub(crate) struct MissingCertSlots {
+    /// Pool for committee peers, shared with every epoch.
+    committee: Arc<Semaphore>,
+    /// Pool for every other peer, shared with every epoch.
+    others: Arc<Semaphore>,
+    /// A pool for each member of this epoch's committee.
+    per_peer: HashMap<AuthorityIdentifier, Arc<Semaphore>>,
+}
+
+impl MissingCertSlots {
     /// Take the permits for one job, or fail with `Busy` without waiting.
     ///
     /// A committee peer takes a permit from its own pool and from the committee pool.
     /// Any other peer takes a permit from the shared pool, so unknown peers add no state.
-    /// Idle pools of former members are dropped once there are more pools than members.
     pub(crate) fn acquire(
         &self,
         peer: BlsPublicKey,
-        committee: &Committee,
     ) -> PrimaryNetworkResult<Vec<OwnedSemaphorePermit>> {
-        let peer = AuthorityIdentifier::from(peer);
-        if !committee.is_authority(&peer) {
+        let Some(own) = self.per_peer.get(&AuthorityIdentifier::from(peer)) else {
             let permit =
                 self.others.clone().try_acquire_owned().map_err(|_| PrimaryNetworkError::Busy)?;
             return Ok(vec![permit]);
-        }
-        // Take the peer's permit under the lock, so pruning cannot drop the pool in between.
-        let peer_permit = {
-            let mut per_peer = self.per_peer.lock();
-            // Only former members can make the map larger than the committee, so scan only then.
-            if per_peer.len() > committee.size() {
-                per_peer.retain(|id, pool| {
-                    committee.is_authority(id)
-                        || pool.available_permits() < MISSING_CERT_JOBS_PER_PEER
-                });
-            }
-            per_peer
-                .entry(peer)
-                .or_insert_with(|| Arc::new(Semaphore::new(MISSING_CERT_JOBS_PER_PEER)))
-                .clone()
-                .try_acquire_owned()
-                .map_err(|_| PrimaryNetworkError::Busy)?
         };
+        let peer_permit = own.clone().try_acquire_owned().map_err(|_| PrimaryNetworkError::Busy)?;
         let pool_permit =
             self.committee.clone().try_acquire_owned().map_err(|_| PrimaryNetworkError::Busy)?;
         Ok(vec![peer_permit, pool_permit])
-    }
-
-    /// Number of peers with a slot pool.
-    #[cfg(test)]
-    pub(crate) fn tracked_peers(&self) -> usize {
-        self.per_peer.lock().len()
     }
 }
 
