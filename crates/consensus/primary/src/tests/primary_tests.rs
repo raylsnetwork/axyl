@@ -1035,24 +1035,44 @@ fn test_missing_cert_slots_outlive_cancelled_requests() {
     });
 }
 
-/// The slot pool of a peer that left the committee is kept while its job runs, then dropped.
+/// Pools of former members are dropped when there are more pools than committee members.
+///
+/// A former member whose job is still running keeps its pool.
 #[test]
 fn test_missing_cert_limits_forget_former_members() {
     use crate::network::handler::MissingCertLimits;
 
-    let old = CommitteeFixture::builder(MemDatabase::default).build();
-    let new = CommitteeFixture::builder(MemDatabase::default).build();
-    let former = old.authorities().next().unwrap().primary_public_key();
-    let current = new.authorities().next().unwrap().primary_public_key();
+    let committee_size = 4;
+    let fixture = || {
+        CommitteeFixture::builder(MemDatabase::default)
+            .committee_size(NonZeroUsize::new(committee_size).unwrap())
+            .build()
+    };
+    let old = fixture();
+    let new = fixture();
     let limits = MissingCertLimits::new();
 
-    // A former member's running job keeps its pool.
-    let job = limits.acquire(former, &old.committee()).expect("job in the old committee");
+    // Every old member runs a job, and one of them is still running.
+    let mut old_members = old.authorities().map(|authority| authority.primary_public_key());
+    let busy = old_members.next().unwrap();
+    let job = limits.acquire(busy, &old.committee()).expect("job in the old committee");
+    for member in old_members {
+        limits.acquire(member, &old.committee()).expect("job in the old committee");
+    }
+    assert_eq!(limits.tracked_peers(), committee_size);
+
+    // While the pools fit the committee, nothing is scanned.
+    let current = new.authorities().next().unwrap().primary_public_key();
+    limits.acquire(current, &new.committee()).expect("job in the new committee");
+    assert_eq!(limits.tracked_peers(), committee_size + 1);
+
+    // Once there are more pools than members, idle former members are dropped.
     limits.acquire(current, &new.committee()).expect("job in the new committee");
     assert_eq!(limits.tracked_peers(), 2);
 
-    // Once the job ends, the next request drops that pool.
-    drop(job);
-    limits.acquire(current, &new.committee()).expect("job in the new committee");
-    assert_eq!(limits.tracked_peers(), 1);
+    // The busy member kept its pool, so its slot limit still holds.
+    let second = limits.acquire(busy, &old.committee()).expect("second slot");
+    let third = limits.acquire(busy, &old.committee());
+    assert!(matches!(third, Err(PrimaryNetworkError::Busy)), "got {third:?}");
+    drop((job, second));
 }

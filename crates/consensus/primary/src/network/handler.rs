@@ -977,7 +977,7 @@ pub(crate) struct MissingCertLimits {
     committee: Arc<Semaphore>,
     /// Smaller pool for every other peer, so observers cannot starve committee catch-up.
     others: Arc<Semaphore>,
-    /// One small pool per committee peer.
+    /// A pool per member, also kept for former members until the map outgrows the committee.
     per_peer: Mutex<HashMap<AuthorityIdentifier, Arc<Semaphore>>>,
 }
 
@@ -994,14 +994,14 @@ impl MissingCertLimits {
     ///
     /// A committee peer takes a permit from its own pool and from the committee pool.
     /// Any other peer takes a permit from the shared pool, so unknown peers add no state.
-    /// The pool of a peer that left the committee is dropped once its jobs end.
+    /// Idle pools of former members are dropped once there are more pools than members.
     pub(crate) fn acquire(
         &self,
         peer: BlsPublicKey,
         committee: &Committee,
     ) -> PrimaryNetworkResult<Vec<OwnedSemaphorePermit>> {
         let peer = AuthorityIdentifier::from(peer);
-        if committee.authority(&peer).is_none() {
+        if !committee.is_authority(&peer) {
             let permit =
                 self.others.clone().try_acquire_owned().map_err(|_| PrimaryNetworkError::Busy)?;
             return Ok(vec![permit]);
@@ -1009,10 +1009,13 @@ impl MissingCertLimits {
         // Take the peer's permit under the lock, so pruning cannot drop the pool in between.
         let peer_permit = {
             let mut per_peer = self.per_peer.lock();
-            per_peer.retain(|id, pool| {
-                committee.authority(id).is_some()
-                    || pool.available_permits() < MISSING_CERT_JOBS_PER_PEER
-            });
+            // Only former members can make the map larger than the committee, so scan only then.
+            if per_peer.len() > committee.size() {
+                per_peer.retain(|id, pool| {
+                    committee.is_authority(id)
+                        || pool.available_permits() < MISSING_CERT_JOBS_PER_PEER
+                });
+            }
             per_peer
                 .entry(peer)
                 .or_insert_with(|| Arc::new(Semaphore::new(MISSING_CERT_JOBS_PER_PEER)))
