@@ -77,6 +77,9 @@ pub enum NetworkError {
     /// Request/response RPC Error
     #[error("{0}")]
     RPCError(String),
+    /// The peer is busy and asked the requester to retry later.
+    #[error("peer is busy, retry later: {0}")]
+    PeerBusy(String),
     /// If a request is made to "any" peer and no peers are currently connected.
     #[error("No connected peers")]
     NoPeers,
