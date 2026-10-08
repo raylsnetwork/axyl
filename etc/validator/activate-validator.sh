@@ -9,11 +9,19 @@ if [[ ! -e "$envPath" ]]; then
     echo "Error: .env file not found at $envPath"
     exit 1
 fi
+set -a
 . "$envPath"
+set +a
 
 cd "$workingDir/../.."
 
-RL_BLS_PASSPHRASE="local"
+BUILD_CONFIG="${BUILD_CONFIG:-debug}"
+
+# BLS keystore passphrase from .env - must match the one used by create-validator.sh
+if [ -z "$RL_BLS_PASSPHRASE" ]; then
+    RL_BLS_PASSPHRASE="local"
+fi
+export RL_BLS_PASSPHRASE
 
 # PRIVATE KEY
 if [ -z "$PRIVATE_KEY" ]; then
@@ -55,6 +63,8 @@ done
 DATADIR="$workingDir/local-validator"
 
 BUILD_ARGS=(
+    "-p"
+    "rayls-network"
     "--bin"
     "rayls-network"
 )
@@ -80,7 +90,7 @@ if [ "$START" = true ]; then
     echo "Starting ${VALIDATOR}, rpc endpoint http://localhost:$RPC_PORT"
     # -vvv for INFO, -vvvvv for TRACE, etc
     # start validator
-    RL_BLS_PASSPHRASE="local" ${workingDir}/../../target/${BUILD_CONFIG}/rayls-network node \
+    ${workingDir}/../../target/${BUILD_CONFIG}/rayls-network node \
         --datadir "${DATADIR}" \
         --instance 99 \
         --metrics "127.0.0.1:9109" \

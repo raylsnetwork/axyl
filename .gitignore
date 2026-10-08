@@ -29,6 +29,7 @@ etc/manage/config/rls-accounts.yaml
 etc/test-network/accounts.yaml
 etc/test-network/rls-accounts.yaml
 local-validator
+etc/validator/validator-bundle.tar.gz
 node_modules
 clk.env
 net.env
