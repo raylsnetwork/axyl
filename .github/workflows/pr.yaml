@@ -2,9 +2,18 @@ name: Pull Request Checks
 on:
   workflow_dispatch:
   pull_request:
-    types: [opened, synchronize, reopened, review_requested, ready_for_review]
+    # `labeled` is what actually runs CI (see below). The other types only
+    # produce a failing "Tests" check telling the author to add `run-ci`.
+    types: [opened, synchronize, reopened, review_requested, ready_for_review, labeled]
     branches:
       - main
+
+# CI is opt-in per run: adding the `run-ci` label runs the jobs below once,
+# against the PR's current head, and the `consume-label` job removes the label
+# again so it can be re-added for the next run. Pushes, other labels, etc. do
+# not run CI: the jobs are skipped and the required "Tests" check (tests-gate)
+# fails, so a commit that CI hasn't run on can't be merged. Manual dispatch
+# always runs.
 
 # Least privilege by default; the jobs that post PR comments re-grant
 # pull-requests: write in their own permissions block.
@@ -13,8 +22,11 @@ permissions:
 
 # Supersede in-flight runs when a PR is pushed/rebased instead of stacking
 # full build+test runs (the "require up-to-date branch" rule causes churn).
+#
+# Runs from unrelated `labeled` events (e.g. adding `bug`) get a group of their
+# own, so they don't cancel a real CI run that's in progress.
 concurrency:
-  group: pr-${{ github.ref }}
+  group: pr-${{ github.ref }}${{ github.event.action == 'labeled' && github.event.label.name != 'run-ci' && format('-{0}', github.run_id) || '' }}
   cancel-in-progress: true
 
 env:
@@ -26,10 +38,34 @@ env:
 
 jobs:
   # ===========================================================================
+  # CONSUME LABEL - remove `run-ci` so it acts as a one-shot trigger
+  #
+  # Runs first thing so the label can be re-added straight away to queue a
+  # fresh run. Fork PRs get a read-only GITHUB_TOKEN, so there the label stays
+  # on and a maintainer has to remove and re-add it for the next run (it being
+  # left on doesn't re-trigger CI on pushes; only the `labeled` event does).
+  # ===========================================================================
+  consume-label:
+    name: Consume run-ci label
+    if: >
+      github.event.action == 'labeled' && github.event.label.name == 'run-ci' &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+      issues: write
+    steps:
+      - name: Remove run-ci label
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh api -X DELETE repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/labels/run-ci
+
+  # ===========================================================================
   # FORMAT - rustfmt check (honors rustfmt.toml)
   # ===========================================================================
   fmt:
     name: Format
+    if: github.event_name != 'pull_request' || (github.event.action == 'labeled' && github.event.label.name == 'run-ci')
     runs-on: ubuntu-latest
     steps:
       # - name: Check if draft PR
@@ -77,6 +113,7 @@ jobs:
   # ===========================================================================
   tests:
     name: Tests (${{ matrix.name }})
+    if: github.event_name != 'pull_request' || (github.event.action == 'labeled' && github.event.label.name == 'run-ci')
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -140,6 +177,10 @@ jobs:
     steps:
       - name: Verify all test legs passed
         run: |
+          if [[ "${{ needs.tests.result }}" == "skipped" ]]; then
+            echo "CI has not run on this commit: add the 'run-ci' label to this PR to execute it."
+            exit 1
+          fi
           if [[ "${{ needs.tests.result }}" != "success" ]]; then
             echo "One or more Tests matrix legs did not succeed (result: ${{ needs.tests.result }})."
             exit 1
@@ -151,6 +192,7 @@ jobs:
   # ===========================================================================
   security-scan:
     name: Security Scan
+    if: github.event_name != 'pull_request' || (github.event.action == 'labeled' && github.event.label.name == 'run-ci')
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -220,6 +262,7 @@ jobs:
   # ===========================================================================
   contracts-tests:
     name: Contracts Tests
+    if: github.event_name != 'pull_request' || (github.event.action == 'labeled' && github.event.label.name == 'run-ci')
     runs-on: ubuntu-latest
     permissions:
       contents: read

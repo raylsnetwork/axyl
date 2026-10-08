@@ -84,6 +84,7 @@ where
                 }
                 _ = peer_addr_metrics_refresh.tick() => {
                     self.refresh_peer_addr_metrics();
+                    self.refresh_relay_set_metrics();
                 },
                 event = self.swarm.select_next_some() => {
                     self.process_event(event).await.inspect_err(|e| {
@@ -218,8 +219,15 @@ where
             SwarmEvent::ConnectionEstablished { peer_id, connection_id, endpoint, .. } => {
                 let path = ConnectionPath::classify(
                     &endpoint,
-                    self.swarm.behaviour().peer_manager.is_relay(&peer_id),
+                    self.swarm.behaviour().peer_manager.is_relay_hop_candidate(&peer_id),
                 );
+                // A circuit is up through this relay: that, and not the address that named it,
+                // is what makes the hop a relay this node depends on. Fires for inbound circuits
+                // too; those only arrive through a relay this node holds a reservation on, which
+                // `StartListening` already registered as configured, so the call is a no-op there.
+                if let ConnectionPath::Circuit { relay: Some(relay), .. } = path {
+                    self.swarm.behaviour_mut().peer_manager.relay_circuit_established(relay);
+                }
                 self.network_metrics
                     .connections_by_path
                     .with_label_values(&[path.metric_label(), self.network_label])
@@ -257,6 +265,15 @@ where
                 cause,
             } => {
                 let path = self.connection_paths.remove(&connection_id);
+                if let Some(ConnectionPath::Circuit { relay: Some(relay), .. }) = path {
+                    self.swarm.behaviour_mut().peer_manager.relay_circuit_closed(relay);
+                }
+                // The last connection to this peer is gone. If it was a relay we reached peers
+                // through, its registration ends here, not when its last circuit closed. For any
+                // other peer this is a no-op; the peer manager does not need to be told which.
+                if num_established == 0 {
+                    self.swarm.behaviour_mut().peer_manager.relay_disconnected(peer_id);
+                }
                 // Diagnostic: the bare swarm event records no cause, which left the duplicate-
                 // connection churn (a peer with both a dialed and an inbound relayed connection
                 // has one dropped ~seconds later) impossible to attribute. Log the transport path,

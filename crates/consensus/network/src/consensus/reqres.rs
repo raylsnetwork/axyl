@@ -156,9 +156,18 @@ where
 /// Classifies an outbound request-response failure into the penalty owed to the target peer.
 ///
 /// Penalties are behaviour-based: a peer is scored only for what *it* did to us. An outbound
-/// request is an operation *we* initiated against a target *we* chose, so most of its failure
-/// modes are not the peer's fault and return `None`. "max sub-streams reached" is local outbound
-/// exhaustion, so penalizing there would let a self-inflicted flood ban innocents.
+/// request is an operation *we* initiated against a target *we* chose, so none of its failure
+/// modes is the peer's provable fault, and every one returns `None`.
+///
+/// `Io` used to cost the target a Mild. The variant is ambiguous: an undecodable response and a
+/// stream reset or read error mid-response surface the same way, and resets are routine on
+/// relayed circuits, which have no transport keep-alive. The arm could not tell a peer's fault
+/// from link weather, and since committee members are penalty-immune, every point it produced
+/// landed on non-committee peers only. A validator one epoch behind, retrying its epoch-record
+/// fetch once a second across every connected peer, disconnected both observers of a testnet
+/// for reputation on nothing but failed streams. A peer that really sends garbage is still
+/// caught where the garbage is inspected: the application handlers decode responses and report
+/// their own penalties for malformed content.
 fn outbound_failure_penalty(error: &OutboundFailure) -> Option<Penalty> {
     match error {
         OutboundFailure::ConnectionClosed
@@ -172,16 +181,9 @@ fn outbound_failure_penalty(error: &OutboundFailure) -> Option<Penalty> {
         // rotation already moves on to the next peer, so the cost of not scoring is one wasted
         // request per rotation.
         OutboundFailure::UnsupportedProtocols => None,
-        // brittle string match: the libp2p handler exposes local exhaustion only as an opaque
-        // `io::Error::other("max sub-streams reached")`, so an SDK bump changing this literal must
-        // re-check the arm (a miss only over-penalizes, never under-penalizes a real fault).
-        OutboundFailure::Io(e) if e.to_string().contains("max sub-streams reached") => None,
-        // `Io` is ambiguous: an undecodable response (the peer's fault) and a connection reset or
-        // read error mid-response (nobody's fault; routine on relayed circuits, which have no
-        // transport keep-alive) surface as the same variant. Mild keeps a peer that keeps sending
-        // garbage scorable (~20 hits to disconnect) without letting link flakiness alone reach the
-        // disconnect threshold, which Medium (4 hits) did.
-        OutboundFailure::Io(_) => Some(Penalty::Mild),
+        // Covers local substream exhaustion ("max sub-streams reached"), resets, read errors and
+        // undecodable responses alike; see the function doc for why none of them is scored here.
+        OutboundFailure::Io(_) => None,
     }
 }
 
@@ -247,14 +249,20 @@ mod tests {
         );
     }
 
-    /// Outbound failures are operations we initiated: only an `Io` failure (possibly a garbage
-    /// response) is scored, and only Mild; a target that does not speak the requested protocol is
-    /// our targeting mistake and must never be scored -- that path banned relays and worker
+    /// Outbound failures are operations we initiated and are never scored. An `Io` failure is
+    /// ambiguous between a garbage response and a reset link, and scoring it disconnected the
+    /// observers of a testnet for reputation on failed streams alone; a target that does not speak
+    /// the requested protocol is our targeting mistake -- that path banned relays and worker
     /// identities picked up by `SendRequestAny`.
     #[test]
     fn outbound_failures_are_not_the_targets_fault() {
         let decode_failure = OutboundFailure::Io(io::Error::other("invalid value"));
-        assert!(matches!(outbound_failure_penalty(&decode_failure), Some(Penalty::Mild)));
+        assert!(
+            outbound_failure_penalty(&decode_failure).is_none(),
+            "an Io failure cannot be told apart from link weather and must not be scored"
+        );
+        let reset = OutboundFailure::Io(io::Error::from(io::ErrorKind::ConnectionReset));
+        assert!(outbound_failure_penalty(&reset).is_none());
 
         assert!(
             outbound_failure_penalty(&OutboundFailure::UnsupportedProtocols).is_none(),

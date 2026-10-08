@@ -784,12 +784,12 @@ async fn test_non_gossip_peer_not_exempt_from_ban() {
 }
 
 /// Relay registration is granted by construction, from the hop of a `/p2p-circuit` we use
-/// (`register_relays_from_addrs` -- fed by `StartListening` for every relay we reserve on and by
-/// a peer's advertised circuit address for every relay we dial through). Registration makes the
-/// hop `is_relay` (prune-exempt, kept out of kad) but confers NO penalty exemption: scoring is
-/// behaviour-based, and no penalty fires for merely being a relay, so a `Fatal` on a registered hop
-/// must still disconnect and ban it. Guards against re-adding a blanket relay carve-out that would
-/// let a planted peer id become immune.
+/// (`register_relays_from_addrs` for the relays in our own configuration,
+/// `relay_circuit_established` for every relay a circuit is actually up through). Registration
+/// makes the hop `is_relay` (prune-exempt, kept out of kad) but confers NO penalty exemption:
+/// scoring is behaviour-based, and no penalty fires for merely being a relay, so a `Fatal` on a
+/// registered hop must still disconnect and ban it. Guards against re-adding a blanket relay
+/// carve-out that would let a planted peer id become immune.
 #[tokio::test]
 async fn test_registered_relay_hop_is_still_banned_by_fatal() {
     let mut peer_manager = create_test_peer_manager(None);
@@ -818,6 +818,164 @@ async fn test_registered_relay_hop_is_still_banned_by_fatal() {
     );
     // registration itself is untouched: the hop stays prune-exempt while banned
     assert!(peer_manager.is_relay(&relay));
+}
+
+/// A circuit address inside a peer's record is that peer's claim about how it is reached. It
+/// must not register the named hop as a relay: a validator could otherwise name every honest
+/// validator as "its relay" in one valid record and have every node skip them for fetches, keep
+/// them out of kad and never prune them.
+#[tokio::test]
+async fn test_record_circuit_address_does_not_register_relay() {
+    let mut peer_manager = create_test_peer_manager(None);
+    let named_as_relay = PeerId::random();
+    let author_netkey = libp2p::identity::Keypair::generate_ed25519().public();
+    let author_id = PeerId::from_public_key(&author_netkey);
+    let circuit: Multiaddr = format!(
+        "/ip4/127.0.0.1/udp/50000/quic-v1/p2p/{named_as_relay}/p2p-circuit/p2p/{author_id}"
+    )
+    .parse()
+    .expect("valid circuit multiaddr");
+    let info =
+        NetworkInfo { pubkey: author_netkey.into(), multiaddrs: vec![circuit], timestamp: now() };
+
+    peer_manager.add_known_peer(*BlsKeypair::generate(&mut rand::rng()).public(), info);
+
+    assert!(!peer_manager.is_relay(&named_as_relay), "a record must not register a relay");
+    assert!(
+        !peer_manager.is_relay_hop_candidate(&named_as_relay),
+        "a record must not even make the hop a candidate"
+    );
+}
+
+/// Dialing through a circuit makes the hop a candidate, so the direct leg to it is classified
+/// and kept out of kad, but grants nothing until a circuit is actually established through it.
+/// The registration then lasts as long as the leg to the relay is connected, through any number
+/// of circuits opening and closing, and a configured relay outlives even the leg.
+#[tokio::test]
+async fn test_relay_registered_on_established_circuit_and_dropped_with_the_leg() {
+    let mut peer_manager = create_test_peer_manager(None);
+    let relay = PeerId::random();
+    let dst = PeerId::random();
+    let circuit: Multiaddr =
+        format!("/ip4/127.0.0.1/udp/50000/quic-v1/p2p/{relay}/p2p-circuit/p2p/{dst}")
+            .parse()
+            .expect("valid circuit multiaddr");
+
+    let sizes = |pm: &PeerManager| pm.relay_set_sizes();
+    assert_eq!(
+        sizes(&peer_manager),
+        RelaySetSizes { registered: 0, configured: 0, pending: 0, circuits: 0 }
+    );
+
+    // dialing through the hop: candidate, not relay
+    peer_manager.dial_peer(dst, vec![circuit], None);
+    assert!(peer_manager.is_relay_hop_candidate(&relay));
+    assert!(!peer_manager.is_relay(&relay), "a dial must not register the hop as a relay");
+    assert_eq!(
+        sizes(&peer_manager),
+        RelaySetSizes { registered: 0, configured: 0, pending: 1, circuits: 0 }
+    );
+
+    // a circuit comes up through it (twice): relay
+    peer_manager.relay_circuit_established(relay);
+    peer_manager.relay_circuit_established(relay);
+    assert!(peer_manager.is_relay(&relay));
+    assert_eq!(
+        sizes(&peer_manager),
+        RelaySetSizes { registered: 1, configured: 0, pending: 0, circuits: 2 }
+    );
+
+    // circuits close, the leg stays: still a relay. Between circuits the leg must not become an
+    // ordinary peer, or request fan-out picks it, penalises it for every failed stream, and the
+    // reputation disconnect temp-bans the very hop the next circuit dial needs.
+    peer_manager.relay_circuit_closed(relay);
+    peer_manager.relay_circuit_closed(relay);
+    peer_manager.relay_circuit_closed(relay); // no circuits left: a no-op, not an underflow
+    assert!(peer_manager.is_relay(&relay), "registered while the leg to it is up");
+    assert!(peer_manager.is_relay_hop_candidate(&relay));
+    assert_eq!(
+        sizes(&peer_manager),
+        RelaySetSizes { registered: 1, configured: 0, pending: 0, circuits: 0 }
+    );
+
+    // the leg itself goes: unregistered
+    peer_manager.relay_disconnected(relay);
+    assert!(!peer_manager.is_relay(&relay), "its last connection closed");
+    assert!(!peer_manager.is_relay_hop_candidate(&relay));
+    assert_eq!(
+        sizes(&peer_manager),
+        RelaySetSizes { registered: 0, configured: 0, pending: 0, circuits: 0 }
+    );
+
+    // a configured relay keeps its registration across circuits and across its leg
+    let configured = PeerId::random();
+    let own_circuit: Multiaddr =
+        format!("/ip4/127.0.0.1/udp/50001/quic-v1/p2p/{configured}/p2p-circuit")
+            .parse()
+            .expect("valid circuit multiaddr");
+    peer_manager.register_relays_from_addrs(std::slice::from_ref(&own_circuit));
+    peer_manager.relay_circuit_established(configured);
+    peer_manager.relay_circuit_closed(configured);
+    peer_manager.relay_disconnected(configured);
+    assert!(peer_manager.is_relay(&configured), "configured relays are not dropped");
+    assert_eq!(
+        sizes(&peer_manager),
+        RelaySetSizes { registered: 1, configured: 1, pending: 0, circuits: 0 }
+    );
+}
+
+/// A hop noted at dial time that never produces a circuit is forgotten on the heartbeat, so a
+/// failed dial or a bogus circuit address cannot keep a peer id classified as a relay leg.
+#[tokio::test]
+async fn test_pending_relay_hop_expires_without_a_circuit() {
+    let mut peer_manager = create_test_peer_manager(None);
+    let relay = PeerId::random();
+    let dst = PeerId::random();
+    let circuit: Multiaddr =
+        format!("/ip4/127.0.0.1/udp/50000/quic-v1/p2p/{relay}/p2p-circuit/p2p/{dst}")
+            .parse()
+            .expect("valid circuit multiaddr");
+    let noted_at = now();
+    peer_manager.dial_peer(dst, vec![circuit.clone()], None);
+    assert!(peer_manager.is_relay_hop_candidate(&relay));
+
+    // still within the window
+    peer_manager.expire_pending_relay_hops(noted_at + 30);
+    assert!(peer_manager.is_relay_hop_candidate(&relay));
+
+    // a redial through the same hop does not restart the clock: the committee redial retries a
+    // missing member every heartbeat, and a renewed timestamp would keep the hop a candidate for
+    // as long as the member stays missing
+    peer_manager.dial_peer(dst, vec![circuit], None);
+    peer_manager.expire_pending_relay_hops(noted_at + 120);
+    assert!(!peer_manager.is_relay_hop_candidate(&relay), "TTL runs from the first dial");
+    assert!(!peer_manager.is_relay(&relay));
+}
+
+/// A circuit address naming a peer that already has a BLS binding does not make that peer a
+/// candidate. A relay never pushes a node record, so a bound peer is a validator or observer,
+/// and treating it as a hop would skip it for request fan-out and the kad add on the word of
+/// whoever wrote the address.
+#[tokio::test]
+async fn test_bound_peer_is_never_a_relay_hop_candidate() {
+    let mut peer_manager = create_test_peer_manager(None);
+    let bls = *BlsKeypair::generate(&mut rand::rng()).public();
+    let netkey: NetworkPublicKey = NetworkKeypair::generate_ed25519().public().into();
+    let validator_id: PeerId = netkey.clone().into();
+    peer_manager.add_known_peer(
+        bls,
+        NetworkInfo { pubkey: netkey, multiaddrs: vec![create_multiaddr(None)], timestamp: now() },
+    );
+
+    let dst = PeerId::random();
+    let circuit: Multiaddr =
+        format!("/ip4/127.0.0.1/udp/50000/quic-v1/p2p/{validator_id}/p2p-circuit/p2p/{dst}")
+            .parse()
+            .expect("valid circuit multiaddr");
+    peer_manager.dial_peer(dst, vec![circuit], None);
+
+    assert!(!peer_manager.is_relay_hop_candidate(&validator_id));
+    assert!(!peer_manager.is_relay(&validator_id));
 }
 
 /// `should_skip_gossip_penalty` must refuse a committee validator: a validator that fails gossipsub
