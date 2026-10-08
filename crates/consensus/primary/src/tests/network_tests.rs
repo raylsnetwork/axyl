@@ -499,6 +499,28 @@ fn full_run_bitmap(containers: u16) -> Vec<u8> {
     bytes
 }
 
+/// Serialized roaring bitmap with one run container of `runs` single-value runs in descending
+/// order.
+///
+/// Decoding inserts each run at the front, so the work grows with the square of `runs`.
+fn descending_runs_bitmap(runs: u16) -> Vec<u8> {
+    // header cookie of a bitmap with run containers, for one container
+    const SERIAL_COOKIE: u32 = 12347;
+    let mut bytes = SERIAL_COOKIE.to_le_bytes().to_vec();
+    // the only container is a run container
+    bytes.push(1);
+    // the container key, then its value count minus one
+    bytes.extend_from_slice(&0_u16.to_le_bytes());
+    bytes.extend_from_slice(&(runs - 1).to_le_bytes());
+    bytes.extend_from_slice(&runs.to_le_bytes());
+    for start in (0..runs).rev() {
+        // a run of one value
+        bytes.extend_from_slice(&start.to_le_bytes());
+        bytes.extend_from_slice(&0_u16.to_le_bytes());
+    }
+    bytes
+}
+
 /// A skip bitmap that declares too many containers is refused before it is decoded.
 ///
 /// A few hundred bytes can stand for over a million rounds, so the container count is checked
@@ -525,6 +547,23 @@ fn test_skip_bitmap_is_refused_before_decoding() {
     let bitmap = roaring::RoaringBitmap::deserialize_from(&over[..]).expect("valid bitmap");
     assert_eq!(bitmap.len(), u64::from(max_containers + 1) << u16::BITS);
     assert_matches!(refusal(over), Some(PrimaryNetworkError::StdIo(_)));
+
+    // A bitmap written by the roaring crate with one container too many is refused too.
+    let mut spread = roaring::RoaringBitmap::new();
+    for key in 0..=u32::from(max_containers) {
+        spread.insert(key << u16::BITS);
+    }
+    let mut written = Vec::new();
+    spread.serialize_into(&mut written).expect("serialize");
+    assert_matches!(refusal(written), Some(PrimaryNetworkError::StdIo(_)));
+
+    // A bitmap longer than any honest one is refused before decoding.
+    // Each run takes four bytes, twice what an honest round takes.
+    let runs = u16::try_from(max_skip_rounds() + 1).expect("fits a container");
+    assert_matches!(
+        refusal(descending_runs_bitmap(runs)),
+        Some(PrimaryNetworkError::InvalidRequest(reason)) if reason.contains("too long")
+    );
 
     // Within the container limit, a bitmap over the round limit is refused.
     assert_matches!(

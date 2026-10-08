@@ -165,7 +165,7 @@ pub struct MissingCertificatesRequest {
 
 /// Most authorities a missing-certificates request may list on the wire.
 ///
-/// Honest requests list about one committee, and the handler applies a committee-based limit.
+/// Honest requests list about one committee, so this bound is far above normal use.
 /// This bound only stops a peer from making the node decode a huge list.
 pub(crate) const MAX_SKIP_ROUND_AUTHORITIES: usize = 1024;
 
@@ -191,6 +191,8 @@ where
             self,
             mut seq: A,
         ) -> Result<Self::Value, A::Error> {
+            // bcs always gives the exact length, so a long list is refused before any entry.
+            // The check in the loop covers formats that give no length.
             let len = seq.size_hint().unwrap_or(0);
             if len > MAX_SKIP_ROUND_AUTHORITIES {
                 return Err(serde::de::Error::invalid_length(len, &self));
@@ -211,9 +213,21 @@ where
 
 /// Most containers a skip-round bitmap may declare.
 ///
-/// One container covers 65,536 rounds from the requester's GC round, so honest bitmaps use one.
+/// Rounds count up from the request's lower bound, so honest bitmaps use one container.
 /// A container can stand for 65,536 rounds in 14 bytes, so the count is checked before decoding.
 pub(crate) const MAX_SKIP_ROUND_CONTAINERS: usize = 16;
+
+/// Most bytes a skip bitmap may take when it holds at most `max_rounds` rounds.
+///
+/// An honest bitmap stores each round in two bytes, after a header and an entry per container.
+/// Capping the length bounds the decoding work, whatever containers the bitmap declares.
+fn max_skip_bitmap_len(max_rounds: usize) -> usize {
+    // the cookie and the container count
+    const HEADER: usize = 2 * size_of::<u32>();
+    // a container's key, its count and its offset
+    const PER_CONTAINER: usize = 2 * size_of::<u32>();
+    HEADER + PER_CONTAINER * MAX_SKIP_ROUND_CONTAINERS + size_of::<u16>() * max_rounds
+}
 
 /// Number of containers a serialized roaring bitmap declares, or `None` for an unknown header.
 fn roaring_container_count(bytes: &[u8]) -> Option<usize> {
@@ -239,8 +253,9 @@ impl MissingCertificatesRequest {
     /// Deserialize the [RoaringBitmap] representing the difference between the requesting peer's
     /// lower boundary and their GC round.
     ///
-    /// Each bitmap is checked for size before it is decoded, and for `max_rounds` before it is
-    /// expanded, so a small bitmap cannot stand for billions of rounds.
+    /// Each bitmap is checked for its container count and length before it is decoded, and for
+    /// `max_rounds` before its rounds are collected, so a small bitmap cannot stand for billions
+    /// of rounds.
     pub(crate) fn get_bounds(
         &self,
         max_rounds: usize,
@@ -258,6 +273,11 @@ impl MissingCertificatesRequest {
                         "skip bitmap declares too many containers",
                     )
                     .into());
+                }
+                if serialized.len() > max_skip_bitmap_len(max_rounds) {
+                    return Err(PrimaryNetworkError::InvalidRequest(
+                        "Skip bitmap is too long".into(),
+                    ));
                 }
                 // Normalize on read: this bitmap comes from a peer request. It is
                 // only iterated today (so the empty-container re-serialize panic

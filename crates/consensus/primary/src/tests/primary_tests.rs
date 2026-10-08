@@ -874,7 +874,9 @@ fn max_response_size() -> usize {
 /// A request naming more authorities than the committee-sized limit is refused.
 #[tokio::test]
 async fn test_missing_certs_request_with_too_many_authorities_is_rejected() {
-    use crate::network::handler::max_requested_authorities;
+    use crate::network::handler::{
+        max_requested_authorities, MIN_REQUESTED_AUTHORITIES, REQUESTED_AUTHORITIES_PER_MEMBER,
+    };
 
     let committee_size = 4;
     let fixture = CommitteeFixture::builder(MemDatabase::default)
@@ -889,6 +891,13 @@ async fn test_missing_certs_request_with_too_many_authorities_is_rejected() {
     let handler = RequestHandler::new(primary.consensus_config(), cb.clone(), synchronizer);
     let peer = fixture.authorities().last().unwrap().primary_public_key();
     let limit = max_requested_authorities(committee_size);
+
+    // Small committees get the floor, and larger ones a multiple of their size.
+    assert_eq!(max_requested_authorities(1), MIN_REQUESTED_AUTHORITIES);
+    assert_eq!(
+        max_requested_authorities(MIN_REQUESTED_AUTHORITIES),
+        REQUESTED_AUTHORITIES_PER_MEMBER * MIN_REQUESTED_AUTHORITIES
+    );
 
     // Invented authorities, none in the committee.
     let invented = |count: usize| -> BTreeMap<AuthorityIdentifier, BTreeSet<u32>> {
@@ -948,6 +957,7 @@ async fn start_then_cancel(
 #[test]
 fn test_missing_cert_slots_outlive_cancelled_requests() {
     use crate::network::handler::{MISSING_CERT_JOBS_OTHERS, MISSING_CERT_JOBS_PER_PEER};
+    use rand::{rngs::StdRng, SeedableRng};
 
     // How long the queued jobs may take to run once the blocking thread is free.
     const SLOTS_FREED_WITHIN: Duration = Duration::from_secs(10);
@@ -974,10 +984,7 @@ fn test_missing_cert_slots_outlive_cancelled_requests() {
         );
         let handler = RequestHandler::new(primary.consensus_config(), cb.clone(), synchronizer);
         let member = |i: usize| fixture.authorities().nth(i).unwrap().primary_public_key();
-        let outsider = || {
-            *BlsKeypair::generate(&mut <rand::rngs::StdRng as rand::SeedableRng>::from_os_rng())
-                .public()
-        };
+        let outsider = || *BlsKeypair::generate(&mut StdRng::from_os_rng()).public();
 
         // Keep the only blocking thread busy.
         let (release, hold) = std::sync::mpsc::channel::<()>();
@@ -992,6 +999,11 @@ fn test_missing_cert_slots_outlive_cancelled_requests() {
         }
         let next = start_then_cancel(&handler, busy_member).await;
         assert!(matches!(next, Some(Err(PrimaryNetworkError::Busy))), "got {next:?}");
+
+        // A busy answer carries no penalty.
+        assert!(
+            Option::<rayls_consensus_network::Penalty>::from(&PrimaryNetworkError::Busy).is_none()
+        );
 
         // Another member has its own slots.
         assert!(start_then_cancel(&handler, member(2)).await.is_none());
@@ -1021,4 +1033,26 @@ fn test_missing_cert_slots_outlive_cancelled_requests() {
         .expect("slots freed after the jobs ran");
         assert!(matches!(freed, Ok(PrimaryResponse::RequestedCertificates(_))), "got {freed:?}");
     });
+}
+
+/// The slot pool of a peer that left the committee is kept while its job runs, then dropped.
+#[test]
+fn test_missing_cert_limits_forget_former_members() {
+    use crate::network::handler::MissingCertLimits;
+
+    let old = CommitteeFixture::builder(MemDatabase::default).build();
+    let new = CommitteeFixture::builder(MemDatabase::default).build();
+    let former = old.authorities().next().unwrap().primary_public_key();
+    let current = new.authorities().next().unwrap().primary_public_key();
+    let limits = MissingCertLimits::new();
+
+    // A former member's running job keeps its pool.
+    let job = limits.acquire(former, &old.committee()).expect("job in the old committee");
+    limits.acquire(current, &new.committee()).expect("job in the new committee");
+    assert_eq!(limits.tracked_peers(), 2);
+
+    // Once the job ends, the next request drops that pool.
+    drop(job);
+    limits.acquire(current, &new.committee()).expect("job in the new committee");
+    assert_eq!(limits.tracked_peers(), 1);
 }

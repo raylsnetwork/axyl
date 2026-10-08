@@ -113,17 +113,6 @@ where
                 continue;
             }
 
-            // validate skip rounds count
-            if rounds.len()
-                > config.network_config().sync_config().max_skip_rounds_for_missing_certs
-            {
-                warn!(target: "cert-collector", "{} has sent {} rounds to skip", origin, rounds.len());
-
-                return Err(PrimaryNetworkError::InvalidRequest(
-                    "Request for rounds out of bounds".into(),
-                ));
-            }
-
             if let Some(next_round) = Self::find_next_round(
                 config.node_storage(),
                 origin,
