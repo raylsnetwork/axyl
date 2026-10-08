@@ -225,3 +225,99 @@ async fn test_malicious_prefix_deceives_peer_to_read_message_and_fails() {
     let res = honest_peer.read_response(&protocol, &mut encoded.as_ref()).await;
     assert!(res.is_err());
 }
+
+/// The default maximum message size a node accepts, taken from the network config rather than
+/// hard-coded. A request may declare up to this many bytes, so the codec is built with this limit.
+fn max_message_size() -> usize {
+    rayls_infrastructure_config::LibP2pConfig::default().max_rpc_message_size
+}
+
+/// How long to let a stalled read run before checking the codec's memory. The body never arrives,
+/// so the read stays blocked the whole time. This is far longer than a healthy local read needs.
+const STALLED_READ_WAIT: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// A 4-byte little-endian prefix that declares a message of `size` bytes.
+fn size_prefix(size: usize) -> [u8; 4] {
+    (size as u32).to_le_bytes()
+}
+
+/// Total memory reserved by the codec buffers.
+fn reserved_bytes(codec: &RLCodec<TestPrimaryRequest, TestPrimaryResponse>) -> usize {
+    codec.decode_buffer.capacity() + codec.compressed_buffer.capacity()
+}
+
+/// A stream that sends a length prefix and then never sends anything else.
+struct StalledStream {
+    prefix: [u8; 4],
+    sent: usize,
+}
+
+impl futures::AsyncRead for StalledStream {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+        buf: &mut [u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        if self.sent >= self.prefix.len() {
+            // The peer stops sending, so the read waits forever.
+            return std::task::Poll::Pending;
+        }
+        let n = buf.len().min(self.prefix.len() - self.sent);
+        let start = self.sent;
+        buf[..n].copy_from_slice(&self.prefix[start..start + n]);
+        self.sent += n;
+        std::task::Poll::Ready(Ok(n))
+    }
+}
+
+// A correct codec grows its buffer as bytes arrive, so for a request with no body it holds almost
+// nothing. Half the declared size is a generous ceiling: it still fails the current code, which
+// reserves the full declared size up front, yet passes once the buffer grows only as bytes arrive.
+#[tokio::test]
+async fn test_prefix_only_request_does_not_reserve_declared_size() {
+    let protocol = StreamProtocol::new("/rayls-test");
+    let max_size = max_message_size();
+    let codec = RLCodec::<TestPrimaryRequest, TestPrimaryResponse>::new(max_size);
+    // libp2p clones the codec for every inbound stream.
+    let mut stream_codec = codec.clone();
+    assert!(reserved_bytes(&stream_codec) < max_size / 2);
+
+    // The peer declares a full-size message, sends no body, and closes the stream.
+    let prefix = size_prefix(max_size);
+    let res = stream_codec.read_request(&protocol, &mut prefix.as_ref()).await;
+    assert!(res.is_err());
+
+    // The codec must not reserve memory for bytes that never arrived.
+    let reserved = reserved_bytes(&stream_codec);
+    assert!(
+        reserved < max_size / 2,
+        "codec reserved {reserved} bytes for a request with no body"
+    );
+}
+
+#[tokio::test]
+async fn test_stalled_request_does_not_hold_declared_size() {
+    let protocol = StreamProtocol::new("/rayls-test");
+    let max_size = max_message_size();
+    let codec = RLCodec::<TestPrimaryRequest, TestPrimaryResponse>::new(max_size);
+    // libp2p clones the codec for every inbound stream.
+    let mut stream_codec = codec.clone();
+    assert!(reserved_bytes(&stream_codec) < max_size / 2);
+
+    // The peer declares a full-size message and then stops sending.
+    let mut stream = StalledStream { prefix: size_prefix(max_size), sent: 0 };
+    let res = tokio::time::timeout(
+        STALLED_READ_WAIT,
+        stream_codec.read_request(&protocol, &mut stream),
+    )
+    .await;
+    assert!(res.is_err(), "read should still be waiting for the body");
+    assert_eq!(stream.sent, 4, "the prefix should have been read");
+
+    // While the peer stalls, the codec must not hold memory for the declared size.
+    let reserved = reserved_bytes(&stream_codec);
+    assert!(
+        reserved < max_size / 2,
+        "codec held {reserved} bytes while waiting for a body that never came"
+    );
+}
