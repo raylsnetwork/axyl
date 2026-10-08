@@ -161,7 +161,7 @@ where
                 // dial them as if they were peers. Those nodes then penalize/ban the relay for not
                 // speaking consensus protocols -- and on a shared IP (local testnet, everything on
                 // 127.0.0.1) an IP-level ban then knocks out every real peer behind that IP.
-                if self.swarm.behaviour().peer_manager.is_relay(&peer_id) {
+                if self.swarm.behaviour().peer_manager.is_relay_hop_candidate(&peer_id) {
                     debug!(target: "network-kad", ?peer_id, "skipping kad add/publish for relay peer");
                 } else {
                     // A relayed inbound connection's send-back address is a bare `/p2p/<src>` with
