@@ -51,6 +51,10 @@ fn parses_every_subcommand() {
         cli.command,
         Command::GetTx { hash, epoch: Some(4), .. } if hash == B256::repeat_byte(0xab)
     ));
+    assert!(matches!(
+        Cli::try_parse_from(["x", "participation", "4", "-d", "a"]).unwrap().command,
+        Command::Participation { epoch: 4, .. }
+    ));
     let cli = Cli::try_parse_from(["x", "summary", "--recover", "-d", "a"]).unwrap();
     assert!(cli.recover);
     assert!(matches!(cli.command, Command::Summary { .. }));
@@ -124,5 +128,5 @@ fn help_renders_for_every_subcommand() {
             assert!(!nested.render_long_help().to_string().trim().is_empty());
         }
     }
-    assert_eq!(seen, 9);
+    assert_eq!(seen, 10);
 }

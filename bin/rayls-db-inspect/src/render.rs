@@ -7,6 +7,7 @@ use crate::{
         batch::{describe_absent_batch, BatchReport, CommitPath, TxReport},
         epoch::{describe_position, EpochCheckReport, EpochReport, EpochStatus, EpochsReport},
         header::{describe_absent, CertReport, HeaderCheckReport, HeaderReport, SignatureCheck},
+        participation::{EpochState, ParticipationReport},
         summary::SummaryReport,
         Report,
     },
@@ -94,6 +95,7 @@ pub fn render(report: &Report) -> String {
         Report::GetBatch(r) => render_batch(r, &mut out),
         Report::GetTx(r) => render_tx(r, &mut out),
         Report::HeaderCheck(r) => render_header_check(r, &mut out),
+        Report::Participation(r) => render_participation(r, &mut out),
         Report::Summary(r) => render_summary(r, &mut out),
     }
     if let Some(v) = report.verdict() {
@@ -787,6 +789,164 @@ fn render_header_check(r: &HeaderCheckReport, out: &mut String) {
                 u.epoch
             );
         }
+    }
+}
+
+fn render_participation(r: &ParticipationReport, out: &mut String) {
+    let _ = writeln!(out, "participation in epoch {}", r.epoch);
+    let mut t = Table::new(&[
+        "node",
+        "state",
+        "headers",
+        "numbers",
+        "tier",
+        "rounds",
+        "certs",
+        "batches",
+        "sigs",
+        "committee",
+    ]);
+    for n in &r.nodes {
+        if n.state == EpochState::NotReached {
+            t.row(vec![n.node.clone(), format!("not reached ({})", describe_position(n.position))]);
+            continue;
+        }
+        let range = |a: Option<u64>, b: Option<u64>| match (a, b) {
+            (Some(a), Some(b)) => format!("{a}..={b}"),
+            _ => "-".to_owned(),
+        };
+        let tier = match (n.hot, n.cold) {
+            (0, 0) => "-".to_owned(),
+            (hot, 0) => format!("{hot} hot"),
+            (0, cold) => format!("{cold} cold"),
+            (hot, cold) => format!("{hot} hot, {cold} cold"),
+        };
+        t.row(vec![
+            n.node.clone(),
+            n.state.to_string(),
+            n.headers.to_string(),
+            range(n.first_header, n.last_header),
+            tier,
+            range(n.first_round.map(u64::from), n.last_round.map(u64::from)),
+            n.totals.certs.to_string(),
+            n.totals.batches.to_string(),
+            n.totals.signatures.to_string(),
+            match (n.committee_size, n.committee_from) {
+                (Some(size), Some(from)) => format!("{size} ({from})"),
+                _ => "none".to_owned(),
+            },
+        ]);
+    }
+    out.push_str(&t.render());
+    for n in &r.nodes {
+        if n.state == EpochState::NotReached {
+            continue;
+        }
+        let _ = writeln!(out, "\n[{}]", n.node);
+        if !n.genesis_headers.is_empty() {
+            section(
+                out,
+                "genesis",
+                format!(
+                    "{} with leader round 0, not tallied: {}",
+                    plural(n.genesis_headers.len(), "header"),
+                    list(&n.genesis_headers)
+                ),
+            );
+        }
+        if !n.cached_not_tallied.is_empty() {
+            section(
+                out,
+                "cached",
+                format!(
+                    "{} not processed, not tallied: {}",
+                    plural(n.cached_not_tallied.len(), "header"),
+                    list(&n.cached_not_tallied)
+                ),
+            );
+        }
+        match (n.boundary_header, n.boundary_round) {
+            (Some(h), Some(r)) => section(
+                out,
+                "boundary",
+                format!("header {h} (round {r}), the epoch's last header per its record"),
+            ),
+            _ if n.state == EpochState::Closed => section(
+                out,
+                "boundary",
+                "unresolved (no record for the epoch here), every stored header is tallied",
+            ),
+            _ => {}
+        }
+        if !n.after_boundary.is_empty() {
+            section(
+                out,
+                "beyond",
+                format!(
+                    "{} past the boundary round, not tallied: {}",
+                    plural(n.after_boundary.len(), "header"),
+                    list(&n.after_boundary)
+                ),
+            );
+        }
+        match (n.committee_size, n.committee_from) {
+            (Some(size), Some(from)) => {
+                section(out, "committee", format!("{size} keys from {from}"))
+            }
+            _ => section(out, "committee", "none, signed column unavailable"),
+        }
+        let outsiders = n.authorities.iter().filter(|a| a.committee_index.is_none()).count();
+        let authors = if n.committee_size.is_some() && outsiders > 0 {
+            format!("{} seen, {outsiders} outside the committee", n.totals.authors)
+        } else {
+            format!("{} seen", n.totals.authors)
+        };
+        section(out, "authors", authors);
+        if n.unknown_signers > 0 {
+            section(
+                out,
+                "unknown sig",
+                format!("{} signer bits beyond the committee", n.unknown_signers),
+            );
+        }
+        let mut t = Table::new(&[
+            "authority",
+            "committee",
+            "participation",
+            "anchor",
+            "share",
+            "certs",
+            "batches",
+            "signed",
+        ]);
+        for a in &n.authorities {
+            t.row(vec![
+                a.authority.clone(),
+                a.committee_index.map_or_else(|| "NO".to_owned(), |i| format!("#{i}")),
+                a.tally.participation_rounds.to_string(),
+                a.tally.anchor_rounds.to_string(),
+                a.tally.participation_bps.map_or_else(|| "-".to_owned(), bps),
+                a.tally.certs.to_string(),
+                a.tally.batches.to_string(),
+                opt(&a.tally.signed),
+            ]);
+        }
+        for line in t.render().lines() {
+            let _ = writeln!(out, "  {line}");
+        }
+    }
+}
+
+/// Basis points as a percentage with two decimals: `10000` is `100.00%`.
+fn bps(bps: u64) -> String {
+    format!("{}.{:02}%", bps / 100, bps % 100)
+}
+
+fn plural(n: usize, noun: &str) -> String {
+    if n == 1 {
+        format!("{n} {noun}")
+    } else {
+        format!("{n} {noun}s")
     }
 }
 

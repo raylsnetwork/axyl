@@ -84,6 +84,9 @@ pub fn run(cli: &Cli) -> eyre::Result<Report> {
         Command::HeaderCheck { number, back, .. } => {
             Report::HeaderCheck(report::header::header_check(&open_all()?, *number, *back)?)
         }
+        Command::Participation { epoch, .. } => {
+            Report::Participation(report::participation::participation(&open_all()?, *epoch)?)
+        }
         Command::Summary { .. } => Report::Summary(report::summary::summary(&open_all()?)?),
     })
 }

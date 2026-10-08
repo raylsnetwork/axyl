@@ -156,6 +156,67 @@ impl Fixture {
         }
     }
 
+    /// A certificate authored by fixture authority `author` at `round`, carrying `batches` and
+    /// signed by `signers` (fixture indices; the quorum check needs at least three of the four).
+    pub fn certificate_by(
+        &self,
+        author: usize,
+        round: u32,
+        batches: &[BlockHash],
+        signers: &[usize],
+    ) -> Certificate {
+        let committee = self.committee.committee();
+        let authorities = self.authorities();
+        let payload: IndexMap<BlockHash, WorkerId> = batches.iter().map(|d| (*d, 0)).collect();
+        let header =
+            authorities[author].header_builder(&committee).payload(payload).round(round).build();
+        let votes = signers
+            .iter()
+            .map(|i| {
+                let v = authorities[*i].vote(&header);
+                (v.author().clone(), *v.signature())
+            })
+            .collect();
+        Certificate::new_unverified(&committee, header, votes).unwrap()
+    }
+
+    /// A consensus header at `number` committing `certificates` under `leader`, as consensus
+    /// stores one commit. Put the leader in `certificates` too to mirror a real commit.
+    pub fn header_with_subdag(
+        &self,
+        number: u64,
+        parent_hash: B256,
+        certificates: Vec<Certificate>,
+        leader: Certificate,
+    ) -> ConsensusHeader {
+        let sub_dag =
+            CommittedSubDag::new(certificates, leader, number, ReputationScores::default(), None);
+        ConsensusHeader { parent_hash, sub_dag, number, extra: B256::default() }
+    }
+
+    /// The unsigned genesis certificate of fixture authority `i`: leader round 0, no signers.
+    pub fn genesis_certificate(&self, i: usize) -> Certificate {
+        let committee = self.committee.committee();
+        let id = self.authorities()[i].id();
+        Certificate::genesis(&committee)
+            .into_iter()
+            .find(|c| c.origin() == &id)
+            .expect("every authority has a genesis certificate")
+    }
+
+    /// Position of fixture authority `i` in the sorted committee an `EpochRecord` stores, which
+    /// is also the index its signer bit uses. The fixture iterates authorities by identifier,
+    /// not by sorted key, so the two orders differ.
+    pub fn committee_index(&self, i: usize) -> usize {
+        let key = self.authorities()[i].primary_public_key();
+        self.keys().iter().position(|k| *k == key).expect("fixture authority in committee")
+    }
+
+    /// Hex of fixture authority `i`'s identifier, as the reports print it.
+    pub fn authority_hex(&self, i: usize) -> String {
+        rayls_db_inspect::view::authority(&self.authorities()[i].id())
+    }
+
     /// Two leader certificates for the same DAG header signed by different quorums: identical
     /// digests, different signer sets.
     pub fn forked_leaders(&self, round: u32) -> (Certificate, Certificate) {

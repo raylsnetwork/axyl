@@ -24,7 +24,7 @@ use rayls_infrastructure_types::{
 };
 use serde::Serialize;
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap},
     path::{Path, PathBuf},
 };
 
@@ -131,6 +131,15 @@ impl std::fmt::Display for ScanStats {
             if self.cold_epochs == 1 { "epoch" } else { "epochs" }
         )
     }
+}
+
+/// The consensus header numbers a node holds for one epoch, by what they mean to the node.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct EpochHeaders {
+    /// Processed headers: the hot table and the cold archive.
+    pub canonical: BTreeSet<u64>,
+    /// Verified-but-unprocessed cache rows with no canonical copy.
+    pub cache_only: BTreeSet<u64>,
 }
 
 /// Outcome of looking a batch up by digest.
@@ -682,6 +691,53 @@ impl NodeDb {
             }
         }
         Ok(None)
+    }
+
+    /// Every consensus header number whose leader is in `epoch`, by tier: the hot table and the
+    /// cold archive are canonical, cache rows without a canonical copy are listed apart. Hot and
+    /// cache rows are projected (leader epoch only), never decoded; the cold tier answers from
+    /// its per-epoch jar index. The hot walk holds one read transaction, newest row first, and
+    /// stops once the leaders are from an earlier epoch.
+    ///
+    /// Numbers only: the headers themselves are read afterwards through [`Self::header`], one
+    /// short transaction each, so the full decode never runs inside the walk's transaction.
+    pub fn epoch_header_numbers(&self, epoch: Epoch) -> eyre::Result<EpochHeaders> {
+        let mut found = EpochHeaders::default();
+        let project = |number: u64, bytes: &[u8]| -> eyre::Result<Epoch> {
+            Ok(ConsensusHeaderMeta::from_bytes(bytes)
+                .map_err(|e| eyre!("{}: project consensus header {number}: {e}", self.label))?
+                .leader_epoch)
+        };
+        if self.table_present::<ConsensusBlocks>()? {
+            for (key, value) in self.db.reverse_raw_iter::<ConsensusBlocks>() {
+                let number = try_decode_key::<u64>(&key)
+                    .map_err(|e| eyre!("{}: decode a consensus header key: {e}", self.label))?;
+                let leader_epoch = project(number, &value)?;
+                if leader_epoch > epoch {
+                    continue;
+                }
+                if leader_epoch < epoch {
+                    break;
+                }
+                found.canonical.insert(number);
+            }
+        }
+        if let Some(cold) = self.cold() {
+            if let Some(range) = cold.consensus_blocks().key_range_for_epoch(epoch) {
+                found.canonical.extend(range);
+            }
+        }
+        if self.table_present::<ConsensusBlocksCache>()? {
+            for (key, value) in self.db.raw_iter::<ConsensusBlocksCache>() {
+                let number = try_decode_key::<u64>(&key).map_err(|e| {
+                    eyre!("{}: decode a cached consensus header key: {e}", self.label)
+                })?;
+                if project(number, &value)? == epoch && !found.canonical.contains(&number) {
+                    found.cache_only.insert(number);
+                }
+            }
+        }
+        Ok(found)
     }
 
     /// Last fully archived epoch, if the cold tier has committed one.

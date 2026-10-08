@@ -229,8 +229,8 @@ has the same active forks as mainnet.
 
 The remaining forks (`Eip1559`, `BatchDigestV2`, `PrecompileGasFix`,
 `TransactionLoadBalancing`, `EmptyOutputBlock`, `DynamicCommitteeSizing`,
-`OutputSeqNormalization`, `SenderAffinityLoadBalancing`) are behavior switches. `0` is safe
-for them.
+`OutputSeqNormalization`, `SenderAffinityLoadBalancing`, `EpochCloseSeedV2`) are behavior
+switches. `0` is safe for them.
 
 ### Template vs. the baked-in `local` schedule
 

@@ -518,3 +518,74 @@ async fn test_too_new_window_slides_and_triggers_ancestor_fetch() -> eyre::Resul
 
     Ok(())
 }
+
+/// Restart with a complete round followed by a partial round: the recovery flow must
+/// report only the parents of the last complete round to the proposer.
+#[tokio::test]
+async fn test_restart_with_partial_round_reports_last_complete_round() -> eyre::Result<()> {
+    let TestTypes { validator, manager, fixture, task_manager, .. } = create_all_test_types();
+    // test types uses last authority for config
+    let primary = fixture.authorities().last().unwrap();
+    let certificate_store = primary.consensus_config().node_storage().clone();
+
+    // spawn manager task
+    task_manager.spawn_critical_task("manager", manager.run());
+
+    let committee = fixture.committee();
+    let genesis =
+        Certificate::genesis(&committee).iter().map(|x| x.digest()).collect::<BTreeSet<_>>();
+    let keys: Vec<_> =
+        fixture.authorities().map(|a| (a.id(), a.keypair().copy())).take(3).collect::<Vec<_>>();
+    let (all_certificates, _next_parents) =
+        make_optimal_signed_certificates(1..=2, &genesis, &committee, &keys);
+    let all_certificates: Vec<_> = all_certificates.into_iter().collect();
+    let round_1_certificates = all_certificates[0..3].to_vec();
+    let round_2_certificates = all_certificates[3..5].to_vec();
+
+    // round 2 arrives before its parents exist -> pends
+    for cert in &round_2_certificates {
+        let err = validator.process_peer_certificate(cert.clone()).await;
+        assert_matches!(err, Err(CertManagerError::Pending(_)));
+    }
+    // round 1 reaches quorum and is accepted, unlocking the pending round 2 certs
+    for cert in &round_1_certificates {
+        validator.process_peer_certificate(cert.clone()).await?;
+    }
+
+    // wait for the last round 2 cert to be persisted before the crash
+    let last_round_2_digest = round_2_certificates.last().expect("round 2 has certs").digest();
+    timeout(Duration::from_secs(3), certificate_store.notify_read(last_round_2_digest)).await??;
+
+    // crash
+    task_manager.abort();
+
+    // recover - round 2 is in the store but below quorum (2/4); recovery reports
+    // only the parents of the last round with a full quorum (round 1).
+    let (recovered_manager, _validator, cb, task_manager) =
+        create_core_test_types_with_tasks(primary, task_manager);
+    task_manager.spawn_critical_task("recovered manager", recovered_manager.run());
+
+    let mut rx_parents = cb.parents().subscribe();
+
+    // skip all round-0 emissions from the recovery flow
+    let received = timeout(Duration::from_secs(3), async {
+        loop {
+            let msg = rx_parents
+                .recv()
+                .await
+                .expect("parents channel closed before a round >= 1 emission");
+            if msg.1 >= 1 {
+                break msg;
+            }
+        }
+    })
+    .await?;
+
+    assert_eq!(received.1, 1);
+    assert_eq!(received.0.len(), round_1_certificates.len());
+    for cert in &round_1_certificates {
+        assert!(received.0.contains(cert));
+    }
+
+    Ok(())
+}
