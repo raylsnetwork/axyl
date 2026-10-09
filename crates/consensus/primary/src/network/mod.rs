@@ -44,6 +44,10 @@ pub mod state;
 #[path = "../tests/network_tests.rs"]
 mod network_tests;
 
+#[cfg(all(test, unix))]
+#[path = "../tests/vote_durability_tests.rs"]
+mod vote_durability_tests;
+
 /// Convenience type for Primary network.
 pub(crate) type Req = PrimaryRequest;
 /// Convenience type for Primary network.

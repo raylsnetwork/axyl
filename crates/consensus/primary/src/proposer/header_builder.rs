@@ -162,6 +162,13 @@ impl<DB: Database> Proposer<DB> {
         reason: &str,
     ) -> ProposerResult<()> {
         // Store the last header.
+        // Repro hook: stall persistence so this header is lost if the node is killed now.
+        // Armed either by env at start, or in place by creating the per-node control file.
+        if std::env::var("RL_REPRO_STALL").as_deref() == Ok("header")
+            || std::env::var("RL_REPRO_STALL_HEADER_FILE").is_ok_and(|f| std::path::Path::new(&f).exists())
+        {
+            rayls_infrastructure_storage::repro::arm_skip_next_write("header");
+        }
         proposer_store
             .write_last_proposed(header)
             .map_err(|e| ProposerError::StoreError(e.to_string()))?;

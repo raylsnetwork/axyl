@@ -28,6 +28,7 @@ pub mod layered_db;
 #[cfg(feature = "reth-libmdbx")]
 pub mod mdbx;
 pub mod mem_db;
+pub mod repro;
 pub mod redb;
 
 pub use rayls_infrastructure_types::{error::StoreError, ReadTimeout};

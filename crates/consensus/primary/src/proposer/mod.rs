@@ -60,6 +60,10 @@ mod types;
 #[path = "../tests/proposer_tests.rs"]
 mod proposer_tests;
 
+#[cfg(all(test, unix))]
+#[path = "../tests/proposer_durability_tests.rs"]
+mod proposer_durability_tests;
+
 pub(crate) use types::OurDigestMessage;
 
 /// The proposer creates new headers and send them to the core for broadcasting and further

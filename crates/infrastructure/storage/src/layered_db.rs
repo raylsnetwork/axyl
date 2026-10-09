@@ -1347,6 +1347,10 @@ impl<DB: Database> Database for LayeredDatabase<DB> {
         if let Some(e) = poisoned_error(self.tx.fatal()) {
             return Err(e);
         }
+        // Repro hook: keep this one write in memory only, so it is lost on the next restart.
+        if crate::repro::take_skip_next_write() {
+            return self.mem_db.insert_queued::<T>(key, value, || Ok(()));
+        }
         // The mem mutation, the in-flight increment and the enqueue share one critical section:
         // channel order equals mem order, so a zero in-flight count is a sound "no queued ops".
         self.mem_db.insert_queued::<T>(key, value, || {

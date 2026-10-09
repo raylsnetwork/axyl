@@ -19,6 +19,14 @@ pub use state_sync::StateSynchronizer;
 #[path = "tests/certificate_tests.rs"]
 mod certificate_tests;
 
+#[cfg(all(test, unix))]
+#[path = "tests/crash_test_utils.rs"]
+mod crash_test_utils;
+
+#[cfg(all(test, unix))]
+#[path = "tests/cert_durability_tests.rs"]
+mod cert_durability_tests;
+
 pub use crate::primary::Primary;
 
 mod consensus_bus;

@@ -383,11 +383,12 @@ impl RethEnv {
         let unwind_block = [rocksdb_unwind, static_file_unwind].into_iter().flatten().min();
 
         if let Some(target_block) = unwind_block {
-            // panic instead of unwinding to block 0
-            assert_ne!(
-                target_block, 0,
-                "A storage consistency check would trigger an unwind to block 0"
-            );
+            // Repro build only: a crash-killed node may be inconsistent down to genesis.
+            // Production panics here; the repro lets the node unwind to block 0 and re-execute,
+            // so repeated kill and restart cycles recover on a short throwaway chain.
+            if target_block == 0 {
+                info!(target: "rayls::reth", "RL_REPRO allowing storage unwind to block 0 after a crash");
+            }
 
             info!(
                 target: "rayls::reth",

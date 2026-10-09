@@ -687,6 +687,13 @@ where
 
         let vote = Vote::new(&header, authority_id, self.consensus_config.key_config());
 
+        // Repro hook: stall persistence so this vote is lost if the node is killed now.
+        // Armed either by env at start, or in place by creating the per-node control file.
+        if std::env::var("RL_REPRO_STALL").as_deref() == Ok("vote")
+            || std::env::var("RL_REPRO_STALL_VOTE_FILE").is_ok_and(|f| std::path::Path::new(&f).exists())
+        {
+            rayls_infrastructure_storage::repro::arm_skip_next_write("vote");
+        }
         self.consensus_config.node_storage().write_vote(&vote)?;
 
         self.consensus_config

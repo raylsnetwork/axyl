@@ -156,6 +156,23 @@ impl<DB: Database> CertificateStore for DB {
     /// In the end it notifies any subscribers that are waiting to hear for the
     /// value.
     fn write_all(&self, certificates: impl IntoIterator<Item = Certificate>) -> StoreResult<()> {
+        // Repro hook: keep these certificates in memory only, so a crash loses them, the same
+        // durability gap as votes and headers. Subscribers and the in-session guard still see them.
+        if crate::repro::should_skip_cert() {
+            for certificate in certificates {
+                let id = certificate.digest();
+                let rkey = (certificate.round(), certificate.origin().clone());
+                let okey = (certificate.origin().clone(), certificate.round());
+                crate::repro::arm_skip_next_write("cert");
+                self.insert::<Certificates>(&id, &certificate)?;
+                crate::repro::arm_skip_next_write("cert");
+                self.insert::<CertificateDigestByRound>(&rkey, &id)?;
+                crate::repro::arm_skip_next_write("cert");
+                self.insert::<CertificateDigestByOrigin>(&okey, &id)?;
+                NOTIFY_SUBSCRIBERS.notify(&id, &certificate);
+            }
+            return Ok(());
+        }
         self.with_write_txn(|txn| {
             for certificate in certificates {
                 let digest = certificate.digest();
