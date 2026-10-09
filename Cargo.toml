@@ -78,6 +78,8 @@ unreachable_pub = "warn"
 unused_crate_dependencies = "warn"
 unused_must_use = "deny"
 rust_2018_idioms = { level = "deny", priority = -1 } # includes unused_crate_dependencies
+# `--cfg tokio_unstable` builds unlock the extra tokio runtime metrics (see task_metrics.rs)
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(tokio_unstable)'] }
 
 [workspace.lints.rustdoc]
 all = "warn"
@@ -93,6 +95,8 @@ tracing = { version = "0.1.0", features = ["release_max_level_debug"] }
 tracing-appender = "0.2"
 tracing-subscriber = "0.3.20"
 metrics = "0.24"                                       # MUST match the version reth's prometheus recorder registers against, or gauge!/counter! bind to a second global and become no-ops
+# runtime/task poll-time + scheduling-delay metrics, reported through the `metrics` recorder above
+tokio-metrics = { version = "0.5.2", default-features = false, features = ["rt", "metrics-rs-integration"] }
 serde_json = "1.0.94"
 humantime-serde = "1.1"
 fdlimit = "0.3.0"

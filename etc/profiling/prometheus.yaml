@@ -1,0 +1,30 @@
+# Scrapes the four validators of etc/docker-network on the shared `validators` network.
+# 5s matches the `--tokio-metrics 5s` sampling interval set in compose.yaml.
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+
+scrape_configs:
+  # reth execution-layer endpoint: reth_* metrics plus reth_tokio_* / reth_tokio_task_*
+  - job_name: rayls-reth
+    static_configs:
+      - targets: ["10.10.0.21:9001"]
+        labels: { validator: validator1 }
+      - targets: ["10.10.0.22:9001"]
+        labels: { validator: validator2 }
+      - targets: ["10.10.0.23:9001"]
+        labels: { validator: validator3 }
+      - targets: ["10.10.0.24:9001"]
+        labels: { validator: validator4 }
+
+  # consensus (Narwhal) endpoint
+  - job_name: rayls-consensus
+    static_configs:
+      - targets: ["10.10.0.21:9101"]
+        labels: { validator: validator1 }
+      - targets: ["10.10.0.22:9101"]
+        labels: { validator: validator2 }
+      - targets: ["10.10.0.23:9101"]
+        labels: { validator: validator3 }
+      - targets: ["10.10.0.24:9101"]
+        labels: { validator: validator4 }
