@@ -1,8 +1,12 @@
 //! Certificate fetcher tests
 
 use crate::{
-    certificate_fetcher::CertificateFetcher,
-    error::CertManagerError,
+    certificate_fetcher::{
+        CertificateFetcher, STALE_SKIP_ROUNDS_CATCHUP_THRESHOLD,
+        STALE_SKIP_ROUNDS_FALLBACK_THRESHOLD,
+    },
+    consensus_bus::NodeMode,
+    error::{CertManagerError, PrimaryNetworkError},
     network::{PrimaryRequest, PrimaryResponse},
     state_sync::StateSynchronizer,
     ConsensusBus,
@@ -19,6 +23,11 @@ use tokio::{
     sync::mpsc::{self, error::TryRecvError},
     time::sleep,
 };
+
+/// Most skip rounds a request may carry per authority, as configured by default.
+fn max_skip_rounds() -> usize {
+    rayls_infrastructure_config::SyncConfig::default().max_skip_rounds_for_missing_certs
+}
 
 async fn verify_certificates_in_store<DB: CertificateStore>(
     certificate_store: &DB,
@@ -161,7 +170,7 @@ async fn fetch_certificates_basic() {
         reply,
     }) = fake_receiver.recv().await
     {
-        let (lower_bound, skip_rounds) = inner.get_bounds().unwrap();
+        let (lower_bound, skip_rounds) = inner.get_bounds(max_skip_rounds()).unwrap();
         // Every authority has a contiguous prefix up through round 1, so the fetcher
         // tightens exclusive_lower_bound to 1 and prunes the now-redundant skip entries.
         assert_eq!(lower_bound, 1);
@@ -200,7 +209,7 @@ async fn fetch_certificates_basic() {
                 request: PrimaryRequest::MissingCertificates { inner },
                 reply,
             }) => {
-                let (lower_bound, skip_rounds) = inner.get_bounds().unwrap();
+                let (lower_bound, skip_rounds) = inner.get_bounds(max_skip_rounds()).unwrap();
                 if lower_bound < 16 {
                     // Drain the fetch requests sent out before the fetcher finished processing
                     // the first batch (their tightened lower_bound is still below round 16).
@@ -260,7 +269,7 @@ async fn fetch_certificates_basic() {
                 request: PrimaryRequest::MissingCertificates { inner },
                 reply,
             }) => {
-                let (lower_bound, skip_rounds) = inner.get_bounds().unwrap();
+                let (lower_bound, skip_rounds) = inner.get_bounds(max_skip_rounds()).unwrap();
                 let all_empty = skip_rounds.values().all(|r| r.is_empty());
                 if lower_bound < 31 || all_empty {
                     // Drain the fetch requests sent out before the fetcher finished processing
@@ -290,7 +299,7 @@ async fn fetch_certificates_basic() {
         match req {
             NetworkCommand::SendRequest { peer: _, request, reply } => match request {
                 PrimaryRequest::MissingCertificates { inner } => {
-                    let (lower_bound, skip_rounds) = inner.get_bounds().unwrap();
+                    let (lower_bound, skip_rounds) = inner.get_bounds(max_skip_rounds()).unwrap();
                     // All authorities have a contiguous {1..=31} prefix so the tightened
                     // exclusive_lower_bound is 31 and skip_rounds is pruned to empty.
                     assert_eq!(lower_bound, 31);
@@ -339,7 +348,7 @@ async fn fetch_certificates_basic() {
         match req {
             NetworkCommand::SendRequest { peer: _, request, reply } => match request {
                 PrimaryRequest::MissingCertificates { inner } => {
-                    let (lower_bound, skip_rounds) = inner.get_bounds().unwrap();
+                    let (lower_bound, skip_rounds) = inner.get_bounds(max_skip_rounds()).unwrap();
                     // All authorities have a contiguous {1..=31} prefix so the tightened
                     // exclusive_lower_bound is 31 and skip_rounds is pruned to empty.
                     assert_eq!(lower_bound, 31);
@@ -381,7 +390,7 @@ async fn fetch_certificates_basic() {
         match req {
             NetworkCommand::SendRequest { peer: _, request, reply } => match request {
                 PrimaryRequest::MissingCertificates { inner } => {
-                    let (lower_bound, skip_rounds) = inner.get_bounds().unwrap();
+                    let (lower_bound, skip_rounds) = inner.get_bounds(max_skip_rounds()).unwrap();
                     // All authorities have a contiguous {1..=31} prefix so the tightened
                     // exclusive_lower_bound is 31 and skip_rounds is pruned to empty.
                     assert_eq!(lower_bound, 31);
@@ -414,4 +423,176 @@ async fn fetch_certificates_basic() {
              * in the range) */
     )
     .await;
+}
+
+/// The highest round the fetcher under test already has from every authority.
+const STORED_ROUND: Round = 1;
+
+/// A certificate fetcher for the first authority, and the requests it sends.
+struct FetcherUnderTest {
+    /// Requests the fetcher sends to peers.
+    requests: mpsc::Receiver<NetworkCommand<PrimaryRequest, PrimaryResponse>>,
+    /// Keeps the fetcher's tasks running.
+    _task_manager: TaskManager,
+}
+
+impl FetcherUnderTest {
+    /// Start a fetcher that has round [STORED_ROUND] from every authority, plus `extra`.
+    ///
+    /// It then receives a certificate whose parents it lacks, so it starts fetching.
+    async fn start(
+        fixture: &CommitteeFixture<MemDatabase>,
+        extra: Vec<Certificate>,
+        mode: NodeMode,
+    ) -> Self {
+        // Rounds of certificates to build, so the trigger is missing its parents.
+        const ROUNDS: Round = 3;
+
+        let primary = fixture.authorities().next().unwrap();
+        let store = primary.consensus_config().node_storage().clone();
+        let cb = ConsensusBus::new();
+        cb.node_mode().send_replace(mode);
+        let task_manager = TaskManager::default();
+        let synchronizer = StateSynchronizer::new(
+            primary.consensus_config(),
+            cb.clone(),
+            task_manager.get_spawner(),
+        );
+        synchronizer.spawn(&task_manager);
+        let (sender, requests) = mpsc::channel(1000);
+        let network: NetworkHandle<PrimaryRequest, PrimaryResponse> = NetworkHandle::new(sender);
+        CertificateFetcher::spawn(
+            primary.consensus_config(),
+            network.into(),
+            cb.clone(),
+            synchronizer.clone(),
+            &task_manager,
+        );
+
+        let genesis = Certificate::genesis(&fixture.committee());
+        for cert in &genesis {
+            store.write(cert.clone()).expect("write genesis");
+        }
+        let mut parents: BTreeSet<_> = genesis.iter().map(|cert| cert.digest()).collect();
+        let mut certificates = vec![];
+        for round in 0..ROUNDS {
+            let (_, headers) = fixture.headers_round(round, &parents);
+            for (digest, worker_id) in headers.iter().flat_map(|h| h.payload().iter()) {
+                store.write_payload(digest, worker_id).expect("write payload");
+            }
+            let round_certs: Vec<_> = headers.iter().map(|h| fixture.certificate(h)).collect();
+            parents = round_certs.iter().map(|cert| cert.digest()).collect();
+            certificates.push(round_certs);
+        }
+
+        for mut cert in certificates[0].clone().into_iter().chain(extra) {
+            cert.set_signature_verification_state(SignatureVerificationState::VerifiedDirectly(
+                cert.aggregated_signature().expect("signed certificate"),
+            ));
+            store.write(cert).expect("write certificate");
+        }
+        let trigger = certificates.last().unwrap()[0].clone();
+        let result = synchronizer.process_peer_certificate(trigger).await;
+        assert_matches!(result, Err(CertManagerError::Pending(_)));
+
+        Self { requests, _task_manager: task_manager }
+    }
+
+    /// The next missing-certificates request, with the channel for its answer.
+    async fn next_request(
+        &mut self,
+    ) -> (
+        crate::network::MissingCertificatesRequest,
+        tokio::sync::oneshot::Sender<
+            rayls_consensus_network::types::NetworkResult<PrimaryResponse>,
+        >,
+    ) {
+        loop {
+            match self.requests.recv().await.expect("fetcher still running") {
+                NetworkCommand::SendRequest {
+                    request: PrimaryRequest::MissingCertificates { inner },
+                    reply,
+                    ..
+                } => return (inner, reply),
+                _ => continue,
+            }
+        }
+    }
+}
+
+/// A request names only committee members, even when the store holds other origins.
+///
+/// Peers skip other origins, and a longer list could pass the limit peers enforce.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn fetch_request_names_only_committee_members() {
+    let fixture = CommitteeFixture::builder(MemDatabase::default).randomize_ports(true).build();
+    let outsiders = CommitteeFixture::builder(MemDatabase::default).randomize_ports(true).build();
+    let genesis: BTreeSet<_> =
+        Certificate::genesis(&outsiders.committee()).iter().map(|cert| cert.digest()).collect();
+    let (_, headers) = outsiders.headers_round(0, &genesis);
+    let outsider_cert = outsiders.certificate(&headers[0]);
+
+    let mut fetcher =
+        FetcherUnderTest::start(&fixture, vec![outsider_cert], NodeMode::CvvActive).await;
+    let (request, _reply) = fetcher.next_request().await;
+    let (_, skip_rounds) = request.get_bounds(max_skip_rounds()).unwrap();
+    let committee = fixture.committee();
+    assert_eq!(skip_rounds.len(), committee.size());
+    assert!(skip_rounds.keys().all(|origin| committee.is_authority(origin)));
+}
+
+/// Busy peers are not failures, so the fetcher keeps its skip rounds.
+///
+/// Repeated failures make the fetcher drop its skip rounds and ask for everything.
+/// Doing that because peers are busy would only add to their load.
+/// An active node asks one peer at a time, and a catching-up node asks every peer at once.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn busy_peers_do_not_trigger_the_stale_session_fallback() {
+    let fixture = CommitteeFixture::builder(MemDatabase::default).randomize_ports(true).build();
+    let peers = fixture.committee().size() - 1;
+    // Answer busy for more fetch rounds than the fallback needs, in either node mode.
+    let threshold = STALE_SKIP_ROUNDS_FALLBACK_THRESHOLD.max(STALE_SKIP_ROUNDS_CATCHUP_THRESHOLD);
+    let busy_answers = (threshold as usize + 1) * peers;
+
+    for mode in [NodeMode::CvvActive, NodeMode::CvvInactive] {
+        let mut fetcher = FetcherUnderTest::start(&fixture, vec![], mode).await;
+        for _ in 0..busy_answers {
+            let (request, reply) = fetcher.next_request().await;
+            let (lower_bound, _) = request.get_bounds(max_skip_rounds()).unwrap();
+            assert_eq!(lower_bound, STORED_ROUND, "{mode:?}: busy answers dropped the skip rounds");
+            let _ = reply.send(Ok(PrimaryResponse::into_error_ref(&PrimaryNetworkError::Busy)));
+        }
+    }
+}
+
+/// One busy peer does not hide that the other peers had nothing to send.
+///
+/// Peers that have nothing to send is the case the stale-session fallback is for.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn one_busy_peer_does_not_hide_empty_answers() {
+    let fixture = CommitteeFixture::builder(MemDatabase::default).randomize_ports(true).build();
+    let peers = fixture.committee().size() - 1;
+    let mut fetcher = FetcherUnderTest::start(&fixture, vec![], NodeMode::CvvInactive).await;
+
+    // A catching-up node asks every peer at once, so each fetch round is `peers` requests.
+    // The first peer of each round is busy, and the others have nothing to send.
+    // Nothing is garbage collected in this test, so the fallback asks from round 0.
+    let gc_round = 0;
+    for fetch_round in 0..=STALE_SKIP_ROUNDS_CATCHUP_THRESHOLD {
+        for peer in 0..peers {
+            let (request, reply) = fetcher.next_request().await;
+            let (lower_bound, _) = request.get_bounds(max_skip_rounds()).unwrap();
+            if fetch_round == STALE_SKIP_ROUNDS_CATCHUP_THRESHOLD {
+                assert_eq!(lower_bound, gc_round, "the fallback did not ask for everything");
+                return;
+            }
+            assert_eq!(lower_bound, STORED_ROUND);
+            let answer = if peer == 0 {
+                PrimaryResponse::into_error_ref(&PrimaryNetworkError::Busy)
+            } else {
+                PrimaryResponse::RequestedCertificates(vec![])
+            };
+            let _ = reply.send(Ok(answer));
+        }
+    }
 }

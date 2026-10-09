@@ -35,7 +35,7 @@ fn test_missing_certs_request() {
         .expect("boundary set")
         .set_max_response_size(max);
     let (decoded_gc_round, decoded_skip_rounds) =
-        missing_req.get_bounds().expect("decode missing bounds");
+        missing_req.get_bounds(max_skip_rounds()).expect("decode missing bounds");
     assert_eq!(expected_gc_round, decoded_gc_round);
     assert_eq!(expected_skip_rounds, decoded_skip_rounds);
 }
@@ -49,15 +49,15 @@ fn test_missing_certs_request_rejects_round_overflow() {
     roaring::RoaringBitmap::from_iter([1u32]).serialize_into(&mut serialized).expect("bitmap");
     let request = MissingCertificatesRequest {
         exclusive_lower_bound: u32::MAX,
-        skip_rounds: vec![(AuthorityIdentifier::dummy_for_test(0), serialized)],
+        skip_rounds: [(AuthorityIdentifier::dummy_for_test(0), serialized)].into_iter().collect(),
         max_response_size: 10,
         exclusive_upper_bound: None,
     };
-    assert_matches!(request.get_bounds(), Err(PrimaryNetworkError::StdIo(_)));
+    assert_matches!(request.get_bounds(max_skip_rounds()), Err(PrimaryNetworkError::StdIo(_)));
 
     // the same delta below the edge decodes as before
     let request = MissingCertificatesRequest { exclusive_lower_bound: u32::MAX - 1, ..request };
-    let (_, skip) = request.get_bounds().expect("no overflow");
+    let (_, skip) = request.get_bounds(max_skip_rounds()).expect("no overflow");
     assert_eq!(skip[&AuthorityIdentifier::dummy_for_test(0)], BTreeSet::from([u32::MAX]));
 }
 
@@ -395,4 +395,226 @@ async fn test_primary_batch_gossip_topics() {
     let topic = TopicHash::from_raw(LibP2pConfig::consensus_output_topic());
     let bad_msg = GossipMessage { source: None, data: data.clone(), sequence_number: None, topic };
     assert!(handler.process_gossip(&bad_msg).await.is_err());
+}
+
+/// Most skip rounds a request may carry per authority, as configured by default.
+fn max_skip_rounds() -> usize {
+    rayls_infrastructure_config::SyncConfig::default().max_skip_rounds_for_missing_certs
+}
+
+/// ULEB128 encoding of `value`, as bcs writes a list length.
+fn uleb128(mut value: usize) -> Vec<u8> {
+    let mut out = Vec::new();
+    loop {
+        let byte = (value & 0x7f) as u8;
+        value >>= 7;
+        if value == 0 {
+            out.push(byte);
+            return out;
+        }
+        out.push(byte | 0x80);
+    }
+}
+
+/// Decoding keeps a bounded number of skip-round entries, and counts every authority named.
+///
+/// A long list then reaches the handler, which refuses it with the full count.
+#[test]
+fn test_missing_certs_request_decode_bounds_authority_list() {
+    use super::message::MAX_SKIP_ROUND_AUTHORITIES;
+    use rayls_infrastructure_types::try_decode;
+
+    // The audit's request named this many invented authorities.
+    const AUDIT_AUTHORITIES: usize = 50_000;
+
+    let request = |count: usize| MissingCertificatesRequest {
+        skip_rounds: (0..count)
+            .map(|i| {
+                let mut bytes = [0u8; 32];
+                bytes[..size_of::<u64>()].copy_from_slice(&(i as u64).to_le_bytes());
+                (AuthorityIdentifier::from(bytes), vec![])
+            })
+            .collect(),
+        ..Default::default()
+    };
+    // Decode a request, and return how many entries it kept and how many authorities it named.
+    let decode = |bytes: &[u8]| {
+        let decoded: MissingCertificatesRequest = try_decode(bytes).expect("request decodes");
+        (decoded.skip_rounds.kept(), decoded.skip_rounds.named())
+    };
+
+    let at_limit = encode(&request(MAX_SKIP_ROUND_AUTHORITIES));
+    assert_eq!(decode(&at_limit), (MAX_SKIP_ROUND_AUTHORITIES, MAX_SKIP_ROUND_AUTHORITIES));
+
+    let over = encode(&request(MAX_SKIP_ROUND_AUTHORITIES + 1));
+    assert_eq!(decode(&over), (MAX_SKIP_ROUND_AUTHORITIES, MAX_SKIP_ROUND_AUTHORITIES + 1));
+
+    // The audit's request fits under the message limit, and decoding keeps only the bound.
+    let attack = encode(&request(AUDIT_AUTHORITIES));
+    assert!(attack.len() < LibP2pConfig::default().max_rpc_message_size);
+    assert_eq!(decode(&attack), (MAX_SKIP_ROUND_AUTHORITIES, AUDIT_AUTHORITIES));
+
+    // A list that only declares the largest length bcs accepts is not decoded.
+    let empty = encode(&request(0));
+    // the list length follows the lower bound
+    let at = encode(&request(0).exclusive_lower_bound).len();
+    assert_eq!(empty[at..at + 1], uleb128(0)[..]);
+    let mut declared = empty[..at].to_vec();
+    declared.extend(uleb128(bcs::MAX_SEQUENCE_LENGTH));
+    declared.extend_from_slice(&empty[at + 1..]);
+    assert!(try_decode::<MissingCertificatesRequest>(&declared).is_err());
+}
+
+/// The handler's limit on named authorities never passes what decoding keeps.
+///
+/// Otherwise the handler could accept a list whose extra entries decoding dropped.
+#[test]
+fn test_requested_authorities_stay_within_the_decoding_limit() {
+    use super::{
+        handler::{max_requested_authorities, REQUESTED_AUTHORITIES_PER_MEMBER},
+        message::MAX_SKIP_ROUND_AUTHORITIES,
+    };
+
+    // A committee of this size reaches the decoding limit through the per-member limit.
+    let largest_unclamped = MAX_SKIP_ROUND_AUTHORITIES / REQUESTED_AUTHORITIES_PER_MEMBER;
+    assert_eq!(max_requested_authorities(largest_unclamped), MAX_SKIP_ROUND_AUTHORITIES);
+    assert_eq!(max_requested_authorities(largest_unclamped + 1), MAX_SKIP_ROUND_AUTHORITIES);
+    // An honest request names the whole committee, so committees up to the limit still fit.
+    for size in [1, largest_unclamped, MAX_SKIP_ROUND_AUTHORITIES] {
+        assert!(max_requested_authorities(size) >= size, "a committee of {size} does not fit");
+    }
+}
+
+/// Serialized roaring bitmap made of `containers` full run containers.
+///
+/// Each container holds every value of its 16-bit range, using the portable run-container format.
+/// The roaring crate never writes run containers, so the bytes are built by hand.
+fn full_run_bitmap(containers: u16) -> Vec<u8> {
+    assert!(containers > 0, "a bitmap needs at least one container");
+    // header cookie of a bitmap with run containers
+    const SERIAL_COOKIE: u32 = 12347;
+    // from this many containers on, an offset table follows the descriptions
+    const NO_OFFSET_THRESHOLD: usize = 4;
+    // a container with one run: the run count, the start and the length minus one
+    const ONE_RUN_LEN: usize = 3 * size_of::<u16>();
+
+    let n = containers as usize;
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(
+        &(SERIAL_COOKIE | (u32::from(containers - 1) << u16::BITS)).to_le_bytes(),
+    );
+    // every container is a run container
+    bytes.extend(std::iter::repeat_n(u8::MAX, n.div_ceil(u8::BITS as usize)));
+    for key in 0..containers {
+        // the container key, then its value count minus one
+        bytes.extend_from_slice(&key.to_le_bytes());
+        bytes.extend_from_slice(&u16::MAX.to_le_bytes());
+    }
+    if n >= NO_OFFSET_THRESHOLD {
+        let start = bytes.len() + size_of::<u32>() * n;
+        for i in 0..n {
+            bytes.extend_from_slice(&((start + ONE_RUN_LEN * i) as u32).to_le_bytes());
+        }
+    }
+    for _ in 0..containers {
+        // one run from the first value covering the whole range
+        bytes.extend_from_slice(&1_u16.to_le_bytes());
+        bytes.extend_from_slice(&0_u16.to_le_bytes());
+        bytes.extend_from_slice(&u16::MAX.to_le_bytes());
+    }
+    bytes
+}
+
+/// Serialized roaring bitmap with one run container of `runs` single-value runs in descending
+/// order.
+///
+/// Decoding inserts each run at the front, so the work grows with the square of `runs`.
+fn descending_runs_bitmap(runs: u16) -> Vec<u8> {
+    assert!(runs > 0, "a container needs at least one run");
+    // header cookie of a bitmap with run containers, for one container
+    const SERIAL_COOKIE: u32 = 12347;
+    let mut bytes = SERIAL_COOKIE.to_le_bytes().to_vec();
+    // the only container is a run container
+    bytes.push(1);
+    // the container key, then its value count minus one
+    bytes.extend_from_slice(&0_u16.to_le_bytes());
+    bytes.extend_from_slice(&(runs - 1).to_le_bytes());
+    bytes.extend_from_slice(&runs.to_le_bytes());
+    for start in (0..runs).rev() {
+        // a run of one value
+        bytes.extend_from_slice(&start.to_le_bytes());
+        bytes.extend_from_slice(&0_u16.to_le_bytes());
+    }
+    bytes
+}
+
+/// A skip bitmap that declares too many containers is refused before it is decoded.
+///
+/// A few hundred bytes can stand for over a million rounds, so the container count is checked
+/// first.
+#[test]
+fn test_skip_bitmap_is_refused_before_decoding() {
+    use super::message::MAX_SKIP_ROUND_CONTAINERS;
+    use crate::state_sync::CertificateCollector;
+
+    let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+    let config = fixture.authorities().next().unwrap().consensus_config();
+    let max_response_size = LibP2pConfig::default().max_rpc_message_size;
+    let request = |bitmap: Vec<u8>| MissingCertificatesRequest {
+        skip_rounds: [(AuthorityIdentifier::dummy_for_test(1), bitmap)].into_iter().collect(),
+        max_response_size,
+        ..Default::default()
+    };
+    let refusal =
+        |bitmap: Vec<u8>| CertificateCollector::new(request(bitmap), config.clone()).err();
+    let max_containers = u16::try_from(MAX_SKIP_ROUND_CONTAINERS).expect("fits a container key");
+
+    // One container over the limit stands for over a million rounds.
+    let over = full_run_bitmap(max_containers + 1);
+    let bitmap = roaring::RoaringBitmap::deserialize_from(&over[..]).expect("valid bitmap");
+    assert_eq!(bitmap.len(), u64::from(max_containers + 1) << u16::BITS);
+    assert_matches!(refusal(over), Some(PrimaryNetworkError::StdIo(_)));
+
+    // A bitmap written by the roaring crate with one container too many is refused too.
+    let mut spread = roaring::RoaringBitmap::new();
+    for key in 0..=u32::from(max_containers) {
+        spread.insert(key << u16::BITS);
+    }
+    let mut written = Vec::new();
+    spread.serialize_into(&mut written).expect("serialize");
+    assert_matches!(refusal(written), Some(PrimaryNetworkError::StdIo(_)));
+
+    // A bitmap longer than any honest one is refused before decoding.
+    // Each run takes four bytes, twice what an honest round takes.
+    let runs = u16::try_from(max_skip_rounds() + 1).expect("fits a container");
+    assert_matches!(
+        refusal(descending_runs_bitmap(runs)),
+        Some(PrimaryNetworkError::InvalidRequest(reason)) if reason.contains("too long")
+    );
+
+    // Within the container limit, a bitmap over the round limit is refused.
+    assert_matches!(
+        refusal(full_run_bitmap(max_containers)),
+        Some(PrimaryNetworkError::InvalidRequest(_))
+    );
+
+    // An unknown header is refused.
+    assert_matches!(refusal(vec![1, 2, 3]), Some(PrimaryNetworkError::StdIo(_)));
+
+    // An honest bitmap at the round limit is accepted.
+    let lower_bound = 10;
+    let max_rounds = u32::try_from(max_skip_rounds()).expect("fits a round");
+    let honest = MissingCertificatesRequest::default()
+        .set_bounds(
+            lower_bound,
+            [(
+                AuthorityIdentifier::dummy_for_test(1),
+                (lower_bound + 1..=lower_bound + max_rounds).collect(),
+            )]
+            .into_iter()
+            .collect(),
+        )
+        .expect("bounds")
+        .set_max_response_size(max_response_size);
+    assert!(CertificateCollector::new(honest, config.clone()).is_ok());
 }
