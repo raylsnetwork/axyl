@@ -5,13 +5,18 @@ existing Rayls network. It is the validator counterpart to
 [`etc/observer/`](../observer/README.md) and uses the same general layout
 (scripts + `.env` + a local datadir).
 
-A validator's life on the network has three explicit stages, each driven by
-a separate script:
+`create-validator.sh` supports two modes:
+
+| Mode | Command | Use it when |
+|---|---|---|
+| **Config only** | `./create-validator.sh --config-only` | You are preparing a validator that will run on its own host and join an existing network. Generates keys and config files only; no on-chain calls, **no private keys and no RPC URL required**. Allowlisting, staking and activation are done later, once the node is running. |
+| **Full flow** | `./create-validator.sh` | You are testing a validator locally and hold the admin key. Generates the config, then funds, allowlists and stakes the validator on-chain. |
+
+The remaining lifecycle steps each have their own script:
 
 | Script | What it does |
 |---|---|
-| [`create-validator.sh`](create-validator.sh) | Generate keys, fund the operator address, allowlist it on `ConsensusRegistry`, and submit the stake transaction. |
-| [`activate-validator.sh`](activate-validator.sh) | Submit `ConsensusRegistry.activate()` (moves the validator into `PendingActivation`); with `--start`, also launch the node so it is ready to vote when the next epoch promotes it to `Active`. |
+| [`activate-validator.sh`](activate-validator.sh) | Submit `ConsensusRegistry.activate()` (moves the validator into `PendingActivation`); with `--start`, also launch the node locally. |
 | [`exit-validator.sh`](exit-validator.sh) | Submit `ConsensusRegistry.beginExit()` to put the validator in the exit queue at the next epoch boundary. |
 
 The on-chain side of the lifecycle (stake → allowlist → activate → exit →
@@ -19,20 +24,19 @@ unstake) is documented in [`rayls-contracts/README.md`](../../rayls-contracts/RE
 
 ## Prerequisites
 
-Before you start you need, from the network operator:
+From the network operator:
 
-- A reachable **RPC URL** of an existing node on the network you are joining.
 - A **`genesis/`** directory containing `genesis.yaml` and `committee.yaml`,
   with a sibling `parameters.yaml` one level above it.
-- An **admin key** with `MAINTAINER` / `DEFAULT_ADMIN_ROLE` permission on
-  `ConsensusRegistry` (`ADMIN_PRIVATE_KEY` below). This key funds the new
-  validator address and allowlists it on-chain. In typical operator setups
-  this is held by the team running the network, not by the validator
-  operator.
+- *(Full flow only)* A reachable **RPC URL** of an existing node, and an
+  **admin key** with `MAINTAINER` / `DEFAULT_ADMIN_ROLE` permission on
+  `ConsensusRegistry` (`ADMIN_PRIVATE_KEY`). This key funds the new
+  validator address and allowlists it on-chain. It is normally held by the
+  team running the network, not by the validator operator.
 
-You also need the Rust toolchain matching the workspace `rust-toolchain` /
-`Cargo.toml` and Foundry's `cast` (for sending the on-chain transactions
-from the scripts).
+Locally you need the Rust toolchain matching the workspace `rust-toolchain` /
+`Cargo.toml` (the scripts build `rayls-network`). Foundry's `cast` is only
+needed for the full flow and for `activate-validator.sh` / `exit-validator.sh`.
 
 ## Configuration — `.env`
 
@@ -40,61 +44,120 @@ from the scripts).
 cp .env.example .env
 ```
 
-Populate `.env` with:
+All scripts read `etc/validator/.env`. Every variable in it is exported, so
+`RL_*` variables are passed straight through to `rayls-network`.
 
-| Variable | Description |
-|---|---|
-| `ADMIN_PRIVATE_KEY` | Key authorised to allowlist validators on `ConsensusRegistry` and to fund the new validator address. Hex, with or without the `0x` prefix — `cast send` accepts both. |
-| `PRIVATE_KEY` | Private key of the new validator's operator address (the address that will hold the stake). Hex, with or without the `0x` prefix. |
-| `ADDRESS` | The validator's operator address (`0x...`). Must match `PRIVATE_KEY`. |
-| `GENESISDIR` | Absolute path to the directory containing `genesis.yaml` and `committee.yaml`. `parameters.yaml` is read from `${GENESISDIR}/..`. |
-| `RPC_URL` | RPC endpoint of an existing network node, used during bootstrap. If unset, scripts will prompt for it. |
-| `STAKE_AMOUNT` | Stake to lock, in wei (e.g. `1000000000000000000000000` for 1M RLS at 18 decimals). |
-| `REGISTRY_CONTRACT_ADDRESS` | *(Optional)* Defaults to the canonical address `0x07E17e17E17e17E17e17E17E17E17e17e17E17e1`. Override only if the network operator has deployed `ConsensusRegistry` elsewhere. |
-| `RPC_PORT` | *(Optional)* Only used in a log line printed by `activate-validator.sh --start`; the node itself starts on its default HTTP port regardless. |
-| `VALIDATOR` | *(Optional)* Human-readable label used in log lines for this validator (e.g. `val1`). |
-| `BUILD_CONFIG` | Build configuration passed to `rayls-network` compilation (e.g. `debug` or `release`). Defaults to `debug` if unset. |
-| `RAYLS_NETWORK` | *(Optional)* Network identifier for the `rayls-network` binary (e.g. `local`). |
+| Variable | Config only | Full flow | Description |
+|---|---|---|---|
+| `ADDRESS` | required | required | The validator's operator address (`0x...`). Becomes the fee/reward recipient in `node-info.yaml` and is the address that later holds the stake. |
+| `GENESISDIR` | required | required | Absolute path to the directory containing `genesis.yaml` and `committee.yaml`. `parameters.yaml` is read from `${GENESISDIR}/..`. |
+| `RL_BLS_PASSPHRASE` | required | optional | Passphrase that encrypts the BLS key in `node-keys/`. The **same** value must be set when starting the node. Defaults to `local` in the full flow (throwaway nodes only). |
+| `RL_EXTERNAL_PRIMARY_ADDR` | optional | optional | Public primary p2p multiaddr written into `node-info.yaml`, e.g. `/ip4/<PUBLIC_IP>/udp/49001/quic-v1`. Set it to the host the validator will run on; the default (`127.0.0.1` with a random port) is only useful for local tests. |
+| `RL_EXTERNAL_WORKER_ADDRS` | optional | optional | Comma-separated public worker multiaddrs, e.g. `/ip4/<PUBLIC_IP>/udp/49101/quic-v1`. |
+| `BUILD_CONFIG` | optional | optional | `debug` (default) or `release`. |
+| `COMPILER_THREADS` | optional | optional | Passed to `cargo build -j`. |
+| `ADMIN_PRIVATE_KEY` | **not needed** | required | Key authorised to allowlist validators on `ConsensusRegistry` and to mint/fund the new validator. |
+| `PRIVATE_KEY` | **not needed** | required | Private key of `ADDRESS`; signs the RLS `approve` and `stake` transactions. Also used by `activate-validator.sh` / `exit-validator.sh`. |
+| `RPC_URL` | **not needed** | required | RPC endpoint of an existing network node. Prompted for if unset. |
+| `STAKE_AMOUNT` | **not needed** | required | Native tokens (wei) sent to `ADDRESS` to cover gas. The RLS stake itself is read from `getCurrentStakeConfig()`. |
+| `REGISTRY_CONTRACT_ADDRESS` | **not needed** | optional | Defaults to `0x07E17e17E17e17E17e17E17E17E17e17e17E17e1`. |
+| `RAYLS_NETWORK` | — | — | *(Optional)* Network identifier used by `activate-validator.sh --start` when launching the node. |
+| `RPC_PORT`, `VALIDATOR` | — | — | *(Optional)* Only used in log lines of `activate-validator.sh --start`. |
 
-The same `.env` is read by all three scripts.
+## Step 1a — generate config only (joining a network)
 
-## Step 1 — `./create-validator.sh`
+```sh
+./create-validator.sh --config-only
+```
+
+1. Builds `rayls-network` (`-p rayls-network --bin rayls-network`).
+2. Runs `rayls-network keytool generate validator --datadir local-validator
+   --address ${ADDRESS}`, encrypting the BLS key with `RL_BLS_PASSPHRASE`.
+3. Copies `${GENESISDIR}/{genesis,committee}.yaml` into
+   `local-validator/genesis/` and `${GENESISDIR}/../parameters.yaml` into
+   `local-validator/`.
+4. Writes the `ConsensusRegistry.stake(...)` calldata (BLS public key +
+   proof of possession) to `local-validator/stake-calldata.txt`, so staking
+   can be done later from any machine with `cast`.
+5. Packs everything into `validator-bundle.tar.gz`.
+
+Output:
+
+```
+local-validator/
+├── node-info.yaml        # public validator info — share with the network operator
+├── node-keys/            # BLS + network keys — keep private
+├── genesis/
+│   ├── genesis.yaml
+│   └── committee.yaml
+├── parameters.yaml
+└── stake-calldata.txt
+validator-bundle.tar.gz   # the directory above, ready to upload
+```
+
+Upload the bundle to the validator host, extract it and start the node there
+with the same passphrase:
+
+```sh
+tar -xzf validator-bundle.tar.gz
+RL_BLS_PASSPHRASE='<same passphrase>' rayls-network node \
+  --datadir ./local-validator \
+  --full --storage.v2 \
+  --http
+```
+
+(See the full flag list used by `activate-validator.sh --start` below.)
+
+`node-keys/` contains the validator's identity. The BLS key is encrypted with
+`RL_BLS_PASSPHRASE`, the network key is not — treat the bundle as a secret
+and do not commit it. If the passphrase is lost the validator must be
+re-provisioned.
+
+### Later: allowlist, stake and activate
+
+Once the node is running, the remaining on-chain steps are done by whoever
+holds the relevant keys:
+
+```sh
+# network operator (admin key)
+cast send $REGISTRY "allowlistValidator(address)" $ADDRESS --private-key $ADMIN_PRIVATE_KEY --rpc-url $RPC_URL
+
+# validator operator (key of $ADDRESS), after acquiring the required RLS stake
+cast send $RLS_TOKEN "approve(address,uint256)(bool)" $REGISTRY $REQUIRED_STAKE --private-key $PRIVATE_KEY --rpc-url $RPC_URL
+cast send $REGISTRY "$(cat local-validator/stake-calldata.txt)" --private-key $PRIVATE_KEY --rpc-url $RPC_URL
+cast send $REGISTRY "activate()" --private-key $PRIVATE_KEY --rpc-url $RPC_URL
+```
+
+`$RLS_TOKEN` is `cast call $REGISTRY "rlsToken()(address)"` and
+`$REQUIRED_STAKE` is the first value of
+`cast call $REGISTRY "getCurrentStakeConfig()(uint256,uint256,uint32)"`.
+`activate-validator.sh` (without `--start`) sends the `activate()` call for you.
+
+## Step 1b — full flow (local testing)
 
 ```sh
 ./create-validator.sh
 ```
 
-What it does:
+Performs steps 1–4 of the config-only mode (no bundle), then:
 
-1. Compiles `rayls-network` in release mode (skipped if the build is already
-   up to date).
-2. Runs `rayls-network keytool generate validator --datadir local-validator
-   --address ${ADDRESS}` to create the validator's BLS and network keys
-   under `local-validator/node-keys/` and write `node-info.yaml`.
-3. Copies `${GENESISDIR}/{genesis,committee}.yaml` into
-   `local-validator/genesis/` and `${GENESISDIR}/../parameters.yaml` into
-   `local-validator/`.
-4. **Funding** — `cast send` from `ADMIN_PRIVATE_KEY` transfers
-    `${STAKE_AMOUNT}` wei (native tokens) to `${ADDRESS}` to cover gas for
-    subsequent on-chain calls. RLS tokens are minted separately.
-5. **Allowlisting** — `cast send` calls
-   `ConsensusRegistry.allowlistValidator(address)` from
-   `ADMIN_PRIVATE_KEY` to add the new operator address to the registry's
-   allowlist.
-6. **Stake** — runs `rayls-network keytool stake-calldata` to produce the
-   ABI-encoded `stake(...)` calldata (with the proof-of-possession), then
-   `cast send` submits the stake transaction signed by `PRIVATE_KEY`.
+5. **Funding** — `cast send` from `ADMIN_PRIVATE_KEY` transfers
+   `${STAKE_AMOUNT}` wei (native tokens) to `${ADDRESS}` to cover gas.
+6. **Allowlisting** — `ConsensusRegistry.allowlistValidator(address)` from
+   `ADMIN_PRIVATE_KEY`.
+7. **Mint + approve** — mints the required RLS stake to `${ADDRESS}`
+   (admin has `MINTER_ROLE`) and approves the registry to spend it, signed by
+   `PRIVATE_KEY`.
+8. **Stake** — submits the stake calldata signed by `PRIVATE_KEY`.
 
-> Note: `create-validator.sh` accepts a `--start` flag for backwards
-> compatibility but ignores it (legacy no-op). To launch the node, use
-> `activate-validator.sh --start` in Step 2.
+After this step the validator is **staked but not yet active**.
 
-After this step the validator is **staked but not yet active** — its status
-on `ConsensusRegistry` is the post-stake state, prior to `activate()`.
+> `create-validator.sh` accepts `--start` for backwards compatibility but
+> ignores it. To launch the node, use `activate-validator.sh --start`.
 
-If `local-validator/` already exists, the script prints a skip message and
-exits 0 without re-running any steps. Remove the directory and re-run if
-you want a fresh provisioning.
+In both modes, if `local-validator/` already exists the script prints a skip
+message and exits 0 without re-running any steps. Remove the directory (and
+`validator-bundle.tar.gz`) to provision a fresh validator.
 
 ## Step 2 — `./activate-validator.sh`
 
@@ -177,9 +240,12 @@ exit has been finalised.
   does not hold `MAINTAINER` on `ConsensusRegistry`. Ask the network
   operator for the right key.
 - **Activation transaction reverts with `not staked`** — `activate-validator.sh`
-  was invoked before `create-validator.sh` finished. Re-run the create
-  script and re-attempt activation.
-- **Node refuses to start, "BLS passphrase required"** — the scripts
-  hardcode `RL_BLS_PASSPHRASE="local"` for convenience. For any non-local
-  deployment, change this in the scripts (or set `RL_BLS_PASSPHRASE`
-  externally and remove the hardcoded export) and use a strong passphrase.
+  was invoked before the validator was staked (full flow not finished, or
+  the stake step of the config-only flow not done yet).
+- **`RL_BLS_PASSPHRASE must be set in .env for --config-only`** — set a
+  passphrase in `.env`; it protects the BLS key and is needed at node start.
+- **Node refuses to start / cannot decrypt BLS key** — the node must be
+  started with the same `RL_BLS_PASSPHRASE` that was in `.env` when the keys
+  were generated. `activate-validator.sh --start` reads it from `.env`
+  (falling back to `local`). To change it later use
+  `rayls-network keytool rotate-passphrase`.

@@ -9,9 +9,9 @@ if [[ ! -e "$envPath" ]]; then
     echo "Error: .env file not found at $envPath"
     exit 1
 fi
+set -a
 . "$envPath"
-
-RL_BLS_PASSPHRASE="local"
+set +a
 
 # PRIVATE KEY
 if [ -z "$PRIVATE_KEY" ]; then
