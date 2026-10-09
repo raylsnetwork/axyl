@@ -352,6 +352,8 @@ contract FeeAggregator is
 
         // Snapshot price before swap (for price impact event only, not for slippage protection).
         // Algebra pool globalState returns (price, tick, lastFee, pluginConfig, communityFee, unlocked).
+        // Only the price is needed (price-impact event).
+        // slither-disable-next-line unused-return
         (uint160 sqrtPriceX96,,,,,) = pool.globalState();
 
         // Use extreme limitSqrtPrice values as a pass-through. Reading spot price
@@ -377,6 +379,8 @@ contract FeeAggregator is
             limitSqrtPrice: limitSqrtPrice
         });
 
+        // Received amount is measured by balance diff below; the router enforces amountOutMinimum.
+        // slither-disable-next-line unused-return
         $.algebraRouter.exactInputSingle(swapParams);
 
         // Reset approval
@@ -386,6 +390,8 @@ contract FeeAggregator is
         rlsReceived = $.rlsToken.balanceOf(address(this)) - rlsBalanceBefore;
 
         // price impact for event
+        // Only the price is needed (price-impact event).
+        // slither-disable-next-line unused-return
         (uint160 sqrtPriceAfter,,,,,) = pool.globalState();
         uint256 priceImpactBps = sqrtPriceX96 > 0
             ? (_absDiff(sqrtPriceAfter, sqrtPriceX96) * MAX_BPS) / sqrtPriceX96
@@ -492,6 +498,8 @@ contract FeeAggregator is
         $.rlsToken.forceApprove(address($.oftBridge), amount);
 
         // Send cross-chain
+        // Bridge burn is fire-and-forget; the messaging/OFT receipts are not needed.
+        // slither-disable-next-line unused-return
         try $.oftBridge.send{value: fee.nativeFee}(sendParam, fee, address(this)) {
             success = true;
             emit BurnBridged(amount, $.burnAddress, $.dstEid);
@@ -743,6 +751,8 @@ contract FeeAggregator is
         onlyRole(DEFAULT_ADMIN_ROLE)
     {
         if (to == address(0)) revert ZeroAddress();
+        // Emergency withdrawal: `to` is chosen by DEFAULT_ADMIN_ROLE by design.
+        // slither-disable-next-line arbitrary-send-eth
         (bool success,) = to.call{value: amount}("");
         if (!success) revert NativeTransferFailed();
         emit EmergencyWithdrawNative(to, amount);

@@ -27,6 +27,9 @@ import {UUPSUpgradeable} from "@openzeppelin/contracts-upgradeable/proxy/utils/U
  * @custom:security-contact secops@parfin.io
  * @custom:upgrade-policy Upgrades require UPGRADER_ROLE with recommended timelock
  */
+// RLS is the ERC-20, not the native-coin controller: mint/burn/burnFrom only share names with
+// INativeTokenController (return types differ).
+// slither-disable-next-line missing-inheritance
 contract RLS is
     Initializable,
     ERC20BurnableUpgradeable,
@@ -199,5 +202,7 @@ contract RLS is
         return super.nonces(owner);
     }
 
+    // Storage gap reserved for future upgrades.
+    // slither-disable-next-line unused-state
     uint256[49] private __gap;
 }
