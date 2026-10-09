@@ -1,4 +1,4 @@
-.PHONY: help attest udeps check test test-faucet fmt clippy docker-login docker-testnet docker-push docker-builder docker-builder-init up down relay-up relay-down validators pr init-submodules update-rayls-contracts revert-submodule
+.PHONY: help attest udeps check test test-faucet fmt clippy docker-login docker-testnet docker-push docker-builder docker-builder-init up down profiling-up profiling-down relay-up relay-down validators pr init-submodules update-rayls-contracts revert-submodule
 
 # full path for the Makefile
 ROOT_DIR:=$(shell dirname $(realpath $(firstword $(MAKEFILE_LIST))))
@@ -135,6 +135,15 @@ up:
 # bring docker compose down
 down:
 	docker compose -f ./etc/docker-network/compose.yaml down --remove-orphans -v ;
+
+# 4-validator network + eBPF profiler (Alloy/Pyroscope) + tokio metrics (Prometheus/Grafana);
+# see doc/profiling-poc.md. `make profiling-up LOAD=1` also starts the transfer load generator.
+PROFILING_COMPOSE = docker compose -f ./etc/docker-network/compose.yaml -f ./etc/profiling/compose.yaml
+profiling-up:
+	VERGEN_GIT_SHA=$$(git rev-parse HEAD) $(PROFILING_COMPOSE) $(if $(LOAD),--profile load) up --build --remove-orphans --detach ;
+
+profiling-down:
+	$(PROFILING_COMPOSE) --profile load down --remove-orphans -v ;
 
 # relay isolation testnet: validators in private networks, reachable only via relays
 relay-up:

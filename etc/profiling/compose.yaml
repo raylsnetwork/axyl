@@ -1,0 +1,113 @@
+# eBPF + tokio-metrics profiling PoC, layered on the 4-validator network in etc/docker-network.
+# See doc/profiling-poc.md.
+#
+#   docker compose -f etc/docker-network/compose.yaml -f etc/profiling/compose.yaml up -d --build
+#   # optional steady transfer load into validator1:
+#   docker compose -f etc/docker-network/compose.yaml -f etc/profiling/compose.yaml --profile load up -d
+#
+# Relative paths resolve against the FIRST compose file's directory (etc/docker-network).
+#
+# Grafana     http://localhost:3000   (anonymous admin; "Rayls / tokio runtime & tasks" dashboard,
+#                                      Explore -> Pyroscope for flame graphs)
+# Pyroscope   http://localhost:4040
+# Prometheus  http://localhost:9090
+# Alloy UI    http://localhost:12345  (profiling targets and their labels)
+# JSON-RPC    http://localhost:7545 .. 7542 (validator1 .. 4)
+
+# Own project name: separate volumes from a plain `make up` network. Both use the same subnet, so
+# don't run them at the same time.
+name: rayls-profiling
+
+x-profiling-image: &profiling-image local-rayls-network:profiling
+
+# The validators' command from etc/docker-network/compose.yaml with the metrics endpoints bound
+# to all interfaces (for Prometheus) and tokio metrics sampled every 5s.
+x-node-command: &node-command >
+  /usr/local/bin/rayls node --datadir /home/nonroot/data
+  --metrics 0.0.0.0:9101 --reth-metrics 0.0.0.0:9001 --tokio-metrics=5s
+  --log.stdout.format log-fmt --full --storage.v2
+  --txpool.pending-max-count 50000 --txpool.pending-max-size 62144000
+  --txpool.basefee-max-count 50000 --txpool.basefee-max-size 1048556000
+  --txpool.queued-max-count 50000 --txpool.queued-max-size 1048556000
+  --txpool.max-pending-txns 50000 --txpool.max-new-txns 50000 --txpool.minimal-protocol-fee 0
+  --txpool.gas-limit 999999999999 --txpool.max-tx-gas 999999999999
+  --txpool.max-tx-input-bytes 999999999999 --txpool.max-account-slots 50000
+  --gpo.default-suggested-fee 0 --http --http.addr 0.0.0.0 --http.api all
+
+services:
+  rayls-base:
+    image: *profiling-image
+    build:
+      context: ../../
+      dockerfile: etc/profiling/Dockerfile
+      args:
+        VERGEN_GIT_SHA: ${VERGEN_GIT_SHA:-}
+
+  setup1: { image: *profiling-image }
+  setup2: { image: *profiling-image }
+  setup3: { image: *profiling-image }
+  setup4: { image: *profiling-image }
+  comittee: { image: *profiling-image }
+
+  validator1: { image: *profiling-image, command: *node-command }
+  validator2: { image: *profiling-image, command: *node-command }
+  validator3: { image: *profiling-image, command: *node-command }
+  validator4: { image: *profiling-image, command: *node-command }
+
+  # eBPF profiler: samples stacks of every process on the host kernel, keeps the rayls ones.
+  alloy:
+    image: grafana/alloy:v1.20.1
+    user: root
+    privileged: true
+    pid: host
+    command:
+      - run
+      - /etc/alloy/config.alloy
+      - --server.http.listen-addr=0.0.0.0:12345
+      - --storage.path=/var/lib/alloy/data
+    volumes:
+      - ../profiling/alloy.config:/etc/alloy/config.alloy:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - /sys/kernel/debug:/sys/kernel/debug:ro
+    ports:
+      - "12345:12345"
+    depends_on: [pyroscope]
+    networks: [validators]
+
+  pyroscope:
+    image: grafana/pyroscope:2.3.2
+    ports:
+      - "4040:4040"
+    networks: [validators]
+
+  prometheus:
+    image: prom/prometheus:v3.15.0
+    volumes:
+      - ../profiling/prometheus.yaml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "9090:9090"
+    networks: [validators]
+
+  grafana:
+    image: grafana/grafana:13.2.3
+    environment:
+      - GF_AUTH_ANONYMOUS_ENABLED=true
+      - GF_AUTH_ANONYMOUS_ORG_ROLE=Admin
+      - GF_AUTH_DISABLE_LOGIN_FORM=true
+    volumes:
+      - ../profiling/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ../profiling/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    ports:
+      - "3000:3000"
+    depends_on: [prometheus, pyroscope]
+    networks: [validators]
+
+  # Optional (`--profile load`): plain transfers into validator1 from the dev-funded account.
+  loadgen:
+    image: ghcr.io/foundry-rs/foundry:v1.8.5
+    profiles: [load]
+    entrypoint: ["sh", "/loadgen.sh"]
+    volumes:
+      - ../profiling/loadgen.sh:/loadgen.sh:ro
+    depends_on: [validator1]
+    networks: [validators]
