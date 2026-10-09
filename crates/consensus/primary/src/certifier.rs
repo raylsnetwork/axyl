@@ -139,13 +139,20 @@ impl<DB: Database> Certifier<DB> {
     /// Rayls: Maximum vote request attempts before giving up.
     const MAX_VOTE_REQUEST_ATTEMPTS: u32 = 30;
 
-    /// Rayls: How long the committed round may stall - while we already hold the certs for a peer's
-    /// limit round - before a "too old" rejection counts toward demotion anyway. Below this, the
-    /// lag is treated as a transient proposer stall (certs arriving, not yet usable as parents)
-    /// and the rejection is ignored; beyond it, the proposer is considered wedged and allowed
-    /// to demote. Far above the normal sub-second commit interval, so transient gaps never trip
-    /// it.
-    const CERT_COVERED_WEDGE_WINDOW: Duration = Duration::from_secs(30);
+    /// Rayls: How long both the cert-store round and the committed round may stall before a
+    /// "too old" rejection counts toward demotion. Below this, the lag is treated as transient
+    /// (a missing certificate being fetched, parents arriving but not yet usable) and the
+    /// rejection is ignored; beyond it, the proposer is considered wedged and allowed to demote.
+    /// Far above a fetch round trip (seconds, 5 s timeout per peer) and the normal sub-second
+    /// commit interval, so transient gaps never trip it. Matches the startup grace period.
+    ///
+    /// Invariant: a node that keeps writing or committing certificates, however far behind,
+    /// is never demoted through this path. The active-mode fetcher is what closes the gap
+    /// either way; demotion would only add the CvvInactive catch-up burst.
+    ///
+    /// Also gates epoch-mismatch rejections when we are one epoch behind the peer (at the
+    /// boundary, about to transition on our own); see `handle_vote_error`.
+    const TOO_OLD_WEDGE_WINDOW: Duration = Duration::from_secs(30);
 
     /// Rayls: Request a vote for a header, retrying up to MAX_VOTE_REQUEST_ATTEMPTS times.
     async fn request_vote(
@@ -375,50 +382,42 @@ impl<DB: Database> Certifier<DB> {
     fn handle_vote_error(&self, error: &DagError, header: &Header) -> VoteErrorAction {
         match error {
             DagError::TooOldRejectedByPeers { peer_id, header_round, limit_round } => {
-                // A "too old" rejection means our PROPOSER is lagging in rounds - not that we lack
-                // data. If our cert store already covers the peer's limit round, we hold every cert
-                // CvvInactive would sync; the lag is transient (those certs are suspended on
-                // missing grandparents and not yet usable as parents, but they are
-                // arriving). Demoting then is a spurious flap that instantly
-                // rejoins. Skip while the DAG is still making progress (committed
-                // round advancing); only if it stalls for CERT_COVERED_WEDGE_WINDOW
-                // is the proposer genuinely wedged and allowed to demote.
+                // A "too old" rejection means our PROPOSER is lagging in rounds. That lag is
+                // transient whenever our own DAG is still moving: certificates are being written
+                // (a lost gossip message is being fetched, suspended parents are landing) or
+                // committed. Demoting then tears down every epoch task and rejoins seconds later
+                // with a catch-up fetch burst, for something the active-mode fetcher resolves on
+                // its own. So a rejection only counts toward demotion once neither the cert-store
+                // round nor the committed round has advanced for TOO_OLD_WEDGE_WINDOW: a wedged
+                // node falls through as soon as the window expires, a recovering node never does.
+                // The gate is local progress, not the peer's limit round, so it also covers the
+                // case where the missing certificate is still in flight (cert store below the
+                // limit) and the legacy string-based path (limit_round = 0).
                 // Mirrors `should_count_epoch_rejection`, which drops rejections carrying no
                 // liveness signal.
-                // `limit_round > 0` excludes the legacy string-based path (set to 0 at the
-                // request site), where we don't know the peer's real limit - those count normally
-                // toward demotion rather than always satisfying `cert_store_round >= 0`.
                 let cert_store_round = *self.consensus_bus.cert_store_round().borrow();
-                if *limit_round > 0 && cert_store_round >= *limit_round {
-                    let committed_round = *self.consensus_bus.committed_round_updates().borrow();
-                    if self
-                        .vote_failures
-                        .skip_cert_covered(committed_round, Self::CERT_COVERED_WEDGE_WINDOW)
-                    {
-                        warn!(
-                            target: "primary::certifier",
-                            auth=?self.authority_id,
-                            peer=?peer_id,
-                            header_round, limit_round, cert_store_round, committed_round,
-                            "ignoring too-old rejection: cert store covers limit round and DAG still progressing (transient proposer lag)"
-                        );
-                        // Count the rejection under a distinct reason even though it isn't held
-                        // against the peer for demotion — otherwise the metric would show zero
-                        // while a node continuously trips the skip path, masking real trouble.
-                        self.consensus_bus
-                            .consensus_metrics()
-                            .vote_request_rejections
-                            .with_label_values(&[&peer_id.to_string(), "too_old_skipped"])
-                            .inc();
-                        return VoteErrorAction::Continue;
-                    }
+                let committed_round = *self.consensus_bus.committed_round_updates().borrow();
+                if self.vote_failures.skip_while_progressing(
+                    cert_store_round,
+                    committed_round,
+                    Self::TOO_OLD_WEDGE_WINDOW,
+                ) {
                     warn!(
                         target: "primary::certifier",
                         auth=?self.authority_id,
                         peer=?peer_id,
                         header_round, limit_round, cert_store_round, committed_round,
-                        "too-old rejection with certs but committed round wedged; counting toward demotion"
+                        "ignoring too-old rejection: DAG still progressing (transient proposer lag)"
                     );
+                    // Count the rejection under a distinct reason even though it isn't held
+                    // against the peer for demotion — otherwise the metric would show zero
+                    // while a node continuously trips the skip path, masking real trouble.
+                    self.consensus_bus
+                        .consensus_metrics()
+                        .vote_request_rejections
+                        .with_label_values(&[&peer_id.to_string(), "too_old_skipped"])
+                        .inc();
+                    return VoteErrorAction::Continue;
                 }
                 let outcome = self.vote_failures.record_too_old(peer_id.clone());
                 self.consensus_bus
@@ -430,10 +429,10 @@ impl<DB: Database> Certifier<DB> {
                     target: "primary::certifier",
                     auth=?self.authority_id,
                     peer=?peer_id,
-                    header_round, limit_round,
+                    header_round, limit_round, cert_store_round, committed_round,
                     count = self.vote_failures.too_old_count(),
                     threshold = self.vote_failures.threshold(),
-                    "peer rejected header as too old"
+                    "peer rejected header as too old with no DAG progress for the wedge window; counting toward demotion"
                 );
                 match outcome {
                     RejectionOutcome::BelowThreshold => VoteErrorAction::Continue,
@@ -470,6 +469,42 @@ impl<DB: Database> Certifier<DB> {
                     return VoteErrorAction::Continue;
                 }
 
+                // One epoch behind the peer means we are at the boundary: our own epoch manager
+                // transitions us the moment the boundary output commits, typically within a
+                // second or two of the peers. While the DAG is still progressing that commit is
+                // on its way, and demoting would only route the epoch change through a
+                // CvvInactive teardown. Same gate as the too-old path; a node that stalls for
+                // the wedge window, or one two or more epochs behind, still counts.
+                // The proposal is aborted either way: peers at the next epoch will never vote
+                // for a header of this one.
+                let cert_store_round = *self.consensus_bus.cert_store_round().borrow();
+                let committed_round = *self.consensus_bus.committed_round_updates().borrow();
+                if VoteFailureTracker::is_one_epoch_behind(*peer_epoch, *our_epoch)
+                    && self.vote_failures.skip_while_progressing(
+                        cert_store_round,
+                        committed_round,
+                        Self::TOO_OLD_WEDGE_WINDOW,
+                    )
+                {
+                    warn!(
+                        target: "primary::certifier",
+                        auth=?self.authority_id,
+                        peer=?peer_id,
+                        peer_epoch, our_epoch, cert_store_round, committed_round,
+                        "ignoring epoch rejection at the epoch boundary: DAG still progressing, own transition pending"
+                    );
+                    self.consensus_bus
+                        .consensus_metrics()
+                        .vote_request_rejections
+                        .with_label_values(&[&peer_id.to_string(), "epoch_mismatch_skipped"])
+                        .inc();
+                    return VoteErrorAction::Abort(DagError::EpochRejectedByPeer {
+                        peer_id: peer_id.clone(),
+                        peer_epoch: *peer_epoch,
+                        our_epoch: *our_epoch,
+                    });
+                }
+
                 let outcome = self.vote_failures.record_epoch_mismatch(peer_id.clone());
                 self.consensus_bus
                     .consensus_metrics()
@@ -480,7 +515,7 @@ impl<DB: Database> Certifier<DB> {
                     target: "primary::certifier",
                     auth=?self.authority_id,
                     peer=?peer_id,
-                    peer_epoch, our_epoch,
+                    peer_epoch, our_epoch, cert_store_round, committed_round,
                     count = self.vote_failures.epoch_mismatch_count(),
                     threshold = self.vote_failures.threshold(),
                     "peer rejected header as wrong epoch"

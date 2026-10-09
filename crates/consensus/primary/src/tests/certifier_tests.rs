@@ -8,7 +8,9 @@ use crate::{
 use rand::{rngs::StdRng, SeedableRng};
 use rayls_consensus_network::types::{NetworkCommand, NetworkHandle};
 use rayls_infrastructure_storage::mem_db::MemDatabase;
-use rayls_infrastructure_types::{BlsKeypair, BlsSigner, RaylsSender, SignatureVerificationState};
+use rayls_infrastructure_types::{
+    BlsKeypair, BlsSigner, RaylsSender, Round, SignatureVerificationState,
+};
 use rayls_testing_test_utils_committee::CommitteeFixture;
 use std::{
     collections::HashMap,
@@ -545,4 +547,147 @@ async fn process_own_certificate_stores_before_returning() {
          re-propose guard reads this store to decide whether a header is already certified, so \
          it no longer covers the window between an attempt finishing and its certificate landing",
     );
+}
+
+/// Spawn a certifier and propose `proposals` headers in consecutive rounds. For proposal `i`,
+/// peer `i` (mod committee) answers the vote request with `reject`; the other peers answer a
+/// plain RPC error, which the certifier treats as non-fatal. One rejecting peer per proposal
+/// keeps the distinct-peer count deterministic: a rejection that aborts the proposal drops the
+/// remaining replies, so the count toward demotion accumulates across proposals, as it does on
+/// a live node.
+///
+/// Returns the bus (to observe demotion requests and metrics), the peers' ids, and the task
+/// manager so the certifier stays alive for the caller's assertions.
+async fn propose_and_reject(
+    proposals: usize,
+    reject: impl Fn(&Header) -> PrimaryResponse,
+) -> (ConsensusBus, Vec<AuthorityIdentifier>, TaskManager) {
+    let fixture = CommitteeFixture::builder(MemDatabase::default).randomize_ports(true).build();
+    let committee = fixture.committee();
+    let primary = fixture.authorities().last().unwrap();
+    let id = primary.id();
+
+    let peers: Vec<(BlsPublicKey, AuthorityIdentifier)> = fixture
+        .authorities()
+        .filter(|a| a.id() != id)
+        .map(|a| (*a.authority().protocol_key(), a.authority().id()))
+        .collect();
+
+    let (sender, mut network_rx) = mpsc::channel(100);
+    let network: NetworkHandle<PrimaryRequest, PrimaryResponse> = NetworkHandle::new(sender);
+    let cb = ConsensusBus::new();
+    let task_manager = TaskManager::default();
+    let synchronizer =
+        StateSynchronizer::new(primary.consensus_config(), cb.clone(), task_manager.get_spawner());
+    synchronizer.spawn(&task_manager);
+    Certifier::spawn(
+        primary.consensus_config(),
+        cb.clone(),
+        synchronizer,
+        network.clone().into(),
+        &task_manager,
+    );
+
+    for i in 0..proposals {
+        let round = (i + 1) as Round;
+        let rejecting_peer = peers[i % peers.len()].0;
+        cb.headers().send(primary.header_with_round(&committee, round)).await.unwrap();
+
+        // answer this round's requests: one rejection, the rest plain errors
+        let mut answered = 0;
+        while let Some(req) = network_rx.recv().await {
+            if let NetworkCommand::SendRequest {
+                peer,
+                request: PrimaryRequest::Vote { header, parents: _ },
+                reply,
+            } = req
+            {
+                if header.round() != round {
+                    // a late request from the previous, already aborted proposal
+                    continue;
+                }
+                let response = if peer == rejecting_peer {
+                    Ok(reject(&header))
+                } else {
+                    Err(NetworkError::RPCError("no vote".to_string()))
+                };
+                // the reply channel is gone once the proposal aborted
+                let _ = reply.send(response);
+                answered += 1;
+            }
+            if answered == peers.len() {
+                break;
+            }
+        }
+        // let the certifier process the rejection before the next proposal
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+
+    (cb, peers.into_iter().map(|(_, id)| id).collect(), task_manager)
+}
+
+fn rejections_with_reason(cb: &ConsensusBus, peers: &[AuthorityIdentifier], reason: &str) -> u64 {
+    peers
+        .iter()
+        .map(|p| {
+            cb.consensus_metrics()
+                .vote_request_rejections
+                .with_label_values(&[&p.to_string(), reason])
+                .get()
+        })
+        .sum()
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn too_old_rejections_do_not_demote_within_the_wedge_window() {
+    // Three proposals, each rejected as too old by a different peer (threshold is 2 of 4),
+    // while the node is inside its progress window and its cert store is below the peer's
+    // limit: the case that used to demote on the spot. Expect no demotion and every rejection
+    // counted as skipped.
+    let (cb, peers, _tm) = propose_and_reject(3, |header| PrimaryResponse::TooOld {
+        header_round: header.round(),
+        limit_round: header.round() + 5,
+    })
+    .await;
+
+    assert!(
+        cb.mode_transition().borrow().is_none(),
+        "too-old rejections demoted a progressing node"
+    );
+    assert_eq!(rejections_with_reason(&cb, &peers, "too_old_skipped"), 3);
+    assert_eq!(rejections_with_reason(&cb, &peers, "too_old"), 0);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn one_epoch_behind_rejections_do_not_demote_within_the_wedge_window() {
+    // Three proposals, each rejected by a different peer that is one epoch ahead: we are at
+    // the boundary and will transition on our own. Expect no demotion and every rejection
+    // counted as skipped.
+    let (cb, peers, _tm) = propose_and_reject(3, |header| PrimaryResponse::EpochMismatch {
+        expected: header.epoch() + 1,
+        received: header.epoch(),
+    })
+    .await;
+
+    assert!(
+        cb.mode_transition().borrow().is_none(),
+        "epoch-boundary rejections demoted a progressing node"
+    );
+    assert_eq!(rejections_with_reason(&cb, &peers, "epoch_mismatch_skipped"), 3);
+    assert_eq!(rejections_with_reason(&cb, &peers, "epoch_mismatch"), 0);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn two_epochs_behind_rejections_still_demote() {
+    // Two proposals rejected by two distinct peers that are two epochs ahead: genuinely far
+    // behind, the gate does not apply and the threshold (2 distinct peers) demotes as before.
+    let (cb, peers, _tm) = propose_and_reject(2, |header| PrimaryResponse::EpochMismatch {
+        expected: header.epoch() + 2,
+        received: header.epoch(),
+    })
+    .await;
+
+    assert_eq!(*cb.mode_transition().borrow(), Some(NodeMode::CvvInactive));
+    assert_eq!(rejections_with_reason(&cb, &peers, "epoch_mismatch_skipped"), 0);
+    assert_eq!(rejections_with_reason(&cb, &peers, "epoch_mismatch"), 2);
 }
