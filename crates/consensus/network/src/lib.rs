@@ -21,8 +21,8 @@ pub use peers::{PeerExchangeMap, Penalty};
 pub use libp2p::{
     gossipsub::{Message as GossipMessage, TopicHash},
     identity::PeerId,
-    request_response::ResponseChannel,
-    Multiaddr,
+    request_response::{Codec, ResponseChannel},
+    Multiaddr, StreamProtocol,
 };
 #[cfg(test)]
 #[path = "./tests/common.rs"]
