@@ -10,10 +10,40 @@ use std::{io::Read, path::Path};
 /// existing one, so existing databases keep the page size they were created with.
 pub const DEFAULT_MDBX_PAGE_SIZE: usize = 16 * 1024;
 
-/// Smallest page size libmdbx accepts, matching its own `MDBX_MIN_PAGESIZE` constant.
-pub const MIN_MDBX_PAGE_SIZE: usize = 256;
+/// The MDBX datafile name inside a database directory.
+pub const MDBX_DAT: &str = "mdbx.dat";
+
+/// Smallest page size we accept, the common OS page size; libmdbx itself allows down to 256 B.
+pub const MIN_MDBX_PAGE_SIZE: usize = 4 * 1024;
 /// Largest page size libmdbx accepts, matching its own `MDBX_MAX_PAGESIZE` constant.
 pub const MAX_MDBX_PAGE_SIZE: usize = 64 * 1024;
+
+/// Returns `page_size` if it is a power of two from [`MIN_MDBX_PAGE_SIZE`] to
+/// [`MAX_MDBX_PAGE_SIZE`].
+pub fn check_page_size(page_size: usize) -> Result<usize, String> {
+    if !(MIN_MDBX_PAGE_SIZE..=MAX_MDBX_PAGE_SIZE).contains(&page_size) {
+        return Err(format!(
+            "must be between {MIN_MDBX_PAGE_SIZE} and {MAX_MDBX_PAGE_SIZE} bytes, got {page_size}"
+        ));
+    }
+    if !page_size.is_power_of_two() {
+        return Err(format!("must be a power of two, got {page_size}"));
+    }
+    Ok(page_size)
+}
+
+/// Page size for a new or empty datafile; `None` lets an existing one keep its own geometry.
+pub fn new_datafile_page_size(
+    db_dir: &Path,
+    configured: Option<usize>,
+) -> Result<Option<usize>, String> {
+    // libmdbx creates the database in an empty datafile, so that one counts as new.
+    let dat_len = std::fs::metadata(db_dir.join(MDBX_DAT)).map(|m| m.len()).unwrap_or(0);
+    if dat_len > 0 {
+        return Ok(None);
+    }
+    check_page_size(configured.unwrap_or(DEFAULT_MDBX_PAGE_SIZE)).map(Some)
+}
 
 /// Reads the datafile's page size from a surviving backup meta page; `None` if neither survives.
 pub fn detect_page_size(dat: &Path) -> Option<usize> {
@@ -43,8 +73,7 @@ fn detect_page_size_in(reader: impl Read) -> Option<usize> {
         let pgno = u32::from_le_bytes(pgno.try_into().ok()?) as usize;
         // Meta page 0 starts at offset 0, so only a backup meta page reveals the page size.
         let ps = (matches!(pgno, 1 | 2) && page_start % pgno == 0).then(|| page_start / pgno)?;
-        (ps.is_power_of_two() && (MIN_MDBX_PAGE_SIZE..=MAX_MDBX_PAGE_SIZE).contains(&ps))
-            .then_some(ps)
+        check_page_size(ps).ok()
     })
 }
 
@@ -67,7 +96,7 @@ mod tests {
 
     #[test]
     fn detects_page_size_from_either_backup_meta_page() {
-        for ps in [MIN_MDBX_PAGE_SIZE, 4096, 16384, MAX_MDBX_PAGE_SIZE] {
+        for ps in [MIN_MDBX_PAGE_SIZE, 16384, MAX_MDBX_PAGE_SIZE] {
             for metas in [&[0, 1, 2][..], &[1, 2], &[1], &[2]] {
                 let head = synthetic(ps, 1 << 18, metas);
                 assert_eq!(detect_page_size_in(&head[..]), Some(ps), "{ps} with metas {metas:?}");
@@ -79,6 +108,18 @@ mod tests {
     fn rejects_a_file_without_a_backup_meta_page() {
         assert_eq!(detect_page_size_in(&b"not an MDBX datafile"[..]), None);
         assert_eq!(detect_page_size_in(&synthetic(16384, 1 << 18, &[0])[..]), None);
+        // A layout below the supported minimum is not trusted.
+        assert_eq!(detect_page_size_in(&synthetic(2048, 1 << 18, &[1, 2])[..]), None);
+    }
+
+    #[test]
+    fn checks_page_size_range_and_power_of_two() {
+        for ok in [4096, 8192, 16384, 32768, 65536] {
+            assert_eq!(check_page_size(ok), Ok(ok));
+        }
+        for bad in [0, 256, 2048, 12 * 1024, 128 * 1024] {
+            assert!(check_page_size(bad).is_err(), "{bad}");
+        }
     }
 
     /// Detection reads only the bounded head, so a huge datafile is never loaded whole.

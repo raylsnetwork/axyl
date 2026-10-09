@@ -8,7 +8,7 @@
 use eyre::{eyre, WrapErr};
 use rayls_infrastructure_storage::{
     cold::{ColdLocation, ColdResult, ARCHIVE_HIGH_WATER_MARK_KEY},
-    mdbx::{open_detecting_page_size, MdbxDatabase},
+    mdbx::{open_detecting_page_size, MdbxConfig, MdbxDatabase},
     tables::{
         Batches, Certificates, ColdArchiveHighWaterMark, ColdBatchLocations,
         ConsensusBlockNumbersByDigest, ConsensusBlocks, ConsensusBlocksCache, EpochCerts,
@@ -768,7 +768,7 @@ impl NodeDb {
 /// during which MDBX settles the head meta page, then closed without touching any table. Fails
 /// if any other process has the database open. The same recovery the node performs on start.
 pub fn recover(consensus_db: &Path) -> eyre::Result<()> {
-    use reth_libmdbx::{Environment, EnvironmentFlags, Geometry, Mode, PageSize, SyncMode};
+    use reth_libmdbx::{Environment, EnvironmentFlags, Mode, SyncMode};
     if !consensus_db.join("mdbx.dat").is_file() {
         return Err(eyre!("no MDBX database at {} (expected mdbx.dat)", consensus_db.display()));
     }
@@ -777,15 +777,12 @@ pub fn recover(consensus_db: &Path) -> eyre::Result<()> {
         exclusive: true,
         ..Default::default()
     };
-    // Detects the page size like the node does, so a datafile from another host recovers too.
+    // A retry passes the node's geometry, so the detected page size keeps the copy's own limits.
     let open_at = |ps: Option<usize>| {
         let mut builder = Environment::builder();
         builder.set_max_dbs(32).set_flags(flags);
-        if let Some(ps) = ps {
-            builder.set_geometry(Geometry::<std::ops::Range<usize>> {
-                page_size: Some(PageSize::Set(ps)),
-                ..Default::default()
-            });
+        if ps.is_some() {
+            builder.set_geometry(MdbxConfig::default().geometry(ps));
         }
         builder.open(consensus_db)
     };

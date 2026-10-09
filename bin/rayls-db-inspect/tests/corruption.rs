@@ -13,7 +13,7 @@ mod common;
 
 use common::*;
 use rayls_db_inspect::{
-    node_db::{NodeDb, OpenOptions},
+    node_db::{recover, NodeDb, OpenOptions},
     report::{
         batch::{get_batch, get_tx},
         epoch::{epoch, epoch_check},
@@ -180,7 +180,7 @@ fn damaged_databases_never_panic_and_stay_readable_where_mdbx_allows() {
     // (name, damage, must the database still open?)
     let variants: Vec<Variant<'_>> = vec![
         ("intact copy", Box::new(|_| {}), true),
-        // The page size is detected from a surviving backup meta page, so these open on any host.
+        // The page size is read from a surviving backup meta page, so the first two open anywhere.
         (
             "meta page 0 zeroed",
             Box::new(move |d| zero_range(&d.join("mdbx.dat"), 0, page as usize)),
@@ -329,17 +329,12 @@ fn damaged_databases_never_panic_and_stay_readable_where_mdbx_allows() {
         if *must_open && matches!(outcomes[0].1, Outcome::Error(_)) {
             unexpected_unopenable.push(format!("{name}: {:?}", outcomes[0].1));
         }
-        // Each meta-page case must open, or fail with a clean "not an MDBX file", as expected.
-        if name.contains("meta page") {
-            let opens = !name.starts_with("all");
-            let clean = match &outcomes[0].1 {
-                Outcome::Report => opens,
-                Outcome::Error(e) => !opens && e.contains("not an MDBX file"),
-                Outcome::Panic(_) => false,
-            };
-            if !clean {
-                bad_meta_errors.push(format!("{name}: {:?}", outcomes[0].1));
-            }
+        // A meta-page case that cannot open must fail with a clean "not an MDBX file".
+        if !*must_open
+            && name.contains("meta page")
+            && !matches!(&outcomes[0].1, Outcome::Error(e) if e.contains("not an MDBX file"))
+        {
+            bad_meta_errors.push(format!("{name}: {:?}", outcomes[0].1));
         }
     }
     eprintln!("{table}");
@@ -372,9 +367,28 @@ fn damaged_databases_never_panic_and_stay_readable_where_mdbx_allows() {
     );
     assert!(
         bad_meta_errors.is_empty(),
-        "meta-page damage should open from a backup meta page, else fail with 'not an MDBX file':\n{}",
+        "losing every meta page should fail with 'not an MDBX file':\n{}",
         bad_meta_errors.join("\n")
     );
+}
+
+/// `--recover` on a copy whose meta page 0 is zeroed keeps the copy's geometry and its size.
+#[test]
+fn recover_after_zeroed_meta_page_0_keeps_the_datafile_size() {
+    let fx = Fixture::new();
+    let node = SeededNode::new(|db| {
+        seed_healthy(&fx, db);
+    });
+    let root = tempfile::tempdir().unwrap();
+    let copy = root.path().join("copy");
+    sparse_copy(Path::new(&node.consensus_db()), &copy);
+    let dat = copy.join("mdbx.dat");
+    let len = fs::metadata(&dat).unwrap().len();
+    zero_range(&dat, 0, page_size(&dat) as usize);
+    recover(&copy).expect("recover");
+    assert_eq!(fs::metadata(&dat).unwrap().len(), len, "recover must not resize the datafile");
+    NodeDb::open(&copy.display().to_string(), &OpenOptions::default())
+        .expect("open recovered copy");
 }
 
 /// db-inspect reads a healthy DB across the common page sizes (4 to 64 KiB).

@@ -238,9 +238,9 @@ Notes on what the data means:
   is a `BROKEN` link or a failed signature; a damaged row or jar row is an error naming the node,
   the table or jar and the row; a cold tier whose index cannot be read is skipped with a note,
   the hot tables still answer; MDBX keeps three copies of its meta page at the start of the
-  datafile and opens with the newest intact one it can locate (with the default 4 KiB pages a
-  damaged first page or two still opens; with larger pages MDBX cannot find the others once the
-  first is gone), while a file that lost all three cannot be opened at all. `header-check` reports an
+  datafile; the tool reads the page size from a surviving copy and opens with the newest intact
+  one, so a file whose first one or two copies are damaged still opens, while a file that lost
+  all three does not. `header-check` reports an
   unreadable node as such and checks the others (`BROKEN unreadable=N`); the other commands stop
   at the first unreadable node, whose label the error names, so drop that node and rerun.
 - Node roles and archive modes do not change what the tool reads. Validators (active or

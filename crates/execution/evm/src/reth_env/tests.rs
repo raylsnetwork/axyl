@@ -30,8 +30,9 @@ use tracing::debug;
 /// header and rows when reopened with the new default.
 #[test]
 fn test_execution_db_default_page_size() -> eyre::Result<()> {
-    use crate::reth_env::{init::DEFAULT_MDBX_PAGE_SIZE, RethCommand};
+    use crate::reth_env::RethCommand;
     use clap::Parser as _;
+    use rayls_infrastructure_utils::mdbx::DEFAULT_MDBX_PAGE_SIZE;
     use reth::{args::DatabaseArgs, builder::NodeConfig};
     use reth_db::{
         tables,
@@ -90,7 +91,7 @@ fn test_execution_db_default_page_size() -> eyre::Result<()> {
 /// Covers the 16 KiB default and ARM's 64 KiB page size.
 #[test]
 fn test_execution_db_recovers_zeroed_meta_page_0() -> eyre::Result<()> {
-    use crate::reth_env::init::DEFAULT_MDBX_PAGE_SIZE;
+    use rayls_infrastructure_utils::mdbx::DEFAULT_MDBX_PAGE_SIZE;
     use reth::builder::NodeConfig;
     use reth_db::{
         tables,
@@ -124,9 +125,39 @@ fn test_execution_db_recovers_zeroed_meta_page_0() -> eyre::Result<()> {
 
         // Reopen with no page-size hint: detect the size, recover, and keep the row.
         let db = RethEnv::new_database(&default_config, dir.path())?;
+        assert_eq!(db.stat().expect("stat").page_size() as usize, page_size);
         let tx = db.tx()?;
         assert_eq!(tx.get::<tables::CanonicalHeaders>(7)?, Some(B256::repeat_byte(0xab)));
     }
+    Ok(())
+}
+
+/// `new_database` rejects an unsupported `--db.page-size` before it opens the datafile.
+#[test]
+fn test_execution_db_rejects_unsupported_page_size() {
+    use reth::builder::NodeConfig;
+    for page_size in [2048, 12 * 1024, 128 * 1024] {
+        let dir = TempDir::new().expect("temp dir");
+        let mut node_config = NodeConfig::default();
+        node_config.db.page_size = Some(page_size);
+        let err = RethEnv::new_database(&RethConfig(node_config), dir.path())
+            .expect_err("unsupported page size must be rejected");
+        assert!(format!("{err:#}").contains("invalid --db.page-size"), "{page_size}: {err:#}");
+        assert!(!dir.path().join("mdbx.dat").exists(), "{page_size}: no datafile is created");
+    }
+}
+
+/// An existing datafile ignores `--db.page-size`, even an unsupported one.
+#[test]
+fn test_execution_db_existing_datafile_ignores_unsupported_page_size() -> eyre::Result<()> {
+    use rayls_infrastructure_utils::mdbx::DEFAULT_MDBX_PAGE_SIZE;
+    use reth::builder::NodeConfig;
+    let dir = TempDir::new()?;
+    drop(RethEnv::new_database(&RethConfig(NodeConfig::default()), dir.path())?);
+    let mut node_config = NodeConfig::default();
+    node_config.db.page_size = Some(2048);
+    let db = RethEnv::new_database(&RethConfig(node_config), dir.path())?;
+    assert_eq!(db.stat().expect("stat").page_size() as usize, DEFAULT_MDBX_PAGE_SIZE);
     Ok(())
 }
 

@@ -481,16 +481,27 @@ impl MdbxConfig {
     }
 
     /// Set the page size in bytes used when creating a new database (`--consensus-db.page-size`).
-    /// libmdbx accepts powers of two from 256 B to 64 KiB; anything else fails at open.
+    /// Must be a power of two from 4 KiB to 64 KiB; opening a new datafile fails otherwise.
     pub fn with_page_size(mut self, page_size: usize) -> Self {
         self.page_size = Some(page_size);
         self
     }
+
+    /// The datafile geometry the node opens with, at `page_size` when one is given.
+    pub fn geometry(&self, page_size: Option<usize>) -> Geometry<std::ops::Range<usize>> {
+        Geometry {
+            size: Some(0..self.max_db_size),
+            growth_step: Some(self.growth_step as isize),
+            // The database never shrinks
+            shrink_threshold: Some((2 * self.growth_step) as isize),
+            page_size: page_size.map(PageSize::Set),
+        }
+    }
 }
 
-// Page-size default and detection shared with the other node database so both stay in sync.
-use rayls_infrastructure_utils::mdbx::detect_page_size;
+// Page-size rules and detection shared with the other node database so both stay in sync.
 pub use rayls_infrastructure_utils::mdbx::DEFAULT_MDBX_PAGE_SIZE;
+use rayls_infrastructure_utils::mdbx::{detect_page_size, new_datafile_page_size, MDBX_DAT};
 
 /// Runs `open` without a page size and, if meta page 0 is unreadable, again at the detected one.
 ///
@@ -537,12 +548,8 @@ impl MdbxDatabase {
 
     /// Create a new database at the specified path with custom configuration.
     pub fn open_with_config<P: AsRef<Path>>(path: P, config: MdbxConfig) -> eyre::Result<Self> {
-        // Only a new datafile takes the configured page size. An existing datafile keeps its own
-        // page size regardless, but libmdbx derives the pre-open geometry from the configured one,
-        // so passing 16 KiB for a 4 KiB datafile would rewrite that file's geometry header.
-        // Leaving it unset keeps the pre-16 KiB behaviour for existing datafiles.
-        let page_size = (!path.as_ref().join(MDBX_DAT).exists())
-            .then(|| config.page_size.unwrap_or(DEFAULT_MDBX_PAGE_SIZE));
+        let page_size = new_datafile_page_size(path.as_ref(), config.page_size)
+            .map_err(|e| eyre::eyre!("invalid consensus DB page size: {e}"))?;
         tracing::info!(
             target: "rayls::mdbx",
             "Opening MDBX database with config: max_read_txn_duration={:?}, max_readers={}, max_size={}GB, new_datafile_page_size={:?}",
@@ -567,13 +574,7 @@ impl MdbxDatabase {
                     coalesce: true,
                     ..Default::default()
                 })
-                .set_geometry(Geometry {
-                    size: Some(0..config.max_db_size),
-                    growth_step: Some(config.growth_step as isize),
-                    // The database never shrinks
-                    shrink_threshold: Some((2 * config.growth_step) as isize),
-                    page_size: ps.map(PageSize::Set),
-                })
+                .set_geometry(config.geometry(ps))
                 .write_map()
                 .set_dp_reserve_limit(512)
                 // Spill threshold for a write transaction, in pages (libmdbx
@@ -754,9 +755,6 @@ impl MdbxDatabase {
         Ok(())
     }
 }
-
-/// The MDBX datafile name inside an environment directory.
-const MDBX_DAT: &str = "mdbx.dat";
 
 /// Datafile sizes measured around an offline [`compact_in_place`] pass.
 #[derive(Debug, Clone, Copy)]
@@ -1400,6 +1398,38 @@ mod test {
         f.write_all(&vec![0u8; zeroed * ps]).expect("zero meta pages");
         f.sync_all().expect("sync");
         temp
+    }
+
+    /// A new datafile with an unsupported page size is refused before libmdbx creates it.
+    #[test]
+    fn rejects_unsupported_page_size_for_new_datafile() {
+        for ps in [2048, 12 * 1024, 128 * 1024] {
+            let temp = tempdir().expect("failed to create temp dir");
+            let cfg = MdbxConfig::default().with_page_size(ps);
+            let err = MdbxDatabase::open_with_config(temp.path(), cfg).err().expect("rejected");
+            assert!(format!("{err:#}").contains("invalid consensus DB page size"), "{ps}: {err:#}");
+            assert!(!temp.path().join(super::MDBX_DAT).exists(), "{ps}: no datafile is created");
+        }
+    }
+
+    /// An existing datafile ignores the configured page size, even an unsupported one.
+    #[test]
+    fn existing_datafile_ignores_an_unsupported_page_size() {
+        let temp = tempdir().expect("failed to create temp dir");
+        drop(MdbxDatabase::open(temp.path()).expect("create database"));
+        let cfg = MdbxConfig::default().with_page_size(2048);
+        let db = MdbxDatabase::open_with_config(temp.path(), cfg).expect("reopen database");
+        assert_eq!(db.page_size().expect("page size"), DEFAULT_MDBX_PAGE_SIZE);
+    }
+
+    /// An empty datafile, left by a crash during creation, still takes the configured page size.
+    #[test]
+    fn empty_datafile_takes_the_configured_page_size() {
+        let temp = tempdir().expect("failed to create temp dir");
+        std::fs::write(temp.path().join(super::MDBX_DAT), b"").expect("create empty datafile");
+        let cfg = MdbxConfig::default().with_page_size(8192).with_growth_step(super::MEGABYTE);
+        let db = MdbxDatabase::open_with_config(temp.path(), cfg).expect("open database");
+        assert_eq!(db.page_size().expect("page size"), 8192);
     }
 
     /// A database created with the previous 4 KiB default keeps its page size, its geometry

@@ -5,7 +5,7 @@ use std::{fmt, str::FromStr, time::Duration};
 // use crate::version::default_client_version;
 use clap::Args;
 use rayls_infrastructure_storage::mdbx::MdbxConfig;
-use rayls_infrastructure_utils::mdbx::{MAX_MDBX_PAGE_SIZE, MIN_MDBX_PAGE_SIZE};
+use rayls_infrastructure_utils::mdbx::check_page_size;
 
 /// Parameters for database configuration
 #[derive(Debug, Args, PartialEq, Eq, Default, Clone, Copy)]
@@ -20,7 +20,7 @@ pub struct ConsensusDatabaseArgs {
     /// Database page size (e.g., 4KB, 8KB, 16KB).
     ///
     /// Specifies the page size used by the MDBX database. The default is 16KB. Must be a
-    /// power of two between 256B and 64KB, the range libmdbx accepts.
+    /// power of two between 4KB and 64KB.
     ///
     /// WARNING: This setting is only used when creating a new database; an existing
     /// database keeps the page size it was created with.
@@ -146,20 +146,9 @@ fn parse_byte_size(s: &str) -> Result<usize, String> {
 
 /// Value parser for page sizes, accepting the same formats as [`parse_byte_size`].
 ///
-/// libmdbx only accepts a power of two between [`MIN_MDBX_PAGE_SIZE`] and
-/// [`MAX_MDBX_PAGE_SIZE`], and rejects anything else when the datafile is created. Validating
-/// here turns that into a clap error at parse time rather than a node startup failure.
+/// Like [`parse_byte_size`], but rejects any page size that [`check_page_size`] refuses.
 fn parse_page_size(s: &str) -> Result<usize, String> {
-    let page_size = parse_byte_size(s)?;
-    if !(MIN_MDBX_PAGE_SIZE..=MAX_MDBX_PAGE_SIZE).contains(&page_size) {
-        return Err(format!(
-            "page size must be between {MIN_MDBX_PAGE_SIZE} and {MAX_MDBX_PAGE_SIZE} bytes, got {page_size} bytes"
-        ));
-    }
-    if !page_size.is_power_of_two() {
-        return Err(format!("page size must be a power of two, got {page_size} bytes"));
-    }
-    Ok(page_size)
+    parse_byte_size(s).and_then(check_page_size)
 }
 
 #[cfg(test)]
@@ -274,12 +263,10 @@ mod tests {
         assert!(result.is_err());
     }
 
-    /// libmdbx only accepts a power of two from 256B to 64KB. A value outside that range, or one
-    /// that parses but is not a power of two, is rejected by clap rather than by `env.open()`
-    /// once the node is already starting up.
+    /// Clap rejects a page size that is not a power of two from 4KB to 64KB.
     #[test]
-    fn test_command_parser_rejects_page_size_outside_libmdbx_range() {
-        for value in ["5KB", "128B", "128KB", "0"] {
+    fn test_command_parser_rejects_unsupported_page_size() {
+        for value in ["5KB", "2KB", "256B", "128KB", "0"] {
             let result = CommandParser::<ConsensusDatabaseArgs>::try_parse_from([
                 "reth",
                 "--consensus-db.page-size",
@@ -291,7 +278,7 @@ mod tests {
 
     #[test]
     fn test_command_parser_accepts_page_size_range_bounds() {
-        for (value, expected) in [("256B", MIN_MDBX_PAGE_SIZE), ("64KB", MAX_MDBX_PAGE_SIZE)] {
+        for (value, expected) in [("4KB", KILOBYTE * 4), ("64KB", KILOBYTE * 64)] {
             let cmd = CommandParser::<ConsensusDatabaseArgs>::try_parse_from([
                 "reth",
                 "--consensus-db.page-size",
