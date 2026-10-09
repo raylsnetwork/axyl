@@ -10,7 +10,9 @@ use crate::{
     ConsensusBus,
 };
 use handler::RequestHandler;
-pub use message::{MissingCertificatesRequest, PrimaryRequest, PrimaryResponse};
+#[cfg(test)]
+pub(crate) use message::MAX_SKIP_ROUND_AUTHORITIES;
+pub use message::{MissingCertificatesRequest, PrimaryRequest, PrimaryResponse, SkipRoundList};
 // Re-exported so downstream crates (state-sync) can build a `PrimaryNetworkHandle` test mock that
 // answers `NetworkCommand`s without taking a direct dependency on the network crate.
 use message::{PrimaryGossip, PrimaryRPCError};
