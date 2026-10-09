@@ -49,7 +49,7 @@ fn test_missing_certs_request_rejects_round_overflow() {
     roaring::RoaringBitmap::from_iter([1u32]).serialize_into(&mut serialized).expect("bitmap");
     let request = MissingCertificatesRequest {
         exclusive_lower_bound: u32::MAX,
-        skip_rounds: vec![(AuthorityIdentifier::dummy_for_test(0), serialized)],
+        skip_rounds: [(AuthorityIdentifier::dummy_for_test(0), serialized)].into_iter().collect(),
         max_response_size: 10,
         exclusive_upper_bound: None,
     };
@@ -416,7 +416,9 @@ fn uleb128(mut value: usize) -> Vec<u8> {
     }
 }
 
-/// Decoding refuses a skip-round list longer than the wire limit.
+/// Decoding keeps a bounded number of skip-round entries, and counts every authority named.
+///
+/// A long list then reaches the handler, which refuses it with the full count.
 #[test]
 fn test_missing_certs_request_decode_bounds_authority_list() {
     use super::message::MAX_SKIP_ROUND_AUTHORITIES;
@@ -429,26 +431,30 @@ fn test_missing_certs_request_decode_bounds_authority_list() {
         skip_rounds: (0..count)
             .map(|i| {
                 let mut bytes = [0u8; 32];
-                bytes[..8].copy_from_slice(&(i as u64).to_le_bytes());
-                (try_decode::<AuthorityIdentifier>(&bytes).expect("id"), vec![])
+                bytes[..size_of::<u64>()].copy_from_slice(&(i as u64).to_le_bytes());
+                (AuthorityIdentifier::from(bytes), vec![])
             })
             .collect(),
         ..Default::default()
     };
+    // Decode a request, and return how many entries it kept and how many authorities it named.
+    let decode = |bytes: &[u8]| {
+        let decoded: MissingCertificatesRequest = try_decode(bytes).expect("request decodes");
+        (decoded.skip_rounds.kept(), decoded.skip_rounds.named())
+    };
 
     let at_limit = encode(&request(MAX_SKIP_ROUND_AUTHORITIES));
-    let decoded: MissingCertificatesRequest = try_decode(&at_limit).expect("at the limit decodes");
-    assert_eq!(decoded.skip_rounds.len(), MAX_SKIP_ROUND_AUTHORITIES);
+    assert_eq!(decode(&at_limit), (MAX_SKIP_ROUND_AUTHORITIES, MAX_SKIP_ROUND_AUTHORITIES));
 
     let over = encode(&request(MAX_SKIP_ROUND_AUTHORITIES + 1));
-    assert!(try_decode::<MissingCertificatesRequest>(&over).is_err());
+    assert_eq!(decode(&over), (MAX_SKIP_ROUND_AUTHORITIES, MAX_SKIP_ROUND_AUTHORITIES + 1));
 
-    // The audit's request fits under the message limit and is refused.
+    // The audit's request fits under the message limit, and decoding keeps only the bound.
     let attack = encode(&request(AUDIT_AUTHORITIES));
     assert!(attack.len() < LibP2pConfig::default().max_rpc_message_size);
-    assert!(try_decode::<MissingCertificatesRequest>(&attack).is_err());
+    assert_eq!(decode(&attack), (MAX_SKIP_ROUND_AUTHORITIES, AUDIT_AUTHORITIES));
 
-    // A list that only declares the largest length bcs accepts is refused.
+    // A list that only declares the largest length bcs accepts is not decoded.
     let empty = encode(&request(0));
     // the list length follows the lower bound
     let at = encode(&request(0).exclusive_lower_bound).len();
@@ -457,6 +463,26 @@ fn test_missing_certs_request_decode_bounds_authority_list() {
     declared.extend(uleb128(bcs::MAX_SEQUENCE_LENGTH));
     declared.extend_from_slice(&empty[at + 1..]);
     assert!(try_decode::<MissingCertificatesRequest>(&declared).is_err());
+}
+
+/// The handler's limit on named authorities never passes what decoding keeps.
+///
+/// Otherwise the handler could accept a list whose extra entries decoding dropped.
+#[test]
+fn test_requested_authorities_stay_within_the_decoding_limit() {
+    use super::{
+        handler::{max_requested_authorities, REQUESTED_AUTHORITIES_PER_MEMBER},
+        message::MAX_SKIP_ROUND_AUTHORITIES,
+    };
+
+    // A committee of this size reaches the decoding limit through the per-member limit.
+    let largest_unclamped = MAX_SKIP_ROUND_AUTHORITIES / REQUESTED_AUTHORITIES_PER_MEMBER;
+    assert_eq!(max_requested_authorities(largest_unclamped), MAX_SKIP_ROUND_AUTHORITIES);
+    assert_eq!(max_requested_authorities(largest_unclamped + 1), MAX_SKIP_ROUND_AUTHORITIES);
+    // An honest request names the whole committee, so committees up to the limit still fit.
+    for size in [1, largest_unclamped, MAX_SKIP_ROUND_AUTHORITIES] {
+        assert!(max_requested_authorities(size) >= size, "a committee of {size} does not fit");
+    }
 }
 
 /// Serialized roaring bitmap made of `containers` full run containers.
@@ -535,7 +561,7 @@ fn test_skip_bitmap_is_refused_before_decoding() {
     let config = fixture.authorities().next().unwrap().consensus_config();
     let max_response_size = LibP2pConfig::default().max_rpc_message_size;
     let request = |bitmap: Vec<u8>| MissingCertificatesRequest {
-        skip_rounds: vec![(AuthorityIdentifier::dummy_for_test(1), bitmap)],
+        skip_rounds: [(AuthorityIdentifier::dummy_for_test(1), bitmap)].into_iter().collect(),
         max_response_size,
         ..Default::default()
     };

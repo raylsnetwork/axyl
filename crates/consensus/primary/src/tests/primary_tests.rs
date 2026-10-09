@@ -2,7 +2,9 @@
 
 use crate::{
     error::PrimaryNetworkError,
-    network::{handler::RequestHandler, MissingCertificatesRequest, PrimaryResponse},
+    network::{
+        handler::RequestHandler, MissingCertificatesRequest, PrimaryRequest, PrimaryResponse,
+    },
     state_sync::StateSynchronizer,
     ConsensusBus,
 };
@@ -926,6 +928,48 @@ async fn test_missing_certs_request_with_too_many_authorities_is_rejected() {
         matches!(err, PrimaryNetworkError::TooManyAuthorities(n, l) if n == limit + 1 && l == limit)
     );
     assert!(Option::<rayls_consensus_network::Penalty>::from(&err).is_some());
+
+    // A list longer than decoding keeps still arrives, and is refused with its full count.
+    // It goes through the network codec both ways, as it would between two nodes.
+    use rayls_consensus_network::{types::IntoResponse, Codec, RLCodec, StreamProtocol};
+    let mut codec = RLCodec::<PrimaryRequest, PrimaryResponse>::new(max_response_size());
+    let protocol = StreamProtocol::new("/rayls-test");
+    let named = crate::network::MAX_SKIP_ROUND_AUTHORITIES + 1;
+    let long: BTreeMap<AuthorityIdentifier, BTreeSet<u32>> = (0..named)
+        .map(|i| {
+            let mut bytes = [0u8; 32];
+            bytes[..size_of::<u64>()].copy_from_slice(&(i as u64).to_le_bytes());
+            (AuthorityIdentifier::from(bytes), BTreeSet::new())
+        })
+        .collect();
+    let inner = MissingCertificatesRequest::default().set_bounds(0, long).expect("bounds");
+    let mut wire = Vec::new();
+    codec
+        .write_request(&protocol, &mut wire, PrimaryRequest::MissingCertificates { inner })
+        .await
+        .expect("send the request");
+    let received = codec.read_request(&protocol, &mut wire.as_slice()).await;
+    let Ok(PrimaryRequest::MissingCertificates { inner }) = received else {
+        panic!("the receiving node did not get the request: {received:?}");
+    };
+    let err = handler.retrieve_missing_certs(peer, inner).await.expect_err("over limit");
+    assert!(
+        matches!(err, PrimaryNetworkError::TooManyAuthorities(n, l) if n == named && l == limit),
+        "got {err:?}"
+    );
+
+    // The sender gets the refusal back, with both numbers.
+    let mut wire = Vec::new();
+    codec
+        .write_response(&protocol, &mut wire, Err::<PrimaryResponse, _>(err).into_response())
+        .await
+        .expect("send the refusal");
+    let answer = codec.read_response(&protocol, &mut wire.as_slice()).await.expect("answer");
+    let PrimaryResponse::Error(reason) = answer else {
+        panic!("the sender did not get an error: {answer:?}");
+    };
+    assert!(reason.0.contains(&named.to_string()), "got {reason:?}");
+    assert!(reason.0.contains(&limit.to_string()), "got {reason:?}");
 }
 
 /// A valid request that asks for no authorities.

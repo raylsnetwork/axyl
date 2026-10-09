@@ -1,7 +1,9 @@
 //! Handle specific request types received from the network.
 
 use super::{
-    message::{ConsensusResult, MissingCertificatesRequest, PrimaryRPCError},
+    message::{
+        ConsensusResult, MissingCertificatesRequest, PrimaryRPCError, MAX_SKIP_ROUND_AUTHORITIES,
+    },
     AuthEquivocationMap, PrimaryResponse,
 };
 use crate::{
@@ -822,9 +824,10 @@ where
     ) -> PrimaryNetworkResult<PrimaryResponse> {
         let committee = self.consensus_config.committee();
         let limit = max_requested_authorities(committee.size());
-        if request.skip_rounds.len() > limit {
-            debug!(target: "primary::handler", %peer, authorities = request.skip_rounds.len(), limit, "missing-certificates request names too many authorities");
-            return Err(PrimaryNetworkError::TooManyAuthorities(request.skip_rounds.len(), limit));
+        let named = request.skip_rounds.named();
+        if named > limit {
+            debug!(target: "primary::handler", %peer, authorities = named, limit, "missing-certificates request names too many authorities");
+            return Err(PrimaryNetworkError::TooManyAuthorities(named, limit));
         }
         let permits = self.missing_cert_slots.acquire(peer).inspect_err(|_| {
             debug!(target: "primary::handler", %peer, "too many missing-certificates requests in progress");
@@ -962,9 +965,14 @@ pub(crate) const MIN_REQUESTED_AUTHORITIES: usize = 64;
 /// Most authorities a missing-certificates request may name.
 ///
 /// An honest request names each committee member once.
+/// The limit never passes [MAX_SKIP_ROUND_AUTHORITIES], since decoding keeps no more entries.
 pub(crate) fn max_requested_authorities(committee_size: usize) -> usize {
-    (REQUESTED_AUTHORITIES_PER_MEMBER * committee_size).max(MIN_REQUESTED_AUTHORITIES)
+    (REQUESTED_AUTHORITIES_PER_MEMBER * committee_size)
+        .clamp(MIN_REQUESTED_AUTHORITIES, MAX_SKIP_ROUND_AUTHORITIES)
 }
+
+// `clamp` panics if its floor is above its ceiling, so this is checked when building.
+const _: () = assert!(MIN_REQUESTED_AUTHORITIES <= MAX_SKIP_ROUND_AUTHORITIES);
 
 /// Missing-certificate jobs one committee peer may have running at once.
 pub(crate) const MISSING_CERT_JOBS_PER_PEER: usize = 2;
@@ -997,6 +1005,14 @@ impl MissingCertLimits {
     /// A member that stays in the next committee gets a new pool there.
     /// For one epoch change it may run twice its share, still within the committee pool.
     pub(crate) fn for_committee(&self, committee: &Committee) -> MissingCertSlots {
+        if committee.size() > MAX_SKIP_ROUND_AUTHORITIES {
+            error!(
+                target: "primary::handler",
+                committee = committee.size(),
+                limit = MAX_SKIP_ROUND_AUTHORITIES,
+                "committee is larger than a missing-certificates request may name, so missing-certificates requests between members will be refused"
+            );
+        }
         let per_peer = committee
             .authorities()
             .iter()

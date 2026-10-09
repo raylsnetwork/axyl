@@ -148,10 +148,7 @@ pub struct MissingCertificatesRequest {
     pub exclusive_lower_bound: Round,
     /// Rounds that should be skipped while processing this request (by authority). The rounds are
     /// serialized as [RoaringBitmap]s.
-    ///
-    /// Decoding fails as soon as the list is longer than [MAX_SKIP_ROUND_AUTHORITIES].
-    #[serde(deserialize_with = "deserialize_skip_rounds")]
-    pub skip_rounds: Vec<(AuthorityIdentifier, Vec<u8>)>,
+    pub skip_rounds: SkipRoundList,
     /// The maximum size of the uncompressed response message (in bytes). The caller shares this so
     /// the response doesn't get rejected by the request_response codec.
     pub max_response_size: usize,
@@ -163,52 +160,84 @@ pub struct MissingCertificatesRequest {
     pub exclusive_upper_bound: Option<Round>,
 }
 
-/// Most authorities a missing-certificates request may list on the wire.
+/// Most skip-round entries a decoded request keeps.
 ///
-/// Honest requests name only committee members, so only a faulty or hostile peer reaches it.
-/// This bound only stops a peer from making the node decode a huge list.
+/// The handler refuses any request that names more authorities than this.
+/// So entries past this bound are never used, and decoding drops them.
 pub(crate) const MAX_SKIP_ROUND_AUTHORITIES: usize = 1024;
 
-/// Decode the skip-round list, refusing a list longer than [MAX_SKIP_ROUND_AUTHORITIES].
+/// The skip-round list of a missing-certificates request.
 ///
-/// The length is checked before any entry is decoded.
-fn deserialize_skip_rounds<'de, D>(
-    deserializer: D,
-) -> Result<Vec<(AuthorityIdentifier, Vec<u8>)>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    struct BoundedList;
+/// On the wire it is a plain list, so the message format does not change.
+/// Decoding keeps at most 1,024 entries and counts the rest.
+/// A long list then still reaches the handler, which refuses it with a clear error.
+/// Encoding writes only the kept entries, so a shortened list does not encode back to the original.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SkipRoundList {
+    /// The entries kept.
+    entries: Vec<(AuthorityIdentifier, Vec<u8>)>,
+    /// How many authorities the list named, including entries that were dropped.
+    named: usize,
+}
 
-    impl<'de> serde::de::Visitor<'de> for BoundedList {
-        type Value = Vec<(AuthorityIdentifier, Vec<u8>)>;
-
-        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            write!(f, "at most {MAX_SKIP_ROUND_AUTHORITIES} skip-round entries")
-        }
-
-        fn visit_seq<A: serde::de::SeqAccess<'de>>(
-            self,
-            mut seq: A,
-        ) -> Result<Self::Value, A::Error> {
-            // bcs always gives the exact length, so a long list is refused before any entry.
-            // The check in the loop covers formats that give no length.
-            let len = seq.size_hint().unwrap_or(0);
-            if len > MAX_SKIP_ROUND_AUTHORITIES {
-                return Err(serde::de::Error::invalid_length(len, &self));
-            }
-            let mut list = Vec::with_capacity(len.min(MAX_SKIP_ROUND_AUTHORITIES));
-            while let Some(entry) = seq.next_element()? {
-                if list.len() == MAX_SKIP_ROUND_AUTHORITIES {
-                    return Err(serde::de::Error::invalid_length(list.len() + 1, &self));
-                }
-                list.push(entry);
-            }
-            Ok(list)
-        }
+impl SkipRoundList {
+    /// How many authorities the list named.
+    pub fn named(&self) -> usize {
+        self.named
     }
 
-    deserializer.deserialize_seq(BoundedList)
+    /// How many entries the list kept.
+    #[cfg(test)]
+    pub(crate) fn kept(&self) -> usize {
+        self.entries.len()
+    }
+}
+
+impl FromIterator<(AuthorityIdentifier, Vec<u8>)> for SkipRoundList {
+    fn from_iter<I: IntoIterator<Item = (AuthorityIdentifier, Vec<u8>)>>(iter: I) -> Self {
+        let entries: Vec<_> = iter.into_iter().collect();
+        Self { named: entries.len(), entries }
+    }
+}
+
+impl Serialize for SkipRoundList {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.entries.serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for SkipRoundList {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct SkipRoundVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for SkipRoundVisitor {
+            type Value = SkipRoundList;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "a list of skip-round entries")
+            }
+
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> Result<Self::Value, A::Error> {
+                // The declared length is not trusted, so it only sizes the kept entries.
+                let declared = seq.size_hint().unwrap_or(0);
+                let mut entries = Vec::with_capacity(declared.min(MAX_SKIP_ROUND_AUTHORITIES));
+                let mut named = 0;
+                // Each entry is decoded, so a list cannot declare more entries than it holds.
+                while let Some(entry) = seq.next_element()? {
+                    named += 1;
+                    if entries.len() < MAX_SKIP_ROUND_AUTHORITIES {
+                        entries.push(entry);
+                    }
+                }
+                Ok(SkipRoundList { entries, named })
+            }
+        }
+
+        deserializer.deserialize_seq(SkipRoundVisitor)
+    }
 }
 
 /// Most containers a skip-round bitmap may declare.
@@ -262,6 +291,7 @@ impl MissingCertificatesRequest {
     ) -> PrimaryNetworkResult<(Round, BTreeMap<AuthorityIdentifier, BTreeSet<Round>>)> {
         let skip_rounds: BTreeMap<AuthorityIdentifier, BTreeSet<Round>> = self
             .skip_rounds
+            .entries
             .iter()
             .map(|(k, serialized)| {
                 let containers = roaring_container_count(serialized).ok_or_else(|| {
@@ -350,7 +380,7 @@ impl MissingCertificatesRequest {
 
                 Ok((k, serialized))
             })
-            .collect::<PrimaryNetworkResult<Vec<_>>>()?;
+            .collect::<PrimaryNetworkResult<SkipRoundList>>()?;
 
         Ok(self)
     }
