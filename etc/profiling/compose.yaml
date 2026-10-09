@@ -49,10 +49,12 @@ services:
   setup4: { image: *profiling-image }
   comittee: { image: *profiling-image }
 
-  validator1: { image: *profiling-image, command: *node-command }
-  validator2: { image: *profiling-image, command: *node-command }
-  validator3: { image: *profiling-image, command: *node-command }
-  validator4: { image: *profiling-image, command: *node-command }
+  # genesis.sh builds chain-id 0x1e7 (487) = the built-in `local` schedule; the base file's
+  # RAYLS_NETWORK=devnet (503) fails the boot-time chain-id check
+  validator1: { image: *profiling-image, command: *node-command, environment: [RAYLS_NETWORK=local] }
+  validator2: { image: *profiling-image, command: *node-command, environment: [RAYLS_NETWORK=local] }
+  validator3: { image: *profiling-image, command: *node-command, environment: [RAYLS_NETWORK=local] }
+  validator4: { image: *profiling-image, command: *node-command, environment: [RAYLS_NETWORK=local] }
 
   # eBPF profiler: samples stacks of every process on the host kernel, keeps the rayls ones.
   alloy:
@@ -106,6 +108,7 @@ services:
   loadgen:
     image: ghcr.io/foundry-rs/foundry:v1.8.5
     profiles: [load]
+    restart: unless-stopped
     entrypoint: ["sh", "/loadgen.sh"]
     volumes:
       - ../profiling/loadgen.sh:/loadgen.sh:ro

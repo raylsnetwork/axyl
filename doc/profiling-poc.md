@@ -120,27 +120,39 @@ The dashboard computes the per-poll and per-wake means as
 `rate(total_X_duration) / (avg_over_time(total_X_count[1m]) / 5)`. It assumes the 5s sampling
 interval.
 
-### First look (single dev node on macOS, idle chain)
+### First look (4 validators on Docker Desktop, Apple Silicon, ~20 transfers/s)
 
-A one-minute smoke test of a `rayls-network dev` node already showed the kind of signal this gives.
+A few minutes of the stack on validator1:
 
-- **`propose-header-*` took about 70% of the runtime's busy time**, nearly all of it in slow polls:
-  roughly 1.27 s of 1.8 s total polling.
-- **The runtime's p95 poll time was about 4 ms.**
+- **BLS dominates CPU.** About 52% of on-CPU samples are in blst's BLS12-381 field arithmetic
+  (`__mul_by_1_mont_384`, `__mul_mont_384`, `__sqr_384`, …).
+  - The flame graph can't say who calls it: the unwinder stops inside blst's assembly, so those
+    stacks start at `[unknown]` (see Limits).
+- **tokio-metrics points at the callers.** The tasks that verify signatures hold a worker far
+  longer than anything else:
+  - `ProcessGossip-rayls-consensus-output-*` averages about 9.3 ms per poll, and every poll is
+    slow (over 50 µs).
+  - `ProcessGossip-rayls-consensus-primary-*` averages about 8.8 ms per poll and uses about 0.19
+    of a worker.
+  - `VoteRequest-*` takes about 2.5–4.5 ms per poll.
+  - The runtime itself isn't saturated (about 0.5 of 6 workers busy), but single polls reach
+    about 67 ms. Across validators, p99 is about 17 ms and p99.9 about 34 ms.
+- **`RequestHandler::behind_consensus`** uses about 6% of CPU, almost all of it in
+  `MemDatabase::reverse_iter` (through `LayeredDatabase`).
+- **The reth metrics endpoint** costs about 4% of CPU, mostly serving Prometheus every 5s
+  (`reth_node_metrics::server::handle_request`). Part of that is this PoC's own scraping.
 
-That task runs `Certifier::spawn_header_proposal`, which calls
-`state_sync.process_own_certificate(…)` and `publish_certificate(…)` inline on a tokio worker.
-Some part of that path (signing, verification, or a synchronous DB write) holds the worker for
-milliseconds per round. The flame graph for that window is how to tell which one. Treat this as a
-lead, not a measurement: it was one dev node on a laptop, not the 4-validator network under load.
+These are leads from one laptop run, not measurements. The obvious next step is to check where
+signature verification runs (inline in the gossip and request handlers vs `spawn_blocking`/rayon),
+and what `behind_consensus` iterates over.
 
 ## Reading the flame graphs
 
 - **`process_cpu:cpu`** (on-CPU) shows the frames that were running, from `main` and the tokio
   worker loop down to the kernel.
   - Filter with `validator="validator1"`.
-  - Search for a crate (`libp2p`, `quinn`, `reth_trie`, `revm`, `blst`, `rayls_consensus_primary`) to
-    see its total share.
+  - Search for a crate (`libp2p`, `quinn`, `reth_trie`, `revm`, `rayls_consensus_primary`) to see its
+    total share. blst is C/assembly, so search for `_384` instead (`__mul_mont_384`, …).
   - Async functions show up as `{{closure}}` / `{async_fn_env#0}` frames inside their parent
     function.
 - **`offcpu`** shows where threads went to sleep, weighted by time asleep.
@@ -161,6 +173,9 @@ lead, not a measurement: it was one dev node on a laptop, not the 4-validator ne
     setup.
   - Build the image natively for the host architecture (the default). An amd64 image under
     Rosetta would profile the translator.
+- **Stacks through blst are cut off.** The unwinder can't walk back through blst's hand-written
+  assembly, so BLS samples show up under `[unknown]` with no Rust caller. This was seen on arm64
+  and may differ on x86_64. Use the per-task poll times to tell which tasks do the BLS work.
 - **No inlined frames or line numbers.** Alloy symbolizes from the ELF symbol table, so heavily
   inlined reth/revm code is attributed to its caller (grafana/pyroscope#4704). `debug = true`
   doesn't change that today; it only helps other tools (`perf`, `samply`).
@@ -177,6 +192,10 @@ lead, not a measurement: it was one dev node on a laptop, not the 4-validator ne
   - Off-CPU isn't in the released image.
   - Alloy's `pyroscope.ebpf` runs the same profiler engine (Grafana's fork) and has none of these
     gaps.
+
+- **`etc/docker-network` sets `RAYLS_NETWORK=devnet`.** Its `genesis.sh` builds chain-id 487, the
+  built-in `local` schedule, so plain `make up` fails the boot-time chain-id check.
+  `etc/profiling/compose.yaml` overrides it to `local`.
 
 ## Profiling a real host (devnet/testnet)
 

@@ -34,6 +34,8 @@ const MAX_TASK_KINDS: usize = 256;
 const OVERFLOW_KIND: &str = "other";
 /// Name tokens longer than this are treated as identifiers, not words.
 const MAX_WORD_LEN: usize = 32;
+/// All-caps tokens up to this length are acronyms (`CVV`, `RPC`); longer ones are identifiers.
+const MAX_ACRONYM_LEN: usize = 6;
 
 static ENABLED: AtomicBool = AtomicBool::new(false);
 static INTERVAL: OnceLock<Duration> = OnceLock::new();
@@ -128,9 +130,6 @@ fn monitor_for(kind: &str) -> TaskMonitor {
 /// output) is dropped.
 fn task_kind(name: &str) -> String {
     let is_separator = |c: char| matches!(c, ' ' | '-' | ':' | '/');
-    let is_word = |token: &str| {
-        token.len() <= MAX_WORD_LEN && token.chars().all(|c| c.is_ascii_alphabetic() || c == '_')
-    };
 
     let name = name.split(['{', '(', '[']).next().unwrap_or_default();
     let mut kind = String::with_capacity(name.len());
@@ -157,6 +156,54 @@ fn task_kind(name: &str) -> String {
     }
     kind.truncate(kind.trim_end_matches(is_separator).len());
     kind
+}
+
+/// Whether a name token reads as a word rather than an identifier: lowercase/snake_case, a short
+/// acronym, or CamelCase whose segments look pronounceable. Base58 digests without digits
+/// (`EJCVwyENSosTWCYg`, `FmuqpwvFgqayJopg`) fail the CamelCase checks.
+fn is_word(token: &str) -> bool {
+    if token.is_empty() || token.len() > MAX_WORD_LEN {
+        return false;
+    }
+    if token.bytes().all(|b| b.is_ascii_lowercase() || b == b'_') {
+        return token.split('_').all(|part| !part.is_empty());
+    }
+    if token.bytes().all(|b| b.is_ascii_uppercase()) {
+        return token.len() <= MAX_ACRONYM_LEN;
+    }
+
+    let starts: Vec<usize> =
+        token.match_indices(|c: char| c.is_ascii_uppercase()).map(|(i, _)| i).collect();
+    if starts.first() != Some(&0) {
+        return false;
+    }
+    let ends = starts.iter().skip(1).copied().chain(std::iter::once(token.len()));
+    starts.iter().zip(ends).all(|(&start, end)| is_pronounceable(&token[start..end]))
+}
+
+/// A CamelCase segment (`Request`, `Batch`): a capital, then lowercase letters, with a vowel and
+/// no run of four consonants.
+fn is_pronounceable(segment: &str) -> bool {
+    let is_vowel =
+        |b: u8| matches!(b.to_ascii_lowercase(), b'a' | b'e' | b'i' | b'o' | b'u' | b'y');
+    let bytes = segment.as_bytes();
+    if bytes.len() < 2 || !bytes[1..].iter().all(u8::is_ascii_lowercase) {
+        return false;
+    }
+    let mut has_vowel = false;
+    let mut consonant_run = 0;
+    for &b in bytes {
+        if is_vowel(b) {
+            has_vowel = true;
+            consonant_run = 0;
+        } else {
+            consonant_run += 1;
+            if consonant_run >= 4 {
+                return false;
+            }
+        }
+    }
+    has_vowel
 }
 
 #[cfg(test)]
@@ -189,6 +236,23 @@ mod tests {
         );
         assert_eq!(task_kind("worker-0 batch-builder"), "worker-* batch-builder");
         assert_eq!(task_kind("a 0x1 0x2 b"), "a * b");
+    }
+
+    #[test]
+    fn task_kind_replaces_letter_only_digests() {
+        // base58 digests seen live on a 4-validator network, no digits in them
+        assert_eq!(task_kind("VoteRequest-EJCVwyENSosTWCYg"), "VoteRequest-*");
+        assert_eq!(task_kind("VoteRequest-FmuqpwvFgqayJopg"), "VoteRequest-*");
+        assert_eq!(task_kind("ReportBatchToPeer-HVAkCzqkvXBLUVFT"), "ReportBatchToPeer-*");
+    }
+
+    #[test]
+    fn task_kind_keeps_camel_case_and_acronyms() {
+        assert_eq!(task_kind("MissingCertsReq-12D3KooWabc"), "MissingCertsReq-*");
+        assert_eq!(task_kind("ConsensusOutputReq-12D3KooWEyop"), "ConsensusOutputReq-*");
+        assert_eq!(task_kind("Clear parent certs for non-CVV"), "Clear parent certs for non-CVV");
+        assert_eq!(task_kind("eth-filters_stale-filters-clean"), "eth-filters_stale-filters-clean");
+        assert_eq!(task_kind("Collect Epoch Signatures"), "Collect Epoch Signatures");
     }
 
     #[test]

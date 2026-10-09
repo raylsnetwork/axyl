@@ -27,9 +27,11 @@ while true; do
         "$to" --value 1wei >/dev/null; then
         nonce=$((nonce + 1))
     else
-        # resync after a rejected send (e.g. node restart)
+        # resync after a rejected send; retry while the node is down (e.g. restarting)
         sleep 1
-        nonce=$(cast nonce --block pending --rpc-url "$RPC_URL" "$from")
+        until nonce=$(cast nonce --block pending --rpc-url "$RPC_URL" "$from" 2>/dev/null); do
+            sleep 2
+        done
     fi
     sleep "$INTERVAL"
 done
