@@ -15,5 +15,11 @@ pub mod rpc;
 pub mod scenario;
 pub mod verify;
 
-/// Axyl chain ID (0x7e1 = 2017).
-pub const CHAIN_ID: u64 = 0x7e1;
+use rayls_infrastructure_types::RaylsNetwork;
+
+/// The network profile the chaos test clusters run. The ceremony's `--chain-id` and every
+/// node's `--network` flag are derived from it so the pair can never drift apart.
+pub const TEST_NETWORK: RaylsNetwork = RaylsNetwork::Local;
+
+/// Chain ID the chaos test clusters run (TEST_NETWORK's chain-id).
+pub const CHAIN_ID: u64 = TEST_NETWORK.chain_id();

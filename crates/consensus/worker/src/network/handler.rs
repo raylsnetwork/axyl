@@ -1,3 +1,5 @@
+//! Handling of peer requests and gossip received by the worker network.
+
 use super::{
     error::{WorkerNetworkError, WorkerNetworkResult},
     message::WorkerGossip,
@@ -9,8 +11,8 @@ use rayls_infrastructure_config::{ConsensusConfig, LibP2pConfig};
 use rayls_infrastructure_network_types::{WorkerOthersBatchMessage, WorkerToPrimaryClient};
 use rayls_infrastructure_storage::tables::Batches;
 use rayls_infrastructure_types::{
-    encode, ensure, now, try_decode, Batch, BatchValidation, BlockHash, BlsPublicKey, Database,
-    DbTx, SealedBatch, WorkerId,
+    encode, ensure, now, try_decode, Batch, BatchValidation, BlockHash, BlsPublicKey, Bytes,
+    CommitteeSlots, Database, DbTx, SealedBatch, WorkerId,
 };
 use std::sync::{Arc, LazyLock};
 use tracing::{debug, error};
@@ -40,7 +42,7 @@ pub struct RequestHandler<DB> {
     validator: Arc<dyn BatchValidation>,
     /// Consensus config with access to database.
     consensus_config: ConsensusConfig<DB>,
-    /// Network handle- so we can respond to gossip.
+    /// Network handle for fetching batches whose digests arrive by gossip.
     network_handle: WorkerNetworkHandle,
 }
 
@@ -63,7 +65,6 @@ where
     /// Workers gossip the Batch Digests once accepted so that non-committee peers can request the
     /// Batch.
     pub(super) async fn process_gossip(&self, msg: &GossipMessage) -> WorkerNetworkResult<()> {
-        // deconstruct message
         let GossipMessage { data, source: _, sequence_number: _, topic } = msg;
 
         // gossip is uncompressed
@@ -75,12 +76,10 @@ where
                     topic.to_string().eq(&LibP2pConfig::worker_batch_topic()),
                     WorkerNetworkError::InvalidTopic
                 );
-                // Retrieve the block...
                 let store = self.consensus_config.node_storage();
-                if !matches!(store.get::<Batches>(&batch_hash), Ok(Some(_))) {
-                    // If we don't have this batch already then try to get it.
-                    // If we are a CVV then we should already have it.
-                    // This allows non-CVVs to pre fetch batches they will soon need.
+                if !store.contains_key::<Batches>(&batch_hash).unwrap_or(false) {
+                    // A committee member already holds the batch; a non-committee node prefetches
+                    // what it will soon need.
                     match self.network_handle.request_batches(vec![batch_hash]).await {
                         Ok(batches) => {
                             if let Some(batch) = batches.first() {
@@ -105,17 +104,23 @@ where
                 if let Some(authority) = self.consensus_config.authority() {
                     let committee = self.consensus_config.committee();
                     let authorities = committee.authorities();
-                    let size = authorities.len();
-                    for (slot, auth) in authorities.into_iter().enumerate() {
-                        if &auth == authority {
-                            if let Err(e) = self.validator.submit_batch_if_mine(
-                                &tx_bytes,
-                                size as u64,
-                                slot as u64,
-                            ) {
-                                error!(target: "worker:network", "failed to submit batch: {e}");
-                            }
-                            break;
+                    // Slot liveness is the committee members this node is connected to (own slot
+                    // always live), so a down owner's senders redirect to a live validator instead
+                    // of stranding. Views are per-node and can briefly disagree; the worst case is
+                    // duplicate inclusion, resolved by the nonce check at execution.
+                    let connected = self
+                        .network_handle
+                        .inner_handle()
+                        .connected_peers()
+                        .await
+                        .unwrap_or_default();
+                    if let Some(own_slot) = authorities.iter().position(|auth| auth == authority) {
+                        let keys: Vec<BlsPublicKey> =
+                            authorities.iter().map(|auth| *auth.protocol_key()).collect();
+                        let slots =
+                            CommitteeSlots::from_connectivity(own_slot as u64, &keys, &connected);
+                        if let Err(e) = self.validator.submit_batch_if_mine(&tx_bytes, &slots) {
+                            error!(target: "worker:network", "failed to submit batch: {e}");
                         }
                     }
                 }
@@ -125,6 +130,11 @@ where
         Ok(())
     }
 
+    /// Admit transactions forwarded directly by an observer, returning the stale-hash ack.
+    pub(super) async fn submit_forwarded_txns(&self, transactions: Vec<Bytes>) -> Vec<BlockHash> {
+        self.validator.submit_forwarded_txns(transactions).await
+    }
+
     /// Process a new reported batch.
     pub(super) async fn process_report_batch(
         &self,
@@ -132,14 +142,13 @@ where
         sealed_batch: SealedBatch,
     ) -> WorkerNetworkResult<()> {
         // return error if reporter isn't in current committee
-        if !self.consensus_config.committee_pub_keys().contains(peer) {
+        if self.consensus_config.committee().authority_by_key(peer).is_none() {
             return Err(WorkerNetworkError::NonCommitteeBatch);
         }
 
         let client = self.consensus_config.local_network().clone();
         let store = self.consensus_config.node_storage().clone();
-        // validate batch - log error if invalid
-        self.validator.validate_batch(sealed_batch.clone()).await?;
+        self.validator.validate_batch(&sealed_batch).await?;
 
         let (mut batch, digest) = sealed_batch.split();
 
@@ -182,15 +191,13 @@ fn collect_requested_batches_blocking<DB: Database>(
     max_response_size: usize,
     consensus_config: ConsensusConfig<DB>,
 ) -> WorkerNetworkResult<Vec<Batch>> {
-    // assume reasonable min is 1 encoded batch (no transactions)
-    // NOTE: caller needs to account for batches + msg overhead, and batches must have
-    // transactions
+    // the floor is one encoded empty batch; the requester must budget for batches plus message
+    // overhead on top
     if max_response_size < *LOCAL_MIN_REQUEST_SIZE {
         debug!(target: "cert-collector", "batch request max size too small: {}", max_response_size);
         return Err(WorkerNetworkError::InvalidRequest("Request size too small".into()));
     }
 
-    // return error for empty batches
     if batch_digests.is_empty() {
         debug!(target: "cert-collector", "batch request empty");
         return Err(WorkerNetworkError::InvalidRequest("Empty batch digests".into()));
@@ -262,36 +269,7 @@ fn collect_requested_batches_blocking<DB: Database>(
 
 // support IT tests
 #[cfg(any(test, feature = "test-utils"))]
-impl<DB> RequestHandler<DB>
-where
-    DB: Database,
-{
-    // /// Publicly available for tests.
-    // /// See [Self::process_gossip].
-    // pub async fn pub_process_gossip(&self, msg: &GossipMessage) -> WorkerNetworkResult<()> {
-    //     self.process_gossip(msg).await
-    // }
-
-    // /// Publicly available for tests.
-    // /// See [Self::process_report_batch].
-    // pub async fn pub_process_report_batch(
-    //     &self,
-    //     peer: &BlsPublicKey,
-    //     sealed_batch: SealedBatch,
-    // ) -> WorkerNetworkResult<()> {
-    //     self.process_report_batch(peer, sealed_batch).await
-    // }
-
-    // /// Publicly available for tests.
-    // /// See [Self::process_request_batches].
-    // pub async fn pub_process_request_batches(
-    //     &self,
-    //     batch_digests: Vec<BlockHash>,
-    //     max_response_size: usize,
-    // ) -> WorkerNetworkResult<Vec<Batch>> {
-    //     self.process_request_batches(batch_digests, max_response_size).await
-    // }
-}
+impl<DB> RequestHandler<DB> where DB: Database {}
 
 #[cfg(test)]
 mod tests {
@@ -345,7 +323,8 @@ mod tests {
         let store = config.node_storage().clone();
 
         // Equal-sized batches so the budget maps cleanly to a batch count.
-        let sample = Batch { transactions: vec![vec![1u8; 256]], ..Default::default() };
+        let sample =
+            Batch { transactions: vec![Bytes::from(vec![1u8; 256])], ..Default::default() };
         let batch_size = sample.size();
 
         const TOTAL: usize = 20;
@@ -381,12 +360,14 @@ mod tests {
         let store = config.node_storage().clone();
 
         let hot_digest = B256::repeat_byte(0x11);
-        let hot_batch = Batch { transactions: vec![vec![1u8; 64]], ..Default::default() };
+        let hot_batch =
+            Batch { transactions: vec![Bytes::from(vec![1u8; 64])], ..Default::default() };
         store.insert::<Batches>(&hot_digest, &hot_batch).expect("insert hot batch");
 
         // The cold batch exists only as a jar row plus its auxiliary-index entry, never hot.
         let cold_digest = B256::repeat_byte(0x22);
-        let cold_batch = Batch { transactions: vec![vec![2u8; 64]], ..Default::default() };
+        let cold_batch =
+            Batch { transactions: vec![Bytes::from(vec![2u8; 64])], ..Default::default() };
         let cold = store.cold().expect("cold attached");
         cold.batches().begin_epoch(1, 0).expect("begin epoch");
         cold.batches()
@@ -417,7 +398,8 @@ mod tests {
         let store = config.node_storage().clone();
 
         let hot = [B256::repeat_byte(0x11), B256::repeat_byte(0x22)];
-        let hot_batch = Batch { transactions: vec![vec![1u8; 64]], ..Default::default() };
+        let hot_batch =
+            Batch { transactions: vec![Bytes::from(vec![1u8; 64])], ..Default::default() };
         for digest in &hot {
             store.insert::<Batches>(digest, &hot_batch).expect("insert hot batch");
         }
@@ -454,8 +436,10 @@ mod tests {
         let store = config.node_storage().clone();
 
         const PRESENT: usize = 4;
-        let within_cap = Batch { transactions: vec![vec![1u8; 64]], ..Default::default() };
-        let past_cap = Batch { transactions: vec![vec![2u8; 64]], ..Default::default() };
+        let within_cap =
+            Batch { transactions: vec![Bytes::from(vec![1u8; 64])], ..Default::default() };
+        let past_cap =
+            Batch { transactions: vec![Bytes::from(vec![2u8; 64])], ..Default::default() };
 
         // Stored batches sit on both sides of the cap, separated by a run of digests with nothing
         // stored. Misses cost no response bytes, so only the cap can decide where serving stops,

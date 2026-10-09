@@ -13,10 +13,14 @@ use crate::{
 };
 use assert_matches::assert_matches;
 use eyre::eyre;
+use futures::StreamExt as _;
 use libp2p::{
+    core::transport::ListenerId,
     gossipsub::{Message as GossipMessage, TopicHash},
     kad::{self, store::RecordStore, ProviderRecord, RecordKey},
-    PeerId,
+    multiaddr::Protocol,
+    swarm::SwarmEvent,
+    Multiaddr, PeerId,
 };
 use rayls_execution_evm::test_utils::fixture_batch_with_transactions;
 use rayls_infrastructure_config::{ConsensusConfig, NetworkConfig};
@@ -74,7 +78,6 @@ fn create_test_peers<Req: RLMessage, Res: RLMessage>(
                 _network_events: network_events,
                 network_handle,
                 network: Some(network),
-                network_metrics: metrics,
             }
         })
         .collect();
@@ -85,7 +88,7 @@ fn create_test_peers<Req: RLMessage, Res: RLMessage>(
     (target, peers, task_manager)
 }
 
-/// A peer on RL
+/// A peer on RL.
 struct TestPeer<Req, Res, DB = MemDatabase>
 where
     Req: RLMessage,
@@ -100,10 +103,8 @@ where
     /// The network task.
     #[allow(clippy::type_complexity)]
     network: Option<ConsensusNetwork<Req, Res, MemDatabase, mpsc::Sender<NetworkEvent<Req, Res>>>>,
-    /// Network metrics shared with the spawned task.
-    network_metrics: Arc<NetworkMetrics>,
 }
-/// A peer on RL
+/// A peer on RL.
 struct NetworkPeer<Req, Res, DB = MemDatabase>
 where
     Req: RLMessage,
@@ -121,7 +122,7 @@ where
     network_metrics: Arc<NetworkMetrics>,
 }
 
-/// The type for holding testng components.
+/// The type for holding testing components.
 struct TestTypes<Req, Res, DB = MemDatabase>
 where
     Req: RLMessage,
@@ -464,9 +465,11 @@ async fn test_outbound_failure_malicious_request() -> eyre::Result<()> {
     // sleep for heartbeat
     tokio::time::sleep(Duration::from_secs(TEST_HEARTBEAT_INTERVAL)).await;
 
-    let peer_score_before_msg = honest_peer.peer_score(malicious_peer_id).await?.unwrap();
+    let honest_score_before = malicious_peer.peer_score(honest_peer_id).await?.unwrap();
+    let _malicious_score_before = honest_peer.peer_score(malicious_peer_id).await?.unwrap();
 
-    // honest peer returns `OutboundFailure` error
+    // honest peer cannot decode the request and closes the stream, which the requester sees as
+    // an `OutboundFailure::Io`
     let response_from_peer = malicious_peer.send_request(malicious_msg, honest_bls).await?;
     let res = timeout(Duration::from_secs(2), response_from_peer)
         .await?
@@ -474,15 +477,22 @@ async fn test_outbound_failure_malicious_request() -> eyre::Result<()> {
 
     assert_matches!(res, Err(NetworkError::Outbound(_)));
 
-    // Allow time for penalty to be applied
+    // Allow time for any penalty to be applied
     tokio::time::sleep(Duration::from_millis(500)).await;
 
-    // TODO: the honest peer penalize the malicious requestor. see Issue #250
-    //
-    // assert honest peer's score is lower - penalties are applied immediately
-    // however, it should be the case that honest peer penalizes the malicious peer
-    let peer_score_after_msg = malicious_peer.peer_score(honest_peer_id).await?.unwrap();
-    assert!(peer_score_before_msg > peer_score_after_msg);
+    // The requester must not score the honest responder for its own bad request: an outbound
+    // `Io` failure is indistinguishable from a reset link and is not the target's fault. This
+    // assertion used to be inverted (the requester lowered the honest peer's score), which is the
+    // misattribution that let a lagging validator disconnect innocent observers.
+    let honest_score_after = malicious_peer.peer_score(honest_peer_id).await?.unwrap();
+    assert_eq!(
+        honest_score_before, honest_score_after,
+        "an outbound Io failure must not lower the target's score"
+    );
+
+    // TODO: the honest peer should penalize the malicious requester for the undecodable request.
+    // See Issue #250. Not asserted here: an inbound `Io` is also not scored today because it is
+    // ambiguous with this node's own failure to write a response.
 
     Ok(())
 }
@@ -1711,6 +1721,93 @@ async fn test_newer_kad_record_replaced() -> eyre::Result<()> {
     Ok(())
 }
 
+/// A replayed or stale record must be deduped before the signature verify: an invalid
+/// signature on a duplicate is never examined, so it must not earn a penalty. A verify-first
+/// ordering would trip the invalid-record penalty and ban an honest peer for a stale replay.
+#[tokio::test]
+async fn test_kad_put_stale_duplicate_deduped_before_signature_verify() -> eyre::Result<()> {
+    let TestTypes { peer1, mut peer2, .. } =
+        create_test_types::<TestWorkerRequest, TestWorkerResponse>();
+    let mut network = peer1.network;
+
+    // store peer2's valid record
+    let valid_record = peer2.network.get_peer_record();
+    network.swarm.behaviour_mut().kademlia.store_mut().put(valid_record.clone())?;
+
+    // craft a stale duplicate (older timestamp) with a garbage signature
+    let mut stale_info = peer2.network.node_record.info.clone();
+    stale_info.timestamp = now() - 10_000;
+    let garbage_signature = peer2.config.key_config().request_signature_direct(&encode(&"garbage"));
+    peer2.network.node_record = NodeRecord { info: stale_info, signature: garbage_signature };
+    let stale_record = peer2.network.get_peer_record();
+
+    let peer2_id = *peer2.network.swarm.local_peer_id();
+    network.process_kad_put_request(peer2_id, stale_record);
+
+    // the stored record is untouched and the sender is not penalized for a signature
+    // that was never checked
+    let store_record = network
+        .swarm
+        .behaviour_mut()
+        .kademlia
+        .store_mut()
+        .get(&valid_record.key)
+        .expect("peer2 record in local kad store");
+    assert_eq!(*store_record, valid_record);
+    assert!(
+        !network.swarm.behaviour().peer_manager.peer_banned(&peer2_id),
+        "stale duplicate must be dropped by the dedup, not verified and penalized"
+    );
+
+    Ok(())
+}
+
+/// Puts beyond the per-peer fixed-window budget are dropped before any per-record work,
+/// so a flood cannot push a fresh record into the store once the window is exhausted.
+#[tokio::test]
+async fn test_kad_put_budget_drops_flood() -> eyre::Result<()> {
+    let TestTypes { peer1, mut peer2, .. } =
+        create_test_types::<TestWorkerRequest, TestWorkerResponse>();
+    let mut network = peer1.network;
+    let peer2_id = *peer2.network.swarm.local_peer_id();
+
+    // store an old-but-valid record for peer2
+    let mut old_info = peer2.network.node_record.info.clone();
+    old_info.timestamp = now() - 10_000;
+    let signature = peer2.config.key_config().request_signature_direct(&encode(&old_info));
+    peer2.network.node_record = NodeRecord { info: old_info, signature };
+    let old_record = peer2.network.get_peer_record();
+    network.swarm.behaviour_mut().kademlia.store_mut().put(old_record.clone())?;
+
+    // exhaust the budget with duplicate puts (each is deduped but still counted)
+    for _ in 0..crate::consensus::kad::kad_put_budget_max() {
+        network.process_kad_put_request(peer2_id, old_record.clone());
+    }
+
+    // a genuinely newer, validly signed record now arrives - over budget, so it is dropped
+    let mut fresh_info = peer2.network.node_record.info.clone();
+    fresh_info.timestamp = now();
+    let signature = peer2.config.key_config().request_signature_direct(&encode(&fresh_info));
+    peer2.network.node_record = NodeRecord { info: fresh_info, signature };
+    let fresh_record = peer2.network.get_peer_record();
+    network.process_kad_put_request(peer2_id, fresh_record.clone());
+
+    let store_record = network
+        .swarm
+        .behaviour_mut()
+        .kademlia
+        .store_mut()
+        .get(&old_record.key)
+        .expect("peer2 record in local kad store");
+    assert_eq!(*store_record, old_record, "over-budget put must not reach the store");
+    assert!(
+        !network.swarm.behaviour().peer_manager.peer_banned(&peer2_id),
+        "over-budget puts are dropped, never penalized"
+    );
+
+    Ok(())
+}
+
 /// FIND-025 Path A: AddProvider store exhaustion must not propagate a fatal error.
 ///
 /// Pre-fill the provider table to capacity, then verify that an overflow AddProvider
@@ -1891,7 +1988,7 @@ async fn test_kad_record_store_exhaustion_does_not_propagate_error() -> eyre::Re
 
 /// `load_known_peers_from_kad_store` rehydrates the in-memory BLS map from persistent
 /// records at startup, so a restarted node does not need to wait for peer re-PUTs to
-/// route gossip. Pins the load-bearing fix for the observer-restart bug.
+/// route gossip.
 #[tokio::test]
 async fn test_load_known_peers_from_kad_store_rehydrates_after_restart() -> eyre::Result<()> {
     let TestTypes { peer1, peer2, .. } =
@@ -2040,7 +2137,7 @@ async fn test_connected_peers_count_double_decrement() -> eyre::Result<()> {
     let connected = peer1_handle.connected_peer_ids().await?;
     assert!(!connected.contains(&peer2_id), "peer2 should be disconnected after fatal penalty");
 
-    // The gauge should be 0 — exactly one peer disconnected.
+    // The gauge should be 0 - exactly one peer disconnected.
     assert_eq!(
         gauge.get(),
         0,
@@ -2048,6 +2145,235 @@ async fn test_connected_peers_count_double_decrement() -> eyre::Result<()> {
          but asymmetric inc/dec in DisconnectPeer/PeerDisconnected/Banned handlers \
          causes the gauge to drift negative"
     );
+
+    Ok(())
+}
+
+/// A swarm with zero listeners must shut down only when nothing can re-create a listener: with
+/// relay reservations desired, `retry_relay_reservations` re-issues them, so an all-relays-down
+/// window (a boot race, a simultaneous relay outage) is retried instead of shutting the network
+/// down.
+#[tokio::test]
+async fn test_zero_listeners_retried_when_relay_reservations_desired() -> eyre::Result<()> {
+    let TestTypes { peer1, .. } = create_test_types::<TestPrimaryRequest, TestPrimaryResponse>();
+    let mut network = peer1.network;
+
+    // no listeners were started: a closed listener with no desired relay reservations is fatal
+    assert_matches!(
+        network.handle_listener_closed(ListenerId::next(), &[]),
+        Err(NetworkError::AllListenersClosed)
+    );
+
+    // with a desired relay reservation the same state is a retried outage, not a shutdown
+    let circuit: Multiaddr =
+        "/ip4/127.0.0.1/udp/4001/quic-v1/p2p/12D3KooWK99VoVxNE7XzyBwXEzW7xhK7Gpv85r9F3V3fyKSUKPH5/p2p-circuit/p2p/12D3KooWJWoaqZhDaoEFshF7Rh1bpY9ohihFhzcW6d69Lr2NASuq"
+            .parse()
+            .expect("valid circuit multiaddr");
+    network.relay_reservations.insert(circuit, None);
+    assert!(network.handle_listener_closed(ListenerId::next(), &[]).is_ok());
+
+    Ok(())
+}
+
+/// Spawns an in-process circuit-relay-v2 server on localhost QUIC, returning its dialable
+/// `/ip4/127.0.0.1/udp/<port>/quic-v1/p2p/<relay-id>` address.
+async fn spawn_relay_server() -> eyre::Result<Multiaddr> {
+    let mut relay_swarm = libp2p::SwarmBuilder::with_new_identity()
+        .with_tokio()
+        .with_quic()
+        .with_behaviour(|keypair| {
+            libp2p::relay::Behaviour::new(keypair.public().to_peer_id(), Default::default())
+        })?
+        .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(60)))
+        .build();
+    let relay_id = *relay_swarm.local_peer_id();
+    relay_swarm.listen_on("/ip4/127.0.0.1/udp/0/quic-v1".parse()?)?;
+    let listen_addr = timeout(Duration::from_secs(5), async {
+        loop {
+            if let SwarmEvent::NewListenAddr { address, .. } = relay_swarm.select_next_some().await
+            {
+                break address;
+            }
+        }
+    })
+    .await?;
+    let relay_addr = listen_addr.with(Protocol::P2p(relay_id));
+    // reservation vouchers advertise the relay's external addresses
+    relay_swarm.add_external_address(relay_addr.clone());
+    tokio::spawn(async move {
+        loop {
+            relay_swarm.select_next_some().await;
+        }
+    });
+    Ok(relay_addr)
+}
+
+/// A request-response round trip between two nodes whose only path to each other is a
+/// circuit-relay-v2 server, on a host where direct connectivity IS physically possible. Every
+/// connection either end establishes must classify as a relay leg or a circuit - the
+/// `direct_nonrelay` count stays 0 - proving the relayed-only topology is a property of the
+/// node's dial/listen behavior, not of the network isolation (firewalls, VPC routing) around it.
+#[tokio::test]
+async fn test_reqres_via_relay_classifies_every_connection_relayed() -> eyre::Result<()> {
+    let relay_addr = spawn_relay_server().await?;
+
+    let TestTypes { peer1, peer2, .. } =
+        create_test_types::<TestWorkerRequest, TestWorkerResponse>();
+
+    // peer1 is the destination behind the relay
+    let NetworkPeer {
+        config: config_1,
+        network_handle: peer1,
+        network_events: mut network_events_1,
+        network,
+        network_metrics: metrics_1,
+    } = peer1;
+    tokio::spawn(async move {
+        network.run().await.expect("network run failed!");
+    });
+
+    // peer2 reaches peer1 through the relay
+    let NetworkPeer {
+        config: config_2,
+        network_handle: peer2,
+        network,
+        network_metrics: metrics_2,
+        ..
+    } = peer2;
+    tokio::spawn(async move {
+        network.run().await.expect("network run failed!");
+    });
+
+    // peer1's ONLY listener is a reservation on the relay - it never listens on a direct address
+    let circuit_listen = relay_addr.clone().with(Protocol::P2pCircuit);
+    peer1.start_listening(circuit_listen.clone()).await?;
+    // the circuit address is reported as a listener once the relay accepts the reservation
+    timeout(Duration::from_secs(10), async {
+        loop {
+            let listeners = peer1.listeners().await.unwrap_or_default();
+            if listeners.iter().any(|a| a.iter().any(|p| matches!(p, Protocol::P2pCircuit))) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await?;
+
+    // peer2 knows peer1 ONLY by its circuit address
+    let peer1_bls = config_1.key_config().primary_public_key();
+    let peer1_id: PeerId = config_1.primary_networkkey().into();
+    let peer1_circuit = circuit_listen.with(Protocol::P2p(peer1_id));
+    peer2.add_explicit_peer(peer1_bls, config_1.primary_networkkey(), peer1_circuit).await?;
+    peer2.dial_by_bls(peer1_bls).await?;
+
+    // peer1 must learn peer2's bls key (kad record published on connect) to accept its request
+    let peer2_bls = config_2.key_config().primary_public_key();
+    timeout(Duration::from_secs(10), async {
+        loop {
+            if peer1.connected_peers().await.unwrap_or_default().contains(&peer2_bls) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await?;
+
+    // full request-response round trip through the circuit
+    let missing_block = fixture_batch_with_transactions(3).seal_slow();
+    let digests = vec![missing_block.digest()];
+    let batch_req = TestWorkerRequest::MissingBatches(digests);
+    let batch_res = TestWorkerResponse::MissingBatches { batches: vec![missing_block] };
+    let response = peer2.send_request(batch_req.clone(), peer1_bls).await?;
+    let event = timeout(Duration::from_secs(5), network_events_1.recv())
+        .await?
+        .expect("network event received");
+    let NetworkEvent::Request { request, channel, .. } = event else {
+        panic!("unexpected network event received");
+    };
+    assert_eq!(request, batch_req);
+    peer1.send_response(batch_res.clone(), channel).await?;
+    assert_eq!(
+        timeout(Duration::from_secs(5), response).await?.expect("response received")?,
+        batch_res
+    );
+
+    // the topology proof: messages flowed, yet neither node ever established a direct connection
+    // to anything but the relay
+    for (label, metrics) in [("peer1", &metrics_1), ("peer2", &metrics_2)] {
+        let count =
+            |path: &str| metrics.connections_by_path.with_label_values(&[path, "primary"]).get();
+        assert_eq!(
+            count("direct_nonrelay"),
+            0,
+            "{label} opened a direct connection to a non-relay peer"
+        );
+        assert!(count("circuit") >= 1, "{label} should hold at least one circuit");
+        assert!(count("relay_direct") >= 1, "{label} should hold its relay leg");
+    }
+
+    Ok(())
+}
+
+/// The path classifier is not vacuously green: two nodes connected directly, with no relay
+/// involved, classify their connections as `direct_nonrelay` on both ends and never as circuits.
+#[tokio::test]
+async fn test_direct_connection_classifies_direct_nonrelay() -> eyre::Result<()> {
+    let TestTypes { peer1, peer2, .. } =
+        create_test_types::<TestWorkerRequest, TestWorkerResponse>();
+    let NetworkPeer {
+        config: config_1,
+        network_handle: peer1,
+        network,
+        network_metrics: metrics_1,
+        ..
+    } = peer1;
+    tokio::spawn(async move {
+        network.run().await.expect("network run failed!");
+    });
+    let NetworkPeer {
+        config: config_2,
+        network_handle: peer2,
+        network,
+        network_metrics: metrics_2,
+        ..
+    } = peer2;
+    tokio::spawn(async move {
+        network.run().await.expect("network run failed!");
+    });
+
+    peer1.start_listening(config_1.primary_address()).await?;
+    peer2.start_listening(config_2.primary_address()).await?;
+
+    peer1
+        .add_explicit_peer(
+            config_2.key_config().primary_public_key(),
+            config_2.primary_networkkey(),
+            config_2.primary_address(),
+        )
+        .await?;
+    peer1.dial_by_bls(config_2.key_config().primary_public_key()).await?;
+
+    // the dial reply can resolve before the network task processes the establishment event, so
+    // poll the counters instead of asserting immediately
+    let direct = |m: &Arc<NetworkMetrics>| {
+        m.connections_by_path.with_label_values(&["direct_nonrelay", "primary"]).get()
+    };
+    timeout(Duration::from_secs(10), async {
+        loop {
+            if direct(&metrics_1) >= 1 && direct(&metrics_2) >= 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await?;
+
+    for (label, metrics) in [("peer1", &metrics_1), ("peer2", &metrics_2)] {
+        let count =
+            |path: &str| metrics.connections_by_path.with_label_values(&[path, "primary"]).get();
+        assert_eq!(count("circuit"), 0, "{label} has no relay, so no circuit connections");
+        assert_eq!(count("relay_direct"), 0, "{label} has no relay, so no relay legs");
+    }
 
     Ok(())
 }

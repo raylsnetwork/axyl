@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use std::collections::{BTreeMap, HashMap};
+use std::{cmp::Ordering, collections::BTreeMap};
 
 use parking_lot::Mutex;
 use rayls_infrastructure_storage::{
@@ -13,7 +13,7 @@ use rayls_infrastructure_types::{
     batch_ordering::{AuthoritySeqState, BatchOrderingState, MAX_PARKED_PER_AUTHORITY},
     batch_tracker::BatchTracker,
     executed_batch_registry::ExecutedBatchRegistry,
-    AcceptResult, Address, Database, DbTx, Epoch, PreparedBatch,
+    leader_epoch_and_batch_digests, AcceptResult, Address, Database, DbTx, Epoch, PreparedBatch,
 };
 use tracing::{debug, info, warn};
 
@@ -21,6 +21,28 @@ use tracing::{debug, info, warn};
 struct BatchOrderingInner<DB: BatchOrderingStore> {
     batch_ordering_state: Mutex<BatchOrderingState>,
     batch_ordering_store: DB,
+    /// This node's execution address, the one authority whose sequence the watch tracks.
+    authority: Address,
+    /// The highest accepted sequence for `authority`; the batch builder paces on it.
+    executed_own_watermark: tokio::sync::watch::Sender<Option<u64>>,
+}
+
+impl<DB: BatchOrderingStore> BatchOrderingInner<DB> {
+    /// Advances the own-authority accepted-sequence watch, ignoring other authorities and
+    /// regressions.
+    fn update_executed_watermark(&self, authority: Address, watermark: Option<u64>) {
+        if authority != self.authority {
+            return;
+        }
+
+        self.executed_own_watermark.send_if_modified(|p| {
+            let updated = watermark > *p;
+            if updated {
+                *p = watermark
+            }
+            updated
+        });
+    }
 }
 
 /// Per-authority batch ordering with parking and epoch-reset.
@@ -30,27 +52,46 @@ pub struct BatchOrdering<DB: BatchOrderingStore> {
 }
 
 impl<DB: Database> BatchOrdering<DB> {
-    pub fn new(store: DB, batch_ordering_state: BatchOrderingState) -> Self {
+    /// Creates the ordering over `store`, seeding the own-authority watch for `address` from the
+    /// given state.
+    pub fn new(store: DB, batch_ordering_state: BatchOrderingState, address: &Address) -> Self {
+        let last_executed_watermark =
+            batch_ordering_state.authorities.get(address).and_then(|s| s.last_executed_seq);
+
         Self {
             inner: Arc::new(BatchOrderingInner {
                 batch_ordering_state: Mutex::new(batch_ordering_state),
                 batch_ordering_store: store,
+                authority: *address,
+                executed_own_watermark: tokio::sync::watch::Sender::new(last_executed_watermark),
             }),
         }
     }
 
+    /// Creates the ordering with no prior state and a zero authority address.
     pub fn new_with_empty_state(store: DB) -> Self {
-        Self::new(store, Default::default())
+        Self::new(store, Default::default(), &Default::default())
+    }
+
+    /// Subscribes to this authority's highest accepted batch sequence, the pacing signal the
+    /// builder uses to resume after a restart and to bound how far ahead of execution it seals.
+    pub fn executed_own_watermark(&self) -> tokio::sync::watch::Receiver<Option<u64>> {
+        self.inner.executed_own_watermark.subscribe()
     }
 
     /// Try to accept a batch for the given authority.
     ///
     /// `seq == 0` means a pre-upgrade node - skip ordering, return [`AcceptResult::InOrder`].
+    ///
+    /// `seq_normalization` is the OutputSeqNormalization activation at the block being built: it
+    /// gates the overflow prune, which changes replicated output, so every node must flip it at
+    /// the same block.
     pub fn try_accept(
         &self,
         authority: Address,
         batch_seq: u64,
         prepared: PreparedBatch,
+        seq_normalization: bool,
     ) -> AcceptResult {
         if batch_seq == 0 {
             return AcceptResult::InOrder(prepared);
@@ -61,8 +102,8 @@ impl<DB: Database> BatchOrdering<DB> {
 
         if let Some(last_seq) = auth.last_executed_seq {
             if batch_seq <= last_seq {
-                // stale reproposal: park would land under an already-executed seq
-                // where drain_consecutive never looks; defer to dedup registry instead
+                // stale re-proposal: parking would land under an already-executed seq where
+                // drain_consecutive never looks; the dedup registry absorbs it instead
                 info!(
                     target: "engine",
                     ?authority,
@@ -83,8 +124,17 @@ impl<DB: Database> BatchOrdering<DB> {
                         batch_digest = ?prepared.batch_digest,
                         "parking limit reached, executing batch out of order"
                     );
-                    // fall through - accept as in-order (forced)
                     auth.last_executed_seq = Some(batch_seq);
+                    self.inner.update_executed_watermark(authority, Some(batch_seq));
+                    // Drop the parked entries the forced jump abandoned: drain_consecutive only
+                    // looks at last_executed_seq + 1, so they can never drain, and leaving them
+                    // pins parked.len() at the limit (every later gap force-executes forever).
+                    // Pre-fork the stranded entries still force-drain as blocks at the epoch
+                    // boundary, so pruning them on only some validators would fork the chain
+                    // there.
+                    if seq_normalization {
+                        auth.parked = auth.parked.split_off(&(batch_seq + 1));
+                    }
                     return AcceptResult::OverflowForced(prepared);
                 }
 
@@ -97,26 +147,25 @@ impl<DB: Database> BatchOrdering<DB> {
                     batch_digest = ?prepared.batch_digest,
                     "parking out-of-order batch"
                 );
-                // Park without registering in the dedup guard - the batch
-                // has not been executed yet. Registration happens when the
-                // batch is eventually drained via drain_consecutive.
+                // Not registered in the dedup guard yet: the batch has not executed. Registration
+                // happens when drain_consecutive releases it.
                 auth.parked.insert(batch_seq, prepared);
                 return AcceptResult::Parked;
             }
         }
 
-        // first batch from this authority OR in-order - accept
         auth.last_executed_seq = Some(batch_seq);
+        self.inner.update_executed_watermark(authority, Some(batch_seq));
         AcceptResult::InOrder(prepared)
     }
 
-    /// Build ordering state for `current_epoch`, preferring persisted state over a history reseed.
+    /// Builds the ordering for `current_epoch`, preferring persisted state over a history reseed.
     ///
     /// Persisted state one epoch behind is kept, not reseeded: a restart between the boundary block
     /// and the next epoch's first output leaves the closing epoch's parked batches undrained (so
     /// `persisted.epoch` lags by one), and reseeding would drop them and fork the chain short.
     /// State further behind is stale and reseeded.
-    pub fn from_history(store: DB, current_epoch: Epoch) -> Self {
+    pub fn from_history(store: DB, current_epoch: Epoch, address: &Address) -> Self {
         let mut state = store
             .read_batch_ordering_state()
             .expect("BatchOrdering: initial DB read failed")
@@ -136,12 +185,13 @@ impl<DB: Database> BatchOrdering<DB> {
             state.authorities = recovered;
             state.epoch = current_epoch;
         }
-        Self::new(store, state)
+        Self::new(store, state, address)
     }
-    /// Drain consecutive parked batches starting from the next expected seq.
+
+    /// Drains consecutive parked batches starting from the next expected seq into `collected`.
     ///
-    /// When `check_dedup` is true (V2), each drained batch is registered in the
-    /// dedup guard. When false (V1), batches were pre-registered at park time.
+    /// With `check_dedup` each drained batch is registered in the dedup guard and skipped if
+    /// already executed; without it the batches were registered at park time.
     pub fn drain_consecutive(
         &self,
         authority: Address,
@@ -151,7 +201,7 @@ impl<DB: Database> BatchOrdering<DB> {
         check_dedup: bool,
     ) {
         loop {
-            let parked = {
+            let (next_seq, parked) = {
                 let mut state = self.inner.batch_ordering_state.lock();
                 let Some(auth) = state.authorities.get_mut(&authority) else {
                     break;
@@ -161,11 +211,15 @@ impl<DB: Database> BatchOrdering<DB> {
                 match auth.parked.remove(&next_seq) {
                     Some(parked) => {
                         auth.last_executed_seq = Some(next_seq);
-                        parked
+                        (next_seq, parked)
                     }
                     None => break,
                 }
             };
+
+            // Draining a parked own batch advances execution just as an in-order accept does, so
+            // the builder's pacing watch must track it too, or the seal-ahead budget never reopens.
+            self.inner.update_executed_watermark(authority, Some(next_seq));
 
             if check_dedup {
                 if !executed_batch_registry.try_register(parked.batch_digest, parked.output_digest)
@@ -191,18 +245,32 @@ impl<DB: Database> BatchOrdering<DB> {
         }
     }
 
-    /// On epoch change, drain ALL parked batches sorted deterministically by `(beneficiary, seq)`.
+    /// Drains every parked batch on an epoch change, sorted by `(beneficiary, seq)` so all
+    /// validators execute them in the same order.
     ///
-    /// Returns an empty vec if the epoch has not changed.
+    /// Returns an empty vec when the epoch has not advanced.
     pub fn drain_epoch(&self, new_epoch: Epoch) -> Vec<PreparedBatch> {
         let mut state = self.inner.batch_ordering_state.lock();
-        if state.epoch == new_epoch {
-            return Vec::new();
+        match new_epoch.cmp(&state.epoch) {
+            Ordering::Equal => return Vec::new(),
+            // Never rewind: the epoch is a monotonic position. A crash after finalize but before
+            // the next output can replay an already-passed epoch's output; draining and moving the
+            // epoch backward here would double-drain the parked set and desync the frame.
+            Ordering::Less => {
+                warn!(
+                    target: "engine",
+                    current_epoch = state.epoch,
+                    replayed_epoch = new_epoch,
+                    "ignoring a batch-ordering drain for an already-passed epoch"
+                );
+                return Vec::new();
+            }
+            Ordering::Greater => {}
         }
 
         let total_parked: usize = state.authorities.values().map(|a| a.parked.len()).sum();
         let mut drained: Vec<PreparedBatch> = Vec::with_capacity(total_parked);
-        for (authority, auth_state) in state.authorities.drain() {
+        for (authority, auth_state) in std::mem::take(&mut state.authorities) {
             for (seq, parked) in auth_state.parked {
                 warn!(
                     target: "engine",
@@ -216,7 +284,6 @@ impl<DB: Database> BatchOrdering<DB> {
             }
         }
 
-        // sort by (beneficiary, seq) for deterministic execution order
         drained
             .sort_by(|a, b| a.beneficiary.cmp(&b.beneficiary).then(a.batch.seq.cmp(&b.batch.seq)));
 
@@ -226,7 +293,7 @@ impl<DB: Database> BatchOrdering<DB> {
                 old_epoch = state.epoch,
                 new_epoch,
                 drained_count = drained.len(),
-                "epoch changed, executing drained parked batches"
+                "epoch changed, drained parked batches from previous epoch"
             );
         } else {
             info!(
@@ -240,28 +307,29 @@ impl<DB: Database> BatchOrdering<DB> {
         drained
     }
 
+    /// Write the current ordering state to the store.
     pub fn persist(&self) {
-        let state = self.inner.batch_ordering_state.lock();
+        // Snapshot under the lock, write outside it: holding the state lock across the DB write
+        // stalls every try_accept/drain for the write's duration (the persist-starvation class).
+        let state = self.inner.batch_ordering_state.lock().clone();
         self.inner
             .batch_ordering_store
             .write_batch_ordering_state(&state)
             .expect("DB write failed");
     }
 
-    /// Snapshot the highest seq executed (or recovered) for `authority`.
-    ///
-    /// `None` means no batch has been observed for this authority in the
-    /// current epoch.
+    /// Returns the highest seq executed (or recovered) for `authority`, or `None` when no batch
+    /// has been observed for it in the current epoch.
     pub fn last_executed_seq(&self, authority: Address) -> Option<u64> {
         self.inner.batch_ordering_state.lock().authorities.get(&authority)?.last_executed_seq
     }
 
-    /// Snapshot the number of authorities tracked in the current epoch.
+    /// Returns the number of authorities tracked in the current epoch.
     pub fn tracked_authorities(&self) -> usize {
         self.inner.batch_ordering_state.lock().authorities.len()
     }
 
-    /// Snapshot the number of parked batches for `authority`.
+    /// Returns the number of parked batches for `authority`.
     pub fn parked_count(&self, authority: Address) -> usize {
         self.inner
             .batch_ordering_state
@@ -273,34 +341,42 @@ impl<DB: Database> BatchOrdering<DB> {
     }
 }
 
-/// Walk `ConsensusBlocks` in reverse, accumulating per-beneficiary max
-/// `batch.seq` for `current_epoch`. Stops at the first block of an earlier
-/// epoch (BatchOrdering state is per-epoch). Returns an empty map if the
-/// store contains no blocks for `current_epoch`.
+/// Walks `ConsensusBlocks` in reverse, accumulating the per-beneficiary max `batch.seq` for
+/// `current_epoch`; stops at the first block of an earlier epoch. Returns an empty map when the
+/// store holds no blocks for `current_epoch`.
 fn recover_authorities_from_history<DB: Database>(
     store: &DB,
     current_epoch: Epoch,
-) -> HashMap<Address, AuthoritySeqState> {
+) -> BTreeMap<Address, AuthoritySeqState> {
     let by_addr = store
         .with_read_txn(|txn| {
-            let mut by_addr: HashMap<Address, u64> = HashMap::new();
-            for (_block_num, consensus_block) in txn.reverse_iter::<ConsensusBlocks>() {
-                if consensus_block.sub_dag.leader_epoch() < current_epoch {
+            // The walk covers a whole epoch of ConsensusBlocks on a cold boot; under the default
+            // long-read cap a slow disk aborts the txn mid-walk. Opt out like the catch-up
+            // accumulator does: this runs once at boot before any writer contends.
+            txn.disable_long_read_safety();
+            let mut by_addr: BTreeMap<Address, u64> = BTreeMap::new();
+            for (_key, value) in txn.reverse_raw_iter::<ConsensusBlocks>() {
+                let (leader_epoch, batch_digests) = leader_epoch_and_batch_digests(&value)?;
+                if leader_epoch < current_epoch {
                     break;
                 }
-                for cert in &consensus_block.sub_dag.certificates {
-                    for (batch_digest, _wid) in cert.header.payload() {
-                        let Ok(Some(batch)) = txn.get::<Batches>(batch_digest) else { continue };
-                        by_addr
-                            .entry(batch.beneficiary)
-                            .and_modify(|s| *s = (*s).max(batch.seq))
-                            .or_insert(batch.seq);
-                    }
+                for batch_digest in batch_digests {
+                    let Ok(Some(batch)) = txn.get::<Batches>(&batch_digest) else { continue };
+                    // batch.beneficiary must equal the live path's key,
+                    // authority_execution_address(cert.origin()). If they diverge, a restart
+                    // seeds watermarks under addresses the live path never looks up, silently
+                    // disabling gap detection.
+                    by_addr
+                        .entry(batch.beneficiary)
+                        .and_modify(|s| *s = (*s).max(batch.seq))
+                        .or_insert(batch.seq);
                 }
             }
             Ok(by_addr)
         })
-        .unwrap_or_default();
+        // Fail closed: with the cap lifted a failure here is a real DB error, and booting with
+        // empty watermarks silently disables gap detection for the epoch.
+        .expect("BatchOrdering: consensus-history read failed on boot");
 
     debug!(
         target: "engine",
@@ -406,7 +482,7 @@ mod tests {
         let auth = Address::from([7u8; 20]);
         write_consensus_block(&store, 1, 3, auth, 100);
 
-        let ord = BatchOrdering::from_history(store, 3);
+        let ord = BatchOrdering::from_history(store, 3, &auth);
         let state = ord.inner.batch_ordering_state.lock();
         assert_eq!(state.epoch, 3);
         assert_eq!(state.authorities.get(&auth).unwrap().last_executed_seq, Some(100));
@@ -427,7 +503,7 @@ mod tests {
 
         write_consensus_block(&store, 1, 3, auth, 999);
 
-        let ord = BatchOrdering::from_history(store, 3);
+        let ord = BatchOrdering::from_history(store, 3, &auth);
         let state = ord.inner.batch_ordering_state.lock();
         assert_eq!(state.authorities.get(&auth).unwrap().last_executed_seq, Some(50));
     }
@@ -461,6 +537,11 @@ mod tests {
         let mut persisted = BatchOrderingState { epoch: 87, ..Default::default() };
         let parked: BTreeMap<u64, PreparedBatch> =
             (1436..=1440u64).map(|seq| (seq, make_parked(auth, seq))).collect();
+        // Production precondition: every committed batch's body row exists in the store the
+        // ordering blob lives in; the by-digest persistence reloads bodies from those rows.
+        for prepared in parked.values() {
+            store.insert::<Batches>(&prepared.batch_digest, &prepared.batch).expect("seed body");
+        }
         persisted
             .authorities
             .insert(auth, AuthoritySeqState { last_executed_seq: Some(1434), parked });
@@ -469,7 +550,7 @@ mod tests {
         // A history reseed against the post-boundary epoch would rebuild empty parked.
         write_consensus_block(&store, 1, 88, auth, 1441);
 
-        let ord = BatchOrdering::from_history(store, 88);
+        let ord = BatchOrdering::from_history(store, 88, &auth);
 
         {
             let state = ord.inner.batch_ordering_state.lock();
@@ -481,5 +562,173 @@ mod tests {
         // the boundary drain on the first new-epoch output flushes them as their own blocks
         let drained = ord.drain_epoch(88);
         assert_eq!(drained.len(), 5, "parked batches drain into the new epoch");
+    }
+
+    #[test]
+    fn executed_own_watermark_tracks_own_authority_monotonically() {
+        // The builder resumes and paces sealing off this watch, so it must reflect only our own
+        // accepted sequence, never regress, and ignore other authorities' progress.
+        let store = MemDatabase::default();
+        let me = Address::from([1u8; 20]);
+        let other = Address::from([2u8; 20]);
+        let ord = BatchOrdering::new(store, BatchOrderingState::default(), &me);
+        let mut watermark = ord.executed_own_watermark();
+
+        assert_eq!(*watermark.borrow_and_update(), None, "no batch accepted yet");
+
+        assert!(matches!(
+            ord.try_accept(me, 1, make_parked(me, 1), false),
+            AcceptResult::InOrder(_)
+        ));
+        assert_eq!(*watermark.borrow_and_update(), Some(1), "own in-order accept advances it");
+
+        assert!(matches!(
+            ord.try_accept(other, 9, make_parked(other, 9), false),
+            AcceptResult::InOrder(_)
+        ));
+        assert_eq!(*watermark.borrow(), Some(1), "a foreign authority must not advance our mark");
+
+        assert!(matches!(
+            ord.try_accept(me, 2, make_parked(me, 2), false),
+            AcceptResult::InOrder(_)
+        ));
+        assert_eq!(*watermark.borrow_and_update(), Some(2), "next own seq advances it");
+
+        assert!(matches!(
+            ord.try_accept(me, 1, make_parked(me, 1), false),
+            AcceptResult::InOrder(_)
+        ));
+        assert_eq!(*watermark.borrow(), Some(2), "a stale re-accept must not regress the mark");
+    }
+
+    #[test]
+    fn executed_own_watermark_advances_when_parked_own_batches_drain() {
+        // The builder paces on this watch, so a parked-then-drained own batch must advance it just
+        // like an in-order accept, or the seal-ahead budget stays exhausted and the builder stalls.
+        let store = MemDatabase::default();
+        let me = Address::from([1u8; 20]);
+        let ord = BatchOrdering::new(store, BatchOrderingState::default(), &me);
+        let mut watermark = ord.executed_own_watermark();
+
+        assert!(matches!(
+            ord.try_accept(me, 1, make_parked(me, 1), false),
+            AcceptResult::InOrder(_)
+        ));
+        assert_eq!(*watermark.borrow_and_update(), Some(1));
+
+        // seq 3 arrives before seq 2, so it parks and the watch holds
+        assert!(matches!(ord.try_accept(me, 3, make_parked(me, 3), false), AcceptResult::Parked));
+        assert_eq!(*watermark.borrow(), Some(1));
+
+        // seq 2 closes the gap; draining then flushes the parked seq 3 for execution
+        assert!(matches!(
+            ord.try_accept(me, 2, make_parked(me, 2), false),
+            AcceptResult::InOrder(_)
+        ));
+        let mut collected = Vec::new();
+        ord.drain_consecutive(me, &mut collected, &ExecutedBatchRegistry::default(), None, false);
+        assert_eq!(collected.len(), 1, "the parked batch drains for execution");
+        assert_eq!(*watermark.borrow(), Some(3), "the watch tracks the drained own batch");
+    }
+
+    #[test]
+    fn overflow_forced_drops_the_stranded_parked_entries() {
+        // Fill the parking budget with a gap, then force one batch far past it. The forced jump
+        // abandons every parked seq below it; leaving them in the map orphans them forever
+        // (drain_consecutive only looks at last_executed_seq + 1) and pins parked.len() at the
+        // limit, so ordering stays off for the authority for the rest of the epoch.
+        let store = MemDatabase::default();
+        let ord = BatchOrdering::new_with_empty_state(store);
+        let auth = Address::from([1u8; 20]);
+
+        // seq 1 executes; the following seqs park behind the missing seq 2 (exactly the limit).
+        assert!(matches!(
+            ord.try_accept(auth, 1, make_parked(auth, 1), false),
+            AcceptResult::InOrder(_)
+        ));
+        for seq in 3..=(2 + MAX_PARKED_PER_AUTHORITY as u64) {
+            assert!(matches!(
+                ord.try_accept(auth, seq, make_parked(auth, seq), false),
+                AcceptResult::Parked
+            ));
+        }
+        assert_eq!(ord.parked_count(auth), MAX_PARKED_PER_AUTHORITY);
+
+        // the next gapped batch trips the overflow and forces execution at seq 100.
+        assert!(matches!(
+            ord.try_accept(auth, 100, make_parked(auth, 100), true),
+            AcceptResult::OverflowForced(_)
+        ));
+        assert_eq!(ord.last_executed_seq(auth), Some(100));
+
+        // the invariant "parked only holds seqs > last_executed_seq" must hold: the abandoned
+        // sub-100 entries are gone, not stranded.
+        assert_eq!(ord.parked_count(auth), 0, "stranded parked entries must be dropped");
+
+        // and ordering is live again: a fresh gap parks rather than force-executing.
+        assert!(matches!(
+            ord.try_accept(auth, 200, make_parked(auth, 200), true),
+            AcceptResult::Parked
+        ));
+    }
+
+    #[test]
+    fn overflow_forced_keeps_stranded_entries_pre_fork() {
+        // Pre-fork pin: un-upgraded peers still boundary-force-drain the stranded entries as
+        // blocks, so the prune must not fire until OutputSeqNormalization activates.
+        let store = MemDatabase::default();
+        let ord = BatchOrdering::new_with_empty_state(store);
+        let auth = Address::from([1u8; 20]);
+
+        assert!(matches!(
+            ord.try_accept(auth, 1, make_parked(auth, 1), false),
+            AcceptResult::InOrder(_)
+        ));
+        for seq in 3..=(2 + MAX_PARKED_PER_AUTHORITY as u64) {
+            assert!(matches!(
+                ord.try_accept(auth, seq, make_parked(auth, seq), false),
+                AcceptResult::Parked
+            ));
+        }
+        assert!(matches!(
+            ord.try_accept(auth, 100, make_parked(auth, 100), false),
+            AcceptResult::OverflowForced(_)
+        ));
+        assert_eq!(
+            ord.parked_count(auth),
+            MAX_PARKED_PER_AUTHORITY,
+            "pre-fork the stranded entries stay parked for the boundary force-drain"
+        );
+    }
+
+    #[test]
+    fn drain_epoch_never_rewinds_to_an_already_passed_epoch() {
+        // A crash after finalize but before the next output can replay an older epoch's output.
+        // drain_epoch for that stale epoch must be a no-op: it must not drain the current parked
+        // set nor move the epoch backward (the epoch is a monotonic position).
+        let store = MemDatabase::default();
+        let ord = BatchOrdering::new_with_empty_state(store);
+        let auth = Address::from([1u8; 20]);
+
+        // advance to epoch 88 with one parked batch belonging to it
+        assert_eq!(ord.drain_epoch(88).len(), 0);
+        assert!(matches!(
+            ord.try_accept(auth, 1, make_parked(auth, 1), false),
+            AcceptResult::InOrder(_)
+        ));
+        assert!(matches!(
+            ord.try_accept(auth, 3, make_parked(auth, 3), false),
+            AcceptResult::Parked
+        ));
+
+        // replay of an already-passed epoch: no drain, no rewind
+        let drained = ord.drain_epoch(87);
+        assert!(drained.is_empty(), "a stale-epoch drain must not drain the current parked set");
+        assert_eq!(ord.parked_count(auth), 1, "the current epoch's parked batch must survive");
+        assert_eq!(
+            ord.inner.batch_ordering_state.lock().epoch,
+            88,
+            "the epoch must not move backward"
+        );
     }
 }

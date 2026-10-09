@@ -524,7 +524,7 @@ async fn test_reconstructed_dag_matches_live_dag() {
 
     // Build the live DAG: feed certs one-by-one via try_insert with
     // check_parents=true. Orphans error and are silently discarded,
-    // mirroring how the live synchronizer rejects certs with missing parents.
+    // mirroring how the live StateSynchronizer rejects certs with missing parents.
     let metrics = Arc::new(ConsensusMetrics::default());
     let gc_depth = 50;
     let mut live_state = ConsensusState::new(metrics.clone(), gc_depth);
@@ -534,7 +534,7 @@ async fn test_reconstructed_dag_matches_live_dag() {
             continue;
         }
         // drop the Err case - a cert with a missing parent is simply not
-        // accepted, matching the synchronizer's check_parents behavior.
+        // accepted, matching the StateSynchronizer's check_parents behavior.
         let _ = live_state.try_insert(cert);
     }
 

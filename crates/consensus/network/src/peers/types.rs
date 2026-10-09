@@ -29,6 +29,13 @@ pub(crate) enum PeerEvent {
     Unbanned(PeerId),
     /// Authorities are missing from the peer map. This triggers kad queries.
     MissingAuthorities(Vec<BlsPublicKey>),
+    /// A known committee member is neither connected nor dialing and should be re-dialed.
+    ///
+    /// Carries the BLS key (not addresses) so the network layer routes the dial through the
+    /// resolving `DialBls` path: a `/dnsaddr`-advertised member must be resolved to concrete
+    /// `/p2p-circuit` addresses off the swarm loop before dialing, or the relay client selects
+    /// its connection handler from the unresolved address shape and mishandles the connection.
+    RedialCommittee(BlsPublicKey),
     /// Initiate a discovery attempt because discovery peer counts are low.
     Discovery,
 }

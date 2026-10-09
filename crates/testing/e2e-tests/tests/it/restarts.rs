@@ -1,9 +1,8 @@
 use alloy::primitives::address;
-use e2e_tests::{config_local_testnet, IT_TEST_MUTEX};
+use e2e_tests::{config_local_testnet, IT_TEST_MUTEX, TEST_NETWORK};
 use escargot::CargoRun;
 use ethereum_tx_sign::{LegacyTransaction, Transaction};
 use eyre::Report;
-use gcloud_sdk::google::cloud::kms::v1::key_operation_attestation;
 use jsonrpsee::{
     core::{client::ClientT, DeserializeOwned},
     http_client::HttpClientBuilder,
@@ -148,7 +147,8 @@ fn run_restart_tests1(
         kill_child(child2);
         error!(target: "restart-test", ?e, "failed to advance network in restart_tests1");
     })?;
-    std::thread::sleep(Duration::from_secs(2)); // Advancing, so pause so that upcoming checks will fail if a node is lagging.
+    std::thread::sleep(Duration::from_secs(2)); // Advancing, so pause so that upcoming checks will
+                                                // fail if a node is lagging.
 
     let key = get_key("test-source");
     let to_account = address_from_word("testing");
@@ -226,7 +226,8 @@ fn run_restart_tests_lagged1(
         kill_child(child2);
         error!(target: "restart-test", ?e, "failed to advance network in restart_tests1");
     })?;
-    std::thread::sleep(Duration::from_secs(2)); // Advancing, so pause so that upcoming checks will fail if a node is lagging.
+    std::thread::sleep(Duration::from_secs(2)); // Advancing, so pause so that upcoming checks will
+                                                // fail if a node is lagging.
 
     let key = get_key("test-source");
     let to_account = address_from_word("testing");
@@ -304,7 +305,8 @@ fn run_restart_tests_lagged1(
 /// Run the second part of tests, broken up like this to allow more robust node shutdown.
 fn run_restart_tests2(client_urls: &[String; 4]) -> eyre::Result<()> {
     network_advancing(client_urls)?;
-    std::thread::sleep(Duration::from_secs(2)); // Advancing, so pause so that upcoming checks will fail if a node is lagging.
+    std::thread::sleep(Duration::from_secs(2)); // Advancing, so pause so that upcoming checks will
+                                                // fail if a node is lagging.
     test_blocks_same(client_urls)?; // Starting from a solid position after a restart?
     let key = get_key("test-source");
     let to_account = address_from_word("testing");
@@ -482,7 +484,8 @@ fn test_restartstt() -> eyre::Result<()> {
 /// Run some test to make sure an observer is participating in the network.
 fn run_observer_tests(client_urls: &[String; 4], obs_url: &str) -> eyre::Result<()> {
     network_advancing(client_urls)?;
-    std::thread::sleep(Duration::from_secs(2)); // Advancing, so pause so that upcoming checks will fail if a node is lagging.
+    std::thread::sleep(Duration::from_secs(2)); // Advancing, so pause so that upcoming checks will
+                                                // fail if a node is lagging.
 
     let key = get_key("test-source");
     let to_account = address_from_word("testing");
@@ -729,7 +732,11 @@ fn start_validator(
         .arg("--http.port")
         .arg(format!("{rpc_port}"))
         // v1 (plain) storage is no longer supported -- the node refuses to start without this
-        .arg("--storage.v2");
+        .arg("--storage.v2")
+        // Must match the ceremony's `--chain-id` (TEST_NETWORK) - external nodes without a
+        // schedule refuse to boot.
+        .arg("--network")
+        .arg(TEST_NETWORK.to_string());
 
     #[cfg(feature = "faucet")]
     command
@@ -762,7 +769,9 @@ fn start_observer(
         .arg("--http.port")
         .arg(format!("{rpc_port}"))
         // v1 (plain) storage is no longer supported -- the node refuses to start without this
-        .arg("--storage.v2");
+        .arg("--storage.v2")
+        .arg("--network")
+        .arg(TEST_NETWORK.to_string());
     command.spawn().expect("failed to execute")
 }
 
@@ -948,7 +957,7 @@ fn send_rls(
     to_addr.copy_from_slice(to_account.as_slice());
     let (from_account, _, _) = decode_key(key)?;
     let new_transaction = LegacyTransaction {
-        chain: 0x7e1,
+        chain: TEST_NETWORK.chain_id(),
         nonce,
         to: Some(to_addr),
         value: amount,

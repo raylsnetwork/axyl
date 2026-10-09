@@ -29,6 +29,8 @@ use tracing::warn;
 #[derive(Debug, Clone, Default, Parser)]
 pub struct RethMetricArgs {
     /// Enable Prometheus metrics for reth execution-layer components.
+    ///
+    /// Overrides `reth_metrics_address` in parameters.yaml when passed.
     #[arg(long = "reth-metrics", value_name = "SOCKET", value_parser = parse_socket_address, help_heading = "Reth Metrics"
     )]
     pub prometheus: Option<SocketAddr>,
@@ -91,16 +93,15 @@ pub struct RethConfig(pub(crate) NodeConfig<RethChainSpec>);
 
 const DEFAULT_UNUSED_ADDR: IpAddr = IpAddr::V4(Ipv4Addr::UNSPECIFIED);
 
-/// All the rpc modules we allow.
-/// Disallow admin
-pub(super) const ALL_MODULES: [RethRpcModule; 6] = [
+/// RPC modules the node exposes; `admin` is deliberately excluded.
+pub(super) const ALL_MODULES: [RethRpcModule; 7] = [
     RethRpcModule::Eth,
     RethRpcModule::Net,
     RethRpcModule::Web3,
     RethRpcModule::Debug,
     RethRpcModule::Trace,
     RethRpcModule::Rpc,
-    // RethRpcModule::Txpool,
+    RethRpcModule::Txpool,
 ];
 
 impl RethConfig {

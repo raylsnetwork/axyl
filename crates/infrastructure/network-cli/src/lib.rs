@@ -22,6 +22,7 @@ pub mod dev;
 pub mod genesis;
 pub mod keytool;
 pub mod node;
+pub mod schedule;
 pub mod version;
 
 /// No Additional arguments

@@ -2,14 +2,12 @@
 
 use crate::{ConfigFmt, ConfigTrait, NodeInfo, RaylsDirs};
 use rayls_infrastructure_types::{
-    get_available_tcp_port, get_available_udp_port, test_genesis, Address, BlsPublicKey,
-    BlsSignature, Genesis, Multiaddr, NetworkPublicKey, RaylsNetwork,
-    ETHEREUM_BLOCK_GAS_LIMIT_56BITS, MAINNET_COMMITTEE, MAINNET_GENESIS, MAINNET_PARAMETERS,
-    MIN_RAYLS_PROTOCOL_BASE_FEE, TESTNET_COMMITTEE, TESTNET_GENESIS, TESTNET_PARAMETERS,
+    get_available_udp_port, test_genesis, Address, BlsPublicKey, BlsSignature, Genesis,
+    NetworkPublicKey, ETHEREUM_BLOCK_GAS_LIMIT_56BITS, MIN_RAYLS_PROTOCOL_BASE_FEE,
 };
 use reth_chainspec::ChainSpec;
 use serde::{Deserialize, Serialize};
-use std::{fs::File, io::Write, time::Duration};
+use std::{net::SocketAddr, time::Duration};
 use tracing::info;
 
 /// The filename to use when reading/writing the validator's BlsKey.
@@ -92,50 +90,6 @@ impl Config {
             Config::load_from_path(rayls_datadir.node_config_parameters_path(), ConfigFmt::YAML)?;
         let genesis: Genesis =
             Config::load_from_path(rayls_datadir.genesis_file_path(), ConfigFmt::YAML)?;
-
-        Ok(Config { node_info: validator_info, parameters, genesis, observer, version })
-    }
-
-    /// Load a config from it's component parts.
-    pub fn load_testnet<P: RaylsDirs>(
-        rayls_datadir: &P,
-        observer: bool,
-        version: &'static str,
-    ) -> eyre::Result<Self> {
-        let validator_info: NodeInfo =
-            Config::load_from_path(rayls_datadir.node_info_path(), ConfigFmt::YAML)?;
-        let parameters: Parameters =
-            serde_yaml::from_str(TESTNET_PARAMETERS).expect("bad testnet parameters yaml data");
-        let genesis: Genesis =
-            serde_yaml::from_str(TESTNET_GENESIS).expect("bad testnet genesis yaml data");
-        // If the default committee file does not exist then save it.
-        let committee_path = rayls_datadir.committee_path();
-        if !committee_path.exists() {
-            std::fs::create_dir_all(rayls_datadir.genesis_path())?;
-            File::create_new(committee_path)?.write_all(TESTNET_COMMITTEE.as_bytes())?
-        }
-
-        Ok(Config { node_info: validator_info, parameters, genesis, observer, version })
-    }
-
-    /// Load a config from it's component parts.
-    pub fn load_mainnet<P: RaylsDirs>(
-        rayls_datadir: &P,
-        observer: bool,
-        version: &'static str,
-    ) -> eyre::Result<Self> {
-        let validator_info: NodeInfo =
-            Config::load_from_path(rayls_datadir.node_info_path(), ConfigFmt::YAML)?;
-        let parameters: Parameters =
-            serde_yaml::from_str(MAINNET_PARAMETERS).expect("bad testnet parameters yaml data");
-        let genesis: Genesis =
-            serde_yaml::from_str(MAINNET_GENESIS).expect("bad testnet genesis yaml data");
-        // If the default committee file does not exist then save it.
-        let committee_path = rayls_datadir.committee_path();
-        if !committee_path.exists() {
-            std::fs::create_dir_all(rayls_datadir.genesis_path())?;
-            File::create_new(committee_path)?.write_all(MAINNET_COMMITTEE.as_bytes())?
-        }
 
         Ok(Config { node_info: validator_info, parameters, genesis, observer, version })
     }
@@ -248,10 +202,6 @@ pub struct Parameters {
     /// The admin address for the FeeAggregator contract (controls upgrades, config, emergency).
     /// Should be a governance multisig in production.
     pub fee_aggregator_admin: Option<Address>,
-    /// Rayls network profile that selects the baked-in hardfork schedule.
-    /// Default: `testnet`.
-    #[serde(default)]
-    pub network: RaylsNetwork,
     /// Minimum EIP-1559 base fee floor (in wei).
     /// The base fee can never drop below this value.
     /// Set to 0 for a gasless (feeless) network.
@@ -261,6 +211,15 @@ pub struct Parameters {
     /// Controls the maximum gas per block and batch.
     #[serde(default = "Parameters::default_gas_limit")]
     pub gas_limit: u64,
+    /// Address for the consensus Prometheus metrics endpoint (the Narwhal/consensus metrics
+    /// suite). `None` (the default) leaves it off. The `--metrics` CLI flag overrides this when
+    /// passed, so operators can enable metrics from `parameters.yaml` without a flag.
+    #[serde(default)]
+    pub metrics_address: Option<SocketAddr>,
+    /// Address for the reth execution-layer Prometheus metrics endpoint. `None` (the default)
+    /// leaves it off. The `--reth-metrics` CLI flag overrides this when passed.
+    #[serde(default)]
+    pub reth_metrics_address: Option<SocketAddr>,
 }
 
 impl Parameters {
@@ -335,29 +294,6 @@ impl Default for NetworkAdminServerParameters {
     }
 }
 
-/// Prometheus metrics multiaddr.
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
-pub struct PrometheusMetricsParameters {
-    /// Socket address the server should be listening to.
-    pub socket_addr: Multiaddr,
-}
-
-impl Default for PrometheusMetricsParameters {
-    fn default() -> Self {
-        let host = "127.0.0.1";
-        Self {
-            socket_addr: format!(
-                "/ip4/{}/tcp/{}/http",
-                host,
-                get_available_tcp_port(host)
-                    .expect("os has available TCP port for default prometheus metrics")
-            )
-            .parse()
-            .expect("default prometheus metrics to parse available socket addr on localhost"),
-        }
-    }
-}
-
 impl Default for Parameters {
     fn default() -> Self {
         Self {
@@ -373,9 +309,10 @@ impl Default for Parameters {
             batch_vote_timeout: Parameters::default_batch_vote_timeout(),
             basefee_address: None,
             fee_aggregator_admin: None,
-            network: RaylsNetwork::default(),
             min_base_fee: Parameters::default_min_base_fee(),
             gas_limit: Parameters::default_gas_limit(),
+            metrics_address: None,
+            reth_metrics_address: None,
         }
     }
 }
@@ -392,8 +329,63 @@ impl Parameters {
         info!("Sync retry nodes set to {} nodes", self.sync_retry_nodes);
         info!("Max batch delay set to {} ms", self.max_batch_delay.as_millis());
         info!("Max concurrent requests set to {}", self.max_concurrent_requests);
-        info!(network = %self.network, "Rayls network hardfork profile");
         info!("Minimum base fee set to {} wei", self.min_base_fee);
         info!("Block gas limit set to {}", self.gas_limit);
+        if let Some(addr) = self.metrics_address {
+            info!(%addr, "Consensus Prometheus metrics endpoint");
+        }
+        if let Some(addr) = self.reth_metrics_address {
+            info!(%addr, "Reth execution-layer Prometheus metrics endpoint");
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parameters_without_metrics_address_default_to_off() {
+        // Backward compatibility: an existing parameters.yaml with no `metrics_address` must
+        // still parse, leaving consensus metrics disabled.
+        let params: Parameters =
+            serde_yaml::from_str("gc_depth: 50\n").expect("parses without metrics_address");
+        assert_eq!(params.metrics_address, None);
+        assert_eq!(params.gc_depth, 50);
+    }
+
+    #[test]
+    fn parameters_ignore_the_legacy_network_field() {
+        // Backward compatibility: a pre-removal parameters.yaml may still carry the
+        // `network` key (e.g. `network: local` stamped by an old `rayls-network dev`).
+        // It must parse and be ignored — the schedule source is now the CLI flag.
+        let params: Parameters =
+            serde_yaml::from_str("gc_depth: 50\nnetwork: local\n").expect("parses legacy file");
+        assert_eq!(params.gc_depth, 50);
+        let params: Parameters =
+            serde_yaml::from_str("gc_depth: 50\nnetwork: null\n").expect("parses legacy file");
+        assert_eq!(params.gc_depth, 50);
+    }
+
+    #[test]
+    fn parameters_parse_metrics_address_when_present() {
+        let params: Parameters = serde_yaml::from_str("metrics_address: \"127.0.0.1:9184\"\n")
+            .expect("parses with metrics_address");
+        assert_eq!(params.metrics_address, Some("127.0.0.1:9184".parse().unwrap()));
+    }
+
+    #[test]
+    fn default_parameters_have_metrics_off() {
+        assert_eq!(Parameters::default().metrics_address, None);
+        assert_eq!(Parameters::default().reth_metrics_address, None);
+    }
+
+    #[test]
+    fn reth_metrics_address_parses_and_defaults_off() {
+        let off: Parameters = serde_yaml::from_str("gc_depth: 50\n").unwrap();
+        assert_eq!(off.reth_metrics_address, None);
+        let on: Parameters =
+            serde_yaml::from_str("reth_metrics_address: \"0.0.0.0:9001\"\n").unwrap();
+        assert_eq!(on.reth_metrics_address, Some("0.0.0.0:9001".parse().unwrap()));
     }
 }

@@ -175,11 +175,21 @@ impl MissingCertificatesRequest {
                 // can't fire here), but routing every untrusted roaring
                 // deserialization through the shared helper keeps that invariant
                 // if this call site ever grows to re-encode the bitmap. See #55.
+                // Both operands are peer-supplied. A plain `+` overflows `Round` on a crafted
+                // request and, with `overflow-checks = true` and `panic = "abort"` in release,
+                // takes the whole node down. Reject instead; the io error maps to a penalty.
                 let rounds =
                     rayls_infrastructure_types::serde::deserialize_normalized(&serialized[..])?
                         .into_iter()
-                        .map(|r| self.exclusive_lower_bound + r as Round)
-                        .collect::<BTreeSet<Round>>();
+                        .map(|r| {
+                            self.exclusive_lower_bound.checked_add(r as Round).ok_or_else(|| {
+                                std::io::Error::new(
+                                    std::io::ErrorKind::InvalidData,
+                                    "skip round overflows the round range",
+                                )
+                            })
+                        })
+                        .collect::<std::io::Result<BTreeSet<Round>>>()?;
                 Ok((k.clone(), rounds))
             })
             .collect::<PrimaryNetworkResult<BTreeMap<_, _>>>()?;

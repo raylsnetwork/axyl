@@ -75,7 +75,7 @@ impl<'de, const DIGEST_LEN: usize> Deserialize<'de> for Digest<DIGEST_LEN> {
                     digest.copy_from_slice(v);
                     Ok(Digest { digest })
                 } else {
-                    let exp = format!(" {DIGEST_LEN} bytes");
+                    let exp = format!("{DIGEST_LEN} bytes");
                     let e: &str = &exp;
                     Err(Error::invalid_length(v.len(), &e))
                 }
@@ -85,10 +85,17 @@ impl<'de, const DIGEST_LEN: usize> Deserialize<'de> for Digest<DIGEST_LEN> {
             where
                 E: Error,
             {
+                // exact-length decode; `onto` rejects an over-long string, a short one leaves
+                // `written` below DIGEST_LEN (it must not zero-pad into a valid-looking digest)
                 let mut bytes = [0_u8; DIGEST_LEN];
-                bs58::decode(v)
+                let written = bs58::decode(v)
                     .onto(&mut bytes)
                     .map_err(|_| Error::invalid_value(Unexpected::Str(v), &self))?;
+                if written != DIGEST_LEN {
+                    let exp = format!("{DIGEST_LEN} bytes");
+                    let e: &str = &exp;
+                    return Err(Error::invalid_length(written, &e));
+                }
                 self.visit_bytes(&bytes)
             }
         }
@@ -275,5 +282,58 @@ mod tests {
         let wrong = Address::from_raw_public_key(&[1; 64]);
         let proof = generate_proof_of_possession_bls(&keypair, &wrong).unwrap();
         assert!(verify_proof_of_possession_bls(&proof, keypair.public(), &address).is_err())
+    }
+}
+
+#[cfg(test)]
+mod digest_serde_tests {
+    use super::Digest;
+
+    #[test]
+    fn short_base58_digest_is_rejected_not_zero_padded() {
+        let full = Digest::<32> { digest: [7u8; 32] };
+        let json = serde_json::to_string(&full).unwrap();
+        assert_eq!(serde_json::from_str::<Digest<32>>(&json).unwrap().digest, [7u8; 32]);
+        // decodes to one byte, not 32
+        let err = serde_json::from_str::<Digest<32>>("\"2\"").unwrap_err().to_string();
+        assert!(err.contains("expected 32 bytes"), "{err}");
+        assert!(!err.contains("  "), "no double space in the message: {err}");
+        // one zero byte, not the zero digest
+        assert!(serde_json::from_str::<Digest<32>>("\"1\"").is_err());
+        assert!(serde_json::from_str::<Digest<32>>(&format!("\"{}\"", "1".repeat(200))).is_err());
+        // BCS: 32 raw bytes behind a length prefix
+        let bytes = bcs::to_bytes(&full).unwrap();
+        assert_eq!(bytes.len(), 33);
+        assert_eq!(bcs::from_bytes::<Digest<32>>(&bytes).unwrap().digest, [7u8; 32]);
+    }
+
+    /// Leading zero bytes survive the round trip; the all-zero digest is the extreme case.
+    #[test]
+    fn leading_zero_digests_round_trip() {
+        let mut one_leading = [0u8; 32];
+        one_leading[1] = 7;
+        one_leading[31] = 255;
+        let mut many_leading = [0u8; 32];
+        many_leading[30] = 1;
+
+        for digest in [[0u8; 32], one_leading, many_leading, [255u8; 32]] {
+            let value = Digest::<32> { digest };
+            let json = serde_json::to_string(&value).unwrap();
+            assert_eq!(
+                serde_json::from_str::<Digest<32>>(&json).unwrap().digest,
+                digest,
+                "JSON round trip lost leading zeros for {digest:?}"
+            );
+            // binary path unchanged
+            assert_eq!(
+                bcs::from_bytes::<Digest<32>>(&bcs::to_bytes(&value).unwrap()).unwrap().digest,
+                digest
+            );
+        }
+
+        // 32 '1's is the zero digest; 31 is a 31-byte value
+        let zero = serde_json::to_string(&Digest::<32> { digest: [0u8; 32] }).unwrap();
+        assert_eq!(zero, format!("\"{}\"", "1".repeat(32)));
+        assert!(serde_json::from_str::<Digest<32>>(&format!("\"{}\"", "1".repeat(31))).is_err());
     }
 }

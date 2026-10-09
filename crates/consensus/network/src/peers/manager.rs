@@ -31,6 +31,24 @@ use libp2p::core::ConnectedPoint;
 /// Rayls: Maximum known peers to track.
 const MAX_KNOWN_PEERS: usize = 2000;
 
+/// How long a relay hop noted at dial time stays a candidate without a circuit being established
+/// through it. Long enough to cover a slow relay leg plus the circuit handshake; a hop that
+/// produced nothing in this time is a failed dial or a peer id that is not a relay at all.
+const PENDING_RELAY_HOP_TTL_SECS: u64 = 60;
+
+/// Sizes of the peer manager's relay peer addr sets (see [`PeerManager::relay_set_sizes`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RelaySetSizes {
+    /// Relays granted the exemptions: configured, or with a live circuit.
+    pub registered: usize,
+    /// Relays from this node's own configuration.
+    pub configured: usize,
+    /// Hops of circuits being dialed through, awaiting a circuit.
+    pub pending: usize,
+    /// Live circuits through registered relays, summed over relays.
+    pub circuits: usize,
+}
+
 #[cfg(test)]
 #[path = "../tests/peer_manager.rs"]
 mod peer_manager;
@@ -85,11 +103,47 @@ pub(crate) struct PeerManager {
     discovery_peers: HashMap<PeerId, Vec<Multiaddr>>,
     /// Consecutive heartbeats with zero connected peers for dial backoff.
     isolation_streak: u32,
+    /// Circuit-relay-v2 servers referenced by peers' `/p2p-circuit` addresses.
+    ///
+    /// Relays only speak the circuit protocol, not the consensus protocols (gossipsub, kad,
+    /// req/res). The direct leg to a relay carries this node's reservation and every circuit
+    /// routed through it, so these peer ids are exempt from *pruning*, kept out of kad and
+    /// skipped by request fan-out. They are NOT exempt from penalties: no remaining penalty fires
+    /// for merely lacking a protocol (`GossipsubNotSupported` is penalty-free), so anything that
+    /// does score a relay is behaviour -- authoring gossip, sending requests, delivering kad
+    /// records -- that a relay never exhibits, and it is banned like any other peer.
+    ///
+    /// Membership is evidence-based, never claim-based. A peer id gets here either from this
+    /// node's own configuration ([`Self::configured_relays`]) or because a `/p2p-circuit`
+    /// connection through it is actually established ([`Self::relay_circuits`]). A circuit
+    /// address inside a peer's kad record or peer-exchange entry is a claim by that peer and
+    /// grants nothing: a validator could otherwise name every honest validator as "its relay"
+    /// in one valid record and have every node exclude them from fetches, keep them out of kad
+    /// and never prune them, an eclipse of the sync paths built from address strings.
+    relay_peers: HashSet<PeerId>,
+    /// Relays from this node's own configuration: its external circuit address, the relays it
+    /// reserves on, and the committee's `/dnsaddr` relays. Registered for the life of the
+    /// process, whether or not a circuit is currently open through them.
+    configured_relays: HashSet<PeerId>,
+    /// Live `/p2p-circuit` connections per relay. A relay that is not configured is registered
+    /// while this is non-zero and dropped again when its last circuit closes.
+    relay_circuits: HashMap<PeerId, usize>,
+    /// Relay hops named by circuit addresses this node is currently dialing through, with the
+    /// time they were noted. Not relays yet: the direct leg to the hop comes up before the
+    /// circuit does, and it must be classified and kept out of kad in that window. Nothing else
+    /// is granted, and an entry that never turns into a circuit expires on the heartbeat.
+    pending_relay_hops: HashMap<PeerId, u64>,
+    /// This node's own peer id.
+    ///
+    /// Used to skip self when re-dialing missing committee members (this node appears in its own
+    /// committee and known-peers maps) and to detect whether this node is itself a committee
+    /// member.
+    local_peer_id: PeerId,
 }
 
 impl PeerManager {
     /// Create a new instance of Self.
-    pub(crate) fn new(config: &PeerConfig) -> Self {
+    pub(crate) fn new(config: &PeerConfig, local_peer_id: PeerId) -> Self {
         let heartbeat =
             tokio::time::interval(tokio::time::Duration::from_secs(config.heartbeat_interval));
 
@@ -113,6 +167,11 @@ impl PeerManager {
             isolation_streak: 0,
             temporarily_banned,
             discovery_peers: Default::default(),
+            relay_peers: Default::default(),
+            configured_relays: Default::default(),
+            relay_circuits: Default::default(),
+            pending_relay_hops: Default::default(),
+            local_peer_id,
         }
     }
 
@@ -152,6 +211,25 @@ impl PeerManager {
         multiaddrs: Vec<Multiaddr>,
         reply: Option<oneshot::Sender<NetworkResult<()>>>,
     ) {
+        // A circuit dial rides on a direct leg to the relay named in the address, and that leg
+        // comes up before the circuit does. Note the hop so the leg is classified as a relay leg
+        // and kept out of kad meanwhile; it becomes a registered relay only once the circuit is
+        // actually established (`relay_circuit_established`). No-op for non-circuit addresses.
+        //
+        // Deliberately BEFORE the early returns below, not after. The two placements fail in
+        // opposite directions and the costs are not symmetric. Noting late can miss the hop:
+        // `Dialing` means an earlier request is already in flight, possibly started by kademlia
+        // or with an address set that carried no circuit, and `Connected` means the leg is
+        // already up and the next reconnect through this circuit address needs the hop known.
+        // A hop that is not a candidate when its leg comes up is classified as an ordinary
+        // direct connection, added to our kad routing table and sent our record; other nodes
+        // then discover and dial the relay as a peer and ban it for not speaking the consensus
+        // protocols, which on a shared IP takes real peers down with it. Noting early costs
+        // nothing: a candidate grants no exemption, is skipped by fan-out and the kad add for
+        // one TTL and is then forgotten, and `note_relay_hops_from_addrs` never notes a bound
+        // peer and never extends an existing TTL, so a rejected dial cannot be used to park a
+        // peer id here.
+        self.note_relay_hops_from_addrs(&multiaddrs);
         // return early if peer is banned, connected, or currently being dialed
         if let Some(peer) = self.peers.get_peer(&peer_id) {
             match peer.connection_status() {
@@ -283,8 +361,46 @@ impl PeerManager {
         // update timestamps
         self.unban_temp_banned_peers();
 
+        // heal committee connectivity without waiting for the epoch boundary
+        self.redial_missing_committee();
+
         // manage discovery peers
         self.discovery_heartbeat();
+
+        // forget relay hops we dialed through that never produced a circuit
+        self.expire_pending_relay_hops(now());
+    }
+
+    /// Requests a re-dial, via [`PeerEvent::RedialCommittee`], of every current-committee member
+    /// that is neither connected nor dialing.
+    ///
+    /// Committee connectivity must not wait for the epoch boundary: a member whose relay or host
+    /// recovers mid-epoch becomes reachable again immediately, while the only other committee
+    /// dial paths run at `NewEpoch` or when this node is fully isolated (discovery seeding). One
+    /// attempt per member per heartbeat bounds the dial rate; committee members are ban-exempt,
+    /// so failed attempts cannot escalate. Only committee members re-dial: an observer with
+    /// peers must not pester the committee, matching the epoch-boundary dial policy.
+    fn redial_missing_committee(&mut self) {
+        if !self.is_peer_validator(&self.local_peer_id) {
+            return;
+        }
+        let connected_or_dialing: HashSet<PeerId> =
+            self.connected_or_dialing_peers().into_iter().collect();
+        let missing: Vec<BlsPublicKey> = self
+            .known_peers
+            .iter()
+            .filter_map(|(bls_key, info)| {
+                let peer_id: PeerId = info.pubkey.clone().into();
+                (peer_id != self.local_peer_id
+                    && self.is_peer_validator(&peer_id)
+                    && !connected_or_dialing.contains(&peer_id))
+                .then_some(*bls_key)
+            })
+            .collect();
+        for bls_key in missing {
+            debug!(target: "peer-manager", ?bls_key, "requesting re-dial of missing committee member");
+            self.events.push_back(PeerEvent::RedialCommittee(bls_key));
+        }
     }
 
     /// Apply a [PeerAction].
@@ -418,10 +534,161 @@ impl PeerManager {
     /// Some reports are propagated to libp2p network layer. Caller is responsible
     /// for specifying the severity of the penalty to apply.
     pub(crate) fn process_penalty(&mut self, peer_id: PeerId, penalty: Penalty) {
+        // Deliberately no carve-out for `relay_peers`: penalties are behaviour-based. A relay is
+        // never scored for merely lacking gossip/kad/req-res (`GossipsubNotSupported` carries no
+        // penalty), so a relay that does get here did something a relay never does and is banned
+        // like any other peer. Banning a relay drops the reservation and all circuits through it,
+        // hence the `warn` below naming the trigger.
         let action = self.peers.process_penalty(&peer_id, penalty);
 
+        // Surface the penalty that tipped a peer into a ban. Emitted at warn (not trace, like the
+        // step below) because a ban severs connectivity and the bare "peer banned" event otherwise
+        // records no cause -- leaving the trigger to be guessed from surrounding logs.
+        if matches!(action, PeerAction::Ban(_)) {
+            warn!(target: "peer-manager", ?peer_id, ?penalty, "penalty resulted in ban");
+        }
         trace!(target: "peer-manager", ?peer_id, ?action, "processed penalty");
         self.apply_peer_action(peer_id, action);
+    }
+
+    /// Whether `peer_id` is a relay server this node depends on: configured, or with a circuit
+    /// currently established through it. Relays are exempt from pruning, kept out of the
+    /// kademlia DHT (they only speak the circuit protocol) and skipped by request fan-out; they
+    /// are NOT exempt from penalties -- see [`Self::process_penalty`].
+    pub(crate) fn is_relay(&self, peer_id: &PeerId) -> bool {
+        self.relay_peers.contains(peer_id)
+    }
+
+    /// Whether `peer_id` is a relay ([`Self::is_relay`]) or the hop of a circuit this node is
+    /// currently dialing through. Used where the direct leg to a hop has to be told apart from an
+    /// ordinary peer before the circuit confirms it: connection classification and the kad
+    /// add/publish skip. It grants none of the relay exemptions.
+    pub(crate) fn is_relay_hop_candidate(&self, peer_id: &PeerId) -> bool {
+        self.relay_peers.contains(peer_id) || self.pending_relay_hops.contains_key(peer_id)
+    }
+
+    /// Note the hops of the `/p2p-circuit` addresses in `addrs` as candidates (see
+    /// [`Self::is_relay_hop_candidate`]). No-op for non-circuit addresses.
+    ///
+    /// Two guards keep a circuit address from parking an arbitrary peer id in the candidate
+    /// set, where it would be skipped by request fan-out and the kad add:
+    /// - A hop that already has a BLS binding is never noted. A relay only speaks the circuit
+    ///   protocol and never pushes a node record, so a bound peer is a validator or observer, not a
+    ///   relay, whatever address named it.
+    /// - A hop already noted keeps its original timestamp, so the TTL runs from the first dial
+    ///   through it. The committee redial re-dials a missing member every heartbeat; renewing the
+    ///   timestamp on each attempt would keep the hop a candidate for as long as the member stays
+    ///   missing, which is exactly the lifetime an attacker's circuit address would want.
+    pub(crate) fn note_relay_hops_from_addrs(&mut self, addrs: &[Multiaddr]) {
+        let noted_at = now();
+        for addr in addrs {
+            if let Some(relay_id) = crate::types::circuit_relay_peer_id(addr) {
+                if self.relay_peers.contains(&relay_id)
+                    || self.known_peerids.contains_key(&relay_id)
+                {
+                    continue;
+                }
+                self.pending_relay_hops.entry(relay_id).or_insert(noted_at);
+            }
+        }
+    }
+
+    /// A `/p2p-circuit` connection through `relay` was established: the hop is a relay this node
+    /// actually uses, so register it for as long as a circuit runs through it.
+    pub(crate) fn relay_circuit_established(&mut self, relay: PeerId) {
+        self.pending_relay_hops.remove(&relay);
+        *self.relay_circuits.entry(relay).or_insert(0) += 1;
+        if self.relay_peers.insert(relay) {
+            debug!(target: "peer-manager", ?relay, "registered relay peer on an established circuit (prune-exempt, kept out of kad; penalties still apply)");
+        }
+    }
+
+    /// A `/p2p-circuit` connection through `relay` closed. Only the circuit count changes: the
+    /// registration lasts as long as the direct leg to the relay does
+    /// ([`Self::relay_disconnected`]). Dropping it with the last circuit left the leg an ordinary
+    /// peer between circuits -- picked by request fan-out, which a relay cannot serve, penalised
+    /// for every failed stream, disconnected for reputation and temp-banned, which then blocked
+    /// the very circuit dial that would have re-registered it.
+    pub(crate) fn relay_circuit_closed(&mut self, relay: PeerId) {
+        let Entry::Occupied(mut circuits) = self.relay_circuits.entry(relay) else { return };
+        *circuits.get_mut() = circuits.get().saturating_sub(1);
+        if *circuits.get() == 0 {
+            circuits.remove();
+        }
+    }
+
+    /// The last connection to `relay` closed. A relay this node reached a peer through stays
+    /// registered while the leg to it is up; once the leg is gone and the relay is not configured,
+    /// the registration goes with it, so `relay_peers` holds configured relays and relays this
+    /// node is currently connected to, nothing stale.
+    ///
+    /// Called for every peer whose last connection closes, relay or not: for a peer that was
+    /// never registered both removals are no-ops, so the caller need not know which it was.
+    pub(crate) fn relay_disconnected(&mut self, relay: PeerId) {
+        self.relay_circuits.remove(&relay);
+        if !self.configured_relays.contains(&relay) && self.relay_peers.remove(&relay) {
+            debug!(target: "peer-manager", ?relay, "relay peer unregistered: disconnected");
+        }
+    }
+
+    /// Drop candidate hops noted more than [`PENDING_RELAY_HOP_TTL_SECS`] before `now` without a
+    /// circuit having been established through them: the dial failed, or the hop is no relay.
+    pub(crate) fn expire_pending_relay_hops(&mut self, now: u64) {
+        self.pending_relay_hops
+            .retain(|_, noted_at| now.saturating_sub(*noted_at) <= PENDING_RELAY_HOP_TTL_SECS);
+    }
+
+    /// Snapshot of the relay peer addr set sizes for the `relay_peer_addr_set_size` metric.
+    pub(crate) fn relay_set_sizes(&self) -> RelaySetSizes {
+        RelaySetSizes {
+            registered: self.relay_peers.len(),
+            configured: self.configured_relays.len(),
+            pending: self.pending_relay_hops.len(),
+            circuits: self.relay_circuits.values().sum(),
+        }
+    }
+
+    /// Whether the gossip penalty may be skipped for a peer that completed connection setup but
+    /// runs none of our gossip protocols (learned authoritatively from gossipsub's
+    /// `GossipsubNotSupported`).
+    ///
+    /// Skipping it deliberately confers NO privilege. "Does not speak gossipsub" is not proof of
+    /// being a relay -- from a bare peer id there is no way to tell a relay from a misconfigured or
+    /// hostile peer -- so the only thing the caller may skip on this signal is the *gossip* penalty
+    /// (the one such a peer would have tripped anyway). The peer stays subject to every other
+    /// penalty and to pruning. Relay registration (prune-exempt, kad-skipped -- never
+    /// penalty-exempt) is granted only to the hop of a `/p2p-circuit` we actually use: every
+    /// relay we reserve on is registered at `StartListening`
+    /// ([`Self::register_relays_from_addrs`]), and every relay we reach a peer through is
+    /// registered once that circuit is established ([`Self::relay_circuit_established`]). A
+    /// relay reaching here *without* being registered is one we do not depend on (typically one
+    /// dialed via a leaked bare address), so leaving it unregistered costs nothing.
+    ///
+    /// Returns `false` when `peer_id` is a known committee validator: a validator that fails
+    /// gossipsub negotiation is a real protocol/version fault the caller must surface, never a
+    /// peer to be quietly reclassified.
+    ///
+    /// Deliberately stateless: any peer id can trigger `GossipsubNotSupported`, so remembering
+    /// them would be an unbounded, attacker-fillable set for no benefit (nothing branches on it).
+    pub(crate) fn should_skip_gossip_penalty(&self, peer_id: &PeerId) -> bool {
+        !self.is_peer_validator(peer_id)
+    }
+
+    /// Register the relay servers referenced by this node's *own* `/p2p-circuit` addresses -- its
+    /// external address, the relays it reserves on, the committee's `/dnsaddr` relays -- as
+    /// configured relays: prune-exempt and kept out of kad for the life of the process. Not for
+    /// addresses learned from peers; see [`Self::note_relay_hops_from_addrs`] and
+    /// [`Self::relay_circuit_established`] for those.
+    pub(crate) fn register_relays_from_addrs(&mut self, addrs: &[Multiaddr]) {
+        for addr in addrs {
+            if let Some(relay_id) = crate::types::circuit_relay_peer_id(addr) {
+                self.configured_relays.insert(relay_id);
+                self.pending_relay_hops.remove(&relay_id);
+                if self.relay_peers.insert(relay_id) {
+                    debug!(target: "peer-manager", ?relay_id, "registered configured relay peer (prune-exempt, kept out of kad; penalties still apply)");
+                }
+            }
+        }
     }
 
     /// Process newly banned IP addresses.
@@ -553,7 +820,8 @@ impl PeerManager {
         let ready_to_prune = connected_peers
             .iter()
             .filter_map(|(peer_id, peer)| {
-                if !self.is_peer_validator(peer_id) && !peer.is_trusted() {
+                if !self.is_peer_validator(peer_id) && !peer.is_trusted() && !self.is_relay(peer_id)
+                {
                     Some(**peer_id)
                 } else {
                     None
@@ -717,8 +985,42 @@ impl PeerManager {
         self.known_peers_time_added.insert(bls_key, now());
         self.known_peerids.insert(peer_id, bls_key);
 
+        // The circuit addresses in `info` are dial hints for reaching this peer, nothing more.
+        // The relay they name is registered when a circuit through it is established, not here:
+        // a record is the peer's own claim, and it may name any peer id it likes as its relay.
+
         // Cleanup if we've exceeded the maximum known peers limit
         self.cleanup_known_peers();
+    }
+
+    /// Snapshot the dial targets in `known_peers` as `(peer_id, multiaddr)` pairs (one per
+    /// advertised address). Used to expose what this node will redial -- including peers it has
+    /// not connected to -- for the `advertised_peer_addr_*` metric.
+    ///
+    /// This node is in its own committee, so `known_peers` contains itself; skip it (as `redial`
+    /// does) so the node's own address is not reported as a dial target -- otherwise it would show
+    /// as a phantom "never connected" entry in the diff against the routing table.
+    pub(crate) fn known_peer_addrs(&self) -> Vec<(PeerId, Multiaddr)> {
+        self.known_peers
+            .values()
+            .flat_map(|info| {
+                let peer_id: PeerId = info.pubkey.clone().into();
+                info.multiaddrs.iter().map(move |addr| (peer_id, addr.clone()))
+            })
+            .filter(|(peer_id, _)| *peer_id != self.local_peer_id)
+            .collect()
+    }
+
+    /// Snapshot the kad-discovery dial candidates in `discovery_peers` as `(peer_id, multiaddr)`
+    /// pairs. These are peers learned from other nodes' routing tables via `get_closest_peers` and
+    /// dialed on the heartbeat -- the path by which a cross-host-unreachable address (e.g. a
+    /// co-located peer's `127.0.0.1`) becomes dial churn. Exposed for the `discovery_peer_addr_*`
+    /// metric.
+    pub(crate) fn discovery_peer_addrs(&self) -> Vec<(PeerId, Multiaddr)> {
+        self.discovery_peers
+            .iter()
+            .flat_map(|(peer_id, addrs)| addrs.iter().map(move |addr| (*peer_id, addr.clone())))
+            .collect()
     }
 
     /// Rayls: Remove oldest known peers when exceeding maximum size.
@@ -900,8 +1202,25 @@ impl PeerManager {
             if !skip_dial && discovery_peers.is_empty() {
                 for (_bls, info) in &self.known_peers {
                     let peer_id: PeerId = info.pubkey.clone().into();
-                    if !self.peer_banned(&peer_id) {
-                        discovery_peers.insert(peer_id, info.multiaddrs.clone());
+                    if self.peer_banned(&peer_id) {
+                        continue;
+                    }
+                    // A `/dnsaddr` member MUST be reached through the resolving `DialBls` path,
+                    // which resolves it to a concrete `/p2p-circuit` before dialing. Raw-dialing
+                    // the unresolved `/dnsaddr` here opens a non-circuit connection that
+                    // `sanitize_ip_addr` denies ("no valid unbanned IP"); the resulting
+                    // `on_dial_failure` then `register_disconnected`s the peer, racing with and
+                    // tearing down the circuit the proper path just established. Committee members
+                    // are re-dialed via `redial_missing_committee`, so seed only concrete
+                    // (already-dialable) addresses and drop `/dnsaddr` ones.
+                    let dialable: Vec<Multiaddr> = info
+                        .multiaddrs
+                        .iter()
+                        .filter(|a| !crate::types::is_dnsaddr(a))
+                        .cloned()
+                        .collect();
+                    if !dialable.is_empty() {
+                        discovery_peers.insert(peer_id, dialable);
                     }
                 }
                 if !discovery_peers.is_empty() {

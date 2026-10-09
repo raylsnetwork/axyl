@@ -185,6 +185,75 @@ mod bcs_layout_tests {
         skip_consumes(&h);
     }
 
+    /// The header the `rayls_latestHeader` RPC returns must survive JSON: every field of the
+    /// committed sub-dag, reputation map included, and the digest and BCS bytes of the decoded
+    /// copy must equal the original's.
+    #[test]
+    fn consensus_header_round_trips_through_json() {
+        let leader = make_cert(0xAA, 4, 7, 3, 2);
+        let mut cert = make_cert(0x11, 3, 7, 3, 2);
+        cert.set_signature_verification_state(SignatureVerificationState::VerifiedDirectly(
+            BlsSignature::default(),
+        ));
+        let mut scores = ReputationScores::default();
+        scores.add_score(&AuthorityIdentifier::dummy_for_test(0xAA), 5);
+        scores.add_score(&AuthorityIdentifier::dummy_for_test(0x11), 2);
+        scores.final_of_schedule = true;
+        let sub_dag = CommittedSubDag::new(vec![cert], leader, 9, scores, None);
+        let header = ConsensusHeader {
+            parent_hash: BlockHash::repeat_byte(0x99),
+            sub_dag,
+            number: 1234,
+            extra: BlockHash::repeat_byte(0xEE),
+        };
+
+        let text = serde_json::to_string(&header).expect("ConsensusHeader serializes to JSON");
+        let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(json["number"], 1234);
+        assert_eq!(json["sub_dag"]["leader"]["header"]["round"], 4);
+        assert_eq!(
+            json["sub_dag"]["leader"]["header"]["author"],
+            AuthorityIdentifier::dummy_for_test(0xAA).to_string(),
+            "identifiers outside map keys are base58 strings too"
+        );
+        let reputation = &json["sub_dag"]["reputation_score"]["scores_per_authority"];
+        assert_eq!(reputation[AuthorityIdentifier::dummy_for_test(0xAA).to_string()], 5);
+        assert_eq!(reputation[AuthorityIdentifier::dummy_for_test(0x11).to_string()], 2);
+        // the payload is an ordered list of [digest, worker] pairs, in insertion order
+        let payload = json["sub_dag"]["certificates"][0]["header"]["payload"].as_array().unwrap();
+        assert_eq!(payload.len(), 3);
+        assert_eq!(payload[1][0], format!("{:#x}", BlockHash::repeat_byte(1)));
+        assert_eq!(payload[2][1], 2);
+        assert_eq!(
+            json["sub_dag"]["certificates"][0]["header"]["parents"].as_array().map(Vec::len),
+            Some(2)
+        );
+
+        let decoded: ConsensusHeader = serde_json::from_str(&text).expect("JSON reads back");
+        assert_eq!(decoded, header);
+        // `Certificate`'s `PartialEq` only compares header digest, round, epoch and origin, so the
+        // line above would still pass if JSON dropped these three fields. Check them by hand.
+        let (a, b) = (&decoded.sub_dag.certificates[0], &header.sub_dag.certificates[0]);
+        // `SignatureVerificationState` has no `PartialEq`; its `Debug` carries the variant and
+        // the signature bytes, which is what we need to know survived
+        assert_eq!(
+            format!("{:?}", a.signature_verification_state()),
+            format!("{:?}", b.signature_verification_state())
+        );
+        assert_eq!(a.signed_authorities(), b.signed_authorities());
+        assert_eq!(a.created_at(), b.created_at());
+        assert_eq!(
+            decoded.sub_dag.reputation_score.scores_per_authority,
+            header.sub_dag.reputation_score.scores_per_authority
+        );
+        let keys = |h: &ConsensusHeader| -> Vec<BlockHash> {
+            h.sub_dag.certificates[0].header().payload().keys().copied().collect()
+        };
+        assert_eq!(keys(&decoded), keys(&header), "payload order survives JSON");
+        assert_eq!(decoded.digest(), header.digest());
+        assert_eq!(crate::encode(&decoded), crate::encode(&header));
+    }
+
     #[test]
     fn skip_handles_all_sig_state_variants() {
         let sigs = [

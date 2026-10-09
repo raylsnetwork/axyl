@@ -3,7 +3,7 @@ use alloy::{primitives::utils::parse_ether, sol_types::SolCall};
 use rand::{rngs::StdRng, SeedableRng as _};
 use rayls_infrastructure_config::{NodeInfo, RLS_IMPL_ADDRESS};
 use rayls_infrastructure_types::{
-    generate_proof_of_possession_bls, payload::RLPayload, Address, BlsKeypair, BlsSignature,
+    generate_proof_of_possession_bls, payload::RLPayload, Address, BlsKeypair, BlsSignature, Bytes,
     Certificate, CommittedSubDag, ConsensusHeader, ConsensusOutput, GenesisAccount, NodeP2pInfo,
     ReputationScores, SignatureVerificationState, TaskManager, B256, U256,
 };
@@ -60,7 +60,7 @@ fn consensus_output_for_tests(round: u32, epoch: u32, subdag_index: u64) -> Cons
 async fn execute_payload_and_update_canonical_chain(
     reth_env: &RethEnv,
     payload: RLPayload,
-    transactions: Vec<Vec<u8>>,
+    transactions: Vec<Bytes>,
 ) -> eyre::Result<ExecutedBlock> {
     let (block, _validation_counts) =
         reth_env.build_block_from_batch_payload(payload, &transactions, &[])?;
@@ -70,6 +70,40 @@ async fn execute_payload_and_update_canonical_chain(
     // flush to disk immediately so tests can read DB state
     reth_env.flush_persistence().await?;
     Ok(block)
+}
+
+/// A `--config-file` profile handed to the constructor reaches the chain spec:
+/// its forks activate at the configured blocks and everything else stays `Never`.
+#[tokio::test]
+async fn profile_schedule_reaches_chain_spec() -> eyre::Result<()> {
+    use crate::{ForkCondition, NetworkProfile, RaylsHardFork, RaylsHardforks};
+
+    // The test genesis carries the local network's chain-id, which the profile must match.
+    let chain_id = rayls_infrastructure_types::RaylsNetwork::Local.chain_id();
+    let profile: NetworkProfile = serde_yaml::from_str(&format!(
+        "chain_id: {chain_id}\nhardforks:\n  TransactionLoadBalancing: 777777\n"
+    ))?;
+
+    let chain = rayls_infrastructure_types::test_chain_spec_arc();
+    let tmp_dir = TempDir::new()?;
+    let task_manager = TaskManager::new("Test Task Manager");
+    let reth_env = RethEnv::new_for_temp_chain_with_profile(
+        chain,
+        tmp_dir.path(),
+        &task_manager,
+        None,
+        &profile,
+    )
+    .await?;
+
+    let spec = reth_env.rayls_chain_spec();
+    assert_eq!(
+        spec.rayls_fork_activation(RaylsHardFork::TransactionLoadBalancing),
+        ForkCondition::Block(777777)
+    );
+    // A fork absent from the file's schedule stays `Never`.
+    assert_eq!(spec.rayls_fork_activation(RaylsHardFork::Eip1559), ForkCondition::Never);
+    Ok(())
 }
 
 /// `batch_txns_all_pending` underpins restart dedup: an empty block's batch is only
@@ -600,7 +634,7 @@ async fn test_close_epochs() -> eyre::Result<()> {
     }
     .abi_encode()
     .into();
-    // stake no longer sends ETH — the ConsensusRegistry pulls ERC-20 RLS via transferFrom
+    // stake no longer sends ETH: the ConsensusRegistry pulls ERC-20 RLS via transferFrom
     let stake_tx = new_validator_eoa.create_eip1559_encoded(
         chain.clone(),
         None,
@@ -1276,7 +1310,7 @@ async fn test_hybrid_rewards_fork_boundary() -> eyre::Result<()> {
         epochDuration: epoch_duration,
     };
 
-    let mut governance_multisig =
+    let governance_multisig =
         TransactionFactory::new_random_from_seed(&mut StdRng::seed_from_u64(33));
     let governance = governance_multisig.address();
     let tmp_genesis = rayls_infrastructure_types::test_genesis().extend_accounts([(
@@ -1472,8 +1506,8 @@ async fn test_fix_genesis_history_rekeys_and_preserves_post_genesis() -> eyre::R
 
     // Simulate post-genesis history under the HASHED keys, as replay's indexer
     // would append:
-    //   slot_b — one open shard [5] (has room → prepend in place)
-    //   slot_c — a FULL sealed shard [1..=2000] + a full open shard [2001..=4000],
+    //   slot_b: one open shard [5] (has room → prepend in place)
+    //   slot_c: a FULL sealed shard [1..=2000] + a full open shard [2001..=4000],
     //            so prepending block 0 (total 4001) must re-chunk into three
     //            <=2000 shards (the cascade / overflow case).
     {
@@ -1569,7 +1603,7 @@ async fn test_fix_genesis_history_rekeys_and_preserves_post_genesis() -> eyre::R
 /// history has no key mismatch (read and write both use the plain address), so
 /// genesis init already seeds it correctly and the fix is a no-op. It only has
 /// work to do after an `IndexAccountHistoryStage` first-sync clear, which this
-/// test simulates — and multi-shard accounts (post-genesis changesets) are left
+/// test simulates, and multi-shard accounts (post-genesis changesets) are left
 /// untouched.
 #[cfg(feature = "archive-replay")]
 #[tokio::test]

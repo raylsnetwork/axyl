@@ -1,14 +1,15 @@
-//! Inner-execution node components for both Worker and Primary execution.
-//!
-//! This module contains the logic for execution.
+//! Execution-layer components behind [`ExecutionNode`](super::ExecutionNode), for both worker and
+//! primary roles.
 
+use super::txn_forwarder::TxnForwarder;
 use crate::types::ExecutionError;
-use eyre::OptionExt;
 use jsonrpsee::http_client::HttpClient;
-use rayls_batch_builder::BatchBuilder;
+use rayls_batch_builder::{BatchBuilder, BatchBuilderConfig, OwnWatermarkReceiver};
 use rayls_batch_validator::BatchValidator;
 use rayls_consensus_worker::WorkerNetworkHandle;
 use rayls_execution_evm::{
+    chainspec::RaylsHardforks,
+    in_flight::InFlightTracker,
     reth_env::RethEnv,
     system_calls::EpochState,
     worker::{WorkerComponents, WorkerNetwork},
@@ -47,6 +48,12 @@ pub(super) struct ExecutionNodeInner {
     /// Collection of execution components by worker.
     /// Index of vec is worker id.
     pub(super) workers: Vec<WorkerComponents>,
+    /// This authority's executed batch-sequence watch, captured when the engine starts and handed
+    /// to each batch builder so it resumes and paces sealing off its own execution progress.
+    pub(super) own_executed_sequence: Option<watch::Receiver<Option<u64>>>,
+    /// Node-scoped in-flight tracker shared by the pool and whichever role the node runs (the
+    /// batch builder's sealing marks or the forwarder's dissemination marks).
+    pub(super) in_flight_tracker: InFlightTracker,
 }
 
 impl ExecutionNodeInner {
@@ -55,7 +62,7 @@ impl ExecutionNodeInner {
     /// The method is consumed by [PrimaryNodeInner::start].
     /// All tasks are spawned with the [ExecutionNodeInner]'s [TaskManager].
     pub(super) async fn start_engine<DB: Database>(
-        &self,
+        &mut self,
         rx_output: mpsc::Receiver<(CameFrom, ConsensusOutput)>,
         rx_shutdown: Noticer,
         gas_accumulator: GasAccumulator,
@@ -68,6 +75,10 @@ impl ExecutionNodeInner {
         executed_batch_registry: ExecutedBatchRegistry,
     ) -> eyre::Result<()> {
         let parent_header = self.reth_env.lookup_head()?;
+
+        // Capture this authority's executed-sequence watch before the ordering layer moves into the
+        // engine, so each batch builder started this epoch can resume and pace off execution.
+        self.own_executed_sequence = Some(batch_ordering.executed_own_watermark());
 
         // Keep a handle to the idle signal so we can flip it true when the engine task EXITS.
         // The engine's own poll() publishes idle only on the `Poll::Pending` path, not on
@@ -91,6 +102,7 @@ impl ExecutionNodeInner {
             engine_idle_tx,
             last_consensus_header,
             executed_batch_registry,
+            self.in_flight_tracker.clone(),
         );
         if let Some(tracker) = batch_tracker {
             rayls_middleware_processor.set_batch_tracker(tracker);
@@ -99,7 +111,7 @@ impl ExecutionNodeInner {
         // spawn rayls engine as a Drainable critical task. Drainable (not Doomed) so the
         // engine future is NOT dropped by a cancelling shutdown select: dropping it would
         // orphan the detached execution task (spawn_blocking_task), which then finalizes
-        // blocks AFTER the shutdown flush — the serialize-replay fork. Instead the engine
+        // blocks AFTER the shutdown flush - the serialize-replay fork. Instead the engine
         // observes shutdown via its own rx_shutdown, drains queued + in-flight outputs, and
         // exits gracefully. `spawn_drainable_result_task` still surfaces a fatal exit (e.g.
         // `ConsensusFork`) as a CriticalExitError so the restart cause stays unambiguous.
@@ -111,7 +123,7 @@ impl ExecutionNodeInner {
                     Ok(_) => info!(target: "engine", "Rayls Engine exited gracefully"),
                     Err(e) => error!(target: "engine", ?e, "Rayls Engine error - halting node"),
                 }
-                // The engine task has stopped — nothing more will execute. Publish idle=true so a
+                // The engine task has stopped - nothing more will execute. Publish idle=true so a
                 // mode-transition drain waiting on `engine_idle` unblocks immediately instead of
                 // waiting out its timeout (poll() only publishes idle on the Pending path, never on
                 // this exit path).
@@ -130,7 +142,7 @@ impl ExecutionNodeInner {
         Ok(())
     }
 
-    /// The worker's RPC, TX pool, and block builder
+    /// Spawn the worker's batch builder for one epoch.
     pub(super) async fn start_batch_builder(
         &mut self,
         worker_id: WorkerId,
@@ -141,41 +153,100 @@ impl ExecutionNodeInner {
         initial_batch_seq: u64,
         epoch_boundary: u64,
     ) -> eyre::Result<()> {
+        // The node-scoped in-flight tracker is shared by every worker pool: a second worker's
+        // boundary clear or reconcile would wipe the sibling's marks. Fence the assumption until
+        // multi-worker mark scoping exists.
+        eyre::ensure!(
+            self.workers.len() == 1,
+            "in-flight dedup assumes a single worker (found {})",
+            self.workers.len()
+        );
         // check for worker components and initialize if they're missing
         let transaction_pool = self
             .workers
             .get(worker_id as usize)
-            .ok_or_eyre("worker components missing for {worker_id}")?
+            .ok_or_else(|| eyre::eyre!("worker components missing for worker {worker_id}"))?
             .pool();
+
+        let own_executed_sequence = self
+            .own_executed_sequence
+            .clone()
+            .expect("own_executed_sequence must be initialized by start_engine before the builder");
+        let own_watermark_receiver = OwnWatermarkReceiver::new(own_executed_sequence);
 
         // create the batch builder for this epoch
         let batch_builder = BatchBuilder::new(
             &self.reth_env,
             transaction_pool.clone(),
             block_provider_sender,
-            self.address,
-            self.rayls_infrastructure_config.parameters.max_batch_delay,
             epoch_task_spawner.clone(),
-            worker_id,
             base_fee,
-            epoch,
-            initial_batch_seq,
-            epoch_boundary,
-            self.rayls_infrastructure_config.parameters.gas_limit,
+            own_watermark_receiver,
+            BatchBuilderConfig {
+                address: self.address,
+                worker_id,
+                epoch,
+                epoch_boundary,
+                max_delay: self.rayls_infrastructure_config.parameters.max_batch_delay,
+                next_batch_seq: initial_batch_seq,
+                gas_limit: self.rayls_infrastructure_config.parameters.gas_limit,
+            },
         );
 
         // spawn block builder task
         epoch_task_spawner.spawn_critical_task("batch builder", async move {
-            let res = batch_builder.await;
+            let res = batch_builder.run().await;
             info!(target: "rayls::execution", ?res, "batch builder task exited");
         });
 
         Ok(())
     }
 
+    /// Spawn the observer transaction forwarder for one epoch.
+    ///
+    /// `committee` is slot-ordered (authorities sorted by id) to match receiver-side dispatch. The
+    /// direct-submit path is fork-gated and re-read per tick, so an un-upgraded peer never receives
+    /// the new request and the fork may activate mid-epoch.
+    pub(super) fn start_txn_forwarder(
+        &self,
+        worker_id: WorkerId,
+        network_handle: WorkerNetworkHandle,
+        executed_anchor: watch::Receiver<ConsensusHeader>,
+        last_seen_header: watch::Receiver<ConsensusHeader>,
+        committee: Vec<BlsPublicKey>,
+        epoch_task_spawner: &TaskSpawner,
+        max_gossip_message_size: usize,
+    ) -> eyre::Result<()> {
+        let transaction_pool = self
+            .workers
+            .get(worker_id as usize)
+            .ok_or_else(|| eyre::eyre!("worker components missing for worker {worker_id}"))?
+            .pool();
+
+        let reth_env = self.reth_env.clone();
+        let direct_submit = Box::new(move || {
+            let next_block = reth_env.canonical_tip().number + 1;
+            reth_env
+                .rayls_chain_spec()
+                .is_sender_affinity_load_balancing_active_at_block(next_block)
+        });
+
+        TxnForwarder::new(
+            transaction_pool,
+            network_handle,
+            executed_anchor,
+            last_seen_header,
+            committee,
+            direct_submit,
+            max_gossip_message_size,
+        )
+        .spawn(self.rayls_infrastructure_config.parameters.max_batch_delay, epoch_task_spawner);
+
+        Ok(())
+    }
+
     /// Initialize the worker's transaction pool and public RPC.
-    /// Must call this function in accending worker_id order or will panic,
-    /// for instance call for worker id 0, then 1, etc.
+    /// Call in ascending worker_id order (0, then 1, ...); any other order panics.
     pub(super) async fn initialize_worker_components<EP>(
         &mut self,
         worker_id: WorkerId,
@@ -185,7 +256,8 @@ impl ExecutionNodeInner {
     where
         EP: EngineToPrimary + Send + Sync + 'static,
     {
-        let transaction_pool = self.reth_env.init_txn_pool()?;
+        let transaction_pool =
+            self.reth_env.init_txn_pool_with_in_flight(self.in_flight_tracker.clone())?;
 
         let network = WorkerNetwork::new(
             self.reth_env.chainspec(),
@@ -233,7 +305,7 @@ impl ExecutionNodeInner {
 
         // take ownership of worker components
         let components = WorkerComponents::new(rpc_handle, transaction_pool, network);
-        // Must call this function in accending worker_id order or will panic.
+        // call in ascending worker_id order; any other order panics
         if worker_id as usize != self.workers.len() {
             panic!("initialize_worker_components not called with sequencial worker ids!")
         }
@@ -274,7 +346,7 @@ impl ExecutionNodeInner {
     /// Fetch the last executed state from the database.
     ///
     /// This method is called when the primary spawns to retrieve
-    /// the last committed sub dag from it's database in the case
+    /// the last committed sub dag from its database in the case
     /// of the node restarting.
     ///
     /// This returns the hash of the last executed ConsensusHeader on the consensus chain.
@@ -334,7 +406,7 @@ impl ExecutionNodeInner {
         Ok(blocks)
     }
 
-    /// Return an database provider.
+    /// Return a database provider.
     pub(super) fn get_reth_env(&self) -> RethEnv {
         self.reth_env.clone()
     }
@@ -407,7 +479,7 @@ impl ExecutionNodeInner {
                         epoch,
                         addr = ?v.validatorAddress,
                         pubkey_len = v.blsPubkey.len(),
-                        "BLS key parsing FAILED — validator DROPPED from committee: {e:?}",
+                        "BLS key parsing FAILED - validator DROPPED from committee: {e:?}",
                     );
                 }
             }

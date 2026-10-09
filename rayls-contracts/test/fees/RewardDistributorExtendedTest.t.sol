@@ -11,6 +11,16 @@ import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {ERC20} from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
 import {RLSAccumulator} from "src/fees/RLSAccumulator.sol";
+import {RewardCurve} from "src/fees/RewardCurve.sol";
+import {IAccessControl} from "@openzeppelin/contracts/access/IAccessControl.sol";
+
+/// @notice Minimal contract that always reverts on getCurrentApyBps, for testing
+///         RewardDistributor's defensive try/catch fallback to the static bps.
+contract RevertingCurve {
+    function getCurrentApyBps(uint256) external pure returns (uint256) {
+        revert("RevertingCurve: always reverts");
+    }
+}
 
 /// @notice Mock RLS token (ERC-20 staking token) for testing
 contract MockRLSExt is ERC20 {
@@ -223,6 +233,14 @@ contract RewardDistributorExtendedTest is Test {
 
         // Set epoch duration (1 day = 86400 seconds)
         registry.setEpochDuration(86400);
+    }
+
+    // Helper: deploy a RewardCurve (issue #103 POC), owner-administered
+    function _deployCurve() internal returns (RewardCurve curve) {
+        RewardCurve impl = new RewardCurve();
+        bytes memory initData = abi.encodeCall(RewardCurve.initialize, (owner));
+        ERC1967Proxy proxy = new ERC1967Proxy(address(impl), initData);
+        curve = RewardCurve(address(proxy));
     }
 
     // =========================================================================
@@ -602,5 +620,209 @@ contract RewardDistributorExtendedTest is Test {
         assertApproxEqRel(p1, (total * s1) / totalStake, 1e13, "v1 reward proportional to stake");
         assertApproxEqRel(p2, (total * s2) / totalStake, 1e13, "v2 reward proportional to stake");
         assertApproxEqRel(p3, (total * s3) / totalStake, 1e13, "v3 reward proportional to stake");
+    }
+
+    // =========================================================================
+    //  9. RewardCurve (issue #103 POC): curve-derived APY compresses the REAL
+    //     payout on both tracks, not just in isolated math
+    // =========================================================================
+
+    /// @notice Proves RewardCurve's numbers survive contact with the real
+    ///         _splitTarget/_distributeByTarget/DelegationPool split: two independently
+    ///         configured curves — Track A ("priority"/locked tier, base-heavy policy) and
+    ///         Track B ("open tier", revenue-leaning policy) — are wired directly into
+    ///         RewardDistributor via setRewardCurve/setOpenTierRewardCurve, which resolves each
+    ///         track's effective APY from the curve itself every distributeRewards() call — no
+    ///         off-chain keeper/oracle involved. Track A and Track B stake grow on independent
+    ///         schedules; the realized per-epoch payout on EACH track must match its own curve's
+    ///         output exactly and compress as that track's own stake grows, proving the
+    ///         self-regulating mechanism holds after going through the real on-chain distribution
+    ///         pipeline, not just in RewardCurveTest's isolated math.
+    function test_curveDrivenApy_compressesRealizedPayout_acrossBothTracks() public {
+        RewardCurve priorityCurve = _deployCurve();
+        RewardCurve openTierCurve = _deployCurve();
+
+        // owner already holds REVENUE_REPORTER_ROLE on both curves — _deployCurve() initializes
+        // each with owner as admin_, and initialize() grants that role to admin_ by default.
+        vm.startPrank(owner);
+        priorityCurve.setBaseMonthlyEmission(500_000e18);
+        openTierCurve.setBaseMonthlyEmission(100_000e18);
+        priorityCurve.recordRevenue(100_000e18); // priority: base-heavy (500k base + 100k revenue)
+        openTierCurve.recordRevenue(500_000e18); // open tier: revenue-leaning (100k base + 500k revenue)
+        vm.stopPrank();
+
+        registry.clearValidators();
+        registry.addActiveValidator(validator1, 0); // no own stake: isolates the two track rates
+
+        _setupAccumulator(50_000_000e18); // targetApyBps=5000 set here is the pre-wiring fallback
+
+        // Wire both curves once — distributeRewards() resolves each track's APY from these
+        // directly from here on, every round, with no further pushes.
+        vm.startPrank(owner);
+        distributor.setRewardCurve(address(priorityCurve));
+        distributor.setOpenTierRewardCurve(address(openTierCurve));
+        vm.stopPrank();
+
+        uint256[3] memory trackAStakes = [uint256(20_000_000e18), 200_000_000e18, 2_000_000_000e18];
+        uint256[3] memory trackBStakes = [uint256(50_000_000e18), 500_000_000e18, 1_000_000_000e18];
+
+        uint256 prevPriorityApy = type(uint256).max;
+        uint256 prevOpenTierApy = type(uint256).max;
+
+        for (uint256 i; i < 3; ++i) {
+            (uint256 priorityApy, uint256 openTierApy) = _runCurveRound(
+                priorityCurve, openTierCurve, trackAStakes[i], trackBStakes[i]
+            );
+
+            // Compression: as each track's OWN stake grows, its OWN curve-derived APY must
+            // strictly fall — proven independently per track, since they move on independent
+            // schedules (Track B growing must not be what compresses Track A, and vice versa).
+            assertLt(priorityApy, prevPriorityApy, "Track A APY must compress as Track A stake grows");
+            assertLt(openTierApy, prevOpenTierApy, "Track B APY must compress as Track B stake grows");
+            prevPriorityApy = priorityApy;
+            prevOpenTierApy = openTierApy;
+        }
+    }
+
+    /// @dev One curve-driven epoch: set this round's stake, distribute (RewardDistributor
+    ///      resolves each track's APY from the already-wired curves itself), and assert the
+    ///      realized payout on each track matches its curve exactly. `priorityApy`/`openTierApy`
+    ///      are still read here directly from the curves — not to push them anywhere, but as
+    ///      this test's own oracle for the expected-value assertions below. Split out from the
+    ///      loop body above solely to keep stack depth low (legacy codegen, no --via-ir
+    ///      configured for this project).
+    function _runCurveRound(
+        RewardCurve priorityCurve,
+        RewardCurve openTierCurve,
+        uint256 trackA,
+        uint256 trackB
+    ) internal returns (uint256 priorityApy, uint256 openTierApy) {
+        delegationPool.setDelegatedStake(validator1, trackA + trackB);
+        delegationPool.setOpenTierDelegatedStake(validator1, trackB);
+
+        priorityApy = priorityCurve.getCurrentApyBps(trackA);
+        openTierApy = openTierCurve.getCurrentApyBps(trackB);
+        assertLe(priorityApy, 10_000, "must stay within RewardDistributor.MAX_APY_BPS");
+        assertLe(openTierApy, 10_000, "must stay within RewardDistributor.MAX_APY_BPS");
+
+        uint256 trackABefore = delegationPool.trackAReceived(validator1);
+        uint256 trackBBefore = delegationPool.trackBReceived(validator1);
+
+        vm.prank(SYSTEM_ADDRESS);
+        distributor.distributeRewards();
+
+        uint256 trackADelta = delegationPool.trackAReceived(validator1) - trackABefore;
+        uint256 trackBDelta = delegationPool.trackBReceived(validator1) - trackBBefore;
+
+        // Accumulator fully funds the shortfall each round (no fee income received), so
+        // totalRewards == totalTarget and nothing gets proportionally scaled — the realized
+        // payout must match _splitTarget's own formula exactly.
+        uint256 expectedTrackA = (trackA * priorityApy * 86400) / (365 days * 10_000);
+        uint256 expectedTrackB = (trackB * openTierApy * 86400) / (365 days * 10_000);
+        assertEq(trackADelta, expectedTrackA, "Track A realized payout must match curve-derived target exactly");
+        assertEq(trackBDelta, expectedTrackB, "Track B realized payout must match curve-derived target exactly");
+    }
+
+    // =========================================================================
+    //  10. RewardCurve wiring: disabled fallback, clamping, defensive fallback,
+    //      access control
+    // =========================================================================
+
+    /// @notice Default (unwired) behavior is unchanged: with rewardCurve/openTierRewardCurve
+    ///         left at address(0), distribution still uses the static admin-set bps exactly as
+    ///         before this feature existed — zero migration risk for any deployment that never
+    ///         calls the new setters.
+    function test_rewardCurve_disabled_fallsBackToStaticBps() public {
+        uint256 stakeAmount = 100_000e18;
+        registry.clearValidators();
+        registry.addActiveValidator(validator1, 0);
+        delegationPool.setDelegatedStake(validator1, stakeAmount);
+        delegationPool.setOpenTierDelegatedStake(validator1, 0);
+
+        _setupAccumulator(50_000_000e18); // sets targetApyBps = 5000 (50%), epochDuration = 1 day
+
+        assertEq(distributor.rewardCurve(), address(0), "rewardCurve unset by default");
+        assertEq(distributor.openTierRewardCurve(), address(0), "openTierRewardCurve unset by default");
+
+        uint256 before = delegationPool.trackAReceived(validator1);
+        vm.prank(SYSTEM_ADDRESS);
+        distributor.distributeRewards();
+        uint256 delta = delegationPool.trackAReceived(validator1) - before;
+
+        uint256 expected = (stakeAmount * 5000 * 86400) / (365 days * 10_000);
+        assertEq(delta, expected, "unwired distribution must match the static targetApyBps formula exactly");
+    }
+
+    /// @notice A curve whose honest output exceeds MAX_APY_BPS (thin stake vs large emission) is
+    ///         clamped to 10_000 bps by RewardDistributor, not applied raw — the realized payout
+    ///         must reflect the clamp.
+    function test_rewardCurve_outputClampedToMaxApyBps() public {
+        RewardCurve curve = _deployCurve();
+        vm.prank(owner);
+        curve.setBaseMonthlyEmission(1_000_000e18); // huge emission vs the tiny stake below
+
+        registry.clearValidators();
+        registry.addActiveValidator(validator1, 0);
+        uint256 trackA = 1e18; // deliberately tiny, so (emission*12/trackA) blows past 100% APY
+        delegationPool.setDelegatedStake(validator1, trackA);
+        delegationPool.setOpenTierDelegatedStake(validator1, 0);
+
+        assertGt(curve.getCurrentApyBps(trackA), 10_000, "test setup must actually exceed MAX_APY_BPS");
+
+        _setupAccumulator(50_000_000e18);
+        vm.prank(owner);
+        distributor.setRewardCurve(address(curve));
+
+        uint256 before = delegationPool.trackAReceived(validator1);
+        vm.prank(SYSTEM_ADDRESS);
+        distributor.distributeRewards();
+        uint256 delta = delegationPool.trackAReceived(validator1) - before;
+
+        uint256 expectedClamped = (trackA * 10_000 * 86400) / (365 days * 10_000);
+        assertEq(delta, expectedClamped, "realized payout must reflect the MAX_APY_BPS clamp, not the raw curve output");
+    }
+
+    /// @notice A reverting/broken curve can never block distributeRewards() (chain liveness on
+    ///         this onlySystemCall path) — falls back to the static bps instead.
+    function test_rewardCurve_revertingCurve_fallsBackToStaticBps() public {
+        RevertingCurve broken = new RevertingCurve();
+        uint256 stakeAmount = 100_000e18;
+
+        registry.clearValidators();
+        registry.addActiveValidator(validator1, 0);
+        delegationPool.setDelegatedStake(validator1, stakeAmount);
+        delegationPool.setOpenTierDelegatedStake(validator1, 0);
+
+        _setupAccumulator(50_000_000e18); // targetApyBps = 5000
+        vm.prank(owner);
+        distributor.setRewardCurve(address(broken));
+
+        uint256 before = delegationPool.trackAReceived(validator1);
+        vm.prank(SYSTEM_ADDRESS);
+        distributor.distributeRewards(); // must not revert despite the broken curve
+
+        uint256 delta = delegationPool.trackAReceived(validator1) - before;
+        uint256 expected = (stakeAmount * 5000 * 86400) / (365 days * 10_000);
+        assertEq(delta, expected, "a reverting curve must fall back to the static targetApyBps exactly");
+    }
+
+    /// @notice Only DEFAULT_ADMIN_ROLE may wire a RewardCurve address.
+    function test_setRewardCurve_onlyAdmin() public {
+        address stranger = address(0x9999);
+        vm.prank(stranger);
+        vm.expectRevert(
+            abi.encodeWithSelector(IAccessControl.AccessControlUnauthorizedAccount.selector, stranger, bytes32(0))
+        );
+        distributor.setRewardCurve(address(0x1234));
+    }
+
+    /// @notice Only DEFAULT_ADMIN_ROLE may wire an open-tier RewardCurve address.
+    function test_setOpenTierRewardCurve_onlyAdmin() public {
+        address stranger = address(0x9999);
+        vm.prank(stranger);
+        vm.expectRevert(
+            abi.encodeWithSelector(IAccessControl.AccessControlUnauthorizedAccount.selector, stranger, bytes32(0))
+        );
+        distributor.setOpenTierRewardCurve(address(0x1234));
     }
 }

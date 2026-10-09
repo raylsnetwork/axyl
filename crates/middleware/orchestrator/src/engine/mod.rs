@@ -1,19 +1,14 @@
-//! Engine mod for Rayls Node
+//! Execution layer for worker and primary roles.
 //!
-//! This module contains all execution layer implementations for worker and primary nodes.
-//!
-//! The worker's execution components track the canonical tip to construct blocks for the worker to
-//! propose. The execution state is also used to validate proposed blocks from other peers.
-//!
-//! The engine for the primary executes consensus output, extends the canonical tip, and updates the
-//! final state of the chain.
-//!
-//! The methods in this module are thread-safe wrappers for the inner type that contains logic.
+//! The worker components track the canonical tip to build batches and validate peers' batches; the
+//! primary's engine executes consensus output and extends the canonical tip. [`ExecutionNode`] is
+//! the thread-safe wrapper around the inner type holding the logic.
 
 mod node;
 mod node_builder;
 mod node_inner;
 mod rayls_builder;
+mod txn_forwarder;
 
 pub use node::*;
 pub use rayls_builder::*;

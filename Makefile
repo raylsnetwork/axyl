@@ -1,4 +1,4 @@
-.PHONY: help attest udeps check test test-faucet fmt clippy docker-login docker-testnet docker-push docker-builder docker-builder-init up down validators pr init-submodules update-rayls-contracts revert-submodule
+.PHONY: help attest udeps check test test-faucet fmt clippy docker-login docker-testnet docker-push docker-builder docker-builder-init up down relay-up relay-down validators pr init-submodules update-rayls-contracts revert-submodule
 
 # full path for the Makefile
 ROOT_DIR:=$(shell dirname $(realpath $(firstword $(MAKEFILE_LIST))))
@@ -9,6 +9,13 @@ BASE_DIR:=$(shell basename $(ROOT_DIR))
 # Default tag is latest if not specified
 TAG ?= latest
 
+# Date-pinned nightly for every nightly-only tool (rustfmt, clippy --fix, udeps).
+# Unstable-option behavior drifts between nightlies, so this must match CI: the
+# fmt job in .github/workflows/pr.yaml and nightly-fuzz.yml, plus rustfmt.toml
+# and etc/test/test-and-attest.sh. Bump every pin together (reformat commit).
+# Install with: rustup toolchain install $(NIGHTLY) --profile minimal --component rustfmt,clippy
+NIGHTLY := nightly-2026-06-24
+
 help:
 	@echo ;
 	@echo "make attest" ;
@@ -17,7 +24,7 @@ help:
 	@echo "make udeps" ;
 	@echo "    :::> Check unused dependencies in the entire project by package." ;
 	@echo "    :::> Dev needs 'cargo-udeps' installed." ;
-	@echo "    :::> Dev also needs rust nightly and protobuf (on mac). ";
+	@echo "    :::> Dev also needs rust $(NIGHTLY) and protobuf (on mac). ";
 	@echo "    :::> To install run: 'cargo install cargo-udeps --locked'." ;
 	@echo ;
 	@echo "make check" ;
@@ -33,10 +40,10 @@ help:
 	@echo "    :::> Test restart integration tests." ;
 	@echo ;
 	@echo "make fmt" ;
-	@echo "    :::> cargo +nightly fmt" ;
+	@echo "    :::> cargo +$(NIGHTLY) fmt (date-pinned to match the CI fmt check)" ;
 	@echo ;
 	@echo "make clippy" ;
-	@echo "    :::> Cargo +nightly clippy for all features with fix enabled." ;
+	@echo "    :::> cargo +$(NIGHTLY) clippy for all features with fix enabled." ;
 	@echo ;
 	@echo "make docker-login" ;
 	@echo "    :::> Setup docker registry using gcloud artifacts." ;
@@ -59,6 +66,12 @@ help:
 	@echo "make down" ;
 	@echo "    :::> Bring the docker compose containers down and remove orphans and volumes." ;
 	@echo ;
+	@echo "make relay-up" ;
+	@echo "    :::> Launch 4 validators isolated in private networks, connected only via relays (etc/relay-network)." ;
+	@echo ;
+	@echo "make relay-down" ;
+	@echo "    :::> Bring the relay isolation testnet down and remove orphans and volumes." ;
+	@echo ;
 	@echo "make validators" ;
 	@echo "    :::> Run 4 validators locally (outside of docker)." ;
 	@echo ;
@@ -69,7 +82,7 @@ attest:
 
 # check for unused dependencies
 udeps:
-	find . -type f -name Cargo.toml -exec sed -rne 's/^name = "(.*)"/\1/p' {} + | xargs -I {} sh -c "echo '\n\n{}:' && cargo +nightly udeps --package {}" ;
+	find . -type f -name Cargo.toml -exec sed -rne 's/^name = "(.*)"/\1/p' {} + | xargs -I {} sh -c "echo '\n\n{}:' && cargo +$(NIGHTLY) udeps --package {}" ;
 
 check:
 	cargo check --workspace --all-features --all-targets ;
@@ -86,13 +99,13 @@ test-faucet:
 test-restarts:
 	cargo test test_restarts -- --ignored ;
 
-# format using +nightly toolchain
+# format using the pinned nightly toolchain (same as the CI fmt check)
 fmt:
-	cargo +nightly fmt ;
+	cargo +$(NIGHTLY) fmt ;
 
-# clippy formatter + try to fix problems
+# clippy on the pinned nightly + try to fix problems
 clippy:
-	cargo +nightly clippy --workspace --all-features --fix ;
+	cargo +$(NIGHTLY) clippy --workspace --all-features --fix ;
 
 # login to gcloud artifact registry for managing docker images
 docker-login:
@@ -122,6 +135,19 @@ up:
 # bring docker compose down
 down:
 	docker compose -f ./etc/docker-network/compose.yaml down --remove-orphans -v ;
+
+# relay isolation testnet: validators in private networks, reachable only via relays
+relay-up:
+	VERGEN_GIT_SHA=$$(git rev-parse HEAD) docker compose -f ./etc/relay-network/compose.yaml up --build --remove-orphans --detach ;
+
+relay-down:
+	docker compose -f ./etc/relay-network/compose.yaml down --remove-orphans -v ;
+
+relay-failover-up:
+	VERGEN_GIT_SHA=$$(git rev-parse HEAD) docker --context desktop-linux compose -f ./etc/relay-network/compose.failover.yaml up --build --remove-orphans --detach ;
+
+relay-failover-down:
+	docker --context desktop-linux compose -f ./etc/relay-network/compose.failover.yaml down --remove-orphans -v ;
 
 # alternative approach to run 4 local validator nodes outside of docker on local machine
 validators:

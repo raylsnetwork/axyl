@@ -12,7 +12,7 @@ use rand::{rngs::ThreadRng, seq::SliceRandom};
 use rayls_consensus_primary_metrics::PrimaryMetrics;
 use rayls_infrastructure_config::ConsensusConfig;
 use rayls_infrastructure_network_types::FetchCertificatesResponse;
-use rayls_infrastructure_storage::CertificateStore;
+use rayls_infrastructure_storage::{CertificateStore, ReadTimeout};
 use rayls_infrastructure_types::{
     validate_received_certificate, AuthorityIdentifier, BlsPublicKey, Certificate, Committee,
     Database, Epoch, Hash as _, Noticer, RaylsReceiver, RaylsSender, Round, TaskManager,
@@ -100,9 +100,9 @@ pub(crate) struct CertificateFetcher<DB> {
     /// The max allowable RPC message size shared with peers (in bytes).
     /// This value should match the `request_response` codec's "max_rpc_message_size".
     max_rpc_message_size: usize,
-    /// Track consecutive fetch failures for exponential backoff
+    /// Track consecutive fetch failures for exponential backoff.
     consecutive_failures: u32,
-    /// Last fetch attempt time for rate limiting
+    /// Last fetch attempt time for rate limiting.
     last_fetch_attempt: Option<Instant>,
     /// Suppresses probes until this instant after an epoch-mismatch outcome.
     /// Prevents tight spin when all peers are on a future epoch.
@@ -390,7 +390,7 @@ impl<DB: Database> CertificateFetcher<DB> {
             written_rounds.insert(authority.id(), BTreeSet::new());
         }
         // NOTE: origins_after_round() is inclusive.
-        match self.certificate_store.origins_after_round(gc_round + 1) {
+        match self.certificate_store.origins_after_round(gc_round + 1, ReadTimeout::Exempt) {
             Ok(origins) => {
                 for (round, origins) in origins {
                     for origin in origins {
@@ -786,7 +786,8 @@ async fn fetch_certificates_helper(
                     result
                 }));
             }
-            let mut interval = Box::pin(sleep(request_interval));
+            let interval = sleep(request_interval);
+            tokio::pin!(interval);
             tokio::select! {
                 res = fut.next() => match res {
                     Some(Ok(certificates)) => {

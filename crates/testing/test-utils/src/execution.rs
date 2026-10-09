@@ -4,7 +4,7 @@ use clap::Parser as _;
 use core::fmt;
 use rayls_execution_evm::{
     reth_env::{RethConfig, RethEnv},
-    RethChainSpec,
+    NetworkProfile, RethChainSpec,
 };
 use rayls_execution_faucet::FaucetArgs;
 use rayls_infrastructure_config::Config;
@@ -21,7 +21,6 @@ pub type TestExecutionNode = ExecutionNode;
 /// Convenience function for creating engine node using tempdir and optional args.
 /// Defaults if params not provided:
 /// - opt_authority_identifier: `AuthorityIdentifier(1)`
-/// - opt_chain: `testnet`
 /// - opt_address: `0x1111111111111111111111111111111111111111`
 pub async fn default_test_execution_node(
     opt_chain: Option<Arc<RethChainSpec>>,
@@ -60,7 +59,7 @@ fn execution_builder<CliExt: clap::Args + fmt::Debug>(
     opt_args: Option<Vec<&str>>,
     tmp_dir: &Path,
 ) -> eyre::Result<(RaylsBuilder, CliExt)> {
-    let default_args = ["rayls-network", "--http", "--chain", "testnet", "--storage.v2"];
+    let default_args = ["rayls-network", "--http", "--storage.v2"];
 
     // extend faucet args if provided
     let cli_args = if let Some(args) = opt_args {
@@ -91,6 +90,12 @@ fn execution_builder<CliExt: clap::Args + fmt::Debug>(
 
     // TODO: this a temporary approach until upstream reth supports public rpc hooks
     let opt_faucet_args = None;
+    // Test engines skip the CLI boot gate and, like temp chains, run without Rayls
+    // hardforks (the schedule the unit tests were written against).
+    let profile = NetworkProfile {
+        chain_id: rayls_infrastructure_config.genesis.config.chain_id,
+        hardforks: Default::default(),
+    };
     let builder = RaylsBuilder::new(
         RethConfig::new(
             reth_command,
@@ -100,6 +105,7 @@ fn execution_builder<CliExt: clap::Args + fmt::Debug>(
             Arc::new(rayls_infrastructure_config.chain_spec()),
         ),
         rayls_infrastructure_config,
+        profile,
         opt_faucet_args,
         None,
         healthcheck,
@@ -121,7 +127,6 @@ pub fn execution_builder_no_args(
 /// Convenience function for creating engine node using tempdir and optional args.
 /// Defaults if params not provided:
 /// - opt_authority_identifier: `AuthorityIdentifier(1)`
-/// - opt_chain: `testnet`
 /// - opt_address: `0x1111111111111111111111111111111111111111`
 // #[cfg(feature = "faucet")]
 pub async fn faucet_test_execution_node(
@@ -145,10 +150,12 @@ pub async fn faucet_test_execution_node(
         execution_builder::<FaucetArgs>(opt_chain.clone(), opt_address, extended_args, tmp_dir)?;
 
     // replace default builder's faucet args
-    let RaylsBuilder { node_config, rayls_infrastructure_config, healthcheck, .. } = builder;
+    let RaylsBuilder { node_config, rayls_infrastructure_config, profile, healthcheck, .. } =
+        builder;
     let builder = RaylsBuilder::new(
         node_config.clone(),
         rayls_infrastructure_config,
+        profile,
         Some(faucet),
         None,
         healthcheck,
@@ -161,12 +168,12 @@ pub async fn faucet_test_execution_node(
         &builder,
         RethEnv::new(
             &node_config,
+            &builder.profile,
             &TaskManager::default(),
             reth_db,
             None,
             RewardsCounter::default(),
             &BuildMetadata::default(),
-            None,
             None,
             false,
         )

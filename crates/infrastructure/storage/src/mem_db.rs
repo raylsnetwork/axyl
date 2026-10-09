@@ -116,7 +116,7 @@ impl StoreEntry {
 pub(crate) type EvictionHeap = BinaryHeap<Reverse<(u64, &'static str, Vec<u8>)>>;
 
 /// Outcome of one eviction pass, for the layered writer's cache-pressure logs.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct EvictionStats {
     /// Total cached rows (live and tombstoned) when the pass started.
     pub before: usize,
@@ -124,6 +124,8 @@ pub struct EvictionStats {
     pub after: usize,
     /// Rows removed during the pass.
     pub evicted: usize,
+    /// Duration of the eviction pass.
+    pub eviction_time: Duration,
 }
 
 /// One cached table: the rows plus a flag set while the producer's clear is queued but not yet
@@ -204,10 +206,8 @@ impl<'a> DbTx for MemDbTx<'a> {
     }
 
     fn skip_to<T: Table>(&self, key: &T::Key) -> eyre::Result<DBIter<'_, T>> {
-        match skip_to_impl::<T>(&self.store, key) {
-            Some(items) => Ok(Box::new(items.into_iter())),
-            None => Err(eyre::eyre!("Invalid table {}", T::NAME)),
-        }
+        skip_to_borrowed::<T>(&self.store, key)
+            .ok_or_else(|| eyre::eyre!("Invalid table {}", T::NAME))
     }
 
     fn reverse_iter<T: Table>(&self) -> DBIter<'_, T> {
@@ -284,10 +284,8 @@ impl<'a> DbTx for MemDbTxMut<'a> {
     }
 
     fn skip_to<T: Table>(&self, key: &T::Key) -> eyre::Result<DBIter<'_, T>> {
-        match skip_to_impl::<T>(&self.store, key) {
-            Some(items) => Ok(Box::new(items.into_iter())),
-            None => Err(eyre::eyre!("Invalid table {}", T::NAME)),
-        }
+        skip_to_borrowed::<T>(&self.store, key)
+            .ok_or_else(|| eyre::eyre!("Invalid table {}", T::NAME))
     }
 
     fn reverse_iter<T: Table>(&self) -> DBIter<'_, T> {
@@ -329,7 +327,8 @@ impl<'a> DbTxMut for MemDbTxMut<'a> {
     }
 
     fn commit(self) -> eyre::Result<()> {
-        // no need to do anything, the lock finishes with the tx drop
+        // Infallible by design: dropping the write guard releases the lock and performs no I/O.
+        // `LayeredDbTxMut::commit` relies on this after it has already enqueued `CommitTxn`.
         Ok(())
     }
 }
@@ -480,19 +479,39 @@ impl MemDatabase {
         }
     }
 
-    /// Evicts settled keys (in-flight == 0) in recency order until the cache fits `max_size`.
+    /// Evicts settled keys (in-flight == 0) in recency order until the cache is at or below
+    /// `max_size / 8`, the trim target (see the relaxed bound in the fast path below).
     /// Candidates are validated at pop: a key re-inserted since its settle, or a row cleared
     /// away, is skipped. A key whose recency was refreshed by a read since it settled is
     /// re-pushed with the fresh clock so hot keys survive eviction. The heap stays writer-owned;
     /// producers never touch it. Every pop removes one entry, so the loop always terminates.
+    ///
+    /// Fast path: rows are pushed to the heap exactly when their in-flight count settles to zero
+    /// and entries leave it only through this pass's pops, so `heap.len()` is an upper bound on
+    /// the settled (evictable) rows. When it is below `max_size / 2` the pass could evict at most
+    /// that many rows, so the exclusive store lock is skipped entirely: the writer runs a pass
+    /// after every applied op and the heap grows by one per settled op, so any skipped eviction
+    /// is picked up on the next pass. The cache may therefore transiently exceed `max_size` by
+    /// less than `max_size / 2` settled rows while a writer backlog drains; in-flight rows are
+    /// never evictable, so this is a bounded relaxation of the cap, not a correctness issue.
     pub fn evict_if_needed(&self, heap: &mut EvictionHeap, max_size: usize) -> EvictionStats {
+        if heap.len() < max_size >> 1 {
+            return EvictionStats::default();
+        }
+        let start = Instant::now();
         let mut store = self.store.write();
         let mut total: usize = store.values().map(|table| table.rows.len()).sum();
         if total <= max_size {
-            return EvictionStats { before: total, after: total, evicted: 0 };
+            return EvictionStats {
+                before: total,
+                after: total,
+                evicted: 0,
+                eviction_time: start.elapsed(),
+            };
         }
+        let evict_until = max_size >> 3;
         let mut evicted = 0usize;
-        while total > max_size {
+        while total > evict_until {
             let Some(Reverse((heap_last_used, table, key))) = heap.pop() else { break };
             let Some(table_map) = store.get_mut(table) else { continue };
             let Some(entry) = table_map.rows.get(&key) else { continue };
@@ -511,11 +530,17 @@ impl MemDatabase {
             total -= 1;
             evicted += 1;
         }
-        EvictionStats { before: total + evicted, after: total, evicted }
+        EvictionStats {
+            before: total + evicted,
+            after: total,
+            evicted,
+            eviction_time: start.elapsed(),
+        }
     }
 
-    /// Total rows (live and tombstoned) held in the cache; the writer keeps this at or below the
-    /// configured max size.
+    /// Total rows (live and tombstoned) held in the cache; the writer trims it toward
+    /// `max_size / 8` on each pass, keeping it near the configured max size (see the relaxed
+    /// bound in [`MemDatabase::evict_if_needed`]).
     pub fn mem_size(&self) -> usize {
         self.store.read().values().map(|table| table.rows.len()).sum()
     }
@@ -839,10 +864,30 @@ fn raw_iter_owned_impl<T: Table>(
     Some(collect_raw_owned(table.rows.iter()))
 }
 
+/// Owned tail from `key` onward, for the non-txn [`MemDatabase::skip_to`] whose read guard is a
+/// temporary and so cannot back a borrowed iterator. Uses `range` for an O(log N) seek rather than
+/// scanning from the front, but still materializes the tail — prefer [`skip_to_borrowed`] on the
+/// txn paths, which is also lazy.
 fn skip_to_impl<T: Table>(store: &StoreType, key: &T::Key) -> Option<Vec<(T::Key, T::Value)>> {
     let table = store.get(T::NAME)?;
     let key_bytes = encode_key(key);
-    Some(collect_typed::<T, _>(table.rows.iter().skip_while(|(k, _)| **k < key_bytes)))
+    Some(collect_typed::<T, _>(table.rows.range(key_bytes..)))
+}
+
+/// Lazy tail from `key` onward, borrowing the read guard. `range` seeks in O(log N) instead of
+/// scanning from the front, and the iterator decodes only the entries the caller actually pulls —
+/// so a `skip_to(..).next()` touches one row, not the whole tail. Used by the txn paths whose guard
+/// outlives the returned iterator.
+fn skip_to_borrowed<'s, T: Table>(store: &'s StoreType, key: &T::Key) -> Option<DBIter<'s, T>> {
+    let table = store.get(T::NAME)?;
+    let key_bytes = encode_key(key);
+    Some(Box::new(
+        table
+            .rows
+            .range(key_bytes..)
+            .filter(|(_, entry)| !entry.tombstoned())
+            .map(|(k, entry)| (decode_key::<T::Key>(k), decode::<T::Value>(&entry.value))),
+    ))
 }
 
 fn reverse_iter_impl<T: Table>(store: &StoreType) -> Option<Vec<(T::Key, T::Value)>> {
@@ -885,9 +930,12 @@ fn record_prior_to_impl<T: Table>(store: &StoreType, key: &T::Key) -> Option<(T:
 
 #[cfg(test)]
 mod test {
-    use rayls_infrastructure_types::{Database, DbTx, DbTxMut};
+    use rayls_infrastructure_types::{encode_key, Database, DbTx, DbTxMut, Table};
 
-    use crate::{mem_db::MemDatabase, test::*};
+    use crate::{
+        mem_db::{EvictionHeap, EvictionStats, MemDatabase},
+        test::*,
+    };
 
     fn open_db() -> MemDatabase {
         let db = MemDatabase::new();
@@ -935,6 +983,131 @@ mod test {
     fn test_memdb_remove() {
         let db = open_db();
         test_remove(db)
+    }
+
+    /// The pre-fix `skip_to` algorithm, kept as a behavioural oracle: scan from the front of the
+    /// map, then materialize the entire tail from `from` onward. The current code seeks with
+    /// `range(from..)` and yields lazily; both must produce the identical sequence.
+    fn old_skip_to_scan(
+        map: &std::collections::BTreeMap<u64, String>,
+        from: u64,
+    ) -> Vec<(u64, String)> {
+        map.iter().skip_while(|(k, _)| **k < from).map(|(k, v)| (*k, v.clone())).collect()
+    }
+
+    /// The lazy `range`-based `skip_to` must return exactly what the pre-fix scan-and-collect did,
+    /// for probes landing before the first key, on a key, in a gap, over a tombstone, and past the
+    /// last key.
+    #[test]
+    fn test_memdb_skip_to_matches_pre_fix_scan() {
+        use std::collections::BTreeMap;
+
+        let db = open_db();
+        let mut oracle: BTreeMap<u64, String> = BTreeMap::new();
+
+        // Sparse keys (step 3) so probes can fall before / on / between entries.
+        let inserted: Vec<u64> = (0..300).map(|i| i * 3).collect();
+        db.with_write_txn(|txn| {
+            for &k in &inserted {
+                txn.insert::<TestTable>(&k, &k.to_string()).unwrap();
+            }
+            Ok(())
+        })
+        .unwrap();
+
+        // Tombstone a few (interior and boundary) to exercise the tombstone filter on both paths.
+        let removed = [0u64, 3, 6, 300, 897];
+        db.with_write_txn(|txn| {
+            for &k in &removed {
+                txn.remove::<TestTable>(&k).unwrap();
+            }
+            Ok(())
+        })
+        .unwrap();
+        for &k in &inserted {
+            if !removed.contains(&k) {
+                oracle.insert(k, k.to_string());
+            }
+        }
+
+        // Probe every boundary: just below, exactly on, and just above each inserted key, plus a
+        // point before the first and well past the last.
+        let mut probes: Vec<u64> = vec![0, 1, 2];
+        for &k in &inserted {
+            probes.extend([k.saturating_sub(1), k, k + 1]);
+        }
+        probes.push(inserted.last().copied().unwrap() + 100);
+
+        db.with_read_txn(|txn| {
+            for &p in &probes {
+                let got: Vec<(u64, String)> = txn.skip_to::<TestTable>(&p).unwrap().collect();
+                let want = old_skip_to_scan(&oracle, p);
+                assert_eq!(got, want, "skip_to({p}) diverged from the pre-fix scan-and-collect");
+            }
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    /// The pre-fix `skip_to` materialized the whole tail on every call, so the
+    /// `skip_to(key).next()` pattern from `next_round_number` was O(N) per call. The lazy
+    /// `range` seek is O(log N). Over a large table with a front-anchored probe (worst case for
+    /// the old scan) the new path must be strictly faster; the margin is enormous (a full
+    /// 10k-row scan + clone vs a single seek), so the assertion is robust against timer noise.
+    #[test]
+    fn test_memdb_skip_to_faster_than_pre_fix_scan() {
+        use std::{collections::BTreeMap, time::Instant};
+
+        let db = open_db();
+        let n: u64 = 10_000;
+        let mut oracle: BTreeMap<u64, String> = BTreeMap::new();
+        db.with_write_txn(|txn| {
+            for i in 0..n {
+                txn.insert::<TestTable>(&i, &i.to_string()).unwrap();
+            }
+            Ok(())
+        })
+        .unwrap();
+        for i in 0..n {
+            oracle.insert(i, i.to_string());
+        }
+
+        // Anchor near the front so the pre-fix algorithm rescans/reclones almost the whole tail
+        // every call — the exact shape of the cert-collector's `find_next_round` walk.
+        let probe = 1u64;
+        let iters = 200u32;
+
+        // NEW: the real lazy path — seek then take one.
+        let new_start = Instant::now();
+        db.with_read_txn(|txn| {
+            for _ in 0..iters {
+                let first = txn.skip_to::<TestTable>(&probe).unwrap().next();
+                assert!(first.is_some());
+            }
+            Ok(())
+        })
+        .unwrap();
+        let new_elapsed = new_start.elapsed();
+
+        // OLD: front scan + collect the entire tail, then take one.
+        let old_start = Instant::now();
+        for _ in 0..iters {
+            let first = old_skip_to_scan(&oracle, probe).into_iter().next();
+            assert!(first.is_some());
+        }
+        let old_elapsed = old_start.elapsed();
+
+        println!(
+            "skip_to(front).next() x{iters} over {n} rows: new={new_elapsed:?}, old={old_elapsed:?} \
+             ({:.1}x faster)",
+            old_elapsed.as_secs_f64() / new_elapsed.as_secs_f64().max(f64::MIN_POSITIVE)
+        );
+
+        assert!(
+            new_elapsed < old_elapsed,
+            "expected the lazy range-based skip_to ({new_elapsed:?}) to beat the pre-fix \
+             scan-and-collect ({old_elapsed:?})"
+        );
     }
 
     #[test]
@@ -1084,6 +1257,80 @@ mod test {
             val_after_commit.unwrap(),
             "fifty".to_string(),
             "Value for key 50 should match reinserted value after commit"
+        );
+    }
+
+    /// The eviction fast path must skip the pass while fewer than `max_size / 2` rows are
+    /// settled — even when the cache is over its cap — and the next pass, once enough ops have
+    /// settled, trims the cache to the target.
+    #[test]
+    fn evict_fast_path_skips_when_few_settled_rows() {
+        let db = open_db();
+        let mut heap = EvictionHeap::new();
+        const MAX: usize = 10;
+
+        let mut txn = db.write_txn().unwrap();
+        for i in 0..12u64 {
+            txn.insert::<TestTable>(&i, &i.to_string()).expect("Failed to insert");
+        }
+        drop(txn);
+        assert_eq!(db.mem_size(), 12, "all rows must be cached, in flight");
+
+        // Settle two rows: heap.len() == 2 < MAX / 2, while the cache (12) exceeds MAX (10).
+        db.on_op_applied(TestTable::NAME, &encode_key(&0u64), &mut heap);
+        db.on_op_applied(TestTable::NAME, &encode_key(&1u64), &mut heap);
+
+        let stats = db.evict_if_needed(&mut heap, MAX);
+        assert_eq!(stats, EvictionStats::default(), "fast path must skip the pass");
+        assert_eq!(db.mem_size(), 12, "no row may be evicted on the fast path");
+
+        // Settle the rest: the heap now exceeds MAX / 2, so the pass runs and trims to MAX / 8.
+        for i in 2..12u64 {
+            db.on_op_applied(TestTable::NAME, &encode_key(&i), &mut heap);
+        }
+        let stats = db.evict_if_needed(&mut heap, MAX);
+        assert!(stats.evicted > 0, "the pass must run once enough rows have settled");
+        assert_eq!(db.mem_size(), MAX >> 3, "the cache must be trimmed to the eviction target");
+    }
+
+    /// Reading a hot key across the recency throttle window refreshes its clock, so an
+    /// eviction pass reorders candidates by recency: the stale heap entry is re-pushed with
+    /// the fresh clock and the unread settled siblings are evicted first, so the read key
+    /// survives down to the target with the newest row.
+    #[test]
+    fn read_recency_protects_a_hot_key() {
+        let db = open_db();
+        let mut heap = EvictionHeap::new();
+        const MAX: usize = 16; // eviction target MAX / 8 = 2
+
+        let mut txn = db.write_txn().unwrap();
+        for i in 1..=17u64 {
+            txn.insert::<TestTable>(&i, &i.to_string()).expect("Failed to insert");
+        }
+        drop(txn);
+        for i in 1..=17u64 {
+            db.on_op_applied(TestTable::NAME, &encode_key(&i), &mut heap);
+        }
+
+        // Cross the recency throttle window, then read key 9: its clock bumps past every
+        // other settle clock.
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        assert_eq!(db.get::<TestTable>(&9).unwrap(), Some("9".to_string()));
+
+        // Overflow the cap (17 > 16): the pass evicts in recency order down to the target.
+        let stats = db.evict_if_needed(&mut heap, MAX);
+        assert!(stats.evicted > 0, "the pass must evict the overflow");
+        assert_eq!(db.mem_size(), 2, "the cache must be trimmed to the target");
+        assert!(db.contains_key::<TestTable>(&9).unwrap(), "read key must stay hot");
+        assert!(db.contains_key::<TestTable>(&17).unwrap(), "newest key must stay hot");
+        assert!(!db.contains_key::<TestTable>(&1).unwrap(), "oldest sibling must be evicted");
+        assert!(
+            !db.contains_key::<TestTable>(&8).unwrap(),
+            "unread sibling below the read key must be evicted"
+        );
+        assert!(
+            !db.contains_key::<TestTable>(&16).unwrap(),
+            "unread sibling above the read key must be evicted"
         );
     }
 }

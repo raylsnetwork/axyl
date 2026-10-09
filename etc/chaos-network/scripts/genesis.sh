@@ -11,7 +11,7 @@ cp -r /home/nonroot/data/validator-4/node-info.yaml /home/nonroot/data/genesis/v
 
 /usr/local/bin/rayls genesis \
     --datadir /home/nonroot/data/ \
-    --chain-id 0x7e1 \
+    --chain-id 487 \
     --epoch-duration-in-secs 15 \
     --dev-funded-account 0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266 \
     --max-header-delay-ms 1000 \

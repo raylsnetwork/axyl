@@ -1,4 +1,4 @@
-//! Committee of validators reach consensus.
+//! Committee of validators that reach consensus, and the authority records it holds.
 
 use crate::{
     bcs_layout::{BcsCursor, BcsLayout, BcsLayoutError, BcsRead},
@@ -25,6 +25,13 @@ pub type VotingPower = u64;
 #[derive(Clone, Serialize, Deserialize, Debug, Eq, PartialEq)]
 pub struct P2pNode {
     /// The network address of the node.
+    ///
+    /// This is the single address the node both ADVERTISES (its published `NodeRecord`, and its
+    /// entry in `committee.yaml`) and, when no `*_LISTENER_MULTIADDR` env overrides it, LISTENS
+    /// on. It is therefore whatever peers should dial: a routable ip, a `/dnsaddr`, a relay
+    /// circuit -- or, for an outbound-only node (observer), a bare `/p2p/<peer-id>` (undialable
+    /// identity). That last form is not listenable, so such a node MUST set `*_LISTENER_MULTIADDR`
+    /// to bind (startup errors otherwise).
     pub network_address: Multiaddr,
     /// Network key of the node.
     pub network_key: NetworkPublicKey,
@@ -52,6 +59,7 @@ pub struct BootstrapServer {
 }
 
 impl BootstrapServer {
+    /// Creates a bootstrap record from the primary's and worker's p2p info.
     pub fn new(primary_node: P2pNode, worker_node: P2pNode) -> Self {
         Self { primary: primary_node, worker: worker_node }
     }
@@ -73,46 +81,64 @@ struct AuthorityInner {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Authority {
     inner: Arc<AuthorityInner>,
+    /// Cached at construction: deriving the id hashes the BLS key and allocates,
+    /// and callers ask for it on every round.
+    id: AuthorityIdentifier,
 }
 
 impl Authority {
-    /// The constructor is not public by design. Everyone who wants to create authorities should do
-    /// it via Committee (more specifically can use [CommitteeBuilder]). As some internal properties
-    /// of Authority are initialised via the Committee, to ensure that the user will not
-    /// accidentally use stale Authority data, should always derive them via the Commitee.
+    /// Private by design: authorities are created through [CommitteeBuilder] so that every
+    /// authority a caller holds belongs to a committee and cannot go stale against it.
     fn new(
         protocol_key: BlsPublicKey,
         voting_power: VotingPower,
         execution_address: Address,
     ) -> Self {
-        Self { inner: Arc::new(AuthorityInner { protocol_key, voting_power, execution_address }) }
+        let id = Self::derive_id(&protocol_key);
+        Self {
+            inner: Arc::new(AuthorityInner { protocol_key, voting_power, execution_address }),
+            id,
+        }
     }
 
-    /// Version of new that can be called directly.  Useful for testing, if you are calling this
-    /// outside of a test you are wrong (see comment on new).
+    /// Builds an authority outside a committee. Test-only; production code must go through
+    /// [CommitteeBuilder] (see `new`).
     pub fn new_for_test(
         protocol_key: BlsPublicKey,
         voting_power: VotingPower,
         execution_address: Address,
     ) -> Self {
-        Self { inner: Arc::new(AuthorityInner { protocol_key, voting_power, execution_address }) }
+        let id = Self::derive_id(&protocol_key);
+        Self {
+            inner: Arc::new(AuthorityInner { protocol_key, voting_power, execution_address }),
+            id,
+        }
     }
 
-    pub fn id(&self) -> AuthorityIdentifier {
-        let bytes = self.inner.protocol_key.to_bytes();
+    /// Derives the identifier, a pure function of the protocol key, once per authority.
+    fn derive_id(protocol_key: &BlsPublicKey) -> AuthorityIdentifier {
+        let bytes = protocol_key.to_bytes();
         let mut hasher = crate::DefaultHashFunction::new();
         hasher.update(&bytes);
         AuthorityIdentifier(Arc::new(*hasher.finalize().as_bytes()))
     }
 
+    /// Returns the authority's identifier.
+    pub fn id(&self) -> AuthorityIdentifier {
+        self.id.clone()
+    }
+
+    /// Returns the BLS key the authority signs consensus messages with.
     pub fn protocol_key(&self) -> &BlsPublicKey {
         &self.inner.protocol_key
     }
 
+    /// Returns the authority's voting power.
     pub fn voting_power(&self) -> VotingPower {
         self.inner.voting_power
     }
 
+    /// Returns the address that receives the authority's fees.
     pub fn execution_address(&self) -> Address {
         self.inner.execution_address
     }
@@ -134,7 +160,8 @@ impl<'de> Deserialize<'de> for Authority {
         D: serde::Deserializer<'de>,
     {
         let inner = AuthorityInner::deserialize(deserializer)?;
-        Ok(Self { inner: Arc::new(inner) })
+        let id = Self::derive_id(&inner.protocol_key);
+        Ok(Self { inner: Arc::new(inner), id })
     }
 }
 
@@ -143,15 +170,15 @@ impl<'de> Deserialize<'de> for Authority {
 struct CommitteeInner {
     /// The authorities of epoch.
     authorities: BTreeMap<BlsPublicKey, Authority>,
-    /// Keeps and index of the Authorities by their respective identifier
+    /// Index of the authorities by identifier.
     #[serde(skip)]
     authorities_by_id: BTreeMap<AuthorityIdentifier, Authority>,
-    /// The epoch number of this committee
+    /// The epoch number of this committee.
     epoch: Epoch,
-    /// The quorum threshold (2f+1)
+    /// The quorum threshold (2f+1).
     #[serde(skip)]
     quorum_threshold: VotingPower,
-    /// The validity threshold (f+1)
+    /// The validity threshold (f+1).
     #[serde(skip)]
     validity_threshold: VotingPower,
     /// The bootstrap servers to initially join a network (probably the initial committee).
@@ -176,7 +203,7 @@ impl CommitteeInner {
         assert!(self.authorities_by_id.len() > 1, "committee size must be larger than 1");
         // Dev builds relax the floor to allow a single-validator committee. The
         // single-node-only invariant is enforced at node startup (see node.rs), not
-        // here — this constructor is shared by the multi-validator consensus test suite.
+        // here - this constructor is shared by the multi-validator consensus test suite.
         #[cfg(feature = "dev-single-node-setup")]
         assert!(!self.authorities_by_id.is_empty(), "committee size must be at least 1");
     }
@@ -234,13 +261,84 @@ impl PartialEq for Committee {
 
 impl Eq for Committee {}
 
-// Every authority gets uniquely identified by the AuthorityIdentifier
-// The type can be easily swapped without needing to change anything else in the implementation.
-// Currently it is the hash of the authorities BLS key (which will be stable).
-#[derive(Eq, PartialEq, Ord, PartialOrd, Clone, Hash, Serialize, Deserialize)]
+/// Unique identifier of an authority: the hash of its BLS key, so it is stable across epochs.
+///
+/// Serde: base58 string in JSON/YAML (usable as a map key), derived newtype bytes in binary, so
+/// stored rows and digests are unchanged. The branch is chosen by `is_human_readable`, which a
+/// `flatten`/`untagged`/tagged wrapper forces to true even in binary; none wraps this type.
+#[derive(Eq, PartialEq, Ord, PartialOrd, Clone, Hash)]
 pub struct AuthorityIdentifier(Arc<[u8; 32]>);
 
+const AUTHORITY_IDENTIFIER_NAME: &str = "AuthorityIdentifier";
+
+impl Serialize for AuthorityIdentifier {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        if serializer.is_human_readable() {
+            serializer.serialize_str(&self.to_string())
+        } else {
+            // byte-identical to the derived newtype
+            serializer.serialize_newtype_struct(AUTHORITY_IDENTIFIER_NAME, &*self.0)
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for AuthorityIdentifier {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        use serde::de::{Error as _, SeqAccess, Unexpected, Visitor};
+
+        struct IdVisitor;
+
+        impl<'de> Visitor<'de> for IdVisitor {
+            type Value = AuthorityIdentifier;
+
+            fn expecting(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a base58 string or 32 bytes")
+            }
+
+            fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Self::Value, E> {
+                // exact-length decode onto a stack buffer; `onto` rejects an over-long string, a
+                // short one leaves `written` below 32
+                let mut bytes = [0u8; 32];
+                let written = bs58::decode(v)
+                    .onto(&mut bytes)
+                    .map_err(|_| E::invalid_value(Unexpected::Str(v), &self))?;
+                if written != 32 {
+                    return Err(E::invalid_length(written, &"32 bytes"));
+                }
+                Ok(AuthorityIdentifier::from(bytes))
+            }
+
+            /// The derived array form, for documents written before the string form.
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+                let mut bytes = [0u8; 32];
+                for (i, slot) in bytes.iter_mut().enumerate() {
+                    *slot =
+                        seq.next_element()?.ok_or_else(|| A::Error::invalid_length(i, &self))?;
+                }
+                if seq.next_element::<u8>()?.is_some() {
+                    return Err(A::Error::invalid_length(33, &self));
+                }
+                Ok(AuthorityIdentifier::from(bytes))
+            }
+
+            fn visit_newtype_struct<D: serde::Deserializer<'de>>(
+                self,
+                deserializer: D,
+            ) -> Result<Self::Value, D::Error> {
+                <[u8; 32]>::deserialize(deserializer).map(AuthorityIdentifier::from)
+            }
+        }
+
+        if deserializer.is_human_readable() {
+            deserializer.deserialize_any(IdVisitor)
+        } else {
+            deserializer.deserialize_newtype_struct(AUTHORITY_IDENTIFIER_NAME, IdVisitor)
+        }
+    }
+}
+
 impl AuthorityIdentifier {
+    /// Builds an identifier from a repeated byte, for tests that need distinct ids.
     pub fn dummy_for_test(byte: u8) -> Self {
         Self(Arc::new([byte; 32]))
     }
@@ -322,11 +420,8 @@ impl Committee {
         Self { inner: Arc::new(RwLock::new(committee)) }
     }
 
-    /// Expose new for tests.  If you are calling this outside of a test you are wrong, see comment
-    /// on new.
-    ///
-    /// Pass an optional epoch_boundary timestamp. Defaults to u64::MAX to disable epoch
-    /// transitions.
+    /// Builds a committee without the builder. Test-only; production code must go through
+    /// [CommitteeBuilder] (see `new`).
     pub fn new_for_test(
         authorities: BTreeMap<BlsPublicKey, Authority>,
         epoch: Epoch,
@@ -352,7 +447,7 @@ impl Committee {
         assert!(committee.authorities_by_id.len() > 1, "committee size must be larger than 1");
         // Dev builds relax the floor to allow a single-validator committee. The
         // single-node-only invariant is enforced at node startup (see node.rs), not
-        // here — this constructor is shared by the multi-validator consensus test suite.
+        // here - this constructor is shared by the multi-validator consensus test suite.
         #[cfg(feature = "dev-single-node-setup")]
         assert!(!committee.authorities_by_id.is_empty(), "committee size must be at least 1");
         // Some sanity checks to ensure that we'll not end up in invalid state
@@ -371,23 +466,26 @@ impl Committee {
         self.inner.read().epoch
     }
 
-    /// Provided an identifier it returns the corresponding authority
+    /// Returns the authority with the given identifier.
     pub fn authority(&self, identifier: &AuthorityIdentifier) -> Option<Authority> {
         self.inner.read().authorities_by_id.get(identifier).cloned()
     }
 
+    /// Returns the authority with the given BLS key.
     pub fn authority_by_key(&self, key: &BlsPublicKey) -> Option<Authority> {
         self.inner.read().authorities.get(key).cloned()
     }
 
+    /// Returns all authorities, sorted by identifier.
+    ///
+    /// Callers rely on the order (leader schedules index into it), so it comes from the id-keyed
+    /// index, never from the key-keyed map.
     pub fn authorities(&self) -> Vec<Authority> {
-        // Return sorted by id (using the id keyed BTree) since this may be important to some code.
         self.inner.read().authorities_by_id.values().cloned().collect()
     }
 
-    /// Return true if the authority for id is in the committee.
+    /// Returns true if the authority for id is in the committee.
     pub fn is_authority(&self, id: &AuthorityIdentifier) -> bool {
-        // Return sorted by id (using the id keyed BTree) since this may be important to some code.
         self.inner.read().authorities_by_id.contains_key(id)
     }
 
@@ -396,11 +494,12 @@ impl Committee {
         self.inner.read().authorities.len()
     }
 
-    /// Return the stake of a specific authority.
+    /// Returns the voting power of the authority with the given key, or 0 if absent.
     pub fn voting_power(&self, name: &BlsPublicKey) -> VotingPower {
         self.inner.read().authorities.get(&name.clone()).map_or_else(|| 0, |x| x.inner.voting_power)
     }
 
+    /// Returns the voting power of the authority with the given id, or 0 if absent.
     pub fn voting_power_by_id(&self, id: &AuthorityIdentifier) -> VotingPower {
         self.inner
             .read()
@@ -419,21 +518,22 @@ impl Committee {
         self.inner.read().validity_threshold
     }
 
-    /// Returns true if the provided stake has reached quorum (2f+1)
+    /// Returns true if the provided stake has reached quorum (2f+1).
     pub fn reached_quorum(&self, voting_power: VotingPower) -> bool {
         voting_power >= self.quorum_threshold()
     }
 
-    /// Returns true if the provided stake has reached availability (f+1)
+    /// Returns true if the provided stake has reached availability (f+1).
     pub fn reached_validity(&self, voting_power: VotingPower) -> bool {
         voting_power >= self.validity_threshold()
     }
 
+    /// Returns the summed voting power of the committee.
     pub fn total_voting_power(&self) -> VotingPower {
         self.inner.read().total_voting_power()
     }
 
-    /// Return all the network addresses in the committee.
+    /// Returns the (identifier, BLS key) of every primary except `myself`.
     pub fn others_primaries_by_id(
         &self,
         myself: Option<&AuthorityIdentifier>,
@@ -476,18 +576,17 @@ impl Committee {
         self.inner.read().authorities.values().map(|authority| *authority.protocol_key()).collect()
     }
 
-    /// Return the bootstrap record for key if it exists.
+    /// Returns the bootstrap record for key if it exists.
     pub fn get_bootstrap(&self, key: &BlsPublicKey) -> Option<BootstrapServer> {
         self.inner.read().bootstrap_servers.get(key).cloned()
     }
 
-    /// Return the map of bootstrap servers.
+    /// Returns the map of bootstrap servers.
     pub fn bootstrap_servers(&self) -> BTreeMap<BlsPublicKey, BootstrapServer> {
         self.inner.read().bootstrap_servers.clone()
     }
 
-    /// Used for testing - not recommended to use for any other case.
-    /// It creates a new instance with updated epoch
+    /// Builds a copy of this committee at a new epoch. Test-only.
     pub fn advance_epoch_for_test(&self, new_epoch: Epoch) -> Committee {
         Committee::new_for_test(
             self.inner.read().authorities.clone(),
@@ -496,10 +595,10 @@ impl Committee {
         )
     }
 
-    /// Return the number of workers that are in use for this committee.
-    /// This is a protocol level value, all nodes have to agree on this and be
-    /// running the required number of workers.
-    /// Currently 1 but may change with a future fork on an epoch boundary.
+    /// Returns the number of workers per authority.
+    ///
+    /// A protocol-level value: every node must agree on it and run that many workers, so a change
+    /// can only land at an epoch boundary.
     pub fn number_of_workers(&self) -> usize {
         1
     }
@@ -539,12 +638,12 @@ pub struct CommitteeBuilder {
 }
 
 impl CommitteeBuilder {
-    /// Create a new instance of [CommitteeBuilder] for making a new [Committee].
+    /// Creates a builder for a [Committee] at the given epoch.
     pub fn new(epoch: Epoch) -> Self {
         Self { epoch, authorities: BTreeMap::default(), bootstrap_server: BTreeMap::default() }
     }
 
-    /// Add an authority and bootstrap server to the committee builder.
+    /// Adds an authority and its bootstrap server.
     pub fn add_authority_and_bootstrap(
         &mut self,
         protocol_key: BlsPublicKey,
@@ -559,7 +658,7 @@ impl CommitteeBuilder {
         self.bootstrap_server.insert(protocol_key, bootstrap);
     }
 
-    /// Add an authority to the committee builder.
+    /// Adds an authority.
     pub fn add_authority(
         &mut self,
         protocol_key: BlsPublicKey,
@@ -570,7 +669,7 @@ impl CommitteeBuilder {
         self.authorities.insert(protocol_key, authority);
     }
 
-    /// Add an authority to the committee builder.
+    /// Adds a bootstrap server.
     pub fn add_bootstrap_server(
         &mut self,
         protocol_key: BlsPublicKey,
@@ -581,6 +680,7 @@ impl CommitteeBuilder {
         self.bootstrap_server.insert(protocol_key, bootstrap);
     }
 
+    /// Builds the committee, computing its thresholds and indexes.
     pub fn build(self) -> Committee {
         Committee::new(self.authorities, self.epoch, self.bootstrap_server)
     }
@@ -591,17 +691,18 @@ impl CommitteeBuilder {
 pub struct CommitteeLookahead(BTreeMap<Epoch, Vec<BlsPublicKey>>);
 
 impl CommitteeLookahead {
+    /// Builds the lookahead, dropping epochs with no keys.
     pub fn from_entries(entries: impl IntoIterator<Item = (Epoch, Vec<BlsPublicKey>)>) -> Self {
         Self(entries.into_iter().filter(|(_, keys)| !keys.is_empty()).collect())
     }
 
+    /// Returns the committee keys for `epoch`, if known.
     pub fn get(&self, epoch: Epoch) -> Option<&[BlsPublicKey]> {
         self.0.get(&epoch).map(|k| k.as_slice())
     }
 }
 
-/// The quorum threshold (2f+1)
-/// This assumes all committee members have the same voting power of 1.
+/// Returns the quorum threshold (2f+1) for a committee whose members all have voting power 1.
 pub fn quorum_threshold(committee_members: u64) -> u64 {
     ((2 * committee_members) / 3) + 1
 }
@@ -609,11 +710,110 @@ pub fn quorum_threshold(committee_members: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use crate::{
-        Address, Authority, BlsKeypair, BlsPublicKey, BootstrapServer, Committee, Multiaddr,
-        NetworkKeypair,
+        decode_key, encode_key, Address, Authority, AuthorityIdentifier, BlsKeypair, BlsPublicKey,
+        BootstrapServer, Committee, Multiaddr, NetworkKeypair,
     };
     use rand::{rng, Rng};
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, HashMap};
+
+    /// Binary encoding matches the derived newtype: stored rows and digests unchanged.
+    #[test]
+    fn authority_identifier_bcs_encoding_is_the_derived_newtype() {
+        #[derive(serde::Serialize)]
+        struct Derived(std::sync::Arc<[u8; 32]>);
+
+        let bytes = [7u8; 32];
+        let id = AuthorityIdentifier::from(bytes);
+        let encoded = bcs::to_bytes(&id).unwrap();
+        assert_eq!(encoded, bcs::to_bytes(&Derived(std::sync::Arc::new(bytes))).unwrap());
+        assert_eq!(encoded, bytes.to_vec(), "32 raw bytes, no length prefix");
+        assert_eq!(bcs::from_bytes::<AuthorityIdentifier>(&encoded).unwrap(), id);
+        assert!(bcs::from_bytes::<AuthorityIdentifier>(&encoded[..31]).is_err());
+
+        // DB key codec: same 32 bytes, same sort order
+        assert_eq!(encode_key(&id), bytes.to_vec());
+        assert_eq!(decode_key::<AuthorityIdentifier>(&encode_key(&id)), id);
+    }
+
+    /// Leading zero bytes survive the round trip; the all-zero id is the extreme case.
+    #[test]
+    fn authority_identifier_leading_zero_bytes_round_trip() {
+        let mut one_leading = [0u8; 32];
+        one_leading[1] = 9;
+        one_leading[31] = 255;
+        let mut many_leading = [0u8; 32];
+        many_leading[30] = 1;
+
+        for bytes in [[0u8; 32], one_leading, many_leading, [255u8; 32]] {
+            let id = AuthorityIdentifier::from(bytes);
+            let json = serde_json::to_string(&id).unwrap();
+            assert_eq!(
+                serde_json::from_str::<AuthorityIdentifier>(&json).unwrap(),
+                id,
+                "JSON round trip lost leading zeros for {bytes:?}"
+            );
+            // as a JSON map key, this impl's reason to exist
+            let map = std::collections::HashMap::from([(id.clone(), 1u64)]);
+            let text = serde_json::to_string(&map).unwrap();
+            assert_eq!(
+                serde_json::from_str::<std::collections::HashMap<AuthorityIdentifier, u64>>(&text)
+                    .unwrap(),
+                map
+            );
+            // binary path unchanged
+            assert_eq!(
+                bcs::from_bytes::<AuthorityIdentifier>(&bcs::to_bytes(&id).unwrap()).unwrap(),
+                id
+            );
+            assert_eq!(decode_key::<AuthorityIdentifier>(&encode_key(&id)), id);
+        }
+
+        // 32 '1's is the zero id; 31 is 31 bytes
+        let zero = AuthorityIdentifier::from([0u8; 32]);
+        assert_eq!(serde_json::to_string(&zero).unwrap(), format!("\"{}\"", "1".repeat(32)));
+        assert!(serde_json::from_str::<AuthorityIdentifier>(&format!("\"{}\"", "1".repeat(31)))
+            .is_err());
+    }
+
+    #[test]
+    fn authority_identifier_json_is_base58_and_reads_the_old_array_form() {
+        let id = AuthorityIdentifier::from([7u8; 32]);
+        let json = serde_json::to_string(&id).unwrap();
+        assert_eq!(json, format!("\"{id}\""));
+        assert_eq!(serde_json::from_str::<AuthorityIdentifier>(&json).unwrap(), id);
+
+        // old array form still reads
+        let legacy = serde_json::to_string(&[7u8; 32]).unwrap();
+        assert_eq!(serde_json::from_str::<AuthorityIdentifier>(&legacy).unwrap(), id);
+        assert!(serde_json::from_str::<AuthorityIdentifier>("\"not base58!\"").is_err());
+        assert!(serde_json::from_str::<AuthorityIdentifier>("[1,2,3]").is_err());
+        let long = serde_json::to_string(&vec![7u8; 33]).unwrap();
+        assert!(serde_json::from_str::<AuthorityIdentifier>(&long).is_err(), "33 bytes");
+        assert!(
+            serde_json::from_str::<AuthorityIdentifier>("\"11\"").is_err(),
+            "valid base58, 2 bytes"
+        );
+        let huge = format!("\"{}\"", "1".repeat(1 << 16));
+        assert!(
+            serde_json::from_str::<AuthorityIdentifier>(&huge).is_err(),
+            "over-long input decodes past 32 bytes and is rejected"
+        );
+
+        // as a JSON object key, which `ReputationScores` needs
+        let scores: HashMap<AuthorityIdentifier, u64> = [(id.clone(), 3)].into_iter().collect();
+        let text = serde_json::to_string(&scores).unwrap();
+        assert_eq!(text, format!("{{\"{id}\":3}}"));
+        assert_eq!(
+            serde_json::from_str::<HashMap<AuthorityIdentifier, u64>>(&text).unwrap(),
+            scores
+        );
+        let value = serde_json::to_value(&scores).unwrap();
+        assert_eq!(value[id.to_string()], 3);
+        assert_eq!(
+            serde_json::from_value::<HashMap<AuthorityIdentifier, u64>>(value).unwrap(),
+            scores
+        );
+    }
 
     #[test]
     fn committee_load() {

@@ -6,7 +6,9 @@
 use clap::Parser;
 use escargot::{CargoBuild, CargoRun};
 use rayls_infrastructure_config::{Config, ConfigFmt, ConfigTrait};
-use rayls_infrastructure_types::{test_utils::CommandParser, Address, Genesis, GenesisAccount};
+use rayls_infrastructure_types::{
+    test_utils::CommandParser, Address, Genesis, GenesisAccount, RaylsNetwork,
+};
 use rayls_middleware_orchestrator::launch_node;
 use rayls_network_cli::{genesis::GenesisArgs, keytool::KeyArgs, node::NodeCommand};
 use std::{
@@ -24,6 +26,10 @@ pub static IT_TEST_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 pub static RAYLS_BINARY: OnceLock<CargoRun> = OnceLock::new();
 
 const NODE_PASSWORD: &str = "sup3rsecuur";
+
+/// The network profile the local test clusters run. The ceremony's `--chain-id` and every
+/// node's `--network` flag are derived from it so the pair can never drift apart.
+pub const TEST_NETWORK: RaylsNetwork = RaylsNetwork::Local;
 
 /// Execute genesis ceremony inside tempdir
 pub fn create_validator_info(dir: &Path, address: &str, passphrase: String) -> eyre::Result<()> {
@@ -82,7 +88,9 @@ pub fn config_local_testnet(
     // init config ceremony for observer
     create_observer_info(dir, passphrase.clone())?;
 
-    // create committee from shared genesis dir
+    // create committee from shared genesis dir. The chain-id must match the `--network`
+    // flag the nodes are spawned with (see TEST_NETWORK).
+    let chain_id = TEST_NETWORK.chain_id().to_string();
     let create_committee_command = CommandParser::<GenesisArgs>::parse_from([
         "rl",
         "--basefee-address",
@@ -95,6 +103,8 @@ pub fn config_local_testnet(
         "1000",
         "--min-header-delay-ms",
         "500",
+        "--chain-id",
+        chain_id.as_str(),
     ]);
     create_committee_command.args.execute(shared_genesis_dir.clone())?;
     // If provided optional accounts then hack them into genesis now...
@@ -143,6 +153,9 @@ pub fn spawn_local_testnet(
 ) -> eyre::Result<()> {
     config_local_testnet(temp_path, NODE_PASSWORD.to_owned(), accounts)?;
 
+    // Must match the `--chain-id` the ceremony ran with (TEST_NETWORK), or the RPC
+    // rejects txs and the node refuses to boot on a chain-id mismatch.
+    let network = TEST_NETWORK.to_string();
     let validators = ["validator-1", "validator-2", "validator-3", "validator-4"];
     for v in validators.into_iter() {
         let dir = temp_path.join(v);
@@ -153,6 +166,8 @@ pub fn spawn_local_testnet(
             "rl",
             "--http",
             "--storage.v2",
+            "--network",
+            &network,
             "--instance",
             &instance,
             "--google-kms",
@@ -160,8 +175,15 @@ pub fn spawn_local_testnet(
             faucet_contract_address,
         ]);
         #[cfg(not(feature = "faucet"))]
-        let command =
-            NodeCommand::parse_from(["rl", "--http", "--storage.v2", "--instance", &instance]);
+        let command = NodeCommand::parse_from([
+            "rl",
+            "--http",
+            "--storage.v2",
+            "--network",
+            &network,
+            "--instance",
+            &instance,
+        ]);
 
         std::thread::spawn(|| {
             let err = command.execute(

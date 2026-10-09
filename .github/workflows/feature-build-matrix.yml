@@ -24,14 +24,18 @@ name: Feature Build Matrix
 permissions:
   contents: read
 
+# Opt-in per run, like pr.yaml: only builds when the `run-ci` label is added
+# (pr.yaml removes the label again). Not a required check.
 on:
   pull_request:
     branches: [main]
+    types: [labeled]
   workflow_dispatch:
 
 # A newer push to the same PR/branch cancels the in-flight run.
+# Unrelated `labeled` events get their own group so they don't cancel a real run.
 concurrency:
-  group: feature-build-${{ github.ref }}
+  group: feature-build-${{ github.ref }}${{ github.event.action == 'labeled' && github.event.label.name != 'run-ci' && format('-{0}', github.run_id) || '' }}
   cancel-in-progress: true
 
 env:
@@ -47,6 +51,7 @@ jobs:
   # shared sccache + registry caches that the variant matrix reuses.
   production:
     name: production (default features + warm cache)
+    if: github.event_name != 'pull_request' || (github.event.action == 'labeled' && github.event.label.name == 'run-ci')
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:

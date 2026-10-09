@@ -1,6 +1,6 @@
 use crate::{
     engine::ExecutionNode,
-    epoch_manager::types::EpochManager,
+    epoch_manager::{network::is_observer_sticky, types::EpochManager},
     primary::PrimaryNode,
     types::{EpochTransitionCheckpoint, EpochTransitionPhase, ShutdownOutcome, TransitionCtx},
 };
@@ -102,27 +102,27 @@ where
     /// where they collide with that epoch's `get_missing_consensus` anchor snapshot: an output
     /// the engine finishes concurrently is dropped as stale (the demote→rejoin flap race).
     ///
-    /// We wait on the engine's own `engine_idle` signal — `pending_task.is_none() &&
-    /// queued.is_empty()`, i.e. it has executed everything it admitted — NOT on the recorded
+    /// We wait on the engine's own `engine_idle` signal - `pending_task.is_none() &&
+    /// queued.is_empty()`, i.e. it has executed everything it admitted - NOT on the recorded
     /// consensus tip. The producers are stopped before this runs (and the forwarder was cancelled
     /// by the run_epoch select even earlier), so nothing new can be admitted: the engine just
     /// finishes its fixed admitted queue and reports idle. Outputs recorded but never admitted
     /// (stranded in `consensus_output` when the forwarder was cancelled) are not in the engine,
-    /// so they must NOT be waited on — they replay cleanly via the next epoch's
+    /// so they must NOT be waited on - they replay cleanly via the next epoch's
     /// `get_missing_consensus` (unadmitted ⇒ not stale-dropped).
     ///
     /// Normally this returns the instant the engine reports idle (immediately if it already is).
     /// The engine also publishes idle when its task exits, so a dying engine (shutdown /
     /// ConsensusFork / stream-close) unblocks us promptly. `backstop` only guards a genuinely
-    /// *hung* engine that never publishes — it bounds the wait (matching the rest of the
+    /// *hung* engine that never publishes - it bounds the wait (matching the rest of the
     /// transition pipeline) and warns rather than stalling the transition forever.
     async fn drain_engine_backlog(&self, backstop: Duration) {
         let mut idle_rx = self.consensus_bus.engine_idle().subscribe();
         let wait = async {
             // The engine publishes idle=true when its queue empties (poll Pending path) and also
             // when its task exits (node_inner publishes on exit), so a dying engine unblocks us
-            // promptly. `changed()` itself won't error on engine-task exit — the bus retains
-            // `tx_engine_idle` for the node's lifetime, so the channel never closes — hence the
+            // promptly. `changed()` itself won't error on engine-task exit - the bus retains
+            // `tx_engine_idle` for the node's lifetime, so the channel never closes - hence the
             // timeout below is the real backstop for a genuinely hung engine that never publishes.
             while !*idle_rx.borrow_and_update() {
                 if idle_rx.changed().await.is_err() {
@@ -136,7 +136,7 @@ where
                 target: "epoch-manager",
                 ?backstop,
                 "engine-idle drain backstop fired before mode transition; engine did not report \
-                 idle in time — proceeding (next epoch's get_missing_consensus replay covers any \
+                 idle in time - proceeding (next epoch's get_missing_consensus replay covers any \
                  unexecuted remainder)"
             );
         }
@@ -293,7 +293,7 @@ where
         // next run_epoch starts with a settled anchor and get_missing_consensus has nothing
         // in-flight to race (the demote→rejoin flap stale-drop). Producers are stopped
         // above; we wait on the engine's idle signal (executed == admitted), NOT the
-        // recorded tip — stranded-but-unadmitted outputs replay cleanly next epoch. Bounded by a
+        // recorded tip - stranded-but-unadmitted outputs replay cleanly next epoch. Bounded by a
         // backstop so a hung engine warns and proceeds instead of stalling the transition forever.
         self.drain_engine_backlog(Duration::from_secs(15)).await;
 
@@ -320,8 +320,10 @@ where
         info!(target: "epoch-manager", ?target_mode, "mode-change phase 2/3: PERSISTENCE_FLUSH");
 
         // Phase 3: APPLY - switch node mode, clear transition request, clear guard.
-        // skip the mode write if caller tried to demote Observer
-        if prior_mode == NodeMode::Observer && target_mode != NodeMode::Observer {
+        // skip the mode write only for a CONFIGURED observer: a node that merely booted into
+        // Observer mode (catch-up) must stay promotable or it can never rejoin the committee
+        let observer_flag = self.builder.rayls_infrastructure_config.observer;
+        if is_observer_sticky(observer_flag, prior_mode, target_mode) {
             warn!(target: "epoch-manager", ?target_mode, "mode-change phase 3/3: APPLY (mode write skipped - Observer is sticky)");
         } else {
             self.consensus_bus.node_mode().send_replace(target_mode);
@@ -375,8 +377,8 @@ where
                 // Decide from the durable execution state: the boundary output runs concludeEpoch,
                 // so if the closing epoch executed, the canonical tip's epoch state has advanced
                 // past it. (The former recently_executed_blocks/parent_beacon fast-path was dead
-                // here — recently_executed_blocks is empty this early in startup,
-                // before any replay — and fragile: a drained parked batch makes the
+                // here - recently_executed_blocks is empty this early in startup,
+                // before any replay - and fragile: a drained parked batch makes the
                 // tip's beacon differ from target_hash.)
                 let tip_state = engine.epoch_state_from_canonical_tip().await?;
                 let execution_done = tip_state.epoch > epoch;

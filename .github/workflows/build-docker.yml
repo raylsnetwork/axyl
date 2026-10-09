@@ -1,6 +1,7 @@
 name: Build & Push Docker Image
 
-# Builds the node-client image and pushes it to private ECR.
+# Builds the node image and pushes it to public ECR, so operators can pull it
+# without an AWS account: public.ecr.aws/rayls/sovereign-axyl
 #
 # Three entry points:
 #   * push tag v*          -> automatic devnet release: builds `devnet-<tag>`
@@ -48,14 +49,18 @@ on:
         default: ''
 
 env:
-  IMAGE_NAME: rayls-stack-node-client
+  IMAGE_NAME: sovereign-axyl
+  # ECR Public lives in the professional-services account and is only reachable
+  # through us-east-1, whatever region anything else here uses. That registry
+  # has two aliases — v9x7l0q0 (auto-generated) and rayls (custom, primary);
+  # rayls is the one to publish under.
+  ECR_PUBLIC_REGISTRY: public.ecr.aws/rayls
+  AWS_REGION_PUBLIC: us-east-1
   DOCKERFILE: etc/docker-network/Dockerfile
 
 jobs:
   # ===========================================================================
-  # META - resolve the image tag/environment once, and make sure the ECR repo
-  # exists before the per-arch legs fan out (so they don't race on
-  # create-repository).
+  # BUILD - Build Docker image and push to public ECR
   # ===========================================================================
   meta:
     name: Resolve tag
@@ -171,19 +176,27 @@ jobs:
         uses: aws-actions/configure-aws-credentials@e7f100cf4c008499ea8adda475de1042d6975c7b # v6.2.0
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
-          aws-region: ${{ vars.AWS_REGION_PRIVATE }}
+          aws-region: ${{ env.AWS_REGION_PUBLIC }}
 
       - name: Login to Amazon ECR
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@fa648b43de3d4d023bcb3f89ed6940096949c419 # v2.1.5
+        with:
+          registry-type: public
 
-      - name: Build and push by digest
-        id: build
+      - name: Create ECR repository if not exists
+        run: |
+          if ! aws ecr-public describe-repositories --repository-names "${{ env.IMAGE_NAME }}" 2>/dev/null; then
+            aws ecr-public create-repository --repository-name "${{ env.IMAGE_NAME }}"
+          fi
+
+      - name: Build and push
         uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
         with:
           context: .
           file: ./${{ env.DOCKERFILE }}
-          platforms: ${{ matrix.platform }}
+          push: true
+          tags: ${{ env.ECR_PUBLIC_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.version }}
           build-args: |
             VERGEN_GIT_SHA=${{ needs.meta.outputs.commit }}
           # Stamp the source commit so promote-docker.yml can verify provenance
@@ -272,30 +285,22 @@ jobs:
     permissions:
       contents: read
       id-token: write
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - platform: linux/amd64
-            runner: ubuntu-latest
-          - platform: linux/arm64
-            runner: ubuntu-24.04-arm
-    env:
-      ECR_PRIVATE_REGISTRY: ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ vars.AWS_REGION_PRIVATE }}.amazonaws.com
     steps:
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@e7f100cf4c008499ea8adda475de1042d6975c7b # v6.2.0
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
-          aws-region: ${{ vars.AWS_REGION_PRIVATE }}
+          aws-region: ${{ env.AWS_REGION_PUBLIC }}
 
       - name: Login to Amazon ECR
         uses: aws-actions/amazon-ecr-login@fa648b43de3d4d023bcb3f89ed6940096949c419 # v2.1.5
+        with:
+          registry-type: public
 
       - name: Run Trivy vulnerability scanner
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
-          image-ref: ${{ env.ECR_PRIVATE_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.meta.outputs.image-tag }}
+          image-ref: ${{ env.ECR_PUBLIC_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.build-and-push.outputs.image-tag }}
           format: 'table'
           exit-code: '1'
           ignore-unfixed: true
@@ -307,7 +312,7 @@ jobs:
         run: |
           echo "## Docker Image Build (${{ matrix.platform }})" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**Image:** \`${{ env.ECR_PRIVATE_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.meta.outputs.image-tag }}\`" >> $GITHUB_STEP_SUMMARY
-          echo "**Environment:** ${{ needs.meta.outputs.environment }}" >> $GITHUB_STEP_SUMMARY
-          echo "**Built from commit:** \`${{ needs.meta.outputs.commit }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "**Image:** \`${{ env.ECR_PUBLIC_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.build-and-push.outputs.image-tag }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "**Environment:** ${{ needs.build-and-push.outputs.environment }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Built from commit:** \`${{ needs.build-and-push.outputs.commit }}\`" >> $GITHUB_STEP_SUMMARY
           echo "**Security scan:** ${{ job.status }}" >> $GITHUB_STEP_SUMMARY

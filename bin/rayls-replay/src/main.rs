@@ -1,19 +1,22 @@
 // SPDX-License-Identifier: BUSL-1.1
 //! `rayls-replay`: rebuild a Rayls archive datadir from a pruned snapshot.
 
-#![cfg_attr(not(test), warn(unused_crate_dependencies))]
+#![cfg_attr(test, allow(unused_crate_dependencies))]
 
 use clap::Parser;
 use eyre::{eyre, Context};
-use rayls_execution_evm::reth_env::RethEnv;
+use rayls_execution_evm::{
+    reth_env::{RethCommand, RethConfig, RethEnv},
+    verify_datadir_chain_id, verify_datadir_schedule_record, FileSchedule, NetworkProfile,
+    SelectedSchedule,
+};
 use rayls_infrastructure_config::Parameters;
 use rayls_infrastructure_storage::open_db;
 use rayls_infrastructure_types::{
-    rewards::RewardsCounter, Address, Genesis, RaylsNetwork, TaskManager, MAINNET_GENESIS,
-    MAINNET_PARAMETERS, TESTNET_GENESIS, TESTNET_PARAMETERS,
+    rewards::RewardsCounter, Address, Genesis, RaylsNetwork, TaskManager,
 };
 use rayls_replay::{
-    rewards::{SnapshotRewardsBackend, SnapshotTallyStore},
+    rewards::{BoundedHybridWalker, HybridTallySource, SnapshotRewardsBackend, SnapshotTallyStore},
     run_replay, verify_chainspec_compatibility, ReplayConfig,
 };
 use reth_chainspec::ChainSpec as RethChainSpec;
@@ -25,6 +28,7 @@ use tokio::sync::watch;
 use tracing::{error, info, warn};
 
 use parking_lot as _;
+use rayls_middleware_rewards as _;
 use thiserror as _;
 
 /// Scripted historical replay from a Rayls snapshot.
@@ -52,20 +56,36 @@ struct Cli {
     #[arg(long, value_name = "PATH")]
     consensus_db: Option<PathBuf>,
 
-    /// Override genesis YAML path. Defaults to `<snapshot-datadir>/genesis/genesis.yaml`,
-    /// falling back to the embedded network genesis if absent.
+    /// Override genesis YAML path. Defaults to `<snapshot-datadir>/genesis/genesis.yaml`.
+    /// Must exist — there is no embedded fallback.
     #[arg(long, value_name = "PATH")]
     genesis: Option<PathBuf>,
 
-    /// Override parameters YAML path. Defaults to `<snapshot-datadir>/parameters.yaml`,
-    /// falling back to the embedded network parameters if absent. CRITICAL for
+    /// Override parameters YAML path. Defaults to `<snapshot-datadir>/parameters.yaml`.
+    /// Must exist — there is no embedded fallback. CRITICAL for
     /// execution-state parity: `basefee_address` must match what live used.
     #[arg(long, value_name = "PATH")]
     parameters: Option<PathBuf>,
 
-    /// Chain selector: `mainnet`, `testnet`, `local`, `devnet`.
+    /// Rayls network: `mainnet`, `testnet`, `local`, `devnet` — the same flag as the
+    /// node's `--network`. Selects the baked-in hardfork schedule applied to both envs;
+    /// the network's chain-id must match the snapshot genesis or the boot refuses.
     #[arg(long, value_enum, default_value_t = RaylsNetwork::Mainnet)]
-    chain: RaylsNetwork,
+    network: RaylsNetwork,
+
+    /// Network config file (YAML) holding named subnets, each with a `chain_id` and a
+    /// `hardforks` schedule (the same format the node takes via `--config-file`).
+    /// With `--subnet`, that subnet's schedule replaces the baked-in `--network` profile
+    /// for both the snapshot and the archive env. Use it when a network historically
+    /// ran a schedule that differs from its baked-in profile. The subnet's
+    /// `chain_id` must match the genesis, and a subnet may not declare a baked-in
+    /// network's chain-id (mainnet/testnet run on `--network`, never a config file).
+    #[arg(long, value_name = "PATH", requires = "subnet", conflicts_with = "network")]
+    config_file: Option<PathBuf>,
+
+    /// Subnet name to select inside `--config-file`.
+    #[arg(long, value_name = "NAME", requires = "config_file")]
+    subnet: Option<String>,
 
     /// First block to replay (inclusive).
     #[arg(long, default_value_t = 1)]
@@ -132,7 +152,13 @@ fn main() -> eyre::Result<()> {
         target: "rayls_replay::main",
         snapshot_datadir = %cli.snapshot_datadir.display(),
         archive_out = %cli.archive_out.display(),
-        chain = %cli.chain,
+        network = if cli.config_file.is_some() {
+            "overridden by --config-file".to_string()
+        } else {
+            cli.network.to_string()
+        },
+        config_file = ?cli.config_file,
+        subnet = ?cli.subnet,
         "rayls-replay starting"
     );
 
@@ -153,9 +179,25 @@ async fn run(cli: Cli) -> eyre::Result<()> {
     let parameters_path =
         cli.parameters.clone().unwrap_or_else(|| cli.snapshot_datadir.join("parameters.yaml"));
 
-    let base_chain = base_chain_spec(cli.chain, &genesis_path)?;
-    let NetworkParams { basefee_address, min_base_fee } =
-        network_params(cli.chain, &parameters_path)?;
+    let base_chain = base_chain_spec(&genesis_path)?;
+
+    // Select and verify the hardfork schedule exactly like the node's boot gate;
+    // both envs below are built from the selected profile.
+    let file_schedule = match (&cli.config_file, &cli.subnet) {
+        (Some(path), Some(subnet)) => Some(FileSchedule::load(path, subnet)?),
+        _ => None,
+    };
+    let selected = SelectedSchedule::select(file_schedule.as_ref(), Some(cli.network))?;
+    verify_datadir_chain_id(base_chain.chain().id(), selected.profile.chain_id, &selected.source)?;
+    verify_snapshot_schedule_record(&cli.snapshot_datadir, &base_chain, &selected.profile)?;
+    info!(
+        target: "rayls_replay::main",
+        source = %selected.source,
+        chain_id = selected.profile.chain_id,
+        hardforks = ?selected.profile.hardforks,
+        "hardfork schedule selected"
+    );
+    let NetworkParams { basefee_address, min_base_fee } = network_params(&parameters_path)?;
     info!(
         target: "rayls_replay::main",
         genesis = %genesis_path.display(),
@@ -168,8 +210,12 @@ async fn run(cli: Cli) -> eyre::Result<()> {
 
     // archive blocks build with the snapshot's committed close-epoch tally,
     // staged into `tally_store` per close block; snapshot env never builds.
+    // Hybrid-reward epochs also need the consensus-DB walk, attached to
+    // `hybrid_source` once the consensus DB is open below.
     let tally_store = SnapshotTallyStore::default();
-    let archive_rewards = SnapshotRewardsBackend::new(tally_store.clone()).into_counter();
+    let hybrid_source = HybridTallySource::default();
+    let archive_rewards =
+        SnapshotRewardsBackend::new(tally_store.clone(), hybrid_source.clone()).into_counter();
 
     let snapshot_task_manager = TaskManager::default();
     let archive_task_manager = TaskManager::default();
@@ -178,7 +224,7 @@ async fn run(cli: Cli) -> eyre::Result<()> {
         Arc::clone(&base_chain),
         &cli.archive_out,
         &archive_task_manager,
-        cli.chain,
+        &selected.profile,
         basefee_address,
         Some(min_base_fee),
         cli.storage_v2,
@@ -222,11 +268,24 @@ async fn run(cli: Cli) -> eyre::Result<()> {
     // maintenance modes).
     let consensus_store = open_db(&consensus_db);
 
+    // hybrid-reward close blocks recompute participation rounds over the snapshot's
+    // consensus DB with a forward, cursor-bounded walk that credits exactly like the
+    // live node's walker but reads each epoch's rows once (see `rewards.rs`; the live
+    // reverse walk scans the whole tail of the table per epoch against a snapshot).
+    // ORDERING: this attach must precede `run_replay` below, whose first
+    // `install_committee_from_contract` forwards the committee to the walker;
+    // `set_committee` only reaches a walker that is already attached.
+    if !hybrid_source
+        .attach(RewardsCounter::from_impl(BoundedHybridWalker::new(consensus_store.clone())))
+    {
+        return Err(eyre!("hybrid tally source attached twice"));
+    }
+
     let snapshot_evm = RethEnv::new_for_archive_replay(
         Arc::clone(&base_chain),
         &cli.snapshot_datadir,
         &snapshot_task_manager,
-        cli.chain,
+        &selected.profile,
         basefee_address,
         Some(min_base_fee),
         cli.storage_v2,
@@ -251,6 +310,8 @@ async fn run(cli: Cli) -> eyre::Result<()> {
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     spawn_shutdown_listener(shutdown_tx);
 
+    // requires `hybrid_source.attach(...)` above to have run: the committee installed
+    // here (and after every close block) must reach the hybrid walker
     let last = run_replay(
         &snapshot_evm,
         &consensus_store,
@@ -424,20 +485,15 @@ fn copy_recursive(src: &Path, dst: &Path) -> eyre::Result<()> {
     Ok(())
 }
 
-/// Resolve `--chain` + optional genesis file to the base reth `ChainSpec`.
+/// Read the genesis YAML at `genesis_path` into the base reth `ChainSpec`.
 ///
-/// Prefers `genesis_path` if it exists on disk (so the archive uses the same
-/// genesis the snapshot was bootstrapped from), otherwise falls back to the
-/// embedded YAML for `network`. Rayls-side hardforks are applied downstream
-/// by `new_for_archive_replay` via `RaylsChainSpec::builder().rayls_hardforks`.
-fn base_chain_spec(
-    network: RaylsNetwork,
-    genesis_path: &std::path::Path,
-) -> eyre::Result<Arc<RethChainSpec>> {
-    let yaml = resolve_config_yaml(network, genesis_path, "genesis", |n| match n {
-        RaylsNetwork::Mainnet => Some(MAINNET_GENESIS),
-        RaylsNetwork::Testnet => Some(TESTNET_GENESIS),
-        RaylsNetwork::Devnet | RaylsNetwork::Local => None,
+/// The file must exist (the snapshot's `genesis/genesis.yaml` or an explicit
+/// `--genesis`): there is no embedded genesis fallback. Rayls-side hardforks
+/// are applied downstream by `new_for_archive_replay` via
+/// `RaylsChainSpec::builder().rayls_hardforks`.
+fn base_chain_spec(genesis_path: &std::path::Path) -> eyre::Result<Arc<RethChainSpec>> {
+    let yaml = std::fs::read_to_string(genesis_path).wrap_err_with(|| {
+        format!("read genesis YAML at {} (pass --genesis if it is absent)", genesis_path.display())
     })?;
     let genesis: Genesis = serde_yaml::from_str(&yaml).wrap_err("parse genesis YAML")?;
     Ok(Arc::new(genesis.into()))
@@ -449,49 +505,25 @@ struct NetworkParams {
     min_base_fee: u64,
 }
 
-/// Extract `basefee_address` and `min_base_fee` from `parameters_path` if it
-/// exists, otherwise the embedded YAML for `network`. Critical for
+/// Extract `basefee_address` and `min_base_fee` from the parameters YAML at
+/// `parameters_path`. The file must exist (the snapshot's `parameters.yaml` or
+/// an explicit `--parameters`): there is no embedded fallback. Critical for
 /// execution-state parity: the standard node reads from the snapshot's
 /// `parameters.yaml`, and `basefee_address` selects where each block's base
 /// fee credit lands. A mismatch silently diverges state at the first
 /// tx-bearing block.
-fn network_params(
-    network: RaylsNetwork,
-    parameters_path: &std::path::Path,
-) -> eyre::Result<NetworkParams> {
-    let params_yaml = resolve_config_yaml(network, parameters_path, "parameters", |n| match n {
-        RaylsNetwork::Mainnet => Some(MAINNET_PARAMETERS),
-        RaylsNetwork::Testnet => Some(TESTNET_PARAMETERS),
-        RaylsNetwork::Devnet | RaylsNetwork::Local => None,
+fn network_params(parameters_path: &std::path::Path) -> eyre::Result<NetworkParams> {
+    let params_yaml = std::fs::read_to_string(parameters_path).wrap_err_with(|| {
+        format!(
+            "read parameters YAML at {} (pass --parameters if it is absent)",
+            parameters_path.display()
+        )
     })?;
 
     let params: Parameters =
         serde_yaml::from_str(&params_yaml).wrap_err("parse parameters YAML")?;
 
     Ok(NetworkParams { basefee_address: params.basefee_address, min_base_fee: params.min_base_fee })
-}
-
-/// Read YAML from `path` if present, else the embedded constant for `network`.
-/// Errors for chains that bake no embedded config (`local`/`devnet`).
-fn resolve_config_yaml(
-    network: RaylsNetwork,
-    path: &Path,
-    kind: &str,
-    embedded: fn(RaylsNetwork) -> Option<&'static str>,
-) -> eyre::Result<String> {
-    if path.exists() {
-        info!(target: "rayls_replay::main", kind, path = %path.display(), "loading config from snapshot datadir");
-        return std::fs::read_to_string(path)
-            .wrap_err_with(|| format!("read {kind} at {}", path.display()));
-    }
-    let embedded = embedded(network).ok_or_else(|| {
-        eyre!(
-            "chain `{network}` does not bake a {kind} and {} does not exist; pass --{kind} explicitly",
-            path.display()
-        )
-    })?;
-    info!(target: "rayls_replay::main", kind, %network, "loading embedded config");
-    Ok(embedded.to_string())
 }
 
 /// Initialize layered non-blocking tracing and return the writer guards.
@@ -534,4 +566,46 @@ fn init_tracing(
 
     tracing_subscriber::registry().with(stdout_layer).with(file_layer).init();
     Ok((stdout_guard, file_guard))
+}
+
+/// Verify the selected hardfork schedule against the snapshot's schedule record,
+/// when the snapshot carries one.
+///
+/// A snapshot taken from a node running the schedule-record boot gate carries
+/// `schedule-record.yaml`, pinning the schedule its executed blocks ran under.
+/// A selection that moves an already-executed fork (or back-dates one into the
+/// executed history) would re-interpret the snapshot's blocks and silently
+/// diverge state, so this refuses it; future boundary moves are reported.
+/// Read-only: replay never writes into the snapshot datadir — the node's gate
+/// re-records, and there is no record here to update. A snapshot without a
+/// record (taken before the feature) is trusted, like the node's no-record
+/// path, minus the write.
+fn verify_snapshot_schedule_record(
+    snapshot_datadir: &Path,
+    chain: &Arc<RethChainSpec>,
+    profile: &NetworkProfile,
+) -> eyre::Result<()> {
+    // The read/verify is shared with the node's boot gate; the throwaway
+    // `RethConfig` exists only for the executed-head read — the snapshot env
+    // is not built yet.
+    let reth = RethCommand::parse_from(["rayls-replay"]);
+    let node_config = RethConfig::new(reth, None, snapshot_datadir, false, Arc::clone(chain));
+    let verification = verify_datadir_schedule_record(snapshot_datadir, &node_config, profile)?;
+    if verification.record.is_none() {
+        warn!(
+            target: "rayls_replay::main",
+            path = tracing::field::debug(&verification.path),
+            head = verification.head,
+            "snapshot has no schedule record; trusting the selected schedule (the \
+             executed-history check is unavailable)"
+        );
+    } else {
+        info!(
+            target: "rayls_replay::main",
+            path = tracing::field::debug(&verification.path),
+            head = verification.head,
+            "snapshot schedule record verified against the selected schedule"
+        );
+    }
+    Ok(())
 }

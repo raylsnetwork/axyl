@@ -10,6 +10,7 @@
 //! Dev-only: it serves an unauthenticated page bound to localhost, signs with
 //! public dev keys, and is started solely by the `dev` subcommand.
 
+use rayls_infrastructure_types::RaylsNetwork;
 use std::{
     io::{Read, Write},
     net::{TcpListener, TcpStream},
@@ -62,7 +63,7 @@ pub(super) fn spawn_dashboard(port: u16, rpc_url: String) {
 }
 
 /// The dev chain-id (matches `GenesisArgs::dev`). Used to EIP-155-sign dev txs.
-const DEV_CHAIN_ID: u64 = 2017;
+const DEV_CHAIN_ID: u64 = RaylsNetwork::Local.chain_id();
 
 /// Serve a response. Reads the request line (enough to route a GET) and always
 /// closes the connection. Routes:

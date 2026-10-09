@@ -37,6 +37,11 @@ pub fn generate_validator_keys(
         address: execution_address,
         external_primary_addr: None,
         external_worker_addrs: None,
+        relay: None,
+        advertise_dnsaddr: None,
+        // A single-node dev validator must be dialable, so it advertises its real
+        // network_address, not an identity-only /p2p.
+        advertise_identity_only: false,
     };
     let key_path = datadir.node_keys_path();
     if !key_path.exists() {

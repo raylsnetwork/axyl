@@ -143,6 +143,10 @@ impl RaylsDirs for DataDirChainPath {
     fn network_config_path(&self) -> PathBuf {
         self.0.as_ref().join("network-config")
     }
+
+    fn schedule_record_path(&self) -> PathBuf {
+        self.0.as_ref().join("schedule-record.yaml")
+    }
 }
 
 /// Returns the path to the rayls network data dir.
@@ -175,26 +179,29 @@ impl XdgPath for LogsDir {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rayls_infrastructure_types::RaylsNetwork;
     use reth::dirs::MaybePlatformPath;
     use std::str::FromStr;
 
     #[test]
     fn test_maybe_data_dir_path() {
+        let chain_id = RaylsNetwork::Local.chain_id();
+        let chain_dir = format!("rayls-network/{chain_id}");
         let path = MaybePlatformPath::<DataDirPath>::default();
-        let path = path.unwrap_or_chain_default(Chain::from_id(2017), default_datadir_args());
-        assert!(path.as_ref().ends_with("rayls-network/2017"), "actual default path is: {path:?}");
+        let path = path.unwrap_or_chain_default(Chain::from_id(chain_id), default_datadir_args());
+        assert!(path.as_ref().ends_with(&chain_dir), "actual default path is: {path:?}");
 
         let db_path = path.db();
-        assert!(db_path.ends_with("rayls-network/2017/db"), "actual db path is: {db_path:?}");
+        assert!(db_path.ends_with(format!("{chain_dir}/db")), "actual db path is: {db_path:?}");
 
         let static_files_path = path.static_files();
         assert!(
-            static_files_path.ends_with("rayls-network/2017/static_files"),
+            static_files_path.ends_with(format!("{chain_dir}/static_files")),
             "actual static_files path is: {static_files_path:?}"
         );
 
         let path = MaybePlatformPath::<DataDirPath>::from_str("my/path/to/datadir").unwrap();
-        let path = path.unwrap_or_chain_default(Chain::from_id(2017), default_datadir_args());
+        let path = path.unwrap_or_chain_default(Chain::from_id(chain_id), default_datadir_args());
         assert!(path.as_ref().ends_with("my/path/to/datadir"), "{path:?}");
     }
 }

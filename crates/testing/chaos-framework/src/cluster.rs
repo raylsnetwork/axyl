@@ -298,6 +298,7 @@ fn e2e_tests_config_local_testnet(
     passphrase: String,
     p2p_ports: &[u16],
 ) -> eyre::Result<()> {
+    use crate::TEST_NETWORK;
     use clap::Parser as _;
     use rayls_infrastructure_types::test_utils::CommandParser;
     use rayls_network_cli::{genesis::GenesisArgs, keytool::KeyArgs};
@@ -359,7 +360,9 @@ fn e2e_tests_config_local_testnet(
     ]);
     keys_command.args.execute(dir, passphrase)?;
 
-    // Create committee from shared genesis.
+    // Create committee from shared genesis. The chain-id must match the `--network` flag
+    // the nodes are spawned with (see node.rs / TEST_NETWORK).
+    let chain_id = TEST_NETWORK.chain_id().to_string();
     let create_committee_command = CommandParser::<GenesisArgs>::parse_from([
         "rl",
         "--basefee-address",
@@ -372,6 +375,8 @@ fn e2e_tests_config_local_testnet(
         "1000",
         "--min-header-delay-ms",
         "500",
+        "--chain-id",
+        &chain_id,
     ]);
     create_committee_command.args.execute(shared_genesis_dir.clone())?;
 

@@ -1,5 +1,5 @@
 //! Implement a container for channels used internally by consensus.
-//! This allows easier examination of message flow and avoids excessives channel passing as
+//! This allows easier examination of message flow and avoids excessive channel passing as
 //! arguments.
 
 use crate::{
@@ -76,7 +76,7 @@ impl<T> Drop for QueChanReceiver<T> {
 }
 
 /// Wrapper around an mpsc channel.  It allows a channel to exist for application lifetime
-/// even if used for epoch messages.  It tracks subscibers so that each epoch will be able to
+/// even if used for epoch messages.  It tracks subscribers so that each epoch will be able to
 /// "subscribe" to the channel (after the last epoch has dropped it's subscription).
 #[derive(Debug)]
 pub struct QueChannel<T> {
@@ -91,6 +91,20 @@ impl<T> QueChannel<T> {
         let (tx, rx) = mpsc::channel(CHANNEL_CAPACITY);
         let receiver = Arc::new(Mutex::new(Some(rx)));
         Self { channel: tx, receiver }
+    }
+
+    /// Subscribe only if no other subscription is in use.
+    ///
+    /// [`RaylsSender::subscribe`] panics when the receiver is already taken, which is right for
+    /// the owner of the queue but not for a caller that only wants to opportunistically drain it
+    /// (the epoch manager drops stale epoch votes after a fast-path fetch). Such a caller gets
+    /// `None` and does nothing while the owner holds the receiver.
+    pub fn try_subscribe(&self) -> Option<impl RaylsReceiver<T> + 'static>
+    where
+        T: Send + 'static,
+    {
+        let receiver = self.receiver.lock().take();
+        receiver.map(|rx| QueChanReceiver { receiver: Some(rx), container: self.receiver.clone() })
     }
 }
 
@@ -168,13 +182,15 @@ impl NodeMode {
         matches!(self, NodeMode::Observer)
     }
 
-    /// True if this node should run a batch builder (active CVV sequences, observer disburses).
+    /// True if this node should run a batch builder (active CVVs sequence into consensus).
     ///
-    /// A catching-up `CvvInactive` node must not: with no proposer draining `our_digests`, a
-    /// sealed batch wedges the worker batch-builder on `report_own_batch`, and that Drainable task
-    /// never observes shutdown, stalling the epoch-transition drain.
+    /// An `Observer` is not batch-producing: it cannot seal, so it forwards its pending
+    /// transactions to the committee instead (see the transaction forwarder). A catching-up
+    /// `CvvInactive` node must not either: with no proposer draining `our_digests`, a sealed batch
+    /// wedges the worker batch-builder on `report_own_batch`, and that Drainable task never
+    /// observes shutdown, stalling the epoch-transition drain.
     pub fn is_batch_producing(&self) -> bool {
-        matches!(self, NodeMode::CvvActive | NodeMode::Observer)
+        matches!(self, NodeMode::CvvActive)
     }
 }
 
@@ -214,6 +230,10 @@ struct ConsensusBusAppInner {
     tx_last_consensus_header: watch::Sender<ConsensusHeader>,
     /// Watch tracking the last gossipped consensus block number and hash.
     tx_last_published_consensus_num_hash: watch::Sender<(u64, BlockHash)>,
+    /// The node's own durable consensus tip: the highest header it has saved to
+    /// `ConsensusBlocks`, on every role. Unlike `tx_last_consensus_header` this is not a
+    /// peer-derived signal and the epoch transition does not reset it.
+    tx_local_consensus_tip: watch::Sender<Arc<ConsensusHeader>>,
 
     /// Consensus output with a consensus header.
     consensus_output: broadcast::Sender<ConsensusOutput>,
@@ -268,6 +288,7 @@ impl ConsensusBusAppInner {
         let (tx_primary_round_updates, _) = watch::channel(0u32);
         let (tx_last_consensus_header, _) = watch::channel(ConsensusHeader::default());
         let (tx_last_published_consensus_num_hash, _) = watch::channel((0, BlockHash::default()));
+        let (tx_local_consensus_tip, _) = watch::channel(Arc::new(ConsensusHeader::default()));
         let (tx_recently_executed_blocks, _) =
             watch::channel(RecentlyExecutedBlocks::new(recently_executed_blocks as usize));
         let (tx_executed_anchor, _) = watch::channel(ConsensusHeader::default());
@@ -293,6 +314,7 @@ impl ConsensusBusAppInner {
             tx_engine_idle,
             tx_last_consensus_header,
             tx_last_published_consensus_num_hash,
+            tx_local_consensus_tip,
             consensus_output,
             consensus_header,
             tx_sync_status,
@@ -341,16 +363,14 @@ struct ConsensusBusEpochInner {
     /// only if it already sent us its whole history.
     new_certificates: MeteredMpscChannel<Certificate>,
     /// Outputs the sequence of ordered certificates to the primary (for cleanup and feedback).
-    /// Each cert's `bool` is `true` when its committed subdag reaches the epoch boundary, so its
-    /// output is dropped by the subscriber cut and its batches must not be cleaned up.
-    committed_certificates: MeteredMpscChannel<(Round, Vec<(Certificate, bool)>)>,
+    committed_certificates: MeteredMpscChannel<(Round, Vec<Certificate>)>,
 
     /// Sends missing certificates to the `CertificateFetcher`.
-    /// Receives certificates with missing parents from the `Synchronizer`.
+    /// Receives certificates with missing parents from the `StateSynchronizer`.
     certificate_fetcher: MeteredMpscChannel<CertificateFetcherCommand>,
     /// Send valid a quorum of certificates' ids to the `Proposer` (along with their round).
     /// Receives the parents to include in the next header (along with their round number) from
-    /// `Synchronizer`.
+    /// `StateSynchronizer`.
     parents: MeteredMpscChannel<(Vec<Certificate>, Round)>,
     /// Receives the batches' digests from our workers.
     our_digests: MeteredMpscChannel<OurDigestMessage>,
@@ -359,9 +379,8 @@ struct ConsensusBusEpochInner {
     /// Updates when headers were committed by consensus.
     ///
     /// NOTE: this does not mean the header was executed yet.
-    /// Each round's `bool` is `true` when its commit reaches the epoch boundary (output dropped by
-    /// the subscriber cut), so the proposer must skip `NodeBatchesCache` cleanup for that header.
-    committed_own_headers: MeteredMpscChannel<(Round, Vec<(Round, bool)>)>,
+    /// Carries the rounds of this authority's own headers included in the commit.
+    committed_own_headers: MeteredMpscChannel<(Round, Vec<Round>)>,
 
     /// Outputs the sequence of ordered certificates to the application layer.
     sequence: MeteredMpscChannel<CommittedSubDag>,
@@ -372,6 +391,11 @@ struct ConsensusBusEpochInner {
     /// Drain signal from manager to subscriber. Manager sends `Some(boundary_round)` to
     /// initiate drain with the deterministic epoch boundary round. `None` means no drain.
     drain_signal: watch::Sender<Option<Round>>,
+    /// Count of certificates currently suspended awaiting parents, owned by the certificate
+    /// manager. The proposer's backpressure gate reads this, never the mirrored metrics gauge:
+    /// control state lives in a component, a metric handle is write-only. Published on each
+    /// suspension and each drain, so the gate releases as soon as the queue empties.
+    suspended_cert_count: watch::Sender<usize>,
 
     /// Subscriber sends drain acknowledgment when all in-flight work is complete.
     /// Wrapped in Arc<Mutex<Option>> because oneshot::Sender is consumed on use and is not Clone.
@@ -433,6 +457,7 @@ impl ConsensusBusEpochInner {
         );
 
         let (drain_signal, _) = watch::channel(None);
+        let (suspended_cert_count, _) = watch::channel(0);
         let (drain_ack_tx, drain_ack_rx) = oneshot::channel();
 
         Self {
@@ -446,6 +471,7 @@ impl ConsensusBusEpochInner {
             sequence,
             certificate_manager,
             drain_signal,
+            suspended_cert_count,
             drain_ack_tx: Arc::new(Mutex::new(Some(drain_ack_tx))),
             drain_ack_rx: Arc::new(Mutex::new(Some(drain_ack_rx))),
         }
@@ -507,14 +533,14 @@ impl ConsensusBus {
 
     /// Outputs the sequence of ordered certificates to the primary (for cleanup and feedback).
     /// Can only be subscribed to once.
-    pub fn committed_certificates(&self) -> &impl RaylsSender<(Round, Vec<(Certificate, bool)>)> {
+    pub fn committed_certificates(&self) -> &impl RaylsSender<(Round, Vec<Certificate>)> {
         &self.inner_epoch.committed_certificates
     }
 
     /// Missing certificates.
     ///
     /// Sends missing certificates to the `CertificateFetcher`.
-    /// Receives certificates with missing parents from the `Synchronizer`.
+    /// Receives certificates with missing parents from the `StateSynchronizer`.
     /// Can only be subscribed to once.
     pub fn certificate_fetcher(&self) -> &impl RaylsSender<CertificateFetcherCommand> {
         &self.inner_epoch.certificate_fetcher
@@ -524,7 +550,7 @@ impl ConsensusBus {
     ///
     /// Sends a valid quorum of certificates' ids to the `Proposer` (along with their round).
     /// Receives the parents to include in the next header (along with their round number) from
-    /// `Synchronizer`.
+    /// `StateSynchronizer`.
     /// Can only be subscribed to once.
     pub fn parents(&self) -> &impl RaylsSender<(Vec<Certificate>, Round)> {
         &self.inner_epoch.parents
@@ -566,7 +592,7 @@ impl ConsensusBus {
     ///
     /// NOTE: this does not mean the header was executed yet.
     /// Can only be subscribed to once.
-    pub fn committed_own_headers(&self) -> &impl RaylsSender<(Round, Vec<(Round, bool)>)> {
+    pub fn committed_own_headers(&self) -> &impl RaylsSender<(Round, Vec<Round>)> {
         &self.inner_epoch.committed_own_headers
     }
 
@@ -590,6 +616,11 @@ impl ConsensusBus {
         &self.inner_epoch.drain_signal
     }
 
+    /// Count of certificates suspended awaiting parents (epoch-scoped, resets with the epoch).
+    pub fn suspended_cert_count(&self) -> &watch::Sender<usize> {
+        &self.inner_epoch.suspended_cert_count
+    }
+
     /// Take the drain acknowledgment sender for the subscriber.
     /// Returns `None` if already taken (can only be taken once per epoch).
     pub fn take_drain_ack_tx(&self) -> Option<oneshot::Sender<()>> {
@@ -606,23 +637,15 @@ impl ConsensusBus {
         rx
     }
 
-    /// Track the most recently executed blocks (a bounded window, newest at the tip).
+    /// The most recently executed blocks (a bounded window, newest at the tip).
     ///
-    /// Safe to read for block *numbers* and *hashes* - those are monotonic. But the tip's nonce
-    /// (`epoch << 32 | round`) is NOT monotonic - neither half: draining a parked (out-of-order
-    /// seq) batch executes a block belonging to an OLDER output that still lands as the newest
-    /// height, so the tip's round (and, for a batch carried over from a previous epoch, its epoch)
-    /// can regress far below the true execution frontier.
-    ///
-    /// Example: execution has genuinely reached round 498. A batch for an earlier seq, mapping to
-    /// round 200, was parked; the gap then fills and it is drained and executed now. That fresh
-    /// block gets the next (highest) block number and becomes the tip, but its nonce encodes round
-    /// 200. A caller reading the round off the tip sees 200, not 498. The proposer throttle did
-    /// exactly this: with consensus at round 500 it computed lag `500 - 200 = 300 > threshold` and
-    /// throttled forever, wedging proposals - when the real lag was `500 - 498 = 2`.
-    ///
-    /// For the frontier epoch/round read the monotonic [`Self::executed_anchor`] instead, or scan
-    /// this window for the max-nonce block.
+    /// Block numbers and hashes in the window are monotonic; the tip's nonce
+    /// (`epoch << 32 | round`) is not, in either half. Draining a parked (out-of-order seq) batch
+    /// executes a block belonging to an older output that still lands as the newest height, so a
+    /// round or epoch read off the tip can regress far below the true execution frontier, and a
+    /// lag computed from it (a throttle, a catch-up gate) wedges on a false gap. For the
+    /// frontier epoch/round read the monotonic [`Self::executed_anchor`] instead, or scan this
+    /// window for the max-nonce block.
     pub fn recently_executed_blocks(&self) -> &watch::Sender<RecentlyExecutedBlocks> {
         &self.inner_app.tx_recently_executed_blocks
     }
@@ -641,13 +664,14 @@ impl ConsensusBus {
 
     /// True when the node-scoped engine has executed everything it admitted (queue empty, nothing
     /// in flight). A mode transition waits on this so the engine's admitted backlog finishes before
-    /// the next epoch's `get_missing_consensus` snapshot — otherwise a concurrently-finishing
+    /// the next epoch's `get_missing_consensus` snapshot - otherwise a concurrently-finishing
     /// output is dropped as stale (the demote→rejoin flap race).
     pub fn engine_idle(&self) -> &watch::Sender<bool> {
         &self.inner_app.tx_engine_idle
     }
 
-    /// Signal that execution replay of missed consensus outputs is complete.
+    /// Whether execution replay of missed consensus outputs is complete.
+    ///
     /// Set by the subscriber after replaying, read by the proposer before creating headers.
     pub fn execution_replay_complete(&self) -> &watch::Sender<bool> {
         &self.inner_app.tx_execution_replay_complete
@@ -664,6 +688,15 @@ impl ConsensusBus {
     /// for block number.  DO NOT send unverified values to this watch.
     pub fn last_published_consensus_num_hash(&self) -> &watch::Sender<(u64, BlockHash)> {
         &self.inner_app.tx_last_published_consensus_num_hash
+    }
+
+    /// The node's own durable consensus tip: the highest header it has saved to
+    /// `ConsensusBlocks`, on every role. The subscriber seeds it from the canonical chain tip at
+    /// every spawn (so it re-anchors after an epoch transition) and publishes each header it
+    /// saves. It is never reset, so the RPC can serve `latestHeader` and the current epoch from
+    /// memory without touching the DB.
+    pub fn local_consensus_tip(&self) -> &watch::Sender<Arc<ConsensusHeader>> {
+        &self.inner_app.tx_local_consensus_tip
     }
 
     /// Broadcast channel with consensus output (includes the consensus chain block).
@@ -772,6 +805,17 @@ impl ConsensusBus {
         &self,
     ) -> &impl RaylsSender<(EpochVote, oneshot::Sender<Result<(), HeaderError>>)> {
         &self.inner_app.new_epoch_votes
+    }
+
+    /// Subscribe to the epoch vote queue only if no other subscription is in use.
+    ///
+    /// Returns `None` while the receiver is held (a running vote collection owns it), so a caller
+    /// that only wants to drop stale queued votes can no-op instead of panicking.
+    pub fn try_subscribe_epoch_votes(
+        &self,
+    ) -> Option<impl RaylsReceiver<(EpochVote, oneshot::Sender<Result<(), HeaderError>>)> + 'static>
+    {
+        self.inner_app.new_epoch_votes.try_subscribe()
     }
 
     /// Update consensus round watch channels.
@@ -922,8 +966,10 @@ impl From<RecvError> for WaitForExecutionError {
 
 #[cfg(test)]
 mod tests {
-    use super::{ConsensusBus, PromotionBarrier};
-    use rayls_infrastructure_types::CertificateDigest;
+    use super::{ConsensusBus, PromotionBarrier, QueChannel};
+    use rayls_infrastructure_types::{
+        CertificateDigest, RaylsReceiver as _, RaylsSender as _, TryRecvError,
+    };
 
     // MissingParentRound (digest=None) must gate on committed_round, not a max-round cert-store
     // watermark: a far-behind node fetches high-round certs out of order, so the max is already
@@ -950,6 +996,28 @@ mod tests {
         let barrier = PromotionBarrier { epoch: 5, round: 100, digest: Some(digest) };
         assert!(barrier.is_cleared(5, 0, |d| *d == digest), "clears when parent digest present");
         assert!(!barrier.is_cleared(5, 0, |_| false), "blocks while parent digest absent");
+    }
+
+    // `try_subscribe` must yield the receiver only while nobody else holds it, so an
+    // opportunistic drainer cannot panic or steal votes from a running collection.
+    #[tokio::test]
+    async fn try_subscribe_yields_the_receiver_only_when_free() {
+        let que: QueChannel<u8> = QueChannel::new();
+        que.send(1).await.expect("send");
+
+        let owner = que.subscribe();
+        assert!(que.try_subscribe().is_none(), "must not hand out a second receiver");
+        drop(owner);
+
+        let mut drainer = que.try_subscribe().expect("receiver is free again");
+        assert_eq!(drainer.try_recv().expect("queued value"), 1);
+        assert!(matches!(drainer.try_recv(), Err(TryRecvError::Empty)));
+        drop(drainer);
+
+        // Dropping the opportunistic receiver returns it, so the next owner can subscribe.
+        let mut owner = que.subscribe();
+        que.send(2).await.expect("send");
+        assert_eq!(owner.recv().await, Some(2));
     }
 
     // The barrier is node-lifetime intent: it must survive the same-epoch mode-change restart the

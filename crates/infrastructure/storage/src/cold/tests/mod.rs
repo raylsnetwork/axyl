@@ -6,7 +6,7 @@
 use std::{collections::BTreeSet, sync::Arc};
 
 use rayls_infrastructure_types::{
-    encode, Batch, BlockHash, Certificate, CommittedSubDag, ConsensusHeader, Database, DbTx,
+    encode, Batch, BlockHash, Bytes, Certificate, CommittedSubDag, ConsensusHeader, Database, DbTx,
     DbTxMut, Epoch, Header, ReputationScores,
 };
 
@@ -68,7 +68,7 @@ struct Fixture {
 fn batch_for(number: u64, epoch: Epoch) -> Batch {
     Batch {
         // Distinct per block so the byte-identical readback assertion is meaningful.
-        transactions: vec![vec![number as u8; 1 + (number as usize % 7)]],
+        transactions: vec![Bytes::from(vec![number as u8; 1 + (number as usize % 7)])],
         epoch,
         worker_id: 0,
         seq: number,

@@ -83,10 +83,17 @@ sequenceDiagram
    consistent before it is trusted as the oracle. Each replayed boundary block is
    then checked against its committed anchor.
 
-6. **Rewards** (`rewards.rs`). Close-epoch blocks are rebuilt with the snapshot's
-   committed leader tally, read from that block's withdrawals and staged into a
-   snapshot-backed `RewardsBackend`. The archive env never recomputes rewards from
-   consensus.
+6. **Rewards** (`rewards.rs`). Pre-`HybridRewards` close-epoch blocks are rebuilt
+   with the snapshot's committed leader tally, read from that block's withdrawals
+   and staged into a snapshot-backed `RewardsBackend`. Post-fork close blocks need
+   per-validator participation rounds, which a block does not preserve; those are
+   recomputed by a forward, cursor-bounded walk over the snapshot's consensus DB
+   (`BoundedHybridWalker`, same crediting as the live node's walker) and held to the
+   block's withdrawals (leader rounds must agree, or the replay aborts as a
+   consensus/execution divergence). The live walker iterates `ConsensusBlocks` in
+   reverse from the newest row; against a snapshot that runs millions of rows past
+   the closing epoch that is a full tail scan per epoch close, so the replay reads
+   each epoch's rows exactly once by keyed lookup instead.
 
 ## Usage
 
@@ -94,7 +101,7 @@ sequenceDiagram
 rayls-replay \
   --snapshot-datadir /path/to/snapshot \
   --archive-out      /path/to/fresh/archive \
-  --chain            testnet
+  --network          testnet
 ```
 
 The snapshot datadir is the rayls root holding `db/`, `static_files/`, `rocksdb/`,
@@ -106,16 +113,33 @@ Full per-block detail is written to `<archive-out>/rayls-replay.log` (honors
 
 ### Config resolution
 
-`genesis.yaml` and `parameters.yaml` are read from the snapshot datadir when
-present (`<datadir>/genesis/genesis.yaml`, `<datadir>/parameters.yaml`), falling
-back to the embedded `chain-configs/<chain>/` copies otherwise. The committee is
-read from the on-chain `ConsensusRegistry` at the archive tip (as the live node
-does), so no `committee.yaml` is needed and committee rotations are tracked.
+`genesis.yaml` and `parameters.yaml` are read from the snapshot datadir
+(`<datadir>/genesis/genesis.yaml`, `<datadir>/parameters.yaml`) or from an
+explicit `--genesis` / `--parameters` override. Both files must exist — there is
+no embedded fallback. The committee is read from the on-chain `ConsensusRegistry`
+at the archive tip (as the live node does), so no `committee.yaml` is needed and
+committee rotations are tracked.
 
-`--chain` independently selects the Rayls hardfork schedule applied to both envs.
-It must match the network the snapshot came from; with a local or devnet snapshot,
-pass the matching `--chain` so the hardfork activation blocks line up with the
-on-disk genesis.
+`--network` selects the baked-in Rayls hardfork schedule applied to both envs
+(the node's `--network` flag); its chain-id must match the snapshot genesis or
+the boot refuses. To replay a network that historically ran a different
+schedule, pass `--config-file <PATH> --subnet <NAME>` (the node's network
+config file format) instead; the subnet's `chain_id` must match the genesis,
+and a subnet may not declare a baked-in network's chain-id (mainnet/testnet
+run on `--network`). If the snapshot carries a `schedule-record.yaml` (taken
+from a node running the schedule-record boot gate), the selected schedule is
+verified against it read-only, and a schedule that moves an already-executed
+fork refuses the boot.
+
+### Historical schedules (`--config-file`)
+
+A replay has to apply the schedule the network *actually executed*, block by block.
+A baked-in `--chain` profile describes a network's intended schedule, which is not
+always what it ran: devnet, for example, was launched with `RAYLS_NETWORK=local` and
+followed the local schedule from genesis, so `--chain devnet` diverges at block 1.
+`etc/docker-replay/networks.yaml` (shipped in the image at `/etc/rayls/networks.yaml`)
+records the historical schedules; select one with
+`--config-file /etc/rayls/networks.yaml --subnet devnet` instead of `--chain`.
 
 ### Resuming
 
@@ -130,9 +154,11 @@ resume from the unwound tip. Use this to retry a run that diverged partway.
 | `--snapshot-datadir <PATH>` | required | Snapshot rayls datadir (`db/`, `consensus-db/`, `genesis/`). |
 | `--archive-out <PATH>` | required | Fresh datadir to rebuild into. |
 | `--consensus-db <PATH>` | `<snapshot>/consensus-db` | Override consensus DB path. |
-| `--genesis <PATH>` | `<snapshot>/genesis/genesis.yaml` | Override genesis YAML; embedded fallback. |
-| `--parameters <PATH>` | `<snapshot>/parameters.yaml` | Override parameters YAML; embedded fallback. Sets `basefee_address`, critical for state parity. |
-| `--chain <CHAIN>` | `mainnet` | `mainnet`, `testnet`, `local`, `devnet`. Selects the hardfork schedule. |
+| `--genesis <PATH>` | `<snapshot>/genesis/genesis.yaml` | Override genesis YAML. Must exist (no embedded fallback). |
+| `--parameters <PATH>` | `<snapshot>/parameters.yaml` | Override parameters YAML. Must exist (no embedded fallback). Sets `basefee_address`, critical for state parity. |
+| `--network <NETWORK>` | `mainnet` | `mainnet`, `testnet`, `local`, `devnet`. Selects the baked-in hardfork schedule; chain-id must match the genesis. |
+| `--config-file <PATH>` | off | Network config file (the node's format); requires `--subnet`, cannot be combined with an explicit `--network`. |
+| `--subnet <NAME>` | off | Subnet to select inside `--config-file`; its schedule replaces the `--network` profile. |
 | `--from-block <N>` | `1` | First block to replay (inclusive). |
 | `--to-block <N>` | snapshot tip | Last block to replay (inclusive). Clamped to the tip. |
 | `--unwind-to <BLOCK>` | off | Unwind the archive to this block and exit. |
@@ -169,9 +195,11 @@ live node is unaffected.
 
 ## Notes
 
-- The hardfork schedule (`--chain`) and `basefee_address` (`parameters.yaml`) must
-  match what the live network used. A mismatch silently diverges state at the
-  first affected block. `verify_chainspec_compatibility` checks genesis agreement
-  up front to surface the common case early.
+- The hardfork schedule (`--network` or `--config-file`) and `basefee_address`
+  (`parameters.yaml`) must match what the live network used. The chain-id gate
+  and the schedule-record cross-check (when the snapshot has a record) surface
+  the common cases up front; anything they cannot see still diverges state
+  silently at the first affected block. `verify_chainspec_compatibility` checks
+  genesis agreement between the two envs.
 - Replay is sequential and CPU-bound on execution plus state-root computation;
   speculative prewarming is disabled because it is wasted work here.

@@ -4,18 +4,16 @@ use crate::{
     persistence,
     reth_env::{types::set_basefee_address, RethConfig, RethDb, RethEnv},
     traits::RaylsNode,
-    RaylsChainSpec,
+    NetworkProfile, RaylsChainSpec,
 };
 use rayls_infrastructure_config::Parameters;
-use rayls_infrastructure_types::{
-    Address, BuildMetadata, RaylsNetwork, TaskManager, TaskSpawner, B256,
-};
+use rayls_infrastructure_types::{Address, BuildMetadata, TaskManager, TaskSpawner, B256};
 use rayls_middleware_rewards::RewardsCounter;
 use reth::{args::DatadirArgs, builder::NodeConfig, dirs::MaybePlatformPath};
 use reth_chainspec::{ChainSpec as RethChainSpec, EthChainSpec};
 use reth_config::config::StageConfig;
 use reth_consensus::noop::NoopConsensus;
-use reth_db::{init_db, DatabaseEnv};
+use reth_db::{init_db, tables::StageCheckpoints, transaction::DbTx, Database, DatabaseEnv};
 use reth_db_common::init::init_genesis_with_settings;
 use reth_downloaders::{bodies::noop::NoopBodiesDownloader, headers::noop::NoopHeaderDownloader};
 use reth_engine_primitives::DEFAULT_PERSISTENCE_THRESHOLD;
@@ -27,7 +25,7 @@ use reth_provider::{
     RocksDBProviderFactory, StorageSettingsCache,
 };
 use reth_prune_types::PruneModes;
-use reth_stages::{sets::DefaultStages, PipelineBuilder, PipelineTarget};
+use reth_stages::{sets::DefaultStages, PipelineBuilder, PipelineTarget, StageId};
 use reth_static_file::StaticFileProducer;
 use reth_trie_db::ChangesetCache;
 use std::{path::Path, sync::Arc};
@@ -47,8 +45,23 @@ impl RethEnv {
         Ok(Arc::new(init_db(db_path, reth_config.0.db.database_args())?))
     }
 
-    /// Produce a new wrapped Reth environment with the network-specific settings (basefee
-    /// address, hardforks, minimum base fee) derived from the node's [`Parameters`].
+    /// Read the chain's executed head the way reth tracks it: the `Finish`
+    /// stage checkpoint, committed by the execution writer with each block.
+    /// A single keyed read (no provider built) — cheap enough for boot-time
+    /// validation.
+    pub fn best_block_number<P: AsRef<Path>>(
+        reth_config: &RethConfig,
+        db_path: P,
+    ) -> eyre::Result<u64> {
+        let db = Self::new_database(reth_config, db_path)?;
+        let tx = db.tx()?;
+        let finish = tx.get::<StageCheckpoints>(StageId::Finish.as_str().to_string())?;
+        Ok(finish.map(|checkpoint| checkpoint.block_number).unwrap_or(0))
+    }
+
+    /// Produce a new wrapped Reth environment with the node's parameter-derived
+    /// settings (basefee address, minimum base fee) and the hardfork schedule
+    /// the CLI boot gate selected (`profile`).
     ///
     /// The single production construction point: node boot and the offline cold migration both
     /// route through it, so both open the EL with identical wiring (consistency check and unwind
@@ -57,6 +70,7 @@ impl RethEnv {
     pub async fn new_from_parameters(
         reth_config: &RethConfig,
         parameters: &Parameters,
+        profile: &NetworkProfile,
         task_manager: &TaskManager,
         database: RethDb,
         rewards_counter: RewardsCounter,
@@ -65,12 +79,12 @@ impl RethEnv {
     ) -> eyre::Result<Self> {
         Self::new(
             reth_config,
+            profile,
             task_manager,
             database,
             parameters.basefee_address,
             rewards_counter,
             build_metadata,
-            Some(parameters.network),
             Some(parameters.min_base_fee),
             allow_v1,
         )
@@ -83,20 +97,28 @@ impl RethEnv {
     /// It is async to support pipeline-based unwind if database inconsistency is detected.
     pub async fn new(
         reth_config: &RethConfig,
+        profile: &NetworkProfile,
         task_manager: &TaskManager,
         database: RethDb,
         basefee_address: Option<Address>,
         rewards_counter: RewardsCounter,
         build_metadata: &BuildMetadata,
-        network: Option<RaylsNetwork>,
         min_base_fee: Option<u64>,
         allow_v1: bool,
     ) -> eyre::Result<Self> {
         let node_config = reth_config.0.clone();
-        let mut builder = RaylsChainSpec::builder(Arc::clone(&node_config.chain));
-        if let Some(network) = network {
-            builder = builder.rayls_hardforks(network);
-        }
+        // The boot gates already verified the profile's chain-id against the datadir's
+        // genesis; restate the invariant for in-process callers that skip the gate.
+        debug_assert_eq!(
+            profile.chain_id,
+            node_config.chain.chain().id(),
+            "profile chain_id must match the node's chain spec"
+        );
+        // The schedule the CLI boot gate selected (a `--config-file` subnet or the
+        // `--network` built-in). In-process engines that never ran the gate (test
+        // utilities, temp chains) pass an empty schedule: no Rayls hardforks.
+        let mut builder = RaylsChainSpec::builder(Arc::clone(&node_config.chain))
+            .add_rayls_hardforks_by_schedule(profile.schedule());
         if let Some(min_fee) = min_base_fee {
             builder = builder.min_base_fee(min_fee);
         }
@@ -202,6 +224,22 @@ impl RethEnv {
         task_manager: &TaskManager,
         rewards: Option<RewardsCounter>,
     ) -> eyre::Result<Self> {
+        // Temp chains run without Rayls hardforks; tests that exercise a schedule
+        // use [`Self::new_for_temp_chain_with_profile`].
+        let profile =
+            NetworkProfile { chain_id: chain.chain().id(), hardforks: Default::default() };
+        Self::new_for_temp_chain_with_profile(chain, db_path, task_manager, rewards, &profile).await
+    }
+
+    /// [`Self::new_for_temp_chain`] with an explicit hardfork schedule, for tests
+    /// that exercise a `--config-file` profile end to end.
+    pub async fn new_for_temp_chain_with_profile<P: AsRef<Path>>(
+        chain: Arc<RethChainSpec>,
+        db_path: P,
+        task_manager: &TaskManager,
+        rewards: Option<RewardsCounter>,
+        profile: &NetworkProfile,
+    ) -> eyre::Result<Self> {
         fdlimit::raise_fd_limit()?;
 
         let node_config = NodeConfig {
@@ -220,12 +258,12 @@ impl RethEnv {
         let database = Self::new_database(&reth_config, db_path)?;
         Self::new(
             &reth_config,
+            profile,
             task_manager,
             database,
             None,
             rewards.unwrap_or_default(),
             &BuildMetadata::default(),
-            None,
             None,
             false,
         )
@@ -234,7 +272,7 @@ impl RethEnv {
 
     /// Create a RethEnv tailored for archive-replay workloads, anchored at a
     /// rayls datadir. Mirrors [`Self::new_for_temp_chain`] but applies the
-    /// network's hardfork schedule, the same `basefee_address` + `min_base_fee`
+    /// selected hardfork schedule, the same `basefee_address` + `min_base_fee`
     /// the production node uses, and selects the v2 storage layout
     /// (`static_files/` + RocksDB) so the rebuilt archive is bit-compatible
     /// with snapshots produced by nodes running `--storage.v2`. Pruning is
@@ -254,7 +292,7 @@ impl RethEnv {
         chain: Arc<RethChainSpec>,
         rayls_datadir: P,
         task_manager: &TaskManager,
-        network: RaylsNetwork,
+        profile: &NetworkProfile,
         basefee_address: Option<Address>,
         min_base_fee: Option<u64>,
         storage_v2: bool,
@@ -288,12 +326,12 @@ impl RethEnv {
         let database = Self::new_database(&reth_config, &db_path)?;
         Self::new(
             &reth_config,
+            profile,
             task_manager,
             database,
             basefee_address,
             rewards_counter,
             &BuildMetadata::default(),
-            Some(network),
             min_base_fee,
             true,
         )

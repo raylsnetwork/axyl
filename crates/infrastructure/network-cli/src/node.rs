@@ -1,13 +1,16 @@
 //! Main node command
 //!
 //! Starts the client
-use crate::{args::ConsensusDatabaseArgs, version::SHORT_VERSION, NoArgs};
-use clap::{value_parser, Parser};
+use crate::{
+    args::ConsensusDatabaseArgs, schedule::verify_schedule_record, version::SHORT_VERSION, NoArgs,
+};
+use clap::{value_parser, Parser, ValueHint};
 use core::fmt;
 use fdlimit::raise_fd_limit;
 use rayls_execution_evm::{
     parse_socket_address,
     reth_env::{RethCommand, RethConfig},
+    verify_datadir_chain_id, FileSchedule, SelectedSchedule,
 };
 use rayls_infrastructure_config::Config;
 // dev-only: reading the committee file for the single-validator gating check
@@ -21,11 +24,10 @@ use rayon::ThreadPoolBuilder;
 use std::{net::SocketAddr, path::PathBuf, sync::Arc, thread::available_parallelism};
 use tracing::*;
 
-/// Chain-ids that must never be paired with `--dev`. Mainnet only — testnet and
-/// the devnet default both use chain-id 2017, so this list cannot exclude testnet
-/// without also blocking valid local devnet use.
+/// Chain-ids that must never be paired with `--dev`. Mainnet only (`72957`) —
+/// testnet, devnet and local have distinct, non-production chain-ids.
 #[cfg(feature = "dev-single-node-setup")]
-const PROD_CHAIN_IDS: &[u64] = &[487];
+const PROD_CHAIN_IDS: &[u64] = &[72957];
 
 /// Enforce the single-node-only invariant for `dev` feature builds, before the node boots.
 ///
@@ -57,26 +59,13 @@ fn check_dev_mode(dev: bool, committee_size: usize, chain_id: u64) -> eyre::Resu
     Ok(())
 }
 
-/// Avaliable "named" chains.
-/// These will have embedded config files and can be joined after gereating keys.
-#[derive(Debug, Copy, Clone, clap::ValueEnum)]
-pub enum NamedChain {
-    /// Testnet
-    Testnet,
-    /// Mainnet
-    Mainnet,
-}
-
 /// Start the node
 #[derive(Debug, Parser)]
 pub struct NodeCommand<Ext: clap::Args + fmt::Debug = NoArgs> {
-    /// Join a named rayls network (for instance test or main net).
-    #[arg(long, value_name = "NAMED_RL_NETWORK", verbatim_doc_comment)]
-    pub chain: Option<NamedChain>,
-
-    /// Enable Prometheus consensus metrics.
+    /// Enable Prometheus consensus metrics, served at the given interface and port.
     ///
-    /// The metrics will be served at the given interface and port.
+    /// Overrides `metrics_address` in parameters.yaml when passed. If neither is set,
+    /// consensus metrics stay off.
     #[arg(long, value_name = "SOCKET", value_parser = parse_socket_address, help_heading = "Consensus Metrics")]
     pub metrics: Option<SocketAddr>,
 
@@ -130,13 +119,37 @@ pub struct NodeCommand<Ext: clap::Args + fmt::Debug = NoArgs> {
     #[arg(long, value_name = "HEALTHCHECK_TCP_PORT", global = true, env = "HEALTHCHECK_TCP_PORT")]
     pub healthcheck: Option<u16>,
 
-    /// Override the Rayls network hardfork profile from parameters.yaml.
-    ///
-    /// Selects which baked-in hardfork schedule to use (devnet, testnet, mainnet).
-    /// When set, overrides the `network` field in parameters.yaml without requiring
-    /// a re-genesis. Useful for activating hardforks on existing networks.
-    #[arg(long, value_name = "RAYLS_NETWORK", global = true, env = "RAYLS_NETWORK")]
+    /// Select the built-in hardfork schedule for this boot (the network's
+    /// chain-id plus its baked-in schedule: devnet, testnet, mainnet, local).
+    /// One of `--network` or a `--config-file`/`--subnet` pair must be given —
+    /// a datadir carries no schedule of its own. In dev mode `local` is
+    /// implied when neither is given.
+    #[arg(
+        long,
+        value_name = "RAYLS_NETWORK",
+        global = true,
+        env = "RAYLS_NETWORK",
+        conflicts_with = "config_file"
+    )]
     pub network: Option<RaylsNetwork>,
+
+    /// The client's network config file (YAML).
+    ///
+    /// The file holds any number of named subnets; each subnet carries the
+    /// network's hardfork schedule. When set, `--subnet` selects which subnet
+    /// this node runs, and its `hardforks` section replaces the schedule baked
+    /// into the binary. Everything else (genesis, parameters, committee, node
+    /// identity) still comes from the datadir, exactly as without the file.
+    /// A subnet may not declare the chain-id of a baked-in network (mainnet
+    /// `72957`, testnet `7295799`) — those networks always run on their
+    /// baked-in schedule and are started with `--network`. Cannot be combined
+    /// with `--network`.
+    #[arg(long, value_name = "PATH", value_hint = ValueHint::FilePath, requires = "subnet", conflicts_with = "network")]
+    pub config_file: Option<PathBuf>,
+
+    /// The subnet to run, as named in `--config-file`.
+    #[arg(long, value_name = "SUBNET", requires = "config_file")]
+    pub subnet: Option<String>,
 
     /// Run as a single-node developer network.
     ///
@@ -145,10 +158,10 @@ pub struct NodeCommand<Ext: clap::Args + fmt::Debug = NoArgs> {
     ///
     /// WARNING: for local development and demos only — NOT FOR PRODUCTION USE.
     /// Refuses to start if the configured chain-id matches a known production
-    /// network (mainnet = 487). Pair with a single-validator genesis generated
+    /// network (mainnet = 72957). Pair with a single-validator genesis generated
     /// locally via `keytool generate validator` and `genesis`.
     #[cfg(feature = "dev-single-node-setup")]
-    #[arg(long, default_value_t = false, conflicts_with = "chain")]
+    #[arg(long, default_value_t = false)]
     pub dev: bool,
 
     /// Additional cli arguments
@@ -216,7 +229,7 @@ impl<Ext: clap::Args + fmt::Debug> NodeCommand<Ext> {
     /// [`execute_maintenance`](Self::execute_maintenance); `enforce_dev_gate` applies the dev
     /// single-validator gating only on the node path (unused in non-dev builds).
     fn build_and_launch<L>(
-        mut self,
+        self,
         rl_datadir: PathBuf,
         passphrase: String,
         launcher: L,
@@ -243,26 +256,41 @@ impl<Ext: clap::Args + fmt::Debug> NodeCommand<Ext> {
             error!("Failed to initialize global thread pool for rayon: {}", err)
         }
 
-        // overwrite all genesis if `genesis` was passed to CLI
-        let mut rayls_infrastructure_config = if let Some(chain) = self.chain.take() {
-            info!(target: "cli", "Overwriting RL config with named chain: {chain:?}");
-            match chain {
-                NamedChain::Testnet => {
-                    Config::load_testnet(&rl_datadir, self.observer, SHORT_VERSION)?
-                }
-                NamedChain::Mainnet => {
-                    Config::load_mainnet(&rl_datadir, self.observer, SHORT_VERSION)?
-                }
-            }
+        // Resolve the hardfork schedule from the client's network config file, if
+        // given — before touching the datadir, so a flag conflict or a broken
+        // file fails fast with an actionable message.
+        let file_schedule = if let Some(config_file) = &self.config_file {
+            let subnet = self.subnet.as_deref().expect("clap requires --subnet with --config-file");
+            Some(FileSchedule::load(config_file, subnet)?)
         } else {
-            Config::load(&rl_datadir, self.observer, SHORT_VERSION)?
+            None
         };
 
-        // override network hardfork profile if specified via CLI / env
-        if let Some(network) = self.network {
-            info!(target: "cli", %network, "overriding network hardfork profile from CLI");
-            rayls_infrastructure_config.parameters.network = network;
-        }
+        // Dev mode implies `local` when no schedule source is given: dev
+        // datadirs are local-chain-id chains, and this keeps `rayls-network
+        // dev` one-command. An explicit `--network`/`--config-file` still
+        // wins; a datadir with any other chain-id is refused by the check
+        // below.
+        #[cfg(feature = "dev-single-node-setup")]
+        let network = if self.dev && file_schedule.is_none() && self.network.is_none() {
+            Some(RaylsNetwork::Local)
+        } else {
+            self.network
+        };
+        #[cfg(not(feature = "dev-single-node-setup"))]
+        let network = self.network;
+
+        // Load the node config from the datadir (genesis, parameters, committee,
+        // node identity). The hardfork schedule comes from the config file
+        // resolved above or from the built-in schedule selected by `--network`.
+        let rayls_infrastructure_config = Config::load(&rl_datadir, self.observer, SHORT_VERSION)?;
+
+        // The datadir must carry the chain-id of the schedule source selected
+        // for this boot, otherwise it belongs to a different network or client
+        // and would run the wrong hardfork schedule.
+        let selected = SelectedSchedule::select(file_schedule.as_ref(), network)?;
+        let actual_chain_id = rayls_infrastructure_config.genesis().config.chain_id;
+        verify_datadir_chain_id(actual_chain_id, selected.profile.chain_id, &selected.source)?;
 
         debug!(target: "cli", validator = ?rayls_infrastructure_config.node_info.name, "rl datadir for node command: {rl_datadir:?}");
         info!(target: "cli", validator = ?rayls_infrastructure_config.node_info.name, "config loaded");
@@ -291,9 +319,10 @@ impl<Ext: clap::Args + fmt::Debug> NodeCommand<Ext> {
 
         // get the worker's transaction address from the config
         let Self {
-            chain: _,    // Used above
-            observer: _, // Used above
-            network: _,  // Used above
+            observer: _,    // Used above
+            network: _,     // Used above
+            config_file: _, // Used above
+            subnet: _,      // Used above
             #[cfg(feature = "dev-single-node-setup")]
                 dev: _, // Used above
             metrics,
@@ -305,6 +334,22 @@ impl<Ext: clap::Args + fmt::Debug> NodeCommand<Ext> {
             consensus_db,
         } = self;
 
+        // Both metrics endpoints can also be enabled from parameters.yaml — `metrics_address` for
+        // the consensus/Narwhal suite and `reth_metrics_address` for the execution layer. The
+        // `--metrics` / `--reth-metrics` CLI flags override the config values when passed.
+        let metrics = metrics.or(rayls_infrastructure_config.parameters.metrics_address);
+        if let Some(addr) = metrics {
+            info!(target: "cli", %addr, "consensus Prometheus metrics enabled");
+        }
+        let mut reth = reth;
+        reth.reth_metrics.prometheus = reth
+            .reth_metrics
+            .prometheus
+            .or(rayls_infrastructure_config.parameters.reth_metrics_address);
+        if let Some(addr) = reth.reth_metrics.prometheus {
+            info!(target: "cli", %addr, "reth execution-layer Prometheus metrics enabled");
+        }
+
         debug!(target: "cli", "node command genesis: {:#?}", rayls_infrastructure_config.genesis());
 
         // set up reth node config for engine components
@@ -314,6 +359,21 @@ impl<Ext: clap::Args + fmt::Debug> NodeCommand<Ext> {
             &rl_datadir,
             with_unused_ports,
             Arc::new(rayls_infrastructure_config.chain_spec()),
+        );
+
+        // The datadir's genesis chain-id must match the schedule source (checked above); so
+        // must the hardfork schedule itself: a schedule that moves an already-activated fork
+        // (or back-dates a new one into the executed history) would re-interpret the blocks
+        // this chain has already run. The datadir's schedule record pins what was executed.
+        verify_schedule_record(&rl_datadir, &node_config, &selected.profile)?;
+
+        // The gate has passed: the selected profile travels with the builder into
+        // every execution-layer constructor (nothing about it is process-global).
+        info!(
+            target: "cli",
+            source = %selected.source,
+            chain_id = actual_chain_id,
+            "hardfork schedule selected"
         );
 
         let build_metadata = BuildMetadata {
@@ -328,6 +388,7 @@ impl<Ext: clap::Args + fmt::Debug> NodeCommand<Ext> {
         let builder = RaylsBuilder::new_with_consensus_db_config(
             node_config,
             rayls_infrastructure_config,
+            selected.profile,
             None,
             metrics,
             healthcheck,
@@ -344,25 +405,25 @@ mod tests {
     use super::check_dev_mode;
 
     // Mainnet chain-id; must be one of `PROD_CHAIN_IDS`.
-    const MAINNET_CHAIN_ID: u64 = 487;
-    // Testnet / devnet default chain-id; not a production chain-id.
-    const DEV_CHAIN_ID: u64 = 2017;
+    const MAINNET_CHAIN_ID: u64 = 72957;
+    // Local chain-id; not a production chain-id.
+    const LOCAL_CHAIN_ID: u64 = 487;
 
     #[test]
     fn single_validator_allowed() {
         // A dev build is single-node: a 1-of-1 committee is the expected case,
         // with or without the --dev auto-bootstrap flag.
-        assert!(check_dev_mode(true, 1, DEV_CHAIN_ID).is_ok());
-        assert!(check_dev_mode(false, 1, DEV_CHAIN_ID).is_ok());
+        assert!(check_dev_mode(true, 1, LOCAL_CHAIN_ID).is_ok());
+        assert!(check_dev_mode(false, 1, LOCAL_CHAIN_ID).is_ok());
     }
 
     #[test]
     fn multi_validator_rejected() {
         // Single-node only: a dev build refuses a multi-validator committee,
         // regardless of the --dev flag.
-        let err = check_dev_mode(true, 4, DEV_CHAIN_ID).unwrap_err();
+        let err = check_dev_mode(true, 4, LOCAL_CHAIN_ID).unwrap_err();
         assert!(err.to_string().contains("single-node only"), "{err}");
-        let err = check_dev_mode(false, 4, DEV_CHAIN_ID).unwrap_err();
+        let err = check_dev_mode(false, 4, LOCAL_CHAIN_ID).unwrap_err();
         assert!(err.to_string().contains("single-node only"), "{err}");
     }
 
@@ -374,7 +435,7 @@ mod tests {
 
     #[test]
     fn dev_allows_non_production_chain_id() {
-        assert!(check_dev_mode(true, 1, DEV_CHAIN_ID).is_ok());
+        assert!(check_dev_mode(true, 1, LOCAL_CHAIN_ID).is_ok());
     }
 
     #[test]
@@ -382,7 +443,7 @@ mod tests {
         // A missing/default committee deserializes to size 0; the single-node gate
         // targets `> 1`, so it must not fire here — the real "no committee" error
         // surfaces later when consensus loads it.
-        assert!(check_dev_mode(false, 0, DEV_CHAIN_ID).is_ok());
-        assert!(check_dev_mode(true, 0, DEV_CHAIN_ID).is_ok());
+        assert!(check_dev_mode(false, 0, LOCAL_CHAIN_ID).is_ok());
+        assert!(check_dev_mode(true, 0, LOCAL_CHAIN_ID).is_ok());
     }
 }

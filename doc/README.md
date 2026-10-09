@@ -17,6 +17,9 @@ Start with one of the pages below depending on what you are trying to do.
   development.
 - [`../README.md`](../README.md) — top-level project README with quick-start
   build/run instructions.
+- [`../bin/rayls-db-inspect/README.md`](../bin/rayls-db-inspect/README.md) — inspect a
+  node's `consensus-db` read-only (epoch records, certificates, consensus headers) and
+  compare several nodes when a transition or sync stalls.
 - [`../etc/validator/README.md`](../etc/validator/README.md) — provision a
   validator from scratch (keys, fund, allowlist, stake, activate, exit).
 - [`../etc/observer/README.md`](../etc/observer/README.md) — provision an
@@ -36,6 +39,9 @@ Start with one of the pages below depending on what you are trying to do.
 - [`index.md`](index.md) — system overview: end-to-end transaction flow,
   architecture diagram, custom database tables, header-field encoding,
   RPC interface.
+- [`node-types.md`](node-types.md) — Validator, Observer, and Archive: what
+  each one is, why it matters, and how consensus participation, state
+  pruning, and RPC exposure differ between them.
 - [`glossary.md`](glossary.md) — terms that mean different things in
   different parts of Axyl (e.g. "network", "whitelist"). Check here before
   using an overloaded term in a design doc or PR description.
@@ -78,6 +84,9 @@ back here):
   the invariants the registry contract is intended to maintain.
 - [`../rayls-contracts/script/interactions/README.md`](../rayls-contracts/script/interactions/README.md) —
   Foundry scripts for operating the deployed contracts.
+- [`../docs/contract-upgrades/README.md`](../docs/contract-upgrades/README.md) —
+  deciding whether a contract change needs a normal proxy upgrade or a hardfork, and the
+  step-by-step runbook for each.
 
 ### "I want to contribute"
 

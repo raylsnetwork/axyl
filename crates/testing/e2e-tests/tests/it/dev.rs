@@ -8,12 +8,13 @@
 use alloy::providers::{Provider, ProviderBuilder};
 use e2e_tests::{get_rayls_network_binary, IT_TEST_MUTEX};
 use ethereum_tx_sign::{LegacyTransaction, Transaction};
+use rayls_infrastructure_types::RaylsNetwork;
 use rayls_network_cli::dev::DEV_ACCOUNTS;
 use secp256k1::SecretKey;
 use std::{process::Child, time::Duration};
 use tokio::time::timeout;
 
-const DEV_CHAIN_ID: u64 = 2017;
+const DEV_CHAIN_ID: u64 = RaylsNetwork::Local.chain_id();
 
 /// Kills the node process on drop (including panic unwind) so a failed assertion
 /// never leaves an orphaned node holding port 8545.

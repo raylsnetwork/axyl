@@ -100,7 +100,7 @@ Network-fault scenarios require root / `CAP_NET_ADMIN` (they use `tc`/`netem` an
 
 ## 3. Fuzz targets (`fuzz-targets`) — 7
 
-`crates/testing/fuzz-targets/fuzz/fuzz_targets/`. Run with `cargo +nightly fuzz run <name>`.
+`crates/testing/fuzz-targets/fuzz/fuzz_targets/`. Run with `cargo +nightly-2026-06-24 fuzz run <name>` (the date-pinned nightly shared with the fmt check, see the Makefile `NIGHTLY` variable).
 
 | Target | Fuzzes |
 |---|---|

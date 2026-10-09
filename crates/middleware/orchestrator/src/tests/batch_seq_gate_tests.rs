@@ -14,11 +14,11 @@ fn cvv_inactive_does_not_produce_batches() {
     assert!(!NodeMode::CvvInactive.is_batch_producing());
 }
 
-/// Active CVVs and observers both produce batches.
+/// Active CVVs produce batches; observers forward instead of sealing.
 #[test]
-fn active_cvv_and_observer_produce_batches() {
+fn only_active_cvv_produces_batches() {
     assert!(NodeMode::CvvActive.is_batch_producing());
-    assert!(NodeMode::Observer.is_batch_producing());
+    assert!(!NodeMode::Observer.is_batch_producing());
 }
 
 fn channels() -> (watch::Sender<bool>, watch::Sender<Option<NodeMode>>, Notifier) {

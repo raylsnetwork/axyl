@@ -22,9 +22,25 @@ use std::{ops::RangeInclusive, sync::Arc};
 use reth_primitives_traits::Block as _;
 
 impl RethEnv {
-    /// Initialize a new transaction pool for worker.
+    /// Initialize a new transaction pool for worker with a fresh in-flight tracker.
     pub fn init_txn_pool(&self) -> eyre::Result<WorkerTxPool> {
-        WorkerTxPool::new(&self.node_config, &self.task_spawner, &self.blockchain_provider)
+        self.init_txn_pool_with_in_flight(crate::in_flight::InFlightTracker::new())
+    }
+
+    /// Initialize a worker transaction pool sharing the given node-scoped in-flight tracker.
+    ///
+    /// The node holds one tracker so the pool and whichever role it runs (the batch builder or the
+    /// forwarder) mark and release the same set of in-flight hashes.
+    pub fn init_txn_pool_with_in_flight(
+        &self,
+        in_flight: crate::in_flight::InFlightTracker,
+    ) -> eyre::Result<WorkerTxPool> {
+        WorkerTxPool::new(
+            &self.node_config,
+            &self.task_spawner,
+            &self.blockchain_provider,
+            in_flight,
+        )
     }
 
     /// Return a channel receiver that will return each canonical block in turn.

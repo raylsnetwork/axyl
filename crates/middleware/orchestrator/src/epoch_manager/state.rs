@@ -8,9 +8,10 @@ use rayls_infrastructure_storage::{
         BatchSeqCounter, CertificateDigestByOrigin, CertificateDigestByRound, Certificates,
         ConsensusBlocks, EpochTransitionCheckpoints, KadProviderRecords, KadRecords,
         KadWorkerProviderRecords, KadWorkerRecords, LastProposed, LastProposedByAuthority,
-        NodeBatchesCache, NodeIdentity, Payload, Votes,
+        NodeBatchesCache, NodeIdentity, Payload, PendingEpochRecord, Votes,
     },
     CertificateStore as _, EpochStore as _, ProposerStore as _, LAST_PROPOSAL_KEY,
+    PENDING_RECORD_LOG_TARGET,
 };
 use rayls_infrastructure_types::{
     AuthorityIdentifier, BlsPublicKey, Committee, CommitteeBuilder, ConsensusHeader,
@@ -51,50 +52,92 @@ where
         epoch: Epoch,
         boundary_consensus_hash: B256,
     ) -> eyre::Result<()> {
+        // Reuse the committee derived below so the registry is read only once.
+        let mut derived_committee: Option<Vec<BlsPublicKey>> = None;
         if epoch == 0 {
             if let Some((epoch_rec, Some(_))) = self.consensus_db.get_epoch_by_number(epoch) {
                 self.epoch_record = Some(epoch_rec);
                 return Ok(());
             }
-        } else if let Some((epoch_rec, _)) = self.consensus_db.get_epoch_by_number(epoch) {
-            self.epoch_record = Some(epoch_rec);
-            return Ok(());
+        } else if let Some((stored, _)) = self.consensus_db.get_epoch_by_number(epoch) {
+            // Cross-check a stored record against the chain committee before reusing it; rebuild on
+            // mismatch. If the chain cannot answer (out-of-window re-entry), reuse it unverified.
+            match engine.validators_for_epoch(epoch).await {
+                Ok(chain_committee) if stored.committee == chain_committee => {
+                    self.epoch_record = Some(stored);
+                    return Ok(());
+                }
+                Ok(chain_committee) => {
+                    warn!(
+                        target: "epoch-manager",
+                        epoch,
+                        "stored epoch record committee does not match chain-derived committee; \
+                         discarding it and rebuilding",
+                    );
+                    if let Err(e) = self.consensus_db.remove_epoch_record(epoch) {
+                        error!(target: "epoch-manager", epoch, "failed to remove invalid epoch record: {e}");
+                    }
+                    // Reuse the committee just derived instead of reading the registry again below.
+                    derived_committee = Some(chain_committee);
+                }
+                Err(e) => {
+                    // Registry cannot answer (out-of-window re-entry); reuse the stored record
+                    // unverified.
+                    warn!(
+                        target: "epoch-manager",
+                        epoch, ?e,
+                        "cannot re-derive committee to revalidate stored epoch record; reusing it unverified",
+                    );
+                    self.epoch_record = Some(stored);
+                    return Ok(());
+                }
+            }
         }
-        let committee_keys = engine.validators_for_epoch(epoch).await?;
+        let committee_keys = match derived_committee {
+            Some(committee) => committee,
+            None => engine.validators_for_epoch(epoch).await?,
+        };
         let next_committee_keys = engine.validators_for_epoch(epoch + 1).await?;
         let parent_hash = if epoch == 0 {
             B256::default()
         } else {
+            // Chain committee for the previous epoch, used to anchor the prev record; None if the
+            // chain cannot answer, in which case the anchor checks below are skipped.
+            let prev_chain_committee = engine.validators_for_epoch(epoch - 1).await.ok();
+
             let mut prev = resolve_local_prev_epoch_record(
                 &self.consensus_db,
                 self.prev_epoch_record.as_ref(),
                 epoch,
             );
-            // Neither memory nor disk has it — e.g. a restart before vote quorum
-            // persisted this node's copy. Peers closed the previous epoch and hold
-            // its certified record, so fetch it directly instead of failing and
-            // waiting for the async collector to backfill (which may not win the
-            // race against this boundary). Trusted because it carries a valid cert
-            // and its next_committee matches the committee we derived for this epoch
-            // from chain state.
+            // If the resolved prev record disagrees with the chain committee, discard it and fall
+            // through to the peer-fetch path below.
+            if let (Some(p), Some(chain_committee)) = (prev.as_ref(), prev_chain_committee.as_ref())
+            {
+                if &p.committee != chain_committee {
+                    warn!(
+                        target: "epoch-manager",
+                        epoch = epoch - 1,
+                        "previous epoch record committee does not match chain-derived committee; \
+                         discarding it",
+                    );
+                    if let Err(e) = self.consensus_db.remove_epoch_record(epoch - 1) {
+                        error!(target: "epoch-manager", epoch = epoch - 1, "failed to remove invalid previous epoch record: {e}");
+                    }
+                    prev = None;
+                }
+            }
+            // No valid prev locally: fetch it from a peer, but trust it only after anchoring to
+            // the chain committee for epoch-1 (committee, next_committee, and cert must all match).
             if prev.is_none() {
                 let network = primary.network_handle().await;
                 match network.request_epoch_cert(Some(epoch - 1), None).await {
                     Ok((peer_rec, cert)) => {
-                        // Validate before trusting; log the specific reason on
-                        // rejection so a live incident can tell bad peer data apart
-                        // from no data.
                         if peer_rec.epoch != epoch - 1 {
                             warn!(
                                 target: "epoch-manager",
                                 want = epoch - 1, got = peer_rec.epoch,
                                 "peer returned wrong epoch for previous epoch record; ignoring",
-                            );
-                        } else if !peer_rec.verify_with_cert(&cert) {
-                            warn!(
-                                target: "epoch-manager",
-                                epoch = epoch - 1,
-                                "peer-provided previous epoch record failed cert verification; ignoring",
                             );
                         } else if committee_keys != peer_rec.next_committee {
                             warn!(
@@ -102,18 +145,32 @@ where
                                 epoch = epoch - 1,
                                 "peer-provided previous epoch record next_committee does not match this epoch's committee; ignoring",
                             );
+                        } else if let Some(chain_committee) = prev_chain_committee.as_ref() {
+                            if !peer_rec.verify_against_committee(chain_committee, &cert) {
+                                warn!(
+                                    target: "epoch-manager",
+                                    epoch = epoch - 1,
+                                    "peer-provided previous epoch record failed cert verification against chain-derived committee; ignoring",
+                                );
+                            } else {
+                                info!(
+                                    target: "epoch-manager",
+                                    epoch = epoch - 1,
+                                    "fetched previous epoch record from a peer for parent_hash",
+                                );
+                                if let Err(e) =
+                                    self.consensus_db.save_epoch_record_with_cert(&peer_rec, &cert)
+                                {
+                                    error!(target: "epoch-manager", "failed to persist peer-fetched previous epoch record: {e}");
+                                }
+                                prev = Some(peer_rec);
+                            }
                         } else {
-                            info!(
+                            warn!(
                                 target: "epoch-manager",
                                 epoch = epoch - 1,
-                                "fetched previous epoch record from a peer for parent_hash",
+                                "cannot derive chain committee for the previous epoch to anchor the peer record; ignoring",
                             );
-                            if let Err(e) =
-                                self.consensus_db.save_epoch_record_with_cert(&peer_rec, &cert)
-                            {
-                                error!(target: "epoch-manager", "failed to persist peer-fetched previous epoch record: {e}");
-                            }
-                            prev = Some(peer_rec);
                         }
                     }
                     Err(e) => {
@@ -126,22 +183,31 @@ where
                 }
             }
             let Some(prev) = prev else {
+                // No valid previous record: demote to CvvInactive instead of crashing, so the node
+                // can recover once a genuine record is backfilled.
                 error!(
                     target: "epoch-manager",
-                    "failed to find previous epoch record when starting epoch",
+                    epoch,
+                    "no valid previous epoch record available when starting epoch; \
+                     demoting instead of halting",
                 );
-                return Err(eyre!("failed to find previous epoch record when starting epoch"));
+                self.force_cvv_inactive("epoch-record-missing-prev");
+                self.epoch_record = None;
+                return Ok(());
             };
             if committee_keys != prev.next_committee {
+                // prev was already validated against the chain above, so this is unexpected;
+                // demote gracefully rather than crash if it still happens.
                 error!(
                     target: "epoch-manager",
-                    "Last epochs next committee not equal to this epochs committee! previous {:?}, current {:?}",
+                    "Last epochs next committee not equal to this epochs committee! previous {:?}, current {:?}; \
+                     demoting instead of halting",
                     prev.next_committee,
                     committee_keys
                 );
-                return Err(eyre!(
-                    "Last epochs next committee not equal to this epochs committee!"
-                ));
+                self.force_cvv_inactive("epoch-record-next-committee-mismatch");
+                self.epoch_record = None;
+                return Ok(());
             }
             prev.digest()
         };
@@ -149,7 +215,7 @@ where
         // and the durable canonical tip. Read the reth canonical head directly rather than the
         // in-memory recently_executed_blocks (which is fed asynchronously by the engine-update
         // task): the tip is the epoch-closing block the engine finalized before this runs,
-        // so parent_state is deterministic and race-free — and identical to the value the
+        // so parent_state is deterministic and race-free - and identical to the value the
         // pre-anchor code committed.
         let parent_state = engine.get_reth_env().await.canonical_tip().num_hash();
 
@@ -162,10 +228,25 @@ where
             parent_consensus: boundary_consensus_hash,
         };
 
-        // Intentionally not persisted here: EpochRecord and EpochCertificate must be
-        // written in a single txn (save_epoch_record_with_cert). Writing the record
-        // alone would leave an unrecoverable half-state if the process dies before
-        // the cert write that happens after vote quorum.
+        // The certified (EpochRecord, EpochCertificate) pair is still only ever written
+        // together in one txn (save_epoch_record_with_cert) - that guarantee, and everything
+        // that relies on EpochRecords holding certified data only, is unchanged.
+        //
+        // Separately, persist this uncertified record as a resume hint (PendingEpochRecord):
+        // if certification never completes in this process's lifetime (a stall, a restart),
+        // there is otherwise nothing durable anywhere for this epoch to resume from - see #142.
+        // This is deliberately not the eager write #470 removed: that write went into
+        // EpochRecords itself, so bootstrap had no way to tell a certified record from an
+        // uncertified one and got stuck (#465). This write goes into a distinct table that
+        // bootstrap treats only as "resume certification for this epoch", never as a
+        // substitute for a certified record.
+        //
+        // The pending table is the collector's only work set, so a record that is not in it is
+        // never voted on or fetched by this node. A consensus-DB write failing at an epoch close
+        // is fatal for the transition, like every other write in it.
+        self.consensus_db
+            .save_pending_epoch_record(&epoch_rec)
+            .map_err(|e| eyre!("failed to persist pending epoch record for epoch {epoch}: {e}"))?;
         self.epoch_record = Some(epoch_rec);
         Ok(())
     }
@@ -248,10 +329,18 @@ where
             txn.clear_table::<LastProposed>()?;
             txn.clear_table::<Votes>()?;
             txn.clear_table::<Payload>()?;
-            // node-specific long-lived tables
+            // node-specific long-lived tables (NodeBatchesCache is no longer written; cleared to
+            // purge rows an older binary may have left in an imported DB)
             txn.clear_table::<NodeBatchesCache>()?;
             txn.clear_table::<EpochTransitionCheckpoints>()?;
             txn.clear_table::<BatchSeqCounter>()?;
+            // The previous owner's closed-but-uncertified records: this node is not a signer for
+            // them and must not spend a collection task trying to certify them.
+            txn.clear_table::<PendingEpochRecord>()?;
+            info!(
+                target: PENDING_RECORD_LOG_TARGET,
+                "pending epoch records cleared: a foreign consensus-db was adopted"
+            );
             // KAD record tables: cleared on snapshot recovery so find_authorities
             // re-queries fresh records, avoiding stale addresses from the snapshot epoch.
             txn.clear_table::<KadRecords>()?;
@@ -557,13 +646,15 @@ where
 /// Resolve the previous epoch's record (`epoch - 1`) from local state when
 /// building the record for the closing `epoch`.
 ///
-/// The record is not eagerly persisted; it lands on disk atomically with its
-/// cert once vote quorum is reached. Prefer a certified on-disk record (it is
-/// what the committee agreed on, which may differ from the one built locally).
-/// Otherwise reuse the in-memory record from the previous transition, falling
-/// back to an uncertified/absent disk record only as a last resort (the epoch-0
-/// dummy, or a restart before the peer-fetch backfill has restored it).
-/// Returns `None` when neither source has it - the caller must fetch from a peer.
+/// A certified record lands in `EpochRecords` atomically with its cert once
+/// vote quorum is reached. Prefer that (it is what the committee agreed on,
+/// which may differ from the one built locally). Otherwise reuse the in-memory
+/// record this node built itself - set by the previous transition in this
+/// process, or seeded from `PendingEpochRecord` at startup by
+/// [`hydrate_prev_epoch_record`] so a restart does not lose it. Last resort is
+/// an uncertified disk row in `EpochRecords`, which only ever holds the
+/// epoch-0 dummy. Returns `None` when no local source has it - the node never
+/// closed `epoch - 1` itself and the caller must fetch it from a peer.
 pub(crate) fn resolve_local_prev_epoch_record<DB: ReDatabase>(
     consensus_db: &DB,
     prev_in_mem: Option<&EpochRecord>,
@@ -590,4 +681,29 @@ pub(crate) fn resolve_local_prev_epoch_record<DB: ReDatabase>(
             .cloned()
             .or_else(|| uncertified.map(|(rec, _)| rec)),
     }
+}
+
+/// Seed `prev_epoch_record` at process start from `PendingEpochRecord`.
+///
+/// In a running process `prev_epoch_record` holds the record this node built for the most
+/// recently closed epoch, so a boundary that arrives before that epoch is certified can still
+/// chain its `parent_hash`. A restart discards it; the pending table holds the same self-built
+/// record durably, so the newest pending row is exactly what the field would have contained.
+/// `None` when nothing is pending: the newest close is certified and on disk, or this node never
+/// closed an epoch, and [`resolve_local_prev_epoch_record`] handles both.
+pub(crate) fn hydrate_prev_epoch_record<DB: ReDatabase>(consensus_db: &DB) -> Option<EpochRecord> {
+    let newest = consensus_db.pending_epoch_records().pop();
+    match &newest {
+        Some(rec) => info!(
+            target: PENDING_RECORD_LOG_TARGET,
+            epoch = rec.epoch,
+            digest = %rec.digest(),
+            "prev_epoch_record seeded from the newest pending epoch record at startup"
+        ),
+        None => info!(
+            target: PENDING_RECORD_LOG_TARGET,
+            "no pending epoch record at startup: nothing to resume, prev_epoch_record unseeded"
+        ),
+    }
+    newest
 }

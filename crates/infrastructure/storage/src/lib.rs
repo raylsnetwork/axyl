@@ -18,7 +18,7 @@ use tables::{
     CertificateDigestByRound, Certificates, ConsensusBlockNumbersByDigest, ConsensusBlocks,
     ConsensusBlocksCache, EpochCerts, EpochRecords, EpochRecordsIndex, EpochTransitionCheckpoints,
     KadProviderRecords, KadRecords, KadWorkerProviderRecords, KadWorkerRecords, LastProposed,
-    LastProposedByAuthority, NodeBatchesCache, NodeIdentity, Payload, Votes,
+    LastProposedByAuthority, NodeBatchesCache, NodeIdentity, Payload, PendingEpochRecord, Votes,
 };
 #[cfg(feature = "cold-storage")]
 use tables::{ColdArchiveHighWaterMark, ColdBatchLocations};
@@ -59,6 +59,7 @@ const NODE_BATCHES_CACHE_CF: &str = "node_batches_cache";
 const EPOCH_RECORDS_CF: &str = "epoch_record_by_number";
 const EPOCH_CERTS_CF: &str = "epoch_cert_by_number";
 const EPOCH_RECORDS_INDEX_CF: &str = "epoch_records_index";
+const PENDING_EPOCH_RECORD_CF: &str = "pending_epoch_record";
 const KAD_RECORD_CF: &str = "kad_record";
 const KAD_PROVIDER_RECORD_CF: &str = "kad_provider_record";
 const KAD_WORKER_RECORD_CF: &str = "kad_worker_record";
@@ -92,9 +93,10 @@ pub mod tables {
     #[cfg(feature = "cold-storage")]
     use crate::cold::ColdLocation;
     use rayls_infrastructure_types::{
-        batch_ordering::BatchOrderingState as TypeBatchOrderingState, AuthorityIdentifier, Batch,
-        BlockHash, Certificate, CertificateDigest, ConsensusHeader, Epoch, EpochCertificate,
-        EpochRecord, EpochTransitionCheckpoint, Header, Round, VoteInfo, WorkerId, B256,
+        batch_ordering::StoredBatchOrderingState as TypeStoredBatchOrderingState,
+        AuthorityIdentifier, Batch, BlockHash, Certificate, CertificateDigest, ConsensusHeader,
+        Epoch, EpochCertificate, EpochRecord, EpochTransitionCheckpoint, Header, Round, VoteInfo,
+        WorkerId, B256,
     };
 
     tables!(
@@ -113,7 +115,9 @@ pub mod tables {
         ConsensusBlockNumbersByDigest;crate::CONSENSUS_BLOCK_NUMBER_BY_DIGEST_CF;<BlockHash, u64>,
         // This is a cache to store verified but unprocessed consensus headers, remove once processed.
         ConsensusBlocksCache;crate::CONSENSUS_BLOCK_CACHE_CF;<u64, ConsensusHeader>,
-        // This is a cache to store this nodes batches before consensus, remove once in a ConsensusHeader.
+        // No longer written: graceful-shutdown txpool persistence replaced the seal-time batch
+        // cache. Retained so existing databases keep a stable column-family set; still cleared
+        // on foreign-DB sanitization to purge rows written by older binaries.
         NodeBatchesCache;crate::NODE_BATCHES_CACHE_CF;<BlockHash, Batch>,
         // These tables are for the epoch chain not the normal consensus.
         EpochRecords;crate::EPOCH_RECORDS_CF;<Epoch, EpochRecord>,
@@ -121,6 +125,12 @@ pub mod tables {
         EpochRecordsIndex;crate::EPOCH_RECORDS_INDEX_CF;<B256, Epoch>,
         // Epoch transition checkpoint for crash recovery. Keyed by epoch, stores at most one entry.
         EpochTransitionCheckpoints;crate::EPOCH_TRANSITION_CHECKPOINTS_CF;<Epoch, EpochTransitionCheckpoint>,
+        // A closed epoch's record, saved as soon as it is built, before certification. Distinct
+        // from EpochRecords (certified-only, see save_epoch_record_with_cert): this is a resume
+        // hint for bootstrap/retry, never trusted as a substitute for a certified record. Keyed
+        // by epoch, one row per closed-but-uncertified epoch; a later close never evicts an
+        // earlier epoch that is still awaiting its cert (#142).
+        PendingEpochRecord;crate::PENDING_EPOCH_RECORD_CF;<Epoch, EpochRecord>,
         // These are used for network storage and separate from consensus
         KadRecords;crate::KAD_RECORD_CF;<BlockHash, Vec<u8>>,
         KadProviderRecords;crate::KAD_PROVIDER_RECORD_CF;<BlockHash, Vec<u8>>,
@@ -131,7 +141,7 @@ pub mod tables {
         // Node identity: stores this validator's AuthorityIdentifier for foreign DB detection.
         NodeIdentity;crate::NODE_IDENTITY_CF;<u8, AuthorityIdentifier>,
         // Batch ordering state for the current epoch.
-        BatchOrderingState;crate::BATCH_ORDERING_STATE_CF;<u8, TypeBatchOrderingState>
+        BatchOrderingState;crate::BATCH_ORDERING_STATE_CF;<u8, TypeStoredBatchOrderingState>
     );
 
     // Cold-tier tables, compiled only with the `cold-storage` feature.
@@ -171,6 +181,9 @@ pub fn open_db_with_consensus_config<Path: AsRef<std::path::Path> + Send>(
     // set.
     #[cfg(all(feature = "reth-libmdbx", not(feature = "redb")))]
     return _open_mdbx(store_path, consensus_db_config);
+    // redb has no MDBX config to consume.
+    #[cfg(feature = "redb")]
+    let _ = consensus_db_config;
     #[cfg(feature = "redb")]
     return _open_redb(store_path);
     panic!("No DB configured!")
@@ -269,6 +282,7 @@ fn open_default_tables<DB: Database>(db: &mut DB) -> eyre::Result<()> {
     open_one::<EpochRecords>(db)?;
     open_one::<EpochCerts>(db)?;
     open_one::<EpochRecordsIndex>(db)?;
+    open_one::<PendingEpochRecord>(db)?;
     open_one::<EpochTransitionCheckpoints>(db)?;
     open_one::<KadRecords>(db)?;
     open_one::<KadProviderRecords>(db)?;
@@ -450,7 +464,8 @@ mod test {
         db.insert::<TestTable>(&123, &"123".to_string()).expect("Failed to insert");
         db.insert::<TestTable>(&456, &"456".to_string()).expect("Failed to insert");
         db.insert::<TestTable>(&789, &"789".to_string()).expect("Failed to insert");
-        db.sync_persist().expect("persist"); // Either a no-op or a chance for write ops to catch up.
+        db.sync_persist().expect("persist"); // Either a no-op or a chance for write ops to catch
+                                             // up.
 
         // Skip all smaller
         let key_vals: Vec<_> = db.skip_to::<TestTable>(&456).expect("Seek failed").collect();
@@ -474,7 +489,8 @@ mod test {
         txn.insert::<TestTable>(&456, &"456".to_string()).expect("Failed to insert");
         txn.insert::<TestTable>(&789, &"789".to_string()).expect("Failed to insert");
         txn.commit().unwrap();
-        db.sync_persist().expect("persist"); // Either a no-op or a chance for write ops to catch up.
+        db.sync_persist().expect("persist"); // Either a no-op or a chance for write ops to catch
+                                             // up.
 
         // Skip to the one before the end
         let key_val = db.record_prior_to::<TestTable>(&999).expect("Seek failed");
@@ -493,8 +509,10 @@ mod test {
             }
         }
         txn.commit().unwrap();
-        db.sync_persist().expect("persist"); // Either a no-op or a chance for write ops to catch up.
-                                             // Skip prior to will return an iterator starting with an "unexpected" key if the sought one
+        db.sync_persist().expect("persist"); // Either a no-op or a chance for write ops to catch
+                                             // up.
+                                             // Skip prior to will return an iterator starting with
+                                             // an "unexpected" key if the sought one
                                              // is not in the table
         let val = db.record_prior_to::<TestTable>(&50).map(|(k, _)| k).unwrap();
         assert_eq!(49, val);
@@ -566,12 +584,14 @@ mod test {
             txn.insert::<TestTable>(&key, &val).expect("Failed to batch insert");
         }
         txn.commit().unwrap();
-        db.sync_persist().expect("persist"); // Either a no-op or a chance for write ops to catch up.
+        db.sync_persist().expect("persist"); // Either a no-op or a chance for write ops to catch
+                                             // up.
 
         // Check we have multiple entries
         assert!(db.iter::<TestTable>().count() > 1);
         let _ = db.clear_table::<TestTable>();
-        db.sync_persist().expect("persist"); // Either a no-op or a chance for write ops to catch up.
+        db.sync_persist().expect("persist"); // Either a no-op or a chance for write ops to catch
+                                             // up.
         assert_eq!(db.iter::<TestTable>().count(), 0);
         // Clear again to ensure safety when clearing empty map
         let _ = db.clear_table::<TestTable>();
@@ -580,7 +600,8 @@ mod test {
         let _ = db.insert::<TestTable>(&1, &"e".to_string());
         assert_eq!(db.iter::<TestTable>().count(), 1);
         let _ = db.clear_table::<TestTable>();
-        db.sync_persist().expect("persist"); // Either a no-op or a chance for write ops to catch up.
+        db.sync_persist().expect("persist"); // Either a no-op or a chance for write ops to catch
+                                             // up.
         assert_eq!(db.iter::<TestTable>().count(), 0);
     }
 
@@ -602,7 +623,8 @@ mod test {
 
         // Clear again to ensure empty works after clearing
         let _ = db.clear_table::<TestTable>();
-        db.sync_persist().expect("persist"); // Either a no-op or a chance for write ops to catch up.
+        db.sync_persist().expect("persist"); // Either a no-op or a chance for write ops to catch
+                                             // up.
         assert_eq!(db.iter::<TestTable>().count(), 0);
         assert!(db.is_empty::<TestTable>());
     }
@@ -640,8 +662,10 @@ mod test {
             txn.remove::<TestTable>(&key).expect("Failed to batch remove");
         }
         txn.commit().unwrap();
-        db.sync_persist().expect("persist"); // Either a no-op or a chance for write ops to catch up.
-                                             // Rayls: Asserting against fetched items, due to chaining of in memory and persistent db,
+        db.sync_persist().expect("persist"); // Either a no-op or a chance for write ops to catch
+                                             // up.
+                                             // Rayls: Asserting against fetched items, due to
+                                             // chaining of in memory and persistent db,
                                              // resulting in double iter size.
         for (k, _) in (0..101).map(|i| (i, i.to_string())).take(50) {
             let val = db.get::<TestTable>(&k).expect("Failed to get removed key");
@@ -654,4 +678,11 @@ mod test {
             assert_eq!(Some(v), val);
         }
     }
+}
+
+/// Anchor for the dev-dependencies that only this crate's own test and bench
+/// targets consume; without it, lib-test builds warn that they are unused.
+#[cfg(test)]
+mod clippy {
+    use criterion as _;
 }

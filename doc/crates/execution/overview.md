@@ -290,6 +290,7 @@ Adds a `rayls` JSON-RPC namespace with Rayls-specific endpoints not covered by `
 | `rayls_genesis` | Chain genesis |
 | `rayls_epochRecord` | `EpochRecord` + `EpochCertificate` by epoch number |
 | `rayls_epochRecordByHash` | `EpochRecord` + `EpochCertificate` by epoch hash |
+| `rayls_nodeStatus` | Node role and sync status |
 
 ---
 

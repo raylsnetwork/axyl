@@ -56,7 +56,6 @@ where
     N: Send + Sync + 'static,
 {
     async fn latest_header(&self) -> RaylsNetworkRpcResult<ConsensusHeader> {
-        // TODO fix me (JSON won't serialize)- issue 375.
         Ok(self.inner_node_network.get_latest_consensus_block())
     }
 

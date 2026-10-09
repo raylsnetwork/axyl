@@ -13,7 +13,7 @@
 //! - Result is always > committee_members / 2 (majority)
 //! - Result is always <= committee_members (can't require more than exist)
 //!
-//! Run: cargo +nightly fuzz run quorum_threshold
+//! Run: cargo +nightly-2026-06-24 fuzz run quorum_threshold
 
 #![no_main]
 use libfuzzer_sys::fuzz_target;

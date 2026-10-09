@@ -60,7 +60,7 @@ cargo build --bin rayls-network --release --features dev-single-node-setup
 target/release/rayls-network dev --datadir /tmp/rayls-dev
 ```
 
-This bootstraps an empty datadir into a single-validator, gasless chain (chain-id `2017`) with HTTP RPC on `http://127.0.0.1:8545` and a status/explorer dashboard at `http://127.0.0.1:8550`. Dev mode lives behind the `dev-single-node-setup` Cargo feature (off by default, so production builds exclude it). See [`doc/dev-mode.md`](doc/dev-mode.md) for pre-funded accounts and wallet setup. For local development only — not for production.
+This bootstraps an empty datadir into a single-validator, gasless chain (the `local` network, chain-id `487`) with HTTP RPC on `http://127.0.0.1:8545` and a status/explorer dashboard at `http://127.0.0.1:8550`. Dev mode lives behind the `dev-single-node-setup` Cargo feature (off by default, so production builds exclude it). See [`doc/dev-mode.md`](doc/dev-mode.md) for pre-funded accounts and wallet setup. For local development only — not for production.
 
 ### Run an observer against testnet
 
@@ -87,12 +87,9 @@ Start your observer node, with a `DATADIR` and passphrase matching the step abov
 target/release/rayls-network node -vvv \
     --http \
     --observer \
-    --chain testnet \
     --bls-passphrase-source ask \
     --datadir DATADIR
 ```
-
-The only valid values for `--chain` are `testnet` and `mainnet`; the embedded chain spec is selected from the value.
 
 ### Run a local multi-validator network
 
@@ -128,13 +125,14 @@ cd axyl
 cargo build --release
 ```
 
-The toolchain is pinned to Rust 1.91 via [`rust-toolchain.toml`](./rust-toolchain.toml). `make pr` runs the same fmt + clippy + test gate as CI (fmt and clippy require a nightly toolchain); `make test` runs the test suite alone.
+The toolchain is pinned to Rust 1.91 via [`rust-toolchain.toml`](./rust-toolchain.toml). `make pr` runs the same fmt + clippy + test gate as CI (fmt and clippy run on the date-pinned nightly set by the `NIGHTLY` variable in the [`Makefile`](./Makefile) — the same nightly CI uses for the fmt check and fuzzing); `make test` runs the test suite alone.
 
 Documentation lives in [`doc/`](doc/):
 
 - [System overview](doc/index.md) — architecture, transaction flow, database tables, RPC.
 - [Crate index](doc/crates/index.md) — every workspace crate with per-domain overviews.
 - [Dev mode](doc/dev-mode.md), [gasless mode](doc/gasless-mode.md), [node lifecycle](doc/node-lifecycle.md).
+- [Hardfork config file](docs/config-file.md) — run a private chain or schedule a hardfork with `--config-file` / `--subnet`.
 
 Contributions are welcome — see [CONTRIBUTING.md](./CONTRIBUTING.md) and our [Code of Conduct](./CODE_OF_CONDUCT.md).
 

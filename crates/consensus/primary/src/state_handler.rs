@@ -37,28 +37,15 @@ impl StateHandler {
         );
     }
 
-    async fn handle_sequenced(
-        &mut self,
-        commit_round: Round,
-        certificates: Vec<(Certificate, bool)>,
-    ) {
-        // Now we are going to signal which of our own batches have been committed, carrying each
-        // one's boundary-drop flag so the proposer cleans pre-boundary headers but keeps dropped
-        // ones for rescue.
-        let own_rounds_committed: Vec<(Round, bool)> = certificates
+    async fn handle_sequenced(&mut self, commit_round: Round, certificates: Vec<Certificate>) {
+        // report which of this authority's own headers the commit covered
+        let own_rounds_committed: Vec<Round> = certificates
             .iter()
-            .filter_map(|(cert, dropped)| {
-                if cert.header().author() == &self.authority_id {
-                    Some((cert.header().round(), *dropped))
-                } else {
-                    None
-                }
-            })
+            .filter(|cert| cert.header().author() == &self.authority_id)
+            .map(|cert| cert.header().round())
             .collect();
         debug!(target: "primary::state_handler", "Own committed rounds {:?} at round {:?}", own_rounds_committed, commit_round);
 
-        // If a reporting channel is available send the committed own
-        // headers to it.
         if let Err(e) = self
             .consensus_bus
             .committed_own_headers()

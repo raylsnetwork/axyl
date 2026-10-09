@@ -22,8 +22,16 @@ use tracing::{debug, info, warn};
 static LOCAL_MIN_REQUEST_SIZE: LazyLock<usize> =
     LazyLock::new(|| encode(&Certificate::default()).len());
 /// The minimal response wrapper using a default, empty message.
-static MESSAGE_OVERHEAD: LazyLock<usize> =
-    LazyLock::new(|| encode(&PrimaryResponse::RequestedCertificates(vec![])).len());
+///
+/// Measured on an empty vector, so it accounts for a single-byte ULEB128 length. A response
+/// carrying 128 or more certificates encodes a wider length prefix, so reserve the widest a
+/// `usize` count can take rather than under-reserving by a few bytes at the cap.
+static MESSAGE_OVERHEAD: LazyLock<usize> = LazyLock::new(|| {
+    encode(&PrimaryResponse::RequestedCertificates(vec![])).len() + ULEB128_MAX_EXTRA_BYTES
+});
+
+/// Widest additional ULEB128 length prefix beyond the single byte an empty vector encodes.
+const ULEB128_MAX_EXTRA_BYTES: usize = 9;
 
 #[cfg(test)]
 #[path = "../tests/cert_collector_tests.rs"]
@@ -61,7 +69,7 @@ pub(crate) struct CertificateCollector<DB> {
     staging_size: usize,
     /// The round currently being staged.
     staging_round: Option<Round>,
-    /// Optional exclusive upper bound — stop fetching at or above this round.
+    /// Optional exclusive upper bound - stop fetching at or above this round.
     exclusive_upper_bound: Option<Round>,
 }
 
@@ -69,7 +77,7 @@ impl<DB> CertificateCollector<DB>
 where
     DB: Database,
 {
-    /// Create a new certificate collector with the given parameters
+    /// Create a new certificate collector with the given parameters.
     pub(crate) fn new(
         request: MissingCertificatesRequest,
         config: ConsensusConfig<DB>,
@@ -175,7 +183,7 @@ where
         Ok(None)
     }
 
-    /// Try to fetch the next available certificate
+    /// Try to fetch the next available certificate.
     pub(crate) fn next_certificate(&mut self) -> PrimaryNetworkResult<Option<Certificate>> {
         while let Some(Reverse((round, origin))) = self.fetch_queue.pop() {
             match self.config.node_storage().read_by_index(&origin, round)? {
@@ -289,7 +297,10 @@ where
             }
             match self.next_certificate() {
                 Ok(Some(cert)) => {
-                    let bytes = encode(&cert).len();
+                    // Size the certificate without building the bytes: the codec encodes the
+                    // response anyway, so encoding here would serialize every certificate served
+                    // twice.
+                    let bytes = bcs::serialized_size(&cert).unwrap_or_else(|_| encode(&cert).len());
                     match self.stage_certificate(cert, bytes) {
                         Staging::Continue => {}
                         Staging::Yield => return self.ready.pop_front().map(Ok),

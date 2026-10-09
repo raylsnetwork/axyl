@@ -81,9 +81,13 @@ pub trait CertificateStore {
     fn after_round(&self, round: Round, timeout: ReadTimeout) -> StoreResult<Vec<Certificate>>;
 
     /// Retrieves origins with certificates in each round >= the provided round.
+    ///
+    /// `timeout` controls whether this scan is subject to the read-transaction
+    /// timeout; recovery-path callers pass [`ReadTimeout::Exempt`].
     fn origins_after_round(
         &self,
         round: Round,
+        timeout: ReadTimeout,
     ) -> StoreResult<BTreeMap<Round, Vec<AuthorityIdentifier>>>;
 
     /// Retrieves the certificates of the last round and the round before that
@@ -286,10 +290,17 @@ impl<DB: Database> CertificateStore for DB {
     fn origins_after_round(
         &self,
         round: Round,
+        timeout: ReadTimeout,
     ) -> StoreResult<BTreeMap<Round, Vec<AuthorityIdentifier>>> {
         // Collect results within a properly scoped read transaction
         // to ensure MDBX can reclaim dirty pages after the iterator completes
         self.with_read_txn(|txn| {
+            if timeout == ReadTimeout::Exempt {
+                // Bounded recovery scan: opt out of the read-txn cap so a transient I/O
+                // stall can't force-reset the txn mid-recovery and silently truncate the
+                // origin set, causing the cert_fetcher to re-fetch certs it already has.
+                txn.disable_long_read_safety();
+            }
             // Skip to a row at or before the requested round.
             let iter = if round > 0 {
                 txn.skip_to::<CertificateDigestByRound>(&(

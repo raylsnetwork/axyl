@@ -1,5 +1,6 @@
 //! Process-level node management for validator and observer nodes.
 
+use crate::TEST_NETWORK;
 use escargot::CargoRun;
 use nix::{
     sys::signal::{self, Signal},
@@ -203,7 +204,11 @@ fn spawn_validator_process(
         .arg("--http.port")
         .arg(format!("{rpc_port}"))
         // v1 (plain) storage is no longer supported -- the node refuses to start without this
-        .arg("--storage.v2");
+        .arg("--storage.v2")
+        // Must match the ceremony's `--chain-id` (TEST_NETWORK) - external nodes without a
+        // schedule refuse to boot.
+        .arg("--network")
+        .arg(TEST_NETWORK.to_string());
 
     command.spawn().expect("failed to spawn validator process")
 }
@@ -235,7 +240,9 @@ fn spawn_observer_process(
         .arg("--http.port")
         .arg(format!("{rpc_port}"))
         // v1 (plain) storage is no longer supported -- the node refuses to start without this
-        .arg("--storage.v2");
+        .arg("--storage.v2")
+        .arg("--network")
+        .arg(TEST_NETWORK.to_string());
 
     command.spawn().expect("failed to spawn observer process")
 }

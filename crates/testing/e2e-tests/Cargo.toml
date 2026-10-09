@@ -35,6 +35,7 @@ escargot = { workspace = true }
 reth = { workspace = true }
 tempfile = { workspace = true }
 serde_json = { workspace = true }
+serde_yaml = { workspace = true }
 rand_chacha = { workspace = true }
 alloy = { workspace = true }
 rand = { workspace = true }

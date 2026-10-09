@@ -36,8 +36,13 @@ use tracing::{debug, error, info, warn};
 
 use crate::batch::BatchOrdering;
 
-/// Maximum queued outputs for execution.
-const MAX_QUEUED_OUTPUTS: usize = 100;
+/// Admission ceiling for the local execution queue.
+///
+/// At the ceiling the engine stops draining its inbound channel instead of growing the queue, so
+/// execution lag backs up the channel and reaches consensus as backpressure rather than being
+/// absorbed as memory (each queued output owns its transaction payloads). Nothing is dropped:
+/// unadmitted outputs wait in the channel until the queue drains.
+pub const MAX_QUEUED_OUTPUTS: usize = 100;
 
 /// Type alias for the blocking task that executes consensus output and returns the finalized
 /// [`SealedHeader`].
@@ -111,7 +116,7 @@ const DIGEST_RECONSTRUCTION_DEPTH: u64 = 2000;
 /// An empty EVM block can mean two different things, and `consensus_db` (the batch's transactions)
 /// plus current EVM state are consulted to tell them apart: a batch whose txns are still PENDING
 /// (nonce-too-high) must be re-enabled for retry (`drop_digest`), but a batch whose txns are
-/// already MINED (nonce-too-low — it was only a stale reproposal) must stay registered, otherwise
+/// already MINED (nonce-too-low - it was only a stale reproposal) must stay registered, otherwise
 /// a restart re-executes it and forks the chain.
 pub fn reconstruct_batch_digests<CDB: Database>(
     reth_env: &RethEnv,
@@ -190,6 +195,7 @@ impl<DB: Database> ExecutorEngine<DB> {
         engine_idle_tx: Option<watch::Sender<bool>>,
         last_consensus_header: ConsensusHeader,
         executed_batch_registry: ExecutedBatchRegistry,
+        in_flight_tracker: rayls_execution_evm::in_flight::InFlightTracker,
     ) -> Self {
         let consensus_output_stream = ReceiverStream::new(rx_consensus_output);
 
@@ -200,6 +206,7 @@ impl<DB: Database> ExecutorEngine<DB> {
             executed_batch_registry,
             batch_ordering,
             gas_limit,
+            in_flight_tracker,
         );
 
         // Seed the dedup anchor from the last executed consensus header. A genesis/default
@@ -243,6 +250,7 @@ impl<DB: Database> ExecutorEngine<DB> {
         batch_tracker_arg: Option<Arc<BatchTracker>>,
         gas_limit: u64,
         batch_ordering: BatchOrdering<DB>,
+        in_flight_tracker: rayls_execution_evm::in_flight::InFlightTracker,
     ) -> Self {
         Self::new(
             reth_env,
@@ -259,6 +267,7 @@ impl<DB: Database> ExecutorEngine<DB> {
             None,
             ConsensusHeader::default(),
             ExecutedBatchRegistry::default(),
+            in_flight_tracker,
         )
     }
 
@@ -375,8 +384,16 @@ impl<DB: Database> Future for ExecutorEngine<DB> {
         }
 
         loop {
-            // check if output is available from consensus to keep broadcast stream from "lagging"
-            match this.consensus_output_stream.poll_next_unpin(cx) {
+            // At capacity, leave the output in the inbound channel: that is what carries the
+            // backpressure to consensus (see [`MAX_QUEUED_OUTPUTS`]). No waker is registered on
+            // the stream here; the pending execution task wakes the engine when it completes, and
+            // admission resumes once the queue has room.
+            let poll = if this.queued.len() >= MAX_QUEUED_OUTPUTS {
+                Poll::Pending
+            } else {
+                this.consensus_output_stream.poll_next_unpin(cx)
+            };
+            match poll {
                 Poll::Ready(Some((came_from, output))) => {
                     // Dedup and order on the deterministic `(epoch, leader_round)` + subdag
                     // digest, not the node-local `number` (which can drift across handoffs).
@@ -477,18 +494,7 @@ impl<DB: Database> Future for ExecutorEngine<DB> {
                         tracker.output_received(output.number);
                     }
 
-                    // Warn if queue is growing too large - indicates execution lag
-                    if this.queued.len() >= MAX_QUEUED_OUTPUTS {
-                        warn!(
-                            target: "engine",
-                            queue_size = this.queued.len(),
-                            "Execution queue at capacity ({MAX_QUEUED_OUTPUTS}), \
-                             consensus is producing faster than execution can consume"
-                        );
-                    }
                     // Queue the output for local execution.
-                    // We accept even when at capacity to preserve consensus correctness,
-                    // but the warning above indicates a performance issue.
                     this.queued.push_back((came_from, output))
                 }
                 Poll::Ready(None) => {
@@ -534,7 +540,7 @@ impl<DB: Database> Future for ExecutorEngine<DB> {
                             Ok(header) => header,
                             // ONLY a closed result channel during shutdown is benign: the blocking
                             // execution task was torn down before sending, so no block was
-                            // finalized. Every other error — including ConsensusFork — propagates
+                            // finalized. Every other error - including ConsensusFork - propagates
                             // even during shutdown, and a closed channel outside shutdown (the
                             // execution task panicked) is a real fault.
                             Err(RLEngineError::ChannelClosed) if this.shutdown_requested => {

@@ -5,13 +5,15 @@
 use crate::{
     codec::{RLCodec, RLMessage},
     consensus::behaviour::RLBehavior,
-    types::{KadQuery, NetworkCommand, NetworkEvent, NetworkResult, NodeRecord},
+    types::{ConnectionPath, KadQuery, NetworkCommand, NetworkEvent, NetworkResult, NodeRecord},
     NetworkMetrics,
 };
 use libp2p::{
+    core::transport::ListenerId,
     kad::QueryId,
     request_response::{InboundRequestId, OutboundRequestId},
-    PeerId, Swarm,
+    swarm::ConnectionId,
+    Multiaddr, PeerId, Swarm,
 };
 use rayls_infrastructure_config::{KeyConfig, LibP2pConfig};
 use rayls_infrastructure_types::{BlsPublicKey, Database, RaylsSender, TaskSpawner};
@@ -30,7 +32,7 @@ mod command;
 mod constructor;
 mod debug;
 mod gossip;
-mod kad;
+pub(crate) mod kad;
 mod maintenance;
 mod peer_events;
 mod reqres;
@@ -91,18 +93,26 @@ where
     /// The collection of kademlia record requests.
     ///
     /// When the application layer makes a request, the swarm stores the kad::QueryId and the
-    /// the bls key associated with the desired authority's [NodeRecord]. The query runs until
+    /// bls key associated with the desired authority's [NodeRecord]. The query runs until
     /// the last step. During this time, results are tracked and compared to one another to
     /// ensure the latest valid record is used for the peer's info.
     kad_record_queries: HashMap<QueryId, KadQuery>,
-    /// Kad queries that are expected to fail because of having 0 peers
+    /// Kad queries that are expected to fail because of having 0 peers.
     kad_expecting_to_fail_query_ids: HashSet<QueryId>,
+    /// Fixed-window count of inbound kad PutRecord requests per peer, as `(window start in
+    /// seconds, puts seen)`.
+    ///
+    /// Every put reaching the verify path costs a BLS verification on the swarm event loop and a
+    /// validly signed replay earns no penalty, so without a budget one peer can convert puts into
+    /// event-loop CPU at will. Honest nodes republish their record on the order of minutes, so the
+    /// budget only bites floods.
+    pub(super) kad_put_budget: HashMap<PeerId, (u64, u32)>,
     /// The configurables for the libp2p consensus network implementation.
     config: LibP2pConfig,
     /// Track peers we have a connection with.
     ///
-    /// This explicitly tracked and is a VecDeque so we can use to round robin requests without an
-    /// explicit peer.
+    /// Tracked explicitly as a VecDeque so requests can round-robin over peers when the caller
+    /// names none.
     connected_peers: VecDeque<PeerId>,
     /// Key manager, provide the BLS public key and sign peer records published to kademlia.
     key_config: KeyConfig,
@@ -114,8 +124,23 @@ where
     node_record: NodeRecord,
     /// Last time cleanup was performed for time-based cleanup.
     last_cleanup: Instant,
-    ///Network metrics for the peer manager
+    /// Network metrics for the peer manager.
     network_metrics: Arc<NetworkMetrics>,
     /// A label for the network to use in metrics.
     network_label: &'static str,
+    /// Desired relay reservations (the `/p2p-circuit` addresses passed to `StartListening`), each
+    /// mapped to its listener id while the reservation is established. `None` marks a reservation
+    /// whose relay went away; `retry_relay_reservations` re-issues it so a returning relay
+    /// restores reachability without a restart.
+    relay_reservations: HashMap<Multiaddr, Option<ListenerId>>,
+    /// The transport path each live connection was established over, classified once at
+    /// `ConnectionEstablished` and removed on `ConnectionClosed`.
+    ///
+    /// Lets every request/response be attributed to the path it traveled (circuit vs direct), the
+    /// audit trail proving a relayed-only node exchanges consensus messages exclusively through
+    /// its relays.
+    connection_paths: HashMap<ConnectionId, ConnectionPath>,
+    /// Resolver for `/dnsaddr` committee peers, used to discover (and prune-protect) the relays a
+    /// node dials through -- so the relay set is learned from DNS rather than configured.
+    relay_resolver: hickory_resolver::TokioResolver,
 }

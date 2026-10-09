@@ -941,7 +941,7 @@ dependencies = [
  "alloy-transport",
  "futures",
  "http 1.4.0",
- "rustls 0.23.37",
+ "rustls 0.23.45",
  "serde_json",
  "tokio",
  "tokio-tungstenite",
@@ -1029,7 +1029,7 @@ version = "1.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "40c48f72fd53cd289104fc64099abca73db4166ad86ea0b4341abe65af83dadc"
 dependencies = [
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1040,7 +1040,7 @@ checksum = "291e6a250ff86cd4a820112fb8898808a366d8f9f58ce16d1f538353ad55747d"
 dependencies = [
  "anstyle",
  "once_cell_polyfill",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1565,9 +1565,9 @@ checksum = "c08606f8c3cbf4ce6ec8e28fb0014a2c086708fe954eaa885384a6165172e7e8"
 
 [[package]]
 name = "aws-lc-rs"
-version = "1.16.2"
+version = "1.18.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a054912289d18629dc78375ba2c3726a3afe3ff71b4edba9dedfca0e3446d1fc"
+checksum = "b281d307588d634de920874890732659e2e7672f72b5e10e81badc1a8a83621e"
 dependencies = [
  "aws-lc-sys",
  "zeroize",
@@ -1575,14 +1575,15 @@ dependencies = [
 
 [[package]]
 name = "aws-lc-sys"
-version = "0.39.1"
+version = "0.45.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "83a25cf98105baa966497416dbd42565ce3a8cf8dbfd59803ec9ad46f3126399"
+checksum = "9bff6c3b54fad79a2e60b8102caf565819711497c1f5f092f49508e2f5c31b27"
 dependencies = [
  "cc",
  "cmake",
  "dunce",
  "fs_extra",
+ "pkg-config",
 ]
 
 [[package]]
@@ -1846,6 +1847,15 @@ dependencies = [
  "serde",
  "tap",
  "wyz",
+]
+
+[[package]]
+name = "blake2"
+version = "0.10.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "46502ad458c9a52b69d4d4d32775c788b7a1b85e8bc9d482d92250fc0e3f8efe"
+dependencies = [
+ "digest 0.10.7",
 ]
 
 [[package]]
@@ -2281,8 +2291,32 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "613afe47fcd5fac7ccf1db93babcb082c5994d996f20b8b159f2ad1658eb5724"
 
 [[package]]
+name = "chacha20"
+version = "0.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c3613f74bd2eac03dad61bd53dbe620703d4371614fe0bc3b9f04dd36fe4e818"
+dependencies = [
+ "cfg-if",
+ "cipher",
+ "cpufeatures 0.2.17",
+]
+
+[[package]]
+name = "chacha20poly1305"
+version = "0.10.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "10cd79432192d1c0f4e1a0fef9527696cc039165d729fb41b3f4f4f354c2dc35"
+dependencies = [
+ "aead",
+ "chacha20",
+ "cipher",
+ "poly1305",
+ "zeroize",
+]
+
+[[package]]
 name = "chaos-framework"
-version = "1.3.0"
+version = "1.5.0"
 dependencies = [
  "clap",
  "const-hex",
@@ -2351,6 +2385,7 @@ checksum = "773f3b9af64447d2ce9850330c473515014aa235e6a783b02db81ff39e4a3dad"
 dependencies = [
  "crypto-common",
  "inout",
+ "zeroize",
 ]
 
 [[package]]
@@ -2545,7 +2580,7 @@ dependencies = [
 
 [[package]]
 name = "consensus-metrics"
-version = "1.3.0"
+version = "1.5.0"
 dependencies = [
  "axum 0.8.8",
  "futures",
@@ -3017,7 +3052,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7ab67060fc6b8ef687992d439ca0fa36e7ed17e9a0b16b25b601e8757df720de"
 dependencies = [
  "data-encoding",
- "syn 1.0.109",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -3234,7 +3269,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users 0.5.2",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3346,7 +3381,7 @@ dependencies = [
 
 [[package]]
 name = "e2e-tests"
-version = "1.3.0"
+version = "1.5.0"
 dependencies = [
  "alloy",
  "clap",
@@ -3371,6 +3406,7 @@ dependencies = [
  "reth",
  "secp256k1 0.31.1",
  "serde_json",
+ "serde_yaml",
  "tempfile",
  "tokio",
  "tonic 0.13.1",
@@ -3553,7 +3589,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3697,6 +3733,18 @@ name = "fast-float2"
 version = "0.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8eb564c5c7423d25c886fb561d1e4ee69f72354d16918afa32c08811f6b6a55"
+
+[[package]]
+name = "fastbloom"
+version = "0.14.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4e7f34442dbe69c60fe8eaf58a8cafff81a1f278816d8ab4db255b3bef4ac3c4"
+dependencies = [
+ "getrandom 0.3.4",
+ "libm",
+ "rand 0.9.3",
+ "siphasher",
+]
 
 [[package]]
 name = "fastrand"
@@ -3989,7 +4037,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a8f2f12607f92c69b12ed746fabf9ca4f5c482cba46679c1a75b874ed7c26adb"
 dependencies = [
  "futures-io",
- "rustls 0.23.37",
+ "rustls 0.23.45",
  "rustls-pki-types",
 ]
 
@@ -4619,7 +4667,7 @@ dependencies = [
  "hyper 1.9.0",
  "hyper-util",
  "log",
- "rustls 0.23.37",
+ "rustls 0.23.45",
  "rustls-native-certs",
  "rustls-pki-types",
  "tokio",
@@ -5076,7 +5124,7 @@ checksum = "3640c1c38b8e4e43584d8df18be5fc6b0aa314ce6ebf51b53313d4306cca8e46"
 dependencies = [
  "hermit-abi",
  "libc",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -5224,7 +5272,7 @@ dependencies = [
  "http 1.4.0",
  "jsonrpsee-core",
  "pin-project 1.1.11",
- "rustls 0.23.37",
+ "rustls 0.23.45",
  "rustls-pki-types",
  "rustls-platform-verifier 0.5.3",
  "soketto",
@@ -5277,7 +5325,7 @@ dependencies = [
  "hyper-util",
  "jsonrpsee-core",
  "jsonrpsee-types",
- "rustls 0.23.37",
+ "rustls 0.23.45",
  "rustls-platform-verifier 0.5.3",
  "serde",
  "serde_json",
@@ -5507,15 +5555,20 @@ dependencies = [
  "libp2p-core",
  "libp2p-dns",
  "libp2p-gossipsub",
+ "libp2p-identify",
  "libp2p-identity",
  "libp2p-kad",
  "libp2p-mdns",
  "libp2p-metrics",
+ "libp2p-noise",
+ "libp2p-ping",
  "libp2p-quic",
+ "libp2p-relay",
  "libp2p-request-response",
  "libp2p-swarm",
  "libp2p-tcp",
  "libp2p-upnp",
+ "libp2p-yamux",
  "multiaddr",
  "pin-project 1.1.11",
  "rw-stream-sink",
@@ -5617,6 +5670,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "libp2p-identify"
+version = "0.47.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8ab792a8b68fdef443a62155b01970c81c3aadab5e659621b063ef252a8e65e8"
+dependencies = [
+ "asynchronous-codec",
+ "either",
+ "futures",
+ "futures-bounded",
+ "futures-timer",
+ "libp2p-core",
+ "libp2p-identity",
+ "libp2p-swarm",
+ "quick-protobuf",
+ "quick-protobuf-codec",
+ "smallvec",
+ "thiserror 2.0.18",
+ "tracing",
+]
+
+[[package]]
 name = "libp2p-identity"
 version = "0.2.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5693,8 +5767,11 @@ dependencies = [
  "futures",
  "libp2p-core",
  "libp2p-gossipsub",
+ "libp2p-identify",
  "libp2p-identity",
  "libp2p-kad",
+ "libp2p-ping",
+ "libp2p-relay",
  "libp2p-swarm",
  "pin-project 1.1.11",
  "prometheus-client",
@@ -5702,10 +5779,49 @@ dependencies = [
 ]
 
 [[package]]
-name = "libp2p-quic"
-version = "0.13.0"
+name = "libp2p-noise"
+version = "0.46.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8dc448b2de9f4745784e3751fe8bc6c473d01b8317edd5ababcb0dec803d843f"
+checksum = "bc73eacbe6462a0eb92a6527cac6e63f02026e5407f8831bde8293f19217bfbf"
+dependencies = [
+ "asynchronous-codec",
+ "bytes",
+ "futures",
+ "libp2p-core",
+ "libp2p-identity",
+ "multiaddr",
+ "multihash",
+ "quick-protobuf",
+ "rand 0.8.5",
+ "snow",
+ "static_assertions",
+ "thiserror 2.0.18",
+ "tracing",
+ "x25519-dalek",
+ "zeroize",
+]
+
+[[package]]
+name = "libp2p-ping"
+version = "0.47.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "74bb7fcdfd9fead4144a3859da0b49576f171a8c8c7c0bfc7c541921d25e60d3"
+dependencies = [
+ "futures",
+ "futures-timer",
+ "libp2p-core",
+ "libp2p-identity",
+ "libp2p-swarm",
+ "rand 0.8.5",
+ "tracing",
+ "web-time",
+]
+
+[[package]]
+name = "libp2p-quic"
+version = "0.13.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9dcc597d70bf7f6f30cbe07081802c836184e48416e89e9ce73a0ba2c56a319e"
 dependencies = [
  "futures",
  "futures-timer",
@@ -5714,13 +5830,38 @@ dependencies = [
  "libp2p-identity",
  "libp2p-tls",
  "quinn",
+ "quinn-proto",
  "rand 0.8.5",
  "ring",
- "rustls 0.23.37",
+ "rustls 0.23.45",
  "socket2 0.5.10",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "libp2p-relay"
+version = "0.21.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d8b9b0392ed623243ad298326b9f806d51191829ac7585cc825c54c6c67b04d9"
+dependencies = [
+ "asynchronous-codec",
+ "bytes",
+ "either",
+ "futures",
+ "futures-bounded",
+ "futures-timer",
+ "libp2p-core",
+ "libp2p-identity",
+ "libp2p-swarm",
+ "quick-protobuf",
+ "quick-protobuf-codec",
+ "rand 0.8.5",
+ "static_assertions",
+ "thiserror 2.0.18",
+ "tracing",
+ "web-time",
 ]
 
 [[package]]
@@ -5801,8 +5942,8 @@ dependencies = [
  "libp2p-identity",
  "rcgen",
  "ring",
- "rustls 0.23.37",
- "rustls-webpki 0.103.13",
+ "rustls 0.23.45",
+ "rustls-webpki 0.103.15",
  "thiserror 2.0.18",
  "x509-parser",
  "yasna",
@@ -5821,6 +5962,21 @@ dependencies = [
  "libp2p-swarm",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "libp2p-yamux"
+version = "0.47.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f15df094914eb4af272acf9adaa9e287baa269943f32ea348ba29cfb9bfc60d8"
+dependencies = [
+ "either",
+ "futures",
+ "libp2p-core",
+ "thiserror 2.0.18",
+ "tracing",
+ "yamux 0.12.1",
+ "yamux 0.13.10",
 ]
 
 [[package]]
@@ -6345,6 +6501,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "nohash-hasher"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2bf50223579dc7cdcfb3bfcacf7069ff68243f8c363f62ffa99cf000a6b9c451"
+
+[[package]]
 name = "nom"
 version = "7.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6396,7 +6558,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -7135,6 +7297,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "poly1305"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8159bd90725d2df49889a078b54f4f79e87f1f8a8444194cdca81d38f5393abf"
+dependencies = [
+ "cpufeatures 0.2.17",
+ "opaque-debug",
+ "universal-hash",
+]
+
+[[package]]
 name = "polyval"
 version = "0.6.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7489,7 +7662,7 @@ dependencies = [
  "quinn-proto",
  "quinn-udp",
  "rustc-hash",
- "rustls 0.23.37",
+ "rustls 0.23.45",
  "socket2 0.6.3",
  "thiserror 2.0.18",
  "tokio",
@@ -7505,12 +7678,13 @@ checksum = "4fcb935c5bec503c2f0e306bdd3e58bb9029dcb14fa8d9ac76e3a5256ac0763e"
 dependencies = [
  "aws-lc-rs",
  "bytes",
+ "fastbloom",
  "getrandom 0.3.4",
  "lru-slab",
  "rand 0.9.3",
  "ring",
  "rustc-hash",
- "rustls 0.23.37",
+ "rustls 0.23.45",
  "rustls-pki-types",
  "slab",
  "thiserror 2.0.18",
@@ -7724,7 +7898,7 @@ dependencies = [
 
 [[package]]
 name = "rayls-batch-builder"
-version = "1.3.0"
+version = "1.5.0"
 dependencies = [
  "assert_matches",
  "futures-util",
@@ -7744,7 +7918,7 @@ dependencies = [
 
 [[package]]
 name = "rayls-batch-validator"
-version = "1.3.0"
+version = "1.5.0"
 dependencies = [
  "assert_matches",
  "async-trait",
@@ -7752,7 +7926,6 @@ dependencies = [
  "rayls-execution-evm",
  "rayls-infrastructure-types",
  "rayon",
- "rustc-hash",
  "serial_test",
  "tempfile",
  "tokio",
@@ -7761,7 +7934,7 @@ dependencies = [
 
 [[package]]
 name = "rayls-consensus-network"
-version = "1.3.0"
+version = "1.5.0"
 dependencies = [
  "assert_matches",
  "async-trait",
@@ -7769,6 +7942,7 @@ dependencies = [
  "bs58",
  "eyre",
  "futures",
+ "hickory-resolver",
  "libp2p",
  "prometheus",
  "rand 0.9.3",
@@ -7788,11 +7962,12 @@ dependencies = [
 
 [[package]]
 name = "rayls-consensus-primary"
-version = "1.3.0"
+version = "1.5.0"
 dependencies = [
  "assert_matches",
  "async-trait",
  "backoff",
+ "bcs",
  "consensus-metrics",
  "eyre",
  "futures",
@@ -7819,7 +7994,7 @@ dependencies = [
 
 [[package]]
 name = "rayls-consensus-primary-metrics"
-version = "1.3.0"
+version = "1.5.0"
 dependencies = [
  "consensus-metrics",
  "prometheus",
@@ -7828,7 +8003,7 @@ dependencies = [
 
 [[package]]
 name = "rayls-consensus-state-sync"
-version = "1.3.0"
+version = "1.5.0"
 dependencies = [
  "consensus-metrics",
  "eyre",
@@ -7845,11 +8020,10 @@ dependencies = [
 
 [[package]]
 name = "rayls-consensus-worker"
-version = "1.3.0"
+version = "1.5.0"
 dependencies = [
  "assert_matches",
  "async-trait",
- "consensus-metrics",
  "eyre",
  "futures",
  "indexmap 2.13.0",
@@ -7872,8 +8046,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "rayls-db-inspect"
+version = "1.5.0"
+dependencies = [
+ "alloy",
+ "clap",
+ "comfy-table",
+ "const-hex",
+ "eyre",
+ "indexmap 2.13.0",
+ "rayls-execution-evm",
+ "rayls-infrastructure-config",
+ "rayls-infrastructure-storage",
+ "rayls-infrastructure-types",
+ "rayls-testing-test-utils",
+ "reth-libmdbx",
+ "roaring 0.10.12",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tracing-subscriber 0.3.23",
+]
+
+[[package]]
 name = "rayls-execution-evm"
-version = "1.3.0"
+version = "1.5.0"
 dependencies = [
  "alloy",
  "alloy-evm",
@@ -7886,6 +8083,8 @@ dependencies = [
  "futures",
  "jsonrpsee",
  "parking_lot",
+ "prometheus",
+ "proptest",
  "rand 0.9.3",
  "rayls-consensus-worker",
  "rayls-execution-evm",
@@ -7937,6 +8136,7 @@ dependencies = [
  "secp256k1 0.31.1",
  "serde",
  "serde_json",
+ "serde_yaml",
  "tempfile",
  "thiserror 1.0.69",
  "tokio",
@@ -7945,7 +8145,7 @@ dependencies = [
 
 [[package]]
 name = "rayls-execution-faucet"
-version = "1.3.0"
+version = "1.5.0"
 dependencies = [
  "async-trait",
  "clap",
@@ -7979,7 +8179,7 @@ dependencies = [
 
 [[package]]
 name = "rayls-execution-metrics"
-version = "1.3.0"
+version = "1.5.0"
 dependencies = [
  "eyre",
  "rayls-infrastructure-types",
@@ -7994,7 +8194,7 @@ dependencies = [
 
 [[package]]
 name = "rayls-execution-rpc"
-version = "1.3.0"
+version = "1.5.0"
 dependencies = [
  "async-trait",
  "jsonrpsee",
@@ -8007,7 +8207,7 @@ dependencies = [
 
 [[package]]
 name = "rayls-infrastructure-config"
-version = "1.3.0"
+version = "1.5.0"
 dependencies = [
  "aes-gcm-siv",
  "backoff",
@@ -8031,7 +8231,7 @@ dependencies = [
 
 [[package]]
 name = "rayls-infrastructure-network-types"
-version = "1.3.0"
+version = "1.5.0"
 dependencies = [
  "async-trait",
  "eyre",
@@ -8044,7 +8244,7 @@ dependencies = [
 
 [[package]]
 name = "rayls-infrastructure-storage"
-version = "1.3.0"
+version = "1.5.0"
 dependencies = [
  "criterion",
  "eyre",
@@ -8067,7 +8267,7 @@ dependencies = [
 
 [[package]]
 name = "rayls-infrastructure-types"
-version = "1.3.0"
+version = "1.5.0"
 dependencies = [
  "alloy",
  "async-trait",
@@ -8092,8 +8292,10 @@ dependencies = [
  "reth-primitives",
  "reth-tasks",
  "roaring 0.10.12",
+ "rustc-hash",
  "secp256k1 0.31.1",
  "serde",
+ "serde_json",
  "serde_repr",
  "serde_with",
  "serde_yaml",
@@ -8105,7 +8307,7 @@ dependencies = [
 
 [[package]]
 name = "rayls-infrastructure-utils"
-version = "1.3.0"
+version = "1.5.0"
 dependencies = [
  "futures",
  "parking_lot",
@@ -8114,7 +8316,7 @@ dependencies = [
 
 [[package]]
 name = "rayls-middleware-bridge"
-version = "1.3.0"
+version = "1.5.0"
 dependencies = [
  "consensus-metrics",
  "eyre",
@@ -8135,9 +8337,10 @@ dependencies = [
 
 [[package]]
 name = "rayls-middleware-orchestrator"
-version = "1.3.0"
+version = "1.5.0"
 dependencies = [
  "alloy",
+ "axum 0.8.8",
  "consensus-metrics",
  "eyre",
  "futures",
@@ -8163,7 +8366,6 @@ dependencies = [
  "rayls-middleware-processor",
  "rayls-middleware-rewards",
  "rayls-testing-test-utils",
- "rayon",
  "reth-db",
  "roaring 0.10.12",
  "serde_json",
@@ -8177,7 +8379,7 @@ dependencies = [
 
 [[package]]
 name = "rayls-middleware-processor"
-version = "1.3.0"
+version = "1.5.0"
 dependencies = [
  "assert_matches",
  "eyre",
@@ -8203,7 +8405,7 @@ dependencies = [
 
 [[package]]
 name = "rayls-middleware-rewards"
-version = "1.3.0"
+version = "1.5.0"
 dependencies = [
  "alloy",
  "eyre",
@@ -8220,7 +8422,7 @@ dependencies = [
 
 [[package]]
 name = "rayls-network"
-version = "1.3.0"
+version = "1.5.0"
 dependencies = [
  "clap",
  "rayls-execution-faucet",
@@ -8232,7 +8434,7 @@ dependencies = [
 
 [[package]]
 name = "rayls-network-cli"
-version = "1.3.0"
+version = "1.5.0"
 dependencies = [
  "alloy",
  "bs58",
@@ -8248,6 +8450,8 @@ dependencies = [
  "rayls-infrastructure-types",
  "rayls-middleware-orchestrator",
  "rayon",
+ "reth-db",
+ "reth-stages",
  "rpassword",
  "secp256k1 0.31.1",
  "serde_yaml",
@@ -8258,8 +8462,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "rayls-relay"
+version = "1.5.0"
+dependencies = [
+ "eyre",
+ "futures",
+ "hex",
+ "libp2p",
+ "rayls-infrastructure-config",
+ "tokio",
+ "tracing",
+ "tracing-subscriber 0.3.23",
+ "web-time",
+]
+
+[[package]]
 name = "rayls-replay"
-version = "1.3.0"
+version = "1.5.0"
 dependencies = [
  "clap",
  "eyre",
@@ -8269,6 +8488,7 @@ dependencies = [
  "rayls-infrastructure-config",
  "rayls-infrastructure-storage",
  "rayls-infrastructure-types",
+ "rayls-middleware-rewards",
  "reth-chainspec",
  "serde_yaml",
  "thiserror 1.0.69",
@@ -8280,7 +8500,7 @@ dependencies = [
 
 [[package]]
 name = "rayls-testing-test-utils"
-version = "1.3.0"
+version = "1.5.0"
 dependencies = [
  "clap",
  "eyre",
@@ -8297,7 +8517,7 @@ dependencies = [
 
 [[package]]
 name = "rayls-testing-test-utils-committee"
-version = "1.3.0"
+version = "1.5.0"
 dependencies = [
  "rand 0.9.3",
  "rayls-execution-evm",
@@ -8519,7 +8739,7 @@ dependencies = [
  "percent-encoding",
  "pin-project-lite",
  "quinn",
- "rustls 0.23.37",
+ "rustls 0.23.45",
  "rustls-native-certs",
  "rustls-pki-types",
  "serde",
@@ -8560,7 +8780,7 @@ dependencies = [
  "percent-encoding",
  "pin-project-lite",
  "quinn",
- "rustls 0.23.37",
+ "rustls 0.23.45",
  "rustls-pki-types",
  "rustls-platform-verifier 0.6.2",
  "serde",
@@ -11588,7 +11808,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -11619,16 +11839,16 @@ dependencies = [
 
 [[package]]
 name = "rustls"
-version = "0.23.37"
+version = "0.23.45"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "758025cb5fccfd3bc2fd74708fd4682be41d99e5dff73c377c0646c6012c73a4"
+checksum = "0d41d731c7d2f962d1ccc364cec258de3c0e93b38c2fb3ba97ac74513048d634"
 dependencies = [
  "aws-lc-rs",
  "log",
  "once_cell",
  "ring",
  "rustls-pki-types",
- "rustls-webpki 0.103.13",
+ "rustls-webpki 0.103.15",
  "subtle",
  "zeroize",
 ]
@@ -11684,10 +11904,10 @@ dependencies = [
  "jni",
  "log",
  "once_cell",
- "rustls 0.23.37",
+ "rustls 0.23.45",
  "rustls-native-certs",
  "rustls-platform-verifier-android",
- "rustls-webpki 0.103.13",
+ "rustls-webpki 0.103.15",
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs 0.26.11",
@@ -11705,14 +11925,14 @@ dependencies = [
  "jni",
  "log",
  "once_cell",
- "rustls 0.23.37",
+ "rustls 0.23.45",
  "rustls-native-certs",
  "rustls-platform-verifier-android",
- "rustls-webpki 0.103.13",
+ "rustls-webpki 0.103.15",
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs 1.0.6",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -11744,9 +11964,9 @@ dependencies = [
 
 [[package]]
 name = "rustls-webpki"
-version = "0.103.13"
+version = "0.103.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "61c429a8649f110dddef65e2a5ad240f747e85f7758a6bccc7e5777bd33f756e"
+checksum = "f3c3cf1d8b1e7d4927e2d154c3fcb02979afb9939629c62cd9048d4f07b60ac2"
 dependencies = [
  "aws-lc-rs",
  "ring",
@@ -12368,6 +12588,23 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1b6b67fb9a61334225b5b790716f609cd58395f895b3fe8b328786812a40bc3b"
 
 [[package]]
+name = "snow"
+version = "0.9.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "850948bee068e713b8ab860fe1adc4d109676ab4c3b621fd8147f06b261f2f85"
+dependencies = [
+ "aes-gcm",
+ "blake2",
+ "chacha20poly1305",
+ "curve25519-dalek",
+ "rand_core 0.6.4",
+ "ring",
+ "rustc_version 0.4.1",
+ "sha2",
+ "subtle",
+]
+
+[[package]]
 name = "socket2"
 version = "0.5.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -12384,7 +12621,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3a766e1110788c36f4fa1c2b71b387a7815aa65f88ce0229841826633d93723e"
 dependencies = [
  "libc",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -12619,7 +12856,7 @@ dependencies = [
  "getrandom 0.4.2",
  "once_cell",
  "rustix",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -12860,7 +13097,7 @@ version = "0.26.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1729aa945f29d91ba541258c8df89027d5792d85a8841fb65e8bf0f4ede4ef61"
 dependencies = [
- "rustls 0.23.37",
+ "rustls 0.23.45",
  "tokio",
 ]
 
@@ -12884,7 +13121,7 @@ checksum = "d25a406cddcc431a75d3d9afc6a7c0f7428d4891dd973e4d54c56b46127bf857"
 dependencies = [
  "futures-util",
  "log",
- "rustls 0.23.37",
+ "rustls 0.23.45",
  "rustls-pki-types",
  "tokio",
  "tokio-rustls 0.26.4",
@@ -13363,7 +13600,7 @@ dependencies = [
  "httparse",
  "log",
  "rand 0.9.3",
- "rustls 0.23.37",
+ "rustls 0.23.45",
  "rustls-pki-types",
  "sha1",
  "thiserror 2.0.18",
@@ -14450,6 +14687,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "x25519-dalek"
+version = "2.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c7e468321c81fb07fa7f4c636c3972b9100f0346e5b6a9f2bd0603a52f7ed277"
+dependencies = [
+ "curve25519-dalek",
+ "rand_core 0.6.4",
+ "serde",
+ "zeroize",
+]
+
+[[package]]
 name = "x509-parser"
 version = "0.17.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -14504,6 +14753,37 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "56c1936c4cc7a1c9ab21a1ebb602eb942ba868cbd44a99cb7cdc5892335e1c85"
 dependencies = [
  "linked-hash-map",
+]
+
+[[package]]
+name = "yamux"
+version = "0.12.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9ed0164ae619f2dc144909a9f082187ebb5893693d8c0196e8085283ccd4b776"
+dependencies = [
+ "futures",
+ "log",
+ "nohash-hasher",
+ "parking_lot",
+ "pin-project 1.1.11",
+ "rand 0.8.5",
+ "static_assertions",
+]
+
+[[package]]
+name = "yamux"
+version = "0.13.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1991f6690292030e31b0144d73f5e8368936c58e45e7068254f7138b23b00672"
+dependencies = [
+ "futures",
+ "log",
+ "nohash-hasher",
+ "parking_lot",
+ "pin-project 1.1.11",
+ "rand 0.9.3",
+ "static_assertions",
+ "web-time",
 ]
 
 [[package]]

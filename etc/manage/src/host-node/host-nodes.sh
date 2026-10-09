@@ -7,7 +7,7 @@ function prepareHostEnvironments() {
 
     if [[ "$USE_DOCKER_FOR_HOST_NODES" == "0" ]]; then
         local sourceDir="$SCRIPT_DIR/../.."
-        cd "$sourceDir" && tar -czf "$sourceTar" ./Cargo* ./bin ./crates ./chain-configs ./rayls-contracts ./etc/docker-network/Dockerfile
+        cd "$sourceDir" && tar -czf "$sourceTar" ./Cargo* ./bin ./crates ./rayls-contracts ./etc/docker-network/Dockerfile
     fi
 
 

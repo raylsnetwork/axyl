@@ -6,7 +6,7 @@ use crate::{
     plan::PlanBlock,
 };
 use rayls_execution_evm::{reth_env::RethEnv, ExecutedBlock};
-use rayls_infrastructure_types::{payload::RLPayload, SealedHeader};
+use rayls_infrastructure_types::{payload::RLPayload, Bytes, SealedHeader};
 use std::collections::BTreeMap;
 use tracing::warn;
 
@@ -27,7 +27,7 @@ pub async fn execute_output_group(
     let mut diverged_count = 0u64;
 
     for plan in plans {
-        let (beneficiary, worker_id, transactions): (_, u16, &[Vec<u8>]) =
+        let (beneficiary, worker_id, transactions): (_, u16, &[Bytes]) =
             if let Some(batch) = plan.batch.as_ref() {
                 (batch.beneficiary, batch.worker_id, batch.transactions.as_slice())
             } else {

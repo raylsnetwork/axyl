@@ -84,6 +84,62 @@ pub struct KeygenArgs {
         value_delimiter = ','
     )]
     pub external_worker_addrs: Option<Vec<Multiaddr>>,
+
+    /// Optional circuit-relay-v2 server address to route this node's p2p traffic through.
+    ///
+    /// When set, the node's advertised primary and worker addresses become
+    /// `<relay>/p2p-circuit/p2p/<node-network-key>` instead of direct QUIC addresses. The node
+    /// then reserves a slot on the relay and peers dial it through the relay. This takes
+    /// precedence over `--external-primary-addr` / `--external-worker-addrs`.
+    ///
+    /// The value MUST be the relay server's dialable QUIC multiaddr including its peer id, e.g.
+    /// /ip4/1.2.3.4/udp/4001/quic-v1/p2p/12D3Koo...
+    #[arg(long, value_name = "MULTIADDR", env = "RL_RELAY_ADDR")]
+    pub relay: Option<Multiaddr>,
+
+    /// Advertise this node via a `/dnsaddr` name instead of a concrete relay address.
+    ///
+    /// The node's advertised primary/worker addresses become `/dnsaddr/<host>/p2p/<node-key>`. A
+    /// DNS TXT record at `_dnsaddr.<host>` then lists the actual relay circuit addresses, which
+    /// lets the node be reached through *several* relays (failover) and lets relays change
+    /// without editing committee.yaml. The concrete relays this node reserves on are supplied
+    /// at runtime via `PRIMARY_RELAY_MULTIADDRS` / `WORKER_RELAY_MULTIADDRS`. Takes precedence
+    /// over `--relay`.
+    #[arg(long, value_name = "HOST", env = "RL_ADVERTISE_DNSADDR")]
+    pub advertise_dnsaddr: Option<String>,
+
+    /// Advertise an identity-only `/p2p/<peer-id>` address instead of a dialable one.
+    ///
+    /// Sets `network_address` (for both primary and worker) to a bare `/p2p/<peer-id>`: the node
+    /// still publishes its record and its `committee.yaml` entry, so peers map its `peer_id ->
+    /// bls` and accept its request-response traffic (e.g. serve its batch requests), but the
+    /// address is undialable so nothing ever tries to connect to it. Because that
+    /// `network_address` is not listenable, such a node MUST pin its listen socket via
+    /// `PRIMARY/WORKER_LISTENER_MULTIADDR` at startup (e.g.
+    /// `/ip4/0.0.0.0/udp/<port>/quic-v1`). Intended for outbound-only nodes (observers) that
+    /// must follow consensus but must not be dialed. Overrides any address set by
+    /// `--external-primary-addr` / `--external-worker-addrs` / `--relay` / `--advertise-dnsaddr`.
+    #[arg(long, env = "RL_ADVERTISE_IDENTITY_ONLY")]
+    pub advertise_identity_only: bool,
+}
+
+/// Build a `/dnsaddr/<host>/p2p/<node-peer-id>` advertise address.
+fn dnsaddr_addr(host: &str, node_p2p: Protocol<'_>) -> Multiaddr {
+    Multiaddr::empty().with(Protocol::Dnsaddr(host.into())).with(node_p2p)
+}
+
+/// Build a circuit-relay-v2 address for a node: `<relay>/p2p-circuit/p2p/<node-peer-id>`.
+///
+/// `relay` must be the relay server's dialable QUIC address including its `/p2p/<relay-peer-id>`
+/// segment; `node_p2p` is the node's own `Protocol::P2p(<node-peer-id>)`.
+fn relay_circuit_addr(relay: &Multiaddr, node_p2p: Protocol<'_>) -> eyre::Result<Multiaddr> {
+    if relay.iter().any(|p| matches!(p, Protocol::P2pCircuit)) {
+        eyre::bail!("relay address must not already contain a /p2p-circuit segment: {relay}");
+    }
+    if !relay.iter().any(|p| matches!(p, Protocol::P2p(_))) {
+        eyre::bail!("relay address must include the relay peer id (/p2p/<relay-peer-id>): {relay}");
+    }
+    Ok(relay.clone().with(Protocol::P2pCircuit).with(node_p2p))
 }
 
 impl KeygenArgs {
@@ -105,43 +161,66 @@ impl KeygenArgs {
         // network keypair for authority
         let network_publickey = key_config.primary_network_public_key();
         node_info.p2p_info.primary.network_key = network_publickey.clone();
-        node_info.p2p_info.primary.network_address =
-            if let Some(primary_addr) = &self.external_primary_addr {
-                primary_addr.clone().with_p2p(network_publickey.into()).map_err(|_| {
-                    eyre::eyre!("Primary address already contains a different P2P protocol")
-                })?
-            } else {
-                let primary_udp_port = get_available_udp_port("127.0.0.1").unwrap_or(49584);
-                let addr: Multiaddr =
-                    format!("/ip4/127.0.0.1/udp/{primary_udp_port}/quic-v1").parse()?;
-                addr.with(Protocol::P2p(network_publickey.into()))
-            };
+        node_info.p2p_info.primary.network_address = if let Some(host) = &self.advertise_dnsaddr {
+            dnsaddr_addr(host, Protocol::P2p(network_publickey.clone().into()))
+        } else if let Some(relay) = &self.relay {
+            relay_circuit_addr(relay, Protocol::P2p(network_publickey.clone().into()))?
+        } else if let Some(primary_addr) = &self.external_primary_addr {
+            primary_addr.clone().with_p2p(network_publickey.into()).map_err(|_| {
+                eyre::eyre!("Primary address already contains a different P2P protocol")
+            })?
+        } else {
+            let primary_udp_port = get_available_udp_port("127.0.0.1").unwrap_or(49584);
+            let addr: Multiaddr =
+                format!("/ip4/127.0.0.1/udp/{primary_udp_port}/quic-v1").parse()?;
+            addr.with(Protocol::P2p(network_publickey.into()))
+        };
 
         info!(target: "rl::generate_keys", primary=?node_info.p2p_info.primary.network_address, "updating primary external network address");
 
         // network keypair for workers
         let network_publickey = key_config.worker_network_public_key();
         node_info.p2p_info.worker.network_key = network_publickey.clone();
-        node_info.p2p_info.worker.network_address =
-            if let Some(worker_addrs) = &self.external_worker_addrs {
-                if let Some(worker_addr) = worker_addrs.first() {
-                    worker_addr.clone().with_p2p(network_publickey.into()).map_err(|_| {
-                        eyre::eyre!("worker address already contains a different P2P protocol")
-                    })?
-                } else {
-                    let worker_udp_port = get_available_udp_port("127.0.0.1").unwrap_or(49584);
-                    let addr: Multiaddr =
-                        format!("/ip4/127.0.0.1/udp/{worker_udp_port}/quic-v1").parse()?;
-                    addr.with(Protocol::P2p(network_publickey.into()))
-                }
+        node_info.p2p_info.worker.network_address = if let Some(host) = &self.advertise_dnsaddr {
+            dnsaddr_addr(host, Protocol::P2p(network_publickey.clone().into()))
+        } else if let Some(relay) = &self.relay {
+            relay_circuit_addr(relay, Protocol::P2p(network_publickey.clone().into()))?
+        } else if let Some(worker_addrs) = &self.external_worker_addrs {
+            if let Some(worker_addr) = worker_addrs.first() {
+                worker_addr.clone().with_p2p(network_publickey.into()).map_err(|_| {
+                    eyre::eyre!("worker address already contains a different P2P protocol")
+                })?
             } else {
                 let worker_udp_port = get_available_udp_port("127.0.0.1").unwrap_or(49584);
                 let addr: Multiaddr =
                     format!("/ip4/127.0.0.1/udp/{worker_udp_port}/quic-v1").parse()?;
                 addr.with(Protocol::P2p(network_publickey.into()))
-            };
+            }
+        } else {
+            let worker_udp_port = get_available_udp_port("127.0.0.1").unwrap_or(49584);
+            let addr: Multiaddr =
+                format!("/ip4/127.0.0.1/udp/{worker_udp_port}/quic-v1").parse()?;
+            addr.with(Protocol::P2p(network_publickey.into()))
+        };
 
         info!(target: "rl::generate_keys", worker=?node_info.p2p_info.worker.network_address, "updating worker external network address");
+
+        // Identity-only advertise: overwrite `network_address` (for both primary and worker) with a
+        // bare `/p2p/<peer-id>`. The node still publishes its record and lands in `committee.yaml`,
+        // so peers map its `peer_id -> bls` and accept its request-response traffic, but the
+        // address is undialable so nothing tries to connect to it. It is also not
+        // listenable -- the node binds via `PRIMARY/WORKER_LISTENER_MULTIADDR` at startup
+        // (see the flag docs). Runs last so it overrides any address set above. For
+        // outbound-only nodes (observers).
+        if self.advertise_identity_only {
+            let primary_p2p = Multiaddr::empty()
+                .with(Protocol::P2p(key_config.primary_network_public_key().into()));
+            let worker_p2p = Multiaddr::empty()
+                .with(Protocol::P2p(key_config.worker_network_public_key().into()));
+            node_info.p2p_info.primary.network_address = primary_p2p.clone();
+            node_info.p2p_info.worker.network_address = worker_p2p.clone();
+            info!(target: "rl::generate_keys", primary=?primary_p2p, worker=?worker_p2p, "advertising identity-only /p2p addresses (undialable)");
+        }
         Ok(())
     }
 

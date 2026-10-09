@@ -20,19 +20,15 @@ use rayls_infrastructure_config::LibP2pConfig;
 use rayls_infrastructure_network_types::{local::LocalNetwork, PrimaryToWorkerClient};
 use rayls_infrastructure_storage::CertificateStore;
 use rayls_infrastructure_types::{
-    Address, AuthorityIdentifier, Batch, BlockHash, CameFrom, CertifiedBatch, CommittedSubDag,
-    Committee, ConsensusHeader, ConsensusOutput, Database, Epoch, Hash as _, Noticer,
-    RaylsReceiver, RaylsSender, Round, TaskKind, TaskManager, TaskSpawner, Timestamp, TimestampSec,
-    B256,
+    Address, AuthorityIdentifier, B256Map, B256Set, Batch, BlockHash, CameFrom, CertifiedBatch,
+    CommittedSubDag, Committee, ConsensusHeader, ConsensusOutput, Database, Epoch, Hash as _,
+    Noticer, RaylsReceiver, RaylsSender, Round, TaskKind, TaskManager, TaskSpawner, Timestamp,
+    TimestampSec, B256,
 };
 // production-only: signing the consensus result for gossip
 #[cfg(not(feature = "dev-single-node-setup"))]
 use rayls_infrastructure_types::{encode, to_intent_message, BlsSigner as _};
-use std::{
-    collections::{HashMap, HashSet},
-    sync::Arc,
-    time::Duration,
-};
+use std::{sync::Arc, time::Duration};
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, trace, warn};
 
@@ -78,6 +74,11 @@ pub fn spawn_subscriber<DB: Database>(
     let committee = config.committee().clone();
     let client = config.local_network().clone();
     let mode = *consensus_bus.node_mode().borrow();
+    // Seed the node's own tip watch from the canonical chain tip. This runs at every spawn, so it
+    // also re-anchors after an epoch transition: a header saved during the boundary drain race is
+    // not the tip once the checkpoint is certified (see `consensus_chain_tip`).
+    let tip = consensus_chain_tip(&config).unwrap_or_default();
+    consensus_bus.local_consensus_tip().send_replace(Arc::new(tip));
     let subscriber = Subscriber {
         consensus_bus,
         config,
@@ -119,6 +120,34 @@ pub fn spawn_subscriber<DB: Database>(
                             Ok(()) => {
                                 info!(target: "subscriber", "subscriber catch-up exited normally")
                             }
+                            // A batch-fetch failure (MissingFetchedBatch / ClientRequestsFailed)
+                            // that outlives the in-loop retries means no peer we are CURRENTLY
+                            // connected to served a batch a committed output references. NB: this is
+                            // NOT garbage collection -- GC prunes the certificate DAG (rounds), not
+                            // the worker batch store, so the batch almost certainly still exists on
+                            // some holder. It's a connectivity/timing gap: most often a restarting
+                            // node whose worker mesh isn't fully re-established yet, so the holder
+                            // isn't among its connected peers within the retry window.
+                            // Do NOT abort the whole rayls-network process over it: step this CVV
+                            // back to Observer so it keeps following best-effort and re-attempts
+                            // catch-up at a later epoch boundary (by which point the mesh is up).
+                            //
+                            // XXX / REVISIT: the proper fix is to make the fetch connectivity-aware
+                            // -- keep retrying while the worker is connected to fewer than the
+                            // committee's workers, rather than declaring a batch "missing" against a
+                            // half-connected mesh. Demotion just converts a fatal panic into a
+                            // survivable degraded state that self-heals once connectivity returns.
+                            Err(e) if e.is_batch_fetch_error() => {
+                                warn!(
+                                    target: "subscriber",
+                                    "catch-up could not fetch a referenced batch from any connected \
+                                     peer (batch not GC'd -- likely mesh not yet re-established); \
+                                     demoting to Observer instead of aborting: {e}"
+                                );
+                                subscriber
+                                    .consensus_bus
+                                    .request_mode_transition(NodeMode::Observer);
+                            }
                             Err(e) => panic!("subscriber catch-up failed fatally: {e}"),
                         }
                     },
@@ -138,6 +167,22 @@ pub fn spawn_subscriber<DB: Database>(
                         match subscriber.follow_consensus(clone, rx_shutdown).await {
                             Ok(()) => {
                                 info!(target: "subscriber", "subscriber follow exited normally")
+                            }
+                            // Same batch-unavailable case as the catch-up path above (no connected
+                            // peer served the batch -- a connectivity/timing gap, NOT GC; the batch
+                            // still exists on some holder). An Observer has no lower mode to fall
+                            // back to, so don't abort the whole process: exit this follow attempt
+                            // without panicking. spawn_subscriber re-arms the follower at the next
+                            // epoch boundary, by which point the mesh should be up.
+                            // XXX / REVISIT: make the fetch connectivity-aware instead -- see the
+                            // catch-up arm above.
+                            Err(e) if e.is_batch_fetch_error() => {
+                                warn!(
+                                    target: "subscriber",
+                                    "follow could not fetch a referenced batch from any connected \
+                                     peer (batch not GC'd -- likely mesh not yet re-established); \
+                                     exiting follow without aborting the node: {e}"
+                                );
                             }
                             Err(e) => panic!("subscriber follow consensus failed fatally: {e}"),
                         }
@@ -340,40 +385,62 @@ impl<DB: Database> Subscriber<DB> {
         verified: ConsensusHeader,
     ) -> BoxFuture<'static, SubscriberResult<(ConsensusOutput, u64)>> {
         let sub = self.clone();
-        let shutdown = self.config.shutdown().clone();
         let sub_dag = verified.sub_dag.clone();
         let parent_hash = verified.parent_hash;
         let number = verified.number;
         Box::pin(async move {
-            let mut retry_count = 0u32;
-            loop {
-                match sub.fetch_batches(sub_dag.clone(), parent_hash, number).await {
-                    Ok(output) => return Ok((output, number)),
-                    Err(e) if e.is_batch_fetch_error() && retry_count < 5 => {
-                        retry_count += 1;
-                        let delay = Duration::from_secs(2).min(
-                            Duration::from_millis(500) * 2u32.saturating_pow(retry_count.min(5)),
-                        );
+            let output = sub.fetch_batches_retrying(sub_dag, parent_hash, number).await?;
+            Ok((output, number))
+        })
+    }
+
+    /// Fetch one committed output's batches, treating a transient batch-fetch failure as
+    /// non-fatal: retry with capped backoff until it succeeds or shutdown fires.
+    ///
+    /// A batch in a committed subdag cannot be skipped (skipping forks the chain) and is held by
+    /// peers -- and, for a rejoining node, usually on local disk too -- so a momentary
+    /// `PeerNotConnected`, most often the worker network still re-meshing after a mode transition,
+    /// must be waited out, never surfaced as fatal. Panicking is strictly worse: a critical-task
+    /// panic tears down the whole epoch task stack and the relaunch re-enters this same wall,
+    /// whereas waiting rides out the blackout with no teardown. Shutdown is the only exit.
+    async fn fetch_batches_retrying(
+        &self,
+        deliver: CommittedSubDag,
+        parent_hash: B256,
+        number: u64,
+    ) -> SubscriberResult<ConsensusOutput> {
+        let shutdown = self.config.shutdown().clone();
+        let mut retry_count = 0u32;
+        loop {
+            match self.fetch_batches(deliver.clone(), parent_hash, number).await {
+                Ok(output) => return Ok(output),
+                Err(e) if e.is_batch_fetch_error() => {
+                    retry_count += 1;
+                    let delay = Duration::from_secs(2)
+                        .min(Duration::from_millis(500) * 2u32.saturating_pow(retry_count.min(5)));
+                    // Loud for the first few attempts, then a throttled heartbeat so a prolonged
+                    // outage stays visible without flooding the log.
+                    if retry_count <= 5 || retry_count % 15 == 0 {
                         warn!(
                             target: "subscriber",
                             header_number = number,
                             retry_count,
                             delay_ms = delay.as_millis(),
-                            "catchup pipeline: batch fetch failed, retrying: {e}"
+                            "catchup batch fetch failed, retrying (transient, non-fatal): {e}"
                         );
-                        let rx_shutdown = shutdown.subscribe();
-                        tokio::select! {
-                            biased;
-                            _ = rx_shutdown => {
-                                return Err(SubscriberError::ClosedChannel("shutdown during retry".to_string()));
-                            }
-                            _ = tokio::time::sleep(delay) => continue,
-                        }
                     }
-                    Err(e) => return Err(e),
+                    let rx_shutdown = shutdown.subscribe();
+                    tokio::select! {
+                        biased;
+                        _ = rx_shutdown => {
+                            return Err(SubscriberError::ClosedChannel("shutdown during retry".to_string()));
+                        }
+                        _ = tokio::time::sleep(delay) => continue,
+                    }
                 }
+                Err(e) => return Err(e),
             }
-        })
+        }
     }
 
     /// Persist a fetched consensus output and forward it to the engine.
@@ -396,7 +463,7 @@ impl<DB: Database> Subscriber<DB> {
             .unwrap_or_else(|| output.sub_dag.leader.round());
 
         // promote to canonical ConsensusBlocks table
-        save_consensus(self.config.node_storage(), output.clone(), &self.inner.authority_id)?;
+        self.save_and_publish(output.clone())?;
 
         let last_round = output.leader_round();
 
@@ -745,6 +812,24 @@ impl<DB: Database> Subscriber<DB> {
         }
     }
 
+    /// Persist a consensus output to the canonical `ConsensusBlocks` chain and publish the saved
+    /// header as the node's own tip.
+    ///
+    /// The publish is monotonic by number, so an out-of-order re-save cannot regress the tip; a
+    /// re-commit at the same number replaces it, since that is the header now on disk.
+    fn save_and_publish(&self, output: ConsensusOutput) -> SubscriberResult<()> {
+        let header = save_consensus(self.config.node_storage(), output, &self.inner.authority_id)?;
+        self.consensus_bus.local_consensus_tip().send_if_modified(|tip| {
+            if header.number >= tip.number {
+                *tip = Arc::new(header);
+                true
+            } else {
+                false
+            }
+        });
+        Ok(())
+    }
+
     /// Return the `(digest, number)` seed for the live consensus-header chain - the parent the
     /// next committed `ConsensusHeader` chains from, read once on startup before `run()`'s loop.
     ///
@@ -788,7 +873,7 @@ impl<DB: Database> Subscriber<DB> {
 
         for consensus_header in missing.into_iter() {
             let consensus_output = self
-                .fetch_batches(
+                .fetch_batches_retrying(
                     consensus_header.sub_dag.clone(),
                     consensus_header.parent_hash,
                     consensus_header.number,
@@ -928,7 +1013,7 @@ impl<DB: Database> Subscriber<DB> {
                             }
 
                             debug!(target: "subscriber", output=?output.digest(), "saving next output");
-                            save_consensus(self.config.node_storage(), output.clone(), &self.inner.authority_id)?;
+                            self.save_and_publish(output.clone())?;
                             {
                                 let digests: Vec<_> = output.batch_digests.iter().copied().collect();
                                 self.consensus_bus.batch_tracker().output_broadcast(output.number, &digests);
@@ -982,7 +1067,7 @@ impl<DB: Database> Subscriber<DB> {
                     let sig =
                         self.config.key_config().request_signature_direct(&encode(&to_intent_message(consensus_result_hash)));
 
-                    // pre-publish gossipsub diagnostics (production only — dev has no peers)
+                    // pre-publish gossipsub diagnostics (production only - dev has no peers)
                     #[cfg(not(feature = "dev-single-node-setup"))]
                     {
                         let consensus_output_topic = LibP2pConfig::consensus_output_topic();
@@ -1035,7 +1120,7 @@ impl<DB: Database> Subscriber<DB> {
                     let header_for_cache = ConsensusHeader { parent_hash, sub_dag: sub_dag.clone(), number, extra: B256::default() };
                     store_consensus_header_in_cache(self.config.node_storage(), &header_for_cache);
 
-                    // Dev (single-node): no peers — skip gossip entirely.
+                    // Dev (single-node): no peers - skip gossip entirely.
                     #[cfg(not(feature = "dev-single-node-setup"))]
                     if let Err(e) = self.network_handle.publish_consensus(epoch, round, number, last_parent, self.config.key_config().public_key(), sig).await {
                         error!(target: "subscriber", "error publishing latest consensus to network {:?}: {}", self.inner.authority_id, e);
@@ -1162,7 +1247,7 @@ impl<DB: Database> Subscriber<DB> {
             ..Default::default()
         };
 
-        let mut batch_set: HashSet<BlockHash> = HashSet::new();
+        let mut batch_set = B256Set::default();
 
         for cert in &sub_dag.certificates {
             for (digest, _) in cert.header().payload().iter() {
@@ -1221,9 +1306,9 @@ impl<DB: Database> Subscriber<DB> {
 
     async fn fetch_batches_from_peers(
         &self,
-        batch_digests: HashSet<BlockHash>,
-    ) -> SubscriberResult<HashMap<BlockHash, Batch>> {
-        let mut fetched_blocks = HashMap::new();
+        batch_digests: B256Set,
+    ) -> SubscriberResult<B256Map<Batch>> {
+        let mut fetched_blocks = B256Map::default();
 
         debug!(target: "subscriber", "Attempting to fetch {} digests peers", batch_digests.len(),);
         let blocks = match self.inner.client.fetch_batches(batch_digests.clone()).await {

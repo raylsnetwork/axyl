@@ -40,6 +40,27 @@ fn test_missing_certs_request() {
     assert_eq!(expected_skip_rounds, decoded_skip_rounds);
 }
 
+/// A crafted request whose lower bound plus a skip delta exceeds `Round::MAX` is rejected
+/// instead of overflowing. The release profile aborts on overflow, so before this any peer
+/// could take a node down with one message.
+#[test]
+fn test_missing_certs_request_rejects_round_overflow() {
+    let mut serialized = Vec::new();
+    roaring::RoaringBitmap::from_iter([1u32]).serialize_into(&mut serialized).expect("bitmap");
+    let request = MissingCertificatesRequest {
+        exclusive_lower_bound: u32::MAX,
+        skip_rounds: vec![(AuthorityIdentifier::dummy_for_test(0), serialized)],
+        max_response_size: 10,
+        exclusive_upper_bound: None,
+    };
+    assert_matches!(request.get_bounds(), Err(PrimaryNetworkError::StdIo(_)));
+
+    // the same delta below the edge decodes as before
+    let request = MissingCertificatesRequest { exclusive_lower_bound: u32::MAX - 1, ..request };
+    let (_, skip) = request.get_bounds().expect("no overflow");
+    assert_eq!(skip[&AuthorityIdentifier::dummy_for_test(0)], BTreeSet::from([u32::MAX]));
+}
+
 /// The type for holding testng components.
 struct TestTypes<DB = MemDatabase> {
     /// Committee committee with authorities that vote.

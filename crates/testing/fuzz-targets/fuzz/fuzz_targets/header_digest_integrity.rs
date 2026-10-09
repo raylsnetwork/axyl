@@ -8,7 +8,7 @@
 //! This is critical because Header digests are certificate references in the
 //! DAG. A collision or inconsistency breaks consensus.
 //!
-//! Run: cargo +nightly fuzz run header_digest_integrity
+//! Run: cargo +nightly-2026-06-24 fuzz run header_digest_integrity
 
 #![no_main]
 use libfuzzer_sys::fuzz_target;

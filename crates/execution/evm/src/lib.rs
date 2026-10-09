@@ -23,20 +23,22 @@ pub use reth_provider::{AccountReader, CanonStateNotificationStream, ExecutionOu
 pub use reth_rpc_eth_types::EthApiError;
 pub use reth_tracing::FileWorkerGuard;
 pub use reth_transaction_pool::{
-    error::{InvalidPoolTransactionError, PoolError, PoolTransactionError},
+    error::{InvalidPoolTransactionError, PoolError, PoolErrorKind, PoolTransactionError},
     identifier::SenderIdentifiers,
     BestTransactions, EthPooledTransaction, PoolTransaction, TransactionPool as TransactionPoolT,
 };
 
-pub mod bypass_validator;
 pub mod chainspec;
 pub mod dirs;
+pub mod network_profile;
+pub mod network_schedule;
 pub mod payload;
 pub mod traits;
 pub mod txn_pool;
 pub use txn_pool::*;
 pub mod error;
 mod evm;
+pub mod in_flight;
 pub mod native_erc20;
 pub(crate) mod persistence;
 pub mod reth_env;
@@ -44,7 +46,23 @@ pub mod rpc_server_args;
 pub mod system_calls;
 pub mod worker;
 
-pub use chainspec::RaylsChainSpec;
+pub use chainspec::{RaylsChainSpec, RaylsHardFork, RaylsHardforks, ScheduledFork};
+pub use network_profile::{
+    verify_datadir_schedule_record, verify_schedule, ForkActivation, FutureForkMove,
+    NetworkConfigFile, NetworkProfile, ScheduleRecord, ScheduleRecordVerification,
+};
+pub use network_schedule::{
+    baked_in_network, verify_datadir_chain_id, FileSchedule, SelectedSchedule,
+};
+pub use reth_chainspec::ForkCondition;
 
 #[cfg(any(feature = "test-utils", test))]
 pub mod test_utils;
+
+/// Anchor for the dev-dependencies that only this crate's own test and bench
+/// targets consume; without it, lib-test builds warn that they are unused.
+#[cfg(test)]
+mod clippy {
+    use criterion as _;
+    use rayls_execution_evm as _;
+}

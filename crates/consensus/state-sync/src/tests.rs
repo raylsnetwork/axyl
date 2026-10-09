@@ -722,6 +722,113 @@ async fn test_catch_up_drops_poisoned_gap_row_and_recovers() {
     assert_eq!(second.number, 102, "catch-up must reach the target after recovering");
 }
 
+/// Regression for the epoch-boundary leak fork: the forward-streamer catch-up
+/// (`catch_up_consensus_from_to`) must HALT when it reaches an output committed by a *closed* epoch
+/// (`leader_epoch < current epoch`), not forward it for execution. Without this a lagging node
+/// replays an epoch-tail straggler into the new epoch and forks (an observer executes a subdag the
+/// committee dropped). The DB-replay path `collect_replayable_headers` already guards this; the
+/// forward streamer did not, so a bombarded observer perpetually catching up hit the unguarded
+/// path.
+#[tokio::test]
+async fn test_catch_up_from_to_halts_on_prior_epoch_leak() {
+    // Current epoch is 1; the leak was committed by the closed epoch 0.
+    let fixture = CommitteeFixture::builder(MemDatabase::default)
+        .randomize_ports(true)
+        .committee_size(NonZeroUsize::new(4).unwrap())
+        .epoch(1)
+        .build();
+    let primary = fixture.authorities().next().unwrap();
+    let config = primary.consensus_config();
+
+    // Anchor at consensus number 100 (current epoch); the next output (101) is a closed-epoch leak
+    // whose subdag was committed by epoch 0 (leader_epoch 0 < current epoch 1). Chain it onto the
+    // anchor so it clears the digest-chain guard and would reach execution WITHOUT the epoch guard
+    // -- the leak must be stopped by the epoch check, not incidentally by a chain mismatch.
+    let anchor = header_for_epoch(100, 1, 5_000);
+    let mut leak = header_for_epoch(101, 0, 6_000);
+    leak.parent_hash = anchor.digest();
+    // The epoch guard runs before the execution wait, so a leak halted correctly never waits; but
+    // seed an executed base block so that WITHOUT the guard the leak would proceed to be streamed
+    // (proving the test isolates the epoch check).
+    let cb = ConsensusBus::new();
+    seed_recently_executed_blocks(&cb);
+    let mut rx = cb.consensus_header().subscribe();
+
+    let result =
+        catch_up_consensus_from_to(&config, &cb, &no_peer_network(), anchor.clone(), leak.clone())
+            .await
+            .expect("catch-up must return Ok (halt), not error, on a closed-epoch leak");
+
+    // Halted at the leak: the anchor did not advance, and the leak was never streamed for
+    // execution.
+    assert_eq!(
+        result.number, anchor.number,
+        "catch-up must halt at the closed-epoch leak without advancing past the anchor"
+    );
+    assert!(
+        rx.try_recv().is_err(),
+        "a closed-epoch leak (leader_epoch < epoch) must not be streamed for execution"
+    );
+}
+
+/// A closed-epoch leak wedged in the DB blocks the *legitimate* current-epoch headers stacked above
+/// it: catch-up halts at the leak and refuses to stream 102..=105 even though those are valid
+/// epoch-1 outputs. This is deliberate -- executing past an unresolved leak forks the chain -- and
+/// the node self-heals once the backwards walk overwrites the leaked row. Documents that the guard
+/// gates on the *first* leak in the range, not only on a leak that is itself the catch-up target.
+#[tokio::test]
+async fn test_catch_up_from_to_leak_blocks_later_valid_headers() {
+    let fixture = CommitteeFixture::builder(MemDatabase::default)
+        .randomize_ports(true)
+        .committee_size(NonZeroUsize::new(4).unwrap())
+        .epoch(1)
+        .build();
+    let primary = fixture.authorities().next().unwrap();
+    let config = primary.consensus_config();
+    let db = config.node_storage();
+
+    // Anchor 100 (epoch 1); a closed-epoch leak at 101 (epoch 0); then legitimate epoch-1 headers
+    // 102..=105 chained above it. All of 101..=105 are DB-resident, so catch-up reads them locally.
+    let anchor = header_for_epoch(100, 1, 5_000);
+    let mut leak = header_for_epoch(101, 0, 6_000);
+    leak.parent_hash = anchor.digest();
+    let mut chain = vec![leak.clone()];
+    let mut parent = leak.digest();
+    for number in 102..=105 {
+        let mut h = header_for_epoch(number, 1, 6_000 + number);
+        h.parent_hash = parent;
+        parent = h.digest();
+        chain.push(h);
+    }
+    let target = chain.last().unwrap().clone();
+    db.with_write_txn(|txn| {
+        for h in &chain {
+            txn.insert::<ConsensusBlocks>(&h.number, h)?;
+            txn.insert::<ConsensusBlockNumbersByDigest>(&h.digest(), &h.number)?;
+        }
+        Ok(())
+    })
+    .unwrap();
+
+    let cb = ConsensusBus::new();
+    seed_recently_executed_blocks(&cb);
+    let mut rx = cb.consensus_header().subscribe();
+
+    let result =
+        catch_up_consensus_from_to(&config, &cb, &no_peer_network(), anchor.clone(), target)
+            .await
+            .expect("catch-up must return Ok (halt), not error, when a leak blocks later headers");
+
+    assert_eq!(
+        result.number, anchor.number,
+        "catch-up must halt at the leak (101) and not advance to the valid tail 102..=105"
+    );
+    assert!(
+        rx.try_recv().is_err(),
+        "no header may be streamed: the leak at 101 blocks the valid 102..=105 above it"
+    );
+}
+
 fn sealed_at(number: u64) -> SealedHeader {
     SealedHeader::new(ExecHeader { number, ..Default::default() }, B256::repeat_byte(number as u8))
 }

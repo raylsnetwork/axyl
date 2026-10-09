@@ -74,7 +74,7 @@ etc/chaos-network/scripts/inject-packet-loss.sh chaos-validator4 15
 
 ## Configuration
 
-- Chain ID: `0x7e1`
+- Chain ID: `487` (local)
 - Epoch duration: 15 seconds (short, to exercise epoch transitions)
 - Consensus ports: UDP 49590 (primary), 49595 (worker)
 - Network: bridge `10.20.0.0/16`

@@ -55,11 +55,14 @@ where
 
         // preserve round knowledge from CvvInactive to avoid TooOld after rejoin
         let current_round = *consensus_bus.primary_round_updates().borrow();
+        // seed the gc round from the primed channel (primed by identify_node_mode before this
+        // runs) so the cert parent-check gate never runs with gc=0 and suspends the history
+        let gc_round = *consensus_bus.gc_round_updates().borrow();
 
         let certificate_validator = CertificateValidator::new(
             config,
             consensus_bus,
-            AtomicRound::new(0),
+            AtomicRound::new(gc_round),
             AtomicRound::new(highest_process_round),
             AtomicRound::new(current_round),
             task_spawner,

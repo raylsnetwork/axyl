@@ -81,10 +81,11 @@ pub enum RewardsError {
     },
 
     /// The requested tally is a known, permanent capability gap (not a
-    /// transient failure) - e.g. `SnapshotRewardsBackend::tally_hybrid` can't
-    /// recover per-validator participation rounds from a plain withdrawals
-    /// snapshot. Retrying will never succeed; distinct from [`Self::Database`]
-    /// specifically so callers don't loop retrying something that can't work.
+    /// transient failure) - e.g. `SnapshotRewardsBackend::tally_hybrid` with no
+    /// consensus DB attached, or a walk that disagrees with the snapshot's
+    /// committed withdrawals. Retrying will never succeed; distinct from
+    /// [`Self::Database`] specifically so callers don't loop retrying something
+    /// that can't work.
     #[error("unsupported: {0}")]
     Unsupported(String),
 }

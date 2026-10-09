@@ -27,7 +27,7 @@ use rayls_infrastructure_types::{
     address, calculate_transaction_root, keccak256, now, test_chain_spec_arc, test_genesis,
     AccessList, Address, Batch, BlobTransactionSidecar, Block, BlockBody, BlockHash, BlsPublicKey,
     Bytes, Committee, CommitteeBuilder, Encodable2718, EthSignature, ExecHeader, ExecutionKeypair,
-    Genesis, GenesisAccount, RecoveredBlock, SealedHeader, TaskManager, Transaction,
+    Genesis, GenesisAccount, RaylsNetwork, RecoveredBlock, SealedHeader, TaskManager, Transaction,
     TransactionSigned, TxEip1559, TxHash, TxKind, WorkerId, B256, EMPTY_OMMER_ROOT_HASH,
     EMPTY_TRANSACTIONS, EMPTY_WITHDRAWALS, ETHEREUM_BLOCK_GAS_LIMIT_56BITS, MIN_PROTOCOL_BASE_FEE,
     U256,
@@ -185,7 +185,7 @@ impl RethEnv {
     /// by simulating deploying proxy contract. The results are then put into genesis.
     pub fn execution_outcome_for_tests(
         &self,
-        txs: Vec<Vec<u8>>,
+        txs: Vec<Bytes>,
         parent: &SealedHeader,
     ) -> BundleState {
         // create "empty" header with default values
@@ -263,10 +263,10 @@ impl RethEnv {
     }
 }
 
-/// Transaction factory
+/// Factory for signed test transactions from one keypair with a running nonce.
 #[derive(Clone, Copy, Debug)]
 pub struct TransactionFactory {
-    /// Keypair for signing transactions
+    /// Keypair for signing transactions.
     keypair: ExecutionKeypair,
     /// The nonce for the next transaction constructed.
     nonce: u64,
@@ -291,7 +291,7 @@ impl TransactionFactory {
         Self { keypair, nonce: 0 }
     }
 
-    /// create a new instance of self from a provided seed.
+    /// Create a new instance of self from a provided seed.
     pub fn new_random_from_seed<R: Rng + ?Sized>(rand: &mut R) -> Self {
         let secp = Secp256k1::new();
         let (secret_key, _public_key) = secp.generate_keypair(rand);
@@ -299,7 +299,7 @@ impl TransactionFactory {
         Self { keypair, nonce: 0 }
     }
 
-    /// create a new instance of self from a random seed.
+    /// Create a new instance of self from a random seed.
     pub fn new_random() -> Self {
         let secp = Secp256k1::new();
         let (secret_key, _public_key) = secp.generate_keypair(&mut StdRng::from_os_rng());
@@ -335,8 +335,8 @@ impl TransactionFactory {
         to: Option<Address>,
         value: U256,
         input: Bytes,
-    ) -> Vec<u8> {
-        self.create_eip1559(chain, gas_limit, gas_price, to, value, input).encoded_2718()
+    ) -> Bytes {
+        self.create_eip1559(chain, gas_limit, gas_price, to, value, input).encoded_2718().into()
     }
 
     /// Create and sign an EIP1559 transaction.
@@ -462,10 +462,11 @@ impl TransactionFactory {
         hash.hash
     }
 
+    // allow: long-doc defaults table for nine optional parameters
     /// Create and sign an EIP1559 transaction with all possible parameters passed.
     ///
     /// All arguments are optional and default to:
-    /// - chain_id: 2017 (testnet)
+    /// - chain_id: the `local` network chain-id (487)
     /// - nonce: `Self::nonce` (correctly incremented)
     /// - max_priority_fee_per_gas: 0 (no tip)
     /// - max_fee_per_gas: basefee minimum (7 wei)
@@ -496,7 +497,7 @@ impl TransactionFactory {
 
         // Eip1559
         let transaction = Transaction::Eip1559(TxEip1559 {
-            chain_id: chain_id.unwrap_or(2017),
+            chain_id: chain_id.unwrap_or(RaylsNetwork::Local.chain_id()),
             nonce: nonce.unwrap_or(self.nonce),
             max_priority_fee_per_gas: max_priority_fee_per_gas.unwrap_or(0),
             max_fee_per_gas: max_fee_per_gas.unwrap_or(MIN_PROTOCOL_BASE_FEE.into()),
@@ -518,14 +519,14 @@ impl TransactionFactory {
         TransactionSigned::new_unhashed(transaction, signature)
     }
 
-    /// Sign the transaction hash with the key in memory
+    /// Sign the transaction hash with the key in memory.
     fn sign_hash(&self, hash: B256) -> EthSignature {
         let secret = B256::from_slice(&self.keypair.secret_bytes());
         let signature = sign_message(secret, hash);
         signature.expect("failed to sign transaction")
     }
 
-    /// Helper to instantiate an `alloy-signer-local::PrivateKeySigner` wrapping the default account
+    /// Instantiate an `alloy-signer-local::PrivateKeySigner` wrapping the default account.
     pub fn get_default_signer(&self) -> eyre::Result<PrivateKeySigner> {
         // circumvent Secp256k1 <> k256 type incompatibility via FieldBytes intermediary
         let binding = self.keypair.secret_key().secret_bytes();
@@ -566,7 +567,7 @@ pub fn get_gas_price(reth_env: &RethEnv) -> u128 {
 }
 
 /// Create a random encoded transaction.
-pub fn transaction(chain: Arc<RethChainSpec>) -> Vec<u8> {
+pub fn transaction(chain: Arc<RethChainSpec>) -> Bytes {
     let mut tx_factory = TransactionFactory::new_random();
     let gas_price = 100_000;
     let value = U256::from(10).checked_pow(U256::from(18)).expect("1e18 doesn't overflow U256");
@@ -582,8 +583,7 @@ pub fn transaction(chain: Arc<RethChainSpec>) -> Vec<u8> {
     )
 }
 
-/// will create a batch with randomly formed transactions
-/// dictated by the parameter number_of_transactions
+/// Create a batch of `number_of_transactions` random transactions.
 pub fn fixture_batch_with_transactions(number_of_transactions: u32) -> Batch {
     let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
     let transactions = (0..number_of_transactions).map(|_v| transaction(chain.clone())).collect();
@@ -598,8 +598,7 @@ pub fn batch(chain: Arc<RethChainSpec>) -> Batch {
     Batch { transactions, ..Default::default() }
 }
 
-/// generate multiple fixture batches. The number of generated batches
-/// are dictated by the parameter num_of_batches.
+/// Create `num_of_batches` fixture batches, the i-th holding i transactions.
 pub fn batches(chain: Arc<RethChainSpec>, num_of_batches: usize) -> Vec<Batch> {
     let mut batches = Vec::new();
 

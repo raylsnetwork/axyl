@@ -1,10 +1,10 @@
 # Code Owners for Axyl
 # These owners will be requested for review on all pull requests
 
-* @bronxyz @kstoykov @procdump
+* @kstoykov @procdump
 
 # CI / pipelines — later matches take precedence, so these owners (plus the
 # defaults above) are requested on changes to workflows and CI config.
-/.github/workflows/ @bronxyz @kstoykov @procdump @bdimitrov-netzine
-/.github/CODEOWNERS  @bronxyz @kstoykov @procdump @bdimitrov-netzine
-/.github/dependabot.yml @bronxyz @kstoykov @procdump @bdimitrov-netzine
+/.github/workflows/ @kstoykov @procdump @bdimitrov-netzine
+/.github/CODEOWNERS  @kstoykov @procdump @bdimitrov-netzine
+/.github/dependabot.yml @kstoykov @procdump @bdimitrov-netzine

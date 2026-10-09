@@ -1,4 +1,3 @@
-mod batches;
 #[cfg(feature = "cold-storage")]
 mod cold_archive;
 mod consensus;
@@ -10,6 +9,7 @@ mod state;
 mod transition;
 mod types;
 mod utils;
+mod vote_triage;
 mod worker;
 
 #[cfg(feature = "cold-storage")]
@@ -26,7 +26,12 @@ pub(crate) use core::{await_execution_replay, ReplayWaitOutcome};
 pub(crate) use network::{decide_node_mode, node_has_local_history};
 
 #[cfg(test)]
-pub(crate) use state::resolve_local_prev_epoch_record;
+pub(crate) use core::{
+    certification_retry_backoff, forget_certified_attempts, next_certification_attempt,
+    record_failed_certification_attempt,
+};
+#[cfg(test)]
+pub(crate) use state::{hydrate_prev_epoch_record, resolve_local_prev_epoch_record};
 
 #[cfg(test)]
 pub(crate) use transition::select_recovery_checkpoint;

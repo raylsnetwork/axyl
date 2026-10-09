@@ -188,6 +188,19 @@ impl Bullshark {
 
         self.metrics.committed_certificates.report(total_committed_certificates);
 
+        // Per-validator participation: count each committed certificate by its author. Distinct
+        // from the leader-only series (`leader_election` / `leader_commits`), this shows which
+        // validators are actually contributing certificates each commit — a direct liveness
+        // signal, and consistent across nodes since every node commits the same sub-dags.
+        for sub_dag in &committed_sub_dags {
+            for certificate in &sub_dag.certificates {
+                self.metrics
+                    .validator_participation
+                    .with_label_values(&[&certificate.origin().to_string()])
+                    .inc();
+            }
+        }
+
         Ok((Outcome::Commit, committed_sub_dags))
     }
 

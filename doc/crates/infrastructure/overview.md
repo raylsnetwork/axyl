@@ -227,6 +227,8 @@ dispatch to the appropriate node subsystem.
 rayls-network
 ├── node          Start the validator/observer node
 ├── genesis       Run the genesis ceremony to create a new network
+├── schedule
+│   └── export    Dump a built-in hardfork schedule as a `--config-file`
 └── keytool
     ├── generate  Generate BLS + network keys for a validator or observer
     └── stake-calldata  Produce ABI-encoded calldata for the staking transaction
@@ -238,7 +240,9 @@ The main entry point for running a node. Key flags:
 
 | Flag | Purpose |
 |---|---|
-| `--chain <NAME>` | Join a named network (`testnet` or `mainnet`); loads embedded config |
+| `--config-file <PATH>` | Load the chain-id and hardfork schedule of the selected subnet from an external per-client YAML file (replaces the baked-in values); requires `--subnet` |
+| `--subnet <NAME>` | Select the subnet entry inside `--config-file`; requires `--config-file` |
+| `--network <NAME>` | Select the built-in Rayls hardfork schedule (`devnet`, `testnet`, `mainnet`, `local`); refused if combined with `--config-file` |
 | `--observer` | Start as a non-validating observer node |
 | `--instance <N>` | Offset ports by instance number (max 200) to run multiple nodes on one host |
 | `--with-unused-ports` | Let the OS assign random free ports (testing) |
@@ -249,6 +253,37 @@ The main entry point for running a node. Key flags:
 
 The `node` command delegates to `launch_node` (orchestrator crate) after building
 the `RaylsBuilder` / `RethConfig` from the parsed CLI arguments.
+
+#### External hardfork configuration (`--config-file` / `--subnet`)
+
+A node can run the chain-id and hardfork schedule of the selected subnet from
+an external per-client YAML file instead of the values baked into the binary.
+One file holds every subnet a client operates (the number of subnets is not
+fixed); see the guide in `docs/config-file.md` and the template
+`docs/config-file.example.yaml`. With `--config-file`:
+
+- the selected subnet's `chain_id` and `hardforks` section are the single
+  source of truth (installed in a process-wide profile the execution layer
+  reads); fork names are case-insensitive, an absent fork stays `never`, every
+  given fork name must be a real one, `chain_id` is required, and a subnet may
+  not declare the chain-id of a baked-in network (mainnet `72957`, testnet
+  `7295799` — those networks always run on their baked-in schedule and are
+  started with `--network`; a subnet declaring one of those chain-ids is
+  refused) (all validated before startup);
+- everything else — genesis, parameters, committee, node identity — comes from
+  the datadir, exactly as without the file, so the datadir must be fully
+  provisioned as before. At boot the datadir's genesis chain-id is verified
+  against the subnet's `chain_id`, and the node refuses to start on a mismatch
+  (the datadir belongs to a different network or client);
+- the flag cannot be combined with `--network`.
+
+Without `--config-file` the schedule is the built-in one selected by
+`--network` (in dev mode `local` is implied when neither flag is given), and
+the datadir's genesis chain-id is still verified against the network's baked-in
+chain-id (mainnet is `72957`, testnet `7295799`, devnet `503` and local `487`)
+and the node refuses to start on a mismatch. A datadir carries no schedule of
+its own: `--network` or the `--config-file`/`--subnet` pair must be given at
+every boot (a legacy `network:` key in `parameters.yaml` is ignored).
 
 ### `genesis` command (`GenesisArgs`)
 
@@ -269,6 +304,19 @@ Key parameters:
 - **`generate observer`** — generates keys for a non-validating observer.
 - **`stake-calldata`** — reads existing keys and produces the ABI-encoded
   `ConsensusRegistry.stake(...)` calldata for on-chain staking.
+
+### `schedule` command (`ScheduleArgs`)
+
+- **`export --network <devnet|testnet|mainnet|local>`** — prints the hardfork
+  schedule baked into this binary for that network as a complete, loadable
+  network config file: one subnet (named after the network, or `--subnet-name`)
+  with its `chain_id` and every known fork, in table order under canonical
+  names. Redirect stdout to a file. Needs no datadir or passphrase. It is the
+  template for a client-defined subnet: rename the subnet, set its `chain_id`,
+  adjust blocks.
+  The devnet and local exports load as-is; the mainnet and testnet exports are
+  templates only, since `node --config-file` refuses their chain-ids (those
+  networks always run on `--network`), and their header says so.
 
 ---
 

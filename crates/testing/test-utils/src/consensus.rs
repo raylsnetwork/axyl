@@ -3,7 +3,7 @@
 use crate::CommitteeFixture;
 use indexmap::IndexMap;
 use rayls_infrastructure_types::{
-    now, test_chain_spec_arc, AuthorityIdentifier, Batch, BlockHash, Certificate,
+    now, test_chain_spec_arc, AuthorityIdentifier, B256Map, Batch, BlockHash, Certificate,
     CertificateDigest, Database, Hash as _, HeaderBuilder, Round, WorkerId,
 };
 use std::{
@@ -60,14 +60,14 @@ where
 pub fn create_signed_certificates_for_rounds<DB>(
     range: RangeInclusive<Round>,
     fixture: &CommitteeFixture<DB>,
-) -> (VecDeque<Certificate>, BTreeSet<CertificateDigest>, HashMap<BlockHash, Batch>)
+) -> (VecDeque<Certificate>, BTreeSet<CertificateDigest>, B256Map<Batch>)
 where
     DB: Database,
 {
     let ids: Vec<_> = fixture.authorities().map(|a| a.id()).collect();
     let mut certificates = VecDeque::new();
     let mut next_parents = BTreeSet::new();
-    let mut batches = HashMap::new();
+    let mut batches = B256Map::default();
     // use genesis for initial parents
     let mut parents: BTreeSet<_> = fixture.genesis().collect();
 

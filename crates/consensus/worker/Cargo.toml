@@ -23,7 +23,6 @@ prometheus = { workspace = true }
 eyre = { workspace = true }
 rayls-consensus-network = { workspace = true }
 serde = { workspace = true }
-consensus-metrics = { workspace = true }
 rand = { workspace = true, optional = true }
 
 [dev-dependencies]

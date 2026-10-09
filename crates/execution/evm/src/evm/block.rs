@@ -1016,7 +1016,8 @@ where
             Some(transactions.iter().map(|tx| tx.blob_gas_used().unwrap_or_default()).sum());
 
         // Rayls-specific values
-        let nonce = ctx.nonce.into(); // subdag leader's nonce: ((epoch as u64) << 32) | self.round as u64
+        let nonce = ctx.nonce.into(); // subdag leader's nonce: ((epoch as u64) << 32) | self.round
+                                      // as u64
         let difficulty = ctx.difficulty; // worker id and batch index
 
         // use keccak256(bls_sig) if closing epoch or Bytes::default
