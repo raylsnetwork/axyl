@@ -611,4 +611,52 @@ mod tests {
         assert_eq!(first, Some(child_102.digest()), "anchor must be the top of the contiguous run");
         assert_eq!(first, second, "derive must be stable across calls on an unchanged cache");
     }
+
+    /// A node one block behind on a stopped chain must still execute the missing block.
+    /// The executed tip is saved and the next block sits only in the header cache.
+    /// No newer block will arrive, so the walk toward the cached block is the only trigger left.
+    /// The walk must hand the cached block to the forward streamer, which listens on
+    /// `last_consensus_header`.
+    #[tokio::test(start_paused = true)]
+    async fn walk_to_cached_tip_hands_it_to_the_streamer() {
+        // The executed tip in the observed run.
+        const EXECUTED_TIP: u64 = 615;
+        let fixture = CommitteeFixture::builder(MemDatabase::default)
+            .randomize_ports(true)
+            .committee_size(NonZeroUsize::new(4).unwrap())
+            .build();
+        let primary = fixture.authorities().next().unwrap();
+        let config = primary.consensus_config();
+        let db = config.node_storage();
+
+        // The executed tip is saved.
+        let canonical = ConsensusHeader { number: EXECUTED_TIP, ..Default::default() };
+        db.with_write_txn(|txn| {
+            txn.insert::<ConsensusBlocks>(&canonical.number, &canonical)?;
+            txn.insert::<ConsensusBlockNumbersByDigest>(&canonical.digest(), &canonical.number)?;
+            Ok(())
+        })
+        .unwrap();
+        // The next block links onto it but is only cached, not executed.
+        let cached = ConsensusHeader {
+            number: EXECUTED_TIP + 1,
+            parent_hash: canonical.digest(),
+            ..Default::default()
+        };
+        store_consensus_header_in_cache(db, &cached);
+
+        // A fresh session after restart, with no reachable peer.
+        let consensus_bus = ConsensusBus::new();
+        let mut session =
+            WalkSession::new(config.clone(), consensus_bus.clone(), no_peer_network());
+
+        // Peers report the cached block as their latest header, so the walk starts there.
+        assert!(session.sync_to(cached.digest()).await.is_continue());
+
+        assert_eq!(
+            consensus_bus.last_consensus_header().borrow().number,
+            cached.number,
+            "the walk reached the cached block but never handed it to the forward streamer"
+        );
+    }
 }

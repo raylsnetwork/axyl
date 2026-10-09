@@ -1,7 +1,7 @@
 use crate::{
     catch_up_consensus_from_to, certified_consensus_checkpoint, consensus_chain_tip,
     get_missing_consensus, highest_executed_anchor, prime_consensus, save_consensus,
-    stream_missing_consensus,
+    spawn_stream_consensus_headers, stream_missing_consensus,
 };
 use rayls_consensus_primary::{
     network::{
@@ -953,5 +953,57 @@ async fn test_wait_for_execution_bounded_tolerates_slow_progress() {
     assert!(
         cb.wait_for_execution_bounded(target, idle).await.is_ok(),
         "steady progress under the idle bound must return Ok"
+    );
+}
+
+/// A node one block behind must execute a tip that was published before its forward streamer
+/// started.
+/// After a restart the backwards walk can fetch the tip and publish it before the streamer
+/// subscribes.
+/// On a stopped chain no later tip arrives to wake the streamer.
+#[tokio::test(start_paused = true)]
+async fn test_streamer_executes_tip_published_before_it_started() {
+    // The executed tip in the live run.
+    const EXECUTED_TIP: u64 = 20;
+    let fixture = CommitteeFixture::builder(MemDatabase::default)
+        .randomize_ports(true)
+        .committee_size(NonZeroUsize::new(4).unwrap())
+        .build();
+    let primary = fixture.authorities().next().unwrap();
+    let config = primary.consensus_config();
+    let db = config.node_storage();
+    let committee = fixture.committee();
+
+    // The executed tip is saved.
+    let executed = chained_header(EXECUTED_TIP, B256::default(), &committee);
+    db.with_write_txn(|txn| {
+        txn.insert::<ConsensusBlocks>(&executed.number, &executed)?;
+        txn.insert::<ConsensusBlockNumbersByDigest>(&executed.digest(), &executed.number)?;
+        Ok(())
+    })
+    .unwrap();
+    // The next block, which the peers already hold.
+    let tip = chained_header(EXECUTED_TIP + 1, executed.digest(), &committee);
+
+    let cb = ConsensusBus::new();
+    seed_recently_executed_blocks(&cb);
+    cb.executed_anchor().send_replace(executed.clone());
+    // The backwards walk publishes the tip before the streamer starts.
+    cb.last_consensus_header().send_replace(tip.clone());
+    let mut rx = cb.consensus_header().subscribe();
+
+    let streamer = tokio::spawn(spawn_stream_consensus_headers(
+        config.clone(),
+        cb.clone(),
+        no_peer_network(),
+        EXECUTED_TIP,
+    ));
+    let streamed = tokio::time::timeout(std::time::Duration::from_secs(60), rx.recv()).await;
+    streamer.abort();
+
+    assert_eq!(
+        streamed.ok().flatten().map(|header| header.number),
+        Some(tip.number),
+        "the tip published before the forward streamer started never reached execution"
     );
 }
