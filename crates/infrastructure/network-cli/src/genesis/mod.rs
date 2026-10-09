@@ -6,7 +6,8 @@ use clap::Args;
 use rayls_execution_evm::{
     reth_env::{genesis::apply_greenfield_fixes, RethEnv},
     system_calls::ConsensusRegistry,
-    RethChainSpec,
+    verify_datadir_chain_id, verify_schedule_against_genesis, FileSchedule, RethChainSpec,
+    SelectedSchedule,
 };
 use rayls_infrastructure_config::{
     Config, ConfigFmt, ConfigTrait, NetworkGenesis, Parameters, RaylsDirs as _,
@@ -166,6 +167,26 @@ pub struct GenesisArgs {
     /// YAML file mapping addresses to an RLS ERC-20 balance to pre-fund at genesis.
     #[arg(long = "rls-accounts", value_name = "YAML_FILE", verbatim_doc_comment)]
     pub rls_accounts: Option<PathBuf>,
+
+    /// The built-in network whose hardfork schedule the generated genesis is
+    /// verified against before it is written.
+    ///
+    /// When given, the ceremony refuses to write a genesis the selected
+    /// schedule's one-shot migrations could not run against (or that would
+    /// leave the chain exposed to EIP-161 reaping) — the same check every node
+    /// runs at boot. Without a schedule source the genesis stays
+    /// schedule-agnostic and each node's own boot gate applies.
+    #[arg(long, value_name = "RAYLS_NETWORK", conflicts_with = "config_file", verbatim_doc_comment)]
+    pub network: Option<RaylsNetwork>,
+
+    /// A client network config file whose subnet's hardfork schedule the
+    /// generated genesis is verified against (with `--subnet`).
+    #[arg(long, value_name = "PATH", value_hint = clap::ValueHint::FilePath, requires = "subnet", conflicts_with = "network")]
+    pub config_file: Option<PathBuf>,
+
+    /// The subnet to select from `--config-file`.
+    #[arg(long, value_name = "SUBNET", requires = "config_file")]
+    pub subnet: Option<String>,
 }
 
 /// Take a string and return the deterministic account derived from it.  This is be used
@@ -215,6 +236,9 @@ impl GenesisArgs {
             min_base_fee: 0,
             gas_limit: ETHEREUM_BLOCK_GAS_LIMIT_56BITS,
             rls_accounts: None,
+            network: None,
+            config_file: None,
+            subnet: None,
         }
     }
 
@@ -332,6 +356,34 @@ impl GenesisArgs {
         // This must happen after pre-genesis contract deployments which run at the default base
         // fee.
         updated_genesis.base_fee_per_gas = Some(self.base_fee as u128);
+
+        // Verify the finished genesis against an explicitly selected hardfork
+        // schedule, when given: a ceremony that wrote a genesis its nodes'
+        // boot gate would refuse would only surface at every node's first
+        // start, so refuse here instead. Without a schedule source the
+        // genesis stays schedule-agnostic (a datadir carries no schedule).
+        if self.network.is_some() || self.config_file.is_some() {
+            let file_schedule = self
+                .config_file
+                .as_ref()
+                .map(|path| {
+                    FileSchedule::load(
+                        path,
+                        self.subnet
+                            .as_deref()
+                            .expect("clap requires --subnet with --config-file"),
+                    )
+                })
+                .transpose()?;
+            let selected = SelectedSchedule::select(file_schedule.as_ref(), self.network)?;
+            verify_datadir_chain_id(self.chain_id, selected.profile.chain_id, &selected.source)?;
+            verify_schedule_against_genesis(&selected.profile, &updated_genesis)?;
+            info!(
+                target: "genesis::ceremony",
+                source = %selected.source,
+                "genesis verified against the selected hardfork schedule"
+            );
+        }
 
         // updated genesis with registry information
         network_genesis.update_genesis(updated_genesis);

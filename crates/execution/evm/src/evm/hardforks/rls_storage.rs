@@ -217,6 +217,28 @@ pub(crate) fn rls_storage_state() -> HashMap<Address, RevmAccount> {
     state
 }
 
+/// Genesis-state preconditions: the RLS proxy must be pristine — no code (the
+/// migration deploys the pinned ERC1967 proxy) and no genesis storage (the
+/// migration re-initializes name/symbol/totalSupply/balances/roles). A proxy
+/// that already carries code or token state belongs to a chain that already
+/// ran this migration, and re-initializing it would overwrite live state.
+pub(crate) fn preconditions(sim: &crate::network_profile::SimAlloc) -> Vec<String> {
+    let mut out = Vec::new();
+    if sim.code(RLS_TOKEN).is_some() {
+        out.push(format!(
+            "RlsStorage: the RLS proxy at {RLS_TOKEN} already has code in the simulated state; \
+             the migration deploys the pinned ERC1967 proxy and would replace it"
+        ));
+    }
+    if sim.genesis_storage(RLS_TOKEN).is_some_and(|storage| !storage.is_empty()) {
+        out.push(format!(
+            "RlsStorage: the RLS proxy at {RLS_TOKEN} carries genesis storage; the migration \
+             re-initializes name/symbol/totalSupply/balances/roles and would overwrite it"
+        ));
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

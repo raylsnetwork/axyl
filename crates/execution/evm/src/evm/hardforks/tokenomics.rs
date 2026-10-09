@@ -256,6 +256,27 @@ pub(crate) fn tokenomics_state() -> HashMap<Address, RevmAccount> {
     state
 }
 
+/// Genesis-state preconditions: the proxies this migration wires must already
+/// carry proxy code (deployed by AdminTransfer/RlsStorage, or present in the
+/// genesis). Without it, the migration would write ERC-7201 wiring slots into
+/// bare addresses, which the live chains it was built against never carried.
+pub(crate) fn preconditions(sim: &crate::network_profile::SimAlloc) -> Vec<String> {
+    let mut out = Vec::new();
+    for (name, address) in [
+        ("DelegationPool", DELEGATION_POOL),
+        ("RewardDistributor", REWARD_DISTRIBUTOR),
+        ("RLS token", RLS_TOKEN),
+    ] {
+        if sim.code(address).is_none() {
+            out.push(format!(
+                "Tokenomics: {name} at {address} has no proxy code in the simulated state; the \
+                 migration expects the deployed proxy"
+            ));
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

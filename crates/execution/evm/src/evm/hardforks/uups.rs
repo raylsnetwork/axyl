@@ -117,6 +117,31 @@ pub(crate) fn uups_state() -> HashMap<Address, RevmAccount> {
     state
 }
 
+/// Genesis-state preconditions: every implementation this migration re-patches
+/// must already carry code. The genesis and the Tokenomics/AdminTransfer
+/// deployments are what place them; a missing implementation means the schedule
+/// fires before the state that carries it (or the genesis was never built with
+/// it).
+pub(crate) fn preconditions(sim: &crate::network_profile::SimAlloc) -> Vec<String> {
+    let mut out = Vec::new();
+    for (name, address) in [
+        ("FeeAggregatorImpl", FEE_AGGREGATOR_IMPL),
+        ("DelegationPoolImpl", DELEGATION_POOL_IMPL),
+        ("RewardDistributorImpl", REWARD_DISTRIBUTOR_IMPL),
+        ("NativeTokenControllerImpl", NATIVE_TOKEN_CONTROLLER_IMPL),
+        ("RLSImpl", RLS_IMPL),
+        ("RLSAccumulatorImpl", RLS_ACCUMULATOR_IMPL),
+    ] {
+        if sim.code(address).is_none() {
+            out.push(format!(
+                "Uups: {name} at {address} has no code in the simulated state; the migration \
+                 re-patches an implementation that was never deployed"
+            ));
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -10,7 +10,7 @@ use fdlimit::raise_fd_limit;
 use rayls_execution_evm::{
     parse_socket_address,
     reth_env::{RethCommand, RethConfig},
-    verify_datadir_chain_id, FileSchedule, SelectedSchedule,
+    verify_datadir_chain_id, verify_schedule_against_genesis, FileSchedule, SelectedSchedule,
 };
 use rayls_infrastructure_config::Config;
 // dev-only: reading the committee file for the single-validator gating check
@@ -291,6 +291,17 @@ impl<Ext: clap::Args + fmt::Debug> NodeCommand<Ext> {
         let selected = SelectedSchedule::select(file_schedule.as_ref(), network)?;
         let actual_chain_id = rayls_infrastructure_config.genesis().config.chain_id;
         verify_datadir_chain_id(actual_chain_id, selected.profile.chain_id, &selected.source)?;
+
+        // The datadir's genesis state must be consistent with the selected
+        // schedule: the embedded one-shot migrations run against the state the
+        // genesis carries, and a schedule built for a different genesis would
+        // rewrite state it was not built for (or leave the chain exposed to
+        // EIP-161 reaping). Refuse before block 0 is materialized, while the
+        // remedy (a different schedule source) still costs nothing.
+        verify_schedule_against_genesis(
+            &selected.profile,
+            rayls_infrastructure_config.genesis(),
+        )?;
 
         debug!(target: "cli", validator = ?rayls_infrastructure_config.node_info.name, "rl datadir for node command: {rl_datadir:?}");
         info!(target: "cli", validator = ?rayls_infrastructure_config.node_info.name, "config loaded");

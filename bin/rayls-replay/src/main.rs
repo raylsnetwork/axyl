@@ -7,8 +7,8 @@ use clap::Parser;
 use eyre::{eyre, Context};
 use rayls_execution_evm::{
     reth_env::{RethCommand, RethConfig, RethEnv},
-    verify_datadir_chain_id, verify_datadir_schedule_record, FileSchedule, NetworkProfile,
-    SelectedSchedule,
+    verify_datadir_chain_id, verify_datadir_schedule_record, verify_schedule_against_genesis,
+    FileSchedule, NetworkProfile, SelectedSchedule,
 };
 use rayls_infrastructure_config::Parameters;
 use rayls_infrastructure_storage::open_db;
@@ -179,7 +179,7 @@ async fn run(cli: Cli) -> eyre::Result<()> {
     let parameters_path =
         cli.parameters.clone().unwrap_or_else(|| cli.snapshot_datadir.join("parameters.yaml"));
 
-    let base_chain = base_chain_spec(&genesis_path)?;
+    let (base_chain, genesis) = base_chain_spec(&genesis_path)?;
 
     // Select and verify the hardfork schedule exactly like the node's boot gate;
     // both envs below are built from the selected profile.
@@ -189,6 +189,11 @@ async fn run(cli: Cli) -> eyre::Result<()> {
     };
     let selected = SelectedSchedule::select(file_schedule.as_ref(), Some(cli.network))?;
     verify_datadir_chain_id(base_chain.chain().id(), selected.profile.chain_id, &selected.source)?;
+    // The snapshot's genesis must be consistent with the selected schedule: the
+    // embedded one-shot migrations fire against the state this genesis carries,
+    // so a schedule built for a different genesis would re-interpret the
+    // replayed blocks and silently diverge state.
+    verify_schedule_against_genesis(&selected.profile, &genesis)?;
     verify_snapshot_schedule_record(&cli.snapshot_datadir, &base_chain, &selected.profile)?;
     info!(
         target: "rayls_replay::main",
@@ -490,13 +495,14 @@ fn copy_recursive(src: &Path, dst: &Path) -> eyre::Result<()> {
 /// The file must exist (the snapshot's `genesis/genesis.yaml` or an explicit
 /// `--genesis`): there is no embedded genesis fallback. Rayls-side hardforks
 /// are applied downstream by `new_for_archive_replay` via
-/// `RaylsChainSpec::builder().rayls_hardforks`.
-fn base_chain_spec(genesis_path: &std::path::Path) -> eyre::Result<Arc<RethChainSpec>> {
+/// `RaylsChainSpec::builder().rayls_hardforks`. The parsed [`Genesis`] is
+/// returned alongside the spec for the genesis/schedule consistency check.
+fn base_chain_spec(genesis_path: &std::path::Path) -> eyre::Result<(Arc<RethChainSpec>, Genesis)> {
     let yaml = std::fs::read_to_string(genesis_path).wrap_err_with(|| {
         format!("read genesis YAML at {} (pass --genesis if it is absent)", genesis_path.display())
     })?;
     let genesis: Genesis = serde_yaml::from_str(&yaml).wrap_err("parse genesis YAML")?;
-    Ok(Arc::new(genesis.into()))
+    Ok((Arc::new(genesis.clone().into()), genesis))
 }
 
 /// Network parameters that affect EVM execution.

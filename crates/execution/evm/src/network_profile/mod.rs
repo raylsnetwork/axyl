@@ -14,6 +14,7 @@
 mod activation;
 mod config_file;
 mod fork_name;
+mod genesis_check;
 mod profile;
 mod record;
 mod verify;
@@ -24,6 +25,7 @@ mod tests;
 pub use activation::ForkActivation;
 pub use config_file::NetworkConfigFile;
 pub use fork_name::ForkName;
+pub use genesis_check::{verify_schedule_against_genesis, SimAlloc};
 pub use profile::NetworkProfile;
 pub use record::ScheduleRecord;
 pub use verify::{

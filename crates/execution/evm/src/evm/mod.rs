@@ -23,7 +23,7 @@ mod config;
 mod context;
 mod factory;
 mod handler;
-mod hardforks;
+pub(crate) mod hardforks;
 pub(crate) use block::*;
 pub(crate) use config::*;
 pub(crate) use context::*;

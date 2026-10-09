@@ -61,6 +61,16 @@ pub(super) const CORRECTION_WEI: U256 = U256::from_be_slice(&[
     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x6d, 0x1b, 0x48, 0xde, 0xe2, 0x77, 0x84, 0x93, 0x60, 0x00,
 ]);
 
+/// The post-correction `TOTAL_SUPPLY` slot value for a given current value.
+pub(crate) fn corrected_total_supply(current: U256) -> Result<U256, BlockExecutionError> {
+    current.checked_add(CORRECTION_WEI).ok_or_else(|| {
+        BlockExecutionError::msg(format!(
+            "UsdrSupplyCorrection: U256 overflow adding correction \
+             ({CORRECTION_WEI}) to current slot value ({current})"
+        ))
+    })
+}
+
 /// Build the state delta for the `UsdrSupplyCorrection` hardfork.
 ///
 /// Unlike the other one-shot migrations in this module, the new slot value
@@ -79,12 +89,7 @@ where
         ))
     })?;
 
-    let new_value = current.checked_add(CORRECTION_WEI).ok_or_else(|| {
-        BlockExecutionError::msg(format!(
-            "UsdrSupplyCorrection: U256 overflow adding correction \
-             ({CORRECTION_WEI}) to current slot value ({current})"
-        ))
-    })?;
+    let new_value = corrected_total_supply(current)?;
 
     // Build the migration's RevmAccount with STOP code explicitly included
     // (see STOP_BYTECODE comment above). The dispatcher will take the

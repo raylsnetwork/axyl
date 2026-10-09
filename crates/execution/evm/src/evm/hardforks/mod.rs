@@ -12,15 +12,20 @@ mod tokenomics;
 mod usdr_supply_correction;
 mod uups;
 
-use crate::chainspec::{RaylsHardFork, RaylsHardforks};
+use crate::{
+    chainspec::{RaylsHardFork, RaylsHardforks},
+    native_erc20::{total_supply_slot, ERC20_PRECOMPILE_ADDRESS},
+    network_profile::SimAlloc,
+};
 use alloy::primitives::Bytes;
 use alloy_evm::block::StateChangeSource;
+use rayls_infrastructure_config::CONSENSUS_REGISTRY_ADDRESS;
 use reth_errors::BlockExecutionError;
 use reth_evm::OnStateHook;
 use reth_revm::{
     bytecode::Bytecode,
     db::StorageWithOriginalValues,
-    state::{Account as RevmAccount, AccountInfo, AccountStatus},
+    state::{Account as RevmAccount, AccountInfo, AccountStatus, EvmStorageSlot},
     State,
 };
 use tracing::info;
@@ -204,6 +209,76 @@ where
         info!(target: "engine", ?fork, "Hardfork migration applied successfully");
     }
 
+    Ok(())
+}
+
+/// The preconditions a one-shot migration expects to find in `sim` at its
+/// activation block: one message per violated precondition, empty when the
+/// migration can run. Used by
+/// [`crate::network_profile::verify_schedule_against_genesis`].
+pub(crate) fn migration_preconditions(fork: RaylsHardFork, sim: &SimAlloc) -> Vec<String> {
+    match fork {
+        RaylsHardFork::AdminTransfer => admin_transfer::preconditions(sim),
+        RaylsHardFork::RlsStorage => rls_storage::preconditions(sim),
+        RaylsHardFork::Tokenomics => tokenomics::preconditions(sim),
+        RaylsHardFork::Uups => uups::preconditions(sim),
+        // The Erc20PrecompileBytecode install is idempotent (it re-asserts the
+        // same STOP byte) and UsdrSupplyCorrection reads its own slot at
+        // activation, so neither has a genesis precondition.
+        RaylsHardFork::Erc20PrecompileBytecode | RaylsHardFork::UsdrSupplyCorrection => {
+            Vec::new()
+        }
+        RaylsHardFork::HybridRewards => hybrid_rewards::preconditions(sim),
+        // Continuous behavioral forks are not one-shot migrations.
+        _ => Vec::new(),
+    }
+}
+
+/// Apply a one-shot migration's state delta to `sim`, mirroring
+/// [`apply_activated_migrations`]. The db-reading migrations
+/// (UsdrSupplyCorrection, HybridRewards) read their inputs from the sim
+/// instead of the database.
+pub(crate) fn apply_migration_sim(fork: RaylsHardFork, sim: &mut SimAlloc) -> Result<(), String> {
+    let state = match fork {
+        RaylsHardFork::AdminTransfer => admin_transfer::admin_transfer_state(),
+        RaylsHardFork::RlsStorage => rls_storage::rls_storage_state(),
+        RaylsHardFork::Tokenomics => tokenomics::tokenomics_state(),
+        RaylsHardFork::Uups => uups::uups_state(),
+        RaylsHardFork::Erc20PrecompileBytecode => {
+            erc20_precompile_bytecode::erc20_precompile_bytecode_state()
+        }
+        RaylsHardFork::UsdrSupplyCorrection => {
+            let slot = total_supply_slot();
+            let current = sim.storage(ERC20_PRECOMPILE_ADDRESS, slot);
+            let new_value =
+                usdr_supply_correction::corrected_total_supply(current).map_err(|e| e.to_string())?;
+            let mut account = account_with_code(erc20_precompile_bytecode::STOP_BYTECODE);
+            account
+                .storage
+                .insert(slot, EvmStorageSlot::new_changed(current, new_value, 0));
+            std::collections::HashMap::from_iter([(ERC20_PRECOMPILE_ADDRESS, account)])
+        }
+        RaylsHardFork::HybridRewards => {
+            let live = sim
+                .code(CONSENSUS_REGISTRY_ADDRESS)
+                .ok_or_else(|| {
+                    format!(
+                        "HybridRewards: the ConsensusRegistry at {CONSENSUS_REGISTRY_ADDRESS} has \
+                         no code in the simulated state"
+                    )
+                })?;
+            let new_code =
+                hybrid_rewards::splice_hybrid_registry_code(live).map_err(|e| e.to_string())?;
+            std::collections::HashMap::from_iter([(
+                CONSENSUS_REGISTRY_ADDRESS,
+                account_with_code(&new_code),
+            )])
+        }
+        // Continuous behavioral forks are not one-shot migrations.
+        _ => return Err(format!("{fork} is not a one-shot migration")),
+    };
+
+    sim.apply(&state);
     Ok(())
 }
 

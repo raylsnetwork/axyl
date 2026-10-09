@@ -1,4 +1,4 @@
-//! End-to-end coverage for the schedule-record boot gate, through real
+//! End-to-end coverage for the schedule boot gates, through real
 //! `rayls-network` process boots on a dev single-validator datadir.
 //!
 //! Scenarios: moving an already-activated fork in a `--config-file` schedule
@@ -6,7 +6,11 @@
 //! is allowed and re-recorded; a deleted record is re-established on the next
 //! boot (trust-on-first-use); a record predating a fork activated within the
 //! executed history is refused with its remedy; a config-file `chain_id`
-//! mismatch and an unknown `--subnet` are both refused at boot.
+//! mismatch and an unknown `--subnet` are both refused at boot. The
+//! genesis-consistency gate is covered separately: a schedule whose
+//! one-shot migrations cannot apply to the datadir's genesis state (or
+//! schedules a behavior-gated migration from genesis) is refused even when
+//! the schedule record would allow it.
 //!
 //! Needs the `dev-single-node-setup` feature: the `dev` subcommand and the
 //! single-validator `--dev` gate only exist in dev builds.
@@ -326,6 +330,79 @@ async fn schedule_record_gate_on_real_boots() -> eyre::Result<()> {
     assert!(!status.success(), "an unknown --subnet must be refused");
     assert!(output.contains("stagenet"), "the refusal should name the requested subnet: {output}");
     assert!(output.contains("local"), "the refusal should list the file's subnets: {output}");
+
+    Ok(())
+}
+
+#[ignore = "boots full dev nodes; run independently from other it tests"]
+#[tokio::test]
+async fn genesis_schedule_consistency_gate_on_real_boots() -> eyre::Result<()> {
+    let _guard = e2e_tests::IT_TEST_MUTEX.lock();
+    init_test_tracing();
+
+    let temp = tempfile::TempDir::with_prefix("genesis_sched_e2e")?;
+    let datadir = temp.path().join("datadir");
+    std::fs::create_dir_all(&datadir)?;
+
+    // 1. Boot the dev node on an empty datadir and kill it once the chain runs. The datadir's
+    //    genesis is the fresh local one, whose pre-genesis ceremony already deploys the pool
+    //    proxies, the RLS proxy and its implementation, and the ConsensusRegistry — so the
+    //    migrations that are `never` on local are consistent (their state is baked in), and a
+    //    schedule that would re-run one of them is not.
+    let port = get_available_tcp_port("127.0.0.1")
+        .ok_or_else(|| eyre::eyre!("no free tcp port for the dev node"))?;
+    let mut command = get_rayls_network_binary().command();
+    command
+        .arg("dev")
+        .arg("--datadir")
+        .arg(&*datadir.to_string_lossy())
+        .arg("--no-dashboard")
+        .arg("--http.port")
+        .arg(port.to_string());
+    let mut dev_node = command.spawn().expect("dev node spawns");
+    let rpc_url = format!("http://127.0.0.1:{port}");
+    wait_for_rpc(&rpc_url).await?;
+    kill_quietly(&mut dev_node);
+
+    // 2. Schedule RlsStorage in the future: the record gate allows this (a `never` fork's
+    //    boundary is still in the future for the pinned head), but the genesis-consistency
+    //    gate must refuse pre-launch — the local genesis already carries the deployed RLS
+    //    proxy, and the migration would replace its code on a live chain.
+    let redeploy_rls =
+        write_config_file(temp.path(), "redeploy-rls.yaml", &local_profile_moving("RlsStorage", 500));
+    let port2 = get_available_tcp_port("127.0.0.1")
+        .ok_or_else(|| eyre::eyre!("no free tcp port for port2"))?;
+    let (child, stderr) = start_node(&datadir, port2, Some((&redeploy_rls, "local")));
+    let (status, output) = wait_for_refusal(child, stderr).await?;
+    assert!(
+        !status.success(),
+        "a boot whose schedule re-runs an already-executed migration must be refused"
+    );
+    assert!(output.contains("RlsStorage"), "the refusal should name the offending fork: {output}");
+    assert!(
+        output.contains("already has code"),
+        "the refusal should say the RLS proxy is already deployed: {output}"
+    );
+    assert!(
+        output.contains("not consistent with the selected hardfork schedule"),
+        "the refusal should name the genesis/schedule inconsistency: {output}"
+    );
+
+    // 3. Schedule the behavior-gated HybridRewards from genesis: its activation would switch the
+    //    epoch-close reward ABI at block 0, against the un-spliced ConsensusRegistry. Refused.
+    let mut block0_hybrid = local_profile_complete();
+    block0_hybrid.hardforks.insert(ForkName::from("HybridRewards"), ForkActivation::Block(0));
+    let hybrid_file = write_config_file(temp.path(), "hybrid-block0.yaml", &block0_hybrid);
+    let port3 = get_available_tcp_port("127.0.0.1")
+        .ok_or_else(|| eyre::eyre!("no free tcp port for port3"))?;
+    let (child, stderr) = start_node(&datadir, port3, Some((&hybrid_file, "local")));
+    let (status, output) = wait_for_refusal(child, stderr).await?;
+    assert!(!status.success(), "a boot scheduling a behavior-gated migration from genesis must be refused");
+    assert!(output.contains("HybridRewards"), "the refusal should name the offending fork: {output}");
+    assert!(
+        output.contains("block 0"),
+        "the refusal should say the fork is active from genesis: {output}"
+    );
 
     Ok(())
 }

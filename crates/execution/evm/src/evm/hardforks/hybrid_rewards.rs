@@ -85,7 +85,7 @@ const NEW_DEPLOYED_BYTECODE: &[u8] =
 /// Fails loudly if `live` is not the expected pre-hybrid contract (wrong length, or link/`_rls`
 /// sites that disagree with each other) rather than installing corrupt code — a mismatch means
 /// the target network does not carry the contract this migration was built against.
-fn splice_hybrid_registry_code(live: &[u8]) -> Result<Vec<u8>, BlockExecutionError> {
+pub(crate) fn splice_hybrid_registry_code(live: &[u8]) -> Result<Vec<u8>, BlockExecutionError> {
     if live.len() != OLD_DEPLOYED_LEN {
         return Err(BlockExecutionError::msg(format!(
             "HybridRewards: live ConsensusRegistry runtime code is {} bytes, expected {} \
@@ -168,6 +168,28 @@ where
     let mut state = HashMap::default();
     state.insert(CONSENSUS_REGISTRY_ADDRESS, account_with_code(&new_code));
     Ok(state)
+}
+
+/// Genesis-state preconditions: the `ConsensusRegistry` must carry the
+/// pre-hybrid runtime code the splice was built against — the length and the
+/// BlsG1/`_rls` site-consistency checks inside
+/// [`splice_hybrid_registry_code`] fail on anything else. A registry that
+/// already carries the hybrid bytecode (or a different contract) has nothing
+/// for the in-place swap to splice from.
+pub(crate) fn preconditions(sim: &crate::network_profile::SimAlloc) -> Vec<String> {
+    let mut out = Vec::new();
+    match sim.code(CONSENSUS_REGISTRY_ADDRESS) {
+        None => out.push(format!(
+            "HybridRewards: the ConsensusRegistry at {CONSENSUS_REGISTRY_ADDRESS} has no code \
+             in the simulated state; the bytecode swap has no live contract to splice from"
+        )),
+        Some(live) => {
+            if let Err(error) = splice_hybrid_registry_code(live) {
+                out.push(error.to_string());
+            }
+        }
+    }
+    out
 }
 
 #[cfg(test)]

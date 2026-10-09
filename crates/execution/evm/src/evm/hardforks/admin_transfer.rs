@@ -377,6 +377,28 @@ pub(crate) const fn new_admin() -> Address {
     NEW_ADMIN
 }
 
+/// Genesis-state preconditions: the four contracts this migration rewrites
+/// must already be deployed with code. A bare (code-less) account would come
+/// out with role slots or a proxy whose implementation was never wired,
+/// which the live chains this migration was built against never carried.
+pub(crate) fn preconditions(sim: &crate::network_profile::SimAlloc) -> Vec<String> {
+    let mut out = Vec::new();
+    for (name, address) in [
+        ("NativeTokenController", NATIVE_TOKEN_CONTROLLER),
+        ("FeeAggregator", FEE_AGGREGATOR),
+        ("DelegationPool", DELEGATION_POOL),
+        ("RewardDistributor", REWARD_DISTRIBUTOR),
+    ] {
+        if sim.code(address).is_none() {
+            out.push(format!(
+                "AdminTransfer: {name} at {address} has no code in the simulated state; the \
+                 migration expects the deployed contract"
+            ));
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     #[cfg(test)]
