@@ -9,11 +9,11 @@ on:
       - main
 
 # CI is opt-in per run: adding the `run-ci` label runs the jobs below once,
-# against the PR's current head, and the `consume-label` job removes the label
-# again so it can be re-added for the next run. Pushes, other labels, etc. do
-# not run CI: the jobs are skipped and the required "Tests" check (tests-gate)
-# fails, so a commit that CI hasn't run on can't be merged. Manual dispatch
-# always runs.
+# against the PR's current head, and consume-run-ci-label.yml removes the label
+# again (fork PRs included) so it can be re-added for the next run. Pushes,
+# other labels, etc. do not run CI: the jobs are skipped and the required
+# "Tests" check (tests-gate) fails, so a commit that CI hasn't run on can't be
+# merged. Manual dispatch always runs.
 
 # Least privilege by default; the jobs that post PR comments re-grant
 # pull-requests: write in their own permissions block.
@@ -37,29 +37,6 @@ env:
   CARGO_PROFILE_DEV_DEBUG: 0
 
 jobs:
-  # ===========================================================================
-  # CONSUME LABEL - remove `run-ci` so it acts as a one-shot trigger
-  #
-  # Runs first thing so the label can be re-added straight away to queue a
-  # fresh run. Fork PRs get a read-only GITHUB_TOKEN, so there the label stays
-  # on and a maintainer has to remove and re-add it for the next run (it being
-  # left on doesn't re-trigger CI on pushes; only the `labeled` event does).
-  # ===========================================================================
-  consume-label:
-    name: Consume run-ci label
-    if: >
-      github.event.action == 'labeled' && github.event.label.name == 'run-ci' &&
-      github.event.pull_request.head.repo.full_name == github.repository
-    runs-on: ubuntu-latest
-    permissions:
-      pull-requests: write
-      issues: write
-    steps:
-      - name: Remove run-ci label
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: gh api -X DELETE repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/labels/run-ci
-
   # ===========================================================================
   # FORMAT - rustfmt check (honors rustfmt.toml)
   # ===========================================================================

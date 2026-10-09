@@ -25,7 +25,7 @@ permissions:
   contents: read
 
 # Opt-in per run, like pr.yaml: only builds when the `run-ci` label is added
-# (pr.yaml removes the label again). Not a required check.
+# (consume-run-ci-label.yml removes the label again). Not a required check.
 on:
   pull_request:
     branches: [main]

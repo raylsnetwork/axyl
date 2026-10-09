@@ -1,0 +1,34 @@
+name: Consume run-ci label
+
+# CI is opt-in per run: adding the `run-ci` label to a PR runs pr.yaml (and
+# feature-build-matrix.yml) once. This workflow removes the label again straight
+# away so it acts as a one-shot trigger and can be re-added to queue a fresh run.
+#
+# Uses pull_request_target (not pull_request) so the job runs in the BASE repo
+# context with a writable GITHUB_TOKEN; on `pull_request`, fork PRs only get a
+# read-only token and the label could never be removed. That's safe because the
+# job never checks out or runs PR code: it makes a single API call using the PR
+# number. Keep it that way: no checkout, no PR-controlled strings in `run:`.
+on:
+  pull_request_target:
+    types: [labeled]
+    branches: [main]
+
+# No token permissions by default; the job re-grants only what it needs.
+permissions: {}
+
+jobs:
+  consume-label:
+    name: Consume run-ci label
+    if: github.event.label.name == 'run-ci'
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+      issues: write
+    steps:
+      - name: Remove run-ci label
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: gh api -X DELETE "repos/$REPO/issues/$PR_NUMBER/labels/run-ci"
