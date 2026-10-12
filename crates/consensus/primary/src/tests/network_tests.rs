@@ -40,6 +40,27 @@ fn test_missing_certs_request() {
     assert_eq!(expected_skip_rounds, decoded_skip_rounds);
 }
 
+/// A crafted request whose lower bound plus a skip delta exceeds `Round::MAX` is rejected
+/// instead of overflowing. The release profile aborts on overflow, so before this any peer
+/// could take a node down with one message.
+#[test]
+fn test_missing_certs_request_rejects_round_overflow() {
+    let mut serialized = Vec::new();
+    roaring::RoaringBitmap::from_iter([1u32]).serialize_into(&mut serialized).expect("bitmap");
+    let request = MissingCertificatesRequest {
+        exclusive_lower_bound: u32::MAX,
+        skip_rounds: vec![(AuthorityIdentifier::dummy_for_test(0), serialized)],
+        max_response_size: 10,
+        exclusive_upper_bound: None,
+    };
+    assert_matches!(request.get_bounds(), Err(PrimaryNetworkError::StdIo(_)));
+
+    // the same delta below the edge decodes as before
+    let request = MissingCertificatesRequest { exclusive_lower_bound: u32::MAX - 1, ..request };
+    let (_, skip) = request.get_bounds().expect("no overflow");
+    assert_eq!(skip[&AuthorityIdentifier::dummy_for_test(0)], BTreeSet::from([u32::MAX]));
+}
+
 /// The type for holding testng components.
 struct TestTypes<DB = MemDatabase> {
     /// Committee committee with authorities that vote.
@@ -128,6 +149,34 @@ async fn test_vote_fails_too_many_parents() -> eyre::Result<()> {
     let res = handler.vote(peer, header, too_many_parents).await;
     debug!(target: "primary::handler_tests", ?res);
     assert_matches!(res, Err(PrimaryNetworkError::InvalidHeader(HeaderError::TooManyParents(received, expected))) if received == 5 && expected == 4 );
+    Ok(())
+}
+
+/// A round-0 header is never a valid proposal. Before the floor in `vote_inner`, a round-0 header
+/// with an unknown parent passed `Header::validate` and the too-old gate (the local round is 0 at
+/// node start and at every epoch start) and reached `check_for_missing_parents`, which keyed the
+/// request by `round - 1`: with overflow checks on and `panic = "abort"` in release, one such
+/// request from a committee member aborted the node.
+#[tokio::test]
+async fn test_vote_fails_round_zero() -> eyre::Result<()> {
+    let TestTypes { committee, handler, parent, task_manager: _task_manager, .. } =
+        create_test_types();
+    let unknown_parent = CertificateDigest::new(BlockHash::random().0);
+    let header = committee
+        .header_builder_last_authority()
+        .round(0)
+        .parents([unknown_parent].into_iter().collect())
+        .latest_execution_block(BlockNumHash::new(parent.number(), parent.hash()))
+        .created_at(1)
+        .build();
+    let peer = *committee.last_authority().authority().protocol_key();
+
+    let res = handler.vote(peer, header, Vec::new()).await;
+    debug!(target: "primary::handler_tests", ?res);
+    assert_matches!(
+        res,
+        Err(PrimaryNetworkError::InvalidHeader(HeaderError::InvalidRound { header_round: 0, .. }))
+    );
     Ok(())
 }
 

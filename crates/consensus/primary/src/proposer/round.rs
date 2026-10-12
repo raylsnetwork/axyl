@@ -211,7 +211,7 @@ impl<DB: Database> Proposer<DB> {
                     parent_round=?round,
                     "adding parents for current round",
                 );
-                // certs arrive from synchronizer once quorum is reached
+                // certs arrive from the state synchronizer once quorum is reached
                 // so these are extra parents
                 self.last_parents.extend(parents);
                 // the schedule can change after an odd round proposal

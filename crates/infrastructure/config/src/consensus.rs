@@ -326,4 +326,9 @@ where
     pub fn worker_address(&self) -> Multiaddr {
         self.inner.config.node_info.p2p_info.worker.network_address.clone()
     }
+
+    /// Retrieve the worker's network public key.
+    pub fn worker_networkkey(&self) -> NetworkPublicKey {
+        self.inner.config.node_info.p2p_info.worker.network_key.clone()
+    }
 }

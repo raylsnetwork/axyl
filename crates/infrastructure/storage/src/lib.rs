@@ -18,7 +18,7 @@ use tables::{
     CertificateDigestByRound, Certificates, ConsensusBlockNumbersByDigest, ConsensusBlocks,
     ConsensusBlocksCache, EpochCerts, EpochRecords, EpochRecordsIndex, EpochTransitionCheckpoints,
     KadProviderRecords, KadRecords, KadWorkerProviderRecords, KadWorkerRecords, LastProposed,
-    LastProposedByAuthority, NodeBatchesCache, NodeIdentity, Payload, Votes,
+    LastProposedByAuthority, NodeBatchesCache, NodeIdentity, Payload, PendingEpochRecord, Votes,
 };
 #[cfg(feature = "cold-storage")]
 use tables::{ColdArchiveHighWaterMark, ColdBatchLocations};
@@ -59,6 +59,7 @@ const NODE_BATCHES_CACHE_CF: &str = "node_batches_cache";
 const EPOCH_RECORDS_CF: &str = "epoch_record_by_number";
 const EPOCH_CERTS_CF: &str = "epoch_cert_by_number";
 const EPOCH_RECORDS_INDEX_CF: &str = "epoch_records_index";
+const PENDING_EPOCH_RECORD_CF: &str = "pending_epoch_record";
 const KAD_RECORD_CF: &str = "kad_record";
 const KAD_PROVIDER_RECORD_CF: &str = "kad_provider_record";
 const KAD_WORKER_RECORD_CF: &str = "kad_worker_record";
@@ -124,6 +125,12 @@ pub mod tables {
         EpochRecordsIndex;crate::EPOCH_RECORDS_INDEX_CF;<B256, Epoch>,
         // Epoch transition checkpoint for crash recovery. Keyed by epoch, stores at most one entry.
         EpochTransitionCheckpoints;crate::EPOCH_TRANSITION_CHECKPOINTS_CF;<Epoch, EpochTransitionCheckpoint>,
+        // A closed epoch's record, saved as soon as it is built, before certification. Distinct
+        // from EpochRecords (certified-only, see save_epoch_record_with_cert): this is a resume
+        // hint for bootstrap/retry, never trusted as a substitute for a certified record. Keyed
+        // by epoch, one row per closed-but-uncertified epoch; a later close never evicts an
+        // earlier epoch that is still awaiting its cert (#142).
+        PendingEpochRecord;crate::PENDING_EPOCH_RECORD_CF;<Epoch, EpochRecord>,
         // These are used for network storage and separate from consensus
         KadRecords;crate::KAD_RECORD_CF;<BlockHash, Vec<u8>>,
         KadProviderRecords;crate::KAD_PROVIDER_RECORD_CF;<BlockHash, Vec<u8>>,
@@ -174,6 +181,9 @@ pub fn open_db_with_consensus_config<Path: AsRef<std::path::Path> + Send>(
     // set.
     #[cfg(all(feature = "reth-libmdbx", not(feature = "redb")))]
     return _open_mdbx(store_path, consensus_db_config);
+    // redb has no MDBX config to consume.
+    #[cfg(feature = "redb")]
+    let _ = consensus_db_config;
     #[cfg(feature = "redb")]
     return _open_redb(store_path);
     panic!("No DB configured!")
@@ -272,6 +282,7 @@ fn open_default_tables<DB: Database>(db: &mut DB) -> eyre::Result<()> {
     open_one::<EpochRecords>(db)?;
     open_one::<EpochCerts>(db)?;
     open_one::<EpochRecordsIndex>(db)?;
+    open_one::<PendingEpochRecord>(db)?;
     open_one::<EpochTransitionCheckpoints>(db)?;
     open_one::<KadRecords>(db)?;
     open_one::<KadProviderRecords>(db)?;
@@ -667,4 +678,11 @@ mod test {
             assert_eq!(Some(v), val);
         }
     }
+}
+
+/// Anchor for the dev-dependencies that only this crate's own test and bench
+/// targets consume; without it, lib-test builds warn that they are unused.
+#[cfg(test)]
+mod clippy {
+    use criterion as _;
 }

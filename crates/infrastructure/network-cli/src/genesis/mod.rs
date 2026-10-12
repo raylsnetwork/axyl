@@ -138,10 +138,10 @@ pub struct GenesisArgs {
     #[arg(long)]
     pub min_header_delay_ms: Option<u64>,
     /// Numeric chain id that will go in the genesis.
-    /// Defaults to the `local` network's chain-id (487). Any value is accepted: the resulting
-    /// datadir carries no baked-in network profile ("external"), so nodes must be started with
-    /// a schedule matching this chain-id — either `--network <devnet|testnet|mainnet|local>`
-    /// (when the chain-id matches that network) or `--config-file <path> --subnet <name>`.
+    /// Defaults to the `local` network's chain-id (487). Any value is accepted: a datadir
+    /// carries no hardfork schedule, so nodes must always be started with a schedule whose
+    /// chain-id matches this one — either `--network <devnet|testnet|mainnet|local>` (when
+    /// the chain-id matches that network) or `--config-file <path> --subnet <name>`.
     #[arg(long, default_value_t = RaylsNetwork::Local.chain_id(), value_parser=maybe_hex)]
     pub chain_id: u64,
     /// YAML file containing accounts to merge into genesis.

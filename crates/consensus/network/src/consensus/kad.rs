@@ -2,7 +2,7 @@ use crate::{
     codec::RLMessage,
     consensus::types::{RecordInvalidReason, SECONDS_IN_FUTURE_RECORD_ALLOWANCE},
     peers::Penalty,
-    types::{NetworkEvent, NetworkResult, NodeRecord},
+    types::{NetworkEvent, NetworkInfo, NetworkResult, NodeRecord},
     ConsensusNetwork,
 };
 use libp2p::{
@@ -305,7 +305,7 @@ where
                 .and_then(|existing| try_decode::<NodeRecord>(&existing.value).ok())
                 .map(|stored| stored.info);
             if let Some(info) = stored_info {
-                self.swarm.behaviour_mut().peer_manager.add_known_peer(key, info);
+                self.admit_record_info(source, key, info);
             }
             return;
         }
@@ -327,7 +327,23 @@ where
         }
 
         trace!(target: "network-kad", %key, "stored fresh kad record");
-        self.swarm.behaviour_mut().peer_manager.add_known_peer(key, decoded_record.info);
+        self.admit_record_info(source, key, decoded_record.info);
+    }
+
+    /// Hand a validated record's info to the peer manager. The peer id is bound to `key` only
+    /// when `source`, the peer the put arrived from, *is* the peer the record is about: the
+    /// connection was authenticated as that peer id by the handshake, which is the one proof of
+    /// network-key ownership a record cannot forge. From anyone else -- a replicating node, or a
+    /// peer naming a network key it does not hold -- the record is dial hints only; the binding
+    /// is made when the named peer connects and pushes its own record.
+    fn admit_record_info(&mut self, source: PeerId, key: BlsPublicKey, info: NetworkInfo) {
+        let about: PeerId = info.pubkey.clone().into();
+        let pm = &mut self.swarm.behaviour_mut().peer_manager;
+        if source == about {
+            pm.add_known_peer(key, info);
+        } else {
+            pm.add_known_peer_addrs(key, info);
+        }
     }
 
     /// Process on inbound add provider request.
@@ -520,23 +536,27 @@ where
     }
 
     /// Cleanup kad record queries (called on last step).
+    ///
+    /// A query answer comes from whichever node stored the record, not from the peer it is
+    /// about, so it yields dial addresses and no peer-id binding (see `admit_record_info`).
     fn close_kad_query(&mut self, query_id: &QueryId) {
         if let Some(query) = self.kad_record_queries.remove(query_id) {
             if let Some(node_record) = query.result {
                 self.swarm
                     .behaviour_mut()
                     .peer_manager
-                    .add_known_peer(query.request, node_record.info);
+                    .add_known_peer_addrs(query.request, node_record.info);
             }
         }
     }
 
     /// Load known peers from the persistent KAD store into the in-memory cache at startup.
     ///
-    /// `KadStore` is persisted across restarts, but `known_peerids` lives only in memory
-    /// and is wiped on every boot. Without this preload, a restarted node rejects
-    /// subsequent re-PUTs from peers as `OldRecord` and never repopulates the BLS mapping
-    /// until those peers themselves restart with a fresh timestamp.
+    /// `KadStore` is persisted across restarts while the in-memory peer tables are wiped on every
+    /// boot. The preload restores the dial addresses of every authority this node knew, so the
+    /// committee can be redialed at once. It does not restore peer-id bindings: a stored record
+    /// carries no proof of who delivered it, so the binding is re-made when each peer connects and
+    /// pushes its record, which the dedup path above accepts even when the record is unchanged.
     pub(super) fn load_known_peers_from_kad_store(&mut self) {
         let local_peer_id = *self.swarm.local_peer_id();
         let records: Vec<kad::Record> = self
@@ -561,7 +581,7 @@ where
             if self.swarm.behaviour().peer_manager.peer_banned(&peer_id) {
                 continue;
             }
-            self.swarm.behaviour_mut().peer_manager.add_known_peer(bls_key, node_record.info);
+            self.swarm.behaviour_mut().peer_manager.add_known_peer_addrs(bls_key, node_record.info);
             loaded += 1;
         }
         info!(
@@ -586,6 +606,13 @@ where
 
     /// Publish and provide our network addresses and peer id under our BLS public key for
     /// discovery.
+    ///
+    /// A node always publishes, even when its advertised address is identity-only (a bare
+    /// `/p2p/<peer-id>`, e.g. an outbound-only observer): the record is the peer's identity, and
+    /// others rely on it to map our `peer_id -> bls` (`peer_to_bls`) so they accept our
+    /// request-response traffic (serving our batch requests). An undialable advertised address is
+    /// harmless -- the `add_address`/discovery transport-less filters keep it out of every dial
+    /// path -- but skipping publish would leave us unidentifiable ("requesting peer unknown").
     pub(super) fn provide_our_data(&mut self) {
         let record = self.get_peer_record();
         info!(target: "network-kad", ?record, "Providing our record to kademlia for peer {:?}", self.swarm.local_peer_id());

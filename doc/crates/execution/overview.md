@@ -103,6 +103,9 @@ feed the parallel sparse trie computation.
 A dedicated OS thread runs reth's `PersistenceService` and is accessed through a
 `PersistenceHandle`. Blocks are flushed from CIM to MDBX asynchronously in the background.
 
+New execution databases are created with a 16 KiB MDBX page size unless `--db.page-size` is
+given (`RethEnv::new_database`); existing databases keep the page size they were created with, and open on a host with a different default page size (for example x86 to ARM).
+
 `PersistenceState`
 ([`evm/src/reth_env/persistence.rs`](../../../crates/execution/evm/src/reth_env/persistence.rs))
 tracks when to trigger a flush:
@@ -290,6 +293,7 @@ Adds a `rayls` JSON-RPC namespace with Rayls-specific endpoints not covered by `
 | `rayls_genesis` | Chain genesis |
 | `rayls_epochRecord` | `EpochRecord` + `EpochCertificate` by epoch number |
 | `rayls_epochRecordByHash` | `EpochRecord` + `EpochCertificate` by epoch hash |
+| `rayls_nodeStatus` | Node role and sync status |
 
 ---
 

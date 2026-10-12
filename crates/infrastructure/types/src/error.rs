@@ -251,6 +251,10 @@ pub enum HeaderError {
     /// The proposed header's round is too far ahead.
     #[error("Header {digest} for round {header_round} is too new for max round {max_round}")]
     TooNew { digest: HeaderDigest, header_round: Round, max_round: Round },
+    /// The proposed header's round is below the first proposable round. Round 0 is genesis and
+    /// is never proposed; a header claiming it has no parent round to check against.
+    #[error("Header {digest} proposes round {header_round}; proposals start at round 1")]
+    InvalidRound { digest: HeaderDigest, header_round: Round },
     /// The header contains a parent with an invalid aggregate BLS signature.
     #[error("Header's parent missing aggregate BLS signature")]
     ParentMissingSignature,

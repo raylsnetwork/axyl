@@ -91,6 +91,13 @@ impl<DB: Database> Processor<DB> {
             .is_output_seq_normalization_active_at_block(parent_block_number + 1)
     }
 
+    /// Check if EpochCloseSeedV2 behavior is active at the next block after `parent`.
+    fn is_epoch_close_seed_v2_active(&self, parent_block_number: u64) -> bool {
+        self.reth_env
+            .rayls_chain_spec()
+            .is_epoch_close_seed_v2_active_at_block(parent_block_number + 1)
+    }
+
     /// Execute consensus output to extend the canonical chain.
     pub fn execute_consensus_output(
         &self,
@@ -179,7 +186,18 @@ impl<DB: Database> Processor<DB> {
             seq_normalization,
         );
 
-        let close_epoch_value = output.close_epoch.then(|| output.keccak_leader_sigs());
+        // Hardfork-gated seed for the epoch-closing block's `extra_data`, evaluated at this
+        // output's first block like the other per-output gates. Post-fork (EpochCloseSeedV2): the
+        // consensus header hash, identical on every node. Pre-fork: the keccak of the leader
+        // certificate's aggregate signature, which varies with the 2f+1 signer subset and forked
+        // the block hash on 2026-08-16 (#233); kept so existing history replays byte-identical.
+        let close_epoch_value = output.close_epoch.then(|| {
+            if self.is_epoch_close_seed_v2_active(canonical_header.number) {
+                output.epoch_close_seed()
+            } else {
+                output.keccak_leader_sigs()
+            }
+        });
 
         // close_epoch only goes to the batch at the last output position, matching the old
         // close_epoch_for_last_batch() consumption semantics.

@@ -721,6 +721,11 @@ impl AllPeers {
         self.current_committee.contains(peer_id)
     }
 
+    /// Boolean indicating if this BLS key seats a member of the current committee.
+    pub(super) fn is_committee_key(&self, bls_key: &BlsPublicKey) -> bool {
+        self.current_committee_keys.contains_key(bls_key)
+    }
+
     /// Boolean indicating this peer is seated now or was seated in the previous epoch.
     ///
     /// Used for gossip authorization and connection priority during a committee handover. This is

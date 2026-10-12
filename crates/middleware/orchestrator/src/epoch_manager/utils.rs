@@ -1,4 +1,3 @@
-use crate::epoch_manager::types::EpochManager;
 use rayls_consensus_state_sync::{highest_executed_anchor, last_executed_consensus_from_anchor};
 use rayls_execution_evm::reth_env::RethEnv;
 use rayls_infrastructure_config::RaylsDirs;
@@ -6,8 +5,8 @@ use rayls_infrastructure_storage::{
     mdbx::MdbxConfig, open_db_with_consensus_config, tables::ConsensusBlocks, DatabaseType,
 };
 use rayls_infrastructure_types::{
-    gas_accumulator::GasAccumulator, AuthorityIdentifier, BlsPublicKey, ConsensusHeader,
-    ConsensusHeaderMeta, Database, DbTx, EpochVote, B256, WALK_PROGRESS_LOG_EVERY,
+    gas_accumulator::GasAccumulator, AuthorityIdentifier, ConsensusHeader, ConsensusHeaderMeta,
+    Database, DbTx, WALK_PROGRESS_LOG_EVERY,
 };
 // production-only: the hardcoded protocol base-fee floor used to seed the accumulator
 #[cfg(not(feature = "dev-single-node-setup"))]
@@ -163,28 +162,6 @@ pub(crate) fn open_consensus_db<P: RaylsDirs + 'static>(
     info!(target: "epoch-manager", ?consensus_db_path, "opened consensus storage");
 
     Ok(db)
-}
-
-impl<P, DB> EpochManager<P, DB>
-where
-    P: RaylsDirs + Clone + 'static,
-    DB: Database,
-{
-    /// Used by `committee_epoch_certs`: returns the BLS pubkey of a committee
-    /// member that signed `vote` matching `hash`, if any.
-    pub(super) fn signed_by_committee(
-        committee_keys: &[BlsPublicKey],
-        vote: &EpochVote,
-        hash: B256,
-    ) -> Option<BlsPublicKey> {
-        if vote.epoch_hash == hash
-            && committee_keys.contains(&vote.public_key)
-            && vote.check_signature()
-        {
-            return Some(vote.public_key);
-        }
-        None
-    }
 }
 
 #[cfg(test)]

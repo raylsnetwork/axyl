@@ -86,6 +86,8 @@ fn main() {
                 passphrase = read_passphrase();
             }
             Commands::Genesis(_) => {} // Don't need the passphrase..
+            // Pure serialization of the built-in schedule; no key is ever opened.
+            Commands::Schedule(_) => {}
             Commands::Node(_) => {
                 // Simple ask once and app will error out later if this is wrong.
                 passphrase =

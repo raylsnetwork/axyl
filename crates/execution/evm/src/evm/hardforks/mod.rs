@@ -136,7 +136,8 @@ where
             | RaylsHardFork::EmptyOutputBlock
             | RaylsHardFork::DynamicCommitteeSizing
             | RaylsHardFork::OutputSeqNormalization
-            | RaylsHardFork::SenderAffinityLoadBalancing => continue,
+            | RaylsHardFork::SenderAffinityLoadBalancing
+            | RaylsHardFork::EpochCloseSeedV2 => continue,
         };
 
         // Pre-load accounts into cache and copy their real AccountInfo.
@@ -209,7 +210,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::chainspec::{RaylsChainHardforks, TESTNET_ADMIN_TRANSFER_BLOCK};
+    use crate::chainspec::{RaylsChainHardforks, ScheduledFork, TESTNET_ADMIN_TRANSFER_BLOCK};
     use rayls_infrastructure_types::{address, Address, RaylsNetwork, U256};
     use reth_revm::{db::EmptyDBTyped, State};
 
@@ -425,7 +426,7 @@ mod tests {
 
     /// Build a synthetic test schedule with only Erc20PrecompileBytecode active at `block`.
     fn synthetic_schedule(block: u64) -> RaylsChainHardforks {
-        RaylsChainHardforks::new([(
+        RaylsChainHardforks::new([ScheduledFork::new(
             RaylsHardFork::Erc20PrecompileBytecode,
             reth_chainspec::ForkCondition::Block(block),
         )])

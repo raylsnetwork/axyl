@@ -23,6 +23,7 @@ where
         let reth_env = RethEnv::new_from_parameters(
             &self.builder.node_config,
             &self.builder.rayls_infrastructure_config.parameters,
+            &self.builder.profile,
             engine_task_manager,
             self.reth_db.clone(),
             gas_accumulator.rewards_counter(),

@@ -34,7 +34,3 @@ dev-single-node-setup = ["rayls-network-cli/dev-single-node-setup"]
 
 [lints]
 workspace = true
-
-[profile.profiling]
-inherits = "release"
-debug = true

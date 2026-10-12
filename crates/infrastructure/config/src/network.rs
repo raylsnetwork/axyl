@@ -210,7 +210,8 @@ pub struct SyncConfig {
     ///
     /// On the happy path, this duration should never be reached. It is a safety measure for the
     /// node to try and recover after enough parents weren't received for a round within time.
-    pub max_consenus_round_timeout: Duration,
+    #[serde(alias = "max_consenus_round_timeout")]
+    pub max_consensus_round_timeout: Duration,
     /// The maximum number of rounds that a proposed header can be behind the node's local round.
     pub max_proposed_header_age_limit: Round,
     /// The tolerable amount of time to wait if a header is proposed before the current time.
@@ -239,7 +240,7 @@ impl Default for SyncConfig {
             max_skip_rounds_for_missing_certs: 1_000,
             max_db_read_time_for_fetching_certificates: Duration::from_secs(3),
             max_diff_between_external_cert_round_and_highest_local_round: 1_000,
-            max_consenus_round_timeout: Duration::from_secs(30),
+            max_consensus_round_timeout: Duration::from_secs(30),
             max_proposed_header_age_limit: 3,
             max_header_time_drift_tolerance: 1,
             max_num_missing_certs_within_gc_round: 50,
@@ -287,6 +288,24 @@ impl Default for QuicConfig {
             max_stream_data: 50 * 1024 * 1024,      // 50MiB
             max_connection_data: 100 * 1024 * 1024, // 100MiB
         }
+    }
+}
+
+impl QuicConfig {
+    /// Applies these limits to a libp2p QUIC transport config.
+    ///
+    /// The single source of the QuicConfig-to-transport field MAPPING; the values still come
+    /// from the caller's instance. The test relay applies `QuicConfig::default()` and does not
+    /// read a node's config file, so an operator tuning `quic_config` above the defaults must
+    /// retune the relay too or it becomes the flow-control bottleneck for circuit traffic.
+    pub fn apply(&self, mut config: libp2p::quic::Config) -> libp2p::quic::Config {
+        config.handshake_timeout = self.handshake_timeout;
+        config.max_idle_timeout = self.max_idle_timeout;
+        config.keep_alive_interval = self.keep_alive_interval;
+        config.max_concurrent_stream_limit = self.max_concurrent_stream_limit;
+        config.max_stream_data = self.max_stream_data;
+        config.max_connection_data = self.max_connection_data;
+        config
     }
 }
 

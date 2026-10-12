@@ -3,6 +3,8 @@ members = [
     # common
     "bin/rayls-network",
     "bin/rayls-replay",
+    "bin/rayls-relay",
+    "bin/rayls-db-inspect",
 
     # consensus
     "crates/consensus/state-sync",
@@ -53,7 +55,7 @@ exclude = ["crates/testing/fuzz-targets"]
 resolver = "2"
 
 [workspace.package]
-version = "1.4.1"
+version = "1.5.0"
 edition = "2021"
 # Remember to update:
 # - .clippy.toml
@@ -83,10 +85,11 @@ all = "warn"
 [workspace.dependencies]
 # misc
 clap = "4.5"
+comfy-table = "7.2"
 eyre = "0.6"
 futures = "0.3"
 tokio = { version = "1.44", default-features = false }
-tracing = { version = "0.1.0", features = ["release_max_level_info"] }
+tracing = { version = "0.1.0", features = ["release_max_level_debug"] }
 tracing-appender = "0.2"
 tracing-subscriber = "0.3.20"
 metrics = "0.24"                                       # MUST match the version reth's prometheus recorder registers against, or gauge!/counter! bind to a second global and become no-ops
@@ -278,6 +281,8 @@ backoff = { version = "0.4.0", features = [
 
 # patch from v0.55
 libp2p = { version = "0.56.0" }
+# keep in lockstep with the hickory-resolver version libp2p-dns uses (one copy in the build)
+hickory-resolver = { version = "0.25" }
 bs58 = { version = "0.5.1" }
 blake3 = { version = "1.8.2" }
 

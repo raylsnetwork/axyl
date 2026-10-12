@@ -15,6 +15,10 @@ use std::sync::{
 use tokio::{sync::watch, time::interval};
 use tracing::{error, warn};
 
+#[cfg(test)]
+#[path = "../tests/gc_tests.rs"]
+mod gc_tests;
+
 /// Long running task that manages the garbage collection events from consensus.
 ///
 /// When the DAG advances the GC round, this task updates the [AtomicRound] and notifies
@@ -67,7 +71,7 @@ where
         // log warning
         warn!(target: "primary::gc",
             "no consensus commit happened for {:?}, triggering certificate fetching.",
-            self.config.network_config().sync_config().max_consenus_round_timeout
+            self.config.network_config().sync_config().max_consensus_round_timeout
         );
 
         // trigger fetch certs
@@ -91,7 +95,7 @@ where
     /// certificate fetching.
     pub(super) async fn ready(&mut self) -> GarbageCollectorResult<()> {
         let mut max_round_timeout =
-            interval(self.config.network_config().sync_config().max_consenus_round_timeout);
+            interval(self.config.network_config().sync_config().max_consensus_round_timeout);
         // reset so interval doesn't tick right away
         max_round_timeout.reset();
 
@@ -110,9 +114,6 @@ where
                 })?;
 
                 self.process_next_round().await?;
-
-                // reset timer - the happy path
-                max_round_timeout.reset();
             }
         }
 

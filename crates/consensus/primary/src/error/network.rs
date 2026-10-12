@@ -152,6 +152,7 @@ fn penalty_from_header_error(error: &HeaderError) -> Option<Penalty> {
         | HeaderError::InvalidParentTimestamp { .. }
         | HeaderError::UnknownWorkerId
         | HeaderError::InvalidHeaderDigest
+        | HeaderError::InvalidRound { .. }
         | HeaderError::UnknownAuthority(_) => Some(Penalty::Fatal),
         // ignore
         HeaderError::PendingCertificateOneshot

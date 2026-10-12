@@ -431,6 +431,9 @@ pub struct MdbxConfig {
     pub max_db_size: usize,
     /// Database growth step in bytes.
     pub growth_step: usize,
+    /// Page size in bytes for a newly created database; `None` uses the 16 KiB default. Ignored
+    /// when opening an existing datafile, which keeps the page size it was created with.
+    pub page_size: Option<usize>,
 }
 
 impl Default for MdbxConfig {
@@ -442,6 +445,7 @@ impl Default for MdbxConfig {
             max_readers: DEFAULT_MAX_READERS,
             max_db_size: 100 * GIGABYTE,
             growth_step: GIGABYTE,
+            page_size: None,
         }
     }
 }
@@ -475,23 +479,68 @@ impl MdbxConfig {
         self.growth_step = growth_step;
         self
     }
+
+    /// Set the page size in bytes used when creating a new database (`--consensus-db.page-size`).
+    /// Must be a power of two from 4 KiB to 64 KiB; opening a new datafile fails otherwise.
+    pub fn with_page_size(mut self, page_size: usize) -> Self {
+        self.page_size = Some(page_size);
+        self
+    }
+
+    /// The datafile geometry the node opens with, at `page_size` when one is given.
+    pub fn geometry(&self, page_size: Option<usize>) -> Geometry<std::ops::Range<usize>> {
+        Geometry {
+            size: Some(0..self.max_db_size),
+            growth_step: Some(self.growth_step as isize),
+            // The database never shrinks
+            shrink_threshold: Some((2 * self.growth_step) as isize),
+            page_size: page_size.map(PageSize::Set),
+        }
+    }
 }
 
-/// Returns the default page size that can be used in this OS.
-fn default_page_size() -> usize {
-    let os_page_size = page_size::get();
+// Page-size rules and detection shared with the other node database so both stay in sync.
+pub use rayls_infrastructure_utils::mdbx::DEFAULT_MDBX_PAGE_SIZE;
+use rayls_infrastructure_utils::mdbx::{detect_page_size, new_datafile_page_size, MDBX_DAT};
 
-    // source: https://gitflic.ru/project/erthink/libmdbx/blob?file=mdbx.h#line-num-821
-    let libmdbx_max_page_size = 0x10000;
-
-    // May lead to errors if it's reduced further because of the potential size of the
-    // data.
-    let min_page_size = 4096;
-
-    os_page_size.clamp(min_page_size, libmdbx_max_page_size)
+/// Runs `open` without a page size and, if meta page 0 is unreadable, again at the detected one.
+///
+/// libmdbx falls back to the host page size when meta page 0 is unreadable, so without this a
+/// datafile whose page size differs from the host's reads as "not an MDBX file".
+pub fn open_detecting_page_size<T>(
+    consensus_db: &Path,
+    open: impl Fn(Option<usize>) -> reth_libmdbx::Result<T>,
+) -> reth_libmdbx::Result<T> {
+    match open(None) {
+        Err(e @ reth_libmdbx::Error::Invalid) => {
+            match detect_page_size(&consensus_db.join(MDBX_DAT)) {
+                Some(ps) => {
+                    tracing::warn!(
+                        target: "rayls::mdbx",
+                        page_size = ps,
+                        "consensus DB meta page 0 unreadable; reopening at the detected page size"
+                    );
+                    open(Some(ps))
+                }
+                None => Err(e),
+            }
+        }
+        other => other,
+    }
 }
 
 impl MdbxDatabase {
+    /// Page size of the opened datafile in bytes.
+    pub fn page_size(&self) -> eyre::Result<usize> {
+        Ok(self.inner.stat()?.page_size() as usize)
+    }
+
+    /// Lower bound of the database geometry in bytes (taken from the datafile header at open).
+    #[cfg(test)]
+    fn geometry_lower(&self) -> u64 {
+        self.inner.info().expect("mdbx info").geometry().min()
+    }
+
     /// Create a new database at the specified path with default configuration.
     pub fn open<P: AsRef<Path>>(path: P) -> eyre::Result<Self> {
         Self::open_with_config(path, MdbxConfig::default())
@@ -499,59 +548,76 @@ impl MdbxDatabase {
 
     /// Create a new database at the specified path with custom configuration.
     pub fn open_with_config<P: AsRef<Path>>(path: P, config: MdbxConfig) -> eyre::Result<Self> {
-        let flags = EnvironmentFlags {
-            mode: Mode::ReadWrite { sync_mode: SyncMode::SafeNoSync },
-            liforeclaim: true,
-            no_rdahead: true,
-            coalesce: true,
-            ..Default::default()
-        };
-
-        // Convert config to MDBX settings
-        let max_read_txn_duration = match config.max_read_transaction_duration {
-            Some(duration) => MaxReadTransactionDuration::Set(duration),
-            None => MaxReadTransactionDuration::Unbounded,
-        };
-
+        let page_size = new_datafile_page_size(path.as_ref(), config.page_size)
+            .map_err(|e| eyre::eyre!("invalid consensus DB page size: {e}"))?;
         tracing::info!(
             target: "rayls::mdbx",
-            "Opening MDBX database with config: max_read_txn_duration={:?}, max_readers={}, max_size={}GB",
+            "Opening MDBX database with config: max_read_txn_duration={:?}, max_readers={}, max_size={}GB, new_datafile_page_size={:?}",
             config.max_read_transaction_duration,
             config.max_readers,
-            config.max_db_size / GIGABYTE
+            config.max_db_size / GIGABYTE,
+            page_size
         );
 
-        let env = Environment::builder()
-            .set_max_dbs(32)
-            .set_flags(flags)
-            .set_geometry(Geometry {
-                size: Some(0..config.max_db_size),
-                growth_step: Some(config.growth_step as isize),
-                // The database never shrinks
-                shrink_threshold: Some((2 * config.growth_step) as isize),
-                page_size: Some(PageSize::Set(default_page_size())),
-            })
-            .write_map()
-            .set_dp_reserve_limit(512)
-            .set_txn_dp_limit(131072)
-            .set_rp_augment_limit(1024 * 1024)
-            // MDBX syncs lazily on the first commit past the period (see SYNC_PERIOD)
-            .set_sync_period(SYNC_PERIOD)
-            // Prevent writer starvation from long-held read transactions which can cause
-            // consensus delays. Configurable via MdbxConfig.
-            .set_max_read_transaction_duration(max_read_txn_duration)
-            // Configurable concurrent readers limit for high-throughput consensus operations
-            .set_max_readers(config.max_readers.into())
-            // Detect slow readers that may be causing memory growth by holding pages
-            .set_handle_slow_readers(handle_slow_readers)
-            .open(path.as_ref())?;
+        // Opens at `ps`, so a failed open can be retried at a detected page size.
+        let open_at = |ps: Option<usize>| {
+            let max_read_txn_duration = match config.max_read_transaction_duration {
+                Some(duration) => MaxReadTransactionDuration::Set(duration),
+                None => MaxReadTransactionDuration::Unbounded,
+            };
+            Environment::builder()
+                .set_max_dbs(32)
+                .set_flags(EnvironmentFlags {
+                    mode: Mode::ReadWrite { sync_mode: SyncMode::SafeNoSync },
+                    liforeclaim: true,
+                    no_rdahead: true,
+                    coalesce: true,
+                    ..Default::default()
+                })
+                .set_geometry(config.geometry(ps))
+                .write_map()
+                .set_dp_reserve_limit(512)
+                // Spill threshold for a write transaction, in pages (libmdbx
+                // MDBX_opt_txn_dp_limit): once a transaction has dirtied this many
+                // pages libmdbx spills them (in write-map mode an msync kick)
+                // rather than failing. Kept as a page count, so it is 512 MiB on
+                // a 4 KiB datafile and 2 GiB on one created with the 16 KiB default.
+                //
+                // The wider ceiling is safe because consensus write transactions are small and
+                // bounded: batches are at most 2 MB and at most 10 per header. Across two full
+                // 4+1-node e2e networks the largest of 150,065 commits dirtied 0.59 MiB, p99 224
+                // KiB.
+                .set_txn_dp_limit(131072)
+                .set_rp_augment_limit(1024 * 1024)
+                // MDBX syncs lazily on the first commit past the period (see SYNC_PERIOD)
+                .set_sync_period(SYNC_PERIOD)
+                // Prevent writer starvation from long-held read transactions which can cause
+                // consensus delays. Configurable via MdbxConfig.
+                .set_max_read_transaction_duration(max_read_txn_duration)
+                // Configurable concurrent readers limit for high-throughput consensus operations
+                .set_max_readers(config.max_readers.into())
+                // Detect slow readers that may be causing memory growth by holding pages
+                .set_handle_slow_readers(handle_slow_readers)
+                .open(path.as_ref())
+        };
+
+        // Only an existing datafile can have an unreadable meta page 0.
+        let env = match page_size {
+            Some(_) => open_at(page_size)?,
+            None => open_detecting_page_size(path.as_ref(), open_at)?,
+        };
 
         // Startup corruption detection
         // Check database integrity immediately after opening to catch corruption early
         // before node starts processing, preventing crashes during operation
         match env.stat() {
-            Ok(_status) => {
-                tracing::info!(target: "rayls::mdbx", "MDBX database integrity check passed");
+            Ok(stat) => {
+                // An existing datafile keeps its own page size, whatever was configured.
+                tracing::info!(
+                    target: "rayls::mdbx",
+                    page_size = stat.page_size(),
+                    "MDBX database integrity check passed"
+                );
             }
             Err(e) => {
                 tracing::error!(
@@ -588,6 +654,83 @@ impl MdbxDatabase {
         })
     }
 
+    /// Opens an existing database read-only, for out-of-process inspection.
+    ///
+    /// Unlike [`Self::open_with_config`] this never writes: the environment is opened with
+    /// `MDBX_RDONLY`, no sub-database is created, and the datafile geometry is left untouched.
+    ///
+    /// `exclusive` requests `MDBX_EXCLUSIVE`: the open fails with `Busy` if any other process has
+    /// the environment open, and a read-only lock file becomes acceptable.
+    ///
+    /// Tables are opened lazily by each transaction (see `get_dbi`); a table that does not exist
+    /// surfaces as a `NotFound` error from the read, never as a created sub-database.
+    pub fn open_read_only<P: AsRef<Path>>(path: P, exclusive: bool) -> eyre::Result<Self> {
+        let path = path.as_ref();
+        let dat = path.join(MDBX_DAT);
+        if !dat.is_file() {
+            return Err(eyre::eyre!(
+                "no MDBX database at {} (expected {MDBX_DAT})",
+                path.display()
+            ));
+        }
+
+        let flags = EnvironmentFlags {
+            mode: Mode::ReadOnly,
+            exclusive,
+            no_rdahead: true,
+            ..Default::default()
+        };
+
+        // A read-only environment never grows, so the geometry only carries a detected page size.
+        let open_at = |ps: Option<usize>| {
+            let mut builder = Environment::builder();
+            builder
+                .set_max_dbs(32)
+                .set_flags(flags)
+                // Inspection scans may legitimately outlast the node's read-transaction cap; the
+                // cap protects the writer in *this* process, of which there is none.
+                .set_max_read_transaction_duration(MaxReadTransactionDuration::Unbounded)
+                .set_max_readers(DEFAULT_MAX_READERS.into());
+            if let Some(ps) = ps {
+                builder.set_geometry(Geometry::<std::ops::Range<usize>> {
+                    page_size: Some(PageSize::Set(ps)),
+                    ..Default::default()
+                });
+            }
+            builder.open(path)
+        };
+        let env = open_detecting_page_size(path, open_at)?;
+
+        // Surface corruption plainly; unlike the node startup path, do not suggest deleting the
+        // database, since an inspector may well be pointed at the only remaining copy.
+        env.stat().map_err(|e| {
+            eyre::eyre!("MDBX database at {} failed its integrity check: {e}", path.display())
+        })?;
+
+        Ok(MdbxDatabase { inner: env, dbis: Arc::new(RwLock::new(HashMap::new())) })
+    }
+
+    /// Returns every named table's entry count, keyed by table name.
+    ///
+    /// Reads the MDBX MAIN database, whose keys are the sub-database names, so it needs no
+    /// schema and also reports tables this build does not know about.
+    pub fn table_entry_counts(&self) -> eyre::Result<BTreeMap<String, usize>> {
+        table_entry_counts(&self.inner)
+    }
+
+    /// Returns whether the sub-database for `T` exists, without creating it.
+    ///
+    /// The regular read path opens tables lazily and reports a missing one as an error; a
+    /// read-only inspector uses this to tell "table never created" apart from "row absent".
+    pub fn has_table<T: Table>(&self) -> eyre::Result<bool> {
+        let txn = self.inner.begin_ro_txn()?;
+        match txn.open_db(Some(T::NAME)) {
+            Ok(_) => Ok(true),
+            Err(reth_libmdbx::Error::NotFound) => Ok(false),
+            Err(e) => Err(e.into()),
+        }
+    }
+
     /// Copy-compacts the environment into the `dest` file, writing only live pages.
     ///
     /// Runs against a consistent read snapshot, so the source may stay open; the copy omits
@@ -612,9 +755,6 @@ impl MdbxDatabase {
         Ok(())
     }
 }
-
-/// The MDBX datafile name inside an environment directory.
-const MDBX_DAT: &str = "mdbx.dat";
 
 /// Datafile sizes measured around an offline [`compact_in_place`] pass.
 #[derive(Debug, Clone, Copy)]
@@ -1136,7 +1276,7 @@ where
 
 #[cfg(test)]
 mod test {
-    use super::{compact_in_place, MdbxConfig, MdbxDatabase};
+    use super::{compact_in_place, MdbxConfig, MdbxDatabase, DEFAULT_MDBX_PAGE_SIZE};
     use crate::{layered_db::LayeredDatabase, test::*};
     use rayls_infrastructure_types::{Database as _, DbTxMut as _};
     use std::path::Path;
@@ -1146,6 +1286,211 @@ mod test {
         let db = MdbxDatabase::open(path).expect("Cannot open database");
         db.open_table::<TestTable>().expect("failed to open table!");
         db
+    }
+
+    /// A table no test ever creates, to probe `has_table` on a read-only handle.
+    #[derive(Debug)]
+    struct TestTable2 {}
+    impl rayls_infrastructure_types::Table for TestTable2 {
+        type Key = u64;
+        type Value = String;
+
+        const NAME: &'static str = "TestTable2";
+    }
+
+    /// A read-only handle sees rows written by a closed read-write handle, reports absent tables
+    /// without creating them, and refuses a directory without a datafile.
+    #[test]
+    fn open_read_only_reads_without_creating_tables() {
+        let temp_dir = tempdir().expect("failed to create temp dir");
+        {
+            let db = open_db(temp_dir.path());
+            db.with_write_txn(|txn| txn.insert::<TestTable>(&7, &"seven".to_owned()))
+                .expect("seed row");
+        }
+
+        let ro = MdbxDatabase::open_read_only(temp_dir.path(), false).expect("open read-only");
+        assert!(ro.has_table::<TestTable>().expect("has_table"));
+        assert_eq!(ro.get::<TestTable>(&7).expect("get"), Some("seven".to_owned()));
+        assert_eq!(ro.get::<TestTable>(&8).expect("get absent"), None);
+
+        // a table this handle never opened is reported absent, not created
+        assert!(!ro.has_table::<TestTable2>().expect("has_table"));
+        assert_eq!(ro.table_entry_counts().expect("counts").len(), 1);
+        drop(ro);
+        let ro = MdbxDatabase::open_read_only(temp_dir.path(), true).expect("exclusive read-only");
+        assert!(!ro.has_table::<TestTable2>().expect("still absent after a read-only session"));
+
+        let empty = tempdir().expect("failed to create temp dir");
+        let err = MdbxDatabase::open_read_only(empty.path(), false).expect_err("no datafile");
+        assert!(err.to_string().contains("mdbx.dat"), "{err}");
+    }
+
+    /// A freshly created database uses the 16 KiB default page size.
+    #[test]
+    fn new_db_uses_default_page_size() {
+        let temp_dir = tempdir().expect("failed to create temp dir");
+        let db = open_db(temp_dir.path());
+        assert_eq!(db.page_size().expect("page size"), DEFAULT_MDBX_PAGE_SIZE);
+    }
+
+    /// Zeroed leading meta pages still open: `open_with_config` detects the page size and reopens.
+    #[test]
+    fn recovers_zeroed_meta_pages_at_every_page_size() {
+        for zeroed in [1, 2] {
+            for ps in [4096usize, 8192, 16384, 32768, 65536] {
+                let temp = db_with_zeroed_meta_pages(ps, zeroed);
+
+                // Reopen with the default config: the open must detect the size.
+                let recover_cfg = MdbxConfig::default().with_growth_step(super::MEGABYTE);
+                let db =
+                    MdbxDatabase::open_with_config(temp.path(), recover_cfg).unwrap_or_else(|e| {
+                        panic!("recover a {ps}-byte-page datafile, {zeroed} metas zeroed: {e:#}")
+                    });
+                assert_eq!(db.page_size().expect("page size"), ps);
+                db.open_table::<TestTable>().expect("open table after recover");
+                assert_row_kept_if_latest_meta_survives(&db, ps, zeroed);
+            }
+        }
+    }
+
+    /// The read-only open used by db-inspect detects the page size the same way.
+    #[test]
+    fn read_only_open_detects_page_size_after_zeroed_meta_pages() {
+        for zeroed in [1, 2] {
+            for ps in [4096usize, 8192, 16384, 32768, 65536] {
+                let temp = db_with_zeroed_meta_pages(ps, zeroed);
+                let db = MdbxDatabase::open_read_only(temp.path(), true).unwrap_or_else(|e| {
+                    panic!("read-only open of a {ps}-byte-page datafile, {zeroed} zeroed: {e:#}")
+                });
+                assert_eq!(db.page_size().expect("page size"), ps);
+                assert_row_kept_if_latest_meta_survives(&db, ps, zeroed);
+            }
+        }
+    }
+
+    /// The row's commit is in meta page 1, so it survives only while that page does; with meta
+    /// page 2 alone libmdbx rolls back to the older commit stored there.
+    fn assert_row_kept_if_latest_meta_survives(db: &MdbxDatabase, ps: usize, zeroed: usize) {
+        if zeroed == 1 {
+            assert_eq!(
+                db.get::<TestTable>(&1).expect("get"),
+                Some("kept".to_owned()),
+                "row lost in a {ps}-byte-page datafile with meta page 0 zeroed"
+            );
+        }
+    }
+
+    /// A database with one row, created at `ps` bytes per page, whose first `zeroed` meta pages
+    /// are then zeroed.
+    fn db_with_zeroed_meta_pages(ps: usize, zeroed: usize) -> tempfile::TempDir {
+        use std::io::Write as _;
+        let temp = tempdir().expect("failed to create temp dir");
+        let cfg = MdbxConfig::default().with_page_size(ps).with_growth_step(super::MEGABYTE);
+        {
+            let db = MdbxDatabase::open_with_config(temp.path(), cfg).expect("create database");
+            db.open_table::<TestTable>().expect("open table");
+            db.with_write_txn(|txn| txn.insert::<TestTable>(&1, &"kept".to_owned()))
+                .expect("insert");
+        }
+        let dat = temp.path().join(super::MDBX_DAT);
+        let mut f = std::fs::OpenOptions::new().write(true).open(&dat).expect("open dat");
+        f.write_all(&vec![0u8; zeroed * ps]).expect("zero meta pages");
+        f.sync_all().expect("sync");
+        temp
+    }
+
+    /// A new datafile with an unsupported page size is refused before libmdbx creates it.
+    #[test]
+    fn rejects_unsupported_page_size_for_new_datafile() {
+        for ps in [2048, 12 * 1024, 128 * 1024] {
+            let temp = tempdir().expect("failed to create temp dir");
+            let cfg = MdbxConfig::default().with_page_size(ps);
+            let err = MdbxDatabase::open_with_config(temp.path(), cfg).err().expect("rejected");
+            assert!(format!("{err:#}").contains("invalid consensus DB page size"), "{ps}: {err:#}");
+            assert!(!temp.path().join(super::MDBX_DAT).exists(), "{ps}: no datafile is created");
+        }
+    }
+
+    /// An existing datafile ignores the configured page size, even an unsupported one.
+    #[test]
+    fn existing_datafile_ignores_an_unsupported_page_size() {
+        let temp = tempdir().expect("failed to create temp dir");
+        drop(MdbxDatabase::open(temp.path()).expect("create database"));
+        let cfg = MdbxConfig::default().with_page_size(2048);
+        let db = MdbxDatabase::open_with_config(temp.path(), cfg).expect("reopen database");
+        assert_eq!(db.page_size().expect("page size"), DEFAULT_MDBX_PAGE_SIZE);
+    }
+
+    /// An empty datafile, left by a crash during creation, still takes the configured page size.
+    #[test]
+    fn empty_datafile_takes_the_configured_page_size() {
+        let temp = tempdir().expect("failed to create temp dir");
+        std::fs::write(temp.path().join(super::MDBX_DAT), b"").expect("create empty datafile");
+        let cfg = MdbxConfig::default().with_page_size(8192).with_growth_step(super::MEGABYTE);
+        let db = MdbxDatabase::open_with_config(temp.path(), cfg).expect("open database");
+        assert_eq!(db.page_size().expect("page size"), 8192);
+    }
+
+    /// A database created with the previous 4 KiB default keeps its page size, its geometry
+    /// header and its rows when reopened with the new default, and through an in-place compaction.
+    #[test]
+    fn existing_db_keeps_page_size_and_rows() {
+        const LEGACY_PAGE_SIZE: usize = 4096;
+        let temp_dir = tempdir().expect("failed to create temp dir");
+        let cfg = MdbxConfig::default().with_growth_step(super::MEGABYTE);
+
+        let legacy_geometry_lower = {
+            let db = MdbxDatabase::open_with_config(
+                temp_dir.path(),
+                cfg.clone().with_page_size(LEGACY_PAGE_SIZE),
+            )
+            .expect("create legacy database");
+            db.open_table::<TestTable>().expect("open table");
+            assert_eq!(db.page_size().expect("page size"), LEGACY_PAGE_SIZE);
+            db.with_write_txn(|txn| txn.insert::<TestTable>(&1, &"legacy".to_string()))
+                .expect("insert");
+            db.geometry_lower()
+        };
+
+        // reopened with the default (16 KiB) configuration: the datafile header is left alone
+        {
+            let db = MdbxDatabase::open_with_config(temp_dir.path(), cfg.clone()).expect("reopen");
+            db.open_table::<TestTable>().expect("open table");
+            assert_eq!(db.page_size().expect("page size"), LEGACY_PAGE_SIZE);
+            assert_eq!(db.geometry_lower(), legacy_geometry_lower);
+            assert_eq!(db.get::<TestTable>(&1).expect("get"), Some("legacy".to_string()));
+        }
+
+        // copy-compaction also preserves the datafile's page size
+        compact_in_place(temp_dir.path(), &cfg).expect("compact legacy database");
+        let db = MdbxDatabase::open_with_config(temp_dir.path(), cfg).expect("reopen compacted");
+        db.open_table::<TestTable>().expect("open table");
+        assert_eq!(db.page_size().expect("page size"), LEGACY_PAGE_SIZE);
+        assert_eq!(db.get::<TestTable>(&1).expect("get"), Some("legacy".to_string()));
+    }
+
+    /// Values below, between and above the two page sizes round-trip on both: the page size sets
+    /// libmdbx's inline-vs-overflow threshold.
+    #[test]
+    fn large_values_round_trip_on_both_page_sizes() {
+        for page_size in [4096, DEFAULT_MDBX_PAGE_SIZE] {
+            let temp_dir = tempdir().expect("failed to create temp dir");
+            let cfg =
+                MdbxConfig::default().with_growth_step(super::MEGABYTE).with_page_size(page_size);
+            let db = MdbxDatabase::open_with_config(temp_dir.path(), cfg).expect("open database");
+            db.open_table::<TestTable>().expect("open table");
+            assert_eq!(db.page_size().expect("page size"), page_size);
+            for (key, len) in [(1u64, 100usize), (2, 8 * 1024), (3, 32 * 1024)] {
+                let value = "v".repeat(len);
+                db.with_write_txn(|txn| txn.insert::<TestTable>(&key, &value)).expect("insert");
+                assert_eq!(
+                    db.get::<TestTable>(&key).expect("get"),
+                    Some(value),
+                    "{len}-byte value on a {page_size}-byte page"
+                );
+            }
+        }
     }
 
     /// Seeds a table, prunes most of it, then compacts in place: the survivors must be

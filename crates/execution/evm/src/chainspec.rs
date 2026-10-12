@@ -66,8 +66,50 @@ hardfork!(
         /// sender's whole nonce chain instead of consecutive ranges scattering across pools and
         /// parking nonce-gapped. Also enables live-successor failover for a down slot owner.
         SenderAffinityLoadBalancing,
+        /// Stamp the consensus header hash into the epoch-closing block's `extra_data` instead of
+        /// the keccak of the leader certificate's aggregate BLS signature. The aggregate varies
+        /// with the 2f+1 signer subset, so two honest nodes holding different certificates for
+        /// the same leader header produced different block hashes for identical state (#233).
+        EpochCloseSeedV2,
     }
 );
+
+/// One entry of a Rayls hardfork schedule: a fork and its activation condition.
+///
+/// `Ord` compares fork-first, so sorting a schedule yields fork order
+/// regardless of the conditions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ScheduledFork {
+    pub fork: RaylsHardFork,
+    pub condition: ForkCondition,
+}
+
+impl ScheduledFork {
+    pub const fn new(fork: RaylsHardFork, condition: ForkCondition) -> Self {
+        Self { fork, condition }
+    }
+
+    /// Return true if the fork is active at `block`.
+    pub fn is_active_at(&self, block: u64) -> bool {
+        self.condition.active_at_block(block)
+    }
+
+    /// The activation block; `None` for a fork that never activates.
+    ///
+    /// Rayls schedules are block-based only; a TTD- or timestamp-based
+    /// condition fires the debug assert.
+    pub fn block_of(&self) -> Option<u64> {
+        debug_assert!(
+            matches!(self.condition, ForkCondition::Block(_) | ForkCondition::Never),
+            "Rayls schedules are block-based only; extend ScheduleRecord before adding \
+             TTD/timestamp forks"
+        );
+        match self.condition {
+            ForkCondition::Block(block) => Some(block),
+            ForkCondition::Never | ForkCondition::TTD { .. } | ForkCondition::Timestamp(_) => None,
+        }
+    }
+}
 
 /// EIP-1559 activation block on the Rayls devnet.
 pub const DEVNET_EIP1559_BLOCK: u64 = 50;
@@ -191,9 +233,6 @@ pub const MAINNET_EMPTY_OUTPUT_BLOCK_BLOCK: u64 = 3_569_194;
 /// EmptyOutputBlock activation block on the local sandbox network.
 pub const LOCAL_EMPTY_OUTPUT_BLOCK_BLOCK: u64 = 0;
 
-/// DynamicCommitteeSizing activation block on the Rayls devnet
-pub const DEVNET_DYNAMIC_COMMITTEE_SIZING_BLOCK: u64 = u64::MAX;
-
 /// DynamicCommitteeSizing activation block on the Rayls testnet
 pub const TESTNET_DYNAMIC_COMMITTEE_SIZING_BLOCK: u64 = 10_934_554;
 
@@ -217,6 +256,11 @@ pub const MAINNET_OUTPUT_SEQ_NORMALIZATION_BLOCK: u64 = 12_231_705;
 /// OutputSeqNormalization activation block on the local network.
 pub const LOCAL_OUTPUT_SEQ_NORMALIZATION_BLOCK: u64 = 0;
 
+/// EpochCloseSeedV2 activation block on the local network. Real networks stay `Never` until an
+/// activation block is scheduled: the fork changes epoch-closing block hashes, so every node
+/// must cross it at the same block.
+pub const LOCAL_EPOCH_CLOSE_SEED_V2_BLOCK: u64 = 0;
+
 impl RaylsHardFork {
     /// Return the protocol version byte for this hardfork.
     pub const fn version_byte(self) -> u8 {
@@ -236,143 +280,221 @@ impl RaylsHardFork {
             Self::HybridRewards => 0x0d,
             Self::OutputSeqNormalization => 0x0e,
             Self::SenderAffinityLoadBalancing => 0x0f,
+            Self::EpochCloseSeedV2 => 0x10,
         }
     }
 
+    /// Look up a hardfork by name, case-insensitively.
+    ///
+    /// `None` when the name is not a known Rayls hardfork.
+    pub fn from_name(name: &str) -> Option<Self> {
+        Self::VARIANTS.iter().find(|fork| fork.name().eq_ignore_ascii_case(name)).copied()
+    }
+
     /// Devnet hardfork schedule.
-    pub const fn devnet() -> [(Self, ForkCondition); 15] {
+    pub const fn devnet() -> [ScheduledFork; 16] {
         [
-            (Self::Eip1559, ForkCondition::Block(DEVNET_EIP1559_BLOCK)),
-            (Self::BatchDigestV2, ForkCondition::Block(DEVNET_BATCH_DIGEST_V2_BLOCK)),
-            (Self::AdminTransfer, ForkCondition::Never),
-            (Self::PrecompileGasFix, ForkCondition::Block(DEVNET_PRECOMPILE_GAS_FIX_BLOCK)),
-            (Self::RlsStorage, ForkCondition::Never),
-            (Self::Tokenomics, ForkCondition::Never),
-            (Self::Uups, ForkCondition::Never),
-            (
+            ScheduledFork::new(Self::Eip1559, ForkCondition::Block(DEVNET_EIP1559_BLOCK)),
+            ScheduledFork::new(
+                Self::BatchDigestV2,
+                ForkCondition::Block(DEVNET_BATCH_DIGEST_V2_BLOCK),
+            ),
+            ScheduledFork::new(Self::AdminTransfer, ForkCondition::Never),
+            ScheduledFork::new(
+                Self::PrecompileGasFix,
+                ForkCondition::Block(DEVNET_PRECOMPILE_GAS_FIX_BLOCK),
+            ),
+            ScheduledFork::new(Self::RlsStorage, ForkCondition::Never),
+            ScheduledFork::new(Self::Tokenomics, ForkCondition::Never),
+            ScheduledFork::new(Self::Uups, ForkCondition::Never),
+            ScheduledFork::new(
                 Self::Erc20PrecompileBytecode,
                 ForkCondition::Block(DEVNET_ERC20_PRECOMPILE_BYTECODE_BLOCK),
             ),
-            (Self::TransactionLoadBalancing, ForkCondition::Block(DEVNET_LOAD_BALANCING_BLOCK)),
-            (Self::UsdrSupplyCorrection, ForkCondition::Never),
-            (Self::EmptyOutputBlock, ForkCondition::Block(DEVNET_EMPTY_OUTPUT_BLOCK_BLOCK)),
-            (
-                Self::DynamicCommitteeSizing,
-                ForkCondition::Block(DEVNET_DYNAMIC_COMMITTEE_SIZING_BLOCK),
+            ScheduledFork::new(
+                Self::TransactionLoadBalancing,
+                ForkCondition::Block(DEVNET_LOAD_BALANCING_BLOCK),
+            ),
+            ScheduledFork::new(Self::UsdrSupplyCorrection, ForkCondition::Never),
+            ScheduledFork::new(
+                Self::EmptyOutputBlock,
+                ForkCondition::Block(DEVNET_EMPTY_OUTPUT_BLOCK_BLOCK),
             ),
             // Never until SRE schedules a concrete devnet activation block.
-            (Self::HybridRewards, ForkCondition::Never),
-            (Self::OutputSeqNormalization, ForkCondition::Never),
+            ScheduledFork::new(Self::DynamicCommitteeSizing, ForkCondition::Never),
+            // Never until SRE schedules a concrete devnet activation block.
+            ScheduledFork::new(Self::HybridRewards, ForkCondition::Never),
+            ScheduledFork::new(Self::OutputSeqNormalization, ForkCondition::Never),
             // Never until an operational activation block is chosen; the mechanism ships dormant.
-            (Self::SenderAffinityLoadBalancing, ForkCondition::Never),
+            ScheduledFork::new(Self::SenderAffinityLoadBalancing, ForkCondition::Never),
+            // Never until SRE schedules an activation block: changes epoch-closing block hashes.
+            ScheduledFork::new(Self::EpochCloseSeedV2, ForkCondition::Never),
         ]
     }
 
     /// Testnet hardfork schedule.
-    pub const fn testnet() -> [(Self, ForkCondition); 15] {
+    pub const fn testnet() -> [ScheduledFork; 16] {
         [
-            (Self::Eip1559, ForkCondition::Block(TESTNET_EIP1559_BLOCK)),
-            (Self::BatchDigestV2, ForkCondition::Block(TESTNET_BATCH_DIGEST_V2_BLOCK)),
-            (Self::AdminTransfer, ForkCondition::Block(TESTNET_ADMIN_TRANSFER_BLOCK)),
-            (Self::PrecompileGasFix, ForkCondition::Block(TESTNET_PRECOMPILE_GAS_FIX_BLOCK)),
-            (Self::RlsStorage, ForkCondition::Block(TESTNET_RLS_STORAGE_BLOCK)),
-            (Self::Tokenomics, ForkCondition::Block(TESTNET_TOKENOMICS_BLOCK)),
-            (Self::Uups, ForkCondition::Block(TESTNET_UUPS_BLOCK)),
-            (Self::Erc20PrecompileBytecode, ForkCondition::Never), /* Bytecode is already
-                                                                    * present on testnet */
-            (Self::TransactionLoadBalancing, ForkCondition::Block(TESTNET_LOAD_BALANCING_BLOCK)),
-            (Self::UsdrSupplyCorrection, ForkCondition::Never),
-            (Self::EmptyOutputBlock, ForkCondition::Block(TESTNET_EMPTY_OUTPUT_BLOCK_BLOCK)),
-            (
+            ScheduledFork::new(Self::Eip1559, ForkCondition::Block(TESTNET_EIP1559_BLOCK)),
+            ScheduledFork::new(
+                Self::BatchDigestV2,
+                ForkCondition::Block(TESTNET_BATCH_DIGEST_V2_BLOCK),
+            ),
+            ScheduledFork::new(
+                Self::AdminTransfer,
+                ForkCondition::Block(TESTNET_ADMIN_TRANSFER_BLOCK),
+            ),
+            ScheduledFork::new(
+                Self::PrecompileGasFix,
+                ForkCondition::Block(TESTNET_PRECOMPILE_GAS_FIX_BLOCK),
+            ),
+            ScheduledFork::new(Self::RlsStorage, ForkCondition::Block(TESTNET_RLS_STORAGE_BLOCK)),
+            ScheduledFork::new(Self::Tokenomics, ForkCondition::Block(TESTNET_TOKENOMICS_BLOCK)),
+            ScheduledFork::new(Self::Uups, ForkCondition::Block(TESTNET_UUPS_BLOCK)),
+            // Bytecode is already present on testnet
+            ScheduledFork::new(Self::Erc20PrecompileBytecode, ForkCondition::Never),
+            ScheduledFork::new(
+                Self::TransactionLoadBalancing,
+                ForkCondition::Block(TESTNET_LOAD_BALANCING_BLOCK),
+            ),
+            ScheduledFork::new(Self::UsdrSupplyCorrection, ForkCondition::Never),
+            ScheduledFork::new(
+                Self::EmptyOutputBlock,
+                ForkCondition::Block(TESTNET_EMPTY_OUTPUT_BLOCK_BLOCK),
+            ),
+            ScheduledFork::new(
                 Self::DynamicCommitteeSizing,
                 ForkCondition::Block(TESTNET_DYNAMIC_COMMITTEE_SIZING_BLOCK),
             ),
             // Never until SRE schedules a concrete testnet activation block.
-            (Self::HybridRewards, ForkCondition::Never),
-            (
+            ScheduledFork::new(Self::HybridRewards, ForkCondition::Never),
+            ScheduledFork::new(
                 Self::OutputSeqNormalization,
                 ForkCondition::Block(TESTNET_OUTPUT_SEQ_NORMALIZATION_BLOCK),
             ),
-            (
+            ScheduledFork::new(
                 Self::SenderAffinityLoadBalancing,
                 ForkCondition::Block(TESTNET_SENDER_AFFINITY_LOAD_BALANCING_BLOCK),
             ),
+            // Never until SRE schedules an activation block: changes epoch-closing block hashes.
+            ScheduledFork::new(Self::EpochCloseSeedV2, ForkCondition::Never),
         ]
     }
 
     /// Mainnet hardfork schedule.
-    pub const fn mainnet() -> [(Self, ForkCondition); 15] {
+    pub const fn mainnet() -> [ScheduledFork; 16] {
         [
-            (Self::Eip1559, ForkCondition::Block(MAINNET_EIP1559_BLOCK)),
-            (Self::BatchDigestV2, ForkCondition::Block(MAINNET_BATCH_DIGEST_V2_BLOCK)),
-            (Self::AdminTransfer, ForkCondition::Never),
-            (Self::PrecompileGasFix, ForkCondition::Block(MAINNET_PRECOMPILE_GAS_FIX_BLOCK)),
-            (Self::RlsStorage, ForkCondition::Never),
-            (Self::Tokenomics, ForkCondition::Never),
-            (Self::Uups, ForkCondition::Never),
-            (
+            ScheduledFork::new(Self::Eip1559, ForkCondition::Block(MAINNET_EIP1559_BLOCK)),
+            ScheduledFork::new(
+                Self::BatchDigestV2,
+                ForkCondition::Block(MAINNET_BATCH_DIGEST_V2_BLOCK),
+            ),
+            ScheduledFork::new(Self::AdminTransfer, ForkCondition::Never),
+            ScheduledFork::new(
+                Self::PrecompileGasFix,
+                ForkCondition::Block(MAINNET_PRECOMPILE_GAS_FIX_BLOCK),
+            ),
+            ScheduledFork::new(Self::RlsStorage, ForkCondition::Never),
+            ScheduledFork::new(Self::Tokenomics, ForkCondition::Never),
+            ScheduledFork::new(Self::Uups, ForkCondition::Never),
+            ScheduledFork::new(
                 Self::Erc20PrecompileBytecode,
                 ForkCondition::Block(MAINNET_ERC20_PRECOMPILE_BYTECODE_BLOCK),
             ),
-            (Self::TransactionLoadBalancing, ForkCondition::Block(MAINNET_LOAD_BALANCING_BLOCK)),
-            (
+            ScheduledFork::new(
+                Self::TransactionLoadBalancing,
+                ForkCondition::Block(MAINNET_LOAD_BALANCING_BLOCK),
+            ),
+            ScheduledFork::new(
                 Self::UsdrSupplyCorrection,
                 ForkCondition::Block(MAINNET_USDR_SUPPLY_CORRECTION_BLOCK),
             ),
-            (Self::EmptyOutputBlock, ForkCondition::Block(MAINNET_EMPTY_OUTPUT_BLOCK_BLOCK)),
-            (
+            ScheduledFork::new(
+                Self::EmptyOutputBlock,
+                ForkCondition::Block(MAINNET_EMPTY_OUTPUT_BLOCK_BLOCK),
+            ),
+            ScheduledFork::new(
                 Self::DynamicCommitteeSizing,
                 ForkCondition::Block(MAINNET_DYNAMIC_COMMITTEE_SIZING_BLOCK),
             ),
             // Never until SRE schedules a concrete mainnet activation block (the reward-fairness
             // rollout for #633); the in-place migration re-links BlsG1 from the live contract.
-            (Self::HybridRewards, ForkCondition::Never),
-            (
+            ScheduledFork::new(Self::HybridRewards, ForkCondition::Never),
+            ScheduledFork::new(
                 Self::OutputSeqNormalization,
                 ForkCondition::Block(MAINNET_OUTPUT_SEQ_NORMALIZATION_BLOCK),
             ),
-            (
+            ScheduledFork::new(
                 Self::SenderAffinityLoadBalancing,
                 ForkCondition::Block(MAINNET_SENDER_AFFINITY_LOAD_BALANCING_BLOCK),
             ),
+            // Never until SRE schedules an activation block: changes epoch-closing block hashes.
+            ScheduledFork::new(Self::EpochCloseSeedV2, ForkCondition::Never),
         ]
     }
 
-    /// Local network hardfork schedule (first four hardforks active at genesis).
-    pub const fn local() -> [(Self, ForkCondition); 15] {
+    /// Local network hardfork schedule: every behavior fork is active at genesis, the
+    /// migrations activate at their `LOCAL_*` blocks, and RlsStorage, Tokenomics and Uups are
+    /// `Never` because the local genesis already carries their state.
+    pub const fn local() -> [ScheduledFork; 16] {
         [
-            (Self::Eip1559, ForkCondition::Block(LOCAL_EIP1559_BLOCK)),
-            (Self::BatchDigestV2, ForkCondition::Block(LOCAL_BATCH_DIGEST_V2_BLOCK)),
-            (Self::AdminTransfer, ForkCondition::Block(LOCAL_ADMIN_TRANSFER_BLOCK)),
-            (Self::PrecompileGasFix, ForkCondition::Block(LOCAL_PRECOMPILE_GAS_FIX_BLOCK)),
-            (Self::RlsStorage, ForkCondition::Never),
-            (Self::Tokenomics, ForkCondition::Never),
-            (Self::Uups, ForkCondition::Never),
-            (
+            ScheduledFork::new(Self::Eip1559, ForkCondition::Block(LOCAL_EIP1559_BLOCK)),
+            ScheduledFork::new(
+                Self::BatchDigestV2,
+                ForkCondition::Block(LOCAL_BATCH_DIGEST_V2_BLOCK),
+            ),
+            ScheduledFork::new(
+                Self::AdminTransfer,
+                ForkCondition::Block(LOCAL_ADMIN_TRANSFER_BLOCK),
+            ),
+            ScheduledFork::new(
+                Self::PrecompileGasFix,
+                ForkCondition::Block(LOCAL_PRECOMPILE_GAS_FIX_BLOCK),
+            ),
+            ScheduledFork::new(Self::RlsStorage, ForkCondition::Never),
+            ScheduledFork::new(Self::Tokenomics, ForkCondition::Never),
+            ScheduledFork::new(Self::Uups, ForkCondition::Never),
+            ScheduledFork::new(
                 Self::Erc20PrecompileBytecode,
                 ForkCondition::Block(LOCAL_ERC20_PRECOMPILE_BYTECODE_BLOCK),
             ),
-            (Self::TransactionLoadBalancing, ForkCondition::Block(LOCAL_LOAD_BALANCING_BLOCK)),
-            (Self::UsdrSupplyCorrection, ForkCondition::Block(LOCAL_USDR_SUPPLY_CORRECTION_BLOCK)),
-            (Self::EmptyOutputBlock, ForkCondition::Block(LOCAL_EMPTY_OUTPUT_BLOCK_BLOCK)),
-            (
+            ScheduledFork::new(
+                Self::TransactionLoadBalancing,
+                ForkCondition::Block(LOCAL_LOAD_BALANCING_BLOCK),
+            ),
+            ScheduledFork::new(
+                Self::UsdrSupplyCorrection,
+                ForkCondition::Block(LOCAL_USDR_SUPPLY_CORRECTION_BLOCK),
+            ),
+            ScheduledFork::new(
+                Self::EmptyOutputBlock,
+                ForkCondition::Block(LOCAL_EMPTY_OUTPUT_BLOCK_BLOCK),
+            ),
+            ScheduledFork::new(
                 Self::DynamicCommitteeSizing,
                 ForkCondition::Block(LOCAL_DYNAMIC_COMMITTEE_SIZING_BLOCK),
             ),
-            (Self::HybridRewards, ForkCondition::Block(LOCAL_HYBRID_REWARDS_BLOCK)),
-            (
+            ScheduledFork::new(
+                Self::HybridRewards,
+                ForkCondition::Block(LOCAL_HYBRID_REWARDS_BLOCK),
+            ),
+            ScheduledFork::new(
                 Self::OutputSeqNormalization,
                 ForkCondition::Block(LOCAL_OUTPUT_SEQ_NORMALIZATION_BLOCK),
             ),
-            (
+            ScheduledFork::new(
                 Self::SenderAffinityLoadBalancing,
                 ForkCondition::Block(LOCAL_SENDER_AFFINITY_LOAD_BALANCING_BLOCK),
+            ),
+            ScheduledFork::new(
+                Self::EpochCloseSeedV2,
+                ForkCondition::Block(LOCAL_EPOCH_CLOSE_SEED_V2_BLOCK),
             ),
         ]
     }
 
     /// Return the hardfork schedule for the given network.
-    pub const fn for_network(network: RaylsNetwork) -> [(Self, ForkCondition); 15] {
+    pub const fn for_network(network: RaylsNetwork) -> [ScheduledFork; 16] {
         match network {
             RaylsNetwork::Devnet => Self::devnet(),
             RaylsNetwork::Testnet => Self::testnet(),
@@ -385,12 +507,12 @@ impl RaylsHardFork {
 /// Sorted hardfork schedule usable without a full [`RaylsChainSpec`].
 #[derive(Debug, Clone)]
 pub struct RaylsChainHardforks {
-    forks: Vec<(RaylsHardFork, ForkCondition)>,
+    forks: Vec<ScheduledFork>,
 }
 
 impl RaylsChainHardforks {
-    /// Create from an iterator of (fork, condition) pairs.
-    pub fn new(forks: impl IntoIterator<Item = (RaylsHardFork, ForkCondition)>) -> Self {
+    /// Create from an iterator of schedule entries, sorted by fork.
+    pub fn new(forks: impl IntoIterator<Item = ScheduledFork>) -> Self {
         let mut forks = forks.into_iter().collect::<Vec<_>>();
         forks.sort();
         Self { forks }
@@ -411,7 +533,7 @@ impl RaylsChainHardforks {
         Self::new(RaylsHardFork::mainnet())
     }
 
-    /// Create with local schedule (first four hardforks active at genesis).
+    /// Create with the local schedule (see [`RaylsHardFork::local`]).
     pub fn local() -> Self {
         Self::new(RaylsHardFork::local())
     }
@@ -425,9 +547,9 @@ impl RaylsChainHardforks {
 impl RaylsHardforks for RaylsChainHardforks {
     fn rayls_fork_activation(&self, fork: RaylsHardFork) -> ForkCondition {
         self.forks
-            .binary_search_by(|(f, _)| f.cmp(&fork))
+            .binary_search_by(|entry| entry.fork.cmp(&fork))
             .ok()
-            .map(|idx| self.forks[idx].1)
+            .map(|idx| self.forks[idx].condition)
             .unwrap_or(ForkCondition::Never)
     }
 }
@@ -519,6 +641,14 @@ pub trait RaylsHardforks {
     /// Return true if the OutputSeqNormalization fork is active at `block`.
     fn is_output_seq_normalization_active_at_block(&self, block: u64) -> bool {
         self.is_rayls_fork_active_at_block(RaylsHardFork::OutputSeqNormalization, block)
+    }
+
+    /// Return true if the EpochCloseSeedV2 fork is active at `block`.
+    ///
+    /// Gates the seed stamped into the epoch-closing block's `extra_data`: the consensus header
+    /// hash once active, the keccak of the leader certificate's aggregate BLS signature before.
+    fn is_epoch_close_seed_v2_active_at_block(&self, block: u64) -> bool {
+        self.is_rayls_fork_active_at_block(RaylsHardFork::EpochCloseSeedV2, block)
     }
 
     /// Return the active version byte at `block`, if any.
@@ -641,8 +771,8 @@ impl RaylsChainSpecBuilder {
 
     /// Apply the baked-in hardfork schedule for the given network.
     pub fn add_rayls_hardforks_by_type(mut self, network: RaylsNetwork) -> Self {
-        for (fork, condition) in RaylsHardFork::for_network(network) {
-            self.inner.hardforks.insert(fork, condition);
+        for entry in RaylsHardFork::for_network(network) {
+            self.inner.hardforks.insert(entry.fork, entry.condition);
         }
         self
     }
@@ -651,10 +781,10 @@ impl RaylsChainSpecBuilder {
     /// network config file. Forks absent from the schedule stay `Never`.
     pub fn add_rayls_hardforks_by_schedule(
         mut self,
-        schedule: impl IntoIterator<Item = (RaylsHardFork, ForkCondition)>,
+        schedule: impl IntoIterator<Item = ScheduledFork>,
     ) -> Self {
-        for (fork, condition) in schedule {
-            self.inner.hardforks.insert(fork, condition);
+        for entry in schedule {
+            self.inner.hardforks.insert(entry.fork, entry.condition);
         }
         self
     }
@@ -716,6 +846,12 @@ impl RaylsChainSpecBuilder {
         self.inner
             .hardforks
             .insert(RaylsHardFork::OutputSeqNormalization, ForkCondition::Block(block));
+        self
+    }
+
+    /// Activate EpochCloseSeedV2 at `block`.
+    pub fn epoch_close_seed_v2(mut self, block: u64) -> Self {
+        self.inner.hardforks.insert(RaylsHardFork::EpochCloseSeedV2, ForkCondition::Block(block));
         self
     }
 
@@ -917,8 +1053,10 @@ mod tests {
     #[test]
     fn local_network_first_four_hardforks_active_at_block_0() {
         let hardforks = RaylsChainHardforks::local();
-        // Only first 4 hardforks are active for local network (RlsStorage, Tokenomics, Uups are
-        // Never)
+        // The four original forks are genesis-active on local. Later behavior forks
+        // (EmptyOutputBlock, DynamicCommitteeSizing, OutputSeqNormalization,
+        // SenderAffinityLoadBalancing, EpochCloseSeedV2) are also block 0 on local; the
+        // version-byte tests below cover them.
         let active_forks = [
             RaylsHardFork::Eip1559,
             RaylsHardFork::BatchDigestV2,
@@ -935,9 +1073,10 @@ mod tests {
     }
 
     #[test]
-    fn local_network_last_three_hardforks_never_activate() {
+    fn local_network_never_forks_never_activate() {
         let hardforks = RaylsChainHardforks::local();
-        // Last 3 hardforks are set to Never for local network
+        // RlsStorage, Tokenomics and Uups are Never on local: their state is already in the local
+        // genesis, so the migrations have nothing to apply.
         let never_forks =
             [RaylsHardFork::RlsStorage, RaylsHardFork::Tokenomics, RaylsHardFork::Uups];
         for fork in never_forks {
@@ -958,21 +1097,21 @@ mod tests {
     fn local_network_version_byte_at_block_0() {
         let hardforks = RaylsChainHardforks::local();
         let version = hardforks.version_byte_at_block(0);
-        // SenderAffinityLoadBalancing (0x0f) activates at block 0 on local and is the highest
-        // such fork, so it owns the version byte from block 0.
-        assert_eq!(version, Some(0x0f));
+        // EpochCloseSeedV2 (0x10) activates at block 0 on local and is the highest such fork, so
+        // it owns the version byte from block 0.
+        assert_eq!(version, Some(0x10));
     }
 
     #[test]
     fn local_network_version_byte_is_the_max_active_code() {
-        // SenderAffinityLoadBalancing (0x0f) is genesis-active on local, so it owns the version
-        // byte across every later activation (HybridRewards at 0x0d included): the byte reports
-        // the max active code, not the most recently crossed block. On real networks it is Never,
-        // so there the highest active fork still advances the byte normally.
+        // EpochCloseSeedV2 (0x10) is genesis-active on local, so it owns the version byte across
+        // every later activation (HybridRewards at 0x0d included): the byte reports the max
+        // active code, not the most recently crossed block. On real networks it is Never, so
+        // there the highest active fork still advances the byte normally.
         let hardforks = RaylsChainHardforks::local();
-        assert_eq!(hardforks.version_byte_at_block(LOCAL_HYBRID_REWARDS_BLOCK - 1), Some(0x0f));
-        assert_eq!(hardforks.version_byte_at_block(LOCAL_HYBRID_REWARDS_BLOCK), Some(0x0f));
-        assert_eq!(hardforks.version_byte_at_block(1_000_000), Some(0x0f));
+        assert_eq!(hardforks.version_byte_at_block(LOCAL_HYBRID_REWARDS_BLOCK - 1), Some(0x10));
+        assert_eq!(hardforks.version_byte_at_block(LOCAL_HYBRID_REWARDS_BLOCK), Some(0x10));
+        assert_eq!(hardforks.version_byte_at_block(1_000_000), Some(0x10));
     }
 
     #[test]
@@ -984,22 +1123,23 @@ mod tests {
             RaylsNetwork::Local,
         ] {
             let schedule = RaylsHardFork::for_network(network);
-            assert_eq!(schedule.len(), 15, "expected 15 hardforks for {network}");
-            assert_eq!(schedule[0].0, RaylsHardFork::Eip1559);
-            assert_eq!(schedule[1].0, RaylsHardFork::BatchDigestV2);
-            assert_eq!(schedule[2].0, RaylsHardFork::AdminTransfer);
-            assert_eq!(schedule[3].0, RaylsHardFork::PrecompileGasFix);
-            assert_eq!(schedule[4].0, RaylsHardFork::RlsStorage);
-            assert_eq!(schedule[5].0, RaylsHardFork::Tokenomics);
-            assert_eq!(schedule[6].0, RaylsHardFork::Uups);
-            assert_eq!(schedule[7].0, RaylsHardFork::Erc20PrecompileBytecode);
-            assert_eq!(schedule[8].0, RaylsHardFork::TransactionLoadBalancing);
-            assert_eq!(schedule[9].0, RaylsHardFork::UsdrSupplyCorrection);
-            assert_eq!(schedule[10].0, RaylsHardFork::EmptyOutputBlock);
-            assert_eq!(schedule[11].0, RaylsHardFork::DynamicCommitteeSizing);
-            assert_eq!(schedule[12].0, RaylsHardFork::HybridRewards);
-            assert_eq!(schedule[13].0, RaylsHardFork::OutputSeqNormalization);
-            assert_eq!(schedule[14].0, RaylsHardFork::SenderAffinityLoadBalancing);
+            assert_eq!(schedule.len(), 16, "expected 16 hardforks for {network}");
+            assert_eq!(schedule[0].fork, RaylsHardFork::Eip1559);
+            assert_eq!(schedule[1].fork, RaylsHardFork::BatchDigestV2);
+            assert_eq!(schedule[2].fork, RaylsHardFork::AdminTransfer);
+            assert_eq!(schedule[3].fork, RaylsHardFork::PrecompileGasFix);
+            assert_eq!(schedule[4].fork, RaylsHardFork::RlsStorage);
+            assert_eq!(schedule[5].fork, RaylsHardFork::Tokenomics);
+            assert_eq!(schedule[6].fork, RaylsHardFork::Uups);
+            assert_eq!(schedule[7].fork, RaylsHardFork::Erc20PrecompileBytecode);
+            assert_eq!(schedule[8].fork, RaylsHardFork::TransactionLoadBalancing);
+            assert_eq!(schedule[9].fork, RaylsHardFork::UsdrSupplyCorrection);
+            assert_eq!(schedule[10].fork, RaylsHardFork::EmptyOutputBlock);
+            assert_eq!(schedule[11].fork, RaylsHardFork::DynamicCommitteeSizing);
+            assert_eq!(schedule[12].fork, RaylsHardFork::HybridRewards);
+            assert_eq!(schedule[13].fork, RaylsHardFork::OutputSeqNormalization);
+            assert_eq!(schedule[14].fork, RaylsHardFork::SenderAffinityLoadBalancing);
+            assert_eq!(schedule[15].fork, RaylsHardFork::EpochCloseSeedV2);
         }
     }
 

@@ -117,6 +117,19 @@ impl EpochRecord {
     pub fn super_quorum(&self) -> usize {
         ((self.committee.len() * 2) / 3) + 1
     }
+
+    /// Verify the cert against `expected_committee` (which the record must declare exactly, both
+    /// stored sorted) rather than against the committee embedded in the record.
+    pub fn verify_against_committee(
+        &self,
+        expected_committee: &[BlsPublicKey],
+        cert: &EpochCertificate,
+    ) -> bool {
+        if self.committee.as_slice() != expected_committee {
+            return false;
+        }
+        self.verify_with_cert(cert)
+    }
 }
 
 /// Vote for an ['EpochRecord'].
@@ -257,18 +270,17 @@ mod test {
         }
     }
 
-    #[ignore = "non-deterministic test"]
     #[test]
     fn test_sorted_keys_serialize_sorts() {
-        // Construct a record with deliberately unsorted keys.
+        // Build sorted keys, then reverse to guarantee unsorted input.
         let mut rng = StdRng::from_os_rng();
         let k1 = TestBlsKeypair::new(&mut rng).public_key();
         let k2 = TestBlsKeypair::new(&mut rng).public_key();
         let k3 = TestBlsKeypair::new(&mut rng).public_key();
-        let unsorted = vec![k3, k1, k2];
-        let mut sorted = unsorted.clone();
+        let mut sorted = vec![k1, k2, k3];
         sorted.sort_unstable();
-        // Sanity: keys are not accidentally already sorted.
+        let mut unsorted = sorted.clone();
+        unsorted.reverse();
         assert_ne!(unsorted, sorted, "test requires unsorted input");
 
         let record = make_record(unsorted);
@@ -391,6 +403,63 @@ mod test {
 
         let cert = EpochCertificate { epoch_hash: decoded.digest(), signature, signed_authorities };
         assert!(decoded.verify_with_cert(&cert), "cert verification failed on sorted record");
+    }
+
+    /// Build a valid certificate for `record` signed by super_quorum of `signers`.
+    fn build_cert(record: &EpochRecord, signers: &[TestBlsKeypair]) -> EpochCertificate {
+        let committee = &record.committee;
+        let mut positioned: Vec<(usize, &TestBlsKeypair)> = signers
+            .iter()
+            .filter_map(|s| committee.iter().position(|k| *k == s.public_key()).map(|p| (p, s)))
+            .collect();
+        positioned.sort_by_key(|(p, _)| *p);
+        let quorum = record.super_quorum();
+        assert!(positioned.len() >= quorum, "need at least super_quorum signers in committee");
+        let chosen = &positioned[..quorum];
+        let sigs: Vec<BlsSignature> =
+            chosen.iter().map(|(_, s)| record.sign_vote(*s).signature).collect();
+        let agg = BlsAggregateSignature::aggregate(&sigs, true).unwrap();
+        let mut bm = RoaringBitmap::new();
+        for (p, _) in chosen {
+            bm.push(*p as u32);
+        }
+        EpochCertificate {
+            epoch_hash: record.digest(),
+            signature: agg.to_signature(),
+            signed_authorities: bm,
+        }
+    }
+
+    #[test]
+    fn test_verify_against_committee_rejects_forged_committee() {
+        let mut rng = StdRng::from_os_rng();
+
+        let genuine: Vec<TestBlsKeypair> = (0..4).map(|_| TestBlsKeypair::new(&mut rng)).collect();
+        let mut genuine_keys: Vec<BlsPublicKey> = genuine.iter().map(|s| s.public_key()).collect();
+        genuine_keys.sort_unstable();
+
+        let attacker: Vec<TestBlsKeypair> = (0..4).map(|_| TestBlsKeypair::new(&mut rng)).collect();
+        let attacker_keys: Vec<BlsPublicKey> = attacker.iter().map(|s| s.public_key()).collect();
+        let forged: EpochRecord =
+            bcs::from_bytes(&encode(&make_record(attacker_keys))).expect("decode forged");
+        let forged_cert = build_cert(&forged, &attacker);
+
+        assert!(
+            forged.verify_with_cert(&forged_cert),
+            "self-signed forged record should self-verify"
+        );
+        assert!(
+            !forged.verify_against_committee(&genuine_keys, &forged_cert),
+            "forged committee must be rejected when bound to the genuine committee",
+        );
+
+        let g_record: EpochRecord =
+            bcs::from_bytes(&encode(&make_record(genuine_keys.clone()))).expect("decode genuine");
+        let g_cert = build_cert(&g_record, &genuine);
+        assert!(
+            g_record.verify_against_committee(&genuine_keys, &g_cert),
+            "genuine record must verify against its genuine committee",
+        );
     }
 
     #[test]

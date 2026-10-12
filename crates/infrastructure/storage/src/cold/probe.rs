@@ -23,7 +23,7 @@ pub(crate) struct TxnStart {
     pub(crate) high_water_mark: bool,
 }
 
-/// A [`MemDatabase`] that counts read transactions, snapshots what each write transaction found
+/// A [`MemDatabase`] that snapshots what each write transaction found
 /// already committed, and can fail every read.
 ///
 /// Transaction boundaries belong to the generic commit path rather than to any backend, so an
@@ -36,8 +36,6 @@ pub(crate) struct ProbeDb {
     read_fault: bool,
     /// Stands in for a hot tier rejecting writes outright (e.g. its map is full).
     write_fault: bool,
-    /// Read transactions opened so far, shared across clones.
-    read_txns: Arc<AtomicUsize>,
     /// Full reverse scans requested so far, shared across clones.
     reverse_iters: Arc<AtomicUsize>,
     /// One snapshot per write transaction, taken when it opens rather than when it commits.
@@ -51,7 +49,6 @@ impl ProbeDb {
             inner: MemDatabase::new(),
             read_fault: false,
             write_fault: false,
-            read_txns: Arc::new(AtomicUsize::new(0)),
             reverse_iters: Arc::new(AtomicUsize::new(0)),
             write_starts: Arc::new(Mutex::new(Vec::new())),
         };
@@ -68,11 +65,6 @@ impl ProbeDb {
     /// Builds a probe whose every `write_txn` fails: a hot tier rejecting writes outright.
     pub(crate) fn failing_writes() -> Self {
         Self { write_fault: true, ..Self::new() }
-    }
-
-    /// Returns how many read transactions have been opened.
-    pub(crate) fn read_txns(&self) -> usize {
-        self.read_txns.load(Ordering::SeqCst)
     }
 
     /// Returns how many full reverse scans have been requested.
@@ -98,7 +90,6 @@ impl Database for ProbeDb {
         Self: 'txn;
 
     fn read_txn(&self) -> eyre::Result<Self::TX<'_>> {
-        self.read_txns.fetch_add(1, Ordering::SeqCst);
         if self.read_fault {
             eyre::bail!("hot read transaction unavailable");
         }

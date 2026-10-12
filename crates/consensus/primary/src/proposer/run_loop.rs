@@ -106,7 +106,7 @@ impl<DB: Database> Proposer<DB> {
                     self.push_digest(digest);
                 }
                 // check for new parent certificates
-                // synchronizer sends collection of certificates when there is quorum (2f+1)
+                // the state synchronizer sends a collection of certificates when there is quorum (2f+1)
                 Some((certs, round)) = rx_parents.recv() => {
                     debug!(target: "primary::proposer", authority=?self.authority_id, this_round=self.round, parent_round=round, num_parents=certs.len(), "received parents");
                     self.process_parents(certs, round)?;
