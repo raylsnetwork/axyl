@@ -826,6 +826,16 @@ where
             (None, None) => self.get_latest_output()?,
         };
 
+        // Test-only: a by-number gap-fetch reply may be overridden with a crafted header to
+        // reproduce the gap-fetch-stall issue. Compiled out of production builds, and inert unless
+        // the serving process is armed by environment. By-hash and latest replies are untouched.
+        #[cfg(feature = "byzantine-test-hooks")]
+        if let (Some(number), None) = (number, hash) {
+            if let Some(crafted) = super::gap_fetch_byzantine::override_gap_fetch(number, &header) {
+                return Ok(PrimaryResponse::ConsensusHeader(Arc::new(crafted)));
+            }
+        }
+
         Ok(PrimaryResponse::ConsensusHeader(Arc::new(header)))
     }
 
