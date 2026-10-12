@@ -2,29 +2,19 @@ name: Pull Request Checks
 on:
   workflow_dispatch:
   pull_request:
-    # `labeled` is what actually runs CI (see below). The other types only
-    # produce a failing "Tests" check telling the author to add `run-ci`.
-    types: [opened, synchronize, reopened, review_requested, ready_for_review, labeled]
+    types: [labeled]
     branches:
       - main
 
 # CI is opt-in per run: adding the `run-ci` label runs the jobs below once,
 # against the PR's current head, and consume-run-ci-label.yml removes the label
-# again (fork PRs included) so it can be re-added for the next run. Pushes,
-# other labels, etc. do not run CI: the jobs are skipped and the required
-# "Tests" check (tests-gate) fails, so a commit that CI hasn't run on can't be
-# merged. Manual dispatch always runs.
+# again (fork PRs included) so it can be re-added for the next run. 
 
 # Least privilege by default; the jobs that post PR comments re-grant
 # pull-requests: write in their own permissions block.
 permissions:
   contents: read
 
-# Supersede in-flight runs when a PR is pushed/rebased instead of stacking
-# full build+test runs (the "require up-to-date branch" rule causes churn).
-#
-# Runs from unrelated `labeled` events (e.g. adding `bug`) get a group of their
-# own, so they don't cancel a real CI run that's in progress.
 concurrency:
   group: pr-${{ github.ref }}${{ github.event.action == 'labeled' && github.event.label.name != 'run-ci' && format('-{0}', github.run_id) || '' }}
   cancel-in-progress: true
@@ -155,7 +145,7 @@ jobs:
       - name: Verify all test legs passed
         run: |
           if [[ "${{ needs.tests.result }}" == "skipped" ]]; then
-            echo "CI has not run on this commit: add the 'run-ci' label to this PR to execute it."
+            echo "No CI ran: this run was triggered by a label other than 'run-ci'. Add the 'run-ci' label to this PR to run CI on its current head."
             exit 1
           fi
           if [[ "${{ needs.tests.result }}" != "success" ]]; then
