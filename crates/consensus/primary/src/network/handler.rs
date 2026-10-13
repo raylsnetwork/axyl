@@ -483,6 +483,12 @@ where
         // current committee
         let committee = self.consensus_config.committee();
 
+        #[cfg(feature = "byzantine-test-hooks")]
+        if std::env::var("RL_BYZ_WITHHOLD_VOTE").is_ok() {
+            warn!(target: "primary::byzantine", round = header.round(), author = ?header.author(), "RL_BYZ_WITHHOLD_VOTE: withholding vote");
+            return Err(HeaderError::AlreadyVoted(header.digest(), header.round()).into());
+        }
+
         // validate header
         header.validate(committee)?;
         // Round 0 is genesis and is never proposed. Without this floor a round-0 header with an
@@ -820,13 +826,53 @@ where
         number: Option<u64>,
         hash: Option<BlockHash>,
     ) -> PrimaryNetworkResult<PrimaryResponse> {
+        #[cfg(not(feature = "byzantine-test-hooks"))]
         let header = match (number, hash) {
             (_, Some(hash)) => self.get_header_by_hash(hash)?,
             (Some(number), _) => self.get_header_by_number(number)?,
             (None, None) => self.get_latest_output()?,
         };
 
+        #[cfg(feature = "byzantine-test-hooks")]
+        let header = {
+            let mut h = match (number, hash) {
+                (_, Some(hash)) => self.get_header_by_hash(hash)?,
+                (Some(number), _) => self.get_header_by_number(number)?,
+                (None, None) => self.get_latest_output()?,
+            };
+            if std::env::var("RL_BYZ_SERVE_VARIANT").is_ok() {
+                self.byz_serve_variant(&mut h);
+            }
+            h
+        };
+
         Ok(PrimaryResponse::ConsensusHeader(Arc::new(header)))
+    }
+
+    #[cfg(feature = "byzantine-test-hooks")]
+    fn byz_serve_variant(&self, header: &mut ConsensusHeader) {
+        let Some(my_id) = self.consensus_config.authority_id() else { return };
+        let committee = self.consensus_config.committee();
+        let Some(my_auth) = committee.authority(&my_id) else { return };
+        let my_key = *my_auth.protocol_key();
+        let keys = committee.bls_keys();
+        let Some(my_index) = keys.iter().position(|k| *k == my_key) else { return };
+
+        let leader_header = header.sub_dag.leader.header().clone();
+        let my_sig =
+            Vote::new(&leader_header, my_id.clone(), self.consensus_config.key_config()).signature;
+        let before: Vec<u32> = header.sub_dag.leader.signed_authorities().iter().collect();
+        if header.sub_dag.leader.byz_add_signer(my_index as u32, my_sig) {
+            let after: Vec<u32> = header.sub_dag.leader.signed_authorities().iter().collect();
+            warn!(
+                target: "primary::byzantine",
+                number = header.number,
+                leader = ?header.sub_dag.leader.digest(),
+                ?before,
+                ?after,
+                "RL_BYZ_SERVE_VARIANT: served superset leader certificate",
+            );
+        }
     }
 
     /// Retrieve an epoch record from local storage.

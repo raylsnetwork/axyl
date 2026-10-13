@@ -55,6 +55,9 @@ cli = ["clap"]
 test-utils = ["tracing-subscriber", "clap"]
 # Relaxes committee-size assertion to allow n=1 for single-validator dev chains.
 dev-single-node-setup = []
+# Exposes methods used only by live-repro Byzantine test harnesses (env-gated hooks
+# that produce variant certificates, withhold votes, etc.). Never enable in production.
+byzantine-test-hooks = []
 
 [lints]
 workspace = true

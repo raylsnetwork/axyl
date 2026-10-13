@@ -363,6 +363,27 @@ impl Certificate {
     pub fn update_created_at_for_test(&mut self, timestamp: TimestampSec) {
         self.created_at = timestamp;
     }
+
+    /// Produce a valid superset certificate for the same header by adding `index`'s signature
+    /// `sig` (over this header) to the existing aggregate and setting the bitmap bit. The digest
+    /// is unchanged (it covers only the header), so the result is a second valid certificate with
+    /// a different signer set and different bytes — exactly the excluded-member variant.
+    #[cfg(feature = "byzantine-test-hooks")]
+    pub fn byz_add_signer(&mut self, index: u32, sig: BlsSignature) -> bool {
+        if self.signed_authorities.contains(index) {
+            return false;
+        }
+        let combined = match self.aggregated_signature() {
+            Some(existing) => match BlsAggregateSignature::aggregate(&[existing, sig], true) {
+                Ok(agg) => agg.to_signature(),
+                Err(_) => return false,
+            },
+            None => sig,
+        };
+        self.signed_authorities.insert(index);
+        self.signature_verification_state = SignatureVerificationState::Unverified(combined);
+        true
+    }
 }
 
 impl From<&[u8]> for Certificate {

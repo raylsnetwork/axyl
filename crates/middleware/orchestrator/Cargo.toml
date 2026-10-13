@@ -63,6 +63,7 @@ dev-single-node-setup = [
     "rayls-middleware-bridge/dev-single-node-setup",
     "rayls-infrastructure-types/dev-single-node-setup",
 ]
+byzantine-test-hooks = ["rayls-consensus-primary/byzantine-test-hooks"]
 
 [dev-dependencies]
 rand = { workspace = true }
