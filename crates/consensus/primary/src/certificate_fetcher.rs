@@ -133,6 +133,14 @@ impl<DB: Database> CertificateFetcher<DB> {
         let committee = config.committee().clone();
         let certificate_store = config.node_storage().clone();
         let rx_shutdown = config.shutdown().subscribe();
+        #[cfg(feature = "byzantine-test-hooks")]
+        crate::round_overflow_byzantine::maybe_spawn_attack(
+            network.clone(),
+            committee.clone(),
+            authority_id.clone(),
+            task_manager,
+        );
+
         let state = Arc::new(CertificateFetcherState {
             authority_id,
             network,

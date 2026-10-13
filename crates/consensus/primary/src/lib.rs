@@ -13,6 +13,9 @@ mod state_handler;
 mod state_sync;
 mod vote_failure_tracker;
 
+#[cfg(feature = "byzantine-test-hooks")]
+mod round_overflow_byzantine;
+
 pub use state_sync::StateSynchronizer;
 
 #[cfg(test)]

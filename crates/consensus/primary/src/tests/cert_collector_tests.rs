@@ -141,3 +141,89 @@ fn test_certificate_iterator() {
         assert!(missing.iter().map(|cert| cert.round()).collect::<Vec<u32>>() >= expected_rounds);
     }
 }
+
+fn overflow_fixture() -> CommitteeFixture<MemDatabase> {
+    CommitteeFixture::builder(MemDatabase::default)
+        .randomize_ports(true)
+        .committee_size(NonZeroUsize::new(4).unwrap())
+        .build()
+}
+
+fn serialize_bitmap(rounds: &[u32]) -> Vec<u8> {
+    let mut bm = roaring::RoaringBitmap::new();
+    for &r in rounds {
+        bm.insert(r);
+    }
+    let mut buf = Vec::new();
+    bm.serialize_into(&mut buf).expect("bitmap");
+    buf
+}
+
+/// A request whose lower bound is u32::MAX and whose skip bitmap is empty must be refused.
+/// The empty bitmap bypasses the checked_add guard in get_bounds (zero iterations), so the
+/// overflow reaches next_round_number at certificate_store.rs:415.
+#[test]
+fn test_collector_refuses_max_lower_bound_with_empty_skip_bitmap() {
+    let fixture = overflow_fixture();
+    let config = fixture.authorities().next().unwrap().consensus_config();
+    let origin = fixture.authorities().nth(1).unwrap().id();
+    let req = MissingCertificatesRequest {
+        exclusive_lower_bound: u32::MAX,
+        skip_rounds: vec![(origin, serialize_bitmap(&[]))],
+        max_response_size: 1_000,
+        exclusive_upper_bound: None,
+    };
+    assert!(CertificateCollector::new(req, config).is_err());
+}
+
+/// A request with lower bound u32::MAX and a skip bitmap containing only offset 0 (absolute
+/// round u32::MAX) passes get_bounds (checked_add(u32::MAX, 0) = u32::MAX) but must still be
+/// refused before next_round_number tries round + 1.
+#[test]
+fn test_collector_refuses_max_lower_bound_with_zero_offset_skip() {
+    let fixture = overflow_fixture();
+    let config = fixture.authorities().next().unwrap().consensus_config();
+    let origin = fixture.authorities().nth(1).unwrap().id();
+    let req = MissingCertificatesRequest {
+        exclusive_lower_bound: u32::MAX,
+        skip_rounds: vec![(origin, serialize_bitmap(&[0]))],
+        max_response_size: 1_000,
+        exclusive_upper_bound: None,
+    };
+    assert!(CertificateCollector::new(req, config).is_err());
+}
+
+/// A request with lower bound u32::MAX and no authorities listed does not overflow (the
+/// collector's fetch queue is empty), but the request is vacuous. This test ensures the
+/// collector handles it gracefully.
+#[test]
+fn test_collector_handles_max_lower_bound_no_authorities() {
+    let fixture = overflow_fixture();
+    let config = fixture.authorities().next().unwrap().consensus_config();
+    let req = MissingCertificatesRequest {
+        exclusive_lower_bound: u32::MAX,
+        skip_rounds: vec![],
+        max_response_size: 1_000,
+        exclusive_upper_bound: None,
+    };
+    let result = CertificateCollector::new(req, config);
+    // Either an error (refused) or an empty collector is acceptable — just no panic.
+    if let Ok(collector) = result {
+        assert_eq!(collector.count(), 0);
+    }
+}
+
+/// Multiple authorities with empty skip bitmaps at u32::MAX must all be refused.
+#[test]
+fn test_collector_refuses_max_lower_bound_multiple_empty_origins() {
+    let fixture = overflow_fixture();
+    let config = fixture.authorities().next().unwrap().consensus_config();
+    let origins: Vec<_> = fixture.authorities().map(|a| a.id()).collect();
+    let req = MissingCertificatesRequest {
+        exclusive_lower_bound: u32::MAX,
+        skip_rounds: origins.into_iter().map(|id| (id, serialize_bitmap(&[]))).collect(),
+        max_response_size: 1_000,
+        exclusive_upper_bound: None,
+    };
+    assert!(CertificateCollector::new(req, config).is_err());
+}
