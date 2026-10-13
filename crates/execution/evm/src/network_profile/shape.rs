@@ -49,14 +49,14 @@ pub fn verify_schedule_shape(profile: &NetworkProfile) -> eyre::Result<()> {
 
     // Set B: USDr precompile.
     let fork_activation = activation(RaylsHardFork::Erc20PrecompileBytecode);
-    if activation(RaylsHardFork::Erc20PrecompileBytecode) != ForkActivation::Block(1) {
+    if fork_activation != ForkActivation::Block(1) {
         violations.push(format!(
             "Erc20PrecompileBytecode must be exactly Block(1), got {fork_activation:?}"
         ));
     }
-    let for_activation = activation(RaylsHardFork::UsdrSupplyCorrection);
-    if activation(RaylsHardFork::UsdrSupplyCorrection) != ForkActivation::Never {
-        violations.push(format!("UsdrSupplyCorrection must be Never, got {for_activation:?}",));
+    let fork_activation = activation(RaylsHardFork::UsdrSupplyCorrection);
+    if fork_activation != ForkActivation::Never {
+        violations.push(format!("UsdrSupplyCorrection must be Never, got {fork_activation:?}"));
     }
 
     // Set C: hybrid rewards (unconstrained for Devnet).
@@ -233,6 +233,21 @@ mod tests {
         assert!(verify_schedule_shape(&profile).is_err());
         let profile = new_chain_profile(99_999, (RaylsHardFork::Uups, ForkActivation::Never));
         assert!(verify_schedule_shape(&profile).is_err());
+    }
+
+    /// Two independent violations are joined into a single error message.
+    #[test]
+    fn multiple_violations_are_joined_in_one_message() {
+        let mut profile = new_chain_profile(
+            99_999,
+            (RaylsHardFork::Erc20PrecompileBytecode, ForkActivation::Never),
+        );
+        profile
+            .hardforks
+            .insert(ForkName::from(RaylsHardFork::HybridRewards.name()), ForkActivation::Block(5));
+        let msg = verify_schedule_shape(&profile).unwrap_err().to_string();
+        assert!(msg.contains("Erc20PrecompileBytecode"));
+        assert!(msg.contains("HybridRewards"));
     }
 
     /// Behavioral forks are unconstrained.
