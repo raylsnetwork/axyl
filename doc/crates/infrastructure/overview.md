@@ -259,7 +259,7 @@ the `RaylsBuilder` / `RethConfig` from the parsed CLI arguments.
 A node can run the chain-id and hardfork schedule of the selected subnet from
 an external per-client YAML file instead of the values baked into the binary.
 One file holds every subnet a client operates (the number of subnets is not
-fixed); see the guide in `docs/config-file/config-file.md` and the template
+fixed); see the guide in `docs/config-file/README.md` and the template
 `docs/config-file/config-file.example.yaml`. With `--config-file`:
 
 - the selected subnet's `chain_id` and `hardforks` section are the single

@@ -25,7 +25,7 @@
 # and are started with `--network <name>`.
 #
 # For a chain that has already produced blocks, see section 5 of
-# docs/config-file.md: the file becomes append-only and the datadir's
+# docs/config-file/README.md: the file becomes append-only and the datadir's
 # schedule-record.yaml freezes the forks that have already activated.
 #
 # To start from the schedule built into a binary instead of this template,
@@ -35,7 +35,7 @@
 #
 # which prints a complete, loadable subnet (change the chain-id afterwards).
 #
-# Full guide (how, when, chain-id checks): docs/config-file.md
+# Full guide (how, when, chain-id checks): docs/config-file/README.md
 
 networks:
   <subnet-name>:

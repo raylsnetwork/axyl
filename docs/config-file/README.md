@@ -230,7 +230,7 @@ updates ship — and the node warns about the change and re-records the new sche
 ## 6. Checklist for a private deployment
 
 1. Run the `genesis` ceremony with your `--chain-id`.
-2. Create the file. Either copy `docs/config-file.example.yaml`, or run
+2. Create the file. Either copy `docs/config-file/config-file.example.yaml`, or run
    `rayls-network schedule export --network local --subnet-name <name> > <file>`
    with the binary you will deploy (section 2). Set `chain_id` to the same value.
 3. Ship the datadir and the config file to every validator and observer.
