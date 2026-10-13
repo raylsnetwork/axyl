@@ -171,6 +171,18 @@ impl<DB: Database> RewardsBackend for ConsensusRewardsCounter<DB> {
             .cloned()
             .ok_or(RewardsError::MissingCommittee { epoch })?;
 
+        // Signer bitmaps index authorities sorted by BLS public key, which is exactly
+        // `Committee::bls_keys()` order and NOT `Committee::authorities()` order (sorted by
+        // identifier) — see `Certificate::skip_with_header_and_signers_span`. Resolved once per
+        // tally rather than per round. `None` entries are impossible (every key comes from the
+        // committee's own map) but are skipped rather than defaulted, so a future refactor
+        // cannot silently credit the zero address.
+        let signer_addresses: Vec<Option<Address>> = committee
+            .bls_keys()
+            .iter()
+            .map(|key| committee.authority_by_key(key).map(|a| a.execution_address()))
+            .collect();
+
         self.inner
             .consensus_db
             .with_read_txn(|txn| {
@@ -227,15 +239,22 @@ impl<DB: Database> RewardsBackend for ConsensusRewardsCounter<DB> {
                         tally.leader_rounds = tally.leader_rounds.saturating_add(1);
                     }
 
-                    // Dedup on the resolved execution address, not the pre-resolution
-                    // authority id: a round credits each address at most once, so two
-                    // distinct authority ids that resolve to the same execution address
-                    // (invariant-precluded, but defended for symmetry with the legacy
-                    // `get_address_counts` merge) can't double-count within one sub-dag.
+                    // Participation credits SIGNING, not authorship: an authority counts for
+                    // this round when its vote reached a certificate that was committed,
+                    // whether or not its own certificate was committed. Authorship penalises
+                    // latency-distant validators, whose certificates routinely miss the
+                    // commit while their votes still land (axyl#246).
+                    //
+                    // Dedup on the resolved execution address, not the committee index: a
+                    // round credits each address at most once, so two distinct authorities
+                    // resolving to the same execution address (invariant-precluded, but
+                    // defended for symmetry with the legacy `get_address_counts` merge)
+                    // can't double-count within one sub-dag.
                     seen.clear();
-                    for author in &meta.participants {
-                        if let Some(authority) = committee.authority(author) {
-                            let address = authority.execution_address();
+                    for index in &meta.signers {
+                        if let Some(address) =
+                            signer_addresses.get(*index as usize).copied().flatten()
+                        {
                             if seen.insert(address) {
                                 let tally = per_address.entry(address).or_default();
                                 tally.participation_rounds =
@@ -314,8 +333,9 @@ mod tests {
         cold_archiver_for, mem_db::MemDatabase, open_db, SealOutcome,
     };
     use rayls_infrastructure_types::{
-        BlsKeypair, Certificate, CertificateDigest, CommittedSubDag, CommitteeBuilder,
-        ConsensusHeader, DbTxMut, Header, HeaderBuilder, ReputationScores, Round, WorkerId,
+        BlsKeypair, BlsSignature, Certificate, CertificateDigest, CommittedSubDag,
+        CommitteeBuilder, ConsensusHeader, DbTxMut, Header, HeaderBuilder, ReputationScores, Round,
+        WorkerId,
     };
     use tempfile::TempDir;
 
@@ -402,7 +422,18 @@ mod tests {
         assert_eq!(after, before, "the closing epoch's tally must survive archival at the floor");
     }
 
-    fn make_cert(author: &AuthorityIdentifier, round: u32, epoch: u32) -> Certificate {
+    /// Build a certificate authored by `author` and signed by `signers`.
+    ///
+    /// Goes through the production constructor so the `signed_authorities` bitmap is built by
+    /// the same code the tally decodes. A hand-set bitmap would let the test agree with a wrong
+    /// index space; this way the committee ordering is exercised rather than assumed.
+    fn make_cert(
+        committee: &Committee,
+        author: &AuthorityIdentifier,
+        round: u32,
+        epoch: u32,
+        signers: &[&AuthorityIdentifier],
+    ) -> Certificate {
         let header = HeaderBuilder::default()
             .author(author.clone())
             .round(round)
@@ -411,24 +442,26 @@ mod tests {
             .payload(IndexMap::<BlockHash, WorkerId>::new())
             .parents(std::collections::BTreeSet::<CertificateDigest>::new())
             .build();
-        let mut cert = Certificate::default();
-        cert.update_header_for_test(header);
-        cert
+        let votes: Vec<(AuthorityIdentifier, BlsSignature)> =
+            signers.iter().map(|s| ((*s).clone(), BlsSignature::default())).collect();
+        Certificate::new_unsigned_for_test(committee, header, votes)
+            .expect("test certificate builds")
     }
 
-    /// Encode a `ConsensusHeader` for one committed round: `leader_author`
-    /// leads at `leader_round`, and every address in `participant_authors`
-    /// (which may include the leader) has a certificate in the sub-dag.
-    fn make_bytes(
+    /// Encode one committed sub-dag from explicit `(author, signers)` pairs.
+    fn make_bytes_per_cert(
+        committee: &Committee,
         leader_author: &AuthorityIdentifier,
         leader_round: u32,
         epoch: u32,
-        participant_authors: &[&AuthorityIdentifier],
+        certs: &[(&AuthorityIdentifier, &[&AuthorityIdentifier])],
     ) -> Vec<u8> {
-        let leader = make_cert(leader_author, leader_round, epoch);
-        let certs = participant_authors
+        let leader = make_cert(committee, leader_author, leader_round, epoch, &[]);
+        let certs = certs
             .iter()
-            .map(|a| make_cert(a, leader_round.saturating_sub(1), epoch))
+            .map(|(author, signers)| {
+                make_cert(committee, author, leader_round.saturating_sub(1), epoch, signers)
+            })
             .collect();
         let sub_dag = CommittedSubDag::new(certs, leader, 0, ReputationScores::default(), None);
         let header = ConsensusHeader {
@@ -438,6 +471,22 @@ mod tests {
             extra: BlockHash::ZERO,
         };
         rayls_infrastructure_types::encode(&header)
+    }
+
+    /// Encode a `ConsensusHeader` for one committed round: `leader_author`
+    /// leads at `leader_round`, and every address in `participant_authors`
+    /// (which may include the leader) has a certificate in the sub-dag.
+    fn make_bytes(
+        committee: &Committee,
+        leader_author: &AuthorityIdentifier,
+        leader_round: u32,
+        epoch: u32,
+        participant_authors: &[&AuthorityIdentifier],
+        signers: &[&AuthorityIdentifier],
+    ) -> Vec<u8> {
+        let certs: Vec<(&AuthorityIdentifier, &[&AuthorityIdentifier])> =
+            participant_authors.iter().map(|a| (*a, signers)).collect();
+        make_bytes_per_cert(committee, leader_author, leader_round, epoch, &certs)
     }
 
     /// The scenario from axyl-private#633: a US validator (`ids[0]`) leads
@@ -457,7 +506,7 @@ mod tests {
 
         let db = MemDatabase::default();
         for (i, round) in [2u32, 4, 6, 8].into_iter().enumerate() {
-            let bytes = make_bytes(leader_id, round, 0, &all_ids);
+            let bytes = make_bytes(&committee, leader_id, round, 0, &all_ids, &all_ids);
             let header: ConsensusHeader = rayls_infrastructure_types::decode(&bytes);
             db.insert::<ConsensusBlocks>(&(i as u64), &header).unwrap();
         }
@@ -481,21 +530,22 @@ mod tests {
     }
 
     #[test]
-    fn tally_hybrid_dedupes_repeated_author_within_one_subdag() {
-        // order_dag can flatten multiple underlying DAG rounds into one
-        // committed sub-dag, so the same author's cert can appear twice.
+    fn tally_hybrid_dedupes_repeated_signer_within_one_subdag() {
+        // order_dag can flatten multiple underlying DAG rounds into one committed sub-dag, so
+        // the same authority can sign several certificates inside one round. It must be
+        // credited once for the round, not once per certificate.
         let (committee, ids) = test_committee(2);
         let (id_a, _) = &ids[0];
         let (id_b, addr_b) = &ids[1];
-        let leader = make_cert(id_a, 4, 0);
-        let certs = vec![make_cert(id_b, 2, 0), make_cert(id_b, 3, 0)];
-        let sub_dag = CommittedSubDag::new(certs, leader, 0, ReputationScores::default(), None);
-        let header = ConsensusHeader {
-            parent_hash: BlockHash::repeat_byte(0xAB),
-            sub_dag,
-            number: 4,
-            extra: BlockHash::ZERO,
-        };
+
+        let bytes = make_bytes_per_cert(
+            &committee,
+            id_a,
+            4,
+            0,
+            &[(id_a, &[id_b][..]), (id_a, &[id_b][..])],
+        );
+        let header: ConsensusHeader = rayls_infrastructure_types::decode(&bytes);
 
         let db = MemDatabase::default();
         db.insert::<ConsensusBlocks>(&0u64, &header).unwrap();
@@ -507,6 +557,79 @@ mod tests {
         assert_eq!(tally.per_address[addr_b].participation_rounds, 1);
     }
 
+    /// The axyl#246 case: a latency-distant validator whose own certificates never get
+    /// committed, but whose votes do land. Authorship scores it zero; signing scores it full.
+    #[test]
+    fn tally_hybrid_credits_a_validator_that_signs_but_never_authors() {
+        // Four authorities, only three of them signing: the signer set must stay a *proper*
+        // subset of the committee. With every member signing, any permutation of the index space
+        // maps the full set onto itself, and the test would pass even if the bitmap were resolved
+        // against the wrong committee ordering.
+        let (committee, ids) = test_committee(4);
+        let (near_id, near_addr) = &ids[0];
+        let (distant_id, distant_addr) = &ids[1];
+        let (third_id, _) = &ids[2];
+        let (_, silent_addr) = &ids[3];
+        let signers = [near_id, distant_id, third_id];
+
+        let db = MemDatabase::default();
+        for (i, round) in [2u32, 4, 6, 8].into_iter().enumerate() {
+            // every committed certificate is authored by the near validators only
+            let bytes = make_bytes(&committee, near_id, round, 0, &[near_id, third_id], &signers);
+            let header: ConsensusHeader = rayls_infrastructure_types::decode(&bytes);
+            db.insert::<ConsensusBlocks>(&(i as u64), &header).unwrap();
+        }
+
+        let counter = ConsensusRewardsCounter::new(db);
+        counter.set_committee(committee);
+        let tally = counter.tally_hybrid(0, u32::MAX).unwrap();
+
+        assert_eq!(tally.total_rounds, 4);
+        // never authored a committed certificate, yet credited for every round
+        assert_eq!(tally.per_address[distant_addr].participation_rounds, 4);
+        assert_eq!(tally.per_address[near_addr].participation_rounds, 4);
+        // and it still earns nothing from the anchor component
+        assert_eq!(tally.per_address[distant_addr].leader_rounds, 0);
+        // the non-signer earns nothing: this is what pins the index space, since crediting it
+        // would mean the bitmap was resolved against the wrong committee ordering
+        assert_eq!(
+            tally.per_address.get(silent_addr).map(|t| t.participation_rounds).unwrap_or(0),
+            0,
+        );
+    }
+
+    #[test]
+    fn tally_hybrid_credits_a_signer_present_on_only_one_certificate_in_the_round() {
+        let (committee, ids) = test_committee(3);
+        let (id_a, _) = &ids[0];
+        let (id_b, addr_b) = &ids[1];
+        let (_, addr_c) = &ids[2];
+
+        // id_b signs only the first certificate; id_c signs neither
+        let bytes = make_bytes_per_cert(
+            &committee,
+            id_a,
+            4,
+            0,
+            &[(id_a, &[id_a, id_b][..]), (id_a, &[id_a][..])],
+        );
+        let header: ConsensusHeader = rayls_infrastructure_types::decode(&bytes);
+
+        let db = MemDatabase::default();
+        db.insert::<ConsensusBlocks>(&0u64, &header).unwrap();
+
+        let counter = ConsensusRewardsCounter::new(db);
+        counter.set_committee(committee);
+        let tally = counter.tally_hybrid(0, u32::MAX).unwrap();
+
+        assert_eq!(tally.per_address[addr_b].participation_rounds, 1);
+        assert_eq!(
+            tally.per_address.get(addr_c).map(|t| t.participation_rounds).unwrap_or(0),
+            0,
+            "an authority that signed nothing in the round must not be credited"
+        );
+    }
+
     #[test]
     fn tally_hybrid_excludes_genesis_and_out_of_range_rounds() {
         // CommitteeBuilder requires size > 1; only id_a's rounds are exercised.
@@ -515,11 +638,11 @@ mod tests {
 
         let db = MemDatabase::default();
         // genesis: leader_round == 0
-        let genesis_bytes = make_bytes(id_a, 0, 0, &[id_a]);
+        let genesis_bytes = make_bytes(&committee, id_a, 0, 0, &[id_a], &[id_a]);
         let genesis_header: ConsensusHeader = rayls_infrastructure_types::decode(&genesis_bytes);
         db.insert::<ConsensusBlocks>(&0u64, &genesis_header).unwrap();
         // not yet executed (round 100 > last_executed_round 10)
-        let future_bytes = make_bytes(id_a, 100, 0, &[id_a]);
+        let future_bytes = make_bytes(&committee, id_a, 100, 0, &[id_a], &[id_a]);
         let future_header: ConsensusHeader = rayls_infrastructure_types::decode(&future_bytes);
         db.insert::<ConsensusBlocks>(&1u64, &future_header).unwrap();
 

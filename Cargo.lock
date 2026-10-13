@@ -8255,6 +8255,7 @@ dependencies = [
 name = "rayls-infrastructure-storage"
 version = "1.5.2"
 dependencies = [
+ "bs58",
  "criterion",
  "eyre",
  "lru",
