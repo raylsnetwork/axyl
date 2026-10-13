@@ -27,6 +27,11 @@ use tracing::{debug, enabled, error, info, warn};
 #[path = "tests/certifier_tests.rs"]
 mod certifier_tests;
 
+// Test-only Byzantine certificate-variant forge, compiled only with `byzantine-test-hooks`.
+#[cfg(feature = "byzantine-test-hooks")]
+#[path = "certifier_byzantine.rs"]
+mod certifier_byzantine;
+
 use crate::vote_failure_tracker::{RejectionOutcome, VoteFailureTracker};
 
 /// Result of evaluating a vote error in `handle_vote_error`.
@@ -67,6 +72,10 @@ pub(crate) struct Certifier<DB> {
     new_proposal: Notifier,
     /// Shared vote rejection tracker - accumulates across proposals.
     vote_failures: VoteFailureTracker,
+    /// Test-only (byzantine-test-hooks): valid variant certificate staged by the forge during a
+    /// proposal, injected through the fetch accept path once the canonical copy has been stored.
+    #[cfg(feature = "byzantine-test-hooks")]
+    fvo_variant: Arc<std::sync::Mutex<Option<Certificate>>>,
 }
 
 impl<DB: Database> Certifier<DB> {
@@ -127,6 +136,8 @@ impl<DB: Database> Certifier<DB> {
                     task_spawner,
                     new_proposal: Notifier::new(),
                     vote_failures: VoteFailureTracker::new(committee_size, grace_deadline),
+                    #[cfg(feature = "byzantine-test-hooks")]
+                    fvo_variant: Arc::new(std::sync::Mutex::new(None)),
                 }
                 .run()
                 .await;
@@ -560,6 +571,14 @@ impl<DB: Database> Certifier<DB> {
         let mut votes_aggregator =
             HeaderVotesAggregator::new(self.metrics.clone(), &self.committee);
         let vote = Vote::new(&header, self.authority_id.clone(), &self.signature_service);
+
+        // Test-only (byzantine-test-hooks): arm the variant forge for this header and record our
+        // own vote. Inert unless this process is the armed node on the target round.
+        #[cfg(feature = "byzantine-test-hooks")]
+        let mut forge = certifier_byzantine::VariantForge::arm(&self.committee, &header);
+        #[cfg(feature = "byzantine-test-hooks")]
+        forge.record(vote.author().clone(), *vote.signature());
+
         let mut certificate = votes_aggregator.append(vote, &self.committee, &header)?;
 
         // create a bounded channel for receiving votes from peers
@@ -605,7 +624,14 @@ impl<DB: Database> Certifier<DB> {
         // loop through requests until complete or cancelled
         loop {
             // certificate created - no more votes needed
-            if certificate.is_some() {
+            //
+            // Test-only (byzantine-test-hooks): on an armed round the forge keeps the loop running
+            // one vote past quorum, so a disjoint signer subset is available for a valid variant.
+            #[cfg(feature = "byzantine-test-hooks")]
+            let keep_collecting = forge.wants_more_votes();
+            #[cfg(not(feature = "byzantine-test-hooks"))]
+            let keep_collecting = false;
+            if certificate.is_some() && !keep_collecting {
                 // signal lingering vote tasks to stop (e.g. retrying dead peers)
                 quorum_notifier.notify();
                 break;
@@ -620,6 +646,9 @@ impl<DB: Database> Certifier<DB> {
                         // happy path
                         Some(Ok(vote)) => {
                             let authority_id = vote.author.clone();
+                            // Test-only (byzantine-test-hooks): record the raw vote for variant building.
+                            #[cfg(feature = "byzantine-test-hooks")]
+                            forge.record(vote.author().clone(), *vote.signature());
                             // prevent invalid votes from derailing certification process
                             certificate = votes_aggregator
                                  .append(vote, &self.committee, &header)
@@ -679,6 +708,14 @@ impl<DB: Database> Certifier<DB> {
 
         debug!(target: "primary::certifier", auth=?self.authority_id, "Assembled {certificate:?}");
 
+        // Test-only (byzantine-test-hooks): build a valid variant certificate for the same header
+        // from a different signer subset and stage it for fetch-path injection by the caller.
+        #[cfg(feature = "byzantine-test-hooks")]
+        {
+            *self.fvo_variant.lock().expect("fvo_variant mutex poisoned") =
+                forge.build(&self.committee, &header, &certificate);
+        }
+
         Ok(certificate)
     }
 
@@ -705,6 +742,24 @@ impl<DB: Database> Certifier<DB> {
                         if let Err(e) = self.rayls_consensus_state_sync.process_own_certificate(certificate.clone()).await {
                             error!(target: "primary::certifier", "error accepting own certificate: {e}");
                             return;
+                        }
+
+                        // Test-only (byzantine-test-hooks): the canonical certificate is now stored
+                        // via the guarded own/gossip accept path. If the forge staged a valid variant
+                        // for the same digest, push it through the production *fetch* accept path,
+                        // which has no stored-digest guard and overwrites the canonical copy.
+                        #[cfg(feature = "byzantine-test-hooks")]
+                        {
+                            let variant =
+                                self.fvo_variant.lock().expect("fvo_variant mutex poisoned").take();
+                            if let Some(variant) = variant {
+                                certifier_byzantine::inject_via_fetch_path(
+                                    &self.consensus_bus,
+                                    &self.certificate_store,
+                                    variant,
+                                )
+                                .await;
+                            }
                         }
 
                         // try to publish the certificate on gossip network.
