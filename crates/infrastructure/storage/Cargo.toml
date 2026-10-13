@@ -38,6 +38,7 @@ lru = { workspace = true, optional = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["rt", "macros"] }
 criterion = { workspace = true }
+bs58 = { workspace = true }
 
 [[bench]]
 name = "cold_read_path"

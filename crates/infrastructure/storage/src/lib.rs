@@ -1,6 +1,11 @@
 // SPDX-License-Identifier: BUSL-1.1
 //! Persistent storage types
 
+// Dev-dependency used only by `examples/validate_signer_projection.rs` (base58 committee keys).
+// Claimed here so `unused_crate_dependencies` does not flag it against the lib-test target.
+#[cfg(test)]
+use bs58 as _;
+
 #[cfg(feature = "cold-storage")]
 pub mod cold;
 mod stores;

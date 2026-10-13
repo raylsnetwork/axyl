@@ -14,6 +14,7 @@ use crate::{
     bcs_layout::{BcsCursor, BcsLayoutError},
     AuthorityIdentifier, Certificate, Epoch, Round, B256,
 };
+use roaring::RoaringBitmap;
 
 /// Leader + participant projection of a stored `ConsensusHeader`.
 #[derive(Debug, Clone)]
@@ -28,6 +29,18 @@ pub struct ConsensusHeaderParticipation {
     /// on-disk order (may repeat an author across the flattened DAG history;
     /// callers wanting a per-round participant set should dedupe).
     pub participants: Vec<AuthorityIdentifier>,
+    /// Committee indices of every authority that signed at least one certificate in the
+    /// committed sub-dag, ascending and deduplicated.
+    ///
+    /// This is the availability signal the hybrid reward tally credits: an authority appears
+    /// here when its vote reached a certificate that was committed, whether or not it authored
+    /// a committed certificate itself. A latency-distant validator routinely fails to get its
+    /// own certificate committed while still signing others', so authorship under-counts it.
+    ///
+    /// Indices address authorities **sorted by BLS public key** — see
+    /// [`Certificate::skip_with_header_and_signers_span`] for why that is not
+    /// `Committee::authorities()` order.
+    pub signers: Vec<u32>,
 }
 
 impl ConsensusHeaderParticipation {
@@ -37,17 +50,27 @@ impl ConsensusHeaderParticipation {
         let mut c = BcsCursor::new(bytes);
         // parent_hash
         c.skip::<B256>()?;
-        // sub_dag.certificates: Vec<Certificate>, author-projected per element.
+        // sub_dag.certificates: Vec<Certificate>, author- and signer-projected per element.
         let n = c.read_len()?;
         let mut participants = Vec::with_capacity(n);
+        let mut signers = RoaringBitmap::new();
         for _ in 0..n {
-            participants.push(read_certificate_author(&mut c)?);
+            let (author, cert_signers) = read_certificate_author_and_signers(&mut c)?;
+            participants.push(author);
+            signers |= cert_signers;
         }
         // sub_dag.leader: read the first three header fields, stop early.
         let leader_author = c.read::<AuthorityIdentifier>()?;
         let leader_round = c.read::<Round>()?;
         let leader_epoch = c.read::<Epoch>()?;
-        Ok(Self { leader_author, leader_round, leader_epoch, participants })
+        Ok(Self {
+            leader_author,
+            leader_round,
+            leader_epoch,
+            participants,
+            // ascending and deduplicated by construction: the union is a bitmap
+            signers: signers.into_iter().collect(),
+        })
     }
 }
 
@@ -63,20 +86,29 @@ impl ConsensusHeaderParticipation {
 /// corrupt the tally, which feeds both the state root (via `applyIncentives`)
 /// and `withdrawals_root`. The author is the first field of the header, so it
 /// sits at the start of the returned header span.
-fn read_certificate_author(c: &mut BcsCursor<'_>) -> Result<AuthorityIdentifier, BcsLayoutError> {
-    let header_span = Certificate::skip_with_header_span(c)?;
-    BcsCursor::new(header_span).read::<AuthorityIdentifier>()
+fn read_certificate_author_and_signers(
+    c: &mut BcsCursor<'_>,
+) -> Result<(AuthorityIdentifier, RoaringBitmap), BcsLayoutError> {
+    let (header_span, signers_span) = Certificate::skip_with_header_and_signers_span(c)?;
+    let author = BcsCursor::new(header_span).read::<AuthorityIdentifier>()?;
+    // `signed_authorities` is a serialized roaring bitmap; an undecodable one means the stored
+    // certificate is corrupt, which must surface rather than silently crediting nobody.
+    let signers = RoaringBitmap::deserialize_from(signers_span)
+        .map_err(|_| BcsLayoutError::InvalidBitmap { type_name: "Certificate" })?;
+    Ok((author, signers))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{Address, BlsKeypair, BlsSignature, Committee, CommitteeBuilder};
     use crate::{
         CertificateDigest, CommittedSubDag, ConsensusHeader, HeaderBuilder, ReputationScores,
         WorkerId,
     };
     use alloy::primitives::BlockHash as AlloyBlockHash;
     use indexmap::IndexMap;
+    use rand::{rngs::StdRng, SeedableRng};
     use std::collections::BTreeSet;
 
     fn make_cert(
@@ -151,6 +183,90 @@ mod tests {
         let m = ConsensusHeaderParticipation::from_bytes(&bytes).unwrap();
         assert_eq!(m.leader_author, AuthorityIdentifier::dummy_for_test(0xEE));
         assert!(m.participants.is_empty());
+        // No certificates means no signatures to union: the tally must credit nobody rather than
+        // fall back to the leader, who signed a certificate the sub-dag does not carry.
+        assert!(m.signers.is_empty());
+    }
+
+    /// Four authorities with random BLS keys, so identifier order and BLS-key order disagree.
+    fn signing_committee() -> Committee {
+        // Fixed seed: the permutation between the two orderings must not vary run to run, or a
+        // genuine index-space regression would only fail intermittently.
+        let mut rng = StdRng::seed_from_u64(0x246);
+        let mut builder = CommitteeBuilder::new(3);
+        for i in 0..4u8 {
+            let keypair = BlsKeypair::generate(&mut rng);
+            builder.add_authority(*keypair.public(), 1, Address::with_last_byte(i + 1));
+        }
+        builder.build()
+    }
+
+    fn make_signed_cert(
+        committee: &Committee,
+        author: AuthorityIdentifier,
+        round: u32,
+        signers: &[AuthorityIdentifier],
+    ) -> crate::Certificate {
+        let header = HeaderBuilder::default()
+            .author(author)
+            .round(round)
+            .epoch(3)
+            .created_at(0)
+            .payload(IndexMap::new())
+            .parents(BTreeSet::new())
+            .build();
+        let votes = signers.iter().map(|id| (id.clone(), BlsSignature::default())).collect();
+        crate::Certificate::new_unsigned_for_test(committee, header, votes).unwrap()
+    }
+
+    /// Pins the signer projection against the production full-decode path, [`Certificate::signed_by`].
+    ///
+    /// The bitmap carries bare indices, so resolving it against the wrong committee ordering
+    /// returns a plausible set of authorities rather than an error — the tally would silently pay
+    /// the wrong validators. Comparing resolved identities (not index values) against the
+    /// canonical decode is what makes that failure visible.
+    #[test]
+    fn signers_resolve_to_the_authorities_the_full_decode_reports() {
+        let committee = signing_committee();
+        let bls_keys = committee.bls_keys();
+        let ids: Vec<AuthorityIdentifier> =
+            committee.authorities().iter().map(|a| a.id()).collect();
+        let ids_in_bls_order: Vec<AuthorityIdentifier> =
+            bls_keys.iter().map(|k| committee.authority_by_key(k).unwrap().id()).collect();
+        assert_ne!(
+            ids, ids_in_bls_order,
+            "fixture no longer exercises the permutation the projection has to get right",
+        );
+
+        // Disjoint-ish signer subsets, so the union is neither one certificate's set nor the
+        // whole committee — both of which a broken resolve could produce by accident.
+        let certs = vec![
+            make_signed_cert(&committee, ids[0].clone(), 8, &[ids[0].clone(), ids[1].clone()]),
+            make_signed_cert(&committee, ids[1].clone(), 8, &[ids[1].clone(), ids[2].clone()]),
+        ];
+        let leader =
+            make_signed_cert(&committee, ids[2].clone(), 9, &[ids[2].clone(), ids[3].clone()]);
+
+        let expected: BTreeSet<AuthorityIdentifier> = certs
+            .iter()
+            .flat_map(|c| c.signed_by(&bls_keys).1)
+            .map(|key| committee.authority_by_key(&key).unwrap().id())
+            .collect();
+
+        let bytes = crate::encode(&make_header(leader, certs));
+        let m = ConsensusHeaderParticipation::from_bytes(&bytes).unwrap();
+        let decoded: BTreeSet<AuthorityIdentifier> = m
+            .signers
+            .iter()
+            .map(|i| committee.authority_by_key(&bls_keys[*i as usize]).unwrap().id())
+            .collect();
+
+        assert_eq!(decoded, expected);
+        assert_eq!(decoded, BTreeSet::from([ids[0].clone(), ids[1].clone(), ids[2].clone()]));
+        // ids[3] signed only the leader certificate, which lives outside the `certificates`
+        // vector this projection walks. In production the leader is also carried in that vector,
+        // so this is a property of the fixture, not a gap in the signal.
+        assert!(!decoded.contains(&ids[3]));
     }
 
     /// Same fixture as `ConsensusHeaderMeta`'s test of the same name: proves
