@@ -8,119 +8,139 @@ use reth_chainspec::ChainSpec;
 use crate::chainspec::{RaylsChainHardforks, RaylsChainSpec, RaylsHardFork, RaylsHardforks};
 
 /// The activation block of `fork` in `spec`; panics for non-block-scheduled forks.
-fn activation_block(spec: &RaylsChainHardforks, fork: RaylsHardFork) -> u64 {
-    spec.rayls_fork_activation(fork).block_number().expect("fork is block-scheduled")
-}
+// fn activation_block(spec: &RaylsChainHardforks, fork: RaylsHardFork) -> u64 {
+//     spec.rayls_fork_activation(fork).block_number().expect("fork is block-scheduled")
+// }
 
 mod schedule {
     use super::*;
 
     #[test]
-    fn batch_digest_v2_inactive_before_activation_block() {
-        let hardforks = RaylsChainHardforks::for_network(RaylsNetwork::Devnet);
-        let block = activation_block(&hardforks, RaylsHardFork::BatchDigestV2);
-        assert!(!hardforks.is_batch_digest_v2_active_at_block(block - 1));
+    fn fork_inactive_before_activation_block() {
+        let hardforks = RaylsChainHardforks::local();
+        assert!(!hardforks.is_rayls_fork_active_at_block(
+            RaylsHardFork::HybridRewards,
+            LOCAL_HYBRID_REWARDS_BLOCK - 1,
+        ));
     }
 
     #[test]
-    fn batch_digest_v2_active_at_activation_block() {
-        let hardforks = RaylsChainHardforks::for_network(RaylsNetwork::Devnet);
-        let block = activation_block(&hardforks, RaylsHardFork::BatchDigestV2);
-        assert!(hardforks.is_batch_digest_v2_active_at_block(block));
+    fn fork_active_at_activation_block() {
+        let hardforks = RaylsChainHardforks::local();
+        assert!(hardforks.is_rayls_fork_active_at_block(
+            RaylsHardFork::HybridRewards,
+            LOCAL_HYBRID_REWARDS_BLOCK,
+        ));
     }
 
     #[test]
-    fn batch_digest_v2_active_after_activation_block() {
-        let hardforks = RaylsChainHardforks::for_network(RaylsNetwork::Devnet);
-        let block = activation_block(&hardforks, RaylsHardFork::BatchDigestV2);
-        assert!(hardforks.is_batch_digest_v2_active_at_block(block + 1));
+    fn fork_active_after_activation_block() {
+        let hardforks = RaylsChainHardforks::local();
+        assert!(hardforks.is_rayls_fork_active_at_block(
+            RaylsHardFork::HybridRewards,
+            LOCAL_HYBRID_REWARDS_BLOCK + 1,
+        ));
+    }
+
+    /// On local, Erc20PrecompileBytecode and HybridRewards share activation block 1;
+    /// exactly those two must be reported as newly activated there.
+    #[test]
+    fn newly_activated_forks_reports_only_forks_crossed_at_block() {
+        let hardforks = RaylsChainHardforks::local();
+        let activated = hardforks
+            .newly_activated_forks(LOCAL_HYBRID_REWARDS_BLOCK - 1, LOCAL_HYBRID_REWARDS_BLOCK);
+        assert_eq!(
+            activated,
+            vec![RaylsHardFork::Erc20PrecompileBytecode, RaylsHardFork::HybridRewards],
+        );
     }
 
     #[test]
-    fn newly_activated_forks_includes_batch_digest_v2() {
-        let hardforks = RaylsChainHardforks::for_network(RaylsNetwork::Devnet);
-        let block = activation_block(&hardforks, RaylsHardFork::BatchDigestV2);
-        let activated = hardforks.newly_activated_forks(block - 1, block);
+    fn newly_activated_forks_is_empty_when_no_fork_crosses() {
+        let hardforks = RaylsChainHardforks::local();
+        let activated = hardforks
+            .newly_activated_forks(LOCAL_HYBRID_REWARDS_BLOCK, LOCAL_HYBRID_REWARDS_BLOCK + 1);
+        assert!(activated.is_empty());
+    }
+
+    /// BatchDigestV2 and AdminTransfer share one activation block on testnet; both must
+    /// be reported as newly activated there.
+    #[test]
+    fn newly_activated_forks_reports_all_forks_at_shared_block() {
+        let hardforks = RaylsChainHardforks::for_network(RaylsNetwork::Testnet);
+        let activated = hardforks
+            .newly_activated_forks(TESTNET_ADMIN_TRANSFER_BLOCK - 1, TESTNET_ADMIN_TRANSFER_BLOCK);
         assert!(activated.contains(&RaylsHardFork::BatchDigestV2));
-    }
-
-    #[test]
-    fn newly_activated_forks_excludes_batch_digest_v2_when_already_active() {
-        let hardforks = RaylsChainHardforks::for_network(RaylsNetwork::Devnet);
-        let block = activation_block(&hardforks, RaylsHardFork::BatchDigestV2);
-        let activated = hardforks.newly_activated_forks(block, block + 1);
-        assert!(!activated.contains(&RaylsHardFork::BatchDigestV2));
-    }
-
-    /// Test Never block
-    #[test]
-    fn admin_transfer_never_activates_on_devnet() {
-        let hardforks = RaylsChainHardforks::for_network(RaylsNetwork::Devnet);
-        for block in [0u64, 1, 1_000, 1_000_000] {
-            assert!(!hardforks.is_rayls_fork_active_at_block(RaylsHardFork::AdminTransfer, block,));
-        }
-    }
-
-    #[test]
-    fn admin_transfer_active_after_testnet_activation_block() {
-        let hardforks = RaylsChainHardforks::for_network(RaylsNetwork::Testnet);
-        let block = activation_block(&hardforks, RaylsHardFork::AdminTransfer);
-        assert!(!hardforks.is_rayls_fork_active_at_block(RaylsHardFork::AdminTransfer, block - 1,));
-        assert!(hardforks.is_rayls_fork_active_at_block(RaylsHardFork::AdminTransfer, block,));
-        assert!(hardforks.is_rayls_fork_active_at_block(RaylsHardFork::AdminTransfer, block + 1,));
-    }
-
-    #[test]
-    fn newly_activated_forks_on_testnet_includes_admin_transfer() {
-        let hardforks = RaylsChainHardforks::for_network(RaylsNetwork::Testnet);
-        let block = activation_block(&hardforks, RaylsHardFork::AdminTransfer);
-        let activated = hardforks.newly_activated_forks(block - 1, block);
         assert!(activated.contains(&RaylsHardFork::AdminTransfer));
     }
 
+    /// A fork scheduled `Never` on a network must stay inactive at any block.
     #[test]
-    fn local_network_first_four_hardforks_active_at_block_0() {
-        let hardforks = RaylsChainHardforks::local();
-        // First four forks in declaration order are genesis-active on local (9 of 16 are;
-        // this pins the leading four).
-        let active_forks = [
-            RaylsHardFork::Eip1559,
-            RaylsHardFork::BatchDigestV2,
-            RaylsHardFork::AdminTransfer,
-            RaylsHardFork::PrecompileGasFix,
+    fn never_scheduled_forks_stay_inactive() {
+        let never_forks = [
+            (RaylsNetwork::Devnet, RaylsHardFork::UsdrSupplyCorrection),
+            (RaylsNetwork::Devnet, RaylsHardFork::HybridRewards),
+            (RaylsNetwork::Devnet, RaylsHardFork::EpochCloseSeedV2),
+            (RaylsNetwork::Testnet, RaylsHardFork::Erc20PrecompileBytecode),
+            (RaylsNetwork::Testnet, RaylsHardFork::UsdrSupplyCorrection),
+            (RaylsNetwork::Testnet, RaylsHardFork::HybridRewards),
+            (RaylsNetwork::Testnet, RaylsHardFork::EpochCloseSeedV2),
+            (RaylsNetwork::Mainnet, RaylsHardFork::AdminTransfer),
+            (RaylsNetwork::Mainnet, RaylsHardFork::RlsStorage),
+            (RaylsNetwork::Mainnet, RaylsHardFork::Tokenomics),
+            (RaylsNetwork::Mainnet, RaylsHardFork::Uups),
+            (RaylsNetwork::Mainnet, RaylsHardFork::HybridRewards),
+            (RaylsNetwork::Mainnet, RaylsHardFork::EpochCloseSeedV2),
+            (RaylsNetwork::Local, RaylsHardFork::UsdrSupplyCorrection),
         ];
-        for fork in active_forks {
+        for (network, fork) in never_forks {
+            let hardforks = RaylsChainHardforks::for_network(network);
             assert!(
-                hardforks.is_rayls_fork_active_at_block(fork, 0),
-                "fork {:?} should be active at block 0",
-                fork
+                !hardforks.is_rayls_fork_active_at_block(fork, u64::MAX),
+                "{network}: {fork:?} is scheduled Never but active at u64::MAX",
             );
         }
     }
 
+    /// Every local fork is genesis-active except three: Erc20PrecompileBytecode and
+    /// HybridRewards activate at the first post-genesis block, and UsdrSupplyCorrection
+    /// never activates (mainnet-only rebase).
     #[test]
-    fn local_network_migration_forks_never_activate() {
+    fn local_schedule_genesis_active_except_block_1_and_never_forks() {
         let hardforks = RaylsChainHardforks::local();
-        // Three migration-only forks that are Never on local (local genesis already carries
-        // the migrated state); declaration indices 4-6, not the last three.
-        let never_forks =
-            [RaylsHardFork::RlsStorage, RaylsHardFork::Tokenomics, RaylsHardFork::Uups];
-        for fork in never_forks {
-            assert!(
-                !hardforks.is_rayls_fork_active_at_block(fork, 0),
-                "fork {:?} should never be active",
-                fork
+        for fork in RaylsHardFork::VARIANTS {
+            let genesis_exception = matches!(
+                *fork,
+                RaylsHardFork::Erc20PrecompileBytecode
+                    | RaylsHardFork::HybridRewards
+                    | RaylsHardFork::UsdrSupplyCorrection
             );
-            assert!(
-                !hardforks.is_rayls_fork_active_at_block(fork, 1_000_000),
-                "fork {:?} should never be active",
+            assert_eq!(
+                hardforks.is_rayls_fork_active_at_block(*fork, 0),
+                !genesis_exception,
+                "fork {:?} has unexpected active state at block 0",
                 fork
             );
         }
     }
 
+    /// The version byte reports the highest version byte among the forks *active* at the
+    /// block, not the most recently crossed block. EpochCloseSeedV2 (0x10) is genesis-active
+    /// on local, so it owns the byte across every later activation (HybridRewards at 0x0d
+    /// included). On real networks it is Never, so there the highest active fork still
+    /// advances the byte normally.
     #[test]
-    fn schedule_matches_declaration_order_for_all_networks() {
+    fn version_byte_is_the_max_active_fork_code() {
+        let hardforks = RaylsChainHardforks::local();
+        assert_eq!(hardforks.version_byte_at_block(0), Some(0x10));
+        assert_eq!(hardforks.version_byte_at_block(LOCAL_HYBRID_REWARDS_BLOCK - 1), Some(0x10));
+        assert_eq!(hardforks.version_byte_at_block(LOCAL_HYBRID_REWARDS_BLOCK), Some(0x10));
+        assert_eq!(hardforks.version_byte_at_block(1_000_000), Some(0x10));
+    }
+
+    /// Every network schedule lists all 16 hardforks in variant order.
+    #[test]
+    fn schedule_contains_all_hardforks_in_order_for_all_networks() {
         for network in [
             RaylsNetwork::Devnet,
             RaylsNetwork::Testnet,
@@ -143,12 +163,83 @@ mod schedule {
     }
 
     #[test]
-    fn erc20_precompile_bytecode_is_never_on_testnet() {
-        let hardforks = RaylsChainHardforks::for_network(RaylsNetwork::Testnet);
-        assert!(
-            !hardforks.is_erc20_precompile_bytecode_active_at_block(u64::MAX),
-            "testnet bytecode is already present; migration must stay Never",
+    fn builder_overrides_batch_digest_v2_activation() {
+        let genesis = rayls_infrastructure_types::test_genesis();
+        let chain_spec: ChainSpec = genesis.into();
+        let spec = RaylsChainSpec::builder(Arc::new(chain_spec))
+            .add_rayls_hardforks_by_type(RaylsNetwork::Devnet)
+            .batch_digest_v2(999)
+            .build();
+        assert!(!spec.is_batch_digest_v2_active_at_block(998));
+        assert!(spec.is_batch_digest_v2_active_at_block(999));
+    }
+
+    /// The mainnet schedule is frozen: any change requires updating this table and the
+    /// schedule in the same PR.
+    #[test]
+    fn mainnet_schedule_is_frozen() {
+        expect_schedule(
+            RaylsNetwork::Mainnet,
+            &[
+                (RaylsHardFork::Eip1559, ForkCondition::Block(0)),
+                (RaylsHardFork::BatchDigestV2, ForkCondition::Block(0)),
+                (RaylsHardFork::AdminTransfer, ForkCondition::Never),
+                (RaylsHardFork::PrecompileGasFix, ForkCondition::Block(0)),
+                (RaylsHardFork::RlsStorage, ForkCondition::Never),
+                (RaylsHardFork::Tokenomics, ForkCondition::Never),
+                (RaylsHardFork::Uups, ForkCondition::Never),
+                (RaylsHardFork::Erc20PrecompileBytecode, ForkCondition::Block(893_558)),
+                (RaylsHardFork::TransactionLoadBalancing, ForkCondition::Block(893_558)),
+                (RaylsHardFork::UsdrSupplyCorrection, ForkCondition::Block(3_569_194)),
+                (RaylsHardFork::EmptyOutputBlock, ForkCondition::Block(3_569_194)),
+                (RaylsHardFork::DynamicCommitteeSizing, ForkCondition::Block(8_291_010)),
+                (RaylsHardFork::HybridRewards, ForkCondition::Never),
+                (RaylsHardFork::OutputSeqNormalization, ForkCondition::Block(12_231_705)),
+                (RaylsHardFork::SenderAffinityLoadBalancing, ForkCondition::Block(12_231_705)),
+                (RaylsHardFork::EpochCloseSeedV2, ForkCondition::Never),
+            ],
         );
+    }
+
+    /// The testnet schedule is frozen: any change requires updating this table and the
+    /// schedule in the same PR.
+    #[test]
+    fn testnet_schedule_is_frozen() {
+        expect_schedule(
+            RaylsNetwork::Testnet,
+            &[
+                (RaylsHardFork::Eip1559, ForkCondition::Block(281_800)),
+                (RaylsHardFork::BatchDigestV2, ForkCondition::Block(560_539)),
+                (RaylsHardFork::AdminTransfer, ForkCondition::Block(560_539)),
+                (RaylsHardFork::PrecompileGasFix, ForkCondition::Block(900_000)),
+                (RaylsHardFork::RlsStorage, ForkCondition::Block(900_000)),
+                (RaylsHardFork::Tokenomics, ForkCondition::Block(1_879_000)),
+                (RaylsHardFork::Uups, ForkCondition::Block(2_872_000)),
+                (RaylsHardFork::Erc20PrecompileBytecode, ForkCondition::Never),
+                (RaylsHardFork::TransactionLoadBalancing, ForkCondition::Block(4_386_290)),
+                (RaylsHardFork::UsdrSupplyCorrection, ForkCondition::Never),
+                (RaylsHardFork::EmptyOutputBlock, ForkCondition::Block(6_663_630)),
+                (RaylsHardFork::DynamicCommitteeSizing, ForkCondition::Block(10_934_554)),
+                (RaylsHardFork::HybridRewards, ForkCondition::Never),
+                (RaylsHardFork::OutputSeqNormalization, ForkCondition::Block(17_300_000)),
+                (RaylsHardFork::SenderAffinityLoadBalancing, ForkCondition::Block(17_300_000)),
+                (RaylsHardFork::EpochCloseSeedV2, ForkCondition::Never),
+            ],
+        );
+    }
+
+    fn expect_schedule(network: RaylsNetwork, expected: &[(RaylsHardFork, ForkCondition)]) {
+        let actual = RaylsHardFork::for_network(network);
+        assert_eq!(actual.len(), expected.len(), "{network}: fork count");
+        for (ScheduledFork { fork, condition }, (want_fork, want_condition)) in
+            actual.iter().zip(expected.iter())
+        {
+            assert_eq!(fork, want_fork, "{network}: fork order");
+            assert_eq!(
+                condition, want_condition,
+                "{network}: {fork:?} must stay {want_condition:?} (frozen schedule — update the freeze test and the schedule in the same PR)"
+            );
+        }
     }
 }
 

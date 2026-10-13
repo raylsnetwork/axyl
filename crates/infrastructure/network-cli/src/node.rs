@@ -10,7 +10,7 @@ use fdlimit::raise_fd_limit;
 use rayls_execution_evm::{
     parse_socket_address,
     reth_env::{RethCommand, RethConfig},
-    verify_datadir_chain_id, FileSchedule, SelectedSchedule,
+    verify_datadir_chain_id, verify_schedule_shape, FileSchedule, SelectedSchedule,
 };
 use rayls_infrastructure_config::Config;
 // dev-only: reading the committee file for the single-validator gating check
@@ -291,6 +291,11 @@ impl<Ext: clap::Args + fmt::Debug> NodeCommand<Ext> {
         let selected = SelectedSchedule::select(file_schedule.as_ref(), network)?;
         let actual_chain_id = rayls_infrastructure_config.genesis().config.chain_id;
         verify_datadir_chain_id(actual_chain_id, selected.profile.chain_id, &selected.source)?;
+
+        // The selected schedule must match the canonical shape of its network
+        // family (new chains only — mainnet/testnet are frozen in CI and guarded
+        // per datadir by the schedule-record gate below).
+        verify_schedule_shape(&selected.profile)?;
 
         debug!(target: "cli", validator = ?rayls_infrastructure_config.node_info.name, "rl datadir for node command: {rl_datadir:?}");
         info!(target: "cli", validator = ?rayls_infrastructure_config.node_info.name, "config loaded");

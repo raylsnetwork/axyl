@@ -37,29 +37,29 @@ impl RaylsHardFork {
     /// Devnet hardfork schedule.
     pub const fn devnet() -> [ScheduledFork; RaylsHardFork::VARIANTS.len()] {
         [
-            ScheduledFork::new(Self::Eip1559, ForkCondition::Block(50)),
-            ScheduledFork::new(Self::BatchDigestV2, ForkCondition::Block(100)),
+            ScheduledFork::new(Self::Eip1559, ForkCondition::Block(0)),
+            ScheduledFork::new(Self::BatchDigestV2, ForkCondition::Block(0)),
             // Planned activation: block 150.
-            ScheduledFork::new(Self::AdminTransfer, ForkCondition::Never),
-            ScheduledFork::new(Self::PrecompileGasFix, ForkCondition::Block(150)),
+            ScheduledFork::new(Self::AdminTransfer, ForkCondition::Block(0)),
+            ScheduledFork::new(Self::PrecompileGasFix, ForkCondition::Block(0)),
             // Planned activation: block 200.
-            ScheduledFork::new(Self::RlsStorage, ForkCondition::Never),
+            ScheduledFork::new(Self::RlsStorage, ForkCondition::Block(0)),
             // Planned activation: block 250. TODO: set to actual devnet block before deploy.
-            ScheduledFork::new(Self::Tokenomics, ForkCondition::Never),
+            ScheduledFork::new(Self::Tokenomics, ForkCondition::Block(0)),
             // Planned activation: block 2_506_000.
-            ScheduledFork::new(Self::Uups, ForkCondition::Never),
-            ScheduledFork::new(Self::Erc20PrecompileBytecode, ForkCondition::Block(1_542_796)),
-            ScheduledFork::new(Self::TransactionLoadBalancing, ForkCondition::Block(1_542_796)),
+            ScheduledFork::new(Self::Uups, ForkCondition::Block(0)),
+            ScheduledFork::new(Self::Erc20PrecompileBytecode, ForkCondition::Block(1)),
+            ScheduledFork::new(Self::TransactionLoadBalancing, ForkCondition::Block(0)),
             ScheduledFork::new(Self::UsdrSupplyCorrection, ForkCondition::Never),
             // Active from genesis.
             ScheduledFork::new(Self::EmptyOutputBlock, ForkCondition::Block(0)),
             // Never until SRE schedules a concrete devnet activation block.
-            ScheduledFork::new(Self::DynamicCommitteeSizing, ForkCondition::Never),
+            ScheduledFork::new(Self::DynamicCommitteeSizing, ForkCondition::Block(0)),
             // Never until SRE schedules a concrete devnet activation block.
             ScheduledFork::new(Self::HybridRewards, ForkCondition::Never),
-            ScheduledFork::new(Self::OutputSeqNormalization, ForkCondition::Never),
+            ScheduledFork::new(Self::OutputSeqNormalization, ForkCondition::Block(0)),
             // Never until an operational activation block is chosen; the mechanism ships dormant.
-            ScheduledFork::new(Self::SenderAffinityLoadBalancing, ForkCondition::Never),
+            ScheduledFork::new(Self::SenderAffinityLoadBalancing, ForkCondition::Block(0)),
             // Never until SRE schedules an activation block: changes epoch-closing block hashes.
             ScheduledFork::new(Self::EpochCloseSeedV2, ForkCondition::Never),
             // Never until SRE schedules an activation block: switches a network request format,
@@ -134,9 +134,9 @@ impl RaylsHardFork {
             ScheduledFork::new(Self::BatchDigestV2, ForkCondition::Block(0)),
             ScheduledFork::new(Self::AdminTransfer, ForkCondition::Block(0)),
             ScheduledFork::new(Self::PrecompileGasFix, ForkCondition::Block(0)),
-            ScheduledFork::new(Self::RlsStorage, ForkCondition::Never),
-            ScheduledFork::new(Self::Tokenomics, ForkCondition::Never),
-            ScheduledFork::new(Self::Uups, ForkCondition::Never),
+            ScheduledFork::new(Self::RlsStorage, ForkCondition::Block(0)),
+            ScheduledFork::new(Self::Tokenomics, ForkCondition::Block(0)),
+            ScheduledFork::new(Self::Uups, ForkCondition::Block(0)),
             // One-shot migrations fire when the chain transitions *across* their activation
             // block (parent_number → block_number). A fork set to `Block(0)` is treated as
             // already-active at genesis and the migration body is never executed (see the
@@ -149,7 +149,7 @@ impl RaylsHardFork {
             // activation → verify totalSupply). Block 100 hits ~7 s into a fresh local devnet
             // at the 4-validator DAG cadence (≈15 EVM blocks/sec), so the pre-fork window is
             // short but enough to run one mint/burn round.
-            ScheduledFork::new(Self::UsdrSupplyCorrection, ForkCondition::Block(100)),
+            ScheduledFork::new(Self::UsdrSupplyCorrection, ForkCondition::Never),
             ScheduledFork::new(Self::EmptyOutputBlock, ForkCondition::Block(0)),
             ScheduledFork::new(Self::DynamicCommitteeSizing, ForkCondition::Block(0)),
             // Block 1 (not 0): genesis deploys the pre-hybrid ConsensusRegistry, and the

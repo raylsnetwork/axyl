@@ -2,11 +2,12 @@
 //! `rayls-network` process boots on a dev single-validator datadir.
 //!
 //! Scenarios: moving an already-activated fork in a `--config-file` schedule
-//! is refused; activating a fork absent from the record (still in the future)
-//! is allowed and re-recorded; a deleted record is re-established on the next
-//! boot (trust-on-first-use); a record predating a fork activated within the
-//! executed history is refused with its remedy; a config-file `chain_id`
-//! mismatch and an unknown `--subnet` are both refused at boot.
+//! is refused; activating a behavioral fork that the record says was absent
+//! (still in the future) is allowed and re-recorded; a deleted record is
+//! re-established on the next boot (trust-on-first-use); a record predating a
+//! fork activated within the executed history is refused with its remedy; a
+//! config-file `chain_id` mismatch and an unknown `--subnet` are both refused
+//! at boot.
 //!
 //! Needs the `dev-single-node-setup` feature: the `dev` subcommand and the
 //! single-validator `--dev` gate only exist in dev builds.
@@ -57,6 +58,14 @@ fn local_profile_complete() -> NetworkProfile {
 fn local_profile_moving(fork: &str, to: u64) -> NetworkProfile {
     let mut profile = local_profile_complete();
     profile.hardforks.insert(ForkName::from(fork), ForkActivation::Block(to));
+    profile
+}
+
+/// `local_profile_complete` with one fork's activation set to an arbitrary
+/// value (used to pin a behavioral fork as `Never` in a config file).
+fn local_profile_setting(fork: &str, activation: ForkActivation) -> NetworkProfile {
+    let mut profile = local_profile_complete();
+    profile.hardforks.insert(ForkName::from(fork), activation);
     profile
 }
 
@@ -233,14 +242,20 @@ async fn schedule_record_gate_on_real_boots() -> eyre::Result<()> {
         "the refusal should mention the schedule record: {output}"
     );
 
-    // 4. Activate a fork that the record says was absent (Uups is Never on local, so this boundary
-    //    is in the future for any realistic head): the boot is allowed and the record is re-written
-    //    with the new boundary.
-    let future =
-        write_config_file(temp.path(), "future.yaml", &local_profile_moving("Uups", 2_000_000));
+    // 4. A new-chain config file that leaves a behavioral fork `never` records it as never; a
+    //    later file activating that same fork in the future is allowed and re-recorded.
+    //    (Migration forks may not be scheduled on a new chain, so the scenario uses a behavioral
+    //    fork.) Fresh datadir, two config files.
+    let future_dir = temp.path().join("future_datadir");
+    std::fs::create_dir_all(&future_dir)?;
+    let file_never = write_config_file(
+        temp.path(),
+        "never.yaml",
+        &local_profile_setting("EpochCloseSeedV2", ForkActivation::Never),
+    );
     let port2 = get_available_tcp_port("127.0.0.1")
         .ok_or_else(|| eyre::eyre!("no free tcp port for port2"))?;
-    let (mut child, mut stderr) = start_node(&datadir, port2, Some((&future, "local")));
+    let (mut child, mut stderr) = start_node(&future_dir, port2, Some((&file_never, "local")));
     wait_for_rpc(&format!("http://127.0.0.1:{port2}")).await.inspect_err(|e| {
         kill_quietly(&mut child);
         let mut out = String::new();
@@ -248,9 +263,30 @@ async fn schedule_record_gate_on_real_boots() -> eyre::Result<()> {
         tracing::error!(target: "schedule-record-test", ?e, node_output = %out, "future-move boot failed");
     })?;
     kill_quietly(&mut child);
-    let record = read_record(&datadir);
+    let record = read_record(&future_dir);
     assert_eq!(
-        record.hardforks.get(&ForkName::from("Uups")),
+        record.hardforks.get(&ForkName::from("EpochCloseSeedV2")),
+        Some(&ForkActivation::Never),
+        "the never behavioral fork must be recorded as never"
+    );
+    let file_future = write_config_file(
+        temp.path(),
+        "future.yaml",
+        &local_profile_moving("EpochCloseSeedV2", 2_000_000),
+    );
+    let port2b = get_available_tcp_port("127.0.0.1")
+        .ok_or_else(|| eyre::eyre!("no free tcp port for port2b"))?;
+    let (mut child, mut stderr) = start_node(&future_dir, port2b, Some((&file_future, "local")));
+    wait_for_rpc(&format!("http://127.0.0.1:{port2b}")).await.inspect_err(|e| {
+        kill_quietly(&mut child);
+        let mut out = String::new();
+        stderr.read_to_string(&mut out).ok();
+        tracing::error!(target: "schedule-record-test", ?e, node_output = %out, "future-move boot failed");
+    })?;
+    kill_quietly(&mut child);
+    let record = read_record(&future_dir);
+    assert_eq!(
+        record.hardforks.get(&ForkName::from("EpochCloseSeedV2")),
         Some(&ForkActivation::Block(2_000_000)),
         "the allowed future activation must be re-recorded"
     );

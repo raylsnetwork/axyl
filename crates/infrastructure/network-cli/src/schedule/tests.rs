@@ -76,11 +76,11 @@ mod schedule_record_tests {
         );
         assert_eq!(
             record.hardforks.get(&ForkName::from("UsdrSupplyCorrection")),
-            Some(&ForkActivation::Block(100))
+            Some(&ForkActivation::Never)
         );
         // `never` forks are recorded explicitly: the record is a complete
         // snapshot of the selected schedule.
-        assert_eq!(record.hardforks.get(&ForkName::from("Uups")), Some(&ForkActivation::Never));
+        assert_eq!(record.hardforks.get(&ForkName::from("Uups")), Some(&ForkActivation::Block(0)));
     }
 
     #[test]
@@ -121,18 +121,19 @@ mod schedule_record_tests {
     fn recorded_never_fork_activated_in_executed_history_is_refused() {
         let dir = tempfile::tempdir().expect("tempdir");
         let config = node_config(dir.path());
-        // A complete record (the new format) pinning Uups as `never`, the rest
-        // at their built-in local boundaries.
+        // A complete record (the new format) pinning EpochCloseSeedV2 as `never`,
+        // the rest at their built-in local boundaries.
         let mut hardforks = BTreeMap::new();
         for entry in RaylsHardFork::for_network(RaylsNetwork::Local) {
-            hardforks.insert(
-                ForkName::from(entry.fork.name()),
-                match entry.condition {
+            let activation = match entry.fork {
+                RaylsHardFork::EpochCloseSeedV2 => ForkActivation::Never,
+                _ => match entry.condition {
                     ForkCondition::Block(block) => ForkActivation::Block(block),
                     ForkCondition::Never => ForkActivation::Never,
                     _ => ForkActivation::Never,
                 },
-            );
+            };
+            hardforks.insert(ForkName::from(entry.fork.name()), activation);
         }
         std::fs::write(
             dir.path().join("schedule-record.yaml"),
@@ -145,14 +146,14 @@ mod schedule_record_tests {
         )
         .expect("record written");
         set_head(&config, dir.path(), 10);
-        let profile = local_profile_moving("Uups", 5);
+        let profile = local_profile_moving("EpochCloseSeedV2", 5);
         let err = {
             let dir = dir.path().to_path_buf();
             verify_schedule_record(&dir, &config, &profile)
         }
         .expect_err("activating a recorded-never fork in the executed history is refused");
         let msg = err.to_string();
-        assert!(msg.contains("Uups"), "{msg}");
+        assert!(msg.contains("EpochCloseSeedV2"), "{msg}");
         assert!(msg.contains("recorded as never"), "{msg}");
         assert!(msg.contains("schedule-record.yaml"), "{msg}");
         assert!(msg.contains("delete"), "{msg}");

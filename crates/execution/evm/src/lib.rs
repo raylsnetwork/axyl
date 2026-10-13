@@ -48,8 +48,8 @@ pub mod worker;
 
 pub use chainspec::{RaylsChainSpec, RaylsHardFork, RaylsHardforks, ScheduledFork};
 pub use network_profile::{
-    verify_datadir_schedule_record, verify_schedule, ForkActivation, FutureForkMove,
-    NetworkConfigFile, NetworkProfile, ScheduleRecord, ScheduleRecordVerification,
+    verify_datadir_schedule_record, verify_schedule, verify_schedule_shape, ForkActivation,
+    FutureForkMove, NetworkConfigFile, NetworkProfile, ScheduleRecord, ScheduleRecordVerification,
 };
 pub use network_schedule::{
     baked_in_network, verify_datadir_chain_id, FileSchedule, SelectedSchedule,

@@ -16,6 +16,7 @@ mod config_file;
 mod fork_name;
 mod profile;
 mod record;
+mod shape;
 mod verify;
 
 #[cfg(test)]
@@ -26,6 +27,7 @@ pub use config_file::NetworkConfigFile;
 pub use fork_name::ForkName;
 pub use profile::NetworkProfile;
 pub use record::ScheduleRecord;
+pub use shape::verify_schedule_shape;
 pub use verify::{
     verify_datadir_schedule_record, verify_schedule, FutureForkMove, ScheduleRecordVerification,
 };

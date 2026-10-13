@@ -1,0 +1,62 @@
+# Canonical hardfork schedule for a new (private) chain.
+#
+# Copy to <client>.yaml and start a node from it with:
+#
+#   rayls-network node --config-file <client>.yaml --subnet <subnet-name>
+#
+# The file only externalizes the chain-id and hardfork schedule of the
+# selected subnet - that is the part that used to be baked into the binary.
+# Everything else (EVM genesis, consensus parameters, committee, node
+# identity) still comes from the node's datadir, exactly as without this file.
+# The number of subnets is not fixed - each client defines its own, one
+# entry per subnet.
+#
+# The `hardforks` map below is the canonical new-chain schedule. Seven of
+# the values are pinned by the boot shape gate (verify_schedule_shape) and
+# the node refuses to start if any of them differs; the other nine are
+# behavioral and free to choose (0, never, or a future block). What each
+# fork does and why each pinned value is pinned: docs/hardforks/README.md.
+#
+# The only field you must change is `chain_id`: set it to the chain-id you
+# passed to the `genesis` ceremony. At boot the datadir's genesis chain-id
+# is checked against it and a mismatch (wrong datadir for this subnet)
+# refuses to start. A subnet may NOT declare the mainnet (72957) or testnet
+# (7295799) chain-id: those networks always run on their baked-in schedule
+# and are started with `--network <name>`.
+#
+# For a chain that has already produced blocks, see section 5 of
+# docs/config-file.md: the file becomes append-only and the datadir's
+# schedule-record.yaml freezes the forks that have already activated.
+#
+# To start from the schedule built into a binary instead of this template,
+# run
+#
+#   rayls-network schedule export --network <devnet|local>
+#
+# which prints a complete, loadable subnet (change the chain-id afterwards).
+#
+# Full guide (how, when, chain-id checks): docs/config-file.md
+
+networks:
+  <subnet-name>:
+    # Chain-id of this subnet's datadir (verified against the datadir's
+    # genesis at boot).
+    chain_id: <chain-id>
+    hardforks:
+      Eip1559: 0
+      BatchDigestV2: 0
+      AdminTransfer: 0
+      PrecompileGasFix: 0
+      RlsStorage: 0
+      Tokenomics: 0
+      Uups: 0
+      Erc20PrecompileBytecode: 1
+      TransactionLoadBalancing: 0
+      UsdrSupplyCorrection: never
+      EmptyOutputBlock: 0
+      DynamicCommitteeSizing: 0
+      HybridRewards: 1
+      OutputSeqNormalization: 0
+      SenderAffinityLoadBalancing: 0
+      EpochCloseSeedV2: 0
+      CertificateFetchEpochV2: 0

@@ -7,8 +7,8 @@ use clap::Parser;
 use eyre::{eyre, Context};
 use rayls_execution_evm::{
     reth_env::{RethCommand, RethConfig, RethEnv},
-    verify_datadir_chain_id, verify_datadir_schedule_record, FileSchedule, NetworkProfile,
-    SelectedSchedule,
+    verify_datadir_chain_id, verify_datadir_schedule_record, verify_schedule_shape, FileSchedule,
+    NetworkProfile, SelectedSchedule,
 };
 use rayls_infrastructure_config::Parameters;
 use rayls_infrastructure_storage::open_db;
@@ -189,6 +189,12 @@ async fn run(cli: Cli) -> eyre::Result<()> {
     };
     let selected = SelectedSchedule::select(file_schedule.as_ref(), Some(cli.network))?;
     verify_datadir_chain_id(base_chain.chain().id(), selected.profile.chain_id, &selected.source)?;
+
+    // The selected schedule must match the canonical shape of its network
+    // family (new chains only — mainnet/testnet are frozen in CI and guarded
+    // per datadir by the schedule-record gate below).
+    verify_schedule_shape(&selected.profile)?;
+
     verify_snapshot_schedule_record(&cli.snapshot_datadir, &base_chain, &selected.profile)?;
     info!(
         target: "rayls_replay::main",

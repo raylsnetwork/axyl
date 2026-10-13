@@ -83,7 +83,7 @@ impl NetworkProfile {
     /// The baked-in hardfork schedule for a built-in network, as a profile.
     ///
     /// This is what `--network <name>` selects: the network's chain-id plus the
-    /// full 15-fork schedule baked into the binary, expressed with the same
+    /// schedule baked into the binary, expressed with the same
     /// profile shape a config-file subnet resolves to, so both schedule
     /// sources flow through one code path.
     pub fn from_builtin(network: RaylsNetwork) -> Self {

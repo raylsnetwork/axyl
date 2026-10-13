@@ -13,13 +13,10 @@ without touching prod.
 - `etc/test-network/.env` exists — if not, `cp etc/test-network/.env.example etc/test-network/.env`.
   Then set in `.env`:
   - `RL_BLS_PASSPHRASE="local"` (the testnet `bls.kw` files were wrapped with that — default already).
-  - `RAYLS_NETWORK="testnet"` — selects the hardfork schedule the snapshot's history
-    was produced under. The `.env.example` default is `devnet`, which won't match the
-    snapshot (e.g. `AdminTransfer` is `Never` on devnet but active on testnet). Don't
-    use `local` either: at the snapshot height it silently *disables* forks that are
-    live on real testnet (`RlsStorage`, `Tokenomics`, `Uups`) and enables one that
-    isn't (`UsdrSupplyCorrection`) — see `RaylsHardFork::testnet()` vs `local()` in
-    `crates/execution/evm/src/chainspec.rs`.
+  - `RAYLS_NETWORK="testnet"` — the hardfork schedule must match the chain the
+    snapshot was captured from; the `.env.example` default `devnet` won't
+    (different chain-id and fork schedule — see `RaylsHardFork::testnet()` vs
+    `devnet()`/`local()` in `crates/execution/evm/src/chainspec.rs`).
 
   The `accounts.yaml` / `rls-accounts.yaml` files are **not** needed for replay — they
   apply only when generating a fresh genesis (see `etc/test-network/README.md`).
