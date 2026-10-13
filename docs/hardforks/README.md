@@ -92,8 +92,26 @@ These touch the USDr precompile at `0x…0400`: the STOP bytecode install
 Fork: `HybridRewards` (#13).
 
 This rewrites the `ConsensusRegistry` at `0x…17e1` (bytecode swap) and
-flips the epoch-close reward ABI from 1-arg `applyIncentives` to 2-arg
-`distributeRewards`.
+flips the epoch-close reward ABI from 1-arg to 2-arg `applyIncentives`.
+
+#### Post-activation (all optional)
+
+The fork itself is self-contained: from the activation block the chain runs
+under the hybrid registry with no further action. Three governance calls can
+then change what the hybrid weights do; none is required for the chain to
+function, so a network may leave them all unset.
+
+| call | who can call | if left unset |
+|------|--------------|---------------|
+| `ConsensusRegistry.setDelegationPool(pool)` (`onlyOwner`) | registry owner | delegated stake counts as 0 in the stake tier (every validator sits at the baseline tier) and the slash pool-split path is skipped |
+| `ConsensusRegistry.setParticipationFloorBps(bps)` (`onlyOwner`) | registry owner | the participation floor is disabled (`0`) |
+| `RewardDistributor.setPerformanceWeightBps(bps)` (admin role) | distributor admin | `distributeRewards()` ignores the hybrid weights entirely (payouts stay 100% stake/target-APY-derived). **Pending** — exists only on the unmerged `wire-hybrid-performance-weights` branch (Fixes #178), not in any shipped release. Enabling it additionally requires a Part 2 proxy upgrade of the distributor first. |
+
+How to make these calls: the Foundry Ops scripts under
+`rayls-contracts/script/interactions/` (note `ConsensusRegistryOps.s.sol` is
+read-only today, so registry owner calls go via `cast send`), and
+[`../contract-upgrades/README.md`](../contract-upgrades/README.md) for the
+upgrade runbook.
 
 ### Why exactly these values on a new chain
 

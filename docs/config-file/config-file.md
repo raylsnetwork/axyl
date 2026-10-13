@@ -10,7 +10,7 @@ Two companion files:
 - [`config-file.example.yaml`](./config-file.example.yaml) — an actual, loadable
   config file. Copy it, change `chain_id`, start the node. This is the template
   this doc points at.
-- [`hardforks/README.md`](./hardforks/README.md) — what the hardforks are, what
+- [`hardforks/README.md`](../hardforks/README.md) — what the hardforks are, what
   each one does, and why the pinned values are pinned. This doc only explains how
   the file is used; the fork model lives there.
 
@@ -119,7 +119,7 @@ private chain use the `local` (or `devnet`) export, or the template.
   canonical new-chain schedule and passes the boot shape gate as-is, so the other
   values need no change unless you have a reason to change a behavioral fork. Which
   values are pinned (must not change) and which are free is in
-  [`hardforks/README.md`](./hardforks/README.md).
+  [`hardforks/README.md`](../hardforks/README.md).
 - **You need to activate a hardfork on a running private chain.** Edit the file,
   set the fork to a future block number, distribute the file to every node
   operator, and have everyone restart before that block. No new binary and no
@@ -196,7 +196,7 @@ only `chain_id`) you are done. Of the 16 forks:
   nine on from genesis.
 
 What each fork does, and why each pinned value is pinned, is in
-[`hardforks/README.md`](./hardforks/README.md). The quick list of the seven pinned
+[`hardforks/README.md`](../hardforks/README.md). The quick list of the seven pinned
 values:
 
 | Fork | Pinned value |
@@ -205,6 +205,11 @@ values:
 | `Erc20PrecompileBytecode` | `1` |
 | `UsdrSupplyCorrection` | `never` |
 | `HybridRewards` | `1` (except the devnet chain-id `503`, which keeps `never`) |
+
+`HybridRewards` needs no post-activation action — the migration and the ABI
+switch happen automatically at the activation block. The optional governance
+steps it unlocks are in
+[`hardforks/README.md`](../hardforks/README.md) (Set C).
 
 ### After the chain has blocks
 
