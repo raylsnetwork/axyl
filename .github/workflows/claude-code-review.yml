@@ -1,10 +1,6 @@
 # =============================================================================
 # Claude Code Review
 # =============================================================================
-# Standalone copy of raylsnetwork/rayls-public-github-workflows'
-# claude-code-review.yml. This repo is public, and GitHub doesn't let public
-# repos call reusable workflows from a private repo, so keep it in sync by hand.
-#
 # Uses pull_request_target (not pull_request) so the job runs in the BASE repo
 # context and can access secrets on PRs from forks. Because that grants secrets
 # to a job that checks out untrusted fork code, the job is gated to same-repo
