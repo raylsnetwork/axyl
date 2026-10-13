@@ -161,10 +161,24 @@ impl<DB: Database> Proposer<DB> {
         consensus_bus: &ConsensusBus,
         reason: &str,
     ) -> ProposerResult<()> {
+        // Repro (power-loss): if this node is armed, snapshot the force-synced
+        // consensus datafile BEFORE this header is written, so the snapshot excludes it. The
+        // driver restores that snapshot after a kill to model a power loss that drops the
+        // committed-but-unsynced header, then the node rebuilds a different header for this round.
+        rayls_infrastructure_storage::repro::maybe_power_loss_snapshot("header", &proposer_store)
+            .await;
+
         // Store the last header.
         proposer_store
             .write_last_proposed(header)
             .map_err(|e| ProposerError::StoreError(e.to_string()))?;
+
+        // The header is broadcast to peers below.
+        // Wait until it is on disk first.
+        // A crash after the broadcast must not lose it, or a restart could build a different header
+        // for this round and create two certificates for it.
+        // Fail closed: on a write error, return the error and send no header.
+        proposer_store.persist().await.map_err(|e| ProposerError::StoreError(e.to_string()))?;
 
         // Send the new header to the `Certifier` that will broadcast and certify it.
         let result =

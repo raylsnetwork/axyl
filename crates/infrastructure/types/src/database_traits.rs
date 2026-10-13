@@ -260,4 +260,23 @@ pub trait Database: Send + Sync + Clone + Unpin + 'static {
     fn sync_persist(&self) -> eyre::Result<()> {
         Ok(())
     }
+
+    /// Force every committed write to physical disk (fsync).
+    ///
+    /// `persist`/`sync_persist` only guarantee a write is committed to the memory map, which
+    /// survives a process crash; this additionally makes it survive a power loss or kernel panic.
+    /// No-op for backends that already sync on commit. Blocking; callers that cannot await should
+    /// run it off the async runtime.
+    fn sync_to_disk(&self) -> eyre::Result<()> {
+        Ok(())
+    }
+
+    /// Write a transactionally consistent, flushed snapshot of the datafile to `dest`.
+    ///
+    /// Takes a read snapshot of the latest committed state, so it is safe to call on a live
+    /// environment under concurrent writes and never captures a torn page. `dest` must not already
+    /// exist. Used by the power-loss reproduction to capture the last-synced on-disk image.
+    fn snapshot_datafile_to(&self, _dest: &std::path::Path) -> eyre::Result<()> {
+        eyre::bail!("snapshot_datafile_to is not supported by this database backend")
+    }
 }

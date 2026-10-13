@@ -414,11 +414,19 @@ impl RethEnv {
         let unwind_block = [rocksdb_unwind, static_file_unwind].into_iter().flatten().min();
 
         if let Some(target_block) = unwind_block {
-            // panic instead of unwinding to block 0
-            assert_ne!(
-                target_block, 0,
-                "A storage consistency check would trigger an unwind to block 0"
-            );
+            // Production refuses to unwind execution storage all the way to genesis and panics.
+            // The power-loss repro deliberately allows it, but ONLY on nodes launched by the
+            // harness, gated on RL_REPRO_PL_DBFILE, the env var repro/net.sh sets on every repro
+            // node, so a node whose consensus DB was rolled back by the snapshot restore can
+            // re-execute and recover across repeated power-loss/restart cycles on a short throwaway
+            // chain. The production guard is unchanged for any node without that env set.
+            if target_block == 0 {
+                assert!(
+                    std::env::var_os("RL_REPRO_PL_DBFILE").is_some(),
+                    "A storage consistency check would trigger an unwind to block 0"
+                );
+                info!(target: "rayls::reth", "RL_REPRO allowing storage unwind to block 0 after a power-loss restore");
+            }
 
             info!(
                 target: "rayls::reth",

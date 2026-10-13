@@ -1543,6 +1543,22 @@ impl<DB: Database> Database for LayeredDatabase<DB> {
         }
         r
     }
+
+    /// Force the underlying tier's committed pages to disk (fsync).
+    ///
+    /// The MDBX environment handle is shared with the writer thread, so a sync through this
+    /// read-side handle flushes every page the writer has committed. Call [`Self::persist`]
+    /// first to drain the writer queue if ordering against in-flight writes matters.
+    fn sync_to_disk(&self) -> eyre::Result<()> {
+        if let Some(e) = poisoned_error(self.tx.fatal()) {
+            return Err(e);
+        }
+        self.db.sync_to_disk()
+    }
+
+    fn snapshot_datafile_to(&self, dest: &std::path::Path) -> eyre::Result<()> {
+        self.db.snapshot_datafile_to(dest)
+    }
 }
 
 trait InsertTrait<DB: Database>: Send + 'static {

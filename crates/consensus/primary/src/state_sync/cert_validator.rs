@@ -100,7 +100,17 @@ where
         &self,
         certificate: Certificate,
     ) -> CertManagerResult<()> {
-        self.process_certificate(certificate, false).await
+        self.process_certificate(certificate, false).await?;
+
+        // The caller broadcasts this certificate to peers after this returns.
+        // Wait until it is on disk first.
+        // A crash that loses it lets a restart re-certify a different header for this round,
+        // because the re-propose guard only trusts the stored certificate. That creates two
+        // certificates for one round. Fail closed: on a write error, return the error and
+        // broadcast nothing.
+        self.config.node_storage().persist().await?;
+
+        Ok(())
     }
 
     /// Process a certificate received from a peer.

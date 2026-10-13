@@ -999,6 +999,27 @@ impl Database for MdbxDatabase {
             .ok()?
             .map(|(k, v)| (decode_key::<T::Key>(&k), decode::<T::Value>(&v)))
     }
+
+    /// Forces every committed write to physical disk (`mdbx_env_sync_ex` with `force = true`).
+    ///
+    /// The environment runs in [`SyncMode::SafeNoSync`]: a commit lands in the memory map but is
+    /// not fsynced until the periodic sync (see `SYNC_PERIOD`) or a clean close. A
+    /// committed-but-unsynced write survives a process crash: the map is backed by the OS page
+    /// cache, which another process still reads, but is lost on a power loss or kernel panic,
+    /// which discards the page cache and leaves the datafile at its last synced state. This makes
+    /// such a write durable across power loss.
+    fn sync_to_disk(&self) -> eyre::Result<()> {
+        self.inner.sync(true)?;
+        Ok(())
+    }
+
+    /// Write a consistent, flushed snapshot of the datafile to `dest` via `mdbx_env_copy`.
+    ///
+    /// Runs against an internal read snapshot of the latest committed state, so it is safe on a
+    /// live environment and never tears. `dest` must not already exist.
+    fn snapshot_datafile_to(&self, dest: &std::path::Path) -> eyre::Result<()> {
+        self.compact_to(dest)
+    }
 }
 
 /// Forward iterator over MDBX key-value pairs.
@@ -1570,6 +1591,103 @@ mod test {
         for n in 0..8u64 {
             assert_eq!(db.get::<TestTable>(&n).expect("get row"), Some(format!("row-{n}")));
         }
+    }
+
+    /// Simulate a power loss: the datafile reverts to its last synced on-disk image.
+    ///
+    /// A real power loss (or kernel panic) discards the OS page cache, so the `mdbx.dat` that
+    /// survives is exactly what was physically fsynced, the bytes captured by the most recent
+    /// `sync_to_disk`. Restoring that captured image reproduces the state MDBX recovers from on
+    /// the next open, regardless of what a clean close may have flushed afterwards. The reader
+    /// lock belongs to the replaced datafile, so it is removed (a fresh open recreates it); this
+    /// mirrors the swap in [`compact_in_place`].
+    fn power_loss_restore(dir: &Path, synced_image: &Path) {
+        std::fs::copy(synced_image, dir.join(super::MDBX_DAT))
+            .expect("restore last-synced datafile");
+        let _ = std::fs::remove_file(dir.join("mdbx.lck"));
+    }
+
+    /// A write that is committed but not synced is lost on a power loss.
+    ///
+    /// This is the power-loss durability gap. A vote, header or certificate is made durable
+    /// *before* it is sent: the record is committed and readable, so it survives a process crash.
+    /// But under `SafeNoSync` that commit is not fsynced, so a power loss in the sync window
+    /// discards it even though peers already saw it. After restart the validator no longer
+    /// knows what it sent, the premise behind an equivocation and halt.
+    #[test]
+    fn committed_write_without_sync_is_lost_on_power_loss() {
+        let temp_dir = tempdir().expect("failed to create temp dir");
+        let dir = temp_dir.path();
+        let synced_image = dir.join("mdbx.dat.synced");
+
+        // A baseline record, forced to disk, captured as the last synced on-disk image.
+        {
+            let db = open_db(dir);
+            db.with_write_txn(|t| t.insert::<TestTable>(&1, &"durable".to_owned()))
+                .expect("seed durable row");
+            db.sync_to_disk().expect("force baseline to disk");
+            std::fs::copy(dir.join(super::MDBX_DAT), &synced_image).expect("capture synced image");
+        }
+
+        // A second record that is committed but never synced, a vote/header/cert made
+        // durable-before-send. It is readable now (a process crash would keep it)…
+        {
+            let db = open_db(dir);
+            db.with_write_txn(|t| t.insert::<TestTable>(&2, &"unsynced".to_owned()))
+                .expect("write unsynced row");
+            assert_eq!(
+                db.get::<TestTable>(&2).expect("get before cut"),
+                Some("unsynced".to_owned()),
+                "the committed record must be readable before the power loss"
+            );
+            // …but no sync_to_disk(): the power-loss gap. A clean close here may flush it, which
+            // the restore below deliberately undoes to model the power loss.
+        }
+
+        power_loss_restore(dir, &synced_image);
+
+        let db = open_db(dir);
+        assert_eq!(
+            db.get::<TestTable>(&1).expect("get durable after cut"),
+            Some("durable".to_owned()),
+            "a synced record must survive the power loss"
+        );
+        assert_eq!(
+            db.get::<TestTable>(&2).expect("get unsynced after cut"),
+            None,
+            "a committed-but-unsynced record is LOST on a power loss (the durability gap)"
+        );
+    }
+
+    /// `sync_to_disk` closes the gap: a force-synced record survives the power loss.
+    ///
+    /// This is the fix primitive: forcing the sync on the durable barrier before the record is
+    /// sent makes it survive power loss, not just a process crash.
+    #[test]
+    fn force_synced_write_survives_power_loss() {
+        let temp_dir = tempdir().expect("failed to create temp dir");
+        let dir = temp_dir.path();
+        let synced_image = dir.join("mdbx.dat.synced");
+
+        {
+            let db = open_db(dir);
+            db.with_write_txn(|t| t.insert::<TestTable>(&1, &"durable".to_owned()))
+                .expect("seed durable row");
+            // The record is force-synced before it would be "sent": now it is on disk.
+            db.with_write_txn(|t| t.insert::<TestTable>(&2, &"synced".to_owned()))
+                .expect("write row");
+            db.sync_to_disk().expect("force record to disk");
+            std::fs::copy(dir.join(super::MDBX_DAT), &synced_image).expect("capture synced image");
+        }
+
+        power_loss_restore(dir, &synced_image);
+
+        let db = open_db(dir);
+        assert_eq!(
+            db.get::<TestTable>(&2).expect("get synced after cut"),
+            Some("synced".to_owned()),
+            "a force-synced record must survive the power loss"
+        );
     }
 
     #[test]

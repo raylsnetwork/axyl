@@ -29,6 +29,8 @@ pub mod layered_db;
 pub mod mdbx;
 pub mod mem_db;
 pub mod redb;
+/// Power-loss reproduction hook. Never shipped; lives only on the reproduction branch.
+pub mod repro;
 
 pub use rayls_infrastructure_types::{error::StoreError, ReadTimeout};
 

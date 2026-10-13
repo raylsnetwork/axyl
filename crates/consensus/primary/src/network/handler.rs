@@ -692,17 +692,40 @@ where
                     return Err(HeaderError::AlreadyVoted(header.digest(), header.round()).into());
                 }
 
+                // This repeats the vote already recorded for this round. Wait until that vote is
+                // committed before replying, so a concurrent first request for the same header
+                // cannot make this node send the vote before it is durable. Fail closed: on a write
+                // error, return the error and send no vote.
+                self.consensus_config.node_storage().persist().await?;
+
                 return Ok(PrimaryResponse::Vote(vote));
             }
         }
 
         let vote = Vote::new(&header, authority_id, self.consensus_config.key_config());
 
+        // Repro (power-loss): if this node is armed, snapshot the force-synced
+        // consensus datafile BEFORE this vote is written, so the snapshot excludes it. The driver
+        // restores that snapshot after a kill to model a power loss that drops the
+        // committed-but-unsynced vote, then the node votes again for a different header this round.
+        rayls_infrastructure_storage::repro::maybe_power_loss_snapshot(
+            "vote",
+            self.consensus_config.node_storage(),
+        )
+        .await;
+
         self.consensus_config.node_storage().write_vote(&vote)?;
 
         self.consensus_config
             .node_storage()
             .write_last_proposed_by_authority(header.author.clone(), &header)?;
+
+        // The vote leaves this node in the reply below.
+        // Wait until the vote and the author's header are on disk first.
+        // A crash after the reply must not lose them, or a restart could vote for a second header
+        // at the same round and create two certificates for it.
+        // Fail closed: on a write error, return the error and send no vote.
+        self.consensus_config.node_storage().persist().await?;
 
         Ok(PrimaryResponse::Vote(vote))
     }
