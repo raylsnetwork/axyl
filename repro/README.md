@@ -38,6 +38,14 @@ often a few rounds after certificate 1, so the "two certificates for the exact s
 `two_cert.sh` can read 0 even when the equivocation and halt did happen. Confirm the halt by checking
 that the block tip stops advancing across two samples.
 
+## Note: the re-send path
+
+The durable-before-send barrier must also cover the idempotent re-send path, where a node re-answers a
+request for a vote, header or certificate it already produced. A re-send that replies before the record
+is on disk can leak a not-yet-durable record the same way the first send can. This is defensive: once
+the barrier is in place it is not separately reproducible here, because a re-request for an
+already-recorded vote is normally served only after that vote is durable.
+
 ## Evidence
 
 A captured run is in `/home/ricardo/parfin/axyl-evidence/vote-durability-two-cert-2026-10-09`
