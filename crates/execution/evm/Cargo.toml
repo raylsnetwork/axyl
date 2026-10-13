@@ -12,6 +12,7 @@ jsonrpsee = { workspace = true }
 clap = { workspace = true, features = ["derive", "env"] }
 rayls-infrastructure-config = { workspace = true }
 rayls-infrastructure-types = { workspace = true }
+rayls-infrastructure-utils = { workspace = true }
 rayls-middleware-rewards = { workspace = true }
 rayls-consensus-worker = { workspace = true }
 dirs-next = "2.0.0"

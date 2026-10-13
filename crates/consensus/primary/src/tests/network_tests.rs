@@ -152,6 +152,34 @@ async fn test_vote_fails_too_many_parents() -> eyre::Result<()> {
     Ok(())
 }
 
+/// A round-0 header is never a valid proposal. Before the floor in `vote_inner`, a round-0 header
+/// with an unknown parent passed `Header::validate` and the too-old gate (the local round is 0 at
+/// node start and at every epoch start) and reached `check_for_missing_parents`, which keyed the
+/// request by `round - 1`: with overflow checks on and `panic = "abort"` in release, one such
+/// request from a committee member aborted the node.
+#[tokio::test]
+async fn test_vote_fails_round_zero() -> eyre::Result<()> {
+    let TestTypes { committee, handler, parent, task_manager: _task_manager, .. } =
+        create_test_types();
+    let unknown_parent = CertificateDigest::new(BlockHash::random().0);
+    let header = committee
+        .header_builder_last_authority()
+        .round(0)
+        .parents([unknown_parent].into_iter().collect())
+        .latest_execution_block(BlockNumHash::new(parent.number(), parent.hash()))
+        .created_at(1)
+        .build();
+    let peer = *committee.last_authority().authority().protocol_key();
+
+    let res = handler.vote(peer, header, Vec::new()).await;
+    debug!(target: "primary::handler_tests", ?res);
+    assert_matches!(
+        res,
+        Err(PrimaryNetworkError::InvalidHeader(HeaderError::InvalidRound { header_round: 0, .. }))
+    );
+    Ok(())
+}
+
 #[tokio::test]
 async fn test_vote_fails_wrong_authority_network_key() -> eyre::Result<()> {
     // common types

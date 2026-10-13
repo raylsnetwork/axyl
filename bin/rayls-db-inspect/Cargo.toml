@@ -16,6 +16,7 @@ path = "src/main.rs"
 [dependencies]
 rayls-infrastructure-storage = { workspace = true }
 rayls-infrastructure-types = { workspace = true }
+rayls-infrastructure-utils = { workspace = true }
 
 alloy = { workspace = true }
 clap = { workspace = true, features = ["derive"] }

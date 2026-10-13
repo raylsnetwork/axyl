@@ -13,7 +13,9 @@ use reth::{args::DatadirArgs, builder::NodeConfig, dirs::MaybePlatformPath};
 use reth_chainspec::{ChainSpec as RethChainSpec, EthChainSpec};
 use reth_config::config::StageConfig;
 use reth_consensus::noop::NoopConsensus;
-use reth_db::{init_db, tables::StageCheckpoints, transaction::DbTx, Database, DatabaseEnv};
+use reth_db::{
+    init_db, tables::StageCheckpoints, transaction::DbTx, Database, DatabaseEnv, DatabaseError,
+};
 use reth_db_common::init::init_genesis_with_settings;
 use reth_downloaders::{bodies::noop::NoopBodiesDownloader, headers::noop::NoopHeaderDownloader};
 use reth_engine_primitives::DEFAULT_PERSISTENCE_THRESHOLD;
@@ -32,6 +34,9 @@ use std::{path::Path, sync::Arc};
 use tokio::sync::{oneshot, watch};
 use tracing::{debug, error, info, warn};
 
+// Page-size rules and detection shared with the other node database so both stay in sync.
+use rayls_infrastructure_utils::mdbx::{detect_page_size, new_datafile_page_size, MDBX_DAT};
+
 impl RethEnv {
     /// Create a new Reth DB.
     /// Break this out so this can be created upfront and used even on a
@@ -41,8 +46,34 @@ impl RethEnv {
         db_path: P,
     ) -> eyre::Result<RethDb> {
         let db_path = db_path.as_ref();
-        info!(target: "rayls::reth", path = ?db_path, "opening database");
-        Ok(Arc::new(init_db(db_path, reth_config.0.db.database_args())?))
+        let mut db_args = reth_config.0.db;
+        // reth does not check --db.page-size, so it is checked here for a new datafile.
+        db_args.page_size = new_datafile_page_size(db_path, db_args.page_size)
+            .map_err(|e| eyre::eyre!("invalid --db.page-size: {e}"))?;
+        // A zeroed meta page 0 reads as "not an MDBX file"; detect the real page size and reopen.
+        let db = match init_db(db_path, db_args.database_args()) {
+            Ok(db) => db,
+            Err(e) if db_args.page_size.is_none() && is_not_an_mdbx_file(&e) => {
+                match detect_page_size(&db_path.join(MDBX_DAT)) {
+                    Some(ps) => {
+                        warn!(target: "rayls::reth", path = ?db_path, page_size = ps, "execution DB meta page 0 unreadable; reopening at the detected page size");
+                        db_args.page_size = Some(ps);
+                        init_db(db_path, db_args.database_args())?
+                    }
+                    None => return Err(e),
+                }
+            }
+            Err(e) => return Err(e),
+        };
+        match db.stat() {
+            Ok(stat) => {
+                info!(target: "rayls::reth", path = ?db_path, page_size = stat.page_size(), "opened database")
+            }
+            Err(err) => {
+                warn!(target: "rayls::reth", path = ?db_path, %err, "opened database, but reading its stats failed")
+            }
+        }
+        Ok(Arc::new(db))
     }
 
     /// Read the chain's executed head the way reth tracks it: the `Finish`
@@ -869,4 +900,12 @@ impl RethEnv {
         );
         Ok(fixed)
     }
+}
+
+/// Whether `init_db` failed with libmdbx's "not an MDBX file" error (`MDBX_INVALID`).
+fn is_not_an_mdbx_file(e: &eyre::Report) -> bool {
+    matches!(
+        e.downcast_ref::<DatabaseError>(),
+        Some(DatabaseError::Open(info)) if info.code == reth_db::mdbx::Error::Invalid.to_err_code()
+    )
 }

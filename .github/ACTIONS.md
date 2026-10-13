@@ -5,7 +5,10 @@ live in [`.github/workflows/`](workflows/) are described below.
 
 ## `pr.yaml` — Pull Request Checks
 
-Triggered on every pull request against `main` (and manually via `workflow_dispatch`).
+Triggered when the `run-ci` label is added to a pull request against `main` (and manually via
+`workflow_dispatch`). Opening or pushing to a PR runs nothing; its required checks stay pending
+until `run-ci` is added. `consume-run-ci-label.yml` removes the label again, so re-add it to
+run CI on a newer commit.
 
 - Skips immediately on draft PRs (the first step exits with an error if
   `github.event.pull_request.draft == true`).

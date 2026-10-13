@@ -25,6 +25,142 @@ use std::sync::Arc;
 use tempfile::TempDir;
 use tracing::debug;
 
+/// A freshly created execution database uses the 16 KiB default page size, `--db.page-size` wins
+/// over it, and a database created with the previous 4 KiB default keeps its page size, geometry
+/// header and rows when reopened with the new default.
+#[test]
+fn test_execution_db_default_page_size() -> eyre::Result<()> {
+    use crate::reth_env::RethCommand;
+    use clap::Parser as _;
+    use rayls_infrastructure_utils::mdbx::DEFAULT_MDBX_PAGE_SIZE;
+    use reth::{args::DatabaseArgs, builder::NodeConfig};
+    use reth_db::{
+        tables,
+        transaction::{DbTx as _, DbTxMut as _},
+        Database as _,
+    };
+
+    let page_size = |db: &RethDb| db.stat().expect("stat").page_size() as usize;
+    let geometry_lower = |db: &RethDb| db.info().expect("info").geometry().min();
+    let default_config = RethConfig(NodeConfig::default());
+
+    // fresh database
+    {
+        let tmp_dir = TempDir::new()?;
+        let db = RethEnv::new_database(&default_config, tmp_dir.path())?;
+        assert_eq!(page_size(&db), DEFAULT_MDBX_PAGE_SIZE);
+    }
+
+    // `--db.page-size`, parsed the way the node CLI does, overrides the default
+    {
+        let cmd = RethCommand::try_parse_from(["rayls", "--db.page-size", "8KB"])?;
+        assert_eq!(cmd.db.page_size, Some(8 * 1024));
+        let cli_config = RethConfig(NodeConfig { db: cmd.db, ..NodeConfig::default() });
+        let tmp_dir = TempDir::new()?;
+        let db = RethEnv::new_database(&cli_config, tmp_dir.path())?;
+        assert_eq!(page_size(&db), 8 * 1024);
+    }
+
+    // legacy 4 KiB database: page size and rows survive a reopen with the default config.
+    // Unlike the blocks above, `legacy_dir` is held for the rest of the function on purpose: the
+    // datafile has to outlive the first `new_database` call so the reopen below finds it.
+    const LEGACY_PAGE_SIZE: usize = 4096;
+    let legacy_dir = TempDir::new()?;
+    let legacy_config = RethConfig(NodeConfig {
+        db: DatabaseArgs { page_size: Some(LEGACY_PAGE_SIZE), ..Default::default() },
+        ..NodeConfig::default()
+    });
+    let legacy_geometry_lower = {
+        let db = RethEnv::new_database(&legacy_config, legacy_dir.path())?;
+        assert_eq!(page_size(&db), LEGACY_PAGE_SIZE);
+        let tx = db.tx_mut()?;
+        tx.put::<tables::CanonicalHeaders>(7, B256::repeat_byte(0xab))?;
+        tx.commit()?;
+        geometry_lower(&db)
+    };
+    let db = RethEnv::new_database(&default_config, legacy_dir.path())?;
+    assert_eq!(page_size(&db), LEGACY_PAGE_SIZE);
+    // the datafile's geometry header is left alone
+    assert_eq!(geometry_lower(&db), legacy_geometry_lower);
+    let tx = db.tx()?;
+    assert_eq!(tx.get::<tables::CanonicalHeaders>(7)?, Some(B256::repeat_byte(0xab)));
+    Ok(())
+}
+
+/// A zeroed meta page 0 still opens: `new_database` detects the page size and reopens.
+/// Covers the 16 KiB default and ARM's 64 KiB page size.
+#[test]
+fn test_execution_db_recovers_zeroed_meta_page_0() -> eyre::Result<()> {
+    use rayls_infrastructure_utils::mdbx::DEFAULT_MDBX_PAGE_SIZE;
+    use reth::builder::NodeConfig;
+    use reth_db::{
+        tables,
+        transaction::{DbTx as _, DbTxMut as _},
+        Database as _,
+    };
+    use std::io::{Seek as _, SeekFrom, Write as _};
+
+    let default_config = RethConfig(NodeConfig::default());
+
+    for page_size in [DEFAULT_MDBX_PAGE_SIZE, 64 * 1024] {
+        let dir = TempDir::new()?;
+
+        // A fresh datafile at this page size with one row.
+        {
+            let mut node_config = NodeConfig::default();
+            node_config.db.page_size = Some(page_size);
+            let db = RethEnv::new_database(&RethConfig(node_config), dir.path())?;
+            assert_eq!(db.stat().expect("stat").page_size() as usize, page_size);
+            let tx = db.tx_mut()?;
+            tx.put::<tables::CanonicalHeaders>(7, B256::repeat_byte(0xab))?;
+            tx.commit()?;
+        }
+
+        // Zero meta page 0, leaving the two backup meta pages intact.
+        let mut f = std::fs::OpenOptions::new().write(true).open(dir.path().join("mdbx.dat"))?;
+        f.seek(SeekFrom::Start(0))?;
+        f.write_all(&vec![0u8; page_size])?;
+        f.sync_all()?;
+        drop(f);
+
+        // Reopen with no page-size hint: detect the size, recover, and keep the row.
+        let db = RethEnv::new_database(&default_config, dir.path())?;
+        assert_eq!(db.stat().expect("stat").page_size() as usize, page_size);
+        let tx = db.tx()?;
+        assert_eq!(tx.get::<tables::CanonicalHeaders>(7)?, Some(B256::repeat_byte(0xab)));
+    }
+    Ok(())
+}
+
+/// `new_database` rejects an unsupported `--db.page-size` before it opens the datafile.
+#[test]
+fn test_execution_db_rejects_unsupported_page_size() {
+    use reth::builder::NodeConfig;
+    for page_size in [2048, 12 * 1024, 128 * 1024] {
+        let dir = TempDir::new().expect("temp dir");
+        let mut node_config = NodeConfig::default();
+        node_config.db.page_size = Some(page_size);
+        let err = RethEnv::new_database(&RethConfig(node_config), dir.path())
+            .expect_err("unsupported page size must be rejected");
+        assert!(format!("{err:#}").contains("invalid --db.page-size"), "{page_size}: {err:#}");
+        assert!(!dir.path().join("mdbx.dat").exists(), "{page_size}: no datafile is created");
+    }
+}
+
+/// An existing datafile ignores `--db.page-size`, even an unsupported one.
+#[test]
+fn test_execution_db_existing_datafile_ignores_unsupported_page_size() -> eyre::Result<()> {
+    use rayls_infrastructure_utils::mdbx::DEFAULT_MDBX_PAGE_SIZE;
+    use reth::builder::NodeConfig;
+    let dir = TempDir::new()?;
+    drop(RethEnv::new_database(&RethConfig(NodeConfig::default()), dir.path())?);
+    let mut node_config = NodeConfig::default();
+    node_config.db.page_size = Some(2048);
+    let db = RethEnv::new_database(&RethConfig(node_config), dir.path())?;
+    assert_eq!(db.stat().expect("stat").page_size() as usize, DEFAULT_MDBX_PAGE_SIZE);
+    Ok(())
+}
+
 /// Helper function for creating a consensus output for tests.
 fn consensus_output_for_tests(round: u32, epoch: u32, subdag_index: u64) -> ConsensusOutput {
     let mut leader = Certificate::default();

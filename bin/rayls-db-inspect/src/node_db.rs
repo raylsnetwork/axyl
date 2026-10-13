@@ -8,7 +8,7 @@
 use eyre::{eyre, WrapErr};
 use rayls_infrastructure_storage::{
     cold::{ColdLocation, ColdResult, ARCHIVE_HIGH_WATER_MARK_KEY},
-    mdbx::MdbxDatabase,
+    mdbx::{open_detecting_page_size, MdbxConfig, MdbxDatabase},
     tables::{
         Batches, Certificates, ColdArchiveHighWaterMark, ColdBatchLocations,
         ConsensusBlockNumbersByDigest, ConsensusBlocks, ConsensusBlocksCache, EpochCerts,
@@ -22,6 +22,7 @@ use rayls_infrastructure_types::{
     BlockHash, CertificateDigest, ConsensusHeader, ConsensusHeaderMeta, Database, DbTx as _, Epoch,
     EpochCertificate, EpochRecord, EpochTransitionCheckpoint, Table, B256,
 };
+use rayls_infrastructure_utils::mdbx::MIN_MDBX_PAGE_SIZE;
 use serde::Serialize;
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
@@ -186,7 +187,7 @@ impl NodeDb {
         let (label, path) = Self::resolve(spec)?;
 
         let dat_len = std::fs::metadata(path.join("mdbx.dat")).map(|m| m.len()).unwrap_or(0);
-        if dat_len < 4096 {
+        if dat_len < MIN_MDBX_PAGE_SIZE as u64 {
             return Err(eyre!(
                 "{label}: {} is {dat_len} bytes long: not even one page; the file is empty or \
                  truncated beyond what MDBX can read",
@@ -776,7 +777,16 @@ pub fn recover(consensus_db: &Path) -> eyre::Result<()> {
         exclusive: true,
         ..Default::default()
     };
-    let env = Environment::builder().set_max_dbs(32).set_flags(flags).open(consensus_db)?;
+    // A retry passes the node's geometry, so the detected page size keeps the copy's own limits.
+    let open_at = |ps: Option<usize>| {
+        let mut builder = Environment::builder();
+        builder.set_max_dbs(32).set_flags(flags);
+        if ps.is_some() {
+            builder.set_geometry(MdbxConfig::default().geometry(ps));
+        }
+        builder.open(consensus_db)
+    };
+    let env = open_detecting_page_size(consensus_db, open_at)?;
     env.stat().map_err(|e| {
         eyre!("MDBX database at {} failed its integrity check: {e}", consensus_db.display())
     })?;

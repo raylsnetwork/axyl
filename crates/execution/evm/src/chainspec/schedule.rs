@@ -79,9 +79,9 @@ impl RaylsHardFork {
             ScheduledFork::new(Self::DynamicCommitteeSizing, ForkCondition::Block(10_934_554)),
             // Never until SRE schedules a concrete testnet activation block.
             ScheduledFork::new(Self::HybridRewards, ForkCondition::Never),
-            ScheduledFork::new(Self::OutputSeqNormalization, ForkCondition::Never),
+            ScheduledFork::new(Self::OutputSeqNormalization, ForkCondition::Block(17_300_000)),
             // Never until an operational activation block is chosen; the mechanism ships dormant.
-            ScheduledFork::new(Self::SenderAffinityLoadBalancing, ForkCondition::Never),
+            ScheduledFork::new(Self::SenderAffinityLoadBalancing, ForkCondition::Block(17_300_000)),
             // Never until SRE schedules an activation block: changes epoch-closing block hashes.
             ScheduledFork::new(Self::EpochCloseSeedV2, ForkCondition::Never),
         ]
@@ -106,9 +106,9 @@ impl RaylsHardFork {
             // rollout for #633); the in-place migration re-links BlsG1 from the live contract.
             ScheduledFork::new(Self::HybridRewards, ForkCondition::Never),
             // Never until SRE schedules a concrete mainnet activation block.
-            ScheduledFork::new(Self::OutputSeqNormalization, ForkCondition::Never),
+            ScheduledFork::new(Self::OutputSeqNormalization, ForkCondition::Block(12_231_705)),
             // Never until an operational activation block is chosen; the mechanism ships dormant.
-            ScheduledFork::new(Self::SenderAffinityLoadBalancing, ForkCondition::Never),
+            ScheduledFork::new(Self::SenderAffinityLoadBalancing, ForkCondition::Block(12_231_705)),
             // Never until SRE schedules an activation block: changes epoch-closing block hashes.
             ScheduledFork::new(Self::EpochCloseSeedV2, ForkCondition::Never),
         ]

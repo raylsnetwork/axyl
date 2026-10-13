@@ -14,6 +14,7 @@ use const_hex as _;
 use eyre as _;
 use rayls_infrastructure_storage as _;
 use rayls_infrastructure_types as _;
+use rayls_infrastructure_utils as _;
 use reth_libmdbx as _;
 use serde as _;
 

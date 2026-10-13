@@ -5,6 +5,7 @@ use std::{fmt, str::FromStr, time::Duration};
 // use crate::version::default_client_version;
 use clap::Args;
 use rayls_infrastructure_storage::mdbx::MdbxConfig;
+use rayls_infrastructure_utils::mdbx::check_page_size;
 
 /// Parameters for database configuration
 #[derive(Debug, Args, PartialEq, Eq, Default, Clone, Copy)]
@@ -16,6 +17,15 @@ pub struct ConsensusDatabaseArgs {
     /// Database growth step (e.g., 4GB, 4KB)
     #[arg(long = "consensus-db.growth-step", value_parser = parse_byte_size)]
     pub consensus_db_growth_step: Option<usize>,
+    /// Database page size (e.g., 4KB, 8KB, 16KB).
+    ///
+    /// Specifies the page size used by the MDBX database. The default is 16KB. Must be a
+    /// power of two between 4KB and 64KB.
+    ///
+    /// WARNING: This setting is only used when creating a new database; an existing
+    /// database keeps the page size it was created with.
+    #[arg(long = "consensus-db.page-size", value_parser = parse_page_size)]
+    pub consensus_db_page_size: Option<usize>,
     /// Read transaction timeout in seconds, 0 means no timeout.
     #[arg(long = "consensus-db.read-transaction-timeout")]
     pub consensus_db_read_transaction_timeout: Option<u64>,
@@ -49,11 +59,16 @@ impl ConsensusDatabaseArgs {
             Some(readers) => readers,
         };
 
-        MdbxConfig::new()
+        let config = config
             .with_max_read_transaction_duration(max_read_transaction_duration)
             .with_max_db_size(consensus_db_max_size)
             .with_growth_step(consensus_db_growth_step)
-            .with_max_readers(consensus_db_max_readers)
+            .with_max_readers(consensus_db_max_readers);
+
+        match self.consensus_db_page_size {
+            None => config, // if not specified, the storage crate applies its default
+            Some(page_size) => config.with_page_size(page_size),
+        }
     }
 }
 
@@ -129,6 +144,13 @@ fn parse_byte_size(s: &str) -> Result<usize, String> {
     s.parse::<ByteSize>().map(Into::into)
 }
 
+/// Value parser for page sizes, accepting the same formats as [`parse_byte_size`].
+///
+/// Like [`parse_byte_size`], but rejects any page size that [`check_page_size`] refuses.
+fn parse_page_size(s: &str) -> Result<usize, String> {
+    parse_byte_size(s).and_then(check_page_size)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -179,6 +201,92 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(cmd.args.consensus_db_growth_step, Some(GIGABYTE * 4));
+    }
+
+    #[test]
+    fn test_command_parser_with_valid_page_size() {
+        let cmd = CommandParser::<ConsensusDatabaseArgs>::try_parse_from([
+            "reth",
+            "--consensus-db.page-size",
+            "8KB",
+        ])
+        .unwrap();
+        assert_eq!(cmd.args.consensus_db_page_size, Some(KILOBYTE * 8));
+        assert_eq!(cmd.args.database_args().page_size, Some(KILOBYTE * 8));
+
+        let cmd = CommandParser::<ConsensusDatabaseArgs>::try_parse_from([
+            "reth",
+            "--consensus-db.page-size",
+            "16384",
+        ])
+        .unwrap();
+        assert_eq!(cmd.args.consensus_db_page_size, Some(KILOBYTE * 16));
+        assert_eq!(cmd.args.database_args().page_size, Some(KILOBYTE * 16));
+    }
+
+    /// The flag (or its absence) decides the page size of a newly created consensus datafile.
+    #[test]
+    fn test_page_size_flag_reaches_new_database() {
+        use rayls_infrastructure_storage::mdbx::{MdbxDatabase, DEFAULT_MDBX_PAGE_SIZE};
+
+        let open = |argv: &[&str]| {
+            let args = CommandParser::<ConsensusDatabaseArgs>::try_parse_from(argv).unwrap().args;
+            let dir = tempfile::tempdir().expect("temp dir");
+            let db = MdbxDatabase::open_with_config(dir.path(), args.database_args())
+                .expect("open consensus database");
+            (dir, db.page_size().expect("page size"))
+        };
+
+        let (_dir, page_size) = open(&["reth", "--consensus-db.page-size", "8KB"]);
+        assert_eq!(page_size, KILOBYTE * 8);
+
+        let (_dir, page_size) = open(&["reth"]);
+        assert_eq!(page_size, DEFAULT_MDBX_PAGE_SIZE);
+    }
+
+    /// Without the flag the page size stays `None` all the way through `database_args()`; the
+    /// 16 KiB default is applied one layer deeper, by the storage crate's `open_with_config`.
+    #[test]
+    fn test_command_parser_without_page_size_defers_to_storage_crate() {
+        let cmd = CommandParser::<ConsensusDatabaseArgs>::try_parse_from(["reth"]).unwrap();
+        assert_eq!(cmd.args.consensus_db_page_size, None);
+        assert_eq!(cmd.args.database_args().page_size, None);
+    }
+
+    #[test]
+    fn test_command_parser_with_invalid_page_size() {
+        let result = CommandParser::<ConsensusDatabaseArgs>::try_parse_from([
+            "reth",
+            "--consensus-db.page-size",
+            "invalid",
+        ]);
+        assert!(result.is_err());
+    }
+
+    /// Clap rejects a page size that is not a power of two from 4KB to 64KB.
+    #[test]
+    fn test_command_parser_rejects_unsupported_page_size() {
+        for value in ["5KB", "2KB", "256B", "128KB", "0"] {
+            let result = CommandParser::<ConsensusDatabaseArgs>::try_parse_from([
+                "reth",
+                "--consensus-db.page-size",
+                value,
+            ]);
+            assert!(result.is_err(), "page size {value} should be rejected");
+        }
+    }
+
+    #[test]
+    fn test_command_parser_accepts_page_size_range_bounds() {
+        for (value, expected) in [("4KB", KILOBYTE * 4), ("64KB", KILOBYTE * 64)] {
+            let cmd = CommandParser::<ConsensusDatabaseArgs>::try_parse_from([
+                "reth",
+                "--consensus-db.page-size",
+                value,
+            ])
+            .unwrap();
+            assert_eq!(cmd.args.consensus_db_page_size, Some(expected), "page size {value}");
+        }
     }
 
     #[test]

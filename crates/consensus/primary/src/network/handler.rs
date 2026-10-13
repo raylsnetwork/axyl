@@ -485,6 +485,17 @@ where
 
         // validate header
         header.validate(committee)?;
+        // Round 0 is genesis and is never proposed. Without this floor a round-0 header with an
+        // unknown parent reaches `check_for_missing_parents`, which keys the request by
+        // `round - 1`: with overflow checks on and `panic = "abort"` in the release profile that
+        // took the node down, and the too-old gate below lets a round-0 header through whenever
+        // the local round is within `max_proposed_header_age_limit` of 0, i.e. at every epoch
+        // start. Only a committee member can reach this handler, so the sender is scored Fatal.
+        ensure!(
+            header.round() >= 1,
+            HeaderError::InvalidRound { digest: header.digest(), header_round: header.round() }
+                .into()
+        );
         let max_round = *self.consensus_bus.committed_round_updates().borrow()
             + self.consensus_config.parameters().gc_depth;
         // Make sure the header is not unreasonable in the future.
@@ -733,7 +744,9 @@ where
         }
 
         unknown_certs.retain(|digest| {
-            let key = (header.round() - 1, *digest);
+            // `vote_inner` rejects round 0 before this runs; saturate anyway so a future caller
+            // that skips that check cannot abort the node on a peer-supplied round.
+            let key = (header.round().saturating_sub(1), *digest);
             if let std::collections::btree_map::Entry::Vacant(e) = current_requests.entry(key) {
                 e.insert(header.author().clone());
                 true

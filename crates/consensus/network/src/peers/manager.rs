@@ -195,6 +195,7 @@ impl PeerManager {
         }
         let peer_id: PeerId = info.pubkey.clone().into();
         debug!(target: "peer-manager", ?peer_id, "Inserting trusted peer into known_peerids");
+        self.known_peerids.retain(|_, bound| bound != &bls_key);
         self.known_peerids.insert(peer_id, bls_key);
         debug!(target: "peer-manager", ?peer_id, "Inserting trusted peer into known_peers");
         self.known_peers.insert(bls_key, info);
@@ -957,33 +958,81 @@ impl PeerManager {
         }
     }
 
-    /// Add a known peer to the known list.
-    /// Used for bootstrap servers or possibly committee members.
+    /// Add a known peer and bind its peer id to `bls_key` for attributing inbound traffic.
+    ///
+    /// Only for information whose author is proven to own the network key in `info`: this node's
+    /// own configuration (bootstrap and committee entries), or a record delivered by the peer
+    /// itself over a connection authenticated as `info.pubkey`. A record that reached this node
+    /// any other way -- a kad query answer, hourly replication, the persisted store -- is a claim
+    /// by whoever signed it about which network key is theirs, and any BLS key can name any
+    /// network key. Binding on such a claim let one valid record under an attacker's BLS key
+    /// re-map a validator's peer id, after which the validator's requests were rejected as not
+    /// coming from their author. Those records go through [`Self::add_known_peer_addrs`].
     pub(crate) fn add_known_peer(&mut self, bls_key: BlsPublicKey, info: NetworkInfo) {
+        self.add_known_peer_inner(bls_key, info, true);
+    }
+
+    /// Add a known peer's addresses without binding its peer id to `bls_key`.
+    ///
+    /// For records learned through third parties (see [`Self::add_known_peer`]). The addresses
+    /// are dial hints: this node can dial the authority and, once connected, the peer pushes its
+    /// own record over the authenticated connection, which is when the binding is made.
+    pub(crate) fn add_known_peer_addrs(&mut self, bls_key: BlsPublicKey, info: NetworkInfo) {
+        self.add_known_peer_inner(bls_key, info, false);
+    }
+
+    fn add_known_peer_inner(&mut self, bls_key: BlsPublicKey, info: NetworkInfo, bind: bool) {
         let peer_id: PeerId = info.pubkey.clone().into();
         trace!(
             target: "peer-manager",
             ?bls_key,
             ?peer_id,
             known_peerids_len = self.known_peerids.len(),
-            "add_known_peer",
+            "{}",
+            if bind { "add_known_peer" } else { "add_known_peer_addrs" },
         );
-        self.peers.upsert_peer(bls_key, info.pubkey.clone(), info.multiaddrs.clone());
 
-        // A member banned before discovery resolved it still carries its ban after `upsert_peer`
-        // trusts it; release it so the unban action repairs the gossipsub blacklist and kad routing
-        // entry. Not in `upsert_peer`: `new_epoch` also calls it and does its own boundary unban.
-        if self.peers.is_peer_validator(&peer_id)
-            && self.peers.get_peer(&peer_id).is_some_and(|p| p.connection_status().is_banned())
-        {
-            let action =
-                self.peers.update_connection_status(&peer_id, NewConnectionStatus::Unbanned);
-            self.apply_peer_action(peer_id, action);
+        // A third-party record naming a network key this node already tracks under another BLS
+        // key must not touch that peer's entry: `upsert_peer` would relabel the entry with the
+        // record's BLS key and append the record's addresses to it, and the unban below would act
+        // on the named peer. The record stays a dial hint for its own BLS key, nothing more.
+        let relabels_tracked_peer = !bind
+            && self
+                .peers
+                .get_peer(&peer_id)
+                .and_then(|peer| peer.bls_public_key())
+                .is_some_and(|tracked| tracked != bls_key);
+        if relabels_tracked_peer {
+            debug!(
+                target: "peer-manager",
+                ?bls_key,
+                ?peer_id,
+                "third-party record names a tracked peer's network key under another BLS key; kept as a dial hint only",
+            );
+        } else {
+            self.peers.upsert_peer(bls_key, info.pubkey.clone(), info.multiaddrs.clone());
+
+            // A member banned before discovery resolved it still carries its ban after
+            // `upsert_peer` trusts it; release it so the unban action repairs the gossipsub
+            // blacklist and kad routing entry. Not in `upsert_peer`: `new_epoch` also calls it
+            // and does its own boundary unban.
+            if self.peers.is_peer_validator(&peer_id)
+                && self.peers.get_peer(&peer_id).is_some_and(|p| p.connection_status().is_banned())
+            {
+                let action =
+                    self.peers.update_connection_status(&peer_id, NewConnectionStatus::Unbanned);
+                self.apply_peer_action(peer_id, action);
+            }
         }
 
         self.known_peers.insert(bls_key, info.clone());
         self.known_peers_time_added.insert(bls_key, now());
-        self.known_peerids.insert(peer_id, bls_key);
+        if bind {
+            // One binding per BLS key: a peer that re-binds from a new network key must not leave
+            // its old peer id attributed to it. The map is keyed by peer id, so clear by value.
+            self.known_peerids.retain(|_, bound| bound != &bls_key);
+            self.known_peerids.insert(peer_id, bls_key);
+        }
 
         // The circuit addresses in `info` are dial hints for reaching this peer, nothing more.
         // The relay they name is registered when a circuit through it is established, not here:
@@ -1043,17 +1092,19 @@ impl PeerManager {
         // Remove the oldest entries (but never remove validators)
         let mut removed = 0;
         for (bls_key, _) in entries.iter().take(entries_to_remove * 2) {
-            // both maps should match so entry should exist in known_peers
-            let pubkey = self.known_peers.get(bls_key).unwrap().pubkey.clone();
-            // Don't remove if this is a validator in the current committee
-            if self.is_peer_validator(&pubkey.clone().into()) {
+            // Judge by the BLS key the entry is stored under, not by the network key it names: a
+            // third-party record under any BLS key can name a validator's network key, and
+            // exempting on that would let an attacker pin unevictable entries at will.
+            if self.peers.is_committee_key(bls_key) {
                 continue;
             }
 
-            if let Some(info) = self.known_peers.remove(bls_key) {
+            if self.known_peers.remove(bls_key).is_some() {
                 self.known_peers_time_added.remove(bls_key);
-                let peer_id: PeerId = info.pubkey.into();
-                self.known_peerids.remove(&peer_id);
+                // Remove the binding by its value, not via the evicted dial entry's network key:
+                // a third-party record may have pointed that entry at another peer's network key,
+                // and following it here would drop that other peer's binding.
+                self.known_peerids.retain(|_, bound| bound != bls_key);
                 removed += 1;
 
                 if removed >= entries_to_remove {
@@ -1089,7 +1140,10 @@ impl PeerManager {
         self.events.push_back(PeerEvent::MissingAuthorities(missing));
     }
 
-    /// Find the peer id for an authority.
+    /// Find the peer id and dial addresses for an authority, as its record claims them.
+    ///
+    /// Good for dialing: a wrong claim costs a failed handshake. Not good for anything that acts
+    /// on the peer id, such as a penalty; use [`Self::bound_auth_to_peer`] for that.
     pub(crate) fn auth_to_peer(&self, bls_key: BlsPublicKey) -> Option<(PeerId, Vec<Multiaddr>)> {
         if let Some(NetworkInfo { pubkey, multiaddrs, .. }) = self.known_peers.get(&bls_key) {
             Some((pubkey.clone().into(), multiaddrs.clone()))
@@ -1097,6 +1151,18 @@ impl PeerManager {
             debug!(target: "peer-manager", ?bls_key, "unknown peer for bls key");
             None
         }
+    }
+
+    /// Find the peer id an authority is bound to: the one whose binding to `bls_key` was made
+    /// from this node's configuration or from the peer's own record over its own connection
+    /// (see [`Self::add_known_peer`]). Resolved by the binding table alone, never through the
+    /// dial table: a peer can publish a record pointing its own dial entry at someone else's
+    /// network key, and a penalty for its key must still land on the connection it actually
+    /// misbehaved from, not on the peer it named and not nowhere. `None` when the authority has
+    /// never connected as itself, in which case none of its traffic was ever attributed to it and
+    /// there is nothing to punish.
+    pub(crate) fn bound_auth_to_peer(&self, bls_key: BlsPublicKey) -> Option<PeerId> {
+        self.known_peerids.iter().find(|(_, bound)| **bound == bls_key).map(|(peer_id, _)| *peer_id)
     }
 
     /// Find the BlsPublicKey for a known PeerId.
