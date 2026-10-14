@@ -3,14 +3,16 @@
 use std::sync::Arc;
 
 use rayls_infrastructure_types::RaylsNetwork;
-use reth_chainspec::ChainSpec;
+use reth_chainspec::{ChainSpec, ForkCondition};
 
-use crate::chainspec::{RaylsChainHardforks, RaylsChainSpec, RaylsHardFork, RaylsHardforks};
+use crate::chainspec::{
+    RaylsChainHardforks, RaylsChainSpec, RaylsHardFork, RaylsHardforks, ScheduledFork,
+};
 
 /// The activation block of `fork` in `spec`; panics for non-block-scheduled forks.
-// fn activation_block(spec: &RaylsChainHardforks, fork: RaylsHardFork) -> u64 {
-//     spec.rayls_fork_activation(fork).block_number().expect("fork is block-scheduled")
-// }
+fn activation_block(spec: &RaylsChainHardforks, fork: RaylsHardFork) -> u64 {
+    spec.rayls_fork_activation(fork).block_number().expect("fork is block-scheduled")
+}
 
 mod schedule {
     use super::*;
@@ -18,27 +20,30 @@ mod schedule {
     #[test]
     fn fork_inactive_before_activation_block() {
         let hardforks = RaylsChainHardforks::local();
+        let block = activation_block(&hardforks, RaylsHardFork::HybridRewards);
         assert!(!hardforks.is_rayls_fork_active_at_block(
             RaylsHardFork::HybridRewards,
-            LOCAL_HYBRID_REWARDS_BLOCK - 1,
+            block - 1,
         ));
     }
 
     #[test]
     fn fork_active_at_activation_block() {
         let hardforks = RaylsChainHardforks::local();
+        let block = activation_block(&hardforks, RaylsHardFork::HybridRewards);
         assert!(hardforks.is_rayls_fork_active_at_block(
             RaylsHardFork::HybridRewards,
-            LOCAL_HYBRID_REWARDS_BLOCK,
+            block,
         ));
     }
 
     #[test]
     fn fork_active_after_activation_block() {
         let hardforks = RaylsChainHardforks::local();
+        let block = activation_block(&hardforks, RaylsHardFork::HybridRewards);
         assert!(hardforks.is_rayls_fork_active_at_block(
             RaylsHardFork::HybridRewards,
-            LOCAL_HYBRID_REWARDS_BLOCK + 1,
+            block + 1,
         ));
     }
 
@@ -47,8 +52,9 @@ mod schedule {
     #[test]
     fn newly_activated_forks_reports_only_forks_crossed_at_block() {
         let hardforks = RaylsChainHardforks::local();
+        let block = activation_block(&hardforks, RaylsHardFork::HybridRewards);
         let activated = hardforks
-            .newly_activated_forks(LOCAL_HYBRID_REWARDS_BLOCK - 1, LOCAL_HYBRID_REWARDS_BLOCK);
+            .newly_activated_forks(block - 1, block);
         assert_eq!(
             activated,
             vec![RaylsHardFork::Erc20PrecompileBytecode, RaylsHardFork::HybridRewards],
@@ -58,8 +64,9 @@ mod schedule {
     #[test]
     fn newly_activated_forks_is_empty_when_no_fork_crosses() {
         let hardforks = RaylsChainHardforks::local();
+        let block = activation_block(&hardforks, RaylsHardFork::HybridRewards);
         let activated = hardforks
-            .newly_activated_forks(LOCAL_HYBRID_REWARDS_BLOCK, LOCAL_HYBRID_REWARDS_BLOCK + 1);
+            .newly_activated_forks(block, block + 1);
         assert!(activated.is_empty());
     }
 
@@ -68,8 +75,9 @@ mod schedule {
     #[test]
     fn newly_activated_forks_reports_all_forks_at_shared_block() {
         let hardforks = RaylsChainHardforks::for_network(RaylsNetwork::Testnet);
+        let block = activation_block(&hardforks, RaylsHardFork::AdminTransfer);
         let activated = hardforks
-            .newly_activated_forks(TESTNET_ADMIN_TRANSFER_BLOCK - 1, TESTNET_ADMIN_TRANSFER_BLOCK);
+            .newly_activated_forks(block - 1, block);
         assert!(activated.contains(&RaylsHardFork::BatchDigestV2));
         assert!(activated.contains(&RaylsHardFork::AdminTransfer));
     }
@@ -132,9 +140,10 @@ mod schedule {
     #[test]
     fn version_byte_is_the_max_active_fork_code() {
         let hardforks = RaylsChainHardforks::local();
+        let block = activation_block(&hardforks, RaylsHardFork::HybridRewards);
         assert_eq!(hardforks.version_byte_at_block(0), Some(0x10));
-        assert_eq!(hardforks.version_byte_at_block(LOCAL_HYBRID_REWARDS_BLOCK - 1), Some(0x10));
-        assert_eq!(hardforks.version_byte_at_block(LOCAL_HYBRID_REWARDS_BLOCK), Some(0x10));
+        assert_eq!(hardforks.version_byte_at_block(block - 1), Some(0x10));
+        assert_eq!(hardforks.version_byte_at_block(block), Some(0x10));
         assert_eq!(hardforks.version_byte_at_block(1_000_000), Some(0x10));
     }
 
