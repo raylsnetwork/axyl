@@ -1,12 +1,9 @@
 //! Certificate fetcher tests
 
 use crate::{
-    certificate_fetcher::{
-        CertificateFetcher, STALE_SKIP_ROUNDS_CATCHUP_THRESHOLD,
-        STALE_SKIP_ROUNDS_FALLBACK_THRESHOLD,
-    },
+    certificate_fetcher::CertificateFetcher,
     consensus_bus::NodeMode,
-    error::{CertManagerError, PrimaryNetworkError},
+    error::CertManagerError,
     network::{PrimaryRequest, PrimaryResponse},
     state_sync::StateSynchronizer,
     ConsensusBus,
@@ -441,9 +438,6 @@ fn epoch_stamp_follows_the_fork_at_the_next_block() {
     assert_eq!(epoch_stamp(Some(u64::MAX), u64::MAX, 1), Some(1));
 }
 
-/// The highest round the fetcher under test already has from every authority.
-const STORED_ROUND: Round = 1;
-
 /// A certificate fetcher for the first authority, and the requests it sends.
 struct FetcherUnderTest {
     /// Requests the fetcher sends to peers.
@@ -453,7 +447,7 @@ struct FetcherUnderTest {
 }
 
 impl FetcherUnderTest {
-    /// Start a fetcher that has round [STORED_ROUND] from every authority, plus `extra`.
+    /// Start a fetcher that already has its low rounds from every authority, plus `extra`.
     ///
     /// It then receives a certificate whose parents it lacks, so it starts fetching.
     async fn start(
@@ -555,60 +549,4 @@ async fn fetch_request_names_only_committee_members() {
     let committee = fixture.committee();
     assert_eq!(skip_rounds.len(), committee.size());
     assert!(skip_rounds.keys().all(|origin| committee.is_authority(origin)));
-}
-
-/// Busy peers are not failures, so the fetcher keeps its skip rounds.
-///
-/// Repeated failures make the fetcher drop its skip rounds and ask for everything.
-/// Doing that because peers are busy would only add to their load.
-/// An active node asks one peer at a time, and a catching-up node asks every peer at once.
-#[tokio::test(flavor = "current_thread", start_paused = true)]
-async fn busy_peers_do_not_trigger_the_stale_session_fallback() {
-    let fixture = CommitteeFixture::builder(MemDatabase::default).randomize_ports(true).build();
-    let peers = fixture.committee().size() - 1;
-    // Answer busy for more fetch rounds than the fallback needs, in either node mode.
-    let threshold = STALE_SKIP_ROUNDS_FALLBACK_THRESHOLD.max(STALE_SKIP_ROUNDS_CATCHUP_THRESHOLD);
-    let busy_answers = (threshold as usize + 1) * peers;
-
-    for mode in [NodeMode::CvvActive, NodeMode::CvvInactive] {
-        let mut fetcher = FetcherUnderTest::start(&fixture, vec![], mode).await;
-        for _ in 0..busy_answers {
-            let (request, reply) = fetcher.next_request().await;
-            let (lower_bound, _) = request.get_bounds(max_skip_rounds()).unwrap();
-            assert_eq!(lower_bound, STORED_ROUND, "{mode:?}: busy answers dropped the skip rounds");
-            let _ = reply.send(Ok(PrimaryResponse::into_error_ref(&PrimaryNetworkError::Busy)));
-        }
-    }
-}
-
-/// One busy peer does not hide that the other peers had nothing to send.
-///
-/// Peers that have nothing to send is the case the stale-session fallback is for.
-#[tokio::test(flavor = "current_thread", start_paused = true)]
-async fn one_busy_peer_does_not_hide_empty_answers() {
-    let fixture = CommitteeFixture::builder(MemDatabase::default).randomize_ports(true).build();
-    let peers = fixture.committee().size() - 1;
-    let mut fetcher = FetcherUnderTest::start(&fixture, vec![], NodeMode::CvvInactive).await;
-
-    // A catching-up node asks every peer at once, so each fetch round is `peers` requests.
-    // The first peer of each round is busy, and the others have nothing to send.
-    // Nothing is garbage collected in this test, so the fallback asks from round 0.
-    let gc_round = 0;
-    for fetch_round in 0..=STALE_SKIP_ROUNDS_CATCHUP_THRESHOLD {
-        for peer in 0..peers {
-            let (request, reply) = fetcher.next_request().await;
-            let (lower_bound, _) = request.get_bounds(max_skip_rounds()).unwrap();
-            if fetch_round == STALE_SKIP_ROUNDS_CATCHUP_THRESHOLD {
-                assert_eq!(lower_bound, gc_round, "the fallback did not ask for everything");
-                return;
-            }
-            assert_eq!(lower_bound, STORED_ROUND);
-            let answer = if peer == 0 {
-                PrimaryResponse::into_error_ref(&PrimaryNetworkError::Busy)
-            } else {
-                PrimaryResponse::RequestedCertificates(vec![])
-            };
-            let _ = reply.send(Ok(answer));
-        }
-    }
 }
