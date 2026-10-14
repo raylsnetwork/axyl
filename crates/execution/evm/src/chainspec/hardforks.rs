@@ -22,11 +22,10 @@ impl RaylsChainHardforks {
     pub fn new(forks: impl IntoIterator<Item = ScheduledFork>) -> Self {
         let mut forks = forks.into_iter().collect::<Vec<_>>();
         forks.sort();
-        debug_assert!(
-            forks.windows(2).all(|w| w[0].fork != w[1].fork),
-            "RaylsChainHardforks: schedule contains duplicate fork {:?}",
-            forks.windows(2).find(|w| w[0].fork == w[1].fork).map(|w| w[0].fork)
-        );
+        #[cfg(debug_assertions)]
+        if let Some(dup) = forks.windows(2).find(|w| w[0].fork == w[1].fork) {
+            panic!("RaylsChainHardforks: schedule contains duplicate fork {:?}", dup[0].fork);
+        }
         Self { forks }
     }
 

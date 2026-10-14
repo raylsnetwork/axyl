@@ -17,6 +17,10 @@ use rayls_infrastructure_types::RaylsNetwork;
 use reth_chainspec::ForkCondition;
 
 /// One entry of a Rayls hardfork schedule: a fork and its activation condition.
+///
+/// `Ord` compares `fork` first (field declaration order), so sorting a schedule yields fork
+/// order regardless of conditions. `RaylsChainHardforks::rayls_fork_activation` relies on
+/// this ordering invariant via `binary_search_by` — do not reorder fields.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ScheduledFork {
     pub fork: RaylsHardFork,
