@@ -517,6 +517,8 @@ impl PrimaryResponse {
             | PrimaryNetworkError::TooManyAuthorities(..) => {
                 Self::Error(PrimaryRPCError(error.to_string()))
             }
+            // A busy node asks the requester to try another peer, and to retry later.
+            PrimaryNetworkError::Busy => Self::RecoverableError(PrimaryRPCError(error.to_string())),
         }
     }
 }
