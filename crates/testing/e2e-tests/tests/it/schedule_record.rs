@@ -242,10 +242,10 @@ async fn schedule_record_gate_on_real_boots() -> eyre::Result<()> {
         "the refusal should mention the schedule record: {output}"
     );
 
-    // 4. A new-chain config file that leaves a behavioral fork `never` records it as never; a
-    //    later file activating that same fork in the future is allowed and re-recorded.
-    //    (Migration forks may not be scheduled on a new chain, so the scenario uses a behavioral
-    //    fork.) Fresh datadir, two config files.
+    // 4. A new-chain config file that leaves a behavioral fork `never` records it as never; a later
+    //    file activating that same fork in the future is allowed and re-recorded. (Migration forks
+    //    may not be scheduled on a new chain, so the scenario uses a behavioral fork.) Fresh
+    //    datadir, two config files.
     let future_dir = temp.path().join("future_datadir");
     std::fs::create_dir_all(&future_dir)?;
     let file_never = write_config_file(

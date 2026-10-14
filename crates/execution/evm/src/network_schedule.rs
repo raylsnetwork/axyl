@@ -147,12 +147,7 @@ impl FileSchedule {
 
 #[cfg(test)]
 mod tests {
-    use crate::{
-        network_profile::{ForkActivation, ForkName, NetworkConfigFile, NetworkProfile},
-        RaylsHardFork,
-    };
     use rayls_infrastructure_types::RaylsNetwork;
-    use std::{collections::BTreeMap, path::PathBuf};
 
     use super::{verify_datadir_chain_id, FileSchedule, SelectedSchedule};
 

@@ -21,30 +21,21 @@ mod schedule {
     fn fork_inactive_before_activation_block() {
         let hardforks = RaylsChainHardforks::local();
         let block = activation_block(&hardforks, RaylsHardFork::HybridRewards);
-        assert!(!hardforks.is_rayls_fork_active_at_block(
-            RaylsHardFork::HybridRewards,
-            block - 1,
-        ));
+        assert!(!hardforks.is_rayls_fork_active_at_block(RaylsHardFork::HybridRewards, block - 1,));
     }
 
     #[test]
     fn fork_active_at_activation_block() {
         let hardforks = RaylsChainHardforks::local();
         let block = activation_block(&hardforks, RaylsHardFork::HybridRewards);
-        assert!(hardforks.is_rayls_fork_active_at_block(
-            RaylsHardFork::HybridRewards,
-            block,
-        ));
+        assert!(hardforks.is_rayls_fork_active_at_block(RaylsHardFork::HybridRewards, block,));
     }
 
     #[test]
     fn fork_active_after_activation_block() {
         let hardforks = RaylsChainHardforks::local();
         let block = activation_block(&hardforks, RaylsHardFork::HybridRewards);
-        assert!(hardforks.is_rayls_fork_active_at_block(
-            RaylsHardFork::HybridRewards,
-            block + 1,
-        ));
+        assert!(hardforks.is_rayls_fork_active_at_block(RaylsHardFork::HybridRewards, block + 1,));
     }
 
     /// On local, Erc20PrecompileBytecode and HybridRewards share activation block 1;
@@ -53,8 +44,7 @@ mod schedule {
     fn newly_activated_forks_reports_only_forks_crossed_at_block() {
         let hardforks = RaylsChainHardforks::local();
         let block = activation_block(&hardforks, RaylsHardFork::HybridRewards);
-        let activated = hardforks
-            .newly_activated_forks(block - 1, block);
+        let activated = hardforks.newly_activated_forks(block - 1, block);
         assert_eq!(
             activated,
             vec![RaylsHardFork::Erc20PrecompileBytecode, RaylsHardFork::HybridRewards],
@@ -65,8 +55,7 @@ mod schedule {
     fn newly_activated_forks_is_empty_when_no_fork_crosses() {
         let hardforks = RaylsChainHardforks::local();
         let block = activation_block(&hardforks, RaylsHardFork::HybridRewards);
-        let activated = hardforks
-            .newly_activated_forks(block, block + 1);
+        let activated = hardforks.newly_activated_forks(block, block + 1);
         assert!(activated.is_empty());
     }
 
@@ -76,8 +65,7 @@ mod schedule {
     fn newly_activated_forks_reports_all_forks_at_shared_block() {
         let hardforks = RaylsChainHardforks::for_network(RaylsNetwork::Testnet);
         let block = activation_block(&hardforks, RaylsHardFork::AdminTransfer);
-        let activated = hardforks
-            .newly_activated_forks(block - 1, block);
+        let activated = hardforks.newly_activated_forks(block - 1, block);
         assert!(activated.contains(&RaylsHardFork::BatchDigestV2));
         assert!(activated.contains(&RaylsHardFork::AdminTransfer));
     }
