@@ -56,6 +56,9 @@ pub(crate) enum CertManagerError {
     /// Fetch certificates failed.
     #[error("No peer can be reached for fetching certificates! Check if network is healthy.")]
     NoCertificateFetched,
+    /// Every peer that answered was busy.
+    #[error("Every peer that answered was busy with other certificate requests")]
+    PeersBusy,
     /// All fetched certificates belong to a future epoch.
     #[error("All {count} fetched certificates are from epoch {theirs} (local epoch {ours})")]
     FutureEpoch { ours: Epoch, theirs: Epoch, count: usize },
