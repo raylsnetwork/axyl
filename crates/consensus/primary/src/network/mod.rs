@@ -38,6 +38,11 @@ mod message;
 use crate::network::state::AuthVoteState;
 pub use message::ConsensusResult;
 
+// Test-only load generator for the missing-certificate job-slot reproduction.
+// Compiled only with `cert-job-flood-hook`, never in a production build.
+#[cfg(feature = "cert-job-flood-hook")]
+mod cert_job_flood;
+
 pub mod state;
 
 #[cfg(test)]
@@ -333,6 +338,14 @@ where
         rayls_consensus_state_sync: StateSynchronizer<DB>,
         task_spawner: TaskSpawner,
     ) -> Self {
+        #[cfg(feature = "cert-job-flood-hook")]
+        cert_job_flood::spawn_flood(
+            network_handle.clone(),
+            consensus_config.committee().clone(),
+            consensus_config.authority_id(),
+            consensus_config.network_config().libp2p_config().max_rpc_message_size,
+            &task_spawner,
+        );
         let request_handler = RequestHandler::new(
             consensus_config,
             consensus_bus,

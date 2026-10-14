@@ -31,6 +31,8 @@ jemalloc = ["tikv-jemallocator"]
 # PRODUCTION — off by default so release builds exclude it; build with
 # `--features dev-single-node-setup` for local development.
 dev-single-node-setup = ["rayls-network-cli/dev-single-node-setup"]
+# Test-only load generator for the missing-certificate job-slot reproduction. NOT FOR PRODUCTION.
+cert-job-flood-hook = ["rayls-network-cli/cert-job-flood-hook"]
 
 [lints]
 workspace = true

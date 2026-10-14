@@ -63,6 +63,8 @@ dev-single-node-setup = [
     "rayls-middleware-bridge/dev-single-node-setup",
     "rayls-infrastructure-types/dev-single-node-setup",
 ]
+# Test-only load generator for the missing-certificate job-slot reproduction. NOT FOR PRODUCTION.
+cert-job-flood-hook = ["rayls-consensus-primary/cert-job-flood-hook"]
 
 [dev-dependencies]
 rand = { workspace = true }

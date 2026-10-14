@@ -11,12 +11,13 @@ use rayls_execution_evm::test_utils::fixture_batch_with_transactions;
 use rayls_infrastructure_network_types::MockPrimaryToWorkerClient;
 use rayls_infrastructure_storage::{mem_db::MemDatabase, CertificateStore, PayloadStore};
 use rayls_infrastructure_types::{
-    encode, error::HeaderError, now, AuthorityIdentifier, BlockNumHash, Certificate, Committee,
-    ExecHeader, Hash as _, SealedHeader, SignatureVerificationState, TaskManager,
+    encode, error::HeaderError, now, AuthorityIdentifier, BlockNumHash, BlsKeypair, BlsPublicKey,
+    Certificate, Committee, ExecHeader, Hash as _, SealedHeader, SignatureVerificationState,
+    TaskManager,
 };
 use rayls_testing_test_utils_committee::CommitteeFixture;
 use std::{
-    collections::{BTreeSet, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     num::NonZeroUsize,
     sync::Arc,
     time::Duration,
@@ -862,4 +863,119 @@ async fn test_request_vote_created_at_in_future() {
         panic!("not a vote!");
     };
     assert!(created_at <= now());
+}
+
+/// Missing-certificate jobs one committee member should be able to run at once.
+///
+/// The fix is expected to define this limit, and this test should then use it.
+const JOBS_PER_MEMBER: usize = 2;
+/// Missing-certificate jobs all peers outside the committee should share at once.
+///
+/// The fix is expected to define this limit, and this test should then use it.
+const JOBS_FOR_OUTSIDERS: usize = 4;
+/// How long a request runs before the test cancels it, as a timed-out peer would.
+const CANCEL_AFTER: Duration = Duration::from_millis(50);
+
+/// A valid request that asks for no authorities.
+fn empty_request() -> MissingCertificatesRequest {
+    MissingCertificatesRequest::default()
+        .set_bounds(0, BTreeMap::new())
+        .expect("bounds")
+        .set_max_response_size(
+            rayls_infrastructure_config::LibP2pConfig::default().max_rpc_message_size,
+        )
+}
+
+/// Start a missing-certificates request from `peer`, and cancel it after [CANCEL_AFTER].
+///
+/// Returns the answer if it came in time, or `None` if the request was cancelled.
+/// The handler does not know who is asking yet, so `peer` is unused until the fix adds it.
+async fn start_then_cancel(
+    handler: &RequestHandler<MemDatabase>,
+    _peer: BlsPublicKey,
+) -> Option<Result<PrimaryResponse, PrimaryNetworkError>> {
+    timeout(CANCEL_AFTER, handler.retrieve_missing_certs(empty_request())).await.ok()
+}
+
+/// A cancelled request keeps its slot until its job ends, and each pool is limited on its own.
+///
+/// The runtime has one blocking thread and the test keeps it busy, so every job stays queued.
+/// Without a limit, every request is queued, so no request is ever refused.
+#[test]
+fn test_missing_cert_slots_outlive_cancelled_requests() {
+    use rand::{rngs::StdRng, SeedableRng};
+
+    // A committee large enough for one busy member, two others, and this node.
+    const COMMITTEE_SIZE: usize = 4;
+    // How long the queued jobs may take to run once the blocking thread is free.
+    const SLOTS_FREED_WITHIN: Duration = Duration::from_secs(10);
+    // How often to retry while the slots are still taken.
+    const RETRY_EVERY: Duration = Duration::from_millis(10);
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .max_blocking_threads(1)
+        .enable_all()
+        .build()
+        .expect("runtime");
+    runtime.block_on(async {
+        let fixture = CommitteeFixture::builder(MemDatabase::default)
+            .committee_size(NonZeroUsize::new(COMMITTEE_SIZE).unwrap())
+            .build();
+        let primary = fixture.authorities().next().unwrap();
+        let cb = ConsensusBus::new();
+        let task_manager = TaskManager::default();
+        let synchronizer = StateSynchronizer::new(
+            primary.consensus_config(),
+            cb.clone(),
+            task_manager.get_spawner(),
+        );
+        let handler = RequestHandler::new(primary.consensus_config(), cb.clone(), synchronizer);
+        let member = |i: usize| fixture.authorities().nth(i).unwrap().primary_public_key();
+        let outsider = || *BlsKeypair::generate(&mut StdRng::from_os_rng()).public();
+
+        // Keep the only blocking thread busy.
+        let (release, hold) = std::sync::mpsc::channel::<()>();
+        let blocker = tokio::task::spawn_blocking(move || {
+            let _ = hold.recv();
+        });
+
+        // Cancelled requests from one member still hold all of its slots.
+        let busy_member = member(1);
+        for _ in 0..JOBS_PER_MEMBER {
+            assert!(start_then_cancel(&handler, busy_member).await.is_none());
+        }
+        let next = start_then_cancel(&handler, busy_member).await;
+        assert!(matches!(next, Some(Err(_))), "a member's extra request was not refused: {next:?}");
+
+        // Another member has its own slots.
+        assert!(start_then_cancel(&handler, member(2)).await.is_none());
+
+        // Peers outside the committee share one pool.
+        for _ in 0..JOBS_FOR_OUTSIDERS {
+            assert!(start_then_cancel(&handler, outsider()).await.is_none());
+        }
+        let next = start_then_cancel(&handler, outsider()).await;
+        assert!(
+            matches!(next, Some(Err(_))),
+            "an outsider's extra request was not refused: {next:?}"
+        );
+
+        // A full outsider pool does not affect members.
+        assert!(start_then_cancel(&handler, member(3)).await.is_none());
+
+        // Once the queued jobs run, the slots are free again.
+        release.send(()).expect("release the blocking thread");
+        blocker.await.expect("blocker");
+        let freed = timeout(SLOTS_FREED_WITHIN, async {
+            loop {
+                match handler.retrieve_missing_certs(empty_request()).await {
+                    Ok(response) => break response,
+                    Err(_) => tokio::time::sleep(RETRY_EVERY).await,
+                }
+            }
+        })
+        .await
+        .expect("slots freed after the jobs ran");
+        assert!(matches!(freed, PrimaryResponse::RequestedCertificates(_)), "got {freed:?}");
+    });
 }
