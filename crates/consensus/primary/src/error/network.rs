@@ -63,6 +63,9 @@ pub(crate) enum PrimaryNetworkError {
     /// A missing-certificates request names more authorities than any honest node sends.
     #[error("Request names {0} authorities, the limit is {1}")]
     TooManyAuthorities(usize, usize),
+    /// Too many missing-certificates requests are already in progress.
+    #[error("Too many missing certificate requests in progress, retry later")]
+    Busy,
 }
 
 impl From<&PrimaryNetworkError> for Option<Penalty> {
@@ -99,6 +102,7 @@ impl From<&PrimaryNetworkError> for Option<Penalty> {
                 | CertManagerError::CertificateManagerOneshot
                 | CertManagerError::FatalForwardAcceptedCertificate
                 | CertManagerError::NoCertificateFetched
+                | CertManagerError::PeersBusy
                 | CertManagerError::FutureEpoch { .. }
                 | CertManagerError::FatalAppendParent
                 | CertManagerError::GC(_)
@@ -117,6 +121,7 @@ impl From<&PrimaryNetworkError> for Option<Penalty> {
             PrimaryNetworkError::InvalidTopic
                 | PrimaryNetworkError::Decode(_) => Some(Penalty::Fatal),
             PrimaryNetworkError::TooManyAuthorities(..) => Some(Penalty::Mild),
+            PrimaryNetworkError::Busy => None,
             PrimaryNetworkError::UnavailableEpoch(_)  // A node might not have this yet...
                 | PrimaryNetworkError::UnavailableEpochDigest(_)  // A node might not have this yet....
                 | PrimaryNetworkError::PeerNotInCommittee(_)
