@@ -2,18 +2,10 @@
 
 use std::sync::Arc;
 
-#[cfg(feature = "archive-replay")]
-use std::sync::LazyLock;
-
 use rayls_infrastructure_types::RaylsNetwork;
 use reth_chainspec::ForkCondition;
 
 use super::{fork::RaylsHardFork, schedule::ScheduledFork, spec::RaylsChainSpec};
-
-/// The baked-in testnet schedule, built once: the identity reference for
-/// `is_tokenomics_outage_block`.
-#[cfg(feature = "archive-replay")]
-static TESTNET: LazyLock<RaylsChainHardforks> = LazyLock::new(|| RaylsChainHardforks::testnet());
 
 /// Sorted hardfork schedule usable without a full [`RaylsChainSpec`].
 #[derive(Debug, Clone)]
@@ -114,15 +106,15 @@ pub trait RaylsHardforks {
     /// A misconfigured tokenomics activation left rewards off for this block range
     /// on the live testnet, so archive replay skips on-chain reward distribution
     /// here to match canonical state. The guard compares this schedule's Tokenomics
-    /// activation against the baked-in testnet's (`1_879_000`); any schedule with
+    /// activation against the live testnet's (`1_879_000`); any schedule with
     /// Tokenomics at that block would also match. This is acceptable because the
     /// method is gated behind `archive-replay`, which only runs against canonical
     /// historical state where no such synthetic schedule would ever be used.
     #[cfg(feature = "archive-replay")]
     fn is_tokenomics_outage_block(&self, block: u64) -> bool {
-        // Identity check: only the live testnet schedule matches.
+        let testnet = RaylsChainHardforks::testnet();
         self.rayls_fork_activation(RaylsHardFork::Tokenomics)
-            == TESTNET.rayls_fork_activation(RaylsHardFork::Tokenomics)
+            == testnet.rayls_fork_activation(RaylsHardFork::Tokenomics)
             && (
                 // First testnet block whose epoch close skipped on-chain reward distribution;
                 // the exclusive upper bound is the first block where distribution resumed.
