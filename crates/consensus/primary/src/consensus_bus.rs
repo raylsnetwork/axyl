@@ -50,6 +50,7 @@ impl PromotionBarrier {
         }
     }
 }
+use crate::network::handler::MissingCertLimits;
 use std::sync::Arc;
 use tokio::{
     sync::{
@@ -277,6 +278,8 @@ struct ConsensusBusAppInner {
     /// Blocks re-promotion until the cert store covers the barrier round.
     /// `None` means no barrier active. Set atomically via `send_modify`.
     promotion_barrier: watch::Sender<Option<PromotionBarrier>>,
+    /// Limits on the missing-certificate jobs this node runs for its peers.
+    missing_cert_limits: Arc<MissingCertLimits>,
 }
 
 impl ConsensusBusAppInner {
@@ -336,6 +339,7 @@ impl ConsensusBusAppInner {
             mode_transition,
             cert_store_round: watch::channel(0).0,
             promotion_barrier: watch::channel(None).0,
+            missing_cert_limits: Arc::new(MissingCertLimits::new()),
         }
     }
 
@@ -560,6 +564,11 @@ impl ConsensusBus {
     /// Can only be subscribed to once.
     pub fn parents(&self) -> &impl RaylsSender<(Vec<Certificate>, Round)> {
         &self.inner_epoch.parents
+    }
+
+    /// Limits on the missing-certificate jobs this node runs for its peers.
+    pub(crate) fn missing_cert_limits(&self) -> &MissingCertLimits {
+        &self.inner_app.missing_cert_limits
     }
 
     /// Contains the highest committed round & corresponding gc_round for consensus.
