@@ -295,13 +295,16 @@ mod tests {
     fn set_a_at_never_is_disallowed() {
         let profile =
             new_chain_profile(99_999, (RaylsHardFork::AdminTransfer, ForkActivation::Never));
-        assert!(verify_schedule_shape(&profile, 0).is_err());
+        assert!(verify_schedule_shape(&profile, 0)
+            .unwrap_err()
+            .to_string()
+            .contains("AdminTransfer"));
         let profile = new_chain_profile(99_999, (RaylsHardFork::RlsStorage, ForkActivation::Never));
-        assert!(verify_schedule_shape(&profile, 0).is_err());
+        assert!(verify_schedule_shape(&profile, 0).unwrap_err().to_string().contains("RlsStorage"));
         let profile = new_chain_profile(99_999, (RaylsHardFork::Tokenomics, ForkActivation::Never));
-        assert!(verify_schedule_shape(&profile, 0).is_err());
+        assert!(verify_schedule_shape(&profile, 0).unwrap_err().to_string().contains("Tokenomics"));
         let profile = new_chain_profile(99_999, (RaylsHardFork::Uups, ForkActivation::Never));
-        assert!(verify_schedule_shape(&profile, 0).is_err());
+        assert!(verify_schedule_shape(&profile, 0).unwrap_err().to_string().contains("Uups"));
     }
 
     /// Two independent violations are joined into a single error message.
