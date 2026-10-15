@@ -8,16 +8,13 @@
 //! devnet, any new production chain) is checked against the rule set of its
 //! state:
 //!
-//! - A **new chain** — the datadir has no executed blocks (`head == 0`) —
-//!   must match the canonical new-chain shape, because a greenfield genesis
-//!   only works with it.
-//! - An **existing chain** (`head > 0`) may legitimately run a historical
-//!   schedule that deviates from the canonical one, so only the constraints
-//!   an executed chain still needs are enforced: Set A forks at `Block(0)` or
-//!   `Never`, `Erc20PrecompileBytecode` exactly `Block(1)`,
-//!   `UsdrSupplyCorrection` at any value (warned when not `Never`), and
-//!   `HybridRewards` at `Never` or `Block(>= 1)`. The schedule-record gate
-//!   guards the executed history per datadir.
+//! - A **new chain** — the datadir has no executed blocks (`head == 0`) — must match the canonical
+//!   new-chain shape, because a greenfield genesis only works with it.
+//! - An **existing chain** (`head > 0`) may legitimately run a historical schedule that deviates
+//!   from the canonical one, so only the constraints an executed chain still needs are enforced:
+//!   Set A forks at `Block(0)` or `Never`, `Erc20PrecompileBytecode` exactly `Block(1)`,
+//!   `UsdrSupplyCorrection` at any value (warned when not `Never`), and `HybridRewards` at `Never`
+//!   or `Block(>= 1)`. The schedule-record gate guards the executed history per datadir.
 //!
 //! See `docs/hardforks/README.md`.
 

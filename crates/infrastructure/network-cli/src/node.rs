@@ -299,7 +299,7 @@ impl<Ext: clap::Args + fmt::Debug> NodeCommand<Ext> {
             config_file: _, // Used above
             subnet: _,      // Used above
             #[cfg(feature = "dev-single-node-setup")]
-                dev, // Used below in the dev gate
+            dev, // Used below in the dev gate
             metrics,
             instance,
             with_unused_ports,
