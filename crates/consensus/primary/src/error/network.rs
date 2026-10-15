@@ -60,6 +60,9 @@ pub(crate) enum PrimaryNetworkError {
     /// Invalid topic- something was published to the wrong topic.
     #[error("Gossip was published to the wrong topic")]
     InvalidTopic,
+    /// Too many missing-certificates requests are already in progress.
+    #[error("Too many missing certificate requests in progress, retry later")]
+    Busy,
 }
 
 impl From<&PrimaryNetworkError> for Option<Penalty> {
@@ -96,6 +99,7 @@ impl From<&PrimaryNetworkError> for Option<Penalty> {
                 | CertManagerError::CertificateManagerOneshot
                 | CertManagerError::FatalForwardAcceptedCertificate
                 | CertManagerError::NoCertificateFetched
+                | CertManagerError::PeersBusy
                 | CertManagerError::FutureEpoch { .. }
                 | CertManagerError::FatalAppendParent
                 | CertManagerError::GC(_)
@@ -113,6 +117,7 @@ impl From<&PrimaryNetworkError> for Option<Penalty> {
                 | PrimaryNetworkError::StdIo(_) => Some(Penalty::Medium),
             PrimaryNetworkError::InvalidTopic
                 | PrimaryNetworkError::Decode(_) => Some(Penalty::Fatal),
+            PrimaryNetworkError::Busy => None,
             PrimaryNetworkError::UnavailableEpoch(_)  // A node might not have this yet...
                 | PrimaryNetworkError::UnavailableEpochDigest(_)  // A node might not have this yet....
                 | PrimaryNetworkError::PeerNotInCommittee(_)
