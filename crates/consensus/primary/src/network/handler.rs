@@ -808,7 +808,6 @@ where
     /// The request is checked for size before any bitmap decoding or storage read.
     pub(crate) async fn retrieve_missing_certs(
         &self,
-        peer: BlsPublicKey,
         request: MissingCertificatesRequest,
         requested_epoch: Option<Epoch>,
     ) -> PrimaryNetworkResult<PrimaryResponse> {
@@ -816,7 +815,7 @@ where
         let limit = max_requested_authorities(committee.size());
         let named = request.skip_rounds.named();
         if named > limit {
-            debug!(target: "primary::handler", %peer, authorities = named, limit, "missing-certificates request names too many authorities");
+            debug!(target: "primary::handler", authorities = named, limit, "missing-certificates request names too many authorities");
             return Err(PrimaryNetworkError::TooManyAuthorities(named, limit));
         }
         let consensus_config = self.consensus_config.clone();

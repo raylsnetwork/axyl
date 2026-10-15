@@ -104,18 +104,16 @@ where
         let max_message_size = request.max_response_size.min(local_max);
         let max_skip_rounds =
             config.network_config().sync_config().max_skip_rounds_for_missing_certs;
-        let (lower_bound, skip_rounds) = request.get_bounds(max_skip_rounds)?;
+        // Only committee members have certificates this node can serve, so decode a skip bitmap
+        // only for them: get_bounds drops every other origin before paying for its decode.
+        let committee = config.committee();
+        let (lower_bound, skip_rounds) =
+            request.get_bounds(max_skip_rounds, |origin| committee.authority(origin).is_some())?;
         let exclusive_upper_bound = request.exclusive_upper_bound;
 
         // initialize the fetch queue with the first round for each authority
         let mut fetch_queue = BinaryHeap::new();
-        let committee = config.committee();
         for (origin, rounds) in &skip_rounds {
-            // only committee members have certificates this node can serve
-            if committee.authority(origin).is_none() {
-                continue;
-            }
-
             if let Some(next_round) = Self::find_next_round(
                 config.node_storage(),
                 scope,

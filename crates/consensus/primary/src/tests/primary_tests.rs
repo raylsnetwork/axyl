@@ -652,7 +652,6 @@ async fn test_fetch_certificates_handler() {
         StateSynchronizer::new(primary.consensus_config(), cb.clone(), task_manager.get_spawner());
     synchronizer.spawn(&task_manager);
     let handler = RequestHandler::new(primary.consensus_config(), cb.clone(), synchronizer.clone());
-    let peer = fixture.authorities().last().unwrap().primary_public_key();
 
     let mut current_round: Vec<_> = Certificate::genesis(&fixture.committee())
         .into_iter()
@@ -730,7 +729,7 @@ async fn test_fetch_certificates_handler() {
             )
             .expect("boundary set")
             .set_max_response_size(response_size);
-        let resp = handler.retrieve_missing_certs(peer, missing_req, None).await.unwrap();
+        let resp = handler.retrieve_missing_certs(missing_req, None).await.unwrap();
         if let PrimaryResponse::RequestedCertificates(certs) = resp {
             assert_eq!(certs.iter().map(|cert| cert.round()).collect::<Vec<_>>(), *expected_rounds);
         } else {
@@ -751,7 +750,7 @@ async fn test_fetch_certificates_handler() {
             )
             .expect("boundary set")
             .set_max_response_size(0);
-        let resp = handler.retrieve_missing_certs(peer, too_big, None).await;
+        let resp = handler.retrieve_missing_certs(too_big, None).await;
         assert!(resp.is_err());
     }
 }
@@ -884,7 +883,6 @@ async fn test_fetch_certificates_handler_survives_max_lower_bound() {
         StateSynchronizer::new(primary.consensus_config(), cb.clone(), task_manager.get_spawner());
     synchronizer.spawn(&task_manager);
     let handler = RequestHandler::new(primary.consensus_config(), cb.clone(), synchronizer.clone());
-    let peer = fixture.authorities().last().unwrap().primary_public_key();
 
     let mut empty_bitmap = Vec::new();
     roaring::RoaringBitmap::new().serialize_into(&mut empty_bitmap).expect("bitmap");
@@ -895,8 +893,7 @@ async fn test_fetch_certificates_handler_survives_max_lower_bound() {
         exclusive_upper_bound: None,
     };
 
-    let resp =
-        handler.retrieve_missing_certs(peer, crafted, None).await.expect("served, not aborted");
+    let resp = handler.retrieve_missing_certs(crafted, None).await.expect("served, not aborted");
     assert!(matches!(resp, PrimaryResponse::RequestedCertificates(certs) if certs.is_empty()));
 }
 
@@ -923,7 +920,6 @@ async fn test_missing_certs_request_with_too_many_authorities_is_rejected() {
     let synchronizer =
         StateSynchronizer::new(primary.consensus_config(), cb.clone(), task_manager.get_spawner());
     let handler = RequestHandler::new(primary.consensus_config(), cb.clone(), synchronizer);
-    let peer = fixture.authorities().last().unwrap().primary_public_key();
     let limit = max_requested_authorities(committee_size);
 
     // Small committees get the floor, and larger ones a multiple of their size.
@@ -950,15 +946,12 @@ async fn test_missing_certs_request_with_too_many_authorities_is_rejected() {
     };
 
     // At the limit, unknown authorities are skipped and nothing is returned.
-    let resp =
-        handler.retrieve_missing_certs(peer, request(limit), None).await.expect("within limit");
+    let resp = handler.retrieve_missing_certs(request(limit), None).await.expect("within limit");
     assert!(matches!(resp, PrimaryResponse::RequestedCertificates(certs) if certs.is_empty()));
 
     // One more is refused, with a penalty.
-    let err = handler
-        .retrieve_missing_certs(peer, request(limit + 1), None)
-        .await
-        .expect_err("over limit");
+    let err =
+        handler.retrieve_missing_certs(request(limit + 1), None).await.expect_err("over limit");
     assert!(
         matches!(err, PrimaryNetworkError::TooManyAuthorities(n, l) if n == limit + 1 && l == limit)
     );
@@ -987,7 +980,7 @@ async fn test_missing_certs_request_with_too_many_authorities_is_rejected() {
     let Ok(PrimaryRequest::MissingCertificates { inner }) = received else {
         panic!("the receiving node did not get the request: {received:?}");
     };
-    let err = handler.retrieve_missing_certs(peer, inner, None).await.expect_err("over limit");
+    let err = handler.retrieve_missing_certs(inner, None).await.expect_err("over limit");
     assert!(
         matches!(err, PrimaryNetworkError::TooManyAuthorities(n, l) if n == named && l == limit),
         "got {err:?}"

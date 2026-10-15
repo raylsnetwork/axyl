@@ -298,59 +298,65 @@ impl MissingCertificatesRequest {
     /// Each bitmap is checked for its container count and length before it is decoded, and for
     /// `max_rounds` before its rounds are collected, so a small bitmap cannot stand for billions
     /// of rounds.
+    ///
+    /// `keep` decides which origins are decoded. The caller passes committee membership, so a
+    /// bitmap is never decoded for an origin this node does not serve, and a repeated origin is
+    /// decoded once: the filtering and the dedup both happen before any bitmap is decoded.
     pub(crate) fn get_bounds(
         &self,
         max_rounds: usize,
+        keep: impl Fn(&AuthorityIdentifier) -> bool,
     ) -> PrimaryNetworkResult<(Round, BTreeMap<AuthorityIdentifier, BTreeSet<Round>>)> {
-        let skip_rounds: BTreeMap<AuthorityIdentifier, BTreeSet<Round>> = self
-            .skip_rounds
-            .entries
-            .iter()
-            .map(|(k, serialized)| {
-                let containers = roaring_container_count(serialized).ok_or_else(|| {
-                    std::io::Error::new(std::io::ErrorKind::InvalidData, "unknown skip bitmap")
-                })?;
-                if containers > MAX_SKIP_ROUND_CONTAINERS {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        "skip bitmap declares too many containers",
-                    )
-                    .into());
-                }
-                if serialized.len() > max_skip_bitmap_len(max_rounds) {
-                    return Err(PrimaryNetworkError::InvalidRequest(
-                        "Skip bitmap is too long".into(),
-                    ));
-                }
-                // Normalize on read: this bitmap comes from a peer request. It is
-                // only iterated today (so the empty-container re-serialize panic
-                // can't fire here), but routing every untrusted roaring
-                // deserialization through the shared helper keeps that invariant
-                // if this call site ever grows to re-encode the bitmap. See #55.
-                // Both operands are peer-supplied. A plain `+` overflows `Round` on a crafted
-                // request and, with `overflow-checks = true` and `panic = "abort"` in release,
-                // takes the whole node down. Reject instead; the io error maps to a penalty.
-                let bitmap =
-                    rayls_infrastructure_types::serde::deserialize_normalized(&serialized[..])?;
-                if bitmap.len() > max_rounds as u64 {
-                    return Err(PrimaryNetworkError::InvalidRequest(
-                        "Request for rounds out of bounds".into(),
-                    ));
-                }
-                let rounds = bitmap
-                    .into_iter()
-                    .map(|r| {
-                        self.exclusive_lower_bound.checked_add(r as Round).ok_or_else(|| {
-                            std::io::Error::new(
-                                std::io::ErrorKind::InvalidData,
-                                "skip round overflows the round range",
-                            )
-                        })
+        let mut skip_rounds: BTreeMap<AuthorityIdentifier, BTreeSet<Round>> = BTreeMap::new();
+        for (k, serialized) in &self.skip_rounds.entries {
+            // Skip before decoding: an origin this node does not serve, or one already decoded.
+            // A crafted list of unwanted or repeated ids then costs no bitmap decode.
+            if !keep(k) || skip_rounds.contains_key(k) {
+                continue;
+            }
+            let containers = roaring_container_count(serialized).ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "unknown skip bitmap")
+            })?;
+            if containers > MAX_SKIP_ROUND_CONTAINERS {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "skip bitmap declares too many containers",
+                )
+                .into());
+            }
+            if serialized.len() > max_skip_bitmap_len(max_rounds) {
+                return Err(PrimaryNetworkError::InvalidRequest("Skip bitmap is too long".into()));
+            }
+            // Decode the raw bitmap, then reject on its count before normalizing. A crafted bitmap
+            // can expand to many rounds, and `from_sorted_iter` would walk every one of them before
+            // the count is known. `deserialize_from` already gives the count, so check it first.
+            let raw = roaring::RoaringBitmap::deserialize_from(&serialized[..])?;
+            if raw.len() > max_rounds as u64 {
+                return Err(PrimaryNetworkError::InvalidRequest(
+                    "Request for rounds out of bounds".into(),
+                ));
+            }
+            // Within bounds now (at most `max_rounds` rounds), so normalizing is cheap. Normalizing
+            // on read keeps the re-encode invariant if this call site ever grows to re-encode the
+            // bitmap, and the empty-container re-serialize panic cannot fire here. See #55.
+            let bitmap = roaring::RoaringBitmap::from_sorted_iter(raw)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+            // Both operands are peer-supplied. A plain `+` overflows `Round` on a crafted request
+            // and, with `overflow-checks = true` and `panic = "abort"` in release, takes the node
+            // down. Reject instead; the io error maps to a penalty.
+            let rounds = bitmap
+                .into_iter()
+                .map(|r| {
+                    self.exclusive_lower_bound.checked_add(r as Round).ok_or_else(|| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "skip round overflows the round range",
+                        )
                     })
-                    .collect::<std::io::Result<BTreeSet<Round>>>()?;
-                Ok((k.clone(), rounds))
-            })
-            .collect::<PrimaryNetworkResult<BTreeMap<_, _>>>()?;
+                })
+                .collect::<std::io::Result<BTreeSet<Round>>>()?;
+            skip_rounds.insert(k.clone(), rounds);
+        }
         Ok((self.exclusive_lower_bound, skip_rounds))
     }
 
