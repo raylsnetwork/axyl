@@ -167,7 +167,7 @@ async fn fetch_certificates_basic() {
         reply,
     }) = fake_receiver.recv().await
     {
-        let (lower_bound, skip_rounds) = inner.get_bounds(max_skip_rounds()).unwrap();
+        let (lower_bound, skip_rounds) = inner.get_bounds(max_skip_rounds(), |_| true).unwrap();
         // Every authority has a contiguous prefix up through round 1, so the fetcher
         // tightens exclusive_lower_bound to 1 and prunes the now-redundant skip entries.
         assert_eq!(lower_bound, 1);
@@ -206,7 +206,8 @@ async fn fetch_certificates_basic() {
                 request: PrimaryRequest::MissingCertificates { inner },
                 reply,
             }) => {
-                let (lower_bound, skip_rounds) = inner.get_bounds(max_skip_rounds()).unwrap();
+                let (lower_bound, skip_rounds) =
+                    inner.get_bounds(max_skip_rounds(), |_| true).unwrap();
                 if lower_bound < 16 {
                     // Drain the fetch requests sent out before the fetcher finished processing
                     // the first batch (their tightened lower_bound is still below round 16).
@@ -266,7 +267,8 @@ async fn fetch_certificates_basic() {
                 request: PrimaryRequest::MissingCertificates { inner },
                 reply,
             }) => {
-                let (lower_bound, skip_rounds) = inner.get_bounds(max_skip_rounds()).unwrap();
+                let (lower_bound, skip_rounds) =
+                    inner.get_bounds(max_skip_rounds(), |_| true).unwrap();
                 let all_empty = skip_rounds.values().all(|r| r.is_empty());
                 if lower_bound < 31 || all_empty {
                     // Drain the fetch requests sent out before the fetcher finished processing
@@ -296,7 +298,8 @@ async fn fetch_certificates_basic() {
         match req {
             NetworkCommand::SendRequest { peer: _, request, reply } => match request {
                 PrimaryRequest::MissingCertificates { inner } => {
-                    let (lower_bound, skip_rounds) = inner.get_bounds(max_skip_rounds()).unwrap();
+                    let (lower_bound, skip_rounds) =
+                        inner.get_bounds(max_skip_rounds(), |_| true).unwrap();
                     // All authorities have a contiguous {1..=31} prefix so the tightened
                     // exclusive_lower_bound is 31 and skip_rounds is pruned to empty.
                     assert_eq!(lower_bound, 31);
@@ -345,7 +348,8 @@ async fn fetch_certificates_basic() {
         match req {
             NetworkCommand::SendRequest { peer: _, request, reply } => match request {
                 PrimaryRequest::MissingCertificates { inner } => {
-                    let (lower_bound, skip_rounds) = inner.get_bounds(max_skip_rounds()).unwrap();
+                    let (lower_bound, skip_rounds) =
+                        inner.get_bounds(max_skip_rounds(), |_| true).unwrap();
                     // All authorities have a contiguous {1..=31} prefix so the tightened
                     // exclusive_lower_bound is 31 and skip_rounds is pruned to empty.
                     assert_eq!(lower_bound, 31);
@@ -387,7 +391,8 @@ async fn fetch_certificates_basic() {
         match req {
             NetworkCommand::SendRequest { peer: _, request, reply } => match request {
                 PrimaryRequest::MissingCertificates { inner } => {
-                    let (lower_bound, skip_rounds) = inner.get_bounds(max_skip_rounds()).unwrap();
+                    let (lower_bound, skip_rounds) =
+                        inner.get_bounds(max_skip_rounds(), |_| true).unwrap();
                     // All authorities have a contiguous {1..=31} prefix so the tightened
                     // exclusive_lower_bound is 31 and skip_rounds is pruned to empty.
                     assert_eq!(lower_bound, 31);
@@ -545,7 +550,7 @@ async fn fetch_request_names_only_committee_members() {
     let mut fetcher =
         FetcherUnderTest::start(&fixture, vec![outsider_cert], NodeMode::CvvActive).await;
     let (request, _reply) = fetcher.next_request().await;
-    let (_, skip_rounds) = request.get_bounds(max_skip_rounds()).unwrap();
+    let (_, skip_rounds) = request.get_bounds(max_skip_rounds(), |_| true).unwrap();
     let committee = fixture.committee();
     assert_eq!(skip_rounds.len(), committee.size());
     assert!(skip_rounds.keys().all(|origin| committee.is_authority(origin)));

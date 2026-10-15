@@ -38,7 +38,7 @@ fn test_missing_certs_request() {
         .expect("boundary set")
         .set_max_response_size(max);
     let (decoded_gc_round, decoded_skip_rounds) =
-        missing_req.get_bounds(max_skip_rounds()).expect("decode missing bounds");
+        missing_req.get_bounds(max_skip_rounds(), |_| true).expect("decode missing bounds");
     assert_eq!(expected_gc_round, decoded_gc_round);
     assert_eq!(expected_skip_rounds, decoded_skip_rounds);
 }
@@ -56,11 +56,14 @@ fn test_missing_certs_request_rejects_round_overflow() {
         max_response_size: 10,
         exclusive_upper_bound: None,
     };
-    assert_matches!(request.get_bounds(max_skip_rounds()), Err(PrimaryNetworkError::StdIo(_)));
+    assert_matches!(
+        request.get_bounds(max_skip_rounds(), |_| true),
+        Err(PrimaryNetworkError::StdIo(_))
+    );
 
     // the same delta below the edge decodes as before
     let request = MissingCertificatesRequest { exclusive_lower_bound: u32::MAX - 1, ..request };
-    let (_, skip) = request.get_bounds(max_skip_rounds()).expect("no overflow");
+    let (_, skip) = request.get_bounds(max_skip_rounds(), |_| true).expect("no overflow");
     assert_eq!(skip[&AuthorityIdentifier::dummy_for_test(0)], BTreeSet::from([u32::MAX]));
 }
 
@@ -594,9 +597,11 @@ fn test_skip_bitmap_is_refused_before_decoding() {
 
     let fixture = CommitteeFixture::builder(MemDatabase::default).build();
     let config = fixture.authorities().next().unwrap().consensus_config();
+    // The server decodes a skip bitmap only for committee members, so the origin must be one.
+    let origin = fixture.authorities().next().unwrap().id();
     let max_response_size = LibP2pConfig::default().max_rpc_message_size;
     let request = |bitmap: Vec<u8>| MissingCertificatesRequest {
-        skip_rounds: [(AuthorityIdentifier::dummy_for_test(1), bitmap)].into_iter().collect(),
+        skip_rounds: [(origin.clone(), bitmap)].into_iter().collect(),
         max_response_size,
         ..Default::default()
     };
@@ -643,14 +648,43 @@ fn test_skip_bitmap_is_refused_before_decoding() {
     let honest = MissingCertificatesRequest::default()
         .set_bounds(
             lower_bound,
-            [(
-                AuthorityIdentifier::dummy_for_test(1),
-                (lower_bound + 1..=lower_bound + max_rounds).collect(),
-            )]
-            .into_iter()
-            .collect(),
+            [(origin.clone(), (lower_bound + 1..=lower_bound + max_rounds).collect())]
+                .into_iter()
+                .collect(),
         )
         .expect("bounds")
         .set_max_response_size(max_response_size);
     assert!(CertificateCollector::new(honest, config.clone(), CertScope::Current).is_ok());
+}
+
+/// The server decodes a skip bitmap only for committee members.
+///
+/// An identical bitmap that is refused for a committee member is ignored for an outsider, so a
+/// crafted bitmap costs no decode unless its origin is one this node serves.
+#[test]
+fn test_skip_bitmap_decoded_only_for_committee_members() {
+    use crate::state_sync::CertificateCollector;
+
+    let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+    let config = fixture.authorities().next().unwrap().consensus_config();
+    let member = fixture.authorities().next().unwrap().id();
+    let outsider = AuthorityIdentifier::dummy_for_test(200);
+    let max_response_size = LibP2pConfig::default().max_rpc_message_size;
+    // An unknown header fails to decode, so it shows whether a decode was attempted at all.
+    let bad_bitmap = vec![1u8, 2, 3];
+    let request = |origin: AuthorityIdentifier| MissingCertificatesRequest {
+        skip_rounds: [(origin, bad_bitmap.clone())].into_iter().collect(),
+        max_response_size,
+        ..Default::default()
+    };
+
+    // A committee member's bad bitmap is decoded and refused.
+    assert_matches!(
+        CertificateCollector::new(request(member), config.clone(), CertScope::Current).err(),
+        Some(PrimaryNetworkError::StdIo(_))
+    );
+    // An outsider's identical bitmap is never decoded, so the request is accepted.
+    assert!(
+        CertificateCollector::new(request(outsider), config.clone(), CertScope::Current).is_ok()
+    );
 }
