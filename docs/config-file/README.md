@@ -186,15 +186,15 @@ Common causes:
 ## 5. The fork schedule: what is pinned, what is free
 
 The template ships the canonical new-chain schedule, so if you use it as-is (change
-only `chain_id`) you are done. Of the 16 forks:
+only `chain_id`) you are done. Of the 17 forks:
 
 - **Seven are pinned** by the boot shape gate (`verify_schedule_shape`) while
   the chain has no blocks: the node refuses to start a new chain (head `0`) if
   any of them deviates. They are the migration forks whose values the genesis
   requires. Once the chain has blocks the gate relaxes (below).
-- **Nine are behavioral** and free to choose: `0` (on from genesis), `never` (off),
+- **Ten are behavioral** and free to choose: `0` (on from genesis), `never` (off),
   or a future block (activate later — section 3). The canonical schedule turns all
-  nine on from genesis.
+  ten on from genesis.
 
 What each fork does, and why each pinned value is pinned, is in
 [`hardforks/README.md`](../hardforks/README.md). The quick list of the seven pinned

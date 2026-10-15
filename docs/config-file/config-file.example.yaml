@@ -14,7 +14,7 @@
 # The `hardforks` map below is the canonical new-chain schedule. Seven of
 # the values are pinned by the boot shape gate (verify_schedule_shape) and
 # the node refuses to start a new chain (head 0) if any of them differs; the
-# other nine are behavioral and free to choose (0, never, or a future block).
+# other ten are behavioral and free to choose (0, never, or a future block).
 # Once the chain has blocks the gate relaxes (section 5 of
 # docs/config-file/README.md). What each fork does and why each pinned value
 # is pinned: docs/hardforks/README.md.

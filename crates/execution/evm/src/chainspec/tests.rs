@@ -77,16 +77,19 @@ mod schedule {
             (RaylsNetwork::Devnet, RaylsHardFork::UsdrSupplyCorrection),
             (RaylsNetwork::Devnet, RaylsHardFork::HybridRewards),
             (RaylsNetwork::Devnet, RaylsHardFork::EpochCloseSeedV2),
+            (RaylsNetwork::Devnet, RaylsHardFork::CertificateFetchEpochV2),
             (RaylsNetwork::Testnet, RaylsHardFork::Erc20PrecompileBytecode),
             (RaylsNetwork::Testnet, RaylsHardFork::UsdrSupplyCorrection),
             (RaylsNetwork::Testnet, RaylsHardFork::HybridRewards),
             (RaylsNetwork::Testnet, RaylsHardFork::EpochCloseSeedV2),
+            (RaylsNetwork::Testnet, RaylsHardFork::CertificateFetchEpochV2),
             (RaylsNetwork::Mainnet, RaylsHardFork::AdminTransfer),
             (RaylsNetwork::Mainnet, RaylsHardFork::RlsStorage),
             (RaylsNetwork::Mainnet, RaylsHardFork::Tokenomics),
             (RaylsNetwork::Mainnet, RaylsHardFork::Uups),
             (RaylsNetwork::Mainnet, RaylsHardFork::HybridRewards),
             (RaylsNetwork::Mainnet, RaylsHardFork::EpochCloseSeedV2),
+            (RaylsNetwork::Mainnet, RaylsHardFork::CertificateFetchEpochV2),
             (RaylsNetwork::Local, RaylsHardFork::UsdrSupplyCorrection),
         ];
         for (network, fork) in never_forks {
@@ -121,21 +124,21 @@ mod schedule {
     }
 
     /// The version byte reports the highest version byte among the forks *active* at the
-    /// block, not the most recently crossed block. EpochCloseSeedV2 (0x10) is genesis-active
-    /// on local, so it owns the byte across every later activation (HybridRewards at 0x0d
-    /// included). On real networks it is Never, so there the highest active fork still
-    /// advances the byte normally.
+    /// block, not the most recently crossed block. CertificateFetchEpochV2 (0x11) is
+    /// genesis-active on local, so it owns the byte across every later activation
+    /// (HybridRewards at 0x0d included). On real networks it is Never, so there the highest
+    /// active fork still advances the byte normally.
     #[test]
     fn version_byte_is_the_max_active_fork_code() {
         let hardforks = RaylsChainHardforks::local();
         let block = activation_block(&hardforks, RaylsHardFork::HybridRewards);
-        assert_eq!(hardforks.version_byte_at_block(0), Some(0x10));
-        assert_eq!(hardforks.version_byte_at_block(block - 1), Some(0x10));
-        assert_eq!(hardforks.version_byte_at_block(block), Some(0x10));
-        assert_eq!(hardforks.version_byte_at_block(1_000_000), Some(0x10));
+        assert_eq!(hardforks.version_byte_at_block(0), Some(0x11));
+        assert_eq!(hardforks.version_byte_at_block(block - 1), Some(0x11));
+        assert_eq!(hardforks.version_byte_at_block(block), Some(0x11));
+        assert_eq!(hardforks.version_byte_at_block(1_000_000), Some(0x11));
     }
 
-    /// Every network schedule lists all 16 hardforks in variant order.
+    /// Every network schedule lists all 17 hardforks in variant order.
     #[test]
     fn schedule_contains_all_hardforks_in_order_for_all_networks() {
         for network in [
@@ -194,6 +197,7 @@ mod schedule {
                 (RaylsHardFork::OutputSeqNormalization, ForkCondition::Block(12_231_705)),
                 (RaylsHardFork::SenderAffinityLoadBalancing, ForkCondition::Block(12_231_705)),
                 (RaylsHardFork::EpochCloseSeedV2, ForkCondition::Never),
+                (RaylsHardFork::CertificateFetchEpochV2, ForkCondition::Never),
             ],
         );
     }
@@ -221,6 +225,7 @@ mod schedule {
                 (RaylsHardFork::OutputSeqNormalization, ForkCondition::Block(17_300_000)),
                 (RaylsHardFork::SenderAffinityLoadBalancing, ForkCondition::Block(17_300_000)),
                 (RaylsHardFork::EpochCloseSeedV2, ForkCondition::Never),
+                (RaylsHardFork::CertificateFetchEpochV2, ForkCondition::Never),
             ],
         );
     }
