@@ -8285,6 +8285,7 @@ dependencies = [
  "hex",
  "indexmap 2.13.0",
  "libp2p",
+ "metrics",
  "once_cell",
  "parking_lot",
  "rand 0.9.3",
@@ -8302,6 +8303,7 @@ dependencies = [
  "serde_yaml",
  "thiserror 1.0.69",
  "tokio",
+ "tokio-metrics",
  "tracing",
  "tracing-subscriber 0.3.23",
 ]
@@ -8368,6 +8370,7 @@ dependencies = [
  "rayls-middleware-rewards",
  "rayls-testing-test-utils",
  "reth-db",
+ "reth-node-metrics",
  "roaring 0.10.12",
  "serde_json",
  "sysinfo",
@@ -8445,6 +8448,7 @@ dependencies = [
  "ethereum-tx-sign",
  "eyre",
  "fdlimit",
+ "humantime",
  "rayls-execution-evm",
  "rayls-infrastructure-config",
  "rayls-infrastructure-storage",
@@ -13073,6 +13077,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "tokio-metrics"
+version = "0.5.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "01f967a7d11cf59ebeb361546fcc207763de7a885db18176e7042dfc28665f1c"
+dependencies = [
+ "futures-util",
+ "metrics",
+ "pin-project-lite",
+ "tokio",
+ "tokio-stream",
+]
+
+[[package]]
 name = "tokio-rustls"
 version = "0.24.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -14105,7 +14122,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.48.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

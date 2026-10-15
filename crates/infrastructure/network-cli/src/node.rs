@@ -21,7 +21,9 @@ use rayls_infrastructure_types::Committee;
 use rayls_infrastructure_types::{BuildMetadata, RaylsNetwork};
 use rayls_middleware_orchestrator::engine::RaylsBuilder;
 use rayon::ThreadPoolBuilder;
-use std::{net::SocketAddr, path::PathBuf, sync::Arc, thread::available_parallelism};
+use std::{
+    net::SocketAddr, path::PathBuf, sync::Arc, thread::available_parallelism, time::Duration,
+};
 use tracing::*;
 
 /// Chain-ids that must never be paired with `--dev`. Mainnet only (`72957`) —
@@ -68,6 +70,22 @@ pub struct NodeCommand<Ext: clap::Args + fmt::Debug = NoArgs> {
     /// consensus metrics stay off.
     #[arg(long, value_name = "SOCKET", value_parser = parse_socket_address, help_heading = "Consensus Metrics")]
     pub metrics: Option<SocketAddr>,
+
+    /// Report tokio runtime metrics and per-task poll time / scheduling delay, sampled at this
+    /// interval (5s when the flag is given without a value).
+    ///
+    /// Published on the `--reth-metrics` endpoint as `reth_tokio_*` (runtime) and
+    /// `reth_tokio_task_*{task="<kind>"}` (tasks spawned through the task manager). Mean poll
+    /// time and the poll-time histogram also need a `RUSTFLAGS="--cfg tokio_unstable"` build.
+    #[arg(
+        long = "tokio-metrics",
+        value_name = "INTERVAL",
+        num_args = 0..=1,
+        default_missing_value = "5s",
+        value_parser = humantime::parse_duration,
+        help_heading = "Consensus Metrics"
+    )]
+    pub tokio_metrics: Option<Duration>,
 
     /// Add a new instance of a node.
     ///
@@ -326,6 +344,7 @@ impl<Ext: clap::Args + fmt::Debug> NodeCommand<Ext> {
             #[cfg(feature = "dev-single-node-setup")]
                 dev: _, // Used above
             metrics,
+            tokio_metrics,
             instance,
             with_unused_ports,
             reth,
@@ -348,6 +367,12 @@ impl<Ext: clap::Args + fmt::Debug> NodeCommand<Ext> {
             .or(rayls_infrastructure_config.parameters.reth_metrics_address);
         if let Some(addr) = reth.reth_metrics.prometheus {
             info!(target: "cli", %addr, "reth execution-layer Prometheus metrics enabled");
+        }
+        if let Some(interval) = tokio_metrics {
+            if reth.reth_metrics.prometheus.is_none() {
+                warn!(target: "cli", "--tokio-metrics is published on the --reth-metrics endpoint, which is off");
+            }
+            info!(target: "cli", ?interval, "tokio runtime/task metrics enabled");
         }
 
         debug!(target: "cli", "node command genesis: {:#?}", rayls_infrastructure_config.genesis());
@@ -394,7 +419,8 @@ impl<Ext: clap::Args + fmt::Debug> NodeCommand<Ext> {
             healthcheck,
             consensus_db.database_args(),
             build_metadata,
-        );
+        )
+        .with_tokio_metrics(tokio_metrics);
 
         launcher(builder, ext, rl_datadir, passphrase)
     }

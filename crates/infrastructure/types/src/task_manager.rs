@@ -1,6 +1,6 @@
 //! Task manager interface to spawn tasks to the tokio runtime.
 
-use crate::Notifier;
+use crate::{task_metrics, Notifier};
 use futures::{future::BoxFuture, stream::FuturesUnordered, FutureExt, StreamExt};
 use std::{
     collections::HashMap,
@@ -101,7 +101,7 @@ where
     F: Future + Send + 'static,
     F::Output: Send + 'static,
 {
-    let handle = tokio::spawn(async move {
+    let handle = task_metrics::spawn(&name, async move {
         tokio::select! {
             _ = rx_shutdown => {}
             _ = future => {}
@@ -216,11 +216,10 @@ impl TaskSpawner {
         E: std::fmt::Debug + Send + 'static,
     {
         let name = name.to_string();
-        let handle = tokio::spawn(critical_result_wrapper(
-            name.clone(),
-            self.local_shutdown.subscribe(),
-            future,
-        ));
+        let handle = task_metrics::spawn(
+            &name,
+            critical_result_wrapper(name.clone(), self.local_shutdown.subscribe(), future),
+        );
         if let Err(err) = self.new_task_tx.try_send(TaskHandle::with_kind(
             name.clone(),
             handle,
@@ -246,7 +245,7 @@ impl TaskSpawner {
         E: std::fmt::Debug + Send + 'static,
     {
         let name = name.to_string();
-        let handle = tokio::spawn(result_task_wrapper(name.clone(), future));
+        let handle = task_metrics::spawn(&name, result_task_wrapper(name.clone(), future));
         if let Err(err) = self.new_task_tx.try_send(TaskHandle::with_kind(
             name.clone(),
             handle,
@@ -298,12 +297,12 @@ impl TaskSpawner {
         // kill them the moment local_shutdown is notified (which join_internal does,
         // after producers are reaped) instead of letting them drain.
         let handle = if kind == TaskKind::Drainable {
-            tokio::spawn(async move {
+            task_metrics::spawn(&name, async move {
                 future.await;
             })
         } else {
             let rx_shutdown = self.local_shutdown.subscribe();
-            tokio::spawn(async move {
+            task_metrics::spawn(&name, async move {
                 tokio::select! {
                     _ = rx_shutdown => {}
                     _ = future => {}
@@ -370,7 +369,7 @@ impl TaskSpawner {
             let handle = tokio::runtime::Handle::current();
             tokio::task::spawn_blocking(move || handle.block_on(f))
         } else {
-            tokio::spawn(f)
+            task_metrics::spawn(name, f)
         };
 
         if let Err(err) = self.new_task_tx.try_send(TaskHandle::with_kind(
@@ -456,11 +455,10 @@ impl TaskManager {
         E: std::fmt::Debug + Send + 'static,
     {
         let name = name.to_string();
-        let handle = tokio::spawn(critical_result_wrapper(
-            name.clone(),
-            self.local_shutdown.subscribe(),
-            future,
-        ));
+        let handle = task_metrics::spawn(
+            &name,
+            critical_result_wrapper(name.clone(), self.local_shutdown.subscribe(), future),
+        );
         self.tasks.push(TaskHandle::with_kind(name, handle, true, TaskKind::Doomed));
     }
 
@@ -502,12 +500,12 @@ impl TaskManager {
         // kill them the moment local_shutdown is notified (which join_internal does,
         // after producers are reaped) instead of letting them drain.
         let handle = if kind == TaskKind::Drainable {
-            tokio::spawn(async move {
+            task_metrics::spawn(&name, async move {
                 future.await;
             })
         } else {
             let rx_shutdown = self.local_shutdown.subscribe();
-            tokio::spawn(async move {
+            task_metrics::spawn(&name, async move {
                 tokio::select! {
                     _ = rx_shutdown => {}
                     _ = future => {}
