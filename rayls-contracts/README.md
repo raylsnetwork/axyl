@@ -26,6 +26,48 @@ To run the smart contract tests, which will run for a bit to fuzz thoroughly, us
 
 The fork tests will require you to add a Sepolia and rayls-network RPC url to the .env file.
 
+## Static Analysis
+
+CI runs [Slither](https://github.com/crytic/slither) on every PR that touches `rayls-contracts/` (the `Slither` job in `.github/workflows/pr.yaml`) and posts the results as a PR comment. The job fails on any Medium or High finding; Low and Informational findings are listed but don't fail it.
+
+To run it locally (Python >= 3.10):
+
+```sh
+pip install slither-analyzer==0.11.6
+slither . --config-file slither.config.json
+```
+
+Slither runs `forge clean` before compiling, so `out/` and `cache/` are rebuilt afterwards.
+
+### Ignore list
+
+Findings that don't apply to these contracts are suppressed in one of two places, always with a reason.
+
+**Whole detectors** are excluded in `slither.config.json` (`detectors_to_exclude`):
+
+| Detector | Why it's excluded |
+| --- | --- |
+| `naming-convention`, `similar-names`, `too-many-digits`, `pragma`, `solc-version` | Style and compiler-version lints; the compiler is pinned in `foundry.toml`. |
+| `assembly`, `low-level-calls` | Informational markers for ERC-7201 storage access, the BLS precompile calls and native transfers, all by design. |
+| `uninitialized-local` | Flags the `uint256 total;` idiom; Solidity zero-initializes locals. |
+| `calls-loop` | Epoch-close loops run over the bounded active validator set and only call our own system contracts. |
+| `reentrancy-events` | Only about event ordering after external calls; the state-changing reentrancy detectors stay enabled. |
+| `costly-loop`, `cyclomatic-complexity`, `boolean-equal` | Gas and style hints. |
+
+Optimization-level detectors are off too (`exclude_optimization`), and `test/`, `script/` and `src/mocks/` are not analyzed (`filter_paths`).
+
+**Individual findings** are suppressed inline, directly above the flagged line, with the reason in the comment before the directive:
+
+```solidity
+// Emergency withdrawal: `to` is chosen by DEFAULT_ADMIN_ROLE by design.
+// slither-disable-next-line arbitrary-send-eth
+(bool success,) = to.call{value: amount}("");
+```
+
+`grep -rn -B2 'slither-disable' src/` lists them all with their reasons. Inline directives move with the code; Slither's central triage file (`slither.db.json`) keys findings by byte offset, so unrelated edits would silently invalidate it.
+
+When Slither flags new code, fix it or add a directive with a reason. `slither . --config-file slither.config.json --warn-unused-ignores` reports directives that no longer suppress anything (ignore the one it flags in OpenZeppelin's `Panic.sol`).
+
 ## ConsensusRegistry Contract
 
 ### Overview

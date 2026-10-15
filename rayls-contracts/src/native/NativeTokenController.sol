@@ -99,6 +99,8 @@ contract NativeTokenController is
     }
 
     // ── Storage gap for upgrade safety ──────────────────────────────────
+    // Storage gap reserved for future upgrades.
+    // slither-disable-next-line unused-state
     uint256[50] private __gap;
 
     // ── Role management helpers (callable by DEFAULT_ADMIN_ROLE) ───────

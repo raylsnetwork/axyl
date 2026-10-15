@@ -268,6 +268,8 @@ contract ConsensusRegistry is
         if (totalStake > maxStake) {
             totalStake = maxStake;
         }
+        // Flooring is intended: the weight steps up once per full STAKE_TIER_STEP.
+        // slither-disable-next-line divide-before-multiply
         uint256 tiers = (totalStake - STAKE_TIER_MIN) / STAKE_TIER_STEP;
         return MAX_BPS + tiers * STAKE_TIER_BONUS_BPS;
     }
@@ -333,6 +335,9 @@ contract ConsensusRegistry is
             } else {
                 // apply pool slash before burning
                 if (poolSlash > 0) {
+                    // DelegationPool is the owner-set system contract (applyPoolSlash is onlyConsensusRegistry) and
+                    // only moves RLS, which has no transfer hooks; applySlashes is onlySystemCall.
+                    // slither-disable-next-line reentrancy-no-eth
                     uint256 slashed = IDelegationPool(pool).applyPoolSlash(
                         slash.validatorAddress,
                         poolSlash
@@ -421,6 +426,8 @@ contract ConsensusRegistry is
     /// @inheritdoc IConsensusRegistry
     function isRetired(address validatorAddress) public view returns (bool) {
         if (
+            // Enum comparison, not a balance check.
+            // slither-disable-next-line incorrect-equality
             validators[validatorAddress].currentStatus ==
             ValidatorStatus.Undefined
         ) {
@@ -435,6 +442,8 @@ contract ConsensusRegistry is
     function getRewards(
         address validatorAddress
     ) public view override returns (uint256) {
+        // Deliberately the validator's own stake version, not the global StakeManager.stakeVersion.
+        // slither-disable-next-line shadowing-local
         uint8 stakeVersion = validators[validatorAddress].stakeVersion;
         uint256 initialStake = versions[stakeVersion].stakeAmount;
 
@@ -457,6 +466,8 @@ contract ConsensusRegistry is
         address validatorAddress,
         address delegator
     ) external view override returns (bytes32) {
+        // Deliberately the current epoch's stake version, not the StakeManager.stakeVersion slot.
+        // slither-disable-next-line shadowing-local
         uint8 stakeVersion = getCurrentEpochInfo().stakeVersion;
         uint64 nonce = delegations[validatorAddress].nonce;
         bytes32 blsPubkeyHash = keccak256(blsPubkey);
@@ -785,6 +796,8 @@ contract ConsensusRegistry is
         bytes calldata blsPubkey,
         address validatorAddress,
         bool isDelegated,
+        // Caller-supplied version to record; shares only the name with StakeManager.stakeVersion.
+        // slither-disable-next-line shadowing-local
         uint8 stakeVersion,
         uint256 stakeAmt
     ) internal {
