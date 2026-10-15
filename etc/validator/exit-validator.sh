@@ -16,7 +16,7 @@ set +a
 # PRIVATE KEY
 if [ -z "$PRIVATE_KEY" ]; then
     echo "Enter private key:"
-    read PRIVATE_KEY
+    read -r PRIVATE_KEY
     if [ -z "$PRIVATE_KEY" ]; then
         echo "Error: Private key is required."
         exit 1
@@ -26,7 +26,7 @@ fi
 # RPC_URL
 if [ -z "$RPC_URL" ]; then
     echo "Enter RPC URL:"
-    read RPC_URL
+    read -r RPC_URL
     if [ -z "$RPC_URL" ]; then
         echo "Error: RPC URL is required."
         exit 1
@@ -34,9 +34,7 @@ if [ -z "$RPC_URL" ]; then
 fi
 
 # registry contract address - if not supplied, use default value
-if [ -z "$REGISTRY_CONTRACT_ADDRESS" ]; then
-    REGISTRY_CONTRACT_ADDRESS="0x07E17e17E17e17E17e17E17E17E17e17e17E17e1"
-fi
+REGISTRY_CONTRACT_ADDRESS="${REGISTRY_CONTRACT_ADDRESS:-0x07E17e17E17e17E17e17E17E17E17e17e17E17e1}"
 
 
 # extract stake calldata from output
