@@ -270,6 +270,37 @@ interface IDelegationPool {
         address validatorAddress
     ) external view returns (uint256);
 
+    /// @notice Get a validator's self-delegated stake — its own capital in its own pool
+    /// @dev "Self" is `delegator == validatorAddress`, the only association the pool can prove.
+    ///      A validator funding its pool from a separate address is indistinguishable from a
+    ///      third-party delegator here and is NOT counted.
+    /// @dev Derived from the validator's own position rather than a stored counter, so it cannot
+    ///      drift: pool totals drop the instant a slash lands while positions shrink lazily at
+    ///      their next settlement, and a running counter would diverge across that gap.
+    /// @param validatorAddress The validator whose pool to query
+    /// @return _ The validator's own effective stake, after applying any pending slash
+    function getSelfDelegatedStake(
+        address validatorAddress
+    ) external view returns (uint256);
+
+    /// @notice Split a validator's delegated backing into its own capital and everyone else's
+    /// @dev Reporting only — reward, commission, slashing and stake-tier maths are unchanged and
+    ///      still treat self-delegated capital exactly like third-party delegation.
+    /// @param validatorAddress The validator whose pool to query
+    /// @return selfDelegated Validator's own effective stake (see `getSelfDelegatedStake`)
+    /// @return thirdPartyDelegated Everyone else's stake, derived as `total - self`. Per-position
+    ///         slashes round up while the pool total does not, so `self` settles marginally low
+    ///         and this figure runs marginally HIGH — wei-scale dust after a slash, never a
+    ///         shortfall. Treat `selfDelegated` as the exact number and this as the remainder
+    /// @return totalDelegated Pool total across both tiers, as `getTotalDelegatedStake` reports
+    function getDelegationComposition(
+        address validatorAddress
+    ) external view returns (
+        uint256 selfDelegated,
+        uint256 thirdPartyDelegated,
+        uint256 totalDelegated
+    );
+
     /// @notice Get a delegator's pending (unclaimed) rewards
     function getPendingRewards(
         address validatorAddress,
