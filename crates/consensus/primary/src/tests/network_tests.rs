@@ -657,12 +657,12 @@ fn test_skip_bitmap_is_refused_before_decoding() {
     assert!(CertificateCollector::new(honest, config.clone(), CertScope::Current).is_ok());
 }
 
-/// The server decodes a skip bitmap only for committee members.
+/// The server decodes a skip bitmap only for an origin it serves.
 ///
-/// An identical bitmap that is refused for a committee member is ignored for an outsider, so a
-/// crafted bitmap costs no decode unless its origin is one this node serves.
+/// For the current epoch that is a committee member, so an outsider's bitmap costs no decode.
+/// The previous epoch's tail is served for every named origin, so there it is decoded.
 #[test]
-fn test_skip_bitmap_decoded_only_for_committee_members() {
+fn test_skip_bitmap_decoded_only_for_served_origins() {
     use crate::state_sync::CertificateCollector;
 
     let fixture = CommitteeFixture::builder(MemDatabase::default).build();
@@ -684,7 +684,15 @@ fn test_skip_bitmap_decoded_only_for_committee_members() {
         Some(PrimaryNetworkError::StdIo(_))
     );
     // An outsider's identical bitmap is never decoded, so the request is accepted.
-    assert!(
-        CertificateCollector::new(request(outsider), config.clone(), CertScope::Current).is_ok()
+    assert!(CertificateCollector::new(
+        request(outsider.clone()),
+        config.clone(),
+        CertScope::Current
+    )
+    .is_ok());
+    // For the previous epoch the same outsider's bitmap is decoded and refused.
+    assert_matches!(
+        CertificateCollector::new(request(outsider), config.clone(), CertScope::PrevEpoch).err(),
+        Some(PrimaryNetworkError::StdIo(_))
     );
 }
