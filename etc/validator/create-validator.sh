@@ -70,7 +70,7 @@ export RL_BLS_PASSPHRASE
 # ADDRESS
 if [ -z "$ADDRESS" ]; then
     echo "Enter validator address:"
-    read ADDRESS
+    read -r ADDRESS
     if [ -z "$ADDRESS" ]; then
         echo "Error: Validator address is required."
         exit 1
@@ -94,7 +94,7 @@ if [ "$CONFIG_ONLY" = false ]; then
     # ADMIN PRIVATE KEY
     if [ -z "$ADMIN_PRIVATE_KEY" ]; then
         echo "Enter admin private key:"
-        read ADMIN_PRIVATE_KEY
+        read -r ADMIN_PRIVATE_KEY
         if [ -z "$ADMIN_PRIVATE_KEY" ]; then
             echo "Error: Admin private key is required."
             exit 1
@@ -104,7 +104,7 @@ if [ "$CONFIG_ONLY" = false ]; then
     # PRIVATE KEY
     if [ -z "$PRIVATE_KEY" ]; then
         echo "Enter private key:"
-        read PRIVATE_KEY
+        read -r PRIVATE_KEY
         if [ -z "$PRIVATE_KEY" ]; then
             echo "Error: Private key is required."
             exit 1
@@ -114,7 +114,7 @@ if [ "$CONFIG_ONLY" = false ]; then
     # RPC_URL
     if [ -z "$RPC_URL" ]; then
         echo "Enter RPC URL:"
-        read RPC_URL
+        read -r RPC_URL
         if [ -z "$RPC_URL" ]; then
             echo "Error: RPC URL is required."
             exit 1
@@ -124,7 +124,7 @@ if [ "$CONFIG_ONLY" = false ]; then
     # STAKE_AMOUNT
     if [ -z "$STAKE_AMOUNT" ]; then
         echo "Enter stake amount:"
-        read STAKE_AMOUNT
+        read -r STAKE_AMOUNT
         if [ -z "$STAKE_AMOUNT" ]; then
             echo "Error: Stake amount is required."
             exit 1
@@ -132,9 +132,7 @@ if [ "$CONFIG_ONLY" = false ]; then
     fi
 
     # registry contract address - if not supplied, use default value
-    if [ -z "$REGISTRY_CONTRACT_ADDRESS" ]; then
-        REGISTRY_CONTRACT_ADDRESS="0x07E17e17E17e17E17e17E17E17E17e17e17E17e1"
-    fi
+    REGISTRY_CONTRACT_ADDRESS="${REGISTRY_CONTRACT_ADDRESS:-0x07E17e17E17e17E17e17E17E17E17e17e17E17e1}"
 fi
 
 # root path for the validator
@@ -180,6 +178,11 @@ cp "${GENESISDIR}/../parameters.yaml" "${DATADIR}/"
 # stake calldata only depends on node-info.yaml (public BLS key + proof of possession)
 CALLDATA_RES=$("${RAYLS_BIN}" keytool stake-calldata --datadir "${DATADIR}")
 CALLDATA=$(echo "$CALLDATA_RES" | grep 'Calldata:' | awk '{print $2}')
+if ! [[ "$CALLDATA" =~ ^0x[0-9a-fA-F]+$ ]]; then
+    echo "Error: failed to extract calldata from keytool output."
+    echo "Raw output: $CALLDATA_RES"
+    exit 1
+fi
 echo "$CALLDATA" > "${DATADIR}/stake-calldata.txt"
 echo ""
 
@@ -204,12 +207,17 @@ echo "Adding validator to whitelist"
 cast send "$REGISTRY_CONTRACT_ADDRESS" "allowlistValidator(address)" "$ADDRESS" --private-key "$ADMIN_PRIVATE_KEY" --rpc-url "$RPC_URL"
 
 # Get RLS token contract address from registry
-RLS_TOKEN=$(cast call --rpc-url "$RPC_URL" "$REGISTRY_CONTRACT_ADDRESS" "rlsToken()(address)" 2>&1)
+RLS_TOKEN=$(cast call --rpc-url "$RPC_URL" "$REGISTRY_CONTRACT_ADDRESS" "rlsToken()(address)")
 echo "RLS token contract: $RLS_TOKEN"
 
 # Get the required stake amount from the current stake config
-STAKE_CONFIG=$(cast call --rpc-url "$RPC_URL" "$REGISTRY_CONTRACT_ADDRESS" "getCurrentStakeConfig()(uint256,uint256,uint32)" 2>&1)
+STAKE_CONFIG=$(cast call --rpc-url "$RPC_URL" "$REGISTRY_CONTRACT_ADDRESS" "getCurrentStakeConfig()(uint256,uint256,uint32)")
 REQUIRED_STAKE=$(echo "$STAKE_CONFIG" | head -1 | sed 's/\[.*\]//;s/ //g')
+if ! [[ "$REQUIRED_STAKE" =~ ^[0-9]+$ ]]; then
+    echo "Error: failed to extract required stake from stake config output."
+    echo "Raw output: $STAKE_CONFIG"
+    exit 1
+fi
 echo "Required stake amount: $REQUIRED_STAKE"
 
 # Mint RLS tokens to validator address (admin has MINTER_ROLE)
