@@ -187,7 +187,7 @@ async fn run(cli: Cli) -> eyre::Result<()> {
         (Some(path), Some(subnet)) => Some(FileSchedule::load(path, subnet)?),
         _ => None,
     };
-    let selected = SelectedSchedule::select(file_schedule.as_ref(), Some(cli.network))?;
+    let selected = SelectedSchedule::select(file_schedule.as_ref(), Some(cli.network))?; // cli.network defaults to Mainnet; safe because select ignores network when file_schedule is Some, and the shape gate keys on profile.chain_id (from the file)
     verify_datadir_chain_id(base_chain.chain().id(), selected.profile.chain_id, &selected.source)?;
 
     // The snapshot's executed head decides how the shape gate treats the

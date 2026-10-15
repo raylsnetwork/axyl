@@ -251,7 +251,7 @@ mod tests {
 
     /// HybridRewards = Block(5) is rejected.
     #[test]
-    fn hybrid_block_5_is_refused() {
+    fn hybrid_block_5_is_refused_on_new_chain() {
         let profile =
             new_chain_profile(99_999, (RaylsHardFork::HybridRewards, ForkActivation::Block(5)));
         let err = verify_schedule_shape(&profile, 0).unwrap_err();
@@ -293,7 +293,7 @@ mod tests {
         assert!(err.to_string().contains("Uups"));
     }
 
-    /// Set A forks at Never are disllowed.
+    /// Set A forks at Never are disallowed.
     #[test]
     fn set_a_at_never_is_disallowed() {
         let profile =

@@ -7,7 +7,7 @@
 //! schedule arrays (`devnet`, `testnet`, `mainnet`, `local`). The test
 //! `schedule_matches_declaration_order_for_all_networks` enforces this at runtime.
 //!
-//! NOTE: `UsdrSupplyCorrection` is scheduled (`Block(...)`) on mainnet and local;
+//! NOTE: `UsdrSupplyCorrection` is scheduled (`Block(...)`) on mainnet;
 //! testnet/devnet stay `Never` until an activation block is chosen operationally.
 //! Flip a `Never` entry in a schedule below to `ForkCondition::Block(<chosen block>)`
 //! when ready. See `crates/execution/evm/src/evm/hardforks/usdr_supply_correction.rs`.
@@ -39,26 +39,19 @@ impl RaylsHardFork {
         [
             ScheduledFork::new(Self::Eip1559, ForkCondition::Block(0)),
             ScheduledFork::new(Self::BatchDigestV2, ForkCondition::Block(0)),
-            // Planned activation: block 150.
             ScheduledFork::new(Self::AdminTransfer, ForkCondition::Block(0)),
             ScheduledFork::new(Self::PrecompileGasFix, ForkCondition::Block(0)),
-            // Planned activation: block 200.
             ScheduledFork::new(Self::RlsStorage, ForkCondition::Block(0)),
-            // Planned activation: block 250. TODO: set to actual devnet block before deploy.
             ScheduledFork::new(Self::Tokenomics, ForkCondition::Block(0)),
-            // Planned activation: block 2_506_000.
             ScheduledFork::new(Self::Uups, ForkCondition::Block(0)),
             ScheduledFork::new(Self::Erc20PrecompileBytecode, ForkCondition::Block(1)),
             ScheduledFork::new(Self::TransactionLoadBalancing, ForkCondition::Block(0)),
             ScheduledFork::new(Self::UsdrSupplyCorrection, ForkCondition::Never),
-            // Active from genesis.
             ScheduledFork::new(Self::EmptyOutputBlock, ForkCondition::Block(0)),
-            // Never until SRE schedules a concrete devnet activation block.
             ScheduledFork::new(Self::DynamicCommitteeSizing, ForkCondition::Block(0)),
             // Never until SRE schedules a concrete devnet activation block.
             ScheduledFork::new(Self::HybridRewards, ForkCondition::Never),
             ScheduledFork::new(Self::OutputSeqNormalization, ForkCondition::Block(0)),
-            // Never until an operational activation block is chosen; the mechanism ships dormant.
             ScheduledFork::new(Self::SenderAffinityLoadBalancing, ForkCondition::Block(0)),
             // Never until SRE schedules an activation block: changes epoch-closing block hashes.
             ScheduledFork::new(Self::EpochCloseSeedV2, ForkCondition::Never),
@@ -87,7 +80,6 @@ impl RaylsHardFork {
             // Never until SRE schedules a concrete testnet activation block.
             ScheduledFork::new(Self::HybridRewards, ForkCondition::Never),
             ScheduledFork::new(Self::OutputSeqNormalization, ForkCondition::Block(17_300_000)),
-            // Never until an operational activation block is chosen; the mechanism ships dormant.
             ScheduledFork::new(Self::SenderAffinityLoadBalancing, ForkCondition::Block(17_300_000)),
             // Never until SRE schedules an activation block: changes epoch-closing block hashes.
             ScheduledFork::new(Self::EpochCloseSeedV2, ForkCondition::Never),
@@ -115,9 +107,7 @@ impl RaylsHardFork {
             // Never until SRE schedules a concrete mainnet activation block (the reward-fairness
             // rollout for #633); the in-place migration re-links BlsG1 from the live contract.
             ScheduledFork::new(Self::HybridRewards, ForkCondition::Never),
-            // Never until SRE schedules a concrete mainnet activation block.
             ScheduledFork::new(Self::OutputSeqNormalization, ForkCondition::Block(12_231_705)),
-            // Never until an operational activation block is chosen; the mechanism ships dormant.
             ScheduledFork::new(Self::SenderAffinityLoadBalancing, ForkCondition::Block(12_231_705)),
             // Never until SRE schedules an activation block: changes epoch-closing block hashes.
             ScheduledFork::new(Self::EpochCloseSeedV2, ForkCondition::Never),
@@ -145,10 +135,6 @@ impl RaylsHardFork {
             // for the precompile's TOTAL_SUPPLY slot to survive EIP-161 - this MUST be ≥ 1.
             ScheduledFork::new(Self::Erc20PrecompileBytecode, ForkCondition::Block(1)),
             ScheduledFork::new(Self::TransactionLoadBalancing, ForkCondition::Block(0)),
-            // Manual end-to-end testing of the hardfork (start chain → mint/burn → wait for
-            // activation → verify totalSupply). Block 100 hits ~7 s into a fresh local devnet
-            // at the 4-validator DAG cadence (≈15 EVM blocks/sec), so the pre-fork window is
-            // short but enough to run one mint/burn round.
             ScheduledFork::new(Self::UsdrSupplyCorrection, ForkCondition::Never),
             ScheduledFork::new(Self::EmptyOutputBlock, ForkCondition::Block(0)),
             ScheduledFork::new(Self::DynamicCommitteeSizing, ForkCondition::Block(0)),
