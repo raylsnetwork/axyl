@@ -820,9 +820,11 @@ where
                         worker.id(),
                         worker.network_handle(),
                         self.consensus_bus.executed_anchor().subscribe(),
-                        // peer-derived latest header: the catch-up gate compares it against the
-                        // executed anchor so a lagging node never re-sends
+                        // peer-derived latest header and gossip tip: the catch-up gate compares
+                        // the higher one against the executed anchor, so a lagging node never
+                        // re-sends
                         self.consensus_bus.last_consensus_header().subscribe(),
+                        self.consensus_bus.last_published_consensus_num_hash().subscribe(),
                         // slot-ordered (authorities sorted by id), matching receiver-side dispatch
                         primary
                             .current_committee()

@@ -21,7 +21,7 @@ use rayls_execution_evm::{
     PoolTxn, WorkerTxPool,
 };
 use rayls_infrastructure_types::{
-    fxhash_slot_digest, ring_walk, B256Set, BlsPublicKey, Bytes, ConsensusHeader,
+    fxhash_slot_digest, ring_walk, B256Set, BlockHash, BlsPublicKey, Bytes, ConsensusHeader,
     Encodable2718 as _, TaskKind, TaskSpawner, TxHash,
 };
 use std::{
@@ -210,6 +210,10 @@ pub(super) struct TxnForwarder {
     executed_anchor: watch::Receiver<ConsensusHeader>,
     /// The latest consensus header this node has seen, used to gate re-sends when lagging.
     last_seen_header: watch::Receiver<ConsensusHeader>,
+    /// The network tip number f+1 validators signed in consensus gossip, also gating re-sends.
+    /// While the next epoch's threshold key is pending, state sync verifies nothing past this
+    /// epoch's boundary, so the header above can stay epochs below the network.
+    network_tip: watch::Receiver<(u64, BlockHash)>,
     /// The committee, slot-ordered (authorities sorted by id), matching receiver-side dispatch.
     committee: Vec<BlsPublicKey>,
     /// Re-evaluated each tick so the sender-affinity fork can activate mid-epoch.
@@ -234,6 +238,7 @@ impl TxnForwarder {
         network_handle: WorkerNetworkHandle,
         executed_anchor: watch::Receiver<ConsensusHeader>,
         last_seen_header: watch::Receiver<ConsensusHeader>,
+        network_tip: watch::Receiver<(u64, BlockHash)>,
         committee: Vec<BlsPublicKey>,
         direct_submit: Box<dyn Fn() -> bool + Send + Sync>,
         max_gossip_message_size: usize,
@@ -250,6 +255,7 @@ impl TxnForwarder {
             marks,
             executed_anchor,
             last_seen_header,
+            network_tip,
             committee,
             direct_submit,
             gossip_budget,
@@ -291,7 +297,11 @@ impl TxnForwarder {
         // First sends of new transactions always flow; re-sends are gated while this node lags,
         // because a node behind the network cannot tell a lost send from its own lag and must not
         // re-flood transactions the network may already have executed.
-        let allow_resend = Self::is_caught_up(self.last_seen_header.borrow().number, anchor);
+        let allow_resend = Self::resend_allowed(
+            self.last_seen_header.borrow().number,
+            self.network_tip.borrow().0,
+            anchor,
+        );
         if !allow_resend {
             self.metrics.on_resend_gated();
             debug!(target: "worker::txn_forwarder", anchor, "local execution behind the seen header; re-sends gated, first sends still flow");
@@ -521,10 +531,17 @@ impl TxnForwarder {
         }
     }
 
+    /// Whether re-sends may flow: execution is close to the higher of the state-sync header and the
+    /// gossip tip. The state-sync header stops at this epoch's boundary while the next epoch's
+    /// threshold key is pending, so on its own it would open the gate epochs behind the network.
+    fn resend_allowed(seen_header: u64, network_tip: u64, anchor: u64) -> bool {
+        Self::is_caught_up(seen_header.max(network_tip), anchor)
+    }
+
     /// Whether local execution is close enough to the peer-latest header to allow re-sends.
     ///
     /// The `seen >= anchor` guard rejects an understated `seen`, which happens when
-    /// `last_consensus_header` resets at an epoch transition.
+    /// `last_consensus_header` and the gossip tip reset at an epoch transition.
     fn is_caught_up(seen: u64, anchor: u64) -> bool {
         seen >= anchor && seen - anchor <= RESEND_MAX_LOCAL_LAG
     }
@@ -611,6 +628,22 @@ mod tests {
         assert!(
             !TxnForwarder::is_caught_up(99, 100),
             "seen below anchor (epoch reset) is not caught up"
+        );
+    }
+
+    /// While the next epoch's threshold key is pending, state sync stops at this epoch's boundary;
+    /// the gossip tip still shows how far behind the network the node is.
+    #[test]
+    fn resends_stay_gated_while_the_gossip_tip_is_far_ahead() {
+        let boundary = 1_000;
+        assert!(
+            !TxnForwarder::resend_allowed(boundary, boundary + 500, boundary - 5),
+            "near the boundary but epochs behind the network"
+        );
+        assert!(TxnForwarder::resend_allowed(boundary, boundary + 10, boundary - 5));
+        assert!(
+            TxnForwarder::resend_allowed(boundary, 0, boundary - 5),
+            "a gossip tip not seen yet leaves the state-sync header in charge"
         );
     }
 

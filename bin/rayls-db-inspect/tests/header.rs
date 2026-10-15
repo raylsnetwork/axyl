@@ -8,9 +8,9 @@ mod common;
 use common::*;
 use rayls_db_inspect::{
     node_db::Tier,
-    report::header::{cert, header, header_check, Link, Lookup, Unverifiable},
+    report::header::{cert, header, header_check, Link, Lookup, NoOutcome, Unverifiable},
 };
-use rayls_infrastructure_types::{Database as _, B256};
+use rayls_infrastructure_types::{Certificate, Database as _, B256};
 
 #[test]
 fn header_agrees_across_nodes() {
@@ -371,7 +371,7 @@ fn missing_epoch_records_make_the_next_epochs_headers_unverifiable() {
     assert!(n.ok, "the links are intact: {}", n.stopped);
     assert_eq!(
         n.unverifiable,
-        vec![Unverifiable { epoch: 2, hops: 4, missing_records: vec![1, 2] }]
+        vec![Unverifiable { epoch: 2, hops: 4, missing_records: vec![1, 2], cause: None }]
     );
     assert_eq!(r.verdict.to_string(), "PARTIAL nodes=1 hops=3 unverifiable=4");
 
@@ -381,4 +381,57 @@ fn missing_epoch_records_make_the_next_epochs_headers_unverifiable() {
         h.nodes[0].signature_check.as_ref().unwrap().to_string(),
         "no committee keys for epoch 2: the source holds no record for epoch 2 or 1"
     );
+}
+
+/// A leader without a signer set, in an epoch the node holds no DKG outcome for, is checked by its
+/// own shape: it cannot be verified, and the report says why. The epoch's leaders that name their
+/// signers still verify, whichever header `header-check` starts from.
+#[test]
+fn a_leader_without_signers_does_not_hide_its_epochs_aggregate_headers() {
+    let fx = Fixture::with_epoch(2);
+    let committee = fx.committee.committee();
+    let mut headers = Vec::new();
+    let mut parent = B256::default();
+    for n in 1..=5u64 {
+        let h = if n == 3 {
+            let dag = fx.committee.first_authority().header_with_round(&committee, n as u32 + 1);
+            let leader = Certificate::new_unsigned_for_test(&committee, dag, vec![]).unwrap();
+            fx.header_with_leader(n, parent, leader)
+        } else {
+            fx.header(n, parent)
+        };
+        parent = h.digest();
+        headers.push(h);
+    }
+    // Epoch 1's record names a boundary this node does not hold, so the outcome of epoch 2 cannot
+    // be computed.
+    let r0 = fx.record(0, None, B256::default());
+    let r1 = fx.record(1, Some(&r0), B256::repeat_byte(0x11));
+    let c1 = fx.certify(&r1, &[0, 1, 2]);
+    let a = SeededNode::new(|db| {
+        for h in &headers {
+            write_header(db, h);
+        }
+        write_epoch(db, &r0, None);
+        write_epoch(db, &r1, Some(&c1));
+    });
+    let nodes = [a.open("a")];
+
+    for (start, back) in [(5, 4), (3, 2)] {
+        let r = header_check(&nodes, start, back).unwrap();
+        let n = &r.nodes[0];
+        for hop in &n.hops {
+            let expected = if hop.number == 3 { "scheme?" } else { "ok" };
+            assert_eq!(hop.verify.word(), expected, "header {} from start {start}", hop.number);
+        }
+        let [unverifiable] = n.unverifiable.as_slice() else {
+            panic!("one epoch unverifiable from start {start}: {:?}", n.unverifiable)
+        };
+        assert_eq!((unverifiable.epoch, unverifiable.hops), (2, 1));
+        assert!(unverifiable.missing_records.is_empty(), "the committee is known");
+        assert!(matches!(
+            unverifiable.cause,
+            Some(NoOutcome::BoundaryNotIndexed { dealing: 1, .. })
+        ));
+    }
 }

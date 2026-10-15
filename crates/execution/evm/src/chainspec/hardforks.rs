@@ -192,6 +192,14 @@ pub trait RaylsHardforks {
         self.is_rayls_fork_active_at_block(RaylsHardFork::CertificateFetchEpochV2, block)
     }
 
+    /// Return true if the ThresholdCertificates fork is active at `block`.
+    ///
+    /// Evaluated at the first block of an epoch: when active there, that epoch's committee runs
+    /// the key generation for the next epoch, which then uses threshold certificates.
+    fn is_threshold_certificates_active_at_block(&self, block: u64) -> bool {
+        self.is_rayls_fork_active_at_block(RaylsHardFork::ThresholdCertificates, block)
+    }
+
     /// Return the max version byte among the forks active at `block`, if any.
     fn version_byte_at_block(&self, block: u64) -> Option<u8> {
         RaylsHardFork::VARIANTS

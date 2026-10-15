@@ -181,6 +181,14 @@ struct CommitteeInner {
     /// The validity threshold (f+1).
     #[serde(skip)]
     validity_threshold: VotingPower,
+    /// The epoch's threshold public polynomial, set when the epoch uses threshold certificates.
+    /// Never serialized: the epoch manager derives it from the previous epoch's committed deals.
+    #[serde(skip)]
+    threshold_key: Option<Arc<crate::crypto::threshold::PublicPolynomial>>,
+    /// Set while the epoch should use threshold certificates but its key is not computed yet:
+    /// nothing verifies under the epoch's scheme until [`Committee::set_threshold_key`].
+    #[serde(skip)]
+    threshold_pending: bool,
     /// The bootstrap servers to initially join a network (probably the initial committee).
     bootstrap_servers: BTreeMap<BlsPublicKey, BootstrapServer>,
 }
@@ -407,6 +415,8 @@ impl Committee {
             authorities_by_id: Default::default(),
             validity_threshold: 0,
             quorum_threshold: 0,
+            threshold_key: None,
+            threshold_pending: false,
             bootstrap_servers,
         };
         committee.load();
@@ -433,6 +443,8 @@ impl Committee {
             authorities_by_id: Default::default(),
             validity_threshold: 0,
             quorum_threshold: 0,
+            threshold_key: None,
+            threshold_pending: false,
             bootstrap_servers,
         };
 
@@ -574,6 +586,44 @@ impl Committee {
     /// Returns all the bls keys of all members.
     pub fn bls_keys(&self) -> Vec<BlsPublicKey> {
         self.inner.read().authorities.values().map(|authority| *authority.protocol_key()).collect()
+    }
+
+    /// Position of `key` in `bls_keys()` order: the index signer bitmaps use and, plus one, the
+    /// threshold share index.
+    pub fn bls_position(&self, key: &BlsPublicKey) -> Option<u32> {
+        self.inner.read().authorities.keys().position(|k| k == key).map(|p| p as u32)
+    }
+
+    /// Position of the authority `id` in `bls_keys()` order.
+    pub fn bls_position_by_id(&self, id: &AuthorityIdentifier) -> Option<u32> {
+        let inner = self.inner.read();
+        let key = inner.authorities_by_id.get(id)?.protocol_key();
+        inner.authorities.keys().position(|k| k == key).map(|p| p as u32)
+    }
+
+    /// The epoch's threshold public polynomial, when the epoch uses threshold certificates.
+    /// Votes are then partial signatures and certificates verify against its group key.
+    pub fn threshold_key(&self) -> Option<Arc<crate::crypto::threshold::PublicPolynomial>> {
+        self.inner.read().threshold_key.clone()
+    }
+
+    /// Makes this a threshold-certificate epoch with the given public polynomial.
+    pub fn set_threshold_key(&self, key: crate::crypto::threshold::PublicPolynomial) {
+        let mut inner = self.inner.write();
+        inner.threshold_key = Some(Arc::new(key));
+        inner.threshold_pending = false;
+    }
+
+    /// Marks the epoch as a threshold-certificate epoch whose key is not computed yet, or clears
+    /// the mark when the key turned out not to exist (the DKG fell back). While marked,
+    /// certificates of the epoch verify under no scheme.
+    pub fn set_threshold_pending(&self, pending: bool) {
+        self.inner.write().threshold_pending = pending;
+    }
+
+    /// True while the epoch's threshold key is not computed yet.
+    pub fn is_threshold_pending(&self) -> bool {
+        self.inner.read().threshold_pending
     }
 
     /// Returns the bootstrap record for key if it exists.

@@ -2,6 +2,7 @@
 mod cold_archive;
 mod consensus;
 mod core;
+mod dkg;
 mod engine;
 mod network;
 mod primary;

@@ -8,7 +8,8 @@ use crate::{
     view::{b256, CertificateSummary, CertificateView},
 };
 use rayls_infrastructure_types::{
-    BlsPublicKey, Certificate, ConsensusHeader, Epoch, SignatureVerificationState, B256,
+    dkg::{DealingReplay, DkgOutcome},
+    BlsPublicKey, Certificate, ConsensusHeader, Epoch, EpochKeys, SignatureVerificationState, B256,
 };
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
@@ -50,6 +51,54 @@ pub enum SignatureCheck {
     Failed { epoch: Epoch, keys: usize, error: String },
     /// The source holds no committee for that epoch (no record for it or the one before).
     NoKeys { epoch: Epoch },
+    /// The certificate has no signer set, so the epoch may use threshold certificates, and the
+    /// source holds the committee but no DKG outcome for the epoch and cannot compute one.
+    SchemeUnknown { epoch: Epoch, keys: usize, cause: NoOutcome },
+}
+
+/// Why the source cannot compute an epoch's DKG outcome from the epoch before, the dealing one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub enum NoOutcome {
+    /// No certified or pending record of the dealing epoch.
+    NoRecord { dealing: Epoch },
+    /// The dealing epoch's boundary, as its record states it, is not in the digest index.
+    BoundaryNotIndexed { dealing: Epoch, boundary: String },
+    /// The dealing epoch's record names a boundary that leads in another epoch.
+    BoundaryInEpoch { dealing: Epoch, leads_in: Epoch },
+    /// A header between the dealing epoch's first header and its boundary is missing.
+    HeaderMissing { number: u64 },
+    /// A header does not link by hash to the boundary above it.
+    LinkBroken { number: u64 },
+}
+
+impl std::fmt::Display for NoOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoRecord { dealing } => write!(
+                f,
+                "no certified or pending record of epoch {dealing}; check its epoch records \
+                 (epoch-check)"
+            ),
+            Self::BoundaryNotIndexed { dealing, boundary } => {
+                write!(f, "epoch {dealing}'s boundary {boundary} is not in the digest index")
+            }
+            Self::BoundaryInEpoch { dealing, leads_in } => {
+                write!(
+                    f,
+                    "epoch {dealing}'s record names a boundary that leads in epoch {leads_in}"
+                )
+            }
+            Self::HeaderMissing { number } => {
+                write!(f, "header {number} is missing; check the chain there (header-check)")
+            }
+            Self::LinkBroken { number } => write!(
+                f,
+                "header {number} does not link to the boundary above it; check the chain there \
+                 (header-check)"
+            ),
+        }
+    }
 }
 
 impl SignatureCheck {
@@ -58,7 +107,7 @@ impl SignatureCheck {
     }
 
     pub fn unverifiable(&self) -> bool {
-        matches!(self, Self::NoKeys { .. })
+        matches!(self, Self::NoKeys { .. } | Self::SchemeUnknown { .. })
     }
 
     /// One word for a table cell.
@@ -68,6 +117,7 @@ impl SignatureCheck {
             Self::Genesis => "genesis",
             Self::Failed { .. } => "FAILED",
             Self::NoKeys { .. } => "no keys",
+            Self::SchemeUnknown { .. } => "scheme?",
         }
     }
 }
@@ -89,6 +139,11 @@ impl std::fmt::Display for SignatureCheck {
                 }
                 Ok(())
             }
+            Self::SchemeUnknown { epoch, keys, cause } => write!(
+                f,
+                "scheme unknown for epoch {epoch} ({keys} keys): no dkg outcome stored, and it \
+                 cannot be computed: {cause}"
+            ),
         }
     }
 }
@@ -110,24 +165,131 @@ pub(crate) fn committee_keys(
     Ok(None)
 }
 
-/// Re-checks one certificate's quorum and aggregate signature.
+/// One epoch's keys as the source knows them.
+// One per epoch looked up; the size gap between the variants does not matter.
+#[allow(clippy::large_enum_variant)]
+#[derive(Clone, Debug)]
+enum KeysLookup {
+    /// The committee and the certificate scheme.
+    Known(EpochKeys, &'static str),
+    /// The committee (this many keys), but not whether the epoch uses threshold certificates.
+    SchemeUnknown(usize, NoOutcome),
+    /// No committee.
+    Missing,
+}
+
+/// [`committee_keys`] with the epoch's certificate scheme: the source's own DKG outcome for the
+/// epoch; else legacy for epochs 0 and 1, for a source no build with threshold certificates ever
+/// opened (it has no outcome table), and for a certificate that names its signers (so a network
+/// where the fork is not active never replays); else, for a certificate without a signer set, the
+/// outcome computed in memory the way the node computes it; else unknown.
+fn epoch_keys(node: &NodeDb, epoch: Epoch, threshold_shaped: bool) -> eyre::Result<KeysLookup> {
+    let Some((keys, keys_from)) = committee_keys(node, epoch)? else {
+        return Ok(KeysLookup::Missing);
+    };
+    let outcome = match node.dkg_outcome(epoch)? {
+        Some(outcome) => outcome,
+        None if epoch <= 1 || !threshold_shaped || !node.has_dkg_outcomes()? => {
+            DkgOutcome::Fallback
+        }
+        None => match compute_outcome(node, epoch)? {
+            Ok(outcome) => outcome,
+            Err(cause) => return Ok(KeysLookup::SchemeUnknown(keys.len(), cause)),
+        },
+    };
+    let group_key = match outcome {
+        DkgOutcome::Key(key) => Some(key.group_key()),
+        DkgOutcome::Fallback => None,
+    };
+    Ok(KeysLookup::Known(EpochKeys { keys, group_key }, keys_from))
+}
+
+/// The DKG outcome for `epoch` computed in memory from the source: the previous epoch's record
+/// (certified, else pending) names the committees and the boundary, and that epoch's headers,
+/// found by walking back from the boundary while the leader epoch matches, are replayed oldest
+/// first. Every row must link by hash to the record's boundary, since the digest index can hold
+/// stale entries and the tiers can disagree on a damaged or forked source. The inner `Err` says
+/// what is missing or broken.
+fn compute_outcome(node: &NodeDb, epoch: Epoch) -> eyre::Result<Result<DkgOutcome, NoOutcome>> {
+    let dealing = epoch - 1;
+    let record = match node.epoch(dealing)? {
+        Some((record, Some(_))) => record,
+        _ => match node.pending_epoch(dealing)? {
+            Some(record) => record,
+            None => return Ok(Err(NoOutcome::NoRecord { dealing })),
+        },
+    };
+    let Some(boundary) = node.header_number_by_digest(record.parent_consensus)? else {
+        let boundary = b256(&record.parent_consensus);
+        return Ok(Err(NoOutcome::BoundaryNotIndexed { dealing, boundary }));
+    };
+    // Walk back keeping only the numbers: an epoch can hold a day of headers.
+    let mut numbers = Vec::new();
+    let mut final_round = None;
+    let mut expected = record.parent_consensus;
+    let mut next = Some(boundary);
+    while let Some(number) = next.filter(|n| *n > 0) {
+        let Some((header, _)) = node.header(number)? else {
+            return Ok(Err(NoOutcome::HeaderMissing { number }));
+        };
+        if header.digest() != expected {
+            return Ok(Err(NoOutcome::LinkBroken { number }));
+        }
+        let leads_in = header.sub_dag.leader_epoch();
+        if leads_in != dealing {
+            if final_round.is_none() {
+                return Ok(Err(NoOutcome::BoundaryInEpoch { dealing, leads_in }));
+            }
+            break;
+        }
+        final_round.get_or_insert(header.sub_dag.leader_round());
+        expected = header.parent_hash;
+        next = number.checked_sub(1);
+        numbers.push(number);
+    }
+    let Some(final_round) = final_round else {
+        return Ok(Err(NoOutcome::HeaderMissing { number: boundary }));
+    };
+    let mut replay = DealingReplay::new(epoch, &record.committee, record.next_committee.clone());
+    for number in numbers.into_iter().rev() {
+        let Some((header, _)) = node.header(number)? else {
+            return Ok(Err(NoOutcome::HeaderMissing { number }));
+        };
+        replay.feed(&header);
+    }
+    Ok(Ok(replay.outcome(final_round)))
+}
+
+/// Re-checks one certificate's quorum and aggregate signature, or its threshold signature in a
+/// threshold epoch.
 pub fn check_certificate(node: &NodeDb, cert: &Certificate) -> eyre::Result<SignatureCheck> {
     if matches!(cert.signature_verification_state(), SignatureVerificationState::Genesis) {
         return Ok(SignatureCheck::Genesis);
     }
     let epoch = cert.epoch();
-    let Some((keys, keys_from)) = committee_keys(node, epoch)? else {
-        return Ok(SignatureCheck::NoKeys { epoch });
+    let (keys, keys_from) = match epoch_keys(node, epoch, cert.signed_authorities().is_empty())? {
+        KeysLookup::Known(keys, keys_from) => (keys, keys_from),
+        KeysLookup::SchemeUnknown(keys, cause) => {
+            return Ok(SignatureCheck::SchemeUnknown { epoch, keys, cause })
+        }
+        KeysLookup::Missing => return Ok(SignatureCheck::NoKeys { epoch }),
     };
-    Ok(match cert.clone().verify_cert(&keys) {
-        Ok(_) => SignatureCheck::Verified { epoch, keys: keys.len(), keys_from },
-        Err(error) => SignatureCheck::Failed { epoch, keys: keys.len(), error: error.to_string() },
+    let count = keys.keys.len();
+    Ok(match cert.clone().verify_cert_with(&keys.scheme()) {
+        Ok(_) => SignatureCheck::Verified { epoch, keys: count, keys_from },
+        Err(error) => SignatureCheck::Failed { epoch, keys: count, error: error.to_string() },
     })
 }
 
-/// The committee per epoch a source knows, looked up once per epoch (`None`: no record for it
-/// nor for the one before).
-type KeysByEpoch = BTreeMap<Epoch, Option<(Vec<BlsPublicKey>, &'static str)>>;
+/// The committee and scheme a source knows, looked up once per epoch and leader shape (whether
+/// the leader certificate has no signer set, see [`epoch_keys`]).
+type KeysByEpoch = BTreeMap<(Epoch, bool), KeysLookup>;
+
+/// The [`KeysByEpoch`] key of a header: its leader's epoch and shape.
+fn keys_slot(header: &ConsensusHeader) -> (Epoch, bool) {
+    let leader = &header.sub_dag.leader;
+    (leader.epoch(), leader.signed_authorities().is_empty())
+}
 
 /// Re-checks every certificate of a header's sub-dag the way the node does on receipt: the
 /// leader directly, the rest directly unless the leader's parents vouch for them.
@@ -136,8 +298,9 @@ pub fn check_header(node: &NodeDb, header: &ConsensusHeader) -> eyre::Result<Sig
     if matches!(leader.signature_verification_state(), SignatureVerificationState::Genesis) {
         return Ok(SignatureCheck::Genesis);
     }
-    let epoch = leader.epoch();
-    let keys = BTreeMap::from([(epoch, committee_keys(node, epoch)?)]);
+    let (epoch, threshold_shaped) = keys_slot(header);
+    let keys =
+        BTreeMap::from([((epoch, threshold_shaped), epoch_keys(node, epoch, threshold_shaped)?)]);
     Ok(verify_header(&keys, header))
 }
 
@@ -147,13 +310,19 @@ fn verify_header(keys: &KeysByEpoch, header: &ConsensusHeader) -> SignatureCheck
     if matches!(leader.signature_verification_state(), SignatureVerificationState::Genesis) {
         return SignatureCheck::Genesis;
     }
-    let epoch = leader.epoch();
-    let Some(Some((keys, keys_from))) = keys.get(&epoch) else {
-        return SignatureCheck::NoKeys { epoch };
+    let slot = keys_slot(header);
+    let epoch = slot.0;
+    let (keys, keys_from) = match keys.get(&slot) {
+        Some(KeysLookup::Known(keys, keys_from)) => (keys, *keys_from),
+        Some(KeysLookup::SchemeUnknown(keys, cause)) => {
+            return SignatureCheck::SchemeUnknown { epoch, keys: *keys, cause: cause.clone() }
+        }
+        Some(KeysLookup::Missing) | None => return SignatureCheck::NoKeys { epoch },
     };
-    match header.clone().verify_header_with_keys(keys) {
-        Ok(_) => SignatureCheck::Verified { epoch, keys: keys.len(), keys_from },
-        Err(error) => SignatureCheck::Failed { epoch, keys: keys.len(), error: error.to_string() },
+    let count = keys.keys.len();
+    match header.clone().verify_header_with_scheme(&keys.scheme()) {
+        Ok(_) => SignatureCheck::Verified { epoch, keys: count, keys_from },
+        Err(error) => SignatureCheck::Failed { epoch, keys: count, error: error.to_string() },
     }
 }
 
@@ -440,7 +609,8 @@ pub struct HeaderCheckNodeView {
     /// Why the check stopped.
     pub stopped: String,
     /// Hops whose certificates could not be checked, per epoch: the node holds neither that
-    /// epoch's record nor the one before, so it has no committee for them.
+    /// epoch's record nor the one before, so it has no committee for them, or it cannot tell
+    /// whether the epoch uses threshold certificates (see [`Unverifiable::cause`]).
     pub unverifiable: Vec<Unverifiable>,
     /// The read that failed on this node, when its database could not be checked (damaged rows
     /// or jars). The other nodes are still checked.
@@ -452,8 +622,11 @@ pub struct HeaderCheckNodeView {
 pub struct Unverifiable {
     pub epoch: Epoch,
     pub hops: usize,
-    /// The records that would supply the committee: the epoch's own and the one before.
+    /// The records that would supply the committee: the epoch's own and the one before. Empty
+    /// when the committee is known but not the certificate scheme.
     pub missing_records: Vec<Epoch>,
+    /// Why the certificate scheme is unknown, when the committee is known.
+    pub cause: Option<NoOutcome>,
 }
 
 /// Hops walked before their certificates are verified together on every core; bounds the
@@ -617,19 +790,33 @@ fn check_node(node: &NodeDb, start: u64, back: u64) -> eyre::Result<HeaderCheckN
     }
     verify_pending(node, &mut keys, &mut pending, &mut view.hops)?;
     view.ok = ok;
-    let mut by_epoch: BTreeMap<Epoch, usize> = BTreeMap::new();
+    // per epoch: hops with no committee, then hops with a committee but no certificate scheme,
+    // by cause (one per epoch: the lookup is cached)
+    let mut no_keys: BTreeMap<Epoch, usize> = BTreeMap::new();
+    let mut no_scheme: BTreeMap<Epoch, (usize, NoOutcome)> = BTreeMap::new();
     for hop in &view.hops {
-        if let SignatureCheck::NoKeys { epoch } = hop.verify {
-            *by_epoch.entry(epoch).or_default() += 1;
+        match &hop.verify {
+            SignatureCheck::NoKeys { epoch } => *no_keys.entry(*epoch).or_default() += 1,
+            SignatureCheck::SchemeUnknown { epoch, cause, .. } => {
+                no_scheme.entry(*epoch).or_insert_with(|| (0, cause.clone())).0 += 1
+            }
+            _ => {}
         }
     }
-    view.unverifiable = by_epoch
+    view.unverifiable = no_keys
         .into_iter()
         .map(|(epoch, hops)| Unverifiable {
             epoch,
             hops,
             missing_records: (epoch.saturating_sub(1)..=epoch).collect(),
+            cause: None,
         })
+        .chain(no_scheme.into_iter().map(|(epoch, (hops, cause))| Unverifiable {
+            epoch,
+            hops,
+            missing_records: Vec::new(),
+            cause: Some(cause),
+        }))
         .collect();
     Ok(view)
 }
@@ -643,11 +830,17 @@ fn verify_pending(
     hops: &mut Vec<Hop>,
 ) -> eyre::Result<()> {
     for (_, header) in pending.iter() {
-        if let std::collections::btree_map::Entry::Vacant(slot) =
-            keys.entry(header.sub_dag.leader_epoch())
-        {
-            let epoch = *slot.key();
-            slot.insert(committee_keys(node, epoch)?);
+        // a genesis leader is reported as such before any lookup
+        if matches!(
+            header.sub_dag.leader.signature_verification_state(),
+            SignatureVerificationState::Genesis
+        ) {
+            continue;
+        }
+        // one lookup per epoch and leader shape, the one `check_header` would make for this header
+        if let std::collections::btree_map::Entry::Vacant(slot) = keys.entry(keys_slot(header)) {
+            let (epoch, threshold_shaped) = *slot.key();
+            slot.insert(epoch_keys(node, epoch, threshold_shaped)?);
         }
     }
     let headers: Vec<&ConsensusHeader> = pending.iter().map(|(_, h)| h).collect();

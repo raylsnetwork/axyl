@@ -2,4 +2,4 @@
 
 pub(crate) mod certificates;
 mod votes;
-pub(crate) use votes::HeaderVotesAggregator;
+pub(crate) use votes::{sign_vote, HeaderVotesAggregator};

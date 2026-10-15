@@ -1,7 +1,7 @@
 use crate::{
     catch_up_consensus_from_to, certified_consensus_checkpoint, consensus_chain_tip,
     get_missing_consensus, highest_executed_anchor, prime_consensus, save_consensus,
-    stream_missing_consensus,
+    spawn_stream_consensus_headers, store_consensus_header_in_cache, stream_missing_consensus,
 };
 use rayls_consensus_primary::{
     network::{
@@ -488,6 +488,57 @@ fn seed_recently_executed_blocks(cb: &ConsensusBus) {
     let exec =
         SealedHeader::new(ExecHeader { number: 1, ..Default::default() }, B256::repeat_byte(0x01));
     cb.recently_executed_blocks().send_modify(|blocks| blocks.push_latest(exec));
+}
+
+/// A target the walk published before the forward streamer subscribed is still streamed. An
+/// anchored walk publishes its epoch's boundary only once, so waiting for the next change would
+/// wait for the transition, which needs that boundary executed.
+#[tokio::test]
+async fn test_streamer_starts_from_a_target_published_before_it_subscribed() {
+    let fixture = CommitteeFixture::builder(MemDatabase::default)
+        .randomize_ports(true)
+        .committee_size(NonZeroUsize::new(4).unwrap())
+        .build();
+    let primary = fixture.authorities().next().unwrap();
+    let config = primary.consensus_config();
+    let db = config.node_storage();
+    let committee = fixture.committee();
+
+    let anchor = chained_header(100, B256::default(), &committee);
+    db.with_write_txn(|txn| {
+        txn.insert::<ConsensusBlocks>(&anchor.number, &anchor)?;
+        txn.insert::<ConsensusBlockNumbersByDigest>(&anchor.digest(), &anchor.number)?;
+        Ok(())
+    })
+    .unwrap();
+    let next = chained_header(101, anchor.digest(), &committee);
+    let target = chained_header(102, next.digest(), &committee);
+    store_consensus_header_in_cache(db, &next);
+    store_consensus_header_in_cache(db, &target);
+
+    let cb = ConsensusBus::new();
+    cb.executed_anchor().send_replace(anchor);
+    seed_recently_executed_blocks(&cb);
+    cb.last_consensus_header().send_replace(target);
+    let mut rx = cb.consensus_header().subscribe();
+
+    let streamer = tokio::spawn(spawn_stream_consensus_headers(
+        config.clone(),
+        cb.clone(),
+        no_peer_network(),
+        100,
+    ));
+    let mut streamed = Vec::new();
+    while streamed.len() < 2 {
+        let header = tokio::time::timeout(std::time::Duration::from_secs(10), rx.recv())
+            .await
+            .expect("the published target is streamed without a further change")
+            .expect("channel open");
+        streamed.push(header.number);
+    }
+    assert_eq!(streamed, vec![101, 102]);
+    config.shutdown().notify();
+    let _ = streamer.await;
 }
 
 /// Regression: a lagging node whose DB holds only header N must fill the gap `N+1..=M` by fetching

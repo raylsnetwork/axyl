@@ -54,6 +54,24 @@ where
         epoch: Epoch,
         boundary_consensus_hash: B256,
     ) -> eyre::Result<()> {
+        // The DKG outcome for the next epoch is ensured before any early return below, on every
+        // node mode: a restart that reuses a stored record still has to persist it. Deterministic
+        // from the committed headers, so recomputing it after a crash gives the same row. Only a
+        // failed save is fatal; an outcome that cannot be computed yet is retried by the next
+        // epoch's configuration.
+        let next = epoch + 1;
+        if super::dkg::ensure_dkg_outcome_with_chain(
+            engine,
+            &self.consensus_db,
+            next,
+            Some(boundary_consensus_hash),
+        )
+        .await?
+        .is_none()
+        {
+            warn!(target: "epoch-manager", epoch = next, "dkg outcome not computable at the boundary");
+        }
+
         // Reuse the committee derived below so the registry is read only once.
         let mut derived_committee: Option<Vec<BlsPublicKey>> = None;
         if epoch == 0 {

@@ -202,6 +202,15 @@ impl RaylsChainSpecBuilder {
         self
     }
 
+    /// Activate ThresholdCertificates at `block`.
+    #[must_use = "builder method result must be used"]
+    pub fn threshold_certificates(mut self, block: u64) -> Self {
+        self.inner
+            .hardforks
+            .insert(RaylsHardFork::ThresholdCertificates, ForkCondition::Block(block));
+        self
+    }
+
     /// Activate EpochCloseSeedV2 at `block`.
     #[must_use = "builder method result must be used"]
     pub fn epoch_close_seed_v2(mut self, block: u64) -> Self {

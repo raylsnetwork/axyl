@@ -6,7 +6,7 @@
 //! or observer) or any task that requires realtime or historic consesus data
 //! if not directly participating in consesus.
 
-use super::{CommittedSubDag, ConsensusOutput};
+use super::{CertificateScheme, CommittedSubDag, ConsensusOutput};
 use crate::{
     bcs_layout::{BcsCursor, BcsLayout, BcsLayoutError},
     crypto,
@@ -59,13 +59,23 @@ impl ConsensusHeader {
 
     /// Verify that all certificates are valid and signed by a quorum of committee.
     pub fn verify_header(self, committee: &Committee) -> CertificateResult<Self> {
-        self.verify_header_with_keys(&committee.bls_keys())
+        let Self { parent_hash, sub_dag, number, extra } = self;
+        let sub_dag = sub_dag.verify_certificates(committee)?;
+        Ok(Self { parent_hash, sub_dag, number, extra })
     }
 
     /// Verify all certificates using raw BLS public keys.
     pub fn verify_header_with_keys(self, keys: &[BlsPublicKey]) -> CertificateResult<Self> {
+        self.verify_header_with_scheme(&CertificateScheme::Aggregate(keys))
+    }
+
+    /// Verify all certificates under the epoch's signature scheme.
+    pub fn verify_header_with_scheme(
+        self,
+        scheme: &CertificateScheme<'_>,
+    ) -> CertificateResult<Self> {
         let Self { parent_hash, sub_dag, number, extra } = self;
-        let sub_dag = sub_dag.verify_certificates_with_keys(keys)?;
+        let sub_dag = sub_dag.verify_certificates_with_scheme(scheme)?;
         Ok(Self { parent_hash, sub_dag, number, extra })
     }
 }

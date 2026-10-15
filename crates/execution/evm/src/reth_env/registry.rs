@@ -109,6 +109,34 @@ impl RethEnv {
         Ok(result)
     }
 
+    /// Read `epoch`'s info from the [ConsensusRegistry] on-chain, at the canonical tip.
+    ///
+    /// `None` outside `current - 3 ..= current`: the registry reverts for epochs it no longer
+    /// keeps, and an epoch that has not started has no start block yet.
+    pub fn epoch_info(&self, epoch: Epoch) -> eyre::Result<Option<ConsensusRegistry::EpochInfo>> {
+        let canonical_tip = self.canonical_tip();
+        let db_provider = self.blockchain_provider.database_provider_ro()?;
+        let state_provider: StateProviderBox = Box::new(LatestStateProvider::new(db_provider));
+        let state = StateProviderDatabase::new(&state_provider);
+        let mut db = State::builder()
+            .with_database(state)
+            .with_bundle_update()
+            .without_state_clear()
+            .build();
+        let mut rayls_evm = self
+            .evm_config
+            .evm_factory()
+            .create_evm(&mut db, self.evm_config.evm_env(&canonical_tip)?);
+
+        let current = self.get_current_epoch_number(&mut rayls_evm)?;
+        if epoch > current || epoch < current.saturating_sub(3) {
+            return Ok(None);
+        }
+        let calldata = ConsensusRegistry::getEpochInfoCall { epoch }.abi_encode().into();
+        self.call_consensus_registry::<_, ConsensusRegistry::EpochInfo>(&mut rayls_evm, calldata)
+            .map(Some)
+    }
+
     /// Extract the epoch number from a header's nonce.
     pub fn extract_epoch_from_header(header: &ExecHeader) -> Epoch {
         rayls_infrastructure_types::nonce::unpack_nonce(header.nonce.into()).0

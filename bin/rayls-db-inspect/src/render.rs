@@ -773,20 +773,36 @@ fn render_header_check(r: &HeaderCheckReport, out: &mut String) {
         // the column says ok/genesis/FAILED/no keys; spell out anything that is not ok, with the
         // unverifiable hops summed per epoch (they come in whole epochs)
         for h in n.hops.iter().filter(|h| {
-            !matches!(h.verify, SignatureCheck::Verified { .. } | SignatureCheck::NoKeys { .. })
+            !matches!(
+                h.verify,
+                SignatureCheck::Verified { .. }
+                    | SignatureCheck::NoKeys { .. }
+                    | SignatureCheck::SchemeUnknown { .. }
+            )
         }) {
             let _ = writeln!(out, "  header {} verify {}", h.number, h.verify);
         }
         for u in &n.unverifiable {
+            let headers = format!(
+                "  {} header{} of epoch {} cannot be verified",
+                u.hops,
+                if u.hops == 1 { "" } else { "s" },
+                u.epoch
+            );
+            if let Some(cause) = &u.cause {
+                let _ = writeln!(
+                    out,
+                    "{headers}: their leaders have no signer set, and this node holds no dkg \
+                     outcome for the epoch and cannot compute it: {cause}"
+                );
+                continue;
+            }
             let records =
                 u.missing_records.iter().map(|e| e.to_string()).collect::<Vec<_>>().join(" or ");
             let _ = writeln!(
                 out,
-                "  {} header{} of epoch {} cannot be verified: this node holds no record for epoch \
-                 {records}; check its epoch records (epoch-check)",
-                u.hops,
-                if u.hops == 1 { "" } else { "s" },
-                u.epoch
+                "{headers}: this node holds no record for epoch {records}; check its epoch records \
+                 (epoch-check)"
             );
         }
     }

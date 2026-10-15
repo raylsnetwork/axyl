@@ -242,7 +242,7 @@ where
             return Ok(mode);
         }
 
-        let (mode, reason) = decide_node_mode(
+        let (mut mode, mut reason) = decide_node_mode(
             in_committee,
             observer_flag,
             explicit_target,
@@ -250,6 +250,11 @@ where
             prior_mode,
             has_local_history,
         );
+        // Without the epoch's threshold key the node can neither vote nor verify certificates of
+        // this epoch: it follows as inactive until the key lands and it rejoins.
+        if mode == NodeMode::CvvActive && consensus_config.scheme_pending() {
+            (mode, reason) = (NodeMode::CvvInactive, "threshold-key-pending");
+        }
 
         info!(
             target: "epoch-manager",

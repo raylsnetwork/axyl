@@ -24,7 +24,7 @@ built-in mainnet/testnet.
 `HybridRewards` is both: it performs a state rewrite (the `ConsensusRegistry`
 bytecode swap) and flips the epoch-close reward ABI from 1-arg to 2-arg.
 
-### 17-fork inventory
+### 18-fork inventory
 
 | # | Fork | Kind | Set |
 |---|------|------|-----|
@@ -45,10 +45,11 @@ bytecode swap) and flips the epoch-close reward ABI from 1-arg to 2-arg.
 | 15 | SenderAffinityLoadBalancing | behavioral | — |
 | 16 | EpochCloseSeedV2 | behavioral | — |
 | 17 | CertificateFetchEpochV2 | behavioral | — |
+| 18 | ThresholdCertificates | behavioral | — |
 
 ### What each behavioral fork does
 
-The ten behavioral forks switch client behavior without a state write; the
+The eleven behavioral forks switch client behavior without a state write; the
 activation block is a rollout decision, not a state-consistency requirement.
 What each one does:
 
@@ -64,6 +65,7 @@ What each one does:
 | `OutputSeqNormalization` | Discards batches parked at the epoch boundary (their transactions stay pooled and re-seal in the new epoch) instead of force-executing them. |
 | `EpochCloseSeedV2` | Seeds the epoch-closing block's `extra_data` with the consensus header hash, identical on every node, instead of the leader-certificate signature hash. |
 | `CertificateFetchEpochV2` | Sends certificate fetch requests stamped with the epoch their rounds refer to, so a peer that has already closed that epoch serves them from the kept tail instead of the new epoch. Gates only the request format a node sends — every node accepts both variants, but a peer that has not been upgraded cannot decode the stamped one. |
+| `ThresholdCertificates` | Signs votes with per-epoch threshold BLS shares from a DKG run in the previous epoch, so any quorum of shares combines into one signature and a header has exactly one valid certificate. Not ready for real networks: keep it `never` outside local. |
 
 The seven migration forks' behavior is described by their set in section 2.
 
@@ -143,10 +145,10 @@ chain is held to the relaxed rules of section 4, which admit its canonical
 
 ## 3. Behavioral Changes Are Business-Logic Based
 
-The 10 behavioral forks (`Eip1559`, `BatchDigestV2`, `PrecompileGasFix`,
+The 11 behavioral forks (`Eip1559`, `BatchDigestV2`, `PrecompileGasFix`,
 `TransactionLoadBalancing`, `EmptyOutputBlock`, `DynamicCommitteeSizing`,
 `OutputSeqNormalization`, `SenderAffinityLoadBalancing`, `EpochCloseSeedV2`,
-`CertificateFetchEpochV2`) change protocol behavior without state writes.
+`CertificateFetchEpochV2`, `ThresholdCertificates`) change protocol behavior without state writes.
 Their activation blocks are network-coordinated rollout or risk decisions
 (SRE), not contract-state consistency requirements.
 
@@ -162,7 +164,7 @@ This is why behavioral forks are:
 
 | layer | what it protects | where |
 |-------|-----------------|-------|
-| **CI freeze tests** | mainnet and testnet baked schedules (full 17-fork literal tables) | `chainspec.rs` |
+| **CI freeze tests** | mainnet and testnet baked schedules (full 18-fork literal tables) | `chainspec.rs` |
 | **Boot shape gate** (`verify_schedule_shape`) | new chains (datadir head `0`) on the strict canonical shape; existing chains (head > 0) on relaxed rules; mainnet/testnet chain-ids always excluded | `network_profile/shape.rs` |
 | **Schedule-record gate** (`schedule-record.yaml`, trust-on-first-use) | per-datadir drift on all networks | `network_profile/verify.rs` |
 | **Genesis ceremony** | out of scope by decision | — |
@@ -185,7 +187,7 @@ This is why behavioral forks are:
   at `Never` or `Block(>= 1)` — the devnet carve-out does not apply to
   executed chains. The schedule-record gate then protects the executed
   history per datadir.
-- A new chain via `--config-file` must enumerate all 17 forks including
+- A new chain via `--config-file` must enumerate all 18 forks including
   `Erc20PrecompileBytecode: 1` and `HybridRewards: 1`. A partial file
   (e.g. missing Erc20) resolves to `Never` and is refused by the shape
   gate — that is intentional (catches the EIP-161 exposure).

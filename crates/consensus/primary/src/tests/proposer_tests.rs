@@ -1,6 +1,6 @@
 //! Proposer unit tests.
 
-use std::collections::BTreeSet;
+use std::{collections::BTreeSet, sync::Arc};
 
 use super::*;
 use crate::consensus::LeaderSwapTable;
@@ -8,8 +8,8 @@ use indexmap::IndexMap;
 use rayls_execution_evm::FixedBytes;
 use rayls_infrastructure_storage::mem_db::MemDatabase;
 use rayls_infrastructure_types::{
-    BlockNumHash, Certificate, CommittedSubDag, ConsensusHeader, ExecHeader, RaylsReceiver,
-    RaylsSender, ReputationScores, SealedHeader, B256,
+    dkg::DealingParams, BlockNumHash, Certificate, CommittedSubDag, ConsensusHeader, ExecHeader,
+    RaylsReceiver, RaylsSender, ReputationScores, SealedHeader, B256,
 };
 use rayls_testing_test_utils_committee::CommitteeFixture;
 
@@ -556,4 +556,63 @@ async fn digests_survive_gc_advance_and_later_round_commit() {
         vec![old_low, old_high, early, queued],
         "gc-evicted headers requeue their digests oldest-round-first, ahead of the queue"
     );
+}
+
+/// While the epoch deals, every new header carries this node's deal (made once, for its own
+/// position) until a committed header of its own carried it; later headers go without.
+#[tokio::test]
+async fn proposer_deals_in_new_headers_until_a_header_with_the_deal_commits() {
+    let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+    let committee = fixture.committee();
+    let primary = fixture.authorities().next().unwrap();
+    let base = primary.consensus_config();
+    let params = DealingParams {
+        epoch: committee.epoch() + 1,
+        threshold: committee.quorum_threshold() as usize,
+        recipients: committee.bls_keys(),
+        complaint_window: 20,
+    };
+    let config = ConsensusConfig::new_for_epoch(
+        base.config().clone(),
+        base.node_storage().clone(),
+        base.key_config().clone(),
+        committee.clone(),
+        Default::default(),
+        base.network_config().clone(),
+        u64::MAX,
+        true,
+        Default::default(),
+        Default::default(),
+        Some(Arc::new(params.clone())),
+    )
+    .unwrap();
+    let cb = ConsensusBus::new();
+    let _rx_headers = cb.headers().subscribe();
+    let task_manager = TaskManager::default();
+    let mut proposer = Proposer::new(
+        config,
+        primary.id(),
+        cb.clone(),
+        LeaderSchedule::new(committee.clone(), LeaderSwapTable::default()),
+        task_manager.get_spawner(),
+    );
+
+    let first = propose_and_record(&mut proposer).await;
+    let second = propose_and_record(&mut proposer).await;
+    let deal = first.dkg().deal.clone().expect("a dealing node deals in its first header");
+    assert_eq!(second.dkg().deal.as_ref(), Some(&deal), "the deal is made once and reused");
+    let position = committee.bls_position(&primary.primary_public_key()).unwrap();
+    deal.validate(position, params.epoch, params.threshold, params.recipients.len()).unwrap();
+
+    // The second header commits without the first: the deal is committed all the same.
+    proposer.process_committed_headers(2, vec![2]);
+    let third = propose_and_record(&mut proposer).await;
+    assert!(third.dkg().is_empty(), "no deal once a header carrying it committed");
+}
+
+/// Propose the next header and record the result the way the run loop does.
+async fn propose_and_record(proposer: &mut Proposer<MemDatabase>) -> Header {
+    let header = proposer.propose_next_header("test".to_string()).unwrap().await.unwrap().unwrap();
+    proposer.handle_proposal_result(Ok(header.clone())).unwrap();
+    header
 }

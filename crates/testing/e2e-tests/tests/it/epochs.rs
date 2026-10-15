@@ -20,12 +20,20 @@ use rayls_execution_evm::{
 use rayls_infrastructure_config::{Config, ConfigFmt, ConfigTrait as _, NodeInfo};
 use rayls_infrastructure_types::{
     test_utils::{self, CommandParser},
-    Address, Bytes, EpochCertificate, EpochRecord, Genesis, GenesisAccount,
+    Address, Bytes, ConsensusHeader, Epoch, EpochCertificate, EpochRecord, Genesis, GenesisAccount,
     MIN_RAYLS_PROTOCOL_BASE_FEE, U256,
 };
 use rayls_network_cli::genesis::GenesisArgs;
-use std::{collections::BTreeMap, panic, path::Path, process::Child, sync::Arc, time::Duration};
-use tokio::time::timeout;
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    ops::RangeInclusive,
+    panic,
+    path::Path,
+    process::Child,
+    sync::Arc,
+    time::Duration,
+};
+use tokio::time::{timeout, Instant};
 use tracing::{debug, info};
 
 const NEW_VALIDATOR: &str = "new-validator";
@@ -42,6 +50,11 @@ const SELECTABLE_TRIALS_TARGET: usize = 25;
 // while keeping test_epoch_boundary's shuffle wait under the 60-min job cap.
 // Retry-based record checks stay correct regardless of cadence.
 const EPOCH_DURATION: u64 = 30;
+/// RPC ports of every node: instance `i` serves on `8546 - i`, the new validator (instance 6) on
+/// 8540.
+const RPC_PORTS: RangeInclusive<u16> = 8540..=8545;
+/// Bound for sampling threshold certificates of two consecutive epochs on every node.
+const THRESHOLD_SAMPLE_WAIT: Duration = Duration::from_secs(4 * EPOCH_DURATION);
 
 async fn test_epoch_boundary_inner(
     genesis: Genesis,
@@ -186,6 +199,29 @@ async fn test_epoch_boundary_inner(
     }
 
     if shuffled {
+        // The first epoch the new validator sat in had its key dealt by a committee it was not
+        // in. Find it now, while the registry still keeps the epochs around it: the loop above
+        // can skip an epoch, and its two registry reads can straddle an epoch change, so step
+        // forward to an epoch that holds the new validator, then back to the first one.
+        let joiner = new_validator.address();
+        let mut e_join = latest_epoch;
+        while !consensus_registry.getEpochInfo(e_join).call().await?.committee.contains(&joiner) {
+            e_join += 1;
+        }
+        while consensus_registry.getEpochInfo(e_join - 1).call().await?.committee.contains(&joiner)
+        {
+            e_join -= 1;
+        }
+
+        // Threshold certificates from epoch 2 (Local schedules the fork at block 0): the current
+        // epoch and the next one certify with empty signer bitmaps on every node.
+        let from = consensus_registry.getCurrentEpoch().call().await?.max(latest_epoch);
+        assert_threshold_certificates(RPC_PORTS, from..=from + 1, THRESHOLD_SAMPLE_WAIT).await?;
+
+        // With t = n - 1 the other members certify without the new validator, so check its share
+        // itself.
+        assert_new_validator_share(temp_path, e_join).await?;
+
         // Check that all nodes have valid (certified) Epoch Records. `latest_epoch`
         // is the current, in-progress epoch - its record isn't certified until it
         // concludes - so verify only epochs strictly before it (all concluded).
@@ -196,6 +232,7 @@ async fn test_epoch_boundary_inner(
                 wait_for_verified_epoch_record(&provider, p, epoch, Duration::from_secs(60))
                     .await?;
             }
+            assert_registry_matches_records(&provider, p).await?;
         }
 
         Ok(())
@@ -264,6 +301,8 @@ async fn test_epoch_sync_inner(
 
     // Go through at least 5 epochs.
     loop_epochs(0, 5).await?;
+    let now = current_epoch(8545).await?;
+    assert_threshold_certificates(RPC_PORTS, now..=now, THRESHOLD_SAMPLE_WAIT).await?;
     // Kill a node
     send_term(&mut *child.lock().unwrap());
     let _ = child.lock().unwrap().wait();
@@ -279,6 +318,13 @@ async fn test_epoch_sync_inner(
     *child.lock().expect("poison") = new_child;
     loop_epochs(10, 5).await?;
 
+    // The restarted validator computed the threshold keys of the epochs it missed: it holds
+    // threshold-certified headers of epochs that started after its restart, like every other
+    // node, and its consensus height keeps up with the network.
+    let now = current_epoch(8545).await?;
+    assert_threshold_certificates(RPC_PORTS, now..=now + 1, THRESHOLD_SAMPLE_WAIT).await?;
+    assert_consensus_keeps_up(8543, 8545, Duration::from_secs(2 * EPOCH_DURATION)).await?;
+
     // Do a check to make sure all the nodes have valid (certified) Epoch Records.
     // The node that was down should also have all these records after syncing.
     // Verify only concluded epochs: the current (in-progress) epoch has no certified
@@ -292,9 +338,100 @@ async fn test_epoch_sync_inner(
         for epoch in 0..latest_epoch {
             wait_for_verified_epoch_record(&provider, p, epoch, Duration::from_secs(60)).await?;
         }
+        assert_registry_matches_records(&provider, p).await?;
     }
 
     Ok(())
+}
+
+/// The current epoch as the registry of the node on `port` states it.
+async fn current_epoch(port: u16) -> eyre::Result<Epoch> {
+    let provider = ProviderBuilder::new().connect_http(format!("http://127.0.0.1:{port}").parse()?);
+    let registry = ConsensusRegistry::new(CONSENSUS_REGISTRY_ADDRESS, &provider);
+    Ok(registry.getCurrentEpoch().call().await?)
+}
+
+/// The latest consensus header of the node on `port`, from `rayls_latestHeader`.
+async fn latest_header(port: u16) -> eyre::Result<ConsensusHeader> {
+    let provider = ProviderBuilder::new().connect_http(format!("http://127.0.0.1:{port}").parse()?);
+    Ok(provider.raw_request::<_, ConsensusHeader>("rayls_latestHeader".into(), ()).await?)
+}
+
+/// Poll `rayls_latestHeader` on every node in `ports` every 500 ms until each returned a header
+/// of every epoch in `epochs`, and require every certificate of those headers, leader included,
+/// to be a threshold certificate: an empty `signed_authorities` bitmap, where an aggregate
+/// certificate names a quorum of signers.
+///
+/// Fails at the first aggregate certificate, when a node reaches a later epoch before one of
+/// `epochs` was sampled on it (only the latest header is served), or after `deadline`.
+async fn assert_threshold_certificates(
+    ports: RangeInclusive<u16>,
+    epochs: RangeInclusive<Epoch>,
+    deadline: Duration,
+) -> eyre::Result<()> {
+    let mut unsampled: BTreeMap<u16, BTreeSet<Epoch>> =
+        ports.map(|port| (port, epochs.clone().collect())).collect();
+    let started = Instant::now();
+    loop {
+        unsampled.retain(|_, missing| !missing.is_empty());
+        if unsampled.is_empty() {
+            return Ok(());
+        }
+        eyre::ensure!(
+            started.elapsed() < deadline,
+            "epochs {epochs:?}: no header sampled within {deadline:?} (port: epochs) {unsampled:?}"
+        );
+        for (port, missing) in unsampled.iter_mut() {
+            // a node busy or restarting answers on a later poll; the deadline bounds the wait
+            let Ok(header) = latest_header(*port).await else { continue };
+            let epoch = header.sub_dag.leader_epoch();
+            if epochs.contains(&epoch) {
+                let certificates =
+                    header.sub_dag.certificates.iter().chain([&header.sub_dag.leader]);
+                for cert in certificates {
+                    eyre::ensure!(
+                        cert.signed_authorities().is_empty(),
+                        "node on port {port}: consensus header {} of epoch {epoch} carries an \
+                         aggregate certificate (round {}, {} signers)",
+                        header.number,
+                        cert.round(),
+                        cert.signed_authorities().len(),
+                    );
+                }
+                missing.remove(&epoch);
+            }
+            if let Some(first) = missing.first() {
+                eyre::ensure!(
+                    *first >= epoch,
+                    "node on port {port}: reached epoch {epoch} before a header of epoch {first} \
+                     was sampled"
+                );
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
+/// Wait until the node on `port` holds a consensus header at least as high as the one the node on
+/// `reference` held when the wait began.
+async fn assert_consensus_keeps_up(
+    port: u16,
+    reference: u16,
+    deadline: Duration,
+) -> eyre::Result<()> {
+    let target = latest_header(reference).await?.number;
+    retry_until(deadline, Duration::from_millis(500), move || async move {
+        let number = latest_header(port).await?.number;
+        eyre::ensure!(number >= target, "at consensus header {number}");
+        Ok(())
+    })
+    .await
+    .map_err(|e| {
+        eyre::eyre!(
+            "node on port {port} did not reach consensus header {target} of port {reference} \
+             within {deadline:?}: {e}"
+        )
+    })
 }
 
 /// Poll `rayls_epochRecord(epoch)` on one node until it returns a record, then
@@ -311,7 +448,7 @@ async fn wait_for_verified_epoch_record<P: Provider>(
     port: u16,
     epoch: u32,
     deadline: Duration,
-) -> eyre::Result<()> {
+) -> eyre::Result<EpochRecord> {
     let (record, cert): (EpochRecord, EpochCertificate) =
         retry_until(deadline, Duration::from_secs(1), move || async move {
             provider
@@ -335,7 +472,64 @@ async fn wait_for_verified_epoch_record<P: Provider>(
         record.digest(),
         cert.epoch_hash
     );
+    Ok(record)
+}
+
+/// The threshold dealing gate reads an epoch's first block from the registry
+/// (`getEpochInfo(epoch).blockHeight`), or, once the registry no longer keeps the epoch, from the
+/// previous epoch's record (one past its closing block). Check that the two agree on the node on
+/// `port`, for its current epoch: the registry keeps it for three more epochs, longer than the
+/// record wait, and a later epoch has no start block yet.
+async fn assert_registry_matches_records<P: Provider>(provider: &P, port: u16) -> eyre::Result<()> {
+    let registry = ConsensusRegistry::new(CONSENSUS_REGISTRY_ADDRESS, provider);
+    let epoch = registry.getCurrentEpoch().call().await?;
+    eyre::ensure!(epoch > 0, "node on port {port} is still in epoch 0");
+    let started = registry.getEpochInfo(epoch).call().await?.blockHeight;
+    let previous =
+        wait_for_verified_epoch_record(provider, port, epoch - 1, Duration::from_secs(60)).await?;
+    eyre::ensure!(
+        started == previous.parent_state.number + 1,
+        "node on port {port}: epoch {epoch} starts at block {started} in the registry, but the \
+         record of epoch {} ends at block {}",
+        epoch - 1,
+        previous.parent_state.number
+    );
     Ok(())
+}
+
+/// Wait until the new validator logged that `epoch` uses threshold certificates with its share,
+/// and fail at once if it logged the epoch without one. The new validator writes its own log
+/// files (see `start_nodes`).
+async fn assert_new_validator_share(temp_path: &Path, epoch: Epoch) -> eyre::Result<()> {
+    let dir = temp_path.join(NEW_VALIDATOR).join("logs").join("rayls-network-logs");
+    let line = |has_share: bool| {
+        format!("epoch uses threshold certificates epoch={epoch} has_share={has_share}")
+    };
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        // reth rotates reth.log into reth.log.N; a file renamed mid-read is read next time
+        let mut text = String::new();
+        for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+            if entry.file_name().to_string_lossy().starts_with("reth.log") {
+                text.push_str(&String::from_utf8_lossy(
+                    &std::fs::read(entry.path()).unwrap_or_default(),
+                ));
+            }
+        }
+        eyre::ensure!(
+            !text.contains(&line(false)),
+            "the new validator has no share of epoch {epoch}'s threshold key"
+        );
+        if text.contains(&line(true)) {
+            return Ok(());
+        }
+        eyre::ensure!(
+            Instant::now() < deadline,
+            "no threshold scheme line for epoch {epoch} in {}",
+            dir.display()
+        );
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
 }
 
 fn kill_procs(procs: &Vec<Arc<std::sync::Mutex<Child>>>) {
@@ -641,6 +835,10 @@ fn start_nodes(temp_path: &Path, validators: &[(&str, Address)]) -> eyre::Result
             // TEST_NETWORK's chain-id must equal the ceremony's `--chain-id` above.
             .arg("--network")
             .arg(TEST_NETWORK.to_string());
+        // The new validator keeps its own log files, which `assert_new_validator_share` reads.
+        if instance == "6" {
+            command.arg("--log.file.directory").arg(dir.join("logs"));
+        }
 
         #[cfg(feature = "faucet")]
         command

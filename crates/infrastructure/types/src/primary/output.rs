@@ -1,7 +1,7 @@
 //! The ouput from consensus (bullshark)
 //! See test_utils output_tests.rs for this modules tests.
 
-use super::{CertificateDigest, ConsensusHeader};
+use super::{CertificateDigest, CertificateScheme, ConsensusHeader};
 use crate::{
     bcs_layout::{BcsCursor, BcsLayout, BcsLayoutError},
     crypto, encode,
@@ -320,13 +320,27 @@ impl CommittedSubDag {
 
     /// Verify that all of the contained certificates are valid and signed by a quorum of committee.
     pub fn verify_certificates(self, committee: &Committee) -> CertificateResult<Self> {
-        self.verify_certificates_with_keys(&committee.bls_keys())
+        match committee.threshold_key() {
+            Some(key) => {
+                let group_key = key.group_key();
+                self.verify_certificates_with_scheme(&CertificateScheme::Threshold(&group_key))
+            }
+            None => self.verify_certificates_with_keys(&committee.bls_keys()),
+        }
     }
 
     /// Verify all certificates using raw BLS public keys.
     pub fn verify_certificates_with_keys(self, keys: &[BlsPublicKey]) -> CertificateResult<Self> {
+        self.verify_certificates_with_scheme(&CertificateScheme::Aggregate(keys))
+    }
+
+    /// Verify all certificates under the epoch's signature scheme.
+    pub fn verify_certificates_with_scheme(
+        self,
+        scheme: &CertificateScheme<'_>,
+    ) -> CertificateResult<Self> {
         let Self { mut certificates, leader, reputation_score, commit_timestamp } = self;
-        let leader = leader.verify_cert(keys)?;
+        let leader = leader.verify_cert_with(scheme)?;
         let mut verified_certs: HashSet<CertificateDigest> =
             leader.header.parents().iter().copied().collect();
         let mut new_certs = Vec::new();
@@ -339,7 +353,7 @@ impl CommittedSubDag {
             if verified_certs.contains(&digest) {
                 new_certs.push(cert);
             } else {
-                let cert = cert.verify_cert(keys)?;
+                let cert = cert.verify_cert_with(scheme)?;
                 verified_certs.insert(cert.digest());
                 new_certs.push(cert);
             }

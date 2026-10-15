@@ -233,6 +233,25 @@ pub enum HeaderError {
     /// The header wasn't proposed by the author.
     #[error("The proposing peer is not the author.")]
     PeerNotAuthor,
+    /// The header carries DKG data in an epoch that is not dealing.
+    #[error("Header carries DKG data but this epoch does not deal")]
+    UnexpectedDkgData,
+    /// The header's deal does not validate for the next epoch.
+    #[error("Invalid DKG deal: {0}")]
+    InvalidDkgDeal(#[source] crate::crypto::dkg::DkgError),
+    /// A complaint in the header does not validate.
+    #[error("Invalid DKG complaint: {0}")]
+    InvalidDkgComplaint(#[source] crate::crypto::dkg::DkgError),
+    /// The header relays more DKG complaints than the committee has members.
+    #[error("Too many DKG complaints in header: {0} > {1}")]
+    TooManyDkgComplaints(usize, usize),
+    /// The epoch uses threshold certificates and this node has no share, so it cannot vote.
+    #[error("No threshold share for this epoch: this node cannot vote")]
+    NoThresholdShare,
+    /// The epoch uses threshold certificates and this node has not computed its key yet, so it
+    /// cannot vote.
+    #[error("Threshold key for this epoch not computed yet: this node cannot vote")]
+    ThresholdKeyPending,
     /// The watch channel for execution results was dropped.
     #[error("Watch channel for execution results dropped.")]
     ClosedWatchChannel,
@@ -323,6 +342,13 @@ pub enum CertificateError {
     /// Certificate is unsigned.
     #[error("Certificate verification state is unsigned")]
     Unsigned,
+    /// A threshold certificate carries a signer bitmap, which it must not.
+    #[error("Threshold certificate carries a signer bitmap")]
+    UnexpectedSigners,
+    /// The epoch uses threshold certificates and this node has not computed its key yet, so it
+    /// cannot verify the certificate either way.
+    #[error("Threshold key for the certificate's epoch not computed yet")]
+    SchemePending,
 }
 
 impl<T: std::fmt::Debug> From<SendError<T>> for HeaderError {

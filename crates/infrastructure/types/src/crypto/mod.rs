@@ -13,8 +13,10 @@ use std::{fmt, future::Future};
 mod bls_keypair;
 mod bls_public_key;
 mod bls_signature;
+pub mod dkg;
 mod intent;
 mod network;
+pub mod threshold;
 
 pub use bls_keypair::*;
 pub use bls_public_key::*;

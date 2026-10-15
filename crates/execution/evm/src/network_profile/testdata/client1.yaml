@@ -23,6 +23,7 @@ networks:
       SenderAffinityLoadBalancing: never
       EpochCloseSeedV2: never
       CertificateFetchEpochV2: never
+      ThresholdCertificates: never
   testnet:
     chain_id: 7295799
     hardforks:
@@ -43,3 +44,4 @@ networks:
       SenderAffinityLoadBalancing: never
       EpochCloseSeedV2: never
       CertificateFetchEpochV2: never
+      ThresholdCertificates: never

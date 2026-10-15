@@ -13,7 +13,7 @@ use rayls_consensus_state_sync::{
     consensus_chain_tip, get_missing_consensus, save_consensus, spawn_state_sync,
     store_consensus_header_in_cache, stream_missing_consensus,
 };
-use rayls_infrastructure_config::ConsensusConfig;
+use rayls_infrastructure_config::{ConsensusConfig, EpochKeysStatus};
 // production-only: consensus-output gossip (dev single-node has no peers to gossip to)
 #[cfg(not(feature = "dev-single-node-setup"))]
 use rayls_infrastructure_config::LibP2pConfig;
@@ -306,7 +306,7 @@ impl<DB: Database> Subscriber<DB> {
     /// Throttle `try_rejoin_consensus` waiting-gate logs to once per this many headers.
     const REJOIN_LOG_THROTTLE: u64 = 100;
 
-    /// Verify BLS signatures on the consensus header's certificates.
+    /// Verify BLS signatures on the consensus header's certificates under the epoch's scheme.
     ///
     /// Wait for committee keys if not yet available (triggers epoch record collector).
     /// Returns the verified header on success, or None if it should be discarded.
@@ -321,21 +321,36 @@ impl<DB: Database> Subscriber<DB> {
         // wait for committee keys, polling until available or timeout
         let deadline = tokio::time::Instant::now() + Self::COMMITTEE_WAIT_TIMEOUT;
         let keys = loop {
-            if let Some(keys) = self.config.get_committee_keys_for_epoch(leader_epoch) {
-                break keys;
+            match self.config.epoch_keys_status(leader_epoch) {
+                EpochKeysStatus::Ready(keys) => break keys,
+                // a threshold epoch past the cut: its key is computed at this epoch's boundary,
+                // so the header can only be verified after the transition
+                EpochKeysStatus::Pending if leader_epoch > self.config.epoch() => {
+                    debug!(
+                        target: "subscriber",
+                        number,
+                        epoch = leader_epoch,
+                        "threshold key for a later epoch pending, discarding header"
+                    );
+                    return None;
+                }
+                // the key is being computed in the background: poll
+                EpochKeysStatus::Pending => {}
+                EpochKeysStatus::NoCommittee => {
+                    // trigger epoch record collector for the needed epoch
+                    self.consensus_bus.requested_missing_epoch().send_if_modified(|current| {
+                        if leader_epoch > *current {
+                            *current = leader_epoch;
+                            true
+                        } else {
+                            false
+                        }
+                    });
+                }
             }
             if shutdown.noticed() {
                 return None;
             }
-            // trigger epoch record collector for the needed epoch
-            self.consensus_bus.requested_missing_epoch().send_if_modified(|current| {
-                if leader_epoch > *current {
-                    *current = leader_epoch;
-                    true
-                } else {
-                    false
-                }
-            });
             if tokio::time::Instant::now() >= deadline {
                 warn!(
                     target: "subscriber",
@@ -349,7 +364,7 @@ impl<DB: Database> Subscriber<DB> {
         };
 
         consensus_header
-            .verify_header_with_keys(&keys)
+            .verify_header_with_scheme(&keys.scheme())
             .inspect_err(|e| {
                 warn!(
                     target: "subscriber",
@@ -504,6 +519,11 @@ impl<DB: Database> Subscriber<DB> {
         //TODO: This IF here works but it is worth checking if this condition can be moved before
         // even invoking the try_rejoin_consensus
         if self.consensus_bus.node_mode().borrow().is_observer() {
+            return false;
+        }
+        // Without the epoch's threshold key the node cannot vote and the epoch manager keeps it
+        // inactive, so rejoining waits until the key lands.
+        if self.config.scheme_pending() {
             return false;
         }
 

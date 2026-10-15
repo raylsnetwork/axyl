@@ -4,7 +4,9 @@ use crate::engine::{
 
 use rayls_consensus_worker::WorkerNetworkHandle;
 use rayls_execution_evm::{
-    reth_env::RethEnv, system_calls::EpochState, CanonStateNotificationStream, WorkerTxPool,
+    reth_env::RethEnv,
+    system_calls::{ConsensusRegistry, EpochState},
+    CanonStateNotificationStream, WorkerTxPool,
 };
 use rayls_execution_rpc::EngineToPrimary;
 use rayls_infrastructure_types::{
@@ -120,6 +122,7 @@ impl ExecutionNode {
         network_handle: WorkerNetworkHandle,
         executed_anchor: watch::Receiver<ConsensusHeader>,
         last_seen_header: watch::Receiver<ConsensusHeader>,
+        network_tip: watch::Receiver<(u64, B256)>,
         committee: Vec<BlsPublicKey>,
         task_spawner: &TaskSpawner,
         max_gossip_message_size: usize,
@@ -130,6 +133,7 @@ impl ExecutionNode {
             network_handle,
             executed_anchor,
             last_seen_header,
+            network_tip,
             committee,
             task_spawner,
             max_gossip_message_size,
@@ -233,5 +237,14 @@ impl ExecutionNode {
     pub async fn validators_for_epoch(&self, epoch: u32) -> eyre::Result<Vec<BlsPublicKey>> {
         let guard = self.internal.read().await;
         guard.validators_for_epoch(epoch)
+    }
+
+    /// Read the registry's info for `epoch`; `None` outside `current - 3 ..= current`.
+    pub async fn epoch_info(
+        &self,
+        epoch: u32,
+    ) -> eyre::Result<Option<ConsensusRegistry::EpochInfo>> {
+        let guard = self.internal.read().await;
+        guard.epoch_info(epoch)
     }
 }

@@ -71,6 +71,7 @@ fuzz_target!(|input: FuzzHeader| {
         payload: payload.clone(),
         parents: parents.clone(),
         latest_execution_block,
+        dkg: Default::default(),
         digest: Default::default(),
     };
 

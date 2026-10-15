@@ -1,18 +1,18 @@
 //! Tasks and helpers for collecting consensus headers trustlessly.
 use futures::{stream::FuturesUnordered, StreamExt};
 use rayls_consensus_primary::{network::PrimaryNetworkHandle, ConsensusBus};
-use rayls_infrastructure_config::ConsensusConfig;
+use rayls_infrastructure_config::{ConsensusConfig, EpochKeysStatus};
 use rayls_infrastructure_storage::{
     tables::{ConsensusBlockNumbersByDigest, ConsensusBlocks, ConsensusBlocksCache},
-    ConsensusStore,
+    ConsensusStore, EpochStore as _,
 };
 use rayls_infrastructure_types::{
-    BlsPublicKey, ConsensusHeader, ConsensusHeaderChainMeta, Database as ReDatabase, DbTxMut as _,
-    Epoch, Noticer, B256,
+    ConsensusHeader, ConsensusHeaderChainMeta, Database as ReDatabase, DbTxMut as _, Epoch,
+    EpochKeys, Noticer, B256,
 };
 use std::{ops::ControlFlow, sync::LazyLock, time::Duration};
 use tokio::sync::watch;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 const COMMITTEE_KEYS_TIMEOUT: Duration = Duration::from_secs(30);
 const COMMITTEE_KEYS_POLL_INTERVAL: Duration = Duration::from_millis(500);
@@ -31,19 +31,8 @@ pub fn store_consensus_header_in_cache<DB: ReDatabase>(db: &DB, header: &Consens
     }
 }
 
-/// Trigger the epoch record collector and poll until committee keys arrive.
-///
-/// Return `None` on shutdown or timeout.
-pub(crate) async fn wait_for_committee_keys<DB: ReDatabase>(
-    epoch: Epoch,
-    config: &ConsensusConfig<DB>,
-    consensus_bus: &ConsensusBus,
-    shutdown: &Noticer,
-) -> Option<Vec<BlsPublicKey>> {
-    if let Some(keys) = config.get_committee_keys_for_epoch(epoch) {
-        return Some(keys);
-    }
-
+/// Ask the epoch record collector for records up to `epoch`.
+fn request_missing_epoch(consensus_bus: &ConsensusBus, epoch: Epoch) {
     // the collector iterates upward from its last_epoch, so requesting
     // the highest unknown epoch bridges all intermediate gaps
     consensus_bus.requested_missing_epoch().send_if_modified(|current| {
@@ -54,6 +43,30 @@ pub(crate) async fn wait_for_committee_keys<DB: ReDatabase>(
             false
         }
     });
+}
+
+/// Trigger the epoch record collector and poll until committee keys arrive. They come with the
+/// epoch's certificate scheme.
+///
+/// Return `None` on shutdown or timeout, and at once for an epoch whose threshold key this node
+/// has not computed yet: it comes from the previous epoch's headers, which a backwards walk
+/// reaches only after this one.
+pub(crate) async fn wait_for_committee_keys<DB: ReDatabase>(
+    epoch: Epoch,
+    config: &ConsensusConfig<DB>,
+    consensus_bus: &ConsensusBus,
+    shutdown: &Noticer,
+) -> Option<EpochKeys> {
+    match config.epoch_keys_status(epoch) {
+        EpochKeysStatus::Ready(keys) => return Some(keys),
+        EpochKeysStatus::Pending => {
+            debug!(target: "state-sync", epoch, "backwards walk: threshold key pending");
+            return None;
+        }
+        EpochKeysStatus::NoCommittee => {}
+    }
+
+    request_missing_epoch(consensus_bus, epoch);
 
     info!(
         target: "state-sync",
@@ -66,9 +79,16 @@ pub(crate) async fn wait_for_committee_keys<DB: ReDatabase>(
         if shutdown.noticed() {
             return None;
         }
-        if let Some(keys) = config.get_committee_keys_for_epoch(epoch) {
-            info!(target: "state-sync", epoch, "backwards walk: committee keys arrived");
-            return Some(keys);
+        match config.epoch_keys_status(epoch) {
+            EpochKeysStatus::Ready(keys) => {
+                info!(target: "state-sync", epoch, "backwards walk: committee keys arrived");
+                return Some(keys);
+            }
+            EpochKeysStatus::Pending => {
+                debug!(target: "state-sync", epoch, "backwards walk: threshold key pending");
+                return None;
+            }
+            EpochKeysStatus::NoCommittee => {}
         }
         if tokio::time::Instant::now() >= deadline {
             warn!(target: "state-sync", epoch, "backwards walk: timed out waiting for committee keys");
@@ -95,36 +115,45 @@ fn republish_if_higher(consensus_bus: &ConsensusBus, header: &ConsensusHeader) {
     }
 }
 
+/// One step of the backwards walk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Step {
+    /// Keep descending from this parent hash.
+    Parent(B256),
+    /// The canonical anchor was reached, or the header could not be fetched or verified.
+    Stop,
+    /// The header leads in this later epoch, whose threshold key this node has not computed yet.
+    /// That key comes from this epoch's headers, so the walk must cover this epoch first.
+    PendingAbove(Epoch),
+}
+
 /// Descend one step of the backwards walk: stop at the canonical anchor, traverse a cached header,
 /// or fetch and BLS-verify from a peer.
-///
-/// Returns `None` at the canonical anchor (the walk is grounded) or on failure; otherwise returns
-/// the parent hash to continue descending.
 async fn get_consensus_header<DB: ReDatabase>(
     hash: B256,
     config: &ConsensusConfig<DB>,
     consensus_bus: &ConsensusBus,
     network: &PrimaryNetworkHandle,
     shutdown: &Noticer,
-) -> Option<B256> {
+) -> Step {
     let db = config.node_storage();
     // Stop only at the canonical anchor (never an unverified cache row); its per-row digest==hash
     // check means a stale, never-pruned ByDigest index entry cannot false-stop the walk.
     if let Some(block) = db.get_canonical_consensus_by_hash(hash) {
         republish_if_higher(consensus_bus, &block);
-        return None;
+        return Step::Stop;
     }
     // Traverse a cached header from the DB instead of refetching it, and keep descending.
     if let Some(cached) = db.get_consensus_by_hash(hash) {
         republish_if_higher(consensus_bus, &cached);
-        return Some(cached.parent_hash);
+        return Step::Parent(cached.parent_hash);
     }
     for attempt in 0u32..3 {
         if attempt > 0 {
             tokio::time::sleep(Duration::from_millis(500 * attempt as u64)).await;
         }
         if shutdown.noticed() {
-            return None;
+            return Step::Stop;
         }
         match network.request_consensus(None, Some(hash)).await {
             Ok(header) => {
@@ -132,30 +161,36 @@ async fn get_consensus_header<DB: ReDatabase>(
                 let Some(keys) =
                     wait_for_committee_keys(leader_epoch, config, consensus_bus, shutdown).await
                 else {
+                    if leader_epoch > config.epoch()
+                        && config.epoch_keys_status(leader_epoch) == EpochKeysStatus::Pending
+                    {
+                        return Step::PendingAbove(leader_epoch);
+                    }
                     warn!(
                         target: "state-sync",
                         ?hash,
                         epoch = leader_epoch,
                         "committee keys unavailable, stopping walk"
                     );
-                    return None;
+                    return Step::Stop;
                 };
-                let Ok(verified) = header.verify_header_with_keys(&keys).inspect_err(|e| {
+                let scheme = keys.scheme();
+                let Ok(verified) = header.verify_header_with_scheme(&scheme).inspect_err(|e| {
                     warn!(target: "state-sync", ?hash, "BLS verification failed, discarding header: {e}");
                 }) else {
-                    return None;
+                    return Step::Stop;
                 };
                 let parent = verified.parent_hash;
                 store_consensus_header_in_cache(db, &verified);
                 republish_if_higher(consensus_bus, &verified);
-                return Some(parent);
+                return Step::Parent(parent);
             }
             Err(e) => {
                 warn!(target: "state-sync", ?hash, ?e, attempt, "failed to fetch consensus header from peers");
             }
         }
     }
-    None
+    Step::Stop
 }
 
 /// Digest of the genesis consensus header (number 0, the default header).
@@ -167,8 +202,11 @@ static GENESIS_DIGEST: LazyLock<B256> = LazyLock::new(|| ConsensusHeader::defaul
 /// Terminal state of a backwards walk.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WalkOutcome {
-    /// Linked the start anchor to local coverage (canonical, genesis, or the session anchor).
-    Covered,
+    /// Linked `head` to local coverage (canonical, genesis, or the session anchor). `boundary`:
+    /// the start led in a later, pending epoch, so `head` is this epoch's certified boundary.
+    Covered { head: B256, boundary: bool },
+    /// The start led in a later, pending epoch, and this epoch's certified record is not held yet.
+    AwaitingBoundary,
     /// Stopped before reaching coverage (a failed fetch).
     Incomplete,
     /// Shutdown was noticed mid-walk.
@@ -214,6 +252,9 @@ fn derive_covered_anchor<DB: ReDatabase>(db: &DB) -> Option<B256> {
     })
 }
 
+/// How often a session waiting for its epoch's certified record asks the collector again.
+const BOUNDARY_RECORD_REQUEST_INTERVAL: Duration = Duration::from_secs(30);
+
 /// One tracker session of backwards walks, owning the coverage anchor that outlives a single walk.
 ///
 /// In-memory on purpose: teardown drops it, and it is re-derived from the persisted cache when
@@ -227,6 +268,13 @@ pub(crate) struct WalkSession<DB> {
     /// re-descending. Cleared on an incomplete walk (stale rows may lie below it), then
     /// re-derived.
     covered: Option<B256>,
+    /// This epoch's certified boundary is covered. Every later epoch is pending until the
+    /// transition, which starts the next session, so later tips are not walked.
+    boundary_covered: bool,
+    /// When this session last asked the collector for its epoch's record.
+    boundary_requested_at: Option<tokio::time::Instant>,
+    /// The skip for a pending epoch key was logged at info.
+    pending_key_logged: bool,
 }
 
 impl<DB: ReDatabase> WalkSession<DB> {
@@ -237,12 +285,38 @@ impl<DB: ReDatabase> WalkSession<DB> {
         network: PrimaryNetworkHandle,
     ) -> Self {
         let shutdown = config.shutdown().subscribe();
-        Self { config, consensus_bus, network, shutdown, covered: None }
+        Self {
+            config,
+            consensus_bus,
+            network,
+            shutdown,
+            covered: None,
+            boundary_covered: false,
+            boundary_requested_at: None,
+            pending_key_logged: false,
+        }
     }
 
     /// Walk backwards from `start_hash` to local coverage, recording the result for the next call.
     /// Returns `Break` when shutdown was noticed and the tracker must exit.
     pub(crate) async fn sync_to(&mut self, start_hash: B256) -> ControlFlow<()> {
+        // Nothing a tip offers verifies before this epoch's key lands or the transition starts the
+        // next session: past a covered boundary every epoch is pending, and so is this one while
+        // its own key is.
+        if self.config.scheme_pending() {
+            if !std::mem::replace(&mut self.pending_key_logged, true) {
+                info!(
+                    target: "state-sync",
+                    epoch = self.config.epoch(),
+                    "backwards walk paused: this epoch's threshold key is not computed yet"
+                );
+            }
+            return ControlFlow::Continue(());
+        }
+        if self.boundary_covered {
+            debug!(target: "state-sync", "backwards walk: boundary covered, waiting for the transition");
+            return ControlFlow::Continue(());
+        }
         // Recover coverage from the persisted cache when the session has none yet (fresh task, or a
         // prior walk cleared it), so this walk stops at the top of the cached run rather than
         // re-descending it. Derivation sweeps and hashes every cached row, so it runs on a blocking
@@ -255,11 +329,14 @@ impl<DB: ReDatabase> WalkSession<DB> {
                 .unwrap_or(None);
         }
         match self.walk(start_hash).await {
-            // `start_hash` now heads a verified chain to canonical; stop here next time.
-            WalkOutcome::Covered => {
-                self.covered = Some(start_hash);
+            // `head` now heads a verified chain to canonical; stop here next time.
+            WalkOutcome::Covered { head, boundary } => {
+                self.covered = Some(head);
+                self.boundary_covered = boundary;
                 ControlFlow::Continue(())
             }
+            // Nothing was descended, so the coverage still holds.
+            WalkOutcome::AwaitingBoundary => ControlFlow::Continue(()),
             // Drop the anchor so the next walk re-derives and re-descends to self-heal the gap.
             WalkOutcome::Incomplete => {
                 self.covered = None;
@@ -270,10 +347,16 @@ impl<DB: ReDatabase> WalkSession<DB> {
     }
 
     /// Descend parent hashes from `start_hash` until reaching local coverage.
-    async fn walk(&self, start_hash: B256) -> WalkOutcome {
-        let db = self.config.node_storage();
+    ///
+    /// A start in a later epoch whose threshold key is pending cannot verify until this epoch's
+    /// headers execute, so the walk descends from this epoch's certified boundary instead. The
+    /// streamer then executes up to it, the transition computes the next key, and the next epoch's
+    /// walk repeats the step.
+    async fn walk(&mut self, start_hash: B256) -> WalkOutcome {
         let covered_hash = self.covered;
         let mut current = start_hash;
+        let mut head = start_hash;
+        let mut anchored = false;
         let mut depth = 0u64;
         let outcome = loop {
             if self.shutdown.noticed() {
@@ -281,7 +364,7 @@ impl<DB: ReDatabase> WalkSession<DB> {
             }
             // Stop at proven coverage without re-descending it: the session anchor or genesis.
             if covered_hash == Some(current) || current == *GENESIS_DIGEST {
-                break WalkOutcome::Covered;
+                break WalkOutcome::Covered { head, boundary: anchored };
             }
             match get_consensus_header(
                 current,
@@ -292,12 +375,42 @@ impl<DB: ReDatabase> WalkSession<DB> {
             )
             .await
             {
-                Some(parent) => current = parent,
+                Step::Parent(parent) => current = parent,
+                // Below this epoch's boundary every header leads in this epoch or an earlier one,
+                // so a second pending header means the chain does not hold together.
+                Step::PendingAbove(tip_epoch) if !anchored => {
+                    let Some(boundary) = self.certified_boundary(tip_epoch) else {
+                        break WalkOutcome::AwaitingBoundary;
+                    };
+                    // A new session derives its coverage from the cache, which can already reach
+                    // the boundary: republish it so the streamer gets its target either way.
+                    if let Some(header) = self.config.node_storage().get_consensus_by_hash(boundary)
+                    {
+                        republish_if_higher(&self.consensus_bus, &header);
+                    }
+                    debug!(
+                        target: "state-sync",
+                        epoch = self.config.epoch(),
+                        ?boundary,
+                        "backwards walk: tip leads in a later epoch whose key is pending, \
+                         walking from this epoch's boundary"
+                    );
+                    anchored = true;
+                    head = boundary;
+                    current = boundary;
+                    continue;
+                }
+                Step::PendingAbove(_) => break WalkOutcome::Incomplete,
                 // `get_consensus_header` stopped at the canonical anchor (Covered) or could not
                 // fetch (Incomplete: coverage below `current` is unknown).
-                None => {
-                    break if db.get_canonical_consensus_by_hash(current).is_some() {
-                        WalkOutcome::Covered
+                Step::Stop => {
+                    break if self
+                        .config
+                        .node_storage()
+                        .get_canonical_consensus_by_hash(current)
+                        .is_some()
+                    {
+                        WalkOutcome::Covered { head, boundary: anchored }
                     } else {
                         WalkOutcome::Incomplete
                     };
@@ -310,9 +423,31 @@ impl<DB: ReDatabase> WalkSession<DB> {
             tokio::task::yield_now().await;
         };
         if depth > 0 {
-            info!(target: "state-sync", depth, ?outcome, "backwards walk: completed");
+            info!(target: "state-sync", depth, anchored, ?outcome, "backwards walk: completed");
         }
         outcome
+    }
+
+    /// The last header of this node's epoch, from the epoch's certified record.
+    ///
+    /// Without that record, ask the collector for records up to the last epoch closed before the
+    /// tip's, at most once per [`BOUNDARY_RECORD_REQUEST_INTERVAL`], and return `None`. The
+    /// collector's pass starts at the last record it holds and refetches it when uncertified, so
+    /// this also replaces the epoch-0 placeholder.
+    fn certified_boundary(&mut self, tip_epoch: Epoch) -> Option<B256> {
+        let epoch = self.config.epoch();
+        if let Some((record, Some(_))) = self.config.node_storage().get_epoch_by_number(epoch) {
+            return Some(record.parent_consensus);
+        }
+        let now = tokio::time::Instant::now();
+        if self
+            .boundary_requested_at
+            .is_none_or(|at| now.duration_since(at) >= BOUNDARY_RECORD_REQUEST_INTERVAL)
+        {
+            self.boundary_requested_at = Some(now);
+            request_missing_epoch(&self.consensus_bus, tip_epoch.saturating_sub(1).max(epoch));
+        }
+        None
     }
 }
 
@@ -439,9 +574,24 @@ pub(crate) async fn spawn_track_recent_consensus<DB: ReDatabase>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rayls_consensus_primary::network::{
+        NetworkCommand, NetworkError, PrimaryRequest, PrimaryResponse,
+    };
+    use rayls_infrastructure_config::DealtEpochs;
     use rayls_infrastructure_storage::{mem_db::MemDatabase, tables::ConsensusBlocks};
+    use rayls_infrastructure_types::{
+        dkg::EpochScheme, Certificate, CommittedSubDag, CommitteeLookahead, EpochCertificate,
+        EpochRecord, ReputationScores,
+    };
     use rayls_testing_test_utils_committee::CommitteeFixture;
-    use std::num::NonZeroUsize;
+    use std::{
+        collections::{BTreeMap, HashMap},
+        num::NonZeroUsize,
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        },
+    };
 
     /// A network handle whose receiver is dropped: every fetch fails fast, so a walk can make
     /// progress only through the local DB/cache, never a peer.
@@ -492,7 +642,7 @@ mod tests {
             after, before,
             "stale index entry false-stopped the walk and republished the wrong block"
         );
-        assert!(parent.is_none(), "no reachable peer, so the fetch fails and the walk yields None");
+        assert_eq!(parent, Step::Stop, "no reachable peer, so the fetch fails and the walk stops");
     }
 
     /// A header already cached by an earlier leg (fetched but not yet executed/canonical) must be
@@ -534,7 +684,7 @@ mod tests {
 
         assert_eq!(
             next,
-            Some(parent_hash),
+            Step::Parent(parent_hash),
             "a cached header is traversed from the DB, returning its parent to keep descending"
         );
         assert_eq!(
@@ -574,7 +724,7 @@ mod tests {
 
         assert_eq!(
             session.walk(child.digest()).await,
-            WalkOutcome::Covered,
+            WalkOutcome::Covered { head: child.digest(), boundary: false },
             "the walk must stop at the covered anchor, not fetch below it"
         );
     }
@@ -610,5 +760,295 @@ mod tests {
         let second = derive_covered_anchor(db);
         assert_eq!(first, Some(child_102.digest()), "anchor must be the top of the contiguous run");
         assert_eq!(first, second, "derive must be stable across calls on an unchanged cache");
+    }
+
+    /// The epoch of the pending-key walk tests: it dealt the next epoch's threshold key.
+    const DEALING_EPOCH: Epoch = 3;
+
+    /// A node in `DEALING_EPOCH` whose next-epoch key is not computed yet: the epoch dealt, and no
+    /// DKG outcome is stored for the next one.
+    fn dealing_epoch_node() -> (CommitteeFixture<MemDatabase>, ConsensusConfig<MemDatabase>) {
+        dealing_epoch_node_with(EpochScheme::Aggregate)
+    }
+
+    /// [`dealing_epoch_node`] with `scheme` as the epoch's own certificate scheme.
+    fn dealing_epoch_node_with(
+        scheme: EpochScheme,
+    ) -> (CommitteeFixture<MemDatabase>, ConsensusConfig<MemDatabase>) {
+        let fixture = CommitteeFixture::builder(MemDatabase::default)
+            .randomize_ports(true)
+            .committee_size(NonZeroUsize::new(4).unwrap())
+            .epoch(DEALING_EPOCH)
+            .build();
+        let base = fixture.authorities().next().unwrap().consensus_config();
+        let config = ConsensusConfig::new_for_epoch(
+            base.config().clone(),
+            base.node_storage().clone(),
+            base.key_config().clone(),
+            base.committee().clone(),
+            base.lookahead().clone(),
+            base.network_config().clone(),
+            u64::MAX,
+            false,
+            scheme,
+            DealtEpochs::from_known(BTreeMap::from([(DEALING_EPOCH, true)])),
+            None,
+        )
+        .unwrap();
+        (fixture, config)
+    }
+
+    /// A consensus header at `number` on `parent_hash` whose leader certificate the fixture's
+    /// committee signed in its epoch.
+    fn signed_header(
+        fixture: &CommitteeFixture<MemDatabase>,
+        number: u64,
+        parent_hash: B256,
+    ) -> ConsensusHeader {
+        let leader = fixture.certificate(&fixture.header_from_last_authority());
+        let sub_dag = CommittedSubDag::new(vec![], leader, 0, ReputationScores::default(), None);
+        ConsensusHeader { parent_hash, sub_dag, number, extra: B256::default() }
+    }
+
+    /// A consensus header at `number` led in `epoch`. Its certificate is unsigned, so it verifies
+    /// under no scheme.
+    fn header_led_in(epoch: Epoch, number: u64) -> ConsensusHeader {
+        let mut leader = Certificate::default();
+        leader.header.epoch = epoch;
+        let sub_dag = CommittedSubDag::new(vec![], leader, 0, ReputationScores::default(), None);
+        ConsensusHeader {
+            parent_hash: B256::repeat_byte(0x99),
+            sub_dag,
+            number,
+            extra: B256::default(),
+        }
+    }
+
+    /// The record of `DEALING_EPOCH` with `boundary` as its last header. `certified` adds a
+    /// certificate; the walk trusts the collector, which saves one only after verifying it.
+    fn save_dealing_epoch_record(
+        config: &ConsensusConfig<MemDatabase>,
+        boundary: B256,
+        certified: bool,
+    ) {
+        let keys = config.committee().bls_keys();
+        let record = EpochRecord {
+            epoch: DEALING_EPOCH,
+            committee: keys.clone(),
+            next_committee: keys,
+            parent_consensus: boundary,
+            ..Default::default()
+        };
+        let db = config.node_storage();
+        if !certified {
+            db.save_epoch_record(&record).unwrap();
+            return;
+        }
+        let vote = record.sign_vote(config.key_config());
+        let mut signed_authorities = roaring::RoaringBitmap::new();
+        signed_authorities.push(0);
+        let cert = EpochCertificate {
+            epoch_hash: record.digest(),
+            signature: vote.signature,
+            signed_authorities,
+        };
+        db.save_epoch_record_with_cert(&record, &cert).unwrap();
+    }
+
+    /// A network handle that answers by-hash header requests from `headers`, like a peer; any
+    /// other hash yields an `RPCError`.
+    fn serving_by_hash(headers: Vec<ConsensusHeader>) -> PrimaryNetworkHandle {
+        serving_by_hash_counted(headers).0
+    }
+
+    /// [`serving_by_hash`], with the number of header requests it received.
+    fn serving_by_hash_counted(
+        headers: Vec<ConsensusHeader>,
+    ) -> (PrimaryNetworkHandle, Arc<AtomicUsize>) {
+        let headers: HashMap<B256, ConsensusHeader> =
+            headers.into_iter().map(|header| (header.digest(), header)).collect();
+        let requests = Arc::new(AtomicUsize::new(0));
+        let counter = requests.clone();
+        let (tx, mut rx) =
+            tokio::sync::mpsc::channel::<NetworkCommand<PrimaryRequest, PrimaryResponse>>(64);
+        tokio::spawn(async move {
+            while let Some(cmd) = rx.recv().await {
+                let NetworkCommand::SendRequestAny { request, reply } = cmd else { continue };
+                let PrimaryRequest::ConsensusHeader { hash, .. } = request else { continue };
+                counter.fetch_add(1, Ordering::SeqCst);
+                let response = match hash.and_then(|hash| headers.get(&hash)) {
+                    Some(header) => Ok(PrimaryResponse::ConsensusHeader(Arc::new(header.clone()))),
+                    None => Err(NetworkError::RPCError("no such header".to_string())),
+                };
+                let _ = reply.send(response);
+            }
+        });
+        (PrimaryNetworkHandle::new_for_test(tx), requests)
+    }
+
+    /// Canonical headers up to `anchor`'s number, then the rest of the epoch to its boundary:
+    /// `(anchor, middle, boundary)`, numbered 10, 11 and 12.
+    fn dealing_epoch_chain(
+        fixture: &CommitteeFixture<MemDatabase>,
+        config: &ConsensusConfig<MemDatabase>,
+    ) -> (ConsensusHeader, ConsensusHeader, ConsensusHeader) {
+        let anchor = signed_header(fixture, 10, B256::default());
+        config
+            .node_storage()
+            .with_write_txn(|txn| {
+                txn.insert::<ConsensusBlocks>(&anchor.number, &anchor)?;
+                txn.insert::<ConsensusBlockNumbersByDigest>(&anchor.digest(), &anchor.number)?;
+                Ok(())
+            })
+            .unwrap();
+        let middle = signed_header(fixture, 11, anchor.digest());
+        let boundary = signed_header(fixture, 12, middle.digest());
+        (anchor, middle, boundary)
+    }
+
+    /// A node behind a threshold boundary must not stall. The tip leads in the next epoch, whose
+    /// key comes from this epoch's headers, so the walk descends from this epoch's certified
+    /// boundary: it verifies and caches the rest of this epoch, and republishes the boundary as
+    /// the streamer's target.
+    #[tokio::test(start_paused = true)]
+    async fn walk_descends_from_the_certified_boundary_when_the_tip_epoch_is_pending() {
+        let (fixture, config) = dealing_epoch_node();
+        let db = config.node_storage();
+
+        // Canonical up to 10; the rest of the epoch, 11 and the boundary 12, is only on peers.
+        let (_, middle, boundary) = dealing_epoch_chain(&fixture, &config);
+        save_dealing_epoch_record(&config, boundary.digest(), true);
+        let tip = header_led_in(DEALING_EPOCH + 1, 20);
+        assert_eq!(
+            config.epoch_keys_status(DEALING_EPOCH + 1),
+            EpochKeysStatus::Pending,
+            "precondition: the tip's epoch key is pending"
+        );
+
+        let consensus_bus = ConsensusBus::new();
+        let (network, requests) =
+            serving_by_hash_counted(vec![tip.clone(), boundary.clone(), middle.clone()]);
+        let mut session = WalkSession::new(config.clone(), consensus_bus.clone(), network);
+        assert!(session.sync_to(tip.digest()).await.is_continue());
+        assert!(session.boundary_covered);
+
+        assert_eq!(
+            consensus_bus.last_consensus_header().borrow().number,
+            boundary.number,
+            "the boundary is the streamer's target"
+        );
+        assert_eq!(
+            session.covered,
+            Some(boundary.digest()),
+            "coverage starts at the verified boundary, not the unverified tip"
+        );
+        assert!(db.get_consensus_by_hash(boundary.digest()).is_some());
+        assert!(db.get_consensus_by_hash(middle.digest()).is_some());
+        assert!(db.get_consensus_by_hash(tip.digest()).is_none(), "the tip is never cached");
+
+        // Nothing above the covered boundary verifies before the transition: later tips are not
+        // even fetched.
+        let fetched = requests.load(Ordering::SeqCst);
+        let later = header_led_in(DEALING_EPOCH + 1, 21);
+        assert!(session.sync_to(later.digest()).await.is_continue());
+        assert_eq!(requests.load(Ordering::SeqCst), fetched, "a later tip is not walked");
+        assert_eq!(session.covered, Some(boundary.digest()));
+    }
+
+    /// A node restarted while executing up to its epoch's boundary finds the rest of the epoch in
+    /// its cache, and derives its coverage right up to the boundary. The walk must still publish
+    /// the boundary, or the new streamer never gets a target and the node never transitions.
+    #[tokio::test(start_paused = true)]
+    async fn a_new_session_republishes_a_boundary_its_cache_already_reaches() {
+        let (fixture, config) = dealing_epoch_node();
+        let (_, middle, boundary) = dealing_epoch_chain(&fixture, &config);
+        store_consensus_header_in_cache(config.node_storage(), &middle);
+        store_consensus_header_in_cache(config.node_storage(), &boundary);
+        save_dealing_epoch_record(&config, boundary.digest(), true);
+        let tip = header_led_in(DEALING_EPOCH + 1, 20);
+
+        // A fresh bus and session, as after a restart.
+        let consensus_bus = ConsensusBus::new();
+        let network = serving_by_hash(vec![tip.clone()]);
+        let mut session = WalkSession::new(config.clone(), consensus_bus.clone(), network);
+        assert!(session.sync_to(tip.digest()).await.is_continue());
+
+        assert_eq!(session.covered, Some(boundary.digest()), "coverage derived from the cache");
+        assert_eq!(
+            consensus_bus.last_consensus_header().borrow().number,
+            boundary.number,
+            "the boundary is the streamer's target"
+        );
+    }
+
+    /// While this epoch's own key is pending nothing of it verifies, so tips are not walked.
+    #[tokio::test(start_paused = true)]
+    async fn a_pending_epoch_key_skips_walks() {
+        let (_, config) = dealing_epoch_node_with(EpochScheme::Pending);
+        let tip = header_led_in(DEALING_EPOCH, 20);
+        let (network, requests) = serving_by_hash_counted(vec![tip.clone()]);
+        let mut session = WalkSession::new(config, ConsensusBus::new(), network);
+        assert!(session.sync_to(tip.digest()).await.is_continue());
+        assert_eq!(requests.load(Ordering::SeqCst), 0);
+    }
+
+    /// A node still in epoch 0 holds only the uncertified epoch-0 placeholder. Asking the
+    /// collector for epoch 0 would change nothing (the request watch starts at 0), so the walk asks
+    /// for the last epoch closed before the tip's; the collector's pass then refetches epoch 0.
+    #[tokio::test(start_paused = true)]
+    async fn a_node_in_epoch_0_asks_for_records_up_to_the_tips_epoch() {
+        let fixture = CommitteeFixture::builder(MemDatabase::default)
+            .randomize_ports(true)
+            .committee_size(NonZeroUsize::new(4).unwrap())
+            .build();
+        let base = fixture.authorities().next().unwrap().consensus_config();
+        let keys = base.committee().bls_keys();
+        // What the dealing gate gives a node in epoch 0 of a network whose fork is active from
+        // genesis: epoch 0 never deals, and later epochs are unknown.
+        let config = ConsensusConfig::new_for_epoch(
+            base.config().clone(),
+            base.node_storage().clone(),
+            base.key_config().clone(),
+            base.committee().clone(),
+            CommitteeLookahead::from_entries(vec![(1, keys.clone()), (2, keys)]),
+            base.network_config().clone(),
+            u64::MAX,
+            false,
+            EpochScheme::Aggregate,
+            DealtEpochs::from_known(BTreeMap::from([(0, false)])),
+            None,
+        )
+        .unwrap();
+        config
+            .node_storage()
+            .save_epoch_record(&EpochRecord { epoch: 0, ..Default::default() })
+            .unwrap();
+        assert_eq!(config.epoch_keys_status(2), EpochKeysStatus::Pending, "precondition");
+        let tip = header_led_in(2, 20);
+
+        let consensus_bus = ConsensusBus::new();
+        let mut session =
+            WalkSession::new(config, consensus_bus.clone(), serving_by_hash(vec![tip.clone()]));
+        assert_eq!(session.walk(tip.digest()).await, WalkOutcome::AwaitingBoundary);
+        assert_eq!(*consensus_bus.requested_missing_epoch().borrow(), 1);
+    }
+
+    /// Without this epoch's certified record the walk cannot know the boundary: it asks the
+    /// collector for the record and waits, publishing nothing.
+    #[tokio::test(start_paused = true)]
+    async fn walk_requests_this_epochs_record_when_the_boundary_is_not_certified() {
+        let (fixture, config) = dealing_epoch_node();
+        let boundary = signed_header(&fixture, 12, B256::default());
+        // A local record without a certificate proves nothing.
+        save_dealing_epoch_record(&config, boundary.digest(), false);
+        let tip = header_led_in(DEALING_EPOCH + 1, 20);
+
+        let consensus_bus = ConsensusBus::new();
+        let network = serving_by_hash(vec![tip.clone(), boundary]);
+        let mut session = WalkSession::new(config.clone(), consensus_bus.clone(), network);
+        assert_eq!(session.walk(tip.digest()).await, WalkOutcome::AwaitingBoundary);
+
+        assert_eq!(*consensus_bus.requested_missing_epoch().borrow(), DEALING_EPOCH);
+        assert_eq!(consensus_bus.last_consensus_header().borrow().number, 0, "nothing published");
     }
 }

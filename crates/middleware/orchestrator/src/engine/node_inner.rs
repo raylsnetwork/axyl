@@ -11,7 +11,7 @@ use rayls_execution_evm::{
     chainspec::RaylsHardforks,
     in_flight::InFlightTracker,
     reth_env::RethEnv,
-    system_calls::EpochState,
+    system_calls::{ConsensusRegistry, EpochState},
     worker::{WorkerComponents, WorkerNetwork},
     RpcServerHandle, WorkerTxPool,
 };
@@ -207,12 +207,14 @@ impl ExecutionNodeInner {
     /// `committee` is slot-ordered (authorities sorted by id) to match receiver-side dispatch. The
     /// direct-submit path is fork-gated and re-read per tick, so an un-upgraded peer never receives
     /// the new request and the fork may activate mid-epoch.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn start_txn_forwarder(
         &self,
         worker_id: WorkerId,
         network_handle: WorkerNetworkHandle,
         executed_anchor: watch::Receiver<ConsensusHeader>,
         last_seen_header: watch::Receiver<ConsensusHeader>,
+        network_tip: watch::Receiver<(u64, B256)>,
         committee: Vec<BlsPublicKey>,
         epoch_task_spawner: &TaskSpawner,
         max_gossip_message_size: usize,
@@ -236,6 +238,7 @@ impl ExecutionNodeInner {
             network_handle,
             executed_anchor,
             last_seen_header,
+            network_tip,
             committee,
             direct_submit,
             max_gossip_message_size,
@@ -461,6 +464,14 @@ impl ExecutionNodeInner {
     /// Read [EpochState] from the canonical tip.
     pub(super) fn epoch_state_from_canonical_tip(&self) -> eyre::Result<EpochState> {
         self.reth_env.epoch_state_from_canonical_tip()
+    }
+
+    /// Read the registry's info for `epoch`; `None` outside `current - 3 ..= current`.
+    pub(super) fn epoch_info(
+        &self,
+        epoch: u32,
+    ) -> eyre::Result<Option<ConsensusRegistry::EpochInfo>> {
+        self.reth_env.epoch_info(epoch)
     }
 
     /// Read committee validator keys for epoch.

@@ -11,16 +11,17 @@ use rayls_infrastructure_storage::{
     mdbx::{open_detecting_page_size, MdbxConfig, MdbxDatabase},
     tables::{
         Batches, Certificates, ColdArchiveHighWaterMark, ColdBatchLocations,
-        ConsensusBlockNumbersByDigest, ConsensusBlocks, ConsensusBlocksCache, EpochCerts,
-        EpochRecords, EpochRecordsIndex, EpochTransitionCheckpoints, NodeIdentity,
+        ConsensusBlockNumbersByDigest, ConsensusBlocks, ConsensusBlocksCache, DkgOutcomes,
+        EpochCerts, EpochRecords, EpochRecordsIndex, EpochTransitionCheckpoints, NodeIdentity,
         PendingEpochRecord,
     },
     ColdConfig, ColdStore,
 };
 use rayls_infrastructure_types::{
-    leader_epoch_and_batch_digests, try_decode, try_decode_key, AuthorityIdentifier, Batch,
-    BlockHash, CertificateDigest, ConsensusHeader, ConsensusHeaderMeta, Database, DbTx as _, Epoch,
-    EpochCertificate, EpochRecord, EpochTransitionCheckpoint, Table, B256,
+    dkg::DkgOutcome, leader_epoch_and_batch_digests, try_decode, try_decode_key,
+    AuthorityIdentifier, Batch, BlockHash, CertificateDigest, ConsensusHeader, ConsensusHeaderMeta,
+    Database, DbTx as _, Epoch, EpochCertificate, EpochRecord, EpochTransitionCheckpoint, Table,
+    B256,
 };
 use rayls_infrastructure_utils::mdbx::MIN_MDBX_PAGE_SIZE;
 use serde::Serialize;
@@ -377,6 +378,18 @@ impl NodeDb {
             .collect::<eyre::Result<_>>()?;
         epochs.sort_unstable();
         Ok(epochs)
+    }
+
+    /// The DKG outcome this node computed for `epoch` (the epoch the key is for), if any: with a
+    /// key, the epoch's certificates are threshold certificates.
+    pub fn dkg_outcome(&self, epoch: Epoch) -> eyre::Result<Option<DkgOutcome>> {
+        self.get::<DkgOutcomes>(&epoch)
+    }
+
+    /// Whether the source has the DKG outcome table. A node with threshold certificates creates
+    /// it on every open, so a source without it holds only aggregate certificates.
+    pub fn has_dkg_outcomes(&self) -> eyre::Result<bool> {
+        self.table_present::<DkgOutcomes>()
     }
 
     /// Leftover transition checkpoint for `epoch` (present only after an interrupted transition).

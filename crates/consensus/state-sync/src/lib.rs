@@ -507,7 +507,11 @@ async fn spawn_stream_consensus_headers<DB: Database>(
     let mut last_consensus_header = consensus_bus.executed_anchor().borrow().clone();
     let mut last_consensus_height = last_consensus_header.number;
 
-    let mut pending_catch_up_target: Option<ConsensusHeader> = None;
+    // A target the walk published before this task subscribed never shows as a change, and an
+    // anchored walk publishes its epoch's boundary only once: start from it.
+    let published = rx_last_consensus_header.borrow_and_update().clone();
+    let mut pending_catch_up_target: Option<ConsensusHeader> =
+        (published.number > last_consensus_height).then_some(published);
 
     info!(
         target: "rayls-consensus-state-sync",

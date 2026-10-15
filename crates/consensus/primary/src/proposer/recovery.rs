@@ -100,7 +100,11 @@ impl<DB: Database> Proposer<DB> {
         // drain every committed round (not just the lowest) so the retransmit split below cannot
         // re-queue a round that already committed
         for round in committed_headers.iter().copied() {
-            self.proposed_headers.remove(&round);
+            if let Some(header) = self.proposed_headers.remove(&round) {
+                // the deal for the next epoch's key is in the committed DAG once any committed
+                // header of ours carried it
+                self.deal_committed |= header.dkg().deal.is_some();
+            }
         }
 
         // Fall back to the commit round when none of our own headers committed: otherwise a

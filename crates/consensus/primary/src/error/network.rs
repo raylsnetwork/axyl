@@ -85,10 +85,13 @@ impl From<&PrimaryNetworkError> for Option<Penalty> {
                     CertificateError::RecoverBlsAggregateSignatureBytes
                     | CertificateError::Unsigned
                     | CertificateError::Inquorate { .. }
+                    | CertificateError::UnexpectedSigners
                     | CertificateError::InvalidSignature => Some(Penalty::Fatal),
                     // ignore
                     CertificateError::ResChannelClosed(_)
                     | CertificateError::TooNew(_, _, _)
+                    // our own epoch key is missing, the peer did nothing wrong
+                    | CertificateError::SchemePending
                     | CertificateError::Storage(_) => None,
                 },
                 // fatal
@@ -157,11 +160,18 @@ fn penalty_from_header_error(error: &HeaderError) -> Option<Penalty> {
         | HeaderError::UnknownWorkerId
         | HeaderError::InvalidHeaderDigest
         | HeaderError::InvalidRound { .. }
+        | HeaderError::UnexpectedDkgData
+        | HeaderError::InvalidDkgDeal(_)
+        | HeaderError::InvalidDkgComplaint(_)
+        | HeaderError::TooManyDkgComplaints(_, _)
         | HeaderError::UnknownAuthority(_) => Some(Penalty::Fatal),
         // ignore
         HeaderError::PendingCertificateOneshot
         | HeaderError::RAYLSSend(_)
         | HeaderError::InvalidEpoch { .. }
+        // our own share is missing, the peer did nothing wrong
+        | HeaderError::NoThresholdShare
+        | HeaderError::ThresholdKeyPending
         | HeaderError::ClosedWatchChannel => None,
     }
 }

@@ -138,7 +138,8 @@ where
             | RaylsHardFork::OutputSeqNormalization
             | RaylsHardFork::SenderAffinityLoadBalancing
             | RaylsHardFork::EpochCloseSeedV2
-            | RaylsHardFork::CertificateFetchEpochV2 => continue,
+            | RaylsHardFork::CertificateFetchEpochV2
+            | RaylsHardFork::ThresholdCertificates => continue,
         };
 
         // Pre-load accounts into cache and copy their real AccountInfo.

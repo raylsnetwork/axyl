@@ -1,10 +1,11 @@
 //! Trait and helpers for accessing Epoch data in the consensus DB.
 use rayls_infrastructure_types::{
-    BlockHash, BlsPublicKey, Database, DbTx, DbTxMut, Epoch, EpochCertificate, EpochRecord,
+    dkg::DkgOutcome, BlockHash, BlsPublicKey, Database, DbTx, DbTxMut, Epoch, EpochCertificate,
+    EpochRecord,
 };
 
 use crate::{
-    tables::{EpochCerts, EpochRecords, EpochRecordsIndex, PendingEpochRecord},
+    tables::{DkgOutcomes, EpochCerts, EpochRecords, EpochRecordsIndex, PendingEpochRecord},
     StoreResult,
 };
 use tracing::{debug, info};
@@ -65,9 +66,23 @@ pub trait EpochStore {
     /// Normally unnecessary: [`EpochStore::save_epoch_record_with_cert`] removes the row itself.
     /// Kept for the defensive sweep of rows whose epoch turns out to be certified already.
     fn clear_pending_epoch_record(&self, epoch: Epoch) -> StoreResult<()>;
+
+    /// The DKG outcome for `epoch` (the epoch the key is for), if this node computed it.
+    fn get_dkg_outcome(&self, epoch: Epoch) -> Option<DkgOutcome>;
+
+    /// Persist the DKG outcome for `epoch`.
+    fn save_dkg_outcome(&self, epoch: Epoch, outcome: &DkgOutcome) -> StoreResult<()>;
 }
 
 impl<DB: Database> EpochStore for DB {
+    fn get_dkg_outcome(&self, epoch: Epoch) -> Option<DkgOutcome> {
+        self.get::<DkgOutcomes>(&epoch).ok().flatten()
+    }
+
+    fn save_dkg_outcome(&self, epoch: Epoch, outcome: &DkgOutcome) -> StoreResult<()> {
+        self.with_write_txn(|tx| tx.insert::<DkgOutcomes>(&epoch, outcome))
+    }
+
     fn get_committee_keys(&self, epoch: Epoch) -> Option<Vec<BlsPublicKey>> {
         if let Ok(Some(rec)) = self.get::<EpochRecords>(&epoch) {
             Some(rec.committee)

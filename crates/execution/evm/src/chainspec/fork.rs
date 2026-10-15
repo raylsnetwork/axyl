@@ -54,6 +54,13 @@ hardfork!(
         /// already closed that epoch serves them from the tail it kept instead of answering from
         /// the new epoch. Gates only the request format a node sends; every node accepts both.
         CertificateFetchEpochV2,
+        /// Threshold BLS certificates: the committee of each epoch deals shares of one epoch key
+        /// to the next committee during the epoch, votes become partial signatures, and any
+        /// quorum of them combines into the same certificate signature. Removes the certificate
+        /// variants behind #233, #273 and #275. An epoch uses threshold certificates when this
+        /// fork is active at the first block of the previous epoch and that epoch's key
+        /// generation succeeded.
+        ThresholdCertificates,
     }
 );
 
@@ -78,6 +85,7 @@ impl RaylsHardFork {
             Self::SenderAffinityLoadBalancing => 0x0f,
             Self::EpochCloseSeedV2 => 0x10,
             Self::CertificateFetchEpochV2 => 0x11,
+            Self::ThresholdCertificates => 0x12,
         }
     }
 

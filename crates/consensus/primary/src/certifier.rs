@@ -1,7 +1,7 @@
 //! Certifier publishes headers and certificates for this primary.
 
 use crate::{
-    aggregators::HeaderVotesAggregator,
+    aggregators::{sign_vote, HeaderVotesAggregator},
     network::{PrimaryNetworkHandle, RequestVoteResult},
     state_sync::StateSynchronizer,
     ConsensusBus, NodeMode,
@@ -9,7 +9,7 @@ use crate::{
 use consensus_metrics::monitored_future;
 use rayls_consensus_network::error::NetworkError;
 use rayls_consensus_primary_metrics::PrimaryMetrics;
-use rayls_infrastructure_config::{ConsensusConfig, KeyConfig};
+use rayls_infrastructure_config::ConsensusConfig;
 use rayls_infrastructure_storage::CertificateStore;
 use rayls_infrastructure_types::{
     ensure,
@@ -48,8 +48,6 @@ pub(crate) struct Certifier<DB> {
     certificate_store: DB,
     /// Handles synchronization with other nodes and our workers.
     rayls_consensus_state_sync: StateSynchronizer<DB>,
-    /// Service to sign headers.
-    signature_service: KeyConfig,
     /// Consensus config to subscribe to shutdown.
     config: ConsensusConfig<DB>,
     /// Consensus channels.
@@ -109,7 +107,6 @@ impl<DB: Database> Certifier<DB> {
                     committee: config.committee().clone(),
                     certificate_store: config.node_storage().clone(),
                     rayls_consensus_state_sync,
-                    signature_service: config.key_config().clone(),
                     config,
                     consensus_bus,
                     network: primary_network,
@@ -571,8 +568,12 @@ impl<DB: Database> Certifier<DB> {
         // reset the votes aggregator and sign own header
         let mut votes_aggregator =
             HeaderVotesAggregator::new(self.metrics.clone(), &self.committee);
-        let vote = Vote::new(&header, self.authority_id.clone(), &self.signature_service);
-        let mut certificate = votes_aggregator.append(vote, &self.committee, &header)?;
+        // Without a threshold share this node cannot vote, not even for its own header; the
+        // other members' votes still reach the quorum.
+        let mut certificate = match sign_vote(&self.config, &header, self.authority_id.clone()) {
+            Some(vote) => votes_aggregator.append(vote, &self.committee, &header)?,
+            None => None,
+        };
 
         // create a bounded channel for receiving votes from peers
         // capacity is committee size since we need at most one vote per peer

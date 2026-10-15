@@ -1,13 +1,16 @@
 use crate::{
     error::{ProposerError, ProposerResult},
-    proposer::{types::ProposerDigest, PendingHeaderTask, Proposer},
+    proposer::{
+        types::{Dealer, ProposerDigest},
+        PendingHeaderTask, Proposer,
+    },
     ConsensusBus,
 };
 use rayls_consensus_primary_metrics::PrimaryMetrics;
 use rayls_infrastructure_storage::ProposerStore;
 use rayls_infrastructure_types::{
-    now, now_in_millis, AuthorityIdentifier, Certificate, Database, Epoch, Hash as _, Header,
-    RaylsSender, Round,
+    dkg::DkgPayload, now, now_in_millis, AuthorityIdentifier, Certificate, Database, Epoch,
+    Hash as _, Header, RaylsSender, Round,
 };
 use std::{collections::VecDeque, sync::Arc};
 use tokio::{
@@ -36,6 +39,8 @@ impl<DB: Database> Proposer<DB> {
     ///
     /// - current_header: caller checks to see if there is already a header built for this round. If
     ///   current_header.is_some() the proposer uses this header instead of building a new one.
+    /// - dealer: set while this node's deal for the next epoch's key still has to be committed; the
+    ///   deal then rides in the new header.
     #[allow(clippy::too_many_arguments)]
     async fn propose_header(
         current_round: Round,
@@ -49,6 +54,7 @@ impl<DB: Database> Proposer<DB> {
         metrics: Arc<PrimaryMetrics>,
         leader_and_support: String,
         max_delay: Duration,
+        dealer: Option<Dealer>,
     ) -> ProposerResult<Header> {
         // check that the included timestamp is consistent with the parent's timestamp
         //
@@ -69,6 +75,19 @@ impl<DB: Database> Proposer<DB> {
             sleep(Duration::from_secs(drift_sec)).await;
         }
 
+        // Made before the header so that making it does not age the header's timestamp. A failure
+        // costs only this header's deal: the next new header tries again.
+        let deal = match dealer {
+            Some(dealer) => dealer
+                .deal()
+                .await
+                .inspect_err(|e| {
+                    error!(target: "primary::proposer", ?e, "dkg deal failed, proposing without");
+                })
+                .ok(),
+            None => None,
+        };
+
         let payload_vec: Vec<_> = digests.iter().map(|m| (m.digest, m.worker_id)).collect();
         consensus_bus.batch_tracker().digests_included_in_header(&payload_vec);
         let header = Header::new(
@@ -79,6 +98,10 @@ impl<DB: Database> Proposer<DB> {
             parents.iter().map(|x| x.digest()).collect(),
             consensus_bus.recently_executed_blocks().borrow().latest_block_num_hash(),
         );
+        let header = match deal {
+            Some(deal) => header.with_dkg(DkgPayload { deal: Some(deal), complaints: Vec::new() }),
+            None => header,
+        };
 
         // update metrics before sending/storing header
         metrics.headers_proposed.with_label_values(&[&leader_and_support]).inc();
@@ -322,6 +345,8 @@ impl<DB: Database> Proposer<DB> {
                 };
 
                 let consensus_bus = self.consensus_bus.clone();
+                // the deal rides in every new header until one that carried it commits
+                let dealer = self.dealer.clone().filter(|_| !self.deal_committed);
                 // spawn tokio task to create, store, and send new header to certifier
                 self.task_spawner.spawn_task("propose header", async move {
                     let proposal = Proposer::propose_header(
@@ -336,6 +361,7 @@ impl<DB: Database> Proposer<DB> {
                         metrics,
                         leader_and_support.to_string(),
                         min_delay,
+                        dealer,
                     )
                     .await;
 

@@ -47,8 +47,8 @@ impl Vote {
         }
     }
 
-    /// Create a vote directly with a suplied signer (private key).
-    /// Used for testing, other wise use one BlsSigner versions.
+    /// Create a vote directly with a suplied signer: the node's threshold share in a threshold
+    /// epoch, or a private key in tests. Otherwise use the BlsSigner version.
     pub fn new_with_signer<S>(header: &Header, author: AuthorityIdentifier, signer: &S) -> Self
     where
         S: Signer,

@@ -6,7 +6,9 @@
 use crate::{
     bcs_layout::{skip_bytes, BcsCursor, BcsLayout, BcsLayoutError},
     crypto::{
-        self, to_intent_message, BlsAggregateSignature, BlsPublicKey, BlsSignature,
+        self,
+        threshold::{combine, PartialSignature, ShareIndex},
+        to_intent_message, BlsAggregateSignature, BlsPublicKey, BlsSignature, ProtocolSignature,
         ValidatorAggregateSignature,
     },
     ensure,
@@ -123,9 +125,7 @@ impl Certificate {
                 false
             })
             .map(|(index, _)| index as u32);
-
-        let signed_authorities= roaring::RoaringBitmap::from_sorted_iter(filtered_votes)
-            .map_err(|_| DagError::InvalidBitmap("Failed to convert votes into a bitmap of authority keys. Something is likely very wrong...".to_string()))?;
+        let indices: Vec<u32> = filtered_votes.collect();
 
         // Ensure that all authorities in the set of votes are known
         ensure!(
@@ -142,13 +142,40 @@ impl Certificate {
         );
 
         let sigs: Vec<BlsSignature> = sigs.iter().map(|(_, sig)| *sig).collect();
-        let bls_signature = if sigs.is_empty() {
-            BlsSignature::default()
-        } else {
-            let aggregated_signature = BlsAggregateSignature::aggregate(&sigs[..], true)
-                .map_err(|_| DagError::InvalidSignature)?;
-
-            aggregated_signature.to_signature()
+        let (bls_signature, signed_authorities) = match committee.threshold_key() {
+            Some(key) if check_stake => {
+                // Threshold epoch: the votes are partial signatures, and any quorum of them
+                // combines into the same signature, so the certificate carries no signer set.
+                let partials: Vec<PartialSignature> = indices
+                    .iter()
+                    .zip(&sigs)
+                    .map(|(index, signature)| PartialSignature {
+                        index: ShareIndex::from_position(*index),
+                        signature: *signature,
+                    })
+                    .collect();
+                let signature = combine(committee.quorum_threshold() as usize, &partials)
+                    .map_err(|_| DagError::CertificateRequiresQuorum)?;
+                // Every vote was verified on its own; one pairing against the group key catches
+                // an inconsistent set before the certificate is gossiped.
+                ensure!(
+                    signature.verify_secure(&to_intent_message(header.digest()), &key.group_key()),
+                    DagError::InvalidSignature
+                );
+                (signature, roaring::RoaringBitmap::new())
+            }
+            _ => {
+                let signed_authorities = roaring::RoaringBitmap::from_sorted_iter(indices.iter().copied())
+                    .map_err(|_| DagError::InvalidBitmap("Failed to convert votes into a bitmap of authority keys. Something is likely very wrong...".to_string()))?;
+                let bls_signature = if sigs.is_empty() {
+                    BlsSignature::default()
+                } else {
+                    BlsAggregateSignature::aggregate(&sigs[..], true)
+                        .map_err(|_| DagError::InvalidSignature)?
+                        .to_signature()
+                };
+                (bls_signature, signed_authorities)
+            }
         };
 
         let signature_verification_state = if !check_stake {
@@ -218,6 +245,14 @@ impl Certificate {
         // Save signature verifications when the header is invalid.
         self.header.validate(committee)?;
 
+        // The scheme comes from the committee, never from the certificate's own bytes. While the
+        // epoch's threshold key is not computed yet, no scheme applies: verifying as aggregate
+        // would reject every honest threshold certificate.
+        ensure!(!committee.is_threshold_pending(), CertificateError::SchemePending);
+        if let Some(key) = committee.threshold_key() {
+            return self.verify_threshold(&key.group_key());
+        }
+
         let (weight, pks) = self.signed_by(&committee.bls_keys());
 
         let threshold = committee.quorum_threshold();
@@ -230,17 +265,52 @@ impl Certificate {
 
     /// Verifies the aggregate signature against `committee`, resetting the verification state
     /// first so an already-verified certificate is re-checked.
-    pub fn verify_cert(mut self, committee: &[BlsPublicKey]) -> CertificateResult<Certificate> {
+    pub fn verify_cert(self, committee: &[BlsPublicKey]) -> CertificateResult<Certificate> {
+        self.verify_cert_with(&CertificateScheme::Aggregate(committee))
+    }
+
+    /// Verifies the certificate under the epoch's signature scheme, resetting the verification
+    /// state first so an already-verified certificate is re-checked.
+    pub fn verify_cert_with(
+        mut self,
+        scheme: &CertificateScheme<'_>,
+    ) -> CertificateResult<Certificate> {
         self = self.validate_received()?;
-        let (weight, pks) = self.signed_by(committee);
+        match scheme {
+            CertificateScheme::Aggregate(committee) => {
+                let (weight, pks) = self.signed_by(committee);
 
-        // All validator have a vote weight of 1.
-        let threshold = quorum_threshold(committee.len() as u64);
-        ensure!(weight >= threshold, CertificateError::Inquorate { stake: weight, threshold });
+                // All validator have a vote weight of 1.
+                let threshold = quorum_threshold(committee.len() as u64);
+                ensure!(
+                    weight >= threshold,
+                    CertificateError::Inquorate { stake: weight, threshold }
+                );
 
-        let verified_cert = self.verify_signature(pks)?;
+                self.verify_signature(pks)
+            }
+            CertificateScheme::Threshold(group_key) => self.verify_threshold(group_key),
+        }
+    }
 
-        Ok(verified_cert)
+    /// Verifies a threshold certificate: one signature against the epoch's group key, and no
+    /// signer set, so that nothing in the certificate's bytes is left to a relay's choice.
+    #[allow(deprecated)]
+    fn verify_threshold(mut self, group_key: &BlsPublicKey) -> CertificateResult<Certificate> {
+        ensure!(self.signed_authorities.is_empty(), CertificateError::UnexpectedSigners);
+        let signature = match self.signature_verification_state {
+            SignatureVerificationState::VerifiedDirectly(_)
+            | SignatureVerificationState::VerifiedIndirectly(_)
+            | SignatureVerificationState::Genesis => return Ok(self),
+            SignatureVerificationState::Unverified(sig) => sig,
+            SignatureVerificationState::Unsigned(_) => return Err(CertificateError::Unsigned),
+        };
+        ensure!(
+            signature.verify_secure(&to_intent_message(self.digest()), group_key),
+            CertificateError::InvalidSignature
+        );
+        self.signature_verification_state = SignatureVerificationState::VerifiedDirectly(signature);
+        Ok(self)
     }
 
     /// Verifies the signature unless the state already says it was verified.
@@ -395,6 +465,35 @@ impl Certificate {
 impl BcsLayout for Certificate {
     fn skip(c: &mut BcsCursor<'_>) -> Result<(), BcsLayoutError> {
         Self::skip_with_header_span(c).map(drop)
+    }
+}
+
+/// How an epoch's certificates are signed. The verifier decides it from the epoch (the committee
+/// or the epoch's recorded key), never from the certificate's own bytes.
+#[derive(Clone, Copy, Debug)]
+pub enum CertificateScheme<'a> {
+    /// An aggregate of individual votes over the committee keys in `bls_keys()` order, with a
+    /// signer bitmap and a quorum count.
+    Aggregate(&'a [BlsPublicKey]),
+    /// One signature by the epoch's threshold group key, with no signer set.
+    Threshold(&'a BlsPublicKey),
+}
+
+/// Owned keys of one epoch, resolved by a verifier that does not hold the epoch's committee.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EpochKeys {
+    /// The committee keys in `bls_keys()` order.
+    pub keys: Vec<BlsPublicKey>,
+    /// The threshold group key, when the epoch uses threshold certificates.
+    pub group_key: Option<BlsPublicKey>,
+}
+
+impl EpochKeys {
+    pub fn scheme(&self) -> CertificateScheme<'_> {
+        match &self.group_key {
+            Some(group_key) => CertificateScheme::Threshold(group_key),
+            None => CertificateScheme::Aggregate(&self.keys),
+        }
     }
 }
 

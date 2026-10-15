@@ -59,6 +59,7 @@ pub enum IntentScope {
     EpochBoundary = 1,     // Used for authority signature on a checkpoint at epochs boundaries.
     ConsensusDigest = 2,   // Used for authority signature on consensus digests.
     SystemMessage = 3,     // Used for signing system messages.
+    DkgShare = 4,          // Used for DKG share decryption keys. Never published.
 }
 
 impl TryFrom<u8> for IntentScope {

@@ -7,6 +7,7 @@ use super::{
     AuthEquivocationMap, PrimaryResponse,
 };
 use crate::{
+    aggregators::sign_vote,
     error::{CertManagerError, PrimaryNetworkError, PrimaryNetworkResult},
     network::{
         message::PrimaryGossip,
@@ -17,17 +18,18 @@ use crate::{
 };
 use parking_lot::Mutex;
 use rayls_consensus_network::GossipMessage;
-use rayls_infrastructure_config::{ConsensusConfig, LibP2pConfig};
+use rayls_infrastructure_config::{ConsensusConfig, EpochKeysStatus, LibP2pConfig};
 use rayls_infrastructure_storage::{
     tables::ConsensusBlocks, CertScope, ConsensusStore, EpochStore, ProposerStore, VoteDigestStore,
 };
 use rayls_infrastructure_types::{
+    dkg::{DealingParams, DkgError, EpochScheme},
     ensure,
     error::{CertificateError, HeaderError, HeaderResult},
     now, to_intent_message, try_decode, AuthorityIdentifier, B256Map, BlockHash, BlockNumHash,
-    BlsPublicKey, Certificate, CertificateDigest, ConsensusHeader, Database, Epoch,
+    BlsPublicKey, Certificate, CertificateDigest, Committee, ConsensusHeader, Database, Epoch,
     EpochCertificate, EpochRecord, Hash as _, Header, ProtocolSignature, RaylsSender as _, Round,
-    SignatureVerificationState, Vote, VotesAggregator,
+    SignatureVerificationState, VotesAggregator,
 };
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -244,21 +246,32 @@ where
                 let unverified_cert = cert.validate_received().map_err(CertManagerError::from)?;
 
                 let epoch = unverified_cert.header().epoch;
-                // verify early so behind_consensus can act; verification is cached on the cert
-                if let Some(committee) = self.get_committee(epoch) {
-                    match unverified_cert.verify_cert(&committee) {
-                        Ok(cert) => {
-                            if self.behind_consensus(epoch, cert.header().round, None).await {
-                                warn!(target: "primary", "certificate indicates we are behind, go to catchup mode!");
-                                return Ok(());
+                // verify early so behind_consensus can act; verification is cached on the cert.
+                // The epoch's scheme (aggregate or threshold) is ours to decide, never the cert's.
+                match self.consensus_config.epoch_keys_status(epoch) {
+                    EpochKeysStatus::Ready(keys) => {
+                        match unverified_cert.verify_cert_with(&keys.scheme()) {
+                            Ok(cert) => {
+                                if self.behind_consensus(epoch, cert.header().round, None).await {
+                                    warn!(target: "primary", "certificate indicates we are behind, go to catchup mode!");
+                                    return Ok(());
+                                }
+                                self.rayls_consensus_state_sync
+                                    .process_peer_certificate(cert)
+                                    .await?;
                             }
-                            self.rayls_consensus_state_sync.process_peer_certificate(cert).await?;
+                            Err(e) => warn!(target: "primary", "Received invalid cert {e}"),
                         }
-                        Err(e) => warn!(target: "primary", "Received invalid cert {e}"),
                     }
-                } else {
-                    // ignore unverifiable cert: going inactive without committee is unsafe
-                    warn!(target: "primary", "failed to get committee for epoch {epoch}, ignoring certificate!", );
+                    EpochKeysStatus::Pending => {
+                        // the epoch's threshold key is not computed here yet: verifying as
+                        // aggregate would reject an honest cert, so ignore it for now
+                        debug!(target: "primary", epoch, "threshold key pending, ignoring certificate");
+                    }
+                    EpochKeysStatus::NoCommittee => {
+                        // ignore unverifiable cert: going inactive without committee is unsafe
+                        warn!(target: "primary", "failed to get committee for epoch {epoch}, ignoring certificate!", );
+                    }
                 }
             }
             PrimaryGossip::Consensus(result) => {
@@ -519,6 +532,18 @@ where
             }
             .into()
         );
+        // DKG data: pure CPU, so it is checked before any blocking I/O.
+        validate_dkg_payload(&header, committee, self.consensus_config.dealing().map(Arc::as_ref))?;
+        // In a threshold epoch a vote is a partial signature by this node's share. A node whose
+        // share could not be derived, or whose epoch key is not computed yet, cannot vote, so it
+        // refuses before any I/O. Neither is the proposer's fault.
+        match self.consensus_config.scheme() {
+            EpochScheme::Pending => return Err(HeaderError::ThresholdKeyPending.into()),
+            EpochScheme::Threshold(threshold) => {
+                ensure!(threshold.share.is_some(), HeaderError::NoThresholdShare.into())
+            }
+            EpochScheme::Aggregate => {}
+        }
 
         // validate parents
         let num_parents = parents.len();
@@ -684,8 +709,8 @@ where
             );
             if header.round() == vote_info.round() {
                 // do not vote twice for the same authority in the same epoch/round
-                let vote =
-                    Vote::new(&header, authority_id.clone(), self.consensus_config.key_config());
+                let vote = sign_vote(&self.consensus_config, &header, authority_id.clone())
+                    .ok_or(HeaderError::NoThresholdShare)?;
 
                 if vote.digest() != vote_info.vote_digest() {
                     warn!(
@@ -707,7 +732,8 @@ where
             }
         }
 
-        let vote = Vote::new(&header, authority_id, self.consensus_config.key_config());
+        let vote = sign_vote(&self.consensus_config, &header, authority_id)
+            .ok_or(HeaderError::NoThresholdShare)?;
 
         self.consensus_config.node_storage().write_vote(&vote)?;
 
@@ -1069,6 +1095,57 @@ pub(crate) fn fetch_scope(requested: Option<Epoch>, our_epoch: Epoch) -> Option<
     }
 }
 
+/// Checks a header's DKG data before voting for it.
+///
+/// Outside a dealing epoch the payload must be empty. In one, a deal must validate for the
+/// author's position in the dealing committee, and each complaint must name the epoch being dealt,
+/// an in-range dealer and recipient, and carry a decryption key the recipient signed. Whether a
+/// complaint is true is decided against the committed deal when the epoch closes; a voter only
+/// checks that it is well formed.
+fn validate_dkg_payload(
+    header: &Header,
+    committee: &Committee,
+    dealing: Option<&DealingParams>,
+) -> HeaderResult<()> {
+    let payload = header.dkg();
+    let Some(params) = dealing else {
+        ensure!(payload.is_empty(), HeaderError::UnexpectedDkgData);
+        return Ok(());
+    };
+    if let Some(deal) = &payload.deal {
+        let dealer = committee
+            .bls_position_by_id(header.author())
+            .ok_or_else(|| HeaderError::UnknownAuthority(header.author().to_string()))?;
+        deal.validate(dealer, params.epoch, params.threshold, params.recipients.len())
+            .map_err(HeaderError::InvalidDkgDeal)?;
+    }
+    let (count, max) = (payload.complaints.len(), committee.size());
+    ensure!(count <= max, HeaderError::TooManyDkgComplaints(count, max));
+    for complaint in &payload.complaints {
+        let tag = complaint.tag;
+        ensure!(
+            tag.epoch == params.epoch,
+            HeaderError::InvalidDkgComplaint(DkgError::WrongEpoch {
+                expected: params.epoch,
+                got: tag.epoch
+            })
+        );
+        ensure!(
+            (tag.dealer as usize) < committee.size(),
+            HeaderError::InvalidDkgComplaint(DkgError::BadPosition(tag.dealer))
+        );
+        let recipient_key = params
+            .recipients
+            .get(tag.recipient as usize)
+            .ok_or(HeaderError::InvalidDkgComplaint(DkgError::BadPosition(tag.recipient)))?;
+        ensure!(
+            complaint.decryption_key.verify_raw(&tag.message(), recipient_key),
+            HeaderError::InvalidDkgComplaint(DkgError::BadDecryptionKey)
+        );
+    }
+    Ok(())
+}
+
 /// Returns true when local execution has a block at `target.number` whose hash diverges from
 /// `target.hash` - evidence the header's execution anchor is forked.
 ///
@@ -1118,9 +1195,15 @@ fn evict_oldest_completed(cache: &mut AuthEquivocationMap, max_entries: usize) {
 
 #[cfg(test)]
 mod tests {
-    use super::{anchor_diverges_from_executed, BehindTracker};
+    use super::{anchor_diverges_from_executed, validate_dkg_payload, BehindTracker};
     use crate::RecentlyExecutedBlocks;
-    use rayls_infrastructure_types::{BlockNumHash, ExecHeader, SealedHeader, B256};
+    use rayls_infrastructure_storage::mem_db::MemDatabase;
+    use rayls_infrastructure_types::{
+        dkg::{Complaint, Deal, DealingParams, DkgError, DkgPayload, ShareTag},
+        error::HeaderError,
+        BlockNumHash, BlsKeypair, Committee, ExecHeader, Header, SealedHeader, B256,
+    };
+    use rayls_testing_test_utils_committee::CommitteeFixture;
     use std::time::Duration;
 
     fn sealed_at(number: u64) -> SealedHeader {
@@ -1195,5 +1278,139 @@ mod tests {
         t.reset(15);
         assert_eq!(t.last_committed_round, 15);
         assert!(!t.record_behind(15, Duration::from_secs(3600)));
+    }
+
+    /// A committee dealing the next epoch's key to itself, as the fork's first dealing epoch does
+    /// when the committee does not change.
+    struct Dealing {
+        fixture: CommitteeFixture<MemDatabase>,
+        committee: Committee,
+        params: DealingParams,
+        /// A header by the last authority, without DKG data.
+        header: Header,
+        /// The header author's position in the committee.
+        author: u32,
+    }
+
+    fn dealing() -> Dealing {
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let committee = fixture.committee();
+        let params = DealingParams {
+            epoch: committee.epoch() + 1,
+            threshold: committee.quorum_threshold() as usize,
+            recipients: committee.bls_keys(),
+            complaint_window: 20,
+        };
+        let header = fixture.header_from_last_authority();
+        let author = committee.bls_position_by_id(header.author()).unwrap();
+        Dealing { fixture, committee, params, header, author }
+    }
+
+    impl Dealing {
+        fn deal(&self, dealer: u32) -> Deal {
+            let p = &self.params;
+            Deal::new(p.epoch, dealer, p.threshold, &p.recipients, &mut rand::rng()).unwrap()
+        }
+
+        /// The key pair of the recipient at `position`.
+        fn recipient(&self, position: u32) -> &BlsKeypair {
+            let key = self.params.recipients[position as usize];
+            self.fixture.authorities().find(|a| a.primary_public_key() == key).unwrap().keypair()
+        }
+
+        fn with_dkg(&self, deal: Option<Deal>, complaints: Vec<Complaint>) -> Header {
+            self.header.clone().with_dkg(DkgPayload { deal, complaints })
+        }
+
+        fn validate(&self, header: &Header) -> Result<(), HeaderError> {
+            validate_dkg_payload(header, &self.committee, Some(&self.params))
+        }
+    }
+
+    #[test]
+    fn empty_dkg_payload_is_valid_whether_or_not_the_epoch_deals() {
+        let d = dealing();
+        assert!(validate_dkg_payload(&d.header, &d.committee, None).is_ok());
+        assert!(d.validate(&d.header).is_ok());
+    }
+
+    #[test]
+    fn dkg_data_outside_a_dealing_epoch_is_rejected() {
+        let d = dealing();
+        let complaint = Complaint::new(
+            ShareTag { epoch: d.params.epoch, dealer: 0, recipient: 1 },
+            d.recipient(1),
+        );
+        for header in
+            [d.with_dkg(Some(d.deal(d.author)), vec![]), d.with_dkg(None, vec![complaint])]
+        {
+            assert!(matches!(
+                validate_dkg_payload(&header, &d.committee, None),
+                Err(HeaderError::UnexpectedDkgData)
+            ));
+        }
+    }
+
+    #[test]
+    fn deal_validates_only_for_its_authors_position() {
+        let d = dealing();
+        assert!(d.validate(&d.with_dkg(Some(d.deal(d.author)), vec![])).is_ok());
+
+        // The deal's proof is bound to the dealer's position: a deal made for another position
+        // (copied from another member, say) fails under this author.
+        let other = (d.author + 1) % d.committee.size() as u32;
+        assert!(matches!(
+            d.validate(&d.with_dkg(Some(d.deal(other)), vec![])),
+            Err(HeaderError::InvalidDkgDeal(DkgError::BadProof))
+        ));
+
+        // A deal for another epoch fails too.
+        let p = &d.params;
+        let stale =
+            Deal::new(p.epoch - 1, d.author, p.threshold, &p.recipients, &mut rand::rng()).unwrap();
+        assert!(matches!(
+            d.validate(&d.with_dkg(Some(stale), vec![])),
+            Err(HeaderError::InvalidDkgDeal(DkgError::WrongEpoch { .. }))
+        ));
+    }
+
+    #[test]
+    fn complaint_must_carry_the_named_recipients_decryption_key() {
+        let d = dealing();
+        let tag = ShareTag { epoch: d.params.epoch, dealer: 0, recipient: 1 };
+        let valid = Complaint::new(tag, d.recipient(1));
+        assert!(d.validate(&d.with_dkg(None, vec![valid.clone()])).is_ok());
+
+        // Signed by another member than the recipient the tag names.
+        let forged = Complaint { tag, decryption_key: tag.decryption_key(d.recipient(2)) };
+        assert!(matches!(
+            d.validate(&d.with_dkg(None, vec![valid.clone(), forged])),
+            Err(HeaderError::InvalidDkgComplaint(DkgError::BadDecryptionKey))
+        ));
+
+        // Wrong epoch, out-of-range dealer, out-of-range recipient.
+        let (epoch, size) = (d.params.epoch, d.committee.size() as u32);
+        let cases = [
+            (
+                ShareTag { epoch: epoch + 1, ..tag },
+                DkgError::WrongEpoch { expected: epoch, got: epoch + 1 },
+            ),
+            (ShareTag { dealer: size, ..tag }, DkgError::BadPosition(size)),
+            (ShareTag { recipient: size, ..tag }, DkgError::BadPosition(size)),
+        ];
+        for (tag, expected) in cases {
+            let complaint = Complaint::new(tag, d.recipient(1));
+            match d.validate(&d.with_dkg(None, vec![complaint])) {
+                Err(HeaderError::InvalidDkgComplaint(error)) => assert_eq!(error, expected),
+                other => panic!("expected {expected:?}, got {other:?}"),
+            }
+        }
+
+        // At most one complaint per committee member.
+        let flood = vec![valid; d.committee.size() + 1];
+        assert!(matches!(
+            d.validate(&d.with_dkg(None, flood)),
+            Err(HeaderError::TooManyDkgComplaints(5, 4))
+        ));
     }
 }
