@@ -135,7 +135,9 @@ The one exception to the pinned values: the **devnet** chain-id (`503`) is
 exempt from the `HybridRewards` pin — its baked-in schedule keeps `HybridRewards:
 Never`, and the shape gate skips the `Block(1)` requirement for that chain-id.
 Every other non-mainnet/testnet chain-id (new private chains, `local`) is pinned
-to `Block(1)`.
+to `Block(1)`. The carve-out covers new devnet chains only; an executed devnet
+chain is held to the relaxed rules of section 4, which admit its canonical
+`Never`.
 
 ## 3. Behavioral Changes Are Business-Logic Based
 
@@ -159,7 +161,7 @@ This is why behavioral forks are:
 | layer | what it protects | where |
 |-------|-----------------|-------|
 | **CI freeze tests** | mainnet and testnet baked schedules (full 16-fork literal tables) | `chainspec.rs` |
-| **Boot shape gate** (`verify_schedule_shape`) | new-chain schedules only (mainnet/testnet chain-ids excluded) | `network_profile/shape.rs` |
+| **Boot shape gate** (`verify_schedule_shape`) | new chains (datadir head `0`) on the strict canonical shape; existing chains (head > 0) on relaxed rules; mainnet/testnet chain-ids always excluded | `network_profile/shape.rs` |
 | **Schedule-record gate** (`schedule-record.yaml`, trust-on-first-use) | per-datadir drift on all networks | `network_profile/verify.rs` |
 | **Genesis ceremony** | out of scope by decision | — |
 
@@ -171,6 +173,16 @@ This is why behavioral forks are:
   mainnet/testnet chain-id is not shape-checked; it is still protected by
   the record gate for forks that have fired, and by the freeze tests for
   the binary schedule.
+- The shape check has two rule sets, selected by the datadir's executed
+  head. A **new chain** (head `0`, no executed blocks) must match the strict
+  canonical new-chain shape (the table in section 2). An **existing chain**
+  (head > 0) may legitimately run a historical schedule that deviates from
+  it, so the gate relaxes: Set A forks at `Block(0)` or `Never`,
+  `Erc20PrecompileBytecode` still exactly `Block(1)`, `UsdrSupplyCorrection`
+  at any value (the node warns when it is not `Never`), and `HybridRewards`
+  at `Never` or `Block(>= 1)` — the devnet carve-out does not apply to
+  executed chains. The schedule-record gate then protects the executed
+  history per datadir.
 - A new chain via `--config-file` must enumerate all 16 forks including
   `Erc20PrecompileBytecode: 1` and `HybridRewards: 1`. A partial file
   (e.g. missing Erc20) resolves to `Never` and is refused by the shape
