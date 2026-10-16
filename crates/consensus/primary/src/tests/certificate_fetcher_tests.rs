@@ -2,6 +2,7 @@
 
 use crate::{
     certificate_fetcher::CertificateFetcher,
+    consensus_bus::NodeMode,
     error::CertManagerError,
     network::{PrimaryRequest, PrimaryResponse},
     state_sync::StateSynchronizer,
@@ -19,6 +20,11 @@ use tokio::{
     sync::mpsc::{self, error::TryRecvError},
     time::sleep,
 };
+
+/// Most skip rounds a request may carry per authority, as configured by default.
+fn max_skip_rounds() -> usize {
+    rayls_infrastructure_config::SyncConfig::default().max_skip_rounds_for_missing_certs
+}
 
 async fn verify_certificates_in_store<DB: CertificateStore>(
     certificate_store: &DB,
@@ -161,7 +167,7 @@ async fn fetch_certificates_basic() {
         reply,
     }) = fake_receiver.recv().await
     {
-        let (lower_bound, skip_rounds) = inner.get_bounds().unwrap();
+        let (lower_bound, skip_rounds) = inner.get_bounds(max_skip_rounds(), |_| true).unwrap();
         // Every authority has a contiguous prefix up through round 1, so the fetcher
         // tightens exclusive_lower_bound to 1 and prunes the now-redundant skip entries.
         assert_eq!(lower_bound, 1);
@@ -200,7 +206,8 @@ async fn fetch_certificates_basic() {
                 request: PrimaryRequest::MissingCertificates { inner },
                 reply,
             }) => {
-                let (lower_bound, skip_rounds) = inner.get_bounds().unwrap();
+                let (lower_bound, skip_rounds) =
+                    inner.get_bounds(max_skip_rounds(), |_| true).unwrap();
                 if lower_bound < 16 {
                     // Drain the fetch requests sent out before the fetcher finished processing
                     // the first batch (their tightened lower_bound is still below round 16).
@@ -260,7 +267,8 @@ async fn fetch_certificates_basic() {
                 request: PrimaryRequest::MissingCertificates { inner },
                 reply,
             }) => {
-                let (lower_bound, skip_rounds) = inner.get_bounds().unwrap();
+                let (lower_bound, skip_rounds) =
+                    inner.get_bounds(max_skip_rounds(), |_| true).unwrap();
                 let all_empty = skip_rounds.values().all(|r| r.is_empty());
                 if lower_bound < 31 || all_empty {
                     // Drain the fetch requests sent out before the fetcher finished processing
@@ -290,7 +298,8 @@ async fn fetch_certificates_basic() {
         match req {
             NetworkCommand::SendRequest { peer: _, request, reply } => match request {
                 PrimaryRequest::MissingCertificates { inner } => {
-                    let (lower_bound, skip_rounds) = inner.get_bounds().unwrap();
+                    let (lower_bound, skip_rounds) =
+                        inner.get_bounds(max_skip_rounds(), |_| true).unwrap();
                     // All authorities have a contiguous {1..=31} prefix so the tightened
                     // exclusive_lower_bound is 31 and skip_rounds is pruned to empty.
                     assert_eq!(lower_bound, 31);
@@ -339,7 +348,8 @@ async fn fetch_certificates_basic() {
         match req {
             NetworkCommand::SendRequest { peer: _, request, reply } => match request {
                 PrimaryRequest::MissingCertificates { inner } => {
-                    let (lower_bound, skip_rounds) = inner.get_bounds().unwrap();
+                    let (lower_bound, skip_rounds) =
+                        inner.get_bounds(max_skip_rounds(), |_| true).unwrap();
                     // All authorities have a contiguous {1..=31} prefix so the tightened
                     // exclusive_lower_bound is 31 and skip_rounds is pruned to empty.
                     assert_eq!(lower_bound, 31);
@@ -381,7 +391,8 @@ async fn fetch_certificates_basic() {
         match req {
             NetworkCommand::SendRequest { peer: _, request, reply } => match request {
                 PrimaryRequest::MissingCertificates { inner } => {
-                    let (lower_bound, skip_rounds) = inner.get_bounds().unwrap();
+                    let (lower_bound, skip_rounds) =
+                        inner.get_bounds(max_skip_rounds(), |_| true).unwrap();
                     // All authorities have a contiguous {1..=31} prefix so the tightened
                     // exclusive_lower_bound is 31 and skip_rounds is pruned to empty.
                     assert_eq!(lower_bound, 31);
@@ -430,4 +441,117 @@ fn epoch_stamp_follows_the_fork_at_the_next_block() {
     assert_eq!(epoch_stamp(Some(0), 0, 7), Some(7));
     // no overflow at the top of the range
     assert_eq!(epoch_stamp(Some(u64::MAX), u64::MAX, 1), Some(1));
+}
+
+/// A certificate fetcher for the first authority, and the requests it sends.
+struct FetcherUnderTest {
+    /// Requests the fetcher sends to peers.
+    requests: mpsc::Receiver<NetworkCommand<PrimaryRequest, PrimaryResponse>>,
+    /// Keeps the fetcher's tasks running.
+    _task_manager: TaskManager,
+}
+
+impl FetcherUnderTest {
+    /// Start a fetcher that already has its low rounds from every authority, plus `extra`.
+    ///
+    /// It then receives a certificate whose parents it lacks, so it starts fetching.
+    async fn start(
+        fixture: &CommitteeFixture<MemDatabase>,
+        extra: Vec<Certificate>,
+        mode: NodeMode,
+    ) -> Self {
+        // Rounds of certificates to build, so the trigger is missing its parents.
+        const ROUNDS: Round = 3;
+
+        let primary = fixture.authorities().next().unwrap();
+        let store = primary.consensus_config().node_storage().clone();
+        let cb = ConsensusBus::new();
+        cb.node_mode().send_replace(mode);
+        let task_manager = TaskManager::default();
+        let synchronizer = StateSynchronizer::new(
+            primary.consensus_config(),
+            cb.clone(),
+            task_manager.get_spawner(),
+        );
+        synchronizer.spawn(&task_manager);
+        let (sender, requests) = mpsc::channel(1000);
+        let network: NetworkHandle<PrimaryRequest, PrimaryResponse> = NetworkHandle::new(sender);
+        CertificateFetcher::spawn(
+            primary.consensus_config(),
+            network.into(),
+            cb.clone(),
+            synchronizer.clone(),
+            &task_manager,
+        );
+
+        let genesis = Certificate::genesis(&fixture.committee());
+        for cert in &genesis {
+            store.write(cert.clone()).expect("write genesis");
+        }
+        let mut parents: BTreeSet<_> = genesis.iter().map(|cert| cert.digest()).collect();
+        let mut certificates = vec![];
+        for round in 0..ROUNDS {
+            let (_, headers) = fixture.headers_round(round, &parents);
+            for (digest, worker_id) in headers.iter().flat_map(|h| h.payload().iter()) {
+                store.write_payload(digest, worker_id).expect("write payload");
+            }
+            let round_certs: Vec<_> = headers.iter().map(|h| fixture.certificate(h)).collect();
+            parents = round_certs.iter().map(|cert| cert.digest()).collect();
+            certificates.push(round_certs);
+        }
+
+        for mut cert in certificates[0].clone().into_iter().chain(extra) {
+            cert.set_signature_verification_state(SignatureVerificationState::VerifiedDirectly(
+                cert.aggregated_signature().expect("signed certificate"),
+            ));
+            store.write(cert).expect("write certificate");
+        }
+        let trigger = certificates.last().unwrap()[0].clone();
+        let result = synchronizer.process_peer_certificate(trigger).await;
+        assert_matches!(result, Err(CertManagerError::Pending(_)));
+
+        Self { requests, _task_manager: task_manager }
+    }
+
+    /// The next missing-certificates request, with the channel for its answer.
+    async fn next_request(
+        &mut self,
+    ) -> (
+        crate::network::MissingCertificatesRequest,
+        tokio::sync::oneshot::Sender<
+            rayls_consensus_network::types::NetworkResult<PrimaryResponse>,
+        >,
+    ) {
+        loop {
+            match self.requests.recv().await.expect("fetcher still running") {
+                NetworkCommand::SendRequest {
+                    request: PrimaryRequest::MissingCertificates { inner },
+                    reply,
+                    ..
+                } => return (inner, reply),
+                _ => continue,
+            }
+        }
+    }
+}
+
+/// A request names only committee members, even when the store holds other origins.
+///
+/// Peers skip other origins, and a longer list could pass the limit peers enforce.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn fetch_request_names_only_committee_members() {
+    let fixture = CommitteeFixture::builder(MemDatabase::default).randomize_ports(true).build();
+    let outsiders = CommitteeFixture::builder(MemDatabase::default).randomize_ports(true).build();
+    let genesis: BTreeSet<_> =
+        Certificate::genesis(&outsiders.committee()).iter().map(|cert| cert.digest()).collect();
+    let (_, headers) = outsiders.headers_round(0, &genesis);
+    let outsider_cert = outsiders.certificate(&headers[0]);
+
+    let mut fetcher =
+        FetcherUnderTest::start(&fixture, vec![outsider_cert], NodeMode::CvvActive).await;
+    let (request, _reply) = fetcher.next_request().await;
+    let (_, skip_rounds) = request.get_bounds(max_skip_rounds(), |_| true).unwrap();
+    let committee = fixture.committee();
+    assert_eq!(skip_rounds.len(), committee.size());
+    assert!(skip_rounds.keys().all(|origin| committee.is_authority(origin)));
 }

@@ -60,6 +60,9 @@ pub(crate) enum PrimaryNetworkError {
     /// Invalid topic- something was published to the wrong topic.
     #[error("Gossip was published to the wrong topic")]
     InvalidTopic,
+    /// A missing-certificates request names more authorities than any honest node sends.
+    #[error("Request names {0} authorities, the limit is {1}")]
+    TooManyAuthorities(usize, usize),
 }
 
 impl From<&PrimaryNetworkError> for Option<Penalty> {
@@ -113,6 +116,7 @@ impl From<&PrimaryNetworkError> for Option<Penalty> {
                 | PrimaryNetworkError::StdIo(_) => Some(Penalty::Medium),
             PrimaryNetworkError::InvalidTopic
                 | PrimaryNetworkError::Decode(_) => Some(Penalty::Fatal),
+            PrimaryNetworkError::TooManyAuthorities(..) => Some(Penalty::Mild),
             PrimaryNetworkError::UnavailableEpoch(_)  // A node might not have this yet...
                 | PrimaryNetworkError::UnavailableEpochDigest(_)  // A node might not have this yet....
                 | PrimaryNetworkError::PeerNotInCommittee(_)

@@ -2,7 +2,9 @@
 
 use crate::{
     error::PrimaryNetworkError,
-    network::{handler::RequestHandler, MissingCertificatesRequest, PrimaryResponse},
+    network::{
+        handler::RequestHandler, MissingCertificatesRequest, PrimaryRequest, PrimaryResponse,
+    },
     state_sync::StateSynchronizer,
     ConsensusBus,
 };
@@ -16,7 +18,7 @@ use rayls_infrastructure_types::{
 };
 use rayls_testing_test_utils_committee::CommitteeFixture;
 use std::{
-    collections::{BTreeSet, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     num::NonZeroUsize,
     sync::Arc,
     time::Duration,
@@ -886,11 +888,114 @@ async fn test_fetch_certificates_handler_survives_max_lower_bound() {
     roaring::RoaringBitmap::new().serialize_into(&mut empty_bitmap).expect("bitmap");
     let crafted = MissingCertificatesRequest {
         exclusive_lower_bound: u32::MAX,
-        skip_rounds: vec![(primary.id(), empty_bitmap)],
+        skip_rounds: vec![(primary.id(), empty_bitmap)].into_iter().collect(),
         max_response_size: usize::MAX,
         exclusive_upper_bound: None,
     };
 
     let resp = handler.retrieve_missing_certs(crafted, None).await.expect("served, not aborted");
     assert!(matches!(resp, PrimaryResponse::RequestedCertificates(certs) if certs.is_empty()));
+}
+
+/// Largest response a missing-certificates request may ask for, as configured by default.
+fn max_response_size() -> usize {
+    rayls_infrastructure_config::LibP2pConfig::default().max_rpc_message_size
+}
+
+/// A request naming more authorities than the committee-sized limit is refused.
+#[tokio::test]
+async fn test_missing_certs_request_with_too_many_authorities_is_rejected() {
+    use crate::network::handler::{
+        max_requested_authorities, MIN_REQUESTED_AUTHORITIES, REQUESTED_AUTHORITIES_PER_MEMBER,
+    };
+
+    let committee_size = 4;
+    let fixture = CommitteeFixture::builder(MemDatabase::default)
+        .randomize_ports(true)
+        .committee_size(NonZeroUsize::new(committee_size).unwrap())
+        .build();
+    let primary = fixture.authorities().next().unwrap();
+    let cb = ConsensusBus::new();
+    let task_manager = TaskManager::default();
+    let synchronizer =
+        StateSynchronizer::new(primary.consensus_config(), cb.clone(), task_manager.get_spawner());
+    let handler = RequestHandler::new(primary.consensus_config(), cb.clone(), synchronizer);
+    let limit = max_requested_authorities(committee_size);
+
+    // Small committees get the floor, and larger ones a multiple of their size.
+    assert_eq!(max_requested_authorities(1), MIN_REQUESTED_AUTHORITIES);
+    assert_eq!(
+        max_requested_authorities(MIN_REQUESTED_AUTHORITIES),
+        REQUESTED_AUTHORITIES_PER_MEMBER * MIN_REQUESTED_AUTHORITIES
+    );
+
+    // Invented authorities, none in the committee.
+    let invented = |count: usize| -> BTreeMap<AuthorityIdentifier, BTreeSet<u32>> {
+        (0..count)
+            .map(|i| {
+                let byte = u8::try_from(i).expect("fits a test authority");
+                (AuthorityIdentifier::dummy_for_test(byte), BTreeSet::new())
+            })
+            .collect()
+    };
+    let request = |count: usize| {
+        MissingCertificatesRequest::default()
+            .set_bounds(0, invented(count))
+            .expect("bounds")
+            .set_max_response_size(max_response_size())
+    };
+
+    // At the limit, unknown authorities are skipped and nothing is returned.
+    let resp = handler.retrieve_missing_certs(request(limit), None).await.expect("within limit");
+    assert!(matches!(resp, PrimaryResponse::RequestedCertificates(certs) if certs.is_empty()));
+
+    // One more is refused, with a penalty.
+    let err =
+        handler.retrieve_missing_certs(request(limit + 1), None).await.expect_err("over limit");
+    assert!(
+        matches!(err, PrimaryNetworkError::TooManyAuthorities(n, l) if n == limit + 1 && l == limit)
+    );
+    assert!(Option::<rayls_consensus_network::Penalty>::from(&err).is_some());
+
+    // A list longer than decoding keeps still arrives, and is refused with its full count.
+    // It goes through the network codec both ways, as it would between two nodes.
+    use rayls_consensus_network::{types::IntoResponse, Codec, RLCodec, StreamProtocol};
+    let mut codec = RLCodec::<PrimaryRequest, PrimaryResponse>::new(max_response_size());
+    let protocol = StreamProtocol::new("/rayls-test");
+    let named = crate::network::MAX_SKIP_ROUND_AUTHORITIES + 1;
+    let long: BTreeMap<AuthorityIdentifier, BTreeSet<u32>> = (0..named)
+        .map(|i| {
+            let mut bytes = [0u8; 32];
+            bytes[..size_of::<u64>()].copy_from_slice(&(i as u64).to_le_bytes());
+            (AuthorityIdentifier::from(bytes), BTreeSet::new())
+        })
+        .collect();
+    let inner = MissingCertificatesRequest::default().set_bounds(0, long).expect("bounds");
+    let mut wire = Vec::new();
+    codec
+        .write_request(&protocol, &mut wire, PrimaryRequest::MissingCertificates { inner })
+        .await
+        .expect("send the request");
+    let received = codec.read_request(&protocol, &mut wire.as_slice()).await;
+    let Ok(PrimaryRequest::MissingCertificates { inner }) = received else {
+        panic!("the receiving node did not get the request: {received:?}");
+    };
+    let err = handler.retrieve_missing_certs(inner, None).await.expect_err("over limit");
+    assert!(
+        matches!(err, PrimaryNetworkError::TooManyAuthorities(n, l) if n == named && l == limit),
+        "got {err:?}"
+    );
+
+    // The sender gets the refusal back, with both numbers.
+    let mut wire = Vec::new();
+    codec
+        .write_response(&protocol, &mut wire, Err::<PrimaryResponse, _>(err).into_response())
+        .await
+        .expect("send the refusal");
+    let answer = codec.read_response(&protocol, &mut wire.as_slice()).await.expect("answer");
+    let PrimaryResponse::Error(reason) = answer else {
+        panic!("the sender did not get an error: {answer:?}");
+    };
+    assert!(reason.0.contains(&named.to_string()), "got {reason:?}");
+    assert!(reason.0.contains(&limit.to_string()), "got {reason:?}");
 }

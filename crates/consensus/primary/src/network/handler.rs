@@ -1,7 +1,9 @@
 //! Handle specific request types received from the network.
 
 use super::{
-    message::{ConsensusResult, MissingCertificatesRequest, PrimaryRPCError},
+    message::{
+        ConsensusResult, MissingCertificatesRequest, PrimaryRPCError, MAX_SKIP_ROUND_AUTHORITIES,
+    },
     AuthEquivocationMap, PrimaryResponse,
 };
 use crate::{
@@ -802,11 +804,20 @@ where
 
     /// Retrieve missing certificates, bounded by time and chunk size.
     /// MDBX reads are offloaded to `spawn_blocking`.
+    ///
+    /// The request is checked for size before any bitmap decoding or storage read.
     pub(crate) async fn retrieve_missing_certs(
         &self,
         request: MissingCertificatesRequest,
         requested_epoch: Option<Epoch>,
     ) -> PrimaryNetworkResult<PrimaryResponse> {
+        let committee = self.consensus_config.committee();
+        let limit = max_requested_authorities(committee.size());
+        let named = request.skip_rounds.named();
+        if named > limit {
+            debug!(target: "primary::handler", authorities = named, limit, "missing-certificates request names too many authorities");
+            return Err(PrimaryNetworkError::TooManyAuthorities(named, limit));
+        }
         let consensus_config = self.consensus_config.clone();
         tokio::task::spawn_blocking(move || {
             collect_missing_certs_blocking(request, requested_epoch, consensus_config)
@@ -929,6 +940,23 @@ where
         }
     }
 }
+
+/// How many times the committee size a request may name, as a margin for committee changes.
+pub(crate) const REQUESTED_AUTHORITIES_PER_MEMBER: usize = 2;
+/// Smallest limit on the authorities a request may name, so small committees can still grow.
+pub(crate) const MIN_REQUESTED_AUTHORITIES: usize = 64;
+
+/// Most authorities a missing-certificates request may name.
+///
+/// An honest request names each committee member once.
+/// The limit never passes [MAX_SKIP_ROUND_AUTHORITIES], since decoding keeps no more entries.
+pub(crate) fn max_requested_authorities(committee_size: usize) -> usize {
+    (REQUESTED_AUTHORITIES_PER_MEMBER * committee_size)
+        .clamp(MIN_REQUESTED_AUTHORITIES, MAX_SKIP_ROUND_AUTHORITIES)
+}
+
+// `clamp` panics if its floor is above its ceiling, so this is checked when building.
+const _: () = assert!(MIN_REQUESTED_AUTHORITIES <= MAX_SKIP_ROUND_AUTHORITIES);
 
 /// Run the cert-collector synchronously inside `spawn_blocking`.
 fn collect_missing_certs_blocking<DB: Database>(

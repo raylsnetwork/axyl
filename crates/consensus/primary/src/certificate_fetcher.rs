@@ -399,7 +399,11 @@ impl<DB: Database> CertificateFetcher<DB> {
             Ok(origins) => {
                 for (round, origins) in origins {
                     for origin in origins {
-                        written_rounds.entry(origin).or_default().insert(round);
+                        // Peers skip origins outside the committee, so leave them out.
+                        // This also keeps the request within the committee size.
+                        if let Some(rounds) = written_rounds.get_mut(&origin) {
+                            rounds.insert(round);
+                        }
                     }
                 }
             }
