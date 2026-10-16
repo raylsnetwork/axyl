@@ -45,97 +45,95 @@ pub fn verify_schedule_shape(profile: &NetworkProfile, head: u64) -> eyre::Resul
     };
     let mut violations: Vec<String> = Vec::new();
 
-    if head == 0 {
-        // New chain: the canonical new-chain shape — a greenfield genesis
-        // only works with it.
-        // Set A: Block(0).
-        for fork in [
-            RaylsHardFork::AdminTransfer,
-            RaylsHardFork::RlsStorage,
-            RaylsHardFork::Tokenomics,
-            RaylsHardFork::Uups,
-        ] {
-            let fork_activation = activation(fork);
-            if fork_activation != ForkActivation::Block(0) {
-                violations
-                    .push(format!("{} must be Block(0), got {fork_activation:?}", fork.name()))
-            }
-        }
+    // This condition will be enabled in a followed-up PR
+    // if head == 0 {
+    //     // New chain: the canonical new-chain shape — a greenfield genesis
+    //     // only works with it.
+    //     // Set A: Block(0).
+    //     for fork in [
+    //         RaylsHardFork::AdminTransfer,
+    //         RaylsHardFork::RlsStorage,
+    //         RaylsHardFork::Tokenomics,
+    //         RaylsHardFork::Uups,
+    //     ] {
+    //         let fork_activation = activation(fork);
+    //         if fork_activation != ForkActivation::Block(0) {
+    //             violations
+    //                 .push(format!("{} must be Block(0), got {fork_activation:?}", fork.name()))
+    //         }
+    //     }
 
-        // Set B: USDr precompile.
-        let fork_activation = activation(RaylsHardFork::Erc20PrecompileBytecode);
-        if fork_activation != ForkActivation::Block(1) {
-            violations.push(format!(
-                "Erc20PrecompileBytecode must be exactly Block(1), got {fork_activation:?}"
-            ));
-        }
-        let fork_activation = activation(RaylsHardFork::UsdrSupplyCorrection);
-        if fork_activation != ForkActivation::Never {
-            violations.push(format!("UsdrSupplyCorrection must be Never, got {fork_activation:?}"));
-        }
+    //     // Set B: USDr precompile.
+    //     let fork_activation = activation(RaylsHardFork::Erc20PrecompileBytecode);
+    //     if fork_activation != ForkActivation::Block(1) {
+    //         violations.push(format!(
+    //             "Erc20PrecompileBytecode must be exactly Block(1), got {fork_activation:?}"
+    //         ));
+    //     }
+    //     let fork_activation = activation(RaylsHardFork::UsdrSupplyCorrection);
+    //     if fork_activation != ForkActivation::Never {
+    //         violations.push(format!("UsdrSupplyCorrection must be Never, got {fork_activation:?}"));
+    //     }
 
-        // Set C: hybrid rewards (unconstrained for Devnet).
-        let devnet_id = RaylsNetwork::Devnet.chain_id();
-        if profile.chain_id != devnet_id {
-            let fork_activation = activation(RaylsHardFork::HybridRewards);
-            if fork_activation != ForkActivation::Block(1) {
-                violations.push(format!(
-                    "HybridRewards must be exactly Block(1), got {fork_activation:?}"
-                ));
-            }
-        }
-    } else {
-        // Existing chain: the relaxed rules. The chain has executed history,
-        // so the schedule it ran under is pinned per datadir by the
-        // schedule-record gate; only the constraints an executed chain still
-        // needs are enforced here.
-        // Set A: Block(0) or Never.
-        for fork in [
-            RaylsHardFork::AdminTransfer,
-            RaylsHardFork::RlsStorage,
-            RaylsHardFork::Tokenomics,
-            RaylsHardFork::Uups,
-        ] {
-            let fork_activation = activation(fork);
-            if !matches!(fork_activation, ForkActivation::Block(0) | ForkActivation::Never) {
-                violations.push(format!(
-                    "{} must be Block(0) or Never, got {fork_activation:?}",
-                    fork.name()
-                ))
-            }
-        }
-
-        // Set B: USDr precompile. The precompile must be in place from block
-        // 1; the supply correction is history-dependent, so any value is
-        // allowed (warned below).
-        let fork_activation = activation(RaylsHardFork::Erc20PrecompileBytecode);
-        if fork_activation != ForkActivation::Block(1) {
-            violations.push(format!(
-                "Erc20PrecompileBytecode must be exactly Block(1), got {fork_activation:?}"
-            ));
-        }
-        let fork_activation = activation(RaylsHardFork::UsdrSupplyCorrection);
-        if fork_activation != ForkActivation::Never {
-            warn!(
-                target: "rayls::reth",
-                chain_id = profile.chain_id,
-                head,
-                "UsdrSupplyCorrection is set to {fork_activation:?} (expected Never); this \
-                 is allowed on an existing chain but unusual — verify the schedule matches \
-                 what the chain has executed"
-            );
-        }
-
-        // Set C: hybrid rewards — Never or Block(>= 1); devnet's canonical
-        // Never is covered, so there is no devnet carve-out for existing
-        // chains.
-        let fork_activation = activation(RaylsHardFork::HybridRewards);
-        if !matches!(fork_activation, ForkActivation::Never | ForkActivation::Block(1..)) {
-            violations.push(format!(
-                "HybridRewards must be Never or Block(>= 1), got {fork_activation:?}"
-            ));
+    //     // Set C: hybrid rewards (unconstrained for Devnet).
+    //     let devnet_id = RaylsNetwork::Devnet.chain_id();
+    //     if profile.chain_id != devnet_id {
+    //         let fork_activation = activation(RaylsHardFork::HybridRewards);
+    //         if fork_activation != ForkActivation::Block(1) {
+    //             violations.push(format!(
+    //                 "HybridRewards must be exactly Block(1), got {fork_activation:?}"
+    //             ));
+    //         }
+    //     }
+    // } else {
+    // Existing chain: the relaxed rules. The chain has executed history,
+    // so the schedule it ran under is pinned per datadir by the
+    // schedule-record gate; only the constraints an executed chain still
+    // needs are enforced here.
+    // Set A: Block(0) or Never.
+    for fork in [
+        RaylsHardFork::AdminTransfer,
+        RaylsHardFork::RlsStorage,
+        RaylsHardFork::Tokenomics,
+        RaylsHardFork::Uups,
+    ] {
+        let fork_activation = activation(fork);
+        if !matches!(fork_activation, ForkActivation::Block(0) | ForkActivation::Never) {
+            violations
+                .push(format!("{} must be Block(0) or Never, got {fork_activation:?}", fork.name()))
         }
     }
+
+    // Set B: USDr precompile. The precompile must be in place from block
+    // 1; the supply correction is history-dependent, so any value is
+    // allowed (warned below).
+    let fork_activation = activation(RaylsHardFork::Erc20PrecompileBytecode);
+    if fork_activation != ForkActivation::Block(1) {
+        violations.push(format!(
+            "Erc20PrecompileBytecode must be exactly Block(1), got {fork_activation:?}"
+        ));
+    }
+    let fork_activation = activation(RaylsHardFork::UsdrSupplyCorrection);
+    if fork_activation != ForkActivation::Never {
+        warn!(
+            target: "rayls::reth",
+            chain_id = profile.chain_id,
+            head,
+            "UsdrSupplyCorrection is set to {fork_activation:?} (expected Never); this \
+             is allowed on an existing chain but unusual — verify the schedule matches \
+             what the chain has executed"
+        );
+    }
+
+    // Set C: hybrid rewards — Never or Block(>= 1); devnet's canonical
+    // Never is covered, so there is no devnet carve-out for existing
+    // chains.
+    let fork_activation = activation(RaylsHardFork::HybridRewards);
+    if !matches!(fork_activation, ForkActivation::Never | ForkActivation::Block(1..)) {
+        violations
+            .push(format!("HybridRewards must be Never or Block(>= 1), got {fork_activation:?}"));
+    }
+    // }
 
     if violations.is_empty() {
         return Ok(());
