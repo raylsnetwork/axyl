@@ -12,11 +12,40 @@ use std::{
 };
 use tracing::info;
 
+/// The committee of the epoch before the current one, kept in memory for the life of the epoch.
+///
+/// A node keeps serving the previous epoch's certificate tail after a transition, and the
+/// committee that produced it may differ from the current one. Holding it here lets request
+/// handlers check membership for that epoch without a store read.
+#[derive(Debug)]
+pub struct PreviousCommittee {
+    keys: Vec<BlsPublicKey>,
+    ids: HashSet<AuthorityIdentifier>,
+}
+
+impl PreviousCommittee {
+    fn new(keys: Vec<BlsPublicKey>) -> Self {
+        let ids = keys.iter().copied().map(AuthorityIdentifier::from).collect();
+        Self { keys, ids }
+    }
+
+    /// The BLS keys of the previous committee.
+    pub fn keys(&self) -> &[BlsPublicKey] {
+        &self.keys
+    }
+
+    /// Whether `id` was a member of the previous committee.
+    pub fn contains(&self, id: &AuthorityIdentifier) -> bool {
+        self.ids.contains(id)
+    }
+}
+
 #[derive(Debug)]
 struct ConsensusConfigInner<DB> {
     config: Config,
     committee: Committee,
     lookahead: CommitteeLookahead,
+    prev_committee: Option<PreviousCommittee>,
     node_storage: DB,
     key_config: KeyConfig,
     authority: Option<Authority>,
@@ -164,11 +193,20 @@ where
             .map(|cert| (cert.digest(), cert))
             .collect();
 
+        // Read once per epoch here, so membership checks against the previous epoch's
+        // certificate tail never go to the store per request.
+        let prev_committee = committee
+            .epoch()
+            .checked_sub(1)
+            .and_then(|epoch| node_storage.get_committee_keys(epoch))
+            .map(PreviousCommittee::new);
+
         Ok(Self {
             inner: Arc::new(ConsensusConfigInner {
                 config,
                 committee,
                 lookahead,
+                prev_committee,
                 node_storage,
                 key_config,
                 authority,
@@ -302,14 +340,28 @@ where
         &self.inner.lookahead
     }
 
+    /// The committee of the previous epoch, if the epoch store had it when this config was built.
+    ///
+    /// `None` for epoch 0, and for a node whose store held no record of the previous epoch at
+    /// that time. This is a snapshot: a record written later in the epoch does not fill it in.
+    /// [`Self::get_committee_keys_for_epoch`] falls back to the store in that case.
+    pub fn previous_committee(&self) -> Option<&PreviousCommittee> {
+        self.inner.prev_committee.as_ref()
+    }
+
     /// Retrieve the BLS committee keys for a given epoch.
     ///
-    /// Falls back through: in-memory committee (current epoch), DB epoch records, then
-    /// lookahead cache.
+    /// Falls back through: in-memory committee (current epoch), in-memory previous committee,
+    /// DB epoch records, then lookahead cache.
     pub fn get_committee_keys_for_epoch(&self, epoch: Epoch) -> Option<Vec<BlsPublicKey>> {
         let current = self.inner.committee.epoch();
         if epoch == current {
             return Some(self.inner.committee.bls_keys());
+        }
+        if Some(epoch) == current.checked_sub(1) {
+            if let Some(prev) = &self.inner.prev_committee {
+                return Some(prev.keys.clone());
+            }
         }
         self.inner
             .node_storage
@@ -346,5 +398,75 @@ where
     /// Retrieve the worker's network public key.
     pub fn worker_networkkey(&self) -> NetworkPublicKey {
         self.inner.config.node_info.p2p_info.worker.network_key.clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rand::{rngs::StdRng, SeedableRng};
+    use rayls_infrastructure_storage::{mem_db::MemDatabase, tables::EpochRecords, EpochStore};
+    use rayls_infrastructure_types::{Address, BlsKeypair, CommitteeBuilder, EpochRecord};
+
+    /// A config for a two-member committee at `epoch` (this node and one other), built on `db`.
+    fn config_at_epoch(
+        epoch: Epoch,
+        db: MemDatabase,
+        keypair: BlsKeypair,
+        rng: &mut StdRng,
+    ) -> ConsensusConfig<MemDatabase> {
+        let mut builder = CommitteeBuilder::new(epoch);
+        builder.add_authority(*keypair.public(), 1, Address::ZERO);
+        builder.add_authority(*BlsKeypair::generate(rng).public(), 1, Address::ZERO);
+        ConsensusConfig::new_with_committee_for_test(
+            Config::default(),
+            db,
+            KeyConfig::new_with_testing_key(keypair),
+            builder.build(),
+            NetworkConfig::default(),
+        )
+        .expect("config")
+    }
+
+    #[test]
+    fn previous_committee_is_kept_in_memory_from_the_epoch_store() {
+        let mut rng = StdRng::seed_from_u64(1);
+        let current = BlsKeypair::generate(&mut rng);
+        let previous = *BlsKeypair::generate(&mut rng).public();
+        let db = MemDatabase::default();
+        let record = EpochRecord { epoch: 0, committee: vec![previous], ..Default::default() };
+        db.save_epoch_record(&record).expect("record");
+
+        let config = config_at_epoch(1, db, current, &mut rng);
+
+        // Drop the record: the previous committee must now come from memory, not the store.
+        config.node_storage().remove::<EpochRecords>(&0).expect("remove");
+        let prev = config.previous_committee().expect("previous committee");
+        assert_eq!(prev.keys(), &[previous]);
+        assert!(prev.contains(&AuthorityIdentifier::from(previous)));
+        let me = AuthorityIdentifier::from(config.key_config().primary_public_key());
+        assert!(!prev.contains(&me));
+        assert_eq!(config.get_committee_keys_for_epoch(0), Some(vec![previous]));
+    }
+
+    #[test]
+    fn no_previous_committee_at_epoch_zero_or_without_a_record() {
+        let mut rng = StdRng::seed_from_u64(2);
+        let keypair = BlsKeypair::generate(&mut rng);
+        let at_zero = config_at_epoch(0, MemDatabase::default(), keypair, &mut rng);
+        assert!(at_zero.previous_committee().is_none());
+
+        let keypair = BlsKeypair::generate(&mut rng);
+        let unknown = config_at_epoch(1, MemDatabase::default(), keypair, &mut rng);
+        assert!(unknown.previous_committee().is_none());
+        assert_eq!(unknown.get_committee_keys_for_epoch(0), None);
+
+        // A record written after the config was built does not fill the snapshot, but the key
+        // lookup still finds it in the store.
+        let previous = *BlsKeypair::generate(&mut rng).public();
+        let record = EpochRecord { epoch: 0, committee: vec![previous], ..Default::default() };
+        unknown.node_storage().save_epoch_record(&record).expect("record");
+        assert!(unknown.previous_committee().is_none());
+        assert_eq!(unknown.get_committee_keys_for_epoch(0), Some(vec![previous]));
     }
 }
