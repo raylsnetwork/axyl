@@ -327,20 +327,17 @@ impl MissingCertificatesRequest {
             if serialized.len() > max_skip_bitmap_len(max_rounds) {
                 return Err(PrimaryNetworkError::InvalidRequest("Skip bitmap is too long".into()));
             }
-            // Decode the raw bitmap, then reject on its count before normalizing. A crafted bitmap
-            // can expand to many rounds, and `from_sorted_iter` would walk every one of them before
-            // the count is known. `deserialize_from` already gives the count, so check it first.
-            let raw = roaring::RoaringBitmap::deserialize_from(&serialized[..])?;
-            if raw.len() > max_rounds as u64 {
+            // A crafted bitmap can stand for many more rounds than it has bytes.
+            // The count is checked before the bitmap is expanded.
+            let Some(bitmap) = rayls_infrastructure_types::serde::deserialize_normalized_bounded(
+                &serialized[..],
+                max_rounds as u64,
+            )?
+            else {
                 return Err(PrimaryNetworkError::InvalidRequest(
                     "Request for rounds out of bounds".into(),
                 ));
-            }
-            // Within bounds now (at most `max_rounds` rounds), so normalizing is cheap. Normalizing
-            // on read keeps the re-encode invariant if this call site ever grows to re-encode the
-            // bitmap, and the empty-container re-serialize panic cannot fire here. See #55.
-            let bitmap = roaring::RoaringBitmap::from_sorted_iter(raw)
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+            };
             // Both operands are peer-supplied. A plain `+` overflows `Round` on a crafted request
             // and, with `overflow-checks = true` and `panic = "abort"` in release, takes the node
             // down. Reject instead; the io error maps to a penalty.

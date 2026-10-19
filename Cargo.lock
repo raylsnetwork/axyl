@@ -7972,6 +7972,7 @@ dependencies = [
  "eyre",
  "futures",
  "indexmap 2.13.0",
+ "libp2p",
  "parking_lot",
  "proptest",
  "rand 0.9.3",

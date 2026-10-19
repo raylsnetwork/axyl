@@ -959,7 +959,8 @@ async fn test_missing_certs_request_with_too_many_authorities_is_rejected() {
 
     // A list longer than decoding keeps still arrives, and is refused with its full count.
     // It goes through the network codec both ways, as it would between two nodes.
-    use rayls_consensus_network::{types::IntoResponse, Codec, RLCodec, StreamProtocol};
+    use libp2p::{request_response::Codec, StreamProtocol};
+    use rayls_consensus_network::{types::IntoResponse, RLCodec};
     let mut codec = RLCodec::<PrimaryRequest, PrimaryResponse>::new(max_response_size());
     let protocol = StreamProtocol::new("/rayls-test");
     let named = crate::network::MAX_SKIP_ROUND_AUTHORITIES + 1;
@@ -1000,45 +1001,52 @@ async fn test_missing_certs_request_with_too_many_authorities_is_rejected() {
     assert!(reason.0.contains(&limit.to_string()), "got {reason:?}");
 }
 
-/// The limit is sized by the larger of this epoch's committee and the previous one.
+/// The limit is sized for the committee of the epoch a request is served from.
 ///
 /// A lagging node asks about the previous epoch, and names that epoch's committee.
+/// Without a record of that committee, the decoding cap is used, so the node is not refused.
 #[tokio::test]
-async fn test_missing_certs_limit_follows_the_larger_committee() {
-    use crate::network::handler::{max_requested_authorities, MIN_REQUESTED_AUTHORITIES};
+async fn test_missing_certs_limit_follows_the_served_epoch() {
+    use crate::network::{
+        handler::{max_requested_authorities, MIN_REQUESTED_AUTHORITIES},
+        MAX_SKIP_ROUND_AUTHORITIES,
+    };
     use rand::{rngs::StdRng, SeedableRng};
     use rayls_infrastructure_storage::EpochStore;
-    use rayls_infrastructure_types::{BlsKeypair, EpochRecord};
+    use rayls_infrastructure_types::{BlsKeypair, BlsPublicKey, EpochRecord};
 
-    // The previous committee is large enough to lift the limit above the floor.
-    let previous_size = MIN_REQUESTED_AUTHORITIES;
-    let mut rng = StdRng::seed_from_u64(9);
-    let previous =
-        (0..previous_size).map(|_| *BlsKeypair::generate(&mut rng).public()).collect::<Vec<_>>();
-    let record = EpochRecord { epoch: 0, committee: previous, ..Default::default() };
-    let fixture = CommitteeFixture::builder(move || {
-        let db = MemDatabase::default();
-        db.save_epoch_record(&record).expect("previous epoch record");
-        db
-    })
-    .randomize_ports(true)
-    .committee_size(NonZeroUsize::new(4).unwrap())
-    .epoch(1)
-    .build();
-    let primary = fixture.authorities().next().unwrap();
-    let cb = ConsensusBus::new();
-    let task_manager = TaskManager::default();
-    let synchronizer =
-        StateSynchronizer::new(primary.consensus_config(), cb.clone(), task_manager.get_spawner());
-    let handler = RequestHandler::new(primary.consensus_config(), cb.clone(), synchronizer);
-    let limit = max_requested_authorities(previous_size);
-    assert!(limit > max_requested_authorities(4), "the previous committee must raise the limit");
-
+    let committee_size = 4;
+    // A handler at epoch 1 of a 4-member committee, with `previous` as the record of epoch 0.
+    let handler_with = |previous: Option<Vec<BlsPublicKey>>| {
+        let fixture = CommitteeFixture::builder(move || {
+            let db = MemDatabase::default();
+            if let Some(committee) = previous.clone() {
+                let record = EpochRecord { epoch: 0, committee, ..Default::default() };
+                db.save_epoch_record(&record).expect("previous epoch record");
+            }
+            db
+        })
+        .randomize_ports(true)
+        .committee_size(NonZeroUsize::new(committee_size).unwrap())
+        .epoch(1)
+        .build();
+        let primary = fixture.authorities().next().unwrap();
+        let cb = ConsensusBus::new();
+        let task_manager = TaskManager::default();
+        let synchronizer = StateSynchronizer::new(
+            primary.consensus_config(),
+            cb.clone(),
+            task_manager.get_spawner(),
+        );
+        (RequestHandler::new(primary.consensus_config(), cb, synchronizer), task_manager)
+    };
+    // A request naming `count` invented authorities, none in either committee.
     let request = |count: usize| {
         let named = (0..count)
             .map(|i| {
-                let byte = u8::try_from(i).expect("fits a test authority");
-                (AuthorityIdentifier::dummy_for_test(byte), BTreeSet::new())
+                let mut bytes = [0u8; 32];
+                bytes[..size_of::<u64>()].copy_from_slice(&(i as u64).to_le_bytes());
+                (AuthorityIdentifier::from(bytes), BTreeSet::new())
             })
             .collect();
         MissingCertificatesRequest::default()
@@ -1046,15 +1054,35 @@ async fn test_missing_certs_limit_follows_the_larger_committee() {
             .expect("bounds")
             .set_max_response_size(max_response_size())
     };
+    let refused_at = |err: PrimaryNetworkError, limit: usize| matches!(err, PrimaryNetworkError::TooManyAuthorities(n, l) if n == limit + 1 && l == limit);
+    let current_limit = max_requested_authorities(committee_size);
 
-    // A request naming as many as the previous committee allows is served.
-    let resp = handler.retrieve_missing_certs(request(limit), Some(0)).await.expect("within limit");
+    // A previous committee large enough to lift its limit above the current one.
+    let mut rng = StdRng::seed_from_u64(9);
+    let previous: Vec<_> =
+        (0..MIN_REQUESTED_AUTHORITIES).map(|_| *BlsKeypair::generate(&mut rng).public()).collect();
+    let previous_limit = max_requested_authorities(previous.len());
+    assert!(previous_limit > current_limit, "the previous committee must raise its limit");
+    let (handler, _tasks) = handler_with(Some(previous));
+
+    // A previous-epoch request is sized for the previous committee.
+    handler.retrieve_missing_certs(request(previous_limit), Some(0)).await.expect("within limit");
+    let err = handler.retrieve_missing_certs(request(previous_limit + 1), Some(0)).await;
+    assert!(refused_at(err.expect_err("over limit"), previous_limit));
+
+    // A current-epoch request is sized for the current committee.
+    handler.retrieve_missing_certs(request(current_limit), Some(1)).await.expect("within limit");
+    let err = handler.retrieve_missing_certs(request(current_limit + 1), Some(1)).await;
+    assert!(refused_at(err.expect_err("over limit"), current_limit));
+
+    // Without a record of the previous committee, a previous-epoch request gets the decoding cap.
+    let (handler, _tasks) = handler_with(None);
+    let cap = MAX_SKIP_ROUND_AUTHORITIES;
+    let resp = handler.retrieve_missing_certs(request(cap), Some(0)).await.expect("within cap");
     assert!(matches!(resp, PrimaryResponse::RequestedCertificates(certs) if certs.is_empty()));
-
-    // One more is refused.
-    let err =
-        handler.retrieve_missing_certs(request(limit + 1), Some(0)).await.expect_err("over limit");
-    assert!(
-        matches!(err, PrimaryNetworkError::TooManyAuthorities(n, l) if n == limit + 1 && l == limit)
-    );
+    let err = handler.retrieve_missing_certs(request(cap + 1), Some(0)).await;
+    assert!(refused_at(err.expect_err("over cap"), cap));
+    // The current epoch is still sized for the current committee.
+    let err = handler.retrieve_missing_certs(request(current_limit + 1), Some(1)).await;
+    assert!(refused_at(err.expect_err("over limit"), current_limit));
 }

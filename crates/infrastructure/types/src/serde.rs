@@ -19,7 +19,27 @@ use serde_with::{DeserializeAs, SerializeAs};
 /// bytes so a malformed bitmap can't crash the node when it is later re-encoded.
 /// See issue #55.
 pub fn deserialize_normalized(bytes: &[u8]) -> std::io::Result<roaring::RoaringBitmap> {
+    normalize(roaring::RoaringBitmap::deserialize_from(bytes)?)
+}
+
+/// Like [`deserialize_normalized`], but returns `Ok(None)` for a bitmap holding more than
+/// `max_len` values.
+///
+/// The count comes from the raw decode, so it is checked before normalizing walks every value.
+/// A few bytes can stand for billions of values, so untrusted bitmaps with a known limit use this.
+pub fn deserialize_normalized_bounded(
+    bytes: &[u8],
+    max_len: u64,
+) -> std::io::Result<Option<roaring::RoaringBitmap>> {
     let raw = roaring::RoaringBitmap::deserialize_from(bytes)?;
+    if raw.len() > max_len {
+        return Ok(None);
+    }
+    normalize(raw).map(Some)
+}
+
+/// Rebuild a decoded bitmap from its values, which drops any empty container. See issue #55.
+fn normalize(raw: roaring::RoaringBitmap) -> std::io::Result<roaring::RoaringBitmap> {
     roaring::RoaringBitmap::from_sorted_iter(raw)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
 }

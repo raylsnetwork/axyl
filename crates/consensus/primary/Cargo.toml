@@ -46,6 +46,7 @@ proptest = { workspace = true }
 tracing = { workspace = true }
 rayls-infrastructure-storage = { workspace = true }
 assert_matches = { workspace = true }
+libp2p = { workspace = true, features = ["request-response"] }
 rayls-infrastructure-types = { workspace = true, features = ["test-utils"] }
 rayls-consensus-primary = { workspace = true, features = ["test-utils"] }
 rayls-testing-test-utils-committee = { workspace = true }

@@ -123,7 +123,9 @@ where
         consensus_bus: ConsensusBus,
         rayls_consensus_state_sync: StateSynchronizer<DB>,
     ) -> Self {
-        let committee_size = requested_committee_size(&consensus_config);
+        let previous_size =
+            consensus_config.previous_committee().map_or(0, |prev| prev.keys().len());
+        let committee_size = consensus_config.committee().size().max(previous_size);
         if committee_size > MAX_SKIP_ROUND_AUTHORITIES {
             error!(
                 target: "primary::handler",
@@ -820,7 +822,9 @@ where
         request: MissingCertificatesRequest,
         requested_epoch: Option<Epoch>,
     ) -> PrimaryNetworkResult<PrimaryResponse> {
-        let limit = max_requested_authorities(requested_committee_size(&self.consensus_config));
+        // The epoch the request is served from decides which committee its list is sized for.
+        let scope = fetch_scope(requested_epoch, self.consensus_config.committee().epoch());
+        let limit = requested_authority_limit(&self.consensus_config, scope);
         let named = request.skip_rounds.named();
         if named > limit {
             debug!(target: "primary::handler", authorities = named, limit, "missing-certificates request names too many authorities");
@@ -828,7 +832,7 @@ where
         }
         let consensus_config = self.consensus_config.clone();
         tokio::task::spawn_blocking(move || {
-            collect_missing_certs_blocking(request, requested_epoch, consensus_config)
+            collect_missing_certs_blocking(request, requested_epoch, scope, consensus_config)
         })
         .await
         .map_err(|e| PrimaryNetworkError::Internal(format!("cert-collector join error: {e}")))?
@@ -954,13 +958,24 @@ pub(crate) const REQUESTED_AUTHORITIES_PER_MEMBER: usize = 2;
 /// Smallest limit on the authorities a request may name, so small committees can still grow.
 pub(crate) const MIN_REQUESTED_AUTHORITIES: usize = 64;
 
-/// Size of the committee an honest missing-certificates request may name.
+/// Most authorities a request served from `scope` may name.
 ///
-/// A request asks about this epoch or the previous one, and names that epoch's committee.
-/// So this is the larger of the two, or this epoch's committee when the previous one is unknown.
-pub(crate) fn requested_committee_size<DB: Database>(config: &ConsensusConfig<DB>) -> usize {
-    let previous = config.previous_committee().map_or(0, |prev| prev.keys().len());
-    config.committee().size().max(previous)
+/// An honest request names the committee of the epoch it asks about.
+/// For the previous epoch that is the previous committee, or the decoding cap if this node has no
+/// record of it, so an honest node is not refused for data this node lacks.
+/// Any other request is sized for the current committee.
+pub(crate) fn requested_authority_limit<DB: Database>(
+    config: &ConsensusConfig<DB>,
+    scope: Option<CertScope>,
+) -> usize {
+    match scope {
+        Some(CertScope::PrevEpoch) => {
+            config.previous_committee().map_or(MAX_SKIP_ROUND_AUTHORITIES, |prev| {
+                max_requested_authorities(prev.keys().len())
+            })
+        }
+        Some(CertScope::Current) | None => max_requested_authorities(config.committee().size()),
+    }
 }
 
 /// Most authorities a missing-certificates request may name.
@@ -980,10 +995,11 @@ const _: () = assert!(MIN_REQUESTED_AUTHORITIES <= MAX_SKIP_ROUND_AUTHORITIES);
 fn collect_missing_certs_blocking<DB: Database>(
     request: MissingCertificatesRequest,
     requested_epoch: Option<Epoch>,
+    scope: Option<CertScope>,
     consensus_config: ConsensusConfig<DB>,
 ) -> PrimaryNetworkResult<PrimaryResponse> {
     let our_epoch = consensus_config.committee().epoch();
-    let Some(scope) = fetch_scope(requested_epoch, our_epoch) else {
+    let Some(scope) = scope else {
         // Either the requester is ahead of us (it closed an epoch we are still finishing, routine
         // around every boundary) or it asks for an epoch older than the one we kept the tail of.
         // Neither is served from here; the requester moves on to the next peer.
