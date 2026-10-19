@@ -333,7 +333,13 @@ impl Certificate {
         self.signature_verification_state = state;
     }
 
-    /// The bitmap of authorities, in committee order, whose votes form the aggregate signature.
+    /// The bitmap of authorities whose votes form the aggregate signature.
+    ///
+    /// Indices address authorities **sorted by BLS public key** — [`crate::Committee::bls_keys`]
+    /// order, which is what [`Self::signed_by`] resolves against. It is NOT
+    /// `Committee::authorities()` order, which sorts by [`AuthorityIdentifier`]; resolving
+    /// against that one returns a plausible set of authorities rather than an error, so the
+    /// mistake is silent. See [`Self::skip_with_header_and_signers_span`].
     pub fn signed_authorities(&self) -> &roaring::RoaringBitmap {
         &self.signed_authorities
     }

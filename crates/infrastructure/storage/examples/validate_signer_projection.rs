@@ -89,6 +89,23 @@ struct EpochStats {
     leader_outside_certificates: u64,
     /// Signer indices that did not resolve to a committee member.
     unmapped_signers: u64,
+    /// Run lengths of consecutive rounds in which a validator signed nothing.
+    ///
+    /// Vote collection is cancelled the moment quorum is reached (`certifier.rs`), so a
+    /// certificate carries the first `quorum` responders and a latency-distant validator loses
+    /// most of those races. That is only unfair if it costs whole *rounds*, so the shape of the
+    /// misses is what matters: one long run is an outage the metric should penalise, while
+    /// scattered singletons would be luck-of-the-draw the metric should not.
+    miss_streak_open: BTreeMap<AuthorityIdentifier, u64>,
+    /// Closed run lengths: validator -> (run length -> how many such runs).
+    miss_streak_hist: BTreeMap<AuthorityIdentifier, BTreeMap<u64, u64>>,
+    /// How many distinct DAG rounds each committed sub-dag spans.
+    ///
+    /// The reward credits one unit per committed sub-dag (one `ConsensusBlocks` row), and a
+    /// sub-dag carries the leader's uncommitted causal history, so it spans several DAG rounds
+    /// rather than one. With N validators a single DAG round holds at most N certificates, so
+    /// this is what explains a certificate count above the committee size.
+    subdag_round_span: BTreeMap<u64, u64>,
     authored_rounds: BTreeMap<AuthorityIdentifier, u32>,
     signed_rounds: BTreeMap<AuthorityIdentifier, u32>,
     signed_certs: BTreeMap<AuthorityIdentifier, u64>,
@@ -196,6 +213,10 @@ fn main() -> eyre::Result<()> {
                 });
             }
 
+            let distinct_rounds: BTreeSet<u32> =
+                header.sub_dag.certificates.iter().map(|c| c.round()).collect();
+            *st.subdag_round_span.entry(distinct_rounds.len() as u64).or_default() += 1;
+
             let mut oracle_signers: BTreeSet<AuthorityIdentifier> = BTreeSet::new();
             // Union over exactly `sub_dag.certificates` — the same vector the projection walks.
             // Chaining the leader in here would compare two different things and mask a real gap.
@@ -245,6 +266,22 @@ fn main() -> eyre::Result<()> {
             if oracle_signers.len() == id_by_index.len() {
                 st.saturated_rounds += 1;
             }
+
+            // Rows arrive in ascending row order within an epoch, so consecutive misses are
+            // genuinely consecutive rounds. Streaks are closed at the epoch boundary below.
+            for id in &id_by_index {
+                if oracle_signers.contains(id) {
+                    if let Some(run) = st.miss_streak_open.remove(id) {
+                        *st.miss_streak_hist
+                            .entry(id.clone())
+                            .or_default()
+                            .entry(run)
+                            .or_default() += 1;
+                    }
+                } else {
+                    *st.miss_streak_open.entry(id.clone()).or_default() += 1;
+                }
+            }
             for id in &oracle_signers {
                 *st.signed_rounds.entry(id.clone()).or_default() += 1;
             }
@@ -256,6 +293,14 @@ fn main() -> eyre::Result<()> {
             }
             Ok(())
         })?;
+
+        // Close any run still open when the epoch ends.
+        let open: Vec<(AuthorityIdentifier, u64)> =
+            st.miss_streak_open.iter().map(|(k, v)| (k.clone(), *v)).collect();
+        for (id, run) in open {
+            *st.miss_streak_hist.entry(id).or_default().entry(run).or_default() += 1;
+        }
+        st.miss_streak_open.clear();
 
         print_epoch(*epoch, &st, &names, quorum);
         merge(&mut totals, st);
@@ -276,6 +321,29 @@ fn main() -> eyre::Result<()> {
         let sc = pct(totals.signed_certs.get(id).copied().unwrap_or(0), totals.certs);
         println!("{name:<10} {a:>13.2}% {sr:>13.2}% {sc:>13.2}%");
     }
+    println!();
+
+    // What a credited unit actually spans. A committed sub-dag carries the leader's uncommitted
+    // causal history, so "certificates per credited round" is not bounded by the committee size.
+    let total_spans: u64 = totals.subdag_round_span.values().sum();
+    let weighted: u64 = totals.subdag_round_span.iter().map(|(s, c)| s * c).sum();
+    println!("---- what one credited round spans ----");
+    println!(
+        "committee={}  certs/sub-dag={:.2}  DAG rounds/sub-dag={:.2}  certs per DAG round={:.2}",
+        id_by_index.len(),
+        totals.certs as f64 / totals.rounds as f64,
+        weighted as f64 / total_spans.max(1) as f64,
+        (totals.certs as f64 / totals.rounds as f64)
+            / (weighted as f64 / total_spans.max(1) as f64),
+    );
+    print!("distribution of DAG rounds per sub-dag:");
+    for (span, count) in &totals.subdag_round_span {
+        print!(" {span}:{count}");
+    }
+    println!("\n");
+
+    println!("---- shape of the signing gaps (axyl#279 review question) ----");
+    print_miss_shape(&totals, &names);
     println!();
 
     // An empty archive must never report PASS: a validation that proves nothing is worse than no
@@ -409,5 +477,44 @@ fn merge(dst: &mut EpochStats, src: EpochStats) {
     }
     for (k, v) in src.leader_rounds {
         *dst.leader_rounds.entry(k).or_default() += v;
+    }
+    for (span, count) in src.subdag_round_span {
+        *dst.subdag_round_span.entry(span).or_default() += count;
+    }
+    for (id, hist) in src.miss_streak_hist {
+        let into = dst.miss_streak_hist.entry(id).or_default();
+        for (run, count) in hist {
+            *into.entry(run).or_default() += count;
+        }
+    }
+}
+
+/// Reports whether validators' signing gaps look like outages or like lost races.
+///
+/// Answers the review question on axyl#279: vote collection is cancelled at quorum, so a
+/// latency-distant validator loses most per-certificate races. This shows whether that ever
+/// costs it a whole round, and if so whether those rounds cluster (an outage, correctly
+/// penalised) or scatter (luck, which would be unfair).
+fn print_miss_shape(totals: &EpochStats, names: &BTreeMap<AuthorityIdentifier, &'static str>) {
+    println!(
+        "{:<10} {:>8} {:>10} {:>11} {:>10} {:>9}",
+        "validator", "missed", "of rounds", "singletons", "longest", "runs"
+    );
+    for (id, name) in names {
+        let hist = match totals.miss_streak_hist.get(id) {
+            Some(h) if !h.is_empty() => h,
+            _ => {
+                println!("{name:<10} {:>8} {:>10} {:>11} {:>10} {:>9}", 0, totals.rounds, 0, 0, 0);
+                continue;
+            }
+        };
+        let runs: u64 = hist.values().sum();
+        let missed: u64 = hist.iter().map(|(len, count)| len * count).sum();
+        let singletons = hist.get(&1).copied().unwrap_or(0);
+        let longest = hist.keys().next_back().copied().unwrap_or(0);
+        println!(
+            "{name:<10} {missed:>8} {:>10} {singletons:>11} {longest:>10} {runs:>9}",
+            totals.rounds
+        );
     }
 }
