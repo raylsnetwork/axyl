@@ -241,6 +241,9 @@ impl<'de> Deserialize<'de> for SkipRoundList {
                 // Each entry is decoded, so a list cannot declare more entries than it holds.
                 while let Some(entry) = seq.next_element()? {
                     named += 1;
+                    // An entry past the cap is still decoded, then dropped.
+                    // bcs cannot skip one unread: it has no `deserialize_any` or `IgnoredAny`.
+                    // The cost is bounded by the message size.
                     if entries.len() < MAX_SKIP_ROUND_AUTHORITIES {
                         entries.push(entry);
                     }
