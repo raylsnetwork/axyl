@@ -824,11 +824,16 @@ where
     ) -> PrimaryNetworkResult<PrimaryResponse> {
         // The epoch the request is served from decides which committee its list is sized for.
         let scope = fetch_scope(requested_epoch, self.consensus_config.committee().epoch());
-        let limit = requested_authority_limit(&self.consensus_config, scope);
-        let named = request.skip_rounds.named();
-        if named > limit {
-            debug!(target: "primary::handler", authorities = named, limit, "missing-certificates request names too many authorities");
-            return Err(PrimaryNetworkError::TooManyAuthorities(named, limit));
+        // A request outside our epoch and the kept tail is answered empty, so its size is not
+        // checked. A peer already in the next epoch names that epoch's committee, which may
+        // be larger.
+        if let Some(scope) = scope {
+            let limit = requested_authority_limit(&self.consensus_config, scope);
+            let named = request.skip_rounds.named();
+            if named > limit {
+                debug!(target: "primary::handler", authorities = named, limit, "missing-certificates request names too many authorities");
+                return Err(PrimaryNetworkError::TooManyAuthorities(named, limit));
+            }
         }
         let consensus_config = self.consensus_config.clone();
         tokio::task::spawn_blocking(move || {
@@ -963,18 +968,18 @@ pub(crate) const MIN_REQUESTED_AUTHORITIES: usize = 64;
 /// An honest request names the committee of the epoch it asks about.
 /// For the previous epoch that is the previous committee, or the decoding cap if this node has no
 /// record of it, so an honest node is not refused for data this node lacks.
-/// Any other request is sized for the current committee.
+/// A current-epoch request is sized for the current committee.
 pub(crate) fn requested_authority_limit<DB: Database>(
     config: &ConsensusConfig<DB>,
-    scope: Option<CertScope>,
+    scope: CertScope,
 ) -> usize {
     match scope {
-        Some(CertScope::PrevEpoch) => {
+        CertScope::PrevEpoch => {
             config.previous_committee().map_or(MAX_SKIP_ROUND_AUTHORITIES, |prev| {
                 max_requested_authorities(prev.keys().len())
             })
         }
-        Some(CertScope::Current) | None => max_requested_authorities(config.committee().size()),
+        CertScope::Current => max_requested_authorities(config.committee().size()),
     }
 }
 

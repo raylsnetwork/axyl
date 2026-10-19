@@ -1005,6 +1005,7 @@ async fn test_missing_certs_request_with_too_many_authorities_is_rejected() {
 ///
 /// A lagging node asks about the previous epoch, and names that epoch's committee.
 /// Without a record of that committee, the decoding cap is used, so the node is not refused.
+/// A request about an epoch this node does not serve is answered empty, whatever its size.
 #[tokio::test]
 async fn test_missing_certs_limit_follows_the_served_epoch() {
     use crate::network::{
@@ -1085,4 +1086,9 @@ async fn test_missing_certs_limit_follows_the_served_epoch() {
     // The current epoch is still sized for the current committee.
     let err = handler.retrieve_missing_certs(request(current_limit + 1), Some(1)).await;
     assert!(refused_at(err.expect_err("over limit"), current_limit));
+
+    // A peer already in the next epoch names that epoch's committee, and is not refused for it.
+    let resp =
+        handler.retrieve_missing_certs(request(cap + 1), Some(2)).await.expect("not refused");
+    assert!(matches!(resp, PrimaryResponse::RequestedCertificates(certs) if certs.is_empty()));
 }
