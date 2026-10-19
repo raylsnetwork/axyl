@@ -19,21 +19,16 @@ jobs:
     name: 🤖 Claude Code Review
     # Only auto-review same-repo PRs, or fork PRs from trusted authors (org
     # members / collaborators). Everyone else uses the @claude mention flow.
-    # Skip Dependabot PRs: claude-code-action rejects bot actors, and
-    # Dependabot-triggered runs get no Actions secrets and a read-only
-    # GITHUB_TOKEN. Keyed on the PR author (not github.actor) so the job also
-    # skips when a human rebases or re-runs a Dependabot PR.
     if: >
-      github.event.pull_request.user.login != 'dependabot[bot]' && (
-        github.event.pull_request.head.repo.full_name == github.repository ||
-        contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.pull_request.author_association)
-      )
+      github.event.pull_request.head.repo.full_name == github.repository ||
+      contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.pull_request.author_association)
 
     runs-on: ubuntu-latest
     permissions:
       contents: read
       pull-requests: write
       actions: read
+      id-token: write
 
     steps:
       - name: Checkout repository
@@ -88,4 +83,4 @@ jobs:
 
           # Restricted per security review: read PR metadata and the diff, post
           # comments, and read files. No arbitrary gh api / git / shell access.
-          claude_args: '--allowedTools "Bash(gh pr view:*),Bash(gh pr diff:*),Bash(git diff:*),Bash(gh pr comment:*),Read,Glob,Grep,mcp__github_inline_comment__create_inline_comment"'
+          claude_args: '--model claude-opus-5-5 --effort high  --allowedTools "Bash(gh pr view:*),Bash(gh pr diff:*),Bash(git diff:*),Bash(gh pr comment:*),Read,Glob,Grep,mcp__github_inline_comment__create_inline_comment"'
