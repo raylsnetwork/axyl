@@ -123,6 +123,15 @@ where
         consensus_bus: ConsensusBus,
         rayls_consensus_state_sync: StateSynchronizer<DB>,
     ) -> Self {
+        let committee_size = requested_committee_size(&consensus_config);
+        if committee_size > MAX_SKIP_ROUND_AUTHORITIES {
+            error!(
+                target: "primary::handler",
+                committee = committee_size,
+                limit = MAX_SKIP_ROUND_AUTHORITIES,
+                "committee is larger than a missing-certificates request may name, so missing-certificates requests between members will be refused"
+            );
+        }
         Self {
             consensus_config,
             consensus_bus,
@@ -811,8 +820,7 @@ where
         request: MissingCertificatesRequest,
         requested_epoch: Option<Epoch>,
     ) -> PrimaryNetworkResult<PrimaryResponse> {
-        let committee = self.consensus_config.committee();
-        let limit = max_requested_authorities(committee.size());
+        let limit = max_requested_authorities(requested_committee_size(&self.consensus_config));
         let named = request.skip_rounds.named();
         if named > limit {
             debug!(target: "primary::handler", authorities = named, limit, "missing-certificates request names too many authorities");
@@ -946,10 +954,20 @@ pub(crate) const REQUESTED_AUTHORITIES_PER_MEMBER: usize = 2;
 /// Smallest limit on the authorities a request may name, so small committees can still grow.
 pub(crate) const MIN_REQUESTED_AUTHORITIES: usize = 64;
 
+/// Size of the committee an honest missing-certificates request may name.
+///
+/// A request asks about this epoch or the previous one, and names that epoch's committee.
+/// So this is the larger of the two, or this epoch's committee when the previous one is unknown.
+pub(crate) fn requested_committee_size<DB: Database>(config: &ConsensusConfig<DB>) -> usize {
+    let previous = config.previous_committee().map_or(0, |prev| prev.keys().len());
+    config.committee().size().max(previous)
+}
+
 /// Most authorities a missing-certificates request may name.
 ///
 /// An honest request names each committee member once.
 /// The limit never passes [MAX_SKIP_ROUND_AUTHORITIES], since decoding keeps no more entries.
+/// A committee larger than that has its honest requests refused, which the handler logs each epoch.
 pub(crate) fn max_requested_authorities(committee_size: usize) -> usize {
     (REQUESTED_AUTHORITIES_PER_MEMBER * committee_size)
         .clamp(MIN_REQUESTED_AUTHORITIES, MAX_SKIP_ROUND_AUTHORITIES)

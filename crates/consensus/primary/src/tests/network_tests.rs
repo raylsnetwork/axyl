@@ -659,40 +659,59 @@ fn test_skip_bitmap_is_refused_before_decoding() {
 
 /// The server decodes a skip bitmap only for an origin it serves.
 ///
-/// For the current epoch that is a committee member, so an outsider's bitmap costs no decode.
-/// The previous epoch's tail is served for every named origin, so there it is decoded.
+/// That is a member of the committee of the epoch the request is served from.
+/// Without a record of the previous committee, the previous epoch's tail keeps every origin.
 #[test]
 fn test_skip_bitmap_decoded_only_for_served_origins() {
     use crate::state_sync::CertificateCollector;
+    use rand::{rngs::StdRng, SeedableRng};
+    use rayls_infrastructure_storage::EpochStore;
+    use rayls_infrastructure_types::{BlsKeypair, EpochRecord};
 
-    let fixture = CommitteeFixture::builder(MemDatabase::default).build();
-    let config = fixture.authorities().next().unwrap().consensus_config();
-    let member = fixture.authorities().next().unwrap().id();
-    let outsider = AuthorityIdentifier::dummy_for_test(200);
     let max_response_size = LibP2pConfig::default().max_rpc_message_size;
     // An unknown header fails to decode, so it shows whether a decode was attempted at all.
     let bad_bitmap = vec![1u8, 2, 3];
-    let request = |origin: AuthorityIdentifier| MissingCertificatesRequest {
-        skip_rounds: [(origin, bad_bitmap.clone())].into_iter().collect(),
+    let request = |origin: &AuthorityIdentifier| MissingCertificatesRequest {
+        skip_rounds: [(origin.clone(), bad_bitmap.clone())].into_iter().collect(),
         max_response_size,
         ..Default::default()
     };
+    // A decode was attempted when the bad bitmap is refused, and skipped when the request passes.
+    let decoded = |origin: &AuthorityIdentifier, fixture: &CommitteeFixture<MemDatabase>, scope| {
+        let config = fixture.authorities().next().unwrap().consensus_config();
+        match CertificateCollector::new(request(origin), config, scope) {
+            Err(PrimaryNetworkError::StdIo(_)) => true,
+            Ok(_) => false,
+            Err(e) => panic!("unexpected error: {e:?}"),
+        }
+    };
 
-    // A committee member's bad bitmap is decoded and refused.
-    assert_matches!(
-        CertificateCollector::new(request(member), config.clone(), CertScope::Current).err(),
-        Some(PrimaryNetworkError::StdIo(_))
-    );
-    // An outsider's identical bitmap is never decoded, so the request is accepted.
-    assert!(CertificateCollector::new(
-        request(outsider.clone()),
-        config.clone(),
-        CertScope::Current
-    )
-    .is_ok());
-    // For the previous epoch the same outsider's bitmap is decoded and refused.
-    assert_matches!(
-        CertificateCollector::new(request(outsider), config.clone(), CertScope::PrevEpoch).err(),
-        Some(PrimaryNetworkError::StdIo(_))
-    );
+    // Epoch 1, with a record of epoch 0 whose committee had one member that has since left.
+    let departed = *BlsKeypair::generate(&mut StdRng::seed_from_u64(7)).public();
+    let record = EpochRecord { epoch: 0, committee: vec![departed], ..Default::default() };
+    let fixture = CommitteeFixture::builder(move || {
+        let db = MemDatabase::default();
+        db.save_epoch_record(&record).expect("previous epoch record");
+        db
+    })
+    .epoch(1)
+    .build();
+    let member = fixture.authorities().next().unwrap().id();
+    let departed = AuthorityIdentifier::from(departed);
+    let outsider = AuthorityIdentifier::dummy_for_test(200);
+
+    // The current epoch decodes only for current members.
+    assert!(decoded(&member, &fixture, CertScope::Current));
+    assert!(!decoded(&departed, &fixture, CertScope::Current));
+    assert!(!decoded(&outsider, &fixture, CertScope::Current));
+
+    // The previous epoch decodes only for its own members.
+    assert!(decoded(&departed, &fixture, CertScope::PrevEpoch));
+    assert!(!decoded(&member, &fixture, CertScope::PrevEpoch));
+    assert!(!decoded(&outsider, &fixture, CertScope::PrevEpoch));
+
+    // With no record of the previous committee, the previous epoch decodes for every origin.
+    let unknown = CommitteeFixture::builder(MemDatabase::default).epoch(1).build();
+    assert!(decoded(&outsider, &unknown, CertScope::PrevEpoch));
+    assert!(!decoded(&outsider, &unknown, CertScope::Current));
 }

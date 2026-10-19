@@ -999,3 +999,62 @@ async fn test_missing_certs_request_with_too_many_authorities_is_rejected() {
     assert!(reason.0.contains(&named.to_string()), "got {reason:?}");
     assert!(reason.0.contains(&limit.to_string()), "got {reason:?}");
 }
+
+/// The limit is sized by the larger of this epoch's committee and the previous one.
+///
+/// A lagging node asks about the previous epoch, and names that epoch's committee.
+#[tokio::test]
+async fn test_missing_certs_limit_follows_the_larger_committee() {
+    use crate::network::handler::{max_requested_authorities, MIN_REQUESTED_AUTHORITIES};
+    use rand::{rngs::StdRng, SeedableRng};
+    use rayls_infrastructure_storage::EpochStore;
+    use rayls_infrastructure_types::{BlsKeypair, EpochRecord};
+
+    // The previous committee is large enough to lift the limit above the floor.
+    let previous_size = MIN_REQUESTED_AUTHORITIES;
+    let mut rng = StdRng::seed_from_u64(9);
+    let previous =
+        (0..previous_size).map(|_| *BlsKeypair::generate(&mut rng).public()).collect::<Vec<_>>();
+    let record = EpochRecord { epoch: 0, committee: previous, ..Default::default() };
+    let fixture = CommitteeFixture::builder(move || {
+        let db = MemDatabase::default();
+        db.save_epoch_record(&record).expect("previous epoch record");
+        db
+    })
+    .randomize_ports(true)
+    .committee_size(NonZeroUsize::new(4).unwrap())
+    .epoch(1)
+    .build();
+    let primary = fixture.authorities().next().unwrap();
+    let cb = ConsensusBus::new();
+    let task_manager = TaskManager::default();
+    let synchronizer =
+        StateSynchronizer::new(primary.consensus_config(), cb.clone(), task_manager.get_spawner());
+    let handler = RequestHandler::new(primary.consensus_config(), cb.clone(), synchronizer);
+    let limit = max_requested_authorities(previous_size);
+    assert!(limit > max_requested_authorities(4), "the previous committee must raise the limit");
+
+    let request = |count: usize| {
+        let named = (0..count)
+            .map(|i| {
+                let byte = u8::try_from(i).expect("fits a test authority");
+                (AuthorityIdentifier::dummy_for_test(byte), BTreeSet::new())
+            })
+            .collect();
+        MissingCertificatesRequest::default()
+            .set_bounds(0, named)
+            .expect("bounds")
+            .set_max_response_size(max_response_size())
+    };
+
+    // A request naming as many as the previous committee allows is served.
+    let resp = handler.retrieve_missing_certs(request(limit), Some(0)).await.expect("within limit");
+    assert!(matches!(resp, PrimaryResponse::RequestedCertificates(certs) if certs.is_empty()));
+
+    // One more is refused.
+    let err =
+        handler.retrieve_missing_certs(request(limit + 1), Some(0)).await.expect_err("over limit");
+    assert!(
+        matches!(err, PrimaryNetworkError::TooManyAuthorities(n, l) if n == limit + 1 && l == limit)
+    );
+}
