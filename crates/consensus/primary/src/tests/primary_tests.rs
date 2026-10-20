@@ -1076,6 +1076,12 @@ async fn test_missing_certs_limit_follows_the_served_epoch() {
     let err = handler.retrieve_missing_certs(request(current_limit + 1), Some(1)).await;
     assert!(refused_at(err.expect_err("over limit"), current_limit));
 
+    // An unstamped request (before the CertificateFetchEpochV2 fork) may come from a node still
+    // in the previous epoch, so it is sized for the larger committee.
+    handler.retrieve_missing_certs(request(previous_limit), None).await.expect("within limit");
+    let err = handler.retrieve_missing_certs(request(previous_limit + 1), None).await;
+    assert!(refused_at(err.expect_err("over limit"), previous_limit));
+
     // Without a record of the previous committee, a previous-epoch request gets the decoding cap.
     let (handler, _tasks) = handler_with(None);
     let cap = MAX_SKIP_ROUND_AUTHORITIES;
@@ -1083,8 +1089,10 @@ async fn test_missing_certs_limit_follows_the_served_epoch() {
     assert!(matches!(resp, PrimaryResponse::RequestedCertificates(certs) if certs.is_empty()));
     let err = handler.retrieve_missing_certs(request(cap + 1), Some(0)).await;
     assert!(refused_at(err.expect_err("over cap"), cap));
-    // The current epoch is still sized for the current committee.
+    // The current epoch is still sized for the current committee, and so is an unstamped request.
     let err = handler.retrieve_missing_certs(request(current_limit + 1), Some(1)).await;
+    assert!(refused_at(err.expect_err("over limit"), current_limit));
+    let err = handler.retrieve_missing_certs(request(current_limit + 1), None).await;
     assert!(refused_at(err.expect_err("over limit"), current_limit));
 
     // A peer already in the next epoch names that epoch's committee, and is not refused for it.

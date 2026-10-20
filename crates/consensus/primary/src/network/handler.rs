@@ -123,9 +123,7 @@ where
         consensus_bus: ConsensusBus,
         rayls_consensus_state_sync: StateSynchronizer<DB>,
     ) -> Self {
-        let previous_size =
-            consensus_config.previous_committee().map_or(0, |prev| prev.keys().len());
-        let committee_size = consensus_config.committee().size().max(previous_size);
+        let committee_size = largest_committee_size(&consensus_config);
         if committee_size > MAX_SKIP_ROUND_AUTHORITIES {
             error!(
                 target: "primary::handler",
@@ -828,7 +826,11 @@ where
         // checked. A peer already in the next epoch names that epoch's committee, which may
         // be larger.
         if let Some(scope) = scope {
-            let limit = requested_authority_limit(&self.consensus_config, scope);
+            let limit = if requested_epoch.is_none() {
+                unstamped_authority_limit(&self.consensus_config)
+            } else {
+                requested_authority_limit(&self.consensus_config, scope)
+            };
             let named = request.skip_rounds.named();
             if named > limit {
                 debug!(target: "primary::handler", authorities = named, limit, "missing-certificates request names too many authorities");
@@ -962,6 +964,21 @@ where
 pub(crate) const REQUESTED_AUTHORITIES_PER_MEMBER: usize = 2;
 /// Smallest limit on the authorities a request may name, so small committees can still grow.
 pub(crate) const MIN_REQUESTED_AUTHORITIES: usize = 64;
+
+/// Size of the larger of this epoch's committee and the previous one, when known.
+pub(crate) fn largest_committee_size<DB: Database>(config: &ConsensusConfig<DB>) -> usize {
+    let previous = config.previous_committee().map_or(0, |prev| prev.keys().len());
+    config.committee().size().max(previous)
+}
+
+/// Most authorities a request with no epoch stamp may name.
+///
+/// Before the `CertificateFetchEpochV2` fork a request carries no epoch, so a requester still in
+/// the previous epoch names that committee while being served from the current one. The limit
+/// covers the larger of the two, so a lagging node is not refused across a committee shrink.
+pub(crate) fn unstamped_authority_limit<DB: Database>(config: &ConsensusConfig<DB>) -> usize {
+    max_requested_authorities(largest_committee_size(config))
+}
 
 /// Most authorities a request served from `scope` may name.
 ///
