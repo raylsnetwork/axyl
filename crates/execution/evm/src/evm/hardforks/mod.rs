@@ -140,7 +140,8 @@ where
             | RaylsHardFork::Eip161EmptyAccountGuard
             | RaylsHardFork::EpochCloseSeedV2
             | RaylsHardFork::CertificateFetchEpochV2
-            | RaylsHardFork::Erc20PrecompileDirectCall => continue,
+            | RaylsHardFork::Erc20PrecompileDirectCall
+            | RaylsHardFork::HeaderParentSigners => continue,
         };
 
         // Pre-load accounts into cache and copy their real AccountInfo.

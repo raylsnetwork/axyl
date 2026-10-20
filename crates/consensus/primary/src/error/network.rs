@@ -139,7 +139,12 @@ fn penalty_from_header_error(error: &HeaderError) -> Option<Penalty> {
         // medium
         HeaderError::InvalidParents
         | HeaderError::WrongNumberOfParents(_, _)
-        | HeaderError::TooOld { .. } => Some(Penalty::Medium),
+        | HeaderError::TooOld { .. }
+        // the claim disagrees with this node's copy of the parent certificate or with the
+        // fork state: a misconfigured or lagging peer, not necessarily a malicious one
+        | HeaderError::OwnParentSignersMismatch { .. }
+        | HeaderError::UnexpectedOwnParentSigners
+        | HeaderError::MissingOwnParentSigners => Some(Penalty::Medium),
         // severe
         HeaderError::InvalidTimestamp { .. } | HeaderError::InvalidParentRound => {
             Some(Penalty::Severe)
@@ -157,6 +162,7 @@ fn penalty_from_header_error(error: &HeaderError) -> Option<Penalty> {
         | HeaderError::UnknownWorkerId
         | HeaderError::InvalidHeaderDigest
         | HeaderError::InvalidRound { .. }
+        | HeaderError::OwnParentSignerOutOfRange { .. }
         | HeaderError::UnknownAuthority(_) => Some(Penalty::Fatal),
         // ignore
         HeaderError::PendingCertificateOneshot

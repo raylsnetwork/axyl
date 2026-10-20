@@ -16,6 +16,7 @@ rayls-infrastructure-types = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
+roaring = { workspace = true }
 alloy = { workspace = true }
 eyre = { workspace = true }
 indexmap = { workspace = true }

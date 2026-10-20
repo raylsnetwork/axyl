@@ -644,6 +644,9 @@ where
             CertManagerError::from(CertificateError::Inquorate { stake, threshold }).into()
         );
 
+        // the author's claim about its own parent certificate's signers, against our copy of it
+        self.check_own_parent_signers(&header, &parents)?;
+
         // blocks until batches become available
         self.rayls_consensus_state_sync.sync_header_batches(&header, false, 0).await?;
 
@@ -737,6 +740,42 @@ where
             .write_last_proposed_by_authority(header.author.clone(), &header)?;
 
         Ok(PrimaryResponse::Vote(vote))
+    }
+
+    /// Checks the header's claim of who signed the author's own parent certificate against the
+    /// fork state and this node's copy of that certificate (see `Header::own_parent_signers`).
+    ///
+    /// Post-fork the claim is required and must equal the signer bitmap of the parent authored by
+    /// the header's author, or be empty when no such parent exists. A proposer that gossiped
+    /// different signer subsets of its certificate to different peers can satisfy only the peers
+    /// holding the variant it claims, so it loses its own certificate rather than splitting the
+    /// tally; every node then credits the same set.
+    fn check_own_parent_signers(
+        &self,
+        header: &Header,
+        parents: &[Certificate],
+    ) -> PrimaryNetworkResult<()> {
+        let active = self.consensus_config.header_parent_signers_active();
+        let claimed = match (active, header.own_parent_signers()) {
+            (false, None) => return Ok(()),
+            (false, Some(_)) => return Err(HeaderError::UnexpectedOwnParentSigners.into()),
+            (true, None) => return Err(HeaderError::MissingOwnParentSigners.into()),
+            (true, Some(claimed)) => claimed,
+        };
+        let expected = parents
+            .iter()
+            .find(|parent| parent.origin() == header.author())
+            .map(|parent| parent.signed_authorities().clone())
+            .unwrap_or_default();
+        ensure!(
+            *claimed == expected,
+            HeaderError::OwnParentSignersMismatch {
+                claimed: claimed.iter().collect(),
+                expected: expected.iter().collect(),
+            }
+            .into()
+        );
+        Ok(())
     }
 
     /// Identify parents not in local storage, pending, or already requested.

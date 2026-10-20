@@ -91,9 +91,16 @@ struct TestTypes<DB = MemDatabase> {
 /// Helper function to create an instance of [RequestHandler] for the first authority in the
 /// committee.
 fn create_test_types() -> TestTypes {
+    create_test_types_with(false)
+}
+
+/// Like [`create_test_types`], with the `HeaderParentSigners` fork state set on the handler's
+/// config.
+fn create_test_types_with(header_parent_signers_active: bool) -> TestTypes {
     let committee = CommitteeFixture::builder(MemDatabase::default).randomize_ports(true).build();
     let authority = committee.first_authority();
-    let config = authority.consensus_config();
+    let mut config = authority.consensus_config();
+    config.set_header_parent_signers_active(header_parent_signers_active);
     let cb = ConsensusBus::new();
 
     // spawn the synchronizer
@@ -131,6 +138,71 @@ async fn test_vote_succeeds() -> eyre::Result<()> {
     let res = handler.vote(peer, header, parents).await;
     debug!(target: "primary::handler_tests", ?res);
     assert!(res.is_ok());
+    Ok(())
+}
+
+/// Once the fork is active a vote request must carry the author's own-parent signer claim and it
+/// must match the parent certificate this node holds. Round-1 headers build on genesis
+/// certificates, whose signer bitmaps are empty, so the only valid claim there is an empty one.
+#[tokio::test]
+async fn test_vote_own_parent_signers_required_and_checked_once_fork_is_active() -> eyre::Result<()>
+{
+    // a refused vote request still marks the author's round on this handler, so each case gets
+    // a fresh one
+    let vote = |claim: Option<roaring::RoaringBitmap>| async move {
+        let TestTypes { committee, handler, parent, task_manager: _task_manager, .. } =
+            create_test_types_with(true);
+        let peer = *committee.last_authority().authority().protocol_key();
+        let header = committee
+            .header_builder_last_authority()
+            .latest_execution_block(BlockNumHash::new(parent.number(), parent.hash()))
+            .created_at(1) // parent is 0
+            .own_parent_signers(claim)
+            .build();
+        handler.vote(peer, header, Vec::new()).await
+    };
+
+    // no claim at all
+    let res = vote(None).await;
+    assert_matches!(
+        res,
+        Err(PrimaryNetworkError::InvalidHeader(HeaderError::MissingOwnParentSigners))
+    );
+
+    // a claim that disagrees with the (empty) genesis parent
+    let res = vote(Some(roaring::RoaringBitmap::from_iter([0u32]))).await;
+    assert_matches!(
+        res,
+        Err(PrimaryNetworkError::InvalidHeader(HeaderError::OwnParentSignersMismatch {
+            claimed,
+            expected
+        })) if claimed == vec![0] && expected.is_empty()
+    );
+
+    // the matching claim
+    let res = vote(Some(roaring::RoaringBitmap::new())).await;
+    assert!(res.is_ok(), "{res:?}");
+    Ok(())
+}
+
+/// Before the fork a claim is refused, so no proposer can start the new layout early.
+#[tokio::test]
+async fn test_vote_fails_own_parent_signers_before_fork() -> eyre::Result<()> {
+    let TestTypes { committee, handler, parent, task_manager: _task_manager, .. } =
+        create_test_types();
+    let header = committee
+        .header_builder_last_authority()
+        .latest_execution_block(BlockNumHash::new(parent.number(), parent.hash()))
+        .created_at(1) // parent is 0
+        .own_parent_signers(Some(roaring::RoaringBitmap::new()))
+        .build();
+    let peer = *committee.last_authority().authority().protocol_key();
+
+    let res = handler.vote(peer, header, Vec::new()).await;
+    assert_matches!(
+        res,
+        Err(PrimaryNetworkError::InvalidHeader(HeaderError::UnexpectedOwnParentSigners))
+    );
     Ok(())
 }
 

@@ -37,7 +37,7 @@ impl<DB: Database> Proposer<DB> {
     /// - current_header: caller checks to see if there is already a header built for this round. If
     ///   current_header.is_some() the proposer uses this header instead of building a new one.
     #[allow(clippy::too_many_arguments)]
-    async fn propose_header(
+    pub(super) async fn propose_header(
         current_round: Round,
         current_epoch: Epoch,
         authority_id: AuthorityIdentifier,
@@ -49,6 +49,7 @@ impl<DB: Database> Proposer<DB> {
         metrics: Arc<PrimaryMetrics>,
         leader_and_support: String,
         max_delay: Duration,
+        claim_own_parent_signers: bool,
     ) -> ProposerResult<Header> {
         // check that the included timestamp is consistent with the parent's timestamp
         //
@@ -71,6 +72,16 @@ impl<DB: Database> Proposer<DB> {
 
         let payload_vec: Vec<_> = digests.iter().map(|m| (m.digest, m.worker_id)).collect();
         consensus_bus.batch_tracker().digests_included_in_header(&payload_vec);
+        // Post-fork, restate who signed our own previous certificate when it is among the parents
+        // (an empty claim otherwise), so the signer set rides inside this signed header and every
+        // node credits the same signers. We built that certificate, so we know its signers.
+        let own_parent_signers = claim_own_parent_signers.then(|| {
+            parents
+                .iter()
+                .find(|parent| *parent.origin() == authority_id)
+                .map(|parent| parent.signed_authorities().clone())
+                .unwrap_or_default()
+        });
         let header = Header::new(
             authority_id,
             current_round,
@@ -78,6 +89,7 @@ impl<DB: Database> Proposer<DB> {
             payload_vec.into_iter().collect(),
             parents.iter().map(|x| x.digest()).collect(),
             consensus_bus.recently_executed_blocks().borrow().latest_block_num_hash(),
+            own_parent_signers,
         );
 
         // update metrics before sending/storing header
@@ -305,6 +317,7 @@ impl<DB: Database> Proposer<DB> {
                 let parents = std::mem::take(&mut self.last_parents);
                 let authority_id = self.authority_id.clone();
                 let min_delay = self.min_header_delay; // copy
+                let claim_own_parent_signers = self.header_parent_signers_active;
                 let leader_and_support = if current_round.is_multiple_of(2) {
                     let authority = self.leader_schedule.leader(current_round);
                     if self.authority_id == authority.id() {
@@ -336,6 +349,7 @@ impl<DB: Database> Proposer<DB> {
                         metrics,
                         leader_and_support.to_string(),
                         min_delay,
+                        claim_own_parent_signers,
                     )
                     .await;
 
