@@ -47,10 +47,11 @@ bytecode swap) and flips the epoch-close reward ABI from 1-arg to 2-arg.
 | 17 | EpochCloseSeedV2 | behavioral | — |
 | 18 | CertificateFetchEpochV2 | behavioral | — |
 | 19 | Erc20PrecompileDirectCall | behavioral | — |
+| 20 | HeaderParentSigners | behavioral | — |
 
 ### What each behavioral fork does
 
-The twelve behavioral forks switch client behavior without a state write; the
+The thirteen behavioral forks switch client behavior without a state write; the
 activation block is a rollout decision, not a state-consistency requirement.
 What each one does:
 
@@ -68,6 +69,7 @@ What each one does:
 | `EpochCloseSeedV2` | Seeds the epoch-closing block's `extra_data` with the consensus header hash, identical on every node, instead of the leader-certificate signature hash. |
 | `CertificateFetchEpochV2` | Sends certificate fetch requests stamped with the epoch their rounds refer to, so a peer that has already closed that epoch serves them from the kept tail instead of the new epoch. Gates only the request format a node sends — every node accepts both variants, but a peer that has not been upgraded cannot decode the stamped one. |
 | `Erc20PrecompileDirectCall` | Rejects `DELEGATECALL`/`CALLCODE` frames into the native ERC-20 precompile (`0x0400`); the precompile is dispatched by bytecode address, so a delegate frame would otherwise run its privileged logic with `target_address != bytecode_address`. Only direct `CALL`/`STATICCALL` are allowed once active. |
+| `HeaderParentSigners` | Puts the signer bitmap of a proposer's own previous certificate into its next header, so the set is inside a signed, committed header that every node holds identically; a certificate's own signer set is outside every commitment and can legitimately differ between nodes. Voters refuse a header whose claim differs from the parent certificate they hold, and the hybrid reward tally credits participation from these claims instead of certificate authorship. Judged per epoch at its first block; nodes that have not upgraded cannot decode the new header layout. |
 
 The seven migration forks' behavior is described by their set in section 2.
 
@@ -135,16 +137,17 @@ The canonical new-chain schedule therefore uses:
 | `Erc20PrecompileBytecode` | **exactly `Block(1)`** | The genesis has no STOP byte, so the first post-genesis block must write it. Block 0 is never executed (genesis initializes state directly, no EVM execution). A later block (e.g. 5) leaves a live EIP-161 cleanup exposure window between blocks 1 and 5. |
 | `UsdrSupplyCorrection` | **exactly `Never`** | A one-time historical mainnet rebase. The corrected value is already baked into the genesis. |
 | `HybridRewards` | **exactly `Block(1)`** | The genesis bakes the pre-hybrid `ConsensusRegistry`. The 2-arg ABI must not be live at genesis (calling it against the pre-hybrid registry reverts — fatal system call). A new chain starts the complete current protocol from the first block, with no legacy-regime window. |
-| 12 behavioral forks | any value | Business-logic based (see below). |
+| 13 behavioral forks | any value | Business-logic based (see below). |
 
 On a new chain these values are required for correctness, but the node does not enforce them: the shape gate applies only the relaxed rules of section 4 to every non-mainnet/testnet chain-id, so a deviating new-chain schedule will boot. In particular, the built-in **devnet** schedule keeps `HybridRewards: Never`, which those rules allow.
 
 ## 3. Behavioral Changes Are Business-Logic Based
 
-The 12 behavioral forks (`Eip1559`, `BatchDigestV2`, `PrecompileGasFix`,
+The 13 behavioral forks (`Eip1559`, `BatchDigestV2`, `PrecompileGasFix`,
 `TransactionLoadBalancing`, `EmptyOutputBlock`, `DynamicCommitteeSizing`,
 `OutputSeqNormalization`, `SenderAffinityLoadBalancing`, `Eip161EmptyAccountGuard`,
-`EpochCloseSeedV2`, `CertificateFetchEpochV2`, `Erc20PrecompileDirectCall`)
+`EpochCloseSeedV2`, `CertificateFetchEpochV2`, `Erc20PrecompileDirectCall`,
+`HeaderParentSigners`)
 change protocol behavior without state writes.
 Their activation blocks are network-coordinated rollout or risk decisions
 (SRE), not contract-state consistency requirements.
@@ -161,7 +164,7 @@ This is why behavioral forks are:
 
 | layer | what it protects | where |
 |-------|-----------------|-------|
-| **CI freeze tests** | mainnet and testnet baked schedules (full 19-fork literal tables) | `chainspec/tests.rs` |
+| **CI freeze tests** | mainnet and testnet baked schedules (full 20-fork literal tables) | `chainspec/tests.rs` |
 | **Boot shape gate** (`verify_schedule_shape`) | all non-mainnet/testnet chain-ids on the relaxed rules; mainnet/testnet chain-ids always excluded | `network_profile/shape.rs` |
 | **Schedule-record gate** (`schedule-record.yaml`, trust-on-first-use) | per-datadir drift on all networks | `network_profile/verify.rs` |
 | **Genesis ceremony** | out of scope by decision | — |

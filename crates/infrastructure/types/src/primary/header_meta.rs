@@ -2,7 +2,7 @@
 
 use crate::{
     bcs_layout::{BcsCursor, BcsLayoutError},
-    crypto, AuthorityIdentifier, BlockHash, Certificate, Epoch, ReputationScores, Round,
+    crypto, AuthorityIdentifier, BlockHash, Certificate, Epoch, Header, ReputationScores, Round,
     TimestampSec, WorkerId, B256,
 };
 
@@ -32,7 +32,7 @@ impl ConsensusHeaderMeta {
         // sub_dag.leader: read the first three header fields, stop early.
         let leader_author = c.read::<AuthorityIdentifier>()?;
         let leader_round = c.read::<Round>()?;
-        let leader_epoch = c.read::<Epoch>()?;
+        let (leader_epoch, _) = Header::split_wire_epoch(c.read::<Epoch>()?);
         Ok(Self { leader_author, leader_round, leader_epoch })
     }
 }
@@ -116,7 +116,7 @@ pub fn leader_epoch_and_batch_digests(
 
     // sub_dag.leader: Certificate; the committing epoch is its header's epoch, after author/round.
     c.skip::<AuthorityIdentifier>()?.skip::<Round>()?;
-    let leader_epoch = c.read::<Epoch>()?;
+    let (leader_epoch, _) = Header::split_wire_epoch(c.read::<Epoch>()?);
     Ok((leader_epoch, digests))
 }
 

@@ -25,6 +25,7 @@ networks:
       EpochCloseSeedV2: never
       CertificateFetchEpochV2: never
       Erc20PrecompileDirectCall: never
+      HeaderParentSigners: never
   testnet:
     chain_id: 7295799
     hardforks:
@@ -47,3 +48,4 @@ networks:
       EpochCloseSeedV2: never
       CertificateFetchEpochV2: never
       Erc20PrecompileDirectCall: never
+      HeaderParentSigners: never

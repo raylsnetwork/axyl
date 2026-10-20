@@ -299,6 +299,7 @@ async fn test_retransmit_headers_on_gap() {
                 payload,
                 BTreeSet::new(),
                 BlockNumHash::default(),
+                None,
             );
             proposer.proposed_headers.insert(round_as_uint, header.clone());
         }
@@ -324,7 +325,7 @@ async fn test_retransmit_headers_on_gap() {
 fn header_with(author: AuthorityIdentifier, round: Round, digest: B256) -> Header {
     let mut payload = IndexMap::new();
     payload.insert(digest, 0u16);
-    Header::new(author, round, 1, payload, BTreeSet::new(), BlockNumHash::default())
+    Header::new(author, round, 1, payload, BTreeSet::new(), BlockNumHash::default(), None)
 }
 
 /// The digests currently queued in the proposer, front to back.
@@ -556,4 +557,67 @@ async fn digests_survive_gc_advance_and_later_round_commit() {
         vec![old_low, old_high, early, queued],
         "gc-evicted headers requeue their digests oldest-round-first, ahead of the queue"
     );
+}
+
+/// Post-fork the proposer restates the signers of its own previous certificate when that
+/// certificate is among the parents, claims nothing when it is not, and stays silent pre-fork.
+#[tokio::test]
+async fn proposed_header_claims_own_parent_signers() {
+    let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+    let committee = fixture.committee();
+    let primary = fixture.authorities().next().unwrap();
+    let authority_id = primary.id();
+    let cb = ConsensusBus::new();
+    let mut rx_headers = cb.headers().subscribe();
+    let metrics = cb.primary_metrics().node_metrics.clone();
+
+    // our own round-1 certificate, signed by the whole committee, plus two others
+    let own_cert = fixture.certificate(&primary.header_builder(&committee).created_at(1).build());
+    assert!(own_cert.signed_authorities().len() >= committee.quorum_threshold());
+    let others: Vec<Certificate> = fixture
+        .authorities()
+        .skip(1)
+        .take(2)
+        .map(|a| fixture.certificate(&a.header_builder(&committee).created_at(1).build()))
+        .collect();
+    let mut with_own = others.clone();
+    with_own.push(own_cert.clone());
+
+    let epoch = committee.epoch();
+    let propose = |parents: Vec<Certificate>, claim: bool| {
+        let store = primary.consensus_config().node_storage().clone();
+        let cb = cb.clone();
+        let authority_id = authority_id.clone();
+        let metrics = metrics.clone();
+        async move {
+            Proposer::<MemDatabase>::propose_header(
+                2,
+                epoch,
+                authority_id,
+                store,
+                &cb,
+                parents,
+                VecDeque::new(),
+                "test".to_string(),
+                metrics,
+                "test".to_string(),
+                Duration::from_millis(1),
+                claim,
+            )
+            .await
+            .expect("header proposed")
+        }
+    };
+
+    let header = propose(with_own.clone(), true).await;
+    assert_eq!(rx_headers.recv().await.unwrap(), header);
+    assert_eq!(header.own_parent_signers(), Some(own_cert.signed_authorities()));
+
+    let header = propose(others, true).await;
+    assert_eq!(rx_headers.recv().await.unwrap(), header);
+    assert_eq!(header.own_parent_signers(), Some(&roaring::RoaringBitmap::new()));
+
+    let header = propose(with_own, false).await;
+    assert_eq!(rx_headers.recv().await.unwrap(), header);
+    assert!(header.own_parent_signers().is_none());
 }

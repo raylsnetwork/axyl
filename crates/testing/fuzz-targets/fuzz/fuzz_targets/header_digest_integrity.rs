@@ -14,6 +14,7 @@
 use libfuzzer_sys::fuzz_target;
 use rayls_infrastructure_types::{
     AuthorityIdentifier, BlockHash, BlockNumHash, CertificateDigest, Hash, Header,
+    HEADER_SIGNERS_EPOCH_FLAG,
 };
 use indexmap::IndexMap;
 use std::collections::BTreeSet;
@@ -66,11 +67,13 @@ fuzz_target!(|input: FuzzHeader| {
     let header = Header {
         author: AuthorityIdentifier::dummy_for_test(input.author_byte),
         round: input.round,
-        epoch: input.epoch,
+        // the top bit of the wire epoch is the header layout flag; a real epoch never has it
+        epoch: input.epoch & !HEADER_SIGNERS_EPOCH_FLAG,
         created_at: input.created_at,
         payload: payload.clone(),
         parents: parents.clone(),
         latest_execution_block,
+        own_parent_signers: None,
         digest: Default::default(),
     };
 

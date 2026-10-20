@@ -79,6 +79,11 @@ pub struct ConsensusConfig<DB> {
     /// from the chain spec by the orchestrator when the epoch config is built; the certificate
     /// fetcher compares it with the executed tip to pick the request variant it sends.
     certificate_fetch_epoch_v2_block: Option<u64>,
+    /// True when the `HeaderParentSigners` fork is active for this epoch (judged at the epoch's
+    /// first block by the orchestrator). Fixed for the life of the epoch. The proposer then puts
+    /// its own previous certificate's signers into every header, and the vote handler requires
+    /// and checks that claim. Default `false` (initial startup load and tests).
+    header_parent_signers_active: bool,
 }
 
 impl<DB> ConsensusConfig<DB>
@@ -218,6 +223,7 @@ where
             epoch_boundary,
             initial_epoch,
             certificate_fetch_epoch_v2_block: None,
+            header_parent_signers_active: false,
         })
     }
 
@@ -225,6 +231,25 @@ where
     pub fn with_certificate_fetch_epoch_v2_block(mut self, block: Option<u64>) -> Self {
         self.certificate_fetch_epoch_v2_block = block;
         self
+    }
+
+    /// Install whether the `HeaderParentSigners` fork is active for this epoch.
+    pub fn with_header_parent_signers_active(mut self, active: bool) -> Self {
+        self.header_parent_signers_active = active;
+        self
+    }
+
+    /// Overrides the `HeaderParentSigners` fork state on this config. Intended for tests that
+    /// drive consensus components directly; production sets it via
+    /// [`Self::with_header_parent_signers_active`].
+    pub fn set_header_parent_signers_active(&mut self, active: bool) {
+        self.header_parent_signers_active = active;
+    }
+
+    /// True when the `HeaderParentSigners` fork is active for this epoch: headers carry, and
+    /// voters require, the author's own-parent signer claim.
+    pub fn header_parent_signers_active(&self) -> bool {
+        self.header_parent_signers_active
     }
 
     /// Returns a reference to the shutdown notifier.

@@ -8,7 +8,10 @@ use std::{collections::BTreeMap, fmt::Debug, sync::Arc};
 /// Per-validator round counts feeding the hybrid (participation + anchor) reward tally.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ValidatorRoundTally {
-    /// Distinct committed rounds whose sub-dag included this validator's certificate.
+    /// Distinct committed rounds in which this validator took part: once the `HeaderParentSigners`
+    /// fork is active, rounds whose sub-dag holds a header attesting that this validator signed
+    /// its author's previous certificate; before it, rounds whose sub-dag included this
+    /// validator's own certificate.
     pub participation_rounds: u32,
     /// Committed rounds this validator led ("Anchor Commit Share" component;
     /// identical signal to what [`RewardsBackend::tally`] counts today).

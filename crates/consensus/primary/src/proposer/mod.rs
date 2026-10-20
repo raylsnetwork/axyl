@@ -117,6 +117,9 @@ pub(crate) struct Proposer<DB: ProposerStore> {
     task_spawner: TaskSpawner,
     /// Garbage collection depth for cleaning up old proposed headers.
     gc_depth: Round,
+    /// True when the `HeaderParentSigners` fork is active for this epoch: every header we build
+    /// restates who signed our own previous certificate (see `Header::own_parent_signers`).
+    header_parent_signers_active: bool,
 }
 
 impl<DB: Database> Proposer<DB> {
@@ -166,6 +169,7 @@ impl<DB: Database> Proposer<DB> {
             advance_round: true,
             task_spawner,
             gc_depth: config.parameters().gc_depth,
+            header_parent_signers_active: config.header_parent_signers_active(),
         }
     }
 
