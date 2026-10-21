@@ -114,6 +114,25 @@ struct EpochStats {
     /// that `Certificate::digest()` hashes, which the sub-dag digest then commits to. If this
     /// reproduces the signing result it buys the same fairness without a fork.
     referenced_rounds: BTreeMap<AuthorityIdentifier, u32>,
+    /// Sub-dags in which this validator would be credited under axyl#310's design: the proposer
+    /// restates the signer set of its *own previous-round* certificate in its next header, and
+    /// the tally unions those claims.
+    ///
+    /// Simulated from existing archive data by finding, for each committed certificate, whether
+    /// its author's own previous-round certificate is among its parents, and if so taking that
+    /// certificate's signer set as the claim it would carry. This is the number that decides
+    /// whether #310 preserves the fairness gain of #279 or lands closer to authorship.
+    claimed_rounds: BTreeMap<AuthorityIdentifier, u32>,
+    /// Certificates that would carry a claim (own previous-round cert among parents).
+    claims_present: u64,
+    /// Certificates that would carry an empty claim, so their signers go uncredited that round.
+    claims_absent: u64,
+    /// Cross-check counters, resolved by an independent (author, round) index rather than by
+    /// scanning parents. `prev_cert_referenced` must equal `claims_present`; a divergence means
+    /// the parent scan is matching something it should not.
+    prev_cert_existed: u64,
+    prev_cert_referenced: u64,
+    prev_cert_missing: u64,
     /// Parent digests that named a certificate absent from this sub-dag, so the reference could
     /// not be attributed. Bounds how much of the signal the sub-dag alone can see.
     unresolved_parents: u64,
@@ -163,6 +182,14 @@ fn main() -> eyre::Result<()> {
         let mut st = EpochStats { min_signers: usize::MAX, ..Default::default() };
         // Epoch-scoped: digests are unique per epoch and this keeps the map bounded.
         let mut author_of: BTreeMap<CertificateDigest, AuthorityIdentifier> = BTreeMap::new();
+        // digest -> (author, round, resolved signers), for the axyl#310 claim simulation.
+        let mut cert_meta: BTreeMap<
+            CertificateDigest,
+            (AuthorityIdentifier, u32, Vec<AuthorityIdentifier>),
+        > = BTreeMap::new();
+        // Independent index for the cross-check: (author, round) -> digest.
+        let mut by_author_round: BTreeMap<(AuthorityIdentifier, u32), CertificateDigest> =
+            BTreeMap::new();
 
         segment.for_each_row_in_epoch_pub(*epoch, |row, bytes| {
             st.rows_visited += 1;
@@ -267,6 +294,70 @@ fn main() -> eyre::Result<()> {
                 *st.referenced_rounds.entry(id.clone()).or_default() += 1;
             }
 
+            // axyl#310 simulation: a header claims the signer set of its author's own
+            // previous-round certificate, when that certificate is among its parents. Credit is
+            // therefore the union of those claims across the sub-dag, not the union of every
+            // certificate's signers.
+            let mut claimed: BTreeSet<AuthorityIdentifier> = BTreeSet::new();
+            for cert in header.sub_dag.certificates.iter() {
+                let author = cert.origin();
+                let own_prev = cert.header().parents().iter().find(|p| {
+                    cert_meta
+                        .get(*p)
+                        .is_some_and(|(a, r, _)| a == author && *r + 1 == cert.round())
+                });
+                match own_prev.and_then(|p| cert_meta.get(p)) {
+                    Some((_, _, signers)) => {
+                        st.claims_present += 1;
+                        claimed.extend(signers.iter().cloned());
+                    }
+                    None => st.claims_absent += 1,
+                }
+
+                // Cross-check by an independent path: look the predecessor up by
+                // (author, round-1) instead of scanning parents, then ask whether that digest
+                // is among the parents. Separates "the author had no previous certificate" from
+                // "it had one and did not reference it" — two very different reasons for a
+                // missing claim — and disagreeing with the scan above would mean the scan is
+                // matching something it should not.
+                if cert.round() > 0 {
+                    match by_author_round.get(&(author.clone(), cert.round() - 1)) {
+                        Some(d) => {
+                            st.prev_cert_existed += 1;
+                            if cert.header().parents().contains(d) {
+                                st.prev_cert_referenced += 1;
+                            }
+                        }
+                        None => st.prev_cert_missing += 1,
+                    }
+                }
+            }
+            for id in &claimed {
+                *st.claimed_rounds.entry(id.clone()).or_default() += 1;
+            }
+
+            // Epoch-wide certificate index: digest -> (author, round, resolved signers). Needed
+            // because a certificate's own previous-round parent is often committed in an earlier
+            // sub-dag, so a per-row index would miss most claims.
+            for c in header
+                .sub_dag
+                .certificates
+                .iter()
+                .chain(std::iter::once(&header.sub_dag.leader))
+            {
+                let digest = CertificateDigest::new(c.header().digest().into());
+                cert_meta.entry(digest).or_insert_with(|| {
+                    let signers: Vec<AuthorityIdentifier> = c
+                        .signed_by(&bls_keys)
+                        .1
+                        .iter()
+                        .filter_map(|k| id_by_key.get(&k.to_string()).cloned())
+                        .collect();
+                    (c.origin().clone(), c.round(), signers)
+                });
+                by_author_round.entry((c.origin().clone(), c.round())).or_insert(digest);
+            }
+
             let mut oracle_signers: BTreeSet<AuthorityIdentifier> = BTreeSet::new();
             // Union over exactly `sub_dag.certificates` — the same vector the projection walks.
             // Chaining the leader in here would compare two different things and mask a real gap.
@@ -360,8 +451,8 @@ fn main() -> eyre::Result<()> {
     print_epoch_header(&totals, quorum);
     println!();
     println!(
-        "{:<10} {:>12} {:>14} {:>13} {:>13}",
-        "validator", "authored%", "signed-round%", "signed-cert%", "referenced%"
+        "{:<10} {:>12} {:>14} {:>13} {:>13} {:>12}",
+        "validator", "authored%", "signed-round%", "signed-cert%", "referenced%", "claimed%"
     );
     for (id, name) in &names {
         let a =
@@ -373,7 +464,9 @@ fn main() -> eyre::Result<()> {
             totals.referenced_rounds.get(id).copied().unwrap_or(0) as u64,
             totals.rounds as u64,
         );
-        println!("{name:<10} {a:>11.2}% {sr:>13.2}% {sc:>12.2}% {rf:>12.2}%");
+        let cl =
+            pct(totals.claimed_rounds.get(id).copied().unwrap_or(0) as u64, totals.rounds as u64);
+        println!("{name:<10} {a:>11.2}% {sr:>13.2}% {sc:>12.2}% {rf:>12.2}% {cl:>11.2}%");
     }
     let parent_total = totals.resolved_parents + totals.unresolved_parents;
     println!(
@@ -381,6 +474,20 @@ fn main() -> eyre::Result<()> {
         totals.resolved_parents,
         parent_total,
         pct(totals.unresolved_parents, parent_total),
+    );
+    let claim_total = totals.claims_present + totals.claims_absent;
+    println!(
+        "axyl#310 claims: {}/{} certificates would carry one ({:.2}% carried no own-previous-round parent, so their signers go uncredited that round)",
+        totals.claims_present,
+        claim_total,
+        pct(totals.claims_absent, claim_total),
+    );
+    println!(
+        "  cross-check: prev cert existed {} (referenced {}), never existed {}  [referenced must equal claims_present {}]",
+        totals.prev_cert_existed,
+        totals.prev_cert_referenced,
+        totals.prev_cert_missing,
+        totals.claims_present,
     );
     println!(
         "`referenced%` is the digest-committed candidate (header.parents()); `signed-round%` is\n\
@@ -533,6 +640,14 @@ fn merge(dst: &mut EpochStats, src: EpochStats) {
     }
     dst.resolved_parents += src.resolved_parents;
     dst.unresolved_parents += src.unresolved_parents;
+    dst.claims_present += src.claims_present;
+    dst.claims_absent += src.claims_absent;
+    dst.prev_cert_existed += src.prev_cert_existed;
+    dst.prev_cert_referenced += src.prev_cert_referenced;
+    dst.prev_cert_missing += src.prev_cert_missing;
+    for (k, v) in src.claimed_rounds {
+        *dst.claimed_rounds.entry(k).or_default() += v;
+    }
     for (k, v) in src.referenced_rounds {
         *dst.referenced_rounds.entry(k).or_default() += v;
     }
