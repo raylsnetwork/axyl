@@ -517,6 +517,9 @@ where
 
         // validate header
         header.validate(committee)?;
+        // fork-state half of the own-parent signer check: needs only the header, so refuse a peer
+        // on the wrong side of the fork before any parent sync or peer-certificate acceptance
+        self.check_own_parent_signers_presence(&header)?;
         // Round 0 is genesis and is never proposed. Without this floor a round-0 header with an
         // unknown parent reaches `check_for_missing_parents`, which keys the request by
         // `round - 1`: with overflow checks on and `panic = "abort"` in the release profile that
@@ -742,8 +745,18 @@ where
         Ok(PrimaryResponse::Vote(vote))
     }
 
-    /// Checks the header's claim of who signed the author's own parent certificate against the
-    /// fork state and this node's copy of that certificate (see `Header::own_parent_signers`).
+    /// Fork-state half of the own-parent signer check: post-fork a header must carry the claim,
+    /// pre-fork it must not. Needs only the header, so it runs before parents are synced.
+    fn check_own_parent_signers_presence(&self, header: &Header) -> PrimaryNetworkResult<()> {
+        match (self.consensus_config.header_parent_signers_active(), header.own_parent_signers()) {
+            (false, Some(_)) => Err(HeaderError::UnexpectedOwnParentSigners.into()),
+            (true, None) => Err(HeaderError::MissingOwnParentSigners.into()),
+            _ => Ok(()),
+        }
+    }
+
+    /// Checks the header's claim of who signed the author's own parent certificate against this
+    /// node's copy of that certificate (see `Header::own_parent_signers`).
     ///
     /// Post-fork the claim is required and must equal the signer bitmap of the parent authored by
     /// the header's author, or be empty when no such parent exists. A proposer that gossiped
@@ -755,13 +768,8 @@ where
         header: &Header,
         parents: &[Certificate],
     ) -> PrimaryNetworkResult<()> {
-        let active = self.consensus_config.header_parent_signers_active();
-        let claimed = match (active, header.own_parent_signers()) {
-            (false, None) => return Ok(()),
-            (false, Some(_)) => return Err(HeaderError::UnexpectedOwnParentSigners.into()),
-            (true, None) => return Err(HeaderError::MissingOwnParentSigners.into()),
-            (true, Some(claimed)) => claimed,
-        };
+        // presence was settled up front by `check_own_parent_signers_presence`
+        let Some(claimed) = header.own_parent_signers() else { return Ok(()) };
         // `parents` is what this node holds. If it already had the author's previous certificate,
         // that is the copy compared; if it did not, the copy came with this vote request from the
         // proposer itself (`try_accept_unknown_certs`). So a match proves the claim is the signer

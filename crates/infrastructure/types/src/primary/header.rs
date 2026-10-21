@@ -18,7 +18,7 @@ use serde::{
     ser::{Error as _, SerializeStruct},
     Deserialize, Deserializer, Serialize, Serializer,
 };
-use serde_with::{serde_as, SerializeAs};
+use serde_with::SerializeAs;
 use std::{collections::BTreeSet, fmt};
 
 /// Bit set in the wire `epoch` field of a header that carries `own_parent_signers`.
@@ -469,7 +469,6 @@ impl<'de> Deserialize<'de> for SignerBytesOwned {
 
 /// Human-readable (JSON/YAML) form: named fields, bitmap as base58, and the signer field only
 /// present when set so pre-fork documents are unchanged.
-#[serde_as]
 #[derive(Serialize, Deserialize)]
 struct HeaderHuman {
     author: AuthorityIdentifier,
@@ -480,9 +479,26 @@ struct HeaderHuman {
     payload: IndexMap<BlockHash, WorkerId>,
     parents: BTreeSet<CertificateDigest>,
     latest_execution_block: BlockNumHash,
-    #[serde_as(as = "Option<RoaringBitmapSerde>")]
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    own_parent_signers: Option<RoaringBitmap>,
+    own_parent_signers: Option<ClaimHuman>,
+}
+
+/// The claim in a human-readable document: base58 roaring bytes, decoded through the same
+/// bounded decoder as the binary path so no ingress expands an unbounded bitmap.
+struct ClaimHuman(RoaringBitmap);
+
+impl Serialize for ClaimHuman {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        RoaringBitmapSerde::serialize_as(&self.0, serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for ClaimHuman {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let text = String::deserialize(deserializer)?;
+        let bytes = bs58::decode(&text).into_vec().map_err(de::Error::custom)?;
+        decode_own_parent_signers(&bytes).map(ClaimHuman).map_err(de::Error::custom)
+    }
 }
 
 impl Serialize for Header {
@@ -502,7 +518,7 @@ impl Serialize for Header {
                 payload: self.payload.clone(),
                 parents: self.parents.clone(),
                 latest_execution_block: self.latest_execution_block,
-                own_parent_signers: self.own_parent_signers.clone(),
+                own_parent_signers: self.own_parent_signers.clone().map(ClaimHuman),
             };
             return human.serialize(serializer);
         }
@@ -540,7 +556,7 @@ impl<'de> Deserialize<'de> for Header {
                 payload: human.payload,
                 parents: human.parents,
                 latest_execution_block: human.latest_execution_block,
-                own_parent_signers: human.own_parent_signers,
+                own_parent_signers: human.own_parent_signers.map(|claim| claim.0),
                 digest: OnceCell::default(),
             });
         }

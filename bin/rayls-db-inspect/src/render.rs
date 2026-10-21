@@ -912,20 +912,24 @@ fn render_participation(r: &ParticipationReport, out: &mut String) {
         section(
             out,
             "participation",
-            if n.attested {
-                "from own-parent signer claims in headers (HeaderParentSigners)"
-            } else {
-                "from certificate authorship"
+            match (n.attested, n.committee_size) {
+                (true, Some(_)) => "from own-parent signer claims in headers (HeaderParentSigners)",
+                (true, None) => {
+                    "from own-parent signer claims, UNRESOLVED: no committee, every count is 0"
+                }
+                (false, _) => "from certificate authorship",
             },
         );
         if n.unknown_claimed_signers > 0 {
+            let why = if n.committee_size.is_some() {
+                "beyond the committee"
+            } else {
+                "with no committee to resolve them"
+            };
             section(
                 out,
                 "unknown claim",
-                format!(
-                    "{} claimed signer indices beyond the committee",
-                    n.unknown_claimed_signers
-                ),
+                format!("{} claimed signer indices {why}", n.unknown_claimed_signers),
             );
         }
         let mut t = Table::new(&[

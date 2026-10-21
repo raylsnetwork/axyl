@@ -185,6 +185,112 @@ async fn test_vote_own_parent_signers_required_and_checked_once_fork_is_active()
     Ok(())
 }
 
+/// The property the fork exists for, against real parents: the voter holds the author's
+/// round-1 certificate with signer set A, and a round-2 header must claim exactly A. A different
+/// valid quorum B is refused, even when the proposer ships its B copy with the request, because
+/// a parent the voter already holds is never replaced by the shipped one.
+#[tokio::test]
+async fn test_vote_own_parent_signers_checked_against_the_stored_parent() -> eyre::Result<()> {
+    use rayls_infrastructure_storage::CertificateStore as _;
+
+    type Claim = fn(&Certificate, &Certificate) -> roaring::RoaringBitmap;
+
+    // one vote request per fresh handler: a refused request marks the author's round. The claim
+    // is picked from the two variants (A = stored, B = the other quorum) once they exist.
+    let vote = |claim_of: Claim, ship_variant_b: bool| async move {
+        let TestTypes { committee, handler, parent, task_manager: _task_manager, .. } =
+            create_test_types_with(true);
+        let author = committee.last_authority();
+        let peer = *author.authority().protocol_key();
+        let exec = BlockNumHash::new(parent.number(), parent.hash());
+
+        // the author's round-1 header, with every committee vote available
+        let own_header = author.header_builder(&committee.committee()).created_at(1).build();
+        let mut votes: Vec<_> = committee
+            .votes(&own_header)
+            .into_iter()
+            .map(|v| (v.author().clone(), *v.signature()))
+            .collect();
+        let own_vote = author.vote(&own_header);
+        if !votes.iter().any(|(a, _)| a == own_vote.author()) {
+            votes.push((own_vote.author().clone(), *own_vote.signature()));
+        }
+        votes.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(votes.len(), 4, "fixture must yield a vote from every authority");
+        // two distinct, equally valid quorum subsets of the same header
+        let variant_a = Certificate::new_unverified(
+            &committee.committee(),
+            own_header.clone(),
+            votes[..3].to_vec(),
+        )
+        .expect("quorum A");
+        let variant_b = Certificate::new_unverified(
+            &committee.committee(),
+            own_header.clone(),
+            votes[1..].to_vec(),
+        )
+        .expect("quorum B");
+        assert_eq!(variant_a.digest(), variant_b.digest());
+        assert_ne!(variant_a.signed_authorities(), variant_b.signed_authorities());
+
+        // the voter already holds variant A, plus two other round-1 parents for quorum
+        let others: Vec<Certificate> = committee
+            .authorities()
+            .filter(|a| a.id() != author.id())
+            .take(2)
+            .map(|a| {
+                committee
+                    .certificate(&a.header_builder(&committee.committee()).created_at(1).build())
+            })
+            .collect();
+        let mut stored = others.clone();
+        stored.push(variant_a.clone());
+        committee
+            .first_authority()
+            .consensus_config()
+            .node_storage()
+            .write_all(stored.clone())
+            .expect("parents stored");
+
+        let header = author
+            .header_builder(&committee.committee())
+            .round(2)
+            .parents(stored.iter().map(|c| c.digest()).collect())
+            .latest_execution_block(exec)
+            .created_at(2)
+            .own_parent_signers(Some(claim_of(&variant_a, &variant_b)))
+            .build();
+        let shipped = if ship_variant_b {
+            let mut shipped = others;
+            shipped.push(variant_b);
+            shipped
+        } else {
+            Vec::new()
+        };
+        handler.vote(peer, header, shipped).await
+    };
+    let mismatch = |res: &Result<_, PrimaryNetworkError>| {
+        matches!(
+            res,
+            Err(PrimaryNetworkError::InvalidHeader(HeaderError::OwnParentSignersMismatch { .. }))
+        )
+    };
+
+    // an empty claim against a real parent
+    let res = vote(|_, _| roaring::RoaringBitmap::new(), false).await;
+    assert!(mismatch(&res), "{res:?}");
+    // the exact stored set: a vote
+    let res = vote(|a, _| a.signed_authorities().clone(), false).await;
+    assert!(res.is_ok(), "{res:?}");
+    // another valid quorum of the same header: refused, the stored copy is what counts
+    let res = vote(|_, b| b.signed_authorities().clone(), false).await;
+    assert!(mismatch(&res), "{res:?}");
+    // the same, with the proposer shipping its B copy alongside: still the stored A is compared
+    let res = vote(|_, b| b.signed_authorities().clone(), true).await;
+    assert!(mismatch(&res), "{res:?}");
+    Ok(())
+}
+
 /// Before the fork a claim is refused, so no proposer can start the new layout early.
 #[tokio::test]
 async fn test_vote_fails_own_parent_signers_before_fork() -> eyre::Result<()> {
