@@ -29,8 +29,8 @@
 
 use rayls_infrastructure_storage::{ColdConfig, ColdStore};
 use rayls_infrastructure_types::{
-    Address, AuthorityIdentifier, BlsPublicKey, Committee, CommitteeBuilder, ConsensusHeader,
-    ConsensusHeaderParticipation,
+    Address, AuthorityIdentifier, BlsPublicKey, CertificateDigest, Committee, CommitteeBuilder,
+    ConsensusHeader, ConsensusHeaderParticipation,
 };
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -106,6 +106,18 @@ struct EpochStats {
     /// rather than one. With N validators a single DAG round holds at most N certificates, so
     /// this is what explains a certificate count above the committee size.
     subdag_round_span: BTreeMap<u64, u64>,
+    /// Sub-dags in which this validator's certificate was referenced as a parent by some other
+    /// committed certificate.
+    ///
+    /// Candidate replacement signal for axyl#279's blocking finding: `signed_authorities` is
+    /// covered by no consensus digest, but `header.parents()` is — it sits inside the header
+    /// that `Certificate::digest()` hashes, which the sub-dag digest then commits to. If this
+    /// reproduces the signing result it buys the same fairness without a fork.
+    referenced_rounds: BTreeMap<AuthorityIdentifier, u32>,
+    /// Parent digests that named a certificate absent from this sub-dag, so the reference could
+    /// not be attributed. Bounds how much of the signal the sub-dag alone can see.
+    unresolved_parents: u64,
+    resolved_parents: u64,
     authored_rounds: BTreeMap<AuthorityIdentifier, u32>,
     signed_rounds: BTreeMap<AuthorityIdentifier, u32>,
     signed_certs: BTreeMap<AuthorityIdentifier, u64>,
@@ -149,6 +161,8 @@ fn main() -> eyre::Result<()> {
 
     for epoch in &targets {
         let mut st = EpochStats { min_signers: usize::MAX, ..Default::default() };
+        // Epoch-scoped: digests are unique per epoch and this keeps the map bounded.
+        let mut author_of: BTreeMap<CertificateDigest, AuthorityIdentifier> = BTreeMap::new();
 
         segment.for_each_row_in_epoch_pub(*epoch, |row, bytes| {
             st.rows_visited += 1;
@@ -216,6 +230,42 @@ fn main() -> eyre::Result<()> {
             let distinct_rounds: BTreeSet<u32> =
                 header.sub_dag.certificates.iter().map(|c| c.round()).collect();
             *st.subdag_round_span.entry(distinct_rounds.len() as u64).or_default() += 1;
+
+            // Candidate header-committed signal: who got referenced as a parent. Digest -> author
+            // is resolvable because `Certificate::digest()` hashes the header, and the author is
+            // a header field, so every node resolves a given digest to the same authority.
+            //
+            // The index accumulates across the whole epoch rather than resetting per sub-dag:
+            // parents point at earlier rounds, whose certificates were often committed in an
+            // earlier sub-dag. Resolving only within the current row undercounts the signal badly
+            // (measured at 56% unresolved), which would understate the candidate being evaluated.
+            for c in header
+                .sub_dag
+                .certificates
+                .iter()
+                .chain(std::iter::once(&header.sub_dag.leader))
+            {
+                author_of
+                    .entry(CertificateDigest::new(c.header().digest().into()))
+                    .or_insert_with(|| c.origin().clone());
+            }
+            let mut referenced: BTreeSet<AuthorityIdentifier> = BTreeSet::new();
+            for cert in header.sub_dag.certificates.iter() {
+                for parent in cert.header().parents() {
+                    match author_of.get(parent) {
+                        Some(author) => {
+                            st.resolved_parents += 1;
+                            referenced.insert(author.clone());
+                        }
+                        // Parent committed in an earlier sub-dag: not attributable from this row
+                        // alone. Counted so the coverage limit is visible rather than assumed.
+                        None => st.unresolved_parents += 1,
+                    }
+                }
+            }
+            for id in &referenced {
+                *st.referenced_rounds.entry(id.clone()).or_default() += 1;
+            }
 
             let mut oracle_signers: BTreeSet<AuthorityIdentifier> = BTreeSet::new();
             // Union over exactly `sub_dag.certificates` — the same vector the projection walks.
@@ -310,8 +360,8 @@ fn main() -> eyre::Result<()> {
     print_epoch_header(&totals, quorum);
     println!();
     println!(
-        "{:<10} {:>14} {:>14} {:>14}",
-        "validator", "authored%", "signed-round%", "signed-cert%"
+        "{:<10} {:>12} {:>14} {:>13} {:>13}",
+        "validator", "authored%", "signed-round%", "signed-cert%", "referenced%"
     );
     for (id, name) in &names {
         let a =
@@ -319,8 +369,23 @@ fn main() -> eyre::Result<()> {
         let sr =
             pct(totals.signed_rounds.get(id).copied().unwrap_or(0) as u64, totals.rounds as u64);
         let sc = pct(totals.signed_certs.get(id).copied().unwrap_or(0), totals.certs);
-        println!("{name:<10} {a:>13.2}% {sr:>13.2}% {sc:>13.2}%");
+        let rf = pct(
+            totals.referenced_rounds.get(id).copied().unwrap_or(0) as u64,
+            totals.rounds as u64,
+        );
+        println!("{name:<10} {a:>11.2}% {sr:>13.2}% {sc:>12.2}% {rf:>12.2}%");
     }
+    let parent_total = totals.resolved_parents + totals.unresolved_parents;
+    println!(
+        "\nparent refs resolved inside the sub-dag: {}/{} ({:.2}% unresolved, committed earlier)",
+        totals.resolved_parents,
+        parent_total,
+        pct(totals.unresolved_parents, parent_total),
+    );
+    println!(
+        "`referenced%` is the digest-committed candidate (header.parents()); `signed-round%` is\n\
+         the PR's current signal, which no consensus digest covers (axyl#279 blocking finding)."
+    );
     println!();
 
     // What a credited unit actually spans. A committed sub-dag carries the leader's uncommitted
@@ -465,6 +530,11 @@ fn merge(dst: &mut EpochStats, src: EpochStats) {
     dst.unmapped_signers += src.unmapped_signers;
     if dst.first_mismatch.is_none() {
         dst.first_mismatch = src.first_mismatch;
+    }
+    dst.resolved_parents += src.resolved_parents;
+    dst.unresolved_parents += src.unresolved_parents;
+    for (k, v) in src.referenced_rounds {
+        *dst.referenced_rounds.entry(k).or_default() += v;
     }
     for (k, v) in src.authored_rounds {
         *dst.authored_rounds.entry(k).or_default() += v;
