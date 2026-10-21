@@ -69,7 +69,7 @@ What each one does:
 | `EpochCloseSeedV2` | Seeds the epoch-closing block's `extra_data` with the consensus header hash, identical on every node, instead of the leader-certificate signature hash. |
 | `CertificateFetchEpochV2` | Sends certificate fetch requests stamped with the epoch their rounds refer to, so a peer that has already closed that epoch serves them from the kept tail instead of the new epoch. Gates only the request format a node sends — every node accepts both variants, but a peer that has not been upgraded cannot decode the stamped one. |
 | `Erc20PrecompileDirectCall` | Rejects `DELEGATECALL`/`CALLCODE` frames into the native ERC-20 precompile (`0x0400`); the precompile is dispatched by bytecode address, so a delegate frame would otherwise run its privileged logic with `target_address != bytecode_address`. Only direct `CALL`/`STATICCALL` are allowed once active. |
-| `HeaderParentSigners` | Puts the signer bitmap of a proposer's own previous certificate into its next header, so the set is inside a signed, committed header that every node holds identically; a certificate's own signer set is outside every commitment and can legitimately differ between nodes. Voters refuse a header whose claim differs from the parent certificate they hold, and the hybrid reward tally credits participation from these claims instead of certificate authorship; a proposer always votes for its own header, so a claim always names its author too, and the signal is a superset of authorship (your certificate landed, or your vote landed in someone else's). Judged per epoch at its first block. Rollout gate: every validator, observer and tool must run a version with this fork before its activation block is scheduled, because a node that has not upgraded cannot decode the new header layout and Fatal-bans the peers sending it; schedule it no earlier than `EpochCloseSeedV2`. |
+| `HeaderParentSigners` | Puts the signer bitmap of a proposer's own previous certificate into its next header, so the set is inside a signed, committed header that every node holds identically; a certificate's own signer set is outside every commitment and can legitimately differ between nodes. Voters refuse a header whose claim differs from the parent certificate they hold, and the hybrid reward tally credits participation from these claims instead of certificate authorship; a proposer always votes for its own header, so a claim always names its author too, and the signal is close to a superset of authorship, with a one-round lag (your certificate landed and your next header committed, or your vote landed in someone else's certificate). Judged per epoch at its first block. Rollout gate: every validator, observer and tool must run a version with this fork before its activation block is scheduled, because a node that has not upgraded cannot decode the new header layout and Fatal-bans the peers sending it; schedule it no earlier than `EpochCloseSeedV2`. |
 
 The seven migration forks' behavior is described by their set in section 2.
 
@@ -153,7 +153,11 @@ Their activation blocks are network-coordinated rollout or risk decisions
 (SRE), not contract-state consistency requirements.
 
 This is why behavioral forks are:
-- **Unchecked by the boot shape gate** — any value is valid.
+- **Unchecked by the boot shape gate** — any value is valid, with one cross-fork
+  exception: a schedule that activates `HeaderParentSigners` must activate
+  `EpochCloseSeedV2` at the same block or earlier. The gate refuses that on
+  local, devnet and any new chain; on the built-in mainnet and testnet, whose
+  schedules we author, it is an operator rule (see the fork's row above).
 - **Not frozen on the built-in mainnet/testnet** — SRE can move future
   boundaries via the schedule-record gate (config file + re-record).
 - **Frozen in CI only for the binary** — the freeze tests pin the values
