@@ -135,14 +135,17 @@ fn penalty_from_header_error(error: &HeaderError) -> Option<Penalty> {
         HeaderError::SyncBatches(_)
         | HeaderError::TooNew { .. }
         | HeaderError::Storage(_)
-        | HeaderError::UnknownExecutionResult(_) => Some(Penalty::Mild),
+        | HeaderError::UnknownExecutionResult(_)
+        // the claim disagrees with this node's copy of the parent certificate. Not attributable:
+        // an honest proposer that re-aggregated a different quorum after a crash trips it too,
+        // and safety does not need the penalty since a mismatched header cannot certify
+        | HeaderError::OwnParentSignersMismatch { .. } => Some(Penalty::Mild),
         // medium
         HeaderError::InvalidParents
         | HeaderError::WrongNumberOfParents(_, _)
         | HeaderError::TooOld { .. }
-        // the claim disagrees with this node's copy of the parent certificate or with the
-        // fork state: a misconfigured or lagging peer, not necessarily a malicious one
-        | HeaderError::OwnParentSignersMismatch { .. }
+        // the header disagrees with this node's fork state: a misconfigured or not yet upgraded
+        // peer, which a peer on the right side of the fork cannot trigger by accident
         | HeaderError::UnexpectedOwnParentSigners
         | HeaderError::MissingOwnParentSigners => Some(Penalty::Medium),
         // severe

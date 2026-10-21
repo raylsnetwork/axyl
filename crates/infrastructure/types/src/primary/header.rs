@@ -44,6 +44,11 @@ pub const MAX_OWN_PARENT_SIGNERS_BYTES: usize = 4096;
 /// take half of [`MAX_OWN_PARENT_SIGNERS_BYTES`], so the two bounds never contradict.
 pub const MAX_OWN_PARENT_SIGNERS: u64 = 1024;
 
+/// Longest base58 text a claim within [`MAX_OWN_PARENT_SIGNERS_BYTES`] can have. Base58 writes at
+/// most 137 characters per 100 bytes (log 256 / log 58 is 1.3657), rounded up, plus one for a
+/// final partial character; anything longer is refused before the quadratic decode runs.
+const MAX_OWN_PARENT_SIGNERS_BASE58_LEN: usize = MAX_OWN_PARENT_SIGNERS_BYTES * 138 / 100 + 1;
+
 /// Decodes a serialized `own_parent_signers` claim, refusing one over the byte or value bounds
 /// before it is expanded. Shared by the serde path and [`Header::project_wire`].
 fn decode_own_parent_signers(bytes: &[u8]) -> std::io::Result<RoaringBitmap> {
@@ -496,6 +501,10 @@ impl Serialize for ClaimHuman {
 impl<'de> Deserialize<'de> for ClaimHuman {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let text = String::deserialize(deserializer)?;
+        // base58 decoding is quadratic in the text length, so bound the text before decoding
+        if text.len() > MAX_OWN_PARENT_SIGNERS_BASE58_LEN {
+            return Err(de::Error::custom("own-parent signer claim text too long"));
+        }
         let bytes = bs58::decode(&text).into_vec().map_err(de::Error::custom)?;
         decode_own_parent_signers(&bytes).map(ClaimHuman).map_err(de::Error::custom)
     }
