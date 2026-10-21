@@ -439,9 +439,13 @@ pub(crate) async fn spawn_track_recent_consensus<DB: ReDatabase>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rayls_consensus_primary::network::{
+        NetworkCommand, NetworkError, PrimaryRequest, PrimaryResponse,
+    };
     use rayls_infrastructure_storage::{mem_db::MemDatabase, tables::ConsensusBlocks};
+    use rayls_infrastructure_types::{Certificate, CommittedSubDag, ReputationScores};
     use rayls_testing_test_utils_committee::CommitteeFixture;
-    use std::num::NonZeroUsize;
+    use std::{num::NonZeroUsize, sync::Arc};
 
     /// A network handle whose receiver is dropped: every fetch fails fast, so a walk can make
     /// progress only through the local DB/cache, never a peer.
@@ -610,5 +614,144 @@ mod tests {
         let second = derive_covered_anchor(db);
         assert_eq!(first, Some(child_102.digest()), "anchor must be the top of the contiguous run");
         assert_eq!(first, second, "derive must be stable across calls on an unchanged cache");
+    }
+
+    /// The genuine tip one block above genesis, its leader certified by the whole fixture
+    /// committee: the walk verifies it and grounds at genesis in one step.
+    fn honest_tip(fixture: &CommitteeFixture<MemDatabase>) -> ConsensusHeader {
+        let leader = fixture.certificate(&fixture.header_from_last_authority());
+        let sub_dag = CommittedSubDag::new(vec![], leader, 0, ReputationScores::default(), None);
+        ConsensusHeader { parent_hash: *GENESIS_DIGEST, sub_dag, number: 1, extra: B256::ZERO }
+    }
+
+    /// What one adversarial validator answers the tip probe with: the highest number there is, and
+    /// an unsigned leader claiming an epoch no committee exists for.
+    fn forged_tip() -> ConsensusHeader {
+        let mut leader = Certificate::default();
+        leader.header.epoch = Epoch::MAX;
+        let sub_dag = CommittedSubDag::new(vec![], leader, 0, ReputationScores::default(), None);
+        ConsensusHeader {
+            parent_hash: B256::repeat_byte(0xAB),
+            sub_dag,
+            number: u64::MAX,
+            extra: B256::ZERO,
+        }
+    }
+
+    /// Peers for the tip probe: `adversary` answers it with `forged`, every other committee member
+    /// with `honest`. A by-hash fetch is answered with whichever header has that digest, as the
+    /// real `send_request_any` rotation ends up asking the adversary for its own header.
+    fn forged_tip_network(
+        adversary: BlsPublicKey,
+        forged: ConsensusHeader,
+        honest: ConsensusHeader,
+    ) -> PrimaryNetworkHandle {
+        let (tx, mut rx) =
+            tokio::sync::mpsc::channel::<NetworkCommand<PrimaryRequest, PrimaryResponse>>(64);
+        tokio::spawn(async move {
+            while let Some(cmd) = rx.recv().await {
+                let (found, reply) = match cmd {
+                    NetworkCommand::SendRequest {
+                        peer,
+                        request: PrimaryRequest::ConsensusHeader { number: None, hash: None },
+                        reply,
+                    } => (
+                        Some(if peer == adversary { forged.clone() } else { honest.clone() }),
+                        reply,
+                    ),
+                    NetworkCommand::SendRequestAny {
+                        request: PrimaryRequest::ConsensusHeader { hash: Some(hash), .. },
+                        reply,
+                    } => (
+                        [&forged, &honest].into_iter().find(|h| h.digest() == hash).cloned(),
+                        reply,
+                    ),
+                    _ => continue,
+                };
+                let response = match found {
+                    Some(header) => Ok(PrimaryResponse::ConsensusHeader(Arc::new(header))),
+                    None => Err(NetworkError::RPCError("unknown consensus header".to_string())),
+                };
+                let _ = reply.send(response);
+            }
+        });
+        PrimaryNetworkHandle::new_for_test(tx)
+    }
+
+    /// One committee member answering the tip probe with an inflated number must not outbid the
+    /// others: the probe hands the walk a tip it can verify, not the biggest unverified claim.
+    #[tokio::test(start_paused = true)]
+    async fn tip_probe_is_not_captured_by_one_validator_inflating_the_number() {
+        let fixture = CommitteeFixture::builder(MemDatabase::default)
+            .randomize_ports(true)
+            .committee_size(NonZeroUsize::new(4).unwrap())
+            .build();
+        let primary = fixture.authorities().next().unwrap();
+        let config = primary.consensus_config();
+        let adversary =
+            config.committee().others_primaries_by_id(config.authority_id().as_ref())[0].1;
+        let honest = honest_tip(&fixture);
+        let network = forged_tip_network(adversary, forged_tip(), honest.clone());
+
+        let picked = probe_peers_for_latest(0, &config, &network).await.expect("peers answered");
+
+        assert_eq!(
+            picked.digest(),
+            honest.digest(),
+            "probe followed one unverified answer (number {}) over two honest ones",
+            picked.number
+        );
+    }
+
+    /// A follower with no gossip must still reach the honest tip when one validator returns a
+    /// forged header to its probe, and the forged header's made-up epoch must not reach
+    /// `requested_missing_epoch`.
+    #[tokio::test(start_paused = true)]
+    async fn forged_tip_probe_does_not_strand_the_follower_or_poison_the_epoch_watch() {
+        let fixture = CommitteeFixture::builder(MemDatabase::default)
+            .randomize_ports(true)
+            .committee_size(NonZeroUsize::new(4).unwrap())
+            .build();
+        let primary = fixture.authorities().next().unwrap();
+        let config = primary.consensus_config();
+        let adversary =
+            config.committee().others_primaries_by_id(config.authority_id().as_ref())[0].1;
+        let honest = honest_tip(&fixture);
+        let keys = config.get_committee_keys_for_epoch(0).expect("current committee");
+        assert!(
+            honest.clone().verify_header_with_keys(&keys).is_ok(),
+            "precondition: honest tip verifies"
+        );
+        assert!(
+            config.get_committee_keys_for_epoch(Epoch::MAX).is_none(),
+            "precondition: no such committee"
+        );
+
+        let consensus_bus = ConsensusBus::new();
+        let network = forged_tip_network(adversary, forged_tip(), honest);
+        tokio::spawn(spawn_track_recent_consensus(config.clone(), consensus_bus.clone(), network));
+
+        // No gossip ever arrives: only the startup probe and the 10s idle probes can find the tip.
+        // Fixed, the honest tip lands within milliseconds; on main every probe follows the forged
+        // header (30s park per walk), so it never lands.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+        while consensus_bus.last_consensus_header().borrow().number < 1
+            && tokio::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let reached = consensus_bus.last_consensus_header().borrow().number;
+        let requested = *consensus_bus.requested_missing_epoch().borrow();
+        config.shutdown().notify();
+
+        assert_eq!(
+            reached, 1,
+            "follower never reached the honest tip: the forged probe answer won every probe"
+        );
+        assert_ne!(
+            requested,
+            Epoch::MAX,
+            "an unverified header's epoch drove requested_missing_epoch"
+        );
     }
 }

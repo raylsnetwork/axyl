@@ -40,6 +40,10 @@ mod message;
 use crate::network::state::AuthVoteState;
 pub use message::ConsensusResult;
 
+// Test-only Byzantine tip-probe override, compiled only with `byzantine-test-hooks`.
+#[cfg(feature = "byzantine-test-hooks")]
+mod tip_probe_byzantine;
+
 pub mod state;
 
 #[cfg(test)]
