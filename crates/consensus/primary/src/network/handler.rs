@@ -1033,6 +1033,9 @@ fn collect_missing_certs_blocking<DB: Database>(
         );
         return Ok(PrimaryResponse::RequestedCertificates(vec![]));
     };
+    // Captured before `request` is moved into the collector, for the test-only poison hook below.
+    #[cfg(feature = "merged-fetch-poison")]
+    let exclusive_lower_bound = request.exclusive_lower_bound;
     let mut collector = CertificateCollector::new(request, consensus_config, scope)?;
 
     let mut missing = Vec::new();
@@ -1052,6 +1055,18 @@ fn collect_missing_certs_blocking<DB: Database>(
         "Collected certificates in {}ms",
         collector.start_time().elapsed().as_millis(),
     );
+
+    // Test-only: a poisoned node replaces the honestly collected certificates with one unusable
+    // certificate to reproduce the merged-fetch-poison issue. Compiled out of production builds,
+    // and inert unless the serving process is armed by environment.
+    #[cfg(feature = "merged-fetch-poison")]
+    if let Some(poisoned) = super::merged_fetch_poison::override_missing_certs(
+        exclusive_lower_bound,
+        our_epoch,
+        missing.len(),
+    ) {
+        return Ok(PrimaryResponse::RequestedCertificates(poisoned));
+    }
 
     Ok(PrimaryResponse::RequestedCertificates(missing))
 }

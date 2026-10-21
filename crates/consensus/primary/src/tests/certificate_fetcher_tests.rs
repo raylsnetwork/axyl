@@ -1,7 +1,7 @@
 //! Certificate fetcher tests
 
 use crate::{
-    certificate_fetcher::CertificateFetcher,
+    certificate_fetcher::{CertificateFetcher, STALE_SKIP_ROUNDS_CATCHUP_THRESHOLD},
     consensus_bus::NodeMode,
     error::CertManagerError,
     network::{PrimaryRequest, PrimaryResponse},
@@ -12,7 +12,8 @@ use assert_matches::assert_matches;
 use rayls_consensus_network::types::{NetworkCommand, NetworkHandle};
 use rayls_infrastructure_storage::{mem_db::MemDatabase, CertificateStore, PayloadStore};
 use rayls_infrastructure_types::{
-    BlsSignature, Certificate, Hash as _, Header, Round, SignatureVerificationState, TaskManager,
+    BlsPublicKey, BlsSignature, Certificate, Hash as _, Header, Round, SignatureVerificationState,
+    TaskManager,
 };
 use rayls_testing_test_utils_committee::CommitteeFixture;
 use std::{collections::BTreeSet, time::Duration};
@@ -554,4 +555,186 @@ async fn fetch_request_names_only_committee_members() {
     let committee = fixture.committee();
     assert_eq!(skip_rounds.len(), committee.size());
     assert!(skip_rounds.keys().all(|origin| committee.is_authority(origin)));
+}
+
+/// Rounds built for the merged-fetch tests. Round 1 is pre-stored, 2..=ROUNDS are fetched.
+const POISON_ROUNDS: Round = 6;
+
+struct MergedFetch {
+    requests: mpsc::Receiver<NetworkCommand<PrimaryRequest, PrimaryResponse>>,
+    store: MemDatabase,
+    /// certificates per round, index 0 = round 1
+    rounds: Vec<Vec<Certificate>>,
+    byzantine: BlsPublicKey,
+    peers: usize,
+    _task_manager: TaskManager,
+}
+
+impl MergedFetch {
+    /// A CvvInactive (merge-mode) fetcher for authority 0 that already stores round 1.
+    async fn start(fixture: &CommitteeFixture<MemDatabase>) -> Self {
+        let primary = fixture.authorities().next().unwrap();
+        let byzantine = *fixture.authorities().nth(1).unwrap().authority().protocol_key();
+        let store = primary.consensus_config().node_storage().clone();
+
+        let genesis = Certificate::genesis(&fixture.committee());
+        for cert in &genesis {
+            store.write(cert.clone()).unwrap();
+        }
+        let mut parents: BTreeSet<_> = genesis.iter().map(|c| c.digest()).collect();
+        let mut rounds = vec![];
+        for r in 0..POISON_ROUNDS {
+            let (_, headers) = fixture.headers_round(r, &parents);
+            for (digest, worker_id) in headers.iter().flat_map(|h| h.payload().iter()) {
+                store.write_payload(digest, worker_id).unwrap();
+            }
+            let certs: Vec<_> = headers.iter().map(|h| fixture.certificate(h)).collect();
+            parents = certs.iter().map(|c| c.digest()).collect();
+            rounds.push(certs);
+        }
+        for mut cert in rounds[0].clone() {
+            cert.set_signature_verification_state(SignatureVerificationState::VerifiedDirectly(
+                cert.aggregated_signature().unwrap(),
+            ));
+            store.write(cert).unwrap();
+        }
+
+        // catch-up mode => merge_all_peers = true
+        let cb = ConsensusBus::new();
+        cb.node_mode().send_replace(NodeMode::CvvInactive);
+        let task_manager = TaskManager::default();
+        let synchronizer = StateSynchronizer::new(
+            primary.consensus_config(),
+            cb.clone(),
+            task_manager.get_spawner(),
+        );
+        synchronizer.spawn(&task_manager);
+        let (sender, requests) = mpsc::channel(1000);
+        let network: NetworkHandle<PrimaryRequest, PrimaryResponse> = NetworkHandle::new(sender);
+        // the warm-start probe in `run()` sends the first merged round immediately
+        CertificateFetcher::spawn(
+            primary.consensus_config(),
+            network.into(),
+            cb,
+            synchronizer,
+            &task_manager,
+        );
+
+        Self {
+            requests,
+            store,
+            rounds,
+            byzantine,
+            peers: fixture.committee().size() - 1,
+            _task_manager: task_manager,
+        }
+    }
+
+    /// Collect one merged round: one request per peer.
+    async fn merged_round(
+        &mut self,
+    ) -> Vec<(
+        BlsPublicKey,
+        crate::network::MissingCertificatesRequest,
+        tokio::sync::oneshot::Sender<
+            rayls_consensus_network::types::NetworkResult<PrimaryResponse>,
+        >,
+    )> {
+        let mut out = vec![];
+        while out.len() < self.peers {
+            if let NetworkCommand::SendRequest {
+                peer,
+                request: PrimaryRequest::MissingCertificates { inner },
+                reply,
+            } = self.requests.recv().await.expect("fetcher running")
+            {
+                out.push((peer, inner, reply));
+            }
+        }
+        out
+    }
+
+    /// Valid certificates for rounds 2..=POISON_ROUNDS-1 (what honest peers serve).
+    fn honest_answer(&self) -> Vec<Certificate> {
+        self.rounds[1..(POISON_ROUNDS as usize - 1)].concat()
+    }
+
+    /// A last-round certificate with a garbage aggregate signature.
+    fn poison(&self) -> Certificate {
+        let mut c = self.rounds[POISON_ROUNDS as usize - 1][0].clone();
+        c.set_signature_verification_state(SignatureVerificationState::Unverified(
+            BlsSignature::default(),
+        ));
+        c
+    }
+}
+
+/// Control (passes on main): with every peer honest, a merged fetch stores the certificates.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn merged_fetch_stores_honest_certificates() {
+    let fixture = CommitteeFixture::builder(MemDatabase::default).randomize_ports(true).build();
+    let mut f = MergedFetch::start(&fixture).await;
+    let answer = f.honest_answer();
+    for (_, _, reply) in f.merged_round().await {
+        reply.send(Ok(PrimaryResponse::RequestedCertificates(answer.clone()))).unwrap();
+    }
+    verify_certificates_in_store(&f.store, &answer, answer.len() as u64).await;
+}
+
+/// FAILS ON MAIN: one peer's invalid certificate discards every honest peer's valid ones.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn merged_fetch_keeps_honest_certificates_despite_one_bad_peer() {
+    let fixture = CommitteeFixture::builder(MemDatabase::default).randomize_ports(true).build();
+    let mut f = MergedFetch::start(&fixture).await;
+    let (answer, poison, byz) = (f.honest_answer(), f.poison(), f.byzantine);
+    for (peer, _, reply) in f.merged_round().await {
+        let certs = if peer == byz { vec![poison.clone()] } else { answer.clone() };
+        reply.send(Ok(PrimaryResponse::RequestedCertificates(certs))).unwrap();
+    }
+    verify_certificates_in_store(&f.store, &answer, answer.len() as u64).await;
+}
+
+/// FAILS ON MAIN: a poisoning peer must not drive the stale-session fallback
+/// (skip_rounds cleared -> every honest peer re-serves from gc_round).
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn poisoned_merged_fetch_does_not_clear_skip_rounds() {
+    let fixture = CommitteeFixture::builder(MemDatabase::default).randomize_ports(true).build();
+    let mut f = MergedFetch::start(&fixture).await;
+    let (answer, poison, byz) = (f.honest_answer(), f.poison(), f.byzantine);
+    for fetch_round in 0..=STALE_SKIP_ROUNDS_CATCHUP_THRESHOLD {
+        for (peer, request, reply) in f.merged_round().await {
+            let (lower_bound, _) = request.get_bounds(max_skip_rounds(), |_| true).unwrap();
+            // round 1 is stored for every authority, so a healthy request starts at >= 1.
+            // on main the third merged round (fetch_round == 2) asks from gc_round 0.
+            assert!(
+                lower_bound >= 1,
+                "merged round {fetch_round}: skip rounds dropped (lower bound {lower_bound})"
+            );
+            let certs = if peer == byz { vec![poison.clone()] } else { answer.clone() };
+            let _ = reply.send(Ok(PrimaryResponse::RequestedCertificates(certs)));
+        }
+    }
+}
+
+/// FAILS ON MAIN (fix guard): a byzantine copy of a real header with a bad signature that
+/// arrives first must not shadow the honest copy (merge dedups by header digest).
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn merged_fetch_bad_copy_does_not_shadow_honest_copy() {
+    let fixture = CommitteeFixture::builder(MemDatabase::default).randomize_ports(true).build();
+    let mut f = MergedFetch::start(&fixture).await;
+    let answer = f.honest_answer();
+    let mut shadow = answer[0].clone(); // same header digest as an honest cert
+    shadow.set_signature_verification_state(SignatureVerificationState::Unverified(
+        BlsSignature::default(),
+    ));
+    let (byz_req, honest): (Vec<_>, Vec<_>) =
+        f.merged_round().await.into_iter().partition(|(p, _, _)| *p == f.byzantine);
+    for (_, _, reply) in byz_req {
+        reply.send(Ok(PrimaryResponse::RequestedCertificates(vec![shadow.clone()]))).unwrap();
+    }
+    sleep(Duration::from_millis(1)).await; // let the merge loop take the byzantine answer first
+    for (_, _, reply) in honest {
+        reply.send(Ok(PrimaryResponse::RequestedCertificates(answer.clone()))).unwrap();
+    }
+    verify_certificates_in_store(&f.store, &answer, answer.len() as u64).await;
 }

@@ -36,6 +36,10 @@ use std::{collections::BTreeMap, sync::Arc, time::Duration};
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, warn};
 pub mod handler;
+// Test-only poison override for missing-certificates fetch replies, compiled only with
+// `merged-fetch-poison`.
+#[cfg(feature = "merged-fetch-poison")]
+mod merged_fetch_poison;
 mod message;
 use crate::network::state::AuthVoteState;
 pub use message::ConsensusResult;

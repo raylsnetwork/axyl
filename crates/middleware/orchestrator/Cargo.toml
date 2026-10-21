@@ -63,6 +63,7 @@ dev-single-node-setup = [
     "rayls-middleware-bridge/dev-single-node-setup",
     "rayls-infrastructure-types/dev-single-node-setup",
 ]
+merged-fetch-poison = ["rayls-consensus-primary/merged-fetch-poison"]
 
 [dev-dependencies]
 rand = { workspace = true }
