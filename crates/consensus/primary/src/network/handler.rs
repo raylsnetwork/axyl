@@ -782,8 +782,9 @@ where
             .find(|parent| parent.origin() == header.author())
             .map(|parent| parent.signed_authorities().clone())
             .unwrap_or_default();
+        // compare the values, not the bitmaps: roaring's equality is false across store kinds
         ensure!(
-            *claimed == expected,
+            claimed.iter().eq(expected.iter()),
             HeaderError::OwnParentSignersMismatch {
                 claimed: claimed.iter().collect(),
                 expected: expected.iter().collect(),

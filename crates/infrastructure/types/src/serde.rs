@@ -8,16 +8,6 @@ use serde::{
 };
 use serde_with::{DeserializeAs, SerializeAs};
 
-/// Deserialize a roaring bitmap from its on-disk bytes and normalize it by
-/// rebuilding from its (already-sorted) values.
-///
-/// `roaring`'s checked deserializer accepts a run-container with zero runs, which
-/// yields an *empty container*. That container panics on the next
-/// re-serialization — `(container.len() - 1)` underflows under overflow-checks.
-/// Rebuilding drops any empty container while preserving every value. Call this
-/// at every roaring deserialization boundary that reads untrusted (peer or disk)
-/// bytes so a malformed bitmap can't crash the node when it is later re-encoded.
-/// See issue #55.
 /// Number of containers a serialized roaring bitmap declares, or `None` for an unknown header.
 ///
 /// Read off the fixed header without building anything, so a caller can refuse a bitmap that
@@ -42,6 +32,16 @@ pub fn roaring_container_count(bytes: &[u8]) -> Option<usize> {
     }
 }
 
+/// Deserialize a roaring bitmap from its on-disk bytes and normalize it by
+/// rebuilding from its (already-sorted) values.
+///
+/// `roaring`'s checked deserializer accepts a run-container with zero runs, which
+/// yields an *empty container*. That container panics on the next
+/// re-serialization — `(container.len() - 1)` underflows under overflow-checks.
+/// Rebuilding drops any empty container while preserving every value. Call this
+/// at every roaring deserialization boundary that reads untrusted (peer or disk)
+/// bytes so a malformed bitmap can't crash the node when it is later re-encoded.
+/// See issue #55.
 pub fn deserialize_normalized(bytes: &[u8]) -> std::io::Result<roaring::RoaringBitmap> {
     normalize(roaring::RoaringBitmap::deserialize_from(bytes)?)
 }
