@@ -168,7 +168,7 @@ mod schedule {
         assert_eq!(hardforks.version_byte_at_block(1_000_000), Some(0x14));
     }
 
-    /// Every network schedule lists all 20 hardforks in variant order.
+    /// Every network schedule lists every hardfork in variant order.
     #[test]
     fn schedule_contains_all_hardforks_in_order_for_all_networks() {
         for network in [
