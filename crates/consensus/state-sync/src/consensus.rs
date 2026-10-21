@@ -13,14 +13,21 @@ use rayls_infrastructure_types::{
     BlsPublicKey, ConsensusHeader, ConsensusHeaderChainMeta, Database as ReDatabase, DbTxMut as _,
     Epoch, Noticer, B256,
 };
-use std::{ops::ControlFlow, sync::LazyLock, time::Duration};
+use std::{collections::BTreeSet, ops::ControlFlow, sync::LazyLock, time::Duration};
 use tokio::sync::watch;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 const COMMITTEE_KEYS_TIMEOUT: Duration = Duration::from_secs(30);
 const COMMITTEE_KEYS_POLL_INTERVAL: Duration = Duration::from_millis(500);
 /// How long to wait for a gossip tip before actively probing peers for the network head.
 const PROBE_INTERVAL: Duration = Duration::from_secs(10);
+/// Overall wall-clock budget for the boot-time peer-head probe.
+pub const BOOT_HEAD_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long to wait between boot-time peer-head probe rounds.
+const BOOT_HEAD_PROBE_RETRY_INTERVAL: Duration = Duration::from_millis(500);
+/// Upper bound on one boot-time peer request, so an unresponsive peer cannot consume the whole
+/// probe budget and starve the retries that reach a peer still connecting.
+const BOOT_HEAD_PROBE_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Cache a consensus header in persistent storage.
 pub fn store_consensus_header_in_cache<DB: ReDatabase>(db: &DB, header: &ConsensusHeader) {
@@ -353,67 +360,118 @@ pub enum BootHeadProbe {
     /// No other committee primary exists: there is nobody to ask.
     NoPeers,
     /// At least one peer answered. `head` is a non-zero consensus-output number reported by one
-    /// of them, or `None` when every answering peer has produced no output yet (a chain still at
-    /// genesis).
+    /// of them, or `None` when every answering committee peer has produced no output yet (a
+    /// chain still at genesis).
     Responded { head: Option<u64> },
-    /// Peers exist but none reported its chain state (all unreachable, their response channels
-    /// closed, or every answer was an RPC error that does not report the chain's state).
+    /// No committee peer reported its chain state before the probe budget expired (all
+    /// unreachable, their response channels closed, only connected non-committee peers answered,
+    /// or every answer was an RPC error that does not report the chain's state).
     NoResponse,
 }
 
-/// Probe all committee peers for the highest consensus-output number any of them has.
+/// Probe the genesis committee and the peers this node is currently connected to for the
+/// chain's consensus head, retrying until [`BOOT_HEAD_PROBE_TIMEOUT`] expires.
 ///
-/// Unlike [`probe_peers_for_latest`], this keeps the distinction the boot-time schedule shape
-/// gate needs: a peer that answers with
-/// [`NO_CONSENSUS_OUTPUT`](rayls_consensus_primary::network::NO_CONSENSUS_OUTPUT) (a chain still
-/// at genesis cannot report a header at number 0, so it answers with that RPC error) counts as a
-/// response at height 0, while any other error counts as no response. Non-genesis RPC errors -
-/// the peer cannot map us yet, or the response came in the wrong shape - say nothing about the
-/// peer's chain state, so they must not be mistaken for genesis. The gate refuses to start when
-/// no peer reports its chain state rather than guessing it.
+/// The target set is refreshed every round, so a peer that is still connecting gets another
+/// chance before the budget runs out. Only
+/// [`NO_CONSENSUS_OUTPUT`](rayls_consensus_primary::network::NO_CONSENSUS_OUTPUT) counts as an
+/// answer from genesis; other RPC errors are retried because they may just mean the peer has not
+/// mapped this node yet.
 ///
-/// Returns as soon as any peer reports a non-zero output (the chain exists, no further answers
-/// needed); otherwise waits for every peer to answer, so a partial set of genesis responses
-/// with other peers still silent stays a timeout for the caller.
+/// Returns the first non-zero head found, `None` when the genesis committee reports genesis, and
+/// [`BootHeadProbe::NoResponse`] when no peer reports its chain state.
 pub async fn probe_peers_for_boot_head<DB: ReDatabase>(
     config: &ConsensusConfig<DB>,
     network: &PrimaryNetworkHandle,
 ) -> BootHeadProbe {
-    let peers = config.committee().others_primaries_by_id(config.authority_id().as_ref());
-    if peers.is_empty() {
+    let committee: BTreeSet<BlsPublicKey> = config
+        .committee()
+        .others_primaries_by_id(config.authority_id().as_ref())
+        .into_iter()
+        .map(|(_, peer)| peer)
+        .collect();
+    if committee.is_empty() {
         return BootHeadProbe::NoPeers;
     }
 
-    let mut inflight: FuturesUnordered<_> = peers
-        .into_iter()
-        .map(|(_, peer)| async move {
-            match network.request_consensus_from_peer(peer, None, None).await {
-                Ok(header) => Some(header.number),
-                // The peer answered that it has no consensus output yet, so it is still at
-                // genesis (height 0). This is the only RPC error that reports the state of the
-                // peer's chain.
-                Err(NetworkError::RPCError(msg)) if is_no_consensus_output(&msg) => Some(0),
-                // Any other failure - transport, timeout, or an RPC error that does not report
-                // the chain's state - is no usable answer.
-                Err(_) => None,
-            }
-        })
-        .collect();
+    let mut saw_genesis = false;
+    let probe = async {
+        loop {
+            // Refresh each round: a peer that was still dialing at boot becomes reachable, and a
+            // joining node may discover a different set of peers while the probe runs.
+            let connected = network.inner_handle().connected_peers().await.unwrap_or_default();
+            let targets: BTreeSet<BlsPublicKey> =
+                committee.iter().copied().chain(connected).collect();
 
-    let mut responded = false;
-    while let Some(result) = inflight.next().await {
-        if let Some(number) = result {
-            responded = true;
-            if number > 0 {
-                return BootHeadProbe::Responded { head: Some(number) };
+            let mut inflight: FuturesUnordered<_> = targets
+                .iter()
+                .map(|&peer| async move {
+                    let answer = tokio::time::timeout(
+                        BOOT_HEAD_PROBE_REQUEST_TIMEOUT,
+                        network.request_consensus_from_peer(peer, None, None),
+                    )
+                    .await;
+                    let head = match answer {
+                        Ok(Ok(header)) => Some(header.number),
+                        // A chain still at genesis cannot report a header at number 0, so a
+                        // peer with no output answers with the explicit no-output RPC error.
+                        Ok(Err(NetworkError::RPCError(msg))) if is_no_consensus_output(&msg) => {
+                            Some(0)
+                        }
+                        // Any other failure - transport, timeout, or an RPC error that does not
+                        // report the chain's state - is no usable answer.
+                        _ => None,
+                    };
+                    (peer, head)
+                })
+                .collect();
+
+            let mut genesis_answers = 0usize;
+            while let Some((peer, head)) = inflight.next().await {
+                match head {
+                    Some(number) if number > 0 => {
+                        info!(
+                            target: "state-sync",
+                            peer = %peer,
+                            head = number,
+                            "boot head probe: peer reported consensus output"
+                        );
+                        return BootHeadProbe::Responded { head: Some(number) };
+                    }
+                    // Only the genesis committee can establish a new chain; a connected peer
+                    // outside it merely proves the chain exists when it reports a head.
+                    Some(_) if committee.contains(&peer) => {
+                        saw_genesis = true;
+                        genesis_answers += 1;
+                    }
+                    _ => {}
+                }
             }
+
+            if genesis_answers == committee.len() {
+                info!(
+                    target: "state-sync",
+                    peers = genesis_answers,
+                    "boot head probe: every committee peer is at genesis"
+                );
+                return BootHeadProbe::Responded { head: None };
+            }
+
+            debug!(
+                target: "state-sync",
+                "boot head probe: no conclusive answer, retrying"
+            );
+            tokio::time::sleep(BOOT_HEAD_PROBE_RETRY_INTERVAL).await;
         }
-    }
+    };
 
-    if responded {
-        BootHeadProbe::Responded { head: None }
-    } else {
-        BootHeadProbe::NoResponse
+    match tokio::time::timeout(BOOT_HEAD_PROBE_TIMEOUT, probe).await {
+        Ok(outcome) => outcome,
+        // A partial set of genesis answers is still a genesis report: the remaining peers were
+        // unreachable for the whole budget and cannot contradict it. Only with no genesis answer
+        // at all is the chain's state unknown.
+        Err(_) if saw_genesis => BootHeadProbe::Responded { head: None },
+        Err(_) => BootHeadProbe::NoResponse,
     }
 }
 
@@ -516,9 +574,12 @@ pub(crate) async fn spawn_track_recent_consensus<DB: ReDatabase>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rayls_consensus_primary::network::{
+        NetworkCommand, PrimaryRPCError, PrimaryRequest, PrimaryResponse, NO_CONSENSUS_OUTPUT,
+    };
     use rayls_infrastructure_storage::{mem_db::MemDatabase, tables::ConsensusBlocks};
     use rayls_testing_test_utils_committee::CommitteeFixture;
-    use std::num::NonZeroUsize;
+    use std::{collections::HashMap, num::NonZeroUsize, sync::Arc};
 
     /// A network handle whose receiver is dropped: every fetch fails fast, so a walk can make
     /// progress only through the local DB/cache, never a peer.
@@ -526,6 +587,155 @@ mod tests {
         let (tx, rx) = tokio::sync::mpsc::channel(1);
         drop(rx);
         PrimaryNetworkHandle::new_for_test(tx)
+    }
+
+    /// A network that reports `connected` peers and answers each `SendRequest` with the response
+    /// `respond` scripts for that peer and 1-based request attempt. `None` fails the request the
+    /// way a not-yet-connected peer does.
+    fn scripted_boot_probe_network(
+        connected: Vec<BlsPublicKey>,
+        mut respond: impl FnMut(&BlsPublicKey, usize) -> Option<PrimaryResponse> + Send + 'static,
+    ) -> PrimaryNetworkHandle {
+        let (tx, mut rx) =
+            tokio::sync::mpsc::channel::<NetworkCommand<PrimaryRequest, PrimaryResponse>>(64);
+        tokio::spawn(async move {
+            let mut attempts: HashMap<BlsPublicKey, usize> = HashMap::new();
+            while let Some(command) = rx.recv().await {
+                match command {
+                    NetworkCommand::ConnectedPeers { reply } => {
+                        let _ = reply.send(connected.clone());
+                    }
+                    NetworkCommand::SendRequest { peer, reply, .. } => {
+                        let attempt = attempts.entry(peer).or_default();
+                        *attempt += 1;
+                        let result = match respond(&peer, *attempt) {
+                            Some(response) => Ok(response),
+                            None => Err(NetworkError::PeerNotConnected),
+                        };
+                        let _ = reply.send(result);
+                    }
+                    _ => {}
+                }
+            }
+        });
+        PrimaryNetworkHandle::new_for_test(tx)
+    }
+
+    fn committee_peers(config: &ConsensusConfig<MemDatabase>) -> Vec<BlsPublicKey> {
+        config
+            .committee()
+            .others_primaries_by_id(config.authority_id().as_ref())
+            .into_iter()
+            .map(|(_, peer)| peer)
+            .collect()
+    }
+
+    fn header_response(number: u64) -> PrimaryResponse {
+        PrimaryResponse::ConsensusHeader(Arc::new(ConsensusHeader { number, ..Default::default() }))
+    }
+
+    fn genesis_response() -> PrimaryResponse {
+        PrimaryResponse::Error(PrimaryRPCError(format!("Internal error: {NO_CONSENSUS_OUTPUT}")))
+    }
+
+    /// A committee peer that is still connecting when the probe starts must be asked again: the
+    /// first attempt fails, a later one reports a head.
+    #[tokio::test(start_paused = true)]
+    async fn boot_probe_retries_peers_that_are_still_connecting() {
+        let fixture = CommitteeFixture::builder(MemDatabase::default)
+            .randomize_ports(true)
+            .committee_size(NonZeroUsize::new(4).unwrap())
+            .build();
+        let primary = fixture.authorities().next().unwrap();
+        let config = primary.consensus_config();
+        let late_peer = committee_peers(&config)[0];
+
+        let network = scripted_boot_probe_network(Vec::new(), move |peer, attempt| {
+            (*peer == late_peer && attempt >= 2).then(|| header_response(42))
+        });
+
+        let probe = probe_peers_for_boot_head(&config, &network).await;
+        assert_eq!(probe, BootHeadProbe::Responded { head: Some(42) });
+    }
+
+    /// A node joining an existing chain is typically connected to the chain's *current*
+    /// committee, which on a fresh datadir is not the local genesis committee. Those connected
+    /// peers must be asked too.
+    #[tokio::test]
+    async fn boot_probe_asks_connected_peers_outside_the_committee() {
+        let fixture = CommitteeFixture::builder(MemDatabase::default)
+            .randomize_ports(true)
+            .committee_size(NonZeroUsize::new(4).unwrap())
+            .build();
+        let primary = fixture.authorities().next().unwrap();
+        let config = primary.consensus_config();
+
+        let outsider = BlsPublicKey::default();
+        assert!(
+            !config.committee().bls_keys().contains(&outsider),
+            "test key must not be in the genesis committee"
+        );
+
+        let network = scripted_boot_probe_network(vec![outsider], move |peer, _| {
+            (*peer == outsider).then(|| header_response(7))
+        });
+
+        let probe = probe_peers_for_boot_head(&config, &network).await;
+        assert_eq!(probe, BootHeadProbe::Responded { head: Some(7) });
+    }
+
+    /// Genesis from one peer is not conclusive: another committee peer may still be connecting
+    /// and report that the chain already exists. The probe must keep asking rather than lock in
+    /// the new-chain rules on the first genesis answer.
+    #[tokio::test(start_paused = true)]
+    async fn boot_probe_does_not_treat_partial_genesis_as_final() {
+        let fixture = CommitteeFixture::builder(MemDatabase::default)
+            .randomize_ports(true)
+            .committee_size(NonZeroUsize::new(4).unwrap())
+            .build();
+        let primary = fixture.authorities().next().unwrap();
+        let config = primary.consensus_config();
+        let peers = committee_peers(&config);
+        let (genesis_peer, late_peer) = (peers[0], peers[1]);
+
+        let network = scripted_boot_probe_network(Vec::new(), move |peer, attempt| {
+            if *peer == genesis_peer {
+                Some(PrimaryResponse::Error(PrimaryRPCError(format!(
+                    "Internal error: {NO_CONSENSUS_OUTPUT}"
+                ))))
+            } else if *peer == late_peer && attempt >= 2 {
+                Some(header_response(42))
+            } else {
+                None
+            }
+        });
+
+        let probe = probe_peers_for_boot_head(&config, &network).await;
+        assert_eq!(
+            probe,
+            BootHeadProbe::Responded { head: Some(42) },
+            "a partial genesis answer must not short-circuit the probe"
+        );
+    }
+
+    /// An unreachable committee peer does not turn a genesis answer into a refusal: after the
+    /// budget expires with no non-zero head, the answering peer still establishes a new chain.
+    #[tokio::test(start_paused = true)]
+    async fn boot_probe_falls_back_to_genesis_when_a_peer_stays_unreachable() {
+        let fixture = CommitteeFixture::builder(MemDatabase::default)
+            .randomize_ports(true)
+            .committee_size(NonZeroUsize::new(4).unwrap())
+            .build();
+        let primary = fixture.authorities().next().unwrap();
+        let config = primary.consensus_config();
+        let genesis_peer = committee_peers(&config)[0];
+
+        let network = scripted_boot_probe_network(Vec::new(), move |peer, _| {
+            (*peer == genesis_peer).then(genesis_response)
+        });
+
+        let probe = probe_peers_for_boot_head(&config, &network).await;
+        assert_eq!(probe, BootHeadProbe::Responded { head: None });
     }
 
     /// A stale `ConsensusBlockNumbersByDigest` entry (foreign digest mapped to a canonical number)

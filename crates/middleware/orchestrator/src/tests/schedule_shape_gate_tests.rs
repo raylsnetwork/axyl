@@ -107,7 +107,7 @@ async fn refuses_invalid_new_chain_when_peers_report_genesis() {
     assert!(msg.contains("AdminTransfer"), "{msg}");
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn fails_boot_when_no_peer_answers() {
     let (_fixture, config) = config();
     let shutdown_notifier = Notifier::new();
@@ -127,7 +127,7 @@ async fn fails_boot_when_no_peer_answers() {
 /// output yet" error has not reported its chain state: the gate must refuse
 /// rather than read the answer as genesis. Here it is the startup race where
 /// the peer cannot map us yet.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn non_genesis_rpc_errors_count_as_no_response() {
     let (_fixture, config) = config();
     let shutdown_notifier = Notifier::new();
@@ -149,7 +149,7 @@ async fn non_genesis_rpc_errors_count_as_no_response() {
 
 /// A response of the wrong type is a protocol violation, not a genesis report:
 /// it must also count as no answer.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn wrong_response_variant_counts_as_no_response() {
     let (_fixture, config) = config();
     let shutdown_notifier = Notifier::new();

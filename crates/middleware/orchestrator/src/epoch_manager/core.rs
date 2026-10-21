@@ -27,7 +27,7 @@ use futures::FutureExt;
 use rayls_consensus_primary::{network::PrimaryNetworkHandle, ConsensusBus, NodeMode, QueChannel};
 use rayls_consensus_state_sync::{
     epoch_committee_valid, epoch_record_valid, probe_peers_for_boot_head,
-    spawn_epoch_record_collector, BootHeadProbe,
+    spawn_epoch_record_collector, BootHeadProbe, BOOT_HEAD_PROBE_TIMEOUT,
 };
 use rayls_consensus_worker::{quorum_waiter::QuorumWaiterTrait, Worker};
 use rayls_execution_evm::{
@@ -79,14 +79,6 @@ const CERTIFICATION_RETRY_BACKOFF: Duration = Duration::from_secs(30);
 /// epoch whose committee can never reach quorum again (its members left for good) costs a few
 /// requests per hour instead of a hundred every two minutes, while the retry itself never stops.
 const MAX_CERTIFICATION_RETRY_BACKOFF: Duration = Duration::from_secs(15 * 60);
-
-/// Overall wall-clock budget for the boot-time peer-head probe.
-///
-/// The probe decides the new-chain vs. existing-chain rule set for a datadir
-/// with no executed blocks; a slow or partitioned peer set must not delay
-/// startup indefinitely. When it expires without any peer answering, the gate
-/// refuses the boot (the chain's state cannot be determined).
-const BOOT_HEAD_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Backoff before certification attempt `attempt + 1`, after `attempt` (1-based) failed:
 /// [`CERTIFICATION_RETRY_BACKOFF`] doubled per failed attempt, capped at
@@ -145,7 +137,9 @@ pub(crate) enum BootShapeGateOutcome {
 /// Called only for a datadir with no executed blocks (`local_head == 0`): a datadir with
 /// executed history is an existing chain on its own, and the CLI already checked it fail-fast
 /// before launching the node (see `build_and_launch` in `rayls-network-cli`). A fresh datadir
-/// may be a new chain or a node joining an existing chain, so the peer set is probed:
+/// may be a new chain or a node joining an existing chain, so the genesis committee and the
+/// peers this node is currently connected to are probed, retrying until
+/// [`BOOT_HEAD_PROBE_TIMEOUT`] expires:
 ///
 /// - a peer-reported consensus output means the chain already exists (relaxed rules);
 /// - a peer that answers with the explicit "no consensus output yet" error
@@ -176,31 +170,21 @@ pub(crate) async fn verify_boot_schedule_shape<DB: ReDatabase>(
             );
             return Ok(BootShapeGateOutcome::Shutdown);
         }
-        result = tokio::time::timeout(
-            BOOT_HEAD_PROBE_TIMEOUT,
-            probe_peers_for_boot_head(consensus_config, network),
-        ) => result,
+        probe = probe_peers_for_boot_head(consensus_config, network) => probe,
     };
 
     let peer_head = match probe {
-        Ok(BootHeadProbe::Responded { head }) => head,
-        Ok(BootHeadProbe::NoPeers) => {
+        BootHeadProbe::Responded { head } => head,
+        BootHeadProbe::NoPeers => {
             // A single-validator committee has no other primary that could hold executed
             // history, so a fresh datadir is a new chain by definition.
             None
         }
-        Ok(BootHeadProbe::NoResponse) => {
-            eyre::bail!(
-                "boot schedule shape gate: the datadir has no executed blocks and no peer \
-                 answered the consensus-head probe, so it cannot be told whether this is a \
-                 new chain or a node joining an existing one; refusing to start"
-            );
-        }
-        Err(_) => {
+        BootHeadProbe::NoResponse => {
             eyre::bail!(
                 "boot schedule shape gate: the datadir has no executed blocks and the peer \
-                 consensus-head probe timed out after {:?}, so it cannot be told whether \
-                 this is a new chain or a node joining an existing one; refusing to start",
+                 consensus-head probe timed out after {:?} with no peer reporting its chain \
+                 state; refusing to start",
                 BOOT_HEAD_PROBE_TIMEOUT
             );
         }
