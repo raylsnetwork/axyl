@@ -183,8 +183,13 @@ impl<DB: Database> RewardsBackend for ConsensusRewardsCounter<DB> {
                 // Signer claims are committee indices in BLS-key order, the index space of
                 // `Certificate::signed_authorities` (`Committee::bls_keys`), NOT the
                 // identifier order `Committee::authorities` yields. Resolving against the
-                // wrong order pays plausible but wrong validators silently.
-                let bls_keys = committee.bls_keys();
+                // wrong order pays plausible but wrong validators silently. Resolved once:
+                // the committee is fixed for the whole tally.
+                let address_by_index: Vec<Option<Address>> = committee
+                    .bls_keys()
+                    .iter()
+                    .map(|key| committee.authority_by_key(key).map(|a| a.execution_address()))
+                    .collect();
                 let mut per_address: BTreeMap<Address, ValidatorRoundTally> = BTreeMap::new();
                 let mut total_rounds: u32 = 0;
                 let mut walked: u64 = 0;
@@ -249,13 +254,9 @@ impl<DB: Database> RewardsBackend for ConsensusRewardsCounter<DB> {
                         // Post-fork: whoever a committed header attests signed its author's
                         // previous certificate. Committed and byte-identical on every node.
                         for index in meta.attested_signers.iter() {
-                            let Some(authority) = bls_keys
-                                .get(index as usize)
-                                .and_then(|key| committee.authority_by_key(key))
-                            else {
-                                continue;
-                            };
-                            credit(authority.execution_address());
+                            if let Some(Some(address)) = address_by_index.get(index as usize) {
+                                credit(*address);
+                            }
                         }
                     } else {
                         // Pre-fork: whoever authored a committed certificate.
