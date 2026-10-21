@@ -3,14 +3,15 @@
 use crate::{
     error::PrimaryNetworkError,
     network::{
-        handler::fetch_scope, message::PrimaryGossip, MissingCertificatesRequest, PrimaryRequest,
+        handler::fetch_scope, is_no_consensus_output, message::PrimaryGossip,
+        MissingCertificatesRequest, PrimaryRPCError, PrimaryRequest, PrimaryResponse,
         RequestHandler,
     },
     state_sync::StateSynchronizer,
     ConsensusBus,
 };
 use assert_matches::assert_matches;
-use rayls_consensus_network::{GossipMessage, TopicHash};
+use rayls_consensus_network::{types::IntoResponse, GossipMessage, TopicHash};
 use rayls_infrastructure_config::LibP2pConfig;
 use rayls_infrastructure_storage::{mem_db::MemDatabase, CertScope};
 use rayls_infrastructure_types::{
@@ -109,6 +110,23 @@ fn create_test_types() -> TestTypes {
 
     let handler = RequestHandler::new(config.clone(), cb.clone(), synchronizer);
     TestTypes { committee, handler, parent, task_manager, consensus_bus: cb }
+}
+
+/// The empty-DB answer is the boot-time "peer is at genesis" signal, so the response the handler
+/// actually builds must be recognised by `is_no_consensus_output`.
+#[tokio::test]
+async fn test_empty_db_response_is_recognized_as_no_consensus_output() {
+    let TestTypes { handler, .. } = create_test_types();
+
+    let response = handler.retrieve_consensus_header(None, None).await.into_response();
+
+    let PrimaryResponse::Error(PrimaryRPCError(message)) = response else {
+        panic!("an empty database must answer with an RPC error, got {response:?}");
+    };
+    assert!(
+        is_no_consensus_output(&message),
+        "empty-database answer is not recognised as no consensus output: {message:?}"
+    );
 }
 
 #[tokio::test]
