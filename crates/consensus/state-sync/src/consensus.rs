@@ -332,7 +332,7 @@ impl<DB: ReDatabase> WalkSession<DB> {
 /// themselves (the state-sync path re-verifies it in `get_consensus_header`).
 /// Returns `None` when no peer answers, or when every answering peer reports a
 /// header at or below `current`.
-pub async fn probe_peers_for_latest<DB: ReDatabase>(
+async fn probe_peers_for_latest<DB: ReDatabase>(
     current: u64,
     config: &ConsensusConfig<DB>,
     network: &PrimaryNetworkHandle,

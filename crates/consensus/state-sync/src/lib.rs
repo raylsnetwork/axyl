@@ -25,8 +25,8 @@ mod consensus;
 
 use consensus::spawn_track_recent_consensus;
 pub use consensus::{
-    probe_peers_for_boot_head, probe_peers_for_latest, store_consensus_header_in_cache,
-    BootHeadProbe, BOOT_HEAD_PROBE_TIMEOUT,
+    probe_peers_for_boot_head, store_consensus_header_in_cache, BootHeadProbe,
+    BOOT_HEAD_PROBE_TIMEOUT,
 };
 
 /// Populate startup-relevant watch channels on `ConsensusBus` from the DB.
