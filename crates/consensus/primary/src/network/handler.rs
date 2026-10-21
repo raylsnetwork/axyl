@@ -762,6 +762,13 @@ where
             (true, None) => return Err(HeaderError::MissingOwnParentSigners.into()),
             (true, Some(claimed)) => claimed,
         };
+        // `parents` is what this node holds. If it already had the author's previous certificate,
+        // that is the copy compared; if it did not, the copy came with this vote request from the
+        // proposer itself (`try_accept_unknown_certs`). So a match proves the claim is the signer
+        // set of some aggregate-verified certificate for that digest and agrees with every voter
+        // that already held one, not "what the whole network saw". That is enough: the tally reads
+        // the committed claim and never a local bitmap. Two variants can also exist with no bad
+        // actor, e.g. an honest proposer re-aggregating after a crash, hence the Medium penalty.
         let expected = parents
             .iter()
             .find(|parent| parent.origin() == header.author())

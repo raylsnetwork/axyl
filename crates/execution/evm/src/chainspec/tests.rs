@@ -101,6 +101,36 @@ mod schedule {
         }
     }
 
+    /// `HeaderParentSigners` must not activate before `EpochCloseSeedV2` on any network: before
+    /// SeedV2 the epoch-closing block's seed still depends on the leader certificate's local
+    /// aggregate signature, the per-node value this fork exists to stop relying on. A scheduled
+    /// `HeaderParentSigners` therefore requires a scheduled SeedV2 at the same block or earlier.
+    #[test]
+    fn header_parent_signers_never_activates_before_epoch_close_seed_v2() {
+        for network in [
+            RaylsNetwork::Devnet,
+            RaylsNetwork::Testnet,
+            RaylsNetwork::Mainnet,
+            RaylsNetwork::Local,
+        ] {
+            let hardforks = RaylsChainHardforks::for_network(network);
+            let ForkCondition::Block(signers) =
+                hardforks.rayls_fork_activation(RaylsHardFork::HeaderParentSigners)
+            else {
+                continue;
+            };
+            match hardforks.rayls_fork_activation(RaylsHardFork::EpochCloseSeedV2) {
+                ForkCondition::Block(seed) => assert!(
+                    seed <= signers,
+                    "{network}: HeaderParentSigners at {signers} before EpochCloseSeedV2 at {seed}"
+                ),
+                other => panic!(
+                    "{network}: HeaderParentSigners scheduled but EpochCloseSeedV2 is {other:?}"
+                ),
+            }
+        }
+    }
+
     /// Every local fork is genesis-active except three: Erc20PrecompileBytecode and
     /// HybridRewards activate at the first post-genesis block, and UsdrSupplyCorrection
     /// never activates (mainnet-only rebase).

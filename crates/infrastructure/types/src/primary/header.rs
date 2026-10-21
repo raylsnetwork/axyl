@@ -5,7 +5,7 @@ use crate::{
     crypto, encode,
     error::{HeaderError, HeaderResult},
     now,
-    serde::{deserialize_normalized, RoaringBitmapSerde},
+    serde::{deserialize_normalized_bounded, RoaringBitmapSerde},
     AuthorityIdentifier, Batch, BlockHash, BlockNumHash, CertificateDigest, Committee, Digest,
     Epoch, Hash, Round, TimestampSec, VoteDigest, WorkerId,
 };
@@ -18,7 +18,7 @@ use serde::{
     ser::{Error as _, SerializeStruct},
     Deserialize, Deserializer, Serialize, Serializer,
 };
-use serde_with::{serde_as, DeserializeAs, SerializeAs};
+use serde_with::{serde_as, SerializeAs};
 use std::{collections::BTreeSet, fmt};
 
 /// Bit set in the wire `epoch` field of a header that carries `own_parent_signers`.
@@ -26,8 +26,44 @@ use std::{collections::BTreeSet, fmt};
 /// The header layout is versioned in-band so every decoder (network, consensus DB, cold archive
 /// projections) tells the two layouts apart from the bytes alone, with no activation table: a
 /// v1 header encodes exactly as it always did, a v2 header sets this bit and appends the signer
-/// bitmap. Real epochs never approach `2^31`, and [`Header::validate`] rejects one that does.
+/// bitmap. Real epochs never approach `2^31`. Decoders strip the bit, so no decoded header carries
+/// it; a header *built* with such an epoch fails to serialize, which `encode` (and with it
+/// `Header::new`, `HeaderBuilder::build` and `Hash::digest`) turns into a panic, so never build a
+/// header from a peer-supplied epoch without checking it against the committee epoch first.
 pub const HEADER_SIGNERS_EPOCH_FLAG: Epoch = 1 << 31;
+
+/// Longest serialized `own_parent_signers` claim accepted, in bytes.
+///
+/// A claim names committee indices, so a legitimate one is a single small container (a few dozen
+/// bytes). Roaring run containers can stand for 65,536 values in about ten bytes, so the claim is
+/// bounded in bytes and in values before it is expanded, on every path that decodes one.
+pub const MAX_OWN_PARENT_SIGNERS_BYTES: usize = 4096;
+
+/// Most values an `own_parent_signers` claim may hold. Far above any committee size, far below
+/// what an unbounded bitmap could be made to expand to. As an array container this many values
+/// take half of [`MAX_OWN_PARENT_SIGNERS_BYTES`], so the two bounds never contradict.
+pub const MAX_OWN_PARENT_SIGNERS: u64 = 1024;
+
+/// Decodes a serialized `own_parent_signers` claim, refusing one over the byte or value bounds
+/// before it is expanded. Shared by the serde path and [`Header::project_wire`].
+fn decode_own_parent_signers(bytes: &[u8]) -> std::io::Result<RoaringBitmap> {
+    use std::io::{Error, ErrorKind};
+    if bytes.len() > MAX_OWN_PARENT_SIGNERS_BYTES {
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            format!(
+                "own-parent signer claim of {} bytes exceeds {MAX_OWN_PARENT_SIGNERS_BYTES}",
+                bytes.len()
+            ),
+        ));
+    }
+    deserialize_normalized_bounded(bytes, MAX_OWN_PARENT_SIGNERS)?.ok_or_else(|| {
+        Error::new(
+            ErrorKind::InvalidData,
+            format!("own-parent signer claim names more than {MAX_OWN_PARENT_SIGNERS} signers"),
+        )
+    })
+}
 
 /// `Header` type for consensus layer.
 #[derive(Builder, Clone, Default)]
@@ -218,7 +254,7 @@ impl Header {
                 .skip::<BlockNumHash>()?;
             let len = c.read_len()?;
             let bytes = c.take(len)?;
-            Some(deserialize_normalized(bytes).map_err(|e| BcsLayoutError::InvalidValue {
+            Some(decode_own_parent_signers(bytes).map_err(|e| BcsLayoutError::InvalidValue {
                 type_name: "RoaringBitmap",
                 reason: e.to_string(),
             })?)
@@ -297,7 +333,7 @@ impl HeaderDigest {
 
 impl From<HeaderDigest> for Digest<{ crypto::DIGEST_LENGTH }> {
     fn from(hd: HeaderDigest) -> Self {
-        Digest::new(hd.0.digest)
+        hd.0
     }
 }
 
@@ -309,13 +345,13 @@ impl From<HeaderDigest> for [u8; crypto::DIGEST_LENGTH] {
 
 impl AsRef<[u8]> for HeaderDigest {
     fn as_ref(&self) -> &[u8] {
-        self.0.as_ref()
+        &self.0.digest
     }
 }
 
 impl From<HeaderDigest> for VoteDigest {
     fn from(value: HeaderDigest) -> Self {
-        VoteDigest::new(value.0.digest)
+        Self::new(value.0.into())
     }
 }
 
@@ -327,7 +363,7 @@ impl fmt::Debug for HeaderDigest {
 
 impl fmt::Display for HeaderDigest {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> Result<(), fmt::Error> {
-        write!(f, "{}", self.0)
+        write!(f, "{}", self.0.to_string().get(0..16).ok_or(fmt::Error)?)
     }
 }
 
@@ -407,11 +443,27 @@ impl Serialize for SignerBytes<'_> {
     }
 }
 
+/// The claim as decoded off the wire, through the bounded decoder: the bytes are peer-supplied
+/// and arrive on the vote path, so they are bounded before the bitmap is expanded.
 struct SignerBytesOwned(RoaringBitmap);
 
 impl<'de> Deserialize<'de> for SignerBytesOwned {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        RoaringBitmapSerde::deserialize_as(deserializer).map(Self)
+        struct ClaimVisitor;
+
+        impl Visitor<'_> for ClaimVisitor {
+            type Value = SignerBytesOwned;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("a bounded roaring bitmap of committee indices")
+            }
+
+            fn visit_bytes<E: de::Error>(self, v: &[u8]) -> Result<Self::Value, E> {
+                decode_own_parent_signers(v).map(SignerBytesOwned).map_err(E::custom)
+            }
+        }
+
+        deserializer.deserialize_bytes(ClaimVisitor)
     }
 }
 
@@ -693,6 +745,34 @@ mod tests {
         assert!(json.get("own_parent_signers").is_some());
         let back: Header = serde_json::from_value(json).unwrap();
         assert_fields_eq(&v2, &back);
+    }
+
+    /// A claim is peer-supplied on the vote path, so an oversized one is refused before the
+    /// bitmap expands, on the serde path and on the projection alike.
+    #[test]
+    fn oversized_signer_claims_are_refused_before_expansion() {
+        // 2^24 values: refused on size before any container is looked at
+        let mut huge = RoaringBitmap::new();
+        huge.insert_range(0..(1u32 << 24));
+        let mut bytes = encode(&sample(Some(huge)));
+
+        assert!(bcs::from_bytes::<Header>(&bytes).is_err());
+        assert!(matches!(
+            Header::project_wire(&bytes),
+            Err(BcsLayoutError::InvalidValue { type_name: "RoaringBitmap", .. })
+        ));
+
+        // a small bitmap that still names too many signers
+        let mut wide = RoaringBitmap::new();
+        wide.insert_range(0..(MAX_OWN_PARENT_SIGNERS as u32 + 1));
+        bytes = encode(&sample(Some(wide)));
+        assert!(bcs::from_bytes::<Header>(&bytes).is_err());
+        assert!(Header::project_wire(&bytes).is_err());
+
+        // the largest legitimate claim decodes
+        let full = RoaringBitmap::from_sorted_iter(0..(MAX_OWN_PARENT_SIGNERS as u32)).unwrap();
+        let decoded: Header = decode(&encode(&sample(Some(full.clone()))));
+        assert_eq!(decoded.own_parent_signers, Some(full));
     }
 
     #[test]
