@@ -56,5 +56,15 @@ rayls-testing-test-utils = { workspace = true }
 rayls-infrastructure-types = { workspace = true, features = ["test-utils"] }
 rayls-infrastructure-config = { workspace = true, features = ["test-utils"] }
 
+[features]
+# Live-reproduction attacker for the kad-store-fill issue. Off by default, so a normal build never
+# contains it. See etc/test/kad-store-fill/.
+kadfill-test-hooks = []
+
+[[bin]]
+name = "kadfill-attacker"
+path = "src/bin/kadfill_attacker.rs"
+required-features = ["kadfill-test-hooks"]
+
 [lints]
 workspace = true

@@ -2464,3 +2464,145 @@ async fn test_direct_connection_classifies_direct_nonrelay() -> eyre::Result<()>
 
     Ok(())
 }
+
+/// A self-signed node record under a freshly minted BLS + network identity: what any connectable
+/// peer can produce for free. No stake, no committee seat. Returns (identity's peer id, record).
+fn mint_identity_record(expires: Option<std::time::Instant>) -> (PeerId, kad::Record) {
+    let keys = KeyConfig::new_with_testing_key(rayls_infrastructure_types::BlsKeypair::generate(
+        &mut rand::rng(),
+    ));
+    let netkey = keys.primary_network_public_key();
+    let peer_id: PeerId = netkey.clone().into();
+    let info =
+        NetworkInfo { pubkey: netkey, multiaddrs: vec![create_multiaddr(None)], timestamp: now() };
+    let signature = keys.request_signature_direct(&encode(&info));
+    let record = kad::Record {
+        key: RecordKey::new(&keys.primary_public_key()),
+        value: encode(&NodeRecord { info, signature }),
+        publisher: Some(peer_id),
+        expires,
+    };
+    (peer_id, record)
+}
+
+/// A kad store filled by self-minted identities (one put each, so the per-source budget never
+/// bites) rejects a not-yet-stored validator's own record with MaxRecords. That push over its own
+/// connection is the only runtime path that binds a post-genesis validator's peer id, so it is
+/// never bound and every request or gossip from it is dropped as from an unknown peer, even after
+/// it is seated. The honest owner is also charged a Mild penalty for our full store.
+#[tokio::test]
+async fn test_minted_identities_fill_kad_store_and_block_new_member_binding() -> eyre::Result<()> {
+    use libp2p::kad::store::MemoryStoreConfig;
+
+    let TestTypes { peer1, peer2, .. } =
+        create_test_types::<TestWorkerRequest, TestWorkerResponse>();
+    let mut network = peer1.network;
+    let max_records = MemoryStoreConfig::default().max_records;
+
+    // attacker: max_records throwaway identities, each pushing its own self-signed record through
+    // the production put path
+    for _ in 0..max_records {
+        let (attacker_id, record) = mint_identity_record(None);
+        network.process_kad_put_request(attacker_id, record);
+    }
+    assert_eq!(
+        network.swarm.behaviour_mut().kademlia.store_mut().records().count(),
+        max_records,
+        "store filled by self-minted identities"
+    );
+
+    // peer2 plays a validator joining at the next epoch (post-genesis: not in committee.yaml, so
+    // `add_bootstrap_peers` never binds it). Its address is known from a query answer, so it is
+    // tracked and has a score.
+    let peer2_record = peer2.network.get_peer_record();
+    let peer2_id = *peer2.network.swarm.local_peer_id();
+    let peer2_bls = peer2.config.key_config().primary_public_key();
+    network
+        .swarm
+        .behaviour_mut()
+        .peer_manager
+        .add_known_peer_addrs(peer2_bls, peer2.network.node_record.info.clone());
+    let score_before =
+        network.swarm.behaviour().peer_manager.peer_score(&peer2_id).expect("peer2 tracked");
+
+    // peer2 pushes its own record over its own connection
+    network.process_kad_put_request(peer2_id, peer2_record.clone());
+    assert_eq!(
+        network.swarm.behaviour().peer_manager.peer_to_bls(&peer2_id),
+        Some(peer2_bls),
+        "a validator's own record over its own connection must bind it even when the store is full"
+    );
+    let score_after =
+        network.swarm.behaviour().peer_manager.peer_score(&peer2_id).expect("peer2 tracked");
+    assert!(
+        score_after >= score_before,
+        "an honest owner must not be penalised for our full store"
+    );
+
+    // seated at the boundary, it re-pushes; still the same outcome on main
+    network
+        .swarm
+        .behaviour_mut()
+        .peer_manager
+        .new_epoch(std::collections::HashSet::from([peer2_bls]));
+    network.process_kad_put_request(peer2_id, peer2_record);
+    assert_eq!(network.swarm.behaviour().peer_manager.peer_to_bls(&peer2_id), Some(peer2_bls));
+    Ok(())
+}
+
+/// The 1024-record store cap does not bound known_peers: a record with a lapsed TTL is admitted
+/// (known_peers insert plus binding of the minted id), then a GetRecord for its key purges it from
+/// the store. 2000 such inserts push known_peers past MAX_KNOWN_PEERS, and the oldest-first
+/// cleanup evicts a next-epoch member (not yet a committee key) together with its binding. Seated
+/// at the boundary, the member is unknown and unbound.
+#[tokio::test]
+async fn test_minted_short_ttl_records_evict_next_epoch_member_binding() -> eyre::Result<()> {
+    use libp2p::kad::store::MemoryStoreConfig;
+
+    let TestTypes { peer1, peer2, .. } =
+        create_test_types::<TestWorkerRequest, TestWorkerResponse>();
+    let mut network = peer1.network;
+    let peer2_record = peer2.network.get_peer_record();
+    let peer2_id = *peer2.network.swarm.local_peer_id();
+    let peer2_bls = peer2.config.key_config().primary_public_key();
+
+    // peer2 (seated next epoch, post-genesis) pushes its own record: stored and bound
+    network.process_kad_put_request(peer2_id, peer2_record);
+    assert_eq!(network.swarm.behaviour().peer_manager.peer_to_bls(&peer2_id), Some(peer2_bls));
+
+    // known_peers timestamps are whole seconds: make every attacker entry strictly newer
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+
+    // attacker: 2000 minted identities (MAX_KNOWN_PEERS). On the wire the TTL would be 1s and the
+    // GetRecord would come 1s later; calling process_kad_put_request directly skips libp2p's
+    // expired-on-arrival check, so an already-lapsed expiry stands in for that wait.
+    for _ in 0..2000 {
+        let (attacker_id, record) = mint_identity_record(Some(std::time::Instant::now()));
+        let key = record.key.clone();
+        network.process_kad_put_request(attacker_id, record);
+        // same expired-record purge as an inbound GetRecord (libp2p-kad 0.48 behaviour.rs:798-801 /
+        // :2423-2427)
+        let _ = network.swarm.behaviour_mut().kademlia.get_record(key);
+    }
+    assert!(
+        network.swarm.behaviour_mut().kademlia.store_mut().records().count()
+            < MemoryStoreConfig::default().max_records,
+        "the store cap never engaged"
+    );
+
+    network
+        .swarm
+        .behaviour_mut()
+        .peer_manager
+        .new_epoch(std::collections::HashSet::from([peer2_bls]));
+    assert!(
+        network.swarm.behaviour().peer_manager.auth_to_peer(peer2_bls).is_some(),
+        "a next-epoch member's dial entry must survive minted-identity churn"
+    );
+    assert_eq!(
+        network.swarm.behaviour().peer_manager.peer_to_bls(&peer2_id),
+        Some(peer2_bls),
+        "a seated member's binding must survive minted-identity churn"
+    );
+    Ok(())
+}

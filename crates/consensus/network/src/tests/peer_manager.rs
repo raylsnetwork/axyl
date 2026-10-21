@@ -1847,3 +1847,46 @@ async fn test_heartbeat_redials_missing_committee_member() {
         "no raw dial may bypass the resolving dial path"
     );
 }
+
+/// The eviction exemption covers only current-committee keys. A validator seated next epoch that
+/// already proved its network key (bound via its own record) is evicted with its binding by
+/// MAX_KNOWN_PEERS newer third-party entries, and is seated at the boundary unknown and unbound.
+#[tokio::test]
+async fn test_next_epoch_member_binding_evicted_by_newer_dial_entries() {
+    let mut peer_manager = create_test_peer_manager(None);
+    let member_bls = *BlsKeypair::generate(&mut rand::rng()).public();
+    let member_netkey: NetworkPublicKey = NetworkKeypair::generate_ed25519().public().into();
+    let member_id: PeerId = member_netkey.clone().into();
+    peer_manager.add_known_peer(
+        member_bls,
+        NetworkInfo {
+            pubkey: member_netkey,
+            multiaddrs: vec![create_multiaddr(None)],
+            timestamp: now(),
+        },
+    );
+    assert_eq!(peer_manager.peer_to_bls(&member_id), Some(member_bls));
+    // strictly the oldest entry (timestamps are whole seconds)
+    peer_manager.known_peers_time_added.insert(member_bls, now().saturating_sub(1));
+
+    for _ in 0..MAX_KNOWN_PEERS {
+        let bls = *BlsKeypair::generate(&mut rand::rng()).public();
+        let netkey: NetworkPublicKey = NetworkKeypair::generate_ed25519().public().into();
+        peer_manager.add_known_peer_addrs(
+            bls,
+            NetworkInfo {
+                pubkey: netkey,
+                multiaddrs: vec![create_multiaddr(None)],
+                timestamp: now(),
+            },
+        );
+    }
+
+    peer_manager.new_epoch(HashSet::from([member_bls]));
+    assert!(peer_manager.auth_to_peer(member_bls).is_some(), "next-epoch member's entry evicted");
+    assert_eq!(
+        peer_manager.peer_to_bls(&member_id),
+        Some(member_bls),
+        "binding evicted: the seated member's requests are rejected as from an unknown peer"
+    );
+}
