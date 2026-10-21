@@ -586,10 +586,17 @@ mod tests {
         let addr_of = |index: usize| {
             committee.authority_by_key(&bls_keys[index]).unwrap().execution_address()
         };
+        let index_of = |id: &AuthorityIdentifier| {
+            let key = *committee.authority(id).unwrap().protocol_key();
+            bls_keys.iter().position(|k| *k == key).unwrap() as u32
+        };
 
         let leader = make_cert(leader_id, 4, 0);
+        // a proposer always votes for its own header, so a real claim always names its author;
+        // ids[1]'s claim does, which pins that self-attestation is credited like any other
+        let claim_1 = roaring::RoaringBitmap::from_iter([1u32, 3, index_of(&ids[1].0)]);
         let certs = vec![
-            make_cert_with_claim(&ids[1].0, 3, 0, roaring::RoaringBitmap::from_iter([1u32, 3])),
+            make_cert_with_claim(&ids[1].0, 3, 0, claim_1),
             make_cert_with_claim(&ids[2].0, 3, 0, roaring::RoaringBitmap::from_iter([3u32])),
             // its own previous certificate was not among its parents: nothing to attest
             make_cert_with_claim(&ids[3].0, 3, 0, roaring::RoaringBitmap::new()),
@@ -616,7 +623,7 @@ mod tests {
             .filter(|(_, t)| t.participation_rounds > 0)
             .map(|(a, _)| *a)
             .collect();
-        assert_eq!(credited, [addr_of(1), addr_of(3)].into_iter().collect());
+        assert_eq!(credited, [addr_of(1), addr_of(3), ids[1].1].into_iter().collect());
         for address in &credited {
             assert_eq!(tally.per_address[address].participation_rounds, 1, "once per sub-dag");
         }

@@ -101,10 +101,12 @@ mod schedule {
         }
     }
 
-    /// `HeaderParentSigners` must not activate before `EpochCloseSeedV2` on any network: before
-    /// SeedV2 the epoch-closing block's seed still depends on the leader certificate's local
-    /// aggregate signature, the per-node value this fork exists to stop relying on. A scheduled
-    /// `HeaderParentSigners` therefore requires a scheduled SeedV2 at the same block or earlier.
+    /// `HeaderParentSigners` must not activate before `EpochCloseSeedV2` on any baked-in
+    /// schedule: before SeedV2 the epoch-closing block's seed still depends on the leader
+    /// certificate's local aggregate signature, the per-node value this fork exists to stop
+    /// relying on. A scheduled `HeaderParentSigners` therefore requires a scheduled SeedV2 at the
+    /// same block or earlier. `--config-file` profiles get the same rule at boot from
+    /// `verify_schedule_shape`.
     #[test]
     fn header_parent_signers_never_activates_before_epoch_close_seed_v2() {
         for network in [
