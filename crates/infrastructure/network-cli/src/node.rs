@@ -334,16 +334,17 @@ impl<Ext: clap::Args + fmt::Debug> NodeCommand<Ext> {
             Arc::new(rayls_infrastructure_config.chain_spec()),
         );
 
-        // The selected schedule must match the canonical shape of its network
-        // family, depending on the datadir's executed head (a single keyed
-        // read over a fresh db handle — no provider built): a chain without
-        // executed history (head 0) must match the canonical new-chain shape
-        // (a greenfield genesis only works with it), an existing chain runs
-        // the relaxed rules and is guarded per datadir by the
-        // schedule-record gate below. Mainnet/testnet are excluded inside the
-        // gate (frozen in CI).
+        // A datadir with executed history is an existing chain on its own: the
+        // relaxed shape rules apply and no peer probe is needed, so the check
+        // runs here, fail-fast, before the node starts. A fresh datadir (head
+        // 0) may be a new chain or a node joining an existing chain, which
+        // only the epoch manager's peer probe can tell apart (see `run_epoch`),
+        // so it is deferred. Mainnet/testnet are excluded inside the gate
+        // (frozen in CI).
         let head = RethEnv::best_block_number(&node_config, rl_datadir.reth_db_path())?;
-        verify_schedule_shape(&selected.profile, head)?;
+        if head > 0 {
+            verify_schedule_shape(&selected.profile, false)?;
+        }
 
         debug!(target: "cli", validator = ?rayls_infrastructure_config.node_info.name, "rl datadir for node command: {rl_datadir:?}");
         info!(target: "cli", validator = ?rayls_infrastructure_config.node_info.name, "config loaded");
@@ -376,7 +377,8 @@ impl<Ext: clap::Args + fmt::Debug> NodeCommand<Ext> {
         // must the hardfork schedule itself: a schedule that moves an already-activated fork
         // (or back-dates a new one into the executed history) would re-interpret the blocks
         // this chain has already run. The datadir's schedule record pins what was executed.
-        verify_schedule_record(&rl_datadir, &node_config, &selected.profile)?;
+        let schedule_record_created =
+            verify_schedule_record(&rl_datadir, &node_config, &selected.profile)?;
 
         // The gate has passed: the selected profile travels with the builder into
         // every execution-layer constructor (nothing about it is process-global).
@@ -400,6 +402,7 @@ impl<Ext: clap::Args + fmt::Debug> NodeCommand<Ext> {
             node_config,
             rayls_infrastructure_config,
             selected.profile,
+            schedule_record_created,
             None,
             metrics,
             healthcheck,

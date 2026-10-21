@@ -24,7 +24,10 @@ pub use epoch::{epoch_committee_valid, epoch_record_valid, spawn_epoch_record_co
 mod consensus;
 
 use consensus::spawn_track_recent_consensus;
-pub use consensus::store_consensus_header_in_cache;
+pub use consensus::{
+    probe_peers_for_boot_head, probe_peers_for_latest, store_consensus_header_in_cache,
+    BootHeadProbe,
+};
 
 /// Populate startup-relevant watch channels on `ConsensusBus` from the DB.
 /// Must run before any consensus task spawns.

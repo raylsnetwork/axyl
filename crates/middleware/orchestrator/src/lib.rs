@@ -200,6 +200,10 @@ mod epoch_transition_tests;
 mod batch_seq_gate_tests;
 
 #[cfg(test)]
+#[path = "tests/schedule_shape_gate_tests.rs"]
+mod schedule_shape_gate_tests;
+
+#[cfg(test)]
 mod clippy {
     use rand as _;
     use rayls_infrastructure_network_types as _;

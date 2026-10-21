@@ -163,7 +163,7 @@ This is why behavioral forks are:
 | layer | what it protects | where |
 |-------|-----------------|-------|
 | **CI freeze tests** | mainnet and testnet baked schedules (full 17-fork literal tables) | `chainspec.rs` |
-| **Boot shape gate** (`verify_schedule_shape`) | new chains (datadir head `0`) on the strict canonical shape; existing chains (head > 0) on relaxed rules; mainnet/testnet chain-ids always excluded | `network_profile/shape.rs` |
+| **Boot shape gate** (`verify_schedule_shape`) | new chains (no executed blocks anywhere) on the strict canonical shape; existing chains on relaxed rules; mainnet/testnet chain-ids always excluded. A datadir with executed history is checked fail-fast at CLI boot with no probe; a fresh datadir is checked in the epoch manager, after the primary network dials peers, by probing them for any consensus output (a fresh chain has none; single-validator committees have nobody to ask). If peers exist but none reports its chain state, the boot is refused. All of this happens before any consensus or subscriber task starts | `network_profile/shape.rs` |
 | **Schedule-record gate** (`schedule-record.yaml`, trust-on-first-use) | per-datadir drift on all networks | `network_profile/verify.rs` |
 | **Genesis ceremony** | out of scope by decision | — |
 
@@ -175,19 +175,53 @@ This is why behavioral forks are:
   mainnet/testnet chain-id is not shape-checked; it is still protected by
   the record gate for forks that have fired, and by the freeze tests for
   the binary schedule.
-- The shape check has two rule sets, selected by the datadir's executed
-  head. A **new chain** (head `0`, no executed blocks) must match the strict
-  canonical new-chain shape (the table in section 2). An **existing chain**
-  (head > 0) may legitimately run a historical schedule that deviates from
-  it, so the gate relaxes: Set A forks at `Block(0)` or `Never`,
-  `Erc20PrecompileBytecode` still exactly `Block(1)`, `UsdrSupplyCorrection`
-  at any value (the node warns when it is not `Never`), and `HybridRewards`
-  at `Never` or `Block(>= 1)` — the devnet carve-out does not apply to
-  executed chains. The schedule-record gate then protects the executed
-  history per datadir.
+- The shape check has two rule sets, selected by whether the chain has any
+  executed blocks. A datadir with executed history (`head > 0`) is an existing
+  chain by itself: the CLI verifies the shape fail-fast at boot, before the
+  node starts, and no peer probe runs. A fresh datadir (`head == 0`) may be a
+  new chain or a node joining an existing chain, so the check moves to the
+  epoch manager's first `run_epoch`, immediately after `create_consensus` has
+  dialed the primary network and waited for its quorum, and before
+  `recover_partial_transition` and `primary.start` spawn the certifier,
+  proposer, Bullshark, and subscriber/replay. There, every other committee
+  primary is asked whether it has any consensus output: a peer-reported output
+  means the chain already exists; peers answering that they have no output yet
+  (still at genesis) mean the chain is new; and a single-validator committee
+  has nobody to ask and is a new chain by definition. Only that explicit "no
+  output yet" answer counts as genesis — any other RPC error says nothing
+  about the peer's chain state. The peer-reported number is a consensus-output
+  sequence number, not an execution height, so only zero vs. non-zero is used.
+  If peers exist but none reports its chain state within the probe timeout,
+  the chain's state is unknowable and the node refuses to start —
+  gracefully, with a non-zero exit and any schedule record created by this
+  boot rolled back — rather than guessing. It is a boot-time property of the
+  selected schedule, so it runs once, on the initial epoch. A **new chain**
+  (no executed blocks anywhere) must match the strict canonical new-chain
+  shape (the table in section 2). An **existing chain** may legitimately run a
+  historical schedule that deviates from it, so the gate relaxes: Set A
+  forks at `Block(0)` or `Never`, `Erc20PrecompileBytecode` still exactly
+  `Block(1)`, `UsdrSupplyCorrection` at any value (the node warns when it is
+  not `Never`), and `HybridRewards` at `Never` or `Block(>= 1)` — the devnet
+  carve-out does not apply to executed chains. The schedule-record gate then
+  protects the executed history per datadir.
+- The new-vs-existing decision is a boot-time snapshot. On a staggered
+  greenfield launch, validators that boot after the first commit see a
+  non-zero peer-reported head and are checked under the relaxed existing-chain
+  rules, so the strict canonical shape is only enforced on validators that
+  boot before consensus advances. A late, misconfigured validator (for example
+  `HybridRewards: Never` on a non-devnet chain) can therefore pass the shape
+  gate; the schedule-record gate still pins what that datadir executes.
 - A new chain via `--config-file` must enumerate all 17 forks including
   `Erc20PrecompileBytecode: 1` and `HybridRewards: 1`. A partial file
   (e.g. missing Erc20) resolves to `Never` and is refused by the shape
   gate — that is intentional (catches the EIP-161 exposure).
-- The shape check runs **before** the schedule-record write, so a refused
-  boot never pollutes the datadir via trust-on-first-use.
+- The schedule-record write (trust-on-first-use) runs at CLI boot. A datadir
+  with executed history is shape-checked there, before the record is written;
+  a fresh datadir's shape check needs the connected primary network and
+  therefore runs in the epoch manager, after the record was written. If that
+  gate refuses a schedule that created the record on this boot, the epoch
+  manager removes that record before exiting, so a refused first boot leaves
+  no trust-on-first-use record behind. A record that predates this boot is
+  never deleted automatically. If the process dies before reaching the gate,
+  the fresh record pins head `0`; correct the schedule and boot again (delete
+  the record only if the record gate refuses the correction).

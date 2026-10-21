@@ -16,14 +16,19 @@ use tracing::{info, warn};
 /// [`ScheduleRecord`] (refusing executed-fork disagreements, reporting future
 /// moves), then re-record it. A datadir without a record (a fresh chain) gets
 /// one written for the selected schedule.
+///
+/// Returns whether this boot created the record (no record existed before).
+/// The epoch manager uses that to roll the record back if the boot-time shape
+/// gate later refuses the selected schedule.
 pub fn verify_schedule_record<P: RaylsDirs>(
     datadir: &P,
     node_config: &RethConfig,
     profile: &NetworkProfile,
-) -> eyre::Result<()> {
+) -> eyre::Result<bool> {
     let chain_id = profile.chain_id;
     let verification = verify_datadir_schedule_record(datadir, node_config, profile)?;
     let head = verification.head;
+    let created = verification.record.is_none();
     // No record: a fresh datadir (head 0) is the normal first-boot case. A
     // datadir with executed history and no record (predating the feature, or
     // deleted) is trusted — and re-recorded below, so the executed-history
@@ -58,7 +63,7 @@ pub fn verify_schedule_record<P: RaylsDirs>(
         %head,
         "hardfork schedule verified against the chain's executed history"
     );
-    Ok(())
+    Ok(created)
 }
 
 pub mod export;

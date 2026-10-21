@@ -12,10 +12,12 @@ use crate::{
 use handler::RequestHandler;
 #[cfg(test)]
 pub(crate) use message::MAX_SKIP_ROUND_AUTHORITIES;
-pub use message::{MissingCertificatesRequest, PrimaryRequest, PrimaryResponse, SkipRoundList};
+pub use message::{
+    MissingCertificatesRequest, PrimaryRPCError, PrimaryRequest, PrimaryResponse, SkipRoundList,
+};
 // Re-exported so downstream crates (state-sync) can build a `PrimaryNetworkHandle` test mock that
 // answers `NetworkCommand`s without taking a direct dependency on the network crate.
-use message::{PrimaryGossip, PrimaryRPCError};
+use message::PrimaryGossip;
 #[doc(hidden)]
 pub use rayls_consensus_network::{error::NetworkError, types::NetworkCommand};
 use rayls_consensus_network::{
@@ -41,6 +43,25 @@ use crate::network::state::AuthVoteState;
 pub use message::ConsensusResult;
 
 pub mod state;
+
+/// The RPC error payload a peer returns when it has no consensus output yet.
+///
+/// Consensus output is numbered from 1, so an empty chain cannot report a header at number 0;
+/// `RequestHandler::retrieve_consensus_header` answers a `(None, None)` request with
+/// [`PrimaryResponse::Error`] carrying this message instead. The boot-time schedule shape gate
+/// relies on exactly this answer to tell "peer up, chain still at genesis" apart from "the peer
+/// did not report its chain state".
+pub const NO_CONSENSUS_OUTPUT: &str = "Consensus headers unavailable";
+
+/// Whether an RPC error message is the explicit "no consensus output yet" answer.
+///
+/// Matches with `contains` because the wire message is the rendered error
+/// (`"Internal error: {NO_CONSENSUS_OUTPUT}"`). Every other RPC error means the peer answered,
+/// but not about the state of its consensus chain; callers must treat those as no answer, not as
+/// genesis.
+pub fn is_no_consensus_output(message: &str) -> bool {
+    message.contains(NO_CONSENSUS_OUTPUT)
+}
 
 #[cfg(test)]
 #[path = "../tests/network_tests.rs"]

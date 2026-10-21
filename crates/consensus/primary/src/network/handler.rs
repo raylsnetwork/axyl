@@ -4,7 +4,7 @@ use super::{
     message::{
         ConsensusResult, MissingCertificatesRequest, PrimaryRPCError, MAX_SKIP_ROUND_AUTHORITIES,
     },
-    AuthEquivocationMap, PrimaryResponse,
+    AuthEquivocationMap, PrimaryResponse, NO_CONSENSUS_OUTPUT,
 };
 use crate::{
     error::{CertManagerError, PrimaryNetworkError, PrimaryNetworkResult},
@@ -910,7 +910,7 @@ where
             }
         }
 
-        executed.ok_or(PrimaryNetworkError::Internal("Consensus headers unavailable".to_string()))
+        executed.ok_or_else(|| PrimaryNetworkError::Internal(NO_CONSENSUS_OUTPUT.to_string()))
     }
 
     /// Retrieve the consensus header by number.

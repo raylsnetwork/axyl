@@ -19,6 +19,11 @@ pub struct RaylsBuilder {
     /// subnet or the `--network` built-in). Every execution-layer constructor
     /// takes it from here; nothing about the schedule is process-global.
     pub profile: NetworkProfile,
+    /// Whether this boot created the datadir's `schedule-record.yaml` (no
+    /// record existed before). The epoch manager removes the record if the
+    /// boot-time shape gate refuses the selected schedule, so a refused first
+    /// boot leaves no trust-on-first-use record behind.
+    pub schedule_record_created: bool,
     /// TODO: temporary solution until upstream reth
     /// rpc hooks are publicly available.
     pub opt_faucet_args: Option<FaucetArgs>,
@@ -46,6 +51,7 @@ impl RaylsBuilder {
         node_config: RethConfig,
         rayls_infrastructure_config: Config,
         profile: NetworkProfile,
+        schedule_record_created: bool,
         opt_faucet_args: Option<FaucetArgs>,
         metrics: Option<SocketAddr>,
         healthcheck: Option<u16>,
@@ -55,6 +61,7 @@ impl RaylsBuilder {
             node_config,
             rayls_infrastructure_config,
             profile,
+            schedule_record_created,
             opt_faucet_args,
             metrics,
             healthcheck,
@@ -67,6 +74,7 @@ impl RaylsBuilder {
         node_config: RethConfig,
         rayls_infrastructure_config: Config,
         profile: NetworkProfile,
+        schedule_record_created: bool,
         opt_faucet_args: Option<FaucetArgs>,
         metrics: Option<SocketAddr>,
         healthcheck: Option<u16>,
@@ -77,6 +85,7 @@ impl RaylsBuilder {
             node_config,
             rayls_infrastructure_config,
             profile,
+            schedule_record_created,
             opt_faucet_args,
             metrics,
             healthcheck,

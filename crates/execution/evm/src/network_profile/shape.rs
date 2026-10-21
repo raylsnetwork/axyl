@@ -8,9 +8,15 @@
 //! devnet, any new production chain) is checked against the rule set of its
 //! state:
 //!
-//! - A **new chain** — the datadir has no executed blocks (`head == 0`) — must match the canonical
-//!   new-chain shape, because a greenfield genesis only works with it.
-//! - An **existing chain** (`head > 0`) may legitimately run a historical schedule that deviates
+//! - A **new chain** — no executed blocks anywhere — must match the canonical new-chain shape,
+//!   because a greenfield genesis only works with it. The caller classifies the chain: the CLI's
+//!   existing-datadir check passes `false` (it only runs when the datadir has history, and defers a
+//!   fresh datadir to the orchestrator), the replay tool passes `true` only when the snapshot has
+//!   no executed blocks, and the orchestrator's boot gate passes the peer probe's result (a peer
+//!   that reported consensus output means existing chain; the peers that answered reporting no
+//!   output yet, or a committee with no other validator, means new chain). A probe that cannot get
+//!   a usable answer from any peer aborts the boot before this function is called.
+//! - An **existing chain** may legitimately run a historical schedule that deviates
 //!   from the canonical one, so only the constraints an executed chain still needs are enforced:
 //!   Set A forks at `Block(0)` or `Never`, `Erc20PrecompileBytecode` exactly `Block(1)`,
 //!   `UsdrSupplyCorrection` at any value (warned when not `Never`), and `HybridRewards` at `Never`
@@ -24,10 +30,15 @@ use tracing::warn;
 use super::{ForkActivation, ForkName, NetworkProfile};
 use crate::chainspec::RaylsHardFork;
 
-/// Verify the shape of the selected schedule for a chain at the given
-/// executed `head`. See the module docs for the rules. Refuses with every
+/// Verify the shape of the selected schedule for a chain classified by
+/// `is_new_chain`. See the module docs for the rules. Refuses with every
 /// violation listed in one message.
-pub fn verify_schedule_shape(profile: &NetworkProfile, head: u64) -> eyre::Result<()> {
+///
+/// `is_new_chain` must be `true` only when the chain has no executed blocks
+/// anywhere (a fresh datadir with no peer reporting consensus output); the
+/// replay tool passes `snapshot_head == 0`, while the CLI only checks datadirs
+/// that already have history and passes `false`.
+pub fn verify_schedule_shape(profile: &NetworkProfile, is_new_chain: bool) -> eyre::Result<()> {
     let mainnet_id = RaylsNetwork::Mainnet.chain_id();
     let testnet_id = RaylsNetwork::Testnet.chain_id();
     if profile.chain_id == mainnet_id || profile.chain_id == testnet_id {
@@ -45,100 +56,101 @@ pub fn verify_schedule_shape(profile: &NetworkProfile, head: u64) -> eyre::Resul
     };
     let mut violations: Vec<String> = Vec::new();
 
-    // This condition will be enabled in a followed-up PR
-    // if head == 0 {
-    //     // New chain: the canonical new-chain shape — a greenfield genesis
-    //     // only works with it.
-    //     // Set A: Block(0).
-    //     for fork in [
-    //         RaylsHardFork::AdminTransfer,
-    //         RaylsHardFork::RlsStorage,
-    //         RaylsHardFork::Tokenomics,
-    //         RaylsHardFork::Uups,
-    //     ] {
-    //         let fork_activation = activation(fork);
-    //         if fork_activation != ForkActivation::Block(0) {
-    //             violations
-    //                 .push(format!("{} must be Block(0), got {fork_activation:?}", fork.name()))
-    //         }
-    //     }
+    if is_new_chain {
+        // New chain: the canonical new-chain shape — a greenfield genesis
+        // only works with it.
+        // Set A: Block(0).
+        for fork in [
+            RaylsHardFork::AdminTransfer,
+            RaylsHardFork::RlsStorage,
+            RaylsHardFork::Tokenomics,
+            RaylsHardFork::Uups,
+        ] {
+            let fork_activation = activation(fork);
+            if fork_activation != ForkActivation::Block(0) {
+                violations
+                    .push(format!("{} must be Block(0), got {fork_activation:?}", fork.name()))
+            }
+        }
 
-    //     // Set B: USDr precompile.
-    //     let fork_activation = activation(RaylsHardFork::Erc20PrecompileBytecode);
-    //     if fork_activation != ForkActivation::Block(1) {
-    //         violations.push(format!(
-    //             "Erc20PrecompileBytecode must be exactly Block(1), got {fork_activation:?}"
-    //         ));
-    //     }
-    //     let fork_activation = activation(RaylsHardFork::UsdrSupplyCorrection);
-    //     if fork_activation != ForkActivation::Never {
-    //         violations.push(format!("UsdrSupplyCorrection must be Never, got
-    // {fork_activation:?}"));     }
+        // Set B: USDr precompile.
+        let fork_activation = activation(RaylsHardFork::Erc20PrecompileBytecode);
+        if fork_activation != ForkActivation::Block(1) {
+            violations.push(format!(
+                "Erc20PrecompileBytecode must be exactly Block(1), got {fork_activation:?}"
+            ));
+        }
+        let fork_activation = activation(RaylsHardFork::UsdrSupplyCorrection);
+        if fork_activation != ForkActivation::Never {
+            violations.push(format!("UsdrSupplyCorrection must be Never, got {fork_activation:?}"));
+        }
 
-    //     // Set C: hybrid rewards (unconstrained for Devnet).
-    //     let devnet_id = RaylsNetwork::Devnet.chain_id();
-    //     if profile.chain_id != devnet_id {
-    //         let fork_activation = activation(RaylsHardFork::HybridRewards);
-    //         if fork_activation != ForkActivation::Block(1) {
-    //             violations.push(format!(
-    //                 "HybridRewards must be exactly Block(1), got {fork_activation:?}"
-    //             ));
-    //         }
-    //     }
-    // } else {
-    // Existing chain: the relaxed rules. The chain has executed history,
-    // so the schedule it ran under is pinned per datadir by the
-    // schedule-record gate; only the constraints an executed chain still
-    // needs are enforced here.
-    // Set A: Block(0) or Never.
-    for fork in [
-        RaylsHardFork::AdminTransfer,
-        RaylsHardFork::RlsStorage,
-        RaylsHardFork::Tokenomics,
-        RaylsHardFork::Uups,
-    ] {
-        let fork_activation = activation(fork);
-        if !matches!(fork_activation, ForkActivation::Block(0) | ForkActivation::Never) {
-            violations
-                .push(format!("{} must be Block(0) or Never, got {fork_activation:?}", fork.name()))
+        // Set C: hybrid rewards (unconstrained for Devnet).
+        let devnet_id = RaylsNetwork::Devnet.chain_id();
+        if profile.chain_id != devnet_id {
+            let fork_activation = activation(RaylsHardFork::HybridRewards);
+            if fork_activation != ForkActivation::Block(1) {
+                violations.push(format!(
+                    "HybridRewards must be exactly Block(1), got {fork_activation:?}"
+                ));
+            }
+        }
+    } else {
+        // Existing chain: the relaxed rules. The chain has executed history,
+        // so the schedule it ran under is pinned per datadir by the
+        // schedule-record gate; only the constraints an executed chain still
+        // needs are enforced here.
+        // Set A: Block(0) or Never.
+        for fork in [
+            RaylsHardFork::AdminTransfer,
+            RaylsHardFork::RlsStorage,
+            RaylsHardFork::Tokenomics,
+            RaylsHardFork::Uups,
+        ] {
+            let fork_activation = activation(fork);
+            if !matches!(fork_activation, ForkActivation::Block(0) | ForkActivation::Never) {
+                violations.push(format!(
+                    "{} must be Block(0) or Never, got {fork_activation:?}",
+                    fork.name()
+                ))
+            }
+        }
+
+        // Set B: USDr precompile. The precompile must be in place from block
+        // 1; the supply correction is history-dependent, so any value is
+        // allowed (warned below).
+        let fork_activation = activation(RaylsHardFork::Erc20PrecompileBytecode);
+        if fork_activation != ForkActivation::Block(1) {
+            violations.push(format!(
+                "Erc20PrecompileBytecode must be exactly Block(1), got {fork_activation:?}"
+            ));
+        }
+        let fork_activation = activation(RaylsHardFork::UsdrSupplyCorrection);
+        if fork_activation != ForkActivation::Never {
+            warn!(
+                target: "rayls::reth",
+                chain_id = profile.chain_id,
+                "UsdrSupplyCorrection is set to {fork_activation:?} (expected Never); this \
+                 is allowed on an existing chain but unusual — verify the schedule matches \
+                 what the chain has executed"
+            );
+        }
+
+        // Set C: hybrid rewards — Never or Block(>= 1); devnet's canonical
+        // Never is covered, so there is no devnet carve-out for existing
+        // chains.
+        let fork_activation = activation(RaylsHardFork::HybridRewards);
+        if !matches!(fork_activation, ForkActivation::Never | ForkActivation::Block(1..)) {
+            violations.push(format!(
+                "HybridRewards must be Never or Block(>= 1), got {fork_activation:?}"
+            ));
         }
     }
-
-    // Set B: USDr precompile. The precompile must be in place from block
-    // 1; the supply correction is history-dependent, so any value is
-    // allowed (warned below).
-    let fork_activation = activation(RaylsHardFork::Erc20PrecompileBytecode);
-    if fork_activation != ForkActivation::Block(1) {
-        violations.push(format!(
-            "Erc20PrecompileBytecode must be exactly Block(1), got {fork_activation:?}"
-        ));
-    }
-    let fork_activation = activation(RaylsHardFork::UsdrSupplyCorrection);
-    if fork_activation != ForkActivation::Never {
-        warn!(
-            target: "rayls::reth",
-            chain_id = profile.chain_id,
-            head,
-            "UsdrSupplyCorrection is set to {fork_activation:?} (expected Never); this \
-             is allowed on an existing chain but unusual — verify the schedule matches \
-             what the chain has executed"
-        );
-    }
-
-    // Set C: hybrid rewards — Never or Block(>= 1); devnet's canonical
-    // Never is covered, so there is no devnet carve-out for existing
-    // chains.
-    let fork_activation = activation(RaylsHardFork::HybridRewards);
-    if !matches!(fork_activation, ForkActivation::Never | ForkActivation::Block(1..)) {
-        violations
-            .push(format!("HybridRewards must be Never or Block(>= 1), got {fork_activation:?}"));
-    }
-    // }
 
     if violations.is_empty() {
         return Ok(());
     }
-    let rule = if head == 0 { "canonical new-chain shape" } else { "existing-chain shape" };
+    let rule = if is_new_chain { "canonical new-chain shape" } else { "existing-chain shape" };
     eyre::bail!(
         "hardfork schedule for chain-id {} does not match the {rule}: {}",
         profile.chain_id,
@@ -154,14 +166,14 @@ mod tests {
     #[test]
     fn mainnet_profile_passes_excluded() {
         let profile = NetworkProfile::from_builtin(RaylsNetwork::Mainnet);
-        assert!(verify_schedule_shape(&profile, 0).is_ok());
+        assert!(verify_schedule_shape(&profile, true).is_ok());
     }
 
     /// Testnet is excluded from the shape check (frozen in CI).
     #[test]
     fn testnet_profile_passes_excluded() {
         let profile = NetworkProfile::from_builtin(RaylsNetwork::Testnet);
-        assert!(verify_schedule_shape(&profile, 0).is_ok());
+        assert!(verify_schedule_shape(&profile, true).is_ok());
     }
 
     /// Mainnet with a different behavioral value still passes (total exclusion).
@@ -169,28 +181,28 @@ mod tests {
     fn mainnet_with_behavioral_change_passes() {
         let mut profile = NetworkProfile::from_builtin(RaylsNetwork::Mainnet);
         profile.hardforks.insert(ForkName::from("EpochCloseSeedV2"), ForkActivation::Block(1));
-        assert!(verify_schedule_shape(&profile, 0).is_ok());
+        assert!(verify_schedule_shape(&profile, true).is_ok());
     }
 
     /// Local built-in passes the new-chain shape.
     #[test]
     fn local_builtin_passes() {
         let profile = NetworkProfile::from_builtin(RaylsNetwork::Local);
-        assert!(verify_schedule_shape(&profile, 0).is_ok());
+        assert!(verify_schedule_shape(&profile, true).is_ok());
     }
 
     /// Devnet built-in passes the new-chain shape.
     #[test]
     fn devnet_builtin_passes() {
         let profile = NetworkProfile::from_builtin(RaylsNetwork::Devnet);
-        assert!(verify_schedule_shape(&profile, 0).is_ok());
+        assert!(verify_schedule_shape(&profile, true).is_ok());
     }
 
     /// A synthetic new-chain profile with canonical values passes.
     #[test]
     fn canonical_new_chain_passes() {
         let profile = new_chain_profile(99_999, (RaylsHardFork::Eip1559, ForkActivation::Block(0)));
-        assert!(verify_schedule_shape(&profile, 0).is_ok());
+        assert!(verify_schedule_shape(&profile, true).is_ok());
     }
 
     /// Erc20PrecompileBytecode = Never is rejected.
@@ -200,7 +212,7 @@ mod tests {
             99_999,
             (RaylsHardFork::Erc20PrecompileBytecode, ForkActivation::Never),
         );
-        let err = verify_schedule_shape(&profile, 0).unwrap_err();
+        let err = verify_schedule_shape(&profile, true).unwrap_err();
         assert!(err.to_string().contains("Erc20PrecompileBytecode"));
     }
 
@@ -211,29 +223,27 @@ mod tests {
             99_999,
             (RaylsHardFork::Erc20PrecompileBytecode, ForkActivation::Block(5)),
         );
-        let err = verify_schedule_shape(&profile, 0).unwrap_err();
+        let err = verify_schedule_shape(&profile, true).unwrap_err();
         assert!(err.to_string().contains("Erc20PrecompileBytecode"));
     }
 
     /// UsdrSupplyCorrection = Block(1) is rejected.
-    #[ignore = "new-chain (head == 0) rule deferred to the follow-up PR; the head = 1 duplicate below covers the active relaxed rules"]
     #[test]
     fn usdr_supply_correction_block_1_is_refused() {
         let profile = new_chain_profile(
             99_999,
             (RaylsHardFork::UsdrSupplyCorrection, ForkActivation::Block(1)),
         );
-        let err = verify_schedule_shape(&profile, 0).unwrap_err();
+        let err = verify_schedule_shape(&profile, true).unwrap_err();
         assert!(err.to_string().contains("UsdrSupplyCorrection"));
     }
 
     /// HybridRewards = Never is rejected.
-    #[ignore = "new-chain (head == 0) rule deferred to the follow-up PR; the head = 1 duplicate below covers the active relaxed rules"]
     #[test]
     fn hybrid_never_is_refused() {
         let profile =
             new_chain_profile(99_999, (RaylsHardFork::HybridRewards, ForkActivation::Never));
-        let err = verify_schedule_shape(&profile, 0).unwrap_err();
+        let err = verify_schedule_shape(&profile, true).unwrap_err();
         assert!(err.to_string().contains("HybridRewards"));
     }
 
@@ -242,17 +252,16 @@ mod tests {
     fn hybrid_block_0_is_refused() {
         let profile =
             new_chain_profile(99_999, (RaylsHardFork::HybridRewards, ForkActivation::Block(0)));
-        let err = verify_schedule_shape(&profile, 0).unwrap_err();
+        let err = verify_schedule_shape(&profile, true).unwrap_err();
         assert!(err.to_string().contains("HybridRewards"));
     }
 
     /// HybridRewards = Block(5) is rejected.
-    #[ignore = "new-chain (head == 0) rule deferred to the follow-up PR; the head = 1 duplicate below covers the active relaxed rules"]
     #[test]
     fn hybrid_block_5_is_refused_on_new_chain() {
         let profile =
             new_chain_profile(99_999, (RaylsHardFork::HybridRewards, ForkActivation::Block(5)));
-        let err = verify_schedule_shape(&profile, 0).unwrap_err();
+        let err = verify_schedule_shape(&profile, true).unwrap_err();
         assert!(err.to_string().contains("HybridRewards"));
     }
 
@@ -261,7 +270,7 @@ mod tests {
     fn admin_transfer_block_500_is_refused() {
         let profile =
             new_chain_profile(99_999, (RaylsHardFork::AdminTransfer, ForkActivation::Block(500)));
-        let err = verify_schedule_shape(&profile, 0).unwrap_err();
+        let err = verify_schedule_shape(&profile, true).unwrap_err();
         assert!(err.to_string().contains("AdminTransfer"));
     }
 
@@ -270,7 +279,7 @@ mod tests {
     fn rls_storage_block_500_is_refused() {
         let profile =
             new_chain_profile(99_999, (RaylsHardFork::RlsStorage, ForkActivation::Block(500)));
-        let err = verify_schedule_shape(&profile, 0).unwrap_err();
+        let err = verify_schedule_shape(&profile, true).unwrap_err();
         assert!(err.to_string().contains("RlsStorage"));
     }
 
@@ -279,7 +288,7 @@ mod tests {
     fn tokenomics_block_500_is_refused() {
         let profile =
             new_chain_profile(99_999, (RaylsHardFork::Tokenomics, ForkActivation::Block(500)));
-        let err = verify_schedule_shape(&profile, 0).unwrap_err();
+        let err = verify_schedule_shape(&profile, true).unwrap_err();
         assert!(err.to_string().contains("Tokenomics"));
     }
 
@@ -287,30 +296,34 @@ mod tests {
     #[test]
     fn uups_block_500_is_refused() {
         let profile = new_chain_profile(99_999, (RaylsHardFork::Uups, ForkActivation::Block(500)));
-        let err = verify_schedule_shape(&profile, 0).unwrap_err();
+        let err = verify_schedule_shape(&profile, true).unwrap_err();
         assert!(err.to_string().contains("Uups"));
     }
 
     /// Set A forks at Never are disallowed.
-    #[ignore = "new-chain (head == 0) rule deferred to the follow-up PR; the head = 1 duplicate below covers the active relaxed rules"]
     #[test]
     fn set_a_at_never_is_disallowed() {
         let profile =
             new_chain_profile(99_999, (RaylsHardFork::AdminTransfer, ForkActivation::Never));
-        assert!(verify_schedule_shape(&profile, 0)
+        assert!(verify_schedule_shape(&profile, true)
             .unwrap_err()
             .to_string()
             .contains("AdminTransfer"));
         let profile = new_chain_profile(99_999, (RaylsHardFork::RlsStorage, ForkActivation::Never));
-        assert!(verify_schedule_shape(&profile, 0).unwrap_err().to_string().contains("RlsStorage"));
+        assert!(verify_schedule_shape(&profile, true)
+            .unwrap_err()
+            .to_string()
+            .contains("RlsStorage"));
         let profile = new_chain_profile(99_999, (RaylsHardFork::Tokenomics, ForkActivation::Never));
-        assert!(verify_schedule_shape(&profile, 0).unwrap_err().to_string().contains("Tokenomics"));
+        assert!(verify_schedule_shape(&profile, true)
+            .unwrap_err()
+            .to_string()
+            .contains("Tokenomics"));
         let profile = new_chain_profile(99_999, (RaylsHardFork::Uups, ForkActivation::Never));
-        assert!(verify_schedule_shape(&profile, 0).unwrap_err().to_string().contains("Uups"));
+        assert!(verify_schedule_shape(&profile, true).unwrap_err().to_string().contains("Uups"));
     }
 
     /// Two independent violations are joined into a single error message.
-    #[ignore = "new-chain (head == 0) rule deferred to the follow-up PR; the head = 1 duplicate below covers the active relaxed rules"]
     #[test]
     fn multiple_violations_are_joined_in_one_message() {
         let mut profile = new_chain_profile(
@@ -320,7 +333,7 @@ mod tests {
         profile
             .hardforks
             .insert(ForkName::from(RaylsHardFork::HybridRewards.name()), ForkActivation::Block(5));
-        let msg = verify_schedule_shape(&profile, 0).unwrap_err().to_string();
+        let msg = verify_schedule_shape(&profile, true).unwrap_err().to_string();
         assert!(msg.contains("Erc20PrecompileBytecode"));
         assert!(msg.contains("HybridRewards"));
     }
@@ -332,23 +345,23 @@ mod tests {
             99_999,
             (RaylsHardFork::EpochCloseSeedV2, ForkActivation::Block(999_999)),
         );
-        assert!(verify_schedule_shape(&profile, 0).is_ok());
+        assert!(verify_schedule_shape(&profile, true).is_ok());
     }
 
-    // --- Existing chains (head > 0): the relaxed rules ----------------------
+    // --- Existing chains (`is_new_chain = false`): the relaxed rules ---------
 
-    /// Mainnet stays excluded from the shape check at any head.
+    /// Mainnet stays excluded from the shape check regardless of chain state.
     #[test]
-    fn mainnet_profile_passes_excluded_at_any_head() {
+    fn mainnet_profile_passes_excluded_regardless_of_chain_state() {
         let profile = NetworkProfile::from_builtin(RaylsNetwork::Mainnet);
-        assert!(verify_schedule_shape(&profile, 1_000_000).is_ok());
+        assert!(verify_schedule_shape(&profile, false).is_ok());
     }
 
     /// An existing chain with the canonical shape passes.
     #[test]
     fn canonical_shape_passes_on_existing_chain() {
         let profile = NetworkProfile::from_builtin(RaylsNetwork::Local);
-        assert!(verify_schedule_shape(&profile, 1000).is_ok());
+        assert!(verify_schedule_shape(&profile, false).is_ok());
     }
 
     /// Set A at Block(0) or Never is allowed on an existing chain.
@@ -361,11 +374,11 @@ mod tests {
             RaylsHardFork::Uups,
         ] {
             let profile = new_chain_profile(99_999, (fork, ForkActivation::Never));
-            assert!(verify_schedule_shape(&profile, 1000).is_ok());
+            assert!(verify_schedule_shape(&profile, false).is_ok());
         }
         let profile =
             new_chain_profile(99_999, (RaylsHardFork::AdminTransfer, ForkActivation::Block(0)));
-        assert!(verify_schedule_shape(&profile, 1000).is_ok());
+        assert!(verify_schedule_shape(&profile, false).is_ok());
     }
 
     /// Set A at Block(> 0) is still refused on an existing chain.
@@ -373,7 +386,7 @@ mod tests {
     fn set_a_at_block_500_is_refused_on_existing_chain() {
         let profile =
             new_chain_profile(99_999, (RaylsHardFork::AdminTransfer, ForkActivation::Block(500)));
-        let err = verify_schedule_shape(&profile, 1000).unwrap_err();
+        let err = verify_schedule_shape(&profile, false).unwrap_err();
         assert!(err.to_string().contains("AdminTransfer"));
     }
 
@@ -385,13 +398,13 @@ mod tests {
             99_999,
             (RaylsHardFork::Erc20PrecompileBytecode, ForkActivation::Never),
         );
-        let err = verify_schedule_shape(&profile, 1000).unwrap_err();
+        let err = verify_schedule_shape(&profile, false).unwrap_err();
         assert!(err.to_string().contains("Erc20PrecompileBytecode"));
         let profile = new_chain_profile(
             99_999,
             (RaylsHardFork::Erc20PrecompileBytecode, ForkActivation::Block(5)),
         );
-        let err = verify_schedule_shape(&profile, 1000).unwrap_err();
+        let err = verify_schedule_shape(&profile, false).unwrap_err();
         assert!(err.to_string().contains("Erc20PrecompileBytecode"));
     }
 
@@ -403,12 +416,12 @@ mod tests {
             99_999,
             (RaylsHardFork::UsdrSupplyCorrection, ForkActivation::Block(1)),
         );
-        assert!(verify_schedule_shape(&profile, 1000).is_ok());
+        assert!(verify_schedule_shape(&profile, false).is_ok());
         let profile = new_chain_profile(
             99_999,
             (RaylsHardFork::UsdrSupplyCorrection, ForkActivation::Block(1_000_000)),
         );
-        assert!(verify_schedule_shape(&profile, 1000).is_ok());
+        assert!(verify_schedule_shape(&profile, false).is_ok());
     }
 
     /// HybridRewards at Never or Block(>= 1) is allowed on an existing chain.
@@ -416,10 +429,10 @@ mod tests {
     fn hybrid_never_or_future_passes_on_existing_chain() {
         let profile =
             new_chain_profile(99_999, (RaylsHardFork::HybridRewards, ForkActivation::Never));
-        assert!(verify_schedule_shape(&profile, 1000).is_ok());
+        assert!(verify_schedule_shape(&profile, false).is_ok());
         let profile =
             new_chain_profile(99_999, (RaylsHardFork::HybridRewards, ForkActivation::Block(5)));
-        assert!(verify_schedule_shape(&profile, 1000).is_ok());
+        assert!(verify_schedule_shape(&profile, false).is_ok());
     }
 
     /// HybridRewards at Block(0) is refused on an existing chain — the devnet
@@ -428,7 +441,7 @@ mod tests {
     fn hybrid_block_0_is_refused_on_existing_chain() {
         let profile =
             new_chain_profile(99_999, (RaylsHardFork::HybridRewards, ForkActivation::Block(0)));
-        let err = verify_schedule_shape(&profile, 1000).unwrap_err();
+        let err = verify_schedule_shape(&profile, false).unwrap_err();
         assert!(err.to_string().contains("HybridRewards"));
     }
 
@@ -439,50 +452,50 @@ mod tests {
         profile
             .hardforks
             .insert(ForkName::from(RaylsHardFork::HybridRewards.name()), ForkActivation::Block(0));
-        let err = verify_schedule_shape(&profile, 1000).unwrap_err();
+        let err = verify_schedule_shape(&profile, false).unwrap_err();
         assert!(err.to_string().contains("HybridRewards"));
     }
 
-    /// Duplicates of the `#[ignore]`d new-chain tests above, run at
-    /// `head = 1` against the relaxed rules that are active today.
+    /// Contrasts with the new-chain tests above: the same deviations run at
+    /// `is_new_chain = false` against the relaxed rules.
 
     /// UsdrSupplyCorrection = Block(1) is allowed on an existing chain
-    /// (warning-only, never a violation). Duplicate of the ignored
-    /// `usdr_supply_correction_block_1_is_refused`, which asserts the
-    /// stricter new-chain rule (exactly `Never`).
+    /// (warning-only, never a violation), in contrast to the stricter
+    /// new-chain rule (exactly `Never`) asserted by
+    /// `usdr_supply_correction_block_1_is_refused` with `is_new_chain = true`.
     #[test]
     fn usdr_supply_correction_block_1_is_allowed_on_existing_chain() {
         let profile = new_chain_profile(
             99_999,
             (RaylsHardFork::UsdrSupplyCorrection, ForkActivation::Block(1)),
         );
-        assert!(verify_schedule_shape(&profile, 1).is_ok());
+        assert!(verify_schedule_shape(&profile, false).is_ok());
     }
 
-    /// HybridRewards = Never is allowed on an existing chain. Duplicate of
-    /// the ignored `hybrid_never_is_refused`, which asserts the stricter
-    /// new-chain rule (exactly `Block(1)`).
+    /// HybridRewards = Never is allowed on an existing chain, in contrast to
+    /// the stricter new-chain rule (exactly `Block(1)`) asserted by
+    /// `hybrid_never_is_refused` with `is_new_chain = true`.
     #[test]
     fn hybrid_never_is_allowed_on_existing_chain() {
         let profile =
             new_chain_profile(99_999, (RaylsHardFork::HybridRewards, ForkActivation::Never));
-        assert!(verify_schedule_shape(&profile, 1).is_ok());
+        assert!(verify_schedule_shape(&profile, false).is_ok());
     }
 
     /// HybridRewards = Block(5) is allowed on an existing chain
-    /// (`Never` or `Block(>= 1)`). Duplicate of the ignored
-    /// `hybrid_block_5_is_refused_on_new_chain`, which asserts the
-    /// stricter new-chain rule (exactly `Block(1)`).
+    /// (`Never` or `Block(>= 1)`), in contrast to the stricter new-chain
+    /// rule (exactly `Block(1)`) asserted by
+    /// `hybrid_block_5_is_refused_on_new_chain` with `is_new_chain = true`.
     #[test]
     fn hybrid_block_5_is_allowed_on_existing_chain() {
         let profile =
             new_chain_profile(99_999, (RaylsHardFork::HybridRewards, ForkActivation::Block(5)));
-        assert!(verify_schedule_shape(&profile, 1).is_ok());
+        assert!(verify_schedule_shape(&profile, false).is_ok());
     }
 
-    /// Set A forks at Never are allowed on an existing chain. Duplicate of
-    /// the ignored `set_a_at_never_is_disallowed`, which asserts the
-    /// stricter new-chain rule (`Block(0)` only).
+    /// Set A forks at Never are allowed on an existing chain, in contrast to
+    /// the stricter new-chain rule (`Block(0)` only) asserted by
+    /// `set_a_at_never_is_disallowed` with `is_new_chain = true`.
     #[test]
     fn set_a_at_never_is_allowed_on_existing_chain() {
         for fork in [
@@ -492,15 +505,16 @@ mod tests {
             RaylsHardFork::Uups,
         ] {
             let profile = new_chain_profile(99_999, (fork, ForkActivation::Never));
-            assert!(verify_schedule_shape(&profile, 1).is_ok());
+            assert!(verify_schedule_shape(&profile, false).is_ok());
         }
     }
 
     /// Two independent violations are joined into a single error message on
-    /// an existing chain. Duplicate of the ignored
-    /// `multiple_violations_are_joined_in_one_message`: `HybridRewards =
-    /// Block(5)` is legal on an existing chain, so the second violation is
-    /// `Block(0)` instead, which is still refused.
+    /// an existing chain. Contrasts with
+    /// `multiple_violations_are_joined_in_one_message` with
+    /// `is_new_chain = true`:
+    /// `HybridRewards = Block(5)` is legal on an existing chain, so the
+    /// second violation is `Block(0)` instead, which is still refused.
     #[test]
     fn multiple_violations_are_joined_in_one_message_on_existing_chain() {
         let mut profile = new_chain_profile(
@@ -510,7 +524,7 @@ mod tests {
         profile
             .hardforks
             .insert(ForkName::from(RaylsHardFork::HybridRewards.name()), ForkActivation::Block(0));
-        let msg = verify_schedule_shape(&profile, 1).unwrap_err().to_string();
+        let msg = verify_schedule_shape(&profile, false).unwrap_err().to_string();
         assert!(msg.contains("Erc20PrecompileBytecode"));
         assert!(msg.contains("HybridRewards"));
     }

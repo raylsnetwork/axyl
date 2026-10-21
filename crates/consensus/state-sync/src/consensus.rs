@@ -1,6 +1,9 @@
 //! Tasks and helpers for collecting consensus headers trustlessly.
 use futures::{stream::FuturesUnordered, StreamExt};
-use rayls_consensus_primary::{network::PrimaryNetworkHandle, ConsensusBus};
+use rayls_consensus_primary::{
+    network::{is_no_consensus_output, NetworkError, PrimaryNetworkHandle},
+    ConsensusBus,
+};
 use rayls_infrastructure_config::ConsensusConfig;
 use rayls_infrastructure_storage::{
     tables::{ConsensusBlockNumbersByDigest, ConsensusBlocks, ConsensusBlocksCache},
@@ -316,9 +319,13 @@ impl<DB: ReDatabase> WalkSession<DB> {
     }
 }
 
-/// Probe all committee peers concurrently, return the highest header above `current`.
-/// BLS is re-verified downstream in `get_consensus_header`.
-async fn probe_peers_for_latest<DB: ReDatabase>(
+/// Probe all committee peers concurrently, returning the highest header above `current`.
+///
+/// Responses are not BLS-verified; callers that rely on a header must verify it
+/// themselves (the state-sync path re-verifies it in `get_consensus_header`).
+/// Returns `None` when no peer answers, or when every answering peer reports a
+/// header at or below `current`.
+pub async fn probe_peers_for_latest<DB: ReDatabase>(
     current: u64,
     config: &ConsensusConfig<DB>,
     network: &PrimaryNetworkHandle,
@@ -338,6 +345,76 @@ async fn probe_peers_for_latest<DB: ReDatabase>(
         }
     }
     best
+}
+
+/// What a boot-time peer-head probe found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BootHeadProbe {
+    /// No other committee primary exists: there is nobody to ask.
+    NoPeers,
+    /// At least one peer answered. `head` is a non-zero consensus-output number reported by one
+    /// of them, or `None` when every answering peer has produced no output yet (a chain still at
+    /// genesis).
+    Responded { head: Option<u64> },
+    /// Peers exist but none reported its chain state (all unreachable, their response channels
+    /// closed, or every answer was an RPC error that does not report the chain's state).
+    NoResponse,
+}
+
+/// Probe all committee peers for the highest consensus-output number any of them has.
+///
+/// Unlike [`probe_peers_for_latest`], this keeps the distinction the boot-time schedule shape
+/// gate needs: a peer that answers with
+/// [`NO_CONSENSUS_OUTPUT`](rayls_consensus_primary::network::NO_CONSENSUS_OUTPUT) (a chain still
+/// at genesis cannot report a header at number 0, so it answers with that RPC error) counts as a
+/// response at height 0, while any other error counts as no response. Non-genesis RPC errors -
+/// the peer cannot map us yet, or the response came in the wrong shape - say nothing about the
+/// peer's chain state, so they must not be mistaken for genesis. The gate refuses to start when
+/// no peer reports its chain state rather than guessing it.
+///
+/// Returns as soon as any peer reports a non-zero output (the chain exists, no further answers
+/// needed); otherwise waits for every peer to answer, so a partial set of genesis responses
+/// with other peers still silent stays a timeout for the caller.
+pub async fn probe_peers_for_boot_head<DB: ReDatabase>(
+    config: &ConsensusConfig<DB>,
+    network: &PrimaryNetworkHandle,
+) -> BootHeadProbe {
+    let peers = config.committee().others_primaries_by_id(config.authority_id().as_ref());
+    if peers.is_empty() {
+        return BootHeadProbe::NoPeers;
+    }
+
+    let mut inflight: FuturesUnordered<_> = peers
+        .into_iter()
+        .map(|(_, peer)| async move {
+            match network.request_consensus_from_peer(peer, None, None).await {
+                Ok(header) => Some(header.number),
+                // The peer answered that it has no consensus output yet, so it is still at
+                // genesis (height 0). This is the only RPC error that reports the state of the
+                // peer's chain.
+                Err(NetworkError::RPCError(msg)) if is_no_consensus_output(&msg) => Some(0),
+                // Any other failure - transport, timeout, or an RPC error that does not report
+                // the chain's state - is no usable answer.
+                Err(_) => None,
+            }
+        })
+        .collect();
+
+    let mut responded = false;
+    while let Some(result) = inflight.next().await {
+        if let Some(number) = result {
+            responded = true;
+            if number > 0 {
+                return BootHeadProbe::Responded { head: Some(number) };
+            }
+        }
+    }
+
+    if responded {
+        BootHeadProbe::Responded { head: None }
+    } else {
+        BootHeadProbe::NoResponse
+    }
 }
 
 /// Blocks until a backwards walk is warranted, returning the tip hash to walk toward.

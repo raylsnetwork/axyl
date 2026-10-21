@@ -57,7 +57,7 @@ mod schedule_record_tests {
 
     fn boot(dir: &Path, config: &RethConfig, network: RaylsNetwork) -> eyre::Result<()> {
         let dir = dir.to_path_buf();
-        verify_schedule_record(&dir, config, &NetworkProfile::from_builtin(network))
+        verify_schedule_record(&dir, config, &NetworkProfile::from_builtin(network)).map(|_| ())
     }
 
     #[test]
@@ -81,6 +81,26 @@ mod schedule_record_tests {
         // `never` forks are recorded explicitly: the record is a complete
         // snapshot of the selected schedule.
         assert_eq!(record.hardforks.get(&ForkName::from("Uups")), Some(&ForkActivation::Block(0)));
+    }
+
+    /// The epoch manager uses this flag to decide whether it may roll the
+    /// record back after a shape refusal: only a record this boot created is
+    /// safe to delete.
+    #[test]
+    fn reports_whether_this_boot_created_the_record() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = node_config(dir.path());
+        let dir = dir.path().to_path_buf();
+        let profile = NetworkProfile::from_builtin(RaylsNetwork::Local);
+
+        assert!(
+            verify_schedule_record(&dir, &config, &profile).expect("first boot passes"),
+            "a fresh datadir's record is created by this boot"
+        );
+        assert!(
+            !verify_schedule_record(&dir, &config, &profile).expect("second boot passes"),
+            "an existing record is not created by this boot"
+        );
     }
 
     #[test]

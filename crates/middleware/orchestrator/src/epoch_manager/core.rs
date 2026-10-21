@@ -26,11 +26,16 @@ use eyre::eyre;
 use futures::FutureExt;
 use rayls_consensus_primary::{network::PrimaryNetworkHandle, ConsensusBus, NodeMode, QueChannel};
 use rayls_consensus_state_sync::{
-    epoch_committee_valid, epoch_record_valid, spawn_epoch_record_collector,
+    epoch_committee_valid, epoch_record_valid, probe_peers_for_boot_head,
+    spawn_epoch_record_collector, BootHeadProbe,
 };
 use rayls_consensus_worker::{quorum_waiter::QuorumWaiterTrait, Worker};
-use rayls_execution_evm::{reth_env::RethEnv, system_calls::EpochState};
-use rayls_infrastructure_config::{KeyConfig, LibP2pConfig, NetworkConfig, RaylsDirs};
+use rayls_execution_evm::{
+    reth_env::RethEnv, system_calls::EpochState, verify_schedule_shape, NetworkProfile,
+};
+use rayls_infrastructure_config::{
+    ConsensusConfig, KeyConfig, LibP2pConfig, NetworkConfig, RaylsDirs,
+};
 use rayls_infrastructure_storage::{
     tables::ConsensusBlocks, EpochStore as _, PENDING_RECORD_LOG_TARGET,
 };
@@ -75,6 +80,14 @@ const CERTIFICATION_RETRY_BACKOFF: Duration = Duration::from_secs(30);
 /// requests per hour instead of a hundred every two minutes, while the retry itself never stops.
 const MAX_CERTIFICATION_RETRY_BACKOFF: Duration = Duration::from_secs(15 * 60);
 
+/// Overall wall-clock budget for the boot-time peer-head probe.
+///
+/// The probe decides the new-chain vs. existing-chain rule set for a datadir
+/// with no executed blocks; a slow or partitioned peer set must not delay
+/// startup indefinitely. When it expires without any peer answering, the gate
+/// refuses the boot (the chain's state cannot be determined).
+const BOOT_HEAD_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Backoff before certification attempt `attempt + 1`, after `attempt` (1-based) failed:
 /// [`CERTIFICATION_RETRY_BACKOFF`] doubled per failed attempt, capped at
 /// [`MAX_CERTIFICATION_RETRY_BACKOFF`].
@@ -116,6 +129,94 @@ pub(crate) fn forget_certified_attempts(
 ) {
     let mut attempts = attempts.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     attempts.retain(|epoch, _| !certified(*epoch));
+}
+
+/// What the boot-time schedule shape gate did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BootShapeGateOutcome {
+    /// The selected schedule passed the gate.
+    Verified,
+    /// The node shut down while the peer probe was running; the gate was skipped.
+    Shutdown,
+}
+
+/// Verify the selected schedule against the boot-time shape of the chain.
+///
+/// Called only for a datadir with no executed blocks (`local_head == 0`): a datadir with
+/// executed history is an existing chain on its own, and the CLI already checked it fail-fast
+/// before launching the node (see `build_and_launch` in `rayls-network-cli`). A fresh datadir
+/// may be a new chain or a node joining an existing chain, so the peer set is probed:
+///
+/// - a peer-reported consensus output means the chain already exists (relaxed rules);
+/// - a peer that answers with the explicit "no consensus output yet" error
+///   ([`rayls_consensus_primary::network::NO_CONSENSUS_OUTPUT`]) means the chain is still at
+///   genesis (strict rules), as does a single-validator committee, which has nobody to ask. Any
+///   other RPC error does not report the peer's chain state and counts as no answer;
+/// - peers exist but none reports its chain state within [`BOOT_HEAD_PROBE_TIMEOUT`] means the
+///   chain's state is unknowable, so the boot is refused rather than guessed. The caller
+///   ([`run_epoch`]) rolls back any schedule record this boot created and propagates the error,
+///   which the epoch manager's teardown turns into a graceful, non-zero shutdown.
+///
+/// The peer-reported number is an unverified consensus-output sequence number, not an execution
+/// height; only zero vs. non-zero matters here. An over-report only moves the gate toward the
+/// relaxed existing-chain rules, and the schedule-record gate still guards the executed history
+/// per datadir.
+pub(crate) async fn verify_boot_schedule_shape<DB: ReDatabase>(
+    profile: &NetworkProfile,
+    consensus_config: &ConsensusConfig<DB>,
+    network: &PrimaryNetworkHandle,
+    shutdown: &Noticer,
+) -> eyre::Result<BootShapeGateOutcome> {
+    let probe = tokio::select! {
+        biased;
+        _ = shutdown => {
+            info!(
+                target: "epoch-manager",
+                "node shutdown during the boot schedule shape probe; skipping the gate"
+            );
+            return Ok(BootShapeGateOutcome::Shutdown);
+        }
+        result = tokio::time::timeout(
+            BOOT_HEAD_PROBE_TIMEOUT,
+            probe_peers_for_boot_head(consensus_config, network),
+        ) => result,
+    };
+
+    let peer_head = match probe {
+        Ok(BootHeadProbe::Responded { head }) => head,
+        Ok(BootHeadProbe::NoPeers) => {
+            // A single-validator committee has no other primary that could hold executed
+            // history, so a fresh datadir is a new chain by definition.
+            None
+        }
+        Ok(BootHeadProbe::NoResponse) => {
+            eyre::bail!(
+                "boot schedule shape gate: the datadir has no executed blocks and no peer \
+                 answered the consensus-head probe, so it cannot be told whether this is a \
+                 new chain or a node joining an existing one; refusing to start"
+            );
+        }
+        Err(_) => {
+            eyre::bail!(
+                "boot schedule shape gate: the datadir has no executed blocks and the peer \
+                 consensus-head probe timed out after {:?}, so it cannot be told whether \
+                 this is a new chain or a node joining an existing one; refusing to start",
+                BOOT_HEAD_PROBE_TIMEOUT
+            );
+        }
+    };
+
+    let new_chain = peer_head.unwrap_or(0) == 0;
+    let rule_set = if new_chain { "new-chain" } else { "existing-chain" };
+    info!(
+        target: "epoch-manager",
+        peer_head = ?peer_head,
+        rule_set,
+        "boot schedule shape gate"
+    );
+
+    verify_schedule_shape(profile, new_chain)?;
+    Ok(BootShapeGateOutcome::Verified)
 }
 
 /// Time allowed for placing one unknown epoch record digest seen in a vote.
@@ -691,6 +792,31 @@ where
         }
     }
 
+    /// Remove a `schedule-record.yaml` created by this boot if the boot-time
+    /// shape gate then refuses the selected schedule. A record that existed
+    /// before this boot is never deleted.
+    fn rollback_created_schedule_record(&self) {
+        if !self.builder.schedule_record_created {
+            return;
+        }
+        let path = self.rayls_datadir.schedule_record_path();
+        match std::fs::remove_file(&path) {
+            Ok(()) => warn!(
+                target: "epoch-manager",
+                path = ?path,
+                "shape gate refused the schedule; removed the record created at this boot"
+            ),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => error!(
+                target: "epoch-manager",
+                path = ?path,
+                ?e,
+                "shape gate refused the schedule but the record created at this boot \
+                 could not be removed"
+            ),
+        }
+    }
+
     /// Run a single epoch.
     ///
     /// If it returns Ok(true) this indicates a mode change occurred and a restart
@@ -719,6 +845,39 @@ where
         let (primary, worker_node, consensus_config) = self
             .create_consensus(engine, &epoch_task_manager, network_config, gas_accumulator.clone())
             .await?;
+
+        // Boot-time schedule shape gate for a fresh datadir (local head 0). A datadir with
+        // executed history was already checked fail-fast by the CLI before the node launched;
+        // a fresh one may instead be a node joining an existing chain, which only the peer
+        // probe can tell apart. `create_consensus` has dialed the primary network and waited
+        // for its quorum, which the probe needs. Keep this before `recover_partial_transition`
+        // and `primary.start` below: the latter spawns the certifier, proposer, Bullshark, and
+        // the subscriber whose `GetMissingConsensus` replay feeds the engine directly, so a
+        // schedule refused here must not have executed or certified anything first. Boot-time
+        // only: the schedule source is immutable for the process lifetime, so the gate runs
+        // once, on the initial epoch.
+        if self.initial_epoch {
+            let local_head = engine.get_reth_env().await.lookup_head()?.number;
+            if local_head == 0 {
+                let network = primary.network_handle().await;
+                match verify_boot_schedule_shape(
+                    &self.builder.profile,
+                    &consensus_config,
+                    &network,
+                    &node_ended,
+                )
+                .await
+                {
+                    Ok(BootShapeGateOutcome::Verified) => {}
+                    Ok(BootShapeGateOutcome::Shutdown) => return Ok(()),
+                    Err(err) => {
+                        self.rollback_created_schedule_record();
+                        return Err(err);
+                    }
+                }
+            }
+        }
+
         // Epoch boundary for this epoch, fixed at config creation. Snapshotted here and handed to
         // detect_epoch_boundary by value (no shared/atomic state on the bus).
         let epoch_boundary = consensus_config.epoch_boundary();

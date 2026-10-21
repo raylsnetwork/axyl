@@ -7,7 +7,8 @@
 //! re-established on the next boot (trust-on-first-use); a record predating a
 //! fork activated within the executed history is refused with its remedy; a
 //! config-file `chain_id` mismatch and an unknown `--subnet` are both refused
-//! at boot.
+//! at boot; and a fresh datadir refused by the shape gate rolls back the
+//! schedule record that boot created.
 //!
 //! Needs the `dev-single-node-setup` feature: the `dev` subcommand and the
 //! single-validator `--dev` gate only exist in dev builds.
@@ -133,9 +134,8 @@ async fn wait_for_rpc(url: &str) -> eyre::Result<()> {
     Ok(())
 }
 
-/// Wait for the boot to be refused: the process must exit non-zero on its own
-/// (a refusal happens pre-launch, so the node never serves RPC). Returns the
-/// captured stderr.
+/// Wait for the boot to be refused: the process must exit non-zero on its own.
+/// Returns the captured stderr.
 async fn wait_for_refusal(
     mut child: Child,
     mut stderr: ChildStderr,
@@ -149,7 +149,7 @@ async fn wait_for_refusal(
                     let _ = child.kill();
                     return Err(eyre::eyre!(
                         "node was still running 120s after a boot under a tampered schedule \
-                         (the gate should have refused it pre-launch)"
+                         (the gate should have refused it)"
                     ));
                 }
                 tokio::time::sleep(Duration::from_millis(250)).await;
@@ -362,6 +362,61 @@ async fn schedule_record_gate_on_real_boots() -> eyre::Result<()> {
     assert!(!status.success(), "an unknown --subnet must be refused");
     assert!(output.contains("stagenet"), "the refusal should name the requested subnet: {output}");
     assert!(output.contains("local"), "the refusal should list the file's subnets: {output}");
+
+    Ok(())
+}
+
+/// The shape gate needs the primary network, but must still run before the primary (and the
+/// subscriber's replay) starts. A fresh dev datadir with a config file that violates the
+/// canonical new-chain shape is refused, and the record written during that boot is rolled
+/// back so a corrected schedule records cleanly on the next boot.
+#[ignore = "boots full dev nodes; run independently from other it tests"]
+#[tokio::test]
+async fn shape_gate_refuses_invalid_new_chain_and_rolls_back_record() -> eyre::Result<()> {
+    let _guard = e2e_tests::IT_TEST_MUTEX.lock();
+    init_test_tracing();
+
+    let temp = tempfile::TempDir::with_prefix("sched_shape_e2e")?;
+    let datadir = temp.path().join("datadir");
+    std::fs::create_dir_all(&datadir)?;
+
+    // Valid for the schedule-record gate (no record, head 0) but invalid for the new-chain
+    // shape: AdminTransfer is a Set A fork pinned to Block(0), not Never.
+    let bad = write_config_file(
+        temp.path(),
+        "bad-new-chain.yaml",
+        &local_profile_setting("AdminTransfer", ForkActivation::Never),
+    );
+    let port = get_available_tcp_port("127.0.0.1")
+        .ok_or_else(|| eyre::eyre!("no free tcp port for the shape-gate node"))?;
+
+    let mut command = get_rayls_network_binary().command();
+    command
+        .arg("dev")
+        .arg("--datadir")
+        .arg(&*datadir.to_string_lossy())
+        .arg("--no-dashboard")
+        .arg("--http.port")
+        .arg(port.to_string())
+        .arg("--config-file")
+        .arg(&*bad.to_string_lossy())
+        .arg("--subnet")
+        .arg("local");
+    let mut child =
+        command.stdout(Stdio::null()).stderr(Stdio::piped()).spawn().expect("node spawns");
+    let stderr = child.stderr.take().expect("stderr piped");
+
+    let (status, output) = wait_for_refusal(child, stderr).await?;
+    assert!(!status.success(), "a new-chain shape violation must be refused: {output}");
+    assert!(
+        output.contains("canonical new-chain shape"),
+        "the refusal should name the strict rule set: {output}"
+    );
+    assert!(output.contains("AdminTransfer"), "the refusal should name the fork: {output}");
+    assert!(
+        !datadir.join("schedule-record.yaml").exists(),
+        "a refused first boot must roll back the record it created"
+    );
 
     Ok(())
 }

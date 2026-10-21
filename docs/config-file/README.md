@@ -189,9 +189,9 @@ The template ships the canonical new-chain schedule, so if you use it as-is (cha
 only `chain_id`) you are done. Of the 17 forks:
 
 - **Seven are pinned** by the boot shape gate (`verify_schedule_shape`) while
-  the chain has no blocks: the node refuses to start a new chain (head `0`) if
-  any of them deviates. They are the migration forks whose values the genesis
-  requires. Once the chain has blocks the gate relaxes (below).
+  the chain has no executed blocks anywhere: the node refuses to start a new
+  chain if any of them deviates. They are the migration forks whose values the
+  genesis requires. Once the chain has blocks the gate relaxes (below).
 - **Ten are behavioral** and free to choose: `0` (on from genesis), `never` (off),
   or a future block (activate later — section 3). The canonical schedule turns all
   ten on from genesis.
@@ -227,7 +227,12 @@ head). A boundary still in the future may be changed — that is how agreed sche
 updates ship — and the node warns about the change and re-records the new schedule.
 
 The boot shape gate relaxes at the same time: it enforces the strict new-chain
-pinned values only while the datadir has no executed blocks (head `0`). Once the
+pinned values only while the chain has no executed blocks anywhere — the
+datadir's head is zero and either the committee has no other validator or the
+peers that answered all reported that they have no consensus output yet (at
+least one of them must). A datadir with executed history is checked fail-fast
+before the node starts; a fresh datadir where peers exist but none reports its
+chain state refuses to start instead of guessing. Once the
 chain has blocks it checks the relaxed shape instead — Set A forks
 (`AdminTransfer`, `RlsStorage`, `Tokenomics`, `Uups`) at `0` or `never`,
 `Erc20PrecompileBytecode` still exactly `1`, `UsdrSupplyCorrection` at any value

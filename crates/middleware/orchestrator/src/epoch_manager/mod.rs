@@ -20,7 +20,9 @@ pub(crate) use utils::{open_consensus_db, recover_executed_anchor};
 pub(crate) use types::*;
 
 #[cfg(test)]
-pub(crate) use core::{await_execution_replay, ReplayWaitOutcome};
+pub(crate) use core::{
+    await_execution_replay, verify_boot_schedule_shape, BootShapeGateOutcome, ReplayWaitOutcome,
+};
 
 #[cfg(test)]
 pub(crate) use network::{decide_node_mode, node_has_local_history};

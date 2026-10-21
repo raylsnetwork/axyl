@@ -106,6 +106,8 @@ fn execution_builder<CliExt: clap::Args + fmt::Debug>(
         ),
         rayls_infrastructure_config,
         profile,
+        // Tests bypass the CLI boot gate, so no schedule record is created.
+        false,
         opt_faucet_args,
         None,
         healthcheck,
@@ -156,6 +158,8 @@ pub async fn faucet_test_execution_node(
         node_config.clone(),
         rayls_infrastructure_config,
         profile,
+        // Tests bypass the CLI boot gate, so no schedule record is created.
+        false,
         Some(faucet),
         None,
         healthcheck,

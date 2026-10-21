@@ -199,12 +199,12 @@ async fn run(cli: Cli) -> eyre::Result<()> {
     let snapshot_head =
         verify_snapshot_schedule_record(&cli.snapshot_datadir, &base_chain, &selected.profile)?;
 
-    // The selected schedule must match the canonical shape of its network
-    // family: a greenfield chain (head 0) on the strict new-chain rules, an
-    // executed chain on the relaxed rules. Mainnet/testnet are excluded
-    // inside the gate (frozen in CI and guarded per datadir by the record
-    // check above).
-    verify_schedule_shape(&selected.profile, snapshot_head)?;
+    // Unlike the node's boot gate — which must probe peers for the chain's
+    // live height because the node's datadir may be empty while the chain
+    // already has history — the snapshot IS the archive source: its head
+    // carries the chain's executed history, so it is a reliable new-vs-
+    // existing signal without any network probe.
+    verify_schedule_shape(&selected.profile, snapshot_head == 0)?;
     info!(
         target: "rayls_replay::main",
         source = %selected.source,
