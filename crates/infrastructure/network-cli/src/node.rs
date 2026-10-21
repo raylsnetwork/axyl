@@ -15,7 +15,7 @@ use rayls_execution_evm::{
 use rayls_infrastructure_config::Config;
 // dev-only: reading the committee file for the single-validator gating check
 #[cfg(feature = "dev-single-node-setup")]
-use rayls_infrastructure_config::{ConfigFmt, ConfigTrait as _};
+use rayls_infrastructure_config::{ConfigFmt, ConfigTrait as _, RaylsDirs as _};
 #[cfg(feature = "dev-single-node-setup")]
 use rayls_infrastructure_types::Committee;
 use rayls_infrastructure_types::{BuildMetadata, RaylsNetwork};
