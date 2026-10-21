@@ -851,6 +851,14 @@ where
         number: Option<u64>,
         hash: Option<BlockHash>,
     ) -> PrimaryNetworkResult<PrimaryResponse> {
+        // Test-only: a latest-header reply, and a by-hash reply for the fake header, may be
+        // overridden to reproduce the tip-probe-number issue. Compiled out of production builds,
+        // and inert unless the serving process is armed by environment.
+        #[cfg(feature = "byzantine-test-hooks")]
+        if let Some(fake) = super::tip_probe_byzantine::override_tip_probe(number, hash) {
+            return Ok(PrimaryResponse::ConsensusHeader(Arc::new(fake)));
+        }
+
         let header = match (number, hash) {
             (_, Some(hash)) => self.get_header_by_hash(hash)?,
             (Some(number), _) => self.get_header_by_number(number)?,
