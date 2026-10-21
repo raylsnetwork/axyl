@@ -291,6 +291,66 @@ async fn test_vote_own_parent_signers_checked_against_the_stored_parent() -> eyr
     Ok(())
 }
 
+/// The other half of the parent-copy rule: a voter that does not hold the author's round-1
+/// certificate asks for the parents, receives them with the retried request, verifies and
+/// stores them, and compares the claim against that shipped copy.
+#[tokio::test]
+async fn test_vote_own_parent_signers_checked_against_the_shipped_parent() -> eyre::Result<()> {
+    use crate::network::message::PrimaryResponse;
+    type Claim = fn(&Certificate) -> roaring::RoaringBitmap;
+
+    let vote = |claim_of: Claim| async move {
+        let TestTypes { committee, handler, parent, task_manager: _task_manager, .. } =
+            create_test_types_with(true);
+        let author = committee.last_authority();
+        let peer = *author.authority().protocol_key();
+        let exec = BlockNumHash::new(parent.number(), parent.hash());
+
+        let own_cert = committee
+            .certificate(&author.header_builder(&committee.committee()).created_at(1).build());
+        let mut parents: Vec<Certificate> = committee
+            .authorities()
+            .filter(|a| a.id() != author.id())
+            .take(2)
+            .map(|a| {
+                committee
+                    .certificate(&a.header_builder(&committee.committee()).created_at(1).build())
+            })
+            .collect();
+        parents.push(own_cert.clone());
+
+        let header = author
+            .header_builder(&committee.committee())
+            .round(2)
+            .parents(parents.iter().map(|c| c.digest()).collect())
+            .latest_execution_block(exec)
+            .created_at(2)
+            .own_parent_signers(Some(claim_of(&own_cert)))
+            .build();
+
+        // nothing stored: the first request comes back asking for the parents
+        let missing = match handler.vote(peer, header.clone(), Vec::new()).await {
+            Ok(PrimaryResponse::MissingParents(missing)) => missing,
+            other => panic!("expected MissingParents, got {other:?}"),
+        };
+        assert_eq!(missing.len(), parents.len());
+        // the retry ships them: verified, stored, and the claim is compared with that copy
+        handler.vote(peer, header, parents).await
+    };
+
+    let res = vote(|own| own.signed_authorities().clone()).await;
+    assert!(matches!(res, Ok(PrimaryResponse::Vote(_))), "{res:?}");
+    let res = vote(|_| roaring::RoaringBitmap::new()).await;
+    assert!(
+        matches!(
+            res,
+            Err(PrimaryNetworkError::InvalidHeader(HeaderError::OwnParentSignersMismatch { .. }))
+        ),
+        "{res:?}"
+    );
+    Ok(())
+}
+
 /// Before the fork a claim is refused, so no proposer can start the new layout early.
 #[tokio::test]
 async fn test_vote_fails_own_parent_signers_before_fork() -> eyre::Result<()> {

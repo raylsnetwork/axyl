@@ -777,17 +777,19 @@ where
         // that already held one, not "what the whole network saw". That is enough: the tally reads
         // the committed claim and never a local bitmap. Two variants can also exist with no bad
         // actor, e.g. an honest proposer re-aggregating after a crash, hence only a Mild penalty.
-        let expected = parents
-            .iter()
-            .find(|parent| parent.origin() == header.author())
-            .map(|parent| parent.signed_authorities().clone())
-            .unwrap_or_default();
+        let own_parent = parents.iter().find(|parent| parent.origin() == header.author());
         // compare the values, not the bitmaps: roaring's equality is false across store kinds
+        let matches = match own_parent {
+            Some(parent) => claimed.iter().eq(parent.signed_authorities().iter()),
+            None => claimed.is_empty(),
+        };
         ensure!(
-            claimed.iter().eq(expected.iter()),
+            matches,
             HeaderError::OwnParentSignersMismatch {
                 claimed: claimed.iter().collect(),
-                expected: expected.iter().collect(),
+                expected: own_parent
+                    .map(|p| p.signed_authorities().iter().collect())
+                    .unwrap_or_default(),
             }
             .into()
         );
