@@ -179,10 +179,9 @@ This is why behavioral forks are:
   at `Never` or `Block(>= 1)`. The canonical new-chain values (section 2)
   are recommended but not enforced. The schedule-record gate then protects
   the executed history per datadir.
-- A new chain via `--config-file` must enumerate all 17 forks because the
-  parser requires every known fork. A missing `Erc20PrecompileBytecode`
-  resolves to `Never` and is refused by the shape gate — that is intentional
-  (catches the EIP-161 exposure). A missing `HybridRewards` resolves to
-  `Never`, which the relaxed rules allow.
+- A new chain via `--config-file` must enumerate all forks; a partial
+  file is refused at load by the completeness check. Setting
+  `Erc20PrecompileBytecode: never` explicitly is refused by the shape gate
+  (catches the EIP-161 exposure); `HybridRewards: never` is allowed.
 - The shape check runs **before** the schedule-record write, so a refused
   boot never pollutes the datadir via trust-on-first-use.
