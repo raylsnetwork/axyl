@@ -122,6 +122,12 @@ mod tests {
     /// Before the normalize-on-deserialize fix in `RoaringBitmapSerde`,
     /// re-encoding this certificate panicked with "attempt to subtract with
     /// overflow" in roaring's serializer.
+    ///
+    /// The fuzzer's header had a random epoch with bit 31 set, which the
+    /// `HeaderParentSigners` layout reads as "signer claim follows". Byte 39
+    /// (the epoch's top byte) was changed from 0xff to 0x7f so the input stays a
+    /// legacy-layout certificate; the roaring bytes that trigger the crash are
+    /// untouched.
     const ROARING_EMPTY_CONTAINER_CRASH: &[u8] =
         include_bytes!("testdata/roaring_empty_container_crash.bin");
 
