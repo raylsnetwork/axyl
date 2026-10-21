@@ -776,7 +776,7 @@ where
         // set of some aggregate-verified certificate for that digest and agrees with every voter
         // that already held one, not "what the whole network saw". That is enough: the tally reads
         // the committed claim and never a local bitmap. Two variants can also exist with no bad
-        // actor, e.g. an honest proposer re-aggregating after a crash, hence the Medium penalty.
+        // actor, e.g. an honest proposer re-aggregating after a crash, hence only a Mild penalty.
         let expected = parents
             .iter()
             .find(|parent| parent.origin() == header.author())

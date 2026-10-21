@@ -5,7 +5,7 @@ use crate::{
     crypto, encode,
     error::{HeaderError, HeaderResult},
     now,
-    serde::{deserialize_normalized_bounded, RoaringBitmapSerde},
+    serde::{deserialize_normalized_bounded, roaring_container_count, RoaringBitmapSerde},
     AuthorityIdentifier, Batch, BlockHash, BlockNumHash, CertificateDigest, Committee, Digest,
     Epoch, Hash, Round, TimestampSec, VoteDigest, WorkerId,
 };
@@ -60,6 +60,20 @@ fn decode_own_parent_signers(bytes: &[u8]) -> std::io::Result<RoaringBitmap> {
                 "own-parent signer claim of {} bytes exceeds {MAX_OWN_PARENT_SIGNERS_BYTES}",
                 bytes.len()
             ),
+        ));
+    }
+    // Committee indices all live in container key 0, so a legitimate claim declares at most one
+    // container (none when empty). Checked off the header before `deserialize_from` builds any
+    // container: a run container is ~10 bytes on the wire and an 8 KiB store once decoded, so
+    // without this a claim within the byte bound could still allocate megabytes before the
+    // value-count check rejected it.
+    let containers = roaring_container_count(bytes).ok_or_else(|| {
+        Error::new(ErrorKind::InvalidData, "own-parent signer claim is not a roaring bitmap")
+    })?;
+    if containers > 1 {
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            format!("own-parent signer claim declares {containers} containers, at most 1 allowed"),
         ));
     }
     deserialize_normalized_bounded(bytes, MAX_OWN_PARENT_SIGNERS)?.ok_or_else(|| {
@@ -791,6 +805,13 @@ mod tests {
         let mut wide = RoaringBitmap::new();
         wide.insert_range(0..(MAX_OWN_PARENT_SIGNERS as u32 + 1));
         bytes = encode(&sample(Some(wide)));
+        assert!(bcs::from_bytes::<Header>(&bytes).is_err());
+        assert!(Header::project_wire(&bytes).is_err());
+
+        // a claim spanning two containers: tiny on the wire and within the value bound, refused
+        // on the declared container count before any container is built
+        let two_containers = RoaringBitmap::from_sorted_iter([1u32, 1 << 16]).unwrap();
+        bytes = encode(&sample(Some(two_containers)));
         assert!(bcs::from_bytes::<Header>(&bytes).is_err());
         assert!(Header::project_wire(&bytes).is_err());
 

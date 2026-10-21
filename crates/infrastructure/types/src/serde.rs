@@ -18,6 +18,30 @@ use serde_with::{DeserializeAs, SerializeAs};
 /// at every roaring deserialization boundary that reads untrusted (peer or disk)
 /// bytes so a malformed bitmap can't crash the node when it is later re-encoded.
 /// See issue #55.
+/// Number of containers a serialized roaring bitmap declares, or `None` for an unknown header.
+///
+/// Read off the fixed header without building anything, so a caller can refuse a bitmap that
+/// declares too many containers before `deserialize_from` materializes them (a run container of
+/// ~10 bytes becomes an 8 KiB store once decoded).
+pub fn roaring_container_count(bytes: &[u8]) -> Option<usize> {
+    // Header of a bitmap without run containers: this cookie, then the container count.
+    const SERIAL_COOKIE_NO_RUNCONTAINER: u32 = 12346;
+    // Header of a bitmap with run containers: this cookie, then the container count minus one.
+    const SERIAL_COOKIE: u16 = 12347;
+    const WORD: usize = size_of::<u32>();
+    let word = |at: usize| -> Option<u32> {
+        Some(u32::from_le_bytes(bytes.get(at..at + WORD)?.try_into().ok()?))
+    };
+    let cookie = word(0)?;
+    if cookie as u16 == SERIAL_COOKIE {
+        Some((cookie >> u16::BITS) as usize + 1)
+    } else if cookie == SERIAL_COOKIE_NO_RUNCONTAINER {
+        Some(word(WORD)? as usize)
+    } else {
+        None
+    }
+}
+
 pub fn deserialize_normalized(bytes: &[u8]) -> std::io::Result<roaring::RoaringBitmap> {
     normalize(roaring::RoaringBitmap::deserialize_from(bytes)?)
 }
