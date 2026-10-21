@@ -12,6 +12,11 @@ pub struct ValidatorRoundTally {
     /// fork is active, rounds whose sub-dag holds a header attesting that this validator signed
     /// its author's previous certificate; before it, rounds whose sub-dag included this
     /// validator's own certificate.
+    ///
+    /// A proposer always votes for its own header, so its own claim always names itself: a
+    /// validator whose certificate landed is credited through its own next header, and one whose
+    /// vote landed in another's certificate is credited through that author's. The post-fork
+    /// signal is therefore a superset of the authorship signal, not a replacement.
     pub participation_rounds: u32,
     /// Committed rounds this validator led ("Anchor Commit Share" component;
     /// identical signal to what [`RewardsBackend::tally`] counts today).
