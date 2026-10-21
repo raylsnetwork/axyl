@@ -11,13 +11,15 @@
 # The number of subnets is not fixed - each client defines its own, one
 # entry per subnet.
 #
-# The `hardforks` map below is the canonical new-chain schedule. Seven of
-# the values are pinned by the boot shape gate (verify_schedule_shape) and
-# the node refuses to start a new chain (head 0) if any of them differs; the
-# other ten are behavioral and free to choose (0, never, or a future block).
-# Once the chain has blocks the gate relaxes (section 5 of
-# docs/config-file/README.md). What each fork does and why each pinned value
-# is pinned: docs/hardforks/README.md.
+# The `hardforks` map below is the canonical new-chain schedule. The boot
+# shape gate (verify_schedule_shape) enforces the relaxed rules for every
+# non-mainnet/testnet chain-id, with no head-dependent strict mode: Set A
+# at 0 or never, Erc20PrecompileBytecode exactly 1, UsdrSupplyCorrection
+# any value (warned when not never), and HybridRewards never or >= 1. The
+# canonical values are recommended but not required; the other ten forks
+# are behavioral and free to choose (0, never, or a future block). What each
+# fork does and why the canonical values are what they are:
+# docs/hardforks/README.md.
 #
 # The only field you must change is `chain_id`: set it to the chain-id you
 # passed to the `genesis` ceremony. At boot the datadir's genesis chain-id

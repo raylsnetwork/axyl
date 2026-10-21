@@ -191,20 +191,13 @@ async fn run(cli: Cli) -> eyre::Result<()> {
                                                                                          // Some, and the shape gate keys on profile.chain_id (from the file)
     verify_datadir_chain_id(base_chain.chain().id(), selected.profile.chain_id, &selected.source)?;
 
-    // The snapshot's executed head decides how the shape gate treats the
-    // selected schedule: the rebuilt chain is only "new" if the snapshot has
-    // no executed blocks (the archive datadir is empty by construction, so
-    // its own head is not a signal). Read-only: replay never writes into the
-    // snapshot datadir.
-    let snapshot_head =
-        verify_snapshot_schedule_record(&cli.snapshot_datadir, &base_chain, &selected.profile)?;
+    // Read-only: replay never writes into the snapshot datadir.
+    verify_snapshot_schedule_record(&cli.snapshot_datadir, &base_chain, &selected.profile)?;
 
-    // The selected schedule must match the canonical shape of its network
-    // family: a greenfield chain (head 0) on the strict new-chain rules, an
-    // executed chain on the relaxed rules. Mainnet/testnet are excluded
-    // inside the gate (frozen in CI and guarded per datadir by the record
-    // check above).
-    verify_schedule_shape(&selected.profile, snapshot_head)?;
+    // The selected schedule must match the relaxed shape of its network
+    // family. Mainnet/testnet are excluded inside the gate (frozen in CI and
+    // guarded per datadir by the record check above).
+    verify_schedule_shape(&selected.profile)?;
     info!(
         target: "rayls_replay::main",
         source = %selected.source,
@@ -584,7 +577,7 @@ fn init_tracing(
 }
 
 /// Verify the selected hardfork schedule against the snapshot's schedule record,
-/// when the snapshot carries one, and return the snapshot's executed head.
+/// when the snapshot carries one.
 ///
 /// A snapshot taken from a node running the schedule-record boot gate carries
 /// `schedule-record.yaml`, pinning the schedule its executed blocks ran under.
@@ -594,14 +587,12 @@ fn init_tracing(
 /// Read-only: replay never writes into the snapshot datadir — the node's gate
 /// re-records, and there is no record here to update. A snapshot without a
 /// record (taken before the feature) is trusted, like the node's no-record
-/// path, minus the write. The returned head is the chain's executed history:
-/// the caller feeds it to the boot shape gate, which then knows whether the
-/// rebuilt chain is new (head 0) or existing.
+/// path, minus the write.
 fn verify_snapshot_schedule_record(
     snapshot_datadir: &Path,
     chain: &Arc<RethChainSpec>,
     profile: &NetworkProfile,
-) -> eyre::Result<u64> {
+) -> eyre::Result<()> {
     // The read/verify is shared with the node's boot gate; the throwaway
     // `RethConfig` exists only for the executed-head read — the snapshot env
     // is not built yet.
@@ -624,5 +615,5 @@ fn verify_snapshot_schedule_record(
             "snapshot schedule record verified against the selected schedule"
         );
     }
-    Ok(verification.head)
+    Ok(())
 }

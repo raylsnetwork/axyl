@@ -9,10 +9,10 @@ use core::fmt;
 use fdlimit::raise_fd_limit;
 use rayls_execution_evm::{
     parse_socket_address,
-    reth_env::{RethCommand, RethConfig, RethEnv},
+    reth_env::{RethCommand, RethConfig},
     verify_datadir_chain_id, verify_schedule_shape, FileSchedule, SelectedSchedule,
 };
-use rayls_infrastructure_config::{Config, RaylsDirs};
+use rayls_infrastructure_config::Config;
 // dev-only: reading the committee file for the single-validator gating check
 #[cfg(feature = "dev-single-node-setup")]
 use rayls_infrastructure_config::{ConfigFmt, ConfigTrait as _};
@@ -334,16 +334,9 @@ impl<Ext: clap::Args + fmt::Debug> NodeCommand<Ext> {
             Arc::new(rayls_infrastructure_config.chain_spec()),
         );
 
-        // The selected schedule must match the canonical shape of its network
-        // family, depending on the datadir's executed head (a single keyed
-        // read over a fresh db handle — no provider built): a chain without
-        // executed history (head 0) must match the canonical new-chain shape
-        // (a greenfield genesis only works with it), an existing chain runs
-        // the relaxed rules and is guarded per datadir by the
-        // schedule-record gate below. Mainnet/testnet are excluded inside the
-        // gate (frozen in CI).
-        let head = RethEnv::best_block_number(&node_config, rl_datadir.reth_db_path())?;
-        verify_schedule_shape(&selected.profile, head)?;
+        // The selected schedule must match the relaxed shape of its network
+        // family and is guarded per datadir by the schedule-record gate below.
+        verify_schedule_shape(&selected.profile)?;
 
         debug!(target: "cli", validator = ?rayls_infrastructure_config.node_info.name, "rl datadir for node command: {rl_datadir:?}");
         info!(target: "cli", validator = ?rayls_infrastructure_config.node_info.name, "config loaded");

@@ -115,7 +115,7 @@ read-only today, so registry owner calls go via `cast send`), and
 [`../contract-upgrades/README.md`](../contract-upgrades/README.md) for the
 upgrade runbook.
 
-### Why exactly these values on a new chain
+### Why these are the canonical new-chain values
 
 A greenfield genesis is initialized by
 `apply_greenfield_fixes` (`reth_env/genesis.rs`), which bakes in:
@@ -123,9 +123,9 @@ A greenfield genesis is initialized by
 - the **pre-hybrid** `ConsensusRegistry` (Set C, pre-hybrid ABI)
 - **no** USDr STOP byte (Set B)
 
-This constrains the new-chain schedule:
+The canonical new-chain schedule therefore uses:
 
-| fork | new-chain value | rationale |
+| fork | canonical value | rationale |
 |------|----------------|-----------|
 | Set A (`AdminTransfer`, `RlsStorage`, `Tokenomics`, `Uups`) | `Block(0)` | The genesis already carries their state. `Block(0)` means "already active at genesis" — the migration bodies never run (`newly_activated_forks` only returns forks that transition between the parent and the block; the first executed block's parent is block 0, where these are already active). |
 | `Erc20PrecompileBytecode` | **exactly `Block(1)`** | The genesis has no STOP byte, so the first post-genesis block must write it. Block 0 is never executed (genesis initializes state directly, no EVM execution). A later block (e.g. 5) leaves a live EIP-161 cleanup exposure window between blocks 1 and 5. |
@@ -133,13 +133,10 @@ This constrains the new-chain schedule:
 | `HybridRewards` | **exactly `Block(1)`** | The genesis bakes the pre-hybrid `ConsensusRegistry`. The 2-arg ABI must not be live at genesis (calling it against the pre-hybrid registry reverts — fatal system call). A new chain starts the complete current protocol from the first block, with no legacy-regime window. |
 | 10 behavioral forks | any value | Business-logic based (see below). |
 
-The one exception to the pinned values: the **devnet** chain-id (`503`) is
-exempt from the `HybridRewards` pin — its baked-in schedule keeps `HybridRewards:
-Never`, and the shape gate skips the `Block(1)` requirement for that chain-id.
-Every other non-mainnet/testnet chain-id (new private chains, `local`) is pinned
-to `Block(1)`. The carve-out covers new devnet chains only; an executed devnet
-chain is held to the relaxed rules of section 4, which admit its canonical
-`Never`.
+These values are recommendations, not hard requirements for new chains: the
+shape gate applies the relaxed rules of section 4 to every non-mainnet/testnet
+chain-id. In particular, the built-in **devnet** schedule keeps
+`HybridRewards: Never`, which those rules allow.
 
 ## 3. Behavioral Changes Are Business-Logic Based
 
@@ -163,7 +160,7 @@ This is why behavioral forks are:
 | layer | what it protects | where |
 |-------|-----------------|-------|
 | **CI freeze tests** | mainnet and testnet baked schedules (full 17-fork literal tables) | `chainspec.rs` |
-| **Boot shape gate** (`verify_schedule_shape`) | new chains (datadir head `0`) on the strict canonical shape; existing chains (head > 0) on relaxed rules; mainnet/testnet chain-ids always excluded | `network_profile/shape.rs` |
+| **Boot shape gate** (`verify_schedule_shape`) | all non-mainnet/testnet chain-ids on the relaxed rules; mainnet/testnet chain-ids always excluded | `network_profile/shape.rs` |
 | **Schedule-record gate** (`schedule-record.yaml`, trust-on-first-use) | per-datadir drift on all networks | `network_profile/verify.rs` |
 | **Genesis ceremony** | out of scope by decision | — |
 
@@ -175,19 +172,17 @@ This is why behavioral forks are:
   mainnet/testnet chain-id is not shape-checked; it is still protected by
   the record gate for forks that have fired, and by the freeze tests for
   the binary schedule.
-- The shape check has two rule sets, selected by the datadir's executed
-  head. A **new chain** (head `0`, no executed blocks) must match the strict
-  canonical new-chain shape (the table in section 2). An **existing chain**
-  (head > 0) may legitimately run a historical schedule that deviates from
-  it, so the gate relaxes: Set A forks at `Block(0)` or `Never`,
-  `Erc20PrecompileBytecode` still exactly `Block(1)`, `UsdrSupplyCorrection`
+- The shape check has one relaxed rule set, applied regardless of the
+  datadir's executed head: Set A forks at `Block(0)` or `Never`,
+  `Erc20PrecompileBytecode` exactly `Block(1)`, `UsdrSupplyCorrection`
   at any value (the node warns when it is not `Never`), and `HybridRewards`
-  at `Never` or `Block(>= 1)` — the devnet carve-out does not apply to
-  executed chains. The schedule-record gate then protects the executed
-  history per datadir.
-- A new chain via `--config-file` must enumerate all 17 forks including
-  `Erc20PrecompileBytecode: 1` and `HybridRewards: 1`. A partial file
-  (e.g. missing Erc20) resolves to `Never` and is refused by the shape
-  gate — that is intentional (catches the EIP-161 exposure).
+  at `Never` or `Block(>= 1)`. The canonical new-chain values (section 2)
+  are recommended but not enforced. The schedule-record gate then protects
+  the executed history per datadir.
+- A new chain via `--config-file` must enumerate all 17 forks because the
+  parser requires every known fork. A missing `Erc20PrecompileBytecode`
+  resolves to `Never` and is refused by the shape gate — that is intentional
+  (catches the EIP-161 exposure). A missing `HybridRewards` resolves to
+  `Never`, which the relaxed rules allow.
 - The shape check runs **before** the schedule-record write, so a refused
   boot never pollutes the datadir via trust-on-first-use.

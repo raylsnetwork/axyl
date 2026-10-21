@@ -11,7 +11,7 @@ Two companion files:
   config file. Copy it, change `chain_id`, start the node. This is the template
   this doc points at.
 - [`hardforks/README.md`](../hardforks/README.md) — what the hardforks are, what
-  each one does, and why the pinned values are pinned. This doc only explains how
+  each one does, and why the canonical values are what they are. This doc only explains how
   the file is used; the fork model lives there.
 
 ---
@@ -116,10 +116,10 @@ private chain use the `local` (or `devnet`) export, or the template.
   schedule), so the node will not start until you give it a schedule. The config
   file is the intended way to do that. Start from the template and change
   `chain_id` to the value you passed to `genesis`. The template's fork map is the
-  canonical new-chain schedule and passes the boot shape gate as-is, so the other
-  values need no change unless you have a reason to change a behavioral fork. Which
-  values are pinned (must not change) and which are free is in
-  [`hardforks/README.md`](../hardforks/README.md).
+  canonical new-chain schedule and passes the boot shape gate as-is. The gate
+  enforces the relaxed rules (section 5); the canonical values are recommended
+  but not required, so you only need to change a value if you have a reason to.
+  See [`hardforks/README.md`](../hardforks/README.md).
 - **You need to activate a hardfork on a running private chain.** Edit the file,
   set the fork to a future block number, distribute the file to every node
   operator, and have everyone restart before that block. No new binary and no
@@ -183,29 +183,33 @@ Common causes:
 
 ---
 
-## 5. The fork schedule: what is pinned, what is free
+## 5. The fork schedule: what is checked, what is free
 
 The template ships the canonical new-chain schedule, so if you use it as-is (change
 only `chain_id`) you are done. Of the 17 forks:
 
-- **Seven are pinned** by the boot shape gate (`verify_schedule_shape`) while
-  the chain has no blocks: the node refuses to start a new chain (head `0`) if
-  any of them deviates. They are the migration forks whose values the genesis
-  requires. Once the chain has blocks the gate relaxes (below).
+- **Seven are checked** by the boot shape gate (`verify_schedule_shape`) against
+  the relaxed rules:
+  - `AdminTransfer`, `RlsStorage`, `Tokenomics`, `Uups` must be `0` or `never`;
+  - `Erc20PrecompileBytecode` must be exactly `1`;
+  - `UsdrSupplyCorrection` may be any value (the node warns when it is not `never`);
+  - `HybridRewards` must be `never` or a block `>= 1`.
 - **Ten are behavioral** and free to choose: `0` (on from genesis), `never` (off),
   or a future block (activate later — section 3). The canonical schedule turns all
   ten on from genesis.
 
-What each fork does, and why each pinned value is pinned, is in
-[`hardforks/README.md`](../hardforks/README.md). The quick list of the seven pinned
-values:
+There is no head-dependent strict mode: the relaxed rules above apply to every
+non-mainnet/testnet chain-id, including a brand-new chain. The canonical values
+are recommended because a greenfield genesis is built to work with them, but they
+are not required. What each fork does, and why the canonical values are what they
+are, is in [`hardforks/README.md`](../hardforks/README.md). The quick list:
 
-| Fork | Pinned value |
+| Fork | Canonical value |
 |---|---|
 | `AdminTransfer`, `RlsStorage`, `Tokenomics`, `Uups` | `0` |
 | `Erc20PrecompileBytecode` | `1` |
 | `UsdrSupplyCorrection` | `never` |
-| `HybridRewards` | `1` (except the devnet chain-id `503`, which keeps `never`) |
+| `HybridRewards` | `1` (the built-in devnet schedule uses `never`) |
 
 `HybridRewards` needs no post-activation action — the migration and the ABI
 switch happen automatically at the activation block. The optional governance
@@ -226,15 +230,10 @@ record to re-record the selected schedule (the check then starts from the curren
 head). A boundary still in the future may be changed — that is how agreed schedule
 updates ship — and the node warns about the change and re-records the new schedule.
 
-The boot shape gate relaxes at the same time: it enforces the strict new-chain
-pinned values only while the datadir has no executed blocks (head `0`). Once the
-chain has blocks it checks the relaxed shape instead — Set A forks
-(`AdminTransfer`, `RlsStorage`, `Tokenomics`, `Uups`) at `0` or `never`,
-`Erc20PrecompileBytecode` still exactly `1`, `UsdrSupplyCorrection` at any value
-(the node warns when it is not `never`), and `HybridRewards` at `never` or a block
-`>= 1` — and the record gate above guards the rest. A historical schedule that
-deviated from the canonical new-chain shape is therefore not refused on an
-existing chain.
+The boot shape gate does not change once the chain has blocks: it always applies
+the relaxed rules above, so a historical schedule that deviated from the
+canonical new-chain values is not refused. The record gate above guards the
+executed history instead.
 
 ---
 
