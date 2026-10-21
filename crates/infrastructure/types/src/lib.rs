@@ -19,6 +19,7 @@ mod processor;
 pub mod serde;
 mod sync;
 mod task_manager;
+pub mod task_metrics;
 mod worker;
 #[macro_use]
 pub mod error;
