@@ -909,6 +909,25 @@ fn render_participation(r: &ParticipationReport, out: &mut String) {
                 format!("{} signer bits beyond the committee", n.unknown_signers),
             );
         }
+        section(
+            out,
+            "participation",
+            if n.attested {
+                "from own-parent signer claims in headers (HeaderParentSigners)"
+            } else {
+                "from certificate authorship"
+            },
+        );
+        if n.unknown_claimed_signers > 0 {
+            section(
+                out,
+                "unknown claim",
+                format!(
+                    "{} claimed signer indices beyond the committee",
+                    n.unknown_claimed_signers
+                ),
+            );
+        }
         let mut t = Table::new(&[
             "authority",
             "committee",

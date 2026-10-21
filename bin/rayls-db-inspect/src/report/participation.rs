@@ -88,6 +88,12 @@ pub struct ParticipationNodeView {
     pub authorities: Vec<AuthorityRow>,
     /// Signer bits beyond the committee's size, summed over every certificate.
     pub unknown_signers: u64,
+    /// True when the tallied headers carry own-parent signer claims (HeaderParentSigners fork):
+    /// `participation` then counts the claimed signers, as the node's tally does, instead of
+    /// certificate authors.
+    pub attested: bool,
+    /// Claimed signer indices beyond the committee's size, summed over every claim.
+    pub unknown_claimed_signers: u64,
 }
 
 /// Sums over every tallied header.
@@ -147,6 +153,10 @@ struct Walk {
     /// Signature counts by committee index.
     signed: Vec<u64>,
     unknown_signers: u64,
+    /// True once any tallied header carried an own-parent signer claim.
+    attested_headers_seen: bool,
+    /// Claimed signer indices beyond the committee's size.
+    unknown_claimed_signers: u64,
 }
 
 pub fn participation(nodes: &[NodeDb], epoch: Epoch) -> eyre::Result<ParticipationReport> {
@@ -181,6 +191,8 @@ pub fn participation(nodes: &[NodeDb], epoch: Epoch) -> eyre::Result<Participati
             totals: Totals::default(),
             authorities: Vec::new(),
             unknown_signers: 0,
+            attested: false,
+            unknown_claimed_signers: 0,
         };
         if state == EpochState::NotReached {
             views.push(view);
@@ -254,6 +266,14 @@ pub fn participation(nodes: &[NodeDb], epoch: Epoch) -> eyre::Result<Participati
             walk.last_round = Some(leader.round());
 
             walk.tallies.entry(leader.origin().clone()).or_default().anchor_rounds += 1;
+            // Mirrors `tally_hybrid`: once any header in the sub-dag carries its author's
+            // own-parent signer claim (HeaderParentSigners fork), participation goes to the
+            // claimed committee indices; before that, to the certificates' authors.
+            let attested = header
+                .sub_dag
+                .certificates
+                .iter()
+                .any(|cert| cert.header().own_parent_signers().is_some());
             let mut seen: BTreeSet<&AuthorityIdentifier> = BTreeSet::new();
             for cert in &header.sub_dag.certificates {
                 let author = cert.origin();
@@ -262,8 +282,21 @@ pub fn participation(nodes: &[NodeDb], epoch: Epoch) -> eyre::Result<Participati
                 tally.batches += cert.header().payload().len() as u64;
                 walk.totals.certs += 1;
                 walk.totals.batches += cert.header().payload().len() as u64;
-                if seen.insert(author) {
+                if !attested && seen.insert(author) {
                     tally.participation_rounds += 1;
+                }
+                if let Some(claim) = cert.header().own_parent_signers() {
+                    walk.attested_headers_seen = true;
+                    for bit in claim.iter() {
+                        let Some((ids, _)) = &committee else { break };
+                        let Some(id) = ids.get(bit as usize) else {
+                            walk.unknown_claimed_signers += 1;
+                            continue;
+                        };
+                        if seen.insert(id) {
+                            walk.tallies.entry(id.clone()).or_default().participation_rounds += 1;
+                        }
+                    }
                 }
                 for bit in cert.signed_authorities().iter() {
                     walk.totals.signatures += 1;
@@ -324,6 +357,8 @@ pub fn participation(nodes: &[NodeDb], epoch: Epoch) -> eyre::Result<Participati
         view.totals = Totals { authors: walk.tallies.len() as u64, ..walk.totals };
         view.authorities = rows;
         view.unknown_signers = walk.unknown_signers;
+        view.attested = walk.attested_headers_seen;
+        view.unknown_claimed_signers = walk.unknown_claimed_signers;
         views.push(view);
     }
 
