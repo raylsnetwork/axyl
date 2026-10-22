@@ -8342,6 +8342,7 @@ name = "rayls-middleware-orchestrator"
 version = "1.5.1"
 dependencies = [
  "alloy",
+ "async-trait",
  "axum 0.8.8",
  "consensus-metrics",
  "eyre",
@@ -8446,6 +8447,7 @@ dependencies = [
  "ethereum-tx-sign",
  "eyre",
  "fdlimit",
+ "rand 0.9.3",
  "rayls-execution-evm",
  "rayls-infrastructure-config",
  "rayls-infrastructure-storage",

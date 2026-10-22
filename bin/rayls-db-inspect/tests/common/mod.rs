@@ -324,7 +324,13 @@ pub fn archive_below(db: &DatabaseType, cutoff: Epoch) {
 /// Seeding helpers mirroring the node's own write paths.
 pub fn write_epoch(db: &DatabaseType, record: &EpochRecord, cert: Option<&EpochCertificate>) {
     match cert {
-        Some(cert) => db.save_epoch_record_with_cert(record, cert).unwrap(),
+        Some(cert) => db
+            .save_epoch_record_with_cert(
+                record,
+                cert,
+                &rayls_infrastructure_types::RecordBinding::Legacy,
+            )
+            .unwrap(),
         None => db.save_epoch_record(record).unwrap(),
     }
 }

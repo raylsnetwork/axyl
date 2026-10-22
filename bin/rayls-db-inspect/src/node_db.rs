@@ -12,16 +12,16 @@ use rayls_infrastructure_storage::{
     tables::{
         Batches, Certificates, ColdArchiveHighWaterMark, ColdBatchLocations,
         ConsensusBlockNumbersByDigest, ConsensusBlocks, ConsensusBlocksCache, DkgOutcomes,
-        EpochCerts, EpochRecords, EpochRecordsIndex, EpochTransitionCheckpoints, NodeIdentity,
-        PendingEpochRecord,
+        EpochCerts, EpochRecordBindings, EpochRecords, EpochRecordsIndex,
+        EpochTransitionCheckpoints, NodeIdentity, PendingEpochRecord,
     },
     ColdConfig, ColdStore,
 };
 use rayls_infrastructure_types::{
     dkg::DkgOutcome, leader_epoch_and_batch_digests, try_decode, try_decode_key,
-    AuthorityIdentifier, Batch, BlockHash, CertificateDigest, ConsensusHeader, ConsensusHeaderMeta,
-    Database, DbTx as _, Epoch, EpochCertificate, EpochRecord, EpochTransitionCheckpoint, Table,
-    B256,
+    AuthorityIdentifier, Batch, BlockHash, BlsPublicKey, CertificateDigest, ConsensusHeader,
+    ConsensusHeaderMeta, Database, DbTx as _, Epoch, EpochCertificate, EpochRecord,
+    EpochTransitionCheckpoint, RecordBinding, RecordKeys, Table, B256,
 };
 use rayls_infrastructure_utils::mdbx::MIN_MDBX_PAGE_SIZE;
 use serde::Serialize;
@@ -384,6 +384,42 @@ impl NodeDb {
     /// key, the epoch's certificates are threshold certificates.
     pub fn dkg_outcome(&self, epoch: Epoch) -> eyre::Result<Option<DkgOutcome>> {
         self.get::<DkgOutcomes>(&epoch)
+    }
+
+    /// What the certificate of the record with `digest` signs besides the record (`Legacy` when
+    /// nothing is stored, or on a source without the table).
+    pub fn record_binding(&self, digest: B256) -> eyre::Result<RecordBinding> {
+        Ok(self.get::<EpochRecordBindings>(&digest)?.unwrap_or(RecordBinding::Legacy))
+    }
+
+    /// The group key of `epoch` as this source knows it, the node's rule: its DKG outcome, else
+    /// the next key the certified record of `epoch - 1` signs, neither when they disagree.
+    /// `None`: aggregate or unknown.
+    pub fn epoch_group_key(&self, epoch: Epoch) -> eyre::Result<Option<BlsPublicKey>> {
+        let from_outcome = self.dkg_outcome(epoch)?.map(|outcome| match outcome {
+            DkgOutcome::Key(key) => Some(key.group_key()),
+            DkgOutcome::Fallback => None,
+        });
+        let from_record = match epoch.checked_sub(1) {
+            Some(prev) => match self.epoch(prev)? {
+                Some((record, Some(_))) => Some(self.record_binding(record.digest())?.next_key()),
+                _ => None,
+            },
+            None => None,
+        };
+        Ok(match (from_outcome, from_record) {
+            (Some(outcome), Some(record)) if outcome != record => None,
+            (Some(known), _) | (None, Some(known)) => known,
+            (None, None) => None,
+        })
+    }
+
+    /// What verifying the certificate of `record` needs, from this source.
+    pub fn record_keys(&self, record: &EpochRecord) -> eyre::Result<RecordKeys> {
+        Ok(RecordKeys {
+            binding: self.record_binding(record.digest())?,
+            group_key: self.epoch_group_key(record.epoch)?,
+        })
     }
 
     /// Whether the source has the DKG outcome table. A node with threshold certificates creates

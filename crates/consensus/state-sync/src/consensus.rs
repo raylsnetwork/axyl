@@ -364,6 +364,15 @@ impl<DB: ReDatabase> WalkSession<DB> {
             }
             // Stop at proven coverage without re-descending it: the session anchor or genesis.
             if covered_hash == Some(current) || current == *GENESIS_DIGEST {
+                // A walk that starts at the anchor traverses nothing, so nothing published the
+                // tip a peer just reported. Publish it here: the epoch transition resets this
+                // watch, and the forward streamer and the rejoin check learn the head only from
+                // it, so a cached tip would otherwise stay unexecuted until a newer header comes.
+                if depth == 0 {
+                    if let Some(tip) = self.config.node_storage().get_consensus_by_hash(current) {
+                        republish_if_higher(&self.consensus_bus, &tip);
+                    }
+                }
                 break WalkOutcome::Covered { head, boundary: anchored };
             }
             match get_consensus_header(
@@ -581,7 +590,7 @@ mod tests {
     use rayls_infrastructure_storage::{mem_db::MemDatabase, tables::ConsensusBlocks};
     use rayls_infrastructure_types::{
         dkg::EpochScheme, Certificate, CommittedSubDag, CommitteeLookahead, EpochCertificate,
-        EpochRecord, ReputationScores,
+        EpochRecord, RecordBinding, ReputationScores,
     };
     use rayls_testing_test_utils_committee::CommitteeFixture;
     use std::{
@@ -792,7 +801,6 @@ mod tests {
             false,
             scheme,
             DealtEpochs::from_known(BTreeMap::from([(DEALING_EPOCH, true)])),
-            None,
         )
         .unwrap();
         (fixture, config)
@@ -852,7 +860,7 @@ mod tests {
             signature: vote.signature,
             signed_authorities,
         };
-        db.save_epoch_record_with_cert(&record, &cert).unwrap();
+        db.save_epoch_record_with_cert(&record, &cert, &RecordBinding::Legacy).unwrap();
     }
 
     /// A network handle that answers by-hash header requests from `headers`, like a peer; any
@@ -1004,7 +1012,7 @@ mod tests {
         let base = fixture.authorities().next().unwrap().consensus_config();
         let keys = base.committee().bls_keys();
         // What the dealing gate gives a node in epoch 0 of a network whose fork is active from
-        // genesis: epoch 0 never deals, and later epochs are unknown.
+        // genesis: epoch 0 deals, and later epochs are unknown.
         let config = ConsensusConfig::new_for_epoch(
             base.config().clone(),
             base.node_storage().clone(),
@@ -1015,8 +1023,7 @@ mod tests {
             u64::MAX,
             false,
             EpochScheme::Aggregate,
-            DealtEpochs::from_known(BTreeMap::from([(0, false)])),
-            None,
+            DealtEpochs::from_known(BTreeMap::from([(0, true)])),
         )
         .unwrap();
         config
@@ -1050,5 +1057,51 @@ mod tests {
 
         assert_eq!(*consensus_bus.requested_missing_epoch().borrow(), DEALING_EPOCH);
         assert_eq!(consensus_bus.last_consensus_header().borrow().number, 0, "nothing published");
+    }
+
+    /// After an epoch transition resets `last_consensus_header` to the default, a probe can find
+    /// the network tip that an earlier leg already cached. The walk then starts at the covered
+    /// anchor and descends nothing, but it must still publish that tip: the forward streamer and
+    /// the rejoin check only learn the target through this watch, and with a stalled network no
+    /// newer header ever arrives to publish it instead.
+    #[tokio::test(start_paused = true)]
+    async fn walk_starting_at_the_covered_anchor_publishes_it() {
+        let fixture = CommitteeFixture::builder(MemDatabase::default)
+            .randomize_ports(true)
+            .committee_size(NonZeroUsize::new(4).unwrap())
+            .build();
+        let primary = fixture.authorities().next().unwrap();
+        let config = primary.consensus_config();
+        let db = config.node_storage();
+
+        // Executed up to 100 (the previous epoch's last output); 101 and 102 were fetched into the
+        // cache before the transition and not executed yet.
+        let canonical = ConsensusHeader { number: 100, ..Default::default() };
+        db.with_write_txn(|txn| {
+            txn.insert::<ConsensusBlocks>(&canonical.number, &canonical)?;
+            Ok(())
+        })
+        .unwrap();
+        let child_101 =
+            ConsensusHeader { number: 101, parent_hash: canonical.digest(), ..Default::default() };
+        let child_102 =
+            ConsensusHeader { number: 102, parent_hash: child_101.digest(), ..Default::default() };
+        store_consensus_header_in_cache(db, &child_101);
+        store_consensus_header_in_cache(db, &child_102);
+
+        // A fresh bus: the watch holds the default header, as after the transition's reset.
+        let consensus_bus = ConsensusBus::new();
+        assert_eq!(consensus_bus.last_consensus_header().borrow().number, 0);
+
+        // The probe found 102, the top of the cached run (the session derives it as its anchor).
+        let mut session = WalkSession::new(config.clone(), consensus_bus.clone(), no_peer_network());
+        assert!(session.sync_to(child_102.digest()).await.is_continue());
+
+        assert_eq!(
+            consensus_bus.last_consensus_header().borrow().number,
+            102,
+            "the probed tip is the covered anchor, so the walk descends nothing, but it must still \
+             publish the tip"
+        );
     }
 }

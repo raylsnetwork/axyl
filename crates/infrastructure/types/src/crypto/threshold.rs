@@ -15,7 +15,8 @@
 use super::{BlsPublicKey, BlsSignature, Signer, DST_G1};
 use blst::{
     blst_bendian_from_scalar, blst_fr, blst_fr_add, blst_fr_from_scalar, blst_fr_from_uint64,
-    blst_fr_inverse, blst_fr_mul, blst_fr_sub, blst_scalar, blst_scalar_from_fr,
+    blst_fr_inverse, blst_fr_mul, blst_fr_sub, blst_scalar, blst_scalar_fr_check,
+    blst_scalar_from_bendian, blst_scalar_from_fr,
     min_sig::{AggregatePublicKey, AggregateSignature, PublicKey, SecretKey, Signature},
 };
 use rand::{CryptoRng, RngCore};
@@ -24,9 +25,9 @@ use std::{num::NonZeroU32, ops::Deref, ptr};
 use thiserror::Error;
 
 /// Scalars passed to `blst`'s multi-scalar multiplication are full field elements.
-const SCALAR_BITS: usize = 255;
+pub(super) const SCALAR_BITS: usize = 255;
 /// Little-endian size of one such scalar.
-const SCALAR_BYTES: usize = 32;
+pub(super) const SCALAR_BYTES: usize = 32;
 /// Domain of the challenge hash in constant-term proofs.
 const PROOF_DST: &[u8] = b"RAYLS_DKG_POK_BLS12381G2_XMD:SHA-256_SSWU_RO_";
 
@@ -52,7 +53,7 @@ pub enum ThresholdError {
 
 /// Element of the scalar field in `blst`'s Montgomery form. Wiped on drop because it may hold a
 /// secret polynomial value.
-struct Fr(blst_fr);
+pub(super) struct Fr(blst_fr);
 
 impl Clone for Fr {
     fn clone(&self) -> Self {
@@ -68,7 +69,7 @@ impl Drop for Fr {
 }
 
 impl Fr {
-    fn from_u64(value: u64) -> Self {
+    pub(super) fn from_u64(value: u64) -> Self {
         let limbs = [value, 0, 0, 0];
         let mut out = blst_fr::default();
         // SAFETY: `limbs` has the four words blst reads; `out` is a valid destination.
@@ -76,14 +77,14 @@ impl Fr {
         Fr(out)
     }
 
-    fn from_scalar(scalar: &blst_scalar) -> Self {
+    pub(super) fn from_scalar(scalar: &blst_scalar) -> Self {
         let mut out = blst_fr::default();
         // SAFETY: both pointers reference live, properly sized values.
         unsafe { blst_fr_from_scalar(&mut out, scalar) };
         Fr(out)
     }
 
-    fn to_scalar(&self) -> blst_scalar {
+    pub(super) fn to_scalar(&self) -> blst_scalar {
         let mut out = blst_scalar { b: [0u8; SCALAR_BYTES] };
         // SAFETY: both pointers reference live, properly sized values.
         unsafe { blst_scalar_from_fr(&mut out, &self.0) };
@@ -91,7 +92,7 @@ impl Fr {
     }
 
     /// Canonical big-endian encoding, the form `SecretKey::from_bytes` takes.
-    fn to_be_bytes(&self) -> [u8; SCALAR_BYTES] {
+    pub(super) fn to_be_bytes(&self) -> [u8; SCALAR_BYTES] {
         let scalar = self.to_scalar();
         let mut out = [0u8; SCALAR_BYTES];
         // SAFETY: `out` is 32 bytes, the size blst writes.
@@ -99,21 +100,21 @@ impl Fr {
         out
     }
 
-    fn add(&self, other: &Fr) -> Fr {
+    pub(super) fn add(&self, other: &Fr) -> Fr {
         let mut out = blst_fr::default();
         // SAFETY: all pointers reference live field elements.
         unsafe { blst_fr_add(&mut out, &self.0, &other.0) };
         Fr(out)
     }
 
-    fn sub(&self, other: &Fr) -> Fr {
+    pub(super) fn sub(&self, other: &Fr) -> Fr {
         let mut out = blst_fr::default();
         // SAFETY: all pointers reference live field elements.
         unsafe { blst_fr_sub(&mut out, &self.0, &other.0) };
         Fr(out)
     }
 
-    fn mul(&self, other: &Fr) -> Fr {
+    pub(super) fn mul(&self, other: &Fr) -> Fr {
         let mut out = blst_fr::default();
         // SAFETY: all pointers reference live field elements.
         unsafe { blst_fr_mul(&mut out, &self.0, &other.0) };
@@ -121,7 +122,7 @@ impl Fr {
     }
 
     /// Multiplicative inverse; `None` for zero, which has none.
-    fn inverse(&self) -> Option<Fr> {
+    pub(super) fn inverse(&self) -> Option<Fr> {
         if self.is_zero() {
             return None;
         }
@@ -131,24 +132,46 @@ impl Fr {
         Some(Fr(out))
     }
 
-    fn is_zero(&self) -> bool {
+    pub(super) fn is_zero(&self) -> bool {
         self.0.l == [0u64; 4]
     }
 
     /// The field element as a signing key. Fails for zero, which `blst` rejects as a key.
-    fn to_secret_key(&self) -> Result<SecretKey, ThresholdError> {
+    pub(super) fn to_secret_key(&self) -> Result<SecretKey, ThresholdError> {
         SecretKey::from_bytes(&self.to_be_bytes()).map_err(|_| ThresholdError::ZeroSecret)
     }
 
-    fn from_secret_key(key: &SecretKey) -> Self {
+    pub(super) fn from_secret_key(key: &SecretKey) -> Self {
         let scalar: &blst_scalar = key.into();
         Self::from_scalar(scalar)
+    }
+
+    /// Additive inverse.
+    pub(super) fn neg(&self) -> Fr {
+        Fr::from_u64(0).sub(self)
+    }
+
+    /// Hash to a field element under `dst`. `None` only when the hash reduces to zero.
+    pub(super) fn hash_to(message: &[u8], dst: &[u8]) -> Option<Fr> {
+        blst_scalar::hash_to(message, dst).map(|scalar| Fr::from_scalar(&scalar))
+    }
+
+    /// Decode a canonical big-endian encoding; `None` when it is not below the field order.
+    pub(super) fn from_be_bytes(bytes: &[u8; SCALAR_BYTES]) -> Option<Fr> {
+        let mut scalar = blst_scalar::default();
+        // SAFETY: `bytes` is 32 bytes, the size blst reads; `scalar` is a valid destination.
+        unsafe { blst_scalar_from_bendian(&mut scalar, bytes.as_ptr()) };
+        // SAFETY: `scalar` is a live, initialised scalar.
+        if !unsafe { blst_scalar_fr_check(&scalar) } {
+            return None;
+        }
+        Some(Fr::from_scalar(&scalar))
     }
 }
 
 /// Uniform non-zero field element. `key_gen` reduces HKDF output modulo the field order and
 /// never returns zero.
-fn random_fr<R: CryptoRng + RngCore>(rng: &mut R) -> Fr {
+pub(super) fn random_fr<R: CryptoRng + RngCore>(rng: &mut R) -> Fr {
     let mut ikm = [0u8; 32];
     rng.fill_bytes(&mut ikm);
     let key = SecretKey::key_gen(&ikm, &[]).expect("32 bytes of ikm is enough");
@@ -173,7 +196,7 @@ impl ShareIndex {
         self.0.get()
     }
 
-    fn as_fr(&self) -> Fr {
+    pub(super) fn as_fr(&self) -> Fr {
         Fr::from_u64(u64::from(self.0.get()))
     }
 }
@@ -223,7 +246,7 @@ impl SecretPolynomial {
     }
 
     /// Horner evaluation at `x`.
-    fn evaluate(&self, x: &Fr) -> Fr {
+    pub(super) fn evaluate(&self, x: &Fr) -> Fr {
         let mut acc = Fr::from_u64(0);
         for coefficient in self.coefficients.iter().rev() {
             acc = acc.mul(x).add(coefficient);
@@ -260,6 +283,32 @@ impl SecretPolynomial {
 pub struct ConstantTermProof {
     commitment: BlsPublicKey,
     response: [u8; SCALAR_BYTES],
+}
+
+impl ConstantTermProof {
+    /// Whether the proof's commitment is in G2's prime-order subgroup and not the identity.
+    pub fn points_valid(&self) -> bool {
+        in_subgroup(&self.commitment)
+    }
+
+    /// A proof of the right shape and no meaning, for sizing encodings.
+    pub(super) fn placeholder() -> Self {
+        Self { commitment: g2_generator_key(), response: [0; SCALAR_BYTES] }
+    }
+}
+
+/// Whether `key` is a usable G2 point: in the prime-order subgroup and not the identity. Keys
+/// decode with an on-curve check only, which admits points with a small-order component.
+pub(super) fn in_subgroup(key: &BlsPublicKey) -> bool {
+    key.deref().validate().is_ok()
+}
+
+/// The G2 generator as a key.
+pub(super) fn g2_generator_key() -> BlsPublicKey {
+    SecretKey::from_bytes(&Fr::from_u64(1).to_be_bytes())
+        .expect("one is a valid secret key")
+        .sk_to_pk()
+        .into()
 }
 
 /// Fiat-Shamir challenge over the context, the constant term and the proof commitment.
@@ -299,6 +348,12 @@ impl PublicPolynomial {
         &self.coefficients
     }
 
+    /// Whether every commitment is in G2's prime-order subgroup and not the identity. A dealing
+    /// with a small-order component in a commitment would give share keys no share matches.
+    pub fn points_valid(&self) -> bool {
+        self.coefficients.iter().all(in_subgroup)
+    }
+
     /// Public key of the committee secret, the key a combined signature verifies against.
     pub fn group_key(&self) -> BlsPublicKey {
         self.coefficients[0]
@@ -323,6 +378,9 @@ impl PublicPolynomial {
     /// Check a proof of knowledge of the constant term made with `prove_constant_term` under the
     /// same `context`: `g2^response == commitment * A_0^challenge`.
     pub fn verify_constant_term_proof(&self, context: &[u8], proof: &ConstantTermProof) -> bool {
+        if !proof.points_valid() || !in_subgroup(&self.group_key()) {
+            return false;
+        }
         let Ok(response) = SecretKey::from_bytes(&proof.response) else {
             return false;
         };
@@ -378,7 +436,7 @@ impl std::fmt::Debug for SecretShare {
 }
 
 impl SecretShare {
-    fn from_fr(index: ShareIndex, value: &Fr) -> Result<Self, ThresholdError> {
+    pub(super) fn from_fr(index: ShareIndex, value: &Fr) -> Result<Self, ThresholdError> {
         Ok(Self { index, key: value.to_secret_key()? })
     }
 

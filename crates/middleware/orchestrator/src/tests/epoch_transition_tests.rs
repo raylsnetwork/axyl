@@ -7,7 +7,9 @@
 use crate::epoch_manager::{decide_node_mode, node_has_local_history, select_recovery_checkpoint};
 use rayls_consensus_primary::{ConsensusBus, NodeMode};
 use rayls_infrastructure_storage::{mem_db::MemDatabase, CheckpointStore};
-use rayls_infrastructure_types::{EpochTransitionCheckpoint, EpochTransitionPhase, Notifier, B256};
+use rayls_infrastructure_types::{
+    EpochTransitionCheckpoint, EpochTransitionPhase, Notifier, RecordBinding, B256,
+};
 use std::sync::{
     atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
     Arc,
@@ -1369,7 +1371,7 @@ fn test_recovery_rebuilds_record_for_checkpoint_epoch() {
         signature: BlsSignature::default(),
         signed_authorities: roaring::RoaringBitmap::new(),
     };
-    db.save_epoch_record_with_cert(&prev_record, &prev_cert).unwrap();
+    db.save_epoch_record_with_cert(&prev_record, &prev_cert, &RecordBinding::Legacy).unwrap();
 
     // The crash window: boundary block executed, tables not yet cleared.
     db.save_checkpoint(&EpochTransitionCheckpoint {
@@ -1427,7 +1429,7 @@ fn test_resolve_prev_record_prefers_certified_disk_over_memory() {
         signature: BlsSignature::default(),
         signed_authorities: roaring::RoaringBitmap::new(),
     };
-    db.save_epoch_record_with_cert(&disk_record, &cert).unwrap();
+    db.save_epoch_record_with_cert(&disk_record, &cert, &RecordBinding::Legacy).unwrap();
     let resolved = resolve_local_prev_epoch_record(&db, Some(&mem_record), epoch)
         .expect("certified disk record must resolve");
     assert_eq!(resolved.digest(), disk_record.digest(), "certified record must win");
@@ -1473,7 +1475,7 @@ fn test_hydrate_prev_record_from_pending_after_restart() {
         signature: BlsSignature::default(),
         signed_authorities: roaring::RoaringBitmap::new(),
     };
-    db.save_epoch_record_with_cert(&certified, &cert).unwrap();
+    db.save_epoch_record_with_cert(&certified, &cert, &RecordBinding::Legacy).unwrap();
     let resolved = resolve_local_prev_epoch_record(&db, Some(&hydrated), 305)
         .expect("certified disk record must resolve");
     assert_eq!(resolved.digest(), certified.digest(), "certified record must win");

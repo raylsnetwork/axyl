@@ -82,6 +82,9 @@ pub(crate) struct EpochManager<P, DB> {
     /// is certified (it lands in `EpochRecords` only with its cert at quorum).
     /// Seeded at startup from `PendingEpochRecord` so a restart keeps it.
     pub(super) prev_epoch_record: Option<EpochRecord>,
+    /// The consensus config of the epoch that ran last, so certifying its record at the next
+    /// epoch's start reuses its threshold share instead of deriving it again.
+    pub(super) last_config: Option<rayls_infrastructure_config::ConsensusConfig<DB>>,
     /// Failed certification attempts per pending epoch. Kept here rather than in the collector
     /// task because that task is respawned at every epoch close while a stalled epoch is not:
     /// with a task-local counter the retry backoff restarted from its base every time any epoch

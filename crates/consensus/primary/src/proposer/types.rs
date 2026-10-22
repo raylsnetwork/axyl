@@ -1,9 +1,5 @@
-use rayls_infrastructure_types::{
-    dkg::{Deal, DealingParams},
-    BlockHash, WorkerId,
-};
-use std::sync::Arc;
-use tokio::sync::{oneshot, OnceCell};
+use rayls_infrastructure_types::{BlockHash, WorkerId};
+use tokio::sync::oneshot;
 
 #[derive(Debug)]
 pub struct OurDigestMessage {
@@ -35,45 +31,4 @@ pub(super) struct ProposerDigest {
     pub digest: BlockHash,
     /// The worker that produced this block.
     pub worker_id: WorkerId,
-}
-
-/// This node's part in dealing the next epoch's threshold key.
-#[derive(Clone)]
-pub(super) struct Dealer {
-    /// The epoch the key is for, its threshold and its recipients.
-    params: Arc<DealingParams>,
-    /// This node's position in the dealing committee, which the deal's proof is bound to.
-    position: u32,
-    /// The deal, made for the first new header that needs it and reused by every later one.
-    deal: Arc<OnceCell<Deal>>,
-}
-
-impl Dealer {
-    pub(super) fn new(params: Arc<DealingParams>, position: u32) -> Self {
-        Self { params, position, deal: Default::default() }
-    }
-
-    /// This node's deal, made on first use. Making it costs a pairing per recipient, so it runs
-    /// on the blocking pool.
-    pub(super) async fn deal(&self) -> eyre::Result<Deal> {
-        let deal = self
-            .deal
-            .get_or_try_init(|| async {
-                let (params, position) = (self.params.clone(), self.position);
-                let deal = tokio::task::spawn_blocking(move || {
-                    let mut rng = rand::rng();
-                    Deal::new(
-                        params.epoch,
-                        position,
-                        params.threshold,
-                        &params.recipients,
-                        &mut rng,
-                    )
-                })
-                .await??;
-                Ok::<_, eyre::Report>(deal)
-            })
-            .await?;
-        Ok(deal.clone())
-    }
 }

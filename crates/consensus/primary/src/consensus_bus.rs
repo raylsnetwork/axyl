@@ -14,8 +14,13 @@ use rayls_infrastructure_config::Parameters;
 use rayls_infrastructure_types::{
     batch_tracker::BatchTracker, error::HeaderError, BlockHash, BlockNumHash, Certificate,
     CertificateDigest, CommittedSubDag, ConsensusHeader, ConsensusOutput, Epoch, EpochVote, Header,
-    RaylsReceiver, RaylsSender, Round, SendError, TryRecvError, TrySendError, CHANNEL_CAPACITY,
+    RaylsReceiver, RaylsSender, Round, SendError, TryRecvError, TrySendError, VoteContext,
+    CHANNEL_CAPACITY,
 };
+
+/// An epoch vote as received, with the context a keyed vote names (`None` for a legacy vote), and
+/// where to answer whether it was valid.
+pub type EpochVoteItem = (EpochVote, Option<VoteContext>, oneshot::Sender<Result<(), HeaderError>>);
 
 /// Gate for re-promotion to CvvActive after a DAG-behind demotion.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -243,7 +248,7 @@ struct ConsensusBusAppInner {
     /// Status of sync?
     tx_sync_status: watch::Sender<NodeMode>,
     /// Produce new epoch certs as they are recieved.
-    new_epoch_votes: QueChannel<(EpochVote, oneshot::Sender<Result<(), HeaderError>>)>,
+    new_epoch_votes: QueChannel<EpochVoteItem>,
     /// The que channel for primary network events.
     primary_network_events: QueChannel<NetworkEvent<crate::network::Req, crate::network::Res>>,
 
@@ -801,9 +806,7 @@ impl ConsensusBus {
     }
 
     /// New epoch certs as they are recieved.
-    pub fn new_epoch_votes(
-        &self,
-    ) -> &impl RaylsSender<(EpochVote, oneshot::Sender<Result<(), HeaderError>>)> {
+    pub fn new_epoch_votes(&self) -> &impl RaylsSender<EpochVoteItem> {
         &self.inner_app.new_epoch_votes
     }
 
@@ -811,10 +814,7 @@ impl ConsensusBus {
     ///
     /// Returns `None` while the receiver is held (a running vote collection owns it), so a caller
     /// that only wants to drop stale queued votes can no-op instead of panicking.
-    pub fn try_subscribe_epoch_votes(
-        &self,
-    ) -> Option<impl RaylsReceiver<(EpochVote, oneshot::Sender<Result<(), HeaderError>>)> + 'static>
-    {
+    pub fn try_subscribe_epoch_votes(&self) -> Option<impl RaylsReceiver<EpochVoteItem> + 'static> {
         self.inner_app.new_epoch_votes.try_subscribe()
     }
 

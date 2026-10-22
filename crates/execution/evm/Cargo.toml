@@ -91,6 +91,8 @@ proptest = { workspace = true }
 default = []
 test-utils = ["secp256k1"]
 archive-replay = []
+# end-to-end test hooks (see `reth_env::init::static_file_provider`)
+dkg-test-hooks = []
 
 [[bench]]
 name = "lib"

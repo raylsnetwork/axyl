@@ -148,6 +148,12 @@ pub trait RaylsDirs: std::fmt::Debug + Send + Sync + 'static {
     /// Return the path to the hardfork schedule record file.
     fn schedule_record_path(&self) -> PathBuf;
 
+    /// Return the path to the genesis validators' dealings of epoch 0's threshold key, present
+    /// when genesis gives epoch 0 one (see `GenesisDealing`).
+    fn genesis_dkg_dealings_path(&self) -> PathBuf {
+        self.genesis_path().join("dkg-dealings.yaml")
+    }
+
     /// Return the path to consensus's epoch storage for a specific epoch.
     fn epoch_db_path(&self, epoch: Epoch) -> PathBuf {
         let extension = format!("epoch_{epoch}");

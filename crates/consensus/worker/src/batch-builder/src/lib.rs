@@ -106,8 +106,12 @@ pub struct BatchBuilderConfig {
     pub worker_id: WorkerId,
     /// The epoch this builder seals batches for.
     pub epoch: Epoch,
-    /// Epoch boundary timestamp (seconds); once the canonical tip reaches it the builder stops.
+    /// Epoch boundary timestamp (seconds); once the canonical tip reaches it the builder stops,
+    /// unless `hold_open_past_boundary`.
     pub epoch_boundary: u64,
+    /// The epoch waits for the next epoch's threshold key before it closes: keep sealing at the
+    /// quiescing pace past the boundary.
+    pub hold_open_past_boundary: bool,
     /// Maximum time to wait before the batching-window tick attempts a build.
     pub max_delay: Duration,
     /// The sequence number the first batch uses, before the execution watermark resumes it.
@@ -178,7 +182,8 @@ impl BatchBuilder {
             self.persisted_highest_sealed_seq,
             self.config.next_batch_seq,
             self.last_canonical_timestamp,
-        );
+        )
+        .holding_open(self.config.hold_open_past_boundary);
         let mut pipeline = PipelineState::Clean(initial_clean);
         pipeline = self.try_start_build(pipeline.on_event(), &mut interval);
 
@@ -218,7 +223,11 @@ impl BatchBuilder {
                         pipeline.on_canonical_update(more.tip().sealed_block().timestamp);
                     }
 
-                    if !is_awaiting && tip_ts >= self.config.epoch_boundary {
+                    // an epoch held open for the next epoch's key goes on past its boundary
+                    if !is_awaiting
+                        && !self.config.hold_open_past_boundary
+                        && tip_ts >= self.config.epoch_boundary
+                    {
                         debug!(
                             target: "worker::batch_builder",
                             epoch = %self.config.epoch,

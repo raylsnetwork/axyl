@@ -127,7 +127,7 @@ mod schedule {
     }
 
     /// The version byte reports the highest version byte among the forks *active* at the
-    /// block, not the most recently crossed block. CertificateFetchEpochV2 (0x11) is
+    /// block, not the most recently crossed block. ThresholdCertificates (0x12) is
     /// genesis-active on local, so it owns the byte across every later activation
     /// (HybridRewards at 0x0d included). On real networks it is Never, so there the highest
     /// active fork still advances the byte normally.
@@ -135,13 +135,13 @@ mod schedule {
     fn version_byte_is_the_max_active_fork_code() {
         let hardforks = RaylsChainHardforks::local();
         let block = activation_block(&hardforks, RaylsHardFork::HybridRewards);
-        assert_eq!(hardforks.version_byte_at_block(0), Some(0x11));
-        assert_eq!(hardforks.version_byte_at_block(block - 1), Some(0x11));
-        assert_eq!(hardforks.version_byte_at_block(block), Some(0x11));
-        assert_eq!(hardforks.version_byte_at_block(1_000_000), Some(0x11));
+        assert_eq!(hardforks.version_byte_at_block(0), Some(0x12));
+        assert_eq!(hardforks.version_byte_at_block(block - 1), Some(0x12));
+        assert_eq!(hardforks.version_byte_at_block(block), Some(0x12));
+        assert_eq!(hardforks.version_byte_at_block(1_000_000), Some(0x12));
     }
 
-    /// Every network schedule lists all 17 hardforks in variant order.
+    /// Every network schedule lists all 18 hardforks in variant order.
     #[test]
     fn schedule_contains_all_hardforks_in_order_for_all_networks() {
         for network in [
@@ -201,6 +201,7 @@ mod schedule {
                 (RaylsHardFork::SenderAffinityLoadBalancing, ForkCondition::Block(12_231_705)),
                 (RaylsHardFork::EpochCloseSeedV2, ForkCondition::Never),
                 (RaylsHardFork::CertificateFetchEpochV2, ForkCondition::Never),
+                (RaylsHardFork::ThresholdCertificates, ForkCondition::Never),
             ],
         );
     }
@@ -229,6 +230,7 @@ mod schedule {
                 (RaylsHardFork::SenderAffinityLoadBalancing, ForkCondition::Block(17_300_000)),
                 (RaylsHardFork::EpochCloseSeedV2, ForkCondition::Never),
                 (RaylsHardFork::CertificateFetchEpochV2, ForkCondition::Never),
+                (RaylsHardFork::ThresholdCertificates, ForkCondition::Never),
             ],
         );
     }

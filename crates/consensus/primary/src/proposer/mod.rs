@@ -16,10 +16,7 @@
 //! header once the Proposer's round advances.
 
 use crate::{
-    consensus::LeaderSchedule,
-    error::ProposerResult,
-    proposer::types::{Dealer, ProposerDigest},
-    ConsensusBus,
+    consensus::LeaderSchedule, error::ProposerResult, proposer::types::ProposerDigest, ConsensusBus,
 };
 use consensus_metrics::monitored_future;
 use rayls_infrastructure_config::ConsensusConfig;
@@ -120,12 +117,6 @@ pub(crate) struct Proposer<DB: ProposerStore> {
     task_spawner: TaskSpawner,
     /// Garbage collection depth for cleaning up old proposed headers.
     gc_depth: Round,
-    /// This node's deal for the next epoch's threshold key, when this epoch deals and the node
-    /// sits in the committee.
-    dealer: Option<Dealer>,
-    /// Set once a committed header of this node carried its deal: only a dealer's first
-    /// committed deal counts, so later headers go without.
-    deal_committed: bool,
 }
 
 impl<DB: Database> Proposer<DB> {
@@ -151,11 +142,6 @@ impl<DB: Database> Proposer<DB> {
         };
         let min_delay_interval = tokio::time::interval(config.parameters().min_header_delay);
         let max_delay_interval = tokio::time::interval(config.parameters().max_header_delay);
-        let dealer = config.dealing().and_then(|params| {
-            let position =
-                config.committee().bls_position(&config.key_config().primary_public_key())?;
-            Some(Dealer::new(params.clone(), position))
-        });
 
         Self {
             authority_id,
@@ -180,8 +166,6 @@ impl<DB: Database> Proposer<DB> {
             advance_round: true,
             task_spawner,
             gc_depth: config.parameters().gc_depth,
-            dealer,
-            deal_committed: false,
         }
     }
 

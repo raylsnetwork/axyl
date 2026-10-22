@@ -1,43 +1,60 @@
 //! Threshold-certificate key generation at the epoch level.
 //!
-//! An epoch deals the next epoch's key when the dealing gate ([`deals`]) says so: the epoch is not
-//! 0 and the `ThresholdCertificates` fork is active at its first block. Its committee puts deals
-//! and complaints in headers, and every node replays the epoch's committed headers through
-//! [`DealingReplay`] to get the same [`DkgOutcome`]. The outcome is persisted keyed by the epoch
-//! the key is for; [`ensure_dkg_outcome`] computes it on demand from durable data only (the
-//! registry, epoch records and committed headers), so a restart anywhere computes the same row.
+//! The key for epoch `E` is dealt during `E-1` through the `DkgManager` system contract: each
+//! validator of `E-1`'s committee submits one publicly verifiable dealing ([`spawn_dealer`]),
+//! which the chain accepts only after verifying it in full. An epoch deals the next epoch's key
+//! when the dealing gate ([`deals`]) says so: the `ThresholdCertificates` fork is active at its
+//! first block. The recipients are the members of `E`'s committee with an encryption key before
+//! `E-1` began, fixed by the contract; when too few have one, `E` gets no key and uses aggregate
+//! certificates. Once `E-1` has closed on-chain the accepted dealings are final, every node reads
+//! the same ones ([`ensure_dkg_outcome_with_chain`]) and saves the same [`DkgOutcome`], and each
+//! recipient decrypts its own share from them ([`own_share`]). The contract keeps only a hash of
+//! each dealing, and the bytes are in block receipts that a pruned node drops after about 10,000
+//! blocks, well within a day-long epoch, so every node keeps the dealings it executes
+//! ([`spawn_dealing_archive`]).
 
+use super::dkg_hooks::{self, CrashPoint};
 use crate::engine::ExecutionNode;
-use rayls_execution_evm::{ForkCondition, RaylsHardFork, RaylsHardforks as _};
-use rayls_infrastructure_config::DealtEpochs;
-use rayls_infrastructure_storage::{ConsensusStore, EpochStore};
-use rayls_infrastructure_types::{
-    dkg::{DealingParams, DealingReplay, DkgOutcome, EpochScheme, EpochThreshold},
-    BlockHash, BlsPublicKey, BlsSignature, BlsSigner, Committee, ConsensusHeader,
-    Database as ReDatabase, Epoch, EpochRecord, Signer,
+use rayls_execution_evm::{
+    reth_env::{
+        dkg_manager::{submitter_key_message, DkgRecipients, DkgSubmitter},
+        genesis::genesis_dealings_commitment,
+        RethEnv,
+    },
+    txn_pool::recover_pooled_transaction,
+    ForkCondition, RaylsHardFork, RaylsHardforks as _, WorkerTxPool,
 };
-use std::{collections::BTreeMap, sync::Arc, time::Duration};
+use rayls_infrastructure_config::{
+    Config, ConfigFmt, ConfigTrait as _, DealtEpochs, GenesisDealing,
+};
+use rayls_infrastructure_storage::EpochStore;
+use rayls_infrastructure_types::{
+    dkg::{DkgOutcome, EpochKey, EpochScheme, EpochThreshold},
+    encode, keccak256,
+    nidkg::{
+        dealing_context, dealing_message, decryption_key_message, encryption_key_context,
+        key_registration_message, BabySteps, Dealing, DecryptionKey,
+    },
+    quorum_threshold,
+    threshold::{SecretPolynomial, SecretShare},
+    try_decode, Address, BlsPublicKey, BlsSigner, Committee, ConsensusHeader, ConsensusOutput,
+    Database as ReDatabase, Encodable2718 as _, Epoch, EpochCloseGate, EpochRecord, RecordBinding,
+    TaskSpawner, TxHash,
+};
+use std::{
+    collections::BTreeMap,
+    sync::{Arc, OnceLock},
+    time::Duration,
+};
+use tokio::sync::watch;
 use tracing::{debug, error, info, warn};
 
-/// Lets the DKG ask a [`BlsSigner`] for decryption keys without exposing the secret key.
-pub(super) struct KeySigner<'a, S>(pub(super) &'a S);
-
-impl<S: BlsSigner> Signer for KeySigner<'_, S> {
-    fn sign(&self, msg: &[u8]) -> BlsSignature {
-        self.0.request_signature_direct(msg)
-    }
-}
-
-/// Dealing parameters for the key of `epoch + 1`, dealt to `next_keys` (bitmap order).
-pub(super) fn dealing_params(epoch: Epoch, next_keys: Vec<BlsPublicKey>) -> DealingParams {
-    DealingParams::new(epoch + 1, next_keys)
-}
-
-/// The dealing gate's answer when it needs no block: epoch 0 never deals, a fork that never
-/// activates never, and one active from genesis always. `None`: the epoch's first block decides.
+/// The dealing gate's answer when it needs no block: epoch 0, whose first block is genesis, deals
+/// when the fork is active there, a fork that never activates never, and one active from genesis
+/// always. `None`: the epoch's first block decides.
 pub(super) fn deals_without_reads(fork: &ForkCondition, epoch: Epoch) -> Option<bool> {
     if epoch == 0 {
-        return Some(false);
+        return Some(fork.active_at_block(0));
     }
     match fork {
         ForkCondition::Never => Some(false),
@@ -67,6 +84,13 @@ async fn threshold_fork(engine: &ExecutionNode) -> ForkCondition {
         .await
         .rayls_chain_spec()
         .rayls_fork_activation(RaylsHardFork::ThresholdCertificates)
+}
+
+/// Whether the `ThresholdCertificates` fork is active at the canonical tip.
+pub(super) async fn fork_active_now(engine: &ExecutionNode) -> bool {
+    let fork = threshold_fork(engine).await;
+    let tip = engine.get_reth_env().await.canonical_tip().number;
+    fork.active_at_block(tip)
 }
 
 /// The dealing gate: whether `epoch` deals the next epoch's key, `None` when this node cannot
@@ -113,210 +137,303 @@ pub(super) async fn dealt_epochs<DB: EpochStore>(
     db: &DB,
     current: Epoch,
 ) -> DealtEpochs {
-    if threshold_fork(engine).await == ForkCondition::Never {
+    let fork = threshold_fork(engine).await;
+    if fork == ForkCondition::Never {
         return DealtEpochs::never();
     }
-    let mut known = BTreeMap::new();
+    // epoch 0 needs no read: genesis is its first block
+    let mut known = BTreeMap::from([(0, fork.active_at_block(0))]);
     for epoch in current.saturating_sub(3)..=current {
         if let Some(dealt) = deals(engine, db, epoch).await {
             known.insert(epoch, dealt);
         }
     }
-    DealtEpochs::from_known(known)
+    DealtEpochs::from_known(known).with_genesis_key(genesis_has_key(engine).await)
 }
 
-/// What one epoch's DKG is computed from: the dealing epoch's committees and its boundary.
-#[derive(Clone, Debug)]
-pub(super) struct DealingInputs {
-    /// The epoch the key is for; the one before it deals.
-    pub(super) epoch: Epoch,
-    /// The dealing committee's keys in bitmap order.
-    pub(super) dealers: Vec<BlsPublicKey>,
-    /// The recipient committee's keys in bitmap order.
-    pub(super) recipients: Vec<BlsPublicKey>,
-    /// Hash of the dealing epoch's boundary, its last consensus header.
-    pub(super) boundary: BlockHash,
+/// Whether epoch 0 has a threshold key: genesis holds dealings for it and the fork is active
+/// from genesis. Dealings in a genesis whose fork starts later are ignored, as the epoch's votes
+/// and records follow the fork.
+async fn genesis_has_key(engine: &ExecutionNode) -> bool {
+    if !threshold_fork(engine).await.active_at_block(0) {
+        return false;
+    }
+    let env = engine.get_reth_env().await;
+    tokio::task::spawn_blocking(move || env.dkg_genesis_dealings())
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .flatten()
+        .is_some()
 }
 
-impl DealingInputs {
-    /// The inputs a dealing epoch's record states: its committee deals to the next committee up
-    /// to its boundary.
-    pub(super) fn from_record(record: &EpochRecord) -> Self {
-        Self {
-            epoch: record.epoch + 1,
-            dealers: record.committee.clone(),
-            recipients: record.next_committee.clone(),
-            boundary: record.parent_consensus,
-        }
-    }
+/// Where this node's genesis keeps the dealings of epoch 0's key, set once at startup.
+static GENESIS_DEALINGS_FILE: OnceLock<std::path::PathBuf> = OnceLock::new();
+
+/// Record where the genesis dealings file is (`RaylsDirs::genesis_dkg_dealings_path`). The first
+/// call wins: a process runs one chain.
+pub(super) fn set_genesis_dealings_file(path: std::path::PathBuf) {
+    let _ = GENESIS_DEALINGS_FILE.set(path);
 }
 
-/// Number of the dealing epoch's first consensus header: one past the previous epoch's boundary
-/// as that epoch's record states it, else found by walking back from `boundary` while the leader
-/// epoch matches. `None` when a header the walk needs is missing.
-fn first_dealing_header<DB: ConsensusStore + EpochStore>(
-    db: &DB,
-    dealing_epoch: Epoch,
-    boundary: &ConsensusHeader,
-) -> Option<u64> {
-    let previous_boundary = dealing_epoch
-        .checked_sub(1)
-        .and_then(|previous| local_record(db, previous))
-        .and_then(|record| db.get_canonical_consensus_by_hash(record.parent_consensus));
-    if let Some(previous) = previous_boundary {
-        if previous.sub_dag.leader_epoch() < dealing_epoch && previous.number < boundary.number {
-            return Some(previous.number + 1);
-        }
-    }
-    let mut first = boundary.number;
-    while first > 1 {
-        let header = db.get_consensus_by_number(first - 1)?;
-        if header.sub_dag.leader_epoch() != dealing_epoch {
-            break;
-        }
-        first -= 1;
-    }
-    Some(first)
-}
-
-/// Compute the outcome for `inputs.epoch` from the dealing epoch's committed headers in the local
-/// DB, walking up from its first header to the boundary. `Ok(None)` when the boundary or a header
-/// in between is missing; an error when the headers contradict the inputs.
-///
-/// Deterministic: the same committed headers give the same outcome on every node and at every
-/// restart. Cost: every header of the dealing epoch is read and fully decoded, deals included.
-pub(super) fn compute_dkg_outcome<DB: ConsensusStore + EpochStore>(
-    db: &DB,
-    inputs: &DealingInputs,
-) -> eyre::Result<Option<DkgOutcome>> {
-    let dealing_epoch =
-        inputs.epoch.checked_sub(1).ok_or_else(|| eyre::eyre!("epoch 0 has no dealing epoch"))?;
-    let Some(boundary) = db.get_canonical_consensus_by_hash(inputs.boundary) else {
-        return Ok(None);
-    };
-    if boundary.sub_dag.leader_epoch() != dealing_epoch {
-        return Err(eyre::eyre!(
-            "boundary {} leads in epoch {}, not the dealing epoch {dealing_epoch}",
-            inputs.boundary,
-            boundary.sub_dag.leader_epoch(),
-        ));
-    }
-    let Some(first) = first_dealing_header(db, dealing_epoch, &boundary) else {
-        return Ok(None);
-    };
-    let started = std::time::Instant::now();
-    let mut replay = DealingReplay::new(inputs.epoch, &inputs.dealers, inputs.recipients.clone());
-    for number in first..boundary.number {
-        let Some(header) = db.get_consensus_by_number(number) else {
-            return Ok(None);
-        };
-        if header.sub_dag.leader_epoch() != dealing_epoch {
-            return Err(eyre::eyre!(
-                "consensus header {number} leads in epoch {}, inside dealing epoch {dealing_epoch}",
-                header.sub_dag.leader_epoch(),
-            ));
-        }
-        replay.feed(&header);
-    }
-    replay.feed(&boundary);
-    let outcome = replay.outcome(boundary.sub_dag.leader_round());
-    info!(
-        target: "epoch-manager",
-        epoch = inputs.epoch,
-        headers = replay.headers,
-        deals = replay.deals,
-        complaints = replay.complaints,
-        threshold = matches!(outcome, DkgOutcome::Key(_)),
-        elapsed_ms = started.elapsed().as_millis() as u64,
-        "dkg outcome computed from committed headers",
+/// The dealings of epoch 0's key from the genesis file, checked against the commitment genesis
+/// state holds. `None` when genesis gave epoch 0 no key. A missing or different file is an error:
+/// this node's genesis is not the chain's.
+fn genesis_dealings(env: &RethEnv) -> eyre::Result<Option<Vec<(Address, Dealing)>>> {
+    let Some(commitment) = env.dkg_genesis_dealings()? else { return Ok(None) };
+    let path = GENESIS_DEALINGS_FILE
+        .get()
+        .ok_or_else(|| eyre::eyre!("genesis dealings file location not set"))?;
+    let entries: Vec<GenesisDealing> =
+        Config::load_from_path(path, ConfigFmt::YAML).map_err(|e| {
+            eyre::eyre!("genesis gives epoch 0 a key but {} is unreadable: {e}", path.display())
+        })?;
+    eyre::ensure!(
+        genesis_dealings_commitment(&entries) == commitment,
+        "{} is not the genesis's dealings of epoch 0's key",
+        path.display()
     );
-    Ok(Some(outcome))
+    entries
+        .into_iter()
+        .map(|entry| {
+            let dealing = try_decode::<Dealing>(&entry.dealing).map_err(|e| {
+                eyre::eyre!("genesis dealing of {} does not decode: {e}", entry.dealer)
+            })?;
+            Ok((entry.dealer, dealing))
+        })
+        .collect::<eyre::Result<Vec<_>>>()
+        .map(Some)
+}
+
+/// Epoch 0's outcome: its key from the genesis dealings, else `Fallback`.
+fn genesis_outcome(env: &RethEnv) -> eyre::Result<DkgOutcome> {
+    let Some(dealings) = genesis_dealings(env)? else { return Ok(DkgOutcome::Fallback) };
+    let members = env.dkg_committee_keys(0)?;
+    let key = EpochKey::from_dealings(0, members, &dealings)?;
+    info!(target: "epoch-manager", dealers = dealings.len(), "epoch 0 key read from the genesis dealings");
+    Ok(DkgOutcome::Key(key))
+}
+
+/// The decryption table, built once per process (about 100 ms, a few megabytes).
+fn baby_steps() -> &'static BabySteps {
+    static TABLE: OnceLock<BabySteps> = OnceLock::new();
+    TABLE.get_or_init(BabySteps::new)
+}
+
+/// This validator's decryption key, from its BLS signature over a message in the
+/// never-published `DkgShare` scope.
+fn decryption_key<S: BlsSigner>(signer: &S) -> eyre::Result<DecryptionKey> {
+    Ok(DecryptionKey::from_signature(&signer.request_signature_direct(&decryption_key_message()))?)
+}
+
+/// The accepted dealings for the key of `epoch`, in acceptance order: the ones this node kept
+/// ([`spawn_dealing_archive`]), else read back from the blocks that accepted them. `None` when
+/// this node has neither for one of them.
+fn accepted_dealings<DB: EpochStore>(
+    env: &RethEnv,
+    db: &DB,
+    epoch: Epoch,
+    dealers: &[Address],
+) -> eyre::Result<Option<Vec<(Address, Dealing)>>> {
+    let mut dealings = Vec::with_capacity(dealers.len());
+    for dealer in dealers {
+        let kept = env.dkg_dealing_hash(epoch, *dealer)?.and_then(|hash| {
+            db.get_dkg_dealing(epoch, hash)
+                .filter(|(kept_dealer, bytes)| kept_dealer == dealer && keccak256(bytes) == hash)
+                .map(|(_, bytes)| bytes)
+        });
+        let bytes = match kept {
+            Some(bytes) => bytes,
+            None => match env.dkg_dealing(epoch, *dealer)? {
+                Some(bytes) => bytes.to_vec(),
+                None => return Ok(None),
+            },
+        };
+        let dealing = try_decode::<Dealing>(&bytes)
+            .map_err(|e| eyre::eyre!("accepted dealing of {dealer} does not decode: {e}"))?;
+        dealings.push((*dealer, dealing));
+    }
+    Ok(Some(dealings))
+}
+
+/// The outcome for `epoch` from the chain, as `DkgManager.finalize` fixed it in the block that
+/// closed `epoch - 1`: the sum of the dealings to the recipient set it recorded, or `Fallback`
+/// when that set had no key (a member without an encryption key in time, or too few dealings,
+/// which the close gate rules out unless the committee changed in the closing block). `None`
+/// before `epoch - 1` closed, and when this node lacks a dealing's block.
+fn outcome_from_chain<DB: EpochStore>(
+    env: &RethEnv,
+    db: &DB,
+    epoch: Epoch,
+) -> eyre::Result<Option<DkgOutcome>> {
+    if !env.dkg_manager_deployed()? {
+        warn!(target: "epoch-manager", epoch, "no DkgManager on this chain: the epoch uses aggregate certificates");
+        return Ok(Some(DkgOutcome::Fallback));
+    }
+    let Some(fin) = env.dkg_final(epoch)? else {
+        // the epoch before has not closed: dealing is still open
+        return Ok(None);
+    };
+    if !fin.keyed {
+        warn!(target: "epoch-manager", epoch, "no threshold key for the epoch: it uses aggregate certificates");
+        return Ok(Some(DkgOutcome::Fallback));
+    }
+    let dealers = env.dkg_dealers(epoch)?;
+    let Some(dealings) = accepted_dealings(env, db, epoch, &dealers)? else {
+        warn!(target: "epoch-manager", epoch, "missing the blocks of some accepted dealings");
+        return Ok(None);
+    };
+    let key = EpochKey::from_dealings(epoch, fin.members, &dealings)?;
+    info!(target: "epoch-manager", epoch, dealers = dealers.len(), "dkg outcome read from the chain");
+    Ok(Some(DkgOutcome::Key(key)))
 }
 
 /// The DKG outcome for `epoch`: the stored row, else computed and saved.
 ///
-/// Epochs 0 and 1 are legacy. When `dealt` says `epoch - 1` did not deal, `Fallback` is saved
-/// without reading headers; when it did, the outcome is computed from `inputs`, else from the
-/// dealing epoch's record. `Ok(None)`, with nothing saved, when that cannot be done yet: the gate
-/// cannot tell, or the inputs or headers are missing. Errors are save failures.
-pub(super) fn ensure_dkg_outcome<DB: ConsensusStore + EpochStore>(
-    db: &DB,
-    epoch: Epoch,
-    dealt: Option<bool>,
-    inputs: Option<DealingInputs>,
-) -> eyre::Result<Option<DkgOutcome>> {
-    if let Some(outcome) = db.get_dkg_outcome(epoch) {
-        return Ok(Some(outcome));
-    }
-    if epoch <= 1 {
-        return Ok(Some(DkgOutcome::Fallback));
-    }
-    let outcome = match dealt {
-        None => return Ok(None),
-        Some(false) => DkgOutcome::Fallback,
-        Some(true) => {
-            let inputs = inputs
-                .or_else(|| local_record(db, epoch - 1).map(|r| DealingInputs::from_record(&r)));
-            let Some(inputs) = inputs else { return Ok(None) };
-            match compute_dkg_outcome(db, &inputs) {
-                Ok(Some(outcome)) => outcome,
-                Ok(None) => return Ok(None),
-                Err(e) => {
-                    error!(target: "epoch-manager", epoch, ?e, "cannot compute dkg outcome");
-                    return Ok(None);
-                }
-            }
-        }
-    };
-    db.save_dkg_outcome(epoch, &outcome)
-        .map_err(|e| eyre::eyre!("failed to persist dkg outcome for epoch {epoch}: {e}"))?;
-    Ok(Some(outcome))
-}
-
-/// [`ensure_dkg_outcome`] with the gate answered from the chain and the computation on the
-/// blocking pool. `boundary` is the dealing epoch's boundary when the caller holds it (an epoch
-/// transition or a recovery checkpoint), so the outcome does not wait for the record: the
-/// committees then come from the registry, which still describes both epochs.
+/// Epoch 0's key, if any, comes from the genesis dealings. For a later epoch, when the gate says
+/// `epoch - 1` did not deal, `Fallback` is saved; when it did, the outcome is read from the
+/// chain. `Ok(None)`, with nothing saved, when that cannot be done yet. Errors are save failures.
 pub(super) async fn ensure_dkg_outcome_with_chain<DB: ReDatabase>(
     engine: &ExecutionNode,
     db: &DB,
     epoch: Epoch,
-    boundary: Option<BlockHash>,
 ) -> eyre::Result<Option<DkgOutcome>> {
     if let Some(outcome) = db.get_dkg_outcome(epoch) {
         return Ok(Some(outcome));
     }
-    if epoch <= 1 {
-        return Ok(Some(DkgOutcome::Fallback));
-    }
-    let dealt = deals(engine, db, epoch - 1).await;
-    let mut inputs = None;
-    if let (Some(true), Some(boundary)) = (dealt, boundary) {
-        match (
-            engine.validators_for_epoch(epoch - 1).await,
-            engine.validators_for_epoch(epoch).await,
-        ) {
-            (Ok(dealers), Ok(recipients)) => {
-                inputs = Some(DealingInputs { epoch, dealers, recipients, boundary });
-            }
-            (Err(e), _) | (_, Err(e)) => {
-                warn!(target: "epoch-manager", epoch, ?e, "no dkg committees from the registry");
+    let outcome = if epoch == 0 && !threshold_fork(engine).await.active_at_block(0) {
+        // genesis dealings count only with the fork active from genesis
+        DkgOutcome::Fallback
+    } else if epoch == 0 {
+        let env = engine.get_reth_env().await;
+        match tokio::task::spawn_blocking(move || genesis_outcome(&env)).await? {
+            Ok(outcome) => outcome,
+            Err(e) => {
+                error!(target: "epoch-manager", ?e, "cannot compute epoch 0's dkg outcome");
+                return Ok(None);
             }
         }
+    } else {
+        match deals(engine, db, epoch - 1).await {
+            None => return Ok(None),
+            Some(false) => DkgOutcome::Fallback,
+            Some(true) => {
+                let (env, db) = (engine.get_reth_env().await, db.clone());
+                let computed =
+                    tokio::task::spawn_blocking(move || outcome_from_chain(&env, &db, epoch))
+                        .await?;
+                match computed {
+                    Ok(Some(outcome)) => outcome,
+                    Ok(None) => return Ok(None),
+                    Err(e) => {
+                        error!(target: "epoch-manager", epoch, ?e, "cannot compute dkg outcome");
+                        return Ok(None);
+                    }
+                }
+            }
+        }
+    };
+    // what the certified record of the epoch before signs as this epoch's key must be what this
+    // node computed from the chain; a disagreement makes both untrusted (`epoch_group_key`)
+    let computed = match &outcome {
+        DkgOutcome::Key(key) => Some(key.group_key()),
+        DkgOutcome::Fallback => None,
+    };
+    if db.epoch_group_key(epoch).is_some_and(|signed| signed != computed) {
+        error!(target: "epoch-manager", epoch, "the certified record of the previous epoch signs another key for this epoch than the chain gives");
     }
-    let db = db.clone();
-    tokio::task::spawn_blocking(move || ensure_dkg_outcome(&db, epoch, dealt, inputs)).await?
+    db.save_dkg_outcome(epoch, &outcome)
+        .map_err(|e| eyre::eyre!("failed to persist dkg outcome for epoch {epoch}: {e}"))?;
+    dkg_hooks::crash_point(CrashPoint::OutcomeSaved, epoch);
+    Ok(Some(outcome))
 }
 
-/// The current epoch's certificate scheme from its DKG outcome. A key switches the committee to
-/// threshold certificates and derives this node's share; a node whose share cannot be derived (a
-/// qualified dealer sent it a bad one) runs without one and cannot vote this epoch. No outcome
-/// yet makes the scheme `Pending`: the node neither votes nor verifies under the epoch's scheme.
-pub(super) fn epoch_scheme<S: BlsSigner>(
+/// This node's share of an epoch key, or why it has none.
+#[derive(Debug)]
+pub(super) enum OwnShare {
+    /// The node holds this share and votes with it.
+    Share(SecretShare),
+    /// The node gets no share this epoch: it is outside the committee, or the dealings skip it
+    /// because its encryption key was not registered before the dealing epoch began.
+    NotRecipient,
+    /// The share should exist but could not be derived yet (logged); worth retrying.
+    Failed,
+}
+
+impl OwnShare {
+    pub(super) fn share(self) -> Option<SecretShare> {
+        match self {
+            Self::Share(share) => Some(share),
+            Self::NotRecipient | Self::Failed => None,
+        }
+    }
+}
+
+/// This node's share of `key`: its share of every accepted dealing, decrypted and summed, at its
+/// position in the committee the key was dealt to.
+pub(super) async fn own_share<S: BlsSigner, DB: ReDatabase>(
+    engine: &ExecutionNode,
+    db: &DB,
+    key: &EpochKey,
+    signer: &S,
+) -> OwnShare {
+    let own_key = signer.public_key();
+    let Some(position) = key.position_of(&own_key) else { return OwnShare::NotRecipient };
+    let env = engine.get_reth_env().await;
+    let decryption = match decryption_key(signer) {
+        Ok(decryption) => decryption,
+        Err(e) => {
+            error!(target: "epoch-manager", epoch = key.epoch, ?e, "cannot derive the decryption key");
+            return OwnShare::Failed;
+        }
+    };
+    let (key, db) = (key.clone(), db.clone());
+    let epoch = key.epoch;
+    let derived = tokio::task::spawn_blocking(move || {
+        let dealings = match key.epoch {
+            0 => genesis_dealings(&env)?
+                .ok_or_else(|| eyre::eyre!("genesis has no dealings for epoch 0's key"))?,
+            _ => accepted_dealings(&env, &db, key.epoch, &key.dealers)?
+                .ok_or_else(|| eyre::eyre!("missing the blocks of some accepted dealings"))?,
+        };
+        // every accepted dealing was verified against the same recipient set
+        if dealings.first().is_some_and(|(_, dealing)| !dealing.positions().contains(&position)) {
+            return Ok(None);
+        }
+        Ok::<_, eyre::Report>(Some(key.derive_share(
+            position,
+            &dealings,
+            &decryption,
+            baby_steps(),
+        )?))
+    })
+    .await;
+    match derived {
+        Ok(Ok(Some(share))) => OwnShare::Share(share),
+        Ok(Ok(None)) => {
+            warn!(target: "epoch-manager", epoch, "no share of this epoch's key: the encryption key was not registered before the dealing epoch began");
+            OwnShare::NotRecipient
+        }
+        Ok(Err(e)) => {
+            error!(target: "epoch-manager", epoch, ?e, "cannot derive threshold share");
+            OwnShare::Failed
+        }
+        Err(e) => {
+            error!(target: "epoch-manager", epoch, ?e, "threshold share task failed");
+            OwnShare::Failed
+        }
+    }
+}
+
+/// The current epoch's certificate scheme from its DKG outcome and this node's share of the key.
+/// A key switches the committee to threshold certificates; a node without a share runs without
+/// one and cannot vote this epoch. No outcome yet makes the scheme `Pending`: the node neither
+/// votes nor verifies under the epoch's scheme. Neither is a key whose threshold is not the
+/// committee's quorum, which no accepted dealing can produce.
+pub(super) fn epoch_scheme(
     committee: &Committee,
     outcome: Option<DkgOutcome>,
-    own_key: &BlsPublicKey,
-    signer: &S,
+    share: Option<SecretShare>,
 ) -> EpochScheme {
     let epoch = committee.epoch();
     let key = match outcome {
@@ -332,21 +449,66 @@ pub(super) fn epoch_scheme<S: BlsSigner>(
             return EpochScheme::Pending;
         }
     };
-    if key.public.threshold() != committee.quorum_threshold() as usize {
-        committee.set_threshold_pending(false);
-        error!(target: "epoch-manager", epoch, "dkg key threshold does not match the committee quorum");
-        return EpochScheme::Aggregate;
+    if !key_runs_with(&key, &committee.bls_keys()) {
+        committee.set_threshold_pending(true);
+        return EpochScheme::Pending;
     }
     committee.set_threshold_key(key.public.clone());
-    let share = committee.bls_position(own_key).and_then(|position| {
-        key.derive_share(position, &KeySigner(signer))
-            .inspect_err(|e| {
-                error!(target: "epoch-manager", epoch, ?e, "cannot derive threshold share");
-            })
-            .ok()
-    });
     info!(target: "epoch-manager", epoch, has_share = share.is_some(), "epoch uses threshold certificates");
     EpochScheme::Threshold(Arc::new(EpochThreshold { key, share }))
+}
+
+/// Whether a committee with keys `committee` runs with `key`: its threshold is the committee's
+/// quorum and it was dealt to that committee (share indices are positions in it). No accepted
+/// dealing makes a key that fails this; a node would neither vote nor verify with one.
+pub(super) fn key_runs_with(key: &EpochKey, committee: &[BlsPublicKey]) -> bool {
+    if key.public.threshold() != quorum_threshold(committee.len() as u64) as usize {
+        error!(target: "epoch-manager", epoch = key.epoch, "dkg key threshold does not match the committee quorum");
+        return false;
+    }
+    if !key.members.is_empty() && key.members != committee {
+        error!(target: "epoch-manager", epoch = key.epoch, "dkg key was dealt to another committee than this node runs");
+        return false;
+    }
+    true
+}
+
+/// How committee members sign the record of an epoch, and check votes for it.
+#[derive(Debug)]
+pub(super) struct RecordSigning {
+    /// What the votes sign besides the record.
+    pub(super) binding: RecordBinding,
+    /// The epoch's key when its certificates are threshold ones: votes are then signed with
+    /// shares of it.
+    pub(super) key: Option<EpochKey>,
+}
+
+/// How `record` is signed: from the `ThresholdCertificates` fork on (the epoch dealt the next
+/// key), with the next epoch's group key as that epoch runs with it (`None`: aggregate
+/// certificates), checked against the record's next committee as `epoch_scheme` checks it; and
+/// with shares of the epoch's own key when it has one. `None` when this node cannot tell yet (a
+/// dealing gate or an outcome it cannot compute), or the next key is one no node runs with.
+pub(super) async fn record_signing<DB: ReDatabase>(
+    engine: &ExecutionNode,
+    db: &DB,
+    record: &EpochRecord,
+) -> Option<RecordSigning> {
+    let epoch = record.epoch;
+    let binding = match deals(engine, db, epoch).await? {
+        false => RecordBinding::Legacy,
+        true => match ensure_dkg_outcome_with_chain(engine, db, epoch + 1).await.ok()?? {
+            DkgOutcome::Fallback => RecordBinding::NextKey(None),
+            DkgOutcome::Key(next) if key_runs_with(&next, &record.next_committee) => {
+                RecordBinding::NextKey(Some(next.group_key()))
+            }
+            DkgOutcome::Key(_) => return None,
+        },
+    };
+    let key = match ensure_dkg_outcome_with_chain(engine, db, epoch).await.ok()?? {
+        DkgOutcome::Key(key) => Some(key),
+        DkgOutcome::Fallback => None,
+    };
+    Some(RecordSigning { binding, key })
 }
 
 /// Backoff before retry `attempt` (1-based) of a pending DKG outcome: 10 s doubling to 10 min.
@@ -356,169 +518,430 @@ pub(super) fn pending_outcome_backoff(attempt: u32) -> Duration {
     BASE.checked_mul(1u32 << attempt.saturating_sub(1).min(31)).unwrap_or(MAX).min(MAX)
 }
 
+/// Least time an epoch waits past its boundary for the next key before closing without one.
+const MIN_KEY_WAIT: u64 = 600;
+
+/// How long past its boundary an epoch of `duration` seconds waits for the next key: one more
+/// epoch, at least [`MIN_KEY_WAIT`]. Dealings land within seconds when the dealers can submit
+/// them, so only a fault shared by most of the committee (unfunded submitters, a pool refusing
+/// the transactions) reaches it; the next epoch then uses aggregate certificates instead of
+/// the committee never changing again.
+pub(super) fn key_wait(duration: u64) -> u64 {
+    dkg_hooks::key_wait().unwrap_or(duration.max(MIN_KEY_WAIT))
+}
+
+/// Holds an epoch that deals the next epoch's key open until that key exists: the epoch may
+/// close at an output only if `DkgManager.isReady(next_epoch)` holds once every earlier output has
+/// executed (see [`EpochCloseGate`]), or once the output reaches `deadline`. The closing block's
+/// `finalize` then records whether the dealings in by then make a key.
+#[derive(Debug)]
+pub(super) struct KeyReadyGate {
+    engine: ExecutionNode,
+    executed: watch::Receiver<ConsensusHeader>,
+    next_epoch: Epoch,
+    /// Commit timestamp from which the epoch closes with or without the key.
+    deadline: u64,
+    /// The answer given for each output, by number.
+    answers: std::sync::Mutex<BTreeMap<u64, bool>>,
+}
+
+impl KeyReadyGate {
+    pub(super) fn new(
+        engine: ExecutionNode,
+        executed: watch::Receiver<ConsensusHeader>,
+        next_epoch: Epoch,
+        deadline: u64,
+    ) -> Self {
+        Self { engine, executed, next_epoch, deadline, answers: Default::default() }
+    }
+}
+
+/// Pause between attempts when the close gate cannot read an answer.
+const GATE_RETRY: Duration = Duration::from_millis(200);
+
+#[async_trait::async_trait]
+impl EpochCloseGate for KeyReadyGate {
+    async fn may_close(&self, output: &ConsensusOutput) -> bool {
+        if let Some(answer) =
+            self.answers.lock().unwrap_or_else(|e| e.into_inner()).get(&output.number)
+        {
+            return *answer;
+        }
+        let epoch = self.next_epoch;
+        if output.reaches_epoch_boundary(self.deadline) {
+            warn!(target: "epoch-manager", epoch, deadline = self.deadline, "the next key is still not ready: closing the epoch without it");
+            self.answers.lock().unwrap_or_else(|e| e.into_inner()).insert(output.number, true);
+            return true;
+        }
+        // the state after every output before this one: output `n - 1` executed, and output `n`
+        // cannot have, since whoever asks has not forwarded it yet, so the canonical tip is
+        // output `n - 1`'s last block (read with its unpersisted blocks)
+        let before = output.number.saturating_sub(1);
+        if self.executed.clone().wait_for(|anchor| anchor.number >= before).await.is_err() {
+            // shutting down: keep the epoch open, the next start decides again
+            return false;
+        }
+        // a node-local failure must not become a decision other nodes would not take: retry
+        // until the chain answers
+        let ready = loop {
+            let env = self.engine.get_reth_env().await;
+            match tokio::task::spawn_blocking(move || env.dkg_is_ready(epoch)).await {
+                Ok(Ok(ready)) => break ready,
+                Ok(Err(e)) => {
+                    warn!(target: "epoch-manager", epoch, ?e, "cannot read whether the next key is ready: retrying");
+                }
+                Err(e) => {
+                    warn!(target: "epoch-manager", epoch, ?e, "key readiness task failed: retrying");
+                }
+            }
+            tokio::time::sleep(GATE_RETRY).await;
+        };
+        if !ready {
+            dkg_hooks::crash_point(CrashPoint::EpochHeldOpen, epoch - 1);
+        }
+        // both cut points (the subscriber and the epoch boundary detection) ask about the same
+        // output and must hear the same answer
+        self.answers.lock().unwrap_or_else(|e| e.into_inner()).insert(output.number, ready);
+        ready
+    }
+}
+
+/// How far behind the canonical tip the dealing archive starts at node startup: the receipts a
+/// pruned (`--full`) node keeps. A node that kept running scanned everything before that; a node
+/// that was stopped did not move its tip, so what it executed last is within reach.
+const ARCHIVE_RESCAN: u64 = 10_064;
+/// Most blocks the archive scans per write.
+const ARCHIVE_BATCH: u64 = 1_000;
+/// Epochs of dealings the archive keeps behind the newest dealt key: enough for the current and
+/// previous keys, and for certifying a record left pending by a stall.
+const ARCHIVE_EPOCHS: Epoch = 8;
+
+/// Keep every dealing the chain accepts, for the life of the node: scan each block this node
+/// executes for `DealingAccepted` events while its receipts are fresh, and save the dealings in
+/// the consensus DB. Epoch keys and shares are derived from them at the next boundary and after
+/// every restart, long after a pruned node dropped those receipts.
+pub(super) fn spawn_dealing_archive<DB: ReDatabase>(
+    engine: ExecutionNode,
+    db: DB,
+    mut executed: watch::Receiver<ConsensusHeader>,
+    spawner: TaskSpawner,
+    shutdown: rayls_infrastructure_types::Noticer,
+) {
+    spawner.spawn_task("dkg dealing archive", async move {
+        let fork = threshold_fork(&engine).await;
+        let first = match fork {
+            ForkCondition::Never => return,
+            ForkCondition::Block(block) => block,
+            _ => 0,
+        };
+        let env = engine.get_reth_env().await;
+        let mut next = first.max(env.canonical_tip().number.saturating_sub(ARCHIVE_RESCAN));
+        let mut newest_key: Epoch = 0;
+        loop {
+            let tip = env.canonical_tip().number;
+            if tip >= next {
+                let to = tip.min(next + ARCHIVE_BATCH - 1);
+                let scan = env.clone();
+                match tokio::task::spawn_blocking(move || scan.dkg_dealings_accepted_in(next, to))
+                    .await
+                {
+                    Ok(Ok(found)) => {
+                        let rows: Vec<_> = found
+                            .into_iter()
+                            .map(|d| (d.epoch, d.hash, d.dealer, d.dealing.to_vec()))
+                            .collect();
+                        if let Err(e) = db.save_dkg_dealings(&rows) {
+                            error!(target: "epoch-manager", ?e, from = next, to, "cannot keep dkg dealings: retrying");
+                            tokio::time::sleep(DEALER_POLL).await;
+                            continue;
+                        }
+                        if !rows.is_empty() {
+                            debug!(target: "epoch-manager", dealings = rows.len(), from = next, to, "kept dkg dealings");
+                        }
+                        if let Some(epoch) = rows.iter().map(|row| row.0).max() {
+                            if epoch > newest_key {
+                                newest_key = epoch;
+                                // a record still pending needs its epoch's key to be signed
+                                let pending =
+                                    db.pending_epoch_records().first().map(|record| record.epoch);
+                                let floor = newest_key
+                                    .saturating_sub(ARCHIVE_EPOCHS)
+                                    .min(pending.unwrap_or(Epoch::MAX));
+                                if let Err(e) = db.prune_dkg_dealings(floor) {
+                                    warn!(target: "epoch-manager", ?e, "cannot prune kept dkg dealings");
+                                }
+                            }
+                        }
+                        next = to + 1;
+                        continue;
+                    }
+                    Ok(Err(e)) => {
+                        warn!(target: "epoch-manager", ?e, from = next, to, "cannot scan blocks for dkg dealings: retrying");
+                    }
+                    Err(e) => {
+                        warn!(target: "epoch-manager", ?e, "dkg dealing scan task failed: retrying");
+                    }
+                }
+            }
+            // wake at the next executed output, or every poll interval
+            tokio::select! {
+                _ = &shutdown => return,
+                changed = executed.changed() => {
+                    if changed.is_err() {
+                        return;
+                    }
+                }
+                _ = tokio::time::sleep(DEALER_POLL) => {}
+            }
+        }
+    });
+}
+
+/// How often the dealer task looks at the chain.
+const DEALER_POLL: Duration = Duration::from_secs(5);
+/// Polls between registration attempts while the key is still not registered.
+const REGISTRATION_RETRY: u32 = 12;
+
+/// This validator's part in the DKG for the life of epoch `epoch`: register its encryption key
+/// once if genesis did not, and, when `epoch` deals and this node is in its committee, deal the
+/// key of `epoch + 1` to the recipients the contract fixed. Transactions go to this node's own
+/// worker pool, so its own batches carry them and no other validator can leave them out. The task
+/// resubmits a transaction that leaves the pool without being executed, and ends when there is
+/// nothing left to do or the epoch's tasks are dropped.
+pub(super) fn spawn_dealer<S, DB>(
+    spawner: TaskSpawner,
+    engine: ExecutionNode,
+    db: DB,
+    signer: S,
+    own_address: Address,
+    epoch: Epoch,
+    in_committee: bool,
+) where
+    S: BlsSigner,
+    DB: ReDatabase,
+{
+    spawner.spawn_task("dkg dealer", async move {
+        let mut dealer = Dealer::new(engine, signer, own_address, epoch).await;
+        let deals_next = in_committee && deals(&dealer.engine, &db, epoch).await == Some(true);
+        loop {
+            match dealer.step(deals_next).await {
+                Ok(true) => return,
+                Ok(false) => {}
+                Err(e) => warn!(target: "epoch-manager", epoch, ?e, "dkg dealer step failed"),
+            }
+            tokio::time::sleep(DEALER_POLL).await;
+        }
+    });
+}
+
+/// State of [`spawn_dealer`]'s task.
+struct Dealer<S> {
+    engine: ExecutionNode,
+    signer: S,
+    own_address: Address,
+    epoch: Epoch,
+    chain_id: u64,
+    submitter: Option<DkgSubmitter>,
+    registration: Option<TxHash>,
+    polls_since_registration: u32,
+    dealing: Option<TxHash>,
+    warned_unfunded: bool,
+}
+
+impl<S: BlsSigner> Dealer<S> {
+    async fn new(engine: ExecutionNode, signer: S, own_address: Address, epoch: Epoch) -> Self {
+        let chain_id = engine.get_reth_env().await.dkg_chain_id();
+        let submitter = DkgSubmitter::from_signature(
+            &signer.request_signature_direct(&submitter_key_message()),
+        )
+        .inspect_err(|e| error!(target: "epoch-manager", ?e, "cannot derive the dkg submitter"))
+        .ok();
+        Self {
+            engine,
+            signer,
+            own_address,
+            epoch,
+            chain_id,
+            submitter,
+            registration: None,
+            polls_since_registration: 0,
+            dealing: None,
+            warned_unfunded: false,
+        }
+    }
+
+    /// One look at the chain: `true` once nothing is left to do this epoch.
+    async fn step(&mut self, deals_next: bool) -> eyre::Result<bool> {
+        let Some(submitter) = self.submitter.clone() else { return Ok(true) };
+        let env = self.engine.get_reth_env().await;
+        if !env.dkg_manager_deployed()? {
+            // a chain without DkgManager never deals
+            return Ok(true);
+        }
+        let pool = self.engine.get_worker_transaction_pool(&0).await?;
+        let pending = |hash: &Option<TxHash>| hash.is_some_and(|hash| pool.get(&hash).is_some());
+
+        let own_key = self.signer.public_key();
+        let (known, registered, dealt) = {
+            let (env, own, epoch) = (env.clone(), self.own_address, self.epoch);
+            tokio::task::spawn_blocking(move || {
+                let known = env.dkg_is_known_validator(own)?;
+                let registered = env.dkg_encryption_key(own)?.is_some();
+                let dealt = env.dkg_dealers(epoch + 1)?.contains(&own);
+                Ok::<_, eyre::Report>((known, registered, dealt))
+            })
+            .await??
+        };
+
+        if !known {
+            // not a staked validator (yet): nothing to register or deal; look again later
+            return Ok(false);
+        }
+        if !registered {
+            // one attempt per REGISTRATION_RETRY polls: a registration that reverted would
+            // otherwise be resent, and paid for, every poll
+            self.polls_since_registration += 1;
+            if !pending(&self.registration)
+                && (self.registration.is_none()
+                    || self.polls_since_registration >= REGISTRATION_RETRY)
+            {
+                self.polls_since_registration = 0;
+                let decryption = decryption_key(&self.signer)?;
+                let key = decryption.encryption_key();
+                let proof =
+                    decryption.prove(&own_key, &encryption_key_context(), &mut rand::rng())?;
+                let signature = self
+                    .signer
+                    .request_signature_direct(&key_registration_message(self.chain_id, &key));
+                let (nonce, fee) = self.nonce_and_fee(&env, &pool, &submitter)?;
+                let tx = submitter.registration(
+                    self.chain_id,
+                    nonce,
+                    fee,
+                    self.own_address,
+                    &key,
+                    encode(&proof),
+                    &signature,
+                )?;
+                self.registration = Some(self.submit(&pool, tx).await?);
+                info!(target: "epoch-manager", epoch = self.epoch, submitter = %submitter.address(), "dkg encryption key registration submitted");
+                dkg_hooks::crash_point(CrashPoint::RegistrationSubmitted, self.epoch);
+            }
+            // a key registered now is for later epochs; this epoch's recipients are fixed
+        }
+        if !deals_next {
+            return Ok(registered);
+        }
+        // a dealing epoch's task runs for the whole epoch: an ejection changes the recipient set,
+        // which voids accepted dealings and can give a keyless epoch a key, and both need a new
+        // dealing
+        if dealt {
+            dkg_hooks::crash_point(CrashPoint::DealingAccepted, self.epoch);
+            return Ok(false);
+        }
+        if pending(&self.dealing) {
+            return Ok(false);
+        }
+        let next = self.epoch + 1;
+        let (has_key, recipients) = {
+            let env = env.clone();
+            tokio::task::spawn_blocking(move || {
+                Ok::<_, eyre::Report>((env.dkg_has_key(next)?, env.dkg_recipients(next)?))
+            })
+            .await??
+        };
+        if !has_key {
+            debug!(target: "epoch-manager", epoch = next, "a committee member has no encryption key in time: no key to deal");
+            return Ok(false);
+        }
+        if dkg_hooks::dealings_held() {
+            debug!(target: "epoch-manager", epoch = next, "dealing held back by the test hook");
+            return Ok(false);
+        }
+        let members = recipients.committee_size;
+        let dealing = self.make_dealing(recipients).await?;
+        let signature = self.signer.request_signature_direct(&dealing_message(
+            self.chain_id,
+            next,
+            self.own_address,
+            &dealing,
+        ));
+        dkg_hooks::crash_point(CrashPoint::DealingBuilt, self.epoch);
+        let (nonce, fee) = self.nonce_and_fee(&env, &pool, &submitter)?;
+        let tx = submitter.dealing(
+            self.chain_id,
+            nonce,
+            fee,
+            next,
+            self.own_address,
+            &signature,
+            dealing,
+            members,
+        )?;
+        self.dealing = Some(self.submit(&pool, tx).await?);
+        info!(target: "epoch-manager", epoch = next, "dkg dealing submitted");
+        dkg_hooks::crash_point(CrashPoint::DealingSubmitted, self.epoch);
+        Ok(false)
+    }
+
+    /// A fresh dealing of the key of `epoch + 1` to `recipients`, encoded, at the threshold of
+    /// the whole committee. Built on the blocking pool: it takes a few hundred milliseconds at
+    /// full committee size.
+    async fn make_dealing(&self, recipients: DkgRecipients) -> eyre::Result<Vec<u8>> {
+        let context = dealing_context(self.chain_id, self.epoch + 1, self.own_address);
+        tokio::task::spawn_blocking(move || {
+            let threshold = quorum_threshold(recipients.committee_size as u64) as usize;
+            let mut rng = rand::rng();
+            let polynomial = SecretPolynomial::random(threshold, &mut rng)?;
+            let dealing = Dealing::new(&context, &polynomial, &recipients.recipients, &mut rng)?;
+            Ok::<_, eyre::Report>(encode(&dealing))
+        })
+        .await?
+    }
+
+    /// The next nonce (past any transaction of ours still pooled) and a fee cap of twice the
+    /// canonical tip's base fee, with no priority fee: the dealer's own batches carry these
+    /// transactions, so they need no tip to be included, and `DkgManager` refunds the gas at the
+    /// base fee.
+    fn nonce_and_fee(
+        &mut self,
+        env: &RethEnv,
+        pool: &WorkerTxPool,
+        submitter: &DkgSubmitter,
+    ) -> eyre::Result<(u64, u128)> {
+        let address = submitter.address();
+        if env.latest()?.account_balance(&address)?.unwrap_or_default().is_zero()
+            && !self.warned_unfunded
+        {
+            warn!(target: "epoch-manager", %address, "the dkg submitter account has no funds: send it enough for one transaction so this validator can register and deal (gas is refunded)");
+            self.warned_unfunded = true;
+        }
+        let nonce =
+            env.account_nonce(address)? + pool.get_transactions_by_sender(address).len() as u64;
+        let base_fee = env.canonical_tip().base_fee_per_gas.unwrap_or(1);
+        let fee = u128::from(base_fee).saturating_mul(2).max(1);
+        Ok((nonce, fee))
+    }
+
+    async fn submit(
+        &self,
+        pool: &WorkerTxPool,
+        tx: rayls_infrastructure_types::TransactionSigned,
+    ) -> eyre::Result<TxHash> {
+        let hash = *tx.tx_hash();
+        let pooled = recover_pooled_transaction(&tx.encoded_2718())?;
+        pool.add_transaction_local(pooled).await?;
+        Ok(hash)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use rayls_infrastructure_storage::mem_db::MemDatabase;
     use rayls_infrastructure_types::{
-        dkg::{dealers_needed, Deal, DkgPayload, DkgState, EpochKey},
-        threshold::SecretPolynomial,
-        AuthorityIdentifier, BlockNumHash, BlsKeypair, Certificate, CommittedSubDag,
-        CommitteeBuilder, Header, Round,
+        BlockHash, BlockNumHash, BlsKeypair, BlsPublicKey, CommitteeBuilder,
     };
-    use std::collections::HashMap;
-
-    /// Minimal [`BlsSigner`] over a test key pair.
-    #[derive(Clone)]
-    struct TestSigner(Arc<BlsKeypair>);
-
-    impl BlsSigner for TestSigner {
-        fn request_signature_direct(&self, msg: &[u8]) -> BlsSignature {
-            self.0.sign(msg)
-        }
-
-        fn public_key(&self) -> BlsPublicKey {
-            *self.0.public()
-        }
-    }
-
-    /// The pre-gate computation, kept to prove the new walk gives the same outcome: walk back from
-    /// the boundary while the leader epoch matches, then feed [`DkgState`] oldest first.
-    fn reference_outcome<DB: ConsensusStore>(
-        db: &DB,
-        params: &DealingParams,
-        dealer_keys: &[BlsPublicKey],
-        boundary_hash: BlockHash,
-    ) -> DkgOutcome {
-        let dealing_epoch = params.epoch - 1;
-        let boundary = db.get_canonical_consensus_by_hash(boundary_hash).unwrap();
-        let final_round = boundary.sub_dag.leader_round();
-        let mut headers = vec![boundary];
-        loop {
-            let number = headers.last().unwrap().number;
-            let Some(prev) = number.checked_sub(1).and_then(|n| db.get_consensus_by_number(n))
-            else {
-                break;
-            };
-            if prev.sub_dag.leader_epoch() != dealing_epoch {
-                break;
-            }
-            headers.push(prev);
-        }
-        headers.reverse();
-        let positions: HashMap<AuthorityIdentifier, u32> = dealer_keys
-            .iter()
-            .enumerate()
-            .map(|(position, key)| (AuthorityIdentifier::from(*key), position as u32))
-            .collect();
-        let mut state =
-            DkgState::new(params.config(dealer_keys.len(), dealers_needed(dealer_keys.len())));
-        for header in &headers {
-            let round = header.sub_dag.leader_round();
-            for cert in &header.sub_dag.certificates {
-                let payload = cert.header().dkg();
-                if payload.is_empty() {
-                    continue;
-                }
-                let Some(&dealer) = positions.get(cert.header().author()) else { continue };
-                if let Some(deal) = &payload.deal {
-                    let _ = state.on_deal(dealer, round, deal.clone());
-                }
-                for complaint in &payload.complaints {
-                    let _ = state.on_complaint(round, complaint);
-                }
-            }
-        }
-        match state.outcome(final_round) {
-            Some(key) => DkgOutcome::Key(key),
-            None => DkgOutcome::Fallback,
-        }
-    }
-
-    /// Four validators dealing epoch `EPOCH`'s key during `EPOCH - 1`, whose consensus headers
-    /// are numbers `FIRST..=BOUNDARY`; the headers around them lead in the epochs next to it.
-    struct Seeded {
-        db: MemDatabase,
-        keypairs: Vec<Arc<BlsKeypair>>,
-        keys: Vec<BlsPublicKey>,
-        boundary: ConsensusHeader,
-    }
-
-    const EPOCH: Epoch = 3;
-    const FIRST: u64 = 11;
-    const BOUNDARY: u64 = 40;
-
-    fn header_with(
-        committee: &Committee,
-        number: u64,
-        epoch: Epoch,
-        round: Round,
-        certs: Vec<(BlsPublicKey, DkgPayload)>,
-    ) -> ConsensusHeader {
-        let certificate = |author: BlsPublicKey, dkg: DkgPayload| {
-            let header = Header {
-                author: AuthorityIdentifier::from(author),
-                round,
-                epoch,
-                created_at: number,
-                ..Default::default()
-            }
-            .with_dkg(dkg);
-            Certificate::new_unsigned_for_test(committee, header, vec![]).unwrap()
-        };
-        let leader_key = certs.first().map(|(key, _)| *key).unwrap_or(committee.bls_keys()[0]);
-        let leader = certificate(leader_key, DkgPayload::default());
-        let certificates = certs.into_iter().map(|(key, dkg)| certificate(key, dkg)).collect();
-        let sub_dag = CommittedSubDag::new(certificates, leader, number, Default::default(), None);
-        ConsensusHeader { number, sub_dag, ..Default::default() }
-    }
-
-    /// Seeds the dealing epoch: dealers 0 and 1 deal at round 24 and dealer 3 at round 76 (too
-    /// late to qualify before the boundary's round 80), dealer 0 deals again at round 28 (only the
-    /// first counts), and the epochs before and after hold deals that must not count.
-    fn seeded() -> Seeded {
-        let mut rng = rand::rng();
-        let keypairs: Vec<BlsKeypair> = (0..4).map(|_| BlsKeypair::generate(&mut rng)).collect();
-        let mut builder = CommitteeBuilder::new(EPOCH - 1);
-        for keypair in &keypairs {
-            builder.add_authority(*keypair.public(), 1, Default::default());
-        }
-        let committee = builder.build();
-        committee.load();
-        let keys = committee.bls_keys();
-        let params = DealingParams::new(EPOCH, keys.clone());
-        let deal = |dealer: u32, epoch: Epoch| DkgPayload {
-            deal: Some(
-                Deal::new(epoch, dealer, params.threshold, &keys, &mut rand::rng()).unwrap(),
-            ),
-            complaints: vec![],
-        };
-        let db = MemDatabase::default();
-        let mut boundary = None;
-        for number in 1..=BOUNDARY + 3 {
-            let epoch = match number {
-                n if n < FIRST => EPOCH - 2,
-                n if n <= BOUNDARY => EPOCH - 1,
-                _ => EPOCH,
-            };
-            let round = number as Round * 2;
-            let certs = match number {
-                n if n == FIRST - 1 => vec![(keys[2], deal(2, EPOCH))],
-                n if n == FIRST + 1 => vec![(keys[0], deal(0, EPOCH)), (keys[1], deal(1, EPOCH))],
-                n if n == FIRST + 3 => vec![(keys[0], deal(0, EPOCH))],
-                n if n == BOUNDARY - 2 => vec![(keys[3], deal(3, EPOCH))],
-                n if n == BOUNDARY + 1 => vec![(keys[2], deal(2, EPOCH))],
-                _ => vec![],
-            };
-            let header = header_with(&committee, number, epoch, round, certs);
-            db.write_subdag_for_test(number, header.sub_dag.clone());
-            if number == BOUNDARY {
-                boundary = db.get_consensus_by_number(number);
-            }
-        }
-        let keypairs = keypairs.into_iter().map(Arc::new).collect();
-        Seeded { db, keypairs, keys, boundary: boundary.unwrap() }
-    }
 
     fn record(
         epoch: Epoch,
@@ -540,7 +963,7 @@ mod tests {
     fn the_gate_answers_from_the_fork_alone_when_it_can() {
         for epoch in [0, 1, 7] {
             assert_eq!(deals_without_reads(&ForkCondition::Never, epoch), Some(false));
-            assert_eq!(deals_without_reads(&ForkCondition::Block(0), epoch), Some(epoch > 0));
+            assert_eq!(deals_without_reads(&ForkCondition::Block(0), epoch), Some(true));
         }
         assert_eq!(deals_without_reads(&ForkCondition::Block(100), 0), Some(false));
         assert_eq!(deals_without_reads(&ForkCondition::Block(100), 3), None);
@@ -558,99 +981,6 @@ mod tests {
         let fork = ForkCondition::Block(1000);
         assert!(fork.active_at_block(first_block_from_records(&db, 5).unwrap()));
         assert!(!ForkCondition::Block(1001).active_at_block(1000));
-    }
-
-    #[test]
-    fn ensure_uses_a_stored_row_and_treats_epochs_0_and_1_as_legacy() {
-        let db = MemDatabase::default();
-        for epoch in [0, 1] {
-            assert_eq!(
-                ensure_dkg_outcome(&db, epoch, None, None).unwrap(),
-                Some(DkgOutcome::Fallback)
-            );
-            assert_eq!(db.get_dkg_outcome(epoch), None, "nothing saved for a legacy epoch");
-        }
-        db.save_dkg_outcome(5, &DkgOutcome::Fallback).unwrap();
-        // The stored row wins over a gate that would compute.
-        assert_eq!(
-            ensure_dkg_outcome(&db, 5, Some(true), None).unwrap(),
-            Some(DkgOutcome::Fallback)
-        );
-    }
-
-    #[test]
-    fn ensure_saves_fallback_for_a_non_dealing_epoch_and_waits_when_it_cannot_tell() {
-        let db = MemDatabase::default();
-        // No record and no headers: nothing is read for a non-dealing epoch.
-        assert_eq!(
-            ensure_dkg_outcome(&db, 4, Some(false), None).unwrap(),
-            Some(DkgOutcome::Fallback)
-        );
-        assert_eq!(db.get_dkg_outcome(4), Some(DkgOutcome::Fallback));
-        assert_eq!(ensure_dkg_outcome(&db, 6, None, None).unwrap(), None);
-        // Dealing, but no record of the dealing epoch.
-        assert_eq!(ensure_dkg_outcome(&db, 6, Some(true), None).unwrap(), None);
-        assert_eq!(db.get_dkg_outcome(6), None);
-    }
-
-    #[test]
-    fn ensure_computes_the_same_outcome_as_the_pre_gate_walk() {
-        let s = seeded();
-        let boundary = s.boundary.digest();
-        let params = DealingParams::new(EPOCH, s.keys.clone());
-        let expected = reference_outcome(&s.db, &params, &s.keys, boundary);
-        let DkgOutcome::Key(key) = &expected else { panic!("two dealers qualify") };
-        assert_eq!(key.deals.iter().map(|(dealer, _)| *dealer).collect::<Vec<_>>(), vec![0, 1]);
-
-        // From the dealing epoch's pending record, first header found by walking back.
-        s.db.save_pending_epoch_record(&record(EPOCH - 1, &s.keys, boundary, 500)).unwrap();
-        let outcome = ensure_dkg_outcome(&s.db, EPOCH, Some(true), None).unwrap();
-        assert_eq!(outcome.as_ref(), Some(&expected));
-        assert_eq!(s.db.get_dkg_outcome(EPOCH), Some(expected.clone()));
-
-        // From explicit inputs, first header from the previous epoch's record.
-        let db = seeded_like(&s);
-        let previous_boundary = db.get_consensus_by_number(FIRST - 1).unwrap().digest();
-        db.save_pending_epoch_record(&record(EPOCH - 2, &s.keys, previous_boundary, 400)).unwrap();
-        let inputs = DealingInputs {
-            epoch: EPOCH,
-            dealers: s.keys.clone(),
-            recipients: s.keys.clone(),
-            boundary,
-        };
-        assert_eq!(compute_dkg_outcome(&db, &inputs).unwrap(), Some(expected));
-    }
-
-    /// A copy of the seeded headers in a fresh DB.
-    fn seeded_like(s: &Seeded) -> MemDatabase {
-        let db = MemDatabase::default();
-        for number in 1..=BOUNDARY + 3 {
-            db.write_subdag_for_test(number, s.db.get_consensus_by_number(number).unwrap().sub_dag);
-        }
-        db
-    }
-
-    #[test]
-    fn ensure_saves_nothing_when_a_header_is_missing() {
-        let s = seeded();
-        let db = MemDatabase::default();
-        for number in (1..=BOUNDARY).filter(|n| *n != FIRST + 5) {
-            db.write_subdag_for_test(number, s.db.get_consensus_by_number(number).unwrap().sub_dag);
-        }
-        let previous_boundary = db.get_consensus_by_number(FIRST - 1).unwrap().digest();
-        db.save_pending_epoch_record(&record(EPOCH - 2, &s.keys, previous_boundary, 400)).unwrap();
-        db.save_pending_epoch_record(&record(EPOCH - 1, &s.keys, s.boundary.digest(), 500))
-            .unwrap();
-        assert_eq!(ensure_dkg_outcome(&db, EPOCH, Some(true), None).unwrap(), None);
-        assert_eq!(db.get_dkg_outcome(EPOCH), None);
-        // An unknown boundary is missing data too.
-        let inputs = DealingInputs {
-            epoch: EPOCH,
-            dealers: s.keys.clone(),
-            recipients: s.keys.clone(),
-            boundary: BlockHash::repeat_byte(7),
-        };
-        assert_eq!(compute_dkg_outcome(&db, &inputs).unwrap(), None);
     }
 
     /// A committee of `keys` for `epoch`, one vote each.
@@ -708,84 +1038,39 @@ mod tests {
         );
     }
 
-    /// A key switches the committee to threshold certificates and gives a recipient its share. A
-    /// node outside the committee verifies without a share, and a key whose threshold is not the
-    /// committee's quorum is refused.
-    #[test]
-    fn epoch_scheme_derives_the_share_from_a_key() {
-        let s = seeded();
-        s.db.save_pending_epoch_record(&record(EPOCH - 1, &s.keys, s.boundary.digest(), 500))
-            .unwrap();
-        let Some(DkgOutcome::Key(key)) =
-            ensure_dkg_outcome(&s.db, EPOCH, Some(true), None).unwrap()
-        else {
-            panic!("two dealers qualify");
-        };
-
-        let committee = committee_over(EPOCH, &s.keys);
-        let signer = TestSigner(s.keypairs[0].clone());
-        let own_key = signer.public_key();
-        assert!(epoch_scheme(&committee, None, &own_key, &signer).is_pending());
-        assert!(committee.is_threshold_pending());
-
-        let outcome = Some(DkgOutcome::Key(key.clone()));
-        let EpochScheme::Threshold(threshold) =
-            epoch_scheme(&committee, outcome.clone(), &own_key, &signer)
-        else {
-            panic!("a key gives threshold certificates");
-        };
-        let position = committee.bls_position(&own_key).unwrap();
-        assert_eq!(
-            threshold.share.as_ref().map(|share| share.public_key()),
-            Some(key.share_key(position)),
-            "the recipient derives its share"
-        );
-        assert_eq!(committee.threshold_key().as_deref(), Some(&key.public));
-        assert!(!committee.is_threshold_pending());
-
-        let outsider = TestSigner(Arc::new(BlsKeypair::generate(&mut rand::rng())));
-        let EpochScheme::Threshold(threshold) = epoch_scheme(
-            &committee_over(EPOCH, &s.keys),
-            outcome,
-            &outsider.public_key(),
-            &outsider,
-        ) else {
-            panic!("a key gives threshold certificates");
-        };
-        assert!(threshold.share.is_none(), "a node outside the committee holds no share");
-
-        let committee = committee_over(EPOCH, &s.keys);
-        committee.set_threshold_pending(true);
-        let quorum = committee.quorum_threshold() as usize;
-        let public =
-            SecretPolynomial::random(quorum + 1, &mut rand::rng()).unwrap().commit().unwrap();
-        let wrong = EpochKey { public, ..key };
-        assert!(matches!(
-            epoch_scheme(&committee, Some(DkgOutcome::Key(wrong)), &own_key, &signer),
-            EpochScheme::Aggregate
-        ));
-        assert!(!committee.is_threshold_pending() && committee.threshold_key().is_none());
-    }
-
+    /// The scheme follows the outcome: none is pending, a fallback is aggregate, a key switches
+    /// the committee to threshold certificates, and a key whose threshold is not the committee's
+    /// quorum stays pending rather than falling back.
     #[test]
     fn epoch_scheme_follows_the_outcome() {
-        let mut builder = CommitteeBuilder::new(EPOCH);
-        for _ in 0..4 {
-            builder.add_authority(
-                *BlsKeypair::generate(&mut rand::rng()).public(),
-                1,
-                Default::default(),
-            );
-        }
-        let committee = builder.build();
-        committee.load();
-        let signer = TestSigner(Arc::new(BlsKeypair::generate(&mut rand::rng())));
-        let pending = epoch_scheme(&committee, None, &signer.public_key(), &signer);
-        assert!(pending.is_pending() && committee.is_threshold_pending());
-        let aggregate =
-            epoch_scheme(&committee, Some(DkgOutcome::Fallback), &signer.public_key(), &signer);
+        let keys: Vec<BlsPublicKey> =
+            (0..4).map(|_| *BlsKeypair::generate(&mut rand::rng()).public()).collect();
+        let committee = committee_over(7, &keys);
+        assert!(epoch_scheme(&committee, None, None).is_pending());
+        assert!(committee.is_threshold_pending());
+        let aggregate = epoch_scheme(&committee, Some(DkgOutcome::Fallback), None);
         assert!(matches!(aggregate, EpochScheme::Aggregate));
         assert!(!committee.is_threshold_pending() && committee.threshold_key().is_none());
+
+        let polynomial = SecretPolynomial::random(3, &mut rand::rng()).unwrap();
+        let key = EpochKey {
+            epoch: 7,
+            public: polynomial.commit().unwrap(),
+            dealers: vec![],
+            members: vec![],
+        };
+        let threshold = epoch_scheme(&committee, Some(DkgOutcome::Key(key.clone())), None);
+        assert!(threshold.threshold().is_some_and(|t| t.share.is_none()));
+        assert_eq!(committee.threshold_key().unwrap().group_key(), key.group_key());
+
+        let wrong = SecretPolynomial::random(2, &mut rand::rng()).unwrap();
+        let wrong = EpochKey {
+            epoch: 7,
+            public: wrong.commit().unwrap(),
+            dealers: vec![],
+            members: vec![],
+        };
+        assert!(epoch_scheme(&committee, Some(DkgOutcome::Key(wrong)), None).is_pending());
     }
 
     #[test]

@@ -138,6 +138,25 @@ fn clean_closes_when_the_tip_reaches_the_boundary() {
     assert!(at.check_boundary(boundary).is_err(), "a tip at the boundary closes the pipeline");
 }
 
+/// An epoch held open for the next epoch's threshold key does not close at the boundary: past it
+/// the pipeline keeps building (at the quiescing pace), so dealings still land. Without the hold
+/// it closes and refuses to build.
+#[test]
+fn held_open_pipeline_builds_past_the_boundary() {
+    let boundary = 100;
+    let held = BatchPipeline::<Clean>::new(None, 1, boundary + 50).holding_open(true);
+    let held = held.check_boundary(boundary).expect("a held-open pipeline does not close");
+    assert!(held.on_event().can_start_build(Some(0), boundary).is_ok());
+
+    let normal = BatchPipeline::<Clean>::new(None, 1, boundary + 50);
+    assert!(normal.check_boundary(boundary).is_err());
+    let normal = BatchPipeline::<Clean>::new(None, 1, boundary + 50).on_event();
+    assert_eq!(
+        normal.can_start_build(Some(0), boundary),
+        Err(GateRejectionReason::EpochBoundaryReached)
+    );
+}
+
 #[test]
 fn resume_seq_prefers_the_executed_watermark() {
     let (_tx, rx) = tokio::sync::watch::channel(Some(5u64));

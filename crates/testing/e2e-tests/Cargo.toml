@@ -64,6 +64,9 @@ faucet = ["dep:rayls-execution-faucet", "dep:futures"]
 # Compile the dev-mode e2e test (tests/it/dev.rs); enables `rayls-network-cli`'s
 # `dev-single-node-setup` feature and builds the test binary with it.
 dev-single-node-setup = ["rayls-network-cli/dev-single-node-setup"]
+# Compile the DKG fault tests (tests/it/dkg_faults.rs) and build the node binary with its
+# fault-injection hooks.
+dkg-test-hooks = ["rayls-network-cli/dkg-test-hooks"]
 
 [lints]
 workspace = true

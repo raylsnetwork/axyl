@@ -40,6 +40,7 @@ pub mod error;
 mod evm;
 pub mod in_flight;
 pub mod native_erc20;
+pub mod nidkg_precompile;
 pub(crate) mod persistence;
 pub mod reth_env;
 pub mod rpc_server_args;

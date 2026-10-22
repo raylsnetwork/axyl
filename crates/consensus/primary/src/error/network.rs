@@ -86,6 +86,7 @@ impl From<&PrimaryNetworkError> for Option<Penalty> {
                     | CertificateError::Unsigned
                     | CertificateError::Inquorate { .. }
                     | CertificateError::UnexpectedSigners
+                    | CertificateError::UnexpectedCreatedAt
                     | CertificateError::InvalidSignature => Some(Penalty::Fatal),
                     // ignore
                     CertificateError::ResChannelClosed(_)
@@ -160,10 +161,6 @@ fn penalty_from_header_error(error: &HeaderError) -> Option<Penalty> {
         | HeaderError::UnknownWorkerId
         | HeaderError::InvalidHeaderDigest
         | HeaderError::InvalidRound { .. }
-        | HeaderError::UnexpectedDkgData
-        | HeaderError::InvalidDkgDeal(_)
-        | HeaderError::InvalidDkgComplaint(_)
-        | HeaderError::TooManyDkgComplaints(_, _)
         | HeaderError::UnknownAuthority(_) => Some(Penalty::Fatal),
         // ignore
         HeaderError::PendingCertificateOneshot

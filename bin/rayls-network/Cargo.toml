@@ -31,6 +31,9 @@ jemalloc = ["tikv-jemallocator"]
 # PRODUCTION — off by default so release builds exclude it; build with
 # `--features dev-single-node-setup` for local development.
 dev-single-node-setup = ["rayls-network-cli/dev-single-node-setup"]
+# DKG fault injection for the e2e tests (`RL_TEST_DKG_*` environment variables). NOT FOR
+# PRODUCTION.
+dkg-test-hooks = ["rayls-network-cli/dkg-test-hooks"]
 
 [lints]
 workspace = true

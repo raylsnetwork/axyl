@@ -2,7 +2,8 @@ use rayls_consensus_primary::{ConsensusBus, NodeMode};
 use rayls_execution_rpc::{EngineToPrimary, NodeRole, NodeStatus};
 use rayls_infrastructure_storage::{ConsensusStore, EpochStore};
 use rayls_infrastructure_types::{
-    BlockHash, ConsensusHeader, Database, Epoch, EpochCertificate, EpochRecord,
+    BlockHash, BlsPublicKey, ConsensusHeader, Database, Epoch, EpochCertificate, EpochRecord,
+    RecordBinding,
 };
 
 #[derive(Debug)]
@@ -62,6 +63,15 @@ impl<DB: Database> EngineToPrimary for EngineToPrimaryRpc<DB> {
             (Some(epoch), _) => self.get_epoch_by_number(epoch),
             (None, None) => None,
         }
+    }
+
+    fn epoch_record_binding(&self, epoch: Epoch) -> Option<RecordBinding> {
+        let (record, _) = self.get_epoch_by_number(epoch)?;
+        Some(self.db.get_record_binding(record.digest()))
+    }
+
+    fn epoch_group_key(&self, epoch: Epoch) -> Option<Option<BlsPublicKey>> {
+        self.db.epoch_group_key(epoch)
     }
 
     fn node_status(&self) -> NodeStatus {

@@ -60,6 +60,10 @@ pub enum IntentScope {
     ConsensusDigest = 2,   // Used for authority signature on consensus digests.
     SystemMessage = 3,     // Used for signing system messages.
     DkgShare = 4,          // Used for DKG share decryption keys. Never published.
+    DkgDealing = 5,        /* Used for authorising a DKG dealing or an encryption key
+                            * registration. */
+    EpochBoundaryKeyed = 6, /* Used for an epoch record together with the next epoch's
+                             * group key, from the `ThresholdCertificates` fork on. */
 }
 
 impl TryFrom<u8> for IntentScope {

@@ -7,6 +7,7 @@
 pub mod accessors;
 pub mod chain;
 pub mod config;
+pub mod dkg_manager;
 pub mod env;
 pub mod execution;
 pub mod genesis;

@@ -13,8 +13,8 @@ use crate::{
         },
         utils::{catchup_accumulator, recover_executed_anchor},
         vote_triage::{
-            backfill_candidate, classify_fetched_record, split_settled_votes, triage_vote,
-            ForeignVote, QueuedVote, VoteAction,
+            backfill_candidate, check_vote, classify_fetched_record, split_settled_votes,
+            triage_checked, ForeignVote, QueuedVote, SignatureCheck, VoteAction, VoteKeys,
         },
     },
     primary::PrimaryNode,
@@ -26,24 +26,32 @@ use eyre::eyre;
 use futures::FutureExt;
 use rayls_consensus_primary::{network::PrimaryNetworkHandle, ConsensusBus, NodeMode, QueChannel};
 use rayls_consensus_state_sync::{
-    epoch_committee_valid, epoch_record_valid, spawn_epoch_record_collector,
+    binding_agrees, epoch_committee_valid, epoch_record_valid, record_keys,
+    spawn_epoch_record_collector,
 };
 use rayls_consensus_worker::{quorum_waiter::QuorumWaiterTrait, Worker};
 use rayls_execution_evm::{reth_env::RethEnv, system_calls::EpochState};
-use rayls_infrastructure_config::{KeyConfig, LibP2pConfig, NetworkConfig, RaylsDirs};
+use rayls_infrastructure_config::{
+    ConsensusConfig, KeyConfig, LibP2pConfig, NetworkConfig, RaylsDirs,
+};
 use rayls_infrastructure_storage::{
     tables::ConsensusBlocks, EpochStore as _, PENDING_RECORD_LOG_TARGET,
 };
 use rayls_infrastructure_types::{
-    error::HeaderError, gas_accumulator::GasAccumulator, B256Map, BlsAggregateSignature,
-    BlsPublicKey, BlsSignature, CameFrom, ConsensusOutput, Database as ReDatabase, Epoch,
-    EpochCertificate, EpochRecord, EpochVote, Noticer, Notifier, RaylsReceiver, RaylsSender,
-    TaskJoinError, TaskKind, TaskManager, VotesAggregator, B256,
+    dkg::{DkgOutcome, EpochThreshold},
+    error::HeaderError,
+    gas_accumulator::GasAccumulator,
+    threshold::{combine, PartialSignature, ShareIndex},
+    B256Map, BlsAggregateSignature, BlsPublicKey, BlsSignature, CameFrom, ConsensusOutput,
+    Database as ReDatabase, Epoch, EpochCertificate, EpochRecord, EpochVote, Noticer, Notifier,
+    RaylsReceiver, RaylsSender, RecordBinding, RecordKeys, TaskJoinError, TaskKind, TaskManager,
+    VoteContext, VotesAggregator, B256,
 };
 use rayls_middleware_processor::{batch::BatchOrdering, reconstruct_batch_digests};
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     panic::AssertUnwindSafe,
+    sync::Arc,
     time::Duration,
 };
 use tokio::sync::{mpsc, oneshot, watch};
@@ -149,54 +157,143 @@ struct PendingCertification {
     committee: Vec<BlsPublicKey>,
     committee_index: HashMap<BlsPublicKey, usize>,
     quorum: u64,
+    /// What the votes sign besides the record.
+    binding: RecordBinding,
+    /// The record's epoch key and this node's share of it, when the epoch uses threshold
+    /// certificates: votes are then partial signatures and the certificate is their unique
+    /// combination.
+    threshold: Option<Arc<EpochThreshold>>,
     my_vote: Option<EpochVote>,
     /// Committee members whose vote has not been counted yet.
     committee_keys: HashSet<BlsPublicKey>,
     sigs: Vec<BlsSignature>,
+    partials: Vec<PartialSignature>,
+    /// Who signed; the certificate lists them only for an aggregate epoch.
     signed_authorities: roaring::RoaringBitmap,
     /// Certified and saved (by us or by someone else): nothing left to collect for it.
     done: bool,
+    /// `binding` and `threshold` are known. Until they are, the node neither votes for the
+    /// record nor counts votes for it, and the collector keeps trying to learn them.
+    context_known: bool,
 }
 
 impl PendingCertification {
-    fn new(record: EpochRecord) -> Self {
+    /// A record whose signing context this node cannot compute yet ([`Self::set_context`]).
+    fn waiting(record: EpochRecord) -> Self {
+        let mut state = Self::new(record, RecordBinding::Legacy, None);
+        state.context_known = false;
+        state
+    }
+
+    /// Learn how the record is signed. Votes counted before cannot exist: none is counted
+    /// without a context.
+    fn set_context(&mut self, binding: RecordBinding, threshold: Option<Arc<EpochThreshold>>) {
+        let record = self.record.clone();
+        *self = Self::new(record, binding, threshold);
+    }
+
+    /// Whether the collector still has to learn something to vote: the context, or this
+    /// node's share of a threshold epoch's key while it sits in the committee.
+    fn incomplete(&self, me: &BlsPublicKey) -> bool {
+        let missing_share = self.threshold.as_ref().is_some_and(|t| t.share.is_none())
+            && self.committee.contains(me)
+            && self.my_vote.is_none();
+        !self.context_known || missing_share
+    }
+
+    fn new(
+        record: EpochRecord,
+        binding: RecordBinding,
+        threshold: Option<Arc<EpochThreshold>>,
+    ) -> Self {
         let epoch_hash = record.digest();
         let committee = record.committee.clone();
         let committee_index = committee.iter().enumerate().map(|(i, k)| (*k, i)).collect();
         let committee_keys: HashSet<BlsPublicKey> = committee.iter().copied().collect();
+        let quorum = match &threshold {
+            Some(threshold) => threshold.key.threshold() as u64,
+            None => record.super_quorum() as u64,
+        };
         Self {
             epoch_hash,
-            quorum: record.super_quorum() as u64,
+            quorum,
             record,
             committee,
             committee_index,
+            binding,
+            threshold,
             my_vote: None,
             committee_keys,
             sigs: Vec::new(),
+            partials: Vec::new(),
             signed_authorities: roaring::RoaringBitmap::new(),
             done: false,
+            context_known: true,
         }
     }
 
-    /// Sign the record as committee member `me` and count that vote.
-    fn sign(&mut self, me: &BlsPublicKey, key_config: &KeyConfig) -> EpochVote {
-        let vote = self.record.sign_vote(key_config);
-        if self.committee_keys.remove(me) {
-            self.sigs.push(vote.signature);
-            if let Some(idx) = self.committee_index.get(me) {
-                self.signed_authorities.insert(*idx as u32);
+    /// What a vote for this record names when gossiped: its epoch and binding, for a keyed
+    /// record.
+    fn context(&self) -> Option<VoteContext> {
+        match self.binding {
+            RecordBinding::Legacy => None,
+            RecordBinding::NextKey(next_key) => {
+                Some(VoteContext { epoch: self.record.epoch, next_key })
             }
         }
-        self.my_vote = Some(vote);
-        vote
     }
 
-    /// Count a committee vote for this record; a repeat from the same signer is ignored.
+    /// What verifying this record's certificate needs.
+    fn record_keys(&self) -> RecordKeys {
+        RecordKeys {
+            binding: self.binding,
+            group_key: self.threshold.as_ref().map(|threshold| threshold.key.group_key()),
+        }
+    }
+
+    /// Check a vote's signature as one for this record.
+    fn check(&self, vote: &EpochVote) -> SignatureCheck {
+        if !self.context_known {
+            return SignatureCheck::Unverifiable;
+        }
+        let keys = VoteKeys {
+            committee: &self.committee,
+            threshold: self.threshold.as_ref().map(|threshold| &threshold.key),
+        };
+        check_vote(vote, &self.binding, keys)
+    }
+
+    /// Sign the record as committee member `me` and count that vote: with this node's share in
+    /// a threshold epoch (`None` when it has none), its own key otherwise.
+    fn sign(&mut self, me: &BlsPublicKey, key_config: &KeyConfig) -> Option<EpochVote> {
+        let vote = match &self.threshold {
+            Some(threshold) => {
+                let share = threshold.share.as_ref()?;
+                self.record.sign_vote_with_share(share, *me, &self.binding)
+            }
+            None => self.record.sign_vote_bound(key_config, &self.binding),
+        };
+        self.count(&vote);
+        self.my_vote = Some(vote);
+        Some(vote)
+    }
+
+    /// Count a committee vote for this record, already checked ([`Self::check`]): a repeat from
+    /// the same signer is ignored.
     fn count(&mut self, vote: &EpochVote) {
         if !self.committee_keys.remove(&vote.public_key) {
             return;
         }
-        self.sigs.push(vote.signature);
+        match &self.threshold {
+            Some(threshold) => {
+                let Some(position) = threshold.key.position_of(&vote.public_key) else { return };
+                self.partials.push(PartialSignature {
+                    index: ShareIndex::from_position(position),
+                    signature: vote.signature,
+                });
+            }
+            None => self.sigs.push(vote.signature),
+        }
         if let Some(idx) = self.committee_index.get(&vote.public_key) {
             self.signed_authorities.insert(*idx as u32);
         }
@@ -206,16 +303,119 @@ impl PendingCertification {
         self.signed_authorities.len() >= self.quorum
     }
 
-    /// Aggregate the collected signatures into a certificate that verifies against the record.
+    /// The certificate the collected signatures make, checked against the record: the threshold
+    /// signature with no signers listed in a threshold epoch, the same on every node; else the
+    /// aggregate and who signed.
     fn certificate(&self) -> Option<EpochCertificate> {
-        let aggregated = BlsAggregateSignature::aggregate(&self.sigs[..], true).ok()?;
-        let cert = EpochCertificate {
-            epoch_hash: self.epoch_hash,
-            signature: aggregated.to_signature(),
-            signed_authorities: self.signed_authorities.clone(),
+        let cert = match &self.threshold {
+            Some(threshold) => EpochCertificate {
+                epoch_hash: self.epoch_hash,
+                signature: combine(threshold.key.threshold(), &self.partials).ok()?,
+                signed_authorities: roaring::RoaringBitmap::new(),
+            },
+            None => EpochCertificate {
+                epoch_hash: self.epoch_hash,
+                signature: BlsAggregateSignature::aggregate(&self.sigs[..], true)
+                    .ok()?
+                    .to_signature(),
+                signed_authorities: self.signed_authorities.clone(),
+            },
         };
-        self.record.verify_with_cert(&cert).then_some(cert)
+        self.record.verify_with_cert(&cert, &self.record_keys()).then_some(cert)
     }
+}
+
+/// What learning a record's signing context needs, kept by the collector for records whose
+/// context or share could not be computed when collection began.
+struct SigningSource<DB> {
+    engine: ExecutionNode,
+    db: DB,
+    key_config: KeyConfig,
+    me: BlsPublicKey,
+    /// The consensus config of the epoch that ran last (see `EpochManager::last_config`).
+    last_config: Option<ConsensusConfig<DB>>,
+}
+
+impl<DB: ReDatabase> SigningSource<DB> {
+    /// The threshold material for a record of `key`'s epoch: the share the epoch ran with when
+    /// it is the one that ran last, else this node's share derived again (after a restart, or
+    /// for a record left pending by an earlier stall) from the dealings it keeps.
+    async fn epoch_threshold(
+        &self,
+        key: rayls_infrastructure_types::dkg::EpochKey,
+    ) -> Arc<EpochThreshold> {
+        let running = self
+            .last_config
+            .as_ref()
+            .filter(|config| config.epoch() == key.epoch)
+            .and_then(|config| config.scheme().threshold().cloned())
+            .filter(|threshold| threshold.key == key && threshold.share.is_some());
+        if let Some(threshold) = running {
+            return threshold;
+        }
+        let share = match key.position_of(&self.me) {
+            Some(_) => {
+                super::dkg::own_share(&self.engine, &self.db, &key, &self.key_config).await.share()
+            }
+            None => None,
+        };
+        Arc::new(EpochThreshold { key, share })
+    }
+
+    /// Learn what `state` still lacks (its context, or this node's share) and, once it can, sign
+    /// the record if this node is in its committee. Returns the vote to publish.
+    async fn complete(&self, state: &mut PendingCertification) -> Option<EpochVote> {
+        if !state.context_known {
+            let signing = super::dkg::record_signing(&self.engine, &self.db, &state.record).await?;
+            let threshold = match signing.key {
+                Some(key) => Some(self.epoch_threshold(key).await),
+                None => None,
+            };
+            state.set_context(signing.binding, threshold);
+            info!(target: PENDING_RECORD_LOG_TARGET, epoch = state.record.epoch, "learned how the pending record is signed");
+        } else if let Some(threshold) = state.threshold.clone().filter(|t| t.share.is_none()) {
+            let share =
+                super::dkg::own_share(&self.engine, &self.db, &threshold.key, &self.key_config)
+                    .await
+                    .share()?;
+            let key = threshold.key.clone();
+            state.threshold = Some(Arc::new(EpochThreshold { key, share: Some(share) }));
+            info!(target: PENDING_RECORD_LOG_TARGET, epoch = state.record.epoch, "derived the share to sign the pending record with");
+        }
+        if state.my_vote.is_some() || !state.committee.contains(&self.me) {
+            return None;
+        }
+        state.sign(&self.me, &self.key_config)
+    }
+}
+
+/// Check a vote for a record this node is not collecting, by the keys of the epoch it names. A
+/// legacy vote names none and is checked against `union_committee` as before the fork.
+fn foreign_vote_check<DB: ReDatabase>(
+    db: &DB,
+    vote: &EpochVote,
+    context: Option<VoteContext>,
+    union_committee: &[BlsPublicKey],
+) -> SignatureCheck {
+    let Some(VoteContext { epoch, next_key }) = context else {
+        let keys = VoteKeys { committee: union_committee, threshold: None };
+        return check_vote(vote, &RecordBinding::Legacy, keys);
+    };
+    // the epoch a keyed vote names is not signed: whatever it says, the voter must sit in a
+    // committee being collected, as for a legacy vote
+    if !union_committee.contains(&vote.public_key) {
+        return SignatureCheck::Invalid;
+    }
+    let Some(committee) = db.get_committee_keys(epoch) else {
+        return SignatureCheck::Unverifiable;
+    };
+    let threshold = match db.get_dkg_outcome(epoch) {
+        Some(DkgOutcome::Key(key)) => Some(key),
+        Some(DkgOutcome::Fallback) => None,
+        None => return SignatureCheck::Unverifiable,
+    };
+    let keys = VoteKeys { committee: &committee, threshold: threshold.as_ref() };
+    check_vote(vote, &RecordBinding::NextKey(next_key), keys)
 }
 
 impl<P, DB> EpochManager<P, DB>
@@ -237,6 +437,7 @@ where
     ) -> eyre::Result<Self> {
         // create key config for lifetime of the app
         let key_config = KeyConfig::read_config(&rayls_datadir, passphrase)?;
+        super::dkg::set_genesis_dealings_file(rayls_datadir.genesis_dkg_dealings_path());
 
         // shutdown long-running node components
         let node_shutdown = Notifier::new();
@@ -275,6 +476,7 @@ where
             worker_event_stream,
             epoch_record: None,
             prev_epoch_record,
+            last_config: None,
             certification_attempts: Default::default(),
             initial_epoch: true,
             #[cfg(feature = "cold-storage")]
@@ -409,6 +611,24 @@ where
                 self.fatal_db_error.clone(),
             );
         }
+
+        // epoch 0's outcome, for verifying its record and certificates whatever epoch this node
+        // starts in (a node only computes the outcome of the epoch it runs)
+        if let Err(e) =
+            super::dkg::ensure_dkg_outcome_with_chain(&engine, &self.consensus_db, 0).await
+        {
+            error!(target: "epoch-manager", ?e, "cannot save epoch 0's dkg outcome");
+        }
+
+        // keep the DKG dealings of every block executed from here on, before their receipts
+        // can be pruned
+        super::dkg::spawn_dealing_archive(
+            engine.clone(),
+            self.consensus_db.clone(),
+            self.consensus_bus.executed_anchor().subscribe(),
+            node_task_manager.get_spawner(),
+            self.node_shutdown.subscribe(),
+        );
 
         // Fires once the engine task has fully drained (its last block executed),
         // so the shutdown flush below runs *after* the final block, not before it.
@@ -803,6 +1023,7 @@ where
                                 current_epoch,
                                 seq,
                                 epoch_boundary,
+                                consensus_config.holds_open_for_key(),
                             )
                             .await?;
                     }
@@ -861,7 +1082,8 @@ where
         // its cert. write_epoch_record already saved the new record to PendingEpochRecord, so
         // the table is the complete work set. One task for all of them: the vote queue is
         // single-consumer (#142).
-        self.resume_pending_certification(&primary, &epoch_task_manager).await;
+        self.resume_pending_certification(engine, &primary, &epoch_task_manager).await;
+        self.last_config = Some(consensus_config.clone());
 
         // biased: node shutdown > consensus shutdown > boundary > mode_transition > task crash
         // snapshot before select: join() fires shutdown as side-effect
@@ -878,7 +1100,7 @@ where
             // samples the state before the select, so it cannot catch a notify that lands during.
             _ = epoch_shutdown_rx => RunningOutcome::NodeShutdown,
 
-            res = self.detect_epoch_boundary(epoch_boundary, to_engine, consensus_output) => {
+            res = self.detect_epoch_boundary(epoch_boundary, &consensus_config, to_engine, consensus_output) => {
                 match res {
                     Ok((target_hash, boundary_output)) => {
                         RunningOutcome::EpochBoundary(target_hash, Box::new(boundary_output))
@@ -1060,19 +1282,22 @@ where
         let network = primary.network_handle().await;
         // single budget: request_epoch_cert owns the retry + per-request timeout.
         // wrapping it in an outer timeout was cancelling mid-retry and defeating the loop
-        let Ok((peer_rec, cert)) = network.request_epoch_cert(Some(epoch_rec.epoch), None).await
+        let Ok((peer_rec, cert, binding)) =
+            network.request_epoch_cert(Some(epoch_rec.epoch), None).await
         else {
             return false;
         };
+        let keys = record_keys(&self.consensus_db, epoch_rec.epoch, &binding);
         if peer_rec.digest() != epoch_hash
-            || !peer_rec.verify_with_cert(&cert)
+            || !binding_agrees(&self.consensus_db, epoch_rec.epoch, &binding)
+            || !peer_rec.verify_with_cert(&cert, &keys)
             || !epoch_committee_valid(&peer_rec, committee)
         {
             return false;
         }
         info!(target: "epoch-manager", epoch = epoch_rec.epoch, "fast-path: fetched epoch cert from peer");
         // Save the peer's record (matching the verified cert), not our local copy.
-        if let Err(e) = self.consensus_db.save_epoch_record_with_cert(&peer_rec, &cert) {
+        if let Err(e) = self.consensus_db.save_epoch_record_with_cert(&peer_rec, &cert, &binding) {
             error!(target: "epoch-manager", "failed to save fast-path epoch record and cert: {e}");
         }
         true
@@ -1106,7 +1331,7 @@ where
     fn requeue_epoch_votes(consensus_bus: &ConsensusBus, votes: VecDeque<QueuedVote>) {
         for item in votes {
             if let Err(err) = consensus_bus.new_epoch_votes().try_send(item) {
-                let (vote, vote_tx) = match err {
+                let (vote, _, vote_tx) = match err {
                     rayls_infrastructure_types::TrySendError::Full(item)
                     | rayls_infrastructure_types::TrySendError::Closed(item)
                     | rayls_infrastructure_types::TrySendError::Broadcast(item) => item,
@@ -1134,11 +1359,12 @@ where
             );
             return false;
         };
-        match consensus_db.save_epoch_record_with_cert(&state.record, &cert) {
+        match consensus_db.save_epoch_record_with_cert(&state.record, &cert, &state.binding) {
             Ok(()) => {
                 info!(
                     target: "epoch-manager",
                     epoch = state.record.epoch,
+                    threshold = state.threshold.is_some(),
                     "reached quorum on epoch close for {epoch_hash}",
                 );
                 true
@@ -1195,7 +1421,8 @@ where
         digest: B256,
         current_epoch: Epoch,
     ) -> ForeignVote {
-        let Ok((record, cert)) = primary_network.request_epoch_cert(None, Some(digest)).await
+        let Ok((record, cert, binding)) =
+            primary_network.request_epoch_cert(None, Some(digest)).await
         else {
             return ForeignVote::Unknown;
         };
@@ -1203,7 +1430,7 @@ where
             return ForeignVote::Unknown;
         }
         // Same validation the collector applies: the record must anchor to the parent we hold.
-        if !epoch_record_valid(consensus_db, record.epoch, &record, &cert) {
+        if !epoch_record_valid(consensus_db, record.epoch, &record, &cert, &binding) {
             return ForeignVote::Unknown;
         }
         let class = classify_fetched_record(record.epoch, current_epoch);
@@ -1212,7 +1439,7 @@ where
         match class {
             ForeignVote::Stale { .. } => {
                 if backfill_candidate(record.epoch, current_epoch, already_certified) {
-                    match consensus_db.save_epoch_record_with_cert(&record, &cert) {
+                    match consensus_db.save_epoch_record_with_cert(&record, &cert, &binding) {
                         Ok(()) => info!(
                             target: "epoch-manager",
                             epoch = record.epoch,
@@ -1233,7 +1460,7 @@ where
                 // and ends our collection for the epoch. Reported as `Adopted` so the vote that
                 // led here, and every later vote for the digest, is acked rather than rejected
                 // as a competing record now that the record is on disk.
-                match consensus_db.save_epoch_record_with_cert(&record, &cert) {
+                match consensus_db.save_epoch_record_with_cert(&record, &cert, &binding) {
                     Ok(()) => {
                         warn!(
                             target: "epoch-manager",
@@ -1280,6 +1507,7 @@ where
     /// Cheap and a no-op when nothing is pending.
     pub(super) async fn resume_pending_certification(
         &self,
+        engine: &ExecutionNode,
         primary: &PrimaryNode<DB>,
         epoch_task_manager: &TaskManager,
     ) {
@@ -1289,6 +1517,13 @@ where
         let catching_up = !self.consensus_bus.node_mode().borrow().is_active_cvv();
         let me = self.builder.rayls_infrastructure_config.primary_bls_key();
         let primary_network = primary.network_handle().await;
+        let source = SigningSource {
+            engine: engine.clone(),
+            db: self.consensus_db.clone(),
+            key_config: self.key_config.clone(),
+            me: *me,
+            last_config: self.last_config.clone(),
+        };
 
         let pending = self.consensus_db.pending_epoch_records();
         let newest_pending = pending.last().map(|record| record.epoch);
@@ -1344,17 +1579,51 @@ where
                 }
             }
 
-            let mut state = PendingCertification::new(record);
+            // what the votes sign and with which keys: until this node knows, it neither votes
+            // nor counts votes, the collector keeps trying, and peers' certificates still reach
+            // it through the record collector
+            let mut state =
+                match super::dkg::record_signing(engine, &self.consensus_db, &record).await {
+                    Some(signing) => {
+                        let threshold = match signing.key {
+                            Some(key) => Some(source.epoch_threshold(key).await),
+                            None => None,
+                        };
+                        PendingCertification::new(record, signing.binding, threshold)
+                    }
+                    None => {
+                        warn!(
+                            target: PENDING_RECORD_LOG_TARGET,
+                            epoch,
+                            "cannot tell yet how the record is signed: collecting, retrying"
+                        );
+                        self.consensus_bus.requested_missing_epoch().send_if_modified(|current| {
+                            if epoch > *current {
+                                *current = epoch;
+                                true
+                            } else {
+                                false
+                            }
+                        });
+                        PendingCertification::waiting(record)
+                    }
+                };
             info!(
                 target: PENDING_RECORD_LOG_TARGET,
                 epoch,
                 %epoch_hash,
                 in_committee = state.committee_keys.contains(me),
+                keyed = state.context().is_some(),
+                threshold = state.threshold.is_some(),
                 "pending epoch enters vote collection"
             );
             // We are in the committee so sign and gossip the epoch record.
-            if state.committee_keys.contains(me) {
-                let vote = state.sign(me, &self.key_config);
+            if state.context_known && state.committee_keys.contains(me) {
+                let Some(vote) = state.sign(me, &self.key_config) else {
+                    warn!(target: "epoch-manager", epoch, "no share of the epoch key to sign its record with: collecting others' votes only");
+                    states.push(state);
+                    continue;
+                };
                 info!(target: "epoch-manager", epoch, "publishing epoch record {epoch_hash}");
 
                 // Dev (single-node): self-certify - no peers to gossip to or collect votes
@@ -1365,10 +1634,11 @@ where
                 if state.committee.len() == 1 {
                     match state.certificate() {
                         Some(cert) => {
-                            match self
-                                .consensus_db
-                                .save_epoch_record_with_cert(&state.record, &cert)
-                            {
+                            match self.consensus_db.save_epoch_record_with_cert(
+                                &state.record,
+                                &cert,
+                                &state.binding,
+                            ) {
                                 Ok(_) => {
                                     info!(target: "epoch-manager", epoch, %epoch_hash, "self-certified epoch (single-node)")
                                 }
@@ -1384,7 +1654,7 @@ where
                     continue;
                 }
 
-                let _ = primary_network.publish_epoch_vote(vote).await;
+                let _ = primary_network.publish_epoch_vote(vote, state.context()).await;
             }
             states.push(state);
         }
@@ -1426,6 +1696,7 @@ where
                     primary_network,
                     certification_attempts,
                     vote_shutdown,
+                    source,
                 )
                 .await
             },
@@ -1442,6 +1713,7 @@ where
     /// stall, not just a slow peer - the records exist only in `PendingEpochRecord`, and this
     /// task (or an identical one resumed by the next `run_epoch`) is the only thing that can
     /// ever finish certifying them.
+    #[allow(clippy::too_many_arguments)]
     async fn certify_pending_epochs(
         mut states: Vec<PendingCertification>,
         consensus_db: DB,
@@ -1449,6 +1721,7 @@ where
         primary_network: PrimaryNetworkHandle,
         certification_attempts: CertificationAttempts,
         vote_shutdown: Noticer,
+        source: SigningSource<DB>,
     ) {
         let certified = |epoch: Epoch| {
             consensus_db.get_epoch_by_number(epoch).is_some_and(|(_, c)| c.is_some())
@@ -1476,7 +1749,7 @@ where
                         "retrying epoch certification; no quorum reached on the previous attempt",
                     );
                     if let Some(vote) = state.my_vote {
-                        let _ = primary_network.publish_epoch_vote(vote).await;
+                        let _ = primary_network.publish_epoch_vote(vote, state.context()).await;
                     }
                 }
             }
@@ -1531,7 +1804,7 @@ where
                 let next = if let Some(queued_vote) = queued.pop_front() {
                     // Votes in hand must not outrank the shutdown the transition waits on.
                     if vote_shutdown.noticed() {
-                        let _ = queued_vote.1.send(Ok(()));
+                        let _ = queued_vote.2.send(Ok(()));
                         break;
                     }
                     Next::Vote(queued_vote)
@@ -1550,19 +1823,23 @@ where
                     }
                 };
                 match next {
-                    Next::Vote((vote, vote_tx)) => {
+                    Next::Vote((vote, context, vote_tx)) => {
                         // A vote for one of the records being collected: count it there.
                         if let Some(&i) = by_digest.get(&vote.epoch_hash) {
                             let state = &mut states[i];
-                            if triage_vote(
+                            let action = triage_checked(
                                 &vote,
+                                state.check(&vote),
                                 state.epoch_hash,
                                 state.record.epoch,
-                                &state.committee,
                                 None,
                                 None,
-                            ) == VoteAction::Count
-                            {
+                            );
+                            if action == VoteAction::Unverified {
+                                let _ = vote_tx.send(Ok(()));
+                                continue;
+                            }
+                            if action == VoteAction::Count {
                                 let _ = vote_tx.send(Ok(())); // If we lost this channel somehow then no big deal.
                                 if state.done {
                                     // A straggler for a record we already certified.
@@ -1603,11 +1880,15 @@ where
                                 .get_epoch_by_hash(digest)
                                 .map(|(rec, cert)| (rec.epoch, cert.is_some()))
                         };
-                        let mut action = triage_vote(
+                        // checked by the keys of the epoch it names, before it can trigger a
+                        // resolution or count toward an alternate record
+                        let check =
+                            foreign_vote_check(&consensus_db, &vote, context, &union_committee);
+                        let mut action = triage_checked(
                             &vote,
+                            check,
                             reference_hash,
                             reference_epoch,
-                            &union_committee,
                             local_record(vote.epoch_hash),
                             resolved_digests.get(&vote.epoch_hash).copied(),
                         );
@@ -1636,11 +1917,11 @@ where
                                 }
                             };
                             resolved_digests.insert(vote.epoch_hash, resolved);
-                            action = triage_vote(
+                            action = triage_checked(
                                 &vote,
+                                check,
                                 reference_hash,
                                 reference_epoch,
-                                &union_committee,
                                 local_record(vote.epoch_hash),
                                 Some(resolved),
                             );
@@ -1648,8 +1929,9 @@ where
 
                         match action {
                             // `Count` cannot happen here (the digest matched no pending record),
-                            // but treat it like honest gossip rather than punishing anyone.
-                            VoteAction::Count => {
+                            // but treat it like honest gossip rather than punishing anyone. An
+                            // unverifiable keyed vote proves nothing either way.
+                            VoteAction::Count | VoteAction::Unverified => {
                                 let _ = vote_tx.send(Ok(()));
                             }
                             VoteAction::IgnoreStale { epoch: stale_epoch } => {
@@ -1762,6 +2044,17 @@ where
                     }
                     Next::Closed => break, // channel issues...
                     Next::Fallback => {
+                        // learn what records waiting on their context or this node's share
+                        // still lack, and vote once it can
+                        for state in
+                            states.iter_mut().filter(|s| !s.done && s.incomplete(&source.me))
+                        {
+                            if let Some(vote) = source.complete(state).await {
+                                info!(target: "epoch-manager", epoch = state.record.epoch, "publishing epoch record {}", state.epoch_hash);
+                                let _ =
+                                    primary_network.publish_epoch_vote(vote, state.context()).await;
+                            }
+                        }
                         // Deadline reached, whether or not votes kept arriving.
                         // Failed after a minute: break and try to request the certs instead.
                         // (Shutdown is handled by the select arm above, not polled here.)
@@ -1789,7 +2082,9 @@ where
                         // Timed out, maybe we are not the only ones having issues so republish.
                         for state in states.iter().filter(|s| !s.done) {
                             if let Some(vote) = state.my_vote {
-                                if let Err(err) = primary_network.publish_epoch_vote(vote).await {
+                                if let Err(err) =
+                                    primary_network.publish_epoch_vote(vote, state.context()).await
+                                {
                                     error!(
                                         target: "epoch-manager",
                                         ?err,
@@ -1936,7 +2231,7 @@ where
         let connected_peers_count = primary_network.connected_peers_count().await.unwrap_or(0);
         for _ in 0..connected_peers_count.min(3) {
             // Request by epoch number in case we had a bad hash...
-            let Ok((new_epoch_rec, cert)) =
+            let Ok((new_epoch_rec, cert, binding)) =
                 primary_network.request_epoch_cert(Some(epoch), None).await
             else {
                 error!(
@@ -1947,8 +2242,11 @@ where
                 continue;
             };
 
-            // invalid epoch record or cert, skip
-            if !new_epoch_rec.verify_with_cert(&cert)
+            // invalid epoch record or cert, skip: checked with this node's own context, never
+            // with the local record's next key, which a peer's record need not share
+            let keys = record_keys(consensus_db, epoch, &binding);
+            if !binding_agrees(consensus_db, epoch, &binding)
+                || !new_epoch_rec.verify_with_cert(&cert, &keys)
                 || !epoch_committee_valid(&new_epoch_rec, &state.committee)
                 || new_epoch_rec.parent_hash != state.record.parent_hash
             {
@@ -1969,7 +2267,9 @@ where
                     "Received wrong epoch record: {new_epoch_hash}, expected {epoch_hash}",
                 );
             }
-            if let Err(err) = consensus_db.save_epoch_record_with_cert(&new_epoch_rec, &cert) {
+            if let Err(err) =
+                consensus_db.save_epoch_record_with_cert(&new_epoch_rec, &cert, &binding)
+            {
                 error!(
                     target: "epoch-manager",
                     ?err,
@@ -1991,11 +2291,29 @@ where
     async fn detect_epoch_boundary(
         &self,
         epoch_boundary: u64,
+        consensus_config: &ConsensusConfig<DB>,
         to_engine: &mpsc::Sender<(CameFrom, ConsensusOutput)>,
         mut consensus_output: impl RaylsReceiver<ConsensusOutput>,
     ) -> eyre::Result<(B256, ConsensusOutput)> {
+        let mut extended = false;
         while let Some(mut output) = consensus_output.recv().await {
-            if output.reaches_epoch_boundary(epoch_boundary) {
+            // the time half of the boundary, then the close gate: an epoch whose successor's
+            // threshold key does not exist yet is extended until it does (same rule as the
+            // subscriber's cut, so both stop at the same output)
+            let reached = output.reaches_epoch_boundary(epoch_boundary);
+            if reached && !consensus_config.may_close(&output).await {
+                if !extended {
+                    warn!(
+                        target: "epoch-manager",
+                        epoch = ?output.leader().epoch(),
+                        "epoch extended: the next epoch's threshold key does not exist yet",
+                    );
+                    extended = true;
+                }
+                to_engine.send((CameFrom::DetectEpochBoundary, output)).await?;
+                continue;
+            }
+            if reached {
                 info!(
                     target: "epoch-manager",
                     epoch=?output.leader().epoch(),
@@ -2122,10 +2440,13 @@ pub(crate) async fn await_execution_replay(
 
 #[cfg(test)]
 mod pending_certification_tests {
-    use super::PendingCertification;
+    use super::{PendingCertification, SignatureCheck};
     use rand::{rngs::StdRng, SeedableRng as _};
     use rayls_infrastructure_types::{
-        BlsKeypair, BlsPublicKey, BlsSignature, BlsSigner, EpochRecord, Signer as _, B256,
+        dkg::{EpochKey, EpochThreshold},
+        threshold::{SecretPolynomial, ShareIndex},
+        BlsKeypair, BlsPublicKey, BlsSignature, BlsSigner, EpochRecord, RecordBinding, RecordKeys,
+        Signer as _, B256,
     };
     use std::sync::Arc;
 
@@ -2160,7 +2481,7 @@ mod pending_certification_tests {
             ..Default::default()
         };
 
-        let mut state = PendingCertification::new(record.clone());
+        let mut state = PendingCertification::new(record.clone(), RecordBinding::Legacy, None);
         assert_eq!(state.quorum, 3);
         assert!(!state.reached_quorum());
         assert!(state.certificate().is_none(), "nothing to aggregate yet");
@@ -2177,12 +2498,66 @@ mod pending_certification_tests {
         state.count(&record.sign_vote(&signers[2]));
         assert!(state.reached_quorum());
         let cert = state.certificate().expect("a quorum aggregates into a verifying cert");
-        assert!(record.verify_with_cert(&cert));
+        assert!(record.verify_with_cert(&cert, &RecordKeys::LEGACY));
         assert_eq!(cert.signed_authorities.len(), 3);
 
         // An outsider's vote is ignored.
         let outsider = TestSigner(Arc::new(BlsKeypair::generate(&mut rng)));
         state.count(&record.sign_vote(&outsider));
         assert_eq!(state.signed_authorities.len(), 3);
+    }
+
+    /// In a threshold epoch the votes are partial signatures and any quorum of them makes the
+    /// same certificate, with no signer listed, over the record and its binding. A long-term
+    /// vote is not a vote for it.
+    #[test]
+    fn threshold_votes_make_one_certificate() {
+        let mut rng = StdRng::seed_from_u64(22);
+        let mut signers: Vec<TestSigner> =
+            (0..4).map(|_| TestSigner(Arc::new(BlsKeypair::generate(&mut rng)))).collect();
+        signers.sort_by_key(|s| s.public_key());
+        let committee: Vec<BlsPublicKey> = signers.iter().map(|s| s.public_key()).collect();
+        let record = EpochRecord {
+            epoch: 303,
+            committee: committee.clone(),
+            next_committee: committee.clone(),
+            ..Default::default()
+        };
+        let polynomial = SecretPolynomial::random(3, &mut rng).unwrap();
+        let key = EpochKey {
+            epoch: 303,
+            public: polynomial.commit().unwrap(),
+            dealers: vec![],
+            members: committee.clone(),
+        };
+        let binding = RecordBinding::NextKey(Some(signers[0].public_key()));
+        let threshold = Arc::new(EpochThreshold { key: key.clone(), share: None });
+        let vote = |i: usize| {
+            let share = polynomial.share(ShareIndex::from_position(i as u32)).unwrap();
+            record.sign_vote_with_share(&share, committee[i], &binding)
+        };
+        let collect = |voters: &[usize]| {
+            let mut state =
+                PendingCertification::new(record.clone(), binding, Some(threshold.clone()));
+            for i in voters {
+                let v = vote(*i);
+                assert_eq!(state.check(&v), SignatureCheck::Valid);
+                state.count(&v);
+            }
+            assert!(state.reached_quorum());
+            state.certificate().expect("a quorum of shares combines")
+        };
+        let first = collect(&[0, 1, 2]);
+        assert_eq!(first, collect(&[1, 2, 3]), "the same certificate from any quorum");
+        assert!(first.signed_authorities.is_empty());
+        let keys = RecordKeys { binding, group_key: Some(key.group_key()) };
+        assert!(record.verify_with_cert(&first, &keys));
+
+        let state = PendingCertification::new(record.clone(), binding, Some(threshold));
+        assert_eq!(
+            state.check(&record.sign_vote_bound(&signers[0], &binding)),
+            SignatureCheck::Invalid
+        );
+        assert_eq!(state.context().map(|c| c.epoch), Some(303));
     }
 }

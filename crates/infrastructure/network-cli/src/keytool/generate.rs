@@ -2,10 +2,15 @@
 
 use crate::args::clap_address_parser;
 use clap::{value_parser, Args, Subcommand};
+use rayls_execution_evm::reth_env::dkg_manager::{submitter_key_message, DkgSubmitter};
 use rayls_infrastructure_config::{
     Config, ConfigFmt, ConfigTrait as _, KeyConfig, NodeInfo, RaylsDirs,
 };
-use rayls_infrastructure_types::{get_available_udp_port, Address, Multiaddr, Protocol};
+use rayls_infrastructure_types::{
+    encode, get_available_udp_port,
+    nidkg::{decryption_key_message, encryption_key_context, DecryptionKey},
+    Address, BlsSigner as _, Multiaddr, Protocol,
+};
 use tracing::info;
 
 /// Generate keypairs and save them to a file.
@@ -153,6 +158,22 @@ impl KeygenArgs {
         let proof = key_config.generate_proof_of_possession_bls(&self.address)?;
         node_info.bls_public_key = key_config.primary_public_key();
         node_info.proof_of_possession = proof;
+        // the account the node pays its DKG transactions from; genesis funds it
+        node_info.dkg_submitter = DkgSubmitter::from_signature(
+            &key_config.request_signature_direct(&submitter_key_message()),
+        )?
+        .address();
+        // the encryption key genesis registers, so the genesis committee deals from epoch 0
+        let decryption = DecryptionKey::from_signature(
+            &key_config.request_signature_direct(&decryption_key_message()),
+        )?;
+        let key_proof = decryption.prove(
+            &node_info.bls_public_key,
+            &encryption_key_context(),
+            &mut rand::rng(),
+        )?;
+        node_info.dkg_encryption_key = decryption.encryption_key().to_bytes().to_vec().into();
+        node_info.dkg_key_proof = encode(&key_proof).into();
         node_info.name = format!(
             "node-{}",
             bs58::encode(&node_info.bls_public_key.to_bytes()[0..8]).into_string()

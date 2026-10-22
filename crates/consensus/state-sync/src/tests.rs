@@ -16,8 +16,8 @@ use rayls_infrastructure_storage::{
 };
 use rayls_infrastructure_types::{
     Certificate, CommittedSubDag, ConsensusHeader, ConsensusOutput, Database, DbTxMut, Epoch,
-    EpochCertificate, EpochRecord, ExecHeader, RaylsReceiver as _, RaylsSender, ReputationScores,
-    SealedHeader, B256,
+    EpochCertificate, EpochRecord, ExecHeader, RaylsReceiver as _, RaylsSender, RecordBinding,
+    ReputationScores, SealedHeader, B256,
 };
 use rayls_testing_test_utils_committee::CommitteeFixture;
 use std::{collections::BTreeMap, num::NonZeroUsize, sync::Arc};
@@ -339,7 +339,7 @@ async fn test_certified_consensus_checkpoint_requires_cert() {
         signature: vote.signature,
         signed_authorities,
     };
-    db.save_epoch_record_with_cert(&record, &cert).unwrap();
+    db.save_epoch_record_with_cert(&record, &cert, &RecordBinding::Legacy).unwrap();
     assert_eq!(certified_consensus_checkpoint(db, 1), Some(100));
 }
 
@@ -385,7 +385,7 @@ async fn test_numbering_seed_excludes_post_boundary_leak() {
         signature: vote.signature,
         signed_authorities,
     };
-    db.save_epoch_record_with_cert(&record, &cert).unwrap();
+    db.save_epoch_record_with_cert(&record, &cert, &RecordBinding::Legacy).unwrap();
     assert_eq!(
         certified_consensus_checkpoint(db, 1),
         Some(100),

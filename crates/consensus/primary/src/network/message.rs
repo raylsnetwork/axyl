@@ -5,7 +5,7 @@ use rayls_consensus_network::{types::IntoRpcError, PeerExchangeMap, RLMessage};
 use rayls_infrastructure_types::{
     error::HeaderError, AuthorityIdentifier, BlockHash, BlsPublicKey, BlsSignature, Certificate,
     CertificateDigest, ConsensusHeader, DefaultHashFunction, Epoch, EpochCertificate, EpochRecord,
-    EpochVote, Header, Round, Votable, Vote, B256,
+    EpochVote, Header, KeyedEpochVote, Round, Votable, Vote, B256,
 };
 use roaring::RoaringBitmap;
 use serde::{Deserialize, Serialize};
@@ -76,6 +76,9 @@ pub(super) enum PrimaryGossip {
     Consensus(Box<ConsensusResult>),
     /// Signed hash sent out by committee memebers at epoch start.
     EpochVote(Box<EpochVote>),
+    /// An epoch vote signed with a binding (the `ThresholdCertificates` fork on), with what it
+    /// binds. Appended so the BCS variant indexes of the others are unchanged.
+    KeyedEpochVote(Box<KeyedEpochVote>),
 }
 
 // impl RLMessage trait for types
@@ -469,6 +472,15 @@ pub enum PrimaryResponse {
         expected: Epoch,
         /// The epoch of the proposed header.
         received: Epoch,
+    },
+    /// The requested epoch record and certificate, for a record whose certificate signs the next
+    /// epoch's group key too (the `ThresholdCertificates` fork on). Appended so the BCS variant
+    /// indexes of the others are unchanged; sent only for such records.
+    KeyedEpochRecord {
+        record: EpochRecord,
+        certificate: EpochCertificate,
+        /// The next epoch's group key the certificate signs; `None`: aggregate certificates.
+        next_key: Option<BlsPublicKey>,
     },
 }
 

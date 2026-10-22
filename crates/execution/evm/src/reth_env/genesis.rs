@@ -17,11 +17,12 @@ use alloy::{
 use alloy_evm::Evm;
 use eyre::OptionExt;
 use rayls_infrastructure_config::{
-    NodeInfo, BLSG1_JSON, CONSENSUS_REGISTRY_JSON, DELEGATION_POOL_IMPL_ADDRESS,
-    DELEGATION_POOL_JSON, ERC1967PROXY_JSON, FEE_AGGREGATOR_IMPL_ADDRESS, FEE_AGGREGATOR_JSON,
-    NATIVE_TOKEN_CONTROLLER_IMPL_ADDRESS, NATIVE_TOKEN_CONTROLLER_JSON,
-    REWARD_DISTRIBUTOR_IMPL_ADDRESS, REWARD_DISTRIBUTOR_JSON, RLS_ACCUMULATOR_IMPL_ADDRESS,
-    RLS_ACCUMULATOR_JSON, RLS_IMPL_ADDRESS, RLS_JSON, USDR_PRECOMPILE_ADDRESS,
+    GenesisDealing, NodeInfo, BLSG1_JSON, CONSENSUS_REGISTRY_JSON, DELEGATION_POOL_IMPL_ADDRESS,
+    DELEGATION_POOL_JSON, DKG_MANAGER_ADDRESS, DKG_MANAGER_JSON, ERC1967PROXY_JSON,
+    FEE_AGGREGATOR_IMPL_ADDRESS, FEE_AGGREGATOR_JSON, NATIVE_TOKEN_CONTROLLER_IMPL_ADDRESS,
+    NATIVE_TOKEN_CONTROLLER_JSON, REWARD_DISTRIBUTOR_IMPL_ADDRESS, REWARD_DISTRIBUTOR_JSON,
+    RLS_ACCUMULATOR_IMPL_ADDRESS, RLS_ACCUMULATOR_JSON, RLS_IMPL_ADDRESS, RLS_JSON,
+    USDR_PRECOMPILE_ADDRESS,
 };
 use rayls_infrastructure_types::{address, Address, Bytes, Genesis, GenesisAccount, B256, U256};
 use reth_chainspec::ChainSpec as RethChainSpec;
@@ -51,6 +52,17 @@ impl RethEnv {
         network_admin: Address,
         rls_prefunds: Vec<(Address, U256)>,
     ) -> eyre::Result<Genesis> {
+        // the genesis validators' encryption keys, registered in DkgManager from genesis
+        let dkg_manager_storage = dkg_manager_genesis_storage(&validators)?;
+        // each genesis validator's DKG submitter gets a native balance for its transactions
+        let dkg_submitters: Vec<(Address, GenesisAccount)> = validators
+            .iter()
+            .filter(|v| !v.dkg_submitter.is_zero())
+            .map(|v| {
+                let balance = U256::from(crate::reth_env::dkg_manager::GENESIS_SUBMITTER_BALANCE);
+                (v.dkg_submitter, GenesisAccount::default().with_balance(balance))
+            })
+            .collect();
         let total_stake_for_transfer = initial_stake_config
             .stakeAmount
             .checked_mul(U256::from(validators.len()))
@@ -508,8 +520,20 @@ impl RethEnv {
 
         let rls_proxy_code = alloy::primitives::Bytes::from(rls_proxy_runtimecode);
 
+        // DkgManager starts with the genesis validators' encryption keys, and funds for refunds
+        let dkg_manager_runtimecode = deployed_runtime(DKG_MANAGER_JSON, "dkg_manager")?;
+        let dkg_manager_balance =
+            U256::from(crate::reth_env::dkg_manager::GENESIS_DKG_MANAGER_BALANCE);
+
         let genesis = genesis.extend_accounts([
             (blsg1_address, GenesisAccount::default().with_code(Some(blsg1_runtimecode.into()))),
+            (
+                DKG_MANAGER_ADDRESS,
+                GenesisAccount::default()
+                    .with_code(Some(dkg_manager_runtimecode.into()))
+                    .with_storage(Some(dkg_manager_storage))
+                    .with_balance(dkg_manager_balance),
+            ),
             // RLS implementation — stateless, just bytecode
             (
                 RLS_IMPL_ADDRESS,
@@ -562,6 +586,7 @@ impl RethEnv {
                     .with_storage(tmp_acc_storage),
             ),
         ]);
+        let genesis = genesis.extend_accounts(dkg_submitters);
 
         Ok(genesis)
     }
@@ -759,4 +784,140 @@ mod greenfield_tests {
         assert_eq!(rls_storage.get(&unrelated_slot), Some(&unrelated_value));
         assert_eq!(rls_storage.get(&RLS_ALLOWANCE_SLOT), Some(&U256_MAX));
     }
+}
+
+/// `DkgManager` storage registering each genesis validator's encryption key, after checking its
+/// proof of knowledge against the validator's BLS key and that no two validators bring the same
+/// key: the key's bytes in `encryptionKeys` (slot 0, a `mapping(address => bytes)`), its owner in
+/// `keyOwners` (slot 1, `mapping(bytes32 => address)` by the key's keccak hash), and no
+/// registration block, which the contract reads as a genesis key. A validator without a key in
+/// its node-info is left out and registers on-chain.
+pub(crate) fn dkg_manager_genesis_storage(
+    validators: &[NodeInfo],
+) -> eyre::Result<BTreeMap<B256, B256>> {
+    use alloy::primitives::keccak256;
+    use rayls_infrastructure_types::nidkg::{
+        encryption_key_context, EncryptionKey, EncryptionKeyProof,
+    };
+    let mut storage = BTreeMap::new();
+    for validator in validators.iter().filter(|v| !v.dkg_encryption_key.is_empty()) {
+        let address = validator.execution_address;
+        let key = EncryptionKey::from_bytes(&validator.dkg_encryption_key)
+            .ok_or_else(|| eyre::eyre!("validator {address}: bad dkg encryption key"))?;
+        let proof: EncryptionKeyProof =
+            rayls_infrastructure_types::try_decode(&validator.dkg_key_proof)
+                .map_err(|e| eyre::eyre!("validator {address}: bad dkg key proof: {e}"))?;
+        eyre::ensure!(
+            key.verify(&validator.bls_public_key, &encryption_key_context(), &proof),
+            "validator {address}: dkg key proof does not verify against its BLS key"
+        );
+        // a `bytes` value of 32 bytes or more: its slot holds `2 * len + 1`, the data fills
+        // consecutive slots from `keccak256(slot)`, the last one left-aligned
+        let bytes = key.to_bytes();
+        let owner_slot =
+            keccak256([keccak256(bytes).0, U256::from(1).to_be_bytes::<32>()].concat());
+        eyre::ensure!(
+            storage.insert(owner_slot, address.into_word()).is_none(),
+            "validator {address}: dkg encryption key already brought by another validator"
+        );
+        let slot = keccak256([address.into_word().0, [0u8; 32]].concat());
+        storage.insert(slot, B256::from(U256::from(bytes.len() * 2 + 1)));
+        let data = U256::from_be_bytes(keccak256(slot).0);
+        for (i, chunk) in bytes.chunks(32).enumerate() {
+            let mut word = [0u8; 32];
+            word[..chunk.len()].copy_from_slice(chunk);
+            storage.insert(B256::from(data + U256::from(i)), B256::from(word));
+        }
+    }
+    Ok(storage)
+}
+
+/// Check the genesis validators' dealings of epoch 0's key and return their commitment, the hash
+/// `DkgManager.genesisDealings` holds: every dealer a distinct genesis validator, signed by its
+/// BLS key, every dealing verified against the genesis committee (every member with an
+/// encryption key, in committee order) at the committee's quorum threshold, and at least a third
+/// of the committee dealing, as for any epoch's key. `dealings` come back sorted by dealer, the
+/// order of the file and of the commitment.
+pub fn verify_genesis_dealings(
+    validators: &[NodeInfo],
+    chain_id: u64,
+    dealings: &mut Vec<GenesisDealing>,
+) -> eyre::Result<B256> {
+    use rayls_infrastructure_types::{
+        dkg::dealers_needed,
+        nidkg::{dealing_context, dealing_message, Dealing, EncryptionKey, Recipient},
+        quorum_threshold, try_decode,
+    };
+    eyre::ensure!(
+        validators.len() <= super::dkg_manager::MAX_KEYED_COMMITTEE,
+        "{} genesis validators: a committee above {} gets no threshold key",
+        validators.len(),
+        super::dkg_manager::MAX_KEYED_COMMITTEE
+    );
+    let mut committee: Vec<&NodeInfo> = validators.iter().collect();
+    committee.sort_by(|a, b| a.bls_public_key.cmp(&b.bls_public_key));
+    let recipients = committee
+        .iter()
+        .enumerate()
+        .map(|(position, validator)| {
+            let key =
+                EncryptionKey::from_bytes(&validator.dkg_encryption_key).ok_or_else(|| {
+                    eyre::eyre!(
+                    "validator {} has no dkg encryption key: epoch 0 cannot have a threshold key",
+                    validator.execution_address
+                )
+                })?;
+            Ok(Recipient { position: position as u32, key })
+        })
+        .collect::<eyre::Result<Vec<_>>>()?;
+    let threshold = quorum_threshold(committee.len() as u64) as usize;
+    dealings.sort_by_key(|dealing| dealing.dealer);
+    eyre::ensure!(
+        dealings.windows(2).all(|pair| pair[0].dealer != pair[1].dealer),
+        "two genesis dealings from one dealer"
+    );
+    eyre::ensure!(
+        dealings.len() >= dealers_needed(committee.len()),
+        "{} genesis dealings, epoch 0's key needs {}",
+        dealings.len(),
+        dealers_needed(committee.len())
+    );
+    for entry in dealings.iter() {
+        let dealer = committee
+            .iter()
+            .find(|validator| validator.execution_address == entry.dealer)
+            .ok_or_else(|| {
+                eyre::eyre!("genesis dealer {} is not a genesis validator", entry.dealer)
+            })?;
+        let message = dealing_message(chain_id, 0, entry.dealer, &entry.dealing);
+        eyre::ensure!(
+            entry.signature.verify_raw(&message, &dealer.bls_public_key),
+            "genesis dealing of {} is not signed by its BLS key",
+            entry.dealer
+        );
+        let dealing: Dealing = try_decode(&entry.dealing)
+            .map_err(|e| eyre::eyre!("genesis dealing of {} does not decode: {e}", entry.dealer))?;
+        dealing
+            .verify(&dealing_context(chain_id, 0, entry.dealer), threshold, &recipients)
+            .map_err(|e| eyre::eyre!("genesis dealing of {} does not verify: {e}", entry.dealer))?;
+    }
+    Ok(genesis_dealings_commitment(dealings))
+}
+
+/// The commitment to genesis dealings sorted by dealer: the keccak hash of their BCS encoding.
+pub fn genesis_dealings_commitment(dealings: &[GenesisDealing]) -> B256 {
+    alloy::primitives::keccak256(rayls_infrastructure_types::encode(&dealings))
+}
+
+/// `genesis` with `DkgManager.genesisDealings` (slot 8) set to `commitment`.
+pub fn with_genesis_dealings(mut genesis: Genesis, commitment: B256) -> eyre::Result<Genesis> {
+    let account = genesis
+        .alloc
+        .get_mut(&DKG_MANAGER_ADDRESS)
+        .ok_or_else(|| eyre::eyre!("genesis has no DkgManager"))?;
+    account
+        .storage
+        .get_or_insert_with(Default::default)
+        .insert(B256::from(U256::from(8)), commitment);
+    Ok(genesis)
 }

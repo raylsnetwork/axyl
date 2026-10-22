@@ -36,7 +36,9 @@ pub struct Certificate {
     signed_authorities: roaring::RoaringBitmap,
     /// Timestamp for certificate creation.
     ///
-    /// This is only used for performance metrics. Consensus relies on the header's timestamp.
+    /// This is only used for performance metrics. Consensus relies on the header's timestamp. A
+    /// threshold certificate takes its header's, so that, like its signature, it is the same
+    /// whoever builds it.
     created_at: TimestampSec,
 }
 
@@ -142,6 +144,8 @@ impl Certificate {
         );
 
         let sigs: Vec<BlsSignature> = sigs.iter().map(|(_, sig)| *sig).collect();
+        let threshold = check_stake && committee.threshold_key().is_some();
+        let created_at = if threshold { header.created_at } else { now() };
         let (bls_signature, signed_authorities) = match committee.threshold_key() {
             Some(key) if check_stake => {
                 // Threshold epoch: the votes are partial signatures, and any quorum of them
@@ -184,12 +188,7 @@ impl Certificate {
             SignatureVerificationState::Unverified(bls_signature)
         };
 
-        Ok(Certificate {
-            header,
-            signature_verification_state,
-            signed_authorities,
-            created_at: now(),
-        })
+        Ok(Certificate { header, signature_verification_state, signed_authorities, created_at })
     }
 
     /// Returns the keys of the authorities that signed this certificate.
@@ -298,6 +297,7 @@ impl Certificate {
     #[allow(deprecated)]
     fn verify_threshold(mut self, group_key: &BlsPublicKey) -> CertificateResult<Certificate> {
         ensure!(self.signed_authorities.is_empty(), CertificateError::UnexpectedSigners);
+        ensure!(self.created_at == self.header.created_at, CertificateError::UnexpectedCreatedAt);
         let signature = match self.signature_verification_state {
             SignatureVerificationState::VerifiedDirectly(_)
             | SignatureVerificationState::VerifiedIndirectly(_)

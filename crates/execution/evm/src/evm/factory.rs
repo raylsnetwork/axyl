@@ -8,6 +8,9 @@ use crate::{
         precompile::Erc20Precompile,
         CompositeInspector, NativeErc20Inspector, BASE_ERROR_GAS, ERC20_PRECOMPILE_ADDRESS,
     },
+    nidkg_precompile::{
+        create_nidkg_dyn_precompile, nidkg_precompile_active_at, NIDKG_PRECOMPILE_ADDRESS,
+    },
 };
 use alloy::sol_types::SolCall;
 use alloy_evm::{precompiles::DynPrecompile, Database};
@@ -252,9 +255,16 @@ fn create_erc20_dyn_precompile() -> DynPrecompile {
 }
 
 /// Create a PrecompilesMap with the Native ERC-20 precompile registered.
-fn create_precompiles_with_erc20(spec_id: SpecId) -> PrecompilesMap {
+fn create_precompiles_with_erc20(spec_id: SpecId, block_number: U256) -> PrecompilesMap {
     let mut precompiles_map =
         PrecompilesMap::from_static(Precompiles::new(PrecompileSpecId::from_spec_id(spec_id)));
+
+    // the NI-DKG verifier exists only from the ThresholdCertificates fork on; before it the
+    // address stays an empty account (not even warm)
+    if nidkg_precompile_active_at(block_number.saturating_to::<u64>()) {
+        precompiles_map
+            .apply_precompile(&NIDKG_PRECOMPILE_ADDRESS, |_| Some(create_nidkg_dyn_precompile()));
+    }
 
     // Only register the ERC-20 precompile if it's been initialized
     if ERC20_PRECOMPILE_INSTANCE.get().is_some() {
@@ -309,13 +319,14 @@ impl RaylsEvmFactory {
 
         // Use the trait method with composite inspector
         let spec_id = input.cfg_env.spec;
+        let block_number = input.block_env.number;
         RaylsEvm {
             inner: Context::mainnet()
                 .with_block(input.block_env)
                 .with_cfg(input.cfg_env)
                 .with_db(db)
                 .build_mainnet_with_inspector(composite)
-                .with_precompiles(create_precompiles_with_erc20(spec_id)),
+                .with_precompiles(create_precompiles_with_erc20(spec_id, block_number)),
             inspect: true,
         }
     }
@@ -348,13 +359,14 @@ impl EvmFactory for RaylsEvmFactory {
 
     fn create_evm<DB: Database>(&self, db: DB, input: EvmEnv) -> Self::Evm<DB, NoOpInspector> {
         let spec_id = input.cfg_env.spec;
+        let block_number = input.block_env.number;
         RaylsEvm {
             inner: Context::mainnet()
                 .with_block(input.block_env)
                 .with_cfg(input.cfg_env)
                 .with_db(db)
                 .build_mainnet_with_inspector(NoOpInspector)
-                .with_precompiles(create_precompiles_with_erc20(spec_id)),
+                .with_precompiles(create_precompiles_with_erc20(spec_id, block_number)),
             inspect: false,
         }
     }
@@ -366,13 +378,14 @@ impl EvmFactory for RaylsEvmFactory {
         inspector: I,
     ) -> Self::Evm<DB, I> {
         let spec_id = input.cfg_env.spec;
+        let block_number = input.block_env.number;
         RaylsEvm {
             inner: Context::mainnet()
                 .with_block(input.block_env)
                 .with_cfg(input.cfg_env)
                 .with_db(db)
                 .build_mainnet_with_inspector(inspector)
-                .with_precompiles(create_precompiles_with_erc20(spec_id)),
+                .with_precompiles(create_precompiles_with_erc20(spec_id, block_number)),
             inspect: true,
         }
     }

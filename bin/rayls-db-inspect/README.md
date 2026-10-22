@@ -99,8 +99,9 @@ of the one before), instead of trusting the verification state stored with the c
 verdict `BROKEN sig_failed=N`; a node without the epoch record (nor the one before) cannot prove
 the certificate, which makes an `OK` verdict `PARTIAL unverifiable=N`, and `header-check` names the
 records that node lacks. A certificate without a signer set is a threshold certificate, checked
-against the epoch's group key: the node's stored DKG outcome, else one computed from the previous
-epoch's headers. `scheme?` means the node can do neither, and `header-check` names what it lacks. Re-checking is BLS work in an optimized library, so the build profile
+against the epoch's group key from the node's stored DKG outcome. `scheme?` means the node stored
+none for that epoch (the key comes from on-chain dealings, which this tool does not read), and
+`header-check` says so. Re-checking is BLS work in an optimized library, so the build profile
 hardly matters: a header whose sub-dag holds six to eight certificates costs 5 ms on an idle
 core and two to three times that on a busy machine. `header` and `cert` are unaffected.
 `header-check` checks the nodes in parallel and verifies each batch of 256 hops on every core, so

@@ -3,7 +3,8 @@ use crate::RaylsDirs;
 use eyre::Context;
 use rayls_infrastructure_types::{
     address, test_genesis, verify_proof_of_possession_bls, Address, BlsPublicKey, BlsSignature,
-    Committee, CommitteeBuilder, Genesis, GenesisAccount, Multiaddr, NetworkPublicKey, NodeP2pInfo,
+    Bytes, Committee, CommitteeBuilder, Genesis, GenesisAccount, Multiaddr, NetworkPublicKey,
+    NodeP2pInfo,
 };
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, ffi::OsStr, fs, path::Path};
@@ -41,6 +42,8 @@ pub const NATIVE_TOKEN_CONTROLLER_JSON: &str =
 /// The path to RLSAccumulator json (rl-contracts submodule).
 pub const RLS_ACCUMULATOR_JSON: &str =
     include_str!("../../../../rayls-contracts/artifacts/RLSAccumulator.json");
+pub const DKG_MANAGER_JSON: &str =
+    include_str!("../../../../rayls-contracts/artifacts/DkgManager.json");
 /// Precompile genesis configuration from the contracts submodule.
 pub const PRECOMPILE_CFG_YAML: &str =
     include_str!("../../../../rayls-contracts/deployments/genesis/precompile-config.yaml");
@@ -81,6 +84,9 @@ pub const RLS_ACCUMULATOR_ADDRESS: Address = address!("07e17e17e17e17e17e17e17e1
 pub const RLS_ACCUMULATOR_IMPL_ADDRESS: Address =
     address!("07e17e17e17e17e17e17e17e17e17e17e17e17ed");
 /// Native ERC-20 precompile (USDr) address — implemented in the node, no EVM bytecode.
+/// `DkgManager`: collects the publicly verifiable dealings of each epoch's threshold key. Stateless
+/// at genesis; inert until the `ThresholdCertificates` fork adds the verifier precompile.
+pub const DKG_MANAGER_ADDRESS: Address = address!("07e17e17e17e17e17e17e17e17e17e17e17e17ee");
 pub const USDR_PRECOMPILE_ADDRESS: Address = address!("0000000000000000000000000000000000000400");
 
 /// The struct for starting a network at genesis.
@@ -312,6 +318,40 @@ pub struct NodeInfo {
     pub execution_address: Address,
     /// Proof
     pub proof_of_possession: BlsSignature,
+    /// The account this validator's node pays its DKG transactions from (see
+    /// `rayls_execution_evm::reth_env::dkg_manager::DkgSubmitter`), derived from its BLS key by
+    /// the keytool. Genesis funds it; zero when unknown (older node-info files).
+    #[serde(default)]
+    pub dkg_submitter: Address,
+    /// This validator's compressed NI-DKG encryption key, derived from its BLS key by the keytool
+    /// (`rayls_infrastructure_types::nidkg::EncryptionKey`). Genesis registers it in
+    /// `DkgManager`, so the genesis committee can deal from epoch 0. Empty when unknown.
+    #[serde(default, skip_serializing_if = "bytes_are_empty")]
+    pub dkg_encryption_key: Bytes,
+    /// BCS-encoded proof of knowledge of `dkg_encryption_key`, bound to `bls_public_key`
+    /// (`rayls_infrastructure_types::nidkg::EncryptionKeyProof`). Genesis checks it.
+    #[serde(default, skip_serializing_if = "bytes_are_empty")]
+    pub dkg_key_proof: Bytes,
+}
+
+/// One genesis validator's dealing of epoch 0's threshold key, made by `keytool genesis-dealing`
+/// once every genesis validator's node-info is collected. The genesis builder checks the dealings,
+/// writes them to `genesis/dkg-dealings.yaml` and commits their hash in `DkgManager`'s genesis
+/// state, so every node with the same genesis computes the same epoch 0 key.
+#[derive(Serialize, Deserialize, PartialEq, Eq, Clone, Debug, Default)]
+pub struct GenesisDealing {
+    /// The dealer's execution address, as in its node-info.
+    pub dealer: Address,
+    /// The BCS-encoded dealing (`rayls_infrastructure_types::nidkg::Dealing`) to the genesis
+    /// committee in committee order, at the committee's quorum threshold.
+    pub dealing: Bytes,
+    /// The dealer's BLS signature over
+    /// `rayls_infrastructure_types::nidkg::dealing_message(chain_id, 0, dealer, dealing)`.
+    pub signature: BlsSignature,
+}
+
+fn bytes_are_empty(bytes: &Bytes) -> bool {
+    bytes.is_empty()
 }
 
 impl NodeInfo {
@@ -351,6 +391,9 @@ impl Default for NodeInfo {
             p2p_info: Default::default(),
             execution_address: Address::ZERO,
             proof_of_possession: BlsSignature::default(),
+            dkg_submitter: Address::ZERO,
+            dkg_encryption_key: Default::default(),
+            dkg_key_proof: Default::default(),
         }
     }
 }
@@ -403,6 +446,9 @@ mod tests {
                 p2p_info: primary_info,
                 execution_address: address,
                 proof_of_possession,
+                dkg_submitter: Address::ZERO,
+                dkg_encryption_key: Default::default(),
+                dkg_key_proof: Default::default(),
             };
             // add validator
             network_genesis.add_validator(validator.clone());
@@ -440,6 +486,9 @@ mod tests {
                 p2p_info: primary_info,
                 execution_address: address,
                 proof_of_possession,
+                dkg_submitter: Address::ZERO,
+                dkg_encryption_key: Default::default(),
+                dkg_key_proof: Default::default(),
             };
             // add validator
             network_genesis.add_validator(validator.clone());

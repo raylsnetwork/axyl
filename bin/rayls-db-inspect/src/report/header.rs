@@ -8,8 +8,8 @@ use crate::{
     view::{b256, CertificateSummary, CertificateView},
 };
 use rayls_infrastructure_types::{
-    dkg::{DealingReplay, DkgOutcome},
-    BlsPublicKey, Certificate, ConsensusHeader, Epoch, EpochKeys, SignatureVerificationState, B256,
+    dkg::DkgOutcome, BlsPublicKey, Certificate, ConsensusHeader, Epoch, EpochKeys,
+    SignatureVerificationState, B256,
 };
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
@@ -56,46 +56,22 @@ pub enum SignatureCheck {
     SchemeUnknown { epoch: Epoch, keys: usize, cause: NoOutcome },
 }
 
-/// Why the source cannot compute an epoch's DKG outcome from the epoch before, the dealing one.
+/// Why the source has no DKG outcome for an epoch that uses threshold certificates.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum NoOutcome {
-    /// No certified or pending record of the dealing epoch.
-    NoRecord { dealing: Epoch },
-    /// The dealing epoch's boundary, as its record states it, is not in the digest index.
-    BoundaryNotIndexed { dealing: Epoch, boundary: String },
-    /// The dealing epoch's record names a boundary that leads in another epoch.
-    BoundaryInEpoch { dealing: Epoch, leads_in: Epoch },
-    /// A header between the dealing epoch's first header and its boundary is missing.
-    HeaderMissing { number: u64 },
-    /// A header does not link by hash to the boundary above it.
-    LinkBroken { number: u64 },
+    /// The source stored no outcome for the epoch. The key comes from the dealings the chain's
+    /// `DkgManager` accepted, which only a node reads; this tool reads the outcome the node saved
+    /// when the epoch started.
+    NotStored { epoch: Epoch },
 }
 
 impl std::fmt::Display for NoOutcome {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::NoRecord { dealing } => write!(
+            Self::NotStored { epoch } => write!(
                 f,
-                "no certified or pending record of epoch {dealing}; check its epoch records \
-                 (epoch-check)"
-            ),
-            Self::BoundaryNotIndexed { dealing, boundary } => {
-                write!(f, "epoch {dealing}'s boundary {boundary} is not in the digest index")
-            }
-            Self::BoundaryInEpoch { dealing, leads_in } => {
-                write!(
-                    f,
-                    "epoch {dealing}'s record names a boundary that leads in epoch {leads_in}"
-                )
-            }
-            Self::HeaderMissing { number } => {
-                write!(f, "header {number} is missing; check the chain there (header-check)")
-            }
-            Self::LinkBroken { number } => write!(
-                f,
-                "header {number} does not link to the boundary above it; check the chain there \
-                 (header-check)"
+                "no stored DKG outcome for epoch {epoch}; the node saves it when the epoch starts"
             ),
         }
     }
@@ -179,85 +155,27 @@ enum KeysLookup {
 }
 
 /// [`committee_keys`] with the epoch's certificate scheme: the source's own DKG outcome for the
-/// epoch; else legacy for epochs 0 and 1, for a source no build with threshold certificates ever
+/// epoch; else legacy for epoch 0, for a source no build with threshold certificates ever
 /// opened (it has no outcome table), and for a certificate that names its signers (so a network
-/// where the fork is not active never replays); else, for a certificate without a signer set, the
-/// outcome computed in memory the way the node computes it; else unknown.
+/// where the fork is not active never needs one); else unknown.
 fn epoch_keys(node: &NodeDb, epoch: Epoch, threshold_shaped: bool) -> eyre::Result<KeysLookup> {
     let Some((keys, keys_from)) = committee_keys(node, epoch)? else {
         return Ok(KeysLookup::Missing);
     };
     let outcome = match node.dkg_outcome(epoch)? {
         Some(outcome) => outcome,
-        None if epoch <= 1 || !threshold_shaped || !node.has_dkg_outcomes()? => {
+        None if epoch == 0 || !threshold_shaped || !node.has_dkg_outcomes()? => {
             DkgOutcome::Fallback
         }
-        None => match compute_outcome(node, epoch)? {
-            Ok(outcome) => outcome,
-            Err(cause) => return Ok(KeysLookup::SchemeUnknown(keys.len(), cause)),
-        },
+        None => {
+            return Ok(KeysLookup::SchemeUnknown(keys.len(), NoOutcome::NotStored { epoch }));
+        }
     };
     let group_key = match outcome {
         DkgOutcome::Key(key) => Some(key.group_key()),
         DkgOutcome::Fallback => None,
     };
     Ok(KeysLookup::Known(EpochKeys { keys, group_key }, keys_from))
-}
-
-/// The DKG outcome for `epoch` computed in memory from the source: the previous epoch's record
-/// (certified, else pending) names the committees and the boundary, and that epoch's headers,
-/// found by walking back from the boundary while the leader epoch matches, are replayed oldest
-/// first. Every row must link by hash to the record's boundary, since the digest index can hold
-/// stale entries and the tiers can disagree on a damaged or forked source. The inner `Err` says
-/// what is missing or broken.
-fn compute_outcome(node: &NodeDb, epoch: Epoch) -> eyre::Result<Result<DkgOutcome, NoOutcome>> {
-    let dealing = epoch - 1;
-    let record = match node.epoch(dealing)? {
-        Some((record, Some(_))) => record,
-        _ => match node.pending_epoch(dealing)? {
-            Some(record) => record,
-            None => return Ok(Err(NoOutcome::NoRecord { dealing })),
-        },
-    };
-    let Some(boundary) = node.header_number_by_digest(record.parent_consensus)? else {
-        let boundary = b256(&record.parent_consensus);
-        return Ok(Err(NoOutcome::BoundaryNotIndexed { dealing, boundary }));
-    };
-    // Walk back keeping only the numbers: an epoch can hold a day of headers.
-    let mut numbers = Vec::new();
-    let mut final_round = None;
-    let mut expected = record.parent_consensus;
-    let mut next = Some(boundary);
-    while let Some(number) = next.filter(|n| *n > 0) {
-        let Some((header, _)) = node.header(number)? else {
-            return Ok(Err(NoOutcome::HeaderMissing { number }));
-        };
-        if header.digest() != expected {
-            return Ok(Err(NoOutcome::LinkBroken { number }));
-        }
-        let leads_in = header.sub_dag.leader_epoch();
-        if leads_in != dealing {
-            if final_round.is_none() {
-                return Ok(Err(NoOutcome::BoundaryInEpoch { dealing, leads_in }));
-            }
-            break;
-        }
-        final_round.get_or_insert(header.sub_dag.leader_round());
-        expected = header.parent_hash;
-        next = number.checked_sub(1);
-        numbers.push(number);
-    }
-    let Some(final_round) = final_round else {
-        return Ok(Err(NoOutcome::HeaderMissing { number: boundary }));
-    };
-    let mut replay = DealingReplay::new(epoch, &record.committee, record.next_committee.clone());
-    for number in numbers.into_iter().rev() {
-        let Some((header, _)) = node.header(number)? else {
-            return Ok(Err(NoOutcome::HeaderMissing { number }));
-        };
-        replay.feed(&header);
-    }
-    Ok(Ok(replay.outcome(final_round)))
 }
 
 /// Re-checks one certificate's quorum and aggregate signature, or its threshold signature in a

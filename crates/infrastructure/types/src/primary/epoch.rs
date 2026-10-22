@@ -70,19 +70,43 @@ impl EpochRecord {
 
     /// Use signer to generate an [`EpochVote`] for this EpochRecord.
     pub fn sign_vote<S: BlsSigner>(&self, signer: &S) -> EpochVote {
-        let epoch_hash = self.digest();
-        let intent =
-            encode(&IntentMessage::new(Intent::consensus(IntentScope::EpochBoundary), epoch_hash));
-        let signature = signer.request_signature_direct(&intent);
+        self.sign_vote_bound(signer, &RecordBinding::Legacy)
+    }
 
+    /// An [`EpochVote`] for this record and `binding`, with `signer`'s own key.
+    pub fn sign_vote_bound<S: BlsSigner>(&self, signer: &S, binding: &RecordBinding) -> EpochVote {
+        let epoch_hash = self.digest();
+        let signature = signer.request_signature_direct(&vote_message(epoch_hash, binding));
         EpochVote { epoch_hash, public_key: signer.public_key(), signature }
     }
 
-    /// Return true if cert contains a quorum of committee signatures for this EpochRecord.
-    pub fn verify_with_cert(&self, cert: &EpochCertificate) -> bool {
+    /// An [`EpochVote`] for this record and `binding` from the member with key `public_key`,
+    /// signed with its `share` of the record's epoch key.
+    pub fn sign_vote_with_share(
+        &self,
+        share: &crate::crypto::threshold::SecretShare,
+        public_key: BlsPublicKey,
+        binding: &RecordBinding,
+    ) -> EpochVote {
+        let epoch_hash = self.digest();
+        let signature = share.partial_sign(&vote_message(epoch_hash, binding)).signature;
+        EpochVote { epoch_hash, public_key, signature }
+    }
+
+    /// Whether `cert` certifies this record under `keys`: the threshold signature of the
+    /// record's epoch key over the record's message (empty bitmap) when `keys.group_key` is set,
+    /// else signatures of a super-quorum of the record's committee aggregated over it.
+    pub fn verify_with_cert(&self, cert: &EpochCertificate, keys: &RecordKeys) -> bool {
         if self.digest() != cert.epoch_hash {
             // Record and cert don't match.
             return false;
+        }
+        let message = vote_message(cert.epoch_hash, &keys.binding);
+        match (&keys.group_key, cert.signed_authorities.is_empty()) {
+            (Some(group_key), true) => return cert.signature.verify_raw(&message, group_key),
+            // a threshold epoch has one certificate, and an aggregate one has signers
+            (Some(_), false) | (None, true) => return false,
+            (None, false) => {}
         }
 
         let auth_indexes = cert.signed_authorities.iter().collect::<Vec<_>>();
@@ -101,14 +125,10 @@ impl EpochRecord {
             .map(|(_, key)| *key)
             .collect();
 
-        let aggregate_signature = BlsAggregateSignature::from_signature(&cert.signature);
-        let intent =
-            IntentMessage::new(Intent::consensus(IntentScope::EpochBoundary), cert.epoch_hash);
         if auth_iter < self.super_quorum() {
-            false
-        } else {
-            aggregate_signature.verify_secure(&intent, &pks[..])
+            return false;
         }
+        cert.signature.verify_aggregate_raw(&message, &pks)
     }
 
     /// Provide a super quorum, this is 2/3 of committee size plus one.
@@ -124,12 +144,91 @@ impl EpochRecord {
         &self,
         expected_committee: &[BlsPublicKey],
         cert: &EpochCertificate,
+        keys: &RecordKeys,
     ) -> bool {
         if self.committee.as_slice() != expected_committee {
             return false;
         }
-        self.verify_with_cert(cert)
+        self.verify_with_cert(cert, keys)
     }
+}
+
+/// What an epoch record's certificate signs besides the record. From the
+/// `ThresholdCertificates` fork on, a record of an epoch that dealt the next epoch's key also
+/// signs that key, so a node that holds the certified record can verify the next epoch's
+/// threshold certificates, record and headers alike, without executing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RecordBinding {
+    /// The record alone, as before the fork.
+    Legacy,
+    /// The record and the next epoch's group key: `None` when that epoch uses aggregate
+    /// certificates.
+    NextKey(Option<BlsPublicKey>),
+}
+
+impl RecordBinding {
+    /// The next epoch's group key, if this binding names one.
+    pub fn next_key(&self) -> Option<BlsPublicKey> {
+        match self {
+            Self::Legacy => None,
+            Self::NextKey(key) => *key,
+        }
+    }
+}
+
+/// What verifying a record's certificate needs besides the record: what it signs, and the
+/// record's epoch key when that epoch uses threshold certificates.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RecordKeys {
+    pub binding: RecordBinding,
+    /// Group key of the record's epoch; `None` for an epoch with aggregate certificates, or one
+    /// whose key this node does not know (a threshold certificate then fails to verify).
+    pub group_key: Option<BlsPublicKey>,
+}
+
+impl RecordKeys {
+    /// A record of an epoch before the fork: legacy message, aggregate certificate.
+    pub const LEGACY: Self = Self { binding: RecordBinding::Legacy, group_key: None };
+}
+
+/// The bytes committee members sign for the record with digest `epoch_hash`.
+pub fn vote_message(epoch_hash: B256, binding: &RecordBinding) -> Vec<u8> {
+    match binding {
+        RecordBinding::Legacy => {
+            encode(&IntentMessage::new(Intent::consensus(IntentScope::EpochBoundary), epoch_hash))
+        }
+        RecordBinding::NextKey(next_key) => encode(&IntentMessage::new(
+            Intent::consensus(IntentScope::EpochBoundaryKeyed),
+            (epoch_hash, *next_key),
+        )),
+    }
+}
+
+/// What a vote signed with a binding names besides the vote, so it can be checked without the
+/// record: the record's epoch and the next epoch's group key it signs.
+#[derive(PartialEq, Eq, Serialize, Deserialize, Copy, Clone, Debug)]
+pub struct VoteContext {
+    pub epoch: Epoch,
+    pub next_key: Option<BlsPublicKey>,
+}
+
+impl KeyedEpochVote {
+    /// The vote's context.
+    pub fn context(&self) -> VoteContext {
+        VoteContext { epoch: self.epoch, next_key: self.next_key }
+    }
+}
+
+/// An epoch vote of a record signed with a binding, as gossiped: it names the record's epoch and
+/// what it binds, so a node that does not hold the record can still check the signature against
+/// that epoch's keys.
+#[derive(PartialEq, Serialize, Deserialize, Copy, Clone, Debug)]
+pub struct KeyedEpochVote {
+    pub vote: EpochVote,
+    /// The epoch of the record voted for.
+    pub epoch: Epoch,
+    /// The next epoch's group key the vote signs with the record.
+    pub next_key: Option<BlsPublicKey>,
 }
 
 /// Vote for an ['EpochRecord'].
@@ -159,11 +258,13 @@ impl EpochVote {
     /// Verify a single signature of the cert.
     /// Used when receiving published "single" signer certs for agregation.
     pub fn check_signature(&self) -> bool {
-        let intent = encode(&IntentMessage::new(
-            Intent::consensus(IntentScope::EpochBoundary),
-            self.epoch_hash,
-        ));
-        self.signature.verify_raw(&intent, &self.public_key)
+        self.check_signature_with(&RecordBinding::Legacy, &self.public_key)
+    }
+
+    /// Verify the signature as one over the record and `binding`, by `key`: the voter's own key,
+    /// or its share key in a threshold epoch.
+    pub fn check_signature_with(&self, binding: &RecordBinding, key: &BlsPublicKey) -> bool {
+        self.signature.verify_raw(&vote_message(self.epoch_hash, binding), key)
     }
 }
 
@@ -402,7 +503,10 @@ mod test {
         }
 
         let cert = EpochCertificate { epoch_hash: decoded.digest(), signature, signed_authorities };
-        assert!(decoded.verify_with_cert(&cert), "cert verification failed on sorted record");
+        assert!(
+            decoded.verify_with_cert(&cert, &RecordKeys::LEGACY),
+            "cert verification failed on sorted record"
+        );
     }
 
     /// Build a valid certificate for `record` signed by super_quorum of `signers`.
@@ -445,11 +549,11 @@ mod test {
         let forged_cert = build_cert(&forged, &attacker);
 
         assert!(
-            forged.verify_with_cert(&forged_cert),
+            forged.verify_with_cert(&forged_cert, &RecordKeys::LEGACY),
             "self-signed forged record should self-verify"
         );
         assert!(
-            !forged.verify_against_committee(&genuine_keys, &forged_cert),
+            !forged.verify_against_committee(&genuine_keys, &forged_cert, &RecordKeys::LEGACY),
             "forged committee must be rejected when bound to the genuine committee",
         );
 
@@ -457,7 +561,7 @@ mod test {
             bcs::from_bytes(&encode(&make_record(genuine_keys.clone()))).expect("decode genuine");
         let g_cert = build_cert(&g_record, &genuine);
         assert!(
-            g_record.verify_against_committee(&genuine_keys, &g_cert),
+            g_record.verify_against_committee(&genuine_keys, &g_cert, &RecordKeys::LEGACY),
             "genuine record must verify against its genuine committee",
         );
     }
@@ -495,18 +599,109 @@ mod test {
                 signed_authorities.push(2);
                 let cert =
                     EpochCertificate { epoch_hash: record.digest(), signature, signed_authorities };
-                assert!(record.verify_with_cert(&cert), "record failed to verify");
+                assert!(
+                    record.verify_with_cert(&cert, &RecordKeys::LEGACY),
+                    "record failed to verify"
+                );
                 // leave out a sig.
                 let mut signed_authorities = RoaringBitmap::new();
                 signed_authorities.push(0);
                 signed_authorities.push(2);
                 let cert =
                     EpochCertificate { epoch_hash: record.digest(), signature, signed_authorities };
-                assert!(!record.verify_with_cert(&cert), "record verified!");
+                assert!(!record.verify_with_cert(&cert, &RecordKeys::LEGACY), "record verified!");
             }
             Err(_) => {
                 panic!("failed to aggregate epoch record signatures",);
             }
         }
+    }
+
+    /// A committee of `n` and a record of epoch 5 it serves.
+    fn committee_record(n: usize, rng: &mut StdRng) -> (Vec<TestBlsKeypair>, EpochRecord) {
+        let mut signers: Vec<TestBlsKeypair> = (0..n).map(|_| TestBlsKeypair::new(rng)).collect();
+        signers.sort_by_key(|s| s.public_key());
+        let committee: Vec<BlsPublicKey> = signers.iter().map(|s| s.public_key()).collect();
+        let record = EpochRecord {
+            epoch: 5,
+            committee: committee.clone(),
+            next_committee: committee,
+            ..Default::default()
+        };
+        (signers, record)
+    }
+
+    /// A threshold epoch's record has one certificate: any quorum of shares combines into the
+    /// same group signature over the record and the next key, with no signer listed. It verifies
+    /// with the epoch key and that binding only.
+    #[test]
+    fn threshold_record_certificate_is_unique_and_bound() {
+        use crate::crypto::threshold::{combine, PartialSignature, SecretPolynomial, ShareIndex};
+        let mut rng = StdRng::seed_from_u64(7);
+        let (signers, record) = committee_record(4, &mut rng);
+        let polynomial = SecretPolynomial::random(3, &mut rng).unwrap();
+        let public = polynomial.commit().unwrap();
+        let next_key = Some(TestBlsKeypair::new(&mut rng).public_key());
+        let binding = RecordBinding::NextKey(next_key);
+        let partials = |indices: &[u32]| -> Vec<PartialSignature> {
+            indices
+                .iter()
+                .map(|i| {
+                    let index = ShareIndex::new(*i).unwrap();
+                    let share = polynomial.share(index).unwrap();
+                    let vote = record.sign_vote_with_share(
+                        &share,
+                        signers[*i as usize - 1].public_key(),
+                        &binding,
+                    );
+                    assert!(vote.check_signature_with(&binding, &public.share_key(index)));
+                    assert!(!vote.check_signature(), "a share vote is not a long-term vote");
+                    PartialSignature { index, signature: vote.signature }
+                })
+                .collect()
+        };
+        let signature = combine(3, &partials(&[1, 2, 3])).unwrap();
+        assert_eq!(signature, combine(3, &partials(&[2, 3, 4])).unwrap(), "unique");
+        let cert = EpochCertificate {
+            epoch_hash: record.digest(),
+            signature,
+            signed_authorities: RoaringBitmap::new(),
+        };
+        let keys = RecordKeys { binding, group_key: Some(public.group_key()) };
+        assert!(record.verify_with_cert(&cert, &keys));
+
+        let other_next = RecordKeys { binding: RecordBinding::NextKey(None), ..keys };
+        assert!(!record.verify_with_cert(&cert, &other_next), "another next key");
+        let legacy = RecordKeys { binding: RecordBinding::Legacy, ..keys };
+        assert!(!record.verify_with_cert(&cert, &legacy), "the legacy message");
+        let no_key = RecordKeys { group_key: None, ..keys };
+        assert!(!record.verify_with_cert(&cert, &no_key), "no epoch key");
+        let mut listed = cert.clone();
+        listed.signed_authorities.insert(0);
+        assert!(!record.verify_with_cert(&listed, &keys), "a threshold cert lists no signer");
+    }
+
+    /// An aggregate certificate of a record after the fork signs the binding too: it verifies
+    /// with that binding only, and never where the epoch has a group key.
+    #[test]
+    fn keyed_aggregate_record_certificate() {
+        let mut rng = StdRng::seed_from_u64(8);
+        let (signers, record) = committee_record(4, &mut rng);
+        let binding = RecordBinding::NextKey(None);
+        let votes: Vec<EpochVote> =
+            signers.iter().take(3).map(|s| record.sign_vote_bound(s, &binding)).collect();
+        for vote in &votes {
+            assert!(vote.check_signature_with(&binding, &vote.public_key));
+            assert!(!vote.check_signature());
+        }
+        let sigs: Vec<BlsSignature> = votes.iter().map(|v| v.signature).collect();
+        let signature = BlsAggregateSignature::aggregate(&sigs, true).unwrap().to_signature();
+        let signed_authorities: RoaringBitmap = (0..3u32).collect();
+        let cert = EpochCertificate { epoch_hash: record.digest(), signature, signed_authorities };
+        let keys = RecordKeys { binding, group_key: None };
+        assert!(record.verify_with_cert(&cert, &keys));
+        assert!(!record.verify_with_cert(&cert, &RecordKeys::LEGACY));
+        let keyed_epoch = RecordKeys { group_key: Some(signers[0].public_key()), ..keys };
+        assert!(!record.verify_with_cert(&cert, &keyed_epoch));
     }
 }

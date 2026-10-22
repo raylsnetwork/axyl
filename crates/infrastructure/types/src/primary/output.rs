@@ -312,8 +312,9 @@ impl CommittedSubDag {
         self.commit_timestamp
     }
 
-    /// Returns true if this subdag committed at or after `epoch_boundary` - the single, timing-free
-    /// epoch-boundary predicate, so all validators cut the epoch at the same subdag.
+    /// Returns true if this subdag committed at or after `epoch_boundary`: the time half of the
+    /// epoch-boundary predicate (see [`EpochCloseGate`] for the other half), so all validators
+    /// cut the epoch at the same subdag.
     pub fn reaches_epoch_boundary(&self, epoch_boundary: TimestampSec) -> bool {
         self.commit_timestamp() >= epoch_boundary
     }
@@ -433,3 +434,16 @@ impl fmt::Display for ConsensusDigest {
 }
 
 // See test_utils output_tests.rs for this modules tests.
+
+/// The second half of the epoch-boundary predicate, for epochs whose successor uses threshold
+/// certificates: the epoch closes at the first output that reaches the boundary timestamp **and**
+/// for which the next epoch's key exists in the state after every earlier output executed. Until
+/// then the epoch is extended: blocks keep coming under its committee and dealings keep landing.
+/// The answer depends only on that state, so every node, including a restarted or syncing one,
+/// closes the epoch at the same output.
+#[async_trait::async_trait]
+pub trait EpochCloseGate: Send + Sync + std::fmt::Debug {
+    /// Whether the epoch may close at `output`, which reached the boundary timestamp. Waits until
+    /// every output before it has executed.
+    async fn may_close(&self, output: &ConsensusOutput) -> bool;
+}

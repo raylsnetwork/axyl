@@ -6,7 +6,10 @@ use crate::{
     node_db::{NodeDb, Position, Tier},
     view::{b256, pubkey, signature, CheckpointView},
 };
-use rayls_infrastructure_types::{BlsPublicKey, Epoch, EpochCertificate, EpochRecord, B256};
+use rayls_infrastructure_types::{
+    vote_message, BlsPublicKey, Epoch, EpochCertificate, EpochRecord, RecordBinding, RecordKeys,
+    B256,
+};
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -159,27 +162,50 @@ pub struct EpochCertView {
     pub epoch_hash: String,
     /// `epoch_hash` equals the record digest.
     pub digest_match: bool,
+    /// A threshold certificate: one signature by the epoch's group key, no signer listed.
+    pub threshold: bool,
+    /// What the certificate signs besides the record: `legacy`, or the next epoch's group key
+    /// (`next-key <key>`, `next-key none` for aggregate certificates).
+    pub binding: String,
     pub signers: Vec<u32>,
     pub signer_count: usize,
-    /// `signer_count >= super_quorum`.
+    /// `signer_count >= super_quorum`; for a threshold certificate, the epoch's group key is
+    /// known.
     pub quorum_ok: bool,
-    /// The aggregate BLS signature verifies against the signers' committee keys.
+    /// The signature verifies: the aggregate against the signers' committee keys, or the
+    /// threshold signature against the epoch's group key.
     pub signature_ok: bool,
     pub valid: bool,
     pub signature: String,
 }
 
 impl EpochCertView {
-    fn of(record: &EpochRecord, cert: &EpochCertificate) -> Self {
+    fn of(record: &EpochRecord, cert: &EpochCertificate, record_keys: &RecordKeys) -> Self {
         let digest_match = record.digest() == cert.epoch_hash;
         let signers: Vec<u32> = cert.signed_authorities.iter().collect();
-        let keys: Vec<BlsPublicKey> =
-            signers.iter().filter_map(|i| record.committee.get(*i as usize).copied()).collect();
-        let quorum_ok = keys.len() == signers.len() && signers.len() >= record.super_quorum();
-        let signature_ok = !keys.is_empty() && cert.check_signatures(&keys);
+        let threshold = signers.is_empty();
+        let message = vote_message(cert.epoch_hash, &record_keys.binding);
+        let (quorum_ok, signature_ok) = if threshold {
+            let ok =
+                record_keys.group_key.is_some_and(|key| cert.signature.verify_raw(&message, &key));
+            (record_keys.group_key.is_some(), ok)
+        } else {
+            let keys: Vec<BlsPublicKey> =
+                signers.iter().filter_map(|i| record.committee.get(*i as usize).copied()).collect();
+            (
+                keys.len() == signers.len() && signers.len() >= record.super_quorum(),
+                cert.signature.verify_aggregate_raw(&message, &keys),
+            )
+        };
         Self {
             epoch_hash: b256(&cert.epoch_hash),
             digest_match,
+            threshold,
+            binding: match record_keys.binding {
+                RecordBinding::Legacy => "legacy".to_string(),
+                RecordBinding::NextKey(None) => "next-key none".to_string(),
+                RecordBinding::NextKey(Some(key)) => format!("next-key {key}"),
+            },
             signer_count: signers.len(),
             signers,
             quorum_ok,
@@ -263,7 +289,8 @@ pub fn epoch(nodes: &[NodeDb], epoch: Epoch, verbose: bool) -> eyre::Result<Epoc
             digests.insert(record.digest());
             let prev = if epoch == 0 { None } else { node.epoch(epoch - 1)?.map(|(r, _)| r) };
             view.record = Some(record_view(node, record, prev.as_ref(), verbose)?);
-            let cert = cert.as_ref().map(|c| EpochCertView::of(record, c));
+            let record_keys = node.record_keys(record)?;
+            let cert = cert.as_ref().map(|c| EpochCertView::of(record, c, &record_keys));
             view.status = match &cert {
                 Some(c) if c.valid => EpochStatus::Certified,
                 _ => EpochStatus::RecordOnly,
@@ -581,6 +608,9 @@ pub struct EpochCheckNodeView {
     pub stale_pending: Vec<Epoch>,
     /// Records whose certificate is present but does not verify.
     pub invalid_certs: Vec<Epoch>,
+    /// Records with a threshold certificate this source cannot check: it lacks the epoch's
+    /// group key (no dkg outcome, and no certified record of the epoch before naming it).
+    pub unverifiable_certs: Vec<Epoch>,
     /// Records where the previous record's `next_committee` differs from this `committee`.
     pub committee_handoff_mismatch: Vec<Epoch>,
     /// Records whose digest the index maps to another epoch, or to none.
@@ -608,9 +638,16 @@ fn link_check(epoch: Epoch, prev: Option<&EpochRecord>, record: &EpochRecord) ->
     }
 }
 
-fn cert_state(record: &EpochRecord, cert: Option<&EpochCertificate>) -> &'static str {
+fn cert_state(
+    record: &EpochRecord,
+    cert: Option<&EpochCertificate>,
+    keys: &RecordKeys,
+) -> &'static str {
     match cert {
-        Some(c) if record.verify_with_cert(c) => "certified",
+        Some(c) if record.verify_with_cert(c, keys) => "certified",
+        // a threshold certificate needs the epoch's group key, which this source may lack (an
+        // attested record, or no dkg outcome for the epoch)
+        Some(c) if c.signed_authorities.is_empty() && keys.group_key.is_none() => "unverifiable",
         Some(_) => "INVALID",
         None if record.epoch == 0 => "genesis",
         None => "record-only",
@@ -642,6 +679,7 @@ pub fn epoch_check(
             stale_pending: pending.iter().copied().filter(|e| keys.contains(e)).collect(),
             pending,
             invalid_certs: Vec::new(),
+            unverifiable_certs: Vec::new(),
             committee_handoff_mismatch: Vec::new(),
             index_mismatch: Vec::new(),
             records_missing: false,
@@ -720,10 +758,11 @@ pub fn epoch_check(
             view.checked += 1;
             let digest = record.digest();
             digests.entry(epoch).or_default().insert(digest);
-            let cert_state = cert_state(&record, cert.as_ref());
+            let cert_state = cert_state(&record, cert.as_ref(), &node.record_keys(&record)?);
             match cert_state {
                 "certified" => view.certified += 1,
                 "INVALID" => view.invalid_certs.push(epoch),
+                "unverifiable" => view.unverifiable_certs.push(epoch),
                 "record-only" => view.uncertified.push(epoch),
                 _ => {}
             }

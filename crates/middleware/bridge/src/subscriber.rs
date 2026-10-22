@@ -288,6 +288,25 @@ impl EpochCut {
         }
         CutAction::Keep
     }
+
+    /// [`Self::classify`] with the epoch's close gate: an output that reaches the boundary while
+    /// the next epoch's threshold key does not exist yet is kept, extending the epoch, and the
+    /// first one after the key exists closes it. Every node asks the gate about the same outputs
+    /// against the same executed state, so they cut at the same one.
+    async fn classify_gated<DB: Database>(
+        &mut self,
+        output: &ConsensusOutput,
+        epoch_boundary: TimestampSec,
+        config: &ConsensusConfig<DB>,
+    ) -> CutAction {
+        if !self.crossed
+            && output.reaches_epoch_boundary(epoch_boundary)
+            && !config.may_close(output).await
+        {
+            return CutAction::Keep;
+        }
+        self.classify(output, epoch_boundary)
+    }
 }
 
 impl<DB: Database> Subscriber<DB> {
@@ -729,7 +748,7 @@ impl<DB: Database> Subscriber<DB> {
                     // numbering). A dropped output must not advance the watermark or trigger rejoin -
                     // the transition starts the next epoch fresh.
                     let epoch_boundary = self.config.epoch_boundary();
-                    match epoch_cut.classify(&output, epoch_boundary) {
+                    match epoch_cut.classify_gated(&output, epoch_boundary, &self.config).await {
                         CutAction::Keep | CutAction::Close => {
                             self.commit_catchup_output(output).await?;
                             last_committed_number = number;
@@ -901,7 +920,11 @@ impl<DB: Database> Subscriber<DB> {
                 .await?;
 
             let epoch_boundary = self.config.epoch_boundary();
-            if consensus_output.reaches_epoch_boundary(epoch_boundary) {
+            // the same cut as the live path: past the boundary, an epoch waiting for its
+            // successor's threshold key goes on, so its outputs replay like any other
+            if consensus_output.reaches_epoch_boundary(epoch_boundary)
+                && self.config.may_close(&consensus_output).await
+            {
                 warn!(
                     target: "subscriber",
                     consensus_output_number = consensus_output.number,
@@ -1005,7 +1028,7 @@ impl<DB: Database> Subscriber<DB> {
                             // the rest - persisting a later output forks the node past the boundary
                             // it signed.
                             let epoch_boundary = self.config.epoch_boundary();
-                            match epoch_cut.classify(&output, epoch_boundary) {
+                            match epoch_cut.classify_gated(&output, epoch_boundary, &self.config).await {
                                 CutAction::Drop => {
                                     info!(
                                         target: "subscriber",

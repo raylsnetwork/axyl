@@ -43,6 +43,28 @@ pub fn create_validator_info(dir: &Path, address: &str, passphrase: String) -> e
     Ok(())
 }
 
+/// Second round of a genesis ceremony that gives epoch 0 a threshold key: the validator in `dir`
+/// deals it to the genesis validators whose node-info files are in `validators`, into `output`.
+pub fn create_genesis_dealing(
+    dir: &Path,
+    validators: &Path,
+    chain_id: u64,
+    output: &Path,
+    passphrase: String,
+) -> eyre::Result<()> {
+    let keys_command = CommandParser::<KeyArgs>::parse_from([
+        "rl",
+        "genesis-dealing",
+        "--validators",
+        &validators.to_string_lossy(),
+        "--chain-id",
+        &chain_id.to_string(),
+        "--output",
+        &output.to_string_lossy(),
+    ]);
+    keys_command.args.execute(dir.to_path_buf(), passphrase)
+}
+
 /// Execute observer config inside tempdir
 fn create_observer_info(datadir: PathBuf, passphrase: String) -> eyre::Result<()> {
     // keytool
@@ -227,8 +249,12 @@ pub fn get_rayls_network_binary() -> &'static CargoRun {
         // The dev-mode e2e test needs the binary built with the `dev` feature so the
         // `dev` subcommand exists; other e2e tests don't, so only add it when this
         // crate is itself built with `--features dev`.
-        #[cfg(feature = "dev-single-node-setup")]
+        #[cfg(all(feature = "dev-single-node-setup", not(feature = "dkg-test-hooks")))]
         let build = build.features("dev-single-node-setup");
+        #[cfg(all(feature = "dkg-test-hooks", not(feature = "dev-single-node-setup")))]
+        let build = build.features("dkg-test-hooks");
+        #[cfg(all(feature = "dev-single-node-setup", feature = "dkg-test-hooks"))]
+        let build = build.features("dev-single-node-setup dkg-test-hooks");
         build.run().expect("Failed to build rayls-network binary")
     })
 }

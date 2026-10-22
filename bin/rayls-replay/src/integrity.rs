@@ -5,8 +5,11 @@
 //! BFT-signed `EpochRecord.parent_state` anchor.
 
 use rayls_execution_evm::reth_env::RethEnv;
-use rayls_infrastructure_storage::tables::{EpochCerts, EpochRecords};
-use rayls_infrastructure_types::{Database, Epoch, EpochRecord, SealedHeader, B256};
+use rayls_infrastructure_storage::{
+    tables::{EpochCerts, EpochRecords},
+    EpochStore as _,
+};
+use rayls_infrastructure_types::{Database, Epoch, EpochRecord, RecordKeys, SealedHeader, B256};
 use std::collections::BTreeMap;
 use tracing::{error, info, warn};
 
@@ -94,7 +97,15 @@ pub fn load_epoch_anchors<DB: Database>(
             .get::<EpochCerts>(&digest)
             .ok()
             .flatten()
-            .map(|cert| record.verify_with_cert(&cert))
+            .map(|cert| {
+                // what the certificate signs besides the record, and the epoch's key when it
+                // uses threshold certificates, as the consensus DB holds them
+                let keys = RecordKeys {
+                    binding: consensus_store.get_record_binding(digest),
+                    group_key: consensus_store.epoch_group_key(epoch).flatten(),
+                };
+                record.verify_with_cert(&cert, &keys)
+            })
             .unwrap_or(false);
         if cert_verified {
             cert_verified_count += 1;

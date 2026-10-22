@@ -1,6 +1,7 @@
 //! Key command to generate all keys for running a node.
 
 mod generate;
+mod genesis_dealing;
 mod rotate_passphrase;
 mod stake_calldata;
 use self::generate::NodeType;
@@ -8,6 +9,7 @@ use clap::{Args, Subcommand};
 use eyre::{eyre, Context};
 
 use generate::GenerateKeys;
+use genesis_dealing::GenesisDealingArgs;
 use rayls_infrastructure_config::RaylsDirs as _;
 // dev-only: used by the feature-gated `generate_validator_keys` below
 #[cfg(feature = "dev-single-node-setup")]
@@ -74,6 +76,9 @@ pub enum KeySubcommand {
     /// Re-encrypt the BLS keystore under a new passphrase (node identity unchanged).
     #[command(name = "rotate-passphrase")]
     RotatePassphrase(RotatePassphrase),
+    /// Deal epoch 0's threshold key to the genesis validators (genesis ceremony, second round).
+    #[command(name = "genesis-dealing")]
+    GenesisDealing(GenesisDealingArgs),
 }
 
 impl KeyArgs {
@@ -97,6 +102,9 @@ impl KeyArgs {
             }
             // `passphrase` is the current one; the new passphrase is sourced in execute.
             KeySubcommand::RotatePassphrase(args) => {
+                args.execute(&datadir, passphrase)?;
+            }
+            KeySubcommand::GenesisDealing(args) => {
                 args.execute(&datadir, passphrase)?;
             }
         }

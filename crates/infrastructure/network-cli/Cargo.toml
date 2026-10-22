@@ -21,6 +21,7 @@ secp256k1 = { workspace = true, features = [
 ]}
 tracing = { workspace = true }
 rpassword = { workspace = true }
+rand = { workspace = true }
 rayls-infrastructure-types = { workspace = true, features = ["cli"] }
 rayls-infrastructure-storage = { workspace = true }
 rayls-infrastructure-config = { workspace = true }
@@ -45,6 +46,11 @@ cold-storage = ["rayls-middleware-orchestrator/cold-storage"]
 # dashboard). NOT FOR PRODUCTION — excluded from default/release builds; enable
 # with `--features dev-single-node-setup`.
 dev-single-node-setup = ["dep:ethereum-tx-sign", "rayls-middleware-orchestrator/dev-single-node-setup"]
+# DKG fault injection for the e2e tests. NOT FOR PRODUCTION.
+dkg-test-hooks = [
+    "rayls-middleware-orchestrator/dkg-test-hooks",
+    "rayls-execution-evm/dkg-test-hooks",
+]
 
 [dev-dependencies]
 tokio = { workspace = true, features = [

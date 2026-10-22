@@ -152,6 +152,7 @@ impl ExecutionNodeInner {
         epoch: Epoch,
         initial_batch_seq: u64,
         epoch_boundary: u64,
+        hold_open_past_boundary: bool,
     ) -> eyre::Result<()> {
         // The node-scoped in-flight tracker is shared by every worker pool: a second worker's
         // boundary clear or reconcile would wipe the sibling's marks. Fence the assumption until
@@ -187,6 +188,7 @@ impl ExecutionNodeInner {
                 worker_id,
                 epoch,
                 epoch_boundary,
+                hold_open_past_boundary,
                 max_delay: self.rayls_infrastructure_config.parameters.max_batch_delay,
                 next_batch_seq: initial_batch_seq,
                 gas_limit: self.rayls_infrastructure_config.parameters.gas_limit,

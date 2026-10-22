@@ -566,7 +566,7 @@ impl MdbxDatabase {
                 None => MaxReadTransactionDuration::Unbounded,
             };
             Environment::builder()
-                .set_max_dbs(32)
+                .set_max_dbs(64)
                 .set_flags(EnvironmentFlags {
                     mode: Mode::ReadWrite { sync_mode: SyncMode::SafeNoSync },
                     liforeclaim: true,
@@ -685,7 +685,7 @@ impl MdbxDatabase {
         let open_at = |ps: Option<usize>| {
             let mut builder = Environment::builder();
             builder
-                .set_max_dbs(32)
+                .set_max_dbs(64)
                 .set_flags(flags)
                 // Inspection scans may legitimately outlast the node's read-transaction cap; the
                 // cap protects the writer in *this* process, of which there is none.

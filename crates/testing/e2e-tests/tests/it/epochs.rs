@@ -20,8 +20,8 @@ use rayls_execution_evm::{
 use rayls_infrastructure_config::{Config, ConfigFmt, ConfigTrait as _, NodeInfo};
 use rayls_infrastructure_types::{
     test_utils::{self, CommandParser},
-    Address, Bytes, ConsensusHeader, Epoch, EpochCertificate, EpochRecord, Genesis, GenesisAccount,
-    MIN_RAYLS_PROTOCOL_BASE_FEE, U256,
+    Address, BlsPublicKey, Bytes, ConsensusHeader, Epoch, EpochCertificate, EpochRecord, Genesis,
+    GenesisAccount, RecordBinding, RecordKeys, MIN_RAYLS_PROTOCOL_BASE_FEE, U256,
 };
 use rayls_network_cli::genesis::GenesisArgs;
 use std::{
@@ -36,8 +36,8 @@ use std::{
 use tokio::time::{timeout, Instant};
 use tracing::{debug, info};
 
-const NEW_VALIDATOR: &str = "new-validator";
-const NODE_PASSWORD: &str = "sup3rsecuur";
+pub(crate) const NEW_VALIDATOR: &str = "new-validator";
+pub(crate) const NODE_PASSWORD: &str = "sup3rsecuur";
 const INITIAL_STAKE_AMOUNT: &str = "1_000_000";
 /// Number of genuine (post-lookahead) epochs to sample before concluding the
 /// new validator was never shuffled in. With a 1/6 per-epoch selection chance,
@@ -49,10 +49,10 @@ const SELECTABLE_TRIALS_TARGET: usize = 25;
 // roughly absolute, not proportional - so 30s (tolerance ~61s) gives ample margin
 // while keeping test_epoch_boundary's shuffle wait under the 60-min job cap.
 // Retry-based record checks stay correct regardless of cadence.
-const EPOCH_DURATION: u64 = 30;
+pub(crate) const EPOCH_DURATION: u64 = 30;
 /// RPC ports of every node: instance `i` serves on `8546 - i`, the new validator (instance 6) on
 /// 8540.
-const RPC_PORTS: RangeInclusive<u16> = 8540..=8545;
+pub(crate) const RPC_PORTS: RangeInclusive<u16> = 8540..=8545;
 /// Bound for sampling threshold certificates of two consecutive epochs on every node.
 const THRESHOLD_SAMPLE_WAIT: Duration = Duration::from_secs(4 * EPOCH_DURATION);
 
@@ -345,14 +345,14 @@ async fn test_epoch_sync_inner(
 }
 
 /// The current epoch as the registry of the node on `port` states it.
-async fn current_epoch(port: u16) -> eyre::Result<Epoch> {
+pub(crate) async fn current_epoch(port: u16) -> eyre::Result<Epoch> {
     let provider = ProviderBuilder::new().connect_http(format!("http://127.0.0.1:{port}").parse()?);
     let registry = ConsensusRegistry::new(CONSENSUS_REGISTRY_ADDRESS, &provider);
     Ok(registry.getCurrentEpoch().call().await?)
 }
 
 /// The latest consensus header of the node on `port`, from `rayls_latestHeader`.
-async fn latest_header(port: u16) -> eyre::Result<ConsensusHeader> {
+pub(crate) async fn latest_header(port: u16) -> eyre::Result<ConsensusHeader> {
     let provider = ProviderBuilder::new().connect_http(format!("http://127.0.0.1:{port}").parse()?);
     Ok(provider.raw_request::<_, ConsensusHeader>("rayls_latestHeader".into(), ()).await?)
 }
@@ -364,7 +364,7 @@ async fn latest_header(port: u16) -> eyre::Result<ConsensusHeader> {
 ///
 /// Fails at the first aggregate certificate, when a node reaches a later epoch before one of
 /// `epochs` was sampled on it (only the latest header is served), or after `deadline`.
-async fn assert_threshold_certificates(
+pub(crate) async fn assert_threshold_certificates(
     ports: RangeInclusive<u16>,
     epochs: RangeInclusive<Epoch>,
     deadline: Duration,
@@ -443,7 +443,7 @@ async fn assert_consensus_keeps_up(
 /// IS returned but fails cert verification is a real correctness bug and fails
 /// immediately (no retry). A node that never produces the record fails once the
 /// deadline is exceeded, with a message naming the node and epoch.
-async fn wait_for_verified_epoch_record<P: Provider>(
+pub(crate) async fn wait_for_verified_epoch_record<P: Provider>(
     provider: &P,
     port: u16,
     epoch: u32,
@@ -465,8 +465,22 @@ async fn wait_for_verified_epoch_record<P: Provider>(
             )
         })?;
 
+    // what the certificate signs besides the record, and the epoch's group key for a threshold
+    // certificate, as the node knows them
+    let binding: RecordBinding = provider
+        .raw_request("rayls_epochRecordBinding".into(), (epoch,))
+        .await
+        .map_err(|e| eyre::eyre!("node on port {port}: epoch {epoch} record binding: {e}"))?;
+    let group_key: Option<BlsPublicKey> = if cert.signed_authorities.is_empty() {
+        provider
+            .raw_request("rayls_epochGroupKey".into(), (epoch,))
+            .await
+            .map_err(|e| eyre::eyre!("node on port {port}: epoch {epoch} group key: {e}"))?
+    } else {
+        None
+    };
     eyre::ensure!(
-        record.verify_with_cert(&cert),
+        record.verify_with_cert(&cert, &RecordKeys { binding, group_key }),
         "node on port {port}: epoch {epoch} record present but failed cert verification: {}/{} {}",
         record.epoch,
         record.digest(),
@@ -576,6 +590,7 @@ async fn test_epoch_boundary() -> eyre::Result<()> {
         new_validator.address(),
         governance_wallet.address(),
         &committee,
+        false,
     )?;
 
     // start nodes (committee + new validator)
@@ -624,6 +639,7 @@ async fn test_epoch_sync() -> eyre::Result<()> {
         new_validator.address(),
         governance_wallet.address(),
         &committee,
+        false,
     )?;
 
     // start nodes (committee + new validator)
@@ -653,11 +669,12 @@ async fn test_epoch_sync() -> eyre::Result<()> {
 ///
 /// Funds a new validator and the governance wallet to issue NFTs.
 /// This method also configures the initial committee to start the network.
-fn create_genesis_for_test(
+pub(crate) fn create_genesis_for_test(
     temp_path: &Path,
     new_validator: Address,
     governance_wallet: Address,
     committee: &Vec<(&str, Address)>,
+    genesis_key: bool,
 ) -> eyre::Result<Genesis> {
     // use same passphrase for all nodes
     let passphrase = NODE_PASSWORD.to_string();
@@ -666,8 +683,17 @@ fn create_genesis_for_test(
     let new_validator_path = temp_path.join(NEW_VALIDATOR);
     create_validator_info(&new_validator_path, &new_validator.to_string(), passphrase.clone())?;
 
+    // the joiner is not a genesis validator, so genesis does not fund its DKG submitter: fund it
+    // here, as an operator would
+    let new_info: NodeInfo =
+        Config::load_from_path(&new_validator_path.join("node-info.yaml"), ConfigFmt::YAML)?;
+
     // fund governance to issue NFT and new validator to stake
     let accounts = vec![
+        (
+            new_info.dkg_submitter,
+            GenesisAccount::default().with_balance(U256::from(parse_ether("100")?)),
+        ),
         (
             governance_wallet,
             GenesisAccount::default().with_balance(U256::from(parse_ether("50_000_000")?)), /* 50mil RLS */
@@ -688,10 +714,17 @@ fn create_genesis_for_test(
         governance_wallet,
         accounts,
         committee,
+        genesis_key,
     )?;
 
     // copy genesis for new validator
     std::fs::create_dir_all(new_validator_path.join("genesis"))?;
+    if genesis_key {
+        std::fs::copy(
+            shared_genesis_dir.join("genesis/dkg-dealings.yaml"),
+            new_validator_path.join("genesis/dkg-dealings.yaml"),
+        )?;
+    }
     std::fs::copy(
         shared_genesis_dir.join("genesis/committee.yaml"),
         new_validator_path.join("genesis/committee.yaml"),
@@ -711,13 +744,16 @@ fn create_genesis_for_test(
 /// Configure the initial committee and fund accounts for network genesis.
 ///
 /// All data is written to file.
-fn config_committee(
+/// With `genesis_key`, the validators also run the second ceremony round and genesis gives epoch
+/// 0 a threshold key.
+pub(crate) fn config_committee(
     temp_path: &Path,
     shared_genesis_dir: &Path,
     passphrase: String,
     consensus_registry_owner: Address,
     accounts: Vec<(Address, GenesisAccount)>,
     validators: &Vec<(&str, Address)>,
+    genesis_key: bool,
 ) -> eyre::Result<Genesis> {
     // create shared genesis dir
     let copy_path = shared_genesis_dir.join("genesis/validators");
@@ -750,18 +786,34 @@ fn config_committee(
     // create committee from shared genesis dir. The chain-id must match the `--network`
     // flag the nodes are started with (see start_nodes / TEST_NETWORK).
     let chain_id = TEST_NETWORK.chain_id().to_string();
-    let create_committee_command = CommandParser::<GenesisArgs>::parse_from([
+    let dealings_dir = shared_genesis_dir.join("dkg-dealings");
+    if genesis_key {
+        std::fs::create_dir_all(&dealings_dir)?;
+        for (v, _) in validators.iter() {
+            e2e_tests::create_genesis_dealing(
+                &temp_path.join(v),
+                &copy_path,
+                TEST_NETWORK.chain_id(),
+                &dealings_dir.join(format!("{v}.yaml")),
+                passphrase.clone(),
+            )?;
+        }
+    }
+    let dealings_arg = dealings_dir.to_string_lossy().into_owned();
+    let owner_arg = consensus_registry_owner.to_string();
+    let duration_arg = EPOCH_DURATION.to_string();
+    let mut ceremony_args = vec![
         "rl",
         "--basefee-address",
         "0x9999999999999999999999999999999999999999",
         "--consensus-registry-owner",
-        &consensus_registry_owner.to_string(),
+        &owner_arg,
         "--initial-stake-per-validator",
         INITIAL_STAKE_AMOUNT,
         "--min-withdraw-amount",
         min_withdrawal,
         "--epoch-duration-in-secs",
-        &EPOCH_DURATION.to_string(),
+        &duration_arg,
         "--dev-funded-account",
         "test-source",
         "--rls-accounts",
@@ -772,7 +824,11 @@ fn config_committee(
         "500",
         "--chain-id",
         &chain_id,
-    ]);
+    ];
+    if genesis_key {
+        ceremony_args.extend(["--dkg-dealings", &dealings_arg]);
+    }
+    let create_committee_command = CommandParser::<GenesisArgs>::parse_from(ceremony_args);
     create_committee_command.args.execute(shared_genesis_dir.to_path_buf())?;
 
     // update genesis with funded accounts
@@ -795,6 +851,12 @@ fn config_committee(
             dir.join("genesis/genesis.yaml"),
         )?;
         std::fs::copy(shared_genesis_dir.join("parameters.yaml"), dir.join("parameters.yaml"))?;
+        if genesis_key {
+            std::fs::copy(
+                shared_genesis_dir.join("genesis/dkg-dealings.yaml"),
+                dir.join("genesis/dkg-dealings.yaml"),
+            )?;
+        }
     }
 
     Ok(genesis)
@@ -856,12 +918,12 @@ fn start_nodes(temp_path: &Path, validators: &[(&str, Address)]) -> eyre::Result
 
 /// A pre-signed onboarding transaction plus the pieces needed to replay it as an
 /// `eth_call` (to surface a revert reason) if it reverts on-chain.
-struct OnboardTx {
-    label: &'static str,
-    from: Address,
-    to: Address,
-    calldata: Vec<u8>,
-    raw: Bytes,
+pub(crate) struct OnboardTx {
+    pub(crate) label: &'static str,
+    pub(crate) from: Address,
+    pub(crate) to: Address,
+    pub(crate) calldata: Vec<u8>,
+    pub(crate) raw: Bytes,
 }
 
 /// Generate all the transactions needed to onboard the new validator so it becomes
@@ -873,7 +935,7 @@ struct OnboardTx {
 /// ordered flow is: governance allowlists → validator approves RLS → validator stakes
 /// (value 0) → validator activates. The validator is already RLS-funded at genesis,
 /// so no separate transfer is needed.
-fn generate_new_validator_txs(
+pub(crate) fn generate_new_validator_txs(
     temp_path: &Path,
     chain: Arc<RethChainSpec>,
     new_validator: &mut TransactionFactory,

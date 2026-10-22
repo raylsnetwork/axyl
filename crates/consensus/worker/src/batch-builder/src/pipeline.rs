@@ -131,6 +131,10 @@ pub struct PipelineData {
     pub(crate) current_seq: u64,
     /// The latest canonical tip timestamp, which the boundary and quiesce checks read.
     pub(crate) last_canonical_timestamp: u64,
+    /// The epoch waits for the next epoch's threshold key before it closes: past the boundary
+    /// the builder keeps sealing at the quiescing pace instead of closing, so dealings can still
+    /// land while the epoch is extended. The epoch's task shutdown stops it.
+    pub(crate) hold_open: bool,
 }
 
 /// The builder pipeline in a statically known phase `S`.
@@ -170,9 +174,10 @@ impl<S> BatchPipeline<S> {
         self.data.last_canonical_timestamp = timestamp;
     }
 
-    /// Closes the pipeline when the canonical tip has reached the epoch boundary.
+    /// Closes the pipeline when the canonical tip has reached the epoch boundary, unless the
+    /// epoch is held open for the next epoch's key.
     pub fn check_boundary(self, epoch_boundary: u64) -> Result<Self, BatchPipeline<Closed>> {
-        if self.data.last_canonical_timestamp >= epoch_boundary {
+        if !self.data.hold_open && self.data.last_canonical_timestamp >= epoch_boundary {
             Err(BatchPipeline { state: Closed, data: self.data })
         } else {
             Ok(self)
@@ -195,8 +200,16 @@ impl BatchPipeline<Clean> {
                 highest_durable_sealed_seq: persisted_highest_sealed_seq,
                 current_seq: start_seq,
                 last_canonical_timestamp: canonical_timestamp,
+                hold_open: false,
             },
         }
+    }
+
+    /// Keep sealing past the boundary, at the quiescing pace, instead of closing (see
+    /// [`PipelineData::hold_open`]).
+    pub fn holding_open(mut self, hold_open: bool) -> Self {
+        self.data.hold_open = hold_open;
+        self
     }
 
     /// Moves to `Accumulating` once a candidate transaction event arrives.
@@ -459,7 +472,11 @@ fn check_build_budget(
     own_executed_seq: Option<u64>,
     epoch_boundary: u64,
 ) -> Result<(), GateRejectionReason> {
-    let phase = EpochPhase::evaluate(epoch_boundary, data.last_canonical_timestamp);
+    let phase = match EpochPhase::evaluate(epoch_boundary, data.last_canonical_timestamp) {
+        // an epoch held open for the next epoch's key stays at the quiescing pace
+        EpochPhase::Closed if data.hold_open => EpochPhase::Quiescing,
+        phase => phase,
+    };
     if phase == EpochPhase::Closed {
         return Err(GateRejectionReason::EpochBoundaryReached);
     }

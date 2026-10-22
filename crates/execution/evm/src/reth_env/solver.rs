@@ -246,6 +246,9 @@ mod tests {
                     p2p_info: NodeP2pInfo::default(),
                     execution_address: addr,
                     proof_of_possession: pop,
+                    dkg_submitter: Address::ZERO,
+                    dkg_encryption_key: Default::default(),
+                    dkg_key_proof: Default::default(),
                 }
             })
             .collect();

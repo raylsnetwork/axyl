@@ -3,10 +3,10 @@ use crate::{Config, ConfigFmt, ConfigTrait as _, KeyConfig, NetworkConfig, Param
 use rayls_infrastructure_network_types::local::LocalNetwork;
 use rayls_infrastructure_storage::EpochStore as _;
 use rayls_infrastructure_types::{
-    dkg::{DealingParams, DkgOutcome, EpochScheme, EpochThreshold},
+    dkg::{EpochScheme, EpochThreshold},
     Authority, AuthorityIdentifier, BlsPublicKey, Certificate, CertificateDigest, Committee,
-    CommitteeLookahead, Database, Epoch, EpochKeys, Hash as _, Multiaddr, NetworkPublicKey,
-    Notifier,
+    CommitteeLookahead, ConsensusOutput, Database, Epoch, EpochCloseGate, EpochKeys, Hash as _,
+    Multiaddr, NetworkPublicKey, Notifier,
 };
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
@@ -59,8 +59,9 @@ struct ConsensusConfigInner<DB> {
     scheme: RwLock<EpochScheme>,
     /// Which epochs dealt the next epoch's key, for verifying other epochs' certificates.
     dealt: DealtEpochs,
-    /// Dealing parameters for the next epoch's key, when this epoch deals.
-    dealing: Option<Arc<DealingParams>>,
+    /// When this epoch deals the next epoch's key: the gate that holds the epoch open until the
+    /// key exists. Set once, at the epoch's start.
+    close_gate: std::sync::OnceLock<Arc<dyn EpochCloseGate>>,
 }
 
 /// Which epochs dealt the next epoch's threshold key, as the orchestrator's dealing gate answered
@@ -72,6 +73,8 @@ pub struct DealtEpochs {
     never: bool,
     /// The gate's answers for the epochs it could read.
     known: BTreeMap<Epoch, bool>,
+    /// Genesis dealt epoch 0's key (`genesis/dkg-dealings.yaml`).
+    genesis_key: bool,
 }
 
 impl Default for DealtEpochs {
@@ -83,18 +86,29 @@ impl Default for DealtEpochs {
 impl DealtEpochs {
     /// No epoch deals: the fork is scheduled `Never`.
     pub fn never() -> Self {
-        Self { never: true, known: BTreeMap::new() }
+        Self { never: true, known: BTreeMap::new(), genesis_key: false }
     }
 
     /// The gate's answers for `known` epochs. Block forks only activate upward, so an epoch
     /// below a known non-dealing one did not deal and one above a known dealing one did.
     pub fn from_known(known: BTreeMap<Epoch, bool>) -> Self {
-        Self { never: false, known }
+        Self { never: false, known, genesis_key: false }
+    }
+
+    /// The same answers, with whether genesis dealt epoch 0's key.
+    pub fn with_genesis_key(mut self, genesis_key: bool) -> Self {
+        self.genesis_key = genesis_key;
+        self
+    }
+
+    /// Whether genesis dealt epoch 0's key, so epoch 0 uses threshold certificates.
+    pub fn genesis_key(&self) -> bool {
+        self.genesis_key
     }
 
     /// Whether `epoch` dealt the next epoch's key; `None` when the gate could not tell.
     pub fn dealt(&self, epoch: Epoch) -> Option<bool> {
-        if self.never || epoch == 0 {
+        if self.never {
             return Some(false);
         }
         if let Some(dealt) = self.known.get(&epoch) {
@@ -186,7 +200,6 @@ where
             true,
             EpochScheme::Aggregate,
             DealtEpochs::never(),
-            None,
         )
     }
 
@@ -213,7 +226,6 @@ where
             true,
             EpochScheme::Aggregate,
             DealtEpochs::never(),
-            None,
         )
     }
 
@@ -233,7 +245,6 @@ where
         initial_epoch: bool,
         scheme: EpochScheme,
         dealt: DealtEpochs,
-        dealing: Option<Arc<DealingParams>>,
     ) -> eyre::Result<Self> {
         Self::new_with_committee(
             config,
@@ -246,7 +257,6 @@ where
             initial_epoch,
             scheme,
             dealt,
-            dealing,
         )
     }
 
@@ -269,7 +279,6 @@ where
         initial_epoch: bool,
         scheme: EpochScheme,
         dealt: DealtEpochs,
-        dealing: Option<Arc<DealingParams>>,
     ) -> eyre::Result<Self> {
         let local_network = LocalNetwork::new(key_config.primary_public_key());
 
@@ -304,7 +313,7 @@ where
                 genesis,
                 scheme: RwLock::new(scheme),
                 dealt,
-                dealing,
+                close_gate: Default::default(),
             }),
             shutdown,
             epoch_boundary,
@@ -317,6 +326,26 @@ where
     pub fn with_certificate_fetch_epoch_v2_block(mut self, block: Option<u64>) -> Self {
         self.certificate_fetch_epoch_v2_block = block;
         self
+    }
+
+    /// Hold this epoch open until `gate` lets it close (see [`EpochCloseGate`]). Only the first
+    /// call has an effect.
+    pub fn set_close_gate(&self, gate: Arc<dyn EpochCloseGate>) {
+        let _ = self.inner.close_gate.set(gate);
+    }
+
+    /// Whether this epoch waits for the next epoch's key before closing.
+    pub fn holds_open_for_key(&self) -> bool {
+        self.inner.close_gate.get().is_some()
+    }
+
+    /// Whether the epoch may close at `output`, which reached the boundary timestamp: always,
+    /// unless a close gate is set and says otherwise.
+    pub async fn may_close(&self, output: &ConsensusOutput) -> bool {
+        match self.inner.close_gate.get() {
+            Some(gate) => gate.may_close(output).await,
+            None => true,
+        }
     }
 
     /// How the current epoch's certificates are signed.
@@ -340,11 +369,6 @@ where
         self.scheme().threshold().cloned()
     }
 
-    /// Dealing parameters for the next epoch's key, when this epoch deals.
-    pub fn dealing(&self) -> Option<&Arc<DealingParams>> {
-        self.inner.dealing.as_ref()
-    }
-
     /// Keys and scheme to verify certificates of `epoch`, when they are known now. See
     /// [`Self::epoch_keys_status`] for why they may not be.
     pub fn epoch_keys(&self, epoch: Epoch) -> Option<EpochKeys> {
@@ -356,8 +380,9 @@ where
 
     /// Keys and scheme to verify certificates of `epoch`. Committee keys fall back through the
     /// same sources as `get_committee_keys_for_epoch`. The scheme is the current epoch's own, or
-    /// the stored DKG outcome; without one, epochs 0 and 1 and any epoch whose previous epoch did
-    /// not deal are legacy, and the rest are `Pending`.
+    /// the stored DKG outcome; without one, epoch 0 unless genesis dealt its key, and any epoch
+    /// whose previous epoch did not deal are legacy, then the next key the certified record of
+    /// `epoch - 1` signs, and the rest are `Pending`.
     pub fn epoch_keys_status(&self, epoch: Epoch) -> EpochKeysStatus {
         if epoch == self.inner.committee.epoch() {
             let group_key = match self.scheme() {
@@ -371,10 +396,12 @@ where
         let Some(keys) = self.get_committee_keys_for_epoch(epoch) else {
             return EpochKeysStatus::NoCommittee;
         };
-        let group_key = match self.inner.node_storage.get_dkg_outcome(epoch) {
-            Some(DkgOutcome::Key(key)) => Some(key.group_key()),
-            Some(DkgOutcome::Fallback) => None,
-            None if epoch <= 1 || self.inner.dealt.dealt(epoch - 1) == Some(false) => None,
+        // the stored DKG outcome, else (not executed yet) what the certified record of the epoch
+        // before signs; checked against each other, a disagreement trusting neither
+        let group_key = match self.inner.node_storage.epoch_group_key(epoch) {
+            Some(group_key) => group_key,
+            None if epoch == 0 && !self.inner.dealt.genesis_key() => None,
+            None if epoch > 0 && self.inner.dealt.dealt(epoch - 1) == Some(false) => None,
             None => return EpochKeysStatus::Pending,
         };
         EpochKeysStatus::Ready(EpochKeys { keys, group_key })
@@ -558,9 +585,9 @@ where
 mod tests {
     use super::*;
     use rand::{rngs::StdRng, SeedableRng};
-    use std::collections::BTreeMap;
     use rayls_infrastructure_storage::{mem_db::MemDatabase, tables::EpochRecords, EpochStore};
     use rayls_infrastructure_types::{Address, BlsKeypair, CommitteeBuilder, EpochRecord};
+    use std::collections::BTreeMap;
 
     /// A config for a two-member committee at `epoch` (this node and one other), built on `db`.
     fn config_at_epoch(
@@ -629,7 +656,7 @@ mod tests {
         let never = DealtEpochs::never();
         assert_eq!(never.dealt(7), Some(false));
         let known = DealtEpochs::from_known(BTreeMap::from([(4, false), (5, true), (6, true)]));
-        assert_eq!(known.dealt(0), Some(false), "epoch 0 never deals");
+        assert_eq!(known.dealt(0), Some(false), "epoch 0 answers like any other");
         assert_eq!(known.dealt(5), Some(true));
         // Below a non-dealing epoch nothing dealt; above a dealing one everything does.
         assert_eq!(known.dealt(2), Some(false));

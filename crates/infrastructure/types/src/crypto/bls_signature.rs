@@ -35,6 +35,18 @@ impl BlsSignature {
     pub fn verify_raw(&self, message: &[u8], public_key: &BlsPublicKey) -> bool {
         self.verify(true, message, DST_G1, &[], public_key, true) == blst::BLST_ERROR::BLST_SUCCESS
     }
+
+    /// Verify an aggregate of signatures over one message (raw bytes) by every key in
+    /// `public_keys`; false for no keys.
+    pub fn verify_aggregate_raw(&self, message: &[u8], public_keys: &[BlsPublicKey]) -> bool {
+        if public_keys.is_empty() {
+            return false;
+        }
+        let keys: Vec<&PublicKey> = public_keys.iter().map(|key| key.deref()).collect();
+        let messages = vec![message; keys.len()];
+        self.aggregate_verify(true, &messages, DST_G1, &keys, true)
+            == blst::BLST_ERROR::BLST_SUCCESS
+    }
 }
 
 impl Deref for BlsSignature {

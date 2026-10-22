@@ -30,7 +30,8 @@ use rayls_infrastructure_storage::PayloadStore;
 use rayls_infrastructure_types::{
     encode, AuthorityIdentifier, BlockHash, BlsPublicKey, BlsSignature, Certificate,
     CertificateDigest, ConsensusHeader, Database, Epoch, EpochCertificate, EpochRecord, EpochVote,
-    Header, RaylsReceiver, RaylsSender, Round, TaskKind, TaskSpawner, Vote,
+    Header, KeyedEpochVote, RaylsReceiver, RaylsSender, RecordBinding, Round, TaskKind,
+    TaskSpawner, Vote, VoteContext,
 };
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
 use tokio::sync::{mpsc, oneshot};
@@ -111,10 +112,20 @@ impl PrimaryNetworkHandle {
         Ok(())
     }
 
-    /// Publish a certificate to the consensus network.
-    pub async fn publish_epoch_vote(&self, vote: EpochVote) -> NetworkResult<()> {
-        let data = encode(&PrimaryGossip::EpochVote(Box::new(vote)));
-        self.handle.publish(LibP2pConfig::epoch_vote_topic(), data).await?;
+    /// Publish an epoch vote: a keyed one (`context` set) with what it binds, so nodes without
+    /// the record can check it.
+    pub async fn publish_epoch_vote(
+        &self,
+        vote: EpochVote,
+        context: Option<VoteContext>,
+    ) -> NetworkResult<()> {
+        let gossip = match context {
+            None => PrimaryGossip::EpochVote(Box::new(vote)),
+            Some(VoteContext { epoch, next_key }) => {
+                PrimaryGossip::KeyedEpochVote(Box::new(KeyedEpochVote { vote, epoch, next_key }))
+            }
+        };
+        self.handle.publish(LibP2pConfig::epoch_vote_topic(), encode(&gossip)).await?;
         Ok(())
     }
 
@@ -161,9 +172,11 @@ impl PrimaryNetworkHandle {
             PrimaryResponse::ConsensusHeader(_consensus_header) => Err(NetworkError::RPCError(
                 "Got wrong response, not a vote is consensus header!".to_string(),
             )),
-            PrimaryResponse::EpochRecord { .. } => Err(NetworkError::RPCError(
-                "Got wrong response, not a vote is epoch record!".to_string(),
-            )),
+            PrimaryResponse::EpochRecord { .. } | PrimaryResponse::KeyedEpochRecord { .. } => {
+                Err(NetworkError::RPCError(
+                    "Got wrong response, not a vote is epoch record!".to_string(),
+                ))
+            }
             PrimaryResponse::PeerExchange { .. } => Err(NetworkError::RPCError(
                 "Got wrong response, not a vote is peer exchange!".to_string(),
             )),
@@ -276,13 +289,12 @@ impl PrimaryNetworkHandle {
         &self,
         peer: BlsPublicKey,
         epoch: Epoch,
-    ) -> NetworkResult<(EpochRecord, EpochCertificate)> {
+    ) -> NetworkResult<(EpochRecord, EpochCertificate, RecordBinding)> {
         let request = PrimaryRequest::EpochRecord { epoch: Some(epoch), hash: None };
         let res = self.handle.send_request(request, peer).await?;
-        match res.await?? {
-            PrimaryResponse::EpochRecord { record, certificate } => Ok((record, certificate)),
-            _ => Err(NetworkError::RPCError("Peer did not return an epoch record!".to_string())),
-        }
+        epoch_record_response(res.await??).ok_or_else(|| {
+            NetworkError::RPCError("Peer did not return an epoch record!".to_string())
+        })
     }
 
     /// Request consensus header from a random peer up to three times from three different peers.
@@ -290,14 +302,16 @@ impl PrimaryNetworkHandle {
         &self,
         epoch: Option<Epoch>,
         hash: Option<BlockHash>,
-    ) -> NetworkResult<(EpochRecord, EpochCertificate)> {
+    ) -> NetworkResult<(EpochRecord, EpochCertificate, RecordBinding)> {
         let request = PrimaryRequest::EpochRecord { epoch, hash };
         // Try up to three times (from three peers) to get consensus.
         // This could be a lot more complicated but this KISS method should work fine.
         for _ in 0..3 {
             let res = self.handle.send_request_any(request.clone()).await?;
-            if let Ok(Ok(PrimaryResponse::EpochRecord { record, certificate })) = res.await {
-                return Ok((record, certificate));
+            if let Some(answer) =
+                res.await.ok().and_then(Result::ok).and_then(epoch_record_response)
+            {
+                return Ok(answer);
             }
         }
         Err(NetworkError::RPCError("Could not get the epoch record!".to_string()))
@@ -612,4 +626,19 @@ pub enum RequestVoteResult {
         /// The epoch of the proposed header.
         received: Epoch,
     },
+}
+
+/// The record, certificate and binding of an epoch record response; `None` for another response.
+fn epoch_record_response(
+    response: PrimaryResponse,
+) -> Option<(EpochRecord, EpochCertificate, RecordBinding)> {
+    match response {
+        PrimaryResponse::EpochRecord { record, certificate } => {
+            Some((record, certificate, RecordBinding::Legacy))
+        }
+        PrimaryResponse::KeyedEpochRecord { record, certificate, next_key } => {
+            Some((record, certificate, RecordBinding::NextKey(next_key)))
+        }
+        _ => None,
+    }
 }

@@ -356,7 +356,7 @@ async fn test_primary_batch_gossip_topics() {
 
     task_manager.spawn_task("process-gossip-test", async move {
         let mut rx = consensus_bus.new_epoch_votes().subscribe();
-        while let Some((_, tx)) = rx.recv().await {
+        while let Some((_, _, tx)) = rx.recv().await {
             let _ = tx.send(Ok(()));
         }
     });

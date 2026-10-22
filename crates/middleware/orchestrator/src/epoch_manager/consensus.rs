@@ -1,10 +1,10 @@
-use super::dkg;
+use super::{
+    dkg::{self, OwnShare},
+    dkg_hooks::{self, CrashPoint},
+};
 use crate::{
-    engine::ExecutionNode,
-    epoch_manager::{transition::select_recovery_checkpoint, types::EpochManager},
-    primary::PrimaryNode,
-    types::EngineToPrimaryRpc,
-    worker::WorkerNode,
+    engine::ExecutionNode, epoch_manager::types::EpochManager, primary::PrimaryNode,
+    types::EngineToPrimaryRpc, worker::WorkerNode,
 };
 use eyre::eyre;
 use rayls_execution_evm::{
@@ -13,14 +13,14 @@ use rayls_execution_evm::{
 };
 use rayls_infrastructure_config::{ConsensusConfig, NetworkConfig, RaylsDirs};
 use rayls_infrastructure_types::{
-    gas_accumulator::GasAccumulator, BlsPublicKey, CommitteeLookahead, Database as ReDatabase,
-    TaskManager,
+    dkg::DkgOutcome, gas_accumulator::GasAccumulator, BlsPublicKey, CommitteeLookahead,
+    Database as ReDatabase, TaskManager,
 };
 use std::{
     collections::{HashMap, HashSet},
     sync::Arc,
 };
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 impl<P, DB> EpochManager<P, DB>
 where
@@ -38,9 +38,9 @@ where
         gas_accumulator: GasAccumulator,
     ) -> eyre::Result<(PrimaryNode<DB>, WorkerNode<DB>, ConsensusConfig<DB>)> {
         // create config for consensus
-        let (consensus_config, preload_keys) =
+        let (consensus_config, preload_keys, share_failed) =
             self.configure_consensus(engine, network_config).await?;
-        if consensus_config.scheme_pending() {
+        if consensus_config.scheme_pending() || share_failed {
             self.spawn_pending_scheme_retry(engine, epoch_task_manager, &consensus_config);
         }
 
@@ -66,6 +66,8 @@ where
             )
             .await?;
 
+        self.spawn_dkg_dealer(engine, epoch_task_manager, &consensus_config).await;
+
         // NOTE: try_restore_state and identify_node_mode moved above - before network starts
         // NOTE: spawn_engine_update_task moved to run() as a node-scoped task
         let primary_handle = primary.network_handle().await;
@@ -83,11 +85,13 @@ where
     ///
     /// This method reads the canonical tip to read the epoch information needed
     /// to create the current committee and the consensus config.
+    /// Also returns whether this node should hold a share of the epoch key but could not derive
+    /// it, so the caller retries.
     async fn configure_consensus(
         &mut self,
         engine: &ExecutionNode,
         network_config: &NetworkConfig,
-    ) -> eyre::Result<(ConsensusConfig<DB>, Vec<BlsPublicKey>)> {
+    ) -> eyre::Result<(ConsensusConfig<DB>, Vec<BlsPublicKey>, bool)> {
         // retrieve epoch information from canonical tip
         let EpochState { epoch, epoch_info, validators, epoch_start } =
             engine.epoch_state_from_canonical_tip().await?;
@@ -111,13 +115,9 @@ where
         let committee = self.create_committee_from_state(epoch, validators).await?;
 
         let mut lookahead_entries = Vec::new();
-        let mut next_epoch_keys = Vec::new();
         for offset in 1..=2 {
             let keys = engine.validators_for_epoch(epoch + offset).await?;
             next_vals.extend(keys.iter().copied());
-            if offset == 1 {
-                next_epoch_keys = keys.clone();
-            }
             lookahead_entries.push((epoch + offset, keys));
         }
         let lookahead = CommitteeLookahead::from_entries(lookahead_entries);
@@ -131,28 +131,35 @@ where
             .rayls_fork_activation_block(RaylsHardFork::CertificateFetchEpochV2);
 
         // Threshold certificates: this epoch's key is the outcome of the previous epoch's DKG,
-        // computed here when missing (a restart; recovery of an interrupted transition runs only
-        // after this, so its checkpoint names the boundary), and this epoch deals the next key
-        // when the dealing gate says so.
-        let boundary = select_recovery_checkpoint(&self.consensus_db)
-            .filter(|checkpoint| checkpoint.epoch + 1 == epoch)
-            .map(|checkpoint| checkpoint.target_hash);
-        let outcome =
-            dkg::ensure_dkg_outcome_with_chain(engine, &self.consensus_db, epoch, boundary)
-                .await
-                .unwrap_or_else(|e| {
-                    error!(target: "epoch-manager", epoch, ?e, "cannot ensure the dkg outcome");
-                    None
-                });
-        let scheme = dkg::epoch_scheme(
-            &committee,
-            outcome,
-            &self.key_config.primary_public_key(),
-            &self.key_config,
-        );
-        let dealt = dkg::dealt_epochs(engine, &self.consensus_db, epoch).await;
-        let dealing = (dealt.dealt(epoch) == Some(true))
-            .then(|| Arc::new(dkg::dealing_params(epoch, next_epoch_keys)));
+        // read from the chain when not stored yet (a restart), and this node's share of it is
+        // decrypted from the accepted dealings.
+        let outcome = dkg::ensure_dkg_outcome_with_chain(engine, &self.consensus_db, epoch)
+            .await
+            .unwrap_or_else(|e| {
+                error!(target: "epoch-manager", epoch, ?e, "cannot ensure the dkg outcome");
+                None
+            });
+        let share = match &outcome {
+            Some(DkgOutcome::Key(key)) => {
+                dkg::own_share(engine, &self.consensus_db, key, &self.key_config).await
+            }
+            _ => OwnShare::NotRecipient,
+        };
+        let share_failed = matches!(share, OwnShare::Failed);
+        let scheme = dkg::epoch_scheme(&committee, outcome, share.share());
+        if scheme.threshold().is_some_and(|threshold| threshold.share.is_some()) {
+            dkg_hooks::crash_point(CrashPoint::ShareDerived, epoch);
+        }
+        // whether this epoch deals decides where it closes: a node that cannot tell must not
+        // guess, so wait until the registry or a record answers
+        let mut dealt = dkg::dealt_epochs(engine, &self.consensus_db, epoch).await;
+        while dealt.dealt(epoch).is_none() {
+            warn!(target: "epoch-manager", epoch, "cannot tell yet whether this epoch deals the next key: waiting");
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            dealt = dkg::dealt_epochs(engine, &self.consensus_db, epoch).await;
+        }
+        // an epoch that deals the next key stays open until that key exists
+        let deals_next = dealt.dealt(epoch) == Some(true);
 
         // create config for consensus
         let consensus_config = ConsensusConfig::new_for_epoch(
@@ -166,16 +173,50 @@ where
             self.initial_epoch,
             scheme,
             dealt,
-            dealing,
         )?
         .with_certificate_fetch_epoch_v2_block(certificate_fetch_epoch_v2_block);
+        if deals_next {
+            consensus_config.set_close_gate(Arc::new(dkg::KeyReadyGate::new(
+                engine.clone(),
+                self.consensus_bus.executed_anchor().subscribe(),
+                epoch + 1,
+                epoch_boundary + dkg::key_wait(epoch_info.epochDuration as u64),
+            )));
+        }
 
-        Ok((consensus_config, next_vals.into_iter().collect()))
+        Ok((consensus_config, next_vals.into_iter().collect(), share_failed))
     }
 
-    /// Retry a pending DKG outcome in the background (10 s doubling to 10 min) for the life of
-    /// the epoch. Once it lands, the committee gets the epoch key and the config the scheme, so
-    /// the node votes and verifies again without a restart.
+    /// Run this validator's DKG duties for the epoch (see [`dkg::spawn_dealer`]) once the
+    /// `ThresholdCertificates` fork is active. Observers and nodes without an execution address
+    /// have none.
+    async fn spawn_dkg_dealer(
+        &self,
+        engine: &ExecutionNode,
+        epoch_task_manager: &TaskManager,
+        consensus_config: &ConsensusConfig<DB>,
+    ) {
+        let config = &self.builder.rayls_infrastructure_config;
+        let own_address = config.node_info.execution_address;
+        if config.observer || own_address.is_zero() || !dkg::fork_active_now(engine).await {
+            return;
+        }
+        let in_committee =
+            consensus_config.authority_id().is_some_and(|id| consensus_config.in_committee(&id));
+        dkg::spawn_dealer(
+            epoch_task_manager.get_spawner(),
+            engine.clone(),
+            self.consensus_db.clone(),
+            self.key_config.clone(),
+            own_address,
+            consensus_config.epoch(),
+            in_committee,
+        );
+    }
+
+    /// Retry a pending DKG outcome, or a share that could not be derived, in the background (10 s
+    /// doubling to 10 min) for the life of the epoch. Once both land, the committee gets the epoch
+    /// key and the config the scheme, so the node votes and verifies again without a restart.
     fn spawn_pending_scheme_retry(
         &self,
         engine: &ExecutionNode,
@@ -188,11 +229,20 @@ where
         epoch_task_manager.get_spawner().spawn_task("dkg outcome retry", async move {
             for attempt in 1u32.. {
                 tokio::time::sleep(dkg::pending_outcome_backoff(attempt)).await;
-                match dkg::ensure_dkg_outcome_with_chain(&engine, &db, epoch, None).await {
+                match dkg::ensure_dkg_outcome_with_chain(&engine, &db, epoch).await {
                     Ok(Some(outcome)) => {
-                        let own_key = key_config.primary_public_key();
+                        let share = match &outcome {
+                            DkgOutcome::Key(key) => {
+                                dkg::own_share(&engine, &db, key, &key_config).await
+                            }
+                            DkgOutcome::Fallback => OwnShare::NotRecipient,
+                        };
+                        if matches!(share, OwnShare::Failed) {
+                            debug!(target: "epoch-manager", epoch, attempt, "threshold share still not derivable");
+                            continue;
+                        }
                         let scheme =
-                            dkg::epoch_scheme(config.committee(), Some(outcome), &own_key, &key_config);
+                            dkg::epoch_scheme(config.committee(), Some(outcome), share.share());
                         config.set_scheme(scheme);
                         info!(target: "epoch-manager", epoch, attempt, "dkg outcome landed: epoch scheme resolved");
                         return;

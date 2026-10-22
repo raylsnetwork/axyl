@@ -165,7 +165,6 @@ mod tests {
             true,
             scheme,
             dealt,
-            None,
         )
         .unwrap()
     }
@@ -180,7 +179,12 @@ mod tests {
                 .unwrap();
         let position = committee.bls_position(&config.key_config().primary_public_key()).unwrap();
         let share = polynomial.share(ShareIndex::from_position(position)).unwrap();
-        let key = EpochKey { epoch: EPOCH, public: polynomial.commit().unwrap(), deals: vec![] };
+        let key = EpochKey {
+            epoch: EPOCH,
+            public: polynomial.commit().unwrap(),
+            dealers: vec![],
+            members: vec![],
+        };
         let share_key = key.share_key(position);
         (EpochThreshold { key, share: Some(share) }, share_key)
     }
@@ -238,6 +242,18 @@ mod tests {
         assert!(second.signed_authorities().is_empty());
         let signature = first.aggregated_signature().unwrap();
         assert_eq!(signature.to_bytes(), second.aggregated_signature().unwrap().to_bytes());
+        // the whole certificate is the same bytes, its creation time the header's
+        assert_eq!(first.created_at(), &s.header.created_at);
+        assert_eq!(
+            rayls_infrastructure_types::encode(&first),
+            rayls_infrastructure_types::encode(&second)
+        );
+        let mut stamped = first.clone().validate_received().unwrap();
+        stamped.update_created_at_for_test(s.header.created_at + 1);
+        assert!(matches!(
+            stamped.validate_and_verify(&s.committee),
+            Err(CertificateError::UnexpectedCreatedAt)
+        ));
 
         let group_key = s.polynomial.commit().unwrap().group_key();
         for certificate in [first, second] {
@@ -295,7 +311,7 @@ mod tests {
         let fixture = CommitteeFixture::builder(MemDatabase::default).build();
         let keys = fixture.committee().bls_keys();
         let lookahead = CommitteeLookahead::from_entries(
-            [1, EPOCH - 1, EPOCH + 1].map(|epoch| (epoch, keys.clone())).to_vec(),
+            [0, EPOCH - 1, EPOCH + 1].map(|epoch| (epoch, keys.clone())).to_vec(),
         );
         let dealt = DealtEpochs::from_known(BTreeMap::from([(EPOCH - 2, true), (EPOCH, true)]));
         let config = config_for(&fixture, EpochScheme::Pending, dealt, lookahead.clone());
@@ -309,9 +325,10 @@ mod tests {
         assert_eq!(config.epoch_keys_status(EPOCH + 1), EpochKeysStatus::Pending);
         assert_eq!(config.epoch_keys_status(EPOCH - 1), EpochKeysStatus::Pending);
         assert_eq!(config.epoch_keys(EPOCH + 1), None);
-        // No committee keys at all, and epoch 1 is legacy whatever the gate says.
+        // No committee keys at all, and epoch 0, which no epoch dealt to, is legacy whatever
+        // the gate says.
         assert_eq!(config.epoch_keys_status(EPOCH + 4), EpochKeysStatus::NoCommittee);
-        assert_eq!(config.epoch_keys_status(1), ready(None));
+        assert_eq!(config.epoch_keys_status(0), ready(None));
 
         // The current key lands, and the boundary stores the next epoch's outcome.
         let (threshold, _) = threshold_for(&config);

@@ -18,6 +18,7 @@ use alloy::{
 };
 use alloy_evm::{block::StateChangeSource, eth::EthTxResult, tx::RecoveredTx as _, Database, Evm};
 use rand::{rngs::StdRng, seq::IteratorRandom, Rng as _, SeedableRng as _};
+use rayls_infrastructure_config::DKG_MANAGER_ADDRESS;
 use rayls_infrastructure_types::{
     rewards::{build_withdrawals, HybridEpochTally},
     Address, Bytes, Encodable2718, ExecHeader, Receipt, SolValue, TransactionSigned, Withdrawals,
@@ -42,7 +43,7 @@ use reth_revm::{
     DatabaseCommit as _, State,
 };
 use std::{collections::BTreeMap, sync::Arc};
-use tracing::{debug, error, info, trace};
+use tracing::{debug, error, info, trace, warn};
 
 /// The reward tally for a closing epoch, in the shape the block's active ABI needs.
 ///
@@ -306,6 +307,31 @@ where
         Ok(())
     }
 
+    /// Record the next epoch's threshold key in `DkgManager` (`finalize`): its recipient set and
+    /// whether the dealings make a key, so ejections after the epoch closes cannot change it.
+    /// Runs in the closing block, after its transactions and before `concludeEpoch`.
+    fn apply_dkg_finalize_call(&mut self) -> RaylsRethResult<()> {
+        let next = self.get_current_epoch_number()? + 1;
+        debug!(target: "engine", next, "finalizing the next epoch's dkg key");
+        let calldata: Bytes =
+            crate::reth_env::dkg_manager::DkgManager::finalizeCall { epoch: next }
+                .abi_encode()
+                .into();
+        let res = self
+            .evm
+            .transact_system_call(SYSTEM_ADDRESS, DKG_MANAGER_ADDRESS, calldata)
+            .map_err(|e| RaylsRethError::EVMCustom(format!("dkg finalize failed: {e}")))?;
+        if !res.result.is_success() {
+            error!(target: "engine", "dkg finalize reverted: {:?}", res.result);
+            return Err(RaylsRethError::EVMCustom("dkg finalize reverted".to_string()));
+        }
+        if let Some(hook) = &mut self.state_hook {
+            hook.on_state(StateChangeSource::Transaction(self.receipts.len()), &res.state);
+        }
+        self.evm.db_mut().commit(res.state);
+        Ok(())
+    }
+
     /// Distribute pending RLS rewards to validators at epoch end.
     ///
     /// Calls `RewardDistributor.distributeRewards()` which reads performance
@@ -443,6 +469,7 @@ where
         }
 
         let new_committee: Vec<ValidatorInfo> = self.next_committee(true)?;
+        let new_committee = self.keep_dkg_ready(new_committee, 0)?;
         let new_committee_size = new_committee.len();
 
         info!(
@@ -479,6 +506,8 @@ where
 
         // read all active validators from consensus registry
         let all_active_validators = self.get_active_validators()?;
+        let all_active_validators =
+            self.keep_dkg_ready(all_active_validators, new_committee_size)?;
 
         info!(
             target: "engine",
@@ -548,6 +577,50 @@ where
         trace!(target: "engine",  ?new_committee_size, ?new_committee, "truncated shuffle for new committee");
 
         Ok(new_committee)
+    }
+
+    /// Under `ThresholdCertificates`, keep the validators that registered a DKG encryption key: a
+    /// committee member without one gets no share of its epoch's key, and then the epoch gets no
+    /// key at all. Selection runs two epochs ahead, so a selected member's key is registered well
+    /// before its key's dealing epoch begins. When no candidate has a key (the fork's first
+    /// epochs on a chain that had none) every candidate is kept.
+    /// `min_ready` is the committee size the caller must fill: fewer keyed candidates keep
+    /// everyone.
+    fn keep_dkg_ready(
+        &mut self,
+        validators: Vec<ValidatorInfo>,
+        min_ready: usize,
+    ) -> RaylsRethResult<Vec<ValidatorInfo>> {
+        let block_number = self.evm.block().number().saturating_to::<u64>();
+        if !self.spec.is_threshold_certificates_active_at_block(block_number) {
+            return Ok(validators);
+        }
+        let mut ready = Vec::with_capacity(validators.len());
+        for validator in &validators {
+            let calldata: Bytes = crate::reth_env::dkg_manager::DkgManager::encryptionKeysCall {
+                validator: validator.validatorAddress,
+            }
+            .abi_encode()
+            .into();
+            let output = self.read_state_on_chain(SYSTEM_ADDRESS, DKG_MANAGER_ADDRESS, calldata)?;
+            // no contract code (an empty answer) reads as no key
+            let key = <Bytes as SolValue>::abi_decode(&output).unwrap_or_default();
+            if !key.is_empty() {
+                ready.push(validator.clone());
+            }
+        }
+        // skipping the keyless must not shrink the committee much: a committee that is only the
+        // first few to register would have almost no fault tolerance. Below a quorum of the
+        // candidates, keep everyone; the epochs with a keyless member use aggregate certificates.
+        let quorum = rayls_infrastructure_types::quorum_threshold(validators.len() as u64) as usize;
+        if ready.len() < quorum.max(min_ready) {
+            warn!(target: "engine", candidates = validators.len(), ready = ready.len(), "too few committee candidates have a dkg encryption key: selecting from all");
+            return Ok(validators);
+        }
+        if ready.len() < validators.len() {
+            info!(target: "engine", candidates = validators.len(), ready = ready.len(), "committee selection skips validators without a dkg encryption key");
+        }
+        Ok(ready)
     }
 
     /// Return the next committee.
@@ -913,6 +986,14 @@ where
             self.apply_consensus_block_rewards(&tally).map_err(|e| {
                 BlockExecutionError::Internal(InternalBlockExecutionError::Other(e.into()))
             })?;
+
+            // the next epoch's key is fixed before the registry moves to that epoch
+            let block_number = self.evm.block().number().saturating_to::<u64>();
+            if self.spec.is_threshold_certificates_active_at_block(block_number) {
+                self.apply_dkg_finalize_call().map_err(|e| {
+                    BlockExecutionError::Internal(InternalBlockExecutionError::Other(e.into()))
+                })?;
+            }
 
             self.apply_closing_epoch_contract_call(randomness).map_err(|e| {
                 BlockExecutionError::Internal(InternalBlockExecutionError::Other(e.into()))

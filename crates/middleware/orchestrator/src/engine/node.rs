@@ -99,6 +99,7 @@ impl ExecutionNode {
         epoch: Epoch,
         initial_batch_seq: u64,
         epoch_boundary: u64,
+        hold_open_past_boundary: bool,
     ) -> eyre::Result<()> {
         let mut guard = self.internal.write().await;
         guard
@@ -110,6 +111,7 @@ impl ExecutionNode {
                 epoch,
                 initial_batch_seq,
                 epoch_boundary,
+                hold_open_past_boundary,
             )
             .await
     }

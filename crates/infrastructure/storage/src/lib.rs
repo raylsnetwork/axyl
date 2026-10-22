@@ -16,10 +16,11 @@ pub use redb::database::ReDB;
 use tables::{
     BatchOrderingState, BatchSeqCounter, Batches, CertificateDigestByOrigin,
     CertificateDigestByRound, Certificates, ConsensusBlockNumbersByDigest, ConsensusBlocks,
-    ConsensusBlocksCache, DkgOutcomes, EpochCerts, EpochRecords, EpochRecordsIndex,
-    EpochTransitionCheckpoints, KadProviderRecords, KadRecords, KadWorkerProviderRecords,
-    KadWorkerRecords, LastProposed, LastProposedByAuthority, NodeBatchesCache, NodeIdentity,
-    Payload, PendingEpochRecord, PrevEpochCertificateDigestByOrigin, PrevEpochCertificates, Votes,
+    ConsensusBlocksCache, DkgDealings, DkgOutcomes, EpochCerts, EpochRecordBindings, EpochRecords,
+    EpochRecordsIndex, EpochTransitionCheckpoints, KadProviderRecords, KadRecords,
+    KadWorkerProviderRecords, KadWorkerRecords, LastProposed, LastProposedByAuthority,
+    NodeBatchesCache, NodeIdentity, Payload, PendingEpochRecord,
+    PrevEpochCertificateDigestByOrigin, PrevEpochCertificates, Votes,
 };
 #[cfg(feature = "cold-storage")]
 use tables::{ColdArchiveHighWaterMark, ColdBatchLocations};
@@ -64,6 +65,8 @@ const EPOCH_CERTS_CF: &str = "epoch_cert_by_number";
 const EPOCH_RECORDS_INDEX_CF: &str = "epoch_records_index";
 const PENDING_EPOCH_RECORD_CF: &str = "pending_epoch_record";
 const DKG_OUTCOMES_CF: &str = "dkg_outcomes";
+const DKG_DEALINGS_CF: &str = "dkg_dealings";
+const EPOCH_RECORD_BINDINGS_CF: &str = "epoch_record_bindings";
 const KAD_RECORD_CF: &str = "kad_record";
 const KAD_PROVIDER_RECORD_CF: &str = "kad_provider_record";
 const KAD_WORKER_RECORD_CF: &str = "kad_worker_record";
@@ -98,9 +101,9 @@ pub mod tables {
     use crate::cold::ColdLocation;
     use rayls_infrastructure_types::{
         batch_ordering::StoredBatchOrderingState as TypeStoredBatchOrderingState, dkg::DkgOutcome,
-        AuthorityIdentifier, Batch, BlockHash, Certificate, CertificateDigest, ConsensusHeader,
-        Epoch, EpochCertificate, EpochRecord, EpochTransitionCheckpoint, Header, Round, VoteInfo,
-        WorkerId, B256,
+        Address, AuthorityIdentifier, Batch, BlockHash, Certificate, CertificateDigest,
+        ConsensusHeader, Epoch, EpochCertificate, EpochRecord, EpochTransitionCheckpoint, Header,
+        RecordBinding, Round, VoteInfo, WorkerId, B256,
     };
 
     tables!(
@@ -132,6 +135,9 @@ pub mod tables {
         EpochRecords;crate::EPOCH_RECORDS_CF;<Epoch, EpochRecord>,
         EpochCerts;crate::EPOCH_CERTS_CF;<B256, EpochCertificate>,
         EpochRecordsIndex;crate::EPOCH_RECORDS_INDEX_CF;<B256, Epoch>,
+        // What each certified record's certificate signs besides the record, by record digest:
+        // from the ThresholdCertificates fork on, the next epoch's group key. No row: legacy.
+        EpochRecordBindings;crate::EPOCH_RECORD_BINDINGS_CF;<B256, RecordBinding>,
         // Epoch transition checkpoint for crash recovery. Keyed by epoch, stores at most one entry.
         EpochTransitionCheckpoints;crate::EPOCH_TRANSITION_CHECKPOINTS_CF;<Epoch, EpochTransitionCheckpoint>,
         // A closed epoch's record, saved as soon as it is built, before certification. Distinct
@@ -141,9 +147,14 @@ pub mod tables {
         // earlier epoch that is still awaiting its cert (#142).
         PendingEpochRecord;crate::PENDING_EPOCH_RECORD_CF;<Epoch, EpochRecord>,
         // Outcome of the DKG run during the previous epoch, keyed by the epoch the key is for.
-        // Recomputed from ConsensusBlocks at every boundary, so it is the same on every node.
+        // Computed from the dealings the chain accepted, so it is the same on every node.
         // Long lived: followers verify an epoch's certificates against it.
         DkgOutcomes;crate::DKG_OUTCOMES_CF;<Epoch, DkgOutcome>,
+        // Every dealing this node saw the chain accept, keyed by the epoch whose key it deals and
+        // its hash, with its dealer. An epoch's key and this node's share are derived from them,
+        // which must not depend on block receipts a pruned node no longer keeps. Only the last
+        // few epochs are kept.
+        DkgDealings;crate::DKG_DEALINGS_CF;<(Epoch, B256), (Address, Vec<u8>)>,
         // These are used for network storage and separate from consensus
         KadRecords;crate::KAD_RECORD_CF;<BlockHash, Vec<u8>>,
         KadProviderRecords;crate::KAD_PROVIDER_RECORD_CF;<BlockHash, Vec<u8>>,
@@ -297,8 +308,10 @@ fn open_default_tables<DB: Database>(db: &mut DB) -> eyre::Result<()> {
     open_one::<EpochRecords>(db)?;
     open_one::<EpochCerts>(db)?;
     open_one::<EpochRecordsIndex>(db)?;
+    open_one::<EpochRecordBindings>(db)?;
     open_one::<PendingEpochRecord>(db)?;
     open_one::<DkgOutcomes>(db)?;
+    open_one::<DkgDealings>(db)?;
     open_one::<EpochTransitionCheckpoints>(db)?;
     open_one::<KadRecords>(db)?;
     open_one::<KadProviderRecords>(db)?;

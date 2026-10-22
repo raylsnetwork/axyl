@@ -16,6 +16,7 @@ mod bls_signature;
 pub mod dkg;
 mod intent;
 mod network;
+pub mod nidkg;
 pub mod threshold;
 
 pub use bls_keypair::*;

@@ -403,8 +403,7 @@ fn a_leader_without_signers_does_not_hide_its_epochs_aggregate_headers() {
         parent = h.digest();
         headers.push(h);
     }
-    // Epoch 1's record names a boundary this node does not hold, so the outcome of epoch 2 cannot
-    // be computed.
+    // This node stored no DKG outcome for epoch 2, so its threshold certificate cannot be checked.
     let r0 = fx.record(0, None, B256::default());
     let r1 = fx.record(1, Some(&r0), B256::repeat_byte(0x11));
     let c1 = fx.certify(&r1, &[0, 1, 2]);
@@ -429,9 +428,6 @@ fn a_leader_without_signers_does_not_hide_its_epochs_aggregate_headers() {
         };
         assert_eq!((unverifiable.epoch, unverifiable.hops), (2, 1));
         assert!(unverifiable.missing_records.is_empty(), "the committee is known");
-        assert!(matches!(
-            unverifiable.cause,
-            Some(NoOutcome::BoundaryNotIndexed { dealing: 1, .. })
-        ));
+        assert!(matches!(unverifiable.cause, Some(NoOutcome::NotStored { epoch: 2 })));
     }
 }

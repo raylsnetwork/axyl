@@ -5,7 +5,8 @@ mod error;
 mod rpc_ext;
 
 use rayls_infrastructure_types::{
-    BlockHash, ConsensusHeader, Epoch, EpochCertificate, EpochRecord, Round,
+    BlockHash, BlsPublicKey, ConsensusHeader, Epoch, EpochCertificate, EpochRecord, RecordBinding,
+    Round,
 };
 pub use rpc_ext::{RaylsNetworkRpcExt, RaylsNetworkRpcExtApiServer};
 use serde::{Deserialize, Serialize};
@@ -58,6 +59,11 @@ pub trait EngineToPrimary {
         epoch: Option<Epoch>,
         hash: Option<BlockHash>,
     ) -> Option<(EpochRecord, EpochCertificate)>;
+    /// What the certificate of the certified record of `epoch` signs besides the record.
+    fn epoch_record_binding(&self, epoch: Epoch) -> Option<RecordBinding>;
+    /// The group key of `epoch` as this node knows it: `Some(None)` for aggregate certificates,
+    /// `None` when unknown.
+    fn epoch_group_key(&self, epoch: Epoch) -> Option<Option<BlsPublicKey>>;
     /// Snapshot of the local node's role and sync progress.
     fn node_status(&self) -> NodeStatus;
 }

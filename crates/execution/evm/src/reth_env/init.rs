@@ -1,10 +1,11 @@
 use crate::{
     evm::{initialize_erc20_precompile, RaylsEvmConfig},
     native_erc20::{Erc20Precompile, Erc20TokenConfig, ERC20_PRECOMPILE_ADDRESS},
+    nidkg_precompile::initialize_nidkg_precompile,
     persistence,
     reth_env::{types::set_basefee_address, RethConfig, RethDb, RethEnv},
     traits::RaylsNode,
-    NetworkProfile, RaylsChainSpec,
+    NetworkProfile, RaylsChainSpec, RaylsHardFork, RaylsHardforks,
 };
 use rayls_infrastructure_config::Parameters;
 use rayls_infrastructure_types::{Address, BuildMetadata, TaskManager, TaskSpawner, B256};
@@ -138,6 +139,9 @@ impl RethEnv {
             builder = builder.min_base_fee(min_fee);
         }
         let chain_spec = Arc::new(builder.build());
+        initialize_nidkg_precompile(
+            chain_spec.rayls_fork_activation(RaylsHardFork::ThresholdCertificates),
+        );
         let evm_config = RaylsEvmConfig::new(chain_spec.clone(), rewards_counter.clone());
         let task_spawner = task_manager.get_spawner();
         let runtime = reth_tasks::Runtime::with_existing_handle(tokio::runtime::Handle::current())?;
@@ -379,7 +383,7 @@ impl RethEnv {
         let mut provider_factory = ProviderFactory::new(
             database,
             chain_spec,
-            StaticFileProvider::read_write(datadir.static_files())?,
+            static_file_provider(datadir.static_files())?,
             rocksdb_provider,
             runtime,
         )?;
@@ -884,4 +888,21 @@ impl RethEnv {
         );
         Ok(fixed)
     }
+}
+
+/// The node's static files. Test builds (`dkg-test-hooks`) read `RL_TEST_RECEIPTS_PER_FILE`: the
+/// blocks per receipts file, so receipt pruning, which deletes whole files, reaches recent blocks
+/// in a short end-to-end test as it does in production after 500,000 blocks.
+fn static_file_provider<N: reth_primitives_traits::NodePrimitives>(
+    path: std::path::PathBuf,
+) -> eyre::Result<StaticFileProvider<N>> {
+    #[cfg(feature = "dkg-test-hooks")]
+    if let Some(blocks) =
+        std::env::var("RL_TEST_RECEIPTS_PER_FILE").ok().and_then(|value| value.parse().ok())
+    {
+        return Ok(reth_provider::StaticFileProviderBuilder::read_write(path)
+            .with_blocks_per_file_for_segment(reth_provider::StaticFileSegment::Receipts, blocks)
+            .build()?);
+    }
+    Ok(StaticFileProvider::read_write(path)?)
 }

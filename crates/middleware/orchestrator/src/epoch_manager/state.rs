@@ -55,19 +55,15 @@ where
         boundary_consensus_hash: B256,
     ) -> eyre::Result<()> {
         // The DKG outcome for the next epoch is ensured before any early return below, on every
-        // node mode: a restart that reuses a stored record still has to persist it. Deterministic
-        // from the committed headers, so recomputing it after a crash gives the same row. Only a
+        // node mode: a restart that reuses a stored record still has to persist it. Read from the
+        // chain once the closing block has executed, so recomputing it after a crash gives the
+        // same row. Only a
         // failed save is fatal; an outcome that cannot be computed yet is retried by the next
         // epoch's configuration.
         let next = epoch + 1;
-        if super::dkg::ensure_dkg_outcome_with_chain(
-            engine,
-            &self.consensus_db,
-            next,
-            Some(boundary_consensus_hash),
-        )
-        .await?
-        .is_none()
+        if super::dkg::ensure_dkg_outcome_with_chain(engine, &self.consensus_db, next)
+            .await?
+            .is_none()
         {
             warn!(target: "epoch-manager", epoch = next, "dkg outcome not computable at the boundary");
         }
@@ -152,7 +148,12 @@ where
             if prev.is_none() {
                 let network = primary.network_handle().await;
                 match network.request_epoch_cert(Some(epoch - 1), None).await {
-                    Ok((peer_rec, cert)) => {
+                    Ok((peer_rec, cert, binding)) => {
+                        let keys = rayls_consensus_state_sync::record_keys(
+                            &self.consensus_db,
+                            epoch - 1,
+                            &binding,
+                        );
                         if peer_rec.epoch != epoch - 1 {
                             warn!(
                                 target: "epoch-manager",
@@ -166,7 +167,15 @@ where
                                 "peer-provided previous epoch record next_committee does not match this epoch's committee; ignoring",
                             );
                         } else if let Some(chain_committee) = prev_chain_committee.as_ref() {
-                            if !peer_rec.verify_against_committee(chain_committee, &cert) {
+                            if !rayls_consensus_state_sync::binding_agrees(
+                                &self.consensus_db,
+                                epoch - 1,
+                                &binding,
+                            ) || !peer_rec.verify_against_committee(
+                                chain_committee,
+                                &cert,
+                                &keys,
+                            ) {
                                 warn!(
                                     target: "epoch-manager",
                                     epoch = epoch - 1,
@@ -178,8 +187,9 @@ where
                                     epoch = epoch - 1,
                                     "fetched previous epoch record from a peer for parent_hash",
                                 );
-                                if let Err(e) =
-                                    self.consensus_db.save_epoch_record_with_cert(&peer_rec, &cert)
+                                if let Err(e) = self
+                                    .consensus_db
+                                    .save_epoch_record_with_cert(&peer_rec, &cert, &binding)
                                 {
                                     error!(target: "epoch-manager", "failed to persist peer-fetched previous epoch record: {e}");
                                 }

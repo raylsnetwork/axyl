@@ -327,6 +327,9 @@ async fn test_genesis_rls_balances_and_stake() -> eyre::Result<()> {
                 p2p_info: NodeP2pInfo::default(),
                 execution_address: addr,
                 proof_of_possession: pop,
+                dkg_submitter: Address::ZERO,
+                dkg_encryption_key: Default::default(),
+                dkg_key_proof: Default::default(),
             }
         })
         .collect();
@@ -462,6 +465,9 @@ async fn test_genesis_alloc_hashed_and_readable_in_storage_v2() -> eyre::Result<
                 p2p_info: NodeP2pInfo::default(),
                 execution_address: addr,
                 proof_of_possession: pop,
+                dkg_submitter: Address::ZERO,
+                dkg_encryption_key: Default::default(),
+                dkg_key_proof: Default::default(),
             }
         })
         .collect();
@@ -662,6 +668,9 @@ async fn test_close_epochs() -> eyre::Result<()> {
                 p2p_info: NodeP2pInfo::default(),
                 execution_address: *addr,
                 proof_of_possession: pop,
+                dkg_submitter: Address::ZERO,
+                dkg_encryption_key: Default::default(),
+                dkg_key_proof: Default::default(),
             }
         })
         .collect();
@@ -1085,6 +1094,9 @@ async fn test_close_epochs_with_dynamic_committee() -> eyre::Result<()> {
                 p2p_info: NodeP2pInfo::default(),
                 execution_address: *addr,
                 proof_of_possession: pop,
+                dkg_submitter: Address::ZERO,
+                dkg_encryption_key: Default::default(),
+                dkg_key_proof: Default::default(),
             }
         })
         .collect();
@@ -1435,6 +1447,9 @@ async fn test_hybrid_rewards_fork_boundary() -> eyre::Result<()> {
                 p2p_info: NodeP2pInfo::default(),
                 execution_address: *addr,
                 proof_of_possession: pop,
+                dkg_submitter: Address::ZERO,
+                dkg_encryption_key: Default::default(),
+                dkg_key_proof: Default::default(),
             }
         })
         .collect();
@@ -1829,5 +1844,551 @@ async fn test_fix_genesis_account_history_seeds_after_clear_and_skips_multishard
     // Idempotent.
     assert_eq!(RethEnv::fix_genesis_account_history_with(&provider_factory, true)?, 0);
 
+    Ok(())
+}
+
+/// Publicly verifiable dealing on a real chain: four validators bring encryption keys to genesis,
+/// so the genesis committee deals the key of epoch 1 in epoch 0. Two of them deal it in
+/// transactions from one submitter, each checked by the NI-DKG precompile and its gas refunded by
+/// `DkgManager`; the block that closes epoch 0 finalizes the key; and every member decrypts its
+/// share from the dealings it reads back from the accepting block's events. Genesis refuses a key
+/// two validators bring, and a registration of a key already in use is refused on-chain.
+#[tokio::test]
+async fn test_dkg_manager_dealing_on_chain() -> eyre::Result<()> {
+    use crate::{
+        chainspec::RaylsChainSpec,
+        nidkg_precompile::initialize_nidkg_precompile,
+        reth_env::dkg_manager::{submitter_key_message, DkgSubmitter},
+    };
+    use alloy::eips::Encodable2718 as _;
+    use rayls_infrastructure_config::DKG_MANAGER_ADDRESS;
+    use rayls_infrastructure_types::{
+        encode,
+        nidkg::{
+            dealing_context, dealing_message, decryption_key_message, encryption_key_context,
+            key_registration_message, BabySteps, Dealing, DecryptionKey, Recipient,
+        },
+        threshold::{SecretPolynomial, ShareIndex},
+        BlsPublicKey, Signer as _,
+    };
+    use reth_chainspec::{EthChainSpec as _, ForkCondition};
+
+    initialize_nidkg_precompile(ForkCondition::Block(0));
+
+    let addresses: Vec<Address> = (1..=4u8).map(|i| Address::repeat_byte(i * 0x11)).collect();
+    let keypairs: Vec<BlsKeypair> =
+        (0..4).map(|i| BlsKeypair::generate(&mut StdRng::seed_from_u64(100 + i))).collect();
+    let decryption_keys: Vec<DecryptionKey> = keypairs
+        .iter()
+        .map(|kp| DecryptionKey::from_signature(&kp.sign(&decryption_key_message())))
+        .collect::<Result<_, _>>()?;
+    // every validator brings its encryption key to genesis, as the keytool writes it
+    let validators: Vec<NodeInfo> = addresses
+        .iter()
+        .zip(&keypairs)
+        .zip(&decryption_keys)
+        .enumerate()
+        .map(|(i, ((addr, bls), dk))| {
+            let proof = dk
+                .prove(
+                    bls.public(),
+                    &encryption_key_context(),
+                    &mut StdRng::seed_from_u64(i as u64),
+                )
+                .unwrap();
+            NodeInfo {
+                name: format!("validator-{i}"),
+                bls_public_key: *bls.public(),
+                p2p_info: NodeP2pInfo::default(),
+                execution_address: *addr,
+                proof_of_possession: generate_proof_of_possession_bls(bls, addr).unwrap(),
+                dkg_submitter: Address::ZERO,
+                dkg_encryption_key: dk.encryption_key().to_bytes().to_vec().into(),
+                dkg_key_proof: encode(&proof).into(),
+            }
+        })
+        .collect();
+    // genesis refuses one key for two validators, and a key whose proof is for another BLS key
+    let mut copied = validators.clone();
+    copied[1].dkg_encryption_key = copied[0].dkg_encryption_key.clone();
+    copied[1].dkg_key_proof = copied[0].dkg_key_proof.clone();
+    let error = crate::reth_env::genesis::dkg_manager_genesis_storage(&copied).unwrap_err();
+    assert!(error.to_string().contains("does not verify"), "{error}");
+    // the same key with a valid proof for validator 1's BLS key: whoever knows a key can prove it
+    let other_proof = decryption_keys[0].prove(
+        keypairs[1].public(),
+        &encryption_key_context(),
+        &mut StdRng::seed_from_u64(5),
+    )?;
+    copied[1].dkg_key_proof = encode(&other_proof).into();
+    let error = crate::reth_env::genesis::dkg_manager_genesis_storage(&copied).unwrap_err();
+    assert!(error.to_string().contains("already brought"), "{error}");
+    let stake_config = ConsensusRegistry::StakeConfig {
+        stakeAmount: U256::from(parse_ether("1_000_000").unwrap()),
+        minWithdrawAmount: U256::from(parse_ether("1_000").unwrap()),
+        epochDuration: 60 * 60 * 24,
+    };
+    let chain_id = rayls_infrastructure_types::test_genesis().config.chain_id;
+    let submitter = DkgSubmitter::from_signature(&keypairs[0].sign(&submitter_key_message()))?;
+    let governance = TransactionFactory::new_random_from_seed(&mut StdRng::seed_from_u64(7));
+    let float = U256::from(parse_ether("10").unwrap());
+    let tmp_genesis = rayls_infrastructure_types::test_genesis().extend_accounts([
+        (
+            governance.address(),
+            GenesisAccount::default().with_balance(U256::from(parse_ether("100_000_000").unwrap())),
+        ),
+        (submitter.address(), GenesisAccount::default().with_balance(float)),
+    ]);
+    let genesis = RethEnv::create_consensus_registry_genesis_accounts(
+        validators.clone(),
+        tmp_genesis,
+        stake_config.clone(),
+        governance.address(),
+        governance.address(),
+        vec![(governance.address(), stake_config.stakeAmount)],
+    )?;
+    let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+    assert_eq!(chain.chain().id(), chain_id);
+    let rayls_chain_spec: Arc<RaylsChainSpec> =
+        Arc::new(RaylsChainSpec::builder(chain.clone()).threshold_certificates(0).build());
+    let tmp_dir = TempDir::new()?;
+    let task_manager = TaskManager::new("Test Task Manager");
+    let reth_env = RethEnv::new_for_temp_chain_with_rayls_spec(
+        chain.clone(),
+        rayls_chain_spec,
+        tmp_dir.path(),
+        &task_manager,
+        None,
+    )
+    .await?;
+
+    // genesis registered every key, so epoch 1 gets a key
+    for (i, (addr, dk)) in addresses.iter().zip(&decryption_keys).enumerate() {
+        assert_eq!(
+            reth_env.dkg_encryption_key(*addr)?,
+            Some(dk.encryption_key()),
+            "validator {i} at genesis"
+        );
+    }
+    assert!(reth_env.dkg_has_key(1)?);
+    assert_eq!(reth_env.dkg_final(1)?, None, "not finalized before epoch 0 closes");
+    let dkg_balance_at_genesis =
+        reth_env.latest()?.account_balance(&DKG_MANAGER_ADDRESS)?.unwrap_or_default();
+
+    // recipients in BLS key order, the protocol's committee order
+    let mut members: Vec<(BlsPublicKey, usize)> =
+        keypairs.iter().enumerate().map(|(i, kp)| (*kp.public(), i)).collect();
+    members.sort();
+    let recipients: Vec<Recipient> = members
+        .iter()
+        .enumerate()
+        .map(|(position, (_, i))| Recipient {
+            position: position as u32,
+            key: decryption_keys[*i].encryption_key(),
+        })
+        .collect();
+    let read = reth_env.dkg_recipients(1)?;
+    assert_eq!(read.committee_size, 4);
+    assert_eq!(read.recipients, recipients, "the node reads the contract's recipient set");
+
+    // validator 3 tries to register validator 0's key again; validators 0 and 2 deal the key of
+    // epoch 1
+    let max_fee = 1_000_000_000u128;
+    let mut txs = Vec::new();
+    let reused = decryption_keys[0].encryption_key();
+    let proof = decryption_keys[0].prove(
+        keypairs[3].public(),
+        &encryption_key_context(),
+        &mut rand::rng(),
+    )?;
+    let signature = keypairs[3].sign(&key_registration_message(chain_id, &reused));
+    let tx = submitter.registration(
+        chain_id,
+        0,
+        max_fee,
+        addresses[3],
+        &reused,
+        encode(&proof),
+        &signature,
+    )?;
+    txs.push(Bytes::from(tx.encoded_2718()));
+    let mut polynomials = Vec::new();
+    for (nonce, dealer) in [(1u64, 0usize), (2, 2)] {
+        let polynomial = SecretPolynomial::random(3, &mut StdRng::seed_from_u64(dealer as u64))?;
+        let context = dealing_context(chain_id, 1, addresses[dealer]);
+        let dealing =
+            Dealing::new(&context, &polynomial, &recipients, &mut StdRng::seed_from_u64(9))?;
+        let bytes = encode(&dealing);
+        let signature =
+            keypairs[dealer].sign(&dealing_message(chain_id, 1, addresses[dealer], &bytes));
+        let tx = submitter.dealing(
+            chain_id,
+            nonce,
+            max_fee,
+            1,
+            addresses[dealer],
+            &signature,
+            bytes,
+            4,
+        )?;
+        txs.push(Bytes::from(tx.encoded_2718()));
+        polynomials.push(polynomial);
+    }
+
+    let mut co = consensus_output_for_tests(2, 0, 1);
+    co.close_epoch = false;
+    let payload = RLPayload::new_for_test(chain.sealed_genesis_header(), &co);
+    let block = execute_payload_and_update_canonical_chain(&reth_env, payload, txs).await?;
+    let receipts = &block.execution_output.receipts;
+    assert!(!receipts[0].success, "a key in use is refused");
+    assert!(receipts[1..].iter().all(|r| r.success), "the dealings must succeed");
+    let gas: Vec<u64> = receipts
+        .iter()
+        .scan(0, |previous, r| {
+            let used = r.cumulative_gas_used - *previous;
+            *previous = r.cumulative_gas_used;
+            Some(used)
+        })
+        .collect();
+    println!("dkg gas used: refused registration {}, dealings {:?}", gas[0], &gas[1..]);
+
+    // the dealings' gas came back: the submitter is within a sliver of its float plus the refused
+    // registration's cost, at DkgManager's cost
+    let base_fee = u128::from(reth_env.canonical_tip().base_fee_per_gas.unwrap_or_default());
+    let paid: u128 = gas[1..].iter().map(|g| u128::from(*g)).sum::<u128>() * base_fee;
+    let refused = U256::from(u128::from(gas[0]) * base_fee);
+    let balance = reth_env.latest()?.account_balance(&submitter.address())?.unwrap_or_default();
+    let net = (float - refused).abs_diff(balance);
+    assert!(net * U256::from(20) < U256::from(paid), "net cost {net} of {paid} paid");
+    let dkg_balance = reth_env.latest()?.account_balance(&DKG_MANAGER_ADDRESS)?.unwrap_or_default();
+    assert!(dkg_balance < dkg_balance_at_genesis, "DkgManager paid the refunds");
+
+    assert_eq!(reth_env.dkg_dealers(1)?, vec![addresses[0], addresses[2]]);
+    assert!(reth_env.dkg_is_ready(1)?, "2 of 4 dealers is ceil(4/3)");
+
+    // the block that closes epoch 0 finalizes the key of epoch 1 to the committee it was dealt to
+    let co = consensus_output_for_tests(4, 0, 2);
+    let payload = RLPayload::new_for_test(block.recovered_block.clone_sealed_header(), &co);
+    execute_payload_and_update_canonical_chain(&reth_env, payload, vec![]).await?;
+    let fin = reth_env.dkg_final(1)?.expect("finalized when epoch 0 closed");
+    assert!(fin.keyed);
+    assert_eq!(fin.members, members.iter().map(|(key, _)| *key).collect::<Vec<_>>());
+    assert_eq!(reth_env.dkg_dealers(1)?, vec![addresses[0], addresses[2]]);
+
+    // each recipient decrypts its share of each dealing; the shares are the polynomials' values
+    let table = BabySteps::new();
+    for (dealer, polynomial) in [0usize, 2].iter().zip(&polynomials) {
+        let bytes = reth_env.dkg_dealing(1, addresses[*dealer])?.expect("accepted dealing");
+        let dealing: Dealing = rayls_infrastructure_types::decode(&bytes);
+        for recipient in &recipients {
+            let validator = members[recipient.position as usize].1;
+            let share = dealing.decrypt(recipient.position, &decryption_keys[validator], &table)?;
+            let expected = polynomial.share(ShareIndex::from_position(recipient.position))?;
+            assert_eq!(share.to_bytes(), expected.to_bytes());
+        }
+    }
+    assert_eq!(reth_env.dkg_dealing(1, addresses[1])?, None, "validator 1 did not deal");
+
+    // a scan of every block finds both dealings, in the block that accepted them, with the hash
+    // the contract stored
+    let tip = reth_env.canonical_tip().number;
+    let found = reth_env.dkg_dealings_accepted_in(0, tip)?;
+    assert_eq!(
+        found.iter().map(|d| (d.epoch, d.dealer)).collect::<Vec<_>>(),
+        vec![(1, addresses[0]), (1, addresses[2])]
+    );
+    for accepted in &found {
+        assert_eq!(reth_env.dkg_dealing_hash(1, accepted.dealer)?, Some(accepted.hash));
+        assert_eq!(reth_env.dkg_dealing(1, accepted.dealer)?, Some(accepted.dealing.clone()));
+    }
+    let dealing_block = block.recovered_block.header().number;
+    assert!(reth_env.dkg_dealings_accepted_in(dealing_block + 1, tip)?.is_empty());
+    assert_eq!(reth_env.dkg_dealings_accepted_in(dealing_block, dealing_block)?, found);
+    Ok(())
+}
+
+/// Gas and execution time of one dealing on a real chain, for committees up to the largest size
+/// planned: `cargo test --release -p rayls-execution-evm --lib measure_dkg_dealing_on_chain --
+/// --ignored --nocapture`.
+#[tokio::test]
+#[ignore = "measurement"]
+async fn measure_dkg_dealing_on_chain() -> eyre::Result<()> {
+    use crate::{
+        chainspec::RaylsChainSpec,
+        nidkg_precompile::initialize_nidkg_precompile,
+        reth_env::dkg_manager::{submitter_key_message, DkgSubmitter},
+    };
+    use alloy::eips::Encodable2718 as _;
+    use rayls_infrastructure_types::{
+        encode,
+        nidkg::{
+            dealing_context, dealing_message, decryption_key_message, encryption_key_context,
+            Dealing, DecryptionKey, Recipient,
+        },
+        quorum_threshold,
+        threshold::SecretPolynomial,
+        BlsPublicKey, Signer as _,
+    };
+    use reth_chainspec::ForkCondition;
+
+    initialize_nidkg_precompile(ForkCondition::Block(0));
+    for n in [4usize, 21, 56] {
+        let keypairs: Vec<BlsKeypair> = (0..n)
+            .map(|i| BlsKeypair::generate(&mut StdRng::seed_from_u64(1000 + i as u64)))
+            .collect();
+        let addresses: Vec<Address> = (0..n)
+            .map(|i| {
+                let mut bytes = [0x77u8; 20];
+                bytes[18..].copy_from_slice(&(i as u16 + 1).to_be_bytes());
+                Address::from(bytes)
+            })
+            .collect();
+        let decryption_keys: Vec<DecryptionKey> = keypairs
+            .iter()
+            .map(|kp| DecryptionKey::from_signature(&kp.sign(&decryption_key_message())))
+            .collect::<Result<_, _>>()?;
+        let validators: Vec<NodeInfo> = addresses
+            .iter()
+            .zip(&keypairs)
+            .zip(&decryption_keys)
+            .enumerate()
+            .map(|(i, ((addr, bls), dk))| NodeInfo {
+                name: format!("validator-{i}"),
+                bls_public_key: *bls.public(),
+                p2p_info: NodeP2pInfo::default(),
+                execution_address: *addr,
+                proof_of_possession: generate_proof_of_possession_bls(bls, addr).unwrap(),
+                dkg_submitter: Address::ZERO,
+                dkg_encryption_key: dk.encryption_key().to_bytes().to_vec().into(),
+                dkg_key_proof: encode(
+                    &dk.prove(bls.public(), &encryption_key_context(), &mut rand::rng()).unwrap(),
+                )
+                .into(),
+            })
+            .collect();
+        let stake_config = ConsensusRegistry::StakeConfig {
+            stakeAmount: U256::from(parse_ether("1_000_000").unwrap()),
+            minWithdrawAmount: U256::from(parse_ether("1_000").unwrap()),
+            epochDuration: 60 * 60 * 24,
+        };
+        let chain_id = rayls_infrastructure_types::test_genesis().config.chain_id;
+        let submitter = DkgSubmitter::from_signature(&keypairs[0].sign(&submitter_key_message()))?;
+        let governance = TransactionFactory::new_random_from_seed(&mut StdRng::seed_from_u64(7));
+        let total_stake = stake_config.stakeAmount * U256::from(n);
+        let tmp_genesis = rayls_infrastructure_types::test_genesis().extend_accounts([
+            (
+                governance.address(),
+                GenesisAccount::default()
+                    .with_balance(U256::from(parse_ether("100_000_000").unwrap()) + total_stake),
+            ),
+            (
+                submitter.address(),
+                GenesisAccount::default().with_balance(U256::from(parse_ether("10").unwrap())),
+            ),
+        ]);
+        let genesis = RethEnv::create_consensus_registry_genesis_accounts(
+            validators,
+            tmp_genesis,
+            stake_config.clone(),
+            governance.address(),
+            governance.address(),
+            vec![(governance.address(), total_stake)],
+        )?;
+        let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+        let rayls_chain_spec: Arc<RaylsChainSpec> =
+            Arc::new(RaylsChainSpec::builder(chain.clone()).threshold_certificates(0).build());
+        let tmp_dir = TempDir::new()?;
+        let task_manager = TaskManager::new("Test Task Manager");
+        let reth_env = RethEnv::new_for_temp_chain_with_rayls_spec(
+            chain.clone(),
+            rayls_chain_spec,
+            tmp_dir.path(),
+            &task_manager,
+            None,
+        )
+        .await?;
+        let read = reth_env.dkg_recipients(1)?;
+        assert_eq!(read.committee_size, n);
+        let mut members: Vec<(BlsPublicKey, usize)> =
+            keypairs.iter().enumerate().map(|(i, kp)| (*kp.public(), i)).collect();
+        members.sort();
+        let recipients: Vec<Recipient> = members
+            .iter()
+            .enumerate()
+            .map(|(position, (_, i))| Recipient {
+                position: position as u32,
+                key: decryption_keys[*i].encryption_key(),
+            })
+            .collect();
+        assert_eq!(read.recipients, recipients);
+        let threshold = quorum_threshold(n as u64) as usize;
+        let polynomial = SecretPolynomial::random(threshold, &mut rand::rng())?;
+        let context = dealing_context(chain_id, 1, addresses[0]);
+        let dealing = Dealing::new(&context, &polynomial, &recipients, &mut rand::rng())?;
+        let bytes = encode(&dealing);
+        let size = bytes.len();
+        let signature = keypairs[0].sign(&dealing_message(chain_id, 1, addresses[0], &bytes));
+        let tx =
+            submitter.dealing(chain_id, 0, 1_000_000_000, 1, addresses[0], &signature, bytes, n)?;
+        let limit = crate::reth_env::dkg_manager::dealing_gas_limit(n, size);
+        let mut co = consensus_output_for_tests(2, 0, 1);
+        co.close_epoch = false;
+        let payload = RLPayload::new_for_test(chain.sealed_genesis_header(), &co);
+        let started = std::time::Instant::now();
+        let block = execute_payload_and_update_canonical_chain(
+            &reth_env,
+            payload,
+            vec![Bytes::from(tx.encoded_2718())],
+        )
+        .await?;
+        let elapsed = started.elapsed();
+        let receipt = &block.execution_output.receipts[0];
+        assert!(receipt.success, "the dealing must be accepted at n = {n}");
+        println!(
+            "n={n:>2} dealing={size:>6} B  gas used={:>9}  gas limit={limit:>9}  block executed in {elapsed:?}",
+            receipt.cumulative_gas_used
+        );
+        assert!(receipt.cumulative_gas_used <= limit);
+    }
+    Ok(())
+}
+
+/// The genesis ceremony for epoch 0's key: genesis accepts dealings by enough distinct genesis
+/// validators, each signed and verified against the whole genesis committee, refuses the rest,
+/// and commits to the accepted ones in `DkgManager.genesisDealings`, which nodes read.
+#[tokio::test]
+async fn test_genesis_dealings_give_epoch_0_a_key() -> eyre::Result<()> {
+    use crate::{
+        chainspec::RaylsChainSpec,
+        nidkg_precompile::initialize_nidkg_precompile,
+        reth_env::genesis::{
+            genesis_dealings_commitment, verify_genesis_dealings, with_genesis_dealings,
+        },
+    };
+    use rayls_infrastructure_config::GenesisDealing;
+    use rayls_infrastructure_types::{
+        encode,
+        nidkg::{
+            dealing_context, dealing_message, decryption_key_message, encryption_key_context,
+            Dealing, DecryptionKey, Recipient,
+        },
+        threshold::SecretPolynomial,
+        BlsPublicKey, Signer as _,
+    };
+    use reth_chainspec::ForkCondition;
+
+    initialize_nidkg_precompile(ForkCondition::Block(0));
+    let addresses: Vec<Address> = (1..=4u8).map(|i| Address::repeat_byte(i * 0x11)).collect();
+    let keypairs: Vec<BlsKeypair> =
+        (0..4).map(|i| BlsKeypair::generate(&mut StdRng::seed_from_u64(200 + i))).collect();
+    let decryption_keys: Vec<DecryptionKey> = keypairs
+        .iter()
+        .map(|kp| DecryptionKey::from_signature(&kp.sign(&decryption_key_message())))
+        .collect::<Result<_, _>>()?;
+    let validators: Vec<NodeInfo> = addresses
+        .iter()
+        .zip(&keypairs)
+        .zip(&decryption_keys)
+        .enumerate()
+        .map(|(i, ((addr, bls), dk))| NodeInfo {
+            name: format!("validator-{i}"),
+            bls_public_key: *bls.public(),
+            p2p_info: NodeP2pInfo::default(),
+            execution_address: *addr,
+            proof_of_possession: generate_proof_of_possession_bls(bls, addr).unwrap(),
+            dkg_submitter: Address::ZERO,
+            dkg_encryption_key: dk.encryption_key().to_bytes().to_vec().into(),
+            dkg_key_proof: encode(
+                &dk.prove(bls.public(), &encryption_key_context(), &mut rand::rng()).unwrap(),
+            )
+            .into(),
+        })
+        .collect();
+    let chain_id = rayls_infrastructure_types::test_genesis().config.chain_id;
+    let mut members: Vec<(BlsPublicKey, usize)> =
+        keypairs.iter().enumerate().map(|(i, kp)| (*kp.public(), i)).collect();
+    members.sort();
+    let recipients: Vec<Recipient> = members
+        .iter()
+        .enumerate()
+        .map(|(position, (_, i))| Recipient {
+            position: position as u32,
+            key: decryption_keys[*i].encryption_key(),
+        })
+        .collect();
+    let deal = |dealer: usize, chain: u64| {
+        let polynomial = SecretPolynomial::random(3, &mut rand::rng()).unwrap();
+        let dealing = Dealing::new(
+            &dealing_context(chain, 0, addresses[dealer]),
+            &polynomial,
+            &recipients,
+            &mut rand::rng(),
+        )
+        .unwrap();
+        let bytes = encode(&dealing);
+        let signature =
+            keypairs[dealer].sign(&dealing_message(chain, 0, addresses[dealer], &bytes));
+        GenesisDealing { dealer: addresses[dealer], dealing: bytes.into(), signature }
+    };
+
+    // too few dealers: one of four, where a third rounded up is two
+    let mut one = vec![deal(2, chain_id)];
+    assert!(verify_genesis_dealings(&validators, chain_id, &mut one).is_err());
+    // a dealing for another chain, and one signed by another validator's key
+    let mut wrong_chain = vec![deal(0, chain_id), deal(1, chain_id + 1)];
+    assert!(verify_genesis_dealings(&validators, chain_id, &mut wrong_chain).is_err());
+    let mut forged = vec![deal(0, chain_id), deal(1, chain_id)];
+    forged[1].signature = forged[0].signature;
+    assert!(verify_genesis_dealings(&validators, chain_id, &mut forged).is_err());
+    // two from one dealer
+    let mut twice = vec![deal(0, chain_id), deal(0, chain_id)];
+    assert!(verify_genesis_dealings(&validators, chain_id, &mut twice).is_err());
+    // a validator without an encryption key leaves epoch 0 no key
+    let mut keyless = validators.clone();
+    keyless[3].dkg_encryption_key = Default::default();
+    let mut good = vec![deal(3, chain_id), deal(1, chain_id)];
+    assert!(verify_genesis_dealings(&keyless, chain_id, &mut good.clone()).is_err());
+
+    let commitment = verify_genesis_dealings(&validators, chain_id, &mut good)?;
+    assert_eq!(good[0].dealer, addresses[1], "sorted by dealer");
+    assert_eq!(commitment, genesis_dealings_commitment(&good));
+
+    let stake_config = ConsensusRegistry::StakeConfig {
+        stakeAmount: U256::from(parse_ether("1_000_000").unwrap()),
+        minWithdrawAmount: U256::from(parse_ether("1_000").unwrap()),
+        epochDuration: 60 * 60 * 24,
+    };
+    let governance = TransactionFactory::new_random_from_seed(&mut StdRng::seed_from_u64(7));
+    let tmp_genesis = rayls_infrastructure_types::test_genesis().extend_accounts([(
+        governance.address(),
+        GenesisAccount::default().with_balance(U256::from(parse_ether("100_000_000").unwrap())),
+    )]);
+    let genesis = RethEnv::create_consensus_registry_genesis_accounts(
+        validators,
+        tmp_genesis,
+        stake_config.clone(),
+        governance.address(),
+        governance.address(),
+        vec![(governance.address(), stake_config.stakeAmount)],
+    )?;
+    let genesis = with_genesis_dealings(genesis, commitment)?;
+    let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+    let rayls_chain_spec: Arc<RaylsChainSpec> =
+        Arc::new(RaylsChainSpec::builder(chain.clone()).threshold_certificates(0).build());
+    let tmp_dir = TempDir::new()?;
+    let task_manager = TaskManager::new("Test Task Manager");
+    let reth_env = RethEnv::new_for_temp_chain_with_rayls_spec(
+        chain.clone(),
+        rayls_chain_spec,
+        tmp_dir.path(),
+        &task_manager,
+        None,
+    )
+    .await?;
+    assert_eq!(reth_env.dkg_genesis_dealings()?, Some(commitment));
+    assert_eq!(
+        reth_env.dkg_committee_keys(0)?,
+        members.iter().map(|(key, _)| *key).collect::<Vec<_>>()
+    );
     Ok(())
 }

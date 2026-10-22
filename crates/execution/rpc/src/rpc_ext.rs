@@ -8,7 +8,8 @@ use async_trait::async_trait;
 use jsonrpsee::proc_macros::rpc;
 use rayls_execution_evm::reth_env::ChainSpec;
 use rayls_infrastructure_types::{
-    BlockHash, ConsensusHeader, Epoch, EpochCertificate, EpochRecord, Genesis,
+    BlockHash, BlsPublicKey, ConsensusHeader, Epoch, EpochCertificate, EpochRecord, Genesis,
+    RecordBinding,
 };
 
 /// Rayls Network RPC namespace.
@@ -34,6 +35,15 @@ pub trait RaylsNetworkRpcExtApi {
         &self,
         hash: BlockHash,
     ) -> RaylsNetworkRpcResult<(EpochRecord, EpochCertificate)>;
+    /// What the certificate of the certified record of `epoch` signs besides the record: from
+    /// the `ThresholdCertificates` fork on, the next epoch's group key (`{"NextKey": key}`, `null`
+    /// key for aggregate certificates); `"Legacy"` before it.
+    #[method(name = "epochRecordBinding")]
+    async fn epoch_record_binding(&self, epoch: Epoch) -> RaylsNetworkRpcResult<RecordBinding>;
+    /// The group key threshold certificates of `epoch` verify against, `null` when the epoch
+    /// uses aggregate certificates; not found when this node does not know yet.
+    #[method(name = "epochGroupKey")]
+    async fn epoch_group_key(&self, epoch: Epoch) -> RaylsNetworkRpcResult<Option<BlsPublicKey>>;
     /// Return the local node's role and sync status.
     #[method(name = "nodeStatus")]
     async fn node_status(&self) -> RaylsNetworkRpcResult<NodeStatus>;
@@ -75,6 +85,14 @@ where
         hash: BlockHash,
     ) -> RaylsNetworkRpcResult<(EpochRecord, EpochCertificate)> {
         self.inner_node_network.epoch(None, Some(hash)).ok_or(RaylsRpcError::NotFound)
+    }
+
+    async fn epoch_record_binding(&self, epoch: Epoch) -> RaylsNetworkRpcResult<RecordBinding> {
+        self.inner_node_network.epoch_record_binding(epoch).ok_or(RaylsRpcError::NotFound)
+    }
+
+    async fn epoch_group_key(&self, epoch: Epoch) -> RaylsNetworkRpcResult<Option<BlsPublicKey>> {
+        self.inner_node_network.epoch_group_key(epoch).ok_or(RaylsRpcError::NotFound)
     }
 
     async fn node_status(&self) -> RaylsNetworkRpcResult<NodeStatus> {

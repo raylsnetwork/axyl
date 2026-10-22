@@ -12,7 +12,8 @@
 //! means. They are pure so the decisions can be tested without a database or a network.
 
 use rayls_infrastructure_types::{
-    error::HeaderError, BlsPublicKey, Database, Epoch, EpochVote, RaylsReceiver, B256,
+    dkg::EpochKey, error::HeaderError, BlsPublicKey, Database, Epoch, EpochVote, RaylsReceiver,
+    RecordBinding, VoteContext, B256,
 };
 use std::collections::VecDeque;
 use tokio::sync::oneshot;
@@ -87,8 +88,54 @@ pub(crate) fn backfill_candidate(
     record_epoch < current_epoch && !already_certified
 }
 
-/// A queued epoch vote with the channel the gossip handler waits on.
-pub(crate) type QueuedVote = (EpochVote, oneshot::Sender<Result<(), HeaderError>>);
+/// A queued epoch vote, with the context a keyed vote names, and the channel the gossip handler
+/// waits on.
+pub(crate) type QueuedVote =
+    (EpochVote, Option<VoteContext>, oneshot::Sender<Result<(), HeaderError>>);
+
+/// Whether a vote's signature holds, as far as this node can tell.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SignatureCheck {
+    /// Signed by a member of the record's committee over the record and its binding.
+    Valid,
+    /// Not a member, or a signature that does not verify: misbehaviour.
+    Invalid,
+    /// This node lacks what checking needs (the epoch's committee or threshold key): nothing is
+    /// proven either way.
+    Unverifiable,
+}
+
+/// The keys an epoch's votes are checked against: its committee, and its threshold key when the
+/// epoch has one (votes are then signed with shares).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct VoteKeys<'a> {
+    pub(crate) committee: &'a [BlsPublicKey],
+    pub(crate) threshold: Option<&'a EpochKey>,
+}
+
+/// Check `vote` as one for a record signed with `binding` by a member of `keys`' committee: with
+/// its share key in a threshold epoch, its own key otherwise.
+pub(crate) fn check_vote(
+    vote: &EpochVote,
+    binding: &RecordBinding,
+    keys: VoteKeys<'_>,
+) -> SignatureCheck {
+    if !keys.committee.contains(&vote.public_key) {
+        return SignatureCheck::Invalid;
+    }
+    let key = match keys.threshold {
+        Some(epoch_key) => match epoch_key.position_of(&vote.public_key) {
+            Some(position) => epoch_key.share_key(position),
+            None => return SignatureCheck::Invalid,
+        },
+        None => vote.public_key,
+    };
+    if vote.check_signature_with(binding, &key) {
+        SignatureCheck::Valid
+    } else {
+        SignatureCheck::Invalid
+    }
+}
 
 /// Take everything currently queued, ack and drop the settled votes, and return the rest in
 /// arrival order.
@@ -105,14 +152,14 @@ where
 
     let mut kept = VecDeque::new();
     let mut settled = 0;
-    while let Ok((vote, vote_tx)) = rx.try_recv() {
+    while let Ok((vote, context, vote_tx)) = rx.try_recv() {
         if vote_is_settled(
             db.get_epoch_by_hash(vote.epoch_hash).map(|(rec, cert)| (rec.epoch, cert.is_some())),
         ) {
             let _ = vote_tx.send(Ok(()));
             settled += 1;
         } else {
-            kept.push_back((vote, vote_tx));
+            kept.push_back((vote, context, vote_tx));
         }
     }
     (settled, kept)
@@ -145,12 +192,16 @@ pub(crate) enum VoteAction {
     NeedsResolve,
     /// Not a committee member, or a bad signature: reject as before.
     Reject,
+    /// A keyed vote this node cannot check (it lacks that epoch's keys): acked, and neither
+    /// counted nor resolved, so a forged one costs nothing and an honest one is not punished.
+    Unverified,
 }
 
 /// Decide what to do with one vote.
 ///
 /// `local` is what `EpochStore::get_epoch_by_hash` knows about the vote's digest, and `resolved`
 /// the outcome of a network resolution when one has already been made (or `None` if not).
+#[cfg(test)]
 pub(crate) fn triage_vote(
     vote: &EpochVote,
     epoch_hash: B256,
@@ -159,8 +210,23 @@ pub(crate) fn triage_vote(
     local: Option<(Epoch, bool)>,
     resolved: Option<ForeignVote>,
 ) -> VoteAction {
-    if !committee.contains(&vote.public_key) || !vote.check_signature() {
-        return VoteAction::Reject;
+    let check = check_vote(vote, &RecordBinding::Legacy, VoteKeys { committee, threshold: None });
+    triage_checked(vote, check, epoch_hash, current_epoch, local, resolved)
+}
+
+/// [`triage_vote`] with the signature already checked against the right epoch's keys.
+pub(crate) fn triage_checked(
+    vote: &EpochVote,
+    check: SignatureCheck,
+    epoch_hash: B256,
+    current_epoch: Epoch,
+    local: Option<(Epoch, bool)>,
+    resolved: Option<ForeignVote>,
+) -> VoteAction {
+    match check {
+        SignatureCheck::Valid => {}
+        SignatureCheck::Invalid => return VoteAction::Reject,
+        SignatureCheck::Unverifiable => return VoteAction::Unverified,
     }
     if vote.epoch_hash == epoch_hash {
         return VoteAction::Count;
@@ -237,7 +303,7 @@ mod tests {
             signature: vote.signature,
             signed_authorities: roaring::RoaringBitmap::new(),
         };
-        db.save_epoch_record_with_cert(record, &cert).unwrap();
+        db.save_epoch_record_with_cert(record, &cert, &RecordBinding::Legacy).unwrap();
     }
 
     // The abort this issue is about: a vote for a record of an earlier epoch must never be
@@ -547,7 +613,7 @@ mod tests {
         let mut acks = Vec::new();
         for record in [&older, &current, &older, &other] {
             let (tx, rx) = oneshot::channel();
-            queue.send((record.sign_vote(&signer), tx)).await.unwrap();
+            queue.send((record.sign_vote(&signer), None, tx)).await.unwrap();
             acks.push(rx);
         }
 
@@ -555,7 +621,7 @@ mod tests {
         let (settled, kept) = split_settled_votes(&mut receiver, &db);
 
         assert_eq!(settled, 2, "both votes for the record we already hold certified are dropped");
-        let kept: Vec<B256> = kept.iter().map(|(vote, _)| vote.epoch_hash).collect();
+        let kept: Vec<B256> = kept.iter().map(|(vote, _, _)| vote.epoch_hash).collect();
         assert_eq!(
             kept,
             vec![current.digest(), other.digest()],
@@ -575,5 +641,62 @@ mod tests {
         let (settled, kept) = split_settled_votes(&mut receiver, &db);
         assert_eq!(settled, 0);
         assert!(kept.is_empty());
+    }
+
+    /// A keyed vote is checked against the binding it signs: the right one is valid, the legacy
+    /// message or another next key is not, and an unverifiable vote is acked, never punished.
+    #[test]
+    fn keyed_votes_are_checked_against_their_binding() {
+        let mut rng = StdRng::seed_from_u64(21);
+        let signer = TestSigner::new(&mut rng);
+        let committee = vec![signer.public_key()];
+        let record = record_for(38, &committee, B256::ZERO);
+        let binding = RecordBinding::NextKey(None);
+        let vote = record.sign_vote_bound(&signer, &binding);
+        let keys = VoteKeys { committee: &committee, threshold: None };
+        assert_eq!(check_vote(&vote, &binding, keys), SignatureCheck::Valid);
+        assert_eq!(check_vote(&vote, &RecordBinding::Legacy, keys), SignatureCheck::Invalid);
+        let other = RecordBinding::NextKey(Some(signer.public_key()));
+        assert_eq!(check_vote(&vote, &other, keys), SignatureCheck::Invalid);
+        assert_eq!(
+            triage_checked(&vote, SignatureCheck::Unverifiable, B256::ZERO, 38, None, None),
+            VoteAction::Unverified,
+        );
+        assert_eq!(
+            triage_checked(&vote, SignatureCheck::Valid, record.digest(), 38, None, None),
+            VoteAction::Count,
+        );
+    }
+
+    /// In a threshold epoch a vote is a share's partial signature: checked against the voter's
+    /// share key, never its own key.
+    #[test]
+    fn threshold_votes_are_checked_against_share_keys() {
+        use rayls_infrastructure_types::threshold::{SecretPolynomial, ShareIndex};
+        let mut rng = StdRng::seed_from_u64(22);
+        let mut signers: Vec<TestSigner> = (0..4).map(|_| TestSigner::new(&mut rng)).collect();
+        signers.sort_by_key(|s| s.public_key());
+        let committee: Vec<BlsPublicKey> = signers.iter().map(|s| s.public_key()).collect();
+        let record = record_for(38, &committee, B256::ZERO);
+        let polynomial = SecretPolynomial::random(3, &mut rng).unwrap();
+        let key = EpochKey {
+            epoch: 38,
+            public: polynomial.commit().unwrap(),
+            dealers: vec![],
+            members: committee.clone(),
+        };
+        let binding = RecordBinding::NextKey(None);
+        let keys = VoteKeys { committee: &committee, threshold: Some(&key) };
+        let share = polynomial.share(ShareIndex::from_position(1)).unwrap();
+        let vote = record.sign_vote_with_share(&share, committee[1], &binding);
+        assert_eq!(check_vote(&vote, &binding, keys), SignatureCheck::Valid);
+        let impostor = rayls_infrastructure_types::EpochVote { public_key: committee[2], ..vote };
+        assert_eq!(
+            check_vote(&impostor, &binding, keys),
+            SignatureCheck::Invalid,
+            "another's share"
+        );
+        let long_term = record.sign_vote_bound(&signers[1], &binding);
+        assert_eq!(check_vote(&long_term, &binding, keys), SignatureCheck::Invalid);
     }
 }

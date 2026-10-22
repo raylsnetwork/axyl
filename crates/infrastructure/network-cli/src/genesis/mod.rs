@@ -4,12 +4,15 @@
 
 use clap::Args;
 use rayls_execution_evm::{
-    reth_env::{genesis::apply_greenfield_fixes, RethEnv},
+    reth_env::{
+        genesis::{apply_greenfield_fixes, verify_genesis_dealings, with_genesis_dealings},
+        RethEnv,
+    },
     system_calls::ConsensusRegistry,
     RethChainSpec,
 };
 use rayls_infrastructure_config::{
-    Config, ConfigFmt, ConfigTrait, NetworkGenesis, Parameters, RaylsDirs as _,
+    Config, ConfigFmt, ConfigTrait, GenesisDealing, NetworkGenesis, Parameters, RaylsDirs as _,
     DELEGATION_POOL_ADDRESS, FEE_AGGREGATOR_ADDRESS, GOVERNANCE_SAFE_ADDRESS,
     NATIVE_TOKEN_CONTROLLER_ADDRESS, REWARD_DISTRIBUTOR_ADDRESS, RLS_ACCUMULATOR_ADDRESS,
 };
@@ -166,6 +169,13 @@ pub struct GenesisArgs {
     /// YAML file mapping addresses to an RLS ERC-20 balance to pre-fund at genesis.
     #[arg(long = "rls-accounts", value_name = "YAML_FILE", verbatim_doc_comment)]
     pub rls_accounts: Option<PathBuf>,
+
+    /// Directory of the genesis validators' dealings of epoch 0's threshold key, one
+    /// `keytool genesis-dealing` output per file, made once every validator's node-info is in.
+    /// With it epoch 0 uses threshold certificates; without it epoch 0 uses aggregate ones and
+    /// the first threshold key is dealt during epoch 0.
+    #[arg(long = "dkg-dealings", value_name = "DIR", verbatim_doc_comment)]
+    pub dkg_dealings: Option<PathBuf>,
 }
 
 /// Take a string and return the deterministic account derived from it.  This is be used
@@ -333,6 +343,20 @@ impl GenesisArgs {
         // fee.
         updated_genesis.base_fee_per_gas = Some(self.base_fee as u128);
 
+        // epoch 0's threshold key: the checked dealings ship as a genesis file, and genesis state
+        // commits to them
+        if let Some(dir) = &self.dkg_dealings {
+            let mut dealings = read_genesis_dealings(dir)?;
+            let commitment = verify_genesis_dealings(&validators, self.chain_id, &mut dealings)?;
+            updated_genesis = with_genesis_dealings(updated_genesis, commitment)?;
+            Config::write_to_path(
+                data_dir.genesis_dkg_dealings_path(),
+                &dealings,
+                ConfigFmt::YAML,
+            )?;
+            info!(target: "genesis::ceremony", dealings = dealings.len(), "epoch 0 has a threshold key");
+        }
+
         // updated genesis with registry information
         network_genesis.update_genesis(updated_genesis);
 
@@ -365,4 +389,16 @@ impl GenesisArgs {
 
         Ok(())
     }
+}
+
+/// Every genesis dealing in `dir`, one YAML file each.
+fn read_genesis_dealings(dir: &std::path::Path) -> eyre::Result<Vec<GenesisDealing>> {
+    let mut dealings = Vec::new();
+    for entry in std::fs::read_dir(dir)? {
+        let path = entry?.path();
+        if path.extension().is_some_and(|ext| ext == "yaml" || ext == "yml") {
+            dealings.push(Config::load_from_path(&path, ConfigFmt::YAML)?);
+        }
+    }
+    Ok(dealings)
 }
