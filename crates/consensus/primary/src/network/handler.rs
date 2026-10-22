@@ -801,20 +801,32 @@ where
             ?claimed,
             ?expected,
             verified,
-            "own-parent signer claim differs from the parent certificate held here (the \
-             differing index altered the aggregate); accepting the author's verified claim and \
-             adopting it, or refusing an unverifiable one"
+            "own-parent signer claim differs from the parent certificate held here (the index \
+             that differs is the member whose signature was added or removed, usually by itself; \
+             an author re-aggregating after a restart also lands here); accepting the author's \
+             verified claim and adopting it, or refusing an unverifiable one"
         );
         if !verified {
             return Err(HeaderError::OwnParentSignersInvalid { claimed, expected }.into());
         }
 
-        // converge the stored copy on the author's own variant; same digest, so nothing else
-        // about the certificate changes
+        // Converge the persisted copy on the author's own variant; same digest, so nothing else
+        // about the certificate changes, and the in-memory DAG keeps the copy it has. Best
+        // effort: the stored signer set is non-canonical and nothing reads it, so a failed write
+        // is logged and the verified vote still proceeds. This runs before the remaining vote
+        // checks, so the copy can change even if the vote is refused later for another reason,
+        // which is harmless since the claim verified.
         if let Some(parent) = own_parent {
             let mut adopted = parent.clone();
             adopted.adopt_verified_signers(claim);
-            self.consensus_config.node_storage().write(adopted).map_err(HeaderError::Storage)?;
+            if let Err(e) = self.consensus_config.node_storage().write(adopted) {
+                warn!(
+                    target: "primary::handler",
+                    ?e,
+                    author = %header.author(),
+                    "failed to persist the adopted own-parent signer claim; vote proceeds"
+                );
+            }
         }
         Ok(())
     }
