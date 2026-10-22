@@ -215,6 +215,11 @@ impl Header {
         latest_execution_block: BlockNumHash,
         own_parent_signers: Option<OwnParentSigners>,
     ) -> Self {
+        debug_assert_eq!(
+            epoch & HEADER_SIGNERS_EPOCH_FLAG,
+            0,
+            "header epoch {epoch} collides with the wire layout flag"
+        );
         let header = Self {
             author,
             round,
@@ -397,10 +402,16 @@ impl HeaderBuilder {
     /// Builds the header and seals its digest. Test-only: `latest_execution_block` defaults to
     /// zero, which a real proposal must never carry.
     pub fn build(self) -> Header {
+        let epoch = self.epoch.expect("epoch set for header builder");
+        debug_assert_eq!(
+            epoch & HEADER_SIGNERS_EPOCH_FLAG,
+            0,
+            "header epoch {epoch} collides with the wire layout flag"
+        );
         let h = Header {
             author: self.author.expect("author set for header builder"),
             round: self.round.expect("round set for header builder"),
-            epoch: self.epoch.expect("epoch set for header builder"),
+            epoch,
             created_at: self.created_at.unwrap_or(0),
             payload: self.payload.unwrap_or_default(),
             parents: self.parents.expect("parents set for header builder"),
@@ -497,7 +508,8 @@ impl fmt::Debug for Header {
             self.epoch(),
             self.payload().len(),
             self.latest_execution_block,
-            self.own_parent_signers.as_ref().map(|c| c.signers.iter().collect::<Vec<_>>()),
+            // the count, not the indices: headers are formatted on hot debug paths
+            self.own_parent_signers.as_ref().map(|c| c.signers.len()),
         )
     }
 }

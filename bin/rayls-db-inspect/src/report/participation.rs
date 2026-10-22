@@ -274,6 +274,10 @@ pub fn participation(nodes: &[NodeDb], epoch: Epoch) -> eyre::Result<Participati
                 .certificates
                 .iter()
                 .any(|cert| cert.header().own_parent_signers().is_some());
+            // Dedup per sub-dag by authority id. The node's tally dedups by execution address,
+            // which the epoch record does not carry (it holds committee keys only); the two
+            // agree unless two authorities share an execution address, which the registry
+            // precludes.
             let mut seen: BTreeSet<&AuthorityIdentifier> = BTreeSet::new();
             for cert in &header.sub_dag.certificates {
                 let author = cert.origin();
