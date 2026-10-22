@@ -198,11 +198,7 @@ only `chain_id`) you are done. Of the 17 forks:
   or a future block (activate later — section 3). The canonical schedule turns all
   ten on from genesis.
 
-There is no head-dependent strict mode: the relaxed rules above apply to every
-non-mainnet/testnet chain-id, including a brand-new chain. The canonical values
-are recommended because a greenfield genesis is built to work with them, but they
-are not required. What each fork does, and why the canonical values are what they
-are, is in [`hardforks/README.md`](../hardforks/README.md). The quick list:
+The relaxed rules above apply to every non-mainnet/testnet chain-id, including a brand-new chain. The canonical values are required althought not strictly checked in the code. What each fork does, and why the canonical values are what they are, is in [`hardforks/README.md`](../hardforks/README.md). The quick list:
 
 | Fork | Canonical value |
 |---|---|

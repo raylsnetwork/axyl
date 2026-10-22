@@ -133,10 +133,7 @@ The canonical new-chain schedule therefore uses:
 | `HybridRewards` | **exactly `Block(1)`** | The genesis bakes the pre-hybrid `ConsensusRegistry`. The 2-arg ABI must not be live at genesis (calling it against the pre-hybrid registry reverts — fatal system call). A new chain starts the complete current protocol from the first block, with no legacy-regime window. |
 | 10 behavioral forks | any value | Business-logic based (see below). |
 
-These values are recommendations, not hard requirements for new chains: the
-shape gate applies the relaxed rules of section 4 to every non-mainnet/testnet
-chain-id. In particular, the built-in **devnet** schedule keeps
-`HybridRewards: Never`, which those rules allow.
+These values are hard requirements for new chains: the shape gate applies the relaxed rules of section 4 to every non-mainnet/testnet chain-id. In particular, the built-in **devnet** schedule keeps `HybridRewards: Never`, which those rules allow.
 
 ## 3. Behavioral Changes Are Business-Logic Based
 
