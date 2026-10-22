@@ -509,7 +509,9 @@ mod datadir_gate_tests {
     use std::sync::Arc;
 
     fn datadir_config(dir: &Path) -> RethConfig {
-        let reth = RethCommand::parse_from(["rayls-test"]);
+        let reth = RethCommand::parse_from(
+            [&["rayls-test"][..], &crate::test_utils::TEST_DB_MAX_SIZE_ARG].concat(),
+        );
         RethConfig::new(reth, None, dir, false, Arc::new(ChainSpec::default()))
     }
 

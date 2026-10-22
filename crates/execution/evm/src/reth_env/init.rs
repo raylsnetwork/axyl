@@ -19,7 +19,7 @@ use reth_db_common::init::init_genesis_with_settings;
 use reth_downloaders::{bodies::noop::NoopBodiesDownloader, headers::noop::NoopHeaderDownloader};
 use reth_engine_primitives::DEFAULT_PERSISTENCE_THRESHOLD;
 use reth_engine_tree::tree::{precompile_cache::PrecompileCacheMap, PayloadProcessor};
-use reth_node_core::args::{EngineArgs, StorageArgs};
+use reth_node_core::args::{DatabaseArgs, EngineArgs, StorageArgs};
 use reth_provider::{
     providers::{BlockchainProvider, RocksDBBuilder, StaticFileProvider},
     BlockNumReader, ChainSpecProvider, DatabaseProviderFactory, ProviderFactory,
@@ -35,6 +35,14 @@ use tracing::{debug, error, info, warn};
 
 // Page-size rules and detection shared with the other node database so both stay in sync.
 use rayls_infrastructure_utils::mdbx::open_page_size;
+
+/// Largest size of a test environment's reth database. reth's default (8 TiB) is mapped as address
+/// space at every open and a process has 128 TiB of it, so a test binary with about 15 databases
+/// open at once fails the next open with ENOMEM. 64 GiB is far beyond any test.
+pub const TEST_DB_MAX_SIZE: usize = 64 * 1024 * 1024 * 1024;
+
+/// [`TEST_DB_MAX_SIZE`] as reth command-line arguments, for tests that parse reth's CLI.
+pub const TEST_DB_MAX_SIZE_ARG: [&str; 2] = ["--db.max-size", "64GB"];
 
 impl RethEnv {
     /// Create a new Reth DB.
@@ -237,6 +245,8 @@ impl RethEnv {
     /// but temp envs skip that path, so a test run inherits the OS default (256 on macOS) and
     /// spends it once a handful run concurrently -- surfacing as `Too many open files` in whichever
     /// test next opens a jar, rather than in the one that exhausted the descriptors.
+    ///
+    /// The reth database is capped at [`TEST_DB_MAX_SIZE`], so many temp envs fit in one process.
     pub async fn new_for_temp_chain<P: AsRef<Path>>(
         chain: Arc<RethChainSpec>,
         db_path: P,
@@ -271,6 +281,7 @@ impl RethEnv {
             },
             chain,
             storage: StorageArgs { v2: true },
+            db: DatabaseArgs { max_size: Some(TEST_DB_MAX_SIZE), ..Default::default() },
             ..NodeConfig::default()
         };
         let reth_config = RethConfig(node_config);

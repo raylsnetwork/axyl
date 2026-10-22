@@ -557,3 +557,132 @@ async fn digests_survive_gc_advance_and_later_round_commit() {
         "gc-evicted headers requeue their digests oldest-round-first, ahead of the queue"
     );
 }
+
+/// A parent certificate lost from gossip is fetched while the proposer waits for it, within a
+/// few max header delays, not only by the certificate fetcher's idle probe once a minute.
+///
+/// The node lacks a quorum of round-1 certificates: authorities 1 and 3 arrive by gossip, the
+/// one from authority 2 is lost, and nobody proposes a round-2 header that would bring it along
+/// as a vote parent. Peers answer every certificate request with it. With exactly a quorum of
+/// validators up, every round waits for the node that lost a certificate.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn parent_lost_from_gossip_is_fetched_within_a_few_max_header_delays() {
+    use crate::{
+        certificate_fetcher::CertificateFetcher,
+        consensus_bus::NodeMode,
+        network::{PrimaryRequest, PrimaryResponse},
+        state_sync::StateSynchronizer,
+    };
+    use rayls_consensus_network::types::{NetworkCommand, NetworkHandle};
+    use rayls_infrastructure_storage::{CertificateStore, PayloadStore};
+    use rayls_infrastructure_types::Hash as _;
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    };
+    use tokio::{sync::mpsc, time::Instant};
+
+    let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+    let committee = fixture.committee();
+    let primary = fixture.authorities().next().unwrap();
+    let config = primary.consensus_config();
+    let max_header_delay = config.parameters().max_header_delay;
+    let store = config.node_storage().clone();
+
+    let genesis = Certificate::genesis(&committee);
+    for cert in &genesis {
+        store.write(cert.clone()).expect("write genesis");
+    }
+    let genesis_digests: BTreeSet<_> = genesis.iter().map(|cert| cert.digest()).collect();
+    let (_, headers) = fixture.headers_round(0, &genesis_digests);
+    for (digest, worker_id) in headers.iter().flat_map(|h| h.payload().iter()) {
+        store.write_payload(digest, worker_id).expect("write payload");
+    }
+    let round_1: Vec<_> = headers.iter().map(|h| fixture.certificate(h)).collect();
+    let lost = round_1[2].clone();
+
+    let cb = ConsensusBus::new();
+    cb.node_mode().send_replace(NodeMode::CvvActive);
+    let mut rx_headers = cb.headers().subscribe();
+    let task_manager = TaskManager::default();
+    let synchronizer =
+        StateSynchronizer::new(config.clone(), cb.clone(), task_manager.get_spawner());
+    synchronizer.spawn(&task_manager);
+    let (sender, mut requests) = mpsc::channel(1000);
+    let network: NetworkHandle<PrimaryRequest, PrimaryResponse> = NetworkHandle::new(sender);
+    CertificateFetcher::spawn(
+        config.clone(),
+        network.into(),
+        cb.clone(),
+        synchronizer.clone(),
+        &task_manager,
+    );
+
+    // Peers: nothing to give before round 1 forms, then the lost certificate on every request.
+    let round_1_formed = Arc::new(AtomicBool::new(false));
+    let fetches = Arc::new(std::sync::Mutex::new(Vec::<Instant>::new()));
+    {
+        let round_1_formed = round_1_formed.clone();
+        let fetches = fetches.clone();
+        let lost = lost.clone();
+        tokio::spawn(async move {
+            while let Some(command) = requests.recv().await {
+                if let NetworkCommand::SendRequest {
+                    request: PrimaryRequest::MissingCertificates { .. },
+                    reply,
+                    ..
+                } = command
+                {
+                    let certs = if round_1_formed.load(Ordering::SeqCst) {
+                        fetches.lock().unwrap().push(Instant::now());
+                        vec![lost.clone()]
+                    } else {
+                        vec![]
+                    };
+                    let _ = reply.send(Ok(PrimaryResponse::RequestedCertificates(certs)));
+                }
+            }
+        });
+    }
+
+    let proposer = Proposer::new(
+        config.clone(),
+        config.authority_id().expect("authority"),
+        cb.clone(),
+        LeaderSchedule::new(committee.clone(), LeaderSwapTable::default()),
+        task_manager.get_spawner(),
+    );
+    proposer.spawn(&task_manager);
+    cb.execution_replay_complete().send_replace(true);
+
+    // round 1 is proposed on the genesis parents; let the fetcher's boot probe finish
+    assert_eq!(rx_headers.recv().await.unwrap().round(), 1);
+    tokio::time::sleep(Duration::from_secs(1)).await;
+
+    // round 1 forms: two certificates arrive by gossip, the third is lost
+    round_1_formed.store(true, Ordering::SeqCst);
+    let start = Instant::now();
+    for cert in [&round_1[1], &round_1[3]] {
+        synchronizer.process_peer_certificate(cert.clone()).await.expect("gossiped certificate");
+    }
+
+    let round_2 = tokio::time::timeout(Duration::from_secs(300), async {
+        loop {
+            let header = rx_headers.recv().await.expect("headers channel open");
+            if header.round() >= 2 {
+                return header;
+            }
+        }
+    })
+    .await
+    .expect("the lost certificate is never fetched");
+    let waited = start.elapsed();
+    let first_fetch = fetches.lock().unwrap().first().map(|at| at.duration_since(start));
+    assert!(store.contains(&lost.digest()).expect("store read"), "lost certificate fetched");
+    assert_eq!(round_2.round(), 2);
+    assert!(
+        waited <= max_header_delay * 3,
+        "round 2 proposed {waited:?} after round 1 formed (first fetch of the lost certificate \
+         after {first_fetch:?}); max header delay {max_header_delay:?}"
+    );
+}

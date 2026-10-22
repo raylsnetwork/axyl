@@ -70,6 +70,10 @@ pub enum CertificateFetcherCommand {
     Ancestors(Arc<Certificate>),
     /// Fetch once from a random primary.
     Kick,
+    /// Ask peers for any certificate missing locally, as the periodic probe does. Sent by the
+    /// proposer when its max header delay expires without a quorum of parents: a certificate
+    /// that never arrived by gossip would otherwise wait for the idle probe, once a minute.
+    Probe,
 }
 
 /// The CertificateFetcher is responsible for fetching certificates that this primary is missing
@@ -186,6 +190,13 @@ impl<DB: Database> CertificateFetcher<DB> {
                 Some(command) = rx_certificate_fetcher.recv() => {
                     let certificate = match command {
                         CertificateFetcherCommand::Ancestors(certificate) => certificate,
+                        CertificateFetcherCommand::Probe => {
+                            // a running fetch already asks peers; `probe` applies the failure backoff
+                            if self.fetch_certificates_task.is_empty() {
+                                self.probe().await;
+                            }
+                            continue;
+                        }
                         CertificateFetcherCommand::Kick => {
                             // Kick start a fetch task if there is no other task running.
                             if self.fetch_certificates_task.is_empty() {

@@ -42,6 +42,9 @@ mod types;
 #[cfg(test)]
 #[path = "../tests/network_tests.rs"]
 mod network_tests;
+#[cfg(test)]
+#[path = "../tests/stale_connection_tests.rs"]
+mod stale_connection_tests;
 
 /// The network type for consensus messages.
 ///

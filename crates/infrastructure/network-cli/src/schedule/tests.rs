@@ -11,7 +11,7 @@ mod schedule_record_tests {
     use clap::Parser;
     use rayls_execution_evm::{
         network_profile::{ForkActivation, ForkName, NetworkProfile},
-        reth_env::{RethCommand, RethConfig, RethEnv},
+        reth_env::{RethCommand, RethConfig, RethEnv, TEST_DB_MAX_SIZE_ARG},
         ForkCondition, RaylsHardFork, RethChainSpec, ScheduleRecord,
     };
     use rayls_infrastructure_types::RaylsNetwork;
@@ -20,7 +20,8 @@ mod schedule_record_tests {
     use std::{collections::BTreeMap, path::Path, sync::Arc};
 
     fn node_config(datadir: &Path) -> RethConfig {
-        let reth = RethCommand::parse_from(["rayls-test"]);
+        // reth's default 8 TiB map would run a parallel test process out of address space
+        let reth = RethCommand::parse_from([&["rayls-test"][..], &TEST_DB_MAX_SIZE_ARG].concat());
         RethConfig::new(reth, None, datadir, false, Arc::new(RethChainSpec::default()))
     }
 

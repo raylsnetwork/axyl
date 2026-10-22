@@ -59,7 +59,13 @@ fn execution_builder<CliExt: clap::Args + fmt::Debug>(
     opt_args: Option<Vec<&str>>,
     tmp_dir: &Path,
 ) -> eyre::Result<(RaylsBuilder, CliExt)> {
-    let default_args = ["rayls-network", "--http", "--storage.v2"];
+    let default_args = [
+        "rayls-network",
+        "--http",
+        "--storage.v2",
+        rayls_execution_evm::test_utils::TEST_DB_MAX_SIZE_ARG[0],
+        rayls_execution_evm::test_utils::TEST_DB_MAX_SIZE_ARG[1],
+    ];
 
     // extend faucet args if provided
     let cli_args = if let Some(args) = opt_args {

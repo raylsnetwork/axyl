@@ -49,6 +49,8 @@ use secp256k1::{
 };
 use std::{collections::HashMap, path::Path, str::FromStr, sync::Arc};
 
+pub use crate::reth_env::{TEST_DB_MAX_SIZE, TEST_DB_MAX_SIZE_ARG};
+
 // methods for tests
 impl RethEnv {
     /// Create a new RethEnv for testing only.
@@ -63,6 +65,7 @@ impl RethEnv {
     /// Create a new RethEnv with a custom RaylsChainSpec for testing hardfork behavior.
     ///
     /// Raises the descriptor limit for the same reason [`RethEnv::new_for_temp_chain`] does.
+    /// Caps the reth database at [`TEST_DB_MAX_SIZE`] like it, too.
     pub async fn new_for_temp_chain_with_rayls_spec<P: AsRef<Path>>(
         chain: Arc<RethChainSpec>,
         rayls_chain_spec: Arc<crate::RaylsChainSpec>,
@@ -77,7 +80,7 @@ impl RethEnv {
             reth_env::RethConfig,
         };
         use reth_node_core::{
-            args::{DatadirArgs, StorageArgs},
+            args::{DatabaseArgs, DatadirArgs, StorageArgs},
             node_config::NodeConfig,
         };
         use reth_provider::providers::BlockchainProvider;
@@ -96,6 +99,7 @@ impl RethEnv {
             },
             chain,
             storage: StorageArgs { v2: true },
+            db: DatabaseArgs { max_size: Some(TEST_DB_MAX_SIZE), ..Default::default() },
             ..NodeConfig::default()
         };
         let reth_config = RethConfig(node_config.clone());
