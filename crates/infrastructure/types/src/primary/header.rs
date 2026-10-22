@@ -93,13 +93,23 @@ fn decode_own_parent_signers(bytes: &[u8]) -> std::io::Result<RoaringBitmap> {
 /// voter happens to hold. Voters do not verify it yet: they compare the claim with their stored
 /// copy and refuse on a difference without scoring the author (see `check_own_parent_signers`).
 /// Switching to verification is a behavioural change with no layout change.
-#[derive(Clone, Debug, PartialEq, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct OwnParentSigners {
     /// Committee indices in BLS-key order, the index space of `Certificate::signed_authorities`.
     pub signers: RoaringBitmap,
     /// The aggregate signature of exactly `signers` over the previous header's digest. `None`
     /// iff `signers` is empty; [`Self::is_well_formed`] holds that invariant.
     pub signature: Option<BlsSignature>,
+}
+
+/// Value equality: the same signer indices and the same signature. Written by hand because
+/// `RoaringBitmap`'s equality is false across store kinds (array vs bitmap) for the same values,
+/// and a claim decoded off the wire need not share the store kind of one built from a
+/// certificate.
+impl PartialEq for OwnParentSigners {
+    fn eq(&self, other: &Self) -> bool {
+        self.signature == other.signature && self.signers.iter().eq(other.signers.iter())
+    }
 }
 
 impl OwnParentSigners {

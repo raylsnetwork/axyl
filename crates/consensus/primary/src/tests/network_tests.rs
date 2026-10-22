@@ -179,7 +179,8 @@ async fn test_vote_own_parent_signers_required_and_checked_once_fork_is_active()
         res,
         Err(PrimaryNetworkError::InvalidHeader(HeaderError::OwnParentSignersMismatch {
             claimed,
-            expected
+            expected,
+            signature_matches: false,
         })) if claimed == vec![0] && expected.is_empty()
     );
 
