@@ -98,7 +98,10 @@ impl CertificateView {
             created_at: *cert.created_at(),
             signers: cert.signed_authorities().iter().collect(),
             signer_count: cert.signed_authorities().len(),
-            claimed_signers: cert.header().own_parent_signers().map(|c| c.iter().collect()),
+            claimed_signers: cert
+                .header()
+                .own_parent_signers()
+                .map(|claim| claim.signers.iter().collect()),
             signature: cert.aggregated_signature().map(|s| signature(&s)),
             verification_state: verification_state_name(cert.signature_verification_state()),
             raw: verbose.then(|| cert.clone()),

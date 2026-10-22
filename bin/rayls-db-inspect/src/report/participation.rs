@@ -287,7 +287,7 @@ pub fn participation(nodes: &[NodeDb], epoch: Epoch) -> eyre::Result<Participati
                 }
                 if let Some(claim) = cert.header().own_parent_signers() {
                     walk.attested_headers_seen = true;
-                    for bit in claim.iter() {
+                    for bit in claim.signers.iter() {
                         // without a committee no claimed index resolves: count them so the
                         // report says the claims went unresolved instead of showing zeros
                         let Some((ids, _)) = &committee else {

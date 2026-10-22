@@ -148,7 +148,7 @@ mod tests {
             .created_at(0)
             .payload(p)
             .parents(parents_set)
-            .own_parent_signers(own_parent_signers)
+            .own_parent_signers(own_parent_signers.map(crate::OwnParentSigners::unsigned_for_test))
             .build();
         let mut cert = crate::Certificate::default();
         cert.update_header_for_test(header);

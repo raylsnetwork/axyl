@@ -2,12 +2,13 @@
 
 use crate::{
     bcs_layout::{skip_bytes, BcsCursor, BcsLayout, BcsLayoutError},
-    crypto, encode,
+    crypto::{self, BlsSignature},
+    encode,
     error::{HeaderError, HeaderResult},
     now,
     serde::{deserialize_normalized_bounded, roaring_container_count, RoaringBitmapSerde},
-    AuthorityIdentifier, Batch, BlockHash, BlockNumHash, CertificateDigest, Committee, Digest,
-    Epoch, Hash, Round, TimestampSec, VoteDigest, WorkerId,
+    AuthorityIdentifier, Batch, BlockHash, BlockNumHash, Certificate, CertificateDigest, Committee,
+    Digest, Epoch, Hash, Round, TimestampSec, VoteDigest, WorkerId,
 };
 use derive_builder::Builder;
 use indexmap::IndexMap;
@@ -25,14 +26,14 @@ use std::{collections::BTreeSet, fmt};
 ///
 /// The header layout is versioned in-band so every decoder (network, consensus DB, cold archive
 /// projections) tells the two layouts apart from the bytes alone, with no activation table: a
-/// v1 header encodes exactly as it always did, a v2 header sets this bit and appends the signer
-/// bitmap. Real epochs never approach `2^31`. Decoders strip the bit, so no decoded header carries
+/// v1 header encodes exactly as it always did, a v2 header sets this bit and appends the claim.
+/// Real epochs never approach `2^31`. Decoders strip the bit, so no decoded header carries
 /// it; a header *built* with such an epoch fails to serialize, which `encode` (and with it
 /// `Header::new`, `HeaderBuilder::build` and `Hash::digest`) turns into a panic, so never build a
 /// header from a peer-supplied epoch without checking it against the committee epoch first.
 pub const HEADER_SIGNERS_EPOCH_FLAG: Epoch = 1 << 31;
 
-/// Longest serialized `own_parent_signers` claim accepted, in bytes.
+/// Longest serialized `own_parent_signers` bitmap accepted, in bytes.
 ///
 /// A claim names committee indices, so a legitimate one is a single small container (a few dozen
 /// bytes). Roaring run containers can stand for 65,536 values in about ten bytes, so the claim is
@@ -49,7 +50,7 @@ pub const MAX_OWN_PARENT_SIGNERS: u64 = 1024;
 /// final partial character; anything longer is refused before the quadratic decode runs.
 const MAX_OWN_PARENT_SIGNERS_BASE58_LEN: usize = MAX_OWN_PARENT_SIGNERS_BYTES * 138 / 100 + 1;
 
-/// Decodes a serialized `own_parent_signers` claim, refusing one over the byte or value bounds
+/// Decodes a serialized `own_parent_signers` bitmap, refusing one over the byte or value bounds
 /// before it is expanded. Shared by the serde path and [`Header::project_wire`].
 fn decode_own_parent_signers(bytes: &[u8]) -> std::io::Result<RoaringBitmap> {
     use std::io::{Error, ErrorKind};
@@ -84,6 +85,50 @@ fn decode_own_parent_signers(bytes: &[u8]) -> std::io::Result<RoaringBitmap> {
     })
 }
 
+/// A proposer's claim about its own previous-round certificate: who signed it, and that
+/// certificate's aggregate signature over the previous header's digest.
+///
+/// The signature is carried so the claim can be verified on its own, against the previous
+/// header's digest and the committee keys, independently of which variant of that certificate a
+/// voter happens to hold. Voters do not verify it yet: they compare the claim with their stored
+/// copy and refuse on a difference without scoring the author (see `check_own_parent_signers`).
+/// Switching to verification is a behavioural change with no layout change.
+#[derive(Clone, Debug, PartialEq, Default)]
+pub struct OwnParentSigners {
+    /// Committee indices in BLS-key order, the index space of `Certificate::signed_authorities`.
+    pub signers: RoaringBitmap,
+    /// The aggregate signature of exactly `signers` over the previous header's digest. `None`
+    /// iff `signers` is empty; [`Self::is_well_formed`] holds that invariant.
+    pub signature: Option<BlsSignature>,
+}
+
+impl OwnParentSigners {
+    /// The claim a proposer makes when its previous-round certificate is not among its parents.
+    pub fn empty() -> Self {
+        Self::default()
+    }
+
+    /// The claim for `certificate`: its signer bitmap and aggregate signature. Genesis
+    /// certificates have neither, which yields the empty claim.
+    pub fn from_certificate(certificate: &Certificate) -> Self {
+        let signers = certificate.signed_authorities().clone();
+        let signature = if signers.is_empty() { None } else { certificate.aggregated_signature() };
+        Self { signers, signature }
+    }
+
+    /// A claim with `signers` and no signature. Only [`Header::validate`] enforces the
+    /// signature invariant, so this serves tests of the paths that never validate: projections,
+    /// the tally, decoding.
+    pub fn unsigned_for_test(signers: RoaringBitmap) -> Self {
+        Self { signers, signature: None }
+    }
+
+    /// True when the signature is present exactly for a non-empty signer set.
+    pub fn is_well_formed(&self) -> bool {
+        self.signature.is_some() == !self.signers.is_empty()
+    }
+}
+
 /// `Header` type for consensus layer.
 #[derive(Builder, Clone, Default)]
 #[builder(pattern = "owned", build_fn(skip))]
@@ -105,19 +150,20 @@ pub struct Header {
     /// Carrying it in a signed header lets peers validate the author's execution result along with
     /// the proposal.
     pub latest_execution_block: BlockNumHash,
-    /// Signers of the author's own parent certificate (its round `round - 1` certificate), as the
-    /// bitmap of committee indices in BLS-key order that certificate carries.
+    /// The author's claim about its own parent certificate (its round `round - 1` certificate):
+    /// the signer bitmap that certificate carries, plus its aggregate signature.
     ///
     /// A certificate's signer set is not part of any commitment (the DAG keys certificates by
-    /// header digest and the committed sub-dag hashes those digests only), so two honest nodes can
-    /// hold the same certificate with different, equally valid signer subsets. Restating the set
-    /// here puts it inside a signed, committed header that every node holds byte-identically,
-    /// which is what lets the reward tally credit signers deterministically. Voters refuse a
-    /// header whose claim differs from the parent certificate they hold.
+    /// header digest and the committed sub-dag hashes those digests only), and any committee
+    /// member can add or remove its own signature to produce another valid variant, so two honest
+    /// nodes can hold the same certificate with different signer sets. Restating the set here puts
+    /// it inside a signed, committed header that every node holds byte-identically, which is what
+    /// lets the reward tally credit signers deterministically. Voters refuse a header whose claim
+    /// differs from the parent certificate they hold, without scoring the author.
     ///
     /// `None` before the `HeaderParentSigners` fork; `Some` (possibly empty, when the author's
     /// previous certificate is not among the parents) once it is active.
-    pub own_parent_signers: Option<RoaringBitmap>,
+    pub own_parent_signers: Option<OwnParentSigners>,
     /// Cached digest. Off-wire, so a decoded header recomputes it on first use.
     pub digest: OnceCell<HeaderDigest>,
 }
@@ -131,7 +177,7 @@ impl Header {
         payload: IndexMap<BlockHash, WorkerId>,
         parents: BTreeSet<CertificateDigest>,
         latest_execution_block: BlockNumHash,
-        own_parent_signers: Option<RoaringBitmap>,
+        own_parent_signers: Option<OwnParentSigners>,
     ) -> Self {
         let header = Self {
             author,
@@ -188,15 +234,21 @@ impl Header {
             }
         }
 
-        // A claimed signer must be a committee index. Whether the claim is allowed at all, and
-        // whether it matches the parent certificate, is checked by the voter against its own copy
-        // of that certificate and the fork state (`vote_inner`).
-        if let Some(max) = self.own_parent_signers.as_ref().and_then(RoaringBitmap::max) {
-            if max as usize >= committee.size() {
-                return Err(HeaderError::OwnParentSignerOutOfRange {
-                    max,
-                    committee_size: committee.size(),
-                });
+        // A claimed signer must be a committee index and the claim must carry a signature exactly
+        // when it names signers. Whether the claim is allowed at all, and whether it matches the
+        // parent certificate, is checked by the voter against its own copy of that certificate
+        // and the fork state (`vote_inner`).
+        if let Some(claim) = &self.own_parent_signers {
+            if let Some(max) = claim.signers.max() {
+                if max as usize >= committee.size() {
+                    return Err(HeaderError::OwnParentSignerOutOfRange {
+                        max,
+                        committee_size: committee.size(),
+                    });
+                }
+            }
+            if !claim.is_well_formed() {
+                return Err(HeaderError::OwnParentSignersMalformed);
             }
         }
 
@@ -227,8 +279,8 @@ impl Header {
     pub fn parents(&self) -> &BTreeSet<CertificateDigest> {
         &self.parents
     }
-    /// The signers the author claims for its own parent certificate, `None` for a pre-fork header.
-    pub fn own_parent_signers(&self) -> Option<&RoaringBitmap> {
+    /// The author's claim about its own parent certificate, `None` for a pre-fork header.
+    pub fn own_parent_signers(&self) -> Option<&OwnParentSigners> {
         self.own_parent_signers.as_ref()
     }
 
@@ -258,9 +310,9 @@ impl Header {
         (wire_epoch & !HEADER_SIGNERS_EPOCH_FLAG, wire_epoch & HEADER_SIGNERS_EPOCH_FLAG != 0)
     }
 
-    /// Projects `author`, `round`, `epoch` and `own_parent_signers` out of one BCS-encoded header
-    /// (the span [`crate::Certificate::skip_with_header_span`] returns), without decoding the
-    /// payload, parents or execution anchor.
+    /// Projects `author`, `round`, `epoch` and the claimed signer bitmap out of one BCS-encoded
+    /// header (the span [`crate::Certificate::skip_with_header_span`] returns), without decoding
+    /// the payload, parents, execution anchor or the claim's signature.
     pub fn project_wire(span: &[u8]) -> Result<HeaderWireMeta, BcsLayoutError> {
         let mut c = BcsCursor::new(span);
         let author = c.read::<AuthorityIdentifier>()?;
@@ -273,10 +325,11 @@ impl Header {
                 .skip::<BlockNumHash>()?;
             let len = c.read_len()?;
             let bytes = c.take(len)?;
-            Some(decode_own_parent_signers(bytes).map_err(|e| BcsLayoutError::InvalidValue {
-                type_name: "RoaringBitmap",
-                reason: e.to_string(),
-            })?)
+            let signers = decode_own_parent_signers(bytes).map_err(|e| {
+                BcsLayoutError::InvalidValue { type_name: "RoaringBitmap", reason: e.to_string() }
+            })?;
+            c.skip::<Option<BlsSignature>>()?;
+            Some(signers)
         } else {
             None
         };
@@ -293,7 +346,8 @@ pub struct HeaderWireMeta {
     pub round: Round,
     /// The epoch this header was created in, flag bit cleared.
     pub epoch: Epoch,
-    /// The author's claim for its own parent certificate's signers, `None` for a v1 header.
+    /// The signer bitmap of the author's claim about its own parent certificate, `None` for a v1
+    /// header. The claim's signature is skipped, not projected.
     pub own_parent_signers: Option<RoaringBitmap>,
 }
 
@@ -400,14 +454,14 @@ impl fmt::Debug for Header {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> Result<(), fmt::Error> {
         write!(
             f,
-            "{}: B{}(v{}, e{}, {}wbs, exec: {:?}, signers: {:?})",
+            "{}: B{}(v{}, e{}, {}wbs, exec: {:?}, claims: {:?})",
             self.digest(),
             self.round(),
             self.author(),
             self.epoch(),
             self.payload().len(),
             self.latest_execution_block,
-            self.own_parent_signers.as_ref().map(|s| s.iter().collect::<Vec<_>>()),
+            self.own_parent_signers.as_ref().map(|c| c.signers.iter().collect::<Vec<_>>()),
         )
     }
 }
@@ -429,8 +483,9 @@ impl PartialEq for Header {
 // Binary (BCS) layout, v1: `author, round, epoch, created_at, payload, parents,
 // latest_execution_block`, byte-identical to the derived encoding the header always had.
 // v2 (`own_parent_signers` is `Some`): the same fields with `HEADER_SIGNERS_EPOCH_FLAG` set in
-// `epoch`, then the signer bitmap as roaring bytes. `digest` is off-wire. Keep `BcsLayout`,
-// `project_wire` and the human-readable form below in lockstep with the struct.
+// `epoch`, then the claim's signer bitmap as roaring bytes, then its signature as
+// `Option<BlsSignature>`. `digest` is off-wire. Keep `BcsLayout`, `project_wire` and the
+// human-readable form below in lockstep with the struct.
 
 const HEADER_FIELDS: &[&str] = &[
     "author",
@@ -441,6 +496,7 @@ const HEADER_FIELDS: &[&str] = &[
     "parents",
     "latest_execution_block",
     "own_parent_signers",
+    "own_parent_signature",
 ];
 
 /// `payload` on the wire: a sequence of `(digest, worker)` pairs in insertion order (what
@@ -462,8 +518,8 @@ impl Serialize for SignerBytes<'_> {
     }
 }
 
-/// The claim as decoded off the wire, through the bounded decoder: the bytes are peer-supplied
-/// and arrive on the vote path, so they are bounded before the bitmap is expanded.
+/// The claimed bitmap as decoded off the wire, through the bounded decoder: the bytes are
+/// peer-supplied and arrive on the vote path, so they are bounded before the bitmap is expanded.
 struct SignerBytesOwned(RoaringBitmap);
 
 impl<'de> Deserialize<'de> for SignerBytesOwned {
@@ -486,8 +542,8 @@ impl<'de> Deserialize<'de> for SignerBytesOwned {
     }
 }
 
-/// Human-readable (JSON/YAML) form: named fields, bitmap as base58, and the signer field only
-/// present when set so pre-fork documents are unchanged.
+/// Human-readable (JSON/YAML) form: named fields, bitmap as base58, and the claim only present
+/// when set so pre-fork documents are unchanged.
 #[derive(Serialize, Deserialize)]
 struct HeaderHuman {
     author: AuthorityIdentifier,
@@ -502,17 +558,37 @@ struct HeaderHuman {
     own_parent_signers: Option<ClaimHuman>,
 }
 
-/// The claim in a human-readable document: base58 roaring bytes, decoded through the same
-/// bounded decoder as the binary path so no ingress expands an unbounded bitmap.
-struct ClaimHuman(RoaringBitmap);
+/// The claim in a human-readable document.
+#[derive(Serialize, Deserialize)]
+struct ClaimHuman {
+    signers: SignersHuman,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    signature: Option<BlsSignature>,
+}
 
-impl Serialize for ClaimHuman {
+impl From<&OwnParentSigners> for ClaimHuman {
+    fn from(claim: &OwnParentSigners) -> Self {
+        Self { signers: SignersHuman(claim.signers.clone()), signature: claim.signature }
+    }
+}
+
+impl From<ClaimHuman> for OwnParentSigners {
+    fn from(claim: ClaimHuman) -> Self {
+        Self { signers: claim.signers.0, signature: claim.signature }
+    }
+}
+
+/// The claimed bitmap in a human-readable document: base58 roaring bytes, decoded through the
+/// same bounded decoder as the binary path so no ingress expands an unbounded bitmap.
+struct SignersHuman(RoaringBitmap);
+
+impl Serialize for SignersHuman {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         RoaringBitmapSerde::serialize_as(&self.0, serializer)
     }
 }
 
-impl<'de> Deserialize<'de> for ClaimHuman {
+impl<'de> Deserialize<'de> for SignersHuman {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let text = String::deserialize(deserializer)?;
         // base58 decoding is quadratic in the text length, so bound the text before decoding
@@ -520,7 +596,7 @@ impl<'de> Deserialize<'de> for ClaimHuman {
             return Err(de::Error::custom("own-parent signer claim text too long"));
         }
         let bytes = bs58::decode(&text).into_vec().map_err(de::Error::custom)?;
-        decode_own_parent_signers(&bytes).map(ClaimHuman).map_err(de::Error::custom)
+        decode_own_parent_signers(&bytes).map(SignersHuman).map_err(de::Error::custom)
     }
 }
 
@@ -541,15 +617,15 @@ impl Serialize for Header {
                 payload: self.payload.clone(),
                 parents: self.parents.clone(),
                 latest_execution_block: self.latest_execution_block,
-                own_parent_signers: self.own_parent_signers.clone().map(ClaimHuman),
+                own_parent_signers: self.own_parent_signers.as_ref().map(ClaimHuman::from),
             };
             return human.serialize(serializer);
         }
 
-        let has_signers = self.own_parent_signers.is_some();
+        let has_claim = self.own_parent_signers.is_some();
         let wire_epoch =
-            if has_signers { self.epoch | HEADER_SIGNERS_EPOCH_FLAG } else { self.epoch };
-        let mut s = serializer.serialize_struct("Header", if has_signers { 8 } else { 7 })?;
+            if has_claim { self.epoch | HEADER_SIGNERS_EPOCH_FLAG } else { self.epoch };
+        let mut s = serializer.serialize_struct("Header", if has_claim { 9 } else { 7 })?;
         s.serialize_field("author", &self.author)?;
         s.serialize_field("round", &self.round)?;
         s.serialize_field("epoch", &wire_epoch)?;
@@ -557,8 +633,9 @@ impl Serialize for Header {
         s.serialize_field("payload", &PayloadSeq(&self.payload))?;
         s.serialize_field("parents", &self.parents)?;
         s.serialize_field("latest_execution_block", &self.latest_execution_block)?;
-        if let Some(signers) = &self.own_parent_signers {
-            s.serialize_field("own_parent_signers", &SignerBytes(signers))?;
+        if let Some(claim) = &self.own_parent_signers {
+            s.serialize_field("own_parent_signers", &SignerBytes(&claim.signers))?;
+            s.serialize_field("own_parent_signature", &claim.signature)?;
         }
         s.end()
     }
@@ -579,7 +656,7 @@ impl<'de> Deserialize<'de> for Header {
                 payload: human.payload,
                 parents: human.parents,
                 latest_execution_block: human.latest_execution_block,
-                own_parent_signers: human.own_parent_signers.map(|claim| claim.0),
+                own_parent_signers: human.own_parent_signers.map(OwnParentSigners::from),
                 digest: OnceCell::default(),
             });
         }
@@ -593,7 +670,7 @@ impl<'de> Deserialize<'de> for Header {
                 f.write_str("a BCS-encoded consensus header")
             }
 
-            // Reads seven fields, and an eighth when the epoch field carries the layout flag.
+            // Reads seven fields, and two more when the epoch field carries the layout flag.
             // BCS hands the visitor a sequence of (at most) `HEADER_FIELDS.len()` elements and
             // does not require all of them to be consumed, which is what lets the v1 layout
             // decode unchanged.
@@ -607,14 +684,19 @@ impl<'de> Deserialize<'de> for Header {
 
                 let author = field!(0, AuthorityIdentifier);
                 let round = field!(1, Round);
-                let (epoch, has_signers) = Header::split_wire_epoch(field!(2, Epoch));
+                let (epoch, has_claim) = Header::split_wire_epoch(field!(2, Epoch));
                 let created_at = field!(3, TimestampSec);
                 let payload: IndexMap<BlockHash, WorkerId> =
                     field!(4, Vec<(BlockHash, WorkerId)>).into_iter().collect();
                 let parents = field!(5, BTreeSet<CertificateDigest>);
                 let latest_execution_block = field!(6, BlockNumHash);
-                let own_parent_signers =
-                    if has_signers { Some(field!(7, SignerBytesOwned).0) } else { None };
+                let own_parent_signers = if has_claim {
+                    let signers = field!(7, SignerBytesOwned).0;
+                    let signature = field!(8, Option<BlsSignature>);
+                    Some(OwnParentSigners { signers, signature })
+                } else {
+                    None
+                };
 
                 Ok(Header {
                     author,
@@ -635,18 +717,19 @@ impl<'de> Deserialize<'de> for Header {
 }
 
 /// BCS layout: `author, round, epoch, created_at, payload, parents, latest_execution_block`,
-/// then `own_parent_signers` (roaring bytes) iff `epoch` carries
+/// then the claim's signer bitmap (roaring bytes) and `Option<BlsSignature>` iff `epoch` carries
 /// [`HEADER_SIGNERS_EPOCH_FLAG`]. `digest` is off-wire. Keep in lockstep with the struct.
 impl BcsLayout for Header {
     fn skip(c: &mut BcsCursor<'_>) -> Result<(), BcsLayoutError> {
         c.skip::<AuthorityIdentifier>()?.skip::<Round>()?;
-        let (_, has_signers) = Header::split_wire_epoch(c.read::<Epoch>()?);
+        let (_, has_claim) = Header::split_wire_epoch(c.read::<Epoch>()?);
         c.skip::<TimestampSec>()?
             .skip::<Vec<(BlockHash, WorkerId)>>()?
             .skip::<BTreeSet<CertificateDigest>>()?
             .skip::<BlockNumHash>()?;
-        if has_signers {
+        if has_claim {
             skip_bytes(c)?;
+            c.skip::<Option<BlsSignature>>()?;
         }
         Ok(())
     }
@@ -672,7 +755,17 @@ mod tests {
         latest_execution_block: &'a BlockNumHash,
     }
 
-    fn sample(own_parent_signers: Option<RoaringBitmap>) -> Header {
+    /// A well-formed claim naming `indices`: a (dummy) signature exactly when non-empty.
+    fn claim(indices: &[u32]) -> OwnParentSigners {
+        claim_of(RoaringBitmap::from_sorted_iter(indices.iter().copied()).unwrap())
+    }
+
+    fn claim_of(signers: RoaringBitmap) -> OwnParentSigners {
+        let signature = (!signers.is_empty()).then(BlsSignature::default);
+        OwnParentSigners { signers, signature }
+    }
+
+    fn sample(own_parent_signers: Option<OwnParentSigners>) -> Header {
         let mut payload = IndexMap::new();
         payload.insert(BlockHash::repeat_byte(0xA1), 0u16);
         payload.insert(BlockHash::repeat_byte(0xA2), 1u16);
@@ -733,8 +826,8 @@ mod tests {
 
     #[test]
     fn v2_wire_roundtrip_sets_the_epoch_flag_and_changes_the_digest() {
-        let signers = RoaringBitmap::from_sorted_iter([0u32, 2, 3]).unwrap();
-        let v2 = sample(Some(signers.clone()));
+        let signed = claim(&[0, 2, 3]);
+        let v2 = sample(Some(signed.clone()));
         let v1 = sample(None);
 
         let bytes = encode(&v2);
@@ -745,29 +838,32 @@ mod tests {
 
         let decoded: Header = decode(&bytes);
         assert_fields_eq(&v2, &decoded);
-        assert_eq!(decoded.own_parent_signers.as_ref(), Some(&signers));
+        assert_eq!(decoded.own_parent_signers.as_ref(), Some(&signed));
+        assert!(decoded.own_parent_signers.as_ref().unwrap().signature.is_some());
 
-        // an empty claim is still a v2 header
-        let empty = sample(Some(RoaringBitmap::new()));
+        // an empty claim is still a v2 header, and the digest covers the signature
+        let empty = sample(Some(OwnParentSigners::empty()));
         let decoded: Header = decode(&encode(&empty));
-        assert_eq!(decoded.own_parent_signers, Some(RoaringBitmap::new()));
+        assert_eq!(decoded.own_parent_signers, Some(OwnParentSigners::empty()));
         assert_ne!(empty.digest(), v1.digest());
+        let unsigned = sample(Some(OwnParentSigners::unsigned_for_test(signed.signers.clone())));
+        assert_ne!(unsigned.digest(), v2.digest());
     }
 
     #[test]
     fn skip_and_projection_consume_exactly_for_both_layouts() {
-        for signers in [None, Some(RoaringBitmap::from_sorted_iter([1u32, 3]).unwrap())] {
-            let h = sample(signers.clone());
+        for c in [None, Some(claim(&[1, 3])), Some(OwnParentSigners::empty())] {
+            let h = sample(c.clone());
             let bytes = encode(&h);
-            let mut c = BcsCursor::new(&bytes);
-            Header::skip(&mut c).unwrap();
-            assert!(c.is_empty(), "{} bytes left after Header::skip", c.len());
+            let mut cursor = BcsCursor::new(&bytes);
+            Header::skip(&mut cursor).unwrap();
+            assert!(cursor.is_empty(), "{} bytes left after Header::skip", cursor.len());
 
             let meta = Header::project_wire(&bytes).unwrap();
             assert_eq!(meta.author, h.author);
             assert_eq!(meta.round, h.round);
             assert_eq!(meta.epoch, h.epoch);
-            assert_eq!(meta.own_parent_signers, signers);
+            assert_eq!(meta.own_parent_signers, c.map(|c| c.signers));
         }
     }
 
@@ -779,11 +875,13 @@ mod tests {
         let back: Header = serde_json::from_value(json).unwrap();
         assert_fields_eq(&v1, &back);
 
-        let v2 = sample(Some(RoaringBitmap::from_sorted_iter([2u32]).unwrap()));
-        let json = serde_json::to_value(&v2).unwrap();
-        assert!(json.get("own_parent_signers").is_some());
-        let back: Header = serde_json::from_value(json).unwrap();
-        assert_fields_eq(&v2, &back);
+        for c in [claim(&[2]), OwnParentSigners::empty()] {
+            let v2 = sample(Some(c));
+            let json = serde_json::to_value(&v2).unwrap();
+            assert!(json.get("own_parent_signers").is_some());
+            let back: Header = serde_json::from_value(json).unwrap();
+            assert_fields_eq(&v2, &back);
+        }
     }
 
     /// A claim is peer-supplied on the vote path, so an oversized one is refused before the
@@ -793,7 +891,7 @@ mod tests {
         // 2^24 values: refused on size before any container is looked at
         let mut huge = RoaringBitmap::new();
         huge.insert_range(0..(1u32 << 24));
-        let mut bytes = encode(&sample(Some(huge)));
+        let mut bytes = encode(&sample(Some(claim_of(huge))));
 
         assert!(bcs::from_bytes::<Header>(&bytes).is_err());
         assert!(matches!(
@@ -804,19 +902,19 @@ mod tests {
         // a small bitmap that still names too many signers
         let mut wide = RoaringBitmap::new();
         wide.insert_range(0..(MAX_OWN_PARENT_SIGNERS as u32 + 1));
-        bytes = encode(&sample(Some(wide)));
+        bytes = encode(&sample(Some(claim_of(wide))));
         assert!(bcs::from_bytes::<Header>(&bytes).is_err());
         assert!(Header::project_wire(&bytes).is_err());
 
         // a claim spanning two containers: tiny on the wire and within the value bound, refused
         // on the declared container count before any container is built
-        let two_containers = RoaringBitmap::from_sorted_iter([1u32, 1 << 16]).unwrap();
-        bytes = encode(&sample(Some(two_containers)));
+        bytes = encode(&sample(Some(claim(&[1, 1 << 16]))));
         assert!(bcs::from_bytes::<Header>(&bytes).is_err());
         assert!(Header::project_wire(&bytes).is_err());
 
         // the largest legitimate claim decodes
-        let full = RoaringBitmap::from_sorted_iter(0..(MAX_OWN_PARENT_SIGNERS as u32)).unwrap();
+        let full =
+            claim_of(RoaringBitmap::from_sorted_iter(0..(MAX_OWN_PARENT_SIGNERS as u32)).unwrap());
         let decoded: Header = decode(&encode(&sample(Some(full.clone()))));
         assert_eq!(decoded.own_parent_signers, Some(full));
     }
@@ -829,7 +927,7 @@ mod tests {
     }
 
     #[test]
-    fn validate_rejects_a_signer_index_outside_the_committee() {
+    fn validate_checks_the_claim_shape() {
         let mut rng = StdRng::seed_from_u64(7);
         let mut builder = CommitteeBuilder::new(3);
         let mut keys = Vec::new();
@@ -841,7 +939,7 @@ mod tests {
         let committee = builder.build();
         let author = AuthorityIdentifier::from(keys[0]);
 
-        let make = |signers: Option<RoaringBitmap>| {
+        let make = |c: Option<OwnParentSigners>| {
             Header::new(
                 author.clone(),
                 1,
@@ -849,16 +947,30 @@ mod tests {
                 IndexMap::new(),
                 BTreeSet::new(),
                 BlockNumHash::default(),
-                signers,
+                c,
             )
         };
         assert!(make(None).validate(&committee).is_ok());
-        assert!(make(Some(RoaringBitmap::from_sorted_iter([0u32, 3]).unwrap()))
-            .validate(&committee)
-            .is_ok());
+        assert!(make(Some(OwnParentSigners::empty())).validate(&committee).is_ok());
+        assert!(make(Some(claim(&[0, 3]))).validate(&committee).is_ok());
+        // a signer index outside the committee
         assert!(matches!(
-            make(Some(RoaringBitmap::from_sorted_iter([0u32, 4]).unwrap())).validate(&committee),
+            make(Some(claim(&[0, 4]))).validate(&committee),
             Err(HeaderError::OwnParentSignerOutOfRange { max: 4, committee_size: 4 })
+        ));
+        // signers without a signature, and a signature without signers
+        let bitmap = RoaringBitmap::from_sorted_iter([0u32, 3]).unwrap();
+        assert!(matches!(
+            make(Some(OwnParentSigners::unsigned_for_test(bitmap))).validate(&committee),
+            Err(HeaderError::OwnParentSignersMalformed)
+        ));
+        let stray = OwnParentSigners {
+            signers: RoaringBitmap::new(),
+            signature: Some(BlsSignature::default()),
+        };
+        assert!(matches!(
+            make(Some(stray)).validate(&committee),
+            Err(HeaderError::OwnParentSignersMalformed)
         ));
     }
 }

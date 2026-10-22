@@ -8,8 +8,8 @@ use indexmap::IndexMap;
 use rayls_execution_evm::FixedBytes;
 use rayls_infrastructure_storage::mem_db::MemDatabase;
 use rayls_infrastructure_types::{
-    BlockNumHash, Certificate, CommittedSubDag, ConsensusHeader, ExecHeader, RaylsReceiver,
-    RaylsSender, ReputationScores, SealedHeader, B256,
+    BlockNumHash, Certificate, CommittedSubDag, ConsensusHeader, ExecHeader, OwnParentSigners,
+    RaylsReceiver, RaylsSender, ReputationScores, SealedHeader, B256,
 };
 use rayls_testing_test_utils_committee::CommitteeFixture;
 
@@ -611,11 +611,15 @@ async fn proposed_header_claims_own_parent_signers() {
 
     let header = propose(with_own.clone(), true).await;
     assert_eq!(rx_headers.recv().await.unwrap(), header);
-    assert_eq!(header.own_parent_signers(), Some(own_cert.signed_authorities()));
+    let claim = header.own_parent_signers().expect("post-fork header carries a claim");
+    assert_eq!(&claim.signers, own_cert.signed_authorities());
+    // the certificate's aggregate signature rides along, so the claim can be verified on its own
+    assert_eq!(claim.signature, own_cert.aggregated_signature());
+    assert!(claim.is_well_formed());
 
     let header = propose(others, true).await;
     assert_eq!(rx_headers.recv().await.unwrap(), header);
-    assert_eq!(header.own_parent_signers(), Some(&roaring::RoaringBitmap::new()));
+    assert_eq!(header.own_parent_signers(), Some(&OwnParentSigners::empty()));
 
     let header = propose(with_own, false).await;
     assert_eq!(rx_headers.recv().await.unwrap(), header);

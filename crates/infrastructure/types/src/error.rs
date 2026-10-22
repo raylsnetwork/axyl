@@ -297,6 +297,9 @@ pub enum HeaderError {
     /// A claimed signer index is not a committee index.
     #[error("Own-parent signer index {max} is outside a committee of {committee_size}")]
     OwnParentSignerOutOfRange { max: u32, committee_size: usize },
+    /// The claim carries a signature without signers, or signers without a signature.
+    #[error("Own-parent signer claim must carry a signature exactly when it names signers")]
+    OwnParentSignersMalformed,
     /// The claimed signers differ from the parent certificate this node holds.
     #[error("Own-parent signers {claimed:?} do not match the stored parent certificate's signers {expected:?}")]
     OwnParentSignersMismatch { claimed: Vec<u32>, expected: Vec<u32> },

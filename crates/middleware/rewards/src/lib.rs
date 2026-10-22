@@ -338,7 +338,8 @@ mod tests {
     };
     use rayls_infrastructure_types::{
         BlsKeypair, Certificate, CertificateDigest, CommittedSubDag, CommitteeBuilder,
-        ConsensusHeader, DbTxMut, Header, HeaderBuilder, ReputationScores, Round, WorkerId,
+        ConsensusHeader, DbTxMut, Header, HeaderBuilder, OwnParentSigners, ReputationScores, Round,
+        WorkerId,
     };
     use tempfile::TempDir;
 
@@ -567,7 +568,7 @@ mod tests {
             .created_at(0)
             .payload(IndexMap::<BlockHash, WorkerId>::new())
             .parents(std::collections::BTreeSet::<CertificateDigest>::new())
-            .own_parent_signers(Some(claim))
+            .own_parent_signers(Some(OwnParentSigners::unsigned_for_test(claim)))
             .build();
         let mut cert = Certificate::default();
         cert.update_header_for_test(header);

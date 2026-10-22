@@ -27,8 +27,8 @@ use rayls_infrastructure_types::{
     error::{CertificateError, HeaderError, HeaderResult},
     now, to_intent_message, try_decode, AuthorityIdentifier, B256Map, BlockHash, BlockNumHash,
     BlsPublicKey, Certificate, CertificateDigest, ConsensusHeader, Database, Epoch,
-    EpochCertificate, EpochRecord, Hash as _, Header, ProtocolSignature, RaylsSender as _, Round,
-    SignatureVerificationState, Vote, VotesAggregator,
+    EpochCertificate, EpochRecord, Hash as _, Header, OwnParentSigners, ProtocolSignature,
+    RaylsSender as _, Round, SignatureVerificationState, Vote, VotesAggregator,
 };
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -755,44 +755,54 @@ where
         }
     }
 
-    /// Checks the header's claim of who signed the author's own parent certificate against this
-    /// node's copy of that certificate (see `Header::own_parent_signers`).
+    /// Checks the header's claim about the author's own parent certificate against this node's
+    /// copy of that certificate (see `Header::own_parent_signers`).
     ///
-    /// Post-fork the claim is required and must equal the signer bitmap of the parent authored by
-    /// the header's author, or be empty when no such parent exists. A proposer that gossiped
-    /// different signer subsets of its certificate to different peers can satisfy only the peers
-    /// holding the variant it claims, so it loses its own certificate rather than splitting the
-    /// tally; every node then credits the same set.
+    /// Post-fork the claim is required and must equal the signer bitmap and aggregate signature of
+    /// the parent authored by the header's author, or be empty when no such parent exists. A
+    /// claim that differs refuses the vote but scores nothing: any committee member can mint
+    /// another valid signer variant of a certificate (a vote is a signature over the header digest
+    /// alone, and BLS aggregates add) and seed it on a peer that has not stored the author's copy
+    /// yet, so a difference does not identify the author as the culprit. The refusal costs the
+    /// author at most that one round, since its next header carries an empty claim. The mismatch
+    /// is logged at `warn` so variants can be seen; the carried signature allows switching this
+    /// check to cryptographic verification later with no layout change.
     fn check_own_parent_signers(
         &self,
         header: &Header,
         parents: &[Certificate],
     ) -> PrimaryNetworkResult<()> {
         // presence was settled up front by `check_own_parent_signers_presence`
-        let Some(claimed) = header.own_parent_signers() else { return Ok(()) };
+        let Some(claim) = header.own_parent_signers() else { return Ok(()) };
         // `parents` is what this node holds. If it already had the author's previous certificate,
         // that is the copy compared; if it did not, the copy came with this vote request from the
-        // proposer itself (`try_accept_unknown_certs`). So a match proves the claim is the signer
-        // set of some aggregate-verified certificate for that digest and agrees with every voter
-        // that already held one, not "what the whole network saw". That is enough: the tally reads
-        // the committed claim and never a local bitmap. Two variants can also exist with no bad
-        // actor, e.g. an honest proposer re-aggregating after a crash, hence only a Mild penalty.
+        // proposer itself (`try_accept_unknown_certs`). A match therefore proves the claim is the
+        // signer set of some aggregate-verified certificate for that digest, not "what the whole
+        // network saw". That is enough: the tally reads the committed claim, never a local bitmap.
         let own_parent = parents.iter().find(|parent| parent.origin() == header.author());
-        // compare the values, not the bitmaps: roaring's equality is false across store kinds
-        let matches = match own_parent {
-            Some(parent) => claimed.iter().eq(parent.signed_authorities().iter()),
-            None => claimed.is_empty(),
-        };
-        ensure!(
-            matches,
-            HeaderError::OwnParentSignersMismatch {
-                claimed: claimed.iter().collect(),
-                expected: own_parent
-                    .map(|p| p.signed_authorities().iter().collect())
-                    .unwrap_or_default(),
-            }
-            .into()
-        );
+        // the claim this node would make for the parent it holds (a genesis parent yields the
+        // empty claim); compare signer values rather than bitmaps, since roaring's equality is
+        // false across store kinds
+        let held = own_parent.map(OwnParentSigners::from_certificate).unwrap_or_default();
+        let signature_matches = claim.signature == held.signature;
+        let matches = claim.signers.iter().eq(held.signers.iter()) && signature_matches;
+        if !matches {
+            let expected: Vec<u32> = held.signers.iter().collect();
+            let claimed: Vec<u32> = claim.signers.iter().collect();
+            warn!(
+                target: "primary::handler",
+                author = %header.author(),
+                round = header.round(),
+                parent = ?own_parent.map(|p| p.digest()),
+                ?claimed,
+                ?expected,
+                signature_matches,
+                "own-parent signer claim differs from the parent certificate held here; \
+                 refusing the vote, not scoring the author (a variant may have been seeded by a \
+                 third party)"
+            );
+            return Err(HeaderError::OwnParentSignersMismatch { claimed, expected }.into());
+        }
         Ok(())
     }
 

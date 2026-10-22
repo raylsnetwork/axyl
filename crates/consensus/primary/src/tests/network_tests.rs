@@ -16,8 +16,8 @@ use rayls_infrastructure_config::LibP2pConfig;
 use rayls_infrastructure_storage::{mem_db::MemDatabase, CertScope, CertificateStore as _};
 use rayls_infrastructure_types::{
     encode, error::HeaderError, now, AuthorityIdentifier, BlockHash, BlockHeader, BlockNumHash,
-    BlsPublicKey, Certificate, CertificateDigest, ExecHeader, Hash as _, RaylsReceiver,
-    RaylsSender, SealedHeader, TaskManager,
+    BlsPublicKey, BlsSignature, Certificate, CertificateDigest, ExecHeader, Hash as _,
+    OwnParentSigners, RaylsReceiver, RaylsSender, SealedHeader, TaskManager,
 };
 use rayls_testing_test_utils_committee::CommitteeFixture;
 use std::collections::{BTreeMap, BTreeSet};
@@ -149,7 +149,7 @@ async fn test_vote_own_parent_signers_required_and_checked_once_fork_is_active()
 {
     // a refused vote request still marks the author's round on this handler, so each case gets
     // a fresh one
-    let vote = |claim: Option<roaring::RoaringBitmap>| async move {
+    let vote = |claim: Option<OwnParentSigners>| async move {
         let TestTypes { committee, handler, parent, task_manager: _task_manager, .. } =
             create_test_types_with(true);
         let peer = *committee.last_authority().authority().protocol_key();
@@ -170,7 +170,11 @@ async fn test_vote_own_parent_signers_required_and_checked_once_fork_is_active()
     );
 
     // a claim that disagrees with the (empty) genesis parent
-    let res = vote(Some(roaring::RoaringBitmap::from_iter([0u32]))).await;
+    let res = vote(Some(OwnParentSigners {
+        signers: roaring::RoaringBitmap::from_iter([0u32]),
+        signature: Some(BlsSignature::default()),
+    }))
+    .await;
     assert_matches!(
         res,
         Err(PrimaryNetworkError::InvalidHeader(HeaderError::OwnParentSignersMismatch {
@@ -179,8 +183,17 @@ async fn test_vote_own_parent_signers_required_and_checked_once_fork_is_active()
         })) if claimed == vec![0] && expected.is_empty()
     );
 
+    // signers without a signature: refused as malformed before any comparison
+    let res =
+        vote(Some(OwnParentSigners::unsigned_for_test(roaring::RoaringBitmap::from_iter([0u32]))))
+            .await;
+    assert_matches!(
+        res,
+        Err(PrimaryNetworkError::InvalidHeader(HeaderError::OwnParentSignersMalformed))
+    );
+
     // the matching claim
-    let res = vote(Some(roaring::RoaringBitmap::new())).await;
+    let res = vote(Some(OwnParentSigners::empty())).await;
     assert!(res.is_ok(), "{res:?}");
     Ok(())
 }
@@ -193,7 +206,7 @@ async fn test_vote_own_parent_signers_required_and_checked_once_fork_is_active()
 async fn test_vote_own_parent_signers_checked_against_the_stored_parent() -> eyre::Result<()> {
     use rayls_infrastructure_storage::CertificateStore as _;
 
-    type Claim = fn(&Certificate, &Certificate) -> roaring::RoaringBitmap;
+    type Claim = fn(&Certificate, &Certificate) -> OwnParentSigners;
 
     // one vote request per fresh handler: a refused request marks the author's round. The claim
     // is picked from the two variants (A = stored, B = the other quorum) once they exist.
@@ -277,16 +290,26 @@ async fn test_vote_own_parent_signers_checked_against_the_stored_parent() -> eyr
     };
 
     // an empty claim against a real parent
-    let res = vote(|_, _| roaring::RoaringBitmap::new(), false).await;
+    let res = vote(|_, _| OwnParentSigners::empty(), false).await;
     assert!(mismatch(&res), "{res:?}");
     // the exact stored set: a vote
-    let res = vote(|a, _| a.signed_authorities().clone(), false).await;
+    let res = vote(|a, _| OwnParentSigners::from_certificate(a), false).await;
     assert!(res.is_ok(), "{res:?}");
     // another valid quorum of the same header: refused, the stored copy is what counts
-    let res = vote(|_, b| b.signed_authorities().clone(), false).await;
+    let res = vote(|_, b| OwnParentSigners::from_certificate(b), false).await;
+    assert!(mismatch(&res), "{res:?}");
+    // the stored signer set with the other quorum's signature: the signature is compared too
+    let res = vote(
+        |a, b| OwnParentSigners {
+            signers: a.signed_authorities().clone(),
+            signature: b.aggregated_signature(),
+        },
+        false,
+    )
+    .await;
     assert!(mismatch(&res), "{res:?}");
     // the same, with the proposer shipping its B copy alongside: still the stored A is compared
-    let res = vote(|_, b| b.signed_authorities().clone(), true).await;
+    let res = vote(|_, b| OwnParentSigners::from_certificate(b), true).await;
     assert!(mismatch(&res), "{res:?}");
     Ok(())
 }
@@ -297,7 +320,7 @@ async fn test_vote_own_parent_signers_checked_against_the_stored_parent() -> eyr
 #[tokio::test]
 async fn test_vote_own_parent_signers_checked_against_the_shipped_parent() -> eyre::Result<()> {
     use crate::network::message::PrimaryResponse;
-    type Claim = fn(&Certificate) -> roaring::RoaringBitmap;
+    type Claim = fn(&Certificate) -> OwnParentSigners;
 
     let vote = |claim_of: Claim| async move {
         let TestTypes { committee, handler, parent, task_manager: _task_manager, .. } =
@@ -338,9 +361,9 @@ async fn test_vote_own_parent_signers_checked_against_the_shipped_parent() -> ey
         handler.vote(peer, header, parents).await
     };
 
-    let res = vote(|own| own.signed_authorities().clone()).await;
+    let res = vote(OwnParentSigners::from_certificate).await;
     assert!(matches!(res, Ok(PrimaryResponse::Vote(_))), "{res:?}");
-    let res = vote(|_| roaring::RoaringBitmap::new()).await;
+    let res = vote(|_| OwnParentSigners::empty()).await;
     assert!(
         matches!(
             res,
@@ -360,7 +383,7 @@ async fn test_vote_fails_own_parent_signers_before_fork() -> eyre::Result<()> {
         .header_builder_last_authority()
         .latest_execution_block(BlockNumHash::new(parent.number(), parent.hash()))
         .created_at(1) // parent is 0
-        .own_parent_signers(Some(roaring::RoaringBitmap::new()))
+        .own_parent_signers(Some(OwnParentSigners::empty()))
         .build();
     let peer = *committee.last_authority().authority().protocol_key();
 
