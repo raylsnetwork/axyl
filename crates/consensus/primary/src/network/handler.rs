@@ -784,9 +784,8 @@ where
         // empty claim); compare signer values rather than bitmaps, since roaring's equality is
         // false across store kinds
         let held = own_parent.map(OwnParentSigners::from_certificate).unwrap_or_default();
-        let signature_matches = claim.signature == held.signature;
-        let matches = claim.signers.iter().eq(held.signers.iter()) && signature_matches;
-        if !matches {
+        if *claim != held {
+            let signature_matches = claim.signature == held.signature;
             let expected: Vec<u32> = held.signers.iter().collect();
             let claimed: Vec<u32> = claim.signers.iter().collect();
             warn!(
@@ -801,7 +800,12 @@ where
                  refusing the vote, not scoring the author (a variant may have been seeded by a \
                  third party)"
             );
-            return Err(HeaderError::OwnParentSignersMismatch { claimed, expected }.into());
+            return Err(HeaderError::OwnParentSignersMismatch {
+                claimed,
+                expected,
+                signature_matches,
+            }
+            .into());
         }
         Ok(())
     }
