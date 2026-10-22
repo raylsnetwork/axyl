@@ -73,7 +73,8 @@ pub fn verify_schedule_shape(profile: &NetworkProfile) -> eyre::Result<()> {
             target: "rayls::reth",
             chain_id = profile.chain_id,
             "UsdrSupplyCorrection is set to {fork_activation:?} (expected Never); this \
-             is allowed for backward compatibility but unusual — verify the schedule \
+             is allowed for backward compatibility but on a chain that has never run the \
+             pre-#404 history, this corrupts supply accounting — verify the schedule \
              matches what the chain has executed"
         );
     }
