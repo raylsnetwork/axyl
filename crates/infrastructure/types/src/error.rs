@@ -300,10 +300,12 @@ pub enum HeaderError {
     /// The claim carries a signature without signers, or signers without a signature.
     #[error("Own-parent signer claim must carry a signature exactly when it names signers")]
     OwnParentSignersMalformed,
-    /// The claim (its signers or its signature) differs from the parent certificate this node
-    /// holds.
-    #[error("Own-parent signer claim differs from the stored parent certificate: claimed signers {claimed:?}, held signers {expected:?}, signature matches: {signature_matches}")]
-    OwnParentSignersMismatch { claimed: Vec<u32>, expected: Vec<u32>, signature_matches: bool },
+    /// The claim differs from the parent certificate this node holds and does not verify on its
+    /// own: the claimed signers do not reach quorum, or the carried signature is not theirs over
+    /// the parent's digest, or a claim was made without the author's own certificate among the
+    /// parents.
+    #[error("Own-parent signer claim does not verify: claimed signers {claimed:?}, held signers {expected:?}")]
+    OwnParentSignersInvalid { claimed: Vec<u32>, expected: Vec<u32> },
 }
 
 /// Result alias for [`CertificateError`].

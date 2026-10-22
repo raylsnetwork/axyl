@@ -169,7 +169,8 @@ async fn test_vote_own_parent_signers_required_and_checked_once_fork_is_active()
         Err(PrimaryNetworkError::InvalidHeader(HeaderError::MissingOwnParentSigners))
     );
 
-    // a claim that disagrees with the (empty) genesis parent
+    // a claim that disagrees with the (empty) genesis parent and cannot verify: one signer is
+    // below quorum, and the signature is not theirs anyway
     let res = vote(Some(OwnParentSigners {
         signers: roaring::RoaringBitmap::from_iter([0u32]),
         signature: Some(BlsSignature::default()),
@@ -177,10 +178,9 @@ async fn test_vote_own_parent_signers_required_and_checked_once_fork_is_active()
     .await;
     assert_matches!(
         res,
-        Err(PrimaryNetworkError::InvalidHeader(HeaderError::OwnParentSignersMismatch {
+        Err(PrimaryNetworkError::InvalidHeader(HeaderError::OwnParentSignersInvalid {
             claimed,
             expected,
-            signature_matches: false,
         })) if claimed == vec![0] && expected.is_empty()
     );
 
@@ -207,7 +207,9 @@ async fn test_vote_own_parent_signers_required_and_checked_once_fork_is_active()
 async fn test_vote_own_parent_signers_checked_against_the_stored_parent() -> eyre::Result<()> {
     use rayls_infrastructure_storage::CertificateStore as _;
 
-    type Claim = fn(&Certificate, &Certificate) -> OwnParentSigners;
+    // the claim is picked from the variants once they exist: A = stored, B = the other quorum,
+    // SMALL = a two-vote aggregate below quorum
+    type Claim = fn(&Certificate, &Certificate, &Certificate) -> OwnParentSigners;
 
     // one vote request per fresh handler: a refused request marks the author's round. The claim
     // is picked from the two variants (A = stored, B = the other quorum) once they exist.
@@ -246,6 +248,12 @@ async fn test_vote_own_parent_signers_checked_against_the_stored_parent() -> eyr
         .expect("quorum B");
         assert_eq!(variant_a.digest(), variant_b.digest());
         assert_ne!(variant_a.signed_authorities(), variant_b.signed_authorities());
+        let variant_small = Certificate::new_unsigned_for_test(
+            &committee.committee(),
+            own_header.clone(),
+            votes[..2].to_vec(),
+        )
+        .expect("two-vote aggregate");
 
         // the voter already holds variant A, plus two other round-1 parents for quorum
         let others: Vec<Certificate> = committee
@@ -272,46 +280,74 @@ async fn test_vote_own_parent_signers_checked_against_the_stored_parent() -> eyr
             .parents(stored.iter().map(|c| c.digest()).collect())
             .latest_execution_block(exec)
             .created_at(2)
-            .own_parent_signers(Some(claim_of(&variant_a, &variant_b)))
+            .own_parent_signers(Some(claim_of(&variant_a, &variant_b, &variant_small)))
             .build();
         let shipped = if ship_variant_b {
             let mut shipped = others;
-            shipped.push(variant_b);
+            shipped.push(variant_b.clone());
             shipped
         } else {
             Vec::new()
         };
-        handler.vote(peer, header, shipped).await
+        let res = handler.vote(peer, header, shipped).await;
+        // what the voter holds for the author's round-1 certificate after the request
+        let stored_after = committee
+            .first_authority()
+            .consensus_config()
+            .node_storage()
+            .read(variant_a.digest())
+            .expect("store read")
+            .expect("parent still stored")
+            .signed_authorities()
+            .clone();
+        (
+            res,
+            stored_after,
+            variant_a.signed_authorities().clone(),
+            variant_b.signed_authorities().clone(),
+        )
     };
-    let mismatch = |res: &Result<_, PrimaryNetworkError>| {
+    let invalid = |res: &Result<_, PrimaryNetworkError>| {
         matches!(
             res,
-            Err(PrimaryNetworkError::InvalidHeader(HeaderError::OwnParentSignersMismatch { .. }))
+            Err(PrimaryNetworkError::InvalidHeader(HeaderError::OwnParentSignersInvalid { .. }))
         )
     };
 
-    // an empty claim against a real parent
-    let res = vote(|_, _| OwnParentSigners::empty(), false).await;
-    assert!(mismatch(&res), "{res:?}");
-    // the exact stored set: a vote
-    let res = vote(|a, _| OwnParentSigners::from_certificate(a), false).await;
+    // an empty claim while the author's certificate is among the parents: nothing to verify
+    let (res, stored, a, _) = vote(|_, _, _| OwnParentSigners::empty(), false).await;
+    assert!(invalid(&res), "{res:?}");
+    assert_eq!(stored, a, "an invalid claim never touches the stored copy");
+    // the exact stored set: a vote, store untouched
+    let (res, stored, a, _) = vote(|a, _, _| OwnParentSigners::from_certificate(a), false).await;
     assert!(res.is_ok(), "{res:?}");
-    // another valid quorum of the same header: refused, the stored copy is what counts
-    let res = vote(|_, b| OwnParentSigners::from_certificate(b), false).await;
-    assert!(mismatch(&res), "{res:?}");
-    // the stored signer set with the other quorum's signature: the signature is compared too
-    let res = vote(
-        |a, b| OwnParentSigners {
+    assert_eq!(stored, a);
+    // another valid quorum of the same header: verified and accepted whatever copy is stored,
+    // and the stored copy converges on the author's claimed variant
+    let (res, stored, _, b) = vote(|_, b, _| OwnParentSigners::from_certificate(b), false).await;
+    assert!(res.is_ok(), "{res:?}");
+    assert_eq!(stored, b, "the stored copy adopts the verified claim");
+    // the same, with the proposer shipping its B copy alongside: the stored A is compared first,
+    // the claim verifies, the copy converges
+    let (res, stored, _, b) = vote(|_, b, _| OwnParentSigners::from_certificate(b), true).await;
+    assert!(res.is_ok(), "{res:?}");
+    assert_eq!(stored, b);
+    // the stored signer set with the other quorum's signature: fails verification
+    let (res, stored, a, _) = vote(
+        |a, b, _| OwnParentSigners {
             signers: a.signed_authorities().clone(),
             signature: b.aggregated_signature(),
         },
         false,
     )
     .await;
-    assert!(mismatch(&res), "{res:?}");
-    // the same, with the proposer shipping its B copy alongside: still the stored A is compared
-    let res = vote(|_, b| OwnParentSigners::from_certificate(b), true).await;
-    assert!(mismatch(&res), "{res:?}");
+    assert!(invalid(&res), "{res:?}");
+    assert_eq!(stored, a);
+    // a real aggregate of two votes, below quorum: fails verification
+    let (res, stored, a, _) =
+        vote(|_, _, small| OwnParentSigners::from_certificate(small), false).await;
+    assert!(invalid(&res), "{res:?}");
+    assert_eq!(stored, a);
     Ok(())
 }
 
@@ -364,11 +400,12 @@ async fn test_vote_own_parent_signers_checked_against_the_shipped_parent() -> ey
 
     let res = vote(OwnParentSigners::from_certificate).await;
     assert!(matches!(res, Ok(PrimaryResponse::Vote(_))), "{res:?}");
+    // an empty claim while the shipped parent is the author's own: nothing verifies it
     let res = vote(|_| OwnParentSigners::empty()).await;
     assert!(
         matches!(
             res,
-            Err(PrimaryNetworkError::InvalidHeader(HeaderError::OwnParentSignersMismatch { .. }))
+            Err(PrimaryNetworkError::InvalidHeader(HeaderError::OwnParentSignersInvalid { .. }))
         ),
         "{res:?}"
     );

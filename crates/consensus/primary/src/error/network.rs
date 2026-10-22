@@ -144,8 +144,10 @@ fn penalty_from_header_error(error: &HeaderError) -> Option<Penalty> {
         // peer, which a peer on the right side of the fork cannot trigger by accident
         | HeaderError::UnexpectedOwnParentSigners
         | HeaderError::MissingOwnParentSigners
-        // a claim with signers but no signature or the reverse: only the author builds it
-        | HeaderError::OwnParentSignersMalformed => Some(Penalty::Medium),
+        // a claim with signers but no signature or the reverse, or one that fails its own
+        // cryptographic verification: only the author builds the claim, so these are its doing
+        | HeaderError::OwnParentSignersMalformed
+        | HeaderError::OwnParentSignersInvalid { .. } => Some(Penalty::Medium),
         // severe
         HeaderError::InvalidTimestamp { .. } | HeaderError::InvalidParentRound => {
             Some(Penalty::Severe)
@@ -165,13 +167,8 @@ fn penalty_from_header_error(error: &HeaderError) -> Option<Penalty> {
         | HeaderError::InvalidRound { .. }
         | HeaderError::OwnParentSignerOutOfRange { .. }
         | HeaderError::UnknownAuthority(_) => Some(Penalty::Fatal),
-        // ignore. The claim disagrees with this node's copy of the parent certificate, which is
-        // not attributable to the author: any committee member can mint another valid signer
-        // variant of a certificate and seed it on a lagging peer, and an honest proposer that
-        // re-aggregated after a crash trips it too. Safety does not need a score here, since a
-        // mismatched header cannot certify; the handler logs it instead.
-        HeaderError::OwnParentSignersMismatch { .. }
-        | HeaderError::PendingCertificateOneshot
+        // ignore
+        HeaderError::PendingCertificateOneshot
         | HeaderError::RAYLSSend(_)
         | HeaderError::InvalidEpoch { .. }
         | HeaderError::ClosedWatchChannel => None,
