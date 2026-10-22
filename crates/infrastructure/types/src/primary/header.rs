@@ -2,7 +2,9 @@
 
 use crate::{
     bcs_layout::{skip_bytes, BcsCursor, BcsLayout, BcsLayoutError},
-    crypto::{self, BlsSignature},
+    crypto::{
+        self, to_intent_message, BlsAggregateSignature, BlsSignature, ValidatorAggregateSignature,
+    },
     encode,
     error::{HeaderError, HeaderResult},
     now,
@@ -136,6 +138,30 @@ impl OwnParentSigners {
     /// True when the signature is present exactly for a non-empty signer set.
     pub fn is_well_formed(&self) -> bool {
         self.signature.is_some() == !self.signers.is_empty()
+    }
+
+    /// Verifies the claim on its own: the claimed signers reach quorum in `committee` and the
+    /// carried aggregate signature is theirs over `parent`, the digest of the certificate being
+    /// claimed. Independent of which variant of that certificate the caller holds. An empty
+    /// claim verifies trivially; a malformed one never does.
+    pub fn verify(&self, parent: CertificateDigest, committee: &Committee) -> bool {
+        if !self.is_well_formed() {
+            return false;
+        }
+        let Some(signature) = self.signature else { return true };
+        if self.signers.len() < committee.quorum_threshold() {
+            return false;
+        }
+        let keys = committee.bls_keys();
+        let mut pks = Vec::with_capacity(self.signers.len() as usize);
+        for index in self.signers.iter() {
+            match keys.get(index as usize) {
+                Some(key) => pks.push(*key),
+                None => return false,
+            }
+        }
+        BlsAggregateSignature::from_signature(&signature)
+            .verify_secure(&to_intent_message(parent), &pks)
     }
 }
 

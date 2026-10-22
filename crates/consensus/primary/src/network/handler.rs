@@ -755,18 +755,21 @@ where
         }
     }
 
-    /// Checks the header's claim about the author's own parent certificate against this node's
-    /// copy of that certificate (see `Header::own_parent_signers`).
+    /// Checks the header's claim about the author's own parent certificate (see
+    /// `Header::own_parent_signers`).
     ///
-    /// Post-fork the claim is required and must equal the signer bitmap and aggregate signature of
-    /// the parent authored by the header's author, or be empty when no such parent exists. A
-    /// claim that differs refuses the vote but scores nothing: any committee member can mint
+    /// Fast path: the claim equals what this node would claim for the parent it holds (empty
+    /// when the author's previous certificate is not among the parents), and the vote proceeds.
+    ///
+    /// Otherwise the claim is verified on its own: quorum stake among the claimed signers and
+    /// their aggregate signature over the parent's digest. A claim that verifies is accepted
+    /// whatever copy this node holds, and the stored copy is replaced with the claimed variant.
+    /// This keeps a third party from costing the author its round: any committee member can mint
     /// another valid signer variant of a certificate (a vote is a signature over the header digest
-    /// alone, and BLS aggregates add) and seed it on a peer that has not stored the author's copy
-    /// yet, so a difference does not identify the author as the culprit. The refusal costs the
-    /// author at most that one round, since its next header carries an empty claim. The mismatch
-    /// is logged at `warn` so variants can be seen; the carried signature allows switching this
-    /// check to cryptographic verification later with no layout change.
+    /// alone, and BLS aggregates add) and seed it on a peer before the author's copy arrives.
+    /// The difference is logged at `warn` with both sets, since the index that differs is the
+    /// member that altered the aggregate. A claim that does not verify is the author's own doing
+    /// and is refused.
     fn check_own_parent_signers(
         &self,
         header: &Header,
@@ -774,38 +777,44 @@ where
     ) -> PrimaryNetworkResult<()> {
         // presence was settled up front by `check_own_parent_signers_presence`
         let Some(claim) = header.own_parent_signers() else { return Ok(()) };
-        // `parents` is what this node holds. If it already had the author's previous certificate,
-        // that is the copy compared; if it did not, the copy came with this vote request from the
-        // proposer itself (`try_accept_unknown_certs`). A match therefore proves the claim is the
-        // signer set of some aggregate-verified certificate for that digest, not "what the whole
-        // network saw". That is enough: the tally reads the committed claim, never a local bitmap.
+        // `parents` is what this node holds: a copy it already had, or the one that came with
+        // this vote request from the proposer itself (`try_accept_unknown_certs`)
         let own_parent = parents.iter().find(|parent| parent.origin() == header.author());
-        // the claim this node would make for the parent it holds (a genesis parent yields the
-        // empty claim); compare signer values rather than bitmaps, since roaring's equality is
-        // false across store kinds
         let held = own_parent.map(OwnParentSigners::from_certificate).unwrap_or_default();
-        if *claim != held {
-            let signature_matches = claim.signature == held.signature;
-            let expected: Vec<u32> = held.signers.iter().collect();
-            let claimed: Vec<u32> = claim.signers.iter().collect();
-            warn!(
-                target: "primary::handler",
-                author = %header.author(),
-                round = header.round(),
-                parent = ?own_parent.map(|p| p.digest()),
-                ?claimed,
-                ?expected,
-                signature_matches,
-                "own-parent signer claim differs from the parent certificate held here; \
-                 refusing the vote, not scoring the author (a variant may have been seeded by a \
-                 third party)"
-            );
-            return Err(HeaderError::OwnParentSignersMismatch {
-                claimed,
-                expected,
-                signature_matches,
-            }
-            .into());
+        if *claim == held {
+            return Ok(());
+        }
+
+        let claimed: Vec<u32> = claim.signers.iter().collect();
+        let expected: Vec<u32> = held.signers.iter().collect();
+        let committee = self.consensus_config.committee();
+        // an empty claim can only be right when no own parent is held (the fast path); with one
+        // held it is the author under-reporting its own certificate, and verifies nothing
+        let verified = own_parent.is_some_and(|parent| {
+            !claim.signers.is_empty() && claim.verify(parent.digest(), committee)
+        });
+        warn!(
+            target: "primary::handler",
+            author = %header.author(),
+            round = header.round(),
+            parent = ?own_parent.map(|p| p.digest()),
+            ?claimed,
+            ?expected,
+            verified,
+            "own-parent signer claim differs from the parent certificate held here (the \
+             differing index altered the aggregate); accepting the author's verified claim and \
+             adopting it, or refusing an unverifiable one"
+        );
+        if !verified {
+            return Err(HeaderError::OwnParentSignersInvalid { claimed, expected }.into());
+        }
+
+        // converge the stored copy on the author's own variant; same digest, so nothing else
+        // about the certificate changes
+        if let Some(parent) = own_parent {
+            let mut adopted = parent.clone();
+            adopted.adopt_verified_signers(claim);
+            self.consensus_config.node_storage().write(adopted).map_err(HeaderError::Storage)?;
         }
         Ok(())
     }
