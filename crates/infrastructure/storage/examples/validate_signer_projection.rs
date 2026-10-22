@@ -294,6 +294,31 @@ fn main() -> eyre::Result<()> {
                 *st.referenced_rounds.entry(id.clone()).or_default() += 1;
             }
 
+            // Epoch-wide certificate index: digest -> (author, round, resolved signers).
+            //
+            // MUST be populated before the claim loop below. A certificate's own previous-round
+            // predecessor is frequently in the *same* sub-dag, not only in an earlier one, so
+            // indexing after the loop silently drops those claims and understates the result.
+            // That was a real defect here, caught in review on axyl#279.
+            for c in header
+                .sub_dag
+                .certificates
+                .iter()
+                .chain(std::iter::once(&header.sub_dag.leader))
+            {
+                let digest = CertificateDigest::new(c.header().digest().into());
+                cert_meta.entry(digest).or_insert_with(|| {
+                    let signers: Vec<AuthorityIdentifier> = c
+                        .signed_by(&bls_keys)
+                        .1
+                        .iter()
+                        .filter_map(|k| id_by_key.get(&k.to_string()).cloned())
+                        .collect();
+                    (c.origin().clone(), c.round(), signers)
+                });
+                by_author_round.entry((c.origin().clone(), c.round())).or_insert(digest);
+            }
+
             // axyl#310 simulation: a header claims the signer set of its author's own
             // previous-round certificate, when that certificate is among its parents. Credit is
             // therefore the union of those claims across the sub-dag, not the union of every
@@ -334,28 +359,6 @@ fn main() -> eyre::Result<()> {
             }
             for id in &claimed {
                 *st.claimed_rounds.entry(id.clone()).or_default() += 1;
-            }
-
-            // Epoch-wide certificate index: digest -> (author, round, resolved signers). Needed
-            // because a certificate's own previous-round parent is often committed in an earlier
-            // sub-dag, so a per-row index would miss most claims.
-            for c in header
-                .sub_dag
-                .certificates
-                .iter()
-                .chain(std::iter::once(&header.sub_dag.leader))
-            {
-                let digest = CertificateDigest::new(c.header().digest().into());
-                cert_meta.entry(digest).or_insert_with(|| {
-                    let signers: Vec<AuthorityIdentifier> = c
-                        .signed_by(&bls_keys)
-                        .1
-                        .iter()
-                        .filter_map(|k| id_by_key.get(&k.to_string()).cloned())
-                        .collect();
-                    (c.origin().clone(), c.round(), signers)
-                });
-                by_author_round.entry((c.origin().clone(), c.round())).or_insert(digest);
             }
 
             let mut oracle_signers: BTreeSet<AuthorityIdentifier> = BTreeSet::new();
