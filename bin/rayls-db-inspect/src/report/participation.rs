@@ -363,7 +363,11 @@ pub fn participation(nodes: &[NodeDb], epoch: Epoch) -> eyre::Result<Participati
         view.after_boundary = walk.after_boundary;
         view.committee_size = committee.as_ref().map(|(ids, _)| ids.len());
         view.committee_from = committee.as_ref().map(|(_, from)| *from);
-        view.totals = Totals { authors: walk.tallies.len() as u64, ..walk.totals };
+        // authors only: post-fork, claimed signers also get tally entries, and a validator that
+        // only voted is not an author
+        let authors =
+            walk.tallies.values().filter(|t| t.certs > 0 || t.anchor_rounds > 0).count() as u64;
+        view.totals = Totals { authors, ..walk.totals };
         view.authorities = rows;
         view.unknown_signers = walk.unknown_signers;
         view.attested = walk.attested_headers_seen;

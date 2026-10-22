@@ -67,9 +67,11 @@ hardfork!(
         /// Carry the signer bitmap of a proposer's own previous certificate inside its next
         /// header, so the set rides in a signed, committed header every node holds identically
         /// (a certificate's own signer set is not part of any commitment and can legitimately
-        /// differ between nodes). Voters check the claim against the parent certificate they
-        /// hold, and the hybrid reward tally credits participation from these claims instead of
-        /// from certificate authorship. Switches per epoch, judged at the epoch's first block.
+        /// differ between nodes). The claim carries that certificate's aggregate signature;
+        /// voters accept a claim equal to the parent copy they hold, verify a differing one on
+        /// its own and adopt it as their stored copy when valid, and refuse an unverifiable one.
+        /// The hybrid reward tally credits participation from these claims instead of from
+        /// certificate authorship. Switches per epoch, judged at the epoch's first block.
         HeaderParentSigners,
     }
 );
