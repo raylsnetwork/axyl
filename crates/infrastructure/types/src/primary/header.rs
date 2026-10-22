@@ -569,6 +569,16 @@ impl Serialize for SignerBytes<'_> {
     }
 }
 
+/// `payload` decoded off the wire straight into the map, as the derived `serde_seq` decoder did,
+/// with no intermediate vector.
+struct PayloadSeqOwned(IndexMap<BlockHash, WorkerId>);
+
+impl<'de> Deserialize<'de> for PayloadSeqOwned {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        indexmap::map::serde_seq::deserialize(deserializer).map(Self)
+    }
+}
+
 /// The claimed bitmap as decoded off the wire, through the bounded decoder: the bytes are
 /// peer-supplied and arrive on the vote path, so they are bounded before the bitmap is expanded.
 struct SignerBytesOwned(RoaringBitmap);
@@ -737,8 +747,7 @@ impl<'de> Deserialize<'de> for Header {
                 let round = field!(1, Round);
                 let (epoch, has_claim) = Header::split_wire_epoch(field!(2, Epoch));
                 let created_at = field!(3, TimestampSec);
-                let payload: IndexMap<BlockHash, WorkerId> =
-                    field!(4, Vec<(BlockHash, WorkerId)>).into_iter().collect();
+                let payload = field!(4, PayloadSeqOwned).0;
                 let parents = field!(5, BTreeSet<CertificateDigest>);
                 let latest_execution_block = field!(6, BlockNumHash);
                 let own_parent_signers = if has_claim {
