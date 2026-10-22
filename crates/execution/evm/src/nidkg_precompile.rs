@@ -151,9 +151,9 @@ fn verify_dealing(call: &verifyDealingCall) -> bool {
     if !signature.verify_raw(&message, &dealer_key) {
         return false;
     }
-    // Anyone can call this precompile, and its gas does not depend on the threshold, so the shape is
-    // bounded before anything is sized by it: the only threshold a key can have is its committee's
-    // quorum, and no committee above the cap gets a key.
+    // Anyone can call this precompile, and its gas does not depend on the threshold, so the shape
+    // is bounded before anything is sized by it: the only threshold a key can have is its
+    // committee's quorum, and no committee above the cap gets a key.
     let members = call.recipientBlsKeys.len();
     if members == 0
         || members > crate::reth_env::dkg_manager::MAX_KEYED_COMMITTEE
@@ -346,6 +346,39 @@ mod tests {
         let mut forged = verifyDealingCall::abi_decode(&call(&f, 5, f.dealer)).unwrap();
         forged.dealerKey = verifyDealingCall::abi_decode(&honest).unwrap().dealerKey;
         assert!(!decode_bool(&run(&forged.abi_encode(), u64::MAX).unwrap()));
+    }
+
+    /// The threshold and committee size are the caller's, and the gas does not depend on the
+    /// threshold, so a shape no key can have is refused before anything is sized by it: a
+    /// threshold other than the committee's quorum, or a committee above the cap. Sizing by a
+    /// `u32::MAX` threshold would allocate that many G2 points and abort the node.
+    #[test]
+    fn refuses_a_threshold_off_quorum_or_a_committee_above_the_cap_before_sizing_anything() {
+        let mut rng = StdRng::seed_from_u64(6);
+        let f = fixture(&mut rng);
+        // the dealer signature does not cover the shape, so each call below still passes it
+        let honest = verifyDealingCall::abi_decode(&call(&f, 5, f.dealer)).unwrap();
+        assert!(verify_dealing(&honest), "precondition: the honest call verifies");
+        let quorum = rayls_infrastructure_types::quorum_threshold(4) as u32;
+        for threshold in [u32::MAX, quorum + 1, quorum - 1] {
+            let off_quorum = verifyDealingCall { threshold, ..honest.clone() };
+            let output = run(&off_quorum.abi_encode(), u64::MAX).unwrap();
+            assert!(!decode_bool(&output), "threshold {threshold} is refused");
+            assert_eq!(output.gas_used, dealing_gas(4, f.dealing.len()));
+        }
+
+        // distinct members without an encryption key fill the committee past the cap
+        let members = crate::reth_env::dkg_manager::MAX_KEYED_COMMITTEE + 1;
+        let mut oversized = honest.clone();
+        while oversized.recipientBlsKeys.len() < members {
+            let keypair = BlsKeypair::generate(&mut rng);
+            oversized.recipientBlsKeys.push(Bytes::from(keypair.public().as_ref().to_vec()));
+            oversized.recipients.push(Bytes::new());
+        }
+        oversized.threshold = rayls_infrastructure_types::quorum_threshold(members as u64) as u32;
+        let output = run(&oversized.abi_encode(), u64::MAX).unwrap();
+        assert!(!decode_bool(&output), "a committee above the cap is refused");
+        assert_eq!(output.gas_used, dealing_gas(members, f.dealing.len()));
     }
 
     #[test]

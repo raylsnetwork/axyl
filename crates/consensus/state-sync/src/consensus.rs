@@ -774,6 +774,15 @@ mod tests {
     /// The epoch of the pending-key walk tests: it dealt the next epoch's threshold key.
     const DEALING_EPOCH: Epoch = 3;
 
+    /// The epoch of the pending-key walk tests' tips: two epochs ahead of the node.
+    ///
+    /// The certified record of `DEALING_EPOCH` signs the next epoch's key, so a node holding it
+    /// verifies a tip led in `DEALING_EPOCH + 1` directly; without it the walk has no boundary
+    /// and waits for the record. A tip's key is pending while the node holds its epoch's
+    /// certified boundary only when the tip leads past the next epoch, whose record the node
+    /// does not hold yet (here `DEALING_EPOCH + 1` deals too, as the dealing gate assumes).
+    const PENDING_TIP_EPOCH: Epoch = DEALING_EPOCH + 2;
+
     /// A node in `DEALING_EPOCH` whose next-epoch key is not computed yet: the epoch dealt, and no
     /// DKG outcome is stored for the next one.
     fn dealing_epoch_node() -> (CommitteeFixture<MemDatabase>, ConsensusConfig<MemDatabase>) {
@@ -790,12 +799,17 @@ mod tests {
             .epoch(DEALING_EPOCH)
             .build();
         let base = fixture.authorities().next().unwrap().consensus_config();
+        // The same committee for the next epochs, so a tip's committee is known.
+        let keys = base.committee().bls_keys();
+        let lookahead = CommitteeLookahead::from_entries(
+            (DEALING_EPOCH + 1..=PENDING_TIP_EPOCH).map(|epoch| (epoch, keys.clone())),
+        );
         let config = ConsensusConfig::new_for_epoch(
             base.config().clone(),
             base.node_storage().clone(),
             base.key_config().clone(),
             base.committee().clone(),
-            base.lookahead().clone(),
+            lookahead,
             base.network_config().clone(),
             u64::MAX,
             false,
@@ -833,7 +847,8 @@ mod tests {
     }
 
     /// The record of `DEALING_EPOCH` with `boundary` as its last header. `certified` adds a
-    /// certificate; the walk trusts the collector, which saves one only after verifying it.
+    /// certificate binding the next epoch's group key, as the record of an epoch that dealt it
+    /// does; the walk trusts the collector, which saves one only after verifying it.
     fn save_dealing_epoch_record(
         config: &ConsensusConfig<MemDatabase>,
         boundary: B256,
@@ -860,7 +875,9 @@ mod tests {
             signature: vote.signature,
             signed_authorities,
         };
-        db.save_epoch_record_with_cert(&record, &cert, &RecordBinding::Legacy).unwrap();
+        // Any key stands in for the next epoch's group key: the walk never verifies under it.
+        let next_key = RecordBinding::NextKey(Some(record.committee[0]));
+        db.save_epoch_record_with_cert(&record, &cert, &next_key).unwrap();
     }
 
     /// A network handle that answers by-hash header requests from `headers`, like a peer; any
@@ -914,8 +931,8 @@ mod tests {
         (anchor, middle, boundary)
     }
 
-    /// A node behind a threshold boundary must not stall. The tip leads in the next epoch, whose
-    /// key comes from this epoch's headers, so the walk descends from this epoch's certified
+    /// A node behind a threshold boundary must not stall. The tip leads in a later epoch whose key
+    /// is pending (see [`PENDING_TIP_EPOCH`]), so the walk descends from this epoch's certified
     /// boundary: it verifies and caches the rest of this epoch, and republishes the boundary as
     /// the streamer's target.
     #[tokio::test(start_paused = true)]
@@ -926,9 +943,9 @@ mod tests {
         // Canonical up to 10; the rest of the epoch, 11 and the boundary 12, is only on peers.
         let (_, middle, boundary) = dealing_epoch_chain(&fixture, &config);
         save_dealing_epoch_record(&config, boundary.digest(), true);
-        let tip = header_led_in(DEALING_EPOCH + 1, 20);
+        let tip = header_led_in(PENDING_TIP_EPOCH, 20);
         assert_eq!(
-            config.epoch_keys_status(DEALING_EPOCH + 1),
+            config.epoch_keys_status(PENDING_TIP_EPOCH),
             EpochKeysStatus::Pending,
             "precondition: the tip's epoch key is pending"
         );
@@ -957,7 +974,7 @@ mod tests {
         // Nothing above the covered boundary verifies before the transition: later tips are not
         // even fetched.
         let fetched = requests.load(Ordering::SeqCst);
-        let later = header_led_in(DEALING_EPOCH + 1, 21);
+        let later = header_led_in(PENDING_TIP_EPOCH, 21);
         assert!(session.sync_to(later.digest()).await.is_continue());
         assert_eq!(requests.load(Ordering::SeqCst), fetched, "a later tip is not walked");
         assert_eq!(session.covered, Some(boundary.digest()));
@@ -973,7 +990,12 @@ mod tests {
         store_consensus_header_in_cache(config.node_storage(), &middle);
         store_consensus_header_in_cache(config.node_storage(), &boundary);
         save_dealing_epoch_record(&config, boundary.digest(), true);
-        let tip = header_led_in(DEALING_EPOCH + 1, 20);
+        let tip = header_led_in(PENDING_TIP_EPOCH, 20);
+        assert_eq!(
+            config.epoch_keys_status(PENDING_TIP_EPOCH),
+            EpochKeysStatus::Pending,
+            "precondition: the tip's epoch key is pending"
+        );
 
         // A fresh bus and session, as after a restart.
         let consensus_bus = ConsensusBus::new();
@@ -1094,7 +1116,8 @@ mod tests {
         assert_eq!(consensus_bus.last_consensus_header().borrow().number, 0);
 
         // The probe found 102, the top of the cached run (the session derives it as its anchor).
-        let mut session = WalkSession::new(config.clone(), consensus_bus.clone(), no_peer_network());
+        let mut session =
+            WalkSession::new(config.clone(), consensus_bus.clone(), no_peer_network());
         assert!(session.sync_to(child_102.digest()).await.is_continue());
 
         assert_eq!(
