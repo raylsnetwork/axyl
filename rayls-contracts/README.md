@@ -8,9 +8,9 @@ This Rayls Network smart contracts repository contains various system and standa
 
 This repository does not use Foundry git submodules due to dependencies that do not properly support them. Instead of the `lib` directory, all dependencies are kept in `node_modules`
 
-Requires Node version >= 18, which can be installed like so:
+Requires Node version >= 22, which can be installed like so:
 
-`nvm install 18`
+`nvm install 22`
 
 And then install using `npm`:
 
