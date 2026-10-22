@@ -200,9 +200,11 @@ async fn test_vote_own_parent_signers_required_and_checked_once_fork_is_active()
 }
 
 /// The property the fork exists for, against real parents: the voter holds the author's
-/// round-1 certificate with signer set A, and a round-2 header must claim exactly A. A different
-/// valid quorum B is refused, even when the proposer ships its B copy with the request, because
-/// a parent the voter already holds is never replaced by the shipped one.
+/// round-1 certificate with signer set A. A round-2 header claiming A is voted at once. One
+/// claiming another valid quorum B is verified on its own and voted too, with and without the
+/// proposer shipping its B copy, and the voter's stored copy converges on B. Claims that cannot
+/// verify, an empty one, A's signers under B's signature, or a real aggregate below quorum, are
+/// refused and leave the stored copy alone.
 #[tokio::test]
 async fn test_vote_own_parent_signers_checked_against_the_stored_parent() -> eyre::Result<()> {
     use rayls_infrastructure_storage::CertificateStore as _;

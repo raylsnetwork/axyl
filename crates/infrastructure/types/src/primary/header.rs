@@ -130,7 +130,8 @@ impl OwnParentSigners {
 
     /// A claim with `signers` and no signature. Only [`Header::validate`] enforces the
     /// signature invariant, so this serves tests of the paths that never validate: projections,
-    /// the tally, decoding.
+    /// the tally, decoding. Test-only, so production code cannot build an ill-formed claim.
+    #[cfg(any(test, feature = "test-utils"))]
     pub fn unsigned_for_test(signers: RoaringBitmap) -> Self {
         Self { signers, signature: None }
     }
@@ -194,8 +195,10 @@ pub struct Header {
     /// member can add or remove its own signature to produce another valid variant, so two honest
     /// nodes can hold the same certificate with different signer sets. Restating the set here puts
     /// it inside a signed, committed header that every node holds byte-identically, which is what
-    /// lets the reward tally credit signers deterministically. Voters refuse a header whose claim
-    /// differs from the parent certificate they hold, without scoring the author.
+    /// lets the reward tally credit signers deterministically. A voter accepts a claim equal to
+    /// the parent copy it holds at once; a differing claim it verifies on its own
+    /// ([`OwnParentSigners::verify`]) and, if valid, adopts as its persisted copy, so stored
+    /// certificates converge on the author's variant. Only an unverifiable claim is refused.
     ///
     /// `None` before the `HeaderParentSigners` fork; `Some` (possibly empty, when the author's
     /// previous certificate is not among the parents) once it is active.
