@@ -90,11 +90,11 @@ fn decode_own_parent_signers(bytes: &[u8]) -> std::io::Result<RoaringBitmap> {
 /// A proposer's claim about its own previous-round certificate: who signed it, and that
 /// certificate's aggregate signature over the previous header's digest.
 ///
-/// The signature is carried so the claim can be verified on its own, against the previous
-/// header's digest and the committee keys, independently of which variant of that certificate a
-/// voter happens to hold. Voters do not verify it yet: they compare the claim with their stored
-/// copy and refuse on a difference without scoring the author (see `check_own_parent_signers`).
-/// Switching to verification is a behavioural change with no layout change.
+/// The signature is carried so the claim can be verified on its own ([`Self::verify`]), against
+/// the previous header's digest and the committee keys, independently of which variant of that
+/// certificate a voter happens to hold. A voter accepts a claim equal to its stored copy at once
+/// and verifies a differing one, adopting it as its persisted copy when valid (see
+/// `check_own_parent_signers`); only an unverifiable claim is refused.
 #[derive(Clone, Debug, Default)]
 pub struct OwnParentSigners {
     /// Committee indices in BLS-key order, the index space of `Certificate::signed_authorities`.
