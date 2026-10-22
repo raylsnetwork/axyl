@@ -403,7 +403,7 @@ fn render_header(r: &HeaderReport, out: &mut String) {
             for c in &raw.sub_dag.certificates {
                 let s = CertificateSummary::of(c);
                 let claimed: Option<Vec<u32>> =
-                    c.header().own_parent_signers().map(|b| b.iter().collect());
+                    c.header().own_parent_signers().map(|claim| claim.signers.iter().collect());
                 let _ = writeln!(
                     out,
                     "    {} r{} e{} by {} signers={} claims={}",

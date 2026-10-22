@@ -7,7 +7,7 @@ use rayls_consensus_primary_metrics::PrimaryMetrics;
 use rayls_infrastructure_storage::ProposerStore;
 use rayls_infrastructure_types::{
     now, now_in_millis, AuthorityIdentifier, Certificate, Database, Epoch, Hash as _, Header,
-    RaylsSender, Round,
+    OwnParentSigners, RaylsSender, Round,
 };
 use std::{collections::VecDeque, sync::Arc};
 use tokio::{
@@ -79,8 +79,8 @@ impl<DB: Database> Proposer<DB> {
             parents
                 .iter()
                 .find(|parent| *parent.origin() == authority_id)
-                .map(|parent| parent.signed_authorities().clone())
-                .unwrap_or_default()
+                .map(OwnParentSigners::from_certificate)
+                .unwrap_or_else(OwnParentSigners::empty)
         });
         let header = Header::new(
             authority_id,
