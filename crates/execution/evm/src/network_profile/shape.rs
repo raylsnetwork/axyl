@@ -90,9 +90,13 @@ pub fn verify_schedule_shape(profile: &NetworkProfile) -> eyre::Result<()> {
     // Set D: HeaderParentSigners never before EpochCloseSeedV2. Before SeedV2 the
     // epoch-closing block's seed still depends on the leader certificate's local
     // aggregate signature, the per-node value HeaderParentSigners exists to stop
-    // relying on, so a profile that schedules the latter must schedule SeedV2 at
-    // the same block or earlier. Baked-in schedules are pinned by a chainspec
-    // test; this covers `--config-file` profiles.
+    // relying on. Worse, HeaderParentSigners rewrites a stored certificate's
+    // signature when a voter adopts a verified claim, so with the pre-SeedV2 seed
+    // still live a restarted node could feed a different leader signature into the
+    // close block than its peers did. A profile that schedules HeaderParentSigners
+    // must therefore schedule SeedV2 at the same block or earlier. Baked-in
+    // schedules are pinned by a chainspec test; this covers `--config-file`
+    // profiles.
     if let ForkActivation::Block(signers) = activation(RaylsHardFork::HeaderParentSigners) {
         match activation(RaylsHardFork::EpochCloseSeedV2) {
             ForkActivation::Block(seed) if seed <= signers => {}
