@@ -22,9 +22,19 @@ permissions: {}
 jobs:
   trivy-comment:
     name: Post Trivy results
+    # head_repository is null when the fork was deleted after the run. Cancelled
+    # runs (superseded by pr.yaml's cancel-in-progress) can still upload a
+    # partial comment from the always() steps, so don't let them post.
     if: >-
       github.event.workflow_run.event == 'pull_request' &&
-      github.event.workflow_run.head_repository.full_name != github.repository
+      github.event.workflow_run.head_repository != null &&
+      github.event.workflow_run.head_repository.full_name != github.repository &&
+      github.event.workflow_run.conclusion != 'cancelled'
+    # Post for the same fork branch one at a time, so two completions can't
+    # interleave their lookup and post.
+    concurrency:
+      group: fork-comment-${{ github.event.workflow_run.head_repository.full_name }}-${{ github.event.workflow_run.head_branch }}
+      cancel-in-progress: false
     runs-on: ubuntu-latest
     permissions:
       actions: read # download the artifact from the triggering run
@@ -57,13 +67,16 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
           HEAD: ${{ github.event.workflow_run.head_repository.owner.login }}:${{ github.event.workflow_run.head_branch }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
         run: |
           # workflow_run.pull_requests is always empty for fork PRs, so look the
-          # PR up by its fork head instead.
+          # PR up by its fork head instead. Only accept it while the PR is still
+          # at the scanned commit, so results from an older run can't replace
+          # newer ones in the sticky comment.
           number=$(gh api -X GET "repos/$REPO/pulls" -f state=open -f base=main -f head="$HEAD" \
-            --jq '.[0].number // empty')
+            --jq '[.[] | select(.head.sha == env.HEAD_SHA)][0].number // empty')
           if [ -z "$number" ]; then
-            echo "No open PR for $HEAD; nothing to post."
+            echo "No open PR for $HEAD at $HEAD_SHA; nothing to post."
             exit 0
           fi
           echo "number=$number" >> "$GITHUB_OUTPUT"
