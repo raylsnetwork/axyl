@@ -1100,3 +1100,99 @@ async fn test_missing_certs_limit_follows_the_served_epoch() {
         handler.retrieve_missing_certs(request(cap + 1), Some(2)).await.expect("not refused");
     assert!(matches!(resp, PrimaryResponse::RequestedCertificates(certs) if certs.is_empty()));
 }
+
+/// Fails on main.
+/// A validator names real parents it does not send, gets MissingParents, and stays silent.
+/// Another author whose header has the same parents must still get a vote from this node.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn test_request_vote_missing_parents_not_squatted_by_silent_author() {
+    const NUM_PARENTS: usize = 10;
+    let fixture = CommitteeFixture::builder(MemDatabase::default)
+        .randomize_ports(true)
+        .committee_size(NonZeroUsize::new(NUM_PARENTS).unwrap())
+        .build();
+    let target = fixture.authorities().next().unwrap();
+    let squatter = fixture.authorities().nth(1).unwrap();
+    let honest = fixture.authorities().nth(2).unwrap();
+    let squatter_peer = *squatter.authority().protocol_key();
+    let honest_peer = *honest.authority().protocol_key();
+    let certificate_store = target.consensus_config().node_storage().clone();
+    let payload_store = target.consensus_config().node_storage().clone();
+
+    let cb = ConsensusBus::new();
+    let dummy_parent = SealedHeader::seal_slow(ExecHeader::default());
+    let dummy_hash = dummy_parent.hash();
+    cb.recently_executed_blocks().send_modify(|blocks| blocks.push_latest(dummy_parent));
+    let task_manager = TaskManager::default();
+    let synchronizer =
+        StateSynchronizer::new(target.consensus_config(), cb.clone(), task_manager.get_spawner());
+    synchronizer.spawn(&task_manager);
+    let handler = RequestHandler::new(target.consensus_config(), cb.clone(), synchronizer.clone());
+
+    let committee: Committee = fixture.committee();
+    let genesis =
+        Certificate::genesis(&committee).iter().map(|x| x.digest()).collect::<BTreeSet<_>>();
+    let ids: Vec<_> = fixture.authorities().map(|a| (a.id(), a.keypair().copy())).collect();
+    let (certificates, _) =
+        make_optimal_signed_certificates(1..=3, &genesis, &committee, ids.as_slice());
+    let all: Vec<_> = certificates.into_iter().collect();
+    let round_1 = all[..NUM_PARENTS].to_vec();
+    let round_2 = all[NUM_PARENTS..(NUM_PARENTS * 2)].to_vec();
+    let (round_2_known, round_2_missing) = round_2.split_at(NUM_PARENTS / 2);
+    let parents: BTreeSet<_> = round_2.iter().map(|c| c.digest()).collect();
+
+    let header_for = |a: &rayls_testing_test_utils_committee::AuthorityFixture<MemDatabase>| {
+        a.header_builder(&committee)
+            .author(a.id())
+            .round(3)
+            .parents(parents.clone())
+            .latest_execution_block(BlockNumHash::new(0, dummy_hash))
+            .with_payload_batch(fixture_batch_with_transactions(10), 0)
+            .build()
+    };
+    let squat_header = header_for(squatter);
+    let honest_header = header_for(honest);
+
+    for cert in round_1.iter().chain(round_2_known) {
+        for (digest, worker_id) in cert.header().payload() {
+            payload_store.write_payload(digest, worker_id).unwrap();
+        }
+        certificate_store.write(cert.clone()).unwrap();
+    }
+    for h in [&squat_header, &honest_header] {
+        for (digest, worker_id) in h.payload() {
+            payload_store.write_payload(digest, worker_id).unwrap();
+        }
+    }
+    cb.committed_round_updates().send_replace(2);
+    let expected: HashSet<_> = round_2_missing.iter().map(|c| c.digest()).collect();
+
+    // 1. The squatter is asked for the missing parents, then stays silent.
+    let res = handler.vote(squatter_peer, squat_header, Vec::new()).await.unwrap();
+    assert!(
+        matches!(&res, PrimaryResponse::MissingParents(m) if m.iter().copied().collect::<HashSet<_>>() == expected)
+    );
+
+    // 2. The honest author with the same parents must be told which parents are missing.
+    // On main it is told nothing.
+    // The handler waits for the parents with no time limit, so this call times out.
+    let res = timeout(
+        Duration::from_secs(5),
+        handler.vote(honest_peer, honest_header.clone(), Vec::new()),
+    )
+    .await;
+    assert!(
+        matches!(&res, Ok(Ok(PrimaryResponse::MissingParents(m))) if m.iter().copied().collect::<HashSet<_>>() == expected),
+        "honest author was not asked for the squatted parents: {res:?}"
+    );
+
+    // 3. The honest author that sends the parents itself must get a vote.
+    // On main the parents are dropped because they were asked from the squatter.
+    // The handler then waits as in step 2, so this call times out.
+    let res = timeout(
+        Duration::from_secs(5),
+        handler.vote(honest_peer, honest_header, round_2_missing.to_vec()),
+    )
+    .await;
+    assert!(matches!(res, Ok(Ok(PrimaryResponse::Vote(_)))), "honest parents rejected: {res:?}");
+}
