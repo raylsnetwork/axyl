@@ -1,0 +1,8 @@
+{
+  "detectors_to_exclude": "naming-convention,solc-version,pragma,assembly,low-level-calls,similar-names,too-many-digits,uninitialized-local,calls-loop,reentrancy-events,costly-loop,cyclomatic-complexity,boolean-equal",
+  "exclude_optimization": true,
+  "filter_paths": "node_modules,test/,script/,src/mocks/",
+  "compile_force_framework": "foundry",
+  "foundry_compile_all": false,
+  "fail_on": "medium"
+}

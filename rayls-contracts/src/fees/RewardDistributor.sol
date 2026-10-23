@@ -192,9 +192,14 @@ contract RewardDistributor is
 
         uint256 totalRewards = $.totalPending;
         if (totalTarget > 0) {
+            // Only external calls are to RLS (no transfer hooks) and the admin-set DelegationPool;
+            // distributeRewards is onlySystemCall + nonReentrant.
+            // slither-disable-next-line reentrancy-no-eth
             totalRewards = _pullAccumulatorTopUp(totalRewards, totalTarget);
         }
 
+        // Zero check on internal reward accounting, not on a balance anyone can donate to.
+        // slither-disable-next-line incorrect-equality
         if (totalRewards == 0) {
             emit RewardsDistributed(0, 0);
             return;
@@ -302,6 +307,8 @@ contract RewardDistributor is
 
             uint256 priorityReward = (totalRewards * priorityTarget) / totalTarget;
             uint256 trackBReward = (totalRewards * trackBTarget) / totalTarget;
+            // Skips validators whose computed share rounds to zero; not a balance check.
+            // slither-disable-next-line incorrect-equality
             if (priorityReward == 0 && trackBReward == 0) continue;
             distributed += _distributeToValidator(
                 activeValidators[i].validatorAddress, priorityReward, trackBReward, s.ownStake, s.trackADelegated
@@ -329,6 +336,8 @@ contract RewardDistributor is
             uint256 weight = s.ownStake + s.trackADelegated + s.trackBDelegated;
             if (weight == 0) continue;
             uint256 validatorReward = (totalRewards * weight) / totalWeight;
+            // Skips validators whose computed share rounds to zero; not a balance check.
+            // slither-disable-next-line incorrect-equality
             if (validatorReward == 0) continue;
             distributed += _distributeToValidatorByStake(
                 activeValidators[i].validatorAddress, validatorReward, s.ownStake, s.trackADelegated, s.trackBDelegated
@@ -397,6 +406,8 @@ contract RewardDistributor is
         returns (uint256 ownStake, uint256 trackA, uint256 trackB)
     {
         RewardDistributorStorage storage $ = _getRewardDistributorStorage();
+        // Only the required stake is needed; balance (includes rewards) and rewards are skipped on purpose.
+        // slither-disable-next-line unused-return
         (, ownStake, ) = IStakeManager(address($.consensusRegistry)).getBalanceBreakdown(validator);
         if (address($.delegationPool) != address(0)) {
             trackB = $.delegationPool.getTotalOpenTierDelegatedStake(validator);
@@ -415,6 +426,8 @@ contract RewardDistributor is
         uint256 ownStake,
         uint256 trackADelegated
     ) internal returns (uint256) {
+        // Early return when both computed shares are zero; not a balance check.
+        // slither-disable-next-line incorrect-equality
         if (priorityReward == 0 && trackBReward == 0) return 0;
 
         RewardDistributorStorage storage $ = _getRewardDistributorStorage();
@@ -617,6 +630,9 @@ contract RewardDistributor is
         uint256 pullAmount = shortfall < available ? shortfall : available;
 
         if (pullAmount > 0) {
+            // `from` is the accumulator set via setAccumulator (DEFAULT_ADMIN_ROLE), not caller input;
+            // only reachable from the onlySystemCall distributeRewards.
+            // slither-disable-next-line arbitrary-send-erc20
             try IERC20($.rls).transferFrom($.accumulator, address(this), pullAmount) returns (bool ok) {
                 if (ok) {
                     $.totalPending += pullAmount;
