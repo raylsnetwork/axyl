@@ -182,42 +182,59 @@ jobs:
           severity: 'HIGH,CRITICAL'
         continue-on-error: true
 
-      - name: Read Trivy results
-        id: results
+      - name: Build Trivy comment
         if: always()
+        env:
+          TRIVY_OUTCOME: ${{ steps.trivy.outcome }}
         run: |
+          # Trivy writes its report to a file, so print it to get it into the job log too
           if [ -f trivy-results.txt ]; then
-            echo "results<<EOF" >> $GITHUB_OUTPUT
-            # cap output so the sticky comment stays under GitHub's 65536-char limit
-            tail -c 60000 trivy-results.txt >> $GITHUB_OUTPUT
-            echo "EOF" >> $GITHUB_OUTPUT
-          else
-            echo "results=No scan results available" >> $GITHUB_OUTPUT
+            cat trivy-results.txt
           fi
+          {
+            echo "## Security Scan - Code"
+            echo
+            echo "**Severity:** HIGH, CRITICAL"
+            echo
+            if [ "$TRIVY_OUTCOME" = failure ]; then
+              echo "**Vulnerabilities found:**"
+            else
+              echo "**No vulnerabilities found**"
+            fi
+            echo
+            echo "<details>"
+            echo "<summary>View scan results</summary>"
+            echo
+            echo '```'
+            if [ -f trivy-results.txt ]; then
+              # cap output so the sticky comment stays under GitHub's 65536-char limit
+              tail -c 60000 trivy-results.txt
+            else
+              echo "No scan results available"
+            fi
+            echo '```'
+            echo
+            echo "</details>"
+          } > trivy-comment.md
 
       - name: Post Trivy results to PR
         # Sticky comments need a writable token, which fork PRs don't get
-        # (read-only GITHUB_TOKEN). Skip on forks — results stay in the job log
-        # and the "Fail if vulnerabilities found" gate below still enforces.
+        # (read-only GITHUB_TOKEN). Forks upload the comment instead (next step).
         if: always() && github.event.pull_request.head.repo.full_name == github.repository
         uses: marocchino/sticky-pull-request-comment@0ea0beb66eb9baf113663a64ec522f60e49231c0 # v3.0.4
         with:
           header: trivy-code
-          message: |
-            ## Security Scan - Code
+          path: trivy-comment.md
 
-            **Severity:** HIGH, CRITICAL
-
-            ${{ steps.trivy.outcome == 'failure' && '**Vulnerabilities found:**' || '**No vulnerabilities found**' }}
-
-            <details>
-            <summary>View scan results</summary>
-
-            ```
-            ${{ steps.results.outputs.results }}
-            ```
-
-            </details>
+      - name: Upload Trivy comment for fork PRs
+        # Picked up by pr-fork-comments.yml, which runs on workflow_run in the
+        # base repo context (writable token) and posts it once this run completes.
+        if: always() && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5.0.0
+        with:
+          name: trivy-comment
+          path: trivy-comment.md
+          retention-days: 3
 
       - name: Fail if vulnerabilities found
         if: steps.trivy.outcome == 'failure'

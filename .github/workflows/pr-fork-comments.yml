@@ -1,0 +1,77 @@
+name: Post fork PR comments
+
+# Fork PRs run pr.yaml with a read-only GITHUB_TOKEN, so they can't post the
+# sticky result comments same-repo PRs get. pr.yaml uploads the comment body as
+# an artifact instead, and this workflow posts it once that run completes.
+# workflow_run runs in the BASE repo context with a writable token, and only
+# from the copy of this file on main.
+#
+# Everything coming out of the triggering run is fork-controlled (a fork PR can
+# edit pr.yaml for its own run), so: no checkout, never execute the artifact,
+# never interpolate run/artifact data into `run:` (pass it via env), and resolve
+# the PR number from the event, not the artifact -- otherwise a fork could get
+# the bot to comment on any PR.
+on:
+  workflow_run:
+    workflows: [Pull Request Checks]
+    types: [completed]
+
+# No token permissions by default; the job re-grants only what it needs.
+permissions: {}
+
+jobs:
+  trivy-comment:
+    name: Post Trivy results
+    if: >-
+      github.event.workflow_run.event == 'pull_request' &&
+      github.event.workflow_run.head_repository.full_name != github.repository
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read # download the artifact from the triggering run
+      contents: read
+      pull-requests: write
+    steps:
+      - name: Download Trivy comment
+        id: download
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+          DEST: ${{ runner.temp }}/trivy-comment
+        run: |
+          # No artifact when the run never reached the scan (non-run-ci label,
+          # cancelled run, ...) -- nothing to post then.
+          count=$(gh api "repos/$REPO/actions/runs/$RUN_ID/artifacts" \
+            --jq '[.artifacts[] | select(.name == "trivy-comment" and .expired == false)] | length')
+          if [ "$count" = 0 ]; then
+            echo "No trivy-comment artifact on run $RUN_ID; nothing to post."
+            exit 0
+          fi
+          gh run download "$RUN_ID" -R "$REPO" -n trivy-comment -D "$DEST"
+          echo "found=true" >> "$GITHUB_OUTPUT"
+
+      - name: Find PR
+        id: pr
+        if: steps.download.outputs.found == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          HEAD: ${{ github.event.workflow_run.head_repository.owner.login }}:${{ github.event.workflow_run.head_branch }}
+        run: |
+          # workflow_run.pull_requests is always empty for fork PRs, so look the
+          # PR up by its fork head instead.
+          number=$(gh api -X GET "repos/$REPO/pulls" -f state=open -f base=main -f head="$HEAD" \
+            --jq '.[0].number // empty')
+          if [ -z "$number" ]; then
+            echo "No open PR for $HEAD; nothing to post."
+            exit 0
+          fi
+          echo "number=$number" >> "$GITHUB_OUTPUT"
+
+      - name: Post Trivy results to PR
+        if: steps.pr.outputs.number != ''
+        uses: marocchino/sticky-pull-request-comment@0ea0beb66eb9baf113663a64ec522f60e49231c0 # v3.0.4
+        with:
+          header: trivy-code
+          number_force: ${{ steps.pr.outputs.number }}
+          path: ${{ runner.temp }}/trivy-comment/trivy-comment.md
