@@ -101,14 +101,16 @@ interface IConsensusRegistry {
     /// @dev Records block production performance weights for the current epoch
     /// @notice Weights are a hybrid blend of participation share, anchor (leader) commit
     /// share, and a stake tier per validator - see `ConsensusRegistry.applyIncentives`
-    /// @notice Called just before concludeEpoch; weights are consumed by RewardDistributor
+    /// @notice Called just before concludeEpoch; weights are optionally consumed by
+    /// RewardDistributor when its performanceWeightBps > 0 (opt-in, default disabled)
     /// @param rewardInfos Per-validator round counts for the closing epoch
     /// @param totalRounds Total committed rounds walked for the closing epoch (the shared
     /// anchor-share and participation-floor denominator)
     function applyIncentives(RewardInfo[] calldata rewardInfos, uint256 totalRounds) external;
 
     /// @dev Returns the performance weights recorded by the most recent applyIncentives call
-    /// @notice Used by RewardDistributor to distribute fee-based rewards proportionally
+    /// @notice Optionally used by RewardDistributor to blend performance into reward
+    /// distribution when its performanceWeightBps > 0 (opt-in, default disabled)
     function getEpochPerformanceWeights() external view returns (PerformanceWeights memory);
 
     /// @dev The network's slashing mechanism, which penalizes validators for misbehaving
