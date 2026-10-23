@@ -27,6 +27,8 @@ use tracing::{debug, trace, warn};
 pub(crate) mod error;
 pub(crate) mod handler;
 pub(crate) mod message;
+#[cfg(feature = "txn-flood-hook")]
+pub(crate) mod txn_flood;
 
 /// Request type of the worker network.
 pub(crate) type Req = WorkerRequest;
@@ -153,6 +155,13 @@ impl WorkerNetworkHandle {
     /// include them in a batch; the pre-fork path for a node that cannot seal batches.
     pub async fn publish_txn(&self, txn: Vec<Bytes>) -> NetworkResult<()> {
         let data = encode(&WorkerGossip::Txn(txn));
+        self.handle.publish(GOSSIP_TOPIC_TXN.into(), data).await?;
+        Ok(())
+    }
+
+    /// Publish already-encoded bytes verbatim on the transaction topic. Test-only flood hook.
+    #[cfg(feature = "txn-flood-hook")]
+    pub async fn publish_raw_txn_gossip(&self, data: Vec<u8>) -> NetworkResult<()> {
         self.handle.publish(GOSSIP_TOPIC_TXN.into(), data).await?;
         Ok(())
     }
@@ -376,6 +385,8 @@ where
 
     /// Run the network for the epoch.
     pub fn spawn(mut self, epoch_task_spawner: &TaskSpawner) {
+        #[cfg(feature = "txn-flood-hook")]
+        txn_flood::maybe_spawn(&self.network_handle, epoch_task_spawner);
         epoch_task_spawner.spawn_classified_task(
             "worker network events",
             async move {
@@ -658,6 +669,71 @@ mod tests {
     use rayls_consensus_network::types::NetworkCommand;
     use rayls_infrastructure_types::{BlsPublicKey, TaskManager, B256};
     use tokio::sync::mpsc::error::TryRecvError;
+
+    /// Generate the live-flood payload files used by etc/test/rogue-member-flood/run.sh.
+    ///
+    /// Writes two files into the directory named by `RL_GEN_OUT`:
+    /// - `filler.bin`: an encoded `WorkerGossip::Txn` of about 2 MiB of undecodable filler. Every
+    ///   validator accepts and forwards it on the transaction topic and the owner discards each
+    ///   entry after a failed decode. Proves accept-forward amplification and no penalty.
+    /// - `txns.bin`: an encoded `WorkerGossip::Txn` of many valid signed transactions, all from one
+    ///   sender so one validator owns the whole batch and runs signature recovery on every entry.
+    ///   Proves the per-validator CPU cost.
+    ///
+    /// Run with: `RL_GEN_OUT=<dir> cargo test -p rayls-consensus-worker --features test-utils --lib
+    /// -- --ignored --exact network::tests::generate_flood_payloads`.
+    #[test]
+    #[ignore = "payload generator for the live reproduction harness, not a unit test"]
+    fn generate_flood_payloads() {
+        use rayls_execution_evm::{test_utils::TransactionFactory, RethChainSpec};
+        use rayls_infrastructure_types::{
+            max_batch_size, test_genesis, Address, Bytes, Encodable2718 as _, U256,
+        };
+        use std::sync::Arc;
+
+        let out = std::env::var("RL_GEN_OUT").expect("set RL_GEN_OUT to an output directory");
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let chain_id = chain.chain.id();
+        // Keep the encoded message under the 2 MiB gossip transmit cap after BCS framing.
+        let budget = max_batch_size(0) - 50_000;
+
+        // Filler: one undecodable entry near the budget. Decode fails on the owner, so it is
+        // discarded, but the message is still accepted and forwarded by every honest node.
+        let filler = WorkerGossip::Txn(vec![Bytes::from(vec![0xABu8; budget])]);
+        let filler_bytes = encode(&filler);
+        std::fs::write(format!("{out}/filler.bin"), &filler_bytes).expect("write filler.bin");
+
+        // Txns: valid signed transactions from one sender, filling the batch budget.
+        let mut factory = TransactionFactory::new();
+        let mut txns: Vec<Bytes> = Vec::new();
+        let mut total = 0usize;
+        while total < budget {
+            let tx = factory
+                .create_explicit_eip1559(
+                    Some(chain_id),
+                    None,
+                    None,
+                    Some(7),
+                    Some(1),
+                    Some(Address::random()),
+                    Some(U256::from(100)),
+                    None,
+                    None,
+                )
+                .encoded_2718();
+            total += tx.len();
+            txns.push(tx.into());
+        }
+        let count = txns.len();
+        let txn_bytes = encode(&WorkerGossip::Txn(txns));
+        std::fs::write(format!("{out}/txns.bin"), &txn_bytes).expect("write txns.bin");
+
+        eprintln!(
+            "wrote {out}/filler.bin ({} bytes) and {out}/txns.bin ({} bytes, {count} txns)",
+            filler_bytes.len(),
+            txn_bytes.len()
+        );
+    }
 
     /// Asserts concurrently in-flight outbound batch requests never exceed
     /// [`MAX_CONCURRENT_BATCH_REQUESTS`]. The mock buffers every pending request before answering

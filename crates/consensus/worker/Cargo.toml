@@ -38,6 +38,9 @@ indexmap = { workspace = true }
 [features]
 default = []
 test-utils = ["dep:rand"]
+# Test-only transaction-gossip flood hook (crate `txn_flood`). Off by default; a normal
+# build never contains it. Used only by the live reproduction harness.
+txn-flood-hook = []
 # Single-node / local dev chain behavior (quorum without peer acks on sole-member committee).
 dev-single-node-setup = []
 

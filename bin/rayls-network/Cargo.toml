@@ -26,6 +26,9 @@ default = ["jemalloc"]
 # the node). Off by default; enable with `--features cold-storage`.
 cold-storage = ["rayls-network-cli/cold-storage"]
 faucet = ["rayls-execution-faucet"]
+# Test-only transaction-gossip flood hook, forwarded to the worker crate. Off by default; never in
+# a release build. Used only by etc/test/rogue-member-flood to reproduce the issue on a live net.
+txn-flood-hook = ["rayls-middleware-orchestrator/txn-flood-hook"]
 jemalloc = ["tikv-jemallocator"]
 # Local single-node development mode (`dev` subcommand + `node --dev`). NOT FOR
 # PRODUCTION — off by default so release builds exclude it; build with
