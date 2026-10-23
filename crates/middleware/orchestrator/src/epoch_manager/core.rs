@@ -277,6 +277,7 @@ where
             prev_epoch_record,
             certification_attempts: Default::default(),
             initial_epoch: true,
+            registered_validators: HashSet::new(),
             #[cfg(feature = "cold-storage")]
             cold_archival,
         })

@@ -140,7 +140,10 @@ where
             )
             .await?;
 
-        network_handle.inner_handle().new_epoch(committee_keys.clone()).await?;
+        network_handle
+            .inner_handle()
+            .new_epoch(committee_keys.clone(), self.registered_validators.clone())
+            .await?;
 
         let worker_address = consensus_config.worker_address();
 

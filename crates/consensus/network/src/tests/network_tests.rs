@@ -1282,14 +1282,18 @@ async fn test_new_epoch_unbans_committee_members() -> eyre::Result<()> {
     assert_eq!(score, min_score, "Peer2 should have ban-level score");
 
     // Now simulate a new epoch where peer2 is in the committee
-    let committee = vec![*config_2.authority().as_ref().expect("authority").protocol_key()]
-        .into_iter()
-        .collect();
+    let committee: std::collections::HashSet<rayls_infrastructure_types::BlsPublicKey> =
+        vec![*config_2.authority().as_ref().expect("authority").protocol_key()]
+            .into_iter()
+            .collect();
 
     // Send NewEpoch command to peer1
     let handle = peer1.clone();
     tokio::spawn(async move {
-        handle.new_epoch(committee).await.expect("Failed to send NewEpoch command");
+        handle
+            .new_epoch(committee.clone(), committee)
+            .await
+            .expect("Failed to send NewEpoch command");
     })
     .await?;
 
@@ -1399,11 +1403,12 @@ async fn test_new_epoch_unbans_committee_member_ip() -> eyre::Result<()> {
     tokio::time::sleep(Duration::from_secs(TEST_HEARTBEAT_INTERVAL)).await;
 
     // Now simulate a new epoch where peer2 is in the committee with the same IP as banned peer1
-    let committee = vec![*peer2.config.authority().as_ref().expect("authority").protocol_key()]
-        .into_iter()
-        .collect();
+    let committee: std::collections::HashSet<rayls_infrastructure_types::BlsPublicKey> =
+        vec![*peer2.config.authority().as_ref().expect("authority").protocol_key()]
+            .into_iter()
+            .collect();
 
-    target_peer.network_handle.new_epoch(committee).await?;
+    target_peer.network_handle.new_epoch(committee.clone(), committee).await?;
 
     // wait for connection to establish
     tokio::time::sleep(Duration::from_secs(TEST_HEARTBEAT_INTERVAL)).await;
@@ -1471,14 +1476,18 @@ async fn test_new_epoch_handles_disconnecting_pending_ban() -> eyre::Result<()> 
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     // Now simulate a new epoch where peer2 is in the committee
-    let committee = vec![*config_2.authority().as_ref().expect("authority").protocol_key()]
-        .into_iter()
-        .collect();
+    let committee: std::collections::HashSet<rayls_infrastructure_types::BlsPublicKey> =
+        vec![*config_2.authority().as_ref().expect("authority").protocol_key()]
+            .into_iter()
+            .collect();
 
     // Send NewEpoch command to peer1
     let handle = peer1.clone();
     tokio::spawn(async move {
-        handle.new_epoch(committee).await.expect("Failed to send NewEpoch command");
+        handle
+            .new_epoch(committee.clone(), committee)
+            .await
+            .expect("Failed to send NewEpoch command");
     })
     .await?;
 
@@ -1680,6 +1689,10 @@ async fn test_newer_kad_record_replaced() -> eyre::Result<()> {
     let TestTypes { peer1, mut peer2, .. } =
         create_test_types::<TestWorkerRequest, TestWorkerResponse>();
     let mut network = peer1.network;
+    // peer2 is a registered validator, so its records are stored
+    network.swarm.behaviour_mut().peer_manager.set_registered_validators(
+        std::collections::HashSet::from([peer2.config.key_config().primary_public_key()]),
+    );
     let peer2_new_record = peer2.network.get_peer_record();
     // create valid peer2 record with old timestamp
     let mut peer2_info = peer2.network.node_record.info.clone();
@@ -1941,9 +1954,12 @@ async fn test_px_disconnect_failure_clears_outbound_request() -> eyre::Result<()
 
 /// FIND-025 Path B: PutRecord store exhaustion must not propagate a fatal error.
 ///
-/// Pre-fill the record store to capacity, then submit a valid BLS-signed PutRecord.
-/// Verify the event returns Ok, the record is not stored, and the peer is not added
-/// as a known peer.
+/// Pre-fill the record store to capacity, then submit a valid BLS-signed PutRecord for a
+/// registered key. The event returns Ok and the record is not stored. A third party's copy
+/// still yields dial hints for the registered key (this node dials it, and a successful store
+/// would have admitted the same hints) but binds no peer id; the peer's own put over its own
+/// connection binds it: the handshake is the proof, and a full store must never cost a
+/// validator its reachability.
 #[tokio::test]
 async fn test_kad_record_store_exhaustion_does_not_propagate_error() -> eyre::Result<()> {
     use libp2p::kad::store::MemoryStoreConfig;
@@ -1951,6 +1967,9 @@ async fn test_kad_record_store_exhaustion_does_not_propagate_error() -> eyre::Re
     let TestTypes { peer1, peer2, .. } =
         create_test_types::<TestWorkerRequest, TestWorkerResponse>();
     let mut network = peer1.network;
+    network.swarm.behaviour_mut().peer_manager.set_registered_validators(
+        std::collections::HashSet::from([peer2.config.key_config().primary_public_key()]),
+    );
 
     let max_records = MemoryStoreConfig::default().max_records;
 
@@ -1971,17 +1990,34 @@ async fn test_kad_record_store_exhaustion_does_not_propagate_error() -> eyre::Re
     let peer2_peer_id = *peer2.network.swarm.local_peer_id();
     let peer2_bls_key = peer2.config.key_config().primary_public_key();
 
-    // deliver the put request via process_kad_put_request directly
+    // a third node replicates peer2's record while the store is full
     // (process_kad_event wraps this but requires a ConnectionId we can't construct)
-    network.process_kad_put_request(peer2_peer_id, peer2_record.clone());
+    let relayer = PeerId::random();
+    network.process_kad_put_request(relayer, peer2_record.clone());
 
     // verify the overflow record was not stored
     let stored = network.swarm.behaviour_mut().kademlia.store_mut().get(&peer2_record.key);
     assert!(stored.is_none(), "overflow record must not be stored");
 
-    // verify the peer was NOT added as a known peer (fall-through bug fix)
+    // the registered key gets dial hints from the relayed copy, but no binding: the relayer
+    // proved who delivered the record, not who owns the network key inside
     let known = network.swarm.behaviour().peer_manager.auth_to_peer(peer2_bls_key);
-    assert!(known.is_none(), "peer must not be added as known when store is full");
+    assert!(known.is_some(), "a registered key's addresses are hints even when not stored");
+    assert_eq!(network.swarm.behaviour().peer_manager.peer_to_bls(&peer2_peer_id), None);
+    assert!(
+        !network.swarm.behaviour().peer_manager.peer_banned(&relayer),
+        "a full store is this node's capacity, not the deliverer's fault"
+    );
+
+    // peer2's own put over its own connection: still not stored, but bound
+    network.process_kad_put_request(peer2_peer_id, peer2_record.clone());
+    let stored = network.swarm.behaviour_mut().kademlia.store_mut().get(&peer2_record.key);
+    assert!(stored.is_none(), "overflow record must not be stored");
+    assert_eq!(
+        network.swarm.behaviour().peer_manager.peer_to_bls(&peer2_peer_id),
+        Some(peer2_bls_key),
+        "an owner-delivered record binds regardless of store capacity"
+    );
 
     Ok(())
 }
@@ -2066,6 +2102,63 @@ async fn test_kad_put_request_refreshes_known_peers_on_duplicate() -> eyre::Resu
     Ok(())
 }
 
+/// Only registered validators' records enter the kad store. An unregistered key (an observer,
+/// or an attacker minting keys) is never stored: delivered by its owner it binds the peer id
+/// for the life of the connection and nothing more, delivered by anyone else it is dropped.
+/// So the store cannot be filled by signing keys, and an observer is reachable without costing
+/// the store a slot.
+#[tokio::test]
+async fn test_kad_put_unregistered_key_binds_owner_without_storing() -> eyre::Result<()> {
+    let TestTypes { peer1, mut peer2, .. } =
+        create_test_types::<TestWorkerRequest, TestWorkerResponse>();
+    let mut network = peer1.network;
+    assert!(
+        !network
+            .swarm
+            .behaviour()
+            .peer_manager
+            .is_registered(&peer2.config.key_config().primary_public_key()),
+        "peer2 must start unregistered"
+    );
+
+    let peer2_record = peer2.network.get_peer_record();
+    let peer2_id = *peer2.network.swarm.local_peer_id();
+    let peer2_bls = peer2.config.key_config().primary_public_key();
+
+    // replicated by a third node: not stored, not known
+    network.process_kad_put_request(PeerId::random(), peer2_record.clone());
+    assert!(network.swarm.behaviour_mut().kademlia.store_mut().get(&peer2_record.key).is_none());
+    assert!(network.swarm.behaviour().peer_manager.auth_to_peer(peer2_bls).is_none());
+
+    // delivered by peer2 itself: still not stored, but bound
+    network.process_kad_put_request(peer2_id, peer2_record.clone());
+    assert!(network.swarm.behaviour_mut().kademlia.store_mut().get(&peer2_record.key).is_none());
+    assert_eq!(network.swarm.behaviour().peer_manager.peer_to_bls(&peer2_id), Some(peer2_bls));
+    assert_eq!(
+        network.swarm.behaviour().peer_manager.bound_auth_to_peer(peer2_bls),
+        Some(peer2_id)
+    );
+
+    // once registered (the next epoch's `NewEpoch`), the same record is stored
+    network
+        .swarm
+        .behaviour_mut()
+        .peer_manager
+        .set_registered_validators(std::collections::HashSet::from([peer2_bls]));
+    let mut newer_info = peer2.network.node_record.info.clone();
+    newer_info.timestamp = now() + 1;
+    let signature = peer2.config.key_config().request_signature_direct(&encode(&newer_info));
+    peer2.network.node_record = NodeRecord { info: newer_info, signature };
+    let newer_record = peer2.network.get_peer_record();
+    network.process_kad_put_request(peer2_id, newer_record.clone());
+    assert_eq!(
+        network.swarm.behaviour_mut().kademlia.store_mut().get(&newer_record.key).as_deref(),
+        Some(&newer_record)
+    );
+
+    Ok(())
+}
+
 /// A record put by anyone other than the peer it is about is stored and yields dial addresses,
 /// but binds no peer id: the put's connection proves who delivered it, not who owns the network
 /// key inside. The peer's own put over its own connection is what binds. Against the re-mapping
@@ -2082,6 +2175,12 @@ async fn test_kad_put_binds_peer_id_only_when_delivered_by_its_owner() -> eyre::
     let peer2_id = *peer2.network.swarm.local_peer_id();
     let peer2_bls = peer2.config.key_config().primary_public_key();
     let relayer = PeerId::random();
+    // peer2 is a registered validator, so third-party copies of its record are stored
+    network
+        .swarm
+        .behaviour_mut()
+        .peer_manager
+        .set_registered_validators(std::collections::HashSet::from([peer2_bls]));
 
     // peer2's genuine record, replicated by a third node: addresses yes, binding no
     network.process_kad_put_request(relayer, peer2_record.clone());
@@ -2462,5 +2561,140 @@ async fn test_direct_connection_classifies_direct_nonrelay() -> eyre::Result<()>
         assert_eq!(count("relay_direct"), 0, "{label} has no relay, so no relay legs");
     }
 
+    Ok(())
+}
+
+/// A record keyed by a non-canonical encoding of a BLS key is rejected. blst also parses the
+/// 192-byte uncompressed form, and the store slot is the raw key bytes, so accepting it would
+/// give a registered validator a second slot that no lookup reads and double the store bound.
+#[tokio::test]
+async fn test_kad_put_rejects_non_canonical_key_encoding() -> eyre::Result<()> {
+    let TestTypes { peer1, peer2, .. } =
+        create_test_types::<TestWorkerRequest, TestWorkerResponse>();
+    let mut network = peer1.network;
+    let peer2_bls = peer2.config.key_config().primary_public_key();
+    let peer2_id = *peer2.network.swarm.local_peer_id();
+    network
+        .swarm
+        .behaviour_mut()
+        .peer_manager
+        .set_registered_validators(std::collections::HashSet::from([peer2_bls]));
+
+    // the same valid record, keyed by the uncompressed encoding of the same key
+    let canonical = peer2.network.get_peer_record();
+    let uncompressed = peer2_bls.serialize();
+    assert_ne!(uncompressed.len(), canonical.key.as_ref().len());
+    assert!(BlsPublicKey::from_literal_bytes(&uncompressed).is_ok(), "blst parses both forms");
+    let non_canonical = kad::Record {
+        key: RecordKey::new(&uncompressed),
+        value: canonical.value.clone(),
+        publisher: canonical.publisher,
+        expires: None,
+    };
+
+    network.process_kad_put_request(peer2_id, non_canonical.clone());
+    assert!(
+        network.swarm.behaviour_mut().kademlia.store_mut().get(&non_canonical.key).is_none(),
+        "a non-canonical key must not get a store slot"
+    );
+    assert_eq!(network.swarm.behaviour().peer_manager.peer_to_bls(&peer2_id), None);
+    // dropped, not punished: such records were stored before this rule and honest peers
+    // replicate them until they expire
+    assert!(
+        !network.swarm.behaviour().peer_manager.peer_banned(&peer2_id),
+        "a non-canonical key must not earn the deliverer a penalty"
+    );
+
+    // the canonical key is stored as usual
+    network.process_kad_put_request(peer2_id, canonical.clone());
+    assert!(network.swarm.behaviour_mut().kademlia.store_mut().get(&canonical.key).is_some());
+    Ok(())
+}
+
+/// A record can be bound without being stored, so the newest info for a key may live only in
+/// `known_peers`. A replayed older record, however validly signed, must not roll that binding
+/// back: not into the store, and not into the dial table.
+#[tokio::test]
+async fn test_kad_put_older_record_cannot_roll_back_an_unstored_binding() -> eyre::Result<()> {
+    let TestTypes { peer1, mut peer2, .. } =
+        create_test_types::<TestWorkerRequest, TestWorkerResponse>();
+    let mut network = peer1.network;
+    let peer2_id = *peer2.network.swarm.local_peer_id();
+    let peer2_bls = peer2.config.key_config().primary_public_key();
+
+    // peer2's older record, from before its last restart, kept by a third party
+    let mut old_info = peer2.network.node_record.info.clone();
+    old_info.timestamp = now() - 10_000;
+    old_info.multiaddrs = vec![create_multiaddr(None)];
+    let signature = peer2.config.key_config().request_signature_direct(&encode(&old_info));
+    let old_record = NodeRecord { info: old_info.clone(), signature };
+    assert!(old_record.clone().verify(&peer2_bls).is_ok());
+    let current_record = peer2.network.get_peer_record();
+    peer2.network.node_record = old_record;
+    let old_kad_record = peer2.network.get_peer_record();
+
+    // peer2 pushes its current record while unregistered: bound, not stored
+    network.process_kad_put_request(peer2_id, current_record.clone());
+    assert!(network.swarm.behaviour_mut().kademlia.store_mut().get(&current_record.key).is_none());
+    let (_, current_addrs) =
+        network.swarm.behaviour().peer_manager.auth_to_peer(peer2_bls).expect("bound");
+
+    // peer2 becomes registered; a relayer replays the older record
+    network
+        .swarm
+        .behaviour_mut()
+        .peer_manager
+        .set_registered_validators(std::collections::HashSet::from([peer2_bls]));
+    network.process_kad_put_request(PeerId::random(), old_kad_record.clone());
+    assert!(
+        network.swarm.behaviour_mut().kademlia.store_mut().get(&old_kad_record.key).is_none(),
+        "an older record must not be stored over a newer binding"
+    );
+    let (_, addrs) = network.swarm.behaviour().peer_manager.auth_to_peer(peer2_bls).expect("bound");
+    assert_eq!(addrs, current_addrs, "the dial table must keep the newer addresses");
+    assert_ne!(addrs, old_info.multiaddrs);
+
+    // the current record pushed again, same timestamp, is now stored
+    network.process_kad_put_request(peer2_id, current_record.clone());
+    assert!(network.swarm.behaviour_mut().kademlia.store_mut().get(&current_record.key).is_some());
+    Ok(())
+}
+
+/// After a restart the kad store preload fills `known_peers` with each stored record's real
+/// timestamp and no binding, then `AddBootstrapPeers` (timestamp 0) binds the configured
+/// committee. The rollback guard must let that binding through, or a restarted node stays
+/// unbound for its committee until every member's own put arrives; the preloaded addresses are
+/// kept over the configured one.
+#[tokio::test]
+async fn test_configured_committee_binds_over_preloaded_records_after_restart() -> eyre::Result<()>
+{
+    let TestTypes { peer1, peer2, .. } =
+        create_test_types::<TestWorkerRequest, TestWorkerResponse>();
+    let mut network = peer1.network;
+    let peer2_record = peer2.network.get_peer_record();
+    let peer2_id = *peer2.network.swarm.local_peer_id();
+    let peer2_bls = peer2.config.key_config().primary_public_key();
+    let peer2_netkey = peer2.network.node_record.info.pubkey.clone();
+    let record_addrs = peer2.network.node_record.info.multiaddrs.clone();
+
+    // the persisted record from a prior boot, rehydrated: addresses, real timestamp, no binding
+    network.swarm.behaviour_mut().kademlia.store_mut().put(peer2_record)?;
+    network.load_known_peers_from_kad_store();
+    assert_eq!(network.swarm.behaviour().peer_manager.peer_to_bls(&peer2_id), None);
+
+    // the configured committee entry, as AddBootstrapPeers inserts it
+    let configured_addr = create_multiaddr(None);
+    network.swarm.behaviour_mut().peer_manager.add_known_peer(
+        peer2_bls,
+        NetworkInfo { pubkey: peer2_netkey, multiaddrs: vec![configured_addr], timestamp: 0 },
+    );
+
+    assert_eq!(
+        network.swarm.behaviour().peer_manager.peer_to_bls(&peer2_id),
+        Some(peer2_bls),
+        "the configured identity must bind the preloaded entry"
+    );
+    let (_, addrs) = network.swarm.behaviour().peer_manager.auth_to_peer(peer2_bls).expect("known");
+    assert_eq!(addrs, record_addrs, "the record's addresses are kept over the configured one");
     Ok(())
 }

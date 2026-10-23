@@ -263,6 +263,15 @@ where
             );
             return;
         };
+        // The key must be the canonical encoding of the BLS key: blst also parses the
+        // uncompressed form, and the store slot is the raw key bytes, so a non-canonical key
+        // would give a registered validator a second slot that no lookup ever reads. Dropped
+        // without penalty: such records were accepted before this rule and are replicated by
+        // honest peers until they expire, so charging the deliverer would ban honest relayers.
+        if key.as_ref() != record.key.as_ref() {
+            trace!(target: "network-kad", ?source, %key, "non-canonical record key - dropping put request");
+            return;
+        }
 
         // Budget gate before any per-record work. Not a penalty: an honest node can burst
         // republishes across an epoch change, so over-budget puts are dropped, never charged.
@@ -271,17 +280,10 @@ where
             return;
         }
 
+        // Nothing is removed from the store here: `publisher` is a wire field that has not been
+        // authenticated at this point, so acting on it would let any peer empty a registered
+        // validator's slot by naming a banned peer id, then fill it with a replayed older record.
         if let Err(reason) = self.check_kad_put_admissibility(&source, &record, &decoded_record) {
-            if matches!(
-                reason,
-                RecordInvalidReason::PublisherBanned
-                    | RecordInvalidReason::SourceBanned
-                    | RecordInvalidReason::MissingPublisher
-            ) {
-                error!(target: "network-kad", ?reason, ?source, publisher=?record.publisher, "rejecting put request for record");
-                // handle race condition with PM
-                self.swarm.behaviour_mut().kademlia.remove_record(&record.key);
-            }
             self.apply_invalid_kad_request_penalty(&source, record.publisher, &reason);
             error!(target: "network-kad", ?source, ?reason, "failed to process kad put request");
             return;
@@ -294,7 +296,16 @@ where
         // A duplicate already lives in our store from a prior put, so refreshing the in-memory
         // BLS mapping (wiped on restart) is safe, but only from the stored record's info, which
         // passed the signature check when it was admitted; the incoming duplicate is unverified.
-        if !self.is_newer_record(&record.key, &decoded_record) {
+        // A record that is never stored (unregistered key) always reaches the verify; the
+        // per-source put budget above is what bounds that cost.
+        //
+        // The refresh is limited to what a fresh put of the same record could do: a stored copy
+        // of a key that is no longer registered (not yet expired) must not hand out third-party
+        // dial hints the admission rule below would refuse.
+        let about: PeerId = decoded_record.info.pubkey.clone().into();
+        let owner_delivered = source == about;
+        let registered = self.swarm.behaviour().peer_manager.is_registered(&key);
+        if !self.is_newer_record(&record.key, &key, &decoded_record) {
             trace!(target: "network-kad", ?source, "duplicate record, refreshing known_peers");
             let stored_info = self
                 .swarm
@@ -305,8 +316,23 @@ where
                 .and_then(|existing| try_decode::<NodeRecord>(&existing.value).ok())
                 .map(|stored| stored.info);
             if let Some(info) = stored_info {
-                self.admit_record_info(source, key, info);
+                // Ownership is judged on the stored (verified) info, not on the unverified
+                // incoming value, which could name the sender to pass this gate.
+                let stored_about: PeerId = info.pubkey.clone().into();
+                if registered || source == stored_about {
+                    self.admit_record_info(source, key, info);
+                }
             }
+            return;
+        }
+
+        // An unregistered key delivered by a third party stays unknown: its addresses are dial
+        // hints for a key nobody will dial, and admitting them would let a closed store be
+        // bypassed to populate `known_peers`. It is dropped whatever the signature says, so
+        // there is nothing to verify: the pairing would only buy a penalty on a bad signature,
+        // and honest peers replicate such records (from before this rule) hourly.
+        if !(registered || owner_delivered) {
+            trace!(target: "network-kad", %key, ?source, "unregistered key from a third party: dropped");
             return;
         }
 
@@ -318,15 +344,34 @@ where
             return;
         }
 
-        // Fresh record: store it first. add_known_peer only on success so a full
-        // store cannot be used as a side-channel to populate known_peers.
-        let publisher = record.publisher;
-        if let Err(err) = self.swarm.behaviour_mut().kademlia.store_mut().put(record) {
-            self.handle_kad_store_error(&source, publisher, err);
-            return;
+        // Fresh, verified record. Only registered validators are stored and replicated: theirs
+        // are the only keys anyone looks up (`find_authorities`), and registering needs the
+        // allowlist and the minimum stake, so the store cannot be filled by minting keys. Every
+        // other peer is identified by its connection alone (below).
+        if registered {
+            let publisher = record.publisher;
+            let value_len = record.value.len();
+            match self.swarm.behaviour_mut().kademlia.store_mut().put(record) {
+                Ok(()) => trace!(target: "network-kad", %key, "stored fresh kad record"),
+                Err(err) => {
+                    // A store that is full or failing is this node's problem and the record
+                    // still binds below. An oversize value is the record's fault: it was just
+                    // penalised, and binding it would unban a committee peer the line before.
+                    if !self.handle_kad_store_error(&source, publisher, value_len, err) {
+                        return;
+                    }
+                }
+            }
+        } else {
+            trace!(target: "network-kad", %key, ?source, "unregistered key: record not stored");
         }
 
-        trace!(target: "network-kad", %key, "stored fresh kad record");
+        // The record is admitted whether or not it was stored. Owner-delivered, it binds: the
+        // handshake authenticated `source` as the peer this record is about, which is all the
+        // binding needs, so an observer is reachable while connected, holds one `known_peers`
+        // entry and no store slot, and a validator stays bound even on the day the store refuses
+        // it. From a third party (registered keys only, see above) it yields dial hints: the key
+        // is one this node dials, and a successful store would have admitted the same hints.
         self.admit_record_info(source, key, decoded_record.info);
     }
 
@@ -409,16 +454,32 @@ where
     ///
     /// Runs after the signature verify, so `publisher` is authenticated: an oversize
     /// value charges only its author, never an honest relayer, matching
-    /// [`kad_record_fault_penalty`]. A full store is a local capacity condition, so the deliverer
-    /// is charged only `Penalty::Mild`.
+    /// [`kad_record_fault_penalty`]. A full store is a local capacity condition and charges
+    /// nobody; it is logged instead, since under the registered-only rule it should never
+    /// happen (pre-upgrade records that have not expired yet, or a cap below the registry size).
+    /// `KadStore::put` also reports a failed DB read or write as `ValueTooLarge`; that is told
+    /// apart by `value_len`, logged, and charges nobody either.
+    ///
+    /// Returns whether the record may still be used for the peer binding: true for a full or
+    /// failing store, false when the record itself was at fault.
     fn handle_kad_store_error(
         &mut self,
         deliverer: &PeerId,
         publisher: Option<PeerId>,
+        value_len: usize,
         err: Error,
-    ) {
+    ) -> bool {
         let penalty = match err {
-            Error::MaxRecords => Some(Penalty::Mild),
+            // A full store is this node's capacity, never the deliverer's fault: the record
+            // that arrives after a flood is the honest one.
+            Error::MaxRecords => {
+                warn!(target: "network-kad", ?deliverer, "kad store full; registered record not stored");
+                return true;
+            }
+            Error::ValueTooLarge if value_len < crate::kad::max_value_bytes() => {
+                error!(target: "network-kad", ?deliverer, value_len, "kad store write failed; registered record not stored");
+                return true;
+            }
             Error::ValueTooLarge => (publisher == Some(*deliverer)).then_some(Penalty::Fatal),
             // `process_add_provider_request` drops provider records, so `add_provider` never runs.
             Error::MaxProvidedKeys => {
@@ -429,6 +490,7 @@ where
             warn!(target: "network-kad", ?deliverer, ?err, ?penalty, "kad store rejected record");
             self.swarm.behaviour_mut().peer_manager.process_penalty(*deliverer, penalty);
         }
+        false
     }
 
     /// Apply the penalty owed for an invalid KAD record delivered by `deliverer`.
@@ -458,14 +520,34 @@ where
     /// This method compares timestamps for verified records to ensure the latest record
     /// is stored (prevents replay attacks). Also returns `true` if the record is not found.
     /// It is the caller's responsibility to ensure records are verified and valid.
-    fn is_newer_record(&mut self, key: &RecordKey, node_record: &NodeRecord) -> bool {
-        let store = self.swarm.behaviour_mut().kademlia.store_mut();
+    ///
+    /// A record can be bound without being stored, so the newest info for a key may live only
+    /// in `known_peers`: a record older than that binding is a replay and is refused too. One
+    /// equal to it is the same record pushed again (a candidate re-publishing after it became
+    /// registered) and may be stored. Configured entries carry timestamp 0 and never block.
+    fn is_newer_record(
+        &mut self,
+        key: &RecordKey,
+        bls_key: &BlsPublicKey,
+        node_record: &NodeRecord,
+    ) -> bool {
+        let incoming = node_record.info.timestamp;
+        if self
+            .swarm
+            .behaviour()
+            .peer_manager
+            .known_peer_timestamp(bls_key)
+            .is_some_and(|bound| bound > incoming)
+        {
+            return false;
+        }
 
+        let store = self.swarm.behaviour_mut().kademlia.store_mut();
         if let Some(existing) = store.get(key) {
             match try_decode::<NodeRecord>(&existing.value) {
                 Ok(existing_record) => {
                     // return true if the new record is newer
-                    existing_record.info.timestamp < node_record.info.timestamp
+                    existing_record.info.timestamp < incoming
                 }
                 _ => false,
             }
@@ -614,6 +696,17 @@ where
     /// harmless -- the `add_address`/discovery transport-less filters keep it out of every dial
     /// path -- but skipping publish would leave us unidentifiable ("requesting peer unknown").
     pub(super) fn provide_our_data(&mut self) {
+        let key = self.publish_our_record();
+        if let Err(err) = self.swarm.behaviour_mut().kademlia.start_providing(key) {
+            error!(target: "network-kad", "Failed to start providing key: {err}");
+        }
+    }
+
+    /// Put our record to the DHT, without the provider announcement. Returns the record key.
+    ///
+    /// Used for the per-epoch republish: peers drop provider records, so the provider walk is
+    /// only worth doing once at startup, not at every boundary.
+    pub(super) fn publish_our_record(&mut self) -> RecordKey {
         let record = self.get_peer_record();
         info!(target: "network-kad", ?record, "Providing our record to kademlia for peer {:?}", self.swarm.local_peer_id());
         let key = record.key.clone();
@@ -635,10 +728,7 @@ where
                 }
             }
         }
-
-        if let Err(err) = self.swarm.behaviour_mut().kademlia.start_providing(key) {
-            error!(target: "network-kad", "Failed to start providing key: {err}");
-        }
+        key
     }
 
     /// Publish our network addresses and peer id AND to the network under our BLS public key for

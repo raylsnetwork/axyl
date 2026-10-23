@@ -154,6 +154,13 @@ pub enum KadStoreType {
     Worker,
 }
 
+/// The value size the store refuses with `Error::ValueTooLarge`. [`KadStore`] uses the libp2p
+/// memory-store default; the kad behaviour reads it here to tell a genuinely oversize value
+/// apart from a DB failure that the store reports under the same variant.
+pub(crate) fn max_value_bytes() -> usize {
+    MemoryStoreConfig::default().max_value_bytes
+}
+
 /// Provide a persistant store for kademlia data.
 /// Wraps around the consensus DB.
 #[derive(Clone, Debug)]
@@ -262,14 +269,8 @@ impl<DB: Database> RecordStore for KadStore<DB> {
                 self.db.get::<KadWorkerRecords>(&key).map_err(|_| Error::ValueTooLarge)?.is_none()
             }
         };
-        // We have a new record so go ahead and inc num_records.
-        // Should be safe since a failure to insert indicates a fatal DB condition.
-        if new_record {
-            if self.num_records >= self.config.max_records {
-                return Err(Error::MaxRecords);
-            } else {
-                self.num_records = self.num_records.saturating_add(1);
-            }
+        if new_record && self.num_records >= self.config.max_records {
+            return Err(Error::MaxRecords);
         }
         match self.kad_type {
             KadStoreType::Primary => self
@@ -281,11 +282,25 @@ impl<DB: Database> RecordStore for KadStore<DB> {
                 .insert::<KadWorkerRecords>(&key, &encode(&kr))
                 .map_err(|_| Error::ValueTooLarge)?,
         }
+        // Count the record only once it is in the DB: a failed insert is reported to the caller
+        // as a store error and retried later, and must not use up a slot each time.
+        if new_record {
+            self.num_records = self.num_records.saturating_add(1);
+        }
         Ok(())
     }
 
     fn remove(&mut self, k: &RecordKey) {
         let key = self.key_to_hash(k);
+        // The DB reports success for a key that was not there, so check first: the count must
+        // only drop for a record that was actually removed.
+        let existed = match self.kad_type {
+            KadStoreType::Primary => self.db.get::<KadRecords>(&key).ok().flatten().is_some(),
+            KadStoreType::Worker => self.db.get::<KadWorkerRecords>(&key).ok().flatten().is_some(),
+        };
+        if !existed {
+            return;
+        }
         if match self.kad_type {
             KadStoreType::Primary => self.db.remove::<KadRecords>(&key),
             KadStoreType::Worker => self.db.remove::<KadWorkerRecords>(&key),

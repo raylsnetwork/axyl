@@ -11,9 +11,9 @@ use rayls_execution_evm::reth_env::RethDb;
 #[cfg(feature = "cold-storage")]
 use super::cold_archive::ColdArchival;
 use rayls_infrastructure_config::KeyConfig;
-use rayls_infrastructure_types::{Epoch, EpochRecord, Notifier};
+use rayls_infrastructure_types::{BlsPublicKey, Epoch, EpochRecord, Notifier};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::{Arc, Mutex},
 };
 use tokio::sync::watch;
@@ -90,6 +90,11 @@ pub(crate) struct EpochManager<P, DB> {
 
     /// Indicates first epoch since process start
     pub(super) initial_epoch: bool,
+
+    /// Every registered (not exited) validator the registry knew at the last epoch
+    /// configuration, plus the committee and lookahead. The network keeps node records in its
+    /// kad store only for these keys; everyone else is identified by its connection alone.
+    pub(super) registered_validators: HashSet<BlsPublicKey>,
 
     /// Cold-archival aggregate: boot healing, backlog migration, and the background seal actor.
     ///

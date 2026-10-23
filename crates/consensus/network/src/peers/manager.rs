@@ -73,6 +73,16 @@ pub(crate) struct PeerManager {
 
     /// PeerId -> BlsPublicKey for know peers.
     known_peerids: HashMap<PeerId, BlsPublicKey>,
+    /// Every registered validator: the committee, the lookahead, and each key the registry
+    /// holds in a non-exited status. Refreshed by [`Self::new_epoch`].
+    ///
+    /// Node records are kept in the kad store for these keys only, and their `known_peers`
+    /// entries are never evicted. Registering needs a governance allowlist entry and the minimum
+    /// stake, so the set is bounded by governance and economics rather than by how fast a peer
+    /// can mint keys. Every other peer is identified by
+    /// its connection alone: an owner-delivered record binds its peer id, holds one
+    /// `known_peers` entry per peer id until replaced or evicted, and is never persisted.
+    registered_validators: HashSet<BlsPublicKey>,
     /// A queue of events that the `PeerManager` is waiting to produce.
     events: VecDeque<PeerEvent>,
     /// A queue of peers to dial.
@@ -162,6 +172,7 @@ impl PeerManager {
             known_peers: Default::default(),
             known_peers_time_added: Default::default(),
             known_peerids: Default::default(),
+            registered_validators: Default::default(),
             events: Default::default(),
             dial_requests: Default::default(),
             isolation_streak: 0,
@@ -193,13 +204,11 @@ impl PeerManager {
         if self.temporarily_banned.remove(&peer_id) {
             warn!(target: "peer-manager", ?peer_id, "removed trusted peer from temporarily banned list");
         }
-        let peer_id: PeerId = info.pubkey.clone().into();
-        debug!(target: "peer-manager", ?peer_id, "Inserting trusted peer into known_peerids");
-        self.known_peerids.retain(|_, bound| bound != &bls_key);
-        self.known_peerids.insert(peer_id, bls_key);
+        // Through the common path, so the rollback guard and the one-entry-per-peer-id rule
+        // apply to configured peers too: a trusted entry (timestamp 0) binds the peer id but
+        // never overwrites addresses learned from the peer's own record.
         debug!(target: "peer-manager", ?peer_id, "Inserting trusted peer into known_peers");
-        self.known_peers.insert(bls_key, info);
-        self.known_peers_time_added.insert(bls_key, now());
+        self.add_known_peer_inner(bls_key, info, true);
 
         debug!(target: "peer-manager", ?peer_id, "Dialing trusted peer");
         self.dial_peer(peer_id, multiaddr, Some(reply));
@@ -917,8 +926,28 @@ impl PeerManager {
             || self.peers.get_peer(peer_id).map(|p| p.is_trusted()).unwrap_or_default()
     }
 
-    /// Update the committee for the new epoch.
-    pub(crate) fn new_epoch(&mut self, committee: HashSet<BlsPublicKey>) {
+    /// Whether `bls_key` is a registered validator (see [`Self::registered_validators`]).
+    pub(crate) fn is_registered(&self, bls_key: &BlsPublicKey) -> bool {
+        self.registered_validators.contains(bls_key)
+    }
+
+    /// Replace the registered-validator set. Called at every epoch by [`Self::new_epoch`]; tests
+    /// use it directly.
+    pub(crate) fn set_registered_validators(&mut self, registered: HashSet<BlsPublicKey>) {
+        self.registered_validators = registered;
+    }
+
+    /// Update the committee and the registered-validator set for the new epoch.
+    ///
+    /// The committee is always registered: a seated member's record must be storable whatever
+    /// the caller's registry view says, so the union is made here rather than trusted.
+    pub(crate) fn new_epoch(
+        &mut self,
+        committee: HashSet<BlsPublicKey>,
+        mut registered: HashSet<BlsPublicKey>,
+    ) {
+        registered.extend(committee.iter().copied());
+        self.set_registered_validators(registered);
         // remove from temporary banned and warn if validator was banned
         //
         // every committee key is forwarded, resolved or not: membership is decided by stake, so a
@@ -992,6 +1021,30 @@ impl PeerManager {
             if bind { "add_known_peer" } else { "add_known_peer_addrs" },
         );
 
+        // Never roll an entry back: a record can be bound without being stored, so the newest
+        // info for a key may live only here, and a replayed older (validly signed) record must
+        // not replace it. Configured entries carry timestamp 0 and are superseded by any record;
+        // an equal timestamp is the same record pushed again and refreshes the binding.
+        //
+        // A binding for the same network key still goes through: after a restart the store
+        // preload fills `known_peers` with real timestamps and no bindings, and the configured
+        // committee (timestamp 0) is what binds them until each member's own put arrives.
+        // Nothing is rolled back by that, the addresses stay as they were. A newer entry naming
+        // a different network key is a rotation, and the stale configured identity must not
+        // bind over it.
+        if let Some(known) = self.known_peers.get(&bls_key) {
+            if known.timestamp > info.timestamp {
+                if bind && known.pubkey == info.pubkey {
+                    trace!(target: "peer-manager", ?bls_key, ?peer_id, "older record binds its peer id; newer addresses are kept");
+                    self.known_peerids.retain(|_, bound| bound != &bls_key);
+                    self.known_peerids.insert(peer_id, bls_key);
+                } else {
+                    trace!(target: "peer-manager", ?bls_key, ?peer_id, "older record ignored; newer info is known");
+                }
+                return;
+            }
+        }
+
         // A third-party record naming a network key this node already tracks under another BLS
         // key must not touch that peer's entry: `upsert_peer` would relabel the entry with the
         // record's BLS key and append the record's addresses to it, and the unban below would act
@@ -1025,6 +1078,18 @@ impl PeerManager {
             }
         }
 
+        if bind {
+            // One `known_peers` entry per peer id for unregistered keys: a peer that re-binds
+            // under a fresh key must not leave the old key's entry behind, or one connection
+            // could mint keys until the table is full and honest entries are evicted. A
+            // registered key's entry stays: it is a validator's dial target in its own right.
+            if let Some(previous) = self.known_peerids.get(&peer_id).copied() {
+                if previous != bls_key && !self.is_registered(&previous) {
+                    self.known_peers.remove(&previous);
+                    self.known_peers_time_added.remove(&previous);
+                }
+            }
+        }
         self.known_peers.insert(bls_key, info.clone());
         self.known_peers_time_added.insert(bls_key, now());
         if bind {
@@ -1040,6 +1105,12 @@ impl PeerManager {
 
         // Cleanup if we've exceeded the maximum known peers limit
         self.cleanup_known_peers();
+    }
+
+    /// Timestamp of the info `known_peers` holds for `bls_key`, if any. Configured entries carry
+    /// 0. The kad put path uses it to refuse a record older than what is already bound.
+    pub(crate) fn known_peer_timestamp(&self, bls_key: &BlsPublicKey) -> Option<u64> {
+        self.known_peers.get(bls_key).map(|info| info.timestamp)
     }
 
     /// Snapshot the dial targets in `known_peers` as `(peer_id, multiaddr)` pairs (one per
@@ -1089,13 +1160,32 @@ impl PeerManager {
 
         entries.sort_by_key(|(_, timestamp)| *timestamp);
 
-        // Remove the oldest entries (but never remove validators)
+        // Entries whose bound peer is connected right now are exempt: evicting one would drop
+        // the binding of a live peer and its requests would be refused as unknown. Peer ids are
+        // free, so a host reconnecting under fresh identities can fill the table in minutes; age
+        // alone would then evict the longest-connected honest observers first. Skipping live
+        // bindings makes such churn evict only its own disconnected entries.
+        let live: HashSet<BlsPublicKey> = self
+            .known_peerids
+            .iter()
+            .filter(|(peer_id, _)| self.is_connected(peer_id))
+            .map(|(_, bound)| *bound)
+            .collect();
+
+        // Remove the oldest evictable entries, oldest first, until the excess is gone. The
+        // oldest entries are often exempt (validators learned at startup, long-connected
+        // observers), so the whole table may have to be walked.
         let mut removed = 0;
-        for (bls_key, _) in entries.iter().take(entries_to_remove * 2) {
+        for (bls_key, _) in entries.iter() {
             // Judge by the BLS key the entry is stored under, not by the network key it names: a
             // third-party record under any BLS key can name a validator's network key, and
             // exempting on that would let an attacker pin unevictable entries at will.
-            if self.peers.is_committee_key(bls_key) {
+            // Registered keys are exempt too: a staked candidate discovered before its seat must
+            // not be aged out by observer churn before the boundary it is needed at.
+            if self.peers.is_committee_key(bls_key)
+                || self.is_registered(bls_key)
+                || live.contains(bls_key)
+            {
                 continue;
             }
 
