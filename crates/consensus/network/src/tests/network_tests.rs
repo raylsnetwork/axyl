@@ -2464,3 +2464,56 @@ async fn test_direct_connection_classifies_direct_nonrelay() -> eyre::Result<()>
 
     Ok(())
 }
+
+/// A circuit address written by another peer must not turn a connected honest peer into a relay.
+/// Peer exchange lists and kad answers carry such addresses, and the heartbeat dials them.
+/// The honest peer has no binding, because it has not sent its own record yet.
+/// When it connects, it must still be added to kad and picked by requests to any peer.
+/// The control node sees the same connection without the circuit dial.
+#[tokio::test]
+async fn test_third_party_circuit_address_does_not_make_honest_peer_a_relay() -> eyre::Result<()> {
+    use crate::{peers::PeerEvent, types::NetworkCommand};
+    use tokio::sync::oneshot;
+
+    let TestTypes { peer1: control, peer2: victim, .. } =
+        create_test_types::<TestWorkerRequest, TestWorkerResponse>();
+    let honest = PeerId::random();
+    let honest_addr: Multiaddr = "/ip4/127.0.0.1/udp/50000/quic-v1".parse()?;
+
+    for (label, mut network, circuit_dial) in
+        [("control", control.network, false), ("victim", victim.network, true)]
+    {
+        if circuit_dial {
+            // An invented destination reached through the honest peer, as an attacker writes it.
+            let fake_dst = PeerId::random();
+            let circuit: Multiaddr =
+                format!("{honest_addr}/p2p/{honest}/p2p-circuit/p2p/{fake_dst}").parse()?;
+            // The same call the discovery heartbeat makes for a peer exchange or kad entry.
+            network.swarm.behaviour_mut().peer_manager.dial_peer(fake_dst, vec![circuit], None);
+        }
+
+        // The honest peer connects while that dial is still pending.
+        network
+            .process_peer_manager_event(PeerEvent::PeerConnected(honest, honest_addr.clone()))?;
+
+        let in_kad = network
+            .swarm
+            .behaviour_mut()
+            .kademlia
+            .kbuckets()
+            .any(|bucket| bucket.iter().any(|entry| *entry.node.key.preimage() == honest));
+        assert!(in_kad, "{label}: honest peer kept out of the kad routing table");
+
+        let (reply, mut to_caller) = oneshot::channel();
+        network.process_command(NetworkCommand::SendRequestAny {
+            request: TestWorkerRequest::MissingBatches(vec![]),
+            reply,
+        })?;
+        assert!(
+            !matches!(to_caller.try_recv(), Ok(Err(NetworkError::NoPeers))),
+            "{label}: honest peer skipped by requests to any peer"
+        );
+    }
+
+    Ok(())
+}
