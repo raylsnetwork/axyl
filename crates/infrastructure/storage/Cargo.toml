@@ -37,10 +37,17 @@ lru = { workspace = true, optional = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["rt", "macros"] }
 criterion = { workspace = true }
+bs58 = { workspace = true }
 
 [[bench]]
 name = "cold_read_path"
 harness = false
+required-features = ["cold-storage"]
+
+# Reads the cold archive, so it cannot build without the cold tier. Without this the example is
+# compiled under `--no-default-features` and fails on the missing `ColdStore`/`ColdConfig`.
+[[example]]
+name = "validate_signer_projection"
 required-features = ["cold-storage"]
 
 [features]
