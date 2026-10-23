@@ -23,7 +23,7 @@ use libp2p::{
     Multiaddr, PeerId,
 };
 use rayls_execution_evm::test_utils::fixture_batch_with_transactions;
-use rayls_infrastructure_config::{ConsensusConfig, NetworkConfig};
+use rayls_infrastructure_config::{ConsensusConfig, NetworkConfig, GOSSIP_TOPIC_TXN};
 use rayls_infrastructure_storage::mem_db::MemDatabase;
 use rayls_infrastructure_types::{encode, now, BlsSigner, Certificate, Header, TaskManager};
 use rayls_testing_test_utils::CommitteeFixture;
@@ -2462,5 +2462,78 @@ async fn test_direct_connection_classifies_direct_nonrelay() -> eyre::Result<()>
         assert_eq!(count("relay_direct"), 0, "{label} has no relay, so no relay legs");
     }
 
+    Ok(())
+}
+
+/// gossipsub is built without `with_peer_score`, so its own mesh-level defences (invalid-message
+/// and behaviour penalties, graylisting, score-based pruning) are all off.
+#[tokio::test]
+async fn test_gossipsub_peer_scoring_is_disabled() {
+    let TestTypes { peer1, .. } = create_test_types::<TestWorkerRequest, TestWorkerResponse>();
+    let gossipsub = &peer1.network.swarm.behaviour().gossipsub;
+    // INVARIANT (inverted for a fix): `.is_some()` for any peer once scoring is enabled
+    assert!(gossipsub.peer_score(&PeerId::random()).is_none(), "gossipsub scoring is enabled");
+}
+
+/// The txn topic is subscribed with no publisher set and is exempt from `max_gossip_message_size`,
+/// so any peer, not only a committee member, may push a roughly 2 MiB message that is accepted and
+/// therefore forwarded to the mesh with no penalty. A restricted topic rejects 12_001 bytes.
+#[tokio::test]
+async fn test_txn_topic_accepts_oversized_gossip_from_any_publisher() -> eyre::Result<()> {
+    let TestTypes { peer1, peer2, .. } =
+        create_test_types::<TestWorkerRequest, TestWorkerResponse>();
+    // publisher: never seated in the receiver's committee, never trusted
+    let NetworkPeer { config: config_1, network_handle: publisher, network, .. } = peer1;
+    tokio::spawn(async move { network.run().await.expect("network run failed!") });
+    let NetworkPeer {
+        config: config_2,
+        network_handle: receiver,
+        network_events: mut receiver_events,
+        network,
+        ..
+    } = peer2;
+    tokio::spawn(async move { network.run().await.expect("network run failed!") });
+
+    publisher.start_listening(config_1.primary_address()).await?;
+    receiver.start_listening(config_2.primary_address()).await?;
+
+    let publisher_bls = config_1.key_config().primary_public_key();
+    let publisher_net = config_1.primary_networkkey();
+    let publisher_id: PeerId = publisher_net.clone().into();
+    receiver.add_explicit_peer(publisher_bls, publisher_net, config_1.primary_address()).await?;
+
+    // production subscription: no publisher set on the txn topic
+    receiver.subscribe(GOSSIP_TOPIC_TXN.into()).await?;
+    // control: a publisher-restricted topic (the publisher IS allowed, so only size can reject)
+    receiver.subscribe_with_publishers(TEST_TOPIC.into(), config_1.committee_pub_keys()).await?;
+    receiver.dial_by_bls(publisher_bls).await?;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let score_before = receiver.peer_score(publisher_id).await?.expect("tracked");
+
+    // ~2 MiB payload, just under gossipsub's max_transmit_size (frame overhead < 1 KiB)
+    let max_gossip = config_2.network_config().libp2p_config().max_gossip_message_size;
+    let big = vec![0xAB_u8; 2 * 1024 * 1024 - 1024];
+    assert!(big.len() > 170 * max_gossip, "payload must dwarf the 12 KB gossip cap");
+    publisher.publish(GOSSIP_TOPIC_TXN.into(), big.clone()).await?;
+
+    let event = timeout(Duration::from_secs(5), receiver_events.recv()).await?.expect("event");
+    let NetworkEvent::Gossip(msg, source) = event else { panic!("unexpected event") };
+    // INVARIANT (inverted for a fix): oversized txn gossip from a non-committee peer is rejected
+    assert_eq!(msg.data.len(), big.len(), "oversized txn gossip was not delivered");
+    assert_eq!(source, publisher_bls);
+    assert_eq!(
+        receiver.peer_score(publisher_id).await?,
+        Some(score_before),
+        "accepted oversized txn gossip was penalised"
+    );
+
+    // control: one byte over the cap on a restricted topic is rejected and Fatal-penalised
+    publisher.publish(TEST_TOPIC.into(), vec![0xCD_u8; max_gossip + 1]).await?;
+    assert!(timeout(Duration::from_secs(2), receiver_events.recv()).await.is_err());
+    assert_eq!(
+        receiver.peer_score(publisher_id).await?,
+        Some(config_2.network_config().peer_config().score_config.min_score)
+    );
     Ok(())
 }

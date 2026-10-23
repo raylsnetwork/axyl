@@ -1847,3 +1847,96 @@ async fn test_heartbeat_redials_missing_committee_member() {
         "no raw dial may bypass the resolving dial path"
     );
 }
+
+/// The inbound gate counts distinct peers, never connections, and an important peer bypasses even
+/// that count: a committee member is admitted for every connection it opens, at and past the cap.
+#[tokio::test]
+async fn test_committee_member_connections_are_unbounded() {
+    let all_nodes = CommitteeFixture::builder(MemDatabase::default).build();
+    let mut authorities = all_nodes.authorities();
+    let authority_1 = authorities.next().expect("first authority");
+    let authority_2 = authorities.next().expect("second authority");
+    let config = authority_1.consensus_config();
+    let config_2 = authority_2.consensus_config();
+    let mut peer_manager =
+        PeerManager::new(config.network_config().peer_config(), PeerId::random());
+
+    // resolve authority_2 and seat the committee, so it is a current validator
+    peer_manager.add_known_peer(
+        *authority_2.authority().protocol_key(),
+        NetworkInfo {
+            pubkey: config_2.key_config().primary_network_public_key(),
+            multiaddrs: vec![config_2.primary_address()],
+            timestamp: now(),
+        },
+    );
+    peer_manager.new_epoch(config.committee_pub_keys());
+    let member: PeerId = config_2.key_config().primary_network_public_key().into();
+    assert!(peer_manager.is_peer_validator(&member), "precondition: seated member");
+
+    // fill the inbound cap with ordinary peers
+    let max_peers = config.network_config().peer_config().max_peers();
+    while peer_manager.connected_or_dialing_peers().len() < max_peers {
+        register_peer(&mut peer_manager, None);
+    }
+    assert!(peer_manager.peer_inbound_limit_reached(), "precondition: cap reached");
+
+    // an ordinary newcomer is refused at the cap
+    let local = create_multiaddr(None);
+    let refused = peer_manager.handle_established_inbound_connection(
+        ConnectionId::new_unchecked(0),
+        PeerId::random(),
+        &local,
+        &create_multiaddr(None),
+    );
+    assert!(refused.is_err(), "ordinary peer admitted past the cap");
+
+    // the member is admitted for every one of many simultaneous connections
+    const CONNECTIONS: usize = 1_000;
+    for i in 0..CONNECTIONS {
+        let remote = create_multiaddr(None);
+        let admitted = peer_manager.handle_established_inbound_connection(
+            ConnectionId::new_unchecked(i + 1),
+            member,
+            &local,
+            &remote,
+        );
+        // INVARIANT (inverted for a fix): admitted.is_err() once i >= per-peer connection limit
+        assert!(admitted.is_ok(), "connection {i} from a committee member was refused");
+        assert!(peer_manager.register_peer_connection(
+            &member,
+            ConnectionType::IncomingConnection { multiaddr: remote }
+        ));
+    }
+
+    // connections are counted (saturating u8) but nothing ever enforces the count
+    let status = *peer_manager.peers.get_peer(&member).expect("tracked").connection_status();
+    assert_matches!(status, ConnectionStatus::Connected { num_in: u8::MAX, .. });
+    // and the distinct-peer count the gate uses never moved
+    assert_eq!(peer_manager.connected_or_dialing_peers().len(), max_peers + 1);
+}
+
+/// Below the cap, an ordinary (non-important) peer may also open any number of connections: extra
+/// connections from an already connected peer do not move the distinct-peer count the gate reads.
+#[tokio::test]
+async fn test_ordinary_peer_extra_connections_are_not_counted() {
+    let mut peer_manager = create_test_peer_manager(None);
+    let local = create_multiaddr(None);
+    let peer = PeerId::random();
+    for i in 0..1_000usize {
+        let remote = create_multiaddr(None);
+        assert!(peer_manager
+            .handle_established_inbound_connection(
+                ConnectionId::new_unchecked(i),
+                peer,
+                &local,
+                &remote
+            )
+            .is_ok());
+        assert!(peer_manager.register_peer_connection(
+            &peer,
+            ConnectionType::IncomingConnection { multiaddr: remote }
+        ));
+    }
+    assert_eq!(peer_manager.connected_or_dialing_peers().len(), 1);
+}
