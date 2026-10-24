@@ -192,6 +192,15 @@ pub trait RaylsHardforks {
         self.is_rayls_fork_active_at_block(RaylsHardFork::CertificateFetchEpochV2, block)
     }
 
+    /// Return true if the HeaderParentSigners fork is active at `block`.
+    ///
+    /// Judged once per epoch at the epoch's first block: every header of that epoch then carries
+    /// its author's own-parent signer claim, voters require it, and the hybrid reward tally
+    /// credits participation from the claims.
+    fn is_header_parent_signers_active_at_block(&self, block: u64) -> bool {
+        self.is_rayls_fork_active_at_block(RaylsHardFork::HeaderParentSigners, block)
+    }
+
     /// Return the max version byte among the forks active at `block`, if any.
     fn version_byte_at_block(&self, block: u64) -> Option<u8> {
         RaylsHardFork::VARIANTS

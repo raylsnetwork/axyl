@@ -139,7 +139,15 @@ fn penalty_from_header_error(error: &HeaderError) -> Option<Penalty> {
         // medium
         HeaderError::InvalidParents
         | HeaderError::WrongNumberOfParents(_, _)
-        | HeaderError::TooOld { .. } => Some(Penalty::Medium),
+        | HeaderError::TooOld { .. }
+        // the header disagrees with this node's fork state: a misconfigured or not yet upgraded
+        // peer, which a peer on the right side of the fork cannot trigger by accident
+        | HeaderError::UnexpectedOwnParentSigners
+        | HeaderError::MissingOwnParentSigners
+        // a claim with signers but no signature or the reverse, or one that fails its own
+        // cryptographic verification: only the author builds the claim, so these are its doing
+        | HeaderError::OwnParentSignersMalformed
+        | HeaderError::OwnParentSignersInvalid { .. } => Some(Penalty::Medium),
         // severe
         HeaderError::InvalidTimestamp { .. } | HeaderError::InvalidParentRound => {
             Some(Penalty::Severe)
@@ -157,6 +165,7 @@ fn penalty_from_header_error(error: &HeaderError) -> Option<Penalty> {
         | HeaderError::UnknownWorkerId
         | HeaderError::InvalidHeaderDigest
         | HeaderError::InvalidRound { .. }
+        | HeaderError::OwnParentSignerOutOfRange { .. }
         | HeaderError::UnknownAuthority(_) => Some(Penalty::Fatal),
         // ignore
         HeaderError::PendingCertificateOneshot

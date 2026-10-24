@@ -15,8 +15,8 @@ use rayls_infrastructure_config::LibP2pConfig;
 use rayls_infrastructure_storage::{mem_db::MemDatabase, CertScope};
 use rayls_infrastructure_types::{
     encode, error::HeaderError, now, AuthorityIdentifier, BlockHash, BlockHeader, BlockNumHash,
-    BlsPublicKey, Certificate, CertificateDigest, ExecHeader, Hash as _, RaylsReceiver,
-    RaylsSender, SealedHeader, TaskManager,
+    BlsPublicKey, BlsSignature, Certificate, CertificateDigest, ExecHeader, Hash as _,
+    OwnParentSigners, RaylsReceiver, RaylsSender, SealedHeader, TaskManager,
 };
 use rayls_testing_test_utils_committee::CommitteeFixture;
 use std::collections::{BTreeMap, BTreeSet};
@@ -90,9 +90,16 @@ struct TestTypes<DB = MemDatabase> {
 /// Helper function to create an instance of [RequestHandler] for the first authority in the
 /// committee.
 fn create_test_types() -> TestTypes {
+    create_test_types_with(false)
+}
+
+/// Like [`create_test_types`], with the `HeaderParentSigners` fork state set on the handler's
+/// config.
+fn create_test_types_with(header_parent_signers_active: bool) -> TestTypes {
     let committee = CommitteeFixture::builder(MemDatabase::default).randomize_ports(true).build();
     let authority = committee.first_authority();
-    let config = authority.consensus_config();
+    let mut config = authority.consensus_config();
+    config.set_header_parent_signers_active(header_parent_signers_active);
     let cb = ConsensusBus::new();
 
     // spawn the synchronizer
@@ -130,6 +137,300 @@ async fn test_vote_succeeds() -> eyre::Result<()> {
     let res = handler.vote(peer, header, parents).await;
     debug!(target: "primary::handler_tests", ?res);
     assert!(res.is_ok());
+    Ok(())
+}
+
+/// Once the fork is active a vote request must carry the author's own-parent signer claim and it
+/// must match the parent certificate this node holds. Round-1 headers build on genesis
+/// certificates, whose signer bitmaps are empty, so the only valid claim there is an empty one.
+#[tokio::test]
+async fn test_vote_own_parent_signers_required_and_checked_once_fork_is_active() -> eyre::Result<()>
+{
+    // a refused vote request still marks the author's round on this handler, so each case gets
+    // a fresh one
+    let vote = |claim: Option<OwnParentSigners>| async move {
+        let TestTypes { committee, handler, parent, task_manager: _task_manager, .. } =
+            create_test_types_with(true);
+        let peer = *committee.last_authority().authority().protocol_key();
+        let header = committee
+            .header_builder_last_authority()
+            .latest_execution_block(BlockNumHash::new(parent.number(), parent.hash()))
+            .created_at(1) // parent is 0
+            .own_parent_signers(claim)
+            .build();
+        handler.vote(peer, header, Vec::new()).await
+    };
+
+    // no claim at all
+    let res = vote(None).await;
+    assert_matches!(
+        res,
+        Err(PrimaryNetworkError::InvalidHeader(HeaderError::MissingOwnParentSigners))
+    );
+
+    // a claim that disagrees with the (empty) genesis parent and cannot verify: one signer is
+    // below quorum, and the signature is not theirs anyway
+    let res = vote(Some(OwnParentSigners {
+        signers: roaring::RoaringBitmap::from_iter([0u32]),
+        signature: Some(BlsSignature::default()),
+    }))
+    .await;
+    assert_matches!(
+        res,
+        Err(PrimaryNetworkError::InvalidHeader(HeaderError::OwnParentSignersInvalid {
+            claimed,
+            expected,
+        })) if claimed == vec![0] && expected.is_empty()
+    );
+
+    // signers without a signature: refused as malformed before any comparison
+    let res =
+        vote(Some(OwnParentSigners::unsigned_for_test(roaring::RoaringBitmap::from_iter([0u32]))))
+            .await;
+    assert_matches!(
+        res,
+        Err(PrimaryNetworkError::InvalidHeader(HeaderError::OwnParentSignersMalformed))
+    );
+
+    // the matching claim
+    let res = vote(Some(OwnParentSigners::empty())).await;
+    assert!(res.is_ok(), "{res:?}");
+    Ok(())
+}
+
+/// The property the fork exists for, against real parents: the voter holds the author's
+/// round-1 certificate with signer set A. A round-2 header claiming A is voted at once. One
+/// claiming another valid quorum B is verified on its own and voted too, with and without the
+/// proposer shipping its B copy, and the voter's stored copy converges on B. Claims that cannot
+/// verify, an empty one, A's signers under B's signature, or a real aggregate below quorum, are
+/// refused and leave the stored copy alone.
+#[tokio::test]
+async fn test_vote_own_parent_signers_checked_against_the_stored_parent() -> eyre::Result<()> {
+    use rayls_infrastructure_storage::CertificateStore as _;
+
+    // the claim is picked from the variants once they exist: A = stored, B = the other quorum,
+    // SMALL = a two-vote aggregate below quorum
+    type Claim = fn(&Certificate, &Certificate, &Certificate) -> OwnParentSigners;
+
+    // one vote request per fresh handler: a refused request marks the author's round. The claim
+    // is picked from the two variants (A = stored, B = the other quorum) once they exist.
+    let vote = |claim_of: Claim, ship_variant_b: bool| async move {
+        let TestTypes { committee, handler, parent, task_manager: _task_manager, .. } =
+            create_test_types_with(true);
+        let author = committee.last_authority();
+        let peer = *author.authority().protocol_key();
+        let exec = BlockNumHash::new(parent.number(), parent.hash());
+
+        // the author's round-1 header, with every committee vote available
+        let own_header = author.header_builder(&committee.committee()).created_at(1).build();
+        let mut votes: Vec<_> = committee
+            .votes(&own_header)
+            .into_iter()
+            .map(|v| (v.author().clone(), *v.signature()))
+            .collect();
+        let own_vote = author.vote(&own_header);
+        if !votes.iter().any(|(a, _)| a == own_vote.author()) {
+            votes.push((own_vote.author().clone(), *own_vote.signature()));
+        }
+        votes.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(votes.len(), 4, "fixture must yield a vote from every authority");
+        // two distinct, equally valid quorum subsets of the same header
+        let variant_a = Certificate::new_unverified(
+            &committee.committee(),
+            own_header.clone(),
+            votes[..3].to_vec(),
+        )
+        .expect("quorum A");
+        let variant_b = Certificate::new_unverified(
+            &committee.committee(),
+            own_header.clone(),
+            votes[1..].to_vec(),
+        )
+        .expect("quorum B");
+        assert_eq!(variant_a.digest(), variant_b.digest());
+        assert_ne!(variant_a.signed_authorities(), variant_b.signed_authorities());
+        let variant_small = Certificate::new_unsigned_for_test(
+            &committee.committee(),
+            own_header.clone(),
+            votes[..2].to_vec(),
+        )
+        .expect("two-vote aggregate");
+
+        // the voter already holds variant A, plus two other round-1 parents for quorum
+        let others: Vec<Certificate> = committee
+            .authorities()
+            .filter(|a| a.id() != author.id())
+            .take(2)
+            .map(|a| {
+                committee
+                    .certificate(&a.header_builder(&committee.committee()).created_at(1).build())
+            })
+            .collect();
+        let mut stored = others.clone();
+        stored.push(variant_a.clone());
+        committee
+            .first_authority()
+            .consensus_config()
+            .node_storage()
+            .write_all(stored.clone())
+            .expect("parents stored");
+
+        let header = author
+            .header_builder(&committee.committee())
+            .round(2)
+            .parents(stored.iter().map(|c| c.digest()).collect())
+            .latest_execution_block(exec)
+            .created_at(2)
+            .own_parent_signers(Some(claim_of(&variant_a, &variant_b, &variant_small)))
+            .build();
+        let shipped = if ship_variant_b {
+            let mut shipped = others;
+            shipped.push(variant_b.clone());
+            shipped
+        } else {
+            Vec::new()
+        };
+        let res = handler.vote(peer, header, shipped).await;
+        // what the voter holds for the author's round-1 certificate after the request
+        let stored_after = committee
+            .first_authority()
+            .consensus_config()
+            .node_storage()
+            .read(variant_a.digest())
+            .expect("store read")
+            .expect("parent still stored")
+            .signed_authorities()
+            .clone();
+        (
+            res,
+            stored_after,
+            variant_a.signed_authorities().clone(),
+            variant_b.signed_authorities().clone(),
+        )
+    };
+    let invalid = |res: &Result<_, PrimaryNetworkError>| {
+        matches!(
+            res,
+            Err(PrimaryNetworkError::InvalidHeader(HeaderError::OwnParentSignersInvalid { .. }))
+        )
+    };
+
+    // an empty claim while the author's certificate is among the parents: nothing to verify
+    let (res, stored, a, _) = vote(|_, _, _| OwnParentSigners::empty(), false).await;
+    assert!(invalid(&res), "{res:?}");
+    assert_eq!(stored, a, "an invalid claim never touches the stored copy");
+    // the exact stored set: a vote, store untouched
+    let (res, stored, a, _) = vote(|a, _, _| OwnParentSigners::from_certificate(a), false).await;
+    assert!(res.is_ok(), "{res:?}");
+    assert_eq!(stored, a);
+    // another valid quorum of the same header: verified and accepted whatever copy is stored,
+    // and the stored copy converges on the author's claimed variant
+    let (res, stored, _, b) = vote(|_, b, _| OwnParentSigners::from_certificate(b), false).await;
+    assert!(res.is_ok(), "{res:?}");
+    assert_eq!(stored, b, "the stored copy adopts the verified claim");
+    // the same, with the proposer shipping its B copy alongside: the stored A is compared first,
+    // the claim verifies, the copy converges
+    let (res, stored, _, b) = vote(|_, b, _| OwnParentSigners::from_certificate(b), true).await;
+    assert!(res.is_ok(), "{res:?}");
+    assert_eq!(stored, b);
+    // the stored signer set with the other quorum's signature: fails verification
+    let (res, stored, a, _) = vote(
+        |a, b, _| OwnParentSigners {
+            signers: a.signed_authorities().clone(),
+            signature: b.aggregated_signature(),
+        },
+        false,
+    )
+    .await;
+    assert!(invalid(&res), "{res:?}");
+    assert_eq!(stored, a);
+    // a real aggregate of two votes, below quorum: fails verification
+    let (res, stored, a, _) =
+        vote(|_, _, small| OwnParentSigners::from_certificate(small), false).await;
+    assert!(invalid(&res), "{res:?}");
+    assert_eq!(stored, a);
+    Ok(())
+}
+
+/// The other half of the parent-copy rule: a voter that does not hold the author's round-1
+/// certificate asks for the parents, receives them with the retried request, verifies and
+/// stores them, and compares the claim against that shipped copy.
+#[tokio::test]
+async fn test_vote_own_parent_signers_checked_against_the_shipped_parent() -> eyre::Result<()> {
+    use crate::network::message::PrimaryResponse;
+    type Claim = fn(&Certificate) -> OwnParentSigners;
+
+    let vote = |claim_of: Claim| async move {
+        let TestTypes { committee, handler, parent, task_manager: _task_manager, .. } =
+            create_test_types_with(true);
+        let author = committee.last_authority();
+        let peer = *author.authority().protocol_key();
+        let exec = BlockNumHash::new(parent.number(), parent.hash());
+
+        let own_cert = committee
+            .certificate(&author.header_builder(&committee.committee()).created_at(1).build());
+        let mut parents: Vec<Certificate> = committee
+            .authorities()
+            .filter(|a| a.id() != author.id())
+            .take(2)
+            .map(|a| {
+                committee
+                    .certificate(&a.header_builder(&committee.committee()).created_at(1).build())
+            })
+            .collect();
+        parents.push(own_cert.clone());
+
+        let header = author
+            .header_builder(&committee.committee())
+            .round(2)
+            .parents(parents.iter().map(|c| c.digest()).collect())
+            .latest_execution_block(exec)
+            .created_at(2)
+            .own_parent_signers(Some(claim_of(&own_cert)))
+            .build();
+
+        // nothing stored: the first request comes back asking for the parents
+        let missing = match handler.vote(peer, header.clone(), Vec::new()).await {
+            Ok(PrimaryResponse::MissingParents(missing)) => missing,
+            other => panic!("expected MissingParents, got {other:?}"),
+        };
+        assert_eq!(missing.len(), parents.len());
+        // the retry ships them: verified, stored, and the claim is compared with that copy
+        handler.vote(peer, header, parents).await
+    };
+
+    let res = vote(OwnParentSigners::from_certificate).await;
+    assert!(matches!(res, Ok(PrimaryResponse::Vote(_))), "{res:?}");
+    // an empty claim while the shipped parent is the author's own: nothing verifies it
+    let res = vote(|_| OwnParentSigners::empty()).await;
+    assert!(
+        matches!(
+            res,
+            Err(PrimaryNetworkError::InvalidHeader(HeaderError::OwnParentSignersInvalid { .. }))
+        ),
+        "{res:?}"
+    );
+    Ok(())
+}
+
+/// Before the fork a claim is refused, so no proposer can start the new layout early.
+#[tokio::test]
+async fn test_vote_fails_own_parent_signers_before_fork() -> eyre::Result<()> {
+    let TestTypes { committee, handler, parent, task_manager: _task_manager, .. } =
+        create_test_types();
+    let header = committee
+        .header_builder_last_authority()
+        .latest_execution_block(BlockNumHash::new(parent.number(), parent.hash()))
+        .created_at(1) // parent is 0
+        .own_parent_signers(Some(OwnParentSigners::empty()))
+        .build();
+    let peer = *committee.last_authority().authority().protocol_key();
+
+    let res = handler.vote(peer, header, Vec::new()).await;
+    assert_matches!(
+        res,
+        Err(PrimaryNetworkError::InvalidHeader(HeaderError::UnexpectedOwnParentSigners))
+    );
     Ok(())
 }
 

@@ -254,8 +254,10 @@ pub enum Command {
     /// Count what each validator did in one epoch from the committed sub-dags on disk, in the
     /// shape the node hands to the ConsensusRegistry at the epoch's close.
     ///
-    /// Per authority: `participation` (headers whose sub-dag holds one of its certificates),
-    /// `anchor` (headers it led), the participation share in basis points, and its certificate,
+    /// Per authority: `participation` (headers whose sub-dag holds one of its certificates, or,
+    /// once headers carry own-parent signer claims after the HeaderParentSigners fork, headers
+    /// whose sub-dag attests that it signed), `anchor` (headers it led), the participation share
+    /// in basis points, and its certificate,
     /// batch and signature counts; per node, the tallied header count (`totalRounds`). Counts
     /// only, nothing inferred. Genesis headers (leader round 0) and cache rows (not processed) are
     /// listed and not counted, as the node's own tally skips them. An open epoch's running tally

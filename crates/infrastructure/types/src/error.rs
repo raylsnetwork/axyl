@@ -288,6 +288,24 @@ pub enum HeaderError {
     /// Oneshot channel dropped for pending certificate result.
     #[error("Failed to return pending certificate manager result.")]
     PendingCertificateOneshot,
+    /// The header claims its own parent certificate's signers before the fork allows it.
+    #[error("Header carries own-parent signers before the HeaderParentSigners fork is active")]
+    UnexpectedOwnParentSigners,
+    /// The fork requires the header to claim its own parent certificate's signers.
+    #[error("Header is missing the own-parent signers the HeaderParentSigners fork requires")]
+    MissingOwnParentSigners,
+    /// A claimed signer index is not a committee index.
+    #[error("Own-parent signer index {max} is outside a committee of {committee_size}")]
+    OwnParentSignerOutOfRange { max: u32, committee_size: usize },
+    /// The claim carries a signature without signers, or signers without a signature.
+    #[error("Own-parent signer claim must carry a signature exactly when it names signers")]
+    OwnParentSignersMalformed,
+    /// The claim differs from the parent certificate this node holds and does not verify on its
+    /// own: the claimed signers do not reach quorum, or the carried signature is not theirs over
+    /// the parent's digest, or a claim was made without the author's own certificate among the
+    /// parents.
+    #[error("Own-parent signer claim does not verify: claimed signers {claimed:?}, held signers {expected:?}")]
+    OwnParentSignersInvalid { claimed: Vec<u32>, expected: Vec<u32> },
 }
 
 /// Result alias for [`CertificateError`].

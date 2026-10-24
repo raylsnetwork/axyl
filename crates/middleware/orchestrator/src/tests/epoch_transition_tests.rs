@@ -2641,7 +2641,7 @@ async fn test_initial_boot_at_epoch_boundary_catches_up_not_fresh_genesis() {
     // history whose subdag did NOT close epoch 3.
     let author = config.authority_id().expect("config has an authority id");
     let leader_header =
-        Header::new(author, 8, 3, Default::default(), Default::default(), Default::default());
+        Header::new(author, 8, 3, Default::default(), Default::default(), Default::default(), None);
     let leader = Certificate::new_unsigned_for_test(&committee, leader_header, vec![])
         .expect("unsigned leader cert");
     let sub_dag = CommittedSubDag::new(vec![], leader, 0, ReputationScores::default(), None);

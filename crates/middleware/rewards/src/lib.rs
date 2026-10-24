@@ -180,6 +180,16 @@ impl<DB: Database> RewardsBackend for ConsensusRewardsCounter<DB> {
                 txn.disable_long_read_safety();
                 info!(target: "rewards", ?epoch, "tally_hybrid: read txn opened");
 
+                // Signer claims are committee indices in BLS-key order, the index space of
+                // `Certificate::signed_authorities` (`Committee::bls_keys`), NOT the
+                // identifier order `Committee::authorities` yields. Resolving against the
+                // wrong order pays plausible but wrong validators silently. Resolved once:
+                // the committee is fixed for the whole tally.
+                let address_by_index: Vec<Option<Address>> = committee
+                    .bls_keys()
+                    .iter()
+                    .map(|key| committee.authority_by_key(key).map(|a| a.execution_address()))
+                    .collect();
                 let mut per_address: BTreeMap<Address, ValidatorRoundTally> = BTreeMap::new();
                 let mut total_rounds: u32 = 0;
                 let mut walked: u64 = 0;
@@ -233,13 +243,26 @@ impl<DB: Database> RewardsBackend for ConsensusRewardsCounter<DB> {
                     // (invariant-precluded, but defended for symmetry with the legacy
                     // `get_address_counts` merge) can't double-count within one sub-dag.
                     seen.clear();
-                    for author in &meta.participants {
-                        if let Some(authority) = committee.authority(author) {
-                            let address = authority.execution_address();
-                            if seen.insert(address) {
-                                let tally = per_address.entry(address).or_default();
-                                tally.participation_rounds =
-                                    tally.participation_rounds.saturating_add(1);
+                    let mut credit = |address: Address| {
+                        if seen.insert(address) {
+                            let tally = per_address.entry(address).or_default();
+                            tally.participation_rounds =
+                                tally.participation_rounds.saturating_add(1);
+                        }
+                    };
+                    if meta.signers_attested {
+                        // Post-fork: whoever a committed header attests signed its author's
+                        // previous certificate. Committed and byte-identical on every node.
+                        for index in meta.attested_signers.iter() {
+                            if let Some(Some(address)) = address_by_index.get(index as usize) {
+                                credit(*address);
+                            }
+                        }
+                    } else {
+                        // Pre-fork: whoever authored a committed certificate.
+                        for author in &meta.participants {
+                            if let Some(authority) = committee.authority(author) {
+                                credit(authority.execution_address());
                             }
                         }
                     }
@@ -315,7 +338,8 @@ mod tests {
     };
     use rayls_infrastructure_types::{
         BlsKeypair, Certificate, CertificateDigest, CommittedSubDag, CommitteeBuilder,
-        ConsensusHeader, DbTxMut, Header, HeaderBuilder, ReputationScores, Round, WorkerId,
+        ConsensusHeader, DbTxMut, Header, HeaderBuilder, OwnParentSigners, ReputationScores, Round,
+        WorkerId,
     };
     use tempfile::TempDir;
 
@@ -529,5 +553,80 @@ mod tests {
 
         assert_eq!(tally.total_rounds, 0);
         assert!(tally.per_address.is_empty());
+    }
+
+    fn make_cert_with_claim(
+        author: &AuthorityIdentifier,
+        round: u32,
+        epoch: u32,
+        claim: roaring::RoaringBitmap,
+    ) -> Certificate {
+        let header = HeaderBuilder::default()
+            .author(author.clone())
+            .round(round)
+            .epoch(epoch)
+            .created_at(0)
+            .payload(IndexMap::<BlockHash, WorkerId>::new())
+            .parents(std::collections::BTreeSet::<CertificateDigest>::new())
+            .own_parent_signers(Some(OwnParentSigners::unsigned_for_test(claim)))
+            .build();
+        let mut cert = Certificate::default();
+        cert.update_header_for_test(header);
+        cert
+    }
+
+    /// Post-fork, participation comes from the own-parent signer claims the committed headers
+    /// carry, not from certificate authorship: whoever a header attests is credited, in
+    /// `Committee::bls_keys` index order, and an author nobody attests is not.
+    #[test]
+    fn tally_hybrid_credits_attested_signers_instead_of_authors_once_claims_exist() {
+        let (committee, ids) = test_committee(4);
+        let (leader_id, leader_addr) = &ids[0];
+        // claims are committee indices in BLS-key order, which is not the order `ids` was built
+        let bls_keys = committee.bls_keys();
+        let addr_of = |index: usize| {
+            committee.authority_by_key(&bls_keys[index]).unwrap().execution_address()
+        };
+        let index_of = |id: &AuthorityIdentifier| {
+            let key = *committee.authority(id).unwrap().protocol_key();
+            bls_keys.iter().position(|k| *k == key).unwrap() as u32
+        };
+
+        let leader = make_cert(leader_id, 4, 0);
+        // a proposer always votes for its own header, so a real claim always names its author;
+        // ids[1]'s claim does, which pins that self-attestation is credited like any other
+        let claim_1 = roaring::RoaringBitmap::from_iter([1u32, 3, index_of(&ids[1].0)]);
+        let certs = vec![
+            make_cert_with_claim(&ids[1].0, 3, 0, claim_1),
+            make_cert_with_claim(&ids[2].0, 3, 0, roaring::RoaringBitmap::from_iter([3u32])),
+            // its own previous certificate was not among its parents: nothing to attest
+            make_cert_with_claim(&ids[3].0, 3, 0, roaring::RoaringBitmap::new()),
+        ];
+        let sub_dag = CommittedSubDag::new(certs, leader, 0, ReputationScores::default(), None);
+        let header = ConsensusHeader {
+            parent_hash: BlockHash::repeat_byte(0xAB),
+            sub_dag,
+            number: 4,
+            extra: BlockHash::ZERO,
+        };
+
+        let db = MemDatabase::default();
+        db.insert::<ConsensusBlocks>(&0u64, &header).unwrap();
+        let counter = ConsensusRewardsCounter::new(db);
+        counter.set_committee(committee.clone());
+        let tally = counter.tally_hybrid(0, u32::MAX).unwrap();
+
+        assert_eq!(tally.total_rounds, 1);
+        assert_eq!(tally.per_address[leader_addr].leader_rounds, 1);
+        let credited: std::collections::BTreeSet<Address> = tally
+            .per_address
+            .iter()
+            .filter(|(_, t)| t.participation_rounds > 0)
+            .map(|(a, _)| *a)
+            .collect();
+        assert_eq!(credited, [addr_of(1), addr_of(3), ids[1].1].into_iter().collect());
+        for address in &credited {
+            assert_eq!(tally.per_address[address].participation_rounds, 1, "once per sub-dag");
+        }
     }
 }

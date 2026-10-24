@@ -6,7 +6,7 @@ that protect against schedule drift.
 
 ## 1. Behavioral vs Migration Hardforks
 
-The 17 hardforks fall into two categories:
+The 18 hardforks fall into two categories:
 
 **Migration hardforks** perform a one-shot atomic state rewrite the client
 executes at the first block where the fork activates
@@ -24,7 +24,7 @@ built-in mainnet/testnet.
 `HybridRewards` is both: it performs a state rewrite (the `ConsensusRegistry`
 bytecode swap) and flips the epoch-close reward ABI from 1-arg to 2-arg.
 
-### 17-fork inventory
+### 18-fork inventory
 
 | # | Fork | Kind | Set |
 |---|------|------|-----|
@@ -45,10 +45,11 @@ bytecode swap) and flips the epoch-close reward ABI from 1-arg to 2-arg.
 | 15 | SenderAffinityLoadBalancing | behavioral | — |
 | 16 | EpochCloseSeedV2 | behavioral | — |
 | 17 | CertificateFetchEpochV2 | behavioral | — |
+| 18 | HeaderParentSigners | behavioral | — |
 
 ### What each behavioral fork does
 
-The ten behavioral forks switch client behavior without a state write; the
+The eleven behavioral forks switch client behavior without a state write; the
 activation block is a rollout decision, not a state-consistency requirement.
 What each one does:
 
@@ -64,6 +65,7 @@ What each one does:
 | `OutputSeqNormalization` | Discards batches parked at the epoch boundary (their transactions stay pooled and re-seal in the new epoch) instead of force-executing them. |
 | `EpochCloseSeedV2` | Seeds the epoch-closing block's `extra_data` with the consensus header hash, identical on every node, instead of the leader-certificate signature hash. |
 | `CertificateFetchEpochV2` | Sends certificate fetch requests stamped with the epoch their rounds refer to, so a peer that has already closed that epoch serves them from the kept tail instead of the new epoch. Gates only the request format a node sends — every node accepts both variants, but a peer that has not been upgraded cannot decode the stamped one. |
+| `HeaderParentSigners` | Puts the signer bitmap and aggregate signature of a proposer's own previous certificate into its next header, so the set is inside a signed, committed header that every node holds identically; a certificate's own signer set is outside every commitment and can legitimately differ between nodes. Voters compare the claim with the parent certificate they hold and, when it differs, verify it on its own (quorum among the claimed signers, their aggregate signature over the parent digest): a verified claim is accepted and the stored copy adopts it, so stored certificates converge on the author's version even if a committee member minted another valid signer variant and seeded it first; the difference is logged with both signer sets. An unverifiable claim is the author's doing and is refused. The hybrid reward tally credits participation from these claims instead of certificate authorship; a proposer always votes for its own header, so a claim always names its author too, and the signal is close to a superset of authorship, with a one-round lag (your certificate landed and your next header committed, or your vote landed in someone else's certificate). Judged per epoch at its first block. Rollout gate: every validator, observer and tool must run a version with this fork before its activation block is scheduled, because a node that has not upgraded cannot decode the new header layout and Fatal-bans the peers sending it, and an upgraded-but-misconfigured validator still proposing without claims in an active epoch is refused every round with a Medium penalty until fixed; schedule it no earlier than `EpochCloseSeedV2`. |
 
 The seven migration forks' behavior is described by their set in section 2.
 
@@ -131,21 +133,25 @@ The canonical new-chain schedule therefore uses:
 | `Erc20PrecompileBytecode` | **exactly `Block(1)`** | The genesis has no STOP byte, so the first post-genesis block must write it. Block 0 is never executed (genesis initializes state directly, no EVM execution). A later block (e.g. 5) leaves a live EIP-161 cleanup exposure window between blocks 1 and 5. |
 | `UsdrSupplyCorrection` | **exactly `Never`** | A one-time historical mainnet rebase. The corrected value is already baked into the genesis. |
 | `HybridRewards` | **exactly `Block(1)`** | The genesis bakes the pre-hybrid `ConsensusRegistry`. The 2-arg ABI must not be live at genesis (calling it against the pre-hybrid registry reverts — fatal system call). A new chain starts the complete current protocol from the first block, with no legacy-regime window. |
-| 10 behavioral forks | any value | Business-logic based (see below). |
+| 11 behavioral forks | any value | Business-logic based (see below); `HeaderParentSigners` only at or after `EpochCloseSeedV2`. |
 
 On a new chain these values are required for correctness, but the node does not enforce them: the shape gate applies only the relaxed rules of section 4 to every non-mainnet/testnet chain-id, so a deviating new-chain schedule will boot. In particular, the built-in **devnet** schedule keeps `HybridRewards: Never`, which those rules allow.
 
 ## 3. Behavioral Changes Are Business-Logic Based
 
-The 10 behavioral forks (`Eip1559`, `BatchDigestV2`, `PrecompileGasFix`,
+The 11 behavioral forks (`Eip1559`, `BatchDigestV2`, `PrecompileGasFix`,
 `TransactionLoadBalancing`, `EmptyOutputBlock`, `DynamicCommitteeSizing`,
 `OutputSeqNormalization`, `SenderAffinityLoadBalancing`, `EpochCloseSeedV2`,
-`CertificateFetchEpochV2`) change protocol behavior without state writes.
+`CertificateFetchEpochV2`, `HeaderParentSigners`) change protocol behavior without state writes.
 Their activation blocks are network-coordinated rollout or risk decisions
 (SRE), not contract-state consistency requirements.
 
 This is why behavioral forks are:
-- **Unchecked by the boot shape gate** — any value is valid.
+- **Unchecked by the boot shape gate** — any value is valid, with one cross-fork
+  exception: a schedule that activates `HeaderParentSigners` must activate
+  `EpochCloseSeedV2` at the same block or earlier. The gate refuses that on
+  local, devnet and any new chain; on the built-in mainnet and testnet, whose
+  schedules we author, it is an operator rule (see the fork's row above).
 - **Not frozen on the built-in mainnet/testnet** — SRE can move future
   boundaries via the schedule-record gate (config file + re-record).
 - **Frozen in CI only for the binary** — the freeze tests pin the values
@@ -156,7 +162,7 @@ This is why behavioral forks are:
 
 | layer | what it protects | where |
 |-------|-----------------|-------|
-| **CI freeze tests** | mainnet and testnet baked schedules (full 17-fork literal tables) | `chainspec.rs` |
+| **CI freeze tests** | mainnet and testnet baked schedules (full 18-fork literal tables) | `chainspec.rs` |
 | **Boot shape gate** (`verify_schedule_shape`) | all non-mainnet/testnet chain-ids on the relaxed rules; mainnet/testnet chain-ids always excluded | `network_profile/shape.rs` |
 | **Schedule-record gate** (`schedule-record.yaml`, trust-on-first-use) | per-datadir drift on all networks | `network_profile/verify.rs` |
 | **Genesis ceremony** | out of scope by decision | — |

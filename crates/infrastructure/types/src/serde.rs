@@ -8,6 +8,30 @@ use serde::{
 };
 use serde_with::{DeserializeAs, SerializeAs};
 
+/// Number of containers a serialized roaring bitmap declares, or `None` for an unknown header.
+///
+/// Read off the fixed header without building anything, so a caller can refuse a bitmap that
+/// declares too many containers before `deserialize_from` materializes them (a run container of
+/// ~10 bytes becomes an 8 KiB store once decoded).
+pub fn roaring_container_count(bytes: &[u8]) -> Option<usize> {
+    // Header of a bitmap without run containers: this cookie, then the container count.
+    const SERIAL_COOKIE_NO_RUNCONTAINER: u32 = 12346;
+    // Header of a bitmap with run containers: this cookie, then the container count minus one.
+    const SERIAL_COOKIE: u16 = 12347;
+    const WORD: usize = size_of::<u32>();
+    let word = |at: usize| -> Option<u32> {
+        Some(u32::from_le_bytes(bytes.get(at..at + WORD)?.try_into().ok()?))
+    };
+    let cookie = word(0)?;
+    if cookie as u16 == SERIAL_COOKIE {
+        Some((cookie >> u16::BITS) as usize + 1)
+    } else if cookie == SERIAL_COOKIE_NO_RUNCONTAINER {
+        Some(word(WORD)? as usize)
+    } else {
+        None
+    }
+}
+
 /// Deserialize a roaring bitmap from its on-disk bytes and normalize it by
 /// rebuilding from its (already-sorted) values.
 ///
@@ -122,6 +146,12 @@ mod tests {
     /// Before the normalize-on-deserialize fix in `RoaringBitmapSerde`,
     /// re-encoding this certificate panicked with "attempt to subtract with
     /// overflow" in roaring's serializer.
+    ///
+    /// The fuzzer's header had a random epoch with bit 31 set, which the
+    /// `HeaderParentSigners` layout reads as "signer claim follows". Byte 39
+    /// (the epoch's top byte) was changed from 0xff to 0x7f so the input stays a
+    /// legacy-layout certificate; the roaring bytes that trigger the crash are
+    /// untouched.
     const ROARING_EMPTY_CONTAINER_CRASH: &[u8] =
         include_bytes!("testdata/roaring_empty_container_crash.bin");
 
