@@ -31,13 +31,16 @@ validators() { local d; for d in "$DATA"/validator-*; do [[ -d $d ]] && basename
 nodes() { validators; if [[ -d $DATA/rpc ]]; then echo rpc; fi; }
 quorum() { local n; n=$(validators | wc -l); echo $((2 * n / 3 + 1)); }
 pid() { cat "$DATA/$1.pid" 2>/dev/null; }
-running() { local p; p=$(pid "$1") && kill -0 "$p" 2>/dev/null; }
+# trust a pid file only while that pid is still this node (pids get reused over long soaks)
+running() { local p; p=$(pid "$1") && [[ $(ps -p "$p" -o command= 2>/dev/null) == *"--datadir $DATA/$1 "* ]]; }
 running_nodes() { local n; for n in $(nodes); do running "$n" && echo "$n"; done; return 0; }
 
 start_node() {
     local n=$1 i
     i=$(instance "$n")
     running "$n" && return 0
+    # own process group, so Ctrl-C on the test runner does not reach the node
+    set -m
     (
         set --
         if [[ $n == rpc ]]; then
@@ -51,12 +54,14 @@ start_node() {
             --txpool.minimal-protocol-fee 0 -"$LOG_LEVEL" $NODE_ARGS
     ) >> "$DATA/$n.log" 2>&1 &
     echo $! > "$DATA/$n.pid"
+    set +m
 }
 
 # SIGTERM and wait. A node still up after 60s is a shutdown bug: fail (and SIGKILL it).
 stop_node() {
     local p
-    p=$(pid "$1") || return 0
+    running "$1" || { rm -f "$DATA/$1.pid"; return 0; }
+    p=$(pid "$1")
     kill -CONT "$p" 2>/dev/null || true
     kill "$p" 2>/dev/null || true
     if ! wait_exit "$p" 60; then
@@ -66,9 +71,16 @@ stop_node() {
     fi
     rm -f "$DATA/$1.pid"
 }
-kill_node() { local p; p=$(pid "$1") || return 0; kill -9 "$p" 2>/dev/null || true; wait_exit "$p" 10; rm -f "$DATA/$1.pid"; }
-pause_node() { kill -STOP "$(pid "$1")"; }
-resume_node() { kill -CONT "$(pid "$1")"; }
+kill_node() {
+    local p
+    running "$1" || { rm -f "$DATA/$1.pid"; return 0; }
+    p=$(pid "$1")
+    kill -9 "$p" 2>/dev/null || true
+    wait_exit "$p" 10
+    rm -f "$DATA/$1.pid"
+}
+pause_node() { running "$1" || fail "$1 is not running"; kill -STOP "$(pid "$1")"; }
+resume_node() { if running "$1"; then kill -CONT "$(pid "$1")"; fi; }
 start_all() { local n; for n in $(nodes); do start_node "$n"; done; }
 stop_all() { local n rc=0; for n in $(nodes); do stop_node "$n" || rc=1; done; return $rc; }
 wait_exit() { local i; for ((i = 0; i < $2; i++)); do kill -0 "$1" 2>/dev/null || return 0; sleep 1; done; return 1; }
@@ -96,25 +108,35 @@ genesis() {
 
 tx() { cast send --rpc-url "$(url validator-1)" "$@" > /dev/null; }
 
+# validator-5 in the registry: 0 undefined, 1 staked, 2 pending activation, 3 active
+v5_status() {
+    cast call "$REGISTRY" 'getValidator(address)((bytes,address,uint32,uint32,uint8,bool,bool,uint8))' \
+        "${OPERATORS[4]}" --rpc-url "$(url validator-1)" | cut -d, -f5 | tr -d ' '
+}
+
 # 5th validator: start it as a follower, then fund, allowlist, stake and activate it on-chain.
-# It joins the committee at a later epoch boundary.
+# It joins the committee at a later epoch boundary. Re-runnable: steps the registry already saw are skipped.
 add_validator() {
-    local n=validator-5 op=${OPERATORS[4]} stake calldata
+    local n=validator-5 op=${OPERATORS[4]} status stake calldata
     if [[ ! -d $DATA/$n ]]; then
         "$BIN" keytool generate validator --datadir "$DATA/$n" --address "$op" > /dev/null
         copy_genesis "$n"
     fi
     start_node "$n"
-    [[ -f $DATA/$n/staked ]] && return 0
-    stake=$(cast call "$REGISTRY" 'getCurrentStakeConfig()(uint256,uint256,uint32)' --rpc-url "$(url validator-1)" | head -1 | cut -d' ' -f1)
-    calldata=$("$BIN" keytool stake-calldata --datadir "$DATA/$n" | awk '/Calldata:/ {print $2}')
-    tx --private-key "$ADMIN_KEY" --value 10ether "$op"
-    tx --private-key "$ADMIN_KEY" "$RLS" 'mint(address,uint256)' "$op" "$stake"
-    tx --private-key "$ADMIN_KEY" "$REGISTRY" 'allowlistValidator(address)' "$op"
-    tx --private-key "$V5_KEY" "$RLS" 'approve(address,uint256)' "$REGISTRY" "$stake"
-    tx --private-key "$V5_KEY" "$REGISTRY" "$calldata"
-    tx --private-key "$V5_KEY" "$REGISTRY" 'activate()'
-    touch "$DATA/$n/staked"
+    status=$(v5_status)
+    if [[ $status == 0 ]]; then
+        stake=$(cast call "$REGISTRY" 'getCurrentStakeConfig()(uint256,uint256,uint32)' --rpc-url "$(url validator-1)" | head -1 | cut -d' ' -f1)
+        calldata=$("$BIN" keytool stake-calldata --datadir "$DATA/$n" | awk '/Calldata:/ {print $2}')
+        tx --private-key "$ADMIN_KEY" --value 10ether "$op"
+        tx --private-key "$ADMIN_KEY" "$RLS" 'mint(address,uint256)' "$op" "$stake"
+        tx --private-key "$ADMIN_KEY" "$REGISTRY" 'allowlistValidator(address)' "$op"
+        tx --private-key "$V5_KEY" "$RLS" 'approve(address,uint256)' "$REGISTRY" "$stake"
+        tx --private-key "$V5_KEY" "$REGISTRY" "$calldata"
+        status=$(v5_status)
+    fi
+    if [[ $status == 1 ]]; then
+        tx --private-key "$V5_KEY" "$REGISTRY" 'activate()'
+    fi
 }
 
 # RPC node: an observer that follows the committee and serves JSON-RPC
@@ -129,12 +151,14 @@ add_rpc() {
 
 # --- load (etc/tps) ---
 
-# One etc/tps batch: tps <txs> <rpc_urls> <keys>. The tool insists on its config file; these env vars override it.
-tps() {
+# etc/tps needs its node modules and a config file; the env vars passed by tps() override the file
+tps_setup() {
     [[ -d $ROOT/etc/tps/node_modules ]] || (cd "$ROOT/etc/tps" && npm ci --silent > /dev/null)
     touch "$ROOT/etc/tps/config/.env"
-    NUM_TRANSACTIONS=$1 RPC_URLS=$2 PRIVATE_KEYS=$3 CHAIN_ID=487 node "$ROOT/etc/tps/src/main.mjs"
 }
+
+# One etc/tps batch: tps <txs> <rpc_urls> <keys>
+tps() { NUM_TRANSACTIONS=$1 RPC_URLS=$2 PRIVATE_KEYS=$3 CHAIN_ID=487 node "$ROOT/etc/tps/src/main.mjs"; }
 
 # with_timeout <secs> <cmd...>: kill cmd (and its children) if it runs longer
 with_timeout() {
@@ -153,6 +177,7 @@ with_timeout() {
 load_loop() {
     set +m
     local addr
+    tps_setup
     addr=$(cast wallet address --private-key "$LOAD_KEY")
     [[ $(cast balance "$addr" --rpc-url "$(url validator-1)") != 0 ]] || tx --private-key "$ADMIN_KEY" --value 1000000ether "$addr"
     while :; do
@@ -239,18 +264,21 @@ assert_stalled() {
     log "chain stalled at block $b"
 }
 
-# all running nodes have the same block hash at the lowest common height
+# all running nodes have the same block hashes at the last 3 common heights
 check_consistency() {
-    local n h min="" hash ref="" count=0
+    local n h min="" from hash ref
     for n in $(running_nodes); do
         h=$(height "$n") || fail "$n is not responding"
         if [[ -z $min ]] || ((h < min)); then min=$h; fi
     done
-    for n in $(running_nodes); do
-        hash=$(block_hash "$n" "$min") || fail "$n has no block $min"
-        ref=${ref:-$hash}
-        [[ $hash == "$ref" ]] || fail "fork at block $min: $n has $hash, expected $ref"
-        count=$((count + 1))
+    from=$((min > 2 ? min - 2 : 0))
+    for ((h = from; h <= min; h++)); do
+        ref=""
+        for n in $(running_nodes); do
+            hash=$(block_hash "$n" "$h") || fail "$n has no block $h"
+            ref=${ref:-$hash}
+            [[ $hash == "$ref" ]] || fail "fork at block $h: $n has $hash, expected $ref"
+        done
     done
-    log "$count nodes agree on block $min"
+    log "$(running_nodes | wc -l | tr -d ' ') nodes agree on blocks $from-$min"
 }
