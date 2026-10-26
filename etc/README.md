@@ -16,6 +16,7 @@ runbooks, and ancillary test helpers.
 | [`state-sum/`](state-sum/) | `state-sum` Rust binary — runs the on-chain USDr supply audit (state-trie sum vs `totalSupply` slot vs event replay). See [`state-sum/README.md`](state-sum/README.md). |
 | [`test/`](test/) | Cross-cutting test scripts (`edge-cases/`, `test-and-attest.sh`). |
 | [`test-network/`](test-network/) | `local-testnet.sh` + helpers for a 4-validator local network. See [`test-network/README.md`](test-network/README.md). |
+| [`testbed/`](testbed/) | `testbed.sh` — local 4-validator network (+ optional 5th validator and RPC node) with basic, chaos and extended test plans; laptop or Proxmox VM. See [`testbed/README.md`](testbed/README.md). |
 | [`tokenomics-testing/`](tokenomics-testing/) | Helpers for exercising staking, delegation, and fee-distribution flows on a running network. |
 | [`tps/`](tps/) | TPS benchmark script for the JSON-RPC layer. See [`tps/README.md`](tps/README.md). |
 | [`validator/`](validator/) | Scripts for provisioning a validator and joining an existing network (`create-validator.sh`, `activate-validator.sh`, `exit-validator.sh`). |
