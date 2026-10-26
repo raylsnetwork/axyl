@@ -102,6 +102,29 @@ where
             .map(|a| *a.protocol_key())
             .collect();
 
+        // Rayls: Always rebuild identity mappings (known_peers, known_peerids) every epoch.
+        // This fixes the race condition where gossip arrives before identity mappings exist,
+        // causing committee members to be incorrectly banned after restart.
+        // Previously only called on initial_epoch, but needed for all epochs to handle restarts.
+        network_handle
+            .inner_handle()
+            .add_bootstrap_peers(
+                consensus_config
+                    .committee()
+                    .bootstrap_servers()
+                    .iter()
+                    .map(|(k, v)| (*k, v.worker.clone()))
+                    .collect(),
+            )
+            .await?;
+
+        // Before the listeners start, as on the primary: commands are handled in order, so the
+        // registered set is in place before the first inbound put can arrive.
+        network_handle
+            .inner_handle()
+            .new_epoch(committee_keys.clone(), self.registered_validators.clone())
+            .await?;
+
         // start listening if the network needs to be initialized
         if initial_epoch {
             let worker_address = Self::parse_listener_address_for_swarm(
@@ -123,27 +146,6 @@ where
             )
             .await?;
         }
-
-        // Rayls: Always rebuild identity mappings (known_peers, known_peerids) every epoch.
-        // This fixes the race condition where gossip arrives before identity mappings exist,
-        // causing committee members to be incorrectly banned after restart.
-        // Previously only called on initial_epoch, but needed for all epochs to handle restarts.
-        network_handle
-            .inner_handle()
-            .add_bootstrap_peers(
-                consensus_config
-                    .committee()
-                    .bootstrap_servers()
-                    .iter()
-                    .map(|(k, v)| (*k, v.worker.clone()))
-                    .collect(),
-            )
-            .await?;
-
-        network_handle
-            .inner_handle()
-            .new_epoch(committee_keys.clone(), self.registered_validators.clone())
-            .await?;
 
         let worker_address = consensus_config.worker_address();
 

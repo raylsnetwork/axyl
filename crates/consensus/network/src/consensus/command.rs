@@ -404,8 +404,13 @@ where
                 // the primary's initial epoch this runs before its listeners are up and is a
                 // no-op; the startup publish and the per-connection push cover that case. Put
                 // only: the provider announcement is dropped by every peer, so it is made once
-                // at startup and not re-walked at every boundary.
-                self.publish_our_record();
+                // at startup and not re-walked at every boundary. Registered keys only: an
+                // observer's record is never stored by anyone, and the per-connection push
+                // already binds it, so its walk would only cost the receivers a verify each.
+                let own_key = self.key_config.primary_public_key();
+                if self.swarm.behaviour().peer_manager.is_registered(&own_key) {
+                    self.publish_our_record();
+                }
             }
             NetworkCommand::FindAuthorities { bls_keys } => {
                 // this will trigger a PeerEvent to fetch records through kad if not in the peer map
