@@ -5,6 +5,7 @@ ROOT="$(cd "$TESTBED/../.." && pwd)"
 
 # Settings (override via env)
 DATA="${TESTBED_DATA:-$TESTBED/data}"
+[[ $DATA == /* ]] || DATA=$PWD/$DATA
 BIN="${RAYLS_BIN:-$ROOT/target/release/rayls-network}"
 EPOCH_SECS="${EPOCH_SECS:-30}"
 HTTP_ADDR="${HTTP_ADDR:-127.0.0.1}"
@@ -177,15 +178,17 @@ with_timeout() {
     return $rc
 }
 
+# Fund the load account once. validator-1 may be restarting, so fund only after a real balance read.
+fund_load() {
+    local addr balance
+    addr=$(cast wallet address --private-key "$LOAD_KEY")
+    until balance=$(cast balance "$addr" --rpc-url "$(url validator-1)" 2> /dev/null); do sleep 2; done
+    [[ $balance != 0 ]] || tx --private-key "$ADMIN_KEY" --value 1000000ether "$addr"
+}
+
 # Steady load: back-to-back batches of LOAD_TXS (default 500) transfers through validator-1, logged to load.log
 load_loop() {
     set +m
-    local addr balance
-    tps_setup
-    addr=$(cast wallet address --private-key "$LOAD_KEY")
-    # validator-1 may be restarting (e.g. LOAD=1 with chaos); fund only after a real balance read
-    until balance=$(cast balance "$addr" --rpc-url "$(url validator-1)" 2> /dev/null); do sleep 2; done
-    [[ $balance != 0 ]] || tx --private-key "$ADMIN_KEY" --value 1000000ether "$addr"
     while :; do
         echo "--- $(date '+%F %T') sending ${LOAD_TXS:-500} txs"
         with_timeout 300 tps "${LOAD_TXS:-500}" "$(url validator-1)" "$LOAD_KEY" | grep -E 'True TPS|Error|error' || echo "batch failed or timed out"
@@ -193,8 +196,11 @@ load_loop() {
     done >> "$DATA/load.log" 2>&1
 }
 
-# run load_loop in the background as its own process group, so stop_load ends the whole tree
+# Install and fund up front (so the admin nonce is settled before tests use it), then run
+# load_loop in the background as its own process group, so stop_load ends the whole tree.
 start_load() {
+    tps_setup
+    fund_load
     set -m
     load_loop &
     LOAD_PID=$!

@@ -38,6 +38,14 @@ not_busy() {
     fi
 }
 
+# stop the running test's whole process group and let its own EXIT trap (e.g. stop_load) finish
+stop_test() {
+    if [[ -n $TEST_PID ]]; then
+        kill -TERM -- -"$TEST_PID" 2> /dev/null || true
+        wait "$TEST_PID" 2> /dev/null || true
+    fi
+}
+
 # create the lock atomically (noclobber), replacing it only if its runner is gone
 lock() {
     until (set -C; echo $$ > "$DATA/test.lock") 2> /dev/null; do
@@ -77,8 +85,9 @@ run_tests() {
     [[ $* == all ]] && set -- basic chaos extended basic chaos
     [[ -f $DATA/genesis/genesis.yaml ]] || die "no testbed in $DATA, start one with: $0 up"
     lock
-    trap 'stop_load; rm -f "$DATA/test.lock"' EXIT
-    [[ $LOAD != 1 ]] || start_load
+    trap 'stop_test; stop_load; rm -f "$DATA/test.lock"' EXIT
+    trap 'exit 130' INT TERM HUP
+    if [[ $LOAD == 1 ]]; then start_load; fi
     for p in "$@"; do
         if [[ -d $TESTBED/tests/$p ]]; then
             files+=("$TESTBED/tests/$p"/*.sh)
@@ -95,7 +104,13 @@ run_tests() {
         before=$(running_nodes)
         t0=$SECONDS
         rc=0
-        bash -c 'set -eo pipefail; source "$1"; source "$2"' _ "$TESTBED/lib.sh" "$f" || rc=$?
+        # own process group, so stopping the runner (Ctrl-C or kill <pid>) also stops the running test
+        set -m
+        bash -c 'set -eo pipefail; trap "exit 143" INT TERM; source "$1"; source "$2"' _ "$TESTBED/lib.sh" "$f" &
+        TEST_PID=$!
+        set +m
+        wait "$TEST_PID" || rc=$?
+        TEST_PID=""
         case $rc in
             0) passed=$((passed + 1)); echo "--- PASS $name ($((SECONDS - t0))s)" ;;
             77) skipped=$((skipped + 1)); echo "--- SKIP $name" ;;
@@ -125,7 +140,9 @@ case "$1" in
     status) status ;;
     start | stop | kill | pause | resume)
         [[ -n $2 ]] || usage
-        "$1_node" "$(node_name "$2")"
+        n=$(node_name "$2")
+        [[ -d $DATA/$n ]] || die "no node $n in $DATA (validator-5 and rpc come from add-validator / add-rpc)"
+        "$1_node" "$n"
         ;;
     add-validator)
         add_validator
@@ -137,6 +154,8 @@ case "$1" in
         ;;
     logs) tail -f "$DATA/$(node_name "${2:?node}").log" ;;
     load)
+        tps_setup
+        fund_load
         echo "sending load through validator-1, see $DATA/load.log (Ctrl-C to stop)"
         load_loop
         ;;
