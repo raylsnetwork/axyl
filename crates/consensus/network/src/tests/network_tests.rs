@@ -2698,3 +2698,60 @@ async fn test_configured_committee_binds_over_preloaded_records_after_restart() 
     assert_eq!(addrs, record_addrs, "the record's addresses are kept over the configured one");
     Ok(())
 }
+
+/// A registered key can have a newer binding than its stored copy: the record was bound from
+/// the owner's own push while the key was not yet registered (so not stored), and an older copy
+/// from before that sits in the store. When a third party then replicates that older stored
+/// copy, the duplicate path must not hand its stale addresses to the dial table.
+#[tokio::test]
+async fn test_replicated_stale_stored_copy_cannot_roll_back_a_newer_binding() -> eyre::Result<()> {
+    let TestTypes { peer1, mut peer2, .. } =
+        create_test_types::<TestWorkerRequest, TestWorkerResponse>();
+    let mut network = peer1.network;
+    let peer2_id = *peer2.network.swarm.local_peer_id();
+    let peer2_bls = peer2.config.key_config().primary_public_key();
+
+    // an older copy, in the store from before (e.g. admitted before the registered-only rule)
+    let mut old_info = peer2.network.node_record.info.clone();
+    old_info.timestamp = now() - 10_000;
+    old_info.multiaddrs = vec![create_multiaddr(None)];
+    let signature = peer2.config.key_config().request_signature_direct(&encode(&old_info));
+    let current_record = peer2.network.get_peer_record();
+    let current_addrs = peer2.network.node_record.info.multiaddrs.clone();
+    peer2.network.node_record = NodeRecord { info: old_info.clone(), signature };
+    let old_record = peer2.network.get_peer_record();
+    network.swarm.behaviour_mut().kademlia.store_mut().put(old_record.clone())?;
+
+    // the owner pushes its current record while unregistered: bound with the current
+    // addresses, not stored, so the store keeps the older copy
+    network.process_kad_put_request(peer2_id, current_record.clone());
+    let (_, addrs) = network.swarm.behaviour().peer_manager.auth_to_peer(peer2_bls).expect("bound");
+    assert_eq!(addrs, current_addrs);
+    assert_eq!(
+        network.swarm.behaviour_mut().kademlia.store_mut().get(&old_record.key).as_deref(),
+        Some(&old_record),
+        "the store still holds the older copy"
+    );
+
+    // the key becomes registered; a third party replicates the older stored copy. It is a
+    // duplicate, and it must not roll the dial table back to the stale addresses.
+    network
+        .swarm
+        .behaviour_mut()
+        .peer_manager
+        .set_registered_validators(std::collections::HashSet::from([peer2_bls]));
+    network.process_kad_put_request(PeerId::random(), old_record.clone());
+    let (_, addrs) = network.swarm.behaviour().peer_manager.auth_to_peer(peer2_bls).expect("bound");
+    assert_eq!(addrs, current_addrs, "a replicated stale copy must not roll the dial table back");
+    assert_ne!(addrs, old_info.multiaddrs);
+    assert_eq!(network.swarm.behaviour().peer_manager.peer_to_bls(&peer2_id), Some(peer2_bls));
+
+    // the owner's current record, pushed again now that the key is registered, replaces the
+    // stored copy
+    network.process_kad_put_request(peer2_id, current_record.clone());
+    assert_eq!(
+        network.swarm.behaviour_mut().kademlia.store_mut().get(&current_record.key).as_deref(),
+        Some(&current_record)
+    );
+    Ok(())
+}

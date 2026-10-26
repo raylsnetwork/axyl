@@ -1036,8 +1036,7 @@ impl PeerManager {
             if known.timestamp > info.timestamp {
                 if bind && known.pubkey == info.pubkey {
                     trace!(target: "peer-manager", ?bls_key, ?peer_id, "older record binds its peer id; newer addresses are kept");
-                    self.known_peerids.retain(|_, bound| bound != &bls_key);
-                    self.known_peerids.insert(peer_id, bls_key);
+                    self.bind_peer_id(peer_id, bls_key);
                 } else {
                     trace!(target: "peer-manager", ?bls_key, ?peer_id, "older record ignored; newer info is known");
                 }
@@ -1078,25 +1077,10 @@ impl PeerManager {
             }
         }
 
-        if bind {
-            // One `known_peers` entry per peer id for unregistered keys: a peer that re-binds
-            // under a fresh key must not leave the old key's entry behind, or one connection
-            // could mint keys until the table is full and honest entries are evicted. A
-            // registered key's entry stays: it is a validator's dial target in its own right.
-            if let Some(previous) = self.known_peerids.get(&peer_id).copied() {
-                if previous != bls_key && !self.is_registered(&previous) {
-                    self.known_peers.remove(&previous);
-                    self.known_peers_time_added.remove(&previous);
-                }
-            }
-        }
         self.known_peers.insert(bls_key, info.clone());
         self.known_peers_time_added.insert(bls_key, now());
         if bind {
-            // One binding per BLS key: a peer that re-binds from a new network key must not leave
-            // its old peer id attributed to it. The map is keyed by peer id, so clear by value.
-            self.known_peerids.retain(|_, bound| bound != &bls_key);
-            self.known_peerids.insert(peer_id, bls_key);
+            self.bind_peer_id(peer_id, bls_key);
         }
 
         // The circuit addresses in `info` are dial hints for reaching this peer, nothing more.
@@ -1105,6 +1089,26 @@ impl PeerManager {
 
         // Cleanup if we've exceeded the maximum known peers limit
         self.cleanup_known_peers();
+    }
+
+    /// Bind `peer_id` to `bls_key`, keeping both tables consistent. The one place that binds, so
+    /// every caller gets the same two invariants:
+    ///
+    /// - one `known_peers` entry per peer id for unregistered keys: a peer that re-binds under a
+    ///   fresh key must not leave the old key's entry behind, or one connection could mint keys
+    ///   until the table is full and honest entries are evicted. A registered key's entry stays: it
+    ///   is a validator's dial target in its own right;
+    /// - one binding per BLS key: a peer that re-binds from a new network key must not leave its
+    ///   old peer id attributed to it. The map is keyed by peer id, so clear by value.
+    fn bind_peer_id(&mut self, peer_id: PeerId, bls_key: BlsPublicKey) {
+        if let Some(previous) = self.known_peerids.get(&peer_id).copied() {
+            if previous != bls_key && !self.is_registered(&previous) {
+                self.known_peers.remove(&previous);
+                self.known_peers_time_added.remove(&previous);
+            }
+        }
+        self.known_peerids.retain(|_, bound| bound != &bls_key);
+        self.known_peerids.insert(peer_id, bls_key);
     }
 
     /// Timestamp of the info `known_peers` holds for `bls_key`, if any. Configured entries carry
@@ -1149,17 +1153,6 @@ impl PeerManager {
             return;
         }
 
-        // Find the oldest entries to remove based on timestamp
-        let entries_to_remove = self.known_peers.len() - MAX_KNOWN_PEERS;
-
-        let mut entries = self
-            .known_peers_time_added
-            .iter()
-            .map(|(k, timestamp)| (*k, *timestamp))
-            .collect::<Vec<_>>();
-
-        entries.sort_by_key(|(_, timestamp)| *timestamp);
-
         // Entries whose bound peer is connected right now are exempt: evicting one would drop
         // the binding of a live peer and its requests would be refused as unknown. Peer ids are
         // free, so a host reconnecting under fresh identities can fill the table in minutes; age
@@ -1172,23 +1165,34 @@ impl PeerManager {
             .map(|(_, bound)| *bound)
             .collect();
 
-        // Remove the oldest evictable entries, oldest first, until the excess is gone. The
-        // oldest entries are often exempt (validators learned at startup, long-connected
-        // observers), so the whole table may have to be walked.
-        let mut removed = 0;
-        for (bls_key, _) in entries.iter() {
-            // Judge by the BLS key the entry is stored under, not by the network key it names: a
-            // third-party record under any BLS key can name a validator's network key, and
-            // exempting on that would let an attacker pin unevictable entries at will.
-            // Registered keys are exempt too: a staked candidate discovered before its seat must
-            // not be aged out by observer churn before the boundary it is needed at.
-            if self.peers.is_committee_key(bls_key)
-                || self.is_registered(bls_key)
-                || live.contains(bls_key)
-            {
-                continue;
-            }
+        // The evictable entries, oldest first. Exemption is judged by the BLS key the entry is
+        // stored under, not by the network key it names: a third-party record under any BLS key
+        // can name a validator's network key, and exempting on that would let an attacker pin
+        // unevictable entries at will. Registered keys are exempt too: a staked candidate
+        // discovered before its seat must not be aged out by observer churn before the boundary
+        // it is needed at.
+        let mut evictable = self
+            .known_peers_time_added
+            .iter()
+            .filter(|(bls_key, _)| {
+                !(self.peers.is_committee_key(bls_key)
+                    || self.is_registered(bls_key)
+                    || live.contains(bls_key))
+            })
+            .map(|(k, timestamp)| (*k, *timestamp))
+            .collect::<Vec<_>>();
+        // The table can sit above the cap for good when the exempt entries alone exceed it
+        // (registered set plus connected observers); then there is nothing to do, and sorting
+        // on every insert would be wasted work on a hot path.
+        if evictable.is_empty() {
+            return;
+        }
+        evictable.sort_by_key(|(_, timestamp)| *timestamp);
 
+        // Remove the oldest evictable entries until the excess is gone.
+        let entries_to_remove = self.known_peers.len() - MAX_KNOWN_PEERS;
+        let mut removed = 0;
+        for (bls_key, _) in evictable.iter() {
             if self.known_peers.remove(bls_key).is_some() {
                 self.known_peers_time_added.remove(bls_key);
                 // Remove the binding by its value, not via the evicted dial entry's network key:

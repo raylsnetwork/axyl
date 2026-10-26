@@ -395,9 +395,12 @@ where
                 // kad store and the peer tables are gated on
                 self.swarm.behaviour_mut().peer_manager.new_epoch(committee, registered);
                 // Republish our own record now: peers admit a newly registered key only from
-                // this boundary on, and the next scheduled republish could be hours away. Best
-                // effort: a peer whose own NewEpoch has not run yet binds this record without
-                // storing it, and the next boundary or the 12-hour republish catches it up. On
+                // this boundary on, and the next scheduled republish could be hours away. The put
+                // reaches the K peers closest to our key, which is the set lookups ask, not every
+                // node; a node elsewhere learns the record from a GetRecord, or directly when we
+                // connect to it. Best effort: a peer whose own NewEpoch has not run yet binds
+                // this record without storing it, and the next boundary or the 12-hour republish
+                // catches it up. On
                 // the primary's initial epoch this runs before its listeners are up and is a
                 // no-op; the startup publish and the per-connection push cover that case. Put
                 // only: the provider announcement is dropped by every peer, so it is made once

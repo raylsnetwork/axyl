@@ -185,7 +185,10 @@ impl<DB: Database> KadStore<DB> {
     pub fn new(db: DB, key_config: &KeyConfig, kad_type: KadStoreType) -> Self {
         let node_key = RecordKey::new(&encode(&key_config.primary_public_key()));
         // Defaults for sanity.
-        let config = MemoryStoreConfig::default();
+        // The value limit comes from the one helper the kad behaviour also reads, so the check
+        // that tells an oversize value from a DB failure cannot drift from what `put` enforces.
+        let mut config = MemoryStoreConfig::default();
+        config.max_value_bytes = max_value_bytes();
         // Count records within a properly scoped read transaction
         // to ensure MDBX can reclaim dirty pages after completion
         let (num_records, num_providers) = db

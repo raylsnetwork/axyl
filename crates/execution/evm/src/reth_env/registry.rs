@@ -77,6 +77,11 @@ impl RethEnv {
     /// a governance allowlist entry and the registry's minimum stake, so the set is bounded by
     /// governance and economics rather than by how fast a peer can mint keys, and a newly staked
     /// candidate is in it epochs before it is seated.
+    ///
+    /// Read at the canonical tip as its own snapshot: it can land on a different block than the
+    /// epoch state and lookahead reads made alongside it. That is harmless, the result is local
+    /// network policy and is unioned with the committee and lookahead, but it must not be relied
+    /// on to match the epoch state exactly.
     pub fn registered_validators(&self) -> eyre::Result<Vec<ConsensusRegistry::ValidatorInfo>> {
         let canonical_tip = self.canonical_tip();
         let db_provider = self.blockchain_provider.database_provider_ro()?;
