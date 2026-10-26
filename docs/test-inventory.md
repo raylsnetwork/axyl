@@ -16,7 +16,7 @@ There is **no separate "regression" suite** — regression protection comes from
 | Unit tests | ~540 | across 20 crates (`#[cfg(test)]` in `src/`) | ✅ PR (`pr.yaml`) |
 | Integration test files | 12 | various crates' `tests/` dirs | ✅ PR |
 | Docker chaos harness | 9 scenarios / 10 scripts | `etc/chaos-network/` | ❌ manual bash |
-| Local testbed plans | 6 basic / 11 chaos / 5 extended | `etc/testbed/tests/` | ❌ manual (`testbed.sh test`) |
+| Local testbed plans | 6 basic / 11 chaos / 5 extended / 1 soak / 2 rust | `etc/testbed/tests/` | ❌ manual (`testbed.sh test`) |
 
 ---
 
