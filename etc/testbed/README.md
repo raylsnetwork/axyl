@@ -92,7 +92,7 @@ lock is ignored.
 | `RAYLS_BIN` | build `target/release/rayls-network` | Use this binary and skip the build |
 | `TESTBED_DATA` | `etc/testbed/data` | Data directory |
 | `EPOCH_SECS` | `30` | Epoch length; applied at genesis (`clean` to change it) |
-| `HTTP_ADDR` | `127.0.0.1` | RPC bind address; `0.0.0.0` exposes the RPCs on the VM |
+| `HTTP_ADDR` | `127.0.0.1` | RPC bind address; `0.0.0.0` exposes the RPCs on the VM. A specific interface IP also works; the scripts then connect to that IP |
 | `LOG_LEVEL` | `vvv` | Node verbosity (`v`..`vvvvv`) |
 | `NODE_ARGS` / `GENESIS_ARGS` | empty | Extra flags for `rayls-network node` / `genesis`, e.g. `GENESIS_ARGS="--base-fee 0 --min-base-fee 0"` |
 | `CYCLES` | `3` | Iterations of `chaos/11-restart-loop` |
@@ -138,7 +138,7 @@ A plan is a directory under `tests/`, and a test is one file in it. Tests run in
 | `01-faults-under-load` | Steady load plus a random stop, kill or freeze each round, for `SOAK_MINUTES` |
 | **rust** (opt-in) | |
 | `e2e` | `e2e-tests` crate, including ignored tests. It starts its own nodes on 8545-8542, so it stops the testbed while it runs |
-| `chaos` | `chaos-framework` crate, 25 scenarios. Needs Linux and root for `tc`/`iptables`; skipped otherwise. Run it with `sudo -E env "PATH=$PATH" ./etc/testbed/testbed.sh test rust/chaos`; afterwards `target/` is handed back to your user, so later builds don't fail on root-owned files |
+| `chaos` | `chaos-framework` crate, 25 scenarios. Needs Linux and root for `tc`/`iptables`; skipped otherwise. Run it with `sudo -E env "PATH=$PATH" ./etc/testbed/testbed.sh test rust/chaos`; afterwards `target/` is handed back to your user, so later builds don't fail on root-owned files. Stop the testbed first (`down`); otherwise a failure there restarts its nodes as root |
 
 After `extended` adds validator-5 and the rpc node, every other plan includes them too, so
 `test basic chaos` exercises the 5-validator network.

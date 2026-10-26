@@ -26,13 +26,14 @@ RLS=0x07E17e17E17e17E17e17E17E17E17e17e17E17eA
 # --- nodes: validator-N runs as --instance N (rpc port 8546-N), the rpc node as instance 6 ---
 
 instance() { if [[ $1 == rpc ]]; then echo 6; else echo "${1#validator-}"; fi; }
-url() { echo "http://127.0.0.1:$((8546 - $(instance "$1")))"; }
+# clients connect to HTTP_ADDR, or to loopback when the nodes listen on every interface
+url() { local h=$HTTP_ADDR; [[ $h != 0.0.0.0 ]] || h=127.0.0.1; echo "http://$h:$((8546 - $(instance "$1")))"; }
 validators() { local d; for d in "$DATA"/validator-*; do [[ -d $d ]] && basename "$d"; done; return 0; }
 nodes() { validators; if [[ -d $DATA/rpc ]]; then echo rpc; fi; }
 quorum() { local n; n=$(validators | wc -l); echo $((2 * n / 3 + 1)); }
 pid() { cat "$DATA/$1.pid" 2>/dev/null; }
 # trust a pid file only while that pid is still this node (pids get reused over long soaks)
-running() { local p; p=$(pid "$1") && [[ $(ps -p "$p" -o command= 2>/dev/null) == *"--datadir $DATA/$1 "* ]]; }
+running() { local p; p=$(pid "$1") && [[ $(ps -ww -p "$p" -o command= 2>/dev/null) == *"--datadir $DATA/$1 "* ]]; }
 running_nodes() { local n; for n in $(nodes); do running "$n" && echo "$n"; done; return 0; }
 
 start_node() {
@@ -66,7 +67,7 @@ stop_node() {
     kill "$p" 2>/dev/null || true
     if ! wait_exit "$p" 60; then
         echo "  $1 did not stop within 60s of SIGTERM, killing it" >&2
-        kill -9 "$p"; wait_exit "$p" 10; rm -f "$DATA/$1.pid"
+        kill -9 "$p"; wait_exit "$p" 10 || true; rm -f "$DATA/$1.pid"
         return 1
     fi
     rm -f "$DATA/$1.pid"
@@ -124,6 +125,7 @@ add_validator() {
     fi
     start_node "$n"
     status=$(v5_status)
+    [[ $status =~ ^[0-9]$ ]] || fail "could not read validator-5 status from the registry: '$status'"
     if [[ $status == 0 ]]; then
         stake=$(cast call "$REGISTRY" 'getCurrentStakeConfig()(uint256,uint256,uint32)' --rpc-url "$(url validator-1)" | head -1 | cut -d' ' -f1)
         calldata=$("$BIN" keytool stake-calldata --datadir "$DATA/$n" | awk '/Calldata:/ {print $2}')
@@ -166,20 +168,24 @@ with_timeout() {
     shift
     "$@" &
     p=$!
-    (sleep "$secs" && { pkill -P "$p"; kill "$p"; }) 2> /dev/null &
+    # the watcher must not hold the caller's stdout, or $(with_timeout ...) waits for it
+    (sleep "$secs" && { pkill -P "$p"; kill "$p"; }) > /dev/null 2>&1 &
     w=$!
     wait "$p" || rc=$?
     pkill -P "$w" 2> /dev/null || true
+    kill "$w" 2> /dev/null || true
     return $rc
 }
 
 # Steady load: back-to-back batches of LOAD_TXS (default 500) transfers through validator-1, logged to load.log
 load_loop() {
     set +m
-    local addr
+    local addr balance
     tps_setup
     addr=$(cast wallet address --private-key "$LOAD_KEY")
-    [[ $(cast balance "$addr" --rpc-url "$(url validator-1)") != 0 ]] || tx --private-key "$ADMIN_KEY" --value 1000000ether "$addr"
+    # validator-1 may be restarting (e.g. LOAD=1 with chaos); fund only after a real balance read
+    until balance=$(cast balance "$addr" --rpc-url "$(url validator-1)" 2> /dev/null); do sleep 2; done
+    [[ $balance != 0 ]] || tx --private-key "$ADMIN_KEY" --value 1000000ether "$addr"
     while :; do
         echo "--- $(date '+%F %T') sending ${LOAD_TXS:-500} txs"
         with_timeout 300 tps "${LOAD_TXS:-500}" "$(url validator-1)" "$LOAD_KEY" | grep -E 'True TPS|Error|error' || echo "batch failed or timed out"
