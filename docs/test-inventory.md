@@ -16,6 +16,7 @@ There is **no separate "regression" suite** — regression protection comes from
 | Unit tests | ~540 | across 20 crates (`#[cfg(test)]` in `src/`) | ✅ PR (`pr.yaml`) |
 | Integration test files | 12 | various crates' `tests/` dirs | ✅ PR |
 | Docker chaos harness | 9 scenarios / 10 scripts | `etc/chaos-network/` | ❌ manual bash |
+| Local testbed plans | 6 basic / 11 chaos / 5 extended | `etc/testbed/tests/` | ❌ manual (`testbed.sh test`) |
 
 ---
 
@@ -172,6 +173,18 @@ Manual, bash + docker — parallel to the Rust chaos framework but driven via `d
 | `inject-packet-loss.sh` | Packet loss | `tc qdisc … netem loss` |
 | `inject-partition.sh` / `remove-partition.sh` | Network partition | `iptables` DROP rules |
 | `genesis.sh`, `setup_validator.sh` | Network bring-up | Genesis config + container setup |
+
+---
+
+## 8. Local testbed (`etc/testbed/`)
+
+`testbed.sh` starts a 4-validator network as native processes, on a laptop or on the Proxmox VM.
+`add-validator` and `add-rpc` add a staked 5th validator and an RPC node. Test plans then run
+against the live network: `basic` (liveness, consistency, node status, transfers, restart, epoch),
+`chaos` (kill, pause, quorum loss, flicker, rolling/full restart, rapid cycling, kill during sync,
+long downtime, kill at an epoch boundary, restart soak) and `extended` (5th validator, RPC node,
+ERC-20 precompile, TPS). A `rust` plan wraps the e2e and chaos-framework crates. See
+[`etc/testbed/README.md`](../etc/testbed/README.md).
 
 ---
 
