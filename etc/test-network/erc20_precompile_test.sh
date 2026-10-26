@@ -127,6 +127,19 @@ send_tx() {
     echo "$result" | jq -r '.transactionHash' 2>/dev/null || echo ""
 }
 
+# Only the precompile's whitelisted minting module may mint/burn. When MINTING_MODULE is not that
+# address on this network, every check that has to sign as the module is skipped.
+module_whitelisted() {
+    cast call "$PRECOMPILE" "mint(address,uint256)" "$FRESH_ADDRESS_1" "1" --from "$MINTING_MODULE" --rpc-url "$RPC" &> /dev/null
+}
+
+skip_module_checks() {
+    if [[ "$MODULE_WHITELISTED" == "1" ]]; then
+        return 1
+    fi
+    test_skip "$1 ($MINTING_MODULE is not the whitelisted minting module on this network)"
+}
+
 # Get transaction status
 get_tx_status() {
     local tx_hash=$1
@@ -468,6 +481,8 @@ test_mint() {
         test_fail "mint() from unauthorized reverts" "revert" "$unauth_mint"
     fi
 
+    skip_module_checks "mint() from minting module, mint() to zero address" && return
+
     # Get balance before mint
     local balance_before
     balance_before=$(cast call "$PRECOMPILE" "balanceOf(address)(uint256)" "$FRESH_ADDRESS_2" --rpc-url "$RPC" 2>/dev/null | cut -d' ' -f1)
@@ -543,11 +558,6 @@ test_mint() {
 test_burn() {
     log_section "Burn Tests (Access Controlled)"
 
-    # First mint some tokens to the minting module so it can burn
-    echo "Minting tokens to minting module for burn test..."
-    send_tx "$PRECOMPILE" "mint(address,uint256)" "$MINTING_MODULE" "500000000000000000000" --private-key "$MINTING_MODULE_PK" > /dev/null
-    sleep 2
-
     # Test burn from unauthorized account (should fail)
     local unauth_burn
     unauth_burn=$(cast call "$PRECOMPILE" "burn(uint256)" "1" --from "$ACCOUNT1" --rpc-url "$RPC" 2>&1)
@@ -556,6 +566,13 @@ test_burn() {
     else
         test_fail "burn() from unauthorized reverts" "revert" "$unauth_burn"
     fi
+
+    skip_module_checks "burn() from minting module" && return
+
+    # First mint some tokens to the minting module so it can burn
+    echo "Minting tokens to minting module for burn test..."
+    send_tx "$PRECOMPILE" "mint(address,uint256)" "$MINTING_MODULE" "500000000000000000000" --private-key "$MINTING_MODULE_PK" > /dev/null
+    sleep 2
 
     # Get balance and supply before burn
     local balance_before supply_before
@@ -627,6 +644,8 @@ test_burn_from() {
     else
         test_fail "burnFrom() from unauthorized reverts" "revert" "$unauth_burn"
     fi
+
+    skip_module_checks "burnFrom() from minting module, burnFrom() without allowance" && return
 
     # Get balance, allowance, and supply before burnFrom
     local balance_before allowance_before supply_before
@@ -709,6 +728,11 @@ main() {
 
     check_requirements
     check_rpc
+
+    MODULE_WHITELISTED=0
+    if module_whitelisted; then
+        MODULE_WHITELISTED=1
+    fi
 
     # Run all tests
     test_metadata
