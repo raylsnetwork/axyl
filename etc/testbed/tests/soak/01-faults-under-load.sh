@@ -9,7 +9,7 @@ while ((SECONDS < end)); do
     victims=($(nodes | grep -vx validator-1))
     v=${victims[RANDOM % ${#victims[@]}]}
     a=${actions[RANDOM % 3]}
-    nonce=$(load_nonce)
+    nonce=$(load_nonce) || fail "could not read the load account nonce"
     log "round $round $(date '+%F %T'): $a $v at block $(height validator-1), epoch $(epoch validator-1)"
     "${a}_node" "$v"
     wait_blocks validator-1 5 120
@@ -17,7 +17,8 @@ while ((SECONDS < end)); do
     if [[ $a == pause ]]; then resume_node "$v"; else start_node "$v"; fi
     wait_synced "$v"
     check_consistency
-    (($(load_nonce) > nonce)) || fail "no load transactions landed during round $round"
+    now=$(load_nonce) || fail "could not read the load account nonce"
+    ((now > nonce)) || fail "no load transactions landed during round $round"
     sleep "${SOAK_INTERVAL:-60}"
 done
 log "$round rounds, no fork or stall"

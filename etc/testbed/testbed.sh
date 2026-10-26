@@ -116,7 +116,12 @@ run_tests() {
 case "$1" in
     up) up ;;
     down) not_busy; stop_all ;;
-    clean) not_busy; stop_all; rm -rf "$DATA" ;;
+    clean)
+        not_busy
+        [[ ! -e $DATA || -d $DATA/genesis ]] || die "$DATA does not look like a testbed, refusing to delete it"
+        stop_all
+        rm -rf "$DATA"
+        ;;
     status) status ;;
     start | stop | kill | pause | resume)
         [[ -n $2 ]] || usage
