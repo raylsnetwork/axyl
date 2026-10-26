@@ -138,7 +138,7 @@ A plan is a directory under `tests/`, and a test is one file in it. Tests run in
 | `01-faults-under-load` | Steady load plus a random stop, kill or freeze each round, for `SOAK_MINUTES` |
 | **rust** (opt-in) | |
 | `e2e` | `e2e-tests` crate, including ignored tests. It starts its own nodes on 8545-8542, so it stops the testbed while it runs |
-| `chaos` | `chaos-framework` crate, 25 scenarios. Needs Linux and root for `tc`/`iptables`; skipped otherwise |
+| `chaos` | `chaos-framework` crate, 25 scenarios. Needs Linux and root for `tc`/`iptables`; skipped otherwise. Run it with `sudo -E env "PATH=$PATH" ./etc/testbed/testbed.sh test rust/chaos`; afterwards `target/` is handed back to your user, so later builds don't fail on root-owned files |
 
 After `extended` adds validator-5 and the rpc node, every other plan includes them too, so
 `test basic chaos` exercises the 5-validator network.

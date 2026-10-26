@@ -21,7 +21,7 @@ usage: $0 <command>
                           'all' = basic chaos extended basic chaos; LOAD=1 runs them under load
 
 settings (env): RAYLS_BIN, TESTBED_DATA, EPOCH_SECS ($EPOCH_SECS), HTTP_ADDR ($HTTP_ADDR),
-                LOG_LEVEL ($LOG_LEVEL), NODE_ARGS, GENESIS_ARGS, LOAD_TXS, SOAK_HOURS, SOAK_INTERVAL
+                LOG_LEVEL ($LOG_LEVEL), NODE_ARGS, GENESIS_ARGS, LOAD_TXS, SOAK_MINUTES, SOAK_INTERVAL
 EOF
     exit 1
 }
@@ -36,6 +36,14 @@ not_busy() {
     if p=$(cat "$DATA/test.lock" 2> /dev/null) && kill -0 "$p" 2> /dev/null; then
         die "test run $p is using this testbed; stop it first"
     fi
+}
+
+# create the lock atomically (noclobber), replacing it only if its runner is gone
+lock() {
+    until (set -C; echo $$ > "$DATA/test.lock") 2> /dev/null; do
+        not_busy
+        rm -f "$DATA/test.lock"
+    done
 }
 
 up() {
@@ -63,13 +71,12 @@ status() {
 }
 
 run_tests() {
-    local files=() f p name rc t0 before passed=0 skipped=0 failed=()
+    local files=() f p n name rc t0 before passed=0 skipped=0 failed=()
     [[ $# -gt 0 ]] || set -- basic
     # basic + chaos on 4 validators, extended adds validator-5 and rpc, then basic + chaos again on those
     [[ $* == all ]] && set -- basic chaos extended basic chaos
     [[ -f $DATA/genesis/genesis.yaml ]] || die "no testbed in $DATA, start one with: $0 up"
-    not_busy
-    echo $$ > "$DATA/test.lock"
+    lock
     trap 'stop_load; rm -f "$DATA/test.lock"' EXIT
     [[ $LOAD != 1 ]] || start_load
     for p in "$@"; do
@@ -95,8 +102,9 @@ run_tests() {
             *)
                 failed+=("$name")
                 echo "--- FAIL $name ($((SECONDS - t0))s)"
-                # bring back whatever the test left paused or stopped
-                for p in $before; do resume_node "$p" 2> /dev/null || true; start_node "$p"; done
+                # bring back whatever the test left paused or stopped, and let it catch up before the next test
+                for n in $before; do resume_node "$n"; start_node "$n"; done
+                for n in $before; do (wait_synced "$n") || echo "  recovery: $n did not catch up" >&2; done
                 ;;
         esac
     done
