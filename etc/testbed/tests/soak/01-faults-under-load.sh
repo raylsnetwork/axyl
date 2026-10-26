@@ -1,5 +1,12 @@
 # Soak: steady load while a random node is stopped, killed or frozen each round, for SOAK_MINUTES (default 480).
-[[ $LOAD == 1 ]] || { start_load; trap stop_load EXIT; }
+command -v node > /dev/null || skip "needs Node.js 22+"
+start=$(load_nonce) || fail "could not read the load account nonce"
+if [[ $LOAD != 1 ]]; then
+    start_load
+    trap stop_load EXIT
+fi
+nonce_above() { local n; n=$(load_nonce) && ((n > $1)); }
+wait_for 300 "the load to land its first transactions" nonce_above "$start"
 end=$((SECONDS + ${SOAK_MINUTES:-480} * 60))
 round=0
 actions=(stop kill pause)
