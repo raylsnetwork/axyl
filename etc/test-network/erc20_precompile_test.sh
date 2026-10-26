@@ -5,6 +5,8 @@
 #
 # Usage: ./erc20_precompile_test.sh [RPC_URL]
 # Default RPC: http://localhost:8545
+# SKIP_MODULE_CHECKS=1 skips the checks that must sign as MINTING_MODULE when the network rejects it
+# as not whitelisted (the precompile only whitelists a system address, see native_erc20/mod.rs)
 #
 # Requirements:
 # - cast (foundry) installed
@@ -127,14 +129,15 @@ send_tx() {
     echo "$result" | jq -r '.transactionHash' 2>/dev/null || echo ""
 }
 
-# Only the precompile's whitelisted minting module may mint/burn. When MINTING_MODULE is not that
-# address on this network, every check that has to sign as the module is skipped.
-module_whitelisted() {
-    cast call "$PRECOMPILE" "mint(address,uint256)" "$FRESH_ADDRESS_1" "1" --from "$MINTING_MODULE" --rpc-url "$RPC" &> /dev/null
+# Only the precompile's whitelisted minting module may mint/burn. With SKIP_MODULE_CHECKS=1, the checks
+# that must sign as MINTING_MODULE are skipped when the network rejects it as not whitelisted. Any
+# other outcome (including RPC errors) still runs them, so real failures are not hidden.
+module_not_whitelisted() {
+    [[ $(cast call "$PRECOMPILE" "mint(address,uint256)" "$FRESH_ADDRESS_1" "1" --from "$MINTING_MODULE" --rpc-url "$RPC" 2>&1) == *"Not whitelisted"* ]]
 }
 
 skip_module_checks() {
-    if [[ "$MODULE_WHITELISTED" == "1" ]]; then
+    if [[ "$SKIP_MODULE" != "1" ]]; then
         return 1
     fi
     test_skip "$1 ($MINTING_MODULE is not the whitelisted minting module on this network)"
@@ -729,9 +732,9 @@ main() {
     check_requirements
     check_rpc
 
-    MODULE_WHITELISTED=0
-    if module_whitelisted; then
-        MODULE_WHITELISTED=1
+    SKIP_MODULE=0
+    if [[ "${SKIP_MODULE_CHECKS:-0}" == "1" ]] && module_not_whitelisted; then
+        SKIP_MODULE=1
     fi
 
     # Run all tests
