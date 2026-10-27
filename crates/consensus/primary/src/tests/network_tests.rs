@@ -11,8 +11,9 @@ use crate::{
 };
 use assert_matches::assert_matches;
 use rayls_consensus_network::{GossipMessage, TopicHash};
+use rayls_consensus_primary::test_utils::make_optimal_signed_certificates;
 use rayls_infrastructure_config::LibP2pConfig;
-use rayls_infrastructure_storage::{mem_db::MemDatabase, CertScope};
+use rayls_infrastructure_storage::{mem_db::MemDatabase, CertScope, CertificateStore as _};
 use rayls_infrastructure_types::{
     encode, error::HeaderError, now, AuthorityIdentifier, BlockHash, BlockHeader, BlockNumHash,
     BlsPublicKey, Certificate, CertificateDigest, ExecHeader, Hash as _, RaylsReceiver,
@@ -346,6 +347,59 @@ async fn test_vote_fails_unknown_authority() -> eyre::Result<()> {
     let res = handler.vote(peer, header, parents).await;
     debug!(target: "primary::handler_tests", ?res);
     assert_matches!(res, Err(PrimaryNetworkError::InvalidHeader(HeaderError::UnknownAuthority(wrong))) if wrong == wrong_authority.to_string());
+    Ok(())
+}
+
+/// A gossiped certificate that is already stored is answered from the memory-tier lookup alone:
+/// no signature verification, no `behind_consensus` read. The re-delivered copy here carries no
+/// signature; past the gate it would fail verification, which only logs, so the skip counter is
+/// what tells the two paths apart.
+#[tokio::test]
+async fn test_gossip_duplicate_certificate_skips_verification() -> eyre::Result<()> {
+    let TestTypes { committee, handler, task_manager: _task_manager, consensus_bus, .. } =
+        create_test_types();
+    let keys: Vec<_> = committee.authorities().map(|a| (a.id(), a.keypair().copy())).collect();
+    let genesis: BTreeSet<_> = committee.genesis().collect();
+    let (mut certs, _) =
+        make_optimal_signed_certificates(1..=1, &genesis, &committee.committee(), &keys);
+    let stored = certs.pop_front().expect("one round of certificates");
+
+    // the node accepted this certificate earlier
+    committee.first_authority().consensus_config().node_storage().write(stored.clone())?;
+
+    // the same certificate (same digest) comes back on gossip, this time without a signature
+    let redelivered = Certificate::new_unsigned_for_test(
+        &committee.committee(),
+        stored.header().clone(),
+        vec![],
+    )?;
+    assert_eq!(redelivered.digest(), stored.digest());
+    let data = encode(&PrimaryGossip::Certificate(Box::new(redelivered)));
+    let topic = TopicHash::from_raw(LibP2pConfig::primary_topic());
+    let msg = GossipMessage { source: None, data, sequence_number: None, topic };
+
+    let metrics = &consensus_bus.primary_metrics().node_metrics;
+    let skipped = metrics.gossip_certificates_skipped_in_memory.get();
+    let verified_duplicates = metrics.duplicate_certificates_processed.get();
+    handler.process_gossip(&msg).await?;
+    assert_eq!(
+        metrics.gossip_certificates_skipped_in_memory.get(),
+        skipped + 1,
+        "re-delivery skipped from the memory tier"
+    );
+
+    // A signed copy is skipped the same way. Without the gate this one would verify and reach
+    // the certificate validator, which counts it as a verified duplicate.
+    let data = encode(&PrimaryGossip::Certificate(Box::new(stored)));
+    let topic = TopicHash::from_raw(LibP2pConfig::primary_topic());
+    let msg = GossipMessage { source: None, data, sequence_number: None, topic };
+    handler.process_gossip(&msg).await?;
+    assert_eq!(metrics.gossip_certificates_skipped_in_memory.get(), skipped + 2);
+    assert_eq!(
+        metrics.duplicate_certificates_processed.get(),
+        verified_duplicates,
+        "neither copy reached the verified-duplicate path"
+    );
     Ok(())
 }
 
