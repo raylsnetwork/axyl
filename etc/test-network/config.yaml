@@ -38,6 +38,7 @@ networks:
       SenderAffinityLoadBalancing: 0
       EpochCloseSeedV2: never
       CertificateFetchEpochV2: never
+      Erc20PrecompileDirectCall: never
   local:
     chain_id: 487
     hardforks:
@@ -58,3 +59,4 @@ networks:
       SenderAffinityLoadBalancing: 0
       EpochCloseSeedV2: 0
       CertificateFetchEpochV2: 0
+      Erc20PrecompileDirectCall: 0

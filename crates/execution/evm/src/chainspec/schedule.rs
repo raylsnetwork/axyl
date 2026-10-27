@@ -58,6 +58,10 @@ impl RaylsHardFork {
             // Never until SRE schedules an activation block: switches a network request format,
             // and nodes that have not upgraded cannot decode the new one.
             ScheduledFork::new(Self::CertificateFetchEpochV2, ForkCondition::Never),
+            // Never until SRE schedules an activation block: changes the state transition for
+            // delegate frames into 0x0400, so replaying pre-activation history must keep accepting
+            // them.
+            ScheduledFork::new(Self::Erc20PrecompileDirectCall, ForkCondition::Never),
         ]
     }
 
@@ -86,6 +90,9 @@ impl RaylsHardFork {
             // Never until SRE schedules an activation block: switches a network request format,
             // and nodes that have not upgraded cannot decode the new one.
             ScheduledFork::new(Self::CertificateFetchEpochV2, ForkCondition::Never),
+            // Never until SRE schedules an activation block: changes the state transition for
+            // delegate frames into 0x0400 (see devnet note).
+            ScheduledFork::new(Self::Erc20PrecompileDirectCall, ForkCondition::Never),
         ]
     }
 
@@ -114,6 +121,9 @@ impl RaylsHardFork {
             // Never until SRE schedules an activation block: switches a network request format,
             // and nodes that have not upgraded cannot decode the new one.
             ScheduledFork::new(Self::CertificateFetchEpochV2, ForkCondition::Never),
+            // Never until SRE schedules an activation block: changes the state transition for
+            // delegate frames into 0x0400 (see devnet note).
+            ScheduledFork::new(Self::Erc20PrecompileDirectCall, ForkCondition::Never),
         ]
     }
 
@@ -147,6 +157,8 @@ impl RaylsHardFork {
             ScheduledFork::new(Self::SenderAffinityLoadBalancing, ForkCondition::Block(0)),
             ScheduledFork::new(Self::EpochCloseSeedV2, ForkCondition::Block(0)),
             ScheduledFork::new(Self::CertificateFetchEpochV2, ForkCondition::Block(0)),
+            // Local is ephemeral: activate from genesis so the direct-call guard is exercised.
+            ScheduledFork::new(Self::Erc20PrecompileDirectCall, ForkCondition::Block(0)),
         ]
     }
 

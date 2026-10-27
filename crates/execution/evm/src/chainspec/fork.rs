@@ -54,6 +54,11 @@ hardfork!(
         /// already closed that epoch serves them from the tail it kept instead of answering from
         /// the new epoch. Gates only the request format a node sends; every node accepts both.
         CertificateFetchEpochV2,
+        /// Reject DELEGATECALL/CALLCODE frames into the native ERC-20 precompile (0x0400). The
+        /// precompile is dispatched by bytecode address, so a delegate frame runs its privileged
+        /// logic with `target_address != bytecode_address`; gating keeps pre-fork blocks replaying
+        /// unchanged while new blocks reject the frame.
+        Erc20PrecompileDirectCall,
     }
 );
 
@@ -78,6 +83,7 @@ impl RaylsHardFork {
             Self::SenderAffinityLoadBalancing => 0x0f,
             Self::EpochCloseSeedV2 => 0x10,
             Self::CertificateFetchEpochV2 => 0x11,
+            Self::Erc20PrecompileDirectCall => 0x12,
         }
     }
 

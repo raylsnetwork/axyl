@@ -2,7 +2,7 @@
 
 use super::{RaylsBlockExecutionCtx, RaylsBlockExecutor, RaylsEvm, RaylsEvmContext};
 use crate::{
-    chainspec::RaylsChainSpec,
+    chainspec::{RaylsChainSpec, RaylsHardFork, RaylsHardforks},
     native_erc20::{
         abi::{eip3009, erc20, Erc20Selector},
         precompile::Erc20Precompile,
@@ -13,6 +13,7 @@ use alloy::sol_types::SolCall;
 use alloy_evm::{precompiles::DynPrecompile, Database};
 use parking_lot::RwLock;
 use rayls_infrastructure_types::{Receipt, TransactionSigned, U256};
+use reth_chainspec::ForkCondition;
 use reth_evm::{
     block::{BlockExecutorFactory, BlockExecutorFor},
     eth::{
@@ -76,8 +77,33 @@ pub(crate) fn initialize_erc20_precompile(
 const ERC20_PRECOMPILE_ID: PrecompileId =
     PrecompileId::Custom(std::borrow::Cow::Borrowed("NativeERC20Wrapper"));
 
-fn create_erc20_dyn_precompile() -> DynPrecompile {
+fn create_erc20_dyn_precompile(direct_call_activation: ForkCondition) -> DynPrecompile {
     DynPrecompile::new(ERC20_PRECOMPILE_ID, move |mut input: PrecompileInput<'_>| {
+        // reject delegate frames once the Erc20PrecompileDirectCall fork is active: a precompile is
+        // dispatched by bytecode address, so a DELEGATECALL/CALLCODE into 0x0400 reaches it with
+        // target_address != bytecode_address and would run its privileged logic against 0x0400's
+        // global state. Enforced here, in the DynPrecompile, so every EVM the factory builds (block
+        // execution, eth_call, tracing) applies the same rule. Gated by block number so pre-fork
+        // history, and any node replaying it, is unchanged.
+        // saturating_to (not to) so an out-of-u64-range block number cannot panic the precompile
+        // (reachable from eth_call under panic=abort); saturating to u64::MAX keeps the gate
+        // active, the fail-closed outcome. Block numbers are u64-derived in practice, so
+        // this never fires.
+        if !input.is_direct_call()
+            && direct_call_activation
+                .active_at_block(input.internals.block_number().saturating_to::<u64>())
+        {
+            // Reject with `PrecompileError` (an exceptional halt): the delegating frame loses the
+            // gas it forwarded and gets no revert data, deliberately matching the native-value and
+            // STATICCALL guards below. This gas behaviour becomes consensus once the fork
+            // activates; the alternative (a gas-preserving `new_reverted`) is a
+            // conscious no, chosen for consistency since a delegate frame into a
+            // precompile is never a legitimate pattern.
+            return PrecompileResult::Err(PrecompileError::other(
+                "ERC-20 precompile must be called directly, not via DELEGATECALL or CALLCODE",
+            ));
+        }
+
         // reject native value: revm transfers value to 0x0400 before precompile dispatch and would
         // otherwise commit it permanently
         if input.value != U256::ZERO {
@@ -252,13 +278,19 @@ fn create_erc20_dyn_precompile() -> DynPrecompile {
 }
 
 /// Create a PrecompilesMap with the Native ERC-20 precompile registered.
-fn create_precompiles_with_erc20(spec_id: SpecId) -> PrecompilesMap {
+///
+/// `direct_call_activation` is the `Erc20PrecompileDirectCall` fork condition; the precompile
+/// rejects delegate frames once it is active at the executing block.
+fn create_precompiles_with_erc20(
+    spec_id: SpecId,
+    direct_call_activation: ForkCondition,
+) -> PrecompilesMap {
     let mut precompiles_map =
         PrecompilesMap::from_static(Precompiles::new(PrecompileSpecId::from_spec_id(spec_id)));
 
     // Only register the ERC-20 precompile if it's been initialized
     if ERC20_PRECOMPILE_INSTANCE.get().is_some() {
-        let erc20_dyn_precompile = create_erc20_dyn_precompile();
+        let erc20_dyn_precompile = create_erc20_dyn_precompile(direct_call_activation);
         precompiles_map.apply_precompile(&ERC20_PRECOMPILE_ADDRESS, |_| Some(erc20_dyn_precompile));
         debug!("Registered Native ERC-20 precompile at {:?}", ERC20_PRECOMPILE_ADDRESS);
     }
@@ -267,11 +299,32 @@ fn create_precompiles_with_erc20(spec_id: SpecId) -> PrecompilesMap {
 }
 
 /// Factory producing [`RaylsEvm`].
-#[derive(Debug, Default, Clone, Copy)]
-#[non_exhaustive]
-pub struct RaylsEvmFactory;
+#[derive(Debug, Clone, Copy)]
+pub struct RaylsEvmFactory {
+    /// Activation of the `Erc20PrecompileDirectCall` fork. EVMs built through the raw
+    /// [`EvmFactory`] methods (RPC, tracing, including the block-level `trace_*` built via
+    /// `create_tracer`) gate delegate frames into the ERC-20 precompile on this, so every path
+    /// enforces the same rule as block execution.
+    direct_call_activation: ForkCondition,
+}
+
+// Test-only: the default factory has the `Erc20PrecompileDirectCall` guard inactive
+// (`ForkCondition::Never`). Production must not build EVMs with the guard silently off, so it
+// constructs the factory with [`RaylsEvmFactory::new`] from `RaylsEvmConfig::new`, passing the
+// chain's activation; this `Default` is gated to tests so it cannot be reached there.
+#[cfg(any(test, feature = "test-utils"))]
+impl Default for RaylsEvmFactory {
+    fn default() -> Self {
+        Self { direct_call_activation: ForkCondition::Never }
+    }
+}
 
 impl RaylsEvmFactory {
+    /// Create a factory that gates delegate frames into `0x0400` per `direct_call_activation`.
+    pub const fn new(direct_call_activation: ForkCondition) -> Self {
+        Self { direct_call_activation }
+    }
+
     /// Create an EVM with CompositeInspector (NativeErc20Inspector + custom inspector).
     ///
     /// This method wraps any inspector with NativeErc20Inspector to ensure ERC-20
@@ -297,6 +350,16 @@ impl RaylsEvmFactory {
             .expect("ERC20_PRECOMPILE_INSTANCE must be initialized before creating EVMs with Native ERC-20 inspector")
             .clone();
 
+        // The precompile gate uses the factory's own activation, the single source of truth shared
+        // with the raw `create_evm`/`create_evm_with_inspector` paths. For a factory built by
+        // `RaylsEvmConfig::new` it equals this chain spec's activation; assert that in debug/test
+        // builds to catch a factory paired with a mismatched chain spec.
+        debug_assert_eq!(
+            self.direct_call_activation,
+            chain_spec.rayls_fork_activation(RaylsHardFork::Erc20PrecompileDirectCall),
+            "RaylsEvmFactory activation must match the chain spec it builds EVMs for",
+        );
+
         // Create NativeErc20Inspector with chain spec for hardfork-gated gas fix
         let native_erc20_inspector = NativeErc20Inspector::new(precompile_instance, chain_spec);
 
@@ -315,7 +378,10 @@ impl RaylsEvmFactory {
                 .with_cfg(input.cfg_env)
                 .with_db(db)
                 .build_mainnet_with_inspector(composite)
-                .with_precompiles(create_precompiles_with_erc20(spec_id)),
+                .with_precompiles(create_precompiles_with_erc20(
+                    spec_id,
+                    self.direct_call_activation,
+                )),
             inspect: true,
         }
     }
@@ -346,6 +412,9 @@ impl EvmFactory for RaylsEvmFactory {
     type BlockEnv = BlockEnv;
     type Precompiles = PrecompilesMap;
 
+    // Precompiles are gated on `self.direct_call_activation`, which `RaylsEvmConfig::new` sets from
+    // the chain spec. Every EVM this factory builds (block execution, eth_call, tracing) therefore
+    // rejects delegate frames into `0x0400` once `Erc20PrecompileDirectCall` is active.
     fn create_evm<DB: Database>(&self, db: DB, input: EvmEnv) -> Self::Evm<DB, NoOpInspector> {
         let spec_id = input.cfg_env.spec;
         RaylsEvm {
@@ -354,11 +423,16 @@ impl EvmFactory for RaylsEvmFactory {
                 .with_cfg(input.cfg_env)
                 .with_db(db)
                 .build_mainnet_with_inspector(NoOpInspector)
-                .with_precompiles(create_precompiles_with_erc20(spec_id)),
+                .with_precompiles(create_precompiles_with_erc20(
+                    spec_id,
+                    self.direct_call_activation,
+                )),
             inspect: false,
         }
     }
 
+    // Also gated on `self.direct_call_activation` (see `create_evm`); this is the path reth uses to
+    // build tracing EVMs, including the block-level `trace_*` built via `create_tracer`.
     fn create_evm_with_inspector<DB: Database, I: Inspector<Self::Context<DB>>>(
         &self,
         db: DB,
@@ -372,7 +446,10 @@ impl EvmFactory for RaylsEvmFactory {
                 .with_cfg(input.cfg_env)
                 .with_db(db)
                 .build_mainnet_with_inspector(inspector)
-                .with_precompiles(create_precompiles_with_erc20(spec_id)),
+                .with_precompiles(create_precompiles_with_erc20(
+                    spec_id,
+                    self.direct_call_activation,
+                )),
             inspect: true,
         }
     }

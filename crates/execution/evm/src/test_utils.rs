@@ -731,7 +731,7 @@ pub(crate) mod pre_execution {
         // A pre-Osaka spec keeps the incidental EIP-2935 blockhashes system call from tripping the
         // Osaka per-transaction gas cap; that call is orthogonal to the pre-execution phase.
         let cfg = CfgEnv::new().with_spec_and_mainnet_gas_params(SpecId::CANCUN);
-        let evm = RaylsEvmFactory.create_evm(&mut state, EvmEnv::new(cfg, block_env));
+        let evm = RaylsEvmFactory::default().create_evm(&mut state, EvmEnv::new(cfg, block_env));
 
         let ctx = RaylsBlockExecutionCtx {
             parent_hash: B256::ZERO,

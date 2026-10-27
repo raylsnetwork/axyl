@@ -177,6 +177,15 @@ impl RaylsChainSpecBuilder {
         self
     }
 
+    /// Activate Erc20PrecompileDirectCall at `block`.
+    #[must_use = "builder method result must be used"]
+    pub fn erc20_precompile_direct_call(mut self, block: u64) -> Self {
+        self.inner
+            .hardforks
+            .insert(RaylsHardFork::Erc20PrecompileDirectCall, ForkCondition::Block(block));
+        self
+    }
+
     /// Activate DynamicCommitteeSizing at `block`.
     #[must_use = "builder method result must be used"]
     pub fn dynamic_committee_sizing(mut self, block: u64) -> Self {

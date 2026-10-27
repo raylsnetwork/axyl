@@ -64,3 +64,4 @@ networks:
       SenderAffinityLoadBalancing: 0
       EpochCloseSeedV2: 0
       CertificateFetchEpochV2: 0
+      Erc20PrecompileDirectCall: 0
