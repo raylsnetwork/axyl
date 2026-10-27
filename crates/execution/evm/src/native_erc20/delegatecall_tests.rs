@@ -18,7 +18,7 @@
 
 use crate::{
     chainspec::{RaylsChainSpec, RaylsHardFork, RaylsHardforks},
-    evm::RaylsEvmFactory,
+    evm::{RaylsEvmConfig, RaylsEvmFactory},
     native_erc20::{
         abi::erc20, precompile::Erc20Precompile, storage::allowance_slot, Erc20TokenConfig,
         ERC20_PRECOMPILE_ADDRESS,
@@ -26,6 +26,7 @@ use crate::{
 };
 use alloy::{primitives::address, sol_types::SolCall as _};
 use rayls_infrastructure_types::{test_chain_spec_arc, Address, U256};
+use rayls_middleware_rewards::RewardsCounter;
 use reth_evm::{EvmEnv, EvmFactory as _};
 use reth_revm::{
     bytecode::Bytecode as RevmBytecode,
@@ -397,64 +398,119 @@ fn direct_call_into_precompile_still_works() {
     );
 }
 
-/// The regression test for the RPC/trace concern: the raw factory paths that reth uses for
-/// `eth_call`/`eth_estimateGas` (`create_evm`) and tracing (`create_evm_with_inspector`) must
-/// reject the delegate frame too, not just the block-execution path. These build no
-/// `NativeErc20Inspector`, so they exercise the gate living in the DynPrecompile keyed on the
-/// factory's activation.
-#[test]
-fn delegatecall_rejected_on_raw_eth_call_and_tracing_paths() {
-    for path in [Path::EthCall, Path::Tracing] {
-        let mut state = seeded_state(true);
-        let calldata =
-            erc20::approveCall { spender: SPENDER, amount: approve_amount() }.abi_encode();
-        let (outcome, diff) = run_at(
-            &mut state,
-            spec_with_direct_call_at(ACTIVATION_BLOCK),
-            path,
-            ACTIVE_BLOCK,
-            FORWARDER,
-            calldata,
-        );
-
-        assert_eq!(
-            allowance_in_diff(&diff, CALLER, SPENDER),
-            U256::ZERO,
-            "a raw factory path (eth_call/tracing) let a DELEGATECALL into 0x0400 write allowance"
-        );
-        assert_guard_rejected(
-            &outcome,
-            "a raw factory path (eth_call/tracing) accepted a DELEGATECALL into 0x0400",
-        );
+/// The allowance slot a forwarded `approve` would write: `DELEGATECALL` keeps the EOA as
+/// `msg.sender`, `CALLCODE` makes the forwarder `msg.sender`.
+fn forwarded_owner(delegatecall: bool) -> Address {
+    if delegatecall {
+        CALLER
+    } else {
+        FORWARDER
     }
 }
 
-/// And before activation the raw paths still execute the delegate frame, matching block execution
-/// (so RPC/tracing of historical blocks stays consistent).
+/// The regression test for the RPC/trace concern: the raw factory paths that reth uses for
+/// `eth_call`/`eth_estimateGas` (`create_evm`) and tracing (`create_evm_with_inspector`) must
+/// reject delegate frames (`DELEGATECALL` and `CALLCODE`) too, not just the block-execution path.
+/// These build no `NativeErc20Inspector`, so they exercise the gate living in the DynPrecompile
+/// keyed on the factory's activation.
 #[test]
-fn delegatecall_executes_on_raw_paths_before_fork() {
+fn delegate_frames_rejected_on_raw_eth_call_and_tracing_paths() {
     for path in [Path::EthCall, Path::Tracing] {
-        let mut state = seeded_state(true);
-        let calldata =
-            erc20::approveCall { spender: SPENDER, amount: approve_amount() }.abi_encode();
-        let (outcome, diff) = run_at(
-            &mut state,
-            spec_with_direct_call_at(ACTIVATION_BLOCK),
-            path,
-            JUST_BEFORE_ACTIVATION,
-            FORWARDER,
-            calldata,
-        );
+        for delegatecall in [true, false] {
+            let mut state = seeded_state(delegatecall);
+            let calldata =
+                erc20::approveCall { spender: SPENDER, amount: approve_amount() }.abi_encode();
+            let (outcome, diff) = run_at(
+                &mut state,
+                spec_with_direct_call_at(ACTIVATION_BLOCK),
+                path,
+                ACTIVE_BLOCK,
+                FORWARDER,
+                calldata,
+            );
 
-        assert_eq!(
-            outcome,
-            Outcome::Success,
-            "before the fork, a raw-path DELEGATECALL into 0x0400 must still execute"
-        );
-        assert_eq!(
-            allowance_in_diff(&diff, CALLER, SPENDER),
-            approve_amount(),
-            "before the fork, a raw-path delegate frame must write the allowance as before"
-        );
+            assert_eq!(
+                allowance_in_diff(&diff, forwarded_owner(delegatecall), SPENDER),
+                U256::ZERO,
+                "a raw factory path let a delegate frame (delegatecall={delegatecall}) into \
+                 0x0400 write allowance"
+            );
+            assert_guard_rejected(
+                &outcome,
+                "a raw factory path accepted a delegate frame into 0x0400",
+            );
+        }
     }
+}
+
+/// And before activation the raw paths still execute the delegate frames, matching block
+/// execution (so RPC/tracing of historical blocks stays consistent).
+#[test]
+fn delegate_frames_execute_on_raw_paths_before_fork() {
+    for path in [Path::EthCall, Path::Tracing] {
+        for delegatecall in [true, false] {
+            let mut state = seeded_state(delegatecall);
+            let calldata =
+                erc20::approveCall { spender: SPENDER, amount: approve_amount() }.abi_encode();
+            let (outcome, diff) = run_at(
+                &mut state,
+                spec_with_direct_call_at(ACTIVATION_BLOCK),
+                path,
+                JUST_BEFORE_ACTIVATION,
+                FORWARDER,
+                calldata,
+            );
+
+            assert_eq!(
+                outcome,
+                Outcome::Success,
+                "before the fork, a raw-path delegate frame (delegatecall={delegatecall}) must \
+                 still execute"
+            );
+            assert_eq!(
+                allowance_in_diff(&diff, forwarded_owner(delegatecall), SPENDER),
+                approve_amount(),
+                "before the fork, a raw-path delegate frame must write the allowance as before"
+            );
+        }
+    }
+}
+
+/// Pins the production wiring: the factory `RaylsEvmConfig::new` builds must carry the chain's
+/// activation. If `config.rs` went back to a guard-off factory, the other tests here (which build
+/// the factory through `factory_for`) would still pass; this one would not.
+#[test]
+fn evm_config_factory_rejects_delegate_frame() {
+    let spec = spec_with_direct_call_at(ACTIVATION_BLOCK);
+    let config = RaylsEvmConfig::new(spec.clone(), RewardsCounter::default());
+    let calldata = erc20::approveCall { spender: SPENDER, amount: approve_amount() }.abi_encode();
+    let env = || {
+        EvmEnv::new(
+            CfgEnv::new().with_spec_and_mainnet_gas_params(SpecId::CANCUN),
+            BlockEnv { number: U256::from(ACTIVE_BLOCK), ..Default::default() },
+        )
+    };
+
+    // eth_call path: only the factory's own activation can gate this one.
+    let mut state = seeded_state(true);
+    let ResultAndState { result, state: diff } = config
+        .evm_factory
+        .create_evm(&mut state, env())
+        .transact_pre_genesis_call(CALLER, FORWARDER, calldata.clone().into())
+        .expect("transact");
+    assert_eq!(allowance_in_diff(&diff, CALLER, SPENDER), U256::ZERO);
+    assert_guard_rejected(&outcome(&result), "RaylsEvmConfig's factory let eth_call through");
+
+    // Block-execution path through the same factory.
+    let mut state = seeded_state(true);
+    let ResultAndState { result, state: diff } = config
+        .evm_factory
+        .create_evm_with_native_erc20_only(&mut state, env(), spec)
+        .transact_pre_genesis_call(CALLER, FORWARDER, calldata.into())
+        .expect("transact");
+    assert_eq!(allowance_in_diff(&diff, CALLER, SPENDER), U256::ZERO);
+    assert_guard_rejected(
+        &outcome(&result),
+        "RaylsEvmConfig's factory let block execution through",
+    );
 }
