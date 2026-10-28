@@ -80,6 +80,20 @@ pub enum RewardsError {
         epoch: Epoch,
     },
 
+    /// Tally requested for an epoch other than the installed committee's.
+    ///
+    /// Hybrid signer bitmaps are positional over [`Committee::bls_keys`], whose order is the
+    /// iteration order of a `BTreeMap<BlsPublicKey, _>`. Adding or removing an authority shifts
+    /// the rank of every key sorted after it, so resolving a bitmap against another epoch's
+    /// membership credits the wrong addresses without any lookup failing. Fail closed instead.
+    #[error("committee epoch mismatch: tally requested for epoch {requested}, committee installed for epoch {installed}")]
+    CommitteeEpochMismatch {
+        /// Epoch the caller requested a tally for.
+        requested: Epoch,
+        /// Epoch of the committee currently installed on the backend.
+        installed: Epoch,
+    },
+
     /// The requested tally is a known, permanent capability gap (not a
     /// transient failure) - e.g. `SnapshotRewardsBackend::tally_hybrid` with no
     /// consensus DB attached, or a walk that disagrees with the snapshot's
