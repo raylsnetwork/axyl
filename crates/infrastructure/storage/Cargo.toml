@@ -51,6 +51,10 @@ required-features = ["cold-storage"]
 name = "validate_signer_projection"
 required-features = ["cold-storage"]
 
+[[example]]
+name = "k_rule_claim_coverage"
+required-features = ["cold-storage"]
+
 [features]
 redb = []
 reth-libmdbx = ["dep:reth-libmdbx", "dep:page_size"]
