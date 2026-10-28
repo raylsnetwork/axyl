@@ -171,6 +171,25 @@ impl<DB: Database> RewardsBackend for ConsensusRewardsCounter<DB> {
             .cloned()
             .ok_or(RewardsError::MissingCommittee { epoch })?;
 
+        // The bitmap index space belongs to `epoch`'s membership, not to whatever committee
+        // happens to be installed. `bls_keys()` iterates a `BTreeMap<BlsPublicKey, _>`, so an
+        // added or removed authority shifts the rank of every key sorted after it and the same
+        // bit then resolves to a different address — silently, because every lookup still
+        // succeeds. The live path installs the committee at epoch start (`epoch_manager`), but
+        // re-execution of a close block during catch-up runs this walk with whatever epoch the
+        // node has since moved to, so the two can diverge. Refuse rather than guess.
+        //
+        // `tally()` is deliberately left unguarded: it resolves by identity, so a mismatch there
+        // drops unknown authorities instead of misattributing, and it is the live path on every
+        // real network (`HybridRewards` is `ForkCondition::Never` on devnet/testnet/mainnet).
+        // Making that path fail closed changes production behaviour and belongs on its own.
+        if committee.epoch() != epoch {
+            return Err(RewardsError::CommitteeEpochMismatch {
+                requested: epoch,
+                installed: committee.epoch(),
+            });
+        }
+
         // Signer bitmaps index authorities sorted by BLS public key, which is exactly
         // `Committee::bls_keys()` order and NOT `Committee::authorities()` order (sorted by
         // identifier) — see `Certificate::skip_with_header_and_signers_span`. Resolved once per
@@ -333,7 +352,7 @@ mod tests {
         cold_archiver_for, mem_db::MemDatabase, open_db, SealOutcome,
     };
     use rayls_infrastructure_types::{
-        BlsKeypair, BlsSignature, Certificate, CertificateDigest, CommittedSubDag,
+        BlsKeypair, BlsPublicKey, BlsSignature, Certificate, CertificateDigest, CommittedSubDag,
         CommitteeBuilder, ConsensusHeader, DbTxMut, Header, HeaderBuilder, ReputationScores, Round,
         WorkerId,
     };
@@ -595,6 +614,110 @@ mod tests {
         assert_eq!(
             tally.per_address.get(silent_addr).map(|t| t.participation_rounds).unwrap_or(0),
             0,
+        );
+    }
+
+    /// The seeded authority set, ordered the way `Committee::bls_keys` reports it (the
+    /// iteration order of a `BTreeMap<BlsPublicKey, _>`), so a slice of it is a committee
+    /// with a known index space.
+    fn seeded_members(n: u8) -> Vec<(BlsPublicKey, Address)> {
+        let mut rng = StdRng::seed_from_u64(0x633);
+        let mut members: Vec<(BlsPublicKey, Address)> = (0..n)
+            .map(|i| (*BlsKeypair::generate(&mut rng).public(), Address::with_last_byte(i + 1)))
+            .collect();
+        members.sort_by_key(|(key, _)| *key);
+        members
+    }
+
+    /// Build a committee at `epoch` from `members`.
+    fn committee_of(epoch: Epoch, members: &[(BlsPublicKey, Address)]) -> Committee {
+        let mut builder = CommitteeBuilder::new(epoch);
+        for (key, address) in members {
+            builder.add_authority(*key, 1, *address);
+        }
+        builder.build()
+    }
+
+    /// The bitmap index space belongs to the epoch being tallied, not to whatever committee
+    /// happens to be installed. A mismatch is the silent-misattribution path, so the walk must
+    /// refuse rather than hand back a tally that looks entirely plausible.
+    #[test]
+    fn tally_hybrid_refuses_a_committee_from_another_epoch() {
+        // Epoch 1's certificates, signed by a proper subset so the bitmap actually carries
+        // position information; epoch 0's committee is the same set minus the authority that
+        // sorts first, so every surviving rank has slid down by one.
+        let members = seeded_members(4);
+        let signing_committee = committee_of(1, &members);
+        let stale_committee = committee_of(0, &members[1..]);
+
+        let ids: Vec<AuthorityIdentifier> =
+            members.iter().map(|(key, _)| AuthorityIdentifier::from(*key)).collect();
+        let signers: Vec<&AuthorityIdentifier> = ids[..3].iter().collect();
+
+        let db = MemDatabase::default();
+        let bytes = make_bytes(&signing_committee, &ids[0], 2, 1, &[&ids[0]], &signers);
+        let header: ConsensusHeader = rayls_infrastructure_types::decode(&bytes);
+        db.insert::<ConsensusBlocks>(&0u64, &header).unwrap();
+
+        let counter = ConsensusRewardsCounter::new(db);
+
+        // The epoch-1 rows are present and would be walked, so without the guard this returns a
+        // populated tally resolved against the wrong index space — credit landing on addresses
+        // that signed nothing. Refusing is the only safe answer.
+        counter.set_committee(stale_committee);
+        let err = counter
+            .tally_hybrid(1, u32::MAX)
+            .expect_err("a committee from another epoch must not resolve this bitmap");
+        assert!(
+            matches!(
+                err,
+                RewardsError::CommitteeEpochMismatch { requested: 1, installed: 0 }
+            ),
+            "unexpected error: {err:?}"
+        );
+
+        // The guard rejects the mismatch specifically, not every call: the right committee
+        // tallies, and credits exactly the three signers.
+        counter.set_committee(signing_committee);
+        let tally = counter.tally_hybrid(1, u32::MAX).expect("matching epoch still tallies");
+        assert_eq!(tally.total_rounds, 1);
+        for (_, address) in &members[..3] {
+            assert_eq!(tally.per_address[address].participation_rounds, 1);
+        }
+        assert_eq!(
+            tally.per_address.get(&members[3].1).map(|t| t.participation_rounds).unwrap_or(0),
+            0,
+            "the non-signer must not be credited"
+        );
+    }
+
+    /// Why the guard above is load-bearing. A bitmap index is a rank in
+    /// `Committee::bls_keys()`, which iterates a `BTreeMap<BlsPublicKey, _>`. Dropping one
+    /// authority renumbers every key sorted after it, so the *same* bit resolves to a different
+    /// execution address — and every lookup still succeeds, so nothing signals the error.
+    #[test]
+    fn bls_key_index_space_renumbers_when_membership_changes() {
+        let members = seeded_members(4);
+        let before = committee_of(0, &members);
+        // The authority sorting first leaves; everyone after it moves down one slot.
+        let after = committee_of(1, &members[1..]);
+
+        let addr_at = |committee: &Committee, i: usize| {
+            committee
+                .authority_by_key(&committee.bls_keys()[i])
+                .map(|a| a.execution_address())
+                .expect("key comes from the committee's own map")
+        };
+
+        assert_ne!(
+            addr_at(&before, 0),
+            addr_at(&after, 0),
+            "bit 0 must resolve to a different validator once membership changes"
+        );
+        assert_eq!(
+            addr_at(&before, 1),
+            addr_at(&after, 0),
+            "rank 1 slides into rank 0: that shift is exactly the misattribution"
         );
     }
 
