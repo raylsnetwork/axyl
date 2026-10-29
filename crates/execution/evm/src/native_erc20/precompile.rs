@@ -283,8 +283,11 @@ impl Erc20Precompile {
     /// `unreachable!("Wrong state transition, touch empty is not possible from Loaded")` and
     /// halt the chain. We evaluate revm's exact predicate (with the post-debit balance) rather
     /// than re-deriving it, so this guard can never drift from the check revm applies at
-    /// commit. The check runs before any balance write, so a rejected transfer leaves the
-    /// state untouched.
+    /// commit. A rejected check causes the precompile to return an error, which reverts the
+    /// entire call frame via the EVM's journal checkpoint — any prior writes (e.g., nonce
+    /// marks in EIP-3009 paths) are rolled back automatically. Do not rely on this check
+    /// running before other writes for atomicity; the revert mechanism is what guarantees
+    /// atomicity.
     fn check_not_left_empty<T: StateAccessAdapter>(
         &self,
         state_access: &mut T,
