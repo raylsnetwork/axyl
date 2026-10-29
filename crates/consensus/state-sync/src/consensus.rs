@@ -611,4 +611,50 @@ mod tests {
         assert_eq!(first, Some(child_102.digest()), "anchor must be the top of the contiguous run");
         assert_eq!(first, second, "derive must be stable across calls on an unchanged cache");
     }
+
+    /// After an epoch transition resets `last_consensus_header` to the default, a probe can find
+    /// the network tip that an earlier leg already cached. The walk then starts at the covered
+    /// anchor and descends nothing, but it must still publish that tip: the forward streamer and
+    /// the rejoin check only learn the target through this watch, and with a stalled network no
+    /// newer header ever arrives to publish it instead.
+    #[tokio::test(start_paused = true)]
+    async fn walk_starting_at_the_covered_anchor_publishes_it() {
+        let fixture = CommitteeFixture::builder(MemDatabase::default)
+            .randomize_ports(true)
+            .committee_size(NonZeroUsize::new(4).unwrap())
+            .build();
+        let primary = fixture.authorities().next().unwrap();
+        let config = primary.consensus_config();
+        let db = config.node_storage();
+
+        // Executed up to 100 (the previous epoch's last output); 101 and 102 were fetched into the
+        // cache before the transition and not executed yet.
+        let canonical = ConsensusHeader { number: 100, ..Default::default() };
+        db.with_write_txn(|txn| {
+            txn.insert::<ConsensusBlocks>(&canonical.number, &canonical)?;
+            Ok(())
+        })
+        .unwrap();
+        let child_101 =
+            ConsensusHeader { number: 101, parent_hash: canonical.digest(), ..Default::default() };
+        let child_102 =
+            ConsensusHeader { number: 102, parent_hash: child_101.digest(), ..Default::default() };
+        store_consensus_header_in_cache(db, &child_101);
+        store_consensus_header_in_cache(db, &child_102);
+
+        // A fresh bus: the watch holds the default header, as after the transition's reset.
+        let consensus_bus = ConsensusBus::new();
+        assert_eq!(consensus_bus.last_consensus_header().borrow().number, 0);
+
+        // The probe found 102, the top of the cached run (the session derives it as its anchor).
+        let mut session = WalkSession::new(config.clone(), consensus_bus.clone(), no_peer_network());
+        assert!(session.sync_to(child_102.digest()).await.is_continue());
+
+        assert_eq!(
+            consensus_bus.last_consensus_header().borrow().number,
+            102,
+            "the probed tip is the covered anchor, so the walk descends nothing, but it must still \
+             publish the tip"
+        );
+    }
 }
