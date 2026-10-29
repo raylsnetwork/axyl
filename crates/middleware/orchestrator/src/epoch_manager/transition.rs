@@ -171,6 +171,18 @@ where
         )?;
         info!(target: "epoch-manager", "phase 1/6: CHECKPOINT");
 
+        // Fault injection for e2e tests: close the epoch late, as a validator does that commits
+        // the boundary seconds after its peers (for one, it was missing a certificate it had to
+        // fetch). Until then this node keeps running the closing epoch and answers the next
+        // epoch's vote requests as a peer one epoch behind.
+        #[cfg(feature = "test-hooks")]
+        if let Some(delay) =
+            std::env::var("RL_TEST_LATE_EPOCH_CLOSE_MS").ok().and_then(|ms| ms.parse().ok())
+        {
+            warn!(target: "epoch-manager", delay_ms = delay, "test hook: closing the epoch late");
+            tokio::time::sleep(Duration::from_millis(delay)).await;
+        }
+
         // Phase 2: SHUTDOWN - drain + stop consensus tasks.
         let outcome = self
             .controlled_shutdown(

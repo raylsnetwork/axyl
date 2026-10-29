@@ -150,8 +150,10 @@ impl PrimaryNetworkHandle {
             PrimaryResponse::EpochMismatch { expected, received } => {
                 Ok(RequestVoteResult::EpochMismatch { expected, received })
             }
-            PrimaryResponse::RecoverableError(PrimaryRPCError(s))
-            | PrimaryResponse::Error(PrimaryRPCError(s)) => Err(NetworkError::RPCError(s)),
+            PrimaryResponse::RecoverableError(PrimaryRPCError(s)) => {
+                Ok(RequestVoteResult::Recoverable(s))
+            }
+            PrimaryResponse::Error(PrimaryRPCError(s)) => Err(NetworkError::RPCError(s)),
             PrimaryResponse::RequestedCertificates(_vec) => Err(NetworkError::RPCError(
                 "Got wrong response, not a vote is requested certificates!".to_string(),
             )),
@@ -612,4 +614,8 @@ pub enum RequestVoteResult {
         /// The epoch of the proposed header.
         received: Epoch,
     },
+    /// The peer still answered with a recoverable error after the resends of `request_vote`: it
+    /// is one epoch behind the header and still finishing that epoch, or it is still processing
+    /// an earlier request for this header. Asking again later can get its vote.
+    Recoverable(String),
 }
