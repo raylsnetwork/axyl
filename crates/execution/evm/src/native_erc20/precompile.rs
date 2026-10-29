@@ -698,9 +698,12 @@ impl Erc20Precompile {
         let sender_balance = self.get_balance(state_access, sender)?;
         trace!(target: "erc20_precompile", ?sender_balance, "burn: loaded sender balance");
 
+        let new_sender_balance = sender_balance.checked_sub(amount).ok_or_else(|| {
+            ERC20Error::overflow_error(ERC20Resource::Balance, ERC20Method::Burn)
+        })?;
         self.check_balance(sender, sender_balance, amount)?;
         if reject_empty_debits {
-            self.check_not_left_empty(state_access, sender, sender_balance - amount)?;
+            self.check_not_left_empty(state_access, sender, new_sender_balance)?;
         }
 
         // Update total supply first (same order as mint)
@@ -714,13 +717,8 @@ impl Erc20Precompile {
         state_access.perform_touch_account(self.contract_address);
 
         // Update sender balance
-        {
-            let new_sender_balance = sender_balance.checked_sub(amount).ok_or_else(|| {
-                ERC20Error::overflow_error(ERC20Resource::Balance, ERC20Method::Burn)
-            })?;
-            self.set_balance(state_access, sender, new_sender_balance)?;
-            trace!(target: "erc20_precompile", ?new_sender_balance, "burn: updated sender balance");
-        }
+        self.set_balance(state_access, sender, new_sender_balance)?;
+        trace!(target: "erc20_precompile", ?new_sender_balance, "burn: updated sender balance");
         state_access.perform_touch_account(sender);
 
         // Emit events
@@ -769,9 +767,12 @@ impl Erc20Precompile {
         let account_balance = self.get_balance(state_access, sender)?;
         trace!(target: "erc20_precompile", ?account_balance, "burn_from: loaded account balance");
 
+        let new_balance = account_balance.checked_sub(amount).ok_or_else(|| {
+            ERC20Error::overflow_error(ERC20Resource::Balance, ERC20Method::Burn)
+        })?;
         self.check_balance(sender, account_balance, amount)?;
         if reject_empty_debits {
-            self.check_not_left_empty(state_access, sender, account_balance - amount)?;
+            self.check_not_left_empty(state_access, sender, new_balance)?;
         }
 
         // Update total supply first (same order as mint)
@@ -785,13 +786,8 @@ impl Erc20Precompile {
         state_access.perform_touch_account(self.contract_address);
 
         // Update account balance
-        {
-            let new_balance = account_balance.checked_sub(amount).ok_or_else(|| {
-                ERC20Error::overflow_error(ERC20Resource::Balance, ERC20Method::Burn)
-            })?;
-            self.set_balance(state_access, sender, new_balance)?;
-            trace!(target: "erc20_precompile", ?new_balance, "burn_from: updated account balance");
-        }
+        self.set_balance(state_access, sender, new_balance)?;
+        trace!(target: "erc20_precompile", ?new_balance, "burn_from: updated account balance");
         state_access.perform_touch_account(sender);
 
         // Decrease allowance (unless unlimited)
