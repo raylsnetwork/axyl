@@ -29,7 +29,7 @@ use tokio::time::timeout;
 use tracing::{debug, info};
 
 const NEW_VALIDATOR: &str = "new-validator";
-const NODE_PASSWORD: &str = "sup3rsecuur";
+pub(crate) const NODE_PASSWORD: &str = "sup3rsecuur";
 const INITIAL_STAKE_AMOUNT: &str = "1_000_000";
 /// Number of genuine (post-lookahead) epochs to sample before concluding the
 /// new validator was never shuffled in. With a 1/6 per-epoch selection chance,
@@ -41,7 +41,7 @@ const SELECTABLE_TRIALS_TARGET: usize = 25;
 // roughly absolute, not proportional - so 30s (tolerance ~61s) gives ample margin
 // while keeping test_epoch_boundary's shuffle wait under the 60-min job cap.
 // Retry-based record checks stay correct regardless of cadence.
-const EPOCH_DURATION: u64 = 30;
+pub(crate) const EPOCH_DURATION: u64 = 30;
 
 async fn test_epoch_boundary_inner(
     genesis: Genesis,
@@ -517,7 +517,7 @@ fn create_genesis_for_test(
 /// Configure the initial committee and fund accounts for network genesis.
 ///
 /// All data is written to file.
-fn config_committee(
+pub(crate) fn config_committee(
     temp_path: &Path,
     shared_genesis_dir: &Path,
     passphrase: String,
