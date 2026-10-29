@@ -289,6 +289,12 @@ blake3 = { version = "1.8.2" }
 [profile.release]
 panic = "abort"
 overflow-checks = true
+# Devnet profiling build of v1.5.0: identical codegen to the release the image workflow
+# ships (`cargo build --release`, no strip step), plus full DWARF so `perf record -g` and
+# `rust-gdb` resolve symbols, inlined frames and locals inside the running validator.
+# Larger binary, no runtime cost. Not for a tagged release.
+debug = true
+strip = "none"
 
 # preserve default wrapping behavior for third-party crates
 [profile.release.package."*"]
