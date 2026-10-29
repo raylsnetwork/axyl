@@ -32,6 +32,7 @@ networks:
       HybridRewards: never
       OutputSeqNormalization: never
       SenderAffinityLoadBalancing: never
+      Eip161EmptyAccountGuard: never
   testnet:
     chain_id: 7295799
     hardforks:
@@ -50,6 +51,7 @@ networks:
       HybridRewards: never
       OutputSeqNormalization: never
       SenderAffinityLoadBalancing: never
+      Eip161EmptyAccountGuard: never
   mainnet:
     chain_id: 72957
     hardforks:
@@ -68,6 +70,7 @@ networks:
       HybridRewards: never
       OutputSeqNormalization: never
       SenderAffinityLoadBalancing: never
+      Eip161EmptyAccountGuard: never
   local:
     chain_id: 487
     hardforks:
@@ -86,3 +89,4 @@ networks:
       HybridRewards: 1
       OutputSeqNormalization: 0
       SenderAffinityLoadBalancing: 0
+      Eip161EmptyAccountGuard: 0

@@ -16,6 +16,18 @@
 //! [`full_drain_of_nonce0_account_is_rejected`] must revert without touching state. The
 //! other two tests are controls: a partial drain leaves the victim non-empty, and a nonce-1
 //! account is never EIP-161 empty.
+//!
+//! The reject itself is gated behind [`RaylsHardFork::Eip161EmptyAccountGuard`]. v1.4.1
+//! already committed the reviewer's two-transaction shape (fund a brand-new account in tx1,
+//! drain it in tx2) because the victim was `InMemoryChange`, not `Loaded`. The
+//! `replay_shape_*` pair pins both sides of the fork: inactive leaves history untouched,
+//! active rejects the drain.
+//!
+//! One revm quirk these tests pin: the precompile account (`0x0400`) is an EIP-161 empty
+//! account, so its auth-nonce storage writes are dropped when the transaction state is
+//! committed (`CacheAccount::touch_empty_eip161`). The nonce is therefore only observable
+//! in the transaction's `EvmState` diff (pre-commit), which is why [`DrainRun`] carries
+//! both `auth_nonce_in_diff` and the post-commit `auth_nonce_used`.
 
 use crate::{
     chainspec::RaylsChainSpec,
@@ -29,16 +41,17 @@ use alloy::{
     primitives::{address, Address, Bytes, B256, U256},
     sol_types::{SolCall as _, SolStruct as _},
 };
-use rayls_infrastructure_types::test_chain_spec_arc;
+use alloy_evm::Evm as _;
+use rayls_infrastructure_types::{test_chain_spec_arc, TxKind, ETHEREUM_BLOCK_GAS_LIMIT_56BITS};
 use reth_evm::EvmEnv;
 use reth_revm::{
     context::{
         result::{ExecutionResult, ResultAndState},
-        BlockEnv, CfgEnv,
+        BlockEnv, CfgEnv, TxEnv,
     },
     db::{CacheDB, EmptyDBTyped},
     primitives::hardfork::SpecId,
-    state::AccountInfo,
+    state::{AccountInfo, EvmState},
     Database as _, DatabaseCommit as _, State,
 };
 use secp256k1::{ecdsa::RecoveryId, Message, SecretKey, SECP256K1};
@@ -139,7 +152,29 @@ struct DrainRun {
     result: ExecutionResult,
     victim: Option<AccountInfo>,
     relayer: Option<AccountInfo>,
+    /// The auth nonce slot in the *post-commit* state.
+    ///
+    /// This is `ZERO` in both fork directions: the precompile account (`0x0400`) is an
+    /// EIP-161 empty account, and revm's commit drops the storage writes of an emptied
+    /// account (`CacheAccount::touch_empty_eip161`). That is a pre-existing revm
+    /// behavior the guard does not change.
     auth_nonce_used: U256,
+    /// The auth nonce slot in the transaction's `EvmState` diff (pre-commit).
+    ///
+    /// This is the fork-discriminating signal: a successful drain consumes the nonce in
+    /// the journal, a rejected drain rolls the consumption back.
+    auth_nonce_in_diff: Option<U256>,
+}
+
+/// Read the auth nonce slot out of a transaction diff (before it is committed), if the
+/// slot was actually changed by the transaction. A reverted drain leaves the slot entry
+/// behind with its original value, so unchanged slots read as `None`.
+fn nonce_slot_in_diff(diff: &EvmState) -> Option<U256> {
+    diff.get(&ERC20_PRECOMPILE_ADDRESS)?
+        .storage
+        .get(&authorization_nonce_slot(VICTIM, AUTH_NONCE))
+        .filter(|slot| slot.is_changed())
+        .map(|slot| slot.present_value)
 }
 
 /// Run one EIP-3009 transfer exactly like the block executor: `transact`, then commit.
@@ -174,16 +209,23 @@ fn drain(victim_nonce: u64, amount: U256) -> DrainRun {
         CfgEnv::new().with_spec_and_mainnet_gas_params(SpecId::CANCUN),
         BlockEnv { number: U256::from(BLOCK_NUMBER), ..Default::default() },
     );
-    let chain_spec =
-        Arc::new(RaylsChainSpec::builder(test_chain_spec_arc()).precompile_gas_fix(0).build());
+    // Post-fork spec: the EIP-161 empty-account guard is active, so a full drain of a
+    // nonce-0 account is rejected. These three tests assert the guarded (post-fork) behavior.
+    let chain_spec = Arc::new(
+        RaylsChainSpec::builder(test_chain_spec_arc())
+            .precompile_gas_fix(0)
+            .eip161_empty_account_guard(0)
+            .build(),
+    );
     let mut evm =
-        RaylsEvmFactory::default().create_evm_with_native_erc20_only(&mut state, env, chain_spec);
+        RaylsEvmFactory::new(chain_spec).create_evm_with_native_erc20_only(&mut state, env);
 
     let ResultAndState { result, state: diff } = evm
         .transact_pre_genesis_call(RELAYER, ERC20_PRECOMPILE_ADDRESS, transfer_calldata(amount))
         .expect("transact must not fail; a rejected transfer returns as a revert result");
 
     // Production commit step (`RaylsBlockExecutor::commit_transaction`).
+    let auth_nonce_in_diff = nonce_slot_in_diff(&diff);
     state.commit(diff);
 
     DrainRun {
@@ -193,6 +235,7 @@ fn drain(victim_nonce: u64, amount: U256) -> DrainRun {
         auth_nonce_used: state
             .storage(ERC20_PRECOMPILE_ADDRESS, authorization_nonce_slot(VICTIM, AUTH_NONCE))
             .expect("in-memory db read"),
+        auth_nonce_in_diff,
     }
 }
 
@@ -266,4 +309,172 @@ fn full_drain_of_nonce1_account() {
         Some(relayer_balance() + full_balance()),
         "the relayer must be credited the full drained amount"
     );
+}
+
+/// Replay-shape sequence across one block, exactly as the reviewer described:
+///
+/// - tx1 funds a *brand-new* VICTIM with a real native value transfer (so the account lands
+///   `InMemoryChange`, not `Loaded`, in the block state cache).
+/// - tx2 drains VICTIM's whole balance via EIP-3009.
+///
+/// On v1.4.1 this committed fine (an `InMemoryChange` account clearing is a legal transition),
+/// so the `guard_active == false` run must succeed and clear the victim. Once the
+/// [`RaylsHardFork::Eip161EmptyAccountGuard`] is active at this block, the same sequence must
+/// revert the drain and leave VICTIM's state untouched. This is the pre/post-fork boundary the
+/// hardfork exists to pin.
+fn replay_full_drain(guard_active: bool) -> DrainRun {
+    // Process-global; the EIP-712 domain above must match this instance.
+    let _ = initialize_erc20_precompile(Erc20Precompile::new(
+        Erc20TokenConfig::default(),
+        ERC20_PRECOMPILE_ADDRESS,
+        1,
+    ));
+
+    // VICTIM is deliberately NOT seeded in the db: tx1 must create it in memory.
+    let mut db = CacheDB::new(EmptyDBTyped::<Infallible>::new());
+    db.insert_account_info(
+        RELAYER,
+        AccountInfo { balance: relayer_balance(), nonce: 0, ..Default::default() },
+    );
+
+    let mut state =
+        State::builder().with_database(db).with_bundle_update().without_state_clear().build();
+    state.set_state_clear_flag(true);
+
+    // Guard activates at the block being executed (active) or one block later (pre-fork).
+    let guard_block = if guard_active { BLOCK_NUMBER } else { BLOCK_NUMBER + 1 };
+    let chain_spec = Arc::new(
+        RaylsChainSpec::builder(test_chain_spec_arc())
+            .precompile_gas_fix(0)
+            .eip161_empty_account_guard(guard_block)
+            .build(),
+    );
+
+    // A real native transfer needs a non-zero block gas limit to pass the per-tx gas check.
+    let env = EvmEnv::new(
+        CfgEnv::new().with_spec_and_mainnet_gas_params(SpecId::CANCUN),
+        BlockEnv {
+            number: U256::from(BLOCK_NUMBER),
+            gas_limit: ETHEREUM_BLOCK_GAS_LIMIT_56BITS,
+            ..Default::default()
+        },
+    );
+    let mut evm =
+        RaylsEvmFactory::new(chain_spec).create_evm_with_native_erc20_only(&mut state, env);
+
+    // tx1: fund the not-yet-existing VICTIM with a native value transfer.
+    let fund_tx = TxEnv {
+        caller: RELAYER,
+        kind: TxKind::Call(VICTIM),
+        nonce: 0,
+        gas_limit: ETHEREUM_BLOCK_GAS_LIMIT_56BITS,
+        value: full_balance(),
+        data: Bytes::new(),
+        gas_price: 0,
+        chain_id: None,
+        gas_priority_fee: None,
+        access_list: Default::default(),
+        blob_hashes: Vec::new(),
+        max_fee_per_blob_gas: 0,
+        tx_type: 0,
+        authorization_list: Default::default(),
+    };
+    let ResultAndState { result: fund_result, state: fund_diff } =
+        evm.transact(fund_tx).expect("funding tx must not fail");
+    assert!(
+        matches!(fund_result, ExecutionResult::Success { .. }),
+        "the funding tx must succeed: {fund_result:?}",
+    );
+    // Commit through the EVM (production idiom, cf. `evm/block.rs`): the EVM still holds a
+    // `&mut state` across both txs, so committing on the outer `state` would double-borrow.
+    evm.db_mut().commit(fund_diff);
+
+    // tx2: drain VICTIM's whole balance via EIP-3009 (same shape as `drain`).
+    let ResultAndState { result, state: diff } = evm
+        .transact_pre_genesis_call(
+            RELAYER,
+            ERC20_PRECOMPILE_ADDRESS,
+            transfer_calldata(full_balance()),
+        )
+        .expect("transact must not fail; a rejected transfer returns as a revert result");
+    let auth_nonce_in_diff = nonce_slot_in_diff(&diff);
+    evm.db_mut().commit(diff);
+
+    DrainRun {
+        result,
+        victim: state.basic(VICTIM).expect("in-memory db read"),
+        relayer: state.basic(RELAYER).expect("in-memory db read"),
+        auth_nonce_used: state
+            .storage(ERC20_PRECOMPILE_ADDRESS, authorization_nonce_slot(VICTIM, AUTH_NONCE))
+            .expect("in-memory db read"),
+        auth_nonce_in_diff,
+    }
+}
+
+/// Pre-fork (v1.4.1 shape): funding a fresh account in tx1 and draining it in tx2 committed
+/// fine because the account was `InMemoryChange`, not `Loaded`. The drain must succeed and
+/// clear the victim.
+#[test]
+fn replay_shape_pre_fork_full_drain_commits() {
+    let run = replay_full_drain(false);
+
+    assert!(
+        matches!(&run.result, ExecutionResult::Success { .. }),
+        "pre-fork the full drain of an InMemoryChange account must succeed: {:?}",
+        run.result
+    );
+    assert!(
+        run.victim.is_none(),
+        "pre-fork the cleared victim is removed from state: {:?}",
+        run.victim
+    );
+    assert_eq!(
+        run.relayer.map(|info| info.balance),
+        Some(relayer_balance()),
+        "the relayer nets zero: funds the victim in tx1 and is credited back in tx2"
+    );
+    assert_eq!(
+        run.auth_nonce_in_diff,
+        Some(U256::ONE),
+        "the successful pre-fork drain must consume the auth nonce in the journal"
+    );
+    // The post-commit slot is still zero: the precompile account (`0x0400`) is EIP-161
+    // empty, and revm's commit drops the storage writes of an emptied account. v1.4.1
+    // behaved identically; the guard does not change this.
+    assert_eq!(
+        run.auth_nonce_used,
+        U256::ZERO,
+        "the emptied precompile account's storage is dropped at commit (pre-existing revm behavior)"
+    );
+}
+
+/// Post-fork: the same sequence is rejected because the drain would leave VICTIM EIP-161
+/// empty. The revert must leave VICTIM's balance, the auth nonce, and the relayer's net
+/// balance (only the tx1 funding) all untouched by the drain.
+#[test]
+fn replay_shape_post_fork_full_drain_reverts() {
+    let run = replay_full_drain(true);
+
+    assert!(
+        matches!(&run.result, ExecutionResult::Revert { .. }),
+        "post-fork the full drain must revert: {:?}",
+        run.result
+    );
+    let victim = run.victim.expect("a rejected drain must leave the victim in state");
+    assert_eq!(
+        victim.balance,
+        full_balance(),
+        "a rejected drain must leave the victim's funded balance untouched"
+    );
+    assert_eq!(victim.nonce, 0, "a rejected drain must leave the victim's nonce at 0");
+    assert_eq!(
+        run.relayer.map(|info| info.balance),
+        Some(relayer_balance() - full_balance()),
+        "only the tx1 funding moved; the rejected tx2 must not credit the relayer"
+    );
+    assert_eq!(
+        run.auth_nonce_in_diff, None,
+        "the rejected drain must roll the in-journal nonce consumption back"
+    );
+    assert_eq!(run.auth_nonce_used, U256::ZERO, "a rejected drain must not consume the nonce");
 }
