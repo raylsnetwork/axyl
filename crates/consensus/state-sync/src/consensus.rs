@@ -281,6 +281,15 @@ impl<DB: ReDatabase> WalkSession<DB> {
             }
             // Stop at proven coverage without re-descending it: the session anchor or genesis.
             if covered_hash == Some(current) || current == *GENESIS_DIGEST {
+                // A walk that starts at the anchor traverses nothing, so nothing published the
+                // tip a peer just reported. Publish it here: the epoch transition resets this
+                // watch, and the forward streamer and the rejoin check learn the head only from
+                // it, so a cached tip would otherwise stay unexecuted until a newer header comes.
+                if depth == 0 {
+                    if let Some(tip) = db.get_consensus_by_hash(current) {
+                        republish_if_higher(&self.consensus_bus, &tip);
+                    }
+                }
                 break WalkOutcome::Covered;
             }
             match get_consensus_header(
