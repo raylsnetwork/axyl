@@ -12,7 +12,7 @@ use crate::native_erc20::{
     MINTING_MODULE_ADDRESS,
 };
 use alloy::{
-    primitives::{Address, Bytes, Log, B256, U256},
+    primitives::{Address, Bytes, Log, B256, KECCAK256_EMPTY, U256},
     sol_types::SolEvent,
 };
 use alloy_evm::traits::EvmInternals;
@@ -275,6 +275,39 @@ impl Erc20Precompile {
         Ok(())
     }
 
+    /// Reject a debit that would leave `account` EIP-161 empty
+    /// (`balance == 0 && nonce == 0 && code_hash == KECCAK256_EMPTY`).
+    ///
+    /// A `Loaded` account that becomes empty inside a transaction makes revm's commit hit
+    /// `unreachable!("Wrong state transition, touch empty is not possible from Loaded")` and
+    /// halts the chain. The check runs before any balance write, so a rejected transfer leaves
+    /// the state untouched.
+    fn check_not_left_empty<T: StateAccessAdapter>(
+        &self,
+        state_access: &mut T,
+        account: Address,
+        new_balance: U256,
+    ) -> Result<(), ERC20Error> {
+        if !new_balance.is_zero() {
+            return Ok(());
+        }
+        let (nonce, code_hash) = {
+            let loaded = state_access
+                .perform_load_account(account)
+                .map_err(|e| ERC20Error::read_error(ERC20Resource::Account(account), e))?;
+            (loaded.data.info.nonce, loaded.data.info.code_hash)
+        };
+        if nonce == 0 && code_hash == KECCAK256_EMPTY {
+            trace!(
+                target: "erc20_precompile",
+                ?account,
+                "debit would leave the account EIP-161 empty; rejecting"
+            );
+            return Err(ERC20Error::TransferWouldEmptyAccount(account));
+        }
+        Ok(())
+    }
+
     fn check_allowance(
         &self,
         spender: Address,
@@ -324,6 +357,7 @@ impl Erc20Precompile {
             let new_balance = balance.checked_sub(amount).ok_or_else(|| {
                 ERC20Error::overflow_error(ERC20Resource::Balance, ERC20Method::Transfer)
             })?;
+            self.check_not_left_empty(state_access, sender, new_balance)?;
             self.set_balance(state_access, sender, new_balance)?;
         }
         state_access.perform_touch_account(sender);
@@ -651,6 +685,7 @@ impl Erc20Precompile {
         trace!(target: "erc20_precompile", ?sender_balance, "burn: loaded sender balance");
 
         self.check_balance(sender, sender_balance, amount)?;
+        self.check_not_left_empty(state_access, sender, sender_balance - amount)?;
 
         // Update total supply first (same order as mint)
         let current_total_supply = self.get_total_supply(state_access)?;
@@ -718,6 +753,7 @@ impl Erc20Precompile {
         trace!(target: "erc20_precompile", ?account_balance, "burn_from: loaded account balance");
 
         self.check_balance(sender, account_balance, amount)?;
+        self.check_not_left_empty(state_access, sender, account_balance - amount)?;
 
         // Update total supply first (same order as mint)
         let current_total_supply = self.get_total_supply(state_access)?;
@@ -1079,6 +1115,9 @@ pub enum ERC20Error {
     /// Generic ERC-20 error.
     #[error("ERC20 Error: {0}")]
     ERC20Other(String),
+    /// Debit would leave the account EIP-161 empty, which revm cannot commit.
+    #[error("Transfer would leave account {0} empty (balance 0, nonce 0, no code)")]
+    TransferWouldEmptyAccount(Address),
 
     // EIP-3009: "Transfer with Authorization"
     /// Authorization not yet valid.

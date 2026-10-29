@@ -1,20 +1,21 @@
 //! Regression tests for the EIP-3009 "empty account" chain halt.
 //!
 //! A fresh EOA (nonce 0, no code) that signs away its entire native ERC-20 balance via
-//! EIP-3009 ends the transaction as an EIP-161 empty account while still `Loaded` in the
-//! state cache. Committing that state panics with:
+//! EIP-3009 would end the transaction as an EIP-161 empty account while still `Loaded` in
+//! the state cache. Committing that state panicked on v1.4.1 with:
 //!
 //! ```text
 //! internal error: entered unreachable code: Wrong state transition,
 //! touch empty is not possible from Loaded
 //! ```
 //!
-//! `eth_call` never commits, so the bug only shows up in block execution. Each test below
+//! `eth_call` never commits, so the bug only showed up in block execution. Each test below
 //! runs the production pair: `transact` on the block-execution EVM, then `State::commit`.
 //!
-//! [`full_drain_of_nonce0_account`] is expected to FAIL on v1.4.1 with the panic above.
-//! The other two tests are controls that pass today and must keep passing: a partial drain
-//! leaves the victim non-empty, and a nonce-1 account is never EIP-161 empty.
+//! The fix rejects any debit that would leave the account EIP-161 empty, so
+//! [`full_drain_of_nonce0_account_is_rejected`] must revert without touching state. The
+//! other two tests are controls: a partial drain leaves the victim non-empty, and a nonce-1
+//! account is never EIP-161 empty.
 
 use crate::{
     chainspec::RaylsChainSpec,
@@ -141,10 +142,10 @@ struct DrainRun {
     auth_nonce_used: U256,
 }
 
-/// Run one EIP-3009 drain exactly like the block executor: `transact`, then commit.
+/// Run one EIP-3009 transfer exactly like the block executor: `transact`, then commit.
 ///
-/// On v1.4.1 the full drain of the nonce-0 victim panics inside `State::commit`; that panic
-/// is the bug under test.
+/// `State::commit` must never panic: a transfer the precompile rejects is returned as
+/// [`ExecutionResult::Revert`] and contributes no state changes.
 fn drain(victim_nonce: u64, amount: U256) -> DrainRun {
     // Process-global; the EIP-712 domain above must match this instance.
     let _ = initialize_erc20_precompile(Erc20Precompile::new(
@@ -180,7 +181,7 @@ fn drain(victim_nonce: u64, amount: U256) -> DrainRun {
 
     let ResultAndState { result, state: diff } = evm
         .transact_pre_genesis_call(RELAYER, ERC20_PRECOMPILE_ADDRESS, transfer_calldata(amount))
-        .expect("transact must succeed: the incident panics at commit, not execution");
+        .expect("transact must not fail; a rejected transfer returns as a revert result");
 
     // Production commit step (`RaylsBlockExecutor::commit_transaction`).
     state.commit(diff);
@@ -195,31 +196,32 @@ fn drain(victim_nonce: u64, amount: U256) -> DrainRun {
     }
 }
 
-/// Draining the whole balance of a fresh nonce-0 EOA.
+/// A full drain of a fresh nonce-0 EOA must be rejected.
 ///
-/// RED on v1.4.1: the commit panics. After the fix the transfer must execute and the victim
-/// must be removed from state (EIP-161). A fix that merely skips the touch would leave the
-/// balance change un-persisted, so the credit and nonce assertions guard against that.
+/// Allowing it would leave the account EIP-161 empty, which revm cannot commit (the v1.4.1
+/// chain halt). The revert must leave every piece of state untouched.
 #[test]
-fn full_drain_of_nonce0_account() {
+fn full_drain_of_nonce0_account_is_rejected() {
     let run = drain(0, full_balance());
 
     assert!(
-        matches!(&run.result, ExecutionResult::Success { .. }),
-        "the full drain must execute: {:?}",
+        matches!(&run.result, ExecutionResult::Revert { .. }),
+        "the full drain must revert: {:?}",
         run.result
     );
     assert_eq!(
         run.relayer.map(|info| info.balance),
-        Some(relayer_balance() + full_balance()),
-        "the relayer must be credited the full drained amount"
+        Some(relayer_balance()),
+        "a rejected transfer must not credit the relayer"
     );
-    assert_eq!(run.auth_nonce_used, U256::ONE, "the authorization nonce must be marked used");
+    assert_eq!(run.auth_nonce_used, U256::ZERO, "a rejected transfer must not use the nonce");
+    let victim = run.victim.expect("a rejected transfer must leave the victim in state");
     assert_eq!(
-        run.victim, None,
-        "the drained nonce-0 account must be removed from state (EIP-161); \
-         if it still exists, the balance change was never persisted"
+        victim.balance,
+        full_balance(),
+        "a rejected transfer must leave the victim's balance unchanged"
     );
+    assert_eq!(victim.nonce, 0, "a rejected transfer must leave the victim's nonce at 0");
 }
 
 /// Control: draining 3 of 5 USDr works today — the victim stays non-empty, so the commit
