@@ -349,6 +349,7 @@ impl Erc20Precompile {
         sender: Address,
         receiver: Address,
         amount: U256,
+        reject_empty_debits: bool,
     ) -> Result<(), ERC20Error> {
         // Debit sender
         {
@@ -357,7 +358,9 @@ impl Erc20Precompile {
             let new_balance = balance.checked_sub(amount).ok_or_else(|| {
                 ERC20Error::overflow_error(ERC20Resource::Balance, ERC20Method::Transfer)
             })?;
-            self.check_not_left_empty(state_access, sender, new_balance)?;
+            if reject_empty_debits {
+                self.check_not_left_empty(state_access, sender, new_balance)?;
+            }
             self.set_balance(state_access, sender, new_balance)?;
         }
         state_access.perform_touch_account(sender);
@@ -482,6 +485,7 @@ impl Erc20Precompile {
         sender: Address,
         receiver: Address,
         amount: U256,
+        reject_empty_debits: bool,
     ) -> Result<PrecompileOutput, ERC20Error> {
         debug!(target: "erc20_precompile", ?sender, ?receiver, ?amount, "handle_transfer");
 
@@ -498,7 +502,7 @@ impl Erc20Precompile {
             return Ok(PrecompileOutput::new(GAS_TRANSFER, encode_bool(true)));
         }
 
-        self.transfer_balance(state_access, sender, receiver, amount)?;
+        self.transfer_balance(state_access, sender, receiver, amount, reject_empty_debits)?;
 
         // emit Transfer event
         let event = Self::encode_transfer_event(self.contract_address, sender, receiver, amount);
@@ -543,6 +547,7 @@ impl Erc20Precompile {
         sender: Address,
         receiver: Address,
         amount: U256,
+        reject_empty_debits: bool,
     ) -> Result<PrecompileOutput, ERC20Error> {
         debug!(target: "erc20_precompile", ?spender, ?sender, ?receiver, ?amount, "handle_transfer_from");
 
@@ -583,7 +588,7 @@ impl Erc20Precompile {
             return Ok(PrecompileOutput::new(GAS_TRANSFER_FROM, encode_bool(true)));
         }
 
-        self.transfer_balance(state_access, sender, receiver, amount)?;
+        self.transfer_balance(state_access, sender, receiver, amount, reject_empty_debits)?;
 
         // decrease allowance (unless unlimited)
         if !is_unlimited {
@@ -664,6 +669,7 @@ impl Erc20Precompile {
         state_access: &mut T,
         caller: Address,
         amount: U256,
+        reject_empty_debits: bool,
     ) -> Result<PrecompileOutput, ERC20Error> {
         debug!(target: "erc20_precompile", ?caller, ?amount, "handle_burn");
 
@@ -685,7 +691,9 @@ impl Erc20Precompile {
         trace!(target: "erc20_precompile", ?sender_balance, "burn: loaded sender balance");
 
         self.check_balance(sender, sender_balance, amount)?;
-        self.check_not_left_empty(state_access, sender, sender_balance - amount)?;
+        if reject_empty_debits {
+            self.check_not_left_empty(state_access, sender, sender_balance - amount)?;
+        }
 
         // Update total supply first (same order as mint)
         let current_total_supply = self.get_total_supply(state_access)?;
@@ -726,6 +734,7 @@ impl Erc20Precompile {
         caller: Address,
         sender: Address,
         amount: U256,
+        reject_empty_debits: bool,
     ) -> Result<PrecompileOutput, ERC20Error> {
         debug!(target: "erc20_precompile", ?caller, ?sender, ?amount, "handle_burn_from");
 
@@ -753,7 +762,9 @@ impl Erc20Precompile {
         trace!(target: "erc20_precompile", ?account_balance, "burn_from: loaded account balance");
 
         self.check_balance(sender, account_balance, amount)?;
-        self.check_not_left_empty(state_access, sender, account_balance - amount)?;
+        if reject_empty_debits {
+            self.check_not_left_empty(state_access, sender, account_balance - amount)?;
+        }
 
         // Update total supply first (same order as mint)
         let current_total_supply = self.get_total_supply(state_access)?;
@@ -903,6 +914,7 @@ impl Erc20Precompile {
         v: u8,
         r: U256,
         s: U256,
+        reject_empty_debits: bool,
     ) -> Result<PrecompileOutput, ERC20Error> {
         // 1. Time window validation
         let current_timestamp = state_access.get_block_timestamp();
@@ -951,10 +963,11 @@ impl Erc20Precompile {
         })?;
 
         // 6. Execute transfer
-        let transfer_result =
-            self.handle_transfer(state_access, sender, receiver, amount).inspect_err(
-                |e| error!(target: "erc20_precompile", "Failed to execute transfer: {:?}", e),
-            )?;
+        let transfer_result = self
+            .handle_transfer(state_access, sender, receiver, amount, reject_empty_debits)
+            .inspect_err(|e| {
+                error!(target: "erc20_precompile", "Failed to execute transfer: {:?}", e);
+            })?;
 
         // 7. Emit AuthorizationUsed event
         let auth_event =
@@ -980,6 +993,7 @@ impl Erc20Precompile {
         v: u8,
         r: B256,
         s: B256,
+        reject_empty_debits: bool,
     ) -> Result<PrecompileOutput, ERC20Error> {
         if caller != receiver {
             return Err(ERC20Error::CallerNotReceiver(caller, receiver));
@@ -1023,7 +1037,8 @@ impl Erc20Precompile {
         self.mark_nonce_used(state_access, sender, nonce)?;
 
         // 6. Execute transfer
-        let transfer_result = self.handle_transfer(state_access, sender, receiver, amount)?;
+        let transfer_result =
+            self.handle_transfer(state_access, sender, receiver, amount, reject_empty_debits)?;
 
         // 7. Emit AuthorizationUsed event
         let auth_event =

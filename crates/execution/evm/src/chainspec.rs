@@ -66,6 +66,12 @@ hardfork!(
         /// sender's whole nonce chain instead of consecutive ranges scattering across pools and
         /// parking nonce-gapped. Also enables live-successor failover for a down slot owner.
         SenderAffinityLoadBalancing,
+        /// Reject native ERC-20 debits that would leave an EIP-161-empty account.
+        ///
+        /// revm panics when such an account transitions from `Loaded` at commit time. This fork
+        /// stays `Never` on real networks because v1.4.1 already committed those sequences;
+        /// enabling it during replay would change historical state roots.
+        Eip161EmptyAccountGuard,
     }
 );
 
@@ -156,6 +162,14 @@ pub const LOCAL_LOAD_BALANCING_BLOCK: u64 = 0;
 /// until an activation block is chosen operationally.
 pub const LOCAL_SENDER_AFFINITY_LOAD_BALANCING_BLOCK: u64 = 0;
 
+/// EIP-161 empty-account guard activation block on the local sandbox network.
+///
+/// Devnet, testnet and mainnet stay `Never`: v1.4.1 already committed the affected
+/// `InMemoryChange` / `LoadedNotExisting` transitions, so the guard must not retroactively change
+/// historical execution. Flip the relevant network entry when a real-network activation is
+/// scheduled operationally.
+pub const LOCAL_EIP161_EMPTY_ACCOUNT_GUARD_BLOCK: u64 = 0;
+
 // NOTE: UsdrSupplyCorrection is active on local and mainnet; testnet/devnet
 // stay `Never` until an activation block is chosen operationally. Flip the
 // relevant network entry in the schedule below from `ForkCondition::Never` to
@@ -226,11 +240,12 @@ impl RaylsHardFork {
             Self::HybridRewards => 0x0d,
             Self::OutputSeqNormalization => 0x0e,
             Self::SenderAffinityLoadBalancing => 0x0f,
+            Self::Eip161EmptyAccountGuard => 0x10,
         }
     }
 
     /// Devnet hardfork schedule.
-    pub const fn devnet() -> [(Self, ForkCondition); 15] {
+    pub const fn devnet() -> [(Self, ForkCondition); 16] {
         [
             (Self::Eip1559, ForkCondition::Block(DEVNET_EIP1559_BLOCK)),
             (Self::BatchDigestV2, ForkCondition::Block(DEVNET_BATCH_DIGEST_V2_BLOCK)),
@@ -255,11 +270,14 @@ impl RaylsHardFork {
             (Self::OutputSeqNormalization, ForkCondition::Never),
             // Never until an operational activation block is chosen; the mechanism ships dormant.
             (Self::SenderAffinityLoadBalancing, ForkCondition::Never),
+            // Never on real networks: replaying v1.4.1 blocks must keep the historical
+            // `InMemoryChange` / `LoadedNotExisting` transitions.
+            (Self::Eip161EmptyAccountGuard, ForkCondition::Never),
         ]
     }
 
     /// Testnet hardfork schedule.
-    pub const fn testnet() -> [(Self, ForkCondition); 15] {
+    pub const fn testnet() -> [(Self, ForkCondition); 16] {
         [
             (Self::Eip1559, ForkCondition::Block(TESTNET_EIP1559_BLOCK)),
             (Self::BatchDigestV2, ForkCondition::Block(TESTNET_BATCH_DIGEST_V2_BLOCK)),
@@ -282,11 +300,14 @@ impl RaylsHardFork {
             (Self::OutputSeqNormalization, ForkCondition::Never),
             // Never until an operational activation block is chosen; the mechanism ships dormant.
             (Self::SenderAffinityLoadBalancing, ForkCondition::Never),
+            // Never on real networks: replaying v1.4.1 blocks must keep the historical
+            // `InMemoryChange` / `LoadedNotExisting` transitions.
+            (Self::Eip161EmptyAccountGuard, ForkCondition::Never),
         ]
     }
 
     /// Mainnet hardfork schedule.
-    pub const fn mainnet() -> [(Self, ForkCondition); 15] {
+    pub const fn mainnet() -> [(Self, ForkCondition); 16] {
         [
             (Self::Eip1559, ForkCondition::Block(MAINNET_EIP1559_BLOCK)),
             (Self::BatchDigestV2, ForkCondition::Block(MAINNET_BATCH_DIGEST_V2_BLOCK)),
@@ -316,11 +337,14 @@ impl RaylsHardFork {
             (Self::OutputSeqNormalization, ForkCondition::Never),
             // Never until an operational activation block is chosen; the mechanism ships dormant.
             (Self::SenderAffinityLoadBalancing, ForkCondition::Never),
+            // Never on real networks: replaying v1.4.1 blocks must keep the historical
+            // `InMemoryChange` / `LoadedNotExisting` transitions.
+            (Self::Eip161EmptyAccountGuard, ForkCondition::Never),
         ]
     }
 
     /// Local network hardfork schedule (first four hardforks active at genesis).
-    pub const fn local() -> [(Self, ForkCondition); 15] {
+    pub const fn local() -> [(Self, ForkCondition); 16] {
         [
             (Self::Eip1559, ForkCondition::Block(LOCAL_EIP1559_BLOCK)),
             (Self::BatchDigestV2, ForkCondition::Block(LOCAL_BATCH_DIGEST_V2_BLOCK)),
@@ -349,11 +373,15 @@ impl RaylsHardFork {
                 Self::SenderAffinityLoadBalancing,
                 ForkCondition::Block(LOCAL_SENDER_AFFINITY_LOAD_BALANCING_BLOCK),
             ),
+            (
+                Self::Eip161EmptyAccountGuard,
+                ForkCondition::Block(LOCAL_EIP161_EMPTY_ACCOUNT_GUARD_BLOCK),
+            ),
         ]
     }
 
     /// Return the hardfork schedule for the given network.
-    pub const fn for_network(network: RaylsNetwork) -> [(Self, ForkCondition); 15] {
+    pub const fn for_network(network: RaylsNetwork) -> [(Self, ForkCondition); 16] {
         match network {
             RaylsNetwork::Devnet => Self::devnet(),
             RaylsNetwork::Testnet => Self::testnet(),
@@ -500,6 +528,14 @@ pub trait RaylsHardforks {
     /// Return true if the OutputSeqNormalization fork is active at `block`.
     fn is_output_seq_normalization_active_at_block(&self, block: u64) -> bool {
         self.is_rayls_fork_active_at_block(RaylsHardFork::OutputSeqNormalization, block)
+    }
+
+    /// Return true if the EIP-161 empty-account guard is active at `block`.
+    ///
+    /// When active, native ERC-20 debits that would leave an EIP-161-empty account are rejected
+    /// instead of producing a state transition revm cannot commit.
+    fn is_eip161_empty_account_guard_active_at_block(&self, block: u64) -> bool {
+        self.is_rayls_fork_active_at_block(RaylsHardFork::Eip161EmptyAccountGuard, block)
     }
 
     /// Return the active version byte at `block`, if any.
@@ -697,6 +733,14 @@ impl RaylsChainSpecBuilder {
         self.inner
             .hardforks
             .insert(RaylsHardFork::OutputSeqNormalization, ForkCondition::Block(block));
+        self
+    }
+
+    /// Activate Eip161EmptyAccountGuard at `block`.
+    pub fn eip161_empty_account_guard(mut self, block: u64) -> Self {
+        self.inner
+            .hardforks
+            .insert(RaylsHardFork::Eip161EmptyAccountGuard, ForkCondition::Block(block));
         self
     }
 
@@ -898,8 +942,8 @@ mod tests {
     #[test]
     fn local_network_first_four_hardforks_active_at_block_0() {
         let hardforks = RaylsChainHardforks::local();
-        // Only first 4 hardforks are active for local network (RlsStorage, Tokenomics, Uups are
-        // Never)
+        // The first 4 hardforks are active for local network (RlsStorage, Tokenomics, Uups are
+        // Never); Eip161EmptyAccountGuard also activates at block 0 and is covered separately.
         let active_forks = [
             RaylsHardFork::Eip1559,
             RaylsHardFork::BatchDigestV2,
@@ -939,21 +983,21 @@ mod tests {
     fn local_network_version_byte_at_block_0() {
         let hardforks = RaylsChainHardforks::local();
         let version = hardforks.version_byte_at_block(0);
-        // SenderAffinityLoadBalancing (0x0f) activates at block 0 on local and is the highest
+        // Eip161EmptyAccountGuard (0x10) activates at block 0 on local and is the highest
         // such fork, so it owns the version byte from block 0.
-        assert_eq!(version, Some(0x0f));
+        assert_eq!(version, Some(0x10));
     }
 
     #[test]
     fn local_network_version_byte_is_the_max_active_code() {
-        // SenderAffinityLoadBalancing (0x0f) is genesis-active on local, so it owns the version
+        // Eip161EmptyAccountGuard (0x10) is genesis-active on local, so it owns the version
         // byte across every later activation (HybridRewards at 0x0d included): the byte reports
         // the max active code, not the most recently crossed block. On real networks it is Never,
         // so there the highest active fork still advances the byte normally.
         let hardforks = RaylsChainHardforks::local();
-        assert_eq!(hardforks.version_byte_at_block(LOCAL_HYBRID_REWARDS_BLOCK - 1), Some(0x0f));
-        assert_eq!(hardforks.version_byte_at_block(LOCAL_HYBRID_REWARDS_BLOCK), Some(0x0f));
-        assert_eq!(hardforks.version_byte_at_block(1_000_000), Some(0x0f));
+        assert_eq!(hardforks.version_byte_at_block(LOCAL_HYBRID_REWARDS_BLOCK - 1), Some(0x10));
+        assert_eq!(hardforks.version_byte_at_block(LOCAL_HYBRID_REWARDS_BLOCK), Some(0x10));
+        assert_eq!(hardforks.version_byte_at_block(1_000_000), Some(0x10));
     }
 
     #[test]
@@ -965,7 +1009,7 @@ mod tests {
             RaylsNetwork::Local,
         ] {
             let schedule = RaylsHardFork::for_network(network);
-            assert_eq!(schedule.len(), 15, "expected 15 hardforks for {network}");
+            assert_eq!(schedule.len(), 16, "expected 16 hardforks for {network}");
             assert_eq!(schedule[0].0, RaylsHardFork::Eip1559);
             assert_eq!(schedule[1].0, RaylsHardFork::BatchDigestV2);
             assert_eq!(schedule[2].0, RaylsHardFork::AdminTransfer);
@@ -981,6 +1025,7 @@ mod tests {
             assert_eq!(schedule[12].0, RaylsHardFork::HybridRewards);
             assert_eq!(schedule[13].0, RaylsHardFork::OutputSeqNormalization);
             assert_eq!(schedule[14].0, RaylsHardFork::SenderAffinityLoadBalancing);
+            assert_eq!(schedule[15].0, RaylsHardFork::Eip161EmptyAccountGuard);
         }
     }
 
@@ -1003,5 +1048,32 @@ mod tests {
             .build();
         assert!(!spec.is_batch_digest_v2_active_at_block(998));
         assert!(spec.is_batch_digest_v2_active_at_block(999));
+    }
+
+    #[test]
+    fn eip161_empty_account_guard_is_local_only() {
+        assert!(RaylsChainHardforks::local().is_eip161_empty_account_guard_active_at_block(0));
+        for network in [RaylsNetwork::Devnet, RaylsNetwork::Testnet, RaylsNetwork::Mainnet] {
+            let hardforks = RaylsChainHardforks::for_network(network);
+            for block in [0u64, 1, u64::MAX] {
+                assert!(
+                    !hardforks.is_eip161_empty_account_guard_active_at_block(block),
+                    "guard must stay Never on {network} (block {block}) so replay stays identical \
+                     to v1.4.1"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn builder_overrides_eip161_empty_account_guard_activation() {
+        let genesis = rayls_infrastructure_types::test_genesis();
+        let chain_spec: ChainSpec = genesis.into();
+        let spec = RaylsChainSpec::builder(Arc::new(chain_spec))
+            .add_rayls_hardforks_by_type(RaylsNetwork::Devnet)
+            .eip161_empty_account_guard(999)
+            .build();
+        assert!(!spec.is_eip161_empty_account_guard_active_at_block(998));
+        assert!(spec.is_eip161_empty_account_guard_active_at_block(999));
     }
 }

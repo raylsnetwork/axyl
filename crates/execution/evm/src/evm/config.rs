@@ -43,13 +43,13 @@ pub struct RaylsEvmConfig<ChainSpec = RaylsChainSpec> {
 impl RaylsEvmConfig {
     /// Creates a new Rayls EVM configuration with the given chain spec.
     pub fn new(chain_spec: Arc<RaylsChainSpec>, rewards_counter: RewardsCounter) -> Self {
-        let evm_factory = RaylsEvmFactory::default();
+        let evm_factory = RaylsEvmFactory::new(chain_spec.clone());
         Self {
             block_assembler: RaylsBlockAssembler::new(chain_spec.clone()),
             executor_factory: RaylsBlockExecutorFactory::new(
                 RethReceiptBuilder::default(),
                 chain_spec,
-                evm_factory,
+                evm_factory.clone(),
             ),
             evm_factory,
             rewards_counter,

@@ -2,7 +2,7 @@
 
 use super::{RaylsBlockExecutionCtx, RaylsBlockExecutor, RaylsEvm, RaylsEvmContext};
 use crate::{
-    chainspec::RaylsChainSpec,
+    chainspec::{RaylsChainSpec, RaylsHardforks},
     native_erc20::{
         abi::{eip3009, erc20, Erc20Selector},
         precompile::Erc20Precompile,
@@ -69,209 +69,235 @@ pub(crate) fn initialize_erc20_precompile(
 //     ERC20_PRECOMPILE_INSTANCE.get().cloned()
 // }
 
-/// Create a DynPrecompile for the Native ERC-20 wrapper.
-///
-/// This is used for eth_call simulations where the inspector path is not available.
 /// ERC-20 precompile ID for the DynPrecompile registration.
 const ERC20_PRECOMPILE_ID: PrecompileId =
     PrecompileId::Custom(std::borrow::Cow::Borrowed("NativeERC20Wrapper"));
 
-fn create_erc20_dyn_precompile() -> DynPrecompile {
-    DynPrecompile::new(ERC20_PRECOMPILE_ID, move |mut input: PrecompileInput<'_>| {
-        // reject native value: revm transfers value to 0x0400 before precompile dispatch and would
-        // otherwise commit it permanently
-        if input.value != U256::ZERO {
-            return PrecompileResult::Err(PrecompileError::other(
-                "ERC-20 precompile rejects native value transfer",
-            ));
-        }
-
-        let precompile = match ERC20_PRECOMPILE_INSTANCE.get() {
-            Some(p) => p.clone(),
-            None => {
-                return PrecompileResult::Err(PrecompileError::other(
-                    "ERC-20 precompile not initialized",
-                ));
-            }
-        };
-
-        if input.data.len() < 4 {
-            return PrecompileResult::Err(PrecompileError::other("Invalid input: too short"));
-        }
-
-        let selector = Erc20Selector::from_calldata(input.data)
-            .ok_or_else(|| PrecompileError::other("Unknown function selector"))?;
-
-        // reject state mutation under STATICCALL: revm enforces is_static only at opcode dispatch,
-        // not journal layer
-        if input.is_static && selector.is_state_mutating() {
-            return PrecompileResult::Err(PrecompileError::other(
-                "ERC-20 state mutation forbidden under static call",
-            ));
-        }
-
-        // Lock the precompile for reading
-        let precompile_guard = precompile.read();
-
-        // Route to appropriate handler based on selector
-        trace!(target: "erc20_precompile", ?selector, "dispatch");
-        let result = match selector {
-            // Metadata - no state access needed
-            Erc20Selector::Name => precompile_guard.handle_name(),
-            Erc20Selector::Symbol => precompile_guard.handle_symbol(),
-            Erc20Selector::Decimals => precompile_guard.handle_decimals(),
-            Erc20Selector::TotalSupply => {
-                precompile_guard.handle_total_supply(&mut input.internals)
-            }
-
-            // Queries
-            Erc20Selector::BalanceOf => {
-                let params = decode_call::<erc20::balanceOfCall>(input.data)?;
-                precompile_guard.handle_balance_of(&mut input.internals, params.account)
-            }
-            Erc20Selector::Allowance => {
-                let params = decode_call::<erc20::allowanceCall>(input.data)?;
-                precompile_guard.handle_allowance(
-                    &mut input.internals,
-                    params.owner,
-                    params.spender,
-                )
-            }
-
-            // State mutations
-            Erc20Selector::Transfer => {
-                let params = decode_call::<erc20::transferCall>(input.data)?;
-                precompile_guard.handle_transfer(
-                    &mut input.internals,
-                    input.caller,
-                    params.to,
-                    params.amount,
-                )
-            }
-            Erc20Selector::Approve => {
-                let params = decode_call::<erc20::approveCall>(input.data)?;
-                precompile_guard.handle_approve(
-                    &mut input.internals,
-                    input.caller,
-                    params.spender,
-                    params.amount,
-                )
-            }
-            Erc20Selector::TransferFrom => {
-                let params = decode_call::<erc20::transferFromCall>(input.data)?;
-                precompile_guard.handle_transfer_from(
-                    &mut input.internals,
-                    input.caller,
-                    params.from,
-                    params.to,
-                    params.amount,
-                )
-            }
-            Erc20Selector::Mint => {
-                let params = decode_call::<erc20::mintCall>(input.data)?;
-                precompile_guard.handle_mint(
-                    &mut input.internals,
-                    input.caller,
-                    params.to,
-                    params.amount,
-                )
-            }
-            Erc20Selector::Burn => {
-                let params = decode_call::<erc20::burnCall>(input.data)?;
-                precompile_guard.handle_burn(&mut input.internals, input.caller, params.amount)
-            }
-            Erc20Selector::BurnFrom => {
-                let params = decode_call::<erc20::burnFromCall>(input.data)?;
-                precompile_guard.handle_burn_from(
-                    &mut input.internals,
-                    input.caller,
-                    params.account,
-                    params.amount,
-                )
-            }
-
-            // EIP-3009 meta-transactions
-            Erc20Selector::TransferWithAuthorization => {
-                let params = decode_call::<eip3009::TransferWithAuthorizationCall>(input.data)?;
-                precompile_guard.handle_transfer_with_authorization(
-                    &mut input.internals,
-                    params.from,
-                    params.to,
-                    params.value,
-                    params.validAfter,
-                    params.validBefore,
-                    params.nonce,
-                    params.v,
-                    params.r.into(),
-                    params.s.into(),
-                )
-            }
-            Erc20Selector::ReceiveWithAuthorization => {
-                let params = decode_call::<eip3009::ReceiveWithAuthorizationCall>(input.data)?;
-                precompile_guard.handle_receive_with_authorization(
-                    &mut input.internals,
-                    input.caller,
-                    params.from,
-                    params.to,
-                    params.value,
-                    params.validAfter,
-                    params.validBefore,
-                    params.nonce,
-                    params.v,
-                    params.r,
-                    params.s,
-                )
-            }
-            Erc20Selector::CancelAuthorization => {
-                let params = decode_call::<eip3009::CancelAuthorizationCall>(input.data)?;
-                precompile_guard.handle_cancel_authorization(
-                    &mut input.internals,
-                    params.authorizer,
-                    params.nonce,
-                    params.v,
-                    params.r,
-                    params.s,
-                )
-            }
-        };
-
-        // gate gas_used on input.gas so PrecompilesMap::run never trips its underflow assert
-        match result {
-            Ok(output) => {
-                if output.gas_used > input.gas {
-                    return Err(PrecompileError::OutOfGas);
-                }
-                Ok(PrecompileOutput::new(output.gas_used, output.bytes))
-            }
-            Err(err) => {
-                let charge = BASE_ERROR_GAS.min(input.gas);
-                Ok(PrecompileOutput::new_reverted(charge, err.into()))
-            }
-        }
-    })
-}
-
-/// Create a PrecompilesMap with the Native ERC-20 precompile registered.
-fn create_precompiles_with_erc20(spec_id: SpecId) -> PrecompilesMap {
-    let mut precompiles_map =
-        PrecompilesMap::from_static(Precompiles::new(PrecompileSpecId::from_spec_id(spec_id)));
-
-    // Only register the ERC-20 precompile if it's been initialized
-    if ERC20_PRECOMPILE_INSTANCE.get().is_some() {
-        let erc20_dyn_precompile = create_erc20_dyn_precompile();
-        precompiles_map.apply_precompile(&ERC20_PRECOMPILE_ADDRESS, |_| Some(erc20_dyn_precompile));
-        debug!("Registered Native ERC-20 precompile at {:?}", ERC20_PRECOMPILE_ADDRESS);
-    }
-
-    precompiles_map
-}
-
 /// Factory producing [`RaylsEvm`].
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Clone)]
 #[non_exhaustive]
-pub struct RaylsEvmFactory;
+pub struct RaylsEvmFactory {
+    /// Chain spec used to evaluate hardfork-gated precompile behavior per call.
+    chain_spec: Arc<RaylsChainSpec>,
+}
 
 impl RaylsEvmFactory {
+    /// Create a factory bound to `chain_spec`.
+    pub const fn new(chain_spec: Arc<RaylsChainSpec>) -> Self {
+        Self { chain_spec }
+    }
+
+    /// Create a DynPrecompile for the Native ERC-20 wrapper, bound to this factory's chain
+    /// spec.
+    ///
+    /// This is used for eth_call simulations where the inspector path is not available.
+    fn erc20_dyn_precompile(&self) -> DynPrecompile {
+        let chain_spec = self.chain_spec.clone();
+        DynPrecompile::new(ERC20_PRECOMPILE_ID, move |mut input: PrecompileInput<'_>| {
+            // reject native value: revm transfers value to 0x0400 before precompile dispatch and would
+            // otherwise commit it permanently
+            if input.value != U256::ZERO {
+                return PrecompileResult::Err(PrecompileError::other(
+                    "ERC-20 precompile rejects native value transfer",
+                ));
+            }
+
+            let precompile = match ERC20_PRECOMPILE_INSTANCE.get() {
+                Some(p) => p.clone(),
+                None => {
+                    return PrecompileResult::Err(PrecompileError::other(
+                        "ERC-20 precompile not initialized",
+                    ));
+                }
+            };
+
+            if input.data.len() < 4 {
+                return PrecompileResult::Err(PrecompileError::other("Invalid input: too short"));
+            }
+
+            let selector = Erc20Selector::from_calldata(input.data)
+                .ok_or_else(|| PrecompileError::other("Unknown function selector"))?;
+
+            // reject state mutation under STATICCALL: revm enforces is_static only at opcode dispatch,
+            // not journal layer
+            if input.is_static && selector.is_state_mutating() {
+                return PrecompileResult::Err(PrecompileError::other(
+                    "ERC-20 state mutation forbidden under static call",
+                ));
+            }
+
+            // Lock the precompile for reading
+            let precompile_guard = precompile.read();
+
+            // Evaluate the hardfork at this call's block, not at factory-construction time.
+            let reject_empty_debits = chain_spec.is_eip161_empty_account_guard_active_at_block(
+                input.internals.block_number().to::<u64>(),
+            );
+
+            // Route to appropriate handler based on selector
+            trace!(target: "erc20_precompile", ?selector, "dispatch");
+            let result = match selector {
+                // Metadata - no state access needed
+                Erc20Selector::Name => precompile_guard.handle_name(),
+                Erc20Selector::Symbol => precompile_guard.handle_symbol(),
+                Erc20Selector::Decimals => precompile_guard.handle_decimals(),
+                Erc20Selector::TotalSupply => {
+                    precompile_guard.handle_total_supply(&mut input.internals)
+                }
+
+                // Queries
+                Erc20Selector::BalanceOf => {
+                    let params = decode_call::<erc20::balanceOfCall>(input.data)?;
+                    precompile_guard.handle_balance_of(&mut input.internals, params.account)
+                }
+                Erc20Selector::Allowance => {
+                    let params = decode_call::<erc20::allowanceCall>(input.data)?;
+                    precompile_guard.handle_allowance(
+                        &mut input.internals,
+                        params.owner,
+                        params.spender,
+                    )
+                }
+
+                // State mutations
+                Erc20Selector::Transfer => {
+                    let params = decode_call::<erc20::transferCall>(input.data)?;
+                    precompile_guard.handle_transfer(
+                        &mut input.internals,
+                        input.caller,
+                        params.to,
+                        params.amount,
+                        reject_empty_debits,
+                    )
+                }
+                Erc20Selector::Approve => {
+                    let params = decode_call::<erc20::approveCall>(input.data)?;
+                    precompile_guard.handle_approve(
+                        &mut input.internals,
+                        input.caller,
+                        params.spender,
+                        params.amount,
+                    )
+                }
+                Erc20Selector::TransferFrom => {
+                    let params = decode_call::<erc20::transferFromCall>(input.data)?;
+                    precompile_guard.handle_transfer_from(
+                        &mut input.internals,
+                        input.caller,
+                        params.from,
+                        params.to,
+                        params.amount,
+                        reject_empty_debits,
+                    )
+                }
+                Erc20Selector::Mint => {
+                    let params = decode_call::<erc20::mintCall>(input.data)?;
+                    precompile_guard.handle_mint(
+                        &mut input.internals,
+                        input.caller,
+                        params.to,
+                        params.amount,
+                    )
+                }
+                Erc20Selector::Burn => {
+                    let params = decode_call::<erc20::burnCall>(input.data)?;
+                    precompile_guard.handle_burn(
+                        &mut input.internals,
+                        input.caller,
+                        params.amount,
+                        reject_empty_debits,
+                    )
+                }
+                Erc20Selector::BurnFrom => {
+                    let params = decode_call::<erc20::burnFromCall>(input.data)?;
+                    precompile_guard.handle_burn_from(
+                        &mut input.internals,
+                        input.caller,
+                        params.account,
+                        params.amount,
+                        reject_empty_debits,
+                    )
+                }
+
+                // EIP-3009 meta-transactions
+                Erc20Selector::TransferWithAuthorization => {
+                    let params = decode_call::<eip3009::TransferWithAuthorizationCall>(input.data)?;
+                    precompile_guard.handle_transfer_with_authorization(
+                        &mut input.internals,
+                        params.from,
+                        params.to,
+                        params.value,
+                        params.validAfter,
+                        params.validBefore,
+                        params.nonce,
+                        params.v,
+                        params.r.into(),
+                        params.s.into(),
+                        reject_empty_debits,
+                    )
+                }
+                Erc20Selector::ReceiveWithAuthorization => {
+                    let params = decode_call::<eip3009::ReceiveWithAuthorizationCall>(input.data)?;
+                    precompile_guard.handle_receive_with_authorization(
+                        &mut input.internals,
+                        input.caller,
+                        params.from,
+                        params.to,
+                        params.value,
+                        params.validAfter,
+                        params.validBefore,
+                        params.nonce,
+                        params.v,
+                        params.r,
+                        params.s,
+                        reject_empty_debits,
+                    )
+                }
+                Erc20Selector::CancelAuthorization => {
+                    let params = decode_call::<eip3009::CancelAuthorizationCall>(input.data)?;
+                    precompile_guard.handle_cancel_authorization(
+                        &mut input.internals,
+                        params.authorizer,
+                        params.nonce,
+                        params.v,
+                        params.r,
+                        params.s,
+                    )
+                }
+            };
+
+            // gate gas_used on input.gas so PrecompilesMap::run never trips its underflow assert
+            match result {
+                Ok(output) => {
+                    if output.gas_used > input.gas {
+                        return Err(PrecompileError::OutOfGas);
+                    }
+                    Ok(PrecompileOutput::new(output.gas_used, output.bytes))
+                }
+                Err(err) => {
+                    let charge = BASE_ERROR_GAS.min(input.gas);
+                    Ok(PrecompileOutput::new_reverted(charge, err.into()))
+                }
+            }
+        })
+    }
+
+    /// Create a PrecompilesMap with the Native ERC-20 precompile registered.
+    fn precompiles(&self, spec_id: SpecId) -> PrecompilesMap {
+        let mut precompiles_map =
+            PrecompilesMap::from_static(Precompiles::new(PrecompileSpecId::from_spec_id(spec_id)));
+
+        // Only register the ERC-20 precompile if it's been initialized
+        if ERC20_PRECOMPILE_INSTANCE.get().is_some() {
+            let erc20_dyn_precompile = self.erc20_dyn_precompile();
+            precompiles_map
+                .apply_precompile(&ERC20_PRECOMPILE_ADDRESS, |_| Some(erc20_dyn_precompile));
+            debug!("Registered Native ERC-20 precompile at {:?}", ERC20_PRECOMPILE_ADDRESS);
+        }
+
+        precompiles_map
+    }
+
     /// Create an EVM with CompositeInspector (NativeErc20Inspector + custom inspector).
     ///
     /// This method wraps any inspector with NativeErc20Inspector to ensure ERC-20
@@ -285,7 +311,6 @@ impl RaylsEvmFactory {
         db: DB,
         input: EvmEnv,
         inner_inspector: I,
-        chain_spec: Arc<RaylsChainSpec>,
     ) -> RaylsEvm<DB, CompositeInspector<I>, PrecompilesMap>
     where
         DB: Database,
@@ -298,7 +323,8 @@ impl RaylsEvmFactory {
             .clone();
 
         // Create NativeErc20Inspector with chain spec for hardfork-gated gas fix
-        let native_erc20_inspector = NativeErc20Inspector::new(precompile_instance, chain_spec);
+        let native_erc20_inspector =
+            NativeErc20Inspector::new(precompile_instance, self.chain_spec.clone());
 
         // Wrap both inspectors in CompositeInspector
         let composite = CompositeInspector::new(native_erc20_inspector, inner_inspector);
@@ -315,7 +341,7 @@ impl RaylsEvmFactory {
                 .with_cfg(input.cfg_env)
                 .with_db(db)
                 .build_mainnet_with_inspector(composite)
-                .with_precompiles(create_precompiles_with_erc20(spec_id)),
+                .with_precompiles(self.precompiles(spec_id)),
             inspect: true,
         }
     }
@@ -327,12 +353,11 @@ impl RaylsEvmFactory {
         &self,
         db: DB,
         input: EvmEnv,
-        chain_spec: Arc<RaylsChainSpec>,
     ) -> RaylsEvm<DB, CompositeInspector<NoOpInspector>, PrecompilesMap>
     where
         DB: Database,
     {
-        self.create_evm_with_native_erc20_inspector(db, input, NoOpInspector, chain_spec)
+        self.create_evm_with_native_erc20_inspector(db, input, NoOpInspector)
     }
 }
 
@@ -354,7 +379,7 @@ impl EvmFactory for RaylsEvmFactory {
                 .with_cfg(input.cfg_env)
                 .with_db(db)
                 .build_mainnet_with_inspector(NoOpInspector)
-                .with_precompiles(create_precompiles_with_erc20(spec_id)),
+                .with_precompiles(self.precompiles(spec_id)),
             inspect: false,
         }
     }
@@ -372,7 +397,7 @@ impl EvmFactory for RaylsEvmFactory {
                 .with_cfg(input.cfg_env)
                 .with_db(db)
                 .build_mainnet_with_inspector(inspector)
-                .with_precompiles(create_precompiles_with_erc20(spec_id)),
+                .with_precompiles(self.precompiles(spec_id)),
             inspect: true,
         }
     }
