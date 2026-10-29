@@ -12,7 +12,7 @@ use crate::native_erc20::{
     MINTING_MODULE_ADDRESS,
 };
 use alloy::{
-    primitives::{Address, Bytes, Log, B256, KECCAK256_EMPTY, U256},
+    primitives::{Address, Bytes, Log, B256, U256},
     sol_types::SolEvent,
 };
 use alloy_evm::traits::EvmInternals;
@@ -275,29 +275,37 @@ impl Erc20Precompile {
         Ok(())
     }
 
-    /// Reject a debit that would leave `account` EIP-161 empty
-    /// (`balance == 0 && nonce == 0 && code_hash == KECCAK256_EMPTY`).
+    /// Reject a debit that would leave `account` EIP-161 empty, using revm's own
+    /// `AccountInfo::is_empty()` definition
+    /// (`balance == 0 && nonce == 0 && (code_hash == KECCAK256_EMPTY || code_hash is zero)`).
     ///
-    /// A `Loaded` account that becomes empty inside a transaction makes revm's commit hit
+    /// Debiting a `Loaded` account to empty inside a transaction makes revm's commit hit
     /// `unreachable!("Wrong state transition, touch empty is not possible from Loaded")` and
-    /// halts the chain. The check runs before any balance write, so a rejected transfer leaves
-    /// the state untouched.
+    /// halt the chain. We evaluate revm's exact predicate (with the post-debit balance) rather
+    /// than re-deriving it, so this guard can never drift from the check revm applies at
+    /// commit. The check runs before any balance write, so a rejected transfer leaves the
+    /// state untouched.
     fn check_not_left_empty<T: StateAccessAdapter>(
         &self,
         state_access: &mut T,
         account: Address,
         new_balance: U256,
     ) -> Result<(), ERC20Error> {
+        // Fast path: a non-zero balance can never make the account empty.
         if !new_balance.is_zero() {
             return Ok(());
         }
-        let (nonce, code_hash) = {
-            let loaded = state_access
+        let would_be_empty = {
+            let mut info = state_access
                 .perform_load_account(account)
-                .map_err(|e| ERC20Error::read_error(ERC20Resource::Account(account), e))?;
-            (loaded.data.info.nonce, loaded.data.info.code_hash)
+                .map_err(|e| ERC20Error::read_error(ERC20Resource::Account(account), e))?
+                .data
+                .info
+                .clone();
+            info.balance = new_balance;
+            info.is_empty()
         };
-        if nonce == 0 && code_hash == KECCAK256_EMPTY {
+        if would_be_empty {
             trace!(
                 target: "erc20_precompile",
                 ?account,
