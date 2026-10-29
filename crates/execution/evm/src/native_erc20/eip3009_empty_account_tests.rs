@@ -31,7 +31,7 @@
 
 use crate::{
     chainspec::RaylsChainSpec,
-    evm::{initialize_erc20_precompile, RaylsEvmFactory},
+    evm::{initialize_erc20_precompile, RaylsEvmFactory, ERC20_PRECOMPILE_INSTANCE},
     native_erc20::{
         abi::eip3009, precompile::Erc20Precompile, storage::authorization_nonce_slot,
         Erc20TokenConfig, ERC20_PRECOMPILE_ADDRESS,
@@ -43,6 +43,7 @@ use alloy::{
 };
 use alloy_evm::Evm as _;
 use rayls_infrastructure_types::{test_chain_spec_arc, TxKind, ETHEREUM_BLOCK_GAS_LIMIT_56BITS};
+use reth_chainspec::EthChainSpec;
 use reth_evm::EvmEnv;
 use reth_revm::{
     bytecode::Bytecode,
@@ -95,17 +96,23 @@ fn victim_secret_key() -> SecretKey {
     SecretKey::from_byte_array(bytes).expect("valid secp256k1 scalar")
 }
 
-/// EIP-712 domain of the process-global precompile instance registered in [`drain`]
-/// (default token config, chain id 1, verifying contract `0x0400`).
+/// EIP-712 domain of whichever precompile instance won the process-wide
+/// [`initialize_erc20_precompile`] race (verifying contract `0x0400`).
+///
+/// `ERC20_PRECOMPILE_INSTANCE` is first-wins, and other tests in this binary (the `reth_env`
+/// tests register with the test chain's id) may populate it before [`drain`] does. Signing
+/// against a domain the registered instance does not verify turns every
+/// `transferWithAuthorization` into an `InvalidAuthorizer` revert, so the domain must be read
+/// from the instance that actually won rather than assumed. Every caller (`drain`,
+/// [`full_drain_of_unnormalised_zero_code_hash_account_is_rejected`], `replay_full_drain`)
+/// registers before it signs, so the instance is guaranteed set by then.
 fn precompile_domain() -> alloy::sol_types::Eip712Domain {
-    let config = Erc20TokenConfig::default();
-    alloy::sol_types::Eip712Domain {
-        name: Some(config.name.into()),
-        version: Some(config.version.into()),
-        chain_id: Some(U256::from(1u64)),
-        verifying_contract: Some(ERC20_PRECOMPILE_ADDRESS),
-        salt: None,
-    }
+    ERC20_PRECOMPILE_INSTANCE
+        .get()
+        .expect("the global precompile is initialized before any signing in these tests")
+        .read()
+        .domain
+        .clone()
 }
 
 /// VICTIM's signed `transferWithAuthorization` moving `value` from VICTIM to RELAYER.
@@ -178,16 +185,40 @@ fn nonce_slot_in_diff(diff: &EvmState) -> Option<U256> {
         .map(|slot| slot.present_value)
 }
 
+/// Decode the reason of a precompile revert.
+///
+/// Precompile errors are encoded like Solidity's `Error(string)` (cf.
+/// `encode_revert_reason` in `native_erc20::abi`): selector `0x08c379a0`, then an ABI
+/// `string` — offset word, length word, zero-padded data. Returns `None` when the output is
+/// not that encoding, so a caller can fail loudly instead of asserting on an unrelated
+/// revert (e.g. an `InvalidAuthorizer` from an EIP-712 domain mismatch).
+fn revert_reason(output: &Bytes) -> Option<String> {
+    const ERROR_STRING_SELECTOR: [u8; 4] = [0x08, 0xc3, 0x79, 0xa0];
+    let rest = output.get(4..)?;
+    if rest.len() < 64 {
+        return None;
+    }
+    let offset = U256::from_be_slice(&rest[0..32]).to::<usize>();
+    let data = rest.get(offset..)?;
+    if data.len() < 32 {
+        return None;
+    }
+    let len = U256::from_be_slice(&data[0..32]).to::<usize>();
+    std::str::from_utf8(data.get(32..32 + len)?).map(str::to_owned).ok()
+}
+
 /// Run one EIP-3009 transfer exactly like the block executor: `transact`, then commit.
 ///
 /// `State::commit` must never panic: a transfer the precompile rejects is returned as
 /// [`ExecutionResult::Revert`] and contributes no state changes.
 fn drain(victim_nonce: u64, amount: U256) -> DrainRun {
-    // Process-global; the EIP-712 domain above must match this instance.
+    // Process-global and first-wins: register with the test chain's id (the chain the EVM
+    // below runs on) so every test in this binary agrees on the domain `precompile_domain`
+    // reads, regardless of which test registers first.
     let _ = initialize_erc20_precompile(Erc20Precompile::new(
         Erc20TokenConfig::default(),
         ERC20_PRECOMPILE_ADDRESS,
-        1,
+        test_chain_spec_arc().chain_id(),
     ));
 
     let mut db = CacheDB::new(EmptyDBTyped::<Infallible>::new());
@@ -248,10 +279,16 @@ fn drain(victim_nonce: u64, amount: U256) -> DrainRun {
 fn full_drain_of_nonce0_account_is_rejected() {
     let run = drain(0, full_balance());
 
+    let ExecutionResult::Revert { output, .. } = &run.result else {
+        panic!("the full drain must revert: {:?}", run.result)
+    };
+    // The revert must be the guard's, not an unrelated one (e.g. an `InvalidAuthorizer`
+    // from an EIP-712 domain mismatch): decode the precompile's `Error(string)` reason.
+    let reason = revert_reason(output)
+        .unwrap_or_else(|| panic!("the guard's revert must carry the precompile's Error(string) reason: {output:?}"));
     assert!(
-        matches!(&run.result, ExecutionResult::Revert { .. }),
-        "the full drain must revert: {:?}",
-        run.result
+        reason.contains("Transfer would leave account"),
+        "the EIP-161 guard, not another error, must reject the drain: {reason}"
     );
     assert_eq!(
         run.relayer.map(|info| info.balance),
@@ -360,11 +397,13 @@ impl Database for UnnormalisedZeroCodeHashDb {
 /// hits the `unreachable!` halt.
 #[test]
 fn full_drain_of_unnormalised_zero_code_hash_account_is_rejected() {
-    // Process-global; the EIP-712 domain above must match this instance.
+    // Process-global and first-wins: register with the test chain's id (the chain the EVM
+    // below runs on) so every test in this binary agrees on the domain `precompile_domain`
+    // reads, regardless of which test registers first.
     let _ = initialize_erc20_precompile(Erc20Precompile::new(
         Erc20TokenConfig::default(),
         ERC20_PRECOMPILE_ADDRESS,
-        1,
+        test_chain_spec_arc().chain_id(),
     ));
 
     // Seed a standard `CacheDB` (VICTIM normalised to `KECCAK256_EMPTY` on insert), then wrap
@@ -412,9 +451,17 @@ fn full_drain_of_unnormalised_zero_code_hash_account_is_rejected() {
     // panic. Against the pre-fix predicate the drain is let through and this line panics.
     state.commit(diff);
 
+    let ExecutionResult::Revert { output, .. } = result else {
+        panic!("a full drain of a zero-code-hash account must revert: {result:?}");
+    };
+    // Same reason check as `full_drain_of_nonce0_account_is_rejected`: the revert must be
+    // the guard's, so an unrelated error (e.g. a domain mismatch) cannot mask a missing
+    // rejection.
+    let reason = revert_reason(&output)
+        .unwrap_or_else(|| panic!("the guard's revert must carry the precompile's Error(string) reason: {output:?}"));
     assert!(
-        matches!(result, ExecutionResult::Revert { .. }),
-        "a full drain of a zero-code-hash account must revert: {result:?}",
+        reason.contains("Transfer would leave account"),
+        "the EIP-161 guard, not another error, must reject the drain: {reason}"
     );
     assert_eq!(
         state.basic(VICTIM).expect("in-memory db read").map(|info| info.balance),
@@ -440,11 +487,13 @@ fn full_drain_of_unnormalised_zero_code_hash_account_is_rejected() {
 /// revert the drain and leave VICTIM's state untouched. This is the pre/post-fork boundary the
 /// hardfork exists to pin.
 fn replay_full_drain(guard_active: bool) -> DrainRun {
-    // Process-global; the EIP-712 domain above must match this instance.
+    // Process-global and first-wins: register with the test chain's id (the chain the EVM
+    // below runs on) so every test in this binary agrees on the domain `precompile_domain`
+    // reads, regardless of which test registers first.
     let _ = initialize_erc20_precompile(Erc20Precompile::new(
         Erc20TokenConfig::default(),
         ERC20_PRECOMPILE_ADDRESS,
-        1,
+        test_chain_spec_arc().chain_id(),
     ));
 
     // VICTIM is deliberately NOT seeded in the db: tx1 must create it in memory.
@@ -572,10 +621,16 @@ fn replay_shape_pre_fork_full_drain_commits() {
 fn replay_shape_post_fork_full_drain_reverts() {
     let run = replay_full_drain(true);
 
+    let ExecutionResult::Revert { output, .. } = &run.result else {
+        panic!("post-fork the full drain must revert: {:?}", run.result)
+    };
+    // The revert must be the guard's (the EIP-161 empty-account reject), not an unrelated
+    // one such as an `InvalidAuthorizer` from an EIP-712 domain mismatch.
+    let reason = revert_reason(output)
+        .unwrap_or_else(|| panic!("the guard's revert must carry the precompile's Error(string) reason: {output:?}"));
     assert!(
-        matches!(&run.result, ExecutionResult::Revert { .. }),
-        "post-fork the full drain must revert: {:?}",
-        run.result
+        reason.contains("Transfer would leave account"),
+        "the EIP-161 guard, not another error, must reject the drain: {reason}"
     );
     let victim = run.victim.expect("a rejected drain must leave the victim in state");
     assert_eq!(
