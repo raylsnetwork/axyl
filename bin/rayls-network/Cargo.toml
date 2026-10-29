@@ -31,6 +31,8 @@ jemalloc = ["tikv-jemallocator"]
 # PRODUCTION — off by default so release builds exclude it; build with
 # `--features dev-single-node-setup` for local development.
 dev-single-node-setup = ["rayls-network-cli/dev-single-node-setup"]
+# Test-only: drop one round of certificate gossip on demand (e2e missing-parent test). NOT FOR PRODUCTION.
+cert-gossip-drop-hook = ["rayls-network-cli/cert-gossip-drop-hook"]
 
 [lints]
 workspace = true

@@ -29,7 +29,7 @@ use tokio::time::timeout;
 use tracing::{debug, info};
 
 const NEW_VALIDATOR: &str = "new-validator";
-const NODE_PASSWORD: &str = "sup3rsecuur";
+pub(crate) const NODE_PASSWORD: &str = "sup3rsecuur";
 const INITIAL_STAKE_AMOUNT: &str = "1_000_000";
 /// Number of genuine (post-lookahead) epochs to sample before concluding the
 /// new validator was never shuffled in. With a 1/6 per-epoch selection chance,
@@ -517,7 +517,7 @@ fn create_genesis_for_test(
 /// Configure the initial committee and fund accounts for network genesis.
 ///
 /// All data is written to file.
-fn config_committee(
+pub(crate) fn config_committee(
     temp_path: &Path,
     shared_genesis_dir: &Path,
     passphrase: String,
