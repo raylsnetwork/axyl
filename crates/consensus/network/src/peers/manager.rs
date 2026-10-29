@@ -13,7 +13,7 @@ use crate::{
     send_or_log_error,
     types::{NetworkInfo, NetworkResult},
 };
-use libp2p::{kad::PeerInfo, multiaddr::Protocol, Multiaddr, PeerId};
+use libp2p::{kad::PeerInfo, multiaddr::Protocol, swarm::ConnectionId, Multiaddr, PeerId};
 use rand::seq::{IteratorRandom as _, SliceRandom as _};
 use rayls_infrastructure_config::PeerConfig;
 use rayls_infrastructure_types::{now, BlsPublicKey};
@@ -21,6 +21,7 @@ use std::{
     collections::{hash_map::Entry, HashMap, HashSet, VecDeque},
     net::IpAddr,
     task::Context,
+    time::{Duration, Instant},
 };
 use tokio::sync::oneshot;
 use tracing::{debug, error, info, trace, warn};
@@ -30,6 +31,17 @@ use libp2p::core::ConnectedPoint;
 
 /// Rayls: Maximum known peers to track.
 const MAX_KNOWN_PEERS: usize = 2000;
+
+/// A new connection to a peer whose existing connection is at least this old means the peer lost
+/// that connection (it restarted, or a path failure timed out on its side only) and our side is
+/// still holding it. Connections that come up closer together are a simultaneous dial, and both
+/// are live. Kept short: misreading a slow simultaneous dial costs one reconnect (the cooldown
+/// stops a second one), while missing a stale connection leaves the peer's gossip broken.
+pub(crate) const STALE_CONNECTION_MIN_AGE: Duration = Duration::from_secs(2);
+
+/// At most one connection reset per peer in this window, so a peer whose connections keep
+/// doubling for any other reason cannot make the node flap it.
+pub(crate) const CONNECTION_RESET_COOLDOWN: Duration = Duration::from_secs(30);
 
 /// How long a relay hop noted at dial time stays a candidate without a circuit being established
 /// through it. Long enough to cover a slow relay leg plus the circuit handshake; a hop that
@@ -139,6 +151,14 @@ pub(crate) struct PeerManager {
     /// committee and known-peers maps) and to detect whether this node is itself a committee
     /// member.
     local_peer_id: PeerId,
+    /// Established connections per peer, oldest first, with the time each came up.
+    peer_connections: HashMap<PeerId, Vec<(ConnectionId, Instant)>>,
+    /// When this node last reset each peer's connections. Pruned on the heartbeat.
+    connection_resets: HashMap<PeerId, Instant>,
+    /// Peers whose connections are closed on the next poll.
+    pending_connection_resets: VecDeque<PeerId>,
+    /// Reset peers to re-dial once their last connection closed.
+    awaiting_reset_redial: HashSet<PeerId>,
 }
 
 impl PeerManager {
@@ -172,7 +192,92 @@ impl PeerManager {
             relay_circuits: Default::default(),
             pending_relay_hops: Default::default(),
             local_peer_id,
+            peer_connections: Default::default(),
+            connection_resets: Default::default(),
+            pending_connection_resets: Default::default(),
+            awaiting_reset_redial: Default::default(),
         }
+    }
+
+    /// Record a new established connection and schedule a reset of the peer's connections when
+    /// it shows the peer lost an older one this node still holds.
+    ///
+    /// libp2p-gossipsub sends this node's subscriptions only on the first connection to a peer
+    /// and never on a later one, not even when an older connection closes, and
+    /// libp2p-request-response spreads requests across all of a peer's connections. A dead
+    /// connection that survives next to a new one (QUIC only drops it after the idle timeout)
+    /// therefore leaves the peer without our subscriptions for as long as it stays connected
+    /// and sends part of our requests into the void. Closing every connection to the peer makes
+    /// the reconnect a first connection on both sides, which resends subscriptions both ways.
+    pub(crate) fn track_connection_opened(
+        &mut self,
+        peer_id: PeerId,
+        connection_id: ConnectionId,
+        now: Instant,
+    ) {
+        let connections = self.peer_connections.entry(peer_id).or_default();
+        let oldest = connections.first().map(|(_, since)| *since);
+        connections.push((connection_id, now));
+        let Some(oldest) = oldest else {
+            return;
+        };
+        if now.saturating_duration_since(oldest) < STALE_CONNECTION_MIN_AGE {
+            // simultaneous dial: both connections are live
+            return;
+        }
+        if self
+            .connection_resets
+            .get(&peer_id)
+            .is_some_and(|at| now.saturating_duration_since(*at) < CONNECTION_RESET_COOLDOWN)
+        {
+            return;
+        }
+        info!(
+            target: "peer-manager",
+            ?peer_id,
+            connections = self.peer_connections.get(&peer_id).map_or(0, Vec::len),
+            "new connection next to an older one: resetting the peer's connections"
+        );
+        self.connection_resets.insert(peer_id, now);
+        self.pending_connection_resets.push_back(peer_id);
+    }
+
+    /// Forget a closed connection. Once a reset peer has no connection left, a committee member
+    /// is re-dialed at once instead of on the next heartbeat.
+    pub(crate) fn track_connection_closed(&mut self, peer_id: PeerId, connection_id: ConnectionId) {
+        if let Entry::Occupied(mut entry) = self.peer_connections.entry(peer_id) {
+            entry.get_mut().retain(|(id, _)| *id != connection_id);
+            if !entry.get().is_empty() {
+                return;
+            }
+            entry.remove();
+        }
+        if !self.awaiting_reset_redial.remove(&peer_id) {
+            return;
+        }
+        if self.is_peer_validator(&self.local_peer_id) && self.is_peer_validator(&peer_id) {
+            if let Some(bls_key) = self.peer_to_bls(&peer_id) {
+                debug!(target: "peer-manager", ?peer_id, "re-dialing peer after connection reset");
+                self.events.push_back(PeerEvent::RedialCommittee(bls_key));
+            }
+        }
+    }
+
+    /// The next peer whose connections must all be closed.
+    pub(crate) fn next_connection_reset(&mut self) -> Option<PeerId> {
+        let peer_id = self.pending_connection_resets.pop_front()?;
+        if !self.peer_connections.contains_key(&peer_id) {
+            // already gone
+            return self.next_connection_reset();
+        }
+        self.awaiting_reset_redial.insert(peer_id);
+        Some(peer_id)
+    }
+
+    /// Number of established connections this node tracks for `peer_id`.
+    #[cfg(test)]
+    pub(crate) fn tracked_connections(&self, peer_id: &PeerId) -> usize {
+        self.peer_connections.get(peer_id).map_or(0, Vec::len)
     }
 
     /// Explicitly add a "trusted" peer and dial it.
@@ -370,6 +475,11 @@ impl PeerManager {
 
         // forget relay hops we dialed through that never produced a circuit
         self.expire_pending_relay_hops(now());
+
+        // forget connection resets whose cooldown has passed
+        let cutoff = Instant::now();
+        self.connection_resets
+            .retain(|_, at| cutoff.saturating_duration_since(*at) < CONNECTION_RESET_COOLDOWN);
     }
 
     /// Requests a re-dial, via [`PeerEvent::RedialCommittee`], of every current-committee member
