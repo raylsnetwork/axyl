@@ -711,6 +711,7 @@ pub(crate) mod pre_execution {
         primitives::hardfork::SpecId,
         State,
     };
+    use std::sync::Arc;
 
     /// Run the pre-execution phase for `spec` at `block_number` with the given intra-output
     /// `batch_index`, against a fresh empty [`State`], and return the post-state for assertions.
@@ -731,7 +732,8 @@ pub(crate) mod pre_execution {
         // A pre-Osaka spec keeps the incidental EIP-2935 blockhashes system call from tripping the
         // Osaka per-transaction gas cap; that call is orthogonal to the pre-execution phase.
         let cfg = CfgEnv::new().with_spec_and_mainnet_gas_params(SpecId::CANCUN);
-        let evm = RaylsEvmFactory::default().create_evm(&mut state, EvmEnv::new(cfg, block_env));
+        let evm = RaylsEvmFactory::new(Arc::new(spec.clone()))
+            .create_evm(&mut state, EvmEnv::new(cfg, block_env));
 
         let ctx = RaylsBlockExecutionCtx {
             parent_hash: B256::ZERO,

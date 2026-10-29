@@ -186,7 +186,7 @@ Common causes:
 ## 5. The fork schedule: what is checked, what is free
 
 The template ships the canonical new-chain schedule, so if you use it as-is (change
-only `chain_id`) you are done. Of the 17 forks:
+only `chain_id`) you are done. Of all the forks:
 
 - **Seven are checked** by the boot shape gate (`verify_schedule_shape`) against
   the relaxed rules:
@@ -194,9 +194,9 @@ only `chain_id`) you are done. Of the 17 forks:
   - `Erc20PrecompileBytecode` must be exactly `1`;
   - `UsdrSupplyCorrection` may be any value (the node warns when it is not `never`);
   - `HybridRewards` must be `never` or a block `>= 1`.
-- **Ten are behavioral** and free to choose: `0` (on from genesis), `never` (off),
-  or a future block (activate later — section 3). The canonical schedule turns all
-  ten on from genesis.
+- **The rest are behavioral** and free to choose: `0` (on from genesis), `never` (off),
+  or a future block (activate later, see section 3). The canonical schedule turns all
+  of them on from genesis.
 
 The relaxed rules above apply to every non-mainnet/testnet chain-id, including a brand-new chain. The canonical values are expected on a new chain, although the code does not enforce them. What each fork does, and why the canonical values are what they are, is in [`hardforks/README.md`](../hardforks/README.md). The quick list:
 

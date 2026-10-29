@@ -11,13 +11,13 @@
 //!
 //! These tests drive every EVM the factory builds (the block-execution path
 //! `create_evm_with_native_erc20_only`, and the raw `create_evm`/`create_evm_with_inspector` paths
-//! that reth uses for `eth_call`/tracing), with the factory's activation set as `RaylsEvmConfig`
-//! does. With the fork active a delegate frame into `0x0400` is rejected and commits no state on
-//! all of them; before the fork the same frame still executes (history preserved); a direct `CALL`
-//! works either way.
+//! that reth uses for `eth_call`/tracing), with the factory built from the chain spec as
+//! `RaylsEvmConfig` does. With the fork active a delegate frame into `0x0400` is rejected and
+//! commits no state on all of them; before the fork the same frame still executes (history
+//! preserved); a direct `CALL` works either way.
 
 use crate::{
-    chainspec::{RaylsChainSpec, RaylsHardFork, RaylsHardforks},
+    chainspec::RaylsChainSpec,
     evm::{RaylsEvmConfig, RaylsEvmFactory},
     native_erc20::{
         abi::erc20, precompile::Erc20Precompile, storage::allowance_slot, Erc20TokenConfig,
@@ -42,7 +42,7 @@ use reth_revm::{
 };
 use std::sync::Arc;
 
-/// Which `RaylsEvmFactory` path builds the EVM — each must enforce the fork identically.
+/// Which `RaylsEvmFactory` path builds the EVM; each must enforce the fork identically.
 #[derive(Clone, Copy)]
 enum Path {
     /// `create_evm_with_native_erc20_only`: the block-execution path (with the inspector).
@@ -51,11 +51,6 @@ enum Path {
     EthCall,
     /// `create_evm_with_inspector`: the raw path reth uses for tracing, including `create_tracer`.
     Tracing,
-}
-
-/// A factory whose `direct_call_activation` matches `spec` (what `RaylsEvmConfig::new` builds).
-fn factory_for(spec: &RaylsChainSpec) -> RaylsEvmFactory {
-    RaylsEvmFactory::new(spec.rayls_fork_activation(RaylsHardFork::Erc20PrecompileDirectCall))
 }
 
 /// EOA that signs the outer transaction.
@@ -183,10 +178,8 @@ fn assert_guard_rejected(outcome: &Outcome, msg: &str) {
     assert_eq!(*outcome, Outcome::Revert(Vec::new()), "{msg}");
 }
 
-/// Build an EVM via the chosen `path` (factory activation from `chain_spec`) at `block_number`,
-/// have `CALLER` call `target` with `calldata`, and return the outcome plus the state
-/// diff. The factory is built with `direct_call_activation` set, so the raw paths exercise that
-/// field (not a `Default::Never`).
+/// Build an EVM for `chain_spec` via the chosen `path` at `block_number`, have `CALLER` call
+/// `target` with `calldata`, and return the outcome plus the state diff.
 fn run_at(
     state: &mut State<CacheDB<EmptyDBTyped<core::convert::Infallible>>>,
     chain_spec: Arc<RaylsChainSpec>,
@@ -198,11 +191,11 @@ fn run_at(
     let block_env = BlockEnv { number: U256::from(block_number), ..Default::default() };
     let cfg = CfgEnv::new().with_spec_and_mainnet_gas_params(SpecId::CANCUN);
     let env = EvmEnv::new(cfg, block_env);
-    let factory = factory_for(&chain_spec);
+    let factory = RaylsEvmFactory::new(chain_spec);
 
     let ResultAndState { result, state: diff } = match path {
         Path::BlockExec => factory
-            .create_evm_with_native_erc20_only(state, env, chain_spec)
+            .create_evm_with_native_erc20_only(state, env)
             .transact_pre_genesis_call(CALLER, target, calldata.into()),
         Path::EthCall => factory.create_evm(state, env).transact_pre_genesis_call(
             CALLER,
@@ -476,13 +469,13 @@ fn delegate_frames_execute_on_raw_paths_before_fork() {
     }
 }
 
-/// Pins the production wiring: the factory `RaylsEvmConfig::new` builds must carry the chain's
-/// activation. If `config.rs` went back to a guard-off factory, the other tests here (which build
-/// the factory through `factory_for`) would still pass; this one would not.
+/// Pins the production wiring: the factory `RaylsEvmConfig::new` builds must carry the chain spec.
+/// If `config.rs` built it from another spec, the other tests here (which build their own factory)
+/// would still pass; this one would not.
 #[test]
 fn evm_config_factory_rejects_delegate_frame() {
     let spec = spec_with_direct_call_at(ACTIVATION_BLOCK);
-    let config = RaylsEvmConfig::new(spec.clone(), RewardsCounter::default());
+    let config = RaylsEvmConfig::new(spec, RewardsCounter::default());
     let calldata = erc20::approveCall { spender: SPENDER, amount: approve_amount() }.abi_encode();
     let env = || {
         EvmEnv::new(
@@ -505,7 +498,7 @@ fn evm_config_factory_rejects_delegate_frame() {
     let mut state = seeded_state(true);
     let ResultAndState { result, state: diff } = config
         .evm_factory
-        .create_evm_with_native_erc20_only(&mut state, env(), spec)
+        .create_evm_with_native_erc20_only(&mut state, env())
         .transact_pre_genesis_call(CALLER, FORWARDER, calldata.into())
         .expect("transact");
     assert_eq!(allowance_in_diff(&diff, CALLER, SPENDER), U256::ZERO);

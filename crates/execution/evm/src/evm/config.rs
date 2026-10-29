@@ -7,10 +7,7 @@ use super::{
     RaylsEvmFactory,
 };
 use crate::{
-    chainspec::{RaylsHardFork, RaylsHardforks},
-    error::RaylsRethError,
-    traits::RaylsPrimitives,
-    RaylsChainSpec,
+    chainspec::RaylsHardforks, error::RaylsRethError, traits::RaylsPrimitives, RaylsChainSpec,
 };
 use alloy::eips::eip7685::EMPTY_REQUESTS_HASH;
 use rayls_infrastructure_types::{
@@ -46,18 +43,13 @@ pub struct RaylsEvmConfig<ChainSpec = RaylsChainSpec> {
 impl RaylsEvmConfig {
     /// Creates a new Rayls EVM configuration with the given chain spec.
     pub fn new(chain_spec: Arc<RaylsChainSpec>, rewards_counter: RewardsCounter) -> Self {
-        // Build the factory with the chain's Erc20PrecompileDirectCall activation, so every EVM it
-        // produces (RPC, tracing, block-level `trace_*` via `create_tracer`) gates delegate frames
-        // into the 0x0400 precompile, matching block execution.
-        let evm_factory = RaylsEvmFactory::new(
-            chain_spec.rayls_fork_activation(RaylsHardFork::Erc20PrecompileDirectCall),
-        );
+        let evm_factory = RaylsEvmFactory::new(chain_spec.clone());
         Self {
             block_assembler: RaylsBlockAssembler::new(chain_spec.clone()),
             executor_factory: RaylsBlockExecutorFactory::new(
                 RethReceiptBuilder::default(),
                 chain_spec,
-                evm_factory,
+                evm_factory.clone(),
             ),
             evm_factory,
             rewards_counter,

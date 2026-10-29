@@ -192,6 +192,11 @@ pub trait RaylsHardforks {
         self.is_rayls_fork_active_at_block(RaylsHardFork::CertificateFetchEpochV2, block)
     }
 
+    /// Return true if the Erc20PrecompileDirectCall fork is active at `block`.
+    fn is_erc20_precompile_direct_call_active_at_block(&self, block: u64) -> bool {
+        self.is_rayls_fork_active_at_block(RaylsHardFork::Erc20PrecompileDirectCall, block)
+    }
+
     /// Return the max version byte among the forks active at `block`, if any.
     fn version_byte_at_block(&self, block: u64) -> Option<u8> {
         RaylsHardFork::VARIANTS

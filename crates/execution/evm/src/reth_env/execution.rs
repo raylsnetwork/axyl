@@ -217,11 +217,7 @@ impl RethEnv {
 
         // NOTE: gas fix in inspector gated by PrecompileGasFix hardfork
         let evm_env = self.evm_config.next_evm_env(&parent_header, &payload)?;
-        let evm = self.evm_config.evm_factory.create_evm_with_native_erc20_only(
-            &mut db,
-            evm_env,
-            self.evm_config.chain_spec().clone(),
-        );
+        let evm = self.evm_config.evm_factory.create_evm_with_native_erc20_only(&mut db, evm_env);
         let ctx = self.evm_config.context_for_next_block(&parent_header, payload)?;
         let ctx_for_assembler = ctx.clone();
         let mut builder = self.evm_config.create_block_builder(evm, &parent_header, ctx);
