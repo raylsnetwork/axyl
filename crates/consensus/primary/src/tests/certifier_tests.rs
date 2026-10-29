@@ -690,3 +690,118 @@ async fn two_epochs_behind_rejections_still_demote() {
     assert_eq!(rejections_with_reason(&cb, &peers, "epoch_mismatch_skipped"), 0);
     assert_eq!(rejections_with_reason(&cb, &peers, "epoch_mismatch"), 2);
 }
+
+/// A peer still behind our epoch (a validator catching up across the boundary) refuses a vote
+/// request, and must still be asked again once it caught up: here a second peer is unreachable,
+/// so the lagging peer's vote is needed for quorum, and while the unreachable peer is retried the
+/// proposal stays in flight, so a re-proposal of the same header is deduplicated and never asks
+/// again. Giving up on the lagging peer leaves the header uncertified for as long as the
+/// unreachable peer is retried, about four minutes on a live node.
+///
+/// A peer one epoch behind answers with a recoverable error, which the network layer resends six
+/// times (seven requests); one further behind answers `EpochMismatch` once.
+#[tokio::test(flavor = "current_thread")]
+async fn vote_request_to_a_peer_one_epoch_behind_is_retried() {
+    // what a peer one epoch behind answers (see `PrimaryResponse::into_error_ref`)
+    let behind =
+        PrimaryResponse::into_error_ref(&crate::error::PrimaryNetworkError::InvalidHeader(
+            rayls_infrastructure_types::error::HeaderError::InvalidEpoch { ours: 0, theirs: 1 },
+        ));
+    assert!(matches!(behind, PrimaryResponse::RecoverableError(_)));
+    lagging_peer_is_asked_again(behind, 7).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn vote_request_to_a_peer_epochs_behind_is_retried() {
+    // the peer is at epoch 3, the header at 5
+    let (cb, lagging) =
+        lagging_peer_is_asked_again(PrimaryResponse::EpochMismatch { expected: 3, received: 5 }, 1)
+            .await;
+    // a stale peer's refusal is visible, and does not count toward demotion
+    assert_eq!(
+        rejections_with_reason(&cb, std::slice::from_ref(&lagging), "epoch_mismatch_stale"),
+        1
+    );
+    assert_eq!(rejections_with_reason(&cb, std::slice::from_ref(&lagging), "epoch_mismatch"), 0);
+}
+
+/// Propose a header to a committee of four where one peer is unreachable and one answers its
+/// first `refusals` vote requests with `refusal`, then votes. Require a certificate. Returns the
+/// bus and the lagging peer's id.
+async fn lagging_peer_is_asked_again(
+    refusal: PrimaryResponse,
+    refusals: usize,
+) -> (ConsensusBus, AuthorityIdentifier) {
+    let fixture = CommitteeFixture::builder(MemDatabase::default).randomize_ports(true).build();
+    let committee = fixture.committee();
+    let primary = fixture.authorities().last().unwrap();
+    let id = primary.id();
+    let proposed_header = primary.header(&committee);
+
+    // four validators, quorum three: with `down` unreachable, own + `lagging` + the third
+    let peers: Vec<_> = fixture.authorities().filter(|a| a.id() != id).collect();
+    assert_eq!(peers.len(), 3, "the test assumes a committee of four");
+    let down = *peers[0].authority().protocol_key();
+    let lagging = *peers[1].authority().protocol_key();
+    let lagging_id = peers[1].authority().id();
+    let mut votes: HashMap<BlsPublicKey, Vote> = peers
+        .iter()
+        .map(|p| {
+            let vote = Vote::new(&proposed_header, p.id(), p.consensus_config().key_config());
+            (*p.authority().protocol_key(), vote)
+        })
+        .collect();
+
+    let (sender, mut network_rx) = mpsc::channel(100);
+    let network: NetworkHandle<PrimaryRequest, PrimaryResponse> = NetworkHandle::new(sender);
+    let cb = ConsensusBus::new();
+    let mut rx_new_certificates = cb.new_certificates().subscribe();
+    let task_manager = TaskManager::default();
+    let synchronizer =
+        StateSynchronizer::new(primary.consensus_config(), cb.clone(), task_manager.get_spawner());
+    synchronizer.spawn(&task_manager);
+    Certifier::spawn(
+        primary.consensus_config(),
+        cb.clone(),
+        synchronizer,
+        network.clone().into(),
+        &task_manager,
+    );
+
+    let proposed_digest = proposed_header.digest();
+    cb.headers().send(proposed_header).await.unwrap();
+
+    // the lagging peer refuses the first certifier attempt and votes once it caught up
+    let mut lagging_requests = 0;
+    let answer = async {
+        while let Some(req) = network_rx.recv().await {
+            if let NetworkCommand::SendRequest {
+                peer,
+                request: PrimaryRequest::Vote { .. },
+                reply,
+            } = req
+            {
+                let response = if peer == down {
+                    Err(NetworkError::PeerNotConnected)
+                } else if peer == lagging && lagging_requests < refusals {
+                    lagging_requests += 1;
+                    Ok(refusal.clone())
+                } else {
+                    match votes.remove(&peer) {
+                        Some(vote) => Ok(PrimaryResponse::Vote(vote)),
+                        None => continue,
+                    }
+                };
+                let _ = reply.send(response);
+            }
+        }
+    };
+    let certificate = tokio::select! {
+        _ = answer => panic!("network channel closed"),
+        certificate = tokio::time::timeout(Duration::from_secs(15), rx_new_certificates.recv()) => {
+            certificate.expect("the lagging peer was not asked again once it caught up").unwrap()
+        }
+    };
+    assert_eq!(certificate.header().digest(), proposed_digest);
+    (cb, lagging_id)
+}
