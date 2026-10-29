@@ -25,6 +25,9 @@ pub mod inspector;
 pub mod precompile;
 pub mod storage;
 
+#[cfg(test)]
+mod eip3009_empty_account_tests;
+
 pub use abi::{eip3009, erc20, Erc20Selector};
 pub use composite_inspector::CompositeInspector;
 pub use inspector::NativeErc20Inspector;
