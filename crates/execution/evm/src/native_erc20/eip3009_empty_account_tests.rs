@@ -45,14 +45,15 @@ use alloy_evm::Evm as _;
 use rayls_infrastructure_types::{test_chain_spec_arc, TxKind, ETHEREUM_BLOCK_GAS_LIMIT_56BITS};
 use reth_evm::EvmEnv;
 use reth_revm::{
+    bytecode::Bytecode,
     context::{
         result::{ExecutionResult, ResultAndState},
         BlockEnv, CfgEnv, TxEnv,
     },
     db::{CacheDB, EmptyDBTyped},
-    primitives::hardfork::SpecId,
+    primitives::{hardfork::SpecId, StorageKey, StorageValue},
     state::{AccountInfo, EvmState},
-    Database as _, DatabaseCommit as _, State,
+    Database, DatabaseCommit as _, State,
 };
 use secp256k1::{ecdsa::RecoveryId, Message, SecretKey, SECP256K1};
 use std::{convert::Infallible, sync::Arc};
@@ -308,6 +309,122 @@ fn full_drain_of_nonce1_account() {
         run.relayer.map(|info| info.balance),
         Some(relayer_balance() + full_balance()),
         "the relayer must be credited the full drained amount"
+    );
+}
+
+/// A database that wraps a `CacheDB` but reports VICTIM with an *un-normalised* zero code
+/// hash on read. `CacheDB` normalises a zero code hash to `KECCAK256_EMPTY` on insert
+/// (`insert_contract`), so the standard `drain` helper can never reach the zero-hash case;
+/// overriding `basic` on read is what lets the reviewer's "DB backend that doesn't normalise
+/// the code hash" scenario survive to the empty-account guard. All other reads delegate to
+/// the wrapped `CacheDB`.
+#[derive(Debug)]
+struct UnnormalisedZeroCodeHashDb {
+    inner: CacheDB<EmptyDBTyped<Infallible>>,
+}
+
+impl Database for UnnormalisedZeroCodeHashDb {
+    type Error = Infallible;
+
+    fn basic(&mut self, address: Address) -> Result<Option<AccountInfo>, Infallible> {
+        let info = self.inner.basic(address)?;
+        Ok(if address == VICTIM {
+            info.map(|mut info| {
+                info.code_hash = B256::ZERO;
+                info.code = None;
+                info
+            })
+        } else {
+            info
+        })
+    }
+
+    fn code_by_hash(&mut self, code_hash: B256) -> Result<Bytecode, Infallible> {
+        self.inner.code_by_hash(code_hash)
+    }
+
+    fn storage(&mut self, address: Address, index: StorageKey) -> Result<StorageValue, Infallible> {
+        self.inner.storage(address, index)
+    }
+
+    fn block_hash(&mut self, number: u64) -> Result<B256, Infallible> {
+        self.inner.block_hash(number)
+    }
+}
+
+/// Regression: an account whose `code_hash` is the un-normalised zero hash (rather than
+/// `KECCAK256_EMPTY`) is still EIP-161 empty by revm's `AccountInfo::is_empty()`, which also
+/// treats a zero code hash as empty code. A full drain of such a `Loaded` account must be
+/// rejected by the guard (which now evaluates revm's own predicate). Against the pre-fix
+/// predicate (`code_hash == KECCAK256_EMPTY`) the drain is let through and `State::commit`
+/// hits the `unreachable!` halt.
+#[test]
+fn full_drain_of_unnormalised_zero_code_hash_account_is_rejected() {
+    // Process-global; the EIP-712 domain above must match this instance.
+    let _ = initialize_erc20_precompile(Erc20Precompile::new(
+        Erc20TokenConfig::default(),
+        ERC20_PRECOMPILE_ADDRESS,
+        1,
+    ));
+
+    // Seed a standard `CacheDB` (VICTIM normalised to `KECCAK256_EMPTY` on insert), then wrap
+    // it so VICTIM is reported with a zero code hash on read — the case `CacheDB` alone can't
+    // reach.
+    let mut inner = CacheDB::new(EmptyDBTyped::<Infallible>::new());
+    inner.insert_account_info(
+        VICTIM,
+        AccountInfo { balance: full_balance(), nonce: 0, ..Default::default() },
+    );
+    inner.insert_account_info(
+        RELAYER,
+        AccountInfo { balance: relayer_balance(), nonce: 0, ..Default::default() },
+    );
+    let db = UnnormalisedZeroCodeHashDb { inner };
+
+    let mut state =
+        State::builder().with_database(db).with_bundle_update().without_state_clear().build();
+    state.set_state_clear_flag(true);
+
+    let env = EvmEnv::new(
+        CfgEnv::new().with_spec_and_mainnet_gas_params(SpecId::CANCUN),
+        BlockEnv { number: U256::from(BLOCK_NUMBER), ..Default::default() },
+    );
+    // Post-fork spec: the EIP-161 empty-account guard is active, so a full drain of a
+    // nonce-0 account is rejected.
+    let chain_spec = Arc::new(
+        RaylsChainSpec::builder(test_chain_spec_arc())
+            .precompile_gas_fix(0)
+            .eip161_empty_account_guard(0)
+            .build(),
+    );
+    let mut evm =
+        RaylsEvmFactory::new(chain_spec).create_evm_with_native_erc20_only(&mut state, env);
+
+    let ResultAndState { result, state: diff } = evm
+        .transact_pre_genesis_call(
+            RELAYER,
+            ERC20_PRECOMPILE_ADDRESS,
+            transfer_calldata(full_balance()),
+        )
+        .expect("transact must not fail; a rejected transfer returns as a revert result");
+
+    // The guard must reject the drain before any balance write, so this commit must not
+    // panic. Against the pre-fix predicate the drain is let through and this line panics.
+    state.commit(diff);
+
+    assert!(
+        matches!(result, ExecutionResult::Revert { .. }),
+        "a full drain of a zero-code-hash account must revert: {result:?}",
+    );
+    assert_eq!(
+        state.basic(VICTIM).expect("in-memory db read").map(|info| info.balance),
+        Some(full_balance()),
+        "a rejected transfer must leave the victim's balance unchanged"
+    );
+    assert_eq!(
+        state.basic(RELAYER).expect("in-memory db read").map(|info| info.balance),
+        Some(relayer_balance()),
+        "a rejected transfer must not credit the relayer"
     );
 }
 
