@@ -279,6 +279,26 @@ impl Erc20Precompile {
     /// `AccountInfo::is_empty()` definition
     /// (`balance == 0 && nonce == 0 && (code_hash == KECCAK256_EMPTY || code_hash is zero)`).
     ///
+    /// **Why a superset predicate.** The actual revm panic (`unreachable!` in
+    /// `AccountStatus::on_touched_empty_post_eip161`) fires only when the account's internal
+    /// status at commit is `Loaded` or `Changed` *and* it is touched empty. A debit that
+    /// leaves an `InMemoryChange` account empty (e.g. an account funded earlier in the same
+    /// block, then drained) commits legally — it transitions to `Destroyed`. This guard uses
+    /// `is_empty()` (a property of the final state alone) rather than the commit-time status
+    /// (which the precompile cannot observe through `StateAccessAdapter`). The predicate is
+    /// therefore a *conservative superset*: it may reject some drains that would commit fine,
+    /// but it never under-rejects — it can never allow a panic.
+    ///
+    /// **User-visible effect.** When the guard is active (gated by
+    /// [`RaylsHardFork::Eip161EmptyAccountGuard`]), a debit that drains a nonce-0, code-less
+    /// account to zero is rejected. This affects only *relayer-submitted* debits — the EOA's
+    /// nonce is not bumped in those paths. Self-called `transfer` does *not* trigger the
+    /// rejection because `pre_execution` bumps the caller's nonce before the precompile runs,
+    /// so `is_empty()` is false (nonce ≥ 1) at check time. `burn` (which debits the
+    /// whitelisted module itself) is also unaffected — the module has code, so it is never
+    /// empty. Affected selectors: `transferWithAuthorization`, `receiveWithAuthorization`,
+    /// and `burnFrom`.
+    ///
     /// Debiting a `Loaded` account to empty inside a transaction makes revm's commit hit
     /// `unreachable!("Wrong state transition, touch empty is not possible from Loaded")` and
     /// halt the chain. We evaluate revm's exact predicate (with the post-debit balance) rather

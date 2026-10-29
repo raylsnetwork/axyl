@@ -32,11 +32,11 @@
 //! emptied account still commits, because its first change promoted it out of `Loaded`;
 //! post-fork the guard reverts it.
 //!
-//! One revm quirk these tests pin: the precompile account (`0x0400`) is an EIP-161 empty
-//! account, so its auth-nonce storage writes are dropped when the transaction state is
-//! committed (`CacheAccount::touch_empty_eip161`). The nonce is therefore only observable
-//! in the transaction's `EvmState` diff (pre-commit), which is why [`DrainRun`] carries
-//! both `auth_nonce_in_diff` and the post-commit `auth_nonce_used`.
+//! Every test seeds STOP bytecode on the precompile account (`0x0400`), matching the
+//! production [`RaylsHardFork::Erc20PrecompileBytecode`] migration. This ensures the
+//! precompile is not EIP-161 empty and its storage writes — including auth nonces —
+//! persist through commit, so the tests exercise the same replay-protection path as
+//! production.
 
 use crate::{
     chainspec::RaylsChainSpec,
@@ -82,6 +82,23 @@ const RELAYER: Address = address!("3C44CdDdB6a900fa2b585dd299e03d12FA4293BC");
 const AUTH_NONCE: B256 = B256::repeat_byte(1);
 /// Any block >= 1 (Spurious Dragon / EIP-161 active).
 const BLOCK_NUMBER: u64 = 1;
+
+/// STOP bytecode installed by the [`RaylsHardFork::Erc20PrecompileBytecode`] migration.
+/// Enough to set `code_hash != KECCAK_EMPTY`, preventing EIP-161 state-clear from
+/// reaping the precompile account's storage.
+const STOP_BYTECODE: &[u8] = &[0x00];
+
+/// Seed the precompile account with STOP bytecode in the database, matching what the
+/// production `Erc20PrecompileBytecode` migration does (see
+/// [`crate::evm::hardforks::erc20_precompile_bytecode`]).
+fn seed_precompile_code(db: &mut CacheDB<EmptyDBTyped<Infallible>>) {
+    let code = Bytecode::new_raw(Bytes::from_static(STOP_BYTECODE));
+    let code_hash = code.hash_slow();
+    db.insert_account_info(
+        ERC20_PRECOMPILE_ADDRESS,
+        AccountInfo { code_hash, code: Some(code), ..Default::default() },
+    );
+}
 
 /// VICTIM's whole balance: 5 USDr (the native token *is* the ERC-20 at `0x0400`).
 fn full_balance() -> U256 {
@@ -229,10 +246,10 @@ struct DrainRun {
     relayer: Option<AccountInfo>,
     /// The auth nonce slot in the *post-commit* state.
     ///
-    /// This is `ZERO` in both fork directions: the precompile account (`0x0400`) is an
-    /// EIP-161 empty account, and revm's commit drops the storage writes of an emptied
-    /// account (`CacheAccount::touch_empty_eip161`). That is a pre-existing revm
-    /// behavior the guard does not change.
+    /// For successful drains: `ONE` — the auth nonce was consumed and persists because the
+    /// precompile account has code (installed by the `Erc20PrecompileBytecode` migration in
+    /// production, seeded in tests). For rejected drains: `ZERO` — the nonce was never
+    /// consumed.
     auth_nonce_used: U256,
     /// The auth nonce slot in the transaction's `EvmState` diff (pre-commit).
     ///
@@ -289,6 +306,9 @@ fn drain(victim_nonce: u64, calldata: Bytes) -> DrainRun {
         RELAYER,
         AccountInfo { balance: relayer_balance(), nonce: 0, ..Default::default() },
     );
+    // Match the production Erc20PrecompileBytecode migration: seed STOP bytecode so the
+    // precompile account is not EIP-161 empty and its storage survives commit.
+    seed_precompile_code(&mut db);
     run_eip3009_call(db, RELAYER, calldata)
 }
 
@@ -299,16 +319,16 @@ fn drain(victim_nonce: u64, calldata: Bytes) -> DrainRun {
 /// the whitelisted minting module for `burnFrom`).
 ///
 /// The allowance is seeded in the database rather than set by an `approve` transaction:
-/// the precompile account (`0x0400`) is an EIP-161 empty account, so revm's commit drops
-/// its storage writes (the same pinned quirk as the auth nonce) and an `approve` tx's
-/// allowance would not survive. Total supply is seeded for `burnFrom`'s control: the burn
-/// is a `checked_sub` against it, and the unseeded slot reads zero.
+/// an `approve` tx's storage writes would also survive commit because the precompile has
+/// STOP bytecode (seeded via [`seed_precompile_code`], matching the production
+/// `Erc20PrecompileBytecode` migration). Total supply is seeded for `burnFrom`'s control:
+/// the burn is a `checked_sub` against it, and the unseeded slot reads zero.
 ///
-/// The precompile account is seeded with *empty* info (it exists in the db, but is still
-/// EIP-161 empty) rather than left absent: `State` treats a *not-existing* account as
-/// "storage known" and short-circuits its slot reads to zero without ever consulting the
-/// database, so an absent account's seeded slots are invisible. An empty account loads as
-/// `LoadedEmptyEIP161` instead, and its slots fall through to the seeded `CacheDB` values.
+/// The precompile account is seeded with STOP bytecode (via [`seed_precompile_code`])
+/// rather than left absent: `State` treats a *not-existing* account as "storage known"
+/// and short-circuits its slot reads to zero without ever consulting the database, so an
+/// absent account's seeded slots are invisible. An account with code loads as `Loaded`
+/// instead, and its slots fall through to the seeded `CacheDB` values.
 fn drain_with_allowance(
     caller: Address,
     owner: Address,
@@ -324,9 +344,9 @@ fn drain_with_allowance(
         RELAYER,
         AccountInfo { balance: relayer_balance(), nonce: 0, ..Default::default() },
     );
-    // Exist but stay EIP-161 empty (see the doc comment): this is what makes the seeded
-    // slots below readable through `State`.
-    db.insert_account_info(ERC20_PRECOMPILE_ADDRESS, AccountInfo::default());
+    // Match the production Erc20PrecompileBytecode migration: seed STOP bytecode so the
+    // precompile account is not EIP-161 empty and its storage survives commit.
+    seed_precompile_code(&mut db);
     db.insert_account_storage(
         ERC20_PRECOMPILE_ADDRESS,
         allowance_slot(owner, spender),
@@ -357,8 +377,10 @@ fn run_eip3009_call(
         test_chain_spec_arc().chain_id(),
     ));
 
-    // Same construction as the production block executor (`reth_env/execution.rs`), then
-    // re-enable state clearing per block (`apply_pre_execution_changes`).
+    // Same construction as the production block executor (`reth_env/execution.rs`).
+    // The precompile code is seeded in the database (see [`seed_precompile_code`]),
+    // matching what `apply_pre_execution_changes` does via the
+    // `Erc20PrecompileBytecode` migration in production.
     let mut state =
         State::builder().with_database(db).with_bundle_update().without_state_clear().build();
     state.set_state_clear_flag(true);
@@ -830,6 +852,8 @@ fn replay_full_drain(guard_active: bool, base_balance: Option<U256>) -> DrainRun
         RELAYER,
         AccountInfo { balance: relayer_balance(), nonce: 0, ..Default::default() },
     );
+    // Match the production Erc20PrecompileBytecode migration.
+    seed_precompile_code(&mut db);
 
     let mut state =
         State::builder().with_database(db).with_bundle_update().without_state_clear().build();
@@ -933,13 +957,13 @@ fn replay_shape_pre_fork_full_drain_commits() {
         Some(U256::ONE),
         "the successful pre-fork drain must consume the auth nonce in the journal"
     );
-    // The post-commit slot is still zero: the precompile account (`0x0400`) is EIP-161
-    // empty, and revm's commit drops the storage writes of an emptied account. v1.4.1
-    // behaved identically; the guard does not change this.
+    // The auth nonce persists because the precompile has STOP bytecode (seeded in the
+    // test, matching the Erc20PrecompileBytecode migration). v1.4.1 behaved identically;
+    // the guard does not change this.
     assert_eq!(
         run.auth_nonce_used,
-        U256::ZERO,
-        "the emptied precompile account's storage is dropped at commit (pre-existing revm behavior)"
+        U256::ONE,
+        "the auth nonce persists: the precompile has code (Erc20PrecompileBytecode migration)"
     );
 }
 
@@ -1009,12 +1033,12 @@ fn replay_shape_pre_fork_changed_account_full_drain_commits() {
         Some(U256::ONE),
         "the successful pre-fork drain must consume the auth nonce in the journal"
     );
-    // The post-commit slot is still zero: the precompile account (`0x0400`) is EIP-161
-    // empty, and revm's commit drops the storage writes of an emptied account.
+    // The auth nonce persists because the precompile has STOP bytecode (seeded in the
+    // test, matching the Erc20PrecompileBytecode migration).
     assert_eq!(
         run.auth_nonce_used,
-        U256::ZERO,
-        "the emptied precompile account's storage is dropped at commit (pre-existing revm behavior)"
+        U256::ONE,
+        "the auth nonce persists: the precompile has code (Erc20PrecompileBytecode migration)"
     );
 }
 
@@ -1054,3 +1078,155 @@ fn replay_shape_post_fork_changed_account_full_drain_reverts() {
     );
     assert_eq!(run.auth_nonce_used, U256::ZERO, "a rejected drain must not consume the nonce");
 }
+
+// endregion: replay-shape across two transactions (the reviewer's scenario)
+
+// region: self-called transfer (nonce bumped → guard does not reject)
+
+/// A self-called `transferWithAuthorization` that drains the sender to zero must succeed.
+///
+/// The EOA's nonce is bumped by `validate_against_state_and_deduct_caller` in pre-execution,
+/// before the precompile runs. At check time the nonce is ≥ 1, so `is_empty()` is false and
+/// the guard does not reject. This is the asymmetry the reviewer flagged: `transfer`
+/// (self-called) is *not* affected by the guard, only relayer-submitted debits (EIP-3009,
+/// `burnFrom`) are.
+#[test]
+fn self_called_transfer_with_authorization_drain_nonce0_allowed() {
+    // Process-global and first-wins: register with the test chain's id.
+    let _ = initialize_erc20_precompile(Erc20Precompile::new(
+        Erc20TokenConfig::default(),
+        ERC20_PRECOMPILE_ADDRESS,
+        test_chain_spec_arc().chain_id(),
+    ));
+
+    let mut db = CacheDB::new(EmptyDBTyped::<Infallible>::new());
+    // VICTIM has a balance but nonce 0 and no code.
+    db.insert_account_info(
+        VICTIM,
+        AccountInfo { balance: full_balance(), nonce: 0, ..Default::default() },
+    );
+    db.insert_account_info(
+        RELAYER,
+        AccountInfo { balance: relayer_balance(), nonce: 0, ..Default::default() },
+    );
+    // Precompile account seeded as empty (see `drain` setup).
+    db.insert_account_info(ERC20_PRECOMPILE_ADDRESS, AccountInfo::default());
+
+    let mut state =
+        State::builder().with_database(db).with_bundle_update().without_state_clear().build();
+    state.set_state_clear_flag(true);
+
+    // Guard active at this block.
+    let chain_spec = Arc::new(
+        RaylsChainSpec::builder(test_chain_spec_arc())
+            .precompile_gas_fix(0)
+            .eip161_empty_account_guard(0)
+            .build(),
+    );
+
+    let env = EvmEnv::new(
+        CfgEnv::new().with_spec_and_mainnet_gas_params(SpecId::CANCUN),
+        BlockEnv {
+            number: U256::from(BLOCK_NUMBER),
+            gas_limit: ETHEREUM_BLOCK_GAS_LIMIT_56BITS,
+            ..Default::default()
+        },
+    );
+    let mut evm =
+        RaylsEvmFactory::new(chain_spec).create_evm_with_native_erc20_only(&mut state, env);
+
+    // VICTIM calls transferWithAuthorization to RELAYER for its full balance.
+    // The nonce is bumped by pre_execution to 1, so the guard sees nonce ≥ 1.
+    let ResultAndState { result, state: diff } = evm
+        .transact_pre_genesis_call(
+            VICTIM,
+            ERC20_PRECOMPILE_ADDRESS,
+            transfer_calldata(full_balance()),
+        )
+        .expect("transact must not fail");
+    assert!(
+        matches!(&result, ExecutionResult::Success { .. }),
+        "self-called full drain (nonce bumped by pre-exec) must succeed: {:?}",
+        result
+    );
+    evm.db_mut().commit(diff);
+
+    // Verify VICTIM's balance is zero and nonce is 1 (bumped by pre-execution).
+    let victim = state.basic(VICTIM).expect("in-memory db read");
+    assert_eq!(victim.as_ref().map(|info| info.balance), Some(U256::ZERO));
+    assert_eq!(victim.as_ref().map(|info| info.nonce), Some(1));
+}
+
+/// A relayer-submitted `transferWithAuthorization` that drains a nonce-0 EOA to zero
+/// must be rejected — the EOA's nonce is NOT bumped (the relayer's nonce is).
+#[test]
+fn relayer_submitted_transfer_with_authorization_drain_nonce0_rejected() {
+    // Process-global and first-wins.
+    let _ = initialize_erc20_precompile(Erc20Precompile::new(
+        Erc20TokenConfig::default(),
+        ERC20_PRECOMPILE_ADDRESS,
+        test_chain_spec_arc().chain_id(),
+    ));
+
+    let mut db = CacheDB::new(EmptyDBTyped::<Infallible>::new());
+    db.insert_account_info(
+        VICTIM,
+        AccountInfo { balance: full_balance(), nonce: 0, ..Default::default() },
+    );
+    db.insert_account_info(
+        RELAYER,
+        AccountInfo { balance: relayer_balance(), nonce: 0, ..Default::default() },
+    );
+    db.insert_account_info(ERC20_PRECOMPILE_ADDRESS, AccountInfo::default());
+
+    let mut state =
+        State::builder().with_database(db).with_bundle_update().without_state_clear().build();
+    state.set_state_clear_flag(true);
+
+    let chain_spec = Arc::new(
+        RaylsChainSpec::builder(test_chain_spec_arc())
+            .precompile_gas_fix(0)
+            .eip161_empty_account_guard(0)
+            .build(),
+    );
+
+    let env = EvmEnv::new(
+        CfgEnv::new().with_spec_and_mainnet_gas_params(SpecId::CANCUN),
+        BlockEnv {
+            number: U256::from(BLOCK_NUMBER),
+            gas_limit: ETHEREUM_BLOCK_GAS_LIMIT_56BITS,
+            ..Default::default()
+        },
+    );
+    let mut evm =
+        RaylsEvmFactory::new(chain_spec).create_evm_with_native_erc20_only(&mut state, env);
+
+    // RELAYER submits transferWithAuthorization on behalf of VICTIM.
+    // VICTIM's nonce is NOT bumped (RELAYER's nonce is).
+    let ResultAndState { result, state: diff } = evm
+        .transact_pre_genesis_call(
+            RELAYER,
+            ERC20_PRECOMPILE_ADDRESS,
+            transfer_calldata(full_balance()),
+        )
+        .expect("transact must not fail");
+
+    let ExecutionResult::Revert { output, .. } = &result else {
+        panic!("relayer-submitted full drain must revert: {:?}", result);
+    };
+    let reason = revert_reason(output).unwrap_or_else(|| {
+        panic!("the guard's revert must carry the precompile's Error(string) reason: {output:?}");
+    });
+    assert!(
+        reason.contains("Transfer would leave account"),
+        "the EIP-161 guard, not another error, must reject the drain: {reason}"
+    );
+    evm.db_mut().commit(diff);
+
+    // Verify VICTIM's balance is unchanged.
+    let victim = state.basic(VICTIM).expect("in-memory db read");
+    assert_eq!(victim.as_ref().map(|info| info.balance), Some(full_balance()));
+    assert_eq!(victim.as_ref().map(|info| info.nonce), Some(0));
+}
+
+// endregion: self-called transfer (nonce bumped → guard does not reject)
