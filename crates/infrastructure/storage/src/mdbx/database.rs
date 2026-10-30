@@ -824,6 +824,10 @@ fn table_entry_counts(env: &Environment) -> eyre::Result<BTreeMap<String, usize>
 
     let mut counts = BTreeMap::new();
     for name in names {
+        // reth-libmdbx panics on a name with a NUL byte; only a damaged datafile holds one
+        if name.contains('\0') {
+            eyre::bail!("damaged MDBX datafile: table name {name:?} contains a NUL byte");
+        }
         let dbi = txn.open_db(Some(&name))?.dbi();
         counts.insert(name, txn.db_stat(dbi)?.entries());
     }
