@@ -16,7 +16,7 @@
 # non-mainnet/testnet chain-id, with no head-dependent strict mode: Set A
 # at 0 or never, Erc20PrecompileBytecode exactly 1, UsdrSupplyCorrection
 # any value (warned when not never), and HybridRewards never or >= 1. The
-# canonical values are recommended but not required; the other ten forks
+# canonical values are recommended but not required; the other forks
 # are behavioral and free to choose (0, never, or a future block). What each
 # fork does and why the canonical values are what they are:
 # docs/hardforks/README.md.
