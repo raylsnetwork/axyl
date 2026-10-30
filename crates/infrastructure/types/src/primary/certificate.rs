@@ -13,8 +13,8 @@ use crate::{
     error::{CertificateError, CertificateResult, DagError, DagResult, HeaderError},
     now, quorum_threshold,
     serde::RoaringBitmapSerde,
-    Authority, AuthorityIdentifier, BlockHash, Committee, Digest, Epoch, Hash, Header, Round,
-    TimestampSec, VotingPower,
+    Authority, AuthorityIdentifier, BlockHash, Committee, Digest, Epoch, Hash, Header,
+    OwnParentSigners, Round, TimestampSec, VotingPower,
 };
 use alloy::primitives::map::FbBuildHasher;
 use serde::{Deserialize, Serialize};
@@ -336,6 +336,19 @@ impl Certificate {
     /// The bitmap of authorities, in committee order, whose votes form the aggregate signature.
     pub fn signed_authorities(&self) -> &roaring::RoaringBitmap {
         &self.signed_authorities
+    }
+
+    /// Replaces this certificate's signer set and aggregate signature with a claim the caller
+    /// has verified for this certificate's digest (`OwnParentSigners::verify`), marking the
+    /// signature verified. Lets a node converge its stored copy on the author's own variant
+    /// once the author's next header names it; the digest, and so the certificate's identity in
+    /// the DAG, is unchanged.
+    pub fn adopt_verified_signers(&mut self, claim: &OwnParentSigners) {
+        if let Some(signature) = claim.signature {
+            self.signed_authorities = claim.signers.clone();
+            self.signature_verification_state =
+                SignatureVerificationState::VerifiedDirectly(signature);
+        }
     }
 
     /// Returns true if the signature has been verified or the certificate is genesis.

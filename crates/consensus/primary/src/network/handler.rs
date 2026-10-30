@@ -19,15 +19,16 @@ use parking_lot::Mutex;
 use rayls_consensus_network::GossipMessage;
 use rayls_infrastructure_config::{ConsensusConfig, LibP2pConfig};
 use rayls_infrastructure_storage::{
-    tables::ConsensusBlocks, CertScope, ConsensusStore, EpochStore, ProposerStore, VoteDigestStore,
+    tables::ConsensusBlocks, CertScope, CertificateStore, ConsensusStore, EpochStore,
+    ProposerStore, VoteDigestStore,
 };
 use rayls_infrastructure_types::{
     ensure,
     error::{CertificateError, HeaderError, HeaderResult},
     now, to_intent_message, try_decode, AuthorityIdentifier, B256Map, BlockHash, BlockNumHash,
     BlsPublicKey, Certificate, CertificateDigest, ConsensusHeader, Database, Epoch,
-    EpochCertificate, EpochRecord, Hash as _, Header, ProtocolSignature, RaylsSender as _, Round,
-    SignatureVerificationState, Vote, VotesAggregator,
+    EpochCertificate, EpochRecord, Hash as _, Header, OwnParentSigners, ProtocolSignature,
+    RaylsSender as _, Round, SignatureVerificationState, Vote, VotesAggregator,
 };
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -496,6 +497,9 @@ where
 
         // validate header
         header.validate(committee)?;
+        // fork-state half of the own-parent signer check: needs only the header, so refuse a peer
+        // on the wrong side of the fork before any parent sync or peer-certificate acceptance
+        self.check_own_parent_signers_presence(&header)?;
         // Round 0 is genesis and is never proposed. Without this floor a round-0 header with an
         // unknown parent reaches `check_for_missing_parents`, which keys the request by
         // `round - 1`: with overflow checks on and `panic = "abort"` in the release profile that
@@ -623,6 +627,9 @@ where
             CertManagerError::from(CertificateError::Inquorate { stake, threshold }).into()
         );
 
+        // the author's claim about its own parent certificate's signers, against our copy of it
+        self.check_own_parent_signers(&header, &parents)?;
+
         // blocks until batches become available
         self.rayls_consensus_state_sync.sync_header_batches(&header, false, 0).await?;
 
@@ -716,6 +723,92 @@ where
             .write_last_proposed_by_authority(header.author.clone(), &header)?;
 
         Ok(PrimaryResponse::Vote(vote))
+    }
+
+    /// Fork-state half of the own-parent signer check: post-fork a header must carry the claim,
+    /// pre-fork it must not. Needs only the header, so it runs before parents are synced.
+    fn check_own_parent_signers_presence(&self, header: &Header) -> PrimaryNetworkResult<()> {
+        match (self.consensus_config.header_parent_signers_active(), header.own_parent_signers()) {
+            (false, Some(_)) => Err(HeaderError::UnexpectedOwnParentSigners.into()),
+            (true, None) => Err(HeaderError::MissingOwnParentSigners.into()),
+            _ => Ok(()),
+        }
+    }
+
+    /// Checks the header's claim about the author's own parent certificate (see
+    /// `Header::own_parent_signers`).
+    ///
+    /// Fast path: the claim equals what this node would claim for the parent it holds (empty
+    /// when the author's previous certificate is not among the parents), and the vote proceeds.
+    ///
+    /// Otherwise the claim is verified on its own: quorum stake among the claimed signers and
+    /// their aggregate signature over the parent's digest. A claim that verifies is accepted
+    /// whatever copy this node holds, and the stored copy is replaced with the claimed variant.
+    /// This keeps a third party from costing the author its round: any committee member can mint
+    /// another valid signer variant of a certificate (a vote is a signature over the header digest
+    /// alone, and BLS aggregates add) and seed it on a peer before the author's copy arrives.
+    /// The difference is logged at `warn` with both sets, since the index that differs is the
+    /// member that altered the aggregate. A claim that does not verify is the author's own doing
+    /// and is refused.
+    fn check_own_parent_signers(
+        &self,
+        header: &Header,
+        parents: &[Certificate],
+    ) -> PrimaryNetworkResult<()> {
+        // presence was settled up front by `check_own_parent_signers_presence`
+        let Some(claim) = header.own_parent_signers() else { return Ok(()) };
+        // `parents` is what this node holds: a copy it already had, or the one that came with
+        // this vote request from the proposer itself (`try_accept_unknown_certs`)
+        let own_parent = parents.iter().find(|parent| parent.origin() == header.author());
+        let held = own_parent.map(OwnParentSigners::from_certificate).unwrap_or_default();
+        if *claim == held {
+            return Ok(());
+        }
+
+        let claimed: Vec<u32> = claim.signers.iter().collect();
+        let expected: Vec<u32> = held.signers.iter().collect();
+        let committee = self.consensus_config.committee();
+        // an empty claim can only be right when no own parent is held (the fast path); with one
+        // held it is the author under-reporting its own certificate, and verifies nothing
+        let verified = own_parent.is_some_and(|parent| {
+            !claim.signers.is_empty() && claim.verify(parent.digest(), committee)
+        });
+        warn!(
+            target: "primary::handler",
+            author = %header.author(),
+            round = header.round(),
+            parent = ?own_parent.map(|p| p.digest()),
+            ?claimed,
+            ?expected,
+            verified,
+            "own-parent signer claim differs from the parent certificate held here (the index \
+             that differs is the member whose signature was added or removed, usually by itself; \
+             an author re-aggregating after a restart also lands here); accepting the author's \
+             verified claim and adopting it, or refusing an unverifiable one"
+        );
+        if !verified {
+            return Err(HeaderError::OwnParentSignersInvalid { claimed, expected }.into());
+        }
+
+        // Converge the persisted copy on the author's own variant; same digest, so nothing else
+        // about the certificate changes, and the in-memory DAG keeps the copy it has. Best
+        // effort: the stored signer set is non-canonical and nothing reads it, so a failed write
+        // is logged and the verified vote still proceeds. This runs before the remaining vote
+        // checks, so the copy can change even if the vote is refused later for another reason,
+        // which is harmless since the claim verified.
+        if let Some(parent) = own_parent {
+            let mut adopted = parent.clone();
+            adopted.adopt_verified_signers(claim);
+            if let Err(e) = self.consensus_config.node_storage().write(adopted) {
+                warn!(
+                    target: "primary::handler",
+                    ?e,
+                    author = %header.author(),
+                    "failed to persist the adopted own-parent signer claim; vote proceeds"
+                );
+            }
+        }
+        Ok(())
     }
 
     /// Identify parents not in local storage, pending, or already requested.

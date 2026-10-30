@@ -14,12 +14,15 @@
 use indexmap::IndexMap;
 use libfuzzer_sys::fuzz_target;
 use rayls_infrastructure_types::{
+    HEADER_SIGNERS_EPOCH_FLAG,
     AuthorityIdentifier, BlockHash, BlockNumHash, CertificateDigest, Header,
 };
 use std::collections::BTreeSet;
 
 fuzz_target!(|data: (u32, u32)| {
     let (epoch, round) = data;
+    // the top bit of the wire epoch is the header layout flag; a real epoch never has it
+    let epoch = epoch & !HEADER_SIGNERS_EPOCH_FLAG;
 
     // Build a minimal header and call the REAL production encoder.
     let header = Header::new(
@@ -29,6 +32,7 @@ fuzz_target!(|data: (u32, u32)| {
         IndexMap::<BlockHash, u16>::new(),
         BTreeSet::<CertificateDigest>::new(),
         BlockNumHash::new(0, BlockHash::default()),
+        None,
     );
     let nonce: u64 = header.nonce();
 

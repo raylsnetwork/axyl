@@ -78,11 +78,13 @@ mod schedule {
             (RaylsNetwork::Devnet, RaylsHardFork::HybridRewards),
             (RaylsNetwork::Devnet, RaylsHardFork::EpochCloseSeedV2),
             (RaylsNetwork::Devnet, RaylsHardFork::CertificateFetchEpochV2),
+            (RaylsNetwork::Devnet, RaylsHardFork::HeaderParentSigners),
             (RaylsNetwork::Testnet, RaylsHardFork::Erc20PrecompileBytecode),
             (RaylsNetwork::Testnet, RaylsHardFork::UsdrSupplyCorrection),
             (RaylsNetwork::Testnet, RaylsHardFork::HybridRewards),
             (RaylsNetwork::Testnet, RaylsHardFork::EpochCloseSeedV2),
             (RaylsNetwork::Testnet, RaylsHardFork::CertificateFetchEpochV2),
+            (RaylsNetwork::Testnet, RaylsHardFork::HeaderParentSigners),
             (RaylsNetwork::Mainnet, RaylsHardFork::AdminTransfer),
             (RaylsNetwork::Mainnet, RaylsHardFork::RlsStorage),
             (RaylsNetwork::Mainnet, RaylsHardFork::Tokenomics),
@@ -90,6 +92,7 @@ mod schedule {
             (RaylsNetwork::Mainnet, RaylsHardFork::HybridRewards),
             (RaylsNetwork::Mainnet, RaylsHardFork::EpochCloseSeedV2),
             (RaylsNetwork::Mainnet, RaylsHardFork::CertificateFetchEpochV2),
+            (RaylsNetwork::Mainnet, RaylsHardFork::HeaderParentSigners),
             (RaylsNetwork::Local, RaylsHardFork::UsdrSupplyCorrection),
         ];
         for (network, fork) in never_forks {
@@ -98,6 +101,38 @@ mod schedule {
                 !hardforks.is_rayls_fork_active_at_block(fork, u64::MAX),
                 "{network}: {fork:?} is scheduled Never but active at u64::MAX",
             );
+        }
+    }
+
+    /// `HeaderParentSigners` must not activate before `EpochCloseSeedV2` on any baked-in
+    /// schedule: before SeedV2 the epoch-closing block's seed still depends on the leader
+    /// certificate's local aggregate signature, the per-node value this fork exists to stop
+    /// relying on. A scheduled `HeaderParentSigners` therefore requires a scheduled SeedV2 at the
+    /// same block or earlier. `--config-file` profiles get the same rule at boot from
+    /// `verify_schedule_shape`.
+    #[test]
+    fn header_parent_signers_never_activates_before_epoch_close_seed_v2() {
+        for network in [
+            RaylsNetwork::Devnet,
+            RaylsNetwork::Testnet,
+            RaylsNetwork::Mainnet,
+            RaylsNetwork::Local,
+        ] {
+            let hardforks = RaylsChainHardforks::for_network(network);
+            let ForkCondition::Block(signers) =
+                hardforks.rayls_fork_activation(RaylsHardFork::HeaderParentSigners)
+            else {
+                continue;
+            };
+            match hardforks.rayls_fork_activation(RaylsHardFork::EpochCloseSeedV2) {
+                ForkCondition::Block(seed) => assert!(
+                    seed <= signers,
+                    "{network}: HeaderParentSigners at {signers} before EpochCloseSeedV2 at {seed}"
+                ),
+                other => panic!(
+                    "{network}: HeaderParentSigners scheduled but EpochCloseSeedV2 is {other:?}"
+                ),
+            }
         }
     }
 
@@ -124,7 +159,7 @@ mod schedule {
     }
 
     /// The version byte reports the highest version byte among the forks *active* at the
-    /// block, not the most recently crossed block. CertificateFetchEpochV2 (0x11) is
+    /// block, not the most recently crossed block. HeaderParentSigners (0x12) is
     /// genesis-active on local, so it owns the byte across every later activation
     /// (HybridRewards at 0x0d included). On real networks it is Never, so there the highest
     /// active fork still advances the byte normally.
@@ -132,13 +167,13 @@ mod schedule {
     fn version_byte_is_the_max_active_fork_code() {
         let hardforks = RaylsChainHardforks::local();
         let block = activation_block(&hardforks, RaylsHardFork::HybridRewards);
-        assert_eq!(hardforks.version_byte_at_block(0), Some(0x11));
-        assert_eq!(hardforks.version_byte_at_block(block - 1), Some(0x11));
-        assert_eq!(hardforks.version_byte_at_block(block), Some(0x11));
-        assert_eq!(hardforks.version_byte_at_block(1_000_000), Some(0x11));
+        assert_eq!(hardforks.version_byte_at_block(0), Some(0x12));
+        assert_eq!(hardforks.version_byte_at_block(block - 1), Some(0x12));
+        assert_eq!(hardforks.version_byte_at_block(block), Some(0x12));
+        assert_eq!(hardforks.version_byte_at_block(1_000_000), Some(0x12));
     }
 
-    /// Every network schedule lists all 17 hardforks in variant order.
+    /// Every network schedule lists every hardfork in variant order.
     #[test]
     fn schedule_contains_all_hardforks_in_order_for_all_networks() {
         for network in [
@@ -198,6 +233,7 @@ mod schedule {
                 (RaylsHardFork::SenderAffinityLoadBalancing, ForkCondition::Block(12_231_705)),
                 (RaylsHardFork::EpochCloseSeedV2, ForkCondition::Never),
                 (RaylsHardFork::CertificateFetchEpochV2, ForkCondition::Never),
+                (RaylsHardFork::HeaderParentSigners, ForkCondition::Never),
             ],
         );
     }
@@ -226,6 +262,7 @@ mod schedule {
                 (RaylsHardFork::SenderAffinityLoadBalancing, ForkCondition::Block(17_300_000)),
                 (RaylsHardFork::EpochCloseSeedV2, ForkCondition::Never),
                 (RaylsHardFork::CertificateFetchEpochV2, ForkCondition::Never),
+                (RaylsHardFork::HeaderParentSigners, ForkCondition::Never),
             ],
         );
     }
@@ -252,22 +289,22 @@ mod hardforks {
     fn local_network_version_byte_at_block_0() {
         let hardforks = RaylsChainHardforks::local();
         let version = hardforks.version_byte_at_block(0);
-        // CertificateFetchEpochV2 (0x11) activates at block 0 on local and is the highest
+        // HeaderParentSigners (0x12) activates at block 0 on local and is the highest
         // such fork, so it owns the version byte from block 0.
-        assert_eq!(version, Some(0x11));
+        assert_eq!(version, Some(0x12));
     }
 
     #[test]
     fn local_network_version_byte_is_the_max_active_code() {
-        // CertificateFetchEpochV2 (0x11) is genesis-active on local, so it owns the version
+        // HeaderParentSigners (0x12) is genesis-active on local, so it owns the version
         // byte across every later activation (HybridRewards at 0x0d included): the byte reports
         // the max active code, not the most recently crossed block. On real networks it is Never,
         // so there the highest active fork still advances the byte normally.
         let hardforks = RaylsChainHardforks::local();
         let hybrid_rewards_block = activation_block(&hardforks, RaylsHardFork::HybridRewards);
-        assert_eq!(hardforks.version_byte_at_block(hybrid_rewards_block - 1), Some(0x11));
-        assert_eq!(hardforks.version_byte_at_block(hybrid_rewards_block), Some(0x11));
-        assert_eq!(hardforks.version_byte_at_block(1_000_000), Some(0x11));
+        assert_eq!(hardforks.version_byte_at_block(hybrid_rewards_block - 1), Some(0x12));
+        assert_eq!(hardforks.version_byte_at_block(hybrid_rewards_block), Some(0x12));
+        assert_eq!(hardforks.version_byte_at_block(1_000_000), Some(0x12));
     }
 }
 

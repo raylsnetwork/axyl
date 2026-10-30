@@ -8418,6 +8418,7 @@ dependencies = [
  "rayls-infrastructure-types",
  "rayls-middleware-rewards",
  "rayls-testing-test-utils",
+ "roaring 0.10.12",
  "tempfile",
  "tracing",
 ]

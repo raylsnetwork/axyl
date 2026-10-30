@@ -218,6 +218,15 @@ impl RaylsChainSpecBuilder {
         self
     }
 
+    /// Activate HeaderParentSigners at `block`.
+    #[must_use = "builder method result must be used"]
+    pub fn header_parent_signers(mut self, block: u64) -> Self {
+        self.inner
+            .hardforks
+            .insert(RaylsHardFork::HeaderParentSigners, ForkCondition::Block(block));
+        self
+    }
+
     /// Set the minimum EIP-1559 base fee floor.
     #[must_use = "builder method result must be used"]
     pub fn min_base_fee(mut self, min_base_fee: u64) -> Self {

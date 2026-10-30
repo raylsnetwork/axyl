@@ -58,6 +58,9 @@ impl RaylsHardFork {
             // Never until SRE schedules an activation block: switches a network request format,
             // and nodes that have not upgraded cannot decode the new one.
             ScheduledFork::new(Self::CertificateFetchEpochV2, ForkCondition::Never),
+            // Never until SRE schedules an activation block: changes the header wire layout and
+            // reward crediting from that epoch on; nodes that have not upgraded cannot decode it.
+            ScheduledFork::new(Self::HeaderParentSigners, ForkCondition::Never),
         ]
     }
 
@@ -86,6 +89,9 @@ impl RaylsHardFork {
             // Never until SRE schedules an activation block: switches a network request format,
             // and nodes that have not upgraded cannot decode the new one.
             ScheduledFork::new(Self::CertificateFetchEpochV2, ForkCondition::Never),
+            // Never until SRE schedules an activation block: changes the header wire layout and
+            // reward crediting from that epoch on; nodes that have not upgraded cannot decode it.
+            ScheduledFork::new(Self::HeaderParentSigners, ForkCondition::Never),
         ]
     }
 
@@ -114,6 +120,9 @@ impl RaylsHardFork {
             // Never until SRE schedules an activation block: switches a network request format,
             // and nodes that have not upgraded cannot decode the new one.
             ScheduledFork::new(Self::CertificateFetchEpochV2, ForkCondition::Never),
+            // Never until SRE schedules an activation block: changes the header wire layout and
+            // reward crediting from that epoch on; nodes that have not upgraded cannot decode it.
+            ScheduledFork::new(Self::HeaderParentSigners, ForkCondition::Never),
         ]
     }
 
@@ -147,6 +156,7 @@ impl RaylsHardFork {
             ScheduledFork::new(Self::SenderAffinityLoadBalancing, ForkCondition::Block(0)),
             ScheduledFork::new(Self::EpochCloseSeedV2, ForkCondition::Block(0)),
             ScheduledFork::new(Self::CertificateFetchEpochV2, ForkCondition::Block(0)),
+            ScheduledFork::new(Self::HeaderParentSigners, ForkCondition::Block(0)),
         ]
     }
 
