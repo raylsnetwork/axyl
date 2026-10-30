@@ -552,6 +552,9 @@ where
     NewEpoch {
         /// The epoch committee.
         committee: HashSet<BlsPublicKey>,
+        /// Every registered validator (committee, lookahead, and each staked key the registry
+        /// knows). Node records are kept in the kad store for these keys only.
+        registered: HashSet<BlsPublicKey>,
     },
     /// Find authorities for a future committee by bls key and return to sender.
     FindAuthorities {
@@ -786,9 +789,14 @@ where
         res.await.map_err(Into::into)
     }
 
-    /// Create a [PeerExchangeMap] for exchanging peers.
-    pub async fn new_epoch(&self, committee: HashSet<BlsPublicKey>) -> NetworkResult<()> {
-        self.sender.send(NetworkCommand::NewEpoch { committee }).await?;
+    /// Start a new epoch: the committee is protected from bans, and node records are admitted
+    /// to the kad store for the registered validators only.
+    pub async fn new_epoch(
+        &self,
+        committee: HashSet<BlsPublicKey>,
+        registered: HashSet<BlsPublicKey>,
+    ) -> NetworkResult<()> {
+        self.sender.send(NetworkCommand::NewEpoch { committee, registered }).await?;
         Ok(())
     }
 

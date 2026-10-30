@@ -838,6 +838,15 @@ async fn test_close_epochs() -> eyre::Result<()> {
     .await?;
     let canonical_header = block1.recovered_block.clone_sealed_header();
 
+    // the new validator is staked but waits for its activation epoch: already registered
+    let registered = reth_env.registered_validators()?;
+    assert_eq!(registered.len(), 6, "five genesis validators plus the pending one");
+    assert!(
+        registered.iter().any(|v| v.validatorAddress == new_validator.execution_address
+            && v.currentStatus == ValidatorStatus::PendingActivation),
+        "a staked, not yet active validator is registered"
+    );
+
     // now close the first epoch
     expected_epoch += 1;
     let consensus_output = consensus_output_for_tests(2, expected_epoch, 2);
@@ -940,6 +949,15 @@ async fn test_close_epochs() -> eyre::Result<()> {
     let block5 = execute_payload_and_update_canonical_chain(&reth_env, payload, vec![]).await?;
     let canonical_header = block5.recovered_block.clone_sealed_header();
 
+    // validator 2 is leaving but its stake is still bonded: still registered
+    let registered = reth_env.registered_validators()?;
+    assert_eq!(registered.len(), 6);
+    assert!(
+        registered.iter().any(|v| v.validatorAddress == validator_2_address
+            && v.currentStatus == ValidatorStatus::PendingExit),
+        "a validator pending exit is still registered"
+    );
+
     // create evm to read latest state
     let state = StateProviderDatabase::new(reth_env.latest()?);
     let mut cached_reads = CachedReads::default();
@@ -995,6 +1013,15 @@ async fn test_close_epochs() -> eyre::Result<()> {
     let payload = RLPayload::new_for_test(canonical_header, &consensus_output);
     let block7 = execute_payload_and_update_canonical_chain(&reth_env, payload, vec![]).await?;
     let canonical_header = block7.recovered_block.clone_sealed_header();
+
+    // validator 2 has exited and withdrawn: no longer registered, so its node record would no
+    // longer be kept in the kad store
+    let registered = reth_env.registered_validators()?;
+    assert_eq!(registered.len(), 5);
+    assert!(
+        registered.iter().all(|v| v.validatorAddress != validator_2_address),
+        "an exited validator is not registered"
+    );
 
     // create evm to read latest state
     let state = StateProviderDatabase::new(reth_env.latest()?);

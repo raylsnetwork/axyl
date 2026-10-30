@@ -558,7 +558,7 @@ async fn test_is_validator() {
 
     // update epoch with random multiaddr
     let committee = config.committee_pub_keys();
-    peer_manager.new_epoch(committee);
+    peer_manager.new_epoch(committee.clone(), committee);
 
     // Verify random peer is not a validator
     assert!(!peer_manager.is_peer_validator(&random_peer_id));
@@ -595,7 +595,7 @@ async fn test_committee_member_resolved_mid_epoch_is_absolved_immediately() {
             timestamp: now(),
         },
     );
-    peer_manager.new_epoch(config.committee_pub_keys());
+    peer_manager.new_epoch(config.committee_pub_keys(), config.committee_pub_keys());
 
     // authority_2 connects before its record arrives, so it is tracked as an ordinary peer
     let config_2 = authority_2.consensus_config();
@@ -649,7 +649,7 @@ async fn resolving_a_banned_committee_member_releases_its_ban() {
             timestamp: now(),
         },
     );
-    peer_manager.new_epoch(config.committee_pub_keys());
+    peer_manager.new_epoch(config.committee_pub_keys(), config.committee_pub_keys());
 
     // authority_2 connects and is banned while still an ordinary, unresolved peer
     let config_2 = authority_2.consensus_config();
@@ -718,7 +718,7 @@ async fn test_admitted_connection_is_registered_under_the_same_ban_predicate() {
             timestamp: now(),
         },
     );
-    peer_manager.new_epoch(config.committee_pub_keys());
+    peer_manager.new_epoch(config.committee_pub_keys(), config.committee_pub_keys());
     assert!(peer_manager.is_peer_validator(&validator), "precondition: validator is in committee");
 
     // two unrelated peers are banned at the advertised address, blocklisting it
@@ -1138,7 +1138,7 @@ async fn test_forged_entry_naming_a_validator_is_not_exempt_from_eviction() {
             timestamp: now(),
         },
     );
-    peer_manager.new_epoch(HashSet::from([victim_bls]));
+    peer_manager.new_epoch(HashSet::from([victim_bls]), HashSet::from([victim_bls]));
     assert!(peer_manager.is_peer_validator(&victim_id));
 
     peer_manager.add_known_peer_addrs(
@@ -1229,7 +1229,7 @@ async fn test_should_skip_gossip_penalty_refuses_validator() {
         timestamp: now(),
     };
     peer_manager.add_known_peer(validator_bls, info);
-    peer_manager.new_epoch(config.committee_pub_keys());
+    peer_manager.new_epoch(config.committee_pub_keys(), config.committee_pub_keys());
 
     // sanity: the derived peer id is recognized as a committee validator
     assert!(peer_manager.is_peer_validator(&validator_peer_id));
@@ -1822,7 +1822,8 @@ async fn test_heartbeat_redials_missing_committee_member() {
         },
     );
 
-    peer_manager.new_epoch(HashSet::from([self_bls, member_bls]));
+    peer_manager
+        .new_epoch(HashSet::from([self_bls, member_bls]), HashSet::from([self_bls, member_bls]));
 
     // an unrelated peer is connected, so the node is not isolated (discovery seeding stays off)
     register_peer(&mut peer_manager, None);
@@ -1845,5 +1846,113 @@ async fn test_heartbeat_redials_missing_committee_member() {
     assert!(
         peer_manager.next_dial_request().is_none(),
         "no raw dial may bypass the resolving dial path"
+    );
+}
+
+/// One `known_peers` entry per peer id for unregistered keys. A peer re-binding under a fresh
+/// key over the same connection replaces its previous entry rather than adding to it; otherwise
+/// one connection could mint keys until the table is full and honest entries are evicted. A
+/// registered key's entry is a validator's dial target in its own right and stays.
+#[tokio::test]
+async fn test_rebinding_under_a_new_unregistered_key_replaces_the_previous_entry() {
+    let mut peer_manager = create_test_peer_manager(None);
+    let netkey: NetworkPublicKey = NetworkKeypair::generate_ed25519().public().into();
+    let peer_id: PeerId = netkey.clone().into();
+    let info = || NetworkInfo {
+        pubkey: netkey.clone(),
+        multiaddrs: vec![create_multiaddr(None)],
+        timestamp: now(),
+    };
+    let key_1 = *BlsKeypair::generate(&mut rand::rng()).public();
+    let key_2 = *BlsKeypair::generate(&mut rand::rng()).public();
+    let key_3 = *BlsKeypair::generate(&mut rand::rng()).public();
+
+    peer_manager.add_known_peer(key_1, info());
+    peer_manager.add_known_peer(key_2, info());
+    assert!(peer_manager.auth_to_peer(key_1).is_none(), "the unregistered previous key is gone");
+    assert!(peer_manager.auth_to_peer(key_2).is_some());
+    assert_eq!(peer_manager.peer_to_bls(&peer_id), Some(key_2));
+
+    // a registered key keeps its entry when the same peer id re-binds under another key
+    peer_manager.set_registered_validators(HashSet::from([key_2]));
+    peer_manager.add_known_peer(key_3, info());
+    assert!(peer_manager.auth_to_peer(key_2).is_some(), "a registered key's entry stays");
+    assert!(peer_manager.auth_to_peer(key_3).is_some());
+    assert_eq!(peer_manager.peer_to_bls(&peer_id), Some(key_3));
+}
+
+/// A registered validator that is not (yet) in the committee is exempt from `known_peers`
+/// eviction, like a committee member: a staked candidate discovered before its seat must not
+/// be aged out by observer churn before the boundary it is needed at. An unregistered entry of
+/// the same age is evicted.
+#[tokio::test]
+async fn test_registered_candidate_is_exempt_from_known_peers_eviction() {
+    let mut peer_manager = create_test_peer_manager(None);
+    let info = |netkey: NetworkPublicKey| NetworkInfo {
+        pubkey: netkey,
+        multiaddrs: vec![create_multiaddr(None)],
+        timestamp: now(),
+    };
+    let candidate_bls = *BlsKeypair::generate(&mut rand::rng()).public();
+    let candidate_netkey: NetworkPublicKey = NetworkKeypair::generate_ed25519().public().into();
+    let observer_bls = *BlsKeypair::generate(&mut rand::rng()).public();
+    let observer_netkey: NetworkPublicKey = NetworkKeypair::generate_ed25519().public().into();
+
+    peer_manager.add_known_peer(candidate_bls, info(candidate_netkey));
+    peer_manager.add_known_peer(observer_bls, info(observer_netkey));
+    peer_manager.set_registered_validators(HashSet::from([candidate_bls]));
+    assert!(!peer_manager.peers.is_committee_key(&candidate_bls), "registered but not seated");
+    // both are the oldest entries, so both are first in line for eviction
+    peer_manager.known_peers_time_added.insert(candidate_bls, 0);
+    peer_manager.known_peers_time_added.insert(observer_bls, 0);
+
+    for _ in 0..MAX_KNOWN_PEERS {
+        let bls = *BlsKeypair::generate(&mut rand::rng()).public();
+        let netkey: NetworkPublicKey = NetworkKeypair::generate_ed25519().public().into();
+        peer_manager.add_known_peer_addrs(bls, info(netkey));
+    }
+
+    assert!(peer_manager.auth_to_peer(candidate_bls).is_some(), "registered: never evicted");
+    assert!(peer_manager.auth_to_peer(observer_bls).is_none(), "unregistered: evicted");
+}
+
+/// Eviction skips entries whose bound peer is connected right now. Peer ids are free, so one host
+/// reconnecting under fresh identities can push the table over the cap in minutes; by age alone
+/// the longest-connected honest observer would be evicted first and lose its binding while
+/// still connected. The churn must only ever evict its own disconnected entries.
+#[tokio::test]
+async fn test_connected_observer_survives_known_peers_churn() {
+    let mut peer_manager = create_test_peer_manager(None);
+    let info = |netkey: NetworkPublicKey| NetworkInfo {
+        pubkey: netkey,
+        multiaddrs: vec![create_multiaddr(None)],
+        timestamp: now(),
+    };
+
+    // an honest observer, bound from its own record and connected
+    let observer_bls = *BlsKeypair::generate(&mut rand::rng()).public();
+    let observer_netkey: NetworkPublicKey = NetworkKeypair::generate_ed25519().public().into();
+    let observer_id: PeerId = observer_netkey.clone().into();
+    let connection = ConnectionType::IncomingConnection { multiaddr: create_multiaddr(None) };
+    assert!(peer_manager.register_peer_connection(&observer_id, connection));
+    peer_manager.add_known_peer(observer_bls, info(observer_netkey));
+    // the oldest entry in the table, so first in line by age
+    peer_manager.known_peers_time_added.insert(observer_bls, 0);
+    assert!(peer_manager.is_connected(&observer_id));
+    assert_eq!(peer_manager.peer_to_bls(&observer_id), Some(observer_bls));
+
+    // a host churning through fresh identities: each connects, binds its own record, leaves
+    for _ in 0..(MAX_KNOWN_PEERS + 10) {
+        let bls = *BlsKeypair::generate(&mut rand::rng()).public();
+        let netkey: NetworkPublicKey = NetworkKeypair::generate_ed25519().public().into();
+        peer_manager.add_known_peer(bls, info(netkey));
+    }
+
+    assert!(peer_manager.known_peers.len() <= MAX_KNOWN_PEERS + 1, "the cap held");
+    assert!(peer_manager.auth_to_peer(observer_bls).is_some(), "the live observer kept its entry");
+    assert_eq!(
+        peer_manager.peer_to_bls(&observer_id),
+        Some(observer_bls),
+        "a connected peer must not lose its binding to someone else's churn"
     );
 }

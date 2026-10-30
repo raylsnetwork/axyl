@@ -13,7 +13,7 @@ use rayls_infrastructure_types::{
     TaskManager,
 };
 use std::collections::{HashMap, HashSet};
-use tracing::debug;
+use tracing::{debug, warn};
 
 impl<P, DB> EpochManager<P, DB>
 where
@@ -107,6 +107,21 @@ where
             lookahead_entries.push((epoch + offset, keys));
         }
         let lookahead = CommitteeLookahead::from_entries(lookahead_entries);
+
+        // Keys whose node records the network may keep in its kad store: every registered
+        // validator, unioned with the committee and lookahead so the set is never narrower than
+        // the keys consensus must be able to find. If the registry read fails, keep last epoch's
+        // set rather than shrinking to committee and lookahead: a transient failure must not drop
+        // the staked candidates for a whole epoch.
+        match engine.registered_validators().await {
+            Ok(keys) => self.registered_validators = keys.into_iter().collect(),
+            Err(err) => warn!(
+                target: "epoch-manager",
+                ?err,
+                "registry read failed; keeping last epoch's registered validators plus committee and lookahead",
+            ),
+        }
+        self.registered_validators.extend(next_vals.iter().copied());
 
         // the certificate fetcher gates the request variant it sends on this fork, against the
         // executed tip it already tracks

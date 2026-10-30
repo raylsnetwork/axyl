@@ -95,7 +95,10 @@ where
             )
             .await?;
 
-        network_handle.inner_handle().new_epoch(committee_keys.clone()).await?;
+        network_handle
+            .inner_handle()
+            .new_epoch(committee_keys.clone(), self.registered_validators.clone())
+            .await?;
         debug!(target: "epoch-manager", auth=?consensus_config.authority_id(), "event stream updated!");
 
         // start listening if the network needs to be initialized

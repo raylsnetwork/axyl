@@ -10,7 +10,7 @@ use libp2p::{
     multiaddr::Protocol,
     Multiaddr,
 };
-use rayls_infrastructure_types::{now, Database, RaylsSender};
+use rayls_infrastructure_types::{Database, RaylsSender};
 use tracing::{debug, error, info, warn};
 
 impl<Req, Res, DB, Events> ConsensusNetwork<Req, Res, DB, Events>
@@ -54,13 +54,11 @@ where
             }
             NetworkCommand::AddTrustedPeerAndDial { bls_pubkey, network_pubkey, addr, reply } => {
                 // update peer manager
+                // Configured entries carry timestamp 0: they are hints that any signed record
+                // from the peer must supersede, and `known_peers` keeps the newer of the two.
                 self.swarm.behaviour_mut().peer_manager.add_trusted_peer_and_dial(
                     bls_pubkey,
-                    NetworkInfo {
-                        pubkey: network_pubkey,
-                        multiaddrs: vec![addr],
-                        timestamp: now(),
-                    },
+                    NetworkInfo { pubkey: network_pubkey, multiaddrs: vec![addr], timestamp: 0 },
                     reply,
                 );
             }
@@ -71,7 +69,7 @@ where
                     NetworkInfo {
                         pubkey: network_pubkey,
                         multiaddrs: vec![addr],
-                        timestamp: now(),
+                        timestamp: 0, // configured hint, see AddTrustedPeerAndDial
                     },
                 );
                 let _ = reply.send(Ok(()));
@@ -92,7 +90,7 @@ where
                         NetworkInfo {
                             pubkey: info.network_key,
                             multiaddrs: vec![info.network_address],
-                            timestamp: now(),
+                            timestamp: 0, // configured hint, see AddTrustedPeerAndDial
                         },
                     );
                 }
@@ -385,21 +383,34 @@ where
                 let peers = self.swarm.behaviour_mut().peer_manager.peers_for_exchange();
                 send_or_log_error!(reply, peers, "PeersForExchange");
             }
-            NetworkCommand::NewEpoch { committee } => {
+            NetworkCommand::NewEpoch { committee, registered } => {
                 // at the start of a new epoch, each node needs to know:
-                // - the current committee
-                // - all staked nodes who will vote at the end of the epoch
-                //      - only synced nodes can vote
-                //
-                // once a node stakes and tries to sync, it would be nice
-                // if it could receive priority on the network for syncing
-                // state
-                //
-                // for now, this only supports the current committee for the epoch
+                // - the current committee, so its members are never banned
+                // - every registered validator, so their node records (and only theirs) are
+                //   admitted to the kad store; a newly staked candidate becomes storable from this
+                //   boundary on, epochs before it is seated, with no config change
 
                 info!(target: "network", this_node=?self.swarm.local_peer_id(), "network update for next committee - ensuring no committee members are banned");
-                // ensure that the next committee isn't banned
-                self.swarm.behaviour_mut().peer_manager.new_epoch(committee);
+                // ensure that the next committee isn't banned; refresh the registered set the
+                // kad store and the peer tables are gated on
+                self.swarm.behaviour_mut().peer_manager.new_epoch(committee, registered);
+                // Republish our own record now: peers admit a newly registered key only from
+                // this boundary on, and the next scheduled republish could be hours away. The put
+                // reaches the K peers closest to our key, which is the set lookups ask, not every
+                // node; a node elsewhere learns the record from a GetRecord, or directly when we
+                // connect to it. Best effort: a peer whose own NewEpoch has not run yet binds
+                // this record without storing it, and the next boundary or the 12-hour republish
+                // catches it up. On
+                // the primary's initial epoch this runs before its listeners are up and is a
+                // no-op; the startup publish and the per-connection push cover that case. Put
+                // only: the provider announcement is dropped by every peer, so it is made once
+                // at startup and not re-walked at every boundary. Every node republishes,
+                // observers included: an observer's record is never stored by anyone, but the
+                // per-connection push that binds it can fail on a fresh circuit (seen in the
+                // field as `QuorumFailed` right after connect), and without this walk the next
+                // retry would be the 12-hour republish. The walk costs the K receivers one
+                // verify each; that is the price of an observer rebinding within an epoch.
+                self.publish_our_record();
             }
             NetworkCommand::FindAuthorities { bls_keys } => {
                 // this will trigger a PeerEvent to fetch records through kad if not in the peer map

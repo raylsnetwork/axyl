@@ -3,7 +3,7 @@ use crate::{
     evm::RaylsEvm,
     reth_env::RethEnv,
     system_calls::{
-        ConsensusRegistry::{self},
+        ConsensusRegistry::{self, ValidatorStatus},
         EpochState, CONSENSUS_REGISTRY_ADDRESS, SYSTEM_ADDRESS,
     },
 };
@@ -68,6 +68,55 @@ impl RethEnv {
         info!(target: "engine", ?epoch_state, "returning epoch state from canonical tip");
 
         Ok(epoch_state)
+    }
+
+    /// Read every validator the [ConsensusRegistry] knows that has not exited: staked, pending
+    /// activation, active, or pending exit.
+    ///
+    /// This is the set whose node records the network keeps in its kad store. Registering needs
+    /// a governance allowlist entry and the registry's minimum stake, so the set is bounded by
+    /// governance and economics rather than by how fast a peer can mint keys, and a newly staked
+    /// candidate is in it epochs before it is seated.
+    ///
+    /// Read at the canonical tip as its own snapshot: it can land on a different block than the
+    /// epoch state and lookahead reads made alongside it. That is harmless, the result is local
+    /// network policy and is unioned with the committee and lookahead, but it must not be relied
+    /// on to match the epoch state exactly.
+    pub fn registered_validators(&self) -> eyre::Result<Vec<ConsensusRegistry::ValidatorInfo>> {
+        let canonical_tip = self.canonical_tip();
+        let db_provider = self.blockchain_provider.database_provider_ro()?;
+        let state_provider: StateProviderBox = Box::new(LatestStateProvider::new(db_provider));
+        let state = StateProviderDatabase::new(&state_provider);
+        let mut db = State::builder()
+            .with_database(state)
+            .with_bundle_update()
+            .without_state_clear()
+            .build();
+        let mut rayls_evm = self
+            .evm_config
+            .evm_factory()
+            .create_evm(&mut db, self.evm_config.evm_env(&canonical_tip)?);
+
+        let calldata = ConsensusRegistry::getValidatorsCall { status: ValidatorStatus::Any.into() }
+            .abi_encode()
+            .into();
+        let all = self.call_consensus_registry::<_, Vec<ConsensusRegistry::ValidatorInfo>>(
+            &mut rayls_evm,
+            calldata,
+        )?;
+        let registered: Vec<_> = all
+            .into_iter()
+            .filter(|v| {
+                !matches!(v.currentStatus, ValidatorStatus::Exited | ValidatorStatus::Undefined)
+            })
+            .collect();
+        info!(
+            target: "engine",
+            canonical_tip_num = canonical_tip.number,
+            registered = registered.len(),
+            "registered_validators: contract returned validators",
+        );
+        Ok(registered)
     }
 
     /// Read the latest committee and epoch information from the [ConsensusRegistry] on-chain.

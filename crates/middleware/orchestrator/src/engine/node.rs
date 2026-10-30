@@ -234,4 +234,10 @@ impl ExecutionNode {
         let guard = self.internal.read().await;
         guard.validators_for_epoch(epoch)
     }
+
+    /// Read the BLS keys of every registered (not exited) validator in the registry.
+    pub async fn registered_validators(&self) -> eyre::Result<Vec<BlsPublicKey>> {
+        let guard = self.internal.read().await;
+        guard.registered_validators()
+    }
 }
