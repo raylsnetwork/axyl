@@ -232,6 +232,34 @@ fn merge_cold_raw<'i, T: Table>(
     Box::new(merged.take_while(move |_| !faulted.get()))
 }
 
+/// A key-descending walk that seeks only when pulled: `first`, then `prior(&key)` of whatever
+/// was last handed out. Unlike `std::iter::successors`, which computes the following row while
+/// handing out the current one, a pull on this walk costs at most one seek (the first pull is
+/// free), so a `last_record` that only needs the first row does one positioned lookup per tier.
+///
+/// The walk ends as soon as `prior` answers with a key that is not strictly below the previous
+/// one: a backend's `record_prior_to` may answer with its last row when the seek fails (MDBX
+/// does), and without this rule a tombstoned tail would loop forever. `first` is the caller's,
+/// so a floor on it is the caller's too.
+fn step_back<'i, T: Table>(
+    first: Option<(T::Key, T::Value)>,
+    prior: impl Fn(&T::Key) -> Option<(T::Key, T::Value)> + 'i,
+) -> DBIter<'i, T> {
+    let mut pending = first;
+    let mut last_key: Option<T::Key> = None;
+    Box::new(std::iter::from_fn(move || {
+        let next = match pending.take() {
+            Some(row) => Some(row),
+            None => {
+                let k = last_key.as_ref()?;
+                prior(k).filter(|(p, _)| p < k)
+            }
+        };
+        last_key = next.as_ref().map(|(k, _)| k.clone());
+        next
+    }))
+}
+
 /// Default cap on total cached rows (live and tombstoned) before the writer evicts settled keys.
 const DEFAULT_MAX_CACHE_SIZE: usize = 10000;
 
@@ -310,10 +338,10 @@ impl<'a, DB: Database> LayeredDbTx<'a, DB> {
         } else {
             db.get::<T>(key)?
                 .map(|value| (key.clone(), value))
-                .or_else(|| db.record_prior_to::<T>(key))
+                .or_else(|| db.record_prior_to::<T>(key).filter(|(p, _)| p < key))
         };
-        let db_iter: DBIter<'_, T> =
-            Box::new(std::iter::successors(db_first, move |(k, _)| db.record_prior_to::<T>(k)));
+        // the floor is applied here; every later step is floored inside `step_back`
+        let db_iter: DBIter<'_, T> = step_back::<T>(db_first, move |k| db.record_prior_to::<T>(k));
 
         let mem = &self.mem_db;
         let mem_first = if mem.is_tombstoned::<T>(key) {
@@ -321,15 +349,81 @@ impl<'a, DB: Database> LayeredDbTx<'a, DB> {
         } else {
             mem.get_no_marked_check::<T>(key).map(|(_, value)| (key.clone(), value))
         }
-        .or_else(|| mem.record_prior_to::<T>(key));
+        .or_else(|| mem.record_prior_to::<T>(key).filter(|(p, _)| p < key));
         let mem_iter: DBIter<'_, T> =
-            Box::new(std::iter::successors(mem_first, move |(k, _)| mem.record_prior_to::<T>(k)));
+            step_back::<T>(mem_first, move |k| mem.record_prior_to::<T>(k));
 
         let is_tombstoned: Box<dyn Fn(&T::Key) -> bool + '_> =
             Box::new(|k| self.mem_db.is_tombstoned::<T>(k));
         let hot: DBIter<'_, T> =
             Box::new(MergeJoinIter::<T>::reverse(db_iter, mem_iter, is_tombstoned));
         Ok(self.chain_cold::<T>(hot, Some(key), true))
+    }
+
+    /// The largest row strictly below `below` (or the largest row when `below` is `None`),
+    /// merged across the tiers.
+    ///
+    /// Backs `last_record` and `record_prior_to`. Each hot side starts by one positioned lookup
+    /// (`last_record` / `record_prior_to`) and steps back one seek per row, so the answer costs
+    /// O(log n) per tier rather than decoding every cached row of the table the way
+    /// `reverse_iter` does; the cold tier is consulted only when the hot tiers have no answer or
+    /// its sealed span could hold a higher key, so the usual case never reads a jar. That
+    /// matters because `last_record::<ConsensusBlocks>` runs once per gossiped certificate (see
+    /// `behind_consensus` in the primary handler); with the collecting `reverse_iter` behind it
+    /// the cost of every certificate delivery scaled with cache occupancy.
+    fn last_below<T: Table>(&self, below: Option<&T::Key>) -> Option<(T::Key, T::Value)> {
+        // The first step is floored here; every later step is floored inside `step_back`. A
+        // backend's `record_prior_to` may answer with its last row when the seek fails (MDBX
+        // does), which would otherwise pass a row at or above the floor through.
+        let db = &self.db;
+        let db_first = if self.mem_db.is_clearing::<T>() {
+            None
+        } else {
+            match below {
+                Some(key) => db.record_prior_to::<T>(key).filter(|(p, _)| p < key),
+                None => db.last_record::<T>(),
+            }
+        };
+        let db_iter: DBIter<'_, T> = step_back::<T>(db_first, move |k| db.record_prior_to::<T>(k));
+
+        let mem = &self.mem_db;
+        let mem_first = match below {
+            Some(key) => mem.record_prior_to::<T>(key).filter(|(p, _)| p < key),
+            None => mem.last_record::<T>(),
+        };
+        let mem_iter: DBIter<'_, T> =
+            step_back::<T>(mem_first, move |k| mem.record_prior_to::<T>(k));
+
+        let is_tombstoned: Box<dyn Fn(&T::Key) -> bool + '_> =
+            Box::new(|k| self.mem_db.is_tombstoned::<T>(k));
+        let mut hot: DBIter<'_, T> =
+            Box::new(MergeJoinIter::<T>::reverse(db_iter, mem_iter, is_tombstoned));
+
+        let first = hot.next();
+        if let Some((k, _)) = &first {
+            if !self.cold_may_hold_above::<T>(k) {
+                return first;
+            }
+        }
+        let hot: DBIter<'_, T> = Box::new(first.into_iter().chain(hot));
+        let mut merged = self.chain_cold::<T>(hot, below, true);
+        match below {
+            // the cold span is served at-or-below its floor; this walk is strictly below
+            Some(key) => merged.find(|(k, _)| k < key),
+            None => merged.next(),
+        }
+    }
+
+    /// Whether the cold tier could answer a walk-back with a key above `key` (index only).
+    #[cfg(feature = "cold-storage")]
+    fn cold_may_hold_above<T: Table>(&self, key: &T::Key) -> bool {
+        self.cold_tx().is_some_and(|tx| tx.may_hold_above::<T>(key))
+    }
+
+    /// Cold storage compiled out: the hot tiers are the whole answer.
+    #[cfg(not(feature = "cold-storage"))]
+    fn cold_may_hold_above<T: Table>(&self, _key: &T::Key) -> bool {
+        false
     }
 
     /// Chains the cold-ordered stream for `T` beneath `hot` (see [`merge_cold`]).
@@ -508,11 +602,11 @@ impl<'a, DB: Database> DbTx for LayeredDbTx<'a, DB> {
     }
 
     fn last_record<T: Table>(&self) -> Option<(T::Key, T::Value)> {
-        self.reverse_iter::<T>().next()
+        self.last_below::<T>(None)
     }
 
     fn record_prior_to<T: Table>(&self, key: &T::Key) -> Option<(T::Key, T::Value)> {
-        self.iter::<T>().take_while(|(k, _)| k < key).last()
+        self.last_below::<T>(Some(key))
     }
 
     fn disable_long_read_safety(&self) {
@@ -1108,6 +1202,20 @@ impl<DB: Database> LayeredDatabase<DB> {
         self
     }
 
+    /// The read transaction behind a database-level positioned walk. When one cannot be opened
+    /// (the persistent tier failing to begin a read transaction) the failure is logged and the
+    /// walk answers from the mem tier alone, as the collecting `reverse_iter` did before it:
+    /// callers treat `None` as "no row", and the cache usually holds the row they want.
+    fn walk_txn(&self, op: &'static str) -> Option<LayeredDbTx<'_, DB>> {
+        match self.read_txn() {
+            Ok(txn) => Some(txn),
+            Err(e) => {
+                tracing::error!(target: "storage", op, ?e, "failed to open a read transaction; answering from the mem tier");
+                None
+            }
+        }
+    }
+
     /// Attaches the cold tier point reads fall through to on a hot miss.
     ///
     /// Reads resolve mem -> db -> cold; writes and iteration never touch the cold tier.
@@ -1187,10 +1295,10 @@ impl<DB: Database> LayeredDatabase<DB> {
         } else {
             db.get::<T>(key)?
                 .map(|value| (key.clone(), value))
-                .or_else(|| db.record_prior_to::<T>(key))
+                .or_else(|| db.record_prior_to::<T>(key).filter(|(p, _)| p < key))
         };
-        let db_iter: DBIter<'_, T> =
-            Box::new(std::iter::successors(db_first, move |(k, _)| db.record_prior_to::<T>(k)));
+        // the floor is applied here; every later step is floored inside `step_back`
+        let db_iter: DBIter<'_, T> = step_back::<T>(db_first, move |k| db.record_prior_to::<T>(k));
 
         let mem = &self.mem_db;
         let mem_first = if mem.is_tombstoned::<T>(key) {
@@ -1198,9 +1306,9 @@ impl<DB: Database> LayeredDatabase<DB> {
         } else {
             mem.get_marked::<T>(key)?.map(|(_, value)| (key.clone(), value))
         }
-        .or_else(|| mem.record_prior_to::<T>(key));
+        .or_else(|| mem.record_prior_to::<T>(key).filter(|(p, _)| p < key));
         let mem_iter: DBIter<'_, T> =
-            Box::new(std::iter::successors(mem_first, move |(k, _)| mem.record_prior_to::<T>(k)));
+            step_back::<T>(mem_first, move |k| mem.record_prior_to::<T>(k));
 
         let is_tombstoned: Box<dyn Fn(&T::Key) -> bool + '_> =
             Box::new(|k| self.mem_db.is_tombstoned::<T>(k));
@@ -1300,6 +1408,14 @@ impl<DB: Database> Database for LayeredDatabase<DB> {
         let mem_db = self.mem_db.write_txn()?;
         self.tx.send(DBMessage::StartTxn).map_err(|_| eyre::eyre!("DB thread gone, FATAL!"))?;
         Ok(LayeredDbTxMut { mem_db, _db: self.db.clone(), tx: self.tx.clone() })
+    }
+
+    fn contains_key_in_memory<T: Table>(&self, key: &T::Key) -> bool {
+        // Mem tier only: a row evicted to the persistent tier answers `false` here even though
+        // `contains_key` would find it. Hot-path callers (the gossip handler skipping a
+        // re-delivered certificate) accept that miss rather than pay a persistent-tier read.
+        // tombstones answer false inside the mem lookup; one guard, one key encode
+        self.mem_db.contains_key_in_memory::<T>(key)
     }
 
     fn contains_key<T: Table>(&self, key: &T::Key) -> eyre::Result<bool> {
@@ -1456,12 +1572,20 @@ impl<DB: Database> Database for LayeredDatabase<DB> {
         self.chain_cold_raw::<T>(hot, None, true)
     }
 
+    // Both through one read transaction: a single hot snapshot for the whole walk, and one
+    // implementation of the positioned walk-back (`LayeredDbTx::last_below`).
     fn record_prior_to<T: Table>(&self, key: &T::Key) -> Option<(T::Key, T::Value)> {
-        self.iter::<T>().take_while(|(k, _)| k < key).last()
+        match self.walk_txn("record_prior_to") {
+            Some(txn) => txn.record_prior_to::<T>(key),
+            None => self.mem_db.record_prior_to::<T>(key),
+        }
     }
 
     fn last_record<T: Table>(&self) -> Option<(T::Key, T::Value)> {
-        self.reverse_iter::<T>().next()
+        match self.walk_txn("last_record") {
+            Some(txn) => txn.last_record::<T>(),
+            None => self.mem_db.last_record::<T>(),
+        }
     }
 
     fn persist(&self) -> impl Future<Output = eyre::Result<()>> + Send {
@@ -1800,6 +1924,9 @@ mod test {
         }
         fn contains_key<T: Table>(&self, key: &T::Key) -> eyre::Result<bool> {
             self.inner.contains_key::<T>(key)
+        }
+        fn contains_key_in_memory<T: Table>(&self, key: &T::Key) -> bool {
+            self.inner.contains_key_in_memory::<T>(key)
         }
         fn get<T: Table>(&self, key: &T::Key) -> eyre::Result<Option<T::Value>> {
             self.inner.get::<T>(key)
@@ -2675,6 +2802,85 @@ mod test {
                 (6, "six".to_string()),
             ]
         );
+    }
+
+    #[test]
+    fn test_layereddb_last_record_walks_past_tombstoned_tail() {
+        // `last_record` / `record_prior_to` are positioned walks, not a full-table decode: a
+        // tombstone in mem over the persistent tier's last row must be skipped, and the walk
+        // must pick the higher key across the two tiers.
+        let temp_dir = tempdir().expect("failed to create temp dir");
+        let db = open_mdbx_prepopulated(temp_dir.path(), &[(1, "one"), (3, "three"), (5, "five")]);
+
+        // mem holds the highest key
+        db.insert::<TestTable>(&6, &"six".to_string()).unwrap();
+        assert_eq!(db.last_record::<TestTable>(), Some((6, "six".to_string())));
+        assert_eq!(db.record_prior_to::<TestTable>(&6), Some((5, "five".to_string())));
+
+        // tombstone the mem row: the persistent tail is the answer again
+        db.remove::<TestTable>(&6).unwrap();
+        assert_eq!(db.last_record::<TestTable>(), Some((5, "five".to_string())));
+
+        // tombstone the persistent tail: the walk steps back over it
+        db.remove::<TestTable>(&5).unwrap();
+        assert_eq!(db.last_record::<TestTable>(), Some((3, "three".to_string())));
+        assert_eq!(db.record_prior_to::<TestTable>(&5), Some((3, "three".to_string())));
+        assert_eq!(db.record_prior_to::<TestTable>(&4), Some((3, "three".to_string())));
+        assert_eq!(db.record_prior_to::<TestTable>(&3), Some((1, "one".to_string())));
+        assert_eq!(db.record_prior_to::<TestTable>(&1), None);
+
+        // same answers through a read transaction
+        use rayls_infrastructure_types::DbTx as _;
+        let txn = db.read_txn().unwrap();
+        assert_eq!(txn.last_record::<TestTable>(), Some((3, "three".to_string())));
+        assert_eq!(txn.record_prior_to::<TestTable>(&5), Some((3, "three".to_string())));
+        drop(txn);
+
+        // and once the tombstones reach the persistent tier
+        db.sync_persist().expect("persist");
+        assert_eq!(db.last_record::<TestTable>(), Some((3, "three".to_string())));
+        assert_eq!(db.record_prior_to::<TestTable>(&5), Some((3, "three".to_string())));
+
+        // everything gone
+        db.remove::<TestTable>(&3).unwrap();
+        db.remove::<TestTable>(&1).unwrap();
+        assert_eq!(db.last_record::<TestTable>(), None);
+        assert_eq!(db.record_prior_to::<TestTable>(&100), None);
+    }
+
+    #[test]
+    fn test_layereddb_contains_key_in_memory_answers_from_the_cache_only() {
+        // A hit is definite; a miss (evicted or never cached) says nothing, and never costs a
+        // persistent-tier read. Tombstones are misses.
+        let temp_dir = tempdir().expect("failed to create temp dir");
+        let inner = MdbxDatabase::open(temp_dir.path()).expect("open mdbx");
+        inner.open_table::<TestTable>().expect("open table");
+        let db = LayeredDatabase::open_with_config(inner, CacheConfig { max_size: 2 });
+        db.open_table::<TestTable>().expect("open layered table");
+
+        db.insert::<TestTable>(&1, &"one".to_string()).unwrap();
+        db.insert::<TestTable>(&2, &"two".to_string()).unwrap();
+        db.insert::<TestTable>(&3, &"three".to_string()).unwrap();
+        assert!(db.contains_key_in_memory::<TestTable>(&3));
+
+        db.sync_persist().expect("persist");
+        // How many rows the writer evicted depends on its timing against the inserts, so
+        // assert the relationship: in-memory answers agree with the cache, every row is still
+        // in the store, and at least one row left the cache.
+        let mut evicted = 0;
+        for k in 1..=3u64 {
+            assert!(db.contains_key::<TestTable>(&k).unwrap(), "{k} is in the store");
+            let cached = db.mem_db.contains_key::<TestTable>(&k).unwrap();
+            assert_eq!(db.contains_key_in_memory::<TestTable>(&k), cached, "{k} agrees");
+            evicted += usize::from(!cached);
+        }
+        assert!(evicted >= 1, "a cache of two cannot hold three rows");
+
+        db.insert::<TestTable>(&4, &"four".to_string()).unwrap();
+        assert!(db.contains_key_in_memory::<TestTable>(&4), "freshly written: known in memory");
+        db.remove::<TestTable>(&4).unwrap();
+        assert!(!db.contains_key_in_memory::<TestTable>(&4), "tombstoned: a miss");
+        assert!(!db.contains_key_in_memory::<TestTable>(&99), "never written: a miss");
     }
 
     #[test]

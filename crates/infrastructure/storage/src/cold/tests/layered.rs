@@ -335,6 +335,36 @@ fn layered_reverse_and_prior_cross_tiers() {
     let first_hot = (EPOCHS as u64 - 1) * BLOCKS_PER_EPOCH;
     let (prior, _) = db.record_prior_to::<ConsensusBlocks>(&first_hot).expect("prior record");
     assert_eq!(prior, first_hot - 1, "the prior of the first hot row is the last archived row");
+
+    // A prior inside the cold span: the cold scan is capped at-or-below its floor, so the
+    // walk must still answer strictly below the key.
+    let archived = first_hot - 1;
+    let (prior, _) = db.record_prior_to::<ConsensusBlocks>(&archived).expect("cold prior");
+    assert_eq!(prior, archived - 1, "strictly below an archived key");
+    assert!(db.record_prior_to::<ConsensusBlocks>(&0).is_none(), "nothing below the first row");
+
+    // A mem update over the persisted hot tip is what `last_record` returns.
+    let tip = total - 1;
+    let updated = header_for(tip, EPOCHS - 1, BlockHash::repeat_byte(0xEE));
+    db.insert::<ConsensusBlocks>(&tip, &updated).expect("update tip");
+    let (last, value) = db.last_record::<ConsensusBlocks>().expect("last record");
+    assert_eq!(last, tip);
+    assert_eq!(encode(&value), encode(&updated), "the mem copy wins over the persisted row");
+    let txn = db.read_txn().expect("read txn");
+    let (last, _) = txn.last_record::<ConsensusBlocks>().expect("last record via txn");
+    assert_eq!(last, tip);
+    drop(txn);
+
+    // A hot row below the sealed span's end (an unpruned copy of block 1): the walk cannot
+    // answer from the hot tiers alone and must merge the cold span, where the higher archived
+    // rows win; below them the hot copy is still served.
+    let marker = header_for(1, 0, BlockHash::repeat_byte(0xAB));
+    db.insert::<ConsensusBlocks>(&1, &marker).expect("insert hot copy");
+    let (prior, _) = db.record_prior_to::<ConsensusBlocks>(&first_hot).expect("prior");
+    assert_eq!(prior, first_hot - 1, "the cold row above the hot copy is the answer");
+    let (prior, value) = db.record_prior_to::<ConsensusBlocks>(&2).expect("prior of 2");
+    assert_eq!(prior, 1);
+    assert_eq!(encode(&value), encode(&marker), "the hot copy wins on its own key");
 }
 
 /// A number present in both tiers surfaces once, with the hot copy winning, so a

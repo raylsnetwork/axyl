@@ -309,6 +309,9 @@ pub struct PrimaryMetrics {
     pub certificate_fetcher_consecutive_failures: IntGauge,
     /// count number of duplicate certificates that the node processed (others + own)
     pub duplicate_certificates_processed: IntCounter,
+    /// gossiped certificates dropped before verification because the memory tier already held
+    /// them (not counted in `duplicate_certificates_processed`, which covers verified copies)
+    pub gossip_certificates_skipped_in_memory: IntCounter,
     /// The current Narwhal round in proposer
     pub current_round: IntGauge,
     /// Latency distribution for generating proposals
@@ -438,6 +441,11 @@ impl PrimaryMetrics {
             duplicate_certificates_processed: register_int_counter_with_registry!(
                 "duplicate_certificates_processed",
                 "Number of certificates that node processed (others + own)",
+                registry
+            )?,
+            gossip_certificates_skipped_in_memory: register_int_counter_with_registry!(
+                "gossip_certificates_skipped_in_memory",
+                "Gossiped certificates dropped before verification because the memory tier already held them",
                 registry
             )?,
             current_round: register_int_gauge_with_registry!(

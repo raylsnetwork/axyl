@@ -147,6 +147,10 @@ pub trait CertificateStore {
     /// Check database for certificate.
     fn contains(&self, digest: &CertificateDigest) -> StoreResult<bool>;
 
+    /// True only when the certificate is present in the memory tier; `false` means "not known
+    /// without a persistent-tier read", not "absent". For hot paths that skip work on a hit.
+    fn contains_in_memory(&self, digest: &CertificateDigest) -> bool;
+
     /// Check database for multiple certificates.
     fn multi_contains<'a>(
         &self,
@@ -326,6 +330,10 @@ impl<DB: Database> CertificateStore for DB {
 
     fn contains(&self, digest: &CertificateDigest) -> StoreResult<bool> {
         self.contains_key::<Certificates>(digest)
+    }
+
+    fn contains_in_memory(&self, digest: &CertificateDigest) -> bool {
+        self.contains_key_in_memory::<Certificates>(digest)
     }
 
     fn multi_contains<'a>(

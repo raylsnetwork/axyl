@@ -64,6 +64,24 @@ impl<'c> ColdTx<'c> {
         typed_stream::<T>(self.cold, from, reverse, Rc::clone(&self.faulted))
     }
 
+    /// Whether the cold tier may hold a `T` row keyed above `key`. Index only, no jar read:
+    /// `false` for a table with no cold key order, an empty segment, or a `key` at or past the
+    /// end of the sealed span. Lets a walk-back that already has a hot answer skip the cold scan,
+    /// whose first step would otherwise read and decode the newest archived row.
+    pub(crate) fn may_hold_above<T: Table>(&self, key: &T::Key) -> bool {
+        if !matches!(cold_kind::<T>(), Some(ColdKind::ConsensusBlocks)) {
+            return false;
+        }
+        let Some(span) = self.cold.consensus_blocks().key_span() else {
+            return false;
+        };
+        match archived_number::<T>(key) {
+            Ok(n) => n < *span.end(),
+            // an undecodable key cannot be placed against the span: let the scan decide
+            Err(_) => true,
+        }
+    }
+
     /// The `'c`-bound raw scan, outliving the handle itself so a merging caller can own it.
     pub(crate) fn raw_scan<T: Table>(
         &self,

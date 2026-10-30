@@ -152,6 +152,15 @@ pub trait Database: Send + Sync + Clone + Unpin + 'static {
     /// Returns true if the map contains a value for the specified key.
     fn contains_key<T: Table>(&self, key: &T::Key) -> eyre::Result<bool>;
 
+    /// Returns true only when the key is known to be present without touching persistent
+    /// storage: a hit in the memory tier of a tiered database, or the full answer for a database
+    /// that lives in memory. `false` means "not known here", never "absent", so a caller uses it
+    /// to skip work on a hit and falls back to its normal path on a miss. The default is the
+    /// conservative answer for databases that would need a disk read.
+    fn contains_key_in_memory<T: Table>(&self, _key: &T::Key) -> bool {
+        false
+    }
+
     /// Returns the value for the given key from the map, if it exists.
     fn get<T: Table>(&self, key: &T::Key) -> eyre::Result<Option<T::Value>>;
 

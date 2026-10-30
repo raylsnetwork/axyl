@@ -614,6 +614,10 @@ impl Database for MemDatabase {
         self.read_txn_impl().contains_key::<T>(key)
     }
 
+    fn contains_key_in_memory<T: Table>(&self, key: &T::Key) -> bool {
+        contains_key_impl::<T>(&self.store.read(), key)
+    }
+
     fn get<T: Table>(&self, key: &T::Key) -> eyre::Result<Option<T::Value>> {
         self.read_txn_impl().get::<T>(key)
     }

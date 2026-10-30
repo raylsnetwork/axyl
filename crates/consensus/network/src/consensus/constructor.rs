@@ -23,6 +23,11 @@ use std::{
     time::{Duration, Instant},
 };
 
+/// How long gossipsub remembers a seen message id (`duplicate_cache_time`). Applies to both the
+/// primary and the worker network, which share the builder in `new`. See there for why this is
+/// far above the 60 s default.
+const GOSSIP_DUPLICATE_CACHE_TIME: Duration = Duration::from_secs(15 * 60);
+
 impl<Req, Res, DB, Events> ConsensusNetwork<Req, Res, DB, Events>
 where
     Req: RLMessage,
@@ -105,6 +110,22 @@ where
             // circuits). Peers negotiate gossipsub v1.2 per connection, so this is a no-op toward
             // peers that don't support it.
             .idontwant_on_publish(true)
+            // How long a seen message id is remembered. The default (60 s) is shorter than the
+            // time a message can spend in transit during a stall (in transport buffers on a
+            // stalled connection, or in the receiver's validation backlog): once that delay
+            // passes 60 s, every certificate that then arrives re-enters the receiving node as
+            // new, is re-verified, re-delivered and re-forwarded, and the mesh feeds on its own
+            // backlog until nodes are restarted (mainnet 2026-10-05, 2026-10-06, 2026-10-26:
+            // re-deliveries spaced exactly 60 s). 15 minutes is an order of magnitude above the
+            // delays seen in those stalls. The cache holds message ids only (~200 B each with
+            // the signed id scheme): at the ~20 messages/s mainnet sees across primary and
+            // worker topics that is ~4 MB; a storm at 120/s would reach ~20 MB. The cache has
+            // no size cap (gossipsub 0.49 expires entries only on insert) and an id is cached
+            // before the topic-subscription check, so a connected peer can grow it at wire rate
+            // with validly signed messages on topics we never validate, now for 15 min instead
+            // of 60 s. Accepted: ~200 B per id means ~10 MB per minute of sustained spam from
+            // one peer, bounded by `max_peers`, and nothing else in the node keys on it.
+            .duplicate_cache_time(GOSSIP_DUPLICATE_CACHE_TIME)
             .build()?;
         let gossipsub = gossipsub::Behaviour::new(
             gossipsub::MessageAuthenticity::Signed(keypair.clone()),
