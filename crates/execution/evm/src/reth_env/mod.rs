@@ -24,6 +24,7 @@ mod tests;
 pub use chain::ChainSpec;
 pub use config::{RethCommand, RethConfig};
 pub use env::RethEnv;
+pub use init::TEST_DB_MAX_SIZE;
 pub use types::{
     ExecutedBatchDigestReceiver, FailedTxNotification, NonceTooHighDetail, RethDb, RpcServer,
     SparseRootFn, ToTree, TxValidationCounts,

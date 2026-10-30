@@ -42,7 +42,7 @@ fn test_execution_db_default_page_size() -> eyre::Result<()> {
 
     let page_size = |db: &RethDb| db.stat().expect("stat").page_size() as usize;
     let geometry_lower = |db: &RethDb| db.info().expect("info").geometry().min();
-    let default_config = RethConfig(NodeConfig::default());
+    let default_config = RethConfig(test_node_config());
 
     // fresh database
     {
@@ -53,8 +53,9 @@ fn test_execution_db_default_page_size() -> eyre::Result<()> {
 
     // `--db.page-size`, parsed the way the node CLI does, overrides the default
     {
-        let cmd = RethCommand::try_parse_from(["rayls", "--db.page-size", "8KB"])?;
+        let mut cmd = RethCommand::try_parse_from(["rayls", "--db.page-size", "8KB"])?;
         assert_eq!(cmd.db.page_size, Some(8 * 1024));
+        cmd.db.max_size = Some(TEST_DB_MAX_SIZE);
         let cli_config = RethConfig(NodeConfig { db: cmd.db, ..NodeConfig::default() });
         let tmp_dir = TempDir::new()?;
         let db = RethEnv::new_database(&cli_config, tmp_dir.path())?;
@@ -67,7 +68,11 @@ fn test_execution_db_default_page_size() -> eyre::Result<()> {
     const LEGACY_PAGE_SIZE: usize = 4096;
     let legacy_dir = TempDir::new()?;
     let legacy_config = RethConfig(NodeConfig {
-        db: DatabaseArgs { page_size: Some(LEGACY_PAGE_SIZE), ..Default::default() },
+        db: DatabaseArgs {
+            page_size: Some(LEGACY_PAGE_SIZE),
+            max_size: Some(TEST_DB_MAX_SIZE),
+            ..Default::default()
+        },
         ..NodeConfig::default()
     });
     let legacy_geometry_lower = {
@@ -92,7 +97,6 @@ fn test_execution_db_default_page_size() -> eyre::Result<()> {
 #[test]
 fn test_execution_db_recovers_zeroed_meta_page_0() -> eyre::Result<()> {
     use rayls_infrastructure_utils::mdbx::DEFAULT_MDBX_PAGE_SIZE;
-    use reth::builder::NodeConfig;
     use reth_db::{
         tables,
         transaction::{DbTx as _, DbTxMut as _},
@@ -100,14 +104,14 @@ fn test_execution_db_recovers_zeroed_meta_page_0() -> eyre::Result<()> {
     };
     use std::io::{Seek as _, SeekFrom, Write as _};
 
-    let default_config = RethConfig(NodeConfig::default());
+    let default_config = RethConfig(test_node_config());
 
     for page_size in [DEFAULT_MDBX_PAGE_SIZE, 64 * 1024] {
         let dir = TempDir::new()?;
 
         // A fresh datafile at this page size with one row.
         {
-            let mut node_config = NodeConfig::default();
+            let mut node_config = test_node_config();
             node_config.db.page_size = Some(page_size);
             let db = RethEnv::new_database(&RethConfig(node_config), dir.path())?;
             assert_eq!(db.stat().expect("stat").page_size() as usize, page_size);
@@ -151,13 +155,49 @@ fn test_execution_db_rejects_unsupported_page_size() {
 #[test]
 fn test_execution_db_existing_datafile_ignores_unsupported_page_size() -> eyre::Result<()> {
     use rayls_infrastructure_utils::mdbx::DEFAULT_MDBX_PAGE_SIZE;
-    use reth::builder::NodeConfig;
     let dir = TempDir::new()?;
-    drop(RethEnv::new_database(&RethConfig(NodeConfig::default()), dir.path())?);
-    let mut node_config = NodeConfig::default();
+    drop(RethEnv::new_database(&RethConfig(test_node_config()), dir.path())?);
+    let mut node_config = test_node_config();
     node_config.db.page_size = Some(2048);
     let db = RethEnv::new_database(&RethConfig(node_config), dir.path())?;
     assert_eq!(db.stat().expect("stat").page_size() as usize, DEFAULT_MDBX_PAGE_SIZE);
+    Ok(())
+}
+
+/// Node config with the reth database capped at [`TEST_DB_MAX_SIZE`].
+fn test_node_config() -> reth::builder::NodeConfig<reth_chainspec::ChainSpec> {
+    let mut node_config = reth::builder::NodeConfig::default();
+    node_config.db.max_size = Some(TEST_DB_MAX_SIZE);
+    node_config
+}
+
+/// Temp envs map at most 64 GiB of address space for their reth database, not 8 TiB.
+#[tokio::test]
+async fn test_temp_env_db_map_is_capped() -> eyre::Result<()> {
+    use crate::RaylsChainSpec;
+    const CAP: usize = 64 * 1024 * 1024 * 1024;
+    let mapped = |env: &RethEnv| env.provider_factory.db_ref().info().expect("info").map_size();
+    let chain = rayls_infrastructure_types::test_chain_spec_arc();
+    let task_manager = TaskManager::new("Test Task Manager");
+
+    let tmp_dir = TempDir::new()?;
+    let env =
+        RethEnv::new_for_temp_chain(chain.clone(), tmp_dir.path(), &task_manager, None).await?;
+    let mapped_bytes = mapped(&env);
+    assert!(mapped_bytes <= CAP, "new_for_temp_chain maps {mapped_bytes} bytes");
+
+    let tmp_dir = TempDir::new()?;
+    let rayls_chain_spec = Arc::new(RaylsChainSpec::builder(chain.clone()).build());
+    let env = RethEnv::new_for_temp_chain_with_rayls_spec(
+        chain,
+        rayls_chain_spec,
+        tmp_dir.path(),
+        &task_manager,
+        None,
+    )
+    .await?;
+    let mapped_bytes = mapped(&env);
+    assert!(mapped_bytes <= CAP, "new_for_temp_chain_with_rayls_spec maps {mapped_bytes} bytes");
     Ok(())
 }
 
@@ -499,7 +539,7 @@ async fn test_genesis_alloc_hashed_and_readable_in_storage_v2() -> eyre::Result<
     let datadir = tmp_dir.path().to_path_buf();
     let db = Arc::new(reth_db::init_db(
         datadir.join("db"),
-        reth_db::mdbx::DatabaseArguments::default(),
+        reth_db::mdbx::DatabaseArguments::default().with_geometry_max_size(Some(TEST_DB_MAX_SIZE)),
     )?);
     let rayls_chain_spec = Arc::new(
         crate::chainspec::RaylsChainSpec::builder(Arc::new(RethChainSpec::from(
@@ -1605,7 +1645,7 @@ async fn test_fix_genesis_history_rekeys_and_preserves_post_genesis() -> eyre::R
     let datadir = tmp_dir.path().to_path_buf();
     let db = Arc::new(reth_db::init_db(
         datadir.join("db"),
-        reth_db::mdbx::DatabaseArguments::default(),
+        reth_db::mdbx::DatabaseArguments::default().with_geometry_max_size(Some(TEST_DB_MAX_SIZE)),
     )?);
     let rayls_chain_spec = Arc::new(
         crate::chainspec::RaylsChainSpec::builder(Arc::new(RethChainSpec::from(genesis))).build(),
@@ -1764,7 +1804,7 @@ async fn test_fix_genesis_account_history_seeds_after_clear_and_skips_multishard
     let datadir = tmp_dir.path().to_path_buf();
     let db = Arc::new(reth_db::init_db(
         datadir.join("db"),
-        reth_db::mdbx::DatabaseArguments::default(),
+        reth_db::mdbx::DatabaseArguments::default().with_geometry_max_size(Some(TEST_DB_MAX_SIZE)),
     )?);
     let rayls_chain_spec = Arc::new(
         crate::chainspec::RaylsChainSpec::builder(Arc::new(RethChainSpec::from(genesis))).build(),
