@@ -26,6 +26,15 @@ ENV VERGEN_GIT_SHA=${VERGEN_GIT_SHA:-0000000000000000000000000000000000000000}
 # `node --dev` chains. Empty (default) -> a production build with no extra features.
 ARG BUILD_FEATURES=""
 
+# Devnet profiling build: keep frame pointers in every Rust function and in blst's C layer so
+# `perf record --call-graph fp` walks the stack in the kernel. perf's DWARF unwinder cannot
+# step through this binary's Rust frames even with full unwind tables present, so frame
+# pointers are the only way to see who calls BLS verification. Costs one general register;
+# a low single-digit percent at most. blst's assembly still uses rbp as scratch, so samples
+# inside it keep losing their first link.
+ENV RUSTFLAGS="-C force-frame-pointers=yes"
+ENV CFLAGS="-fno-omit-frame-pointer"
+
 # move binary out of cache for subsequent build steps
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
