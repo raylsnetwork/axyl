@@ -16,5 +16,7 @@ mod faucet;
 mod genesis_tests;
 #[cfg(not(feature = "dev-single-node-setup"))]
 mod restarts;
+#[cfg(not(feature = "dev-single-node-setup"))]
+mod statesync_anchor_republish;
 
 fn main() {}
