@@ -8,12 +8,15 @@ use libp2p::{
         behaviour::ConnectionEstablished,
         dial_opts::{DialOpts, PeerCondition},
         dummy::ConnectionHandler,
-        ConnectionClosed, ConnectionDenied, ConnectionId, DialError, DialFailure, FromSwarm,
-        NetworkBehaviour, THandler, THandlerInEvent, ToSwarm,
+        CloseConnection, ConnectionClosed, ConnectionDenied, ConnectionId, DialError, DialFailure,
+        FromSwarm, NetworkBehaviour, THandler, THandlerInEvent, ToSwarm,
     },
     Multiaddr, PeerId,
 };
-use std::task::{Context, Poll};
+use std::{
+    task::{Context, Poll},
+    time::Instant,
+};
 use tracing::{debug, error, info, trace};
 
 #[cfg(test)]
@@ -123,10 +126,12 @@ impl NetworkBehaviour for PeerManager {
         match event {
             FromSwarm::ConnectionEstablished(ConnectionEstablished {
                 peer_id,
+                connection_id,
                 endpoint,
                 other_established,
                 ..
             }) => {
+                self.track_connection_opened(peer_id, connection_id, Instant::now());
                 // NOTE: The ConnectionEstablished event must be handled because
                 // NetworkBehaviour::handle_established_inbound_connection and
                 // NetworkBehaviour::handle_established_outbound_connection are fallible.
@@ -137,10 +142,14 @@ impl NetworkBehaviour for PeerManager {
             }
             FromSwarm::ConnectionClosed(ConnectionClosed {
                 peer_id,
+                connection_id,
                 endpoint,
                 remaining_established,
                 ..
-            }) => self.on_connection_closed(peer_id, endpoint, remaining_established),
+            }) => {
+                self.on_connection_closed(peer_id, endpoint, remaining_established);
+                self.track_connection_closed(peer_id, connection_id);
+            }
             FromSwarm::DialFailure(DialFailure { peer_id, error, connection_id: _ }) => {
                 debug!(target: "peer-manager", ?peer_id, ?error, "failed to dial peer");
                 self.on_dial_failure(peer_id, error);
@@ -174,6 +183,15 @@ impl NetworkBehaviour for PeerManager {
         // poll heartbeat
         while self.heartbeat_ready(cx) {
             self.heartbeat();
+        }
+
+        // replace a peer's stale connection: close every connection to it so the next one is a
+        // first connection again for gossipsub (which only sends subscriptions then)
+        if let Some(peer_id) = self.next_connection_reset() {
+            return Poll::Ready(ToSwarm::CloseConnection {
+                peer_id,
+                connection: CloseConnection::All,
+            });
         }
 
         // pass the next event to the swarm if the manager's events aren't empty
