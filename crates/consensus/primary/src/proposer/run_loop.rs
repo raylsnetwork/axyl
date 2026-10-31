@@ -1,4 +1,5 @@
 use crate::{
+    certificate_fetcher::CertificateFetcherCommand,
     error::ProposerResult,
     proposer::{
         Proposer, BACKPRESSURE_DELAY, EXECUTION_BACKPRESSURE_DELAY, EXECUTION_LAG_THRESHOLD,
@@ -299,6 +300,16 @@ impl<DB: Database> Proposer<DB> {
                         min_delay_timed_out = false;
                     } else {
                         warn!(target: "primary::proposer", interval=?self.max_delay_interval.period(), self_round = self.round, self_epoch = self.committee.epoch(), last_proposed_round = last_proposed.round(), last_proposed_epoch = last_proposed.epoch(), last_proposed_digest = ?last_proposed.digest(), "re-proposing last header after max delay interval expired");
+                        // No quorum of parents after the max header delay. Either a certificate
+                        // of the round exists but never reached us (lost gossip), which only a
+                        // fetch recovers, or the round's headers are still short of votes, and
+                        // the probe finds nothing (its failure backoff spaces later ones). Ask
+                        // peers now instead of waiting for the fetcher's idle probe. A full
+                        // channel means fetcher work is already queued.
+                        let _ = self
+                            .consensus_bus
+                            .certificate_fetcher()
+                            .try_send(CertificateFetcherCommand::Probe);
                         let (tx, rx) = oneshot::channel();
                         let consensus_bus = self.consensus_bus.clone();
                         let proposer_store = self.proposer_store.clone();

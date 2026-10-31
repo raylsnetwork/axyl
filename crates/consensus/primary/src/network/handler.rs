@@ -241,6 +241,10 @@ where
                     topic.to_string().eq(&LibP2pConfig::primary_topic()),
                     PrimaryNetworkError::InvalidTopic
                 );
+                #[cfg(feature = "cert-gossip-drop-hook")]
+                if crate::test_hooks::drop_certificate_gossip(cert.epoch(), cert.round(), false) {
+                    return Ok(());
+                }
                 let unverified_cert = cert.validate_received().map_err(CertManagerError::from)?;
 
                 let epoch = unverified_cert.header().epoch;
