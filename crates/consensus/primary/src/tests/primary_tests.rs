@@ -1330,3 +1330,54 @@ fn test_missing_cert_slots_limit_each_outsider() {
     drop(other_jobs);
     assert_eq!(limits.tracked_outsiders(), 0);
 }
+
+/// Every member of a large committee can use its own share of jobs.
+///
+/// Otherwise faulty members could hold the whole committee pool.
+#[test]
+fn test_missing_cert_slots_grow_with_the_committee() {
+    use crate::network::handler::{
+        MissingCertLimits, MISSING_CERT_JOBS_COMMITTEE, MISSING_CERT_JOBS_PER_PEER,
+    };
+
+    let committee_size = MISSING_CERT_JOBS_COMMITTEE / MISSING_CERT_JOBS_PER_PEER + 1;
+    let fixture = CommitteeFixture::builder(MemDatabase::default)
+        .committee_size(NonZeroUsize::new(committee_size).unwrap())
+        .build();
+    let limits = MissingCertLimits::new();
+    let slots = limits.for_committee(&fixture.committee());
+
+    let jobs: Vec<_> = fixture
+        .authorities()
+        .flat_map(|member| {
+            let key = member.primary_public_key();
+            (0..MISSING_CERT_JOBS_PER_PEER).map(move |_| key)
+        })
+        .map(|key| slots.acquire(key).expect("slot for every member"))
+        .collect();
+    assert_eq!(jobs.len(), committee_size * MISSING_CERT_JOBS_PER_PEER);
+    assert_eq!(limits.free_committee_slots(), 0);
+}
+
+/// Only `Busy` is a recoverable answer to a missing-certificates request.
+///
+/// The requester reads a recoverable answer to that request as busy.
+#[test]
+fn test_only_busy_is_a_recoverable_missing_certs_answer() {
+    use rayls_infrastructure_types::error::StoreError;
+
+    // Every error a missing-certificates request can return.
+    let errors = [
+        PrimaryNetworkError::Busy,
+        PrimaryNetworkError::TooManyAuthorities(2, 1),
+        PrimaryNetworkError::InvalidRequest("bad request".into()),
+        PrimaryNetworkError::Internal("join error".into()),
+        PrimaryNetworkError::Storage(StoreError::msg("read failed")),
+    ];
+    for error in errors {
+        let busy = matches!(error, PrimaryNetworkError::Busy);
+        let answer = PrimaryResponse::into_error_ref(&error);
+        let recoverable = matches!(answer, PrimaryResponse::RecoverableError(_));
+        assert_eq!(recoverable, busy, "{error} answered as {answer:?}");
+    }
+}

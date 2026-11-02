@@ -878,6 +878,7 @@ where
             return Err(PrimaryNetworkError::TooManyAuthorities(named, limit));
         }
         let permits = self.missing_cert_slots.acquire(peer).inspect_err(|_| {
+            self.consensus_bus.primary_metrics().node_metrics.missing_cert_requests_busy.inc();
             debug!(target: "primary::handler", %peer, "too many missing-certificates requests in progress");
         })?;
 
@@ -1057,11 +1058,13 @@ pub(crate) fn max_requested_authorities(committee_size: usize) -> usize {
 
 // `clamp` panics if its floor is above its ceiling, so this is checked when building.
 const _: () = assert!(MIN_REQUESTED_AUTHORITIES <= MAX_SKIP_ROUND_AUTHORITIES);
+
 /// Missing-certificate jobs one committee peer may have running at once.
 pub(crate) const MISSING_CERT_JOBS_PER_PEER: usize = 2;
-/// Missing-certificate jobs that committee peers may have running at once, in total.
-const MISSING_CERT_JOBS_COMMITTEE: usize = 64;
+/// Smallest committee pool, grown so every member can use its share.
+pub(crate) const MISSING_CERT_JOBS_COMMITTEE: usize = 64;
 /// Missing-certificate jobs that other peers may have running at once, in total.
+/// A few outside peers together can still fill it.
 pub(crate) const MISSING_CERT_JOBS_OTHERS: usize = 4;
 /// Missing-certificate jobs one outside peer may have running at once.
 /// Honest nodes send each peer one request at a time.
@@ -1080,6 +1083,8 @@ type OutsiderJobs = Arc<Mutex<HashMap<BlsPublicKey, usize>>>;
 pub(crate) struct MissingCertLimits {
     /// Pool for committee peers.
     committee: Arc<Semaphore>,
+    /// Permits the committee pool was made with, including any growth.
+    committee_capacity: Mutex<usize>,
     /// Smaller pool for every other peer, so observers cannot starve committee catch-up.
     others: Arc<Semaphore>,
     /// Running jobs per outside peer.
@@ -1091,6 +1096,7 @@ impl MissingCertLimits {
     pub(crate) fn new() -> Self {
         Self {
             committee: Arc::new(Semaphore::new(MISSING_CERT_JOBS_COMMITTEE)),
+            committee_capacity: Mutex::new(MISSING_CERT_JOBS_COMMITTEE),
             others: Arc::new(Semaphore::new(MISSING_CERT_JOBS_OTHERS)),
             outsider_jobs: Default::default(),
         }
@@ -1101,6 +1107,15 @@ impl MissingCertLimits {
     /// A member that stays in the next committee gets a new pool there.
     /// For one epoch change it may run twice its share, still within the committee pool.
     pub(crate) fn for_committee(&self, committee: &Committee) -> MissingCertSlots {
+        // Faulty members must never hold the whole pool.
+        // It only grows, so jobs from an earlier epoch keep their permits.
+        let needed = MISSING_CERT_JOBS_PER_PEER * committee.size();
+        let mut capacity = self.committee_capacity.lock();
+        if needed > *capacity {
+            self.committee.add_permits(needed - *capacity);
+            *capacity = needed;
+        }
+        drop(capacity);
         let per_peer = committee
             .authorities()
             .iter()
