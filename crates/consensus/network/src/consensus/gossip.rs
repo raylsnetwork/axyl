@@ -21,6 +21,25 @@ where
     pub(super) fn process_gossip_event(&mut self, event: GossipEvent) -> NetworkResult<()> {
         match event {
             GossipEvent::Message { propagation_source, message_id, message } => {
+                // CHAOS: gossipsub only emits a message id it has no record of, so a second
+                // emission means its duplicate cache expired before this copy arrived. Log it
+                // with the age since the first acceptance (first time is kept, so repeats show
+                // growing ages).
+                if let Some(seen) = self.chaos_seen_gossip.as_mut() {
+                    let now = std::time::Instant::now();
+                    let first = *seen.entry(message_id.clone()).or_insert(now);
+                    if first != now {
+                        info!(
+                            target: "network::chaos",
+                            network = self.network_label,
+                            %message_id,
+                            %propagation_source,
+                            topic = %message.topic,
+                            age_s = now.duration_since(first).as_secs(),
+                            "gossip message re-accepted"
+                        );
+                    }
+                }
                 trace!(target: "network", topic=?self.authorized_publishers.keys(), ?propagation_source, ?message_id, ?message, "message received from publisher");
                 // verify message was published by authorized node
                 let msg_acceptance = self.verify_gossip(&message);

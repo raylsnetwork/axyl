@@ -143,4 +143,9 @@ where
     /// Resolver for `/dnsaddr` committee peers, used to discover (and prune-protect) the relays a
     /// node dials through -- so the relay set is learned from DNS rather than configured.
     relay_resolver: hickory_resolver::TokioResolver,
+    /// CHAOS (local experiments only): when the gossip delay toggle is enabled, the first time
+    /// each gossip message id was accepted, so a later acceptance of the same id (gossipsub's
+    /// duplicate cache expired before a late copy arrived) is logged with its age. `None` on
+    /// normal runs. Pruned after 15 minutes in the run loop's cleanup.
+    chaos_seen_gossip: Option<HashMap<libp2p::gossipsub::MessageId, Instant>>,
 }

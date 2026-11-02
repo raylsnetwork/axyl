@@ -252,6 +252,7 @@ where
             relay_reservations: Default::default(),
             relay_resolver,
             connection_paths: Default::default(),
+            chaos_seen_gossip: super::runtime::chaos_gossip_delay_path().map(|_| HashMap::new()),
         })
     }
 
