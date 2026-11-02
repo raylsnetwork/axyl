@@ -621,7 +621,7 @@ async fn one_busy_peer_does_not_hide_empty_answers() {
     }
 }
 
-/// An unreachable or silent peer does not hide that the others are busy.
+/// An unreachable peer or a local send error does not hide busy answers.
 ///
 /// One validator down is common, often while the others are busy.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
@@ -630,8 +630,17 @@ async fn an_unreachable_peer_does_not_hide_busy_answers() {
     let peers = fixture.committee().size() - 1;
     let threshold = STALE_SKIP_ROUNDS_FALLBACK_THRESHOLD.max(STALE_SKIP_ROUNDS_CATCHUP_THRESHOLD);
 
+    // How the first peer fails: no error means it never answers.
+    type Failure = fn() -> Option<NetworkError>;
+    let failures: [(&str, Failure); 4] = [
+        ("disconnected", || Some(NetworkError::Disconnected)),
+        ("queue overflow", || Some(NetworkError::RequestQueueOverflow)),
+        ("ack closed", || Some(NetworkError::AckChannelClosed("dropped".into()))),
+        ("silent", || None),
+    ];
+
     for mode in [NodeMode::CvvActive, NodeMode::CvvInactive] {
-        for silent in [false, true] {
+        for (case, failure) in failures {
             let mut fetcher = FetcherUnderTest::start(&fixture, vec![], mode).await;
             // Requests the silent peer never answers, kept open so they time out.
             let mut unanswered = vec![];
@@ -640,14 +649,14 @@ async fn an_unreachable_peer_does_not_hide_busy_answers() {
                 for peer in 0..peers {
                     let (request, reply) = fetcher.next_request().await;
                     let (lower_bound, _) = request.get_bounds(max_skip_rounds(), |_| true).unwrap();
-                    assert_eq!(lower_bound, STORED_ROUND, "{mode:?}, silent {silent}");
+                    assert_eq!(lower_bound, STORED_ROUND, "{mode:?}, {case}");
                     if peer > 0 {
                         let busy = PrimaryResponse::into_error_ref(&PrimaryNetworkError::Busy);
                         let _ = reply.send(Ok(busy));
-                    } else if silent {
-                        unanswered.push(reply);
+                    } else if let Some(error) = failure() {
+                        let _ = reply.send(Err(error));
                     } else {
-                        let _ = reply.send(Err(NetworkError::Disconnected));
+                        unanswered.push(reply);
                     }
                 }
             }

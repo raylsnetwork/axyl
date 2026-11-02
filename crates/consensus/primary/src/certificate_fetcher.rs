@@ -101,7 +101,10 @@ impl FetchAnswers {
             | NetworkError::Disconnected
             | NetworkError::PeerNotConnected
             | NetworkError::PeerMissing
-            | NetworkError::NoPeers => {}
+            | NetworkError::NoPeers
+            // Our own network task failed, which says nothing about the peer.
+            | NetworkError::RequestQueueOverflow
+            | NetworkError::AckChannelClosed(_) => {}
             _ => self.failed = true,
         }
     }
