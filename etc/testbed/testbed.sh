@@ -16,12 +16,13 @@ usage: $0 <command>
   add-validator           add validator-5 and stake it into the committee
   add-rpc                 add an rpc (observer) node
   logs <node>             follow a node's log
-  load                    send a steady stream of etc/tps transfers until Ctrl-C
+  load                    send a steady stream of tps-checker transfers until Ctrl-C
   test [plan|plan/test]   run tests (default: basic). Plans: $(ls "$TESTBED/tests" | tr '\n' ' ')
                           'all' = basic chaos extended basic chaos; LOAD=1 runs them under load
 
 settings (env): RAYLS_BIN, TESTBED_DATA, EPOCH_SECS ($EPOCH_SECS), HTTP_ADDR ($HTTP_ADDR),
-                LOG_LEVEL ($LOG_LEVEL), NODE_ARGS, GENESIS_ARGS, LOAD_TXS, SOAK_MINUTES, SOAK_INTERVAL
+                LOG_LEVEL ($LOG_LEVEL), NODE_ARGS, GENESIS_ARGS, LOAD_TPS, LOAD_WALLETS,
+                TPS_CHECKER_DIR, TPS_CHECKER_BIN, SOAK_MINUTES, SOAK_INTERVAL
 EOF
     exit 1
 }
