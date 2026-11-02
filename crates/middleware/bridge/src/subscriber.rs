@@ -763,7 +763,7 @@ impl<DB: Database> Subscriber<DB> {
                     match result {
                         Some(consensus_header) => {
                             let number = consensus_header.number;
-                            // drop a later epoch before verifying: this committee cannot handle it
+                            // later epoch: drop unverified, never touch the watermark (see #295)
                             if consensus_header.sub_dag.leader_epoch() > self.inner.committee.epoch()
                             {
                                 info!(
@@ -771,7 +771,7 @@ impl<DB: Database> Subscriber<DB> {
                                     number,
                                     epoch = consensus_header.sub_dag.leader_epoch(),
                                     current_epoch = self.inner.committee.epoch(),
-                                    "catch-up: dropping header of a later epoch (belongs to the next epoch)"
+                                    "catch-up: dropping unverified header of a later epoch"
                                 );
                                 continue;
                             }

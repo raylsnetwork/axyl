@@ -53,7 +53,7 @@ fn commit(
     ConsensusHeader { parent_hash: B256::default(), sub_dag, number, extra: B256::default() }
 }
 
-async fn sync_across_validator_join(mode: NodeMode) -> eyre::Result<()> {
+async fn sync_across_validator_join(mode: NodeMode, next_epoch_keys: bool) -> eyre::Result<()> {
     let before = CommitteeFixture::builder(MemDatabase::default)
         .epoch(0)
         .with_rng(StdRng::seed_from_u64(SEED))
@@ -81,14 +81,18 @@ async fn sync_across_validator_join(mode: NodeMode) -> eyre::Result<()> {
     config.set_epoch_boundary(u64::MAX);
 
     // The certified epoch-0 record names the epoch-1 committee, so epoch-1 commits verify.
-    let record = EpochRecord {
-        epoch: 0,
-        committee: before.committee().bls_keys(),
-        next_committee: after.committee().bls_keys(),
-        ..Default::default()
-    };
-    config.node_storage().with_write_txn(|txn| txn.insert::<EpochRecords>(&0, &record))?;
-    assert_eq!(config.get_committee_keys_for_epoch(1), Some(after.committee().bls_keys()));
+    if next_epoch_keys {
+        let record = EpochRecord {
+            epoch: 0,
+            committee: before.committee().bls_keys(),
+            next_committee: after.committee().bls_keys(),
+            ..Default::default()
+        };
+        config.node_storage().with_write_txn(|txn| txn.insert::<EpochRecords>(&0, &record))?;
+        assert_eq!(config.get_committee_keys_for_epoch(1), Some(after.committee().bls_keys()));
+    } else {
+        assert_eq!(config.get_committee_keys_for_epoch(1), None);
+    }
 
     // 1: an epoch-0 commit; 2: the new validator's first epoch-1 commit; 2 again: an epoch-0 one.
     let batches: Vec<Batch> =
@@ -157,7 +161,10 @@ async fn sync_across_validator_join(mode: NodeMode) -> eyre::Result<()> {
              {joined} who joined in epoch 1): {exited:?}"
         ),
         output = timeout(WAIT, outputs.recv()) => {
-            let output = output?.expect("consensus output channel open");
+            // without the keys, verifying first would wait 30 s, longer than WAIT
+            let output = output
+                .map_err(|_| eyre::eyre!("{mode:?} subscriber did not take commit 2 in time"))?
+                .expect("consensus output channel open");
             assert_eq!(output.number, 2, "{mode:?} subscriber skipped commit 2");
             assert_eq!(output.sub_dag.leader.digest(), expected, "{mode:?} took the epoch-1 commit");
         }
@@ -179,11 +186,17 @@ async fn sync_across_validator_join(mode: NodeMode) -> eyre::Result<()> {
 /// An observer following the chain across the epoch where a validator joined.
 #[tokio::test]
 async fn observer_syncs_across_validator_join() -> eyre::Result<()> {
-    sync_across_validator_join(NodeMode::Observer).await
+    sync_across_validator_join(NodeMode::Observer, true).await
 }
 
 /// A validator catching up (to rejoin) across the epoch where a validator joined.
 #[tokio::test]
 async fn rejoining_validator_syncs_across_validator_join() -> eyre::Result<()> {
-    sync_across_validator_join(NodeMode::CvvInactive).await
+    sync_across_validator_join(NodeMode::CvvInactive, true).await
+}
+
+/// The later-epoch commit is dropped before it is verified, so missing keys do not hold it up.
+#[tokio::test]
+async fn later_epoch_commit_is_dropped_before_verifying() -> eyre::Result<()> {
+    sync_across_validator_join(NodeMode::Observer, false).await
 }
