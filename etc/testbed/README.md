@@ -10,8 +10,11 @@ gets the same chain id, accounts and ports.
 - A Rust toolchain. `up` builds `target/release/rayls-network`; set `RAYLS_BIN` to use a prebuilt
   binary instead.
 - Foundry `cast`, `curl`.
-- Optional: `jq` for `extended/04-erc20-precompile`, Node.js 22+ for `load`, `soak` and
-  `extended/05-tps`.
+- Optional: `jq` for `extended/04-erc20-precompile`.
+- For `load`, `soak` and `extended/05-tps`: [tps-checker](https://github.com/raylsnetwork/tps-checker),
+  checked out next to this repo (`../tps-checker`). If it isn't there, the testbed clones it and
+  builds it, which needs access to the repo. To use another checkout or binary, set
+  `TPS_CHECKER_DIR` or `TPS_CHECKER_BIN`.
 
 ## Quick start
 
@@ -27,8 +30,15 @@ gets the same chain id, accounts and ports.
 
 ### Load and overnight soak
 
-`etc/tps` can keep a steady stream of transfers going. It sends back-to-back batches of `LOAD_TXS`
-transfers (default 500) through validator-1 and logs to `data/load.log`.
+tps-checker keeps a steady stream of transfers going. It runs in continuous mode at `LOAD_TPS`
+(default 200) from `LOAD_WALLETS` wallets (default 4), sends through validator-1, and logs to
+`data/load.log`.
+
+- The wallets come from the test mnemonic starting at index 10, so they never share a nonce with
+  the admin or operator accounts.
+- The testbed funds them up front.
+- The gas price is twice the base fee.
+- If tps-checker exits, for example because validator-1 was restarted, it is started again.
 
 ```sh
 ./etc/testbed/testbed.sh load                 # load only, until Ctrl-C
@@ -64,7 +74,7 @@ lock is ignored.
 | `add-validator` | Add `validator-5`: fund, mint RLS, allowlist, stake and activate it on-chain. It joins the committee within a few epochs |
 | `add-rpc` | Add an RPC node (observer) |
 | `logs <node>` | Follow a node's log |
-| `load` | Steady `etc/tps` load through validator-1 until Ctrl-C |
+| `load` | Steady tps-checker load through validator-1 until Ctrl-C |
 | `test [plan\|plan/test ...]` | Run plans or single tests, e.g. `test chaos/03-lose-quorum`. Defaults to `basic`. `all` runs `basic chaos extended basic chaos`, so basic and chaos cover both the 4-validator network and the network with validator-5 and the rpc node |
 
 ## Network
@@ -97,7 +107,9 @@ lock is ignored.
 | `NODE_ARGS` / `GENESIS_ARGS` | empty | Extra flags for `rayls-network node` / `genesis`, e.g. `GENESIS_ARGS="--base-fee 0 --min-base-fee 0"` |
 | `CYCLES` | `3` | Iterations of `chaos/11-restart-loop` |
 | `LOAD` | unset | `1` runs the background load during `test` |
-| `LOAD_TXS` / `TPS_TXS` | `500` / `2000` | Transfers per load batch / in `extended/05-tps` |
+| `LOAD_TPS` / `LOAD_WALLETS` | `200` / `4` | Rate and wallet count of the background load |
+| `TPS_TXS` | `3000` | Transfers in the `extended/05-tps` burst |
+| `TPS_CHECKER_DIR` / `TPS_CHECKER_BIN` | `../tps-checker` / its `target/release/tps-checker` | Where tps-checker is checked out and built |
 | `SOAK_MINUTES` / `SOAK_INTERVAL` | `480` / `60` | Soak duration / seconds between rounds |
 
 On the Proxmox VM, start with `HTTP_ADDR=0.0.0.0 ./etc/testbed/testbed.sh up`. The RPCs are then
@@ -133,7 +145,7 @@ A plan is a directory under `tests/`, and a test is one file in it. Tests run in
 | `02-rpc-node` | `add-rpc`: syncs from genesis, relays a transfer, survives a restart |
 | `03-faults-with-new-nodes` | `chaos/01-kill` and `chaos/03-lose-quorum` with 5 validators and the rpc node |
 | `04-erc20-precompile` | Runs `etc/test-network/erc20_precompile_test.sh` against validator-1 |
-| `05-tps` | Load test with `etc/tps` through validators 1-3; every transfer lands |
+| `05-tps` | tps-checker burst through validators 1-3. Every transfer must be accepted and land on-chain; this is counted from the wallets' nonces, not from the tool's own summary |
 | **soak** (opt-in) | |
 | `01-faults-under-load` | Steady load plus a random stop, kill or freeze each round, for `SOAK_MINUTES` |
 | **rust** (opt-in) | |
@@ -180,7 +192,8 @@ scripts are unchanged.
 | `etc/test/edge-cases/net-04.sh` (flickering connectivity) | `chaos/04-flicker` |
 | `fork_test_configs/kill.sh`, `bounce-node.sh` | `chaos/11-restart-loop` |
 | `etc/test-network/stake-relay-node.sh`, `etc/validator/create-validator.sh` (staking flow) | `add-validator` |
-| `etc/test-network/erc20_precompile_test.sh`, `etc/tps` | `extended/04`, `extended/05` |
+| `etc/test-network/erc20_precompile_test.sh` | `extended/04` |
+| `etc/tps` (replaced by [tps-checker](https://github.com/raylsnetwork/tps-checker)) | `extended/05`, `load`, `soak` |
 | `e2e-tests`, `chaos-framework` crates | `rust/e2e`, `rust/chaos` |
 
 These are not covered:
