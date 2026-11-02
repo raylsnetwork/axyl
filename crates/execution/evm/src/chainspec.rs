@@ -166,6 +166,9 @@ pub const MAINNET_SENDER_AFFINITY_LOAD_BALANCING_BLOCK: u64 = 12_231_705;
 /// an activation block is chosen operationally.
 pub const LOCAL_SENDER_AFFINITY_LOAD_BALANCING_BLOCK: u64 = 0;
 
+/// EIP-161 empty-account guard activation block on Rayls testnet.
+pub const TESTNET_EIP161_EMPTY_ACCOUNT_GUARD_BLOCK: u64 = 22_075_500;
+
 /// EIP-161 empty-account guard activation block on the local sandbox network.
 ///
 /// Devnet, testnet and mainnet stay `Never`: v1.4.1 already committed the affected
@@ -315,8 +318,10 @@ impl RaylsHardFork {
                 Self::SenderAffinityLoadBalancing,
                 ForkCondition::Block(TESTNET_SENDER_AFFINITY_LOAD_BALANCING_BLOCK),
             ),
-            // Never until an operational activation block is chosen; the mechanism ships dormant.
-            (Self::Eip161EmptyAccountGuard, ForkCondition::Never),
+            (
+                Self::Eip161EmptyAccountGuard,
+                ForkCondition::Block(TESTNET_EIP161_EMPTY_ACCOUNT_GUARD_BLOCK),
+            ),
         ]
     }
 
