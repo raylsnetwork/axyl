@@ -15,7 +15,7 @@ use rayls_infrastructure_storage::{
 };
 use rayls_infrastructure_types::{
     now, test_chain_spec_arc, AuthorityIdentifier, B256Map, Batch, CommittedSubDag,
-    ConsensusHeader, Database, DbTxMut, Epoch, EpochRecord, HeaderBuilder, Notifier,
+    ConsensusHeader, Database, DbTxMut, Epoch, EpochRecord, Hash as _, HeaderBuilder, Notifier,
     RaylsReceiver as _, RaylsSender as _, ReputationScores, Round, TaskManager, B256,
 };
 use rayls_middleware_bridge::subscriber::spawn_subscriber;
@@ -26,8 +26,8 @@ use tokio::{sync::mpsc, time::timeout};
 /// Seed shared by both fixtures, so the epoch-1 committee keeps the four epoch-0 validators.
 const SEED: u64 = 0x5eed;
 
-/// How long the subscriber gets to act on a commit that should change nothing.
-const SETTLE: Duration = Duration::from_secs(2);
+/// How long the subscriber gets to take a commit or to stop.
+const WAIT: Duration = Duration::from_secs(10);
 
 /// A commit at `number` whose leader is `author`'s certificate of `(epoch, round)`, carrying
 /// `batch`.
@@ -122,7 +122,7 @@ async fn sync_across_validator_join(mode: NodeMode) -> eyre::Result<()> {
     consensus_bus.node_mode().send_replace(mode);
     let mut outputs = consensus_bus.consensus_output().subscribe();
     let mut task_manager = TaskManager::new("committee-change-test");
-    // no 2 s straggler grace, so a crash shows up within SETTLE
+    // no 2 s straggler grace, so a crash shows up at once
     task_manager.set_join_wait(0);
     let (to_engine, _engine_rx) = mpsc::channel(100);
     spawn_subscriber(
@@ -143,11 +143,12 @@ async fn sync_across_validator_join(mode: NodeMode) -> eyre::Result<()> {
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
     });
-    let taken = timeout(Duration::from_secs(10), outputs.recv()).await;
+    let taken = timeout(WAIT, outputs.recv()).await;
     streamer.abort();
     assert_eq!(taken?.map(|output| output.number), Some(1), "the control commit must be taken");
 
-    // The subscriber must take and drop the epoch-1 commit, so the second commit 2 is a duplicate.
+    // the epoch-1 commit must be dropped without using its number: commit 2 is the epoch-0 one
+    let expected = same_number.sub_dag.leader.digest();
     consensus_bus.consensus_header().send(joined_commit).await?;
     consensus_bus.consensus_header().send(same_number).await?;
     tokio::select! {
@@ -155,14 +156,23 @@ async fn sync_across_validator_join(mode: NodeMode) -> eyre::Result<()> {
             "{mode:?} subscriber exited on the first epoch-1 commit (authored by validator \
              {joined} who joined in epoch 1): {exited:?}"
         ),
-        output = outputs.recv() => panic!(
-            "{mode:?} subscriber took commit {:?}: the epoch-1 commit must be dropped",
-            output.map(|output| output.number)
-        ),
-        _ = tokio::time::sleep(SETTLE) => {}
+        output = timeout(WAIT, outputs.recv()) => {
+            let output = output?.expect("consensus output channel open");
+            assert_eq!(output.number, 2, "{mode:?} subscriber skipped commit 2");
+            assert_eq!(output.sub_dag.leader.digest(), expected, "{mode:?} took the epoch-1 commit");
+        }
     }
+
+    // stop the subscriber before reading what it stored
     config.shutdown().notify();
-    assert!(config.node_storage().get::<ConsensusBlocks>(&2)?.is_none(), "commit 2 was stored");
+    let stopped = timeout(WAIT, task_manager.join(config.shutdown().clone())).await;
+    assert!(stopped.is_ok(), "{mode:?} subscriber did not stop");
+    let stored = config.node_storage().get::<ConsensusBlocks>(&2)?.expect("commit 2 is stored");
+    assert_eq!(
+        stored.sub_dag.leader.digest(),
+        expected,
+        "commit 2 is stored from the wrong commit"
+    );
     Ok(())
 }
 

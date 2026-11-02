@@ -763,6 +763,18 @@ impl<DB: Database> Subscriber<DB> {
                     match result {
                         Some(consensus_header) => {
                             let number = consensus_header.number;
+                            // drop a later epoch before verifying: this committee cannot handle it
+                            if consensus_header.sub_dag.leader_epoch() > self.inner.committee.epoch()
+                            {
+                                info!(
+                                    target: "subscriber",
+                                    number,
+                                    epoch = consensus_header.sub_dag.leader_epoch(),
+                                    current_epoch = self.inner.committee.epoch(),
+                                    "catch-up: dropping header of a later epoch (belongs to the next epoch)"
+                                );
+                                continue;
+                            }
                             // dedup before verifying; the predicate cannot advance the watermark,
                             // so a header that fails verification cannot skip the honest one.
                             if !should_process_consensus_header(number, last_processed_number) {
@@ -794,17 +806,6 @@ impl<DB: Database> Subscriber<DB> {
                                 continue;
                             }
                             last_processed_number = number;
-                            // skip a later epoch: its authors may be missing from this committee
-                            if verified.sub_dag.leader_epoch() > self.inner.committee.epoch() {
-                                info!(
-                                    target: "subscriber",
-                                    number,
-                                    epoch = verified.sub_dag.leader_epoch(),
-                                    current_epoch = self.inner.committee.epoch(),
-                                    "catch-up: dropping header of a later epoch (belongs to the next epoch)"
-                                );
-                                continue;
-                            }
                             waiting.push_back(self.schedule_catchup_fetch(verified));
                         }
                         None => {
