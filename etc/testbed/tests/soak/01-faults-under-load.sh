@@ -1,5 +1,5 @@
 # Soak: steady load while a random node is stopped, killed or frozen each round, for SOAK_MINUTES (default 480).
-command -v node > /dev/null || skip "needs Node.js 22+"
+tps_setup || skip "tps-checker not available; clone github.com/raylsnetwork/tps-checker next to this repo"
 start=$(load_nonce) || fail "could not read the load account nonce"
 if [[ $LOAD != 1 ]]; then
     start_load

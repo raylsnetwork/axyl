@@ -20,7 +20,7 @@ OPERATORS=(0x9965507D1a55bcC2695C58ba16FB37d819B0A4dc 0x976EA74026E726554dB657fA
     0x14dC79964da2C08b23698B3D3cc7Ca32193d9955 0x23618e81E3f5cdF7f54C3d65f7FBc0aBf5B21E8f
     0xa0Ee7A142d267C1f36714E4a8F75612F20a79720)
 V5_KEY=0x2a871d0798f97d79848a013d4936a73bf4cc922c825d33c1cf7073dff6d409c6
-LOAD_KEY=0x7c852118294e51e653712a81e05800f419141751be58f605c371e15141b007a6 # anvil #3, used only by the load loop
+MNEMONIC="test test test test test test test test test test test junk"
 REGISTRY=0x07E17e17E17e17E17e17E17E17E17e17e17E17e1
 RLS=0x07E17e17E17e17E17e17E17E17E17e17e17E17eA
 
@@ -51,9 +51,11 @@ start_node() {
             export WORKER_LISTENER_MULTIADDR=/ip4/127.0.0.1/udp/49106/quic-v1
             set -- --observer
         fi
+        # txpool sized for load tests like local-testnet.sh (reth's default is 16 pending txs per sender)
         exec "$BIN" node "$@" --datadir "$DATA/$n" --instance "$i" --metrics "127.0.0.1:$((9099 + i))" \
             --http --http.addr "$HTTP_ADDR" --http.api all --full --storage.v2 --log.stdout.format log-fmt \
-            --txpool.minimal-protocol-fee 0 -"$LOG_LEVEL" $NODE_ARGS
+            --txpool.minimal-protocol-fee 0 --txpool.max-account-slots 50000 --txpool.pending-max-count 50000 \
+            --txpool.queued-max-count 50000 --txpool.basefee-max-count 50000 -"$LOG_LEVEL" $NODE_ARGS
     ) >> "$DATA/$n.log" 2>&1 &
     echo $! > "$DATA/$n.pid"
     set +m
@@ -152,16 +154,34 @@ add_rpc() {
     start_node rpc
 }
 
-# --- load (etc/tps) ---
+# --- load (tps-checker, github.com/raylsnetwork/tps-checker, checked out next to this repo) ---
 
-# etc/tps needs its node modules and a config file; the env vars passed by tps() override the file
+TPS_CHECKER_DIR="${TPS_CHECKER_DIR:-$(dirname "$ROOT")/tps-checker}"
+TPS_CHECKER="${TPS_CHECKER_BIN:-$TPS_CHECKER_DIR/target/release/tps-checker}"
+
+# Use an existing tps-checker build, or clone and build it next to this repo
 tps_setup() {
-    [[ -d $ROOT/etc/tps/node_modules ]] || (cd "$ROOT/etc/tps" && npm ci --silent > /dev/null)
-    touch "$ROOT/etc/tps/config/.env"
+    [[ -x $TPS_CHECKER ]] && return 0
+    [[ -d $TPS_CHECKER_DIR ]] || git clone -q git@github.com:raylsnetwork/tps-checker.git "$TPS_CHECKER_DIR" || return 1
+    (cd "$TPS_CHECKER_DIR" && cargo build --release -q)
 }
 
-# One etc/tps batch: tps <txs> <rpc_urls> <keys>
-tps() { NUM_TRANSACTIONS=$1 RPC_URLS=$2 PRIVATE_KEYS=$3 CHAIN_ID=487 node "$ROOT/etc/tps/src/main.mjs"; }
+# tps-checker against this chain. Runs from the data dir so no stray .env is picked up. The gas
+# price is twice the base fee: the chain never mines under its 48 gwei floor, and eth_gasPrice
+# would ratchet up because it follows the prices the load itself pays.
+tps_checker() {
+    local fee
+    fee=$(cast base-fee --rpc-url "$(url validator-1)") || return 1
+    (cd "$DATA" && exec "$TPS_CHECKER" --chain-id 487 --gas-price $((fee * 2)) "$@")
+}
+
+# private keys of test-mnemonic wallets: wallet_keys <first index> <count>
+wallet_keys() {
+    local i
+    for ((i = $1; i < $1 + $2; i++)); do cast wallet private-key --mnemonic "$MNEMONIC" --mnemonic-index "$i"; done | paste -sd, -
+}
+# load wallets start at index 10, clear of the admin (#0), test (#1-#4) and operator (#5-#9) accounts
+load_keys() { wallet_keys 10 "${LOAD_WALLETS:-4}"; }
 
 # with_timeout <secs> <cmd...>: kill cmd (and its children) if it runs longer
 with_timeout() {
@@ -178,21 +198,27 @@ with_timeout() {
     return $rc
 }
 
-# Fund the load account once. validator-1 may be restarting, so fund only after a real balance read.
+# Fund the load wallets once. validator-1 may be restarting, so fund only after a real balance read.
 fund_load() {
-    local addr balance
-    addr=$(cast wallet address --private-key "$LOAD_KEY")
-    until balance=$(cast balance "$addr" --rpc-url "$(url validator-1)" 2> /dev/null); do sleep 2; done
-    [[ $balance != 0 ]] || tx --private-key "$ADMIN_KEY" --value 1000000ether "$addr"
+    local key addr balance
+    for key in $(load_keys | tr , ' '); do
+        addr=$(cast wallet address --private-key "$key")
+        until balance=$(cast balance "$addr" --rpc-url "$(url validator-1)" 2> /dev/null); do sleep 2; done
+        [[ $balance != 0 ]] || tx --private-key "$ADMIN_KEY" --value 1000000ether "$addr"
+    done
 }
 
-# Steady load: back-to-back batches of LOAD_TXS (default 500) transfers through validator-1, logged to load.log
+# Steady load: tps-checker in continuous mode at LOAD_TPS (default 200) through validator-1, logged to
+# load.log. It is restarted whenever it exits, e.g. after validator-1 itself was restarted.
 load_loop() {
     set +m
+    local keys
+    keys=$(load_keys)
     while :; do
-        echo "--- $(date '+%F %T') sending ${LOAD_TXS:-500} txs"
-        with_timeout 300 tps "${LOAD_TXS:-500}" "$(url validator-1)" "$LOAD_KEY" | grep -E 'True TPS|Error|error' || echo "batch failed or timed out"
-        sleep 1
+        echo "--- $(date '+%F %T') tps-checker at ${LOAD_TPS:-200} tps"
+        tps_checker --private-keys "$keys" --rpc-url "$(url validator-1)" --continuous \
+            --target-tps "${LOAD_TPS:-200}" --num-transactions 1000000000 --report-interval-secs 30 || true
+        sleep 2
     done >> "$DATA/load.log" 2>&1
 }
 
@@ -208,7 +234,7 @@ start_load() {
     log "load running (pid $LOAD_PID), see $DATA/load.log"
 }
 stop_load() { if [[ -n $LOAD_PID ]]; then kill -- -"$LOAD_PID" 2> /dev/null || true; fi; }
-load_nonce() { cast nonce "$(cast wallet address --private-key "$LOAD_KEY")" --rpc-url "$(url validator-1)"; }
+load_nonce() { cast nonce "$(cast wallet address --private-key "$(wallet_keys 10 1)")" --rpc-url "$(url validator-1)"; }
 
 # --- RPC queries ---
 
