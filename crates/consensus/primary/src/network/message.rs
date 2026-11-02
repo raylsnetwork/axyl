@@ -494,6 +494,7 @@ impl PrimaryResponse {
                 if *theirs == ours + 1 =>
             {
                 // This is a common race condition on epoch restart so report as recoverable.
+                // Missing-certificates requests never return this; see the `Busy` arm.
                 Self::RecoverableError(PrimaryRPCError(error.to_string()))
             }
             PrimaryNetworkError::InvalidHeader(HeaderError::InvalidEpoch { ours, theirs }) => {
@@ -518,6 +519,7 @@ impl PrimaryResponse {
                 Self::Error(PrimaryRPCError(error.to_string()))
             }
             // A busy node asks the requester to try another peer, and to retry later.
+            // `fetch_certificates` reads every recoverable certificate answer as busy.
             PrimaryNetworkError::Busy => Self::RecoverableError(PrimaryRPCError(error.to_string())),
         }
     }

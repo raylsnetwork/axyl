@@ -844,6 +844,7 @@ where
     /// Retrieve missing certificates, bounded by time and chunk size.
     /// MDBX reads are offloaded to `spawn_blocking`.
     ///
+    /// A request we cannot serve is answered empty, without a permit.
     /// The request is checked for size before any bitmap decoding or storage read.
     /// A permit limits how many of these jobs run at once, per peer and in total.
     /// The blocking job holds its permit until it ends, even if the request is cancelled.
@@ -854,21 +855,27 @@ where
         requested_epoch: Option<Epoch>,
     ) -> PrimaryNetworkResult<PrimaryResponse> {
         // The epoch the request is served from decides which committee its list is sized for.
-        let scope = fetch_scope(requested_epoch, self.consensus_config.committee().epoch());
-        // A request outside our epoch and the kept tail is answered empty, so its size is not
-        // checked. A peer already in the next epoch names that epoch's committee, which may
-        // be larger.
-        if let Some(scope) = scope {
-            let limit = if requested_epoch.is_none() {
-                unstamped_authority_limit(&self.consensus_config)
-            } else {
-                requested_authority_limit(&self.consensus_config, scope)
-            };
-            let named = request.skip_rounds.named();
-            if named > limit {
-                debug!(target: "primary::handler", authorities = named, limit, "missing-certificates request names too many authorities");
-                return Err(PrimaryNetworkError::TooManyAuthorities(named, limit));
-            }
+        let our_epoch = self.consensus_config.committee().epoch();
+        let Some(scope) = fetch_scope(requested_epoch, our_epoch) else {
+            // We do not serve this epoch, so the requester tries another peer.
+            // The size is not checked, since a next-epoch committee may be larger.
+            info!(
+                target: "cert-collector",
+                requested_epoch = ?requested_epoch,
+                our_epoch,
+                "missing-certificates request outside our epoch and the kept tail; answering empty"
+            );
+            return Ok(PrimaryResponse::RequestedCertificates(vec![]));
+        };
+        let limit = if requested_epoch.is_none() {
+            unstamped_authority_limit(&self.consensus_config)
+        } else {
+            requested_authority_limit(&self.consensus_config, scope)
+        };
+        let named = request.skip_rounds.named();
+        if named > limit {
+            debug!(target: "primary::handler", authorities = named, limit, "missing-certificates request names too many authorities");
+            return Err(PrimaryNetworkError::TooManyAuthorities(named, limit));
         }
         let permits = self.missing_cert_slots.acquire(peer).inspect_err(|_| {
             debug!(target: "primary::handler", %peer, "too many missing-certificates requests in progress");
@@ -877,7 +884,7 @@ where
         let consensus_config = self.consensus_config.clone();
         tokio::task::spawn_blocking(move || {
             let _permits = permits;
-            collect_missing_certs_blocking(request, requested_epoch, scope, consensus_config)
+            collect_missing_certs_blocking(request, scope, consensus_config)
         })
         .await
         .map_err(|e| PrimaryNetworkError::Internal(format!("cert-collector join error: {e}")))?
@@ -1056,6 +1063,15 @@ pub(crate) const MISSING_CERT_JOBS_PER_PEER: usize = 2;
 const MISSING_CERT_JOBS_COMMITTEE: usize = 64;
 /// Missing-certificate jobs that other peers may have running at once, in total.
 pub(crate) const MISSING_CERT_JOBS_OTHERS: usize = 4;
+/// Missing-certificate jobs one outside peer may have running at once.
+/// Honest nodes send each peer one request at a time.
+pub(crate) const MISSING_CERT_JOBS_PER_OUTSIDER: usize = 1;
+
+// One outside peer must not fill the shared pool.
+const _: () = assert!(MISSING_CERT_JOBS_PER_OUTSIDER < MISSING_CERT_JOBS_OTHERS);
+
+/// Running jobs per outside peer, only for peers with one.
+type OutsiderJobs = Arc<Mutex<HashMap<BlsPublicKey, usize>>>;
 
 /// Concurrency limits for missing-certificate jobs, shared by every epoch.
 ///
@@ -1066,6 +1082,9 @@ pub(crate) struct MissingCertLimits {
     committee: Arc<Semaphore>,
     /// Smaller pool for every other peer, so observers cannot starve committee catch-up.
     others: Arc<Semaphore>,
+    /// Running jobs per outside peer.
+    /// Each tracked job holds a permit from `others`, so this stays small.
+    outsider_jobs: OutsiderJobs,
 }
 
 impl MissingCertLimits {
@@ -1073,6 +1092,7 @@ impl MissingCertLimits {
         Self {
             committee: Arc::new(Semaphore::new(MISSING_CERT_JOBS_COMMITTEE)),
             others: Arc::new(Semaphore::new(MISSING_CERT_JOBS_OTHERS)),
+            outsider_jobs: Default::default(),
         }
     }
 
@@ -1084,11 +1104,14 @@ impl MissingCertLimits {
         let per_peer = committee
             .authorities()
             .iter()
-            .map(|authority| (authority.id(), Arc::new(Semaphore::new(MISSING_CERT_JOBS_PER_PEER))))
+            .map(|authority| {
+                (*authority.protocol_key(), Arc::new(Semaphore::new(MISSING_CERT_JOBS_PER_PEER)))
+            })
             .collect();
         MissingCertSlots {
             committee: self.committee.clone(),
             others: self.others.clone(),
+            outsider_jobs: self.outsider_jobs.clone(),
             per_peer,
         }
     }
@@ -1097,6 +1120,12 @@ impl MissingCertLimits {
     #[cfg(test)]
     pub(crate) fn free_committee_slots(&self) -> usize {
         self.committee.available_permits()
+    }
+
+    /// Outside peers with a running job.
+    #[cfg(test)]
+    pub(crate) fn tracked_outsiders(&self) -> usize {
+        self.outsider_jobs.lock().len()
     }
 }
 
@@ -1109,51 +1138,82 @@ pub(crate) struct MissingCertSlots {
     committee: Arc<Semaphore>,
     /// Pool for every other peer, shared with every epoch.
     others: Arc<Semaphore>,
+    /// Running jobs per outside peer, shared with every epoch.
+    outsider_jobs: OutsiderJobs,
     /// A pool for each member of this epoch's committee.
-    per_peer: HashMap<AuthorityIdentifier, Arc<Semaphore>>,
+    per_peer: HashMap<BlsPublicKey, Arc<Semaphore>>,
+}
+
+/// The permits one missing-certificate job holds until it ends.
+#[derive(Debug)]
+pub(crate) struct MissingCertPermits {
+    /// The member's own permit.
+    _peer: Option<OwnedSemaphorePermit>,
+    /// The outside peer's counted job.
+    _outsider: Option<OutsiderJob>,
+    /// The permit from the committee or outsider pool.
+    _pool: OwnedSemaphorePermit,
+}
+
+/// One running job of an outside peer, uncounted on drop.
+#[derive(Debug)]
+struct OutsiderJob {
+    /// The peer the job runs for.
+    peer: BlsPublicKey,
+    /// Running jobs per outside peer.
+    jobs: OutsiderJobs,
+}
+
+impl Drop for OutsiderJob {
+    fn drop(&mut self) {
+        let mut jobs = self.jobs.lock();
+        if let Some(running) = jobs.get_mut(&self.peer) {
+            *running -= 1;
+            if *running == 0 {
+                jobs.remove(&self.peer);
+            }
+        }
+    }
 }
 
 impl MissingCertSlots {
     /// Take the permits for one job, or fail with `Busy` without waiting.
     ///
     /// A committee peer takes a permit from its own pool and from the committee pool.
-    /// Any other peer takes a permit from the shared pool, so unknown peers add no state.
-    pub(crate) fn acquire(
-        &self,
-        peer: BlsPublicKey,
-    ) -> PrimaryNetworkResult<Vec<OwnedSemaphorePermit>> {
-        let Some(own) = self.per_peer.get(&AuthorityIdentifier::from(peer)) else {
-            let permit =
-                self.others.clone().try_acquire_owned().map_err(|_| PrimaryNetworkError::Busy)?;
-            return Ok(vec![permit]);
+    /// Any other peer takes a permit from the shared pool, within its own limit.
+    pub(crate) fn acquire(&self, peer: BlsPublicKey) -> PrimaryNetworkResult<MissingCertPermits> {
+        let Some(own) = self.per_peer.get(&peer) else {
+            return self.acquire_outsider(peer);
         };
-        let peer_permit = own.clone().try_acquire_owned().map_err(|_| PrimaryNetworkError::Busy)?;
-        let pool_permit =
+        // A member at its limit is refused before touching the pool.
+        // If the pool is full, the member's permit is dropped and so given back.
+        let peer = own.clone().try_acquire_owned().map_err(|_| PrimaryNetworkError::Busy)?;
+        let pool =
             self.committee.clone().try_acquire_owned().map_err(|_| PrimaryNetworkError::Busy)?;
-        Ok(vec![peer_permit, pool_permit])
+        Ok(MissingCertPermits { _peer: Some(peer), _outsider: None, _pool: pool })
+    }
+
+    /// Take the permits for one job of an outside peer.
+    /// The lock makes the limit check and the count one step.
+    fn acquire_outsider(&self, peer: BlsPublicKey) -> PrimaryNetworkResult<MissingCertPermits> {
+        let mut jobs = self.outsider_jobs.lock();
+        if jobs.get(&peer).is_some_and(|running| *running >= MISSING_CERT_JOBS_PER_OUTSIDER) {
+            return Err(PrimaryNetworkError::Busy);
+        }
+        let pool =
+            self.others.clone().try_acquire_owned().map_err(|_| PrimaryNetworkError::Busy)?;
+        *jobs.entry(peer).or_default() += 1;
+        let job = OutsiderJob { peer, jobs: self.outsider_jobs.clone() };
+        Ok(MissingCertPermits { _peer: None, _outsider: Some(job), _pool: pool })
     }
 }
 
 /// Run the cert-collector synchronously inside `spawn_blocking`.
 fn collect_missing_certs_blocking<DB: Database>(
     request: MissingCertificatesRequest,
-    requested_epoch: Option<Epoch>,
-    scope: Option<CertScope>,
+    scope: CertScope,
     consensus_config: ConsensusConfig<DB>,
 ) -> PrimaryNetworkResult<PrimaryResponse> {
-    let our_epoch = consensus_config.committee().epoch();
-    let Some(scope) = scope else {
-        // Either the requester is ahead of us (it closed an epoch we are still finishing, routine
-        // around every boundary) or it asks for an epoch older than the one we kept the tail of.
-        // Neither is served from here; the requester moves on to the next peer.
-        info!(
-            target: "cert-collector",
-            requested_epoch = ?requested_epoch,
-            our_epoch,
-            "missing-certificates request outside our epoch and the kept tail; answering empty"
-        );
-        return Ok(PrimaryResponse::RequestedCertificates(vec![]));
-    };
     let mut collector = CertificateCollector::new(request, consensus_config, scope)?;
 
     let mut missing = Vec::new();
