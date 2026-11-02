@@ -859,7 +859,8 @@ where
         let Some(scope) = fetch_scope(requested_epoch, our_epoch) else {
             // We do not serve this epoch, so the requester tries another peer.
             // The size is not checked, since a next-epoch committee may be larger.
-            info!(
+            // Debug level, since any peer can send this for free.
+            debug!(
                 target: "cert-collector",
                 requested_epoch = ?requested_epoch,
                 our_epoch,
@@ -1062,6 +1063,7 @@ const _: () = assert!(MIN_REQUESTED_AUTHORITIES <= MAX_SKIP_ROUND_AUTHORITIES);
 /// Missing-certificate jobs one committee peer may have running at once.
 pub(crate) const MISSING_CERT_JOBS_PER_PEER: usize = 2;
 /// Smallest committee pool, grown so every member can use its share.
+/// It only refuses while jobs from an earlier epoch are still running.
 pub(crate) const MISSING_CERT_JOBS_COMMITTEE: usize = 64;
 /// Missing-certificate jobs that other peers may have running at once, in total.
 /// A few outside peers together can still fill it.
