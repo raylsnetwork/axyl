@@ -1124,14 +1124,6 @@ async fn test_missing_certs_limit_follows_the_served_epoch() {
     assert!(matches!(resp, PrimaryResponse::RequestedCertificates(certs) if certs.is_empty()));
 }
 
-/// Missing-certificate jobs one committee member should be able to run at once.
-///
-/// The fix is expected to define this limit, and this test should then use it.
-const JOBS_PER_MEMBER: usize = 2;
-/// Missing-certificate jobs all peers outside the committee should share at once.
-///
-/// The fix is expected to define this limit, and this test should then use it.
-const JOBS_FOR_OUTSIDERS: usize = 4;
 /// How long a request runs before the test cancels it, as a timed-out peer would.
 const CANCEL_AFTER: Duration = Duration::from_millis(50);
 
@@ -1161,6 +1153,7 @@ async fn start_then_cancel(
 /// Without a limit, every request is queued, so no request is ever refused.
 #[test]
 fn test_missing_cert_slots_outlive_cancelled_requests() {
+    use crate::network::handler::{MISSING_CERT_JOBS_OTHERS, MISSING_CERT_JOBS_PER_PEER};
     use rand::{rngs::StdRng, SeedableRng};
 
     // A committee large enough for one busy member, two others, and this node.
@@ -1199,22 +1192,33 @@ fn test_missing_cert_slots_outlive_cancelled_requests() {
 
         // Cancelled requests from one member still hold all of its slots.
         let busy_member = member(1);
-        for _ in 0..JOBS_PER_MEMBER {
+        for _ in 0..MISSING_CERT_JOBS_PER_PEER {
             assert!(start_then_cancel(&handler, busy_member).await.is_none());
         }
         let next = start_then_cancel(&handler, busy_member).await;
-        assert!(matches!(next, Some(Err(_))), "a member's extra request was not refused: {next:?}");
+        assert!(
+            matches!(next, Some(Err(PrimaryNetworkError::Busy))),
+            "a member's extra request was not refused: {next:?}"
+        );
+
+        // An out-of-epoch request is answered empty, even for a busy member.
+        let ahead = primary.consensus_config().committee().epoch() + 2;
+        let answer = handler.retrieve_missing_certs(busy_member, empty_request(), Some(ahead)).await;
+        assert!(
+            matches!(&answer, Ok(PrimaryResponse::RequestedCertificates(certs)) if certs.is_empty()),
+            "a request outside our epoch was not answered empty: {answer:?}"
+        );
 
         // Another member has its own slots.
         assert!(start_then_cancel(&handler, member(2)).await.is_none());
 
         // Peers outside the committee share one pool.
-        for _ in 0..JOBS_FOR_OUTSIDERS {
+        for _ in 0..MISSING_CERT_JOBS_OTHERS {
             assert!(start_then_cancel(&handler, outsider()).await.is_none());
         }
         let next = start_then_cancel(&handler, outsider()).await;
         assert!(
-            matches!(next, Some(Err(_))),
+            matches!(next, Some(Err(PrimaryNetworkError::Busy))),
             "an outsider's extra request was not refused: {next:?}"
         );
 
@@ -1244,7 +1248,7 @@ fn test_missing_cert_slots_outlive_cancelled_requests() {
 #[test]
 fn test_missing_cert_slots_follow_the_epoch_committee() {
     use crate::network::handler::{
-        MissingCertLimits, MISSING_CERT_JOBS_OTHERS, MISSING_CERT_JOBS_PER_PEER,
+        MissingCertLimits, MISSING_CERT_JOBS_PER_OUTSIDER, MISSING_CERT_JOBS_PER_PEER,
     };
 
     let committee_size = 4;
@@ -1271,8 +1275,8 @@ fn test_missing_cert_slots_follow_the_epoch_committee() {
     let new_slots = limits.for_committee(&new.committee());
     assert_eq!(limits.free_committee_slots(), free_at_start - MISSING_CERT_JOBS_PER_PEER);
 
-    // In the new epoch the former member is an outsider, so it uses the shared pool.
-    let outsider_jobs: Vec<_> = (0..MISSING_CERT_JOBS_OTHERS)
+    // In the new epoch the former member has an outsider's limit.
+    let outsider_jobs: Vec<_> = (0..MISSING_CERT_JOBS_PER_OUTSIDER)
         .map(|_| new_slots.acquire(former).expect("slot in the shared pool"))
         .collect();
     let next = new_slots.acquire(former);
@@ -1285,4 +1289,44 @@ fn test_missing_cert_slots_follow_the_epoch_committee() {
     // Slots come back once the jobs end.
     drop((old_jobs, outsider_jobs, member_job));
     assert_eq!(limits.free_committee_slots(), free_at_start);
+}
+
+/// One outside peer cannot fill the shared outsider pool.
+#[test]
+fn test_missing_cert_slots_limit_each_outsider() {
+    use crate::network::handler::{
+        MissingCertLimits, MISSING_CERT_JOBS_OTHERS, MISSING_CERT_JOBS_PER_OUTSIDER,
+    };
+    use rand::{rngs::StdRng, SeedableRng};
+
+    let fixture = CommitteeFixture::builder(MemDatabase::default)
+        .committee_size(NonZeroUsize::new(4).unwrap())
+        .build();
+    let limits = MissingCertLimits::new();
+    let slots = limits.for_committee(&fixture.committee());
+    let outsider = |seed: u64| *BlsKeypair::generate(&mut StdRng::seed_from_u64(seed)).public();
+
+    // One outsider at its limit is refused while the pool has room.
+    let greedy = outsider(0);
+    let greedy_jobs: Vec<_> = (0..MISSING_CERT_JOBS_PER_OUTSIDER)
+        .map(|_| slots.acquire(greedy).expect("slot for an outsider"))
+        .collect();
+    let next = slots.acquire(greedy);
+    assert!(matches!(next, Err(PrimaryNetworkError::Busy)), "got {next:?}");
+
+    // Other outsiders get the rest of the pool, until it is full.
+    let other_jobs: Vec<_> = (1..)
+        .take(MISSING_CERT_JOBS_OTHERS - MISSING_CERT_JOBS_PER_OUTSIDER)
+        .map(|seed| slots.acquire(outsider(seed)).expect("slot in the shared pool"))
+        .collect();
+    let next = slots.acquire(outsider(u64::MAX));
+    assert!(matches!(next, Err(PrimaryNetworkError::Busy)), "got {next:?}");
+
+    // Only outsiders with a running job are tracked.
+    assert_eq!(limits.tracked_outsiders(), 1 + other_jobs.len());
+    drop(greedy_jobs);
+    assert_eq!(limits.tracked_outsiders(), other_jobs.len());
+    slots.acquire(greedy).expect("slot once the outsider's job ended");
+    drop(other_jobs);
+    assert_eq!(limits.tracked_outsiders(), 0);
 }
