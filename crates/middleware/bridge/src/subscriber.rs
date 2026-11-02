@@ -794,6 +794,21 @@ impl<DB: Database> Subscriber<DB> {
                                 continue;
                             }
                             last_processed_number = number;
+                            // A commit of a later epoch is past the epoch cut, so it would be
+                            // dropped after the fetch anyway. Drop it before: the fetch looks each
+                            // certificate's author up in this epoch's committee, and a validator
+                            // that joined later is not in it. The next epoch's subscriber, which
+                            // has that committee, streams the commit again.
+                            if verified.sub_dag.leader_epoch() > self.config.epoch() {
+                                info!(
+                                    target: "subscriber",
+                                    number,
+                                    epoch = verified.sub_dag.leader_epoch(),
+                                    current_epoch = self.config.epoch(),
+                                    "catch-up: dropping header of a later epoch (belongs to the next epoch)"
+                                );
+                                continue;
+                            }
                             waiting.push_back(self.schedule_catchup_fetch(verified));
                         }
                         None => {
