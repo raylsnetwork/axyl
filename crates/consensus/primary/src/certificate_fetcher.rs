@@ -72,7 +72,7 @@ enum FetchOutcome {
 enum FetchFailure {
     /// Every peer that answered was busy.
     Busy,
-    /// Peers failed, timed out or had nothing to send.
+    /// Peers failed, had nothing to send, or none answered.
     Failed,
 }
 
@@ -93,10 +93,16 @@ impl FetchAnswers {
 
     /// Record a failed request.
     fn record_error(&mut self, error: &NetworkError) {
-        if matches!(error, NetworkError::PeerBusy(_)) {
-            self.busy = true;
-        } else {
-            self.failed = true;
+        match error {
+            NetworkError::PeerBusy(_) => self.busy = true,
+            // A peer we could not reach says nothing about our request.
+            NetworkError::Outbound(_)
+            | NetworkError::Timeout
+            | NetworkError::Disconnected
+            | NetworkError::PeerNotConnected
+            | NetworkError::PeerMissing
+            | NetworkError::NoPeers => {}
+            _ => self.failed = true,
         }
     }
 
@@ -315,6 +321,11 @@ impl<DB: Database> CertificateFetcher<DB> {
                                 FetchOutcome::Busy => {
                                     // Busy peers are not failing.
                                     // This skips the backoff and the stale-session fallback.
+                                    self.consensus_bus
+                                        .primary_metrics()
+                                        .node_metrics
+                                        .certificate_fetcher_busy_rounds
+                                        .inc();
                                 }
                                 FetchOutcome::EpochMismatch => {
                                     // suppress probes while peers return future-epoch certs;
@@ -797,9 +808,11 @@ async fn fetch_certificates_helper(
             * peers.len().try_into().expect("usize into secs duration")
             + PARALLEL_FETCH_REQUEST_ADDITIONAL_TIMEOUT
     };
+    // Kept outside the timeout, so a timed-out round keeps its answers.
+    let mut round = FetchAnswers::default();
+    let answers = &mut round;
     let fetch_callback = async move {
         debug!(target: "primary::cert_fetcher", "Starting to fetch certificates");
-        let mut answers = FetchAnswers::default();
 
         if merge_all_peers {
             // fire requests to ALL peers immediately in parallel
@@ -906,9 +919,10 @@ async fn fetch_certificates_helper(
             }
         }
     };
-    timeout(fetch_timeout, fetch_callback).await.unwrap_or_else(|e| {
+    let result = timeout(fetch_timeout, fetch_callback).await;
+    result.unwrap_or_else(|e| {
         debug!(target: "primary::cert_fetcher", "Timed out fetching certificates: {e}");
-        Err(FetchFailure::Failed)
+        Err(round.failure())
     })
 }
 

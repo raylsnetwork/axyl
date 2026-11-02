@@ -12,7 +12,10 @@ use crate::{
     ConsensusBus,
 };
 use assert_matches::assert_matches;
-use rayls_consensus_network::types::{NetworkCommand, NetworkHandle};
+use rayls_consensus_network::{
+    error::NetworkError,
+    types::{NetworkCommand, NetworkHandle},
+};
 use rayls_infrastructure_storage::{mem_db::MemDatabase, CertificateStore, PayloadStore};
 use rayls_infrastructure_types::{
     BlsSignature, Certificate, Hash as _, Header, Round, SignatureVerificationState, TaskManager,
@@ -445,6 +448,7 @@ fn epoch_stamp_follows_the_fork_at_the_next_block() {
     // no overflow at the top of the range
     assert_eq!(epoch_stamp(Some(u64::MAX), u64::MAX, 1), Some(1));
 }
+
 /// The highest round the fetcher under test already has from every authority.
 const STORED_ROUND: Round = 1;
 
@@ -613,6 +617,40 @@ async fn one_busy_peer_does_not_hide_empty_answers() {
                 PrimaryResponse::RequestedCertificates(vec![])
             };
             let _ = reply.send(Ok(answer));
+        }
+    }
+}
+
+/// An unreachable or silent peer does not hide that the others are busy.
+///
+/// One validator down is common, often while the others are busy.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn an_unreachable_peer_does_not_hide_busy_answers() {
+    let fixture = CommitteeFixture::builder(MemDatabase::default).randomize_ports(true).build();
+    let peers = fixture.committee().size() - 1;
+    let threshold = STALE_SKIP_ROUNDS_FALLBACK_THRESHOLD.max(STALE_SKIP_ROUNDS_CATCHUP_THRESHOLD);
+
+    for mode in [NodeMode::CvvActive, NodeMode::CvvInactive] {
+        for silent in [false, true] {
+            let mut fetcher = FetcherUnderTest::start(&fixture, vec![], mode).await;
+            // Requests the silent peer never answers, kept open so they time out.
+            let mut unanswered = vec![];
+            // In each fetch round the first peer is unreachable and the rest busy.
+            for _ in 0..=threshold {
+                for peer in 0..peers {
+                    let (request, reply) = fetcher.next_request().await;
+                    let (lower_bound, _) = request.get_bounds(max_skip_rounds(), |_| true).unwrap();
+                    assert_eq!(lower_bound, STORED_ROUND, "{mode:?}, silent {silent}");
+                    if peer > 0 {
+                        let busy = PrimaryResponse::into_error_ref(&PrimaryNetworkError::Busy);
+                        let _ = reply.send(Ok(busy));
+                    } else if silent {
+                        unanswered.push(reply);
+                    } else {
+                        let _ = reply.send(Err(NetworkError::Disconnected));
+                    }
+                }
+            }
         }
     }
 }
