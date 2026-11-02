@@ -2,30 +2,56 @@
 //!
 //! The syncing node starts in epoch 0 with the 4-validator committee. The network has moved on to
 //! epoch 1, where a fifth validator joined. The node's first epoch-1 commit has a certificate from
-//! the new validator. Verification passes (the epoch-0 record names the epoch-1 committee), but the
-//! subscriber then looks the new validator up in the epoch-0 committee it started with, does not
-//! find it, and fails fatally. That crashes the node, and it crashes the same way on every restart.
+//! the new validator. The subscriber must drop that commit, not look the new validator up in the
+//! epoch-0 committee it started with: that lookup fails fatally and crashes the node.
 
 use rand::{rngs::StdRng, SeedableRng as _};
 use rayls_consensus_network::types::{MessageId, NetworkCommand};
 use rayls_consensus_primary::{network::PrimaryNetworkHandle, ConsensusBus, NodeMode};
 use rayls_infrastructure_network_types::MockPrimaryToWorkerClient;
-use rayls_infrastructure_storage::{mem_db::MemDatabase, tables::EpochRecords};
+use rayls_infrastructure_storage::{
+    mem_db::MemDatabase,
+    tables::{ConsensusBlocks, EpochRecords},
+};
 use rayls_infrastructure_types::{
-    now, test_chain_spec_arc, B256Map, CommittedSubDag, ConsensusHeader, Database, DbTxMut,
-    EpochRecord, HeaderBuilder, Notifier, RaylsSender as _, ReputationScores, TaskManager, B256,
+    now, test_chain_spec_arc, AuthorityIdentifier, B256Map, Batch, CommittedSubDag,
+    ConsensusHeader, Database, DbTxMut, Epoch, EpochRecord, HeaderBuilder, Notifier,
+    RaylsReceiver as _, RaylsSender as _, ReputationScores, Round, TaskManager, B256,
 };
 use rayls_middleware_bridge::subscriber::spawn_subscriber;
 use rayls_testing_test_utils::CommitteeFixture;
 use std::{collections::BTreeSet, num::NonZeroUsize, sync::Arc, time::Duration};
 use tokio::{sync::mpsc, time::timeout};
 
-/// Seed shared by both committee fixtures, so the epoch-1 committee keeps the four epoch-0
-/// validators (same keys and execution addresses) and adds one.
+/// Seed shared by both fixtures, so the epoch-1 committee keeps the four epoch-0 validators.
 const SEED: u64 = 0x5eed;
 
-/// How long the subscriber must survive the epoch-1 commit.
-const SURVIVE: Duration = Duration::from_secs(10);
+/// How long the subscriber gets to act on a commit that should change nothing.
+const SETTLE: Duration = Duration::from_secs(2);
+
+/// A commit at `number` whose leader is `author`'s certificate of `(epoch, round)`, carrying
+/// `batch`.
+fn commit(
+    fixture: &CommitteeFixture<MemDatabase>,
+    author: &AuthorityIdentifier,
+    epoch: Epoch,
+    round: Round,
+    number: u64,
+    batch: Batch,
+) -> ConsensusHeader {
+    let header = HeaderBuilder::default()
+        .author(author.clone())
+        .round(round)
+        .epoch(epoch)
+        .parents(fixture.genesis().collect())
+        .created_at(now())
+        .with_payload_batch(batch, 0)
+        .build();
+    let leader = fixture.certificate(&header);
+    let sub_dag =
+        CommittedSubDag::new(vec![leader.clone()], leader, 0, ReputationScores::default(), None);
+    ConsensusHeader { parent_hash: B256::default(), sub_dag, number, extra: B256::default() }
+}
 
 async fn sync_across_validator_join(mode: NodeMode) -> eyre::Result<()> {
     let before = CommitteeFixture::builder(MemDatabase::default)
@@ -46,13 +72,15 @@ async fn sync_across_validator_join(mode: NodeMode) -> eyre::Result<()> {
         .expect("one validator joined in epoch 1")
         .id();
     assert!(before.committee().authority(&joined).is_none());
+    let old_member = before.first_authority().id();
 
     // The syncing node: an epoch-0 validator, configured with the epoch-0 committee.
-    let config = before.first_authority().consensus_config().clone();
+    let mut config = before.first_authority().consensus_config().clone();
     assert_eq!(config.epoch(), 0);
+    // Boundary unknown, so the epoch cut cannot drop the epoch-1 commit for the subscriber.
+    config.set_epoch_boundary(u64::MAX);
 
-    // The certified epoch-0 record names the epoch-1 committee, as on any node that synced the
-    // epoch records. This is what lets the node verify epoch-1 headers.
+    // The certified epoch-0 record names the epoch-1 committee, so epoch-1 commits verify.
     let record = EpochRecord {
         epoch: 0,
         committee: before.committee().bls_keys(),
@@ -62,34 +90,22 @@ async fn sync_across_validator_join(mode: NodeMode) -> eyre::Result<()> {
     config.node_storage().with_write_txn(|txn| txn.insert::<EpochRecords>(&0, &record))?;
     assert_eq!(config.get_committee_keys_for_epoch(1), Some(after.committee().bls_keys()));
 
-    // The first epoch-1 commit: its leader is the new validator's certificate, carrying one batch,
-    // signed by the epoch-1 committee.
-    let batch = rayls_execution_evm::test_utils::batch(test_chain_spec_arc());
-    let mut batches = B256Map::default();
-    batches.insert(batch.digest(), batch.clone());
-    let leader_header = HeaderBuilder::default()
-        .author(joined.clone())
-        .round(2)
-        .epoch(1)
-        .parents(after.genesis().collect())
-        .created_at(now())
-        .with_payload_batch(batch, 0)
-        .build();
-    let leader = after.certificate(&leader_header);
-    let sub_dag =
-        CommittedSubDag::new(vec![leader.clone()], leader, 0, ReputationScores::default(), None);
-    let header = ConsensusHeader {
-        parent_hash: B256::default(),
-        sub_dag,
-        number: 1,
-        extra: B256::default(),
-    };
-    assert_eq!(header.sub_dag.leader_epoch(), 1);
+    // 1: an epoch-0 commit; 2: the new validator's first epoch-1 commit; 2 again: an epoch-0 one.
+    let batches: Vec<Batch> =
+        (0..3).map(|_| rayls_execution_evm::test_utils::batch(test_chain_spec_arc())).collect();
+    let control = commit(&before, &old_member, 0, 2, 1, batches[0].clone());
+    let joined_commit = commit(&after, &joined, 1, 2, 2, batches[1].clone());
+    let same_number = commit(&before, &old_member, 0, 4, 2, batches[2].clone());
+    assert_eq!(joined_commit.sub_dag.leader_epoch(), 1);
 
-    // Peers serve the batch.
-    config
-        .local_network()
-        .set_primary_to_worker_local_handler(Arc::new(MockPrimaryToWorkerClient { batches }));
+    // Peers serve every batch.
+    let mut served = B256Map::default();
+    for batch in batches {
+        served.insert(batch.digest(), batch);
+    }
+    config.local_network().set_primary_to_worker_local_handler(Arc::new(
+        MockPrimaryToWorkerClient { batches: served },
+    ));
 
     // Mock network (ack publishes; header requests go unanswered).
     let (tx, mut rx) = mpsc::channel(5);
@@ -104,7 +120,10 @@ async fn sync_across_validator_join(mode: NodeMode) -> eyre::Result<()> {
 
     let consensus_bus = ConsensusBus::new();
     consensus_bus.node_mode().send_replace(mode);
+    let mut outputs = consensus_bus.consensus_output().subscribe();
     let mut task_manager = TaskManager::new("committee-change-test");
+    // no 2 s straggler grace, so a crash shows up within SETTLE
+    task_manager.set_join_wait(0);
     let (to_engine, _engine_rx) = mpsc::channel(100);
     spawn_subscriber(
         config.clone(),
@@ -116,26 +135,34 @@ async fn sync_across_validator_join(mode: NodeMode) -> eyre::Result<()> {
         tokio::sync::watch::channel(()).0,
     );
 
-    // Deliver the epoch-1 header the way the header streamer does, repeatedly: a broadcast send
-    // to a channel nobody listens on yet is dropped silently, and the subscriber skips the
-    // duplicates once it has taken the header.
+    // Resend the control until it is taken: a broadcast to a channel with no listener is lost.
     let streamer_bus = consensus_bus.clone();
     let streamer = tokio::spawn(async move {
         loop {
-            let _ = streamer_bus.consensus_header().send(header.clone()).await;
+            let _ = streamer_bus.consensus_header().send(control.clone()).await;
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
     });
-
-    // The subscriber is a critical task: the task manager resolves only if it exits.
-    let exited = timeout(SURVIVE, task_manager.join(Notifier::new())).await;
+    let taken = timeout(Duration::from_secs(10), outputs.recv()).await;
     streamer.abort();
+    assert_eq!(taken?.map(|output| output.number), Some(1), "the control commit must be taken");
+
+    // The subscriber must take and drop the epoch-1 commit, so the second commit 2 is a duplicate.
+    consensus_bus.consensus_header().send(joined_commit).await?;
+    consensus_bus.consensus_header().send(same_number).await?;
+    tokio::select! {
+        exited = task_manager.join(Notifier::new()) => panic!(
+            "{mode:?} subscriber exited on the first epoch-1 commit (authored by validator \
+             {joined} who joined in epoch 1): {exited:?}"
+        ),
+        output = outputs.recv() => panic!(
+            "{mode:?} subscriber took commit {:?}: the epoch-1 commit must be dropped",
+            output.map(|output| output.number)
+        ),
+        _ = tokio::time::sleep(SETTLE) => {}
+    }
     config.shutdown().notify();
-    assert!(
-        exited.is_err(),
-        "{mode:?} subscriber exited on the first epoch-1 commit (authored by validator {joined} \
-         who joined in epoch 1): {exited:?}"
-    );
+    assert!(config.node_storage().get::<ConsensusBlocks>(&2)?.is_none(), "commit 2 was stored");
     Ok(())
 }
 
