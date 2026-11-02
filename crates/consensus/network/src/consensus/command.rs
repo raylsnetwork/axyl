@@ -401,8 +401,9 @@ where
                 // connect to it. Best effort: a peer whose own NewEpoch has not run yet binds
                 // this record without storing it, and the next boundary or the 12-hour republish
                 // catches it up. On
-                // the primary's initial epoch this runs before its listeners are up and is a
-                // no-op; the startup publish and the per-connection push cover that case. Put
+                // the initial epoch this runs before the listeners are up, on the primary and
+                // the worker alike, and is a no-op; the startup publish and the per-connection
+                // push cover that case. Put
                 // only: the provider announcement is dropped by every peer, so it is made once
                 // at startup and not re-walked at every boundary. Every node republishes,
                 // observers included: an observer's record is never stored by anyone, but the

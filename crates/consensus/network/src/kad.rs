@@ -154,11 +154,15 @@ pub enum KadStoreType {
     Worker,
 }
 
-/// The value size the store refuses with `Error::ValueTooLarge`. [`KadStore`] uses the libp2p
-/// memory-store default; the kad behaviour reads it here to tell a genuinely oversize value
-/// apart from a DB failure that the store reports under the same variant.
+/// The value size the store refuses with `Error::ValueTooLarge`: the libp2p memory-store
+/// default (64 KiB). One constant, read by [`KadStore`] for its limit and by the kad behaviour
+/// to tell a genuinely oversize value apart from a DB failure that the store reports under the
+/// same variant, so the two cannot drift apart.
+pub(crate) const MAX_VALUE_BYTES: usize = 65 * 1024;
+
+/// See [`MAX_VALUE_BYTES`].
 pub(crate) fn max_value_bytes() -> usize {
-    MemoryStoreConfig::default().max_value_bytes
+    MAX_VALUE_BYTES
 }
 
 /// Provide a persistant store for kademlia data.
@@ -775,5 +779,40 @@ mod test {
         // Should be full now so get max errors.
         assert!(matches!(kad_store.put(rec.clone()), Err(Error::MaxRecords)));
         assert!(matches!(kad_store_worker.put(rec.clone()), Err(Error::MaxRecords)));
+    }
+
+    /// `num_records` must follow what is actually in the DB: removing a key that is not there
+    /// (the expiry job may ask twice) must not decrement it, or the count drifts below the real
+    /// size and the cap stops protecting the store.
+    #[test]
+    fn test_kad_remove_absent_key_keeps_the_count() {
+        let tmp_dir = TempDir::new().expect("temp dir");
+        let db = open_db(tmp_dir.path());
+        let key_config =
+            KeyConfig::new_with_testing_key(BlsKeypair::generate(&mut StdRng::from_os_rng()));
+        let mut kad_store = KadStore::new(db, &key_config, KadStoreType::Primary);
+
+        let rec = test_record(false);
+        kad_store.put(rec.clone()).expect("put record");
+        assert_eq!(kad_store.num_records, 1);
+
+        // a key that was never stored, twice
+        let absent = test_record(false);
+        kad_store.remove(&absent.key);
+        kad_store.remove(&absent.key);
+        assert_eq!(kad_store.num_records, 1, "removing an absent key must not decrement");
+
+        // the stored key, twice: one decrement
+        kad_store.remove(&rec.key);
+        kad_store.remove(&rec.key);
+        assert_eq!(kad_store.num_records, 0);
+        assert!(kad_store.get(&rec.key).is_none());
+    }
+
+    /// The store's value limit and the behaviour's oversize-vs-DB-failure split read the same
+    /// constant; it is the libp2p memory-store default, which is what the store used before.
+    #[test]
+    fn test_max_value_bytes_matches_the_store_default() {
+        assert_eq!(MAX_VALUE_BYTES, MemoryStoreConfig::default().max_value_bytes);
     }
 }

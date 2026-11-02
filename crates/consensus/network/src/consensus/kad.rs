@@ -273,6 +273,22 @@ where
             return;
         }
 
+        // An unregistered key delivered by a third party stays unknown: its addresses are dial
+        // hints for a key nobody will dial, and admitting them would let a closed store be
+        // bypassed to populate `known_peers`. It is dropped whatever the signature says, so
+        // there is nothing to verify: the pairing would only buy a penalty on a bad signature,
+        // and honest peers replicate such records (from before this rule) hourly. Dropped
+        // before the budget gate, so that replication does not spend the sender's budget and
+        // refuse the registered records in the same burst; the drop is a hash lookup on fields
+        // already decoded, and it lets nothing new through.
+        let about: PeerId = decoded_record.info.pubkey.clone().into();
+        let owner_delivered = source == about;
+        let registered = self.swarm.behaviour().peer_manager.is_registered(&key);
+        if !(registered || owner_delivered) {
+            trace!(target: "network-kad", %key, ?source, "unregistered key from a third party: dropped");
+            return;
+        }
+
         // Budget gate before any per-record work. Not a penalty: an honest node can burst
         // republishes across an epoch change, so over-budget puts are dropped, never charged.
         if !self.within_kad_put_budget(&source) {
@@ -301,10 +317,7 @@ where
         //
         // The refresh is limited to what a fresh put of the same record could do: a stored copy
         // of a key that is no longer registered (not yet expired) must not hand out third-party
-        // dial hints the admission rule below would refuse.
-        let about: PeerId = decoded_record.info.pubkey.clone().into();
-        let owner_delivered = source == about;
-        let registered = self.swarm.behaviour().peer_manager.is_registered(&key);
+        // dial hints the admission rule above would refuse.
         if !self.is_newer_record(&record.key, &key, &decoded_record) {
             trace!(target: "network-kad", ?source, "duplicate record, refreshing known_peers");
             let stored_info = self
@@ -323,16 +336,6 @@ where
                     self.admit_record_info(source, key, info);
                 }
             }
-            return;
-        }
-
-        // An unregistered key delivered by a third party stays unknown: its addresses are dial
-        // hints for a key nobody will dial, and admitting them would let a closed store be
-        // bypassed to populate `known_peers`. It is dropped whatever the signature says, so
-        // there is nothing to verify: the pairing would only buy a penalty on a bad signature,
-        // and honest peers replicate such records (from before this rule) hourly.
-        if !(registered || owner_delivered) {
-            trace!(target: "network-kad", %key, ?source, "unregistered key from a third party: dropped");
             return;
         }
 
@@ -517,9 +520,10 @@ where
 
     /// Check the local kad store to compare record timestamps.
     ///
-    /// This method compares timestamps for verified records to ensure the latest record
-    /// is stored (prevents replay attacks). Also returns `true` if the record is not found.
-    /// It is the caller's responsibility to ensure records are verified and valid.
+    /// This method compares timestamps to ensure only the latest record is stored (prevents
+    /// replay attacks). Also returns `true` if the record is not found. It runs before the
+    /// signature verify: the incoming timestamp is only compared, never trusted, and both
+    /// references it is compared against came from a verified record or from configuration.
     ///
     /// A record can be bound without being stored, so the newest info for a key may live only
     /// in `known_peers`: a record older than that binding is a replay and is refused too. One
