@@ -63,6 +63,9 @@ dev-single-node-setup = [
     "rayls-middleware-bridge/dev-single-node-setup",
     "rayls-infrastructure-types/dev-single-node-setup",
 ]
+# Test-only fault injection (faulty proposers, slow nodes) for multi-node regression tests.
+# NOT FOR PRODUCTION.
+fault-injection-test-hooks = ["rayls-consensus-primary/fault-injection-test-hooks"]
 
 [dev-dependencies]
 rand = { workspace = true }

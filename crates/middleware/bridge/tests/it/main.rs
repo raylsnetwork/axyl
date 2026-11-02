@@ -2,6 +2,8 @@
 
 #![allow(unused_crate_dependencies)]
 
+mod committee_change;
+
 use rayls_consensus_network::types::{MessageId, NetworkCommand};
 use rayls_consensus_primary::{
     consensus::{Bullshark, Consensus, LeaderSchedule},

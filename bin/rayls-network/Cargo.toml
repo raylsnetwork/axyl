@@ -31,6 +31,9 @@ jemalloc = ["tikv-jemallocator"]
 # PRODUCTION — off by default so release builds exclude it; build with
 # `--features dev-single-node-setup` for local development.
 dev-single-node-setup = ["rayls-network-cli/dev-single-node-setup"]
+# Test-only fault injection (faulty proposers, slow nodes) for multi-node regression tests.
+# NOT FOR PRODUCTION.
+fault-injection-test-hooks = ["rayls-network-cli/fault-injection-test-hooks"]
 
 [lints]
 workspace = true

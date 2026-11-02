@@ -171,6 +171,12 @@ where
         )?;
         info!(target: "epoch-manager", "phase 1/6: CHECKPOINT");
 
+        // Test-only fault: a slow checkpoint write or a stalled task delays the shutdown, so the
+        // previous epoch's consensus tasks keep running past the boundary. Compiled out of
+        // production builds, and inert unless the process is armed by environment.
+        #[cfg(feature = "fault-injection-test-hooks")]
+        super::teardown_delay_fault::delay_teardown(epoch).await;
+
         // Phase 2: SHUTDOWN - drain + stop consensus tasks.
         let outcome = self
             .controlled_shutdown(

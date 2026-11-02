@@ -58,6 +58,9 @@ test-utils = ["rayls-execution-evm", "indexmap", "tempfile"]
 # skipping peer-only subsystems like the certificate fetcher). Off by default;
 # enabled transitively by the top-level `dev-single-node-setup` feature. NOT FOR PRODUCTION.
 dev-single-node-setup = []
+# Test-only fault injection (faulty proposers, slow nodes) for multi-node regression tests.
+# NOT FOR PRODUCTION.
+fault-injection-test-hooks = []
 
 [lints]
 workspace = true
