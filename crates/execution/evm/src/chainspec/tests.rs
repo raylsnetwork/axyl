@@ -124,7 +124,7 @@ mod schedule {
     }
 
     /// The version byte reports the highest version byte among the forks *active* at the
-    /// block, not the most recently crossed block. Erc20PrecompileDirectCall (0x12) is
+    /// block, not the most recently crossed block. Erc20PrecompileDirectCall (0x13) is
     /// genesis-active on local, so it owns the byte across every later activation
     /// (HybridRewards at 0x0d included). On real networks it is Never, so there the highest
     /// active fork still advances the byte normally.
@@ -138,7 +138,7 @@ mod schedule {
         assert_eq!(hardforks.version_byte_at_block(1_000_000), Some(0x13));
     }
 
-    /// Every network schedule lists all 18 hardforks in variant order.
+    /// Every network schedule lists all 19 hardforks in variant order.
     #[test]
     fn schedule_contains_all_hardforks_in_order_for_all_networks() {
         for network in [
