@@ -457,6 +457,8 @@ const STORED_ROUND: Round = 1;
 struct FetcherUnderTest {
     /// Requests the fetcher sends to peers.
     requests: mpsc::Receiver<NetworkCommand<PrimaryRequest, PrimaryResponse>>,
+    /// The fetcher's bus, to change its node mode.
+    consensus_bus: ConsensusBus,
     /// Keeps the fetcher's tasks running.
     _task_manager: TaskManager,
 }
@@ -520,7 +522,7 @@ impl FetcherUnderTest {
         let result = synchronizer.process_peer_certificate(trigger).await;
         assert_matches!(result, Err(CertManagerError::Pending(_)));
 
-        Self { requests, _task_manager: task_manager }
+        Self { requests, consensus_bus: cb, _task_manager: task_manager }
     }
 
     /// The next missing-certificates request, with the channel for its answer.
@@ -615,6 +617,35 @@ async fn busy_rounds_grow_the_backoff() {
     }
     let gaps: Vec<_> = starts.windows(2).map(|pair| pair[1] - pair[0]).collect();
     assert!(gaps.last() > gaps.first(), "busy rounds did not grow the backoff: {gaps:?}");
+}
+
+/// Busy rounds while catching up do not delay the first fetch once active.
+///
+/// Catching up never backs off, so those rounds must not count once active.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn busy_rounds_while_catching_up_do_not_delay_the_active_node() {
+    // Enough rounds to reach the backoff cap, had they counted.
+    const ROUNDS: usize = 20;
+    // Well under the backoff cap, and above one fetch round.
+    const FIRST_FETCH_WITHIN: Duration = Duration::from_secs(20);
+
+    let fixture = CommitteeFixture::builder(MemDatabase::default).randomize_ports(true).build();
+    let peers = fixture.committee().size() - 1;
+    let mut fetcher = FetcherUnderTest::start(&fixture, vec![], NodeMode::CvvInactive).await;
+    let busy = || Ok(PrimaryResponse::into_error_ref(&PrimaryNetworkError::Busy));
+
+    // A catching-up node asks every peer at once, and every peer is busy.
+    for _ in 0..ROUNDS * peers {
+        let (_, reply) = fetcher.next_request().await;
+        let _ = reply.send(busy());
+    }
+
+    // The node becomes active, e.g. from certificates it got by gossip.
+    fetcher.consensus_bus.node_mode().send_replace(NodeMode::CvvActive);
+    let switched = tokio::time::Instant::now();
+    let _ = fetcher.next_request().await;
+    let waited = switched.elapsed();
+    assert!(waited < FIRST_FETCH_WITHIN, "first active fetch waited {waited:?}");
 }
 
 /// One busy peer does not hide that the other peers sent nothing usable.
