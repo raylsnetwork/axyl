@@ -4,7 +4,8 @@
 
 use crate::{
     certificate_fetcher::CertificateFetcherCommand, consensus::ConsensusRound,
-    proposer::OurDigestMessage, state_sync::CertificateManagerCommand, RecentlyExecutedBlocks,
+    network::handler::MissingCertLimits, proposer::OurDigestMessage,
+    state_sync::CertificateManagerCommand, RecentlyExecutedBlocks,
 };
 use consensus_metrics::metered_channel::{self, channel_with_total_sender, MeteredMpscChannel};
 use parking_lot::Mutex;
@@ -50,7 +51,6 @@ impl PromotionBarrier {
         }
     }
 }
-use crate::network::handler::MissingCertLimits;
 use std::sync::Arc;
 use tokio::{
     sync::{
