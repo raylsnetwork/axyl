@@ -1385,6 +1385,47 @@ fn test_missing_cert_slots_limit_each_outsider_under_races() {
     assert_eq!(limits.tracked_outsiders(), 0);
 }
 
+/// An outside peer at its limit takes no shared slot from other outside peers.
+#[test]
+fn test_missing_cert_slots_at_limit_outsider_leaves_the_pool_alone() {
+    use crate::network::handler::{MissingCertLimits, MISSING_CERT_JOBS_PER_OUTSIDER};
+    use rand::{rngs::StdRng, SeedableRng};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    const SPAMMERS: usize = 7;
+    const HONEST_REQUESTS: usize = 20_000;
+
+    let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+    let limits = MissingCertLimits::new();
+    let slots = limits.for_committee(&fixture.committee());
+    let outsider = |seed: u64| *BlsKeypair::generate(&mut StdRng::seed_from_u64(seed)).public();
+    let (greedy, honest) = (outsider(0), outsider(1));
+    let greedy_jobs: Vec<_> = (0..MISSING_CERT_JOBS_PER_OUTSIDER)
+        .map(|_| slots.acquire(greedy).expect("slot for an outsider"))
+        .collect();
+    let done = AtomicBool::new(false);
+    let greedy_served = AtomicUsize::new(0);
+
+    let honest_refused = std::thread::scope(|scope| {
+        for _ in 0..SPAMMERS {
+            scope.spawn(|| {
+                while !done.load(Ordering::SeqCst) {
+                    if slots.acquire(greedy).is_ok() {
+                        greedy_served.fetch_add(1, Ordering::SeqCst);
+                    }
+                }
+            });
+        }
+        let refused = (0..HONEST_REQUESTS).filter(|_| slots.acquire(honest).is_err()).count();
+        done.store(true, Ordering::SeqCst);
+        refused
+    });
+
+    assert_eq!(greedy_served.load(Ordering::SeqCst), 0, "an outsider went over its limit");
+    assert_eq!(honest_refused, 0, "requests from an outsider at its limit took the pool");
+    drop(greedy_jobs);
+}
+
 /// Every member of a large committee can use its own share of jobs.
 ///
 /// Otherwise faulty members could hold the whole committee pool.
