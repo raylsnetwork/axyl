@@ -617,6 +617,8 @@ async fn busy_rounds_grow_the_backoff() {
     }
     let gaps: Vec<_> = starts.windows(2).map(|pair| pair[1] - pair[0]).collect();
     assert!(gaps.last() > gaps.first(), "busy rounds did not grow the backoff: {gaps:?}");
+    let metrics = &fetcher.consensus_bus.primary_metrics().node_metrics;
+    assert!(metrics.certificate_fetcher_consecutive_busy.get() > 0, "busy rounds not shown");
 }
 
 /// Busy rounds while catching up do not delay the first fetch once active.
