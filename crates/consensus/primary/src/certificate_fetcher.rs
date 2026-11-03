@@ -9,7 +9,7 @@ use crate::{
 use consensus_metrics::{monitored_future, monitored_scope};
 use futures::{stream::FuturesUnordered, StreamExt};
 use rand::{rngs::ThreadRng, seq::SliceRandom};
-use rayls_consensus_network::error::NetworkError;
+use rayls_consensus_network::{error::NetworkError, OutboundFailure};
 use rayls_consensus_primary_metrics::PrimaryMetrics;
 use rayls_infrastructure_config::ConsensusConfig;
 use rayls_infrastructure_network_types::FetchCertificatesResponse;
@@ -95,6 +95,8 @@ impl FetchAnswers {
     fn record_error(&mut self, error: &NetworkError) {
         match error {
             NetworkError::PeerBusy(_) => self.busy = true,
+            // An IO error may be a malformed answer, so it counts, as before.
+            NetworkError::Outbound(OutboundFailure::Io(_)) => self.failed = true,
             // A peer we could not reach says nothing about our request.
             NetworkError::Outbound(_)
             | NetworkError::Dial(_)
