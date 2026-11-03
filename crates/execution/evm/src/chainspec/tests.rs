@@ -263,14 +263,14 @@ mod hardforks {
 
     #[test]
     fn local_network_version_byte_is_the_max_active_code() {
-        // Erc20PrecompileDirectCall (0x13) is genesis-active on local, so it owns the version
+        // HybridRewards (0x13) is genesis-active on local, so it owns the version
         // byte across every later activation (HybridRewards at 0x0d included): the byte reports
         // the max active code, not the most recently crossed block. On real networks it is Never,
         // so there the highest active fork still advances the byte normally.
         let hardforks = RaylsChainHardforks::local();
-        let activation_block = activation_block(&hardforks, RaylsHardFork::Erc20PrecompileDirectCall);
-        assert_eq!(hardforks.version_byte_at_block(activation_block - 1), Some(0x13));
-        assert_eq!(hardforks.version_byte_at_block(activation_block), Some(0x13));
+        let hybrid_rewards_block = activation_block(&hardforks, RaylsHardFork::HybridRewards);
+        assert_eq!(hardforks.version_byte_at_block(hybrid_rewards_block - 1), Some(0x13));
+        assert_eq!(hardforks.version_byte_at_block(hybrid_rewards_block), Some(0x13));
         assert_eq!(hardforks.version_byte_at_block(1_000_000), Some(0x13));
     }
 }
