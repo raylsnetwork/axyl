@@ -306,6 +306,9 @@ impl<DB: Database> Subscriber<DB> {
     /// Throttle `try_rejoin_consensus` waiting-gate logs to once per this many headers.
     const REJOIN_LOG_THROTTLE: u64 = 100;
 
+    /// Log other-epoch header drops at `info!` once per this many drops.
+    const OTHER_EPOCH_LOG_THROTTLE: u64 = 100;
+
     /// Verify BLS signatures on the consensus header's certificates.
     ///
     /// Wait for committee keys if not yet available (triggers epoch record collector).
@@ -670,6 +673,7 @@ impl<DB: Database> Subscriber<DB> {
         // epoch, the same tracker the live committer drives.
         let mut epoch_cut = EpochCut::default();
         let mut last_committed_number = last_processed_number;
+        let mut other_epoch_drops = 0u64;
         // Arm immediately on post-demote re-entry: Bullshark demoted on
         // MissingParent, local tip already matches last_streamed, and no new
         // headers will arrive. Without this the node stalls waiting for
@@ -768,13 +772,26 @@ impl<DB: Database> Subscriber<DB> {
                             let epoch = consensus_header.sub_dag.leader_epoch();
                             let current_epoch = self.inner.committee.epoch();
                             if epoch != current_epoch {
-                                debug!(
-                                    target: "subscriber",
-                                    number,
-                                    epoch,
-                                    current_epoch,
-                                    "catch-up: dropping unverified header of another epoch"
-                                );
+                                other_epoch_drops += 1;
+                                // throttled at info so a stalled transition shows in default logs
+                                if other_epoch_drops % Self::OTHER_EPOCH_LOG_THROTTLE == 1 {
+                                    info!(
+                                        target: "subscriber",
+                                        number,
+                                        epoch,
+                                        current_epoch,
+                                        dropped = other_epoch_drops,
+                                        "catch-up: dropping unverified headers of another epoch"
+                                    );
+                                } else {
+                                    debug!(
+                                        target: "subscriber",
+                                        number,
+                                        epoch,
+                                        current_epoch,
+                                        "catch-up: dropping unverified header of another epoch"
+                                    );
+                                }
                                 continue;
                             }
                             // dedup before verifying; the predicate cannot advance the watermark,
