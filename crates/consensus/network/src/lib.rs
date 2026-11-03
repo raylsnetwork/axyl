@@ -21,7 +21,7 @@ pub use peers::{PeerExchangeMap, Penalty};
 pub use libp2p::{
     gossipsub::{Message as GossipMessage, TopicHash},
     identity::PeerId,
-    request_response::ResponseChannel,
+    request_response::{OutboundFailure, ResponseChannel},
     Multiaddr,
 };
 #[cfg(test)]
