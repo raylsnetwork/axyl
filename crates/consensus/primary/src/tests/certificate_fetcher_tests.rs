@@ -590,6 +590,33 @@ async fn busy_peers_do_not_trigger_the_stale_session_fallback() {
     }
 }
 
+/// Busy rounds slow an active node down, as failed rounds do.
+///
+/// Otherwise one member that always answers busy would stop it from backing off.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn busy_rounds_grow_the_backoff() {
+    // Enough rounds for the backoff to outlast one fetch round.
+    const ROUNDS: usize = 12;
+
+    let fixture = CommitteeFixture::builder(MemDatabase::default).randomize_ports(true).build();
+    let peers = fixture.committee().size() - 1;
+    let mut fetcher = FetcherUnderTest::start(&fixture, vec![], NodeMode::CvvActive).await;
+
+    // When each fetch round sends its first request.
+    let mut starts = vec![];
+    for _ in 0..ROUNDS {
+        for peer in 0..peers {
+            let (_, reply) = fetcher.next_request().await;
+            if peer == 0 {
+                starts.push(tokio::time::Instant::now());
+            }
+            let _ = reply.send(Ok(PrimaryResponse::into_error_ref(&PrimaryNetworkError::Busy)));
+        }
+    }
+    let gaps: Vec<_> = starts.windows(2).map(|pair| pair[1] - pair[0]).collect();
+    assert!(gaps.last() > gaps.first(), "busy rounds did not grow the backoff: {gaps:?}");
+}
+
 /// One busy peer does not hide that the other peers sent nothing usable.
 ///
 /// Peers that have nothing to send is the case the stale-session fallback is for.

@@ -882,9 +882,15 @@ where
             debug!(target: "primary::handler", authorities = named, limit, "missing-certificates request names too many authorities");
             return Err(PrimaryNetworkError::TooManyAuthorities(named, limit));
         }
-        let permits = self.missing_cert_slots.acquire(peer).inspect_err(|_| {
-            self.consensus_bus.primary_metrics().node_metrics.missing_cert_requests_busy.inc();
-            debug!(target: "primary::handler", %peer, "too many missing-certificates requests in progress");
+        let permits = self.missing_cert_slots.acquire(peer).map_err(|limit| {
+            self.consensus_bus
+                .primary_metrics()
+                .node_metrics
+                .missing_cert_requests_busy
+                .with_label_values(&[limit.label()])
+                .inc();
+            debug!(target: "primary::handler", %peer, ?limit, "too many missing-certificates requests in progress");
+            PrimaryNetworkError::Busy
         })?;
 
         let consensus_config = self.consensus_config.clone();
@@ -1212,8 +1218,31 @@ impl OutsiderSlots {
     }
 }
 
+/// The limit that refused a missing-certificate job.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BusyLimit {
+    /// The member already runs its share of jobs.
+    Member,
+    /// The committee pool is full, with jobs from an earlier epoch.
+    Committee,
+    /// The outside peer is at its limit, or the outsider pool is full.
+    Outsider,
+}
+
+impl BusyLimit {
+    /// The label of this limit in the refusal metric.
+    fn label(self) -> &'static str {
+        match self {
+            Self::Member => "member",
+            Self::Committee => "committee",
+            Self::Outsider => "outsider",
+        }
+    }
+}
+
 /// The permits one missing-certificate job holds until it ends.
 /// Fields drop in order, so an outsider's slot is freed before its permit.
+/// A request that races a drop may be refused as busy, and retries later.
 #[derive(Debug)]
 pub(crate) struct MissingCertPermits {
     /// The member's own permit.
@@ -1240,33 +1269,31 @@ impl Drop for OutsiderJob {
 }
 
 impl MissingCertSlots {
-    /// Take the permits for one job, or fail with `Busy` without waiting.
+    /// Take the permits for one job, or name the full limit without waiting.
     ///
     /// A committee peer takes a permit from its own pool and from the committee pool.
     /// Any other peer takes a permit from the shared pool, within its own limit.
-    pub(crate) fn acquire(&self, peer: BlsPublicKey) -> PrimaryNetworkResult<MissingCertPermits> {
+    pub(crate) fn acquire(&self, peer: BlsPublicKey) -> Result<MissingCertPermits, BusyLimit> {
         let Some(own) = self.per_peer.get(&peer) else {
             return self.acquire_outsider(peer);
         };
         // A member at its limit is refused before touching the pool.
         // If the pool is full, the member's permit is dropped and so given back.
-        let peer = own.clone().try_acquire_owned().map_err(|_| PrimaryNetworkError::Busy)?;
-        let pool =
-            self.committee.clone().try_acquire_owned().map_err(|_| PrimaryNetworkError::Busy)?;
+        let peer = own.clone().try_acquire_owned().map_err(|_| BusyLimit::Member)?;
+        let pool = self.committee.clone().try_acquire_owned().map_err(|_| BusyLimit::Committee)?;
         Ok(MissingCertPermits { _peer: Some(peer), _outsider: None, _pool: pool })
     }
 
     /// Take the permits for one job of an outside peer.
-    fn acquire_outsider(&self, peer: BlsPublicKey) -> PrimaryNetworkResult<MissingCertPermits> {
+    fn acquire_outsider(&self, peer: BlsPublicKey) -> Result<MissingCertPermits, BusyLimit> {
         let tag = self.outsiders.tag(&peer);
         // A peer at its limit is refused before touching the shared pool.
         if self.outsiders.running(tag) >= MISSING_CERT_JOBS_PER_OUTSIDER {
-            return Err(PrimaryNetworkError::Busy);
+            return Err(BusyLimit::Outsider);
         }
-        let pool =
-            self.others.clone().try_acquire_owned().map_err(|_| PrimaryNetworkError::Busy)?;
+        let pool = self.others.clone().try_acquire_owned().map_err(|_| BusyLimit::Outsider)?;
         // If a racing request won, the pool permit is dropped and so given back.
-        let job = self.outsiders.claim(tag).ok_or(PrimaryNetworkError::Busy)?;
+        let job = self.outsiders.claim(tag).ok_or(BusyLimit::Outsider)?;
         Ok(MissingCertPermits { _peer: None, _outsider: Some(job), _pool: pool })
     }
 }
