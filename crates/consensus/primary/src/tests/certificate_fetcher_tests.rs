@@ -15,6 +15,7 @@ use assert_matches::assert_matches;
 use rayls_consensus_network::{
     error::NetworkError,
     types::{NetworkCommand, NetworkHandle},
+    OutboundFailure,
 };
 use rayls_infrastructure_storage::{mem_db::MemDatabase, CertificateStore, PayloadStore};
 use rayls_infrastructure_types::{
@@ -589,34 +590,41 @@ async fn busy_peers_do_not_trigger_the_stale_session_fallback() {
     }
 }
 
-/// One busy peer does not hide that the other peers had nothing to send.
+/// One busy peer does not hide that the other peers sent nothing usable.
 ///
 /// Peers that have nothing to send is the case the stale-session fallback is for.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn one_busy_peer_does_not_hide_empty_answers() {
     let fixture = CommitteeFixture::builder(MemDatabase::default).randomize_ports(true).build();
     let peers = fixture.committee().size() - 1;
-    let mut fetcher = FetcherUnderTest::start(&fixture, vec![], NodeMode::CvvInactive).await;
 
-    // A catching-up node asks every peer at once, so each fetch round is `peers` requests.
-    // The first peer of each round is busy, and the others have nothing to send.
-    // Nothing is garbage collected in this test, so the fallback asks from round 0.
-    let gc_round = 0;
-    for fetch_round in 0..=STALE_SKIP_ROUNDS_CATCHUP_THRESHOLD {
-        for peer in 0..peers {
-            let (request, reply) = fetcher.next_request().await;
-            let (lower_bound, _) = request.get_bounds(max_skip_rounds(), |_| true).unwrap();
-            if fetch_round == STALE_SKIP_ROUNDS_CATCHUP_THRESHOLD {
-                assert_eq!(lower_bound, gc_round, "the fallback did not ask for everything");
-                return;
+    // The other peers send an empty answer, or one we cannot decode.
+    for malformed in [false, true] {
+        let mut fetcher = FetcherUnderTest::start(&fixture, vec![], NodeMode::CvvInactive).await;
+
+        // A catching-up node asks every peer at once, so each fetch round is `peers` requests.
+        // The first peer of each round is busy.
+        // Nothing is garbage collected in this test, so the fallback asks from round 0.
+        let gc_round = 0;
+        'rounds: for fetch_round in 0..=STALE_SKIP_ROUNDS_CATCHUP_THRESHOLD {
+            for peer in 0..peers {
+                let (request, reply) = fetcher.next_request().await;
+                let (lower_bound, _) = request.get_bounds(max_skip_rounds(), |_| true).unwrap();
+                if fetch_round == STALE_SKIP_ROUNDS_CATCHUP_THRESHOLD {
+                    assert_eq!(lower_bound, gc_round, "no fallback, malformed {malformed}");
+                    break 'rounds;
+                }
+                assert_eq!(lower_bound, STORED_ROUND);
+                let answer = if peer == 0 {
+                    Ok(PrimaryResponse::into_error_ref(&PrimaryNetworkError::Busy))
+                } else if malformed {
+                    let io = std::io::Error::new(std::io::ErrorKind::InvalidData, "bad answer");
+                    Err(NetworkError::Outbound(OutboundFailure::Io(io)))
+                } else {
+                    Ok(PrimaryResponse::RequestedCertificates(vec![]))
+                };
+                let _ = reply.send(answer);
             }
-            assert_eq!(lower_bound, STORED_ROUND);
-            let answer = if peer == 0 {
-                PrimaryResponse::into_error_ref(&PrimaryNetworkError::Busy)
-            } else {
-                PrimaryResponse::RequestedCertificates(vec![])
-            };
-            let _ = reply.send(Ok(answer));
         }
     }
 }
