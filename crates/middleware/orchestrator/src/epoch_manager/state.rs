@@ -125,25 +125,46 @@ where
                     }
                 }
             }
-            let Some(prev) = prev else {
-                error!(
-                    target: "epoch-manager",
-                    "failed to find previous epoch record when starting epoch",
-                );
-                return Err(eyre!("failed to find previous epoch record when starting epoch"));
-            };
-            if committee_keys != prev.next_committee {
-                error!(
-                    target: "epoch-manager",
-                    "Last epochs next committee not equal to this epochs committee! previous {:?}, current {:?}",
-                    prev.next_committee,
-                    committee_keys
-                );
-                return Err(eyre!(
-                    "Last epochs next committee not equal to this epochs committee!"
-                ));
+            match prev {
+                Some(prev) => {
+                    if committee_keys != prev.next_committee {
+                        error!(
+                            target: "epoch-manager",
+                            "Last epochs next committee not equal to this epochs committee! previous {:?}, current {:?}",
+                            prev.next_committee,
+                            committee_keys
+                        );
+                        return Err(eyre!(
+                            "Last epochs next committee not equal to this epochs committee!"
+                        ));
+                    }
+                    prev.digest()
+                }
+                // No node holds the previous record: its vote never reached quorum, so it
+                // only lived in memory, and every node restarted before this boundary.
+                // Peers have nothing to serve, so without an operator-supplied digest the
+                // whole committee halts here on every restart.
+                None => match recovery_prev_epoch_digest(epoch - 1) {
+                    Some(digest) => {
+                        warn!(
+                            target: "epoch-manager",
+                            epoch = epoch - 1,
+                            %digest,
+                            "previous epoch record missing locally and on all peers; using operator-supplied digest from {RECOVERY_PREV_EPOCH_DIGEST_ENV} as parent_hash",
+                        );
+                        digest
+                    }
+                    None => {
+                        error!(
+                            target: "epoch-manager",
+                            "failed to find previous epoch record when starting epoch",
+                        );
+                        return Err(eyre!(
+                            "failed to find previous epoch record when starting epoch"
+                        ));
+                    }
+                },
             }
-            prev.digest()
         };
         // Use deterministic sources: boundary_consensus_hash from the boundary output (immutable)
         // and the durable canonical tip. Read the reth canonical head directly rather than the
@@ -591,4 +612,27 @@ pub(crate) fn resolve_local_prev_epoch_record<DB: ReDatabase>(
             .cloned()
             .or_else(|| uncertified.map(|(rec, _)| rec)),
     }
+}
+
+/// Operator escape hatch for a previous epoch record that no node holds.
+///
+/// Format: `<epoch>:<0x-prefixed record digest>`. The digest is the one every node
+/// logged as `failed to reach quorum on epoch close for <digest>`. Every node must be
+/// given the same value so they all derive the same record for the closing epoch and
+/// can certify it.
+pub(crate) const RECOVERY_PREV_EPOCH_DIGEST_ENV: &str = "RAYLS_RECOVERY_PREV_EPOCH_DIGEST";
+
+fn recovery_prev_epoch_digest(prev_epoch: Epoch) -> Option<B256> {
+    let raw = std::env::var(RECOVERY_PREV_EPOCH_DIGEST_ENV).ok()?;
+    parse_recovery_prev_epoch_digest(&raw, prev_epoch)
+}
+
+/// Parses a [`RECOVERY_PREV_EPOCH_DIGEST_ENV`] value. Returns the digest only when its
+/// epoch is exactly `prev_epoch`, so a value left in place after recovery is inert.
+pub(crate) fn parse_recovery_prev_epoch_digest(raw: &str, prev_epoch: Epoch) -> Option<B256> {
+    let (epoch, digest) = raw.trim().split_once(':')?;
+    if epoch.trim().parse::<Epoch>().ok()? != prev_epoch {
+        return None;
+    }
+    digest.trim().parse::<B256>().ok()
 }

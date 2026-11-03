@@ -2629,3 +2629,23 @@ fn test_decide_node_mode_observer_sole_member_stays_observer() {
     assert_eq!(mode, NodeMode::Observer);
     assert_eq!(reason, "observer-flag");
 }
+
+/// The `RAYLS_RECOVERY_PREV_EPOCH_DIGEST` escape hatch is honoured only for the exact
+/// previous epoch it names, so a value left in the environment after recovery cannot
+/// leak into a later boundary.
+#[test]
+fn test_parse_recovery_prev_epoch_digest() {
+    use crate::epoch_manager::parse_recovery_prev_epoch_digest;
+
+    let digest = B256::random();
+    let raw = format!("187:{digest}");
+
+    assert_eq!(parse_recovery_prev_epoch_digest(&raw, 187), Some(digest));
+    assert_eq!(parse_recovery_prev_epoch_digest(&format!(" 187 : {digest}\n"), 187), Some(digest));
+
+    // wrong epoch, missing separator, or malformed digest: ignored
+    assert_eq!(parse_recovery_prev_epoch_digest(&raw, 188), None);
+    assert_eq!(parse_recovery_prev_epoch_digest(&digest.to_string(), 187), None);
+    assert_eq!(parse_recovery_prev_epoch_digest("187:0x1234", 187), None);
+    assert_eq!(parse_recovery_prev_epoch_digest(&format!("x:{digest}"), 187), None);
+}
