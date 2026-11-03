@@ -443,6 +443,11 @@ impl<DB: Database> CertificateFetcher<DB> {
             .node_metrics
             .certificate_fetcher_consecutive_failures
             .set(self.consecutive_failures as i64);
+        self.consensus_bus
+            .primary_metrics()
+            .node_metrics
+            .certificate_fetcher_consecutive_busy
+            .set(self.consecutive_busy as i64);
         if backoff > Duration::ZERO {
             // only enforce backoff in CvvActive mode
             if is_active {
