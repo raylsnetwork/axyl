@@ -28,14 +28,18 @@ pub trait RLMessage:
 
 /// The Rayls Network request/response codec for consensus messages between peers.
 ///
-/// The codec reuses pre-allocated buffers to asynchronously read messages per the libp2p [Codec]
-/// trait. All messages include a 4-byte prefix that indicates the message's uncompressed length.
-/// Peers use this prefix to safely decompress and decode messages from peers.
+/// The codec reuses its buffers across messages to asynchronously read and write per the libp2p
+/// [Codec] trait. All messages include a 4-byte prefix that indicates the message's uncompressed
+/// length. The decode buffer grows only as decompressed bytes are produced, so a peer that
+/// sends only the length prefix reserves no buffer.
 #[derive(Clone, Debug)]
 pub struct RLCodec<Req, Res> {
-    /// The fixed-size buffer for compressed messages.
+    /// The buffer for compressed message data.
     compressed_buffer: Vec<u8>,
-    /// The fixed-size buffer for requests.
+    /// The buffer for decompressed message data.
+    ///
+    /// Grows only as decompressed bytes are produced; it is never pre-sized to the declared
+    /// length, so a prefix-only or stalled request reserves no memory.
     decode_buffer: Vec<u8>,
     /// The maximum size (bytes) for a single message.
     ///
@@ -46,9 +50,7 @@ pub struct RLCodec<Req, Res> {
 }
 
 impl<Req, Res> RLCodec<Req, Res> {
-    /// Create a new instance of Self.
     pub fn new(max_chunk_size: usize) -> Self {
-        // create buffer from max possible compression length based on max request size
         let max_compress_len = snap::raw::max_compress_len(max_chunk_size);
         let compressed_buffer = Vec::with_capacity(max_compress_len);
         // allocate capacity for decoding max message size
@@ -71,26 +73,18 @@ impl<Req, Res> RLCodec<Req, Res> {
         T: AsyncRead + Unpin + Send,
         M: RLMessage,
     {
-        // clear buffers
         self.compressed_buffer.clear();
         self.decode_buffer.clear();
 
-        // retrieve prefix for uncompressed message length
         let mut prefix = [0; 4];
         io.read_exact(&mut prefix).await?;
 
         // NOTE: cast u32 to usize is safe
         let length = u32::from_le_bytes(prefix) as usize;
 
-        // ensure message length within bounds
         if length > self.max_chunk_size {
             return Err(std::io::Error::other("prefix indicates message size is too large"));
         }
-
-        // resize buffer to reported message size
-        //
-        // NOTE: this should not reallocate
-        self.decode_buffer.resize(length, 0);
 
         // take max possible compression size based on reported length
         // this is used to limit the amount read in case peer used malicious prefix
@@ -99,12 +93,23 @@ impl<Req, Res> RLCodec<Req, Res> {
         let max_compress_len = snap::raw::max_compress_len(length);
         io.take(max_compress_len as u64).read_to_end(&mut self.compressed_buffer).await?;
 
-        // decompress bytes
+        // decompress into `decode_buffer`, capping the output at the declared length so
+        // snappy amplification can't exceed it
+        //
+        // NOTE: the buffer is not pre-sized to the declared length; it grows as bytes arrive,
+        // so a prefix-only or stalled request reserves no memory
         let reader = std::io::Cursor::new(&mut self.compressed_buffer);
-        let mut snappy_decoder = FrameDecoder::new(reader);
-        snappy_decoder.read_exact(&mut self.decode_buffer)?;
+        let snappy_decoder = FrameDecoder::new(reader);
+        snappy_decoder.take(length as u64).read_to_end(&mut self.decode_buffer)?;
 
-        // decode bytes
+        // the prefix declares the exact uncompressed length; shorter data is a protocol violation
+        if self.decode_buffer.len() < length {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "decompressed data smaller than declared prefix",
+            ));
+        }
+
         bcs::from_bytes(&self.decode_buffer).map_err(std::io::Error::other)
     }
 
@@ -117,17 +122,14 @@ impl<Req, Res> RLCodec<Req, Res> {
         T: AsyncWrite + Unpin + Send,
         M: RLMessage,
     {
-        // clear buffers
         self.compressed_buffer.clear();
         self.decode_buffer.clear();
 
-        // encode into allocated buffer
         encode_into_buffer(&mut self.decode_buffer, &msg).map_err(|e| {
             let error = format!("encode into buffer: {e}");
             std::io::Error::other(error)
         })?;
 
-        // ensure encoded bytes are within bounds
         if self.decode_buffer.len() > self.max_chunk_size {
             return Err(std::io::Error::other("encode data > max_chunk_size"));
         }
@@ -143,7 +145,6 @@ impl<Req, Res> RLCodec<Req, Res> {
         encoder.write_all(&self.decode_buffer)?;
         encoder.flush()?;
 
-        // add compressed bytes to prefix
         io.write_all(encoder.get_ref()).await?;
 
         Ok(())

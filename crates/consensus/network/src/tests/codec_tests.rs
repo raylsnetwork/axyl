@@ -14,7 +14,6 @@ async fn test_encode_decode_same_message() {
     let mut codec = RLCodec::<TestPrimaryRequest, TestPrimaryResponse>::new(max_chunk_size);
     let protocol = StreamProtocol::new("/rayls-test");
 
-    // encode request
     let mut encoded = Vec::new();
     let request = TestPrimaryRequest::Vote {
         header: Header::default(),
@@ -25,12 +24,10 @@ async fn test_encode_decode_same_message() {
         .await
         .expect("write valid request");
 
-    // now decode request
     let decoded =
         codec.read_request(&protocol, &mut encoded.as_ref()).await.expect("read valid request");
     assert_eq!(decoded, request);
 
-    // encode response
     let mut encoded = Vec::new();
     let response = TestPrimaryResponse::MissingParents(vec![CertificateDigest::new([b'a'; 32])]);
     codec
@@ -38,7 +35,6 @@ async fn test_encode_decode_same_message() {
         .await
         .expect("write valid response");
 
-    // now decode response
     let decoded =
         codec.read_response(&protocol, &mut encoded.as_ref()).await.expect("read valid response");
     assert_eq!(decoded, response);
@@ -50,7 +46,6 @@ async fn test_fail_to_write_message_too_big() {
     let mut codec = RLCodec::<TestPrimaryRequest, TestPrimaryResponse>::new(max_chunk_size);
     let protocol = StreamProtocol::new("/rayls-test");
 
-    // encode request
     let mut encoded = Vec::new();
     let request = TestPrimaryRequest::Vote {
         header: Header::default(),
@@ -59,7 +54,6 @@ async fn test_fail_to_write_message_too_big() {
     let res = codec.write_request(&protocol, &mut encoded, request).await;
     assert!(res.is_err());
 
-    // encode response
     let mut encoded = Vec::new();
     let response = TestPrimaryResponse::MissingCertificates(vec![Certificate::default()]);
     let res = codec.write_response(&protocol, &mut encoded, response).await;
@@ -82,7 +76,6 @@ async fn test_reject_message_prefix_too_big() {
     // sanity check
     let mut encoded = Vec::new();
 
-    //println!("size: {}", std::mem::size_of::<TestPrimaryRequest>());
     // this is 344 bytes uncompressed (max chunk size)
     let request = TestPrimaryRequest::Vote {
         header: Header::default(),
@@ -224,4 +217,103 @@ async fn test_malicious_prefix_deceives_peer_to_read_message_and_fails() {
     // should cause an unexpected EOF
     let res = honest_peer.read_response(&protocol, &mut encoded.as_ref()).await;
     assert!(res.is_err());
+}
+
+/// Emits `data` once, then blocks forever (peer end stays open, no EOF).
+///
+/// Used to model a peer that sends the 4-byte length prefix and then stalls without ever
+/// sending body bytes or closing the stream.
+struct StallReader {
+    data: Vec<u8>,
+    pos: usize,
+}
+
+impl futures::AsyncRead for StallReader {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut futures::task::Context<'_>,
+        buf: &mut [u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        let this = self.get_mut();
+        if this.pos < this.data.len() {
+            let n = this.data.len().min(buf.len());
+            buf[..n].copy_from_slice(&this.data[this.pos..this.pos + n]);
+            this.pos += n;
+            std::task::Poll::Ready(Ok(n))
+        } else {
+            std::task::Poll::Pending
+        }
+    }
+}
+
+/// A request that sends only the 4-byte length prefix (declaring the maximum message size)
+/// and then closes the stream must not reserve the declared size in `decode_buffer`.
+///
+/// Regression test for a memory-exhaustion vulnerability: the old implementation called
+/// `decode_buffer.resize(length, 0)` before any body bytes arrived, immediately reserving
+/// up to `max_chunk_size` per stream.
+#[tokio::test]
+async fn test_prefix_only_request_does_not_reserve_declared_size() {
+    let max_chunk_size = 2 * 1024 * 1024; // 2 MiB
+    let codec = RLCodec::<TestPrimaryRequest, TestPrimaryResponse>::new(max_chunk_size);
+    let protocol = StreamProtocol::new("/rayls-test");
+
+    // Clone the codec as libp2p does for each inbound stream.
+    let mut stream_codec = codec.clone();
+
+    // A 4-byte prefix declaring the maximum size, with no body following.
+    let mut prefix_only = vec![0u8; 4];
+    prefix_only[..].copy_from_slice(&(max_chunk_size as u32).to_le_bytes());
+
+    let result = stream_codec.read_request(&protocol, &mut prefix_only.as_slice()).await;
+    assert!(result.is_err());
+
+    // The buffer must NOT be pre-sized to the declared length.
+    let declared = max_chunk_size;
+    assert!(
+        stream_codec.decode_buffer.len() < declared / 2,
+        "decode_buffer holds {} bytes, expected < {}",
+        stream_codec.decode_buffer.len(),
+        declared / 2
+    );
+}
+
+/// A request that sends only the 4-byte length prefix and then stalls (peer end stays open,
+/// no EOF) must not hold the declared size in `decode_buffer`.
+///
+/// Regression test for a memory-exhaustion vulnerability: the old implementation called
+/// `decode_buffer.resize(length, 0)` before any body bytes arrived, immediately reserving
+/// up to `max_chunk_size` per stream.
+#[tokio::test]
+async fn test_stalled_request_does_not_hold_declared_size() {
+    use tokio::time::{timeout, Duration};
+
+    let max_chunk_size = 2 * 1024 * 1024; // 2 MiB
+    let codec = RLCodec::<TestPrimaryRequest, TestPrimaryResponse>::new(max_chunk_size);
+    let protocol = StreamProtocol::new("/rayls-test");
+
+    // Clone the codec as libp2p does for each inbound stream.
+    let mut stream_codec = codec.clone();
+
+    // A 4-byte prefix declaring the maximum size, followed by a stall.
+    let mut prefix_only = vec![0u8; 4];
+    prefix_only[..].copy_from_slice(&(max_chunk_size as u32).to_le_bytes());
+    let mut reader = StallReader { data: prefix_only, pos: 0 };
+
+    // The read should genuinely block on the body (the prefix is consumed first), so the
+    // 200 ms timeout elapses rather than the read erroring early.
+    let result =
+        timeout(Duration::from_millis(200), stream_codec.read_request(&protocol, &mut reader))
+            .await;
+    assert!(result.is_err(), "read should still be waiting (stalled stream), not complete early");
+
+    // After cancellation the codec outlives the future, so in the vulnerable code the buffer
+    // would still hold the declared size (the resize happened before the read blocked).
+    let declared = max_chunk_size;
+    assert!(
+        stream_codec.decode_buffer.len() < declared / 2,
+        "decode_buffer holds {} bytes after stall, expected < {}",
+        stream_codec.decode_buffer.len(),
+        declared / 2
+    );
 }
