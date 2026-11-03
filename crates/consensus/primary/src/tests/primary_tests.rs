@@ -1163,6 +1163,20 @@ fn test_missing_cert_slots_outlive_cancelled_requests() {
     // How often to retry while the slots are still taken.
     const RETRY_EVERY: Duration = Duration::from_millis(10);
 
+    /// Retry a request from `peer` while it is refused as busy.
+    async fn answer_once_free(
+        handler: &RequestHandler<MemDatabase>,
+        peer: BlsPublicKey,
+    ) -> PrimaryResponse {
+        loop {
+            match handler.retrieve_missing_certs(peer, empty_request(), None).await {
+                Ok(response) => return response,
+                Err(PrimaryNetworkError::Busy) => tokio::time::sleep(RETRY_EVERY).await,
+                Err(e) => panic!("unexpected error while waiting for a slot: {e:?}"),
+            }
+        }
+    }
+
     let runtime = tokio::runtime::Builder::new_current_thread()
         .max_blocking_threads(1)
         .enable_all()
@@ -1225,20 +1239,15 @@ fn test_missing_cert_slots_outlive_cancelled_requests() {
         // A full outsider pool does not affect members.
         assert!(start_then_cancel(&handler, member(3)).await.is_none());
 
-        // Once the queued jobs run, the slots are free again.
+        // Once the queued jobs run, the member's and the outsiders' slots are free again.
         release.send(()).expect("release the blocking thread");
         blocker.await.expect("blocker");
-        let freed = timeout(SLOTS_FREED_WITHIN, async {
-            loop {
-                match handler.retrieve_missing_certs(busy_member, empty_request(), None).await {
-                    Ok(response) => break response,
-                    Err(_) => tokio::time::sleep(RETRY_EVERY).await,
-                }
-            }
-        })
-        .await
-        .expect("slots freed after the jobs ran");
-        assert!(matches!(freed, PrimaryResponse::RequestedCertificates(_)), "got {freed:?}");
+        for (peer, who) in [(busy_member, "the busy member"), (outsider(), "an outsider")] {
+            let freed = timeout(SLOTS_FREED_WITHIN, answer_once_free(&handler, peer))
+                .await
+                .unwrap_or_else(|_| panic!("{who} got no slot after the jobs ran"));
+            assert!(matches!(freed, PrimaryResponse::RequestedCertificates(_)), "{who}: {freed:?}");
+        }
     });
 }
 
@@ -1328,6 +1337,51 @@ fn test_missing_cert_slots_limit_each_outsider() {
     assert_eq!(limits.tracked_outsiders(), other_jobs.len());
     slots.acquire(greedy).expect("slot once the outsider's job ended");
     drop(other_jobs);
+    assert_eq!(limits.tracked_outsiders(), 0);
+}
+
+/// Racing requests from one outside peer never run more jobs than its limit.
+#[test]
+fn test_missing_cert_slots_limit_each_outsider_under_races() {
+    use crate::network::handler::{MissingCertLimits, MISSING_CERT_JOBS_PER_OUTSIDER};
+    use rand::{rngs::StdRng, SeedableRng};
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Barrier,
+    };
+
+    const THREADS: usize = 8;
+    const ROUNDS: usize = 20_000;
+
+    let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+    let limits = MissingCertLimits::new();
+    let slots = limits.for_committee(&fixture.committee());
+    let greedy = *BlsKeypair::generate(&mut StdRng::seed_from_u64(0)).public();
+    let running = AtomicUsize::new(0);
+    let most_running = AtomicUsize::new(0);
+    let served = AtomicUsize::new(0);
+    let start = Barrier::new(THREADS);
+
+    std::thread::scope(|scope| {
+        for _ in 0..THREADS {
+            scope.spawn(|| {
+                start.wait();
+                for _ in 0..ROUNDS {
+                    let Ok(job) = slots.acquire(greedy) else { continue };
+                    let now = running.fetch_add(1, Ordering::SeqCst) + 1;
+                    most_running.fetch_max(now, Ordering::SeqCst);
+                    // Hold the job a moment, so racing jobs overlap.
+                    std::thread::yield_now();
+                    running.fetch_sub(1, Ordering::SeqCst);
+                    served.fetch_add(1, Ordering::SeqCst);
+                    drop(job);
+                }
+            });
+        }
+    });
+
+    assert!(served.load(Ordering::SeqCst) > 0, "no request was served");
+    assert_eq!(most_running.load(Ordering::SeqCst), MISSING_CERT_JOBS_PER_OUTSIDER);
     assert_eq!(limits.tracked_outsiders(), 0);
 }
 

@@ -32,7 +32,11 @@ use rayls_infrastructure_types::{
 };
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
-    sync::Arc,
+    hash::{BuildHasher, RandomState},
+    sync::{
+        atomic::{AtomicU64, AtomicUsize, Ordering},
+        Arc,
+    },
     time::Duration,
 };
 use tokio::{
@@ -1075,9 +1079,6 @@ pub(crate) const MISSING_CERT_JOBS_PER_OUTSIDER: usize = 1;
 // One outside peer must not fill the shared pool.
 const _: () = assert!(MISSING_CERT_JOBS_PER_OUTSIDER < MISSING_CERT_JOBS_OTHERS);
 
-/// Running jobs per outside peer, only for peers with one.
-type OutsiderJobs = Arc<Mutex<HashMap<BlsPublicKey, usize>>>;
-
 /// Concurrency limits for missing-certificate jobs, shared by every epoch.
 ///
 /// The node keeps one for its whole life, so jobs left over from an earlier epoch still count.
@@ -1086,21 +1087,20 @@ pub(crate) struct MissingCertLimits {
     /// Pool for committee peers.
     committee: Arc<Semaphore>,
     /// Permits the committee pool was made with, including any growth.
-    committee_capacity: Mutex<usize>,
+    committee_capacity: AtomicUsize,
     /// Smaller pool for every other peer, so observers cannot starve committee catch-up.
     others: Arc<Semaphore>,
-    /// Running jobs per outside peer.
-    /// Each tracked job holds a permit from `others`, so this stays small.
-    outsider_jobs: OutsiderJobs,
+    /// Outside peers' running jobs, one slot per permit of `others`.
+    outsiders: Arc<OutsiderSlots>,
 }
 
 impl MissingCertLimits {
     pub(crate) fn new() -> Self {
         Self {
             committee: Arc::new(Semaphore::new(MISSING_CERT_JOBS_COMMITTEE)),
-            committee_capacity: Mutex::new(MISSING_CERT_JOBS_COMMITTEE),
+            committee_capacity: AtomicUsize::new(MISSING_CERT_JOBS_COMMITTEE),
             others: Arc::new(Semaphore::new(MISSING_CERT_JOBS_OTHERS)),
-            outsider_jobs: Default::default(),
+            outsiders: Arc::new(OutsiderSlots::new()),
         }
     }
 
@@ -1112,12 +1112,11 @@ impl MissingCertLimits {
         // Faulty members must never hold the whole pool.
         // It only grows, so jobs from an earlier epoch keep their permits.
         let needed = MISSING_CERT_JOBS_PER_PEER * committee.size();
-        let mut capacity = self.committee_capacity.lock();
-        if needed > *capacity {
-            self.committee.add_permits(needed - *capacity);
-            *capacity = needed;
+        // Racing callers each add only the part they grew.
+        let before = self.committee_capacity.fetch_max(needed, Ordering::SeqCst);
+        if needed > before {
+            self.committee.add_permits(needed - before);
         }
-        drop(capacity);
         let per_peer = committee
             .authorities()
             .iter()
@@ -1128,7 +1127,7 @@ impl MissingCertLimits {
         MissingCertSlots {
             committee: self.committee.clone(),
             others: self.others.clone(),
-            outsider_jobs: self.outsider_jobs.clone(),
+            outsiders: self.outsiders.clone(),
             per_peer,
         }
     }
@@ -1139,10 +1138,10 @@ impl MissingCertLimits {
         self.committee.available_permits()
     }
 
-    /// Outside peers with a running job.
+    /// Slots held by outside peers' running jobs.
     #[cfg(test)]
     pub(crate) fn tracked_outsiders(&self) -> usize {
-        self.outsider_jobs.lock().len()
+        self.outsiders.held()
     }
 }
 
@@ -1155,41 +1154,80 @@ pub(crate) struct MissingCertSlots {
     committee: Arc<Semaphore>,
     /// Pool for every other peer, shared with every epoch.
     others: Arc<Semaphore>,
-    /// Running jobs per outside peer, shared with every epoch.
-    outsider_jobs: OutsiderJobs,
+    /// Outside peers' running jobs, shared with every epoch.
+    outsiders: Arc<OutsiderSlots>,
     /// A pool for each member of this epoch's committee.
     per_peer: HashMap<BlsPublicKey, Arc<Semaphore>>,
 }
 
+/// Marks a free slot in [OutsiderSlots].
+const FREE_SLOT: u64 = 0;
+
+/// Outside peers' running jobs, one slot per permit of the shared pool.
+///
+/// A slot holds a hash of the peer's key, salted per node.
+/// A collision only refuses a request, which the requester retries.
+#[derive(Debug)]
+struct OutsiderSlots {
+    /// The slots, claimed with compare-and-swap.
+    slots: [AtomicU64; MISSING_CERT_JOBS_OTHERS],
+    /// Hashes peer keys with a salt random to this node.
+    hasher: RandomState,
+}
+
+impl OutsiderSlots {
+    fn new() -> Self {
+        Self {
+            slots: std::array::from_fn(|_| AtomicU64::new(FREE_SLOT)),
+            hasher: RandomState::new(),
+        }
+    }
+
+    /// Claim a slot for `peer`, unless it is at its limit.
+    /// The caller holds a pool permit, so a slot is free, but a race may miss it.
+    fn claim(self: &Arc<Self>, peer: &BlsPublicKey) -> Option<OutsiderJob> {
+        let tag = self.hasher.hash_one(peer).max(FREE_SLOT + 1);
+        let index = self.slots.iter().position(|slot| {
+            slot.compare_exchange(FREE_SLOT, tag, Ordering::SeqCst, Ordering::SeqCst).is_ok()
+        })?;
+        let job = OutsiderJob { index, outsiders: self.clone() };
+        // Claim first and count after, so racing claims cannot both pass.
+        // If both see each other, both are refused and retry later.
+        let running = self.slots.iter().filter(|slot| slot.load(Ordering::SeqCst) == tag).count();
+        (running <= MISSING_CERT_JOBS_PER_OUTSIDER).then_some(job)
+    }
+
+    /// Slots in use.
+    #[cfg(test)]
+    fn held(&self) -> usize {
+        self.slots.iter().filter(|slot| slot.load(Ordering::SeqCst) != FREE_SLOT).count()
+    }
+}
+
 /// The permits one missing-certificate job holds until it ends.
+/// Fields drop in order, so an outsider's slot is freed before its permit.
 #[derive(Debug)]
 pub(crate) struct MissingCertPermits {
     /// The member's own permit.
     _peer: Option<OwnedSemaphorePermit>,
-    /// The outside peer's counted job.
+    /// The outside peer's slot.
     _outsider: Option<OutsiderJob>,
     /// The permit from the committee or outsider pool.
     _pool: OwnedSemaphorePermit,
 }
 
-/// One running job of an outside peer, uncounted on drop.
+/// One running job of an outside peer, whose slot is freed on drop.
 #[derive(Debug)]
 struct OutsiderJob {
-    /// The peer the job runs for.
-    peer: BlsPublicKey,
-    /// Running jobs per outside peer.
-    jobs: OutsiderJobs,
+    /// The slot the job holds.
+    index: usize,
+    /// The slots it was claimed from.
+    outsiders: Arc<OutsiderSlots>,
 }
 
 impl Drop for OutsiderJob {
     fn drop(&mut self) {
-        let mut jobs = self.jobs.lock();
-        if let Some(running) = jobs.get_mut(&self.peer) {
-            *running -= 1;
-            if *running == 0 {
-                jobs.remove(&self.peer);
-            }
-        }
+        self.outsiders.slots[self.index].store(FREE_SLOT, Ordering::SeqCst);
     }
 }
 
@@ -1211,16 +1249,11 @@ impl MissingCertSlots {
     }
 
     /// Take the permits for one job of an outside peer.
-    /// The lock makes the limit check and the count one step.
     fn acquire_outsider(&self, peer: BlsPublicKey) -> PrimaryNetworkResult<MissingCertPermits> {
-        let mut jobs = self.outsider_jobs.lock();
-        if jobs.get(&peer).is_some_and(|running| *running >= MISSING_CERT_JOBS_PER_OUTSIDER) {
-            return Err(PrimaryNetworkError::Busy);
-        }
         let pool =
             self.others.clone().try_acquire_owned().map_err(|_| PrimaryNetworkError::Busy)?;
-        *jobs.entry(peer).or_default() += 1;
-        let job = OutsiderJob { peer, jobs: self.outsider_jobs.clone() };
+        // A peer at its limit drops the pool permit, so it is given back.
+        let job = self.outsiders.claim(&peer).ok_or(PrimaryNetworkError::Busy)?;
         Ok(MissingCertPermits { _peer: None, _outsider: Some(job), _pool: pool })
     }
 }
