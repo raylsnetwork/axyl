@@ -97,6 +97,8 @@ impl FetchAnswers {
             NetworkError::PeerBusy(_) => self.busy = true,
             // A peer we could not reach says nothing about our request.
             NetworkError::Outbound(_)
+            | NetworkError::Dial(_)
+            | NetworkError::DialBannedPeer(_)
             | NetworkError::Timeout
             | NetworkError::Disconnected
             | NetworkError::PeerNotConnected
@@ -104,7 +106,10 @@ impl FetchAnswers {
             | NetworkError::NoPeers
             // Our own network task failed, which says nothing about the peer.
             | NetworkError::RequestQueueOverflow
-            | NetworkError::AckChannelClosed(_) => {}
+            | NetworkError::AckChannelClosed(_)
+            | NetworkError::ChannelSender(_)
+            | NetworkError::MpscTrySend(_) => {}
+            // Anything else counts as a failure, as it did before busy answers.
             _ => self.failed = true,
         }
     }
@@ -322,8 +327,8 @@ impl<DB: Database> CertificateFetcher<DB> {
                                     // not a real failure - don't count toward stale-session fallback
                                 }
                                 FetchOutcome::Busy => {
-                                    // Busy peers are not failing.
-                                    // This skips the backoff and the stale-session fallback.
+                                    // Busy peers are not failing, so this neither grows the backoff
+                                    // nor counts toward the stale-session fallback.
                                     self.consensus_bus
                                         .primary_metrics()
                                         .node_metrics

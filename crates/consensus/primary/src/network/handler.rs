@@ -1070,7 +1070,7 @@ pub(crate) const MISSING_CERT_JOBS_PER_PEER: usize = 2;
 /// It only refuses while jobs from an earlier epoch are still running.
 pub(crate) const MISSING_CERT_JOBS_COMMITTEE: usize = 64;
 /// Missing-certificate jobs that other peers may have running at once, in total.
-/// A few outside peers together can still fill it.
+/// A full pool delays observers and members of the next or previous epoch (#357).
 pub(crate) const MISSING_CERT_JOBS_OTHERS: usize = 4;
 /// Missing-certificate jobs one outside peer may have running at once.
 /// Honest nodes send each peer one request at a time.
