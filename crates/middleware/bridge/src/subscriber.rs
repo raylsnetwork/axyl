@@ -763,7 +763,8 @@ impl<DB: Database> Subscriber<DB> {
                     match result {
                         Some(consensus_header) => {
                             let number = consensus_header.number;
-                            // other epoch: drop unverified, never touch the watermark (see #295)
+                            // other epoch: drop unverified, never touch the watermark (see #295);
+                            // no older one is expected past the anchor, so dropping loses nothing
                             let epoch = consensus_header.sub_dag.leader_epoch();
                             let current_epoch = self.inner.committee.epoch();
                             if epoch != current_epoch {
@@ -785,7 +786,7 @@ impl<DB: Database> Subscriber<DB> {
                                 target: "subscriber",
                                 number,
                                 pipeline = waiting.len(),
-                                epoch = consensus_header.sub_dag.leader_epoch(),
+                                epoch,
                                 "stream_and_follow: received header, verifying"
                             );
                             let Some(verified) = self
