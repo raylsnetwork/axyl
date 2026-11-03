@@ -169,6 +169,7 @@ pub(crate) struct CertificateFetcher<DB> {
     consecutive_failures: u32,
     /// Consecutive rounds in which every peer that answered was busy.
     /// They grow the backoff, but not toward the stale-session fallback.
+    /// As with failures, only a success or nothing left to fetch resets them.
     consecutive_busy: u32,
     /// Last fetch attempt time for rate limiting.
     last_fetch_attempt: Option<Instant>,
@@ -423,6 +424,7 @@ impl<DB: Database> CertificateFetcher<DB> {
         }
 
         // NOTE: skip backoff in CvvInactive mode for fast catch-up
+        // Busy rounds too: a busy peer refuses at once, which costs it little.
         let is_active = self.consensus_bus.node_mode().borrow().is_active_cvv();
 
         // exponential backoff on consecutive failures (1.5x multiplier)
@@ -447,6 +449,7 @@ impl<DB: Database> CertificateFetcher<DB> {
                         trace!(
                             target: "primary::cert_fetcher",
                             failures = self.consecutive_failures,
+                            busy = self.consecutive_busy,
                             "Backoff active, skipping fetch. Wait {:?} more",
                             backoff.saturating_sub(elapsed)
                         );
@@ -457,6 +460,7 @@ impl<DB: Database> CertificateFetcher<DB> {
                 trace!(
                     target: "primary::cert_fetcher",
                     failures = self.consecutive_failures,
+                    busy = self.consecutive_busy,
                     "Skipping backoff - node in catch-up mode (CvvInactive)"
                 );
             }

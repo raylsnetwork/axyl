@@ -1476,9 +1476,10 @@ fn test_missing_cert_slots_grow_with_the_committee() {
 fn test_only_busy_is_a_recoverable_missing_certs_answer() {
     use rayls_infrastructure_types::error::StoreError;
 
-    // Every error a missing-certificates request can return.
+    // Errors a missing-certificates request returns, and one recoverable elsewhere.
     let errors = [
         PrimaryNetworkError::Busy,
+        PrimaryNetworkError::InvalidHeader(HeaderError::InvalidEpoch { ours: 1, theirs: 2 }),
         PrimaryNetworkError::TooManyAuthorities(2, 1),
         PrimaryNetworkError::InvalidRequest("bad request".into()),
         PrimaryNetworkError::Internal("join error".into()),
@@ -1486,8 +1487,9 @@ fn test_only_busy_is_a_recoverable_missing_certs_answer() {
     ];
     for error in errors {
         let busy = matches!(error, PrimaryNetworkError::Busy);
-        let answer = PrimaryResponse::into_error_ref(&error);
+        let name = error.to_string();
+        let answer = PrimaryResponse::missing_certs_answer(Err(error));
         let recoverable = matches!(answer, PrimaryResponse::RecoverableError(_));
-        assert_eq!(recoverable, busy, "{error} answered as {answer:?}");
+        assert_eq!(recoverable, busy, "{name} answered as {answer:?}");
     }
 }
