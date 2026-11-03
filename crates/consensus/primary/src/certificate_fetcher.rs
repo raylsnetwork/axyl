@@ -167,7 +167,7 @@ pub(crate) struct CertificateFetcher<DB> {
     max_rpc_message_size: usize,
     /// Track consecutive fetch failures for exponential backoff.
     consecutive_failures: u32,
-    /// Consecutive rounds in which every peer that answered was busy.
+    /// Consecutive rounds, while active, in which every peer that answered was busy.
     /// They grow the backoff, but not toward the stale-session fallback.
     /// As with failures, only a success or nothing left to fetch resets them.
     consecutive_busy: u32,
@@ -337,7 +337,10 @@ impl<DB: Database> CertificateFetcher<DB> {
                                 FetchOutcome::Busy => {
                                     // Busy peers ask us to slow down, so this grows the backoff.
                                     // The stale-session fallback would only add to their load.
-                                    self.consecutive_busy = self.consecutive_busy.saturating_add(1);
+                                    // Counted only while active, since catching up never backs off.
+                                    if self.consensus_bus.node_mode().borrow().is_active_cvv() {
+                                        self.consecutive_busy = self.consecutive_busy.saturating_add(1);
+                                    }
                                     self.consensus_bus
                                         .primary_metrics()
                                         .node_metrics
@@ -429,18 +432,18 @@ impl<DB: Database> CertificateFetcher<DB> {
 
         // exponential backoff on consecutive failures (1.5x multiplier)
         let backoff = self.calculate_backoff();
+        // Set on every probe, so the gauges drop back to 0 after a success.
+        self.consensus_bus
+            .primary_metrics()
+            .node_metrics
+            .certificate_fetcher_backoff_ms
+            .set(backoff.as_millis() as i64);
+        self.consensus_bus
+            .primary_metrics()
+            .node_metrics
+            .certificate_fetcher_consecutive_failures
+            .set(self.consecutive_failures as i64);
         if backoff > Duration::ZERO {
-            self.consensus_bus
-                .primary_metrics()
-                .node_metrics
-                .certificate_fetcher_backoff_ms
-                .set(backoff.as_millis() as i64);
-            self.consensus_bus
-                .primary_metrics()
-                .node_metrics
-                .certificate_fetcher_consecutive_failures
-                .set(self.consecutive_failures as i64);
-
             // only enforce backoff in CvvActive mode
             if is_active {
                 if let Some(last_attempt) = self.last_fetch_attempt {
