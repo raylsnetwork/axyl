@@ -1183,18 +1183,26 @@ impl OutsiderSlots {
         }
     }
 
-    /// Claim a slot for `peer`, unless it is at its limit.
+    /// The tag a peer's slots hold, never [FREE_SLOT].
+    fn tag(&self, peer: &BlsPublicKey) -> u64 {
+        self.hasher.hash_one(peer).max(FREE_SLOT + 1)
+    }
+
+    /// Slots held by the peer with `tag`.
+    fn running(&self, tag: u64) -> usize {
+        self.slots.iter().filter(|slot| slot.load(Ordering::SeqCst) == tag).count()
+    }
+
+    /// Claim a slot for the peer with `tag`, unless it is at its limit.
     /// The caller holds a pool permit, so a slot is free, but a race may miss it.
-    fn claim(self: &Arc<Self>, peer: &BlsPublicKey) -> Option<OutsiderJob> {
-        let tag = self.hasher.hash_one(peer).max(FREE_SLOT + 1);
+    fn claim(self: &Arc<Self>, tag: u64) -> Option<OutsiderJob> {
         let index = self.slots.iter().position(|slot| {
             slot.compare_exchange(FREE_SLOT, tag, Ordering::SeqCst, Ordering::SeqCst).is_ok()
         })?;
         let job = OutsiderJob { index, outsiders: self.clone() };
         // Claim first and count after, so racing claims cannot both pass.
         // If both see each other, both are refused and retry later.
-        let running = self.slots.iter().filter(|slot| slot.load(Ordering::SeqCst) == tag).count();
-        (running <= MISSING_CERT_JOBS_PER_OUTSIDER).then_some(job)
+        (self.running(tag) <= MISSING_CERT_JOBS_PER_OUTSIDER).then_some(job)
     }
 
     /// Slots in use.
@@ -1250,10 +1258,15 @@ impl MissingCertSlots {
 
     /// Take the permits for one job of an outside peer.
     fn acquire_outsider(&self, peer: BlsPublicKey) -> PrimaryNetworkResult<MissingCertPermits> {
+        let tag = self.outsiders.tag(&peer);
+        // A peer at its limit is refused before touching the shared pool.
+        if self.outsiders.running(tag) >= MISSING_CERT_JOBS_PER_OUTSIDER {
+            return Err(PrimaryNetworkError::Busy);
+        }
         let pool =
             self.others.clone().try_acquire_owned().map_err(|_| PrimaryNetworkError::Busy)?;
-        // A peer at its limit drops the pool permit, so it is given back.
-        let job = self.outsiders.claim(&peer).ok_or(PrimaryNetworkError::Busy)?;
+        // If a racing request won, the pool permit is dropped and so given back.
+        let job = self.outsiders.claim(tag).ok_or(PrimaryNetworkError::Busy)?;
         Ok(MissingCertPermits { _peer: None, _outsider: Some(job), _pool: pool })
     }
 }
