@@ -632,8 +632,10 @@ async fn an_unreachable_peer_does_not_hide_busy_answers() {
 
     // How the first peer fails: no error means it never answers.
     type Failure = fn() -> Option<NetworkError>;
-    let failures: [(&str, Failure); 4] = [
+    let failures: [(&str, Failure); 6] = [
         ("disconnected", || Some(NetworkError::Disconnected)),
+        ("dial", || Some(NetworkError::Dial("refused".into()))),
+        ("channel closed", || Some(NetworkError::ChannelSender("closed".into()))),
         ("queue overflow", || Some(NetworkError::RequestQueueOverflow)),
         ("ack closed", || Some(NetworkError::AckChannelClosed("dropped".into()))),
         ("silent", || None),
