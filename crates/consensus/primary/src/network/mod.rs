@@ -186,7 +186,7 @@ impl PrimaryNetworkHandle {
         let res = res.await??;
         match res {
             PrimaryResponse::RequestedCertificates(certs) => Ok(certs),
-            // Only a busy node sends a recoverable error here (see `into_error_ref`).
+            // Only a busy node sends a recoverable error here (see `missing_certs_answer`).
             // A fake one counts only if no other peer answers, when no fallback helps.
             PrimaryResponse::RecoverableError(PrimaryRPCError(s)) => Err(NetworkError::PeerBusy(s)),
             PrimaryResponse::Error(PrimaryRPCError(s)) => Err(NetworkError::RPCError(s)),
@@ -462,7 +462,7 @@ where
                         }
                     }
 
-                    let response = result.into_response();
+                    let response = PrimaryResponse::missing_certs_answer(result);
                     let _ = network_handle.handle.send_response(response, channel).await;
                 }
                 // cancel notification from network layer
