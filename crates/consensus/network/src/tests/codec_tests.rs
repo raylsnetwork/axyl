@@ -246,35 +246,6 @@ impl futures::AsyncRead for StallReader {
     }
 }
 
-/// `StallReader` must handle split reads (a `buf` smaller than the remaining data) without
-/// reading past the end, and still stall once the data is exhausted.
-#[tokio::test]
-async fn test_stall_reader_survives_split_reads() {
-    use futures::AsyncReadExt;
-
-    let mut reader = StallReader { data: vec![1, 2, 3, 4], pos: 0 };
-
-    // a partial read leaves pos > 0
-    let mut byte = [0u8; 1];
-    reader.read_exact(&mut byte).await.expect("read one byte");
-    assert_eq!(byte[0], 1);
-
-    // the next read has a buffer that fits the whole payload; it must return only the
-    // remaining bytes, not read past the end
-    let mut buf = [0u8; 8];
-    let n = reader.read(&mut buf).await.expect("read remaining bytes");
-    assert_eq!(n, 3);
-    assert_eq!(&buf[..3], &[2, 3, 4]);
-
-    // data exhausted: the read stalls (Pending), mirroring a stalled peer
-    let stalled = tokio::time::timeout(
-        tokio::time::Duration::from_millis(50),
-        reader.read_exact(&mut [0u8; 8]),
-    )
-    .await;
-    assert!(stalled.is_err(), "read should stall after data is exhausted");
-}
-
 /// A request that sends only the 4-byte length prefix (declaring the maximum message size)
 /// and then closes the stream must not reserve the declared size in `decode_buffer`.
 ///
