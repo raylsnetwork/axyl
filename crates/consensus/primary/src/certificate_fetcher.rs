@@ -167,6 +167,9 @@ pub(crate) struct CertificateFetcher<DB> {
     max_rpc_message_size: usize,
     /// Track consecutive fetch failures for exponential backoff.
     consecutive_failures: u32,
+    /// Consecutive rounds in which every peer that answered was busy.
+    /// They grow the backoff, but not toward the stale-session fallback.
+    consecutive_busy: u32,
     /// Last fetch attempt time for rate limiting.
     last_fetch_attempt: Option<Instant>,
     /// Suppresses probes until this instant after an epoch-mismatch outcome.
@@ -222,6 +225,7 @@ impl<DB: Database> CertificateFetcher<DB> {
                         fetch_certificates_task: JoinSet::new(),
                         max_rpc_message_size,
                         consecutive_failures: 0,
+                        consecutive_busy: 0,
                         last_fetch_attempt: None,
                         epoch_mismatch_until: None,
                     }
@@ -320,6 +324,7 @@ impl<DB: Database> CertificateFetcher<DB> {
                             match outcome {
                                 FetchOutcome::Success => {
                                     self.consecutive_failures = 0;
+                                    self.consecutive_busy = 0;
                                     self.epoch_mismatch_until = None;
                                 }
                                 FetchOutcome::HardFailure => {
@@ -329,8 +334,9 @@ impl<DB: Database> CertificateFetcher<DB> {
                                     // not a real failure - don't count toward stale-session fallback
                                 }
                                 FetchOutcome::Busy => {
-                                    // Busy peers are not failing, so this neither grows the backoff
-                                    // nor counts toward the stale-session fallback.
+                                    // Busy peers ask us to slow down, so this grows the backoff.
+                                    // The stale-session fallback would only add to their load.
+                                    self.consecutive_busy = self.consecutive_busy.saturating_add(1);
                                     self.consensus_bus
                                         .primary_metrics()
                                         .node_metrics
@@ -391,6 +397,7 @@ impl<DB: Database> CertificateFetcher<DB> {
         let is_active = self.consensus_bus.node_mode().borrow().is_active_cvv();
         if is_active && self.targets.is_empty() {
             self.consecutive_failures = 0;
+            self.consecutive_busy = 0;
             info!(target: "primary::cert_fetcher", gc_round = self.gc_round(), "targets empty and active - nothing to fetch");
             return;
         }
@@ -645,16 +652,19 @@ impl<DB: Database> CertificateFetcher<DB> {
     }
 
     /// Calculate exponential backoff (1.5x multiplier, 100ms base, 60s cap).
+    ///
+    /// Failed and busy rounds both count.
     fn calculate_backoff(&self) -> Duration {
         const BASE_TIMEOUT: Duration = Duration::from_millis(100);
         const MAX_TIMEOUT: Duration = Duration::from_secs(60);
 
-        if self.consecutive_failures == 0 {
+        let rounds = self.consecutive_failures.saturating_add(self.consecutive_busy);
+        if rounds == 0 {
             return Duration::ZERO;
         }
 
         let mut timeout = BASE_TIMEOUT;
-        for _ in 0..self.consecutive_failures.min(20) {
+        for _ in 0..rounds.min(20) {
             timeout = timeout + timeout / 2; // 1.5x multiplier
         }
         timeout.min(MAX_TIMEOUT)

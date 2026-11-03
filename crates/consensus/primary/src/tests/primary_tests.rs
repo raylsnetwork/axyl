@@ -1239,6 +1239,12 @@ fn test_missing_cert_slots_outlive_cancelled_requests() {
         // A full outsider pool does not affect members.
         assert!(start_then_cancel(&handler, member(3)).await.is_none());
 
+        // Each refusal is counted under the limit that refused it.
+        let refused = &cb.primary_metrics().node_metrics.missing_cert_requests_busy;
+        for (limit, count) in [("member", 1), ("committee", 0), ("outsider", 1)] {
+            assert_eq!(refused.with_label_values(&[limit]).get(), count, "{limit} refusals");
+        }
+
         // Once the queued jobs run, the member's and the outsiders' slots are free again.
         release.send(()).expect("release the blocking thread");
         blocker.await.expect("blocker");
@@ -1257,7 +1263,7 @@ fn test_missing_cert_slots_outlive_cancelled_requests() {
 #[test]
 fn test_missing_cert_slots_follow_the_epoch_committee() {
     use crate::network::handler::{
-        MissingCertLimits, MISSING_CERT_JOBS_PER_OUTSIDER, MISSING_CERT_JOBS_PER_PEER,
+        BusyLimit, MissingCertLimits, MISSING_CERT_JOBS_PER_OUTSIDER, MISSING_CERT_JOBS_PER_PEER,
     };
 
     let committee_size = 4;
@@ -1278,7 +1284,7 @@ fn test_missing_cert_slots_follow_the_epoch_committee() {
         .map(|_| old_slots.acquire(former).expect("slot in the old epoch"))
         .collect();
     let next = old_slots.acquire(former);
-    assert!(matches!(next, Err(PrimaryNetworkError::Busy)), "got {next:?}");
+    assert!(matches!(next, Err(BusyLimit::Member)), "got {next:?}");
 
     // The next epoch's committee pool still counts the old jobs.
     let new_slots = limits.for_committee(&new.committee());
@@ -1289,7 +1295,7 @@ fn test_missing_cert_slots_follow_the_epoch_committee() {
         .map(|_| new_slots.acquire(former).expect("slot in the shared pool"))
         .collect();
     let next = new_slots.acquire(former);
-    assert!(matches!(next, Err(PrimaryNetworkError::Busy)), "got {next:?}");
+    assert!(matches!(next, Err(BusyLimit::Outsider)), "got {next:?}");
 
     // New members have their own slots.
     let member = new.authorities().next().unwrap().primary_public_key();
@@ -1304,7 +1310,7 @@ fn test_missing_cert_slots_follow_the_epoch_committee() {
 #[test]
 fn test_missing_cert_slots_limit_each_outsider() {
     use crate::network::handler::{
-        MissingCertLimits, MISSING_CERT_JOBS_OTHERS, MISSING_CERT_JOBS_PER_OUTSIDER,
+        BusyLimit, MissingCertLimits, MISSING_CERT_JOBS_OTHERS, MISSING_CERT_JOBS_PER_OUTSIDER,
     };
     use rand::{rngs::StdRng, SeedableRng};
 
@@ -1321,7 +1327,7 @@ fn test_missing_cert_slots_limit_each_outsider() {
         .map(|_| slots.acquire(greedy).expect("slot for an outsider"))
         .collect();
     let next = slots.acquire(greedy);
-    assert!(matches!(next, Err(PrimaryNetworkError::Busy)), "got {next:?}");
+    assert!(matches!(next, Err(BusyLimit::Outsider)), "got {next:?}");
 
     // Other outsiders get the rest of the pool, until it is full.
     let other_jobs: Vec<_> = (1..)
@@ -1329,7 +1335,7 @@ fn test_missing_cert_slots_limit_each_outsider() {
         .map(|seed| slots.acquire(outsider(seed)).expect("slot in the shared pool"))
         .collect();
     let next = slots.acquire(outsider(u64::MAX));
-    assert!(matches!(next, Err(PrimaryNetworkError::Busy)), "got {next:?}");
+    assert!(matches!(next, Err(BusyLimit::Outsider)), "got {next:?}");
 
     // Only outsiders with a running job are tracked.
     assert_eq!(limits.tracked_outsiders(), 1 + other_jobs.len());
@@ -1432,13 +1438,16 @@ fn test_missing_cert_slots_at_limit_outsider_leaves_the_pool_alone() {
 #[test]
 fn test_missing_cert_slots_grow_with_the_committee() {
     use crate::network::handler::{
-        MissingCertLimits, MISSING_CERT_JOBS_COMMITTEE, MISSING_CERT_JOBS_PER_PEER,
+        BusyLimit, MissingCertLimits, MISSING_CERT_JOBS_COMMITTEE, MISSING_CERT_JOBS_PER_PEER,
     };
 
     let committee_size = MISSING_CERT_JOBS_COMMITTEE / MISSING_CERT_JOBS_PER_PEER + 1;
-    let fixture = CommitteeFixture::builder(MemDatabase::default)
-        .committee_size(NonZeroUsize::new(committee_size).unwrap())
-        .build();
+    let fixture = || {
+        CommitteeFixture::builder(MemDatabase::default)
+            .committee_size(NonZeroUsize::new(committee_size).unwrap())
+            .build()
+    };
+    let (fixture, next_fixture) = (fixture(), fixture());
     let limits = MissingCertLimits::new();
     let slots = limits.for_committee(&fixture.committee());
 
@@ -1452,6 +1461,12 @@ fn test_missing_cert_slots_grow_with_the_committee() {
         .collect();
     assert_eq!(jobs.len(), committee_size * MISSING_CERT_JOBS_PER_PEER);
     assert_eq!(limits.free_committee_slots(), 0);
+
+    // While those jobs run, a member of the next committee waits for the pool.
+    let next_slots = limits.for_committee(&next_fixture.committee());
+    let next_member = next_fixture.authorities().next().unwrap().primary_public_key();
+    let next = next_slots.acquire(next_member);
+    assert!(matches!(next, Err(BusyLimit::Committee)), "got {next:?}");
 }
 
 /// Only `Busy` is a recoverable answer to a missing-certificates request.
