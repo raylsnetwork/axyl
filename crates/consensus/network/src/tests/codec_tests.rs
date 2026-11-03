@@ -236,7 +236,7 @@ impl futures::AsyncRead for StallReader {
     ) -> std::task::Poll<std::io::Result<usize>> {
         let this = self.get_mut();
         if this.pos < this.data.len() {
-            let n = this.data.len().min(buf.len());
+            let n = (this.data.len() - this.pos).min(buf.len());
             buf[..n].copy_from_slice(&this.data[this.pos..this.pos + n]);
             this.pos += n;
             std::task::Poll::Ready(Ok(n))
@@ -244,6 +244,35 @@ impl futures::AsyncRead for StallReader {
             std::task::Poll::Pending
         }
     }
+}
+
+/// `StallReader` must handle split reads (a `buf` smaller than the remaining data) without
+/// reading past the end, and still stall once the data is exhausted.
+#[tokio::test]
+async fn test_stall_reader_survives_split_reads() {
+    use futures::AsyncReadExt;
+
+    let mut reader = StallReader { data: vec![1, 2, 3, 4], pos: 0 };
+
+    // a partial read leaves pos > 0
+    let mut byte = [0u8; 1];
+    reader.read_exact(&mut byte).await.expect("read one byte");
+    assert_eq!(byte[0], 1);
+
+    // the next read has a buffer that fits the whole payload; it must return only the
+    // remaining bytes, not read past the end
+    let mut buf = [0u8; 8];
+    let n = reader.read(&mut buf).await.expect("read remaining bytes");
+    assert_eq!(n, 3);
+    assert_eq!(&buf[..3], &[2, 3, 4]);
+
+    // data exhausted: the read stalls (Pending), mirroring a stalled peer
+    let stalled = tokio::time::timeout(
+        tokio::time::Duration::from_millis(50),
+        reader.read_exact(&mut [0u8; 8]),
+    )
+    .await;
+    assert!(stalled.is_err(), "read should stall after data is exhausted");
 }
 
 /// A request that sends only the 4-byte length prefix (declaring the maximum message size)
@@ -268,12 +297,20 @@ async fn test_prefix_only_request_does_not_reserve_declared_size() {
     let result = stream_codec.read_request(&protocol, &mut prefix_only.as_slice()).await;
     assert!(result.is_err());
 
-    // The buffer must NOT be pre-sized to the declared length.
+    // The buffers must NOT reserve the declared length. We assert on capacity() (the
+    // actually-allocated memory) rather than len(), so a regression that reintroduces the
+    // reservation via reserve()/with_capacity() is still caught even when len() stays 0.
     let declared = max_chunk_size;
     assert!(
-        stream_codec.decode_buffer.len() < declared / 2,
-        "decode_buffer holds {} bytes, expected < {}",
-        stream_codec.decode_buffer.len(),
+        stream_codec.decode_buffer.capacity() < declared / 2,
+        "decode_buffer reserved {} bytes of capacity, expected < {}",
+        stream_codec.decode_buffer.capacity(),
+        declared / 2
+    );
+    assert!(
+        stream_codec.compressed_buffer.capacity() < declared / 2,
+        "compressed_buffer reserved {} bytes of capacity, expected < {}",
+        stream_codec.compressed_buffer.capacity(),
         declared / 2
     );
 }
@@ -309,11 +346,20 @@ async fn test_stalled_request_does_not_hold_declared_size() {
 
     // After cancellation the codec outlives the future, so in the vulnerable code the buffer
     // would still hold the declared size (the resize happened before the read blocked).
+    //
+    // As above, capacity() (not len()) is the measure of reserved memory, so the assertion
+    // catches a regression that re-reserves via reserve()/with_capacity() while len() stays 0.
     let declared = max_chunk_size;
     assert!(
-        stream_codec.decode_buffer.len() < declared / 2,
-        "decode_buffer holds {} bytes after stall, expected < {}",
-        stream_codec.decode_buffer.len(),
+        stream_codec.decode_buffer.capacity() < declared / 2,
+        "decode_buffer reserved {} bytes of capacity after stall, expected < {}",
+        stream_codec.decode_buffer.capacity(),
+        declared / 2
+    );
+    assert!(
+        stream_codec.compressed_buffer.capacity() < declared / 2,
+        "compressed_buffer reserved {} bytes of capacity after stall, expected < {}",
+        stream_codec.compressed_buffer.capacity(),
         declared / 2
     );
 }

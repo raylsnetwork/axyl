@@ -28,9 +28,9 @@ pub trait RLMessage:
 
 /// The Rayls Network request/response codec for consensus messages between peers.
 ///
-/// The codec reuses its buffers across messages to asynchronously read and write per the libp2p
-/// [Codec] trait. All messages include a 4-byte prefix that indicates the message's uncompressed
-/// length. The decode buffer grows only as decompressed bytes are produced, so a peer that
+/// The codec reuses its buffers per stream to asynchronously read and write messages per the
+/// libp2p [Codec] trait. All messages include a 4-byte prefix that indicates the message's
+/// uncompressed length. Buffers start empty and grow only as data is produced, so a peer that
 /// sends only the length prefix reserves no buffer.
 #[derive(Clone, Debug)]
 pub struct RLCodec<Req, Res> {
@@ -51,14 +51,12 @@ pub struct RLCodec<Req, Res> {
 
 impl<Req, Res> RLCodec<Req, Res> {
     pub fn new(max_chunk_size: usize) -> Self {
-        let max_compress_len = snap::raw::max_compress_len(max_chunk_size);
-        let compressed_buffer = Vec::with_capacity(max_compress_len);
-        // allocate capacity for decoding max message size
-        let decode_buffer = Vec::with_capacity(max_chunk_size);
-
+        // buffers stay empty: libp2p clones the codec for every stream (inbound and outbound)
+        // and a clone of an empty buffer starts at capacity 0, so pre-allocating here would
+        // only pin that memory in the template codec, which never performs I/O
         Self {
-            compressed_buffer,
-            decode_buffer,
+            compressed_buffer: Vec::new(),
+            decode_buffer: Vec::new(),
             max_chunk_size,
             _phantom: PhantomData::<(Req, Res)>,
         }
