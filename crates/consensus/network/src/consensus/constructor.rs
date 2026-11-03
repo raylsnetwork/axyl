@@ -96,6 +96,10 @@ where
             .validation_mode(gossipsub::ValidationMode::Strict)
             // RL specific: filter against authorized_publishers for certain topics
             .validate_messages()
+            // How long a seen message id is remembered (default 60 s). A copy that waits longer
+            // than this in a stalled stream re-enters the receiving node as new. Commented out on
+            // purpose so this branch runs the 60 s v1.4.1 baseline; uncomment to apply the fix.
+            // .duplicate_cache_time(Duration::from_secs(15 * 60))
             .build()?;
         let gossipsub = gossipsub::Behaviour::new(
             gossipsub::MessageAuthenticity::Signed(keypair.clone()),
@@ -189,6 +193,7 @@ where
             last_cleanup: Instant::now(),
             network_metrics,
             network_label,
+            chaos_seen_gossip: super::runtime::chaos_gossip_delay_path().map(|_| HashMap::new()),
         })
     }
 

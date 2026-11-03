@@ -6,10 +6,32 @@ use crate::{
     ConsensusNetwork,
 };
 use futures::StreamExt as _;
-use libp2p::{kad::Mode, swarm::SwarmEvent};
+use libp2p::{gossipsub, kad::Mode, swarm::SwarmEvent};
 use rayls_infrastructure_types::{Database, RaylsSender};
-use std::time::{Duration, Instant};
-use tracing::{debug, error, info, instrument};
+use std::{
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
+    time::{Duration, Instant},
+};
+use tracing::{debug, error, info, instrument, warn};
+
+/// CHAOS: how long `chaos_seen_gossip` remembers a message id's first acceptance.
+const CHAOS_SEEN_GOSSIP_TTL: Duration = Duration::from_secs(15 * 60);
+
+/// CHAOS (local experiments only): the gossip read delay toggle file, if enabled.
+///
+/// `RAYLS_CHAOS_GOSSIP_DELAY_FILE` names the file directly. Otherwise
+/// `RAYLS_CHAOS_GOSSIP_DELAY_DIR` gives a directory and the file is `<dir>/<pid>`, so one
+/// variable exported for a whole local network still gives every node its own toggle.
+pub(super) fn chaos_gossip_delay_path() -> Option<String> {
+    std::env::var("RAYLS_CHAOS_GOSSIP_DELAY_FILE").ok().or_else(|| {
+        std::env::var("RAYLS_CHAOS_GOSSIP_DELAY_DIR")
+            .ok()
+            .map(|dir| format!("{dir}/{}", std::process::id()))
+    })
+}
 
 impl<Req, Res, DB, Events> ConsensusNetwork<Req, Res, DB, Events>
 where
@@ -40,9 +62,50 @@ where
         // Time-based cleanup interval (10 seconds)
         const CLEANUP_INTERVAL: Duration = Duration::from_secs(10);
 
+        // CHAOS (local experiments only, not for real networks): slow socket reading on the
+        // primary network. The toggle file (see `chaos_gossip_delay_path`) is re-read every
+        // second and its value (ms, 0 or missing = off) is slept before each gossip message is
+        // handled. The sleep stalls the whole swarm loop, so connection tasks stop reading their
+        // streams, data waits in quinn's receive buffers, and Accept (and with it the forward) is
+        // reported late, while quinn keeps the connections alive.
+        let gossip_delay_ms = Arc::new(AtomicU64::new(0));
+        if self.network_label == "primary" {
+            if let Some(path) = chaos_gossip_delay_path() {
+                warn!(target: "network::chaos", %path, "gossip read delay toggle ENABLED");
+                let delay = gossip_delay_ms.clone();
+                tokio::spawn(async move {
+                    let mut tick = tokio::time::interval(Duration::from_secs(1));
+                    // Exit once the network loop (the other Arc holder) is gone.
+                    while Arc::strong_count(&delay) > 1 {
+                        tick.tick().await;
+                        let ms = std::fs::read_to_string(&path)
+                            .ok()
+                            .and_then(|s| s.trim().parse::<u64>().ok())
+                            .unwrap_or(0);
+                        let prev = delay.swap(ms, Ordering::Relaxed);
+                        if prev != ms {
+                            warn!(target: "network::chaos", prev, ms, "gossip read delay changed");
+                        }
+                    }
+                });
+            }
+        }
+
         loop {
             tokio::select! {
                 event = self.swarm.select_next_some() => {
+                    // CHAOS: see `gossip_delay_ms` above.
+                    if matches!(
+                        event,
+                        SwarmEvent::Behaviour(RLBehaviorEvent::Gossipsub(
+                            gossipsub::Event::Message { .. }
+                        ))
+                    ) {
+                        let ms = gossip_delay_ms.load(Ordering::Relaxed);
+                        if ms > 0 {
+                            tokio::time::sleep(Duration::from_millis(ms)).await;
+                        }
+                    }
                     self.process_event(event).await.inspect_err(|e| {
                         error!(target: "network", ?e, "network event error")
                     })?;
@@ -52,6 +115,9 @@ where
                     let time_for_cleanup = self.last_cleanup.elapsed() >= CLEANUP_INTERVAL;
                     if event_counter.is_multiple_of(1000) || time_for_cleanup {
                         self.cleanup_request_maps();
+                        if let Some(seen) = self.chaos_seen_gossip.as_mut() {
+                            seen.retain(|_, first| first.elapsed() < CHAOS_SEEN_GOSSIP_TTL);
+                        }
                         self.last_cleanup = Instant::now();
                     }
                 },

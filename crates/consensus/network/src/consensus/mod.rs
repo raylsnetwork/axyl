@@ -126,4 +126,9 @@ where
     network_metrics: Arc<NetworkMetrics>,
     /// A label for the network to use in metrics.
     network_label: &'static str,
+    /// CHAOS (local experiments only): when the gossip delay toggle is enabled, the first time
+    /// each gossip message id was accepted, so a later acceptance of the same id (gossipsub's
+    /// duplicate cache expired before a late copy arrived) is logged with its age. `None` on
+    /// normal runs. Pruned after 15 minutes in the run loop's cleanup.
+    chaos_seen_gossip: Option<HashMap<libp2p::gossipsub::MessageId, Instant>>,
 }
