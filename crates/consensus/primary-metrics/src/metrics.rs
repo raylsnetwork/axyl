@@ -307,6 +307,8 @@ pub struct PrimaryMetrics {
     pub certificate_fetcher_backoff_ms: IntGauge,
     /// The number of consecutive fetch failures.
     pub certificate_fetcher_consecutive_failures: IntGauge,
+    /// The number of consecutive busy rounds while active, which also grow the backoff.
+    pub certificate_fetcher_consecutive_busy: IntGauge,
     /// Fetch rounds in which every peer that answered was busy.
     pub certificate_fetcher_busy_rounds: IntCounter,
     /// Missing-certificates requests refused because too many were running, by limit.
@@ -440,6 +442,11 @@ impl PrimaryMetrics {
             certificate_fetcher_consecutive_failures: register_int_gauge_with_registry!(
                 "certificate_fetcher_consecutive_failures",
                 "Number of consecutive certificate fetch failures",
+                registry
+            )?,
+            certificate_fetcher_consecutive_busy: register_int_gauge_with_registry!(
+                "certificate_fetcher_consecutive_busy",
+                "Number of consecutive busy certificate fetch rounds while active",
                 registry
             )?,
             certificate_fetcher_busy_rounds: register_int_counter_with_registry!(
