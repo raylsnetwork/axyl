@@ -202,6 +202,14 @@ impl RaylsChainSpecBuilder {
         self
     }
 
+    /// Activate Eip161EmptyAccountGuard at `block`.
+    pub fn eip161_empty_account_guard(mut self, block: u64) -> Self {
+        self.inner
+            .hardforks
+            .insert(RaylsHardFork::Eip161EmptyAccountGuard, ForkCondition::Block(block));
+        self
+    }
+
     /// Activate EpochCloseSeedV2 at `block`.
     #[must_use = "builder method result must be used"]
     pub fn epoch_close_seed_v2(mut self, block: u64) -> Self {

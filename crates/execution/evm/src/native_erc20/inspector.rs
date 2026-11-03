@@ -127,6 +127,7 @@ impl NativeErc20Inspector {
         &self,
         context: &mut RaylsEvmContext<DB>,
         inputs: &mut CallInputs,
+        reject_empty_debits: bool,
     ) -> Result<CallOutcome, ERC20Error>
     where
         DB::Error: 'static,
@@ -141,6 +142,7 @@ impl NativeErc20Inspector {
             inputs.caller,
             params.to,
             params.amount,
+            reject_empty_debits,
         )?;
 
         #[allow(deprecated)]
@@ -219,6 +221,7 @@ impl NativeErc20Inspector {
         &self,
         context: &mut RaylsEvmContext<DB>,
         inputs: &CallInputs,
+        reject_empty_debits: bool,
     ) -> Result<CallOutcome, ERC20Error>
     where
         DB::Error: 'static,
@@ -233,6 +236,7 @@ impl NativeErc20Inspector {
             params.from,
             params.to,
             params.amount,
+            reject_empty_debits,
         )?;
 
         #[allow(deprecated)]
@@ -267,6 +271,7 @@ impl NativeErc20Inspector {
         &self,
         context: &mut RaylsEvmContext<DB>,
         inputs: &CallInputs,
+        reject_empty_debits: bool,
     ) -> Result<CallOutcome, ERC20Error>
     where
         DB::Error: 'static,
@@ -279,7 +284,8 @@ impl NativeErc20Inspector {
         let caller = inputs.caller;
         debug!(target: "native_erc20_inspector", "handle_burn: caller={:?} amount={:?}", caller, params.amount);
 
-        let result = self.precompile.read().handle_burn(context, caller, params.amount);
+        let result =
+            self.precompile.read().handle_burn(context, caller, params.amount, reject_empty_debits);
 
         match &result {
             Ok(output) => {
@@ -299,6 +305,7 @@ impl NativeErc20Inspector {
         &self,
         context: &mut RaylsEvmContext<DB>,
         inputs: &CallInputs,
+        reject_empty_debits: bool,
     ) -> Result<CallOutcome, ERC20Error>
     where
         DB::Error: 'static,
@@ -313,6 +320,7 @@ impl NativeErc20Inspector {
             inputs.caller,
             params.account,
             params.amount,
+            reject_empty_debits,
         )?;
 
         #[allow(deprecated)]
@@ -325,6 +333,7 @@ impl NativeErc20Inspector {
         &self,
         context: &mut RaylsEvmContext<DB>,
         inputs: &CallInputs,
+        reject_empty_debits: bool,
     ) -> Result<CallOutcome, ERC20Error>
     where
         DB::Error: 'static,
@@ -347,6 +356,7 @@ impl NativeErc20Inspector {
                 params.v,
                 params.r.into(),
                 params.s.into(),
+                reject_empty_debits,
             )
             .inspect_err(|e| {
                 error!(target: "native_erc20_inspector", "Error calling transferWithAuthorization: {:?}", e);
@@ -362,6 +372,7 @@ impl NativeErc20Inspector {
         &self,
         context: &mut RaylsEvmContext<DB>,
         inputs: &CallInputs,
+        reject_empty_debits: bool,
     ) -> Result<CallOutcome, ERC20Error>
     where
         DB::Error: 'static,
@@ -382,6 +393,7 @@ impl NativeErc20Inspector {
             params.v,
             params.r,
             params.s,
+            reject_empty_debits,
         )?;
 
         #[allow(deprecated)]
@@ -534,6 +546,9 @@ where
         self.ensure_precompile_code(context);
 
         // pre-fork: legacy inspector path (broken gas, matches history)
+        let reject_empty_debits = self
+            .chain_spec
+            .is_eip161_empty_account_guard_active_at_block(context.block.number.to::<u64>());
         let calldata = inputs.input.bytes(context);
         let selector = Erc20Selector::from_calldata(&calldata)?;
 
@@ -552,19 +567,21 @@ where
         }
 
         let result = match selector {
-            Erc20Selector::Transfer => self.handle_transfer(context, inputs),
+            Erc20Selector::Transfer => self.handle_transfer(context, inputs, reject_empty_debits),
             Erc20Selector::BalanceOf => self.handle_balance_of(context, inputs),
             Erc20Selector::Allowance => self.handle_allowance(context, inputs),
             Erc20Selector::Approve => self.handle_approve(context, inputs),
-            Erc20Selector::TransferFrom => self.handle_transfer_from(context, inputs),
+            Erc20Selector::TransferFrom => {
+                self.handle_transfer_from(context, inputs, reject_empty_debits)
+            }
             Erc20Selector::Mint => self.handle_mint(context, inputs),
-            Erc20Selector::Burn => self.handle_burn(context, inputs),
-            Erc20Selector::BurnFrom => self.handle_burn_from(context, inputs),
+            Erc20Selector::Burn => self.handle_burn(context, inputs, reject_empty_debits),
+            Erc20Selector::BurnFrom => self.handle_burn_from(context, inputs, reject_empty_debits),
             Erc20Selector::TransferWithAuthorization => {
-                self.handle_transfer_with_authorization(context, inputs)
+                self.handle_transfer_with_authorization(context, inputs, reject_empty_debits)
             }
             Erc20Selector::ReceiveWithAuthorization => {
-                self.handle_receive_with_authorization(context, inputs)
+                self.handle_receive_with_authorization(context, inputs, reject_empty_debits)
             }
             Erc20Selector::CancelAuthorization => self.handle_cancel_authorization(context, inputs),
             _ => return None,

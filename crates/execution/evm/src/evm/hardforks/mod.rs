@@ -137,6 +137,7 @@ where
             | RaylsHardFork::DynamicCommitteeSizing
             | RaylsHardFork::OutputSeqNormalization
             | RaylsHardFork::SenderAffinityLoadBalancing
+            | RaylsHardFork::Eip161EmptyAccountGuard
             | RaylsHardFork::EpochCloseSeedV2
             | RaylsHardFork::CertificateFetchEpochV2
             | RaylsHardFork::Erc20PrecompileDirectCall => continue,

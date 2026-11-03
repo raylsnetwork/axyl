@@ -132,10 +132,10 @@ mod schedule {
     fn version_byte_is_the_max_active_fork_code() {
         let hardforks = RaylsChainHardforks::local();
         let block = activation_block(&hardforks, RaylsHardFork::HybridRewards);
-        assert_eq!(hardforks.version_byte_at_block(0), Some(0x12));
-        assert_eq!(hardforks.version_byte_at_block(block - 1), Some(0x12));
-        assert_eq!(hardforks.version_byte_at_block(block), Some(0x12));
-        assert_eq!(hardforks.version_byte_at_block(1_000_000), Some(0x12));
+        assert_eq!(hardforks.version_byte_at_block(0), Some(0x13));
+        assert_eq!(hardforks.version_byte_at_block(block - 1), Some(0x13));
+        assert_eq!(hardforks.version_byte_at_block(block), Some(0x13));
+        assert_eq!(hardforks.version_byte_at_block(1_000_000), Some(0x13));
     }
 
     /// Every network schedule lists all 18 hardforks in variant order.
@@ -196,6 +196,7 @@ mod schedule {
                 (RaylsHardFork::HybridRewards, ForkCondition::Never),
                 (RaylsHardFork::OutputSeqNormalization, ForkCondition::Block(12_231_705)),
                 (RaylsHardFork::SenderAffinityLoadBalancing, ForkCondition::Block(12_231_705)),
+                (RaylsHardFork::Eip161EmptyAccountGuard, ForkCondition::Block(13_832_605)),
                 (RaylsHardFork::EpochCloseSeedV2, ForkCondition::Never),
                 (RaylsHardFork::CertificateFetchEpochV2, ForkCondition::Never),
                 (RaylsHardFork::Erc20PrecompileDirectCall, ForkCondition::Never),
@@ -225,6 +226,7 @@ mod schedule {
                 (RaylsHardFork::HybridRewards, ForkCondition::Never),
                 (RaylsHardFork::OutputSeqNormalization, ForkCondition::Block(17_300_000)),
                 (RaylsHardFork::SenderAffinityLoadBalancing, ForkCondition::Block(17_300_000)),
+                (RaylsHardFork::Eip161EmptyAccountGuard, ForkCondition::Block(22_075_500)),
                 (RaylsHardFork::EpochCloseSeedV2, ForkCondition::Never),
                 (RaylsHardFork::CertificateFetchEpochV2, ForkCondition::Never),
                 (RaylsHardFork::Erc20PrecompileDirectCall, ForkCondition::Never),
@@ -254,22 +256,22 @@ mod hardforks {
     fn local_network_version_byte_at_block_0() {
         let hardforks = RaylsChainHardforks::local();
         let version = hardforks.version_byte_at_block(0);
-        // Erc20PrecompileDirectCall (0x12) activates at block 0 on local and is the highest
+        // Erc20PrecompileDirectCall (0x13) activates at block 0 on local and is the highest
         // such fork, so it owns the version byte from block 0.
-        assert_eq!(version, Some(0x12));
+        assert_eq!(version, Some(0x13));
     }
 
     #[test]
     fn local_network_version_byte_is_the_max_active_code() {
-        // Erc20PrecompileDirectCall (0x12) is genesis-active on local, so it owns the version
+        // Erc20PrecompileDirectCall (0x13) is genesis-active on local, so it owns the version
         // byte across every later activation (HybridRewards at 0x0d included): the byte reports
         // the max active code, not the most recently crossed block. On real networks it is Never,
         // so there the highest active fork still advances the byte normally.
         let hardforks = RaylsChainHardforks::local();
-        let hybrid_rewards_block = activation_block(&hardforks, RaylsHardFork::HybridRewards);
-        assert_eq!(hardforks.version_byte_at_block(hybrid_rewards_block - 1), Some(0x12));
-        assert_eq!(hardforks.version_byte_at_block(hybrid_rewards_block), Some(0x12));
-        assert_eq!(hardforks.version_byte_at_block(1_000_000), Some(0x12));
+        let activation_block = activation_block(&hardforks, RaylsHardFork::Erc20PrecompileDirectCall);
+        assert_eq!(hardforks.version_byte_at_block(activation_block - 1), Some(0x13));
+        assert_eq!(hardforks.version_byte_at_block(activation_block), Some(0x13));
+        assert_eq!(hardforks.version_byte_at_block(1_000_000), Some(0x13));
     }
 }
 

@@ -53,6 +53,7 @@ impl RaylsHardFork {
             ScheduledFork::new(Self::HybridRewards, ForkCondition::Never),
             ScheduledFork::new(Self::OutputSeqNormalization, ForkCondition::Block(0)),
             ScheduledFork::new(Self::SenderAffinityLoadBalancing, ForkCondition::Block(0)),
+            ScheduledFork::new(Self::Eip161EmptyAccountGuard, ForkCondition::Block(0)),
             // Never until SRE schedules an activation block: changes epoch-closing block hashes.
             ScheduledFork::new(Self::EpochCloseSeedV2, ForkCondition::Never),
             // Never until SRE schedules an activation block: switches a network request format,
@@ -85,6 +86,7 @@ impl RaylsHardFork {
             ScheduledFork::new(Self::HybridRewards, ForkCondition::Never),
             ScheduledFork::new(Self::OutputSeqNormalization, ForkCondition::Block(17_300_000)),
             ScheduledFork::new(Self::SenderAffinityLoadBalancing, ForkCondition::Block(17_300_000)),
+            ScheduledFork::new(Self::Eip161EmptyAccountGuard, ForkCondition::Block(22_075_500)),
             // Never until SRE schedules an activation block: changes epoch-closing block hashes.
             ScheduledFork::new(Self::EpochCloseSeedV2, ForkCondition::Never),
             // Never until SRE schedules an activation block: switches a network request format,
@@ -116,6 +118,7 @@ impl RaylsHardFork {
             ScheduledFork::new(Self::HybridRewards, ForkCondition::Never),
             ScheduledFork::new(Self::OutputSeqNormalization, ForkCondition::Block(12_231_705)),
             ScheduledFork::new(Self::SenderAffinityLoadBalancing, ForkCondition::Block(12_231_705)),
+            ScheduledFork::new(Self::Eip161EmptyAccountGuard, ForkCondition::Block(13_832_605)),
             // Never until SRE schedules an activation block: changes epoch-closing block hashes.
             ScheduledFork::new(Self::EpochCloseSeedV2, ForkCondition::Never),
             // Never until SRE schedules an activation block: switches a network request format,
@@ -155,6 +158,7 @@ impl RaylsHardFork {
             ScheduledFork::new(Self::OutputSeqNormalization, ForkCondition::Block(0)),
             // Real networks stay `Never` until an activation block is chosen operationally.
             ScheduledFork::new(Self::SenderAffinityLoadBalancing, ForkCondition::Block(0)),
+            ScheduledFork::new(Self::Eip161EmptyAccountGuard, ForkCondition::Block(0)),
             ScheduledFork::new(Self::EpochCloseSeedV2, ForkCondition::Block(0)),
             ScheduledFork::new(Self::CertificateFetchEpochV2, ForkCondition::Block(0)),
             // Local is ephemeral: activate from genesis so the direct-call guard is exercised.
