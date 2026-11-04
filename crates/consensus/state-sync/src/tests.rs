@@ -1266,3 +1266,84 @@ async fn test_catch_up_waits_for_walk_when_gap_out_of_reach() {
     }
     assert_eq!(streamed, (n + 1..=m).collect::<Vec<_>>());
 }
+
+/// A bad by-number reply fails the link to the trusted header above it. The headers this call
+/// already proved and streamed must stay as the new anchor, so a peer that answers some numbers
+/// with bad headers cannot send every retry back to the same anchor.
+#[tokio::test]
+async fn test_catch_up_keeps_proven_progress_on_mismatch() {
+    let fixture = CommitteeFixture::builder(MemDatabase::default)
+        .randomize_ports(true)
+        .committee_size(NonZeroUsize::new(4).unwrap())
+        .build();
+    let primary = fixture.authorities().next().unwrap();
+    let config = primary.consensus_config();
+    let db = config.node_storage();
+    let committee = fixture.committee();
+
+    let anchor = chained_header(100, B256::default(), &committee);
+    db.with_write_txn(|txn| {
+        txn.insert::<ConsensusBlocks>(&anchor.number, &anchor)?;
+        txn.insert::<ConsensusBlockNumbersByDigest>(&anchor.digest(), &anchor.number)?;
+        Ok(())
+    })
+    .unwrap();
+    // Real chain 101..=110. The walk has cached the even numbers; the odd ones are fetched by
+    // number.
+    let mut chain: BTreeMap<u64, ConsensusHeader> = BTreeMap::new();
+    let mut parent = anchor.digest();
+    for number in 101..=110u64 {
+        let header = chained_header(number, parent, &committee);
+        parent = header.digest();
+        if number % 2 == 0 {
+            store_consensus_header_in_cache(db, &header);
+        }
+        chain.insert(number, header);
+    }
+    let target = chain[&110].clone();
+
+    // A bad reply at 105: real parent link and number, fabricated sub_dag.
+    let mut fake_leader = Certificate::default();
+    fake_leader.header.created_at = 123_456;
+    let bad_105 = ConsensusHeader {
+        parent_hash: chain[&104].digest(),
+        sub_dag: CommittedSubDag::new(vec![], fake_leader, 0, ReputationScores::default(), None),
+        number: 105,
+        extra: B256::default(),
+    };
+    let mut served = chain.clone();
+    served.insert(105, bad_105);
+
+    let cb = ConsensusBus::new();
+    seed_recently_executed_blocks(&cb);
+    let _rx = cb.consensus_header().subscribe();
+    let mut last_header = anchor.clone();
+    let mut last_height = anchor.number;
+
+    let pending = attempt_catch_up(
+        &config,
+        &cb,
+        &serving_network(served),
+        &mut last_header,
+        &mut last_height,
+        target.clone(),
+        "test",
+    )
+    .await;
+    assert!(pending.is_some(), "the bad reply keeps the target pending");
+    assert_eq!(last_height, 104, "headers proven before the bad reply must become the anchor");
+    assert_eq!(last_header.digest(), chain[&104].digest());
+
+    let pending = attempt_catch_up(
+        &config,
+        &cb,
+        &serving_network(chain),
+        &mut last_header,
+        &mut last_height,
+        target.clone(),
+        "test retry",
+    )
+    .await;
+    assert!(pending.is_none());
+    assert_eq!(last_height, 110);
+}
