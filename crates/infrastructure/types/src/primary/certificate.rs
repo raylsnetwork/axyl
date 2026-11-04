@@ -231,6 +231,12 @@ impl Certificate {
     /// Verifies the aggregate signature against `committee`, resetting the verification state
     /// first so an already-verified certificate is re-checked.
     pub fn verify_cert(mut self, committee: &[BlsPublicKey]) -> CertificateResult<Certificate> {
+        // A quorum of `committee` can sign a header authored outside it (a validator that joined
+        // later, leaving out its own vote); such a certificate is not valid for this committee.
+        ensure!(
+            committee.iter().any(|key| AuthorityIdentifier::from(*key) == *self.origin()),
+            CertificateError::from(HeaderError::UnknownAuthority(self.origin().to_string()))
+        );
         self = self.validate_received()?;
         let (weight, pks) = self.signed_by(committee);
 
