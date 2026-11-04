@@ -203,6 +203,7 @@ impl RaylsChainSpecBuilder {
     }
 
     /// Activate Eip161EmptyAccountGuard at `block`.
+    #[must_use = "builder method result must be used"]
     pub fn eip161_empty_account_guard(mut self, block: u64) -> Self {
         self.inner
             .hardforks

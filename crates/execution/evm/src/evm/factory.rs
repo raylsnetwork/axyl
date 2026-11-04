@@ -142,7 +142,7 @@ impl RaylsEvmFactory {
 
             // Evaluate the hardfork at this call's block, not at factory-construction time.
             let reject_empty_debits = chain_spec.is_eip161_empty_account_guard_active_at_block(
-                input.internals.block_number().to::<u64>(),
+                input.internals.block_number().saturating_to(),
             );
 
             // Route to appropriate handler based on selector

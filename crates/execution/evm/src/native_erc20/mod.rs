@@ -27,6 +27,8 @@ pub mod storage;
 
 #[cfg(test)]
 mod delegatecall_tests;
+#[cfg(test)]
+mod eip3009_empty_account_tests;
 
 pub use abi::{eip3009, erc20, Erc20Selector};
 pub use composite_inspector::CompositeInspector;
