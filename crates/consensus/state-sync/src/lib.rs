@@ -774,9 +774,12 @@ async fn catch_up_consensus_from_to<DB: Database>(
                 actual = ?consensus_header.digest(),
                 "consensus header digest mismatch - retrying (a non-canonical poison row is cleared to self-heal; a canonical fork needs a DB restore)"
             );
-            // Keep what this call already proved and streamed, so a peer that answers some numbers
-            // with a bad header cannot send every retry back to the same anchor.
-            if streamed > 0 {
+            // When a by-number reply is on either side of the failed link, the streamed headers
+            // below it are not implicated: keep them, so a peer that answers some numbers with a
+            // bad header cannot send every retry back to the same anchor. When both sides are
+            // stored rows, the row at `number - 1` may be the bad one, so keep the anchor below it
+            // and let the clear above remove that row.
+            if streamed > 0 && (from_gap_fetch || !unproven.is_empty()) {
                 return Ok(result_header);
             }
             return Err(eyre::eyre!("consensus header digest mismatch at number {number}"));
