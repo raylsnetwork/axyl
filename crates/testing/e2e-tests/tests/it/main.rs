@@ -14,6 +14,9 @@ mod epochs;
 mod faucet;
 #[cfg(not(feature = "dev-single-node-setup"))]
 mod genesis_tests;
+// Needs the node built with the test-only certificate gossip drop hook.
+#[cfg(all(feature = "cert-gossip-drop-hook", not(feature = "dev-single-node-setup")))]
+mod missing_parent;
 #[cfg(not(feature = "dev-single-node-setup"))]
 mod restarts;
 

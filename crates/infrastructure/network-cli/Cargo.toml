@@ -45,6 +45,8 @@ cold-storage = ["rayls-middleware-orchestrator/cold-storage"]
 # dashboard). NOT FOR PRODUCTION — excluded from default/release builds; enable
 # with `--features dev-single-node-setup`.
 dev-single-node-setup = ["dep:ethereum-tx-sign", "rayls-middleware-orchestrator/dev-single-node-setup"]
+# Test-only: drop one round of certificate gossip on demand (e2e missing-parent test). NOT FOR PRODUCTION.
+cert-gossip-drop-hook = ["rayls-middleware-orchestrator/cert-gossip-drop-hook"]
 
 [dev-dependencies]
 tokio = { workspace = true, features = [

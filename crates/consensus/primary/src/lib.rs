@@ -11,6 +11,8 @@ mod primary;
 mod proposer;
 mod state_handler;
 mod state_sync;
+#[cfg(feature = "cert-gossip-drop-hook")]
+mod test_hooks;
 mod vote_failure_tracker;
 
 pub use state_sync::StateSynchronizer;

@@ -50,6 +50,8 @@ rayls-execution-faucet = { workspace = true }
 libc = "0.2"
 
 [features]
+# Test-only: drop one round of certificate gossip on demand (e2e missing-parent test). NOT FOR PRODUCTION.
+cert-gossip-drop-hook = ["rayls-consensus-primary/cert-gossip-drop-hook"]
 # Propagates the consensus DB cold tier. On by default; disable to compile out the cold archiver
 # wiring (boot migration, boundary archival) along with the storage crate's cold-storage code.
 cold-storage = ["rayls-infrastructure-storage/cold-storage", "dep:reth-db"]

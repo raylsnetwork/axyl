@@ -229,6 +229,9 @@ pub fn get_rayls_network_binary() -> &'static CargoRun {
         // crate is itself built with `--features dev`.
         #[cfg(feature = "dev-single-node-setup")]
         let build = build.features("dev-single-node-setup");
+        // The missing-parent e2e test needs the node built with its gossip drop hook.
+        #[cfg(feature = "cert-gossip-drop-hook")]
+        let build = build.features("cert-gossip-drop-hook");
         build.run().expect("Failed to build rayls-network binary")
     })
 }

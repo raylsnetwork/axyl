@@ -84,6 +84,14 @@ impl PrimaryNetworkHandle {
 
     /// Publish a certificate to the consensus network.
     pub async fn publish_certificate(&self, certificate: Certificate) -> NetworkResult<()> {
+        #[cfg(feature = "cert-gossip-drop-hook")]
+        if crate::test_hooks::drop_certificate_gossip(
+            certificate.epoch(),
+            certificate.round(),
+            true,
+        ) {
+            return Ok(());
+        }
         let data = encode(&PrimaryGossip::Certificate(Box::new(certificate)));
         self.handle.publish(LibP2pConfig::primary_topic(), data).await?;
         Ok(())
