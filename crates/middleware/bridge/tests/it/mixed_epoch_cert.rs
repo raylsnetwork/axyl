@@ -13,7 +13,7 @@ use rayls_infrastructure_network_types::MockPrimaryToWorkerClient;
 use rayls_infrastructure_storage::mem_db::MemDatabase;
 use rayls_infrastructure_types::{
     now, test_chain_spec_arc, AuthorityIdentifier, B256Map, Batch, Certificate, CommittedSubDag,
-    ConsensusHeader, ConsensusOutput, Epoch, Hash as _, HeaderBuilder, Notifier, RaylsReceiver,
+    ConsensusHeader, ConsensusOutput, Epoch, HeaderBuilder, Notifier, RaylsReceiver,
     RaylsSender as _, ReputationScores, Round, TaskManager, B256,
 };
 use rayls_middleware_bridge::subscriber::spawn_subscriber;
@@ -233,16 +233,17 @@ async fn honest_joined_cert_is_rejected_not_fatal() -> eyre::Result<()> {
     Ok(())
 }
 
-/// The crash: a joined validator that leaves out its own vote gets a certificate that verifies
-/// against the epoch-0 keys, and the follower's subscriber stops fatally on its author.
+/// The crash: a joined validator that leaves out its own vote gets a certificate signed by a
+/// quorum of the epoch-0 keys. Its author is outside that committee, so it must be rejected at
+/// verification rather than stop the follower's subscriber fatally on the author lookup.
 #[tokio::test]
 async fn selfless_joined_cert_crashes_follower() -> eyre::Result<()> {
     for mode in [NodeMode::Observer, NodeMode::CvvInactive] {
         let (before, after, joined) = committees();
         let cert = selfless_joined_cert(&before, &after, &joined);
         assert!(
-            cert.clone().verify_cert(&before.committee().bls_keys()).is_ok(),
-            "the selfless certificate must pass the epoch-0 keys"
+            cert.clone().verify_cert(&before.committee().bls_keys()).is_err(),
+            "a certificate authored outside the epoch-0 committee must fail the epoch-0 keys"
         );
         let result = run(mode, cert).await?;
         assert!(
