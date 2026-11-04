@@ -96,7 +96,8 @@ fn honest_joined_cert(
     joined: &AuthorityIdentifier,
 ) -> Certificate {
     let header = joined_header(after, joined, 1, 3);
-    let own = after.authorities().find(|a| &a.id() == joined).expect("joined authority").vote(&header);
+    let own =
+        after.authorities().find(|a| &a.id() == joined).expect("joined authority").vote(&header);
     let mut votes = vec![(own.author().clone(), *own.signature())];
     votes.extend(after.votes(&header).into_iter().map(|v| (v.author().clone(), *v.signature())));
     Certificate::new_unverified(&after.committee(), header, votes).expect("quorum")
