@@ -631,6 +631,19 @@ async fn attempt_catch_up<DB: Database>(
     }
 }
 
+/// Most by-number replies held at once while waiting for a trusted header to link onto them.
+const MAX_UNPROVEN_GAP: u64 = 64;
+
+/// True when the target or a stored header lies within [`MAX_UNPROVEN_GAP`] numbers above
+/// `number`, so by-number replies from `number` up can be proven within the hold bound.
+fn trusted_header_within_reach<DB: Database>(db: &DB, number: u64, target: u64) -> bool {
+    target - number <= MAX_UNPROVEN_GAP
+        || (number + 1..=number + MAX_UNPROVEN_GAP).any(|n| {
+            db.contains_key::<ConsensusBlocks>(&n).unwrap_or(false)
+                || db.contains_key::<ConsensusBlocksCache>(&n).unwrap_or(false)
+        })
+}
+
 /// Applies consensus output from (exclusive) to max_consensus_height (inclusive).
 /// Returns the last applied ConsensusHeader.
 async fn catch_up_consensus_from_to<DB: Database>(
@@ -663,19 +676,34 @@ async fn catch_up_consensus_from_to<DB: Database>(
     let epoch = config.epoch();
     let mut result_header = from;
     let mut streamed = 0u64;
+    // A by-number reply proves only its number and parent link, not its contents, so it is held
+    // here (not cached, not forwarded) until a trusted header links onto it: a DB row from the
+    // hash-verified backwards walk, or the target. That link fixes every held reply below it.
+    let mut unproven: Vec<ConsensusHeader> = Vec::new();
     for number in last_consensus_height + 1..=max_consensus_height {
-        // A by-number gap fetch is unverified (only the number is checked), so it is cached only
-        // after the digest-chain guard below links it onto the verified parent; caching earlier
-        // poisons every retry until the backwards walk overwrites it.
         let mut from_gap_fetch = false;
         let consensus_header = if number == max_consensus_height {
             max_consensus.clone()
         } else if let Some(block) = db.get_consensus_by_number(number) {
             block
         } else {
-            // The backwards walk has not refilled this number yet; fetch it by number rather than
-            // wedge behind one slow hash. Safety rests on the later gates (the digest-chain guard
-            // below, and the subscriber's BLS re-verify before execution), not this fetch.
+            // The backwards walk has not refilled this number yet. Fetch it by number rather than
+            // stall behind one slow hash, but only while a trusted header close above can prove
+            // the replies; otherwise wait for the walk to come down.
+            let out_of_reach = if unproven.is_empty() {
+                !trusted_header_within_reach(db, number, max_consensus_height)
+            } else {
+                unproven.len() as u64 >= MAX_UNPROVEN_GAP
+            };
+            if out_of_reach {
+                debug!(
+                    target: "rayls-consensus-state-sync",
+                    number,
+                    streamed,
+                    "catch_up_from_to: no trusted header within reach of the gap, returning early (awaiting backwards walk)"
+                );
+                return Ok(result_header);
+            }
             match network.request_consensus(Some(number), None).await {
                 Ok(header) => {
                     from_gap_fetch = true;
@@ -720,9 +748,8 @@ async fn catch_up_consensus_from_to<DB: Database>(
         last_parent =
             ConsensusHeader::digest_from_parts(parent_hash, &consensus_header.sub_dag, number);
         if last_parent != consensus_header.digest() {
-            // `number` does not chain onto the row at `number - 1`. A gap fetch proves only the
-            // reply's parent_hash and number, not its sub_dag, so a bad peer can plant a row the
-            // next real header cannot link to; drop that poisoned non-canonical row to force a
+            // `number` does not chain onto the header at `number - 1`. Held by-number replies are
+            // simply dropped with this return; a non-canonical cache row is removed to force a
             // re-fetch. Never drop a canonical row: a mismatch there is a real fork (needs an
             // operator restore), and removing history the walk cannot rebuild loses state silently.
             let poisoned_parent_number = number - 1;
@@ -750,68 +777,75 @@ async fn catch_up_consensus_from_to<DB: Database>(
             return Err(eyre::eyre!("consensus header digest mismatch at number {number}"));
         }
 
-        // Guard passed; persist a gap-fetched header now (DB-hit and max_consensus are stored).
         if from_gap_fetch {
-            store_consensus_header_in_cache(db, &consensus_header);
+            unproven.push(consensus_header);
+            continue;
         }
-
-        let base_execution_block = consensus_header.sub_dag.leader.header().latest_execution_block;
-        if streamed.is_multiple_of(100) {
-            let recent_latest =
-                consensus_bus.recently_executed_blocks().borrow().latest_block_num_hash();
-            info!(
-                target: "rayls-consensus-state-sync",
-                consensus_number = number,
-                exec_current = recent_latest.number,
-                streamed,
-                leader_epoch = consensus_header.sub_dag.leader_epoch(),
-                "catch_up_from_to: streaming progress"
-            );
+        // A trusted header linked on, so every held reply below it is canonical.
+        for header in &unproven {
+            store_consensus_header_in_cache(db, header);
         }
-        // Gate streaming on execution so we never outrun it and miss a fork. Bounded so a target
-        // that never executes errors out instead of parking forever; the error is surfaced to
-        // retry.
-        if let Err(wait_err) = consensus_bus
-            .wait_for_execution_bounded(base_execution_block, EXECUTION_STALL_TIMEOUT)
-            .await
-        {
-            // A genuine `Forked` recurs and needs an operator DB restore: catch-up cannot rebuild
-            // forked committed history.
-            let recent = consensus_bus.recently_executed_blocks().borrow();
-            let recent_oldest = recent.oldest_block_number();
-            let recent_latest = recent.latest_block_num_hash();
-            let recent_len = recent.len();
-            drop(recent);
+        for consensus_header in unproven.drain(..).chain(std::iter::once(consensus_header)) {
+            let number = consensus_header.number;
+            let base_execution_block =
+                consensus_header.sub_dag.leader.header().latest_execution_block;
+            if streamed.is_multiple_of(100) {
+                let recent_latest =
+                    consensus_bus.recently_executed_blocks().borrow().latest_block_num_hash();
+                info!(
+                    target: "rayls-consensus-state-sync",
+                    consensus_number = number,
+                    exec_current = recent_latest.number,
+                    streamed,
+                    leader_epoch = consensus_header.sub_dag.leader_epoch(),
+                    "catch_up_from_to: streaming progress"
+                );
+            }
+            // Gate streaming on execution so we never outrun it and miss a fork. Bounded so a
+            // target that never executes errors out instead of parking forever; the error is
+            // surfaced to retry.
+            if let Err(wait_err) = consensus_bus
+                .wait_for_execution_bounded(base_execution_block, EXECUTION_STALL_TIMEOUT)
+                .await
+            {
+                // A genuine `Forked` recurs and needs an operator DB restore: catch-up cannot
+                // rebuild forked committed history.
+                let recent = consensus_bus.recently_executed_blocks().borrow();
+                let recent_oldest = recent.oldest_block_number();
+                let recent_latest = recent.latest_block_num_hash();
+                let recent_len = recent.len();
+                drop(recent);
 
-            error!(
-                target: "rayls-consensus-state-sync",
-                consensus_header_number = number,
-                consensus_leader_round = consensus_header.sub_dag.leader_round(),
-                base_exec_block_number = base_execution_block.number,
-                base_exec_block_hash = ?base_execution_block.hash,
-                recently_executed_blocks_oldest = recent_oldest,
-                recently_executed_blocks_latest_number = recent_latest.number,
-                recently_executed_blocks_latest_hash = ?recent_latest.hash,
-                recently_executed_blocks_len = recent_len,
-                %wait_err,
-                "catch-up could not confirm execution reached the referenced block"
-            );
+                error!(
+                    target: "rayls-consensus-state-sync",
+                    consensus_header_number = number,
+                    consensus_leader_round = consensus_header.sub_dag.leader_round(),
+                    base_exec_block_number = base_execution_block.number,
+                    base_exec_block_hash = ?base_execution_block.hash,
+                    recently_executed_blocks_oldest = recent_oldest,
+                    recently_executed_blocks_latest_number = recent_latest.number,
+                    recently_executed_blocks_latest_hash = ?recent_latest.hash,
+                    recently_executed_blocks_len = recent_len,
+                    %wait_err,
+                    "catch-up could not confirm execution reached the referenced block"
+                );
 
-            return Err(eyre::eyre!(
-                "catch-up could not confirm execution of consensus header {} \
-                 (references execution block {}, hash {:?}): {wait_err}. \
-                 recently_executed_blocks range is [{}, {}] with {} blocks; the streamer will retry.",
-                number,
-                base_execution_block.number,
-                base_execution_block.hash,
-                recent_oldest,
-                recent_latest.number,
-                recent_len
-            ));
+                return Err(eyre::eyre!(
+                    "catch-up could not confirm execution of consensus header {} \
+                     (references execution block {}, hash {:?}): {wait_err}. \
+                     recently_executed_blocks range is [{}, {}] with {} blocks; the streamer will retry.",
+                    number,
+                    base_execution_block.number,
+                    base_execution_block.hash,
+                    recent_oldest,
+                    recent_latest.number,
+                    recent_len
+                ));
+            }
+            consensus_bus.consensus_header().send(consensus_header.clone()).await?;
+            streamed += 1;
+            result_header = consensus_header;
         }
-        consensus_bus.consensus_header().send(consensus_header.clone()).await?;
-        streamed += 1;
-        result_header = consensus_header;
     }
     info!(
         target: "rayls-consensus-state-sync",
