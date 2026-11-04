@@ -1847,3 +1847,69 @@ async fn test_heartbeat_redials_missing_committee_member() {
         "no raw dial may bypass the resolving dial path"
     );
 }
+
+/// A second connection next to an old one resets the peer once; simultaneous dials and repeats
+/// inside the cooldown do not, so neither a dial race nor a doubling peer can flap it.
+#[tokio::test]
+async fn test_stale_connection_reset_policy() {
+    let mut peer_manager = create_test_peer_manager(None);
+    let peer = PeerId::random();
+    let start = std::time::Instant::now();
+
+    // simultaneous dial: two connections close together are both live
+    peer_manager.track_connection_opened(peer, ConnectionId::new_unchecked(1), start);
+    peer_manager.track_connection_opened(
+        peer,
+        ConnectionId::new_unchecked(2),
+        start + Duration::from_millis(100),
+    );
+    assert_eq!(peer_manager.next_connection_reset(), None);
+    assert_eq!(peer_manager.tracked_connections(&peer), 2);
+    peer_manager.track_connection_closed(peer, ConnectionId::new_unchecked(2));
+
+    // a new connection next to an old one: reset every connection to the peer
+    let later = start + STALE_CONNECTION_MIN_AGE;
+    peer_manager.track_connection_opened(peer, ConnectionId::new_unchecked(3), later);
+    assert_eq!(peer_manager.next_connection_reset(), Some(peer));
+    assert_eq!(peer_manager.next_connection_reset(), None);
+    peer_manager.track_connection_closed(peer, ConnectionId::new_unchecked(1));
+    peer_manager.track_connection_closed(peer, ConnectionId::new_unchecked(3));
+    assert_eq!(peer_manager.tracked_connections(&peer), 0);
+
+    // the reconnect is a single first connection: nothing to do
+    let reconnect = later + Duration::from_secs(1);
+    peer_manager.track_connection_opened(peer, ConnectionId::new_unchecked(4), reconnect);
+    assert_eq!(peer_manager.next_connection_reset(), None);
+
+    // inside the cooldown another doubling is left alone
+    let again = reconnect + STALE_CONNECTION_MIN_AGE;
+    assert!(again < later + CONNECTION_RESET_COOLDOWN);
+    peer_manager.track_connection_opened(peer, ConnectionId::new_unchecked(5), again);
+    assert_eq!(peer_manager.next_connection_reset(), None);
+    peer_manager.track_connection_closed(peer, ConnectionId::new_unchecked(5));
+
+    // after the cooldown the peer can be reset again
+    let after = later + CONNECTION_RESET_COOLDOWN;
+    peer_manager.track_connection_opened(peer, ConnectionId::new_unchecked(6), after);
+    assert_eq!(peer_manager.next_connection_reset(), Some(peer));
+}
+
+/// A reset whose peer already disconnected is dropped, and other peers are unaffected.
+#[tokio::test]
+async fn test_stale_connection_reset_skips_gone_peer() {
+    let mut peer_manager = create_test_peer_manager(None);
+    let peer = PeerId::random();
+    let other = PeerId::random();
+    let start = std::time::Instant::now();
+    peer_manager.track_connection_opened(other, ConnectionId::new_unchecked(10), start);
+    peer_manager.track_connection_opened(peer, ConnectionId::new_unchecked(1), start);
+    peer_manager.track_connection_opened(
+        peer,
+        ConnectionId::new_unchecked(2),
+        start + STALE_CONNECTION_MIN_AGE,
+    );
+    peer_manager.track_connection_closed(peer, ConnectionId::new_unchecked(1));
+    peer_manager.track_connection_closed(peer, ConnectionId::new_unchecked(2));
+    assert_eq!(peer_manager.next_connection_reset(), None);
+    assert_eq!(peer_manager.tracked_connections(&other), 1);
+}

@@ -16,5 +16,7 @@ mod faucet;
 mod genesis_tests;
 #[cfg(not(feature = "dev-single-node-setup"))]
 mod restarts;
+#[cfg(not(feature = "dev-single-node-setup"))]
+mod stale_connection;
 
 fn main() {}
