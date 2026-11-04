@@ -91,6 +91,10 @@ impl<Req, Res> RLCodec<Req, Res> {
         let snappy_decoder = FrameDecoder::new(reader);
         snappy_decoder.take(length as u64).read_to_end(&mut decode_buffer)?;
 
+        // Decompression is complete and the decoder no longer borrows `compressed_buffer`.
+        // Release it before `bcs::from_bytes` allocates the owned message on top of it.
+        drop(compressed_buffer);
+
         // the prefix declares the exact uncompressed length; shorter data is a protocol violation
         if decode_buffer.len() < length {
             return Err(std::io::Error::new(
