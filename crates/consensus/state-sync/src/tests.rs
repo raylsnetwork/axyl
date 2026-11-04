@@ -1347,3 +1347,85 @@ async fn test_catch_up_keeps_proven_progress_on_mismatch() {
     assert!(pending.is_none());
     assert_eq!(last_height, 110);
 }
+
+/// When both sides of a failed link are stored rows, the row below the link may be the bad one
+/// (a stale row from another fork). The anchor must not advance onto it, so the row is cleared and
+/// a later pass can replace it, even when headers below it were already streamed.
+#[tokio::test]
+async fn test_catch_up_does_not_anchor_on_stale_stored_row() {
+    let fixture = CommitteeFixture::builder(MemDatabase::default)
+        .randomize_ports(true)
+        .committee_size(NonZeroUsize::new(4).unwrap())
+        .build();
+    let primary = fixture.authorities().next().unwrap();
+    let config = primary.consensus_config();
+    let db = config.node_storage();
+    let committee = fixture.committee();
+
+    let anchor = chained_header(100, B256::default(), &committee);
+    db.with_write_txn(|txn| {
+        txn.insert::<ConsensusBlocks>(&anchor.number, &anchor)?;
+        txn.insert::<ConsensusBlockNumbersByDigest>(&anchor.digest(), &anchor.number)?;
+        Ok(())
+    })
+    .unwrap();
+    let mut chain: BTreeMap<u64, ConsensusHeader> = BTreeMap::new();
+    let mut parent = anchor.digest();
+    for number in 101..=105u64 {
+        let header = chained_header(number, parent, &committee);
+        parent = header.digest();
+        chain.insert(number, header);
+    }
+    let target = chain[&105].clone();
+
+    // Stored rows 101..=104, with a stale row at 103: real parent link, different sub_dag.
+    let mut fake_leader = Certificate::default();
+    fake_leader.header.created_at = 123_456;
+    let stale_103 = ConsensusHeader {
+        parent_hash: chain[&102].digest(),
+        sub_dag: CommittedSubDag::new(vec![], fake_leader, 0, ReputationScores::default(), None),
+        number: 103,
+        extra: B256::default(),
+    };
+    for header in [&chain[&101], &chain[&102], &stale_103, &chain[&104]] {
+        store_consensus_header_in_cache(db, header);
+    }
+
+    let cb = ConsensusBus::new();
+    seed_recently_executed_blocks(&cb);
+    let _rx = cb.consensus_header().subscribe();
+    let mut last_header = anchor.clone();
+    let mut last_height = anchor.number;
+
+    let pending = attempt_catch_up(
+        &config,
+        &cb,
+        &no_peer_network(),
+        &mut last_header,
+        &mut last_height,
+        target.clone(),
+        "test",
+    )
+    .await;
+    assert!(pending.is_some());
+    assert_eq!(
+        last_height, 100,
+        "the anchor must not advance onto a row the failed link implicates"
+    );
+    assert!(db.get_consensus_by_number(103).is_none(), "the stale row must be cleared");
+
+    // The walk refills 103; the next pass reaches the target.
+    store_consensus_header_in_cache(db, &chain[&103]);
+    let pending = attempt_catch_up(
+        &config,
+        &cb,
+        &no_peer_network(),
+        &mut last_header,
+        &mut last_height,
+        target,
+        "test retry",
+    )
+    .await;
+    assert!(pending.is_none());
+    assert_eq!(last_height, 105);
+}
