@@ -63,7 +63,6 @@ impl<Req, Res> RLCodec<Req, Res> {
         // Scoped to this message so a large or partially-read message does not pin memory on
         // the codec after the call completes or is cancelled.
         let mut compressed_buffer: Vec<u8> = Vec::new();
-        let mut decode_buffer: Vec<u8> = Vec::new();
 
         let mut prefix = [0; 4];
         io.read_exact(&mut prefix).await?;
@@ -82,12 +81,22 @@ impl<Req, Res> RLCodec<Req, Res> {
         let max_compress_len = snap::raw::max_compress_len(length);
         io.take(max_compress_len as u64).read_to_end(&mut compressed_buffer).await?;
 
-        // decompress into `decode_buffer`, capping the output at the declared length so
-        // snappy amplification can't exceed it
-        //
-        // NOTE: the buffer is not pre-sized to the declared length; it grows as bytes arrive,
-        // so a prefix-only or stalled request reserves no memory
-        let reader = std::io::Cursor::new(&mut compressed_buffer);
+        // The body has arrived, so no `.await` remains between allocating the output buffer and
+        // dropping it: the rest of this function is synchronous. Sizing from the prefix here
+        // therefore cannot pin memory across the stream timeout or a cancellation. Reject an
+        // empty body first so a prefix-only request still allocates nothing.
+        if length > 0 && compressed_buffer.is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "empty body for non-zero declared length",
+            ));
+        }
+
+        // Decompress into `decode_buffer`, capping the output at the declared length so snappy
+        // amplification can't exceed it. The exact capacity avoids `read_to_end` doubling to
+        // ~2x the declared size when the output is a power of two (e.g. the 2 MiB limit).
+        let mut decode_buffer = Vec::with_capacity(length);
+        let reader = std::io::Cursor::new(&compressed_buffer);
         let snappy_decoder = FrameDecoder::new(reader);
         snappy_decoder.take(length as u64).read_to_end(&mut decode_buffer)?;
 
