@@ -111,7 +111,9 @@ impl<Req, Res> RLCodec<Req, Res> {
         T: AsyncWrite + Unpin + Send,
         M: RLMessage,
     {
-        // Scoped to this message so large encode buffers are not retained on the codec.
+        // Build and compress the message before touching the wire. Locals in an async fn stay in
+        // the future's state across `.await` points unless dropped, so this keeps `msg` and
+        // `encoded` from being pinned while waiting for a slow peer.
         let mut encoded: Vec<u8> = Vec::new();
 
         encode_into_buffer(&mut encoded, &msg).map_err(|e| {
@@ -119,26 +121,37 @@ impl<Req, Res> RLCodec<Req, Res> {
             std::io::Error::other(error)
         })?;
 
+        // `msg` is no longer needed. Release it before compression and I/O.
+        drop(msg);
+
         if encoded.len() > self.max_chunk_size {
             return Err(std::io::Error::other("encode data > max_chunk_size"));
         }
-
-        // `encoded` is our own size-checked message, so the maximum compressed size is known.
-        // Allocate once to avoid repeated reallocations for large messages.
-        let mut compressed_buffer = Vec::with_capacity(snap::raw::max_compress_len(encoded.len()));
 
         // length prefix for uncompressed bytes
         //
         // NOTE: 32bit max 4,294,967,295
         let prefix = (encoded.len() as u32).to_le_bytes();
+
+        // `encoded` is our own size-checked message, so the maximum compressed size is known.
+        // Allocate once to avoid repeated reallocations for large messages.
+        let mut compressed_buffer = Vec::with_capacity(snap::raw::max_compress_len(encoded.len()));
+
+        // Scoped so the encoder's mutable borrow of `compressed_buffer` ends before the write.
+        {
+            let mut encoder = snap::write::FrameEncoder::new(&mut compressed_buffer);
+            encoder.write_all(&encoded)?;
+            encoder.flush()?;
+        }
+
+        // Release the uncompressed buffer before awaiting. Only the prefix and compressed bytes
+        // are needed from here on.
+        drop(encoded);
+
+        // Do I/O only after compression succeeds, so a compression failure cannot leave a stray
+        // length prefix on the stream.
         io.write_all(&prefix).await?;
-
-        // compress data using allocated buffer
-        let mut encoder = snap::write::FrameEncoder::new(&mut compressed_buffer);
-        encoder.write_all(&encoded)?;
-        encoder.flush()?;
-
-        io.write_all(encoder.get_ref()).await?;
+        io.write_all(&compressed_buffer).await?;
 
         Ok(())
     }
