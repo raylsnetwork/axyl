@@ -21,6 +21,7 @@ networks:
       HybridRewards: never
       OutputSeqNormalization: never
       SenderAffinityLoadBalancing: never
+      Eip161EmptyAccountGuard: 0
       EpochCloseSeedV2: never
       CertificateFetchEpochV2: never
       Erc20PrecompileDirectCall: never
@@ -42,6 +43,7 @@ networks:
       HybridRewards: never
       OutputSeqNormalization: never
       SenderAffinityLoadBalancing: never
+      Eip161EmptyAccountGuard: 0
       EpochCloseSeedV2: never
       CertificateFetchEpochV2: never
       Erc20PrecompileDirectCall: never

@@ -85,11 +85,6 @@ pub trait RaylsHardforks {
         self.is_rayls_fork_active_at_block(RaylsHardFork::PrecompileGasFix, block)
     }
 
-    /// Return true if the Erc20PrecompileBytecode fork is active at `block`.
-    fn is_erc20_precompile_bytecode_active_at_block(&self, block: u64) -> bool {
-        self.is_rayls_fork_active_at_block(RaylsHardFork::Erc20PrecompileBytecode, block)
-    }
-
     /// Return true if the RlsStorage fork is active at `block`.
     fn is_rls_storage_active_at_block(&self, block: u64) -> bool {
         self.is_rayls_fork_active_at_block(RaylsHardFork::RlsStorage, block)
@@ -129,6 +124,11 @@ pub trait RaylsHardforks {
         self.is_rayls_fork_active_at_block(RaylsHardFork::Uups, block)
     }
 
+    /// Return true if the Erc20PrecompileBytecode fork is active at `block`.
+    fn is_erc20_precompile_bytecode_active_at_block(&self, block: u64) -> bool {
+        self.is_rayls_fork_active_at_block(RaylsHardFork::Erc20PrecompileBytecode, block)
+    }
+
     /// Return true if the TransactionLoadBalancing fork is active at `block`.
     fn is_transaction_load_balancing_active_at_block(&self, block: u64) -> bool {
         self.is_rayls_fork_active_at_block(RaylsHardFork::TransactionLoadBalancing, block)
@@ -137,11 +137,6 @@ pub trait RaylsHardforks {
     /// Return true if the UsdrSupplyCorrection fork is active at `block`.
     fn is_usdr_supply_correction_active_at_block(&self, block: u64) -> bool {
         self.is_rayls_fork_active_at_block(RaylsHardFork::UsdrSupplyCorrection, block)
-    }
-
-    /// Return true if the SenderAffinityLoadBalancing fork is active at `block`.
-    fn is_sender_affinity_load_balancing_active_at_block(&self, block: u64) -> bool {
-        self.is_rayls_fork_active_at_block(RaylsHardFork::SenderAffinityLoadBalancing, block)
     }
 
     /// Return true if the EmptyOutputBlock fork is active at `block`.
@@ -168,20 +163,25 @@ pub trait RaylsHardforks {
         self.is_rayls_fork_active_at_block(RaylsHardFork::OutputSeqNormalization, block)
     }
 
+    /// Return true if the SenderAffinityLoadBalancing fork is active at `block`.
+    fn is_sender_affinity_load_balancing_active_at_block(&self, block: u64) -> bool {
+        self.is_rayls_fork_active_at_block(RaylsHardFork::SenderAffinityLoadBalancing, block)
+    }
+
+    /// Return true if the EIP-161 empty-account guard is active at `block`.
+    ///
+    /// When active, native ERC-20 debits that would leave an EIP-161-empty account are rejected
+    /// instead of producing a state transition revm cannot commit.
+    fn is_eip161_empty_account_guard_active_at_block(&self, block: u64) -> bool {
+        self.is_rayls_fork_active_at_block(RaylsHardFork::Eip161EmptyAccountGuard, block)
+    }
+
     /// Return true if the EpochCloseSeedV2 fork is active at `block`.
     ///
     /// Gates the seed stamped into the epoch-closing block's `extra_data`: the consensus header
     /// hash once active, the keccak of the leader certificate's aggregate BLS signature before.
     fn is_epoch_close_seed_v2_active_at_block(&self, block: u64) -> bool {
         self.is_rayls_fork_active_at_block(RaylsHardFork::EpochCloseSeedV2, block)
-    }
-
-    /// Return the block `fork` activates at, or `None` when it is not block-scheduled (`Never`).
-    fn rayls_fork_activation_block(&self, fork: RaylsHardFork) -> Option<u64> {
-        match self.rayls_fork_activation(fork) {
-            ForkCondition::Block(block) => Some(block),
-            _ => None,
-        }
     }
 
     /// Return true if the CertificateFetchEpochV2 fork is active at `block`.
@@ -195,6 +195,14 @@ pub trait RaylsHardforks {
     /// Return true if the Erc20PrecompileDirectCall fork is active at `block`.
     fn is_erc20_precompile_direct_call_active_at_block(&self, block: u64) -> bool {
         self.is_rayls_fork_active_at_block(RaylsHardFork::Erc20PrecompileDirectCall, block)
+    }
+
+    /// Return the block `fork` activates at, or `None` when it is not block-scheduled (`Never`).
+    fn rayls_fork_activation_block(&self, fork: RaylsHardFork) -> Option<u64> {
+        match self.rayls_fork_activation(fork) {
+            ForkCondition::Block(block) => Some(block),
+            _ => None,
+        }
     }
 
     /// Return the max version byte among the forks active at `block`, if any.

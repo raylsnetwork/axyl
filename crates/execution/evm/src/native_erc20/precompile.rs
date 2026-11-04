@@ -275,6 +275,70 @@ impl Erc20Precompile {
         Ok(())
     }
 
+    /// Reject a debit that would leave `account` EIP-161 empty, using revm's own
+    /// `AccountInfo::is_empty()` definition
+    /// (`balance == 0 && nonce == 0 && (code_hash == KECCAK256_EMPTY || code_hash is zero)`).
+    ///
+    /// **Why a superset predicate.** The actual revm panic (`unreachable!` in
+    /// `AccountStatus::on_touched_empty_post_eip161`) fires only when the account's internal
+    /// status at commit is `Loaded` or `Changed` *and* it is touched empty. A debit that
+    /// leaves an `InMemoryChange` account empty (e.g. an account funded earlier in the same
+    /// block, then drained) commits legally — it transitions to `Destroyed`. This guard uses
+    /// `is_empty()` (a property of the final state alone) rather than the commit-time status
+    /// (which the precompile cannot observe through `StateAccessAdapter`). The predicate is
+    /// therefore a *conservative superset*: it may reject some drains that would commit fine,
+    /// but it never under-rejects — it can never allow a panic.
+    ///
+    /// **User-visible effect.** When the guard is active (gated by
+    /// [`RaylsHardFork::Eip161EmptyAccountGuard`]), a debit that drains a nonce-0, code-less
+    /// account to zero is rejected. This affects only *relayer-submitted* debits — the EOA's
+    /// nonce is not bumped in those paths. Self-called `transfer` does *not* trigger the
+    /// rejection because `pre_execution` bumps the caller's nonce before the precompile runs,
+    /// so `is_empty()` is false (nonce ≥ 1) at check time. `burn` (which debits the
+    /// whitelisted module itself) is also unaffected — the module has code, so it is never
+    /// empty. Affected selectors: `transferWithAuthorization`, `receiveWithAuthorization`,
+    /// and `burnFrom`.
+    ///
+    /// Debiting a `Loaded` account to empty inside a transaction makes revm's commit hit
+    /// `unreachable!("Wrong state transition, touch empty is not possible from Loaded")` and
+    /// halt the chain. We evaluate revm's exact predicate (with the post-debit balance) rather
+    /// than re-deriving it, so this guard can never drift from the check revm applies at
+    /// commit. A rejected check causes the precompile to return an error, which reverts the
+    /// entire call frame via the EVM's journal checkpoint — any prior writes (e.g., nonce
+    /// marks in EIP-3009 paths) are rolled back automatically. Do not rely on this check
+    /// running before other writes for atomicity; the revert mechanism is what guarantees
+    /// atomicity.
+    fn check_not_left_empty<T: StateAccessAdapter>(
+        &self,
+        state_access: &mut T,
+        account: Address,
+        new_balance: U256,
+    ) -> Result<(), ERC20Error> {
+        // Fast path: a non-zero balance can never make the account empty.
+        if !new_balance.is_zero() {
+            return Ok(());
+        }
+        let would_be_empty = {
+            let mut info = state_access
+                .perform_load_account(account)
+                .map_err(|e| ERC20Error::read_error(ERC20Resource::Account(account), e))?
+                .data
+                .info
+                .clone();
+            info.balance = new_balance;
+            info.is_empty()
+        };
+        if would_be_empty {
+            trace!(
+                target: "erc20_precompile",
+                ?account,
+                "debit would leave the account EIP-161 empty; rejecting"
+            );
+            return Err(ERC20Error::TransferWouldEmptyAccount(account));
+        }
+        Ok(())
+    }
+
     fn check_allowance(
         &self,
         spender: Address,
@@ -316,6 +380,7 @@ impl Erc20Precompile {
         sender: Address,
         receiver: Address,
         amount: U256,
+        reject_empty_debits: bool,
     ) -> Result<(), ERC20Error> {
         // Debit sender
         {
@@ -324,6 +389,9 @@ impl Erc20Precompile {
             let new_balance = balance.checked_sub(amount).ok_or_else(|| {
                 ERC20Error::overflow_error(ERC20Resource::Balance, ERC20Method::Transfer)
             })?;
+            if reject_empty_debits {
+                self.check_not_left_empty(state_access, sender, new_balance)?;
+            }
             self.set_balance(state_access, sender, new_balance)?;
         }
         state_access.perform_touch_account(sender);
@@ -448,6 +516,7 @@ impl Erc20Precompile {
         sender: Address,
         receiver: Address,
         amount: U256,
+        reject_empty_debits: bool,
     ) -> Result<PrecompileOutput, ERC20Error> {
         debug!(target: "erc20_precompile", ?sender, ?receiver, ?amount, "handle_transfer");
 
@@ -464,7 +533,7 @@ impl Erc20Precompile {
             return Ok(PrecompileOutput::new(GAS_TRANSFER, encode_bool(true)));
         }
 
-        self.transfer_balance(state_access, sender, receiver, amount)?;
+        self.transfer_balance(state_access, sender, receiver, amount, reject_empty_debits)?;
 
         // emit Transfer event
         let event = Self::encode_transfer_event(self.contract_address, sender, receiver, amount);
@@ -509,6 +578,7 @@ impl Erc20Precompile {
         sender: Address,
         receiver: Address,
         amount: U256,
+        reject_empty_debits: bool,
     ) -> Result<PrecompileOutput, ERC20Error> {
         debug!(target: "erc20_precompile", ?spender, ?sender, ?receiver, ?amount, "handle_transfer_from");
 
@@ -549,7 +619,7 @@ impl Erc20Precompile {
             return Ok(PrecompileOutput::new(GAS_TRANSFER_FROM, encode_bool(true)));
         }
 
-        self.transfer_balance(state_access, sender, receiver, amount)?;
+        self.transfer_balance(state_access, sender, receiver, amount, reject_empty_debits)?;
 
         // decrease allowance (unless unlimited)
         if !is_unlimited {
@@ -630,6 +700,7 @@ impl Erc20Precompile {
         state_access: &mut T,
         caller: Address,
         amount: U256,
+        reject_empty_debits: bool,
     ) -> Result<PrecompileOutput, ERC20Error> {
         debug!(target: "erc20_precompile", ?caller, ?amount, "handle_burn");
 
@@ -651,6 +722,12 @@ impl Erc20Precompile {
         trace!(target: "erc20_precompile", ?sender_balance, "burn: loaded sender balance");
 
         self.check_balance(sender, sender_balance, amount)?;
+        let new_sender_balance = sender_balance
+            .checked_sub(amount)
+            .ok_or_else(|| ERC20Error::overflow_error(ERC20Resource::Balance, ERC20Method::Burn))?;
+        if reject_empty_debits {
+            self.check_not_left_empty(state_access, sender, new_sender_balance)?;
+        }
 
         // Update total supply first (same order as mint)
         let current_total_supply = self.get_total_supply(state_access)?;
@@ -663,13 +740,8 @@ impl Erc20Precompile {
         state_access.perform_touch_account(self.contract_address);
 
         // Update sender balance
-        {
-            let new_sender_balance = sender_balance.checked_sub(amount).ok_or_else(|| {
-                ERC20Error::overflow_error(ERC20Resource::Balance, ERC20Method::Burn)
-            })?;
-            self.set_balance(state_access, sender, new_sender_balance)?;
-            trace!(target: "erc20_precompile", ?new_sender_balance, "burn: updated sender balance");
-        }
+        self.set_balance(state_access, sender, new_sender_balance)?;
+        trace!(target: "erc20_precompile", ?new_sender_balance, "burn: updated sender balance");
         state_access.perform_touch_account(sender);
 
         // Emit events
@@ -691,6 +763,7 @@ impl Erc20Precompile {
         caller: Address,
         sender: Address,
         amount: U256,
+        reject_empty_debits: bool,
     ) -> Result<PrecompileOutput, ERC20Error> {
         debug!(target: "erc20_precompile", ?caller, ?sender, ?amount, "handle_burn_from");
 
@@ -718,6 +791,12 @@ impl Erc20Precompile {
         trace!(target: "erc20_precompile", ?account_balance, "burn_from: loaded account balance");
 
         self.check_balance(sender, account_balance, amount)?;
+        let new_balance = account_balance
+            .checked_sub(amount)
+            .ok_or_else(|| ERC20Error::overflow_error(ERC20Resource::Balance, ERC20Method::Burn))?;
+        if reject_empty_debits {
+            self.check_not_left_empty(state_access, sender, new_balance)?;
+        }
 
         // Update total supply first (same order as mint)
         let current_total_supply = self.get_total_supply(state_access)?;
@@ -730,13 +809,8 @@ impl Erc20Precompile {
         state_access.perform_touch_account(self.contract_address);
 
         // Update account balance
-        {
-            let new_balance = account_balance.checked_sub(amount).ok_or_else(|| {
-                ERC20Error::overflow_error(ERC20Resource::Balance, ERC20Method::Burn)
-            })?;
-            self.set_balance(state_access, sender, new_balance)?;
-            trace!(target: "erc20_precompile", ?new_balance, "burn_from: updated account balance");
-        }
+        self.set_balance(state_access, sender, new_balance)?;
+        trace!(target: "erc20_precompile", ?new_balance, "burn_from: updated account balance");
         state_access.perform_touch_account(sender);
 
         // Decrease allowance (unless unlimited)
@@ -867,6 +941,7 @@ impl Erc20Precompile {
         v: u8,
         r: U256,
         s: U256,
+        reject_empty_debits: bool,
     ) -> Result<PrecompileOutput, ERC20Error> {
         // 1. Time window validation
         let current_timestamp = state_access.get_block_timestamp();
@@ -915,10 +990,11 @@ impl Erc20Precompile {
         })?;
 
         // 6. Execute transfer
-        let transfer_result =
-            self.handle_transfer(state_access, sender, receiver, amount).inspect_err(
-                |e| error!(target: "erc20_precompile", "Failed to execute transfer: {:?}", e),
-            )?;
+        let transfer_result = self
+            .handle_transfer(state_access, sender, receiver, amount, reject_empty_debits)
+            .inspect_err(|e| {
+                error!(target: "erc20_precompile", "Failed to execute transfer: {:?}", e);
+            })?;
 
         // 7. Emit AuthorizationUsed event
         let auth_event =
@@ -944,6 +1020,7 @@ impl Erc20Precompile {
         v: u8,
         r: B256,
         s: B256,
+        reject_empty_debits: bool,
     ) -> Result<PrecompileOutput, ERC20Error> {
         if caller != receiver {
             return Err(ERC20Error::CallerNotReceiver(caller, receiver));
@@ -987,7 +1064,8 @@ impl Erc20Precompile {
         self.mark_nonce_used(state_access, sender, nonce)?;
 
         // 6. Execute transfer
-        let transfer_result = self.handle_transfer(state_access, sender, receiver, amount)?;
+        let transfer_result =
+            self.handle_transfer(state_access, sender, receiver, amount, reject_empty_debits)?;
 
         // 7. Emit AuthorizationUsed event
         let auth_event =
@@ -1079,6 +1157,9 @@ pub enum ERC20Error {
     /// Generic ERC-20 error.
     #[error("ERC20 Error: {0}")]
     ERC20Other(String),
+    /// Debit would leave the account EIP-161 empty, which revm cannot commit.
+    #[error("Transfer would leave account {0} empty (balance 0, nonce 0, no code)")]
+    TransferWouldEmptyAccount(Address),
 
     // EIP-3009: "Transfer with Authorization"
     /// Authorization not yet valid.

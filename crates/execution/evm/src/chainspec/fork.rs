@@ -45,6 +45,11 @@ hardfork!(
         /// sender's whole nonce chain instead of consecutive ranges scattering across pools and
         /// parking nonce-gapped. Also enables live-successor failover for a down slot owner.
         SenderAffinityLoadBalancing,
+        /// Reject native ERC-20 debits that would leave an EIP-161-empty account.
+        /// revm panics when such an account transitions from `Loaded` at commit time. Gated
+        /// behind a fork because v1.4.1 already committed those sequences; replaying
+        /// pre-fork history with the guard active would change historical state roots.
+        Eip161EmptyAccountGuard,
         /// Stamp the consensus header hash into the epoch-closing block's `extra_data` instead of
         /// the keccak of the leader certificate's aggregate BLS signature. The aggregate varies
         /// with the 2f+1 signer subset, so two honest nodes holding different certificates for
@@ -81,9 +86,10 @@ impl RaylsHardFork {
             Self::HybridRewards => 0x0d,
             Self::OutputSeqNormalization => 0x0e,
             Self::SenderAffinityLoadBalancing => 0x0f,
-            Self::EpochCloseSeedV2 => 0x10,
-            Self::CertificateFetchEpochV2 => 0x11,
-            Self::Erc20PrecompileDirectCall => 0x12,
+            Self::Eip161EmptyAccountGuard => 0x10,
+            Self::EpochCloseSeedV2 => 0x11,
+            Self::CertificateFetchEpochV2 => 0x12,
+            Self::Erc20PrecompileDirectCall => 0x13,
         }
     }
 
