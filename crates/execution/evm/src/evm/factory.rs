@@ -94,7 +94,8 @@ impl RaylsEvmFactory {
     fn erc20_dyn_precompile(&self) -> DynPrecompile {
         let chain_spec = self.chain_spec.clone();
         DynPrecompile::new(ERC20_PRECOMPILE_ID, move |mut input: PrecompileInput<'_>| {
-            // reject DELEGATECALL/CALLCODE frames once Erc20PrecompileDirectCall is active, see #319
+            // reject DELEGATECALL/CALLCODE frames once Erc20PrecompileDirectCall is active, see
+            // #319
             if !input.is_direct_call()
                 && chain_spec.is_erc20_precompile_direct_call_active_at_block(
                     input.internals.block_number().saturating_to(),
@@ -105,8 +106,8 @@ impl RaylsEvmFactory {
                 ));
             }
 
-            // reject native value: revm transfers value to 0x0400 before precompile dispatch and would
-            // otherwise commit it permanently
+            // reject native value: revm transfers value to 0x0400 before precompile dispatch and
+            // would otherwise commit it permanently
             if input.value != U256::ZERO {
                 return PrecompileResult::Err(PrecompileError::other(
                     "ERC-20 precompile rejects native value transfer",
@@ -129,8 +130,8 @@ impl RaylsEvmFactory {
             let selector = Erc20Selector::from_calldata(input.data)
                 .ok_or_else(|| PrecompileError::other("Unknown function selector"))?;
 
-            // reject state mutation under STATICCALL: revm enforces is_static only at opcode dispatch,
-            // not journal layer
+            // reject state mutation under STATICCALL: revm enforces is_static only at opcode
+            // dispatch, not journal layer
             if input.is_static && selector.is_state_mutating() {
                 return PrecompileResult::Err(PrecompileError::other(
                     "ERC-20 state mutation forbidden under static call",

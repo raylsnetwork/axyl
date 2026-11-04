@@ -818,11 +818,11 @@ fn full_drain_of_unnormalised_zero_code_hash_account_is_rejected() {
 ///
 /// `base_balance` selects the account shape:
 ///
-/// - `None`: VICTIM is *brand new* (not in the db); tx1 creates it in memory, so the
-///   account lands `InMemoryChange`, not `Loaded`, in the block state cache.
-/// - `Some(base)`: VICTIM *pre-exists* in the db at `base`; tx1 only credits it, so the
-///   account's first change promotes it out of `Loaded` (to `InMemoryChange`, as a nonce-0
-///   code-less account) before tx2 empties it.
+/// - `None`: VICTIM is *brand new* (not in the db); tx1 creates it in memory, so the account lands
+///   `InMemoryChange`, not `Loaded`, in the block state cache.
+/// - `Some(base)`: VICTIM *pre-exists* in the db at `base`; tx1 only credits it, so the account's
+///   first change promotes it out of `Loaded` (to `InMemoryChange`, as a nonce-0 code-less account)
+///   before tx2 empties it.
 ///
 /// On v1.4.1 both shapes committed fine (an `InMemoryChange` account clearing is a legal
 /// transition), so the `guard_active == false` run must succeed and clear the victim.

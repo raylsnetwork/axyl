@@ -722,9 +722,9 @@ impl Erc20Precompile {
         trace!(target: "erc20_precompile", ?sender_balance, "burn: loaded sender balance");
 
         self.check_balance(sender, sender_balance, amount)?;
-        let new_sender_balance = sender_balance.checked_sub(amount).ok_or_else(|| {
-            ERC20Error::overflow_error(ERC20Resource::Balance, ERC20Method::Burn)
-        })?;
+        let new_sender_balance = sender_balance
+            .checked_sub(amount)
+            .ok_or_else(|| ERC20Error::overflow_error(ERC20Resource::Balance, ERC20Method::Burn))?;
         if reject_empty_debits {
             self.check_not_left_empty(state_access, sender, new_sender_balance)?;
         }
@@ -791,9 +791,9 @@ impl Erc20Precompile {
         trace!(target: "erc20_precompile", ?account_balance, "burn_from: loaded account balance");
 
         self.check_balance(sender, account_balance, amount)?;
-        let new_balance = account_balance.checked_sub(amount).ok_or_else(|| {
-            ERC20Error::overflow_error(ERC20Resource::Balance, ERC20Method::Burn)
-        })?;
+        let new_balance = account_balance
+            .checked_sub(amount)
+            .ok_or_else(|| ERC20Error::overflow_error(ERC20Resource::Balance, ERC20Method::Burn))?;
         if reject_empty_debits {
             self.check_not_left_empty(state_access, sender, new_balance)?;
         }
