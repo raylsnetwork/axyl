@@ -71,13 +71,24 @@ impl<DB: Database> Proposer<DB> {
 
         let payload_vec: Vec<_> = digests.iter().map(|m| (m.digest, m.worker_id)).collect();
         consensus_bus.batch_tracker().digests_included_in_header(&payload_vec);
+        let latest_execution_block =
+            consensus_bus.recently_executed_blocks().borrow().latest_block_num_hash();
+        // Test-only fault: anchor the header on an older executed block. Compiled out of
+        // production builds, and inert unless the proposing process is armed by environment.
+        #[cfg(feature = "fault-injection-test-hooks")]
+        let latest_execution_block = super::stale_anchor_fault::override_anchor(
+            current_epoch,
+            current_round,
+            latest_execution_block,
+            parents.iter().map(|parent| parent.header().latest_execution_block),
+        );
         let header = Header::new(
             authority_id,
             current_round,
             current_epoch,
             payload_vec.into_iter().collect(),
             parents.iter().map(|x| x.digest()).collect(),
-            consensus_bus.recently_executed_blocks().borrow().latest_block_num_hash(),
+            latest_execution_block,
         );
 
         // update metrics before sending/storing header

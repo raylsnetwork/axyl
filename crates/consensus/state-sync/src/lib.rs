@@ -668,10 +668,43 @@ async fn catch_up_consensus_from_to<DB: Database>(
         // after the digest-chain guard below links it onto the verified parent; caching earlier
         // poisons every retry until the backwards walk overwrites it.
         let mut from_gap_fetch = false;
+        // Test-only fault: skip the DB cache lookup for blocks whose leader epoch is
+        // below a threshold, so the forward streamer must fetch them by number from a
+        // peer. This exercises the unverified by-number gap-fetch path.
+        #[cfg(feature = "fault-injection-test-hooks")]
+        let skip_cache = std::env::var("RL_FAULT_SKIP_CACHED_BELOW_EPOCH")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .and_then(|threshold| {
+                db.get_consensus_by_number(number)
+                    .map(|block| block.sub_dag.leader_epoch() < threshold)
+            })
+            .unwrap_or(false);
+        #[cfg(not(feature = "fault-injection-test-hooks"))]
+        let skip_cache = false;
         let consensus_header = if number == max_consensus_height {
             max_consensus.clone()
-        } else if let Some(block) = db.get_consensus_by_number(number) {
-            block
+        } else if !skip_cache {
+            if let Some(block) = db.get_consensus_by_number(number) {
+                block
+            } else {
+                match network.request_consensus(Some(number), None).await {
+                    Ok(header) => {
+                        from_gap_fetch = true;
+                        header
+                    }
+                    Err(_) => {
+                        warn!(
+                            target: "rayls-consensus-state-sync",
+                            number,
+                            streamed,
+                            remaining = max_consensus_height - number + 1,
+                            "catch_up_from_to: header not in DB and by-number fetch failed, returning early (awaiting backwards walk)"
+                        );
+                        return Ok(result_header);
+                    }
+                }
+            }
         } else {
             // The backwards walk has not refilled this number yet; fetch it by number rather than
             // wedge behind one slow hash. Safety rests on the later gates (the digest-chain guard

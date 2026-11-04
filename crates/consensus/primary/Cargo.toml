@@ -60,6 +60,9 @@ test-utils = ["rayls-execution-evm", "indexmap", "tempfile"]
 dev-single-node-setup = []
 # Test-only Byzantine behaviour for multi-node regression tests. NOT FOR PRODUCTION.
 byzantine-test-hooks = []
+# Test-only fault injection (faulty proposers, slow nodes) for multi-node regression tests.
+# NOT FOR PRODUCTION.
+fault-injection-test-hooks = []
 
 [lints]
 workspace = true

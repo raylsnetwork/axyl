@@ -614,6 +614,10 @@ impl<DB: Database> Certifier<DB> {
         // drop sender so channel closes when all vote tasks complete
         drop(tx_votes);
 
+        // Test-only: valid peer votes, for the Byzantine extra certificate.
+        #[cfg(feature = "byzantine-test-hooks")]
+        let mut byzantine_votes = Vec::new();
+
         // loop through requests until complete or cancelled
         loop {
             // certificate created - no more votes needed
@@ -632,9 +636,16 @@ impl<DB: Database> Certifier<DB> {
                         // happy path
                         Some(Ok(vote)) => {
                             let authority_id = vote.author.clone();
+                            // Test-only: keep the valid peer votes for the Byzantine extra certificate.
+                            #[cfg(feature = "byzantine-test-hooks")]
+                            let signed = (vote.author.clone(), *vote.signature());
                             // prevent invalid votes from derailing certification process
-                            certificate = votes_aggregator
-                                 .append(vote, &self.committee, &header)
+                            let appended = votes_aggregator.append(vote, &self.committee, &header);
+                            #[cfg(feature = "byzantine-test-hooks")]
+                            if appended.is_ok() {
+                                byzantine_votes.push(signed);
+                            }
+                            certificate = appended
                                  .unwrap_or_else(|e| {
                                      error!(target: "primary::certifier", "received an invalid vote from {authority_id:?}: {e:?}");
                                      None
@@ -690,6 +701,15 @@ impl<DB: Database> Certifier<DB> {
         })?;
 
         debug!(target: "primary::certifier", auth=?self.authority_id, "Assembled {certificate:?}");
+
+        // Test-only: inert unless armed by environment, compiled out of production builds.
+        #[cfg(feature = "byzantine-test-hooks")]
+        crate::network::gap_fetch_byzantine::record_extra_certificate(
+            &self.config,
+            &header,
+            &certificate,
+            &byzantine_votes,
+        );
 
         Ok(certificate)
     }

@@ -6,6 +6,8 @@ mod engine;
 mod network;
 mod primary;
 mod state;
+#[cfg(feature = "fault-injection-test-hooks")]
+mod teardown_delay_fault;
 mod transition;
 mod types;
 mod utils;

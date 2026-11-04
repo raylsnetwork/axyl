@@ -42,7 +42,7 @@ pub use message::ConsensusResult;
 
 // Test-only Byzantine gap-fetch override, compiled only with `byzantine-test-hooks`.
 #[cfg(feature = "byzantine-test-hooks")]
-mod gap_fetch_byzantine;
+pub(crate) mod gap_fetch_byzantine;
 
 pub mod state;
 

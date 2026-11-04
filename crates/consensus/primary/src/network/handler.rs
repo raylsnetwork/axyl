@@ -872,6 +872,30 @@ where
         number: Option<u64>,
         hash: Option<BlockHash>,
     ) -> PrimaryNetworkResult<PrimaryResponse> {
+        // Test-only crash-probe route (compiled out of production, inert unless armed): a by-hash
+        // request for the poison's own digest, or a "latest" probe, is answered with the poison, so
+        // the crash can be delivered through the follower's backwards walk rather than a by-number
+        // request. Checked before the honest lookup so an unknown poison digest is still served.
+        #[cfg(feature = "byzantine-test-hooks")]
+        match (number, hash) {
+            (_, Some(hash)) => {
+                if let Some(poison) = super::gap_fetch_byzantine::override_by_hash(
+                    self.consensus_config.node_storage(),
+                    hash,
+                ) {
+                    return Ok(PrimaryResponse::ConsensusHeader(Arc::new(poison)));
+                }
+            }
+            (None, None) => {
+                if let Some(poison) =
+                    super::gap_fetch_byzantine::override_latest(self.consensus_config.node_storage())
+                {
+                    return Ok(PrimaryResponse::ConsensusHeader(Arc::new(poison)));
+                }
+            }
+            _ => {}
+        }
+
         let header = match (number, hash) {
             (_, Some(hash)) => self.get_header_by_hash(hash)?,
             (Some(number), _) => self.get_header_by_number(number)?,

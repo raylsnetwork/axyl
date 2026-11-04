@@ -54,6 +54,8 @@ mod header_builder;
 mod recovery;
 mod round;
 mod run_loop;
+#[cfg(feature = "fault-injection-test-hooks")]
+mod stale_anchor_fault;
 mod types;
 
 #[cfg(test)]

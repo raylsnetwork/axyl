@@ -146,7 +146,20 @@ async fn get_consensus_header<DB: ReDatabase>(
                     return None;
                 };
                 let parent = verified.parent_hash;
-                store_consensus_header_in_cache(db, &verified);
+                // Test-only fault: skip storing the header in the DB cache for blocks whose
+                // leader epoch is below a threshold, so the forward streamer must fetch
+                // those blocks by number. The walk still proceeds and republishes the highest
+                // header (giving the forward streamer its sync target).
+                #[cfg(feature = "fault-injection-test-hooks")]
+                let skip_store = std::env::var("RL_FAULT_SKIP_BACKWARD_STORE_BELOW_EPOCH")
+                    .ok()
+                    .and_then(|v| v.parse::<u32>().ok())
+                    .is_some_and(|threshold| leader_epoch < threshold);
+                #[cfg(not(feature = "fault-injection-test-hooks"))]
+                let skip_store = false;
+                if !skip_store {
+                    store_consensus_header_in_cache(db, &verified);
+                }
                 republish_if_higher(consensus_bus, &verified);
                 return Some(parent);
             }
@@ -323,10 +336,22 @@ async fn probe_peers_for_latest<DB: ReDatabase>(
     config: &ConsensusConfig<DB>,
     network: &PrimaryNetworkHandle,
 ) -> Option<ConsensusHeader> {
+    // Test-only fault: restrict the probe to a single named peer, to model the startup window in
+    // which the attacker is the peer that answers the follower's first probe (before honest peers
+    // respond). Without this the test would depend on connection-order timing. Honest otherwise.
+    #[cfg(feature = "fault-injection-test-hooks")]
+    let only_peer = std::env::var("RL_FAULT_PROBE_ONLY_PEER").ok();
     let mut inflight: FuturesUnordered<_> = config
         .committee()
         .others_primaries_by_id(config.authority_id().as_ref())
         .into_iter()
+        .filter(|(_, peer)| {
+            #[cfg(feature = "fault-injection-test-hooks")]
+            if let Some(ref only) = only_peer {
+                return peer.to_string() == *only;
+            }
+            true
+        })
         .map(|(_, peer)| network.request_consensus_from_peer(peer, None, None))
         .collect();
     let mut best: Option<ConsensusHeader> = None;
