@@ -112,27 +112,30 @@ impl<Req, Res> RLCodec<Req, Res> {
         M: RLMessage,
     {
         // Scoped to this message so large encode buffers are not retained on the codec.
-        let mut compressed_buffer: Vec<u8> = Vec::new();
-        let mut decode_buffer: Vec<u8> = Vec::new();
+        let mut encoded: Vec<u8> = Vec::new();
 
-        encode_into_buffer(&mut decode_buffer, &msg).map_err(|e| {
+        encode_into_buffer(&mut encoded, &msg).map_err(|e| {
             let error = format!("encode into buffer: {e}");
             std::io::Error::other(error)
         })?;
 
-        if decode_buffer.len() > self.max_chunk_size {
+        if encoded.len() > self.max_chunk_size {
             return Err(std::io::Error::other("encode data > max_chunk_size"));
         }
+
+        // `encoded` is our own size-checked message, so the maximum compressed size is known.
+        // Allocate once to avoid repeated reallocations for large messages.
+        let mut compressed_buffer = Vec::with_capacity(snap::raw::max_compress_len(encoded.len()));
 
         // length prefix for uncompressed bytes
         //
         // NOTE: 32bit max 4,294,967,295
-        let prefix = (decode_buffer.len() as u32).to_le_bytes();
+        let prefix = (encoded.len() as u32).to_le_bytes();
         io.write_all(&prefix).await?;
 
         // compress data using allocated buffer
         let mut encoder = snap::write::FrameEncoder::new(&mut compressed_buffer);
-        encoder.write_all(&decode_buffer)?;
+        encoder.write_all(&encoded)?;
         encoder.flush()?;
 
         io.write_all(encoder.get_ref()).await?;
