@@ -28,19 +28,13 @@ pub trait RLMessage:
 
 /// The Rayls Network request/response codec for consensus messages between peers.
 ///
-/// The codec reuses its buffers per stream to asynchronously read and write messages per the
-/// libp2p [Codec] trait. All messages include a 4-byte prefix that indicates the message's
-/// uncompressed length. Buffers start empty and grow only as data is produced, so a peer that
-/// sends only the length prefix reserves no buffer.
+/// The codec is stateless apart from the maximum message size. Each read or write allocates
+/// temporary buffers for that message only, so memory is released as soon as the call completes
+/// or is cancelled. All messages include a 4-byte prefix that indicates the message's
+/// uncompressed length. Buffers grow only as data is produced, so a peer that sends only the
+/// length prefix reserves no buffer.
 #[derive(Clone, Debug)]
 pub struct RLCodec<Req, Res> {
-    /// The buffer for compressed message data.
-    compressed_buffer: Vec<u8>,
-    /// The buffer for decompressed message data.
-    ///
-    /// Grows only as decompressed bytes are produced; it is never pre-sized to the declared
-    /// length, so a prefix-only or stalled request reserves no memory.
-    decode_buffer: Vec<u8>,
     /// The maximum size (bytes) for a single message.
     ///
     /// The 4-byte message prefix does not count towards this value.
@@ -51,15 +45,10 @@ pub struct RLCodec<Req, Res> {
 
 impl<Req, Res> RLCodec<Req, Res> {
     pub fn new(max_chunk_size: usize) -> Self {
-        // buffers stay empty: libp2p clones the codec for every stream (inbound and outbound)
-        // and a clone of an empty buffer starts at capacity 0, so pre-allocating here would
-        // only pin that memory in the template codec, which never performs I/O
-        Self {
-            compressed_buffer: Vec::new(),
-            decode_buffer: Vec::new(),
-            max_chunk_size,
-            _phantom: PhantomData::<(Req, Res)>,
-        }
+        // Buffers are allocated per message rather than stored here: libp2p clones the codec
+        // for every substream, and a substream exchanges only one request/response, so reuse
+        // would be minimal while large buffers would be retained between calls.
+        Self { max_chunk_size, _phantom: PhantomData::<(Req, Res)> }
     }
 
     /// Convenience method to keep READ logic DRY.
@@ -71,8 +60,10 @@ impl<Req, Res> RLCodec<Req, Res> {
         T: AsyncRead + Unpin + Send,
         M: RLMessage,
     {
-        self.compressed_buffer.clear();
-        self.decode_buffer.clear();
+        // Scoped to this message so a large or partially-read message does not pin memory on
+        // the codec after the call completes or is cancelled.
+        let mut compressed_buffer: Vec<u8> = Vec::new();
+        let mut decode_buffer: Vec<u8> = Vec::new();
 
         let mut prefix = [0; 4];
         io.read_exact(&mut prefix).await?;
@@ -89,26 +80,26 @@ impl<Req, Res> RLCodec<Req, Res> {
         //
         // NOTE: usize -> u64 won't lose precision (even on 32bit system)
         let max_compress_len = snap::raw::max_compress_len(length);
-        io.take(max_compress_len as u64).read_to_end(&mut self.compressed_buffer).await?;
+        io.take(max_compress_len as u64).read_to_end(&mut compressed_buffer).await?;
 
         // decompress into `decode_buffer`, capping the output at the declared length so
         // snappy amplification can't exceed it
         //
         // NOTE: the buffer is not pre-sized to the declared length; it grows as bytes arrive,
         // so a prefix-only or stalled request reserves no memory
-        let reader = std::io::Cursor::new(&mut self.compressed_buffer);
+        let reader = std::io::Cursor::new(&mut compressed_buffer);
         let snappy_decoder = FrameDecoder::new(reader);
-        snappy_decoder.take(length as u64).read_to_end(&mut self.decode_buffer)?;
+        snappy_decoder.take(length as u64).read_to_end(&mut decode_buffer)?;
 
         // the prefix declares the exact uncompressed length; shorter data is a protocol violation
-        if self.decode_buffer.len() < length {
+        if decode_buffer.len() < length {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::UnexpectedEof,
                 "decompressed data smaller than declared prefix",
             ));
         }
 
-        bcs::from_bytes(&self.decode_buffer).map_err(std::io::Error::other)
+        bcs::from_bytes(&decode_buffer).map_err(std::io::Error::other)
     }
 
     /// Convenience method to keep WRITE logic DRY.
@@ -120,27 +111,28 @@ impl<Req, Res> RLCodec<Req, Res> {
         T: AsyncWrite + Unpin + Send,
         M: RLMessage,
     {
-        self.compressed_buffer.clear();
-        self.decode_buffer.clear();
+        // Scoped to this message so large encode buffers are not retained on the codec.
+        let mut compressed_buffer: Vec<u8> = Vec::new();
+        let mut decode_buffer: Vec<u8> = Vec::new();
 
-        encode_into_buffer(&mut self.decode_buffer, &msg).map_err(|e| {
+        encode_into_buffer(&mut decode_buffer, &msg).map_err(|e| {
             let error = format!("encode into buffer: {e}");
             std::io::Error::other(error)
         })?;
 
-        if self.decode_buffer.len() > self.max_chunk_size {
+        if decode_buffer.len() > self.max_chunk_size {
             return Err(std::io::Error::other("encode data > max_chunk_size"));
         }
 
         // length prefix for uncompressed bytes
         //
         // NOTE: 32bit max 4,294,967,295
-        let prefix = (self.decode_buffer.len() as u32).to_le_bytes();
+        let prefix = (decode_buffer.len() as u32).to_le_bytes();
         io.write_all(&prefix).await?;
 
         // compress data using allocated buffer
-        let mut encoder = snap::write::FrameEncoder::new(&mut self.compressed_buffer);
-        encoder.write_all(&self.decode_buffer)?;
+        let mut encoder = snap::write::FrameEncoder::new(&mut compressed_buffer);
+        encoder.write_all(&decode_buffer)?;
         encoder.flush()?;
 
         io.write_all(encoder.get_ref()).await?;
