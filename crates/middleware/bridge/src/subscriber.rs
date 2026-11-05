@@ -783,14 +783,6 @@ impl<DB: Database> Subscriber<DB> {
                                         dropped = other_epoch_drops,
                                         "catch-up: dropping unverified headers of another epoch"
                                     );
-                                } else {
-                                    debug!(
-                                        target: "subscriber",
-                                        number,
-                                        epoch,
-                                        current_epoch,
-                                        "catch-up: dropping unverified header of another epoch"
-                                    );
                                 }
                                 continue;
                             }
