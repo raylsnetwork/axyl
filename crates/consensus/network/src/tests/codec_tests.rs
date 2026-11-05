@@ -14,7 +14,6 @@ async fn test_encode_decode_same_message() {
     let mut codec = RLCodec::<TestPrimaryRequest, TestPrimaryResponse>::new(max_chunk_size);
     let protocol = StreamProtocol::new("/rayls-test");
 
-    // encode request
     let mut encoded = Vec::new();
     let request = TestPrimaryRequest::Vote {
         header: Header::default(),
@@ -25,12 +24,10 @@ async fn test_encode_decode_same_message() {
         .await
         .expect("write valid request");
 
-    // now decode request
     let decoded =
         codec.read_request(&protocol, &mut encoded.as_ref()).await.expect("read valid request");
     assert_eq!(decoded, request);
 
-    // encode response
     let mut encoded = Vec::new();
     let response = TestPrimaryResponse::MissingParents(vec![CertificateDigest::new([b'a'; 32])]);
     codec
@@ -38,7 +35,6 @@ async fn test_encode_decode_same_message() {
         .await
         .expect("write valid response");
 
-    // now decode response
     let decoded =
         codec.read_response(&protocol, &mut encoded.as_ref()).await.expect("read valid response");
     assert_eq!(decoded, response);
@@ -50,7 +46,6 @@ async fn test_fail_to_write_message_too_big() {
     let mut codec = RLCodec::<TestPrimaryRequest, TestPrimaryResponse>::new(max_chunk_size);
     let protocol = StreamProtocol::new("/rayls-test");
 
-    // encode request
     let mut encoded = Vec::new();
     let request = TestPrimaryRequest::Vote {
         header: Header::default(),
@@ -59,7 +54,6 @@ async fn test_fail_to_write_message_too_big() {
     let res = codec.write_request(&protocol, &mut encoded, request).await;
     assert!(res.is_err());
 
-    // encode response
     let mut encoded = Vec::new();
     let response = TestPrimaryResponse::MissingCertificates(vec![Certificate::default()]);
     let res = codec.write_response(&protocol, &mut encoded, response).await;
@@ -82,7 +76,6 @@ async fn test_reject_message_prefix_too_big() {
     // sanity check
     let mut encoded = Vec::new();
 
-    //println!("size: {}", std::mem::size_of::<TestPrimaryRequest>());
     // this is 344 bytes uncompressed (max chunk size)
     let request = TestPrimaryRequest::Vote {
         header: Header::default(),
@@ -224,4 +217,23 @@ async fn test_malicious_prefix_deceives_peer_to_read_message_and_fails() {
     // should cause an unexpected EOF
     let res = honest_peer.read_response(&protocol, &mut encoded.as_ref()).await;
     assert!(res.is_err());
+}
+
+/// A request that sends only the 4-byte length prefix and then closes the stream must be
+/// rejected as a protocol violation.
+#[tokio::test]
+async fn test_prefix_only_request_is_rejected() {
+    let max_chunk_size = 2 * 1024 * 1024; // 2 MiB
+    let mut codec = RLCodec::<TestPrimaryRequest, TestPrimaryResponse>::new(max_chunk_size);
+    let protocol = StreamProtocol::new("/rayls-test");
+
+    // A 4-byte prefix declaring the maximum size, with no body following.
+    let mut prefix_only = vec![0u8; 4];
+    prefix_only[..].copy_from_slice(&(max_chunk_size as u32).to_le_bytes());
+
+    let error = codec
+        .read_request(&protocol, &mut prefix_only.as_slice())
+        .await
+        .expect_err("prefix-only request should be rejected");
+    assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof);
 }
