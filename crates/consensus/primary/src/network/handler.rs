@@ -1240,7 +1240,7 @@ impl OutsiderSlots {
 /// The limit that refused a missing-certificate job.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum BusyLimit {
-    /// The member already runs its share of jobs.
+    /// A member, or last epoch's member, already runs its share of jobs.
     Member,
     /// The committee pool is full, with jobs from an earlier epoch.
     Committee,
