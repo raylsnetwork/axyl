@@ -50,6 +50,15 @@ pub enum BcsLayoutError {
         /// Offending byte.
         byte: u8,
     },
+
+    /// A field's bytes were well-formed BCS but not a valid value of its type.
+    #[error("invalid {type_name} bytes: {reason}")]
+    InvalidValue {
+        /// Type the bytes failed to decode as.
+        type_name: &'static str,
+        /// What the type's own decoder reported.
+        reason: String,
+    },
 }
 
 /// Advance past the BCS encoding of `Self` without constructing it.

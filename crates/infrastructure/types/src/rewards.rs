@@ -8,7 +8,18 @@ use std::{collections::BTreeMap, fmt::Debug, sync::Arc};
 /// Per-validator round counts feeding the hybrid (participation + anchor) reward tally.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ValidatorRoundTally {
-    /// Distinct committed rounds whose sub-dag included this validator's certificate.
+    /// Distinct committed rounds in which this validator took part: once the `HeaderParentSigners`
+    /// fork is active, rounds whose sub-dag holds a header attesting that this validator signed
+    /// its author's previous certificate; before it, rounds whose sub-dag included this
+    /// validator's own certificate.
+    ///
+    /// A proposer always votes for its own header, so its own claim always names itself: a
+    /// validator whose certificate landed is credited through its own next header, and one whose
+    /// vote landed in another's certificate is credited through that author's. The post-fork
+    /// signal is therefore close to a superset of the authorship signal, with a one-round lag:
+    /// credit for round `r` arrives with a committed round `r + 1` header, so a certificate whose
+    /// author's next header never commits, or that sits in an epoch's last round, earns nothing
+    /// unless another author's claim names its signer.
     pub participation_rounds: u32,
     /// Committed rounds this validator led ("Anchor Commit Share" component;
     /// identical signal to what [`RewardsBackend::tally`] counts today).

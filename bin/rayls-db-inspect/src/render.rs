@@ -331,6 +331,15 @@ fn render_epoch_check(r: &EpochCheckReport, out: &mut String) {
     }
 }
 
+/// A header's own-parent signer claim: the indices, `none` for an empty claim, `-` (no claim
+/// field) for a pre-fork header.
+fn claims(claimed: &Option<Vec<u32>>) -> String {
+    match claimed {
+        Some(indices) => list(indices),
+        None => "-".to_owned(),
+    }
+}
+
 fn list<T: std::fmt::Display>(items: &[T]) -> String {
     const MAX: usize = 8;
     if items.is_empty() {
@@ -393,14 +402,17 @@ fn render_header(r: &HeaderReport, out: &mut String) {
             }
             for c in &raw.sub_dag.certificates {
                 let s = CertificateSummary::of(c);
+                let claimed: Option<Vec<u32>> =
+                    c.header().own_parent_signers().map(|claim| claim.signers.iter().collect());
                 let _ = writeln!(
                     out,
-                    "    {} r{} e{} by {} signers={}",
+                    "    {} r{} e{} by {} signers={} claims={}",
                     s.digest,
                     s.round,
                     s.epoch,
                     s.author,
-                    c.signed_authorities().len()
+                    list(&c.signed_authorities().iter().collect::<Vec<u32>>()),
+                    claims(&claimed)
                 );
             }
         }
@@ -446,6 +458,7 @@ fn render_cert(r: &CertReport, out: &mut String) {
         "round",
         "epoch",
         "signers",
+        "claims",
         "state",
         "signature",
         "verify",
@@ -461,6 +474,7 @@ fn render_cert(r: &CertReport, out: &mut String) {
                 c.summary.round.to_string(),
                 c.summary.epoch.to_string(),
                 list(&c.signers),
+                claims(&c.claimed_signers),
                 c.verification_state.to_owned(),
                 c.signature.clone().unwrap_or_else(|| "-".to_owned()),
                 verify_word(n.signature_check.as_ref()),
@@ -614,6 +628,7 @@ fn render_commit_path(path: &CommitPath, out: &mut String) {
             field(out, "header", &c.certificate.header_digest);
             field(out, "created at", c.certificate.created_at);
             field(out, "signers", list(&c.certificate.signers));
+            field(out, "claims", claims(&c.certificate.claimed_signers));
             field(out, "state", c.certificate.verification_state);
         }
         None => section(out, "certificate", "NONE of the sub-dag lists this batch"),
@@ -907,6 +922,29 @@ fn render_participation(r: &ParticipationReport, out: &mut String) {
                 out,
                 "unknown sig",
                 format!("{} signer bits beyond the committee", n.unknown_signers),
+            );
+        }
+        section(
+            out,
+            "participation",
+            match (n.attested, n.committee_size) {
+                (true, Some(_)) => "from own-parent signer claims in headers (HeaderParentSigners)",
+                (true, None) => {
+                    "from own-parent signer claims, UNRESOLVED: no committee, every count is 0"
+                }
+                (false, _) => "from certificate authorship",
+            },
+        );
+        if n.unknown_claimed_signers > 0 {
+            let why = if n.committee_size.is_some() {
+                "beyond the committee"
+            } else {
+                "with no committee to resolve them"
+            };
+            section(
+                out,
+                "unknown claim",
+                format!("{} claimed signer indices {why}", n.unknown_claimed_signers),
             );
         }
         let mut t = Table::new(&[

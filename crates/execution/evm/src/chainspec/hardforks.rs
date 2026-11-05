@@ -197,6 +197,15 @@ pub trait RaylsHardforks {
         self.is_rayls_fork_active_at_block(RaylsHardFork::Erc20PrecompileDirectCall, block)
     }
 
+    /// Return true if the HeaderParentSigners fork is active at `block`.
+    ///
+    /// Judged once per epoch at the epoch's first block: every header of that epoch then carries
+    /// its author's own-parent signer claim, voters require it, and the hybrid reward tally
+    /// credits participation from the claims.
+    fn is_header_parent_signers_active_at_block(&self, block: u64) -> bool {
+        self.is_rayls_fork_active_at_block(RaylsHardFork::HeaderParentSigners, block)
+    }
+
     /// Return the block `fork` activates at, or `None` when it is not block-scheduled (`Never`).
     fn rayls_fork_activation_block(&self, fork: RaylsHardFork) -> Option<u64> {
         match self.rayls_fork_activation(fork) {

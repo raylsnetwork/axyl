@@ -116,6 +116,14 @@ where
             .rayls_chain_spec()
             .rayls_fork_activation_block(RaylsHardFork::CertificateFetchEpochV2);
 
+        // the header layout and reward crediting switch per epoch: active for every header of an
+        // epoch whose first block is at or past the fork block, so all nodes flip at one boundary
+        let header_parent_signers_active = engine
+            .get_reth_env()
+            .await
+            .rayls_chain_spec()
+            .is_header_parent_signers_active_at_block(epoch_info.blockHeight);
+
         // create config for consensus
         let consensus_config = ConsensusConfig::new_for_epoch(
             self.builder.rayls_infrastructure_config.clone(),
@@ -127,7 +135,8 @@ where
             epoch_boundary,
             self.initial_epoch,
         )?
-        .with_certificate_fetch_epoch_v2_block(certificate_fetch_epoch_v2_block);
+        .with_certificate_fetch_epoch_v2_block(certificate_fetch_epoch_v2_block)
+        .with_header_parent_signers_active(header_parent_signers_active);
 
         Ok((consensus_config, next_vals.into_iter().collect()))
     }

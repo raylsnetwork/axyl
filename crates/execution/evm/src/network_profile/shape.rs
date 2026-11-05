@@ -87,6 +87,26 @@ pub fn verify_schedule_shape(profile: &NetworkProfile) -> eyre::Result<()> {
             .push(format!("HybridRewards must be Never or Block(>= 1), got {fork_activation:?}"));
     }
 
+    // Set D: HeaderParentSigners never before EpochCloseSeedV2. Before SeedV2 the
+    // epoch-closing block's seed still depends on the leader certificate's local
+    // aggregate signature, the per-node value HeaderParentSigners exists to stop
+    // relying on. Worse, HeaderParentSigners rewrites a stored certificate's
+    // signature when a voter adopts a verified claim, so with the pre-SeedV2 seed
+    // still live a restarted node could feed a different leader signature into the
+    // close block than its peers did. A profile that schedules HeaderParentSigners
+    // must therefore schedule SeedV2 at the same block or earlier. Baked-in
+    // schedules are pinned by a chainspec test; this covers `--config-file`
+    // profiles.
+    if let ForkActivation::Block(signers) = activation(RaylsHardFork::HeaderParentSigners) {
+        match activation(RaylsHardFork::EpochCloseSeedV2) {
+            ForkActivation::Block(seed) if seed <= signers => {}
+            other => violations.push(format!(
+                "HeaderParentSigners at Block({signers}) requires EpochCloseSeedV2 at the same \
+                 block or earlier, got {other:?}"
+            )),
+        }
+    }
+
     if violations.is_empty() {
         return Ok(());
     }
@@ -210,13 +230,43 @@ mod tests {
         assert!(err.to_string().contains("Uups"));
     }
 
-    /// Behavioral forks are unconstrained.
+    /// Behavioral forks are unconstrained, apart from the `HeaderParentSigners` /
+    /// `EpochCloseSeedV2` ordering tested below.
     #[test]
     fn behavioral_forks_are_unconstrained() {
         let profile = new_chain_profile(
             99_999,
-            (RaylsHardFork::EpochCloseSeedV2, ForkActivation::Block(999_999)),
+            (RaylsHardFork::OutputSeqNormalization, ForkActivation::Block(999_999)),
         );
+        assert!(verify_schedule_shape(&profile).is_ok());
+    }
+
+    /// The one cross-fork constraint: a profile scheduling `HeaderParentSigners` must schedule
+    /// `EpochCloseSeedV2` at the same block or earlier.
+    #[test]
+    fn header_parent_signers_requires_epoch_close_seed_v2_first() {
+        // SeedV2 after the signers fork
+        let mut profile = new_chain_profile(
+            99_999,
+            (RaylsHardFork::HeaderParentSigners, ForkActivation::Block(100)),
+        );
+        profile.hardforks.insert(ForkName::from("EpochCloseSeedV2"), ForkActivation::Block(101));
+        let msg = verify_schedule_shape(&profile).unwrap_err().to_string();
+        assert!(msg.contains("HeaderParentSigners"), "{msg}");
+
+        // SeedV2 never
+        profile.hardforks.insert(ForkName::from("EpochCloseSeedV2"), ForkActivation::Never);
+        assert!(verify_schedule_shape(&profile).is_err());
+
+        // SeedV2 at the same block, and earlier: fine
+        profile.hardforks.insert(ForkName::from("EpochCloseSeedV2"), ForkActivation::Block(100));
+        assert!(verify_schedule_shape(&profile).is_ok());
+        profile.hardforks.insert(ForkName::from("EpochCloseSeedV2"), ForkActivation::Block(7));
+        assert!(verify_schedule_shape(&profile).is_ok());
+
+        // the signers fork unscheduled: no constraint on SeedV2
+        profile.hardforks.insert(ForkName::from("HeaderParentSigners"), ForkActivation::Never);
+        profile.hardforks.insert(ForkName::from("EpochCloseSeedV2"), ForkActivation::Never);
         assert!(verify_schedule_shape(&profile).is_ok());
     }
 
