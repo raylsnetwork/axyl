@@ -680,6 +680,11 @@ async fn catch_up_consensus_from_to<DB: Database>(
                     .map(|block| block.sub_dag.leader_epoch() < threshold)
             })
             .unwrap_or(false);
+        // With RL_FAULT_SKIP_CACHED_ODD_ONLY set, only odd numbers are skipped, so the stored even
+        // blocks stay available to link a by-number reply onto.
+        #[cfg(feature = "fault-injection-test-hooks")]
+        let skip_cache = skip_cache
+            && (std::env::var_os("RL_FAULT_SKIP_CACHED_ODD_ONLY").is_none() || number % 2 == 1);
         #[cfg(not(feature = "fault-injection-test-hooks"))]
         let skip_cache = false;
         let consensus_header = if number == max_consensus_height {

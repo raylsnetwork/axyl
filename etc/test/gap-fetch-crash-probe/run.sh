@@ -32,11 +32,14 @@ set -uo pipefail
 
 usage() {
     cat <<EOF
-usage: $0 [-a selfless|honest|off] [-l senders] [-b binary] [-d workdir] [-r restarts] [-e epoch-secs] [-i instance]
+usage: $0 [-a selfless|honest|off] [-n] [-l senders] [-b binary] [-d workdir] [-r restarts] [-e epoch-secs] [-i instance]
   -a  what the attacker adds to the older block it serves on the probe (default selfless):
       selfless  a certificate of node5's own built from the other members' votes only (the issue)
       honest    node5's real certificate, which carries its own vote (control)
       off       nothing; the attacker serves honest replies (control)
+  -n  no eclipse: the observer keeps its connections to the honest validators, and only its probe
+      goes to the attacker. Use this to test a fix: a fully eclipsed observer has no honest source
+      of the latest block, so it cannot catch up with any fix (default: eclipse)
   -l  parallel transfer senders, so blocks carry batches (default 16)
   -b  rayls-network binary built with --features byzantine-test-hooks,fault-injection-test-hooks and
       panic=abort, as in release (default: build target/panic-abort/debug/rayls-network from here)
@@ -50,15 +53,17 @@ EOF
 }
 
 ADD=selfless
+ECLIPSE=1
 LOAD_SENDERS=16
 BIN=""
 WORKDIR=""
 RESTARTS=3
 EPOCH_SECS=60
 INSTANCE_BASE=60
-while getopts "a:l:b:d:r:e:i:h" opt; do
+while getopts "a:nl:b:d:r:e:i:h" opt; do
     case "$opt" in
         a) ADD=$OPTARG ;;
+        n) ECLIPSE=0 ;;
         l) LOAD_SENDERS=$OPTARG ;;
         b) BIN=$OPTARG ;;
         d) WORKDIR=$OPTARG ;;
@@ -365,8 +370,12 @@ done
 kill -KILL "${PIDS[$VICTIM]}" 2>/dev/null; wait "${PIDS[$VICTIM]}" 2>/dev/null; unset "PIDS[$VICTIM]"
 PROBE_NUMBER=$((A + 1))
 log "observer stopped at block $A; it will be served poison labelled block $PROBE_NUMBER"
-eclipse_observer_committee || fail "could not route the observer to the attacker"
-log "routed the observer's committee connections to $ATTACKER (eclipse)"
+if [[ $ECLIPSE == 1 ]]; then
+    eclipse_observer_committee || fail "could not route the observer to the attacker"
+    log "routed the observer's committee connections to $ATTACKER (eclipse)"
+else
+    log "no eclipse: the observer keeps its honest connections; only its probe goes to $ATTACKER"
+fi
 
 log "staking node5 through the registry"
 stake_node5 || fail "staking node5 failed"

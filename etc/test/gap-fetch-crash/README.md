@@ -58,6 +58,12 @@ From a fresh clone, with a Rust toolchain, `curl` and Foundry's `cast` available
 ./etc/test/gap-fetch-crash/run.sh -a off     # node5 is honest (control, healthy)
 ```
 
+By default the observer's backward walk stores none of the older blocks, so the observer fetches
+every one of them by number. A fix that accepts a block fetched by number only once a stored block
+links onto it has nothing to link to in that setup, so the observer could never catch up. To test
+such a fix, pass `-k`: the walk stores every block and the observer skips only the odd-numbered
+stored older blocks, so it still fetches those from node5 by number.
+
 The script is self-contained. It builds the node binary with the hooks and `panic=abort` (as in
 release) under `target/panic-abort/`, generates keys and genesis for a fresh local network under
 `target/gap-fetch-crash/<timestamp>/`, starts the nodes, drives the scenario, and cleans up the

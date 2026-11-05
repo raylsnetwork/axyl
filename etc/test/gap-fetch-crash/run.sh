@@ -28,11 +28,15 @@ set -uo pipefail
 
 usage() {
     cat <<EOF
-usage: $0 [-a selfless|honest|off] [-t ms] [-s rounds] [-l senders] [-b binary] [-d workdir] [-r restarts] [-e epoch-secs] [-i instance]
+usage: $0 [-a selfless|honest|off] [-k] [-t ms] [-s rounds] [-l senders] [-b binary] [-d workdir] [-r restarts] [-e epoch-secs] [-i instance]
   -a  what node5 adds to the older blocks it serves (default selfless):
       selfless  a certificate of its own built from the other members' votes only (the issue)
       honest    its real certificate, which carries its own vote as every real one does (control)
       off       nothing; node5 serves honest replies (control)
+  -k  keep the backward walk's stored blocks; the observer skips only the odd-numbered stored older
+      blocks, so it still fetches those from node5 by number. Use this to test a fix that accepts a
+      block fetched by number only once a stored block links onto it (default: the walk stores
+      no older blocks and the observer fetches every older block by number)
   -t  milliseconds the observer waits at each epoch boundary before stopping the epoch's consensus
       tasks (default 15000), so it stays on the older epoch while it fetches its blocks; 0 for none
   -s  rounds at the start of each epoch whose headers the other validators anchor on an older block
@@ -50,6 +54,7 @@ EOF
 }
 
 ADD=selfless
+KEEP_WALK=0
 TEARDOWN_DELAY_MS=15000
 STALE_ROUNDS=0
 LOAD_SENDERS=16
@@ -58,9 +63,10 @@ WORKDIR=""
 RESTARTS=3
 EPOCH_SECS=60
 INSTANCE_BASE=50
-while getopts "a:t:s:l:b:d:r:e:i:h" opt; do
+while getopts "a:kt:s:l:b:d:r:e:i:h" opt; do
     case "$opt" in
         a) ADD=$OPTARG ;;
+        k) KEEP_WALK=1 ;;
         t) TEARDOWN_DELAY_MS=$OPTARG ;;
         s) STALE_ROUNDS=$OPTARG ;;
         l) LOAD_SENDERS=$OPTARG ;;
@@ -176,10 +182,13 @@ start_node() {
         # forward streamer never falls through to by-number peer fetch. These hooks force it:
         # (1) skip storing backward-walked blocks for pre-join epochs in the DB, and
         # (2) skip reading cached blocks for pre-join epochs in the forward streamer.
-        env=(
-            RL_FAULT_SKIP_BACKWARD_STORE_BELOW_EPOCH="${SEAT_EPOCH:-999}"
-            RL_FAULT_SKIP_CACHED_BELOW_EPOCH="${SEAT_EPOCH:-999}"
-        )
+        # With -k, (1) is off and (2) skips only odd numbers, so stored even blocks remain.
+        env=(RL_FAULT_SKIP_CACHED_BELOW_EPOCH="${SEAT_EPOCH:-999}")
+        if [[ $KEEP_WALK == 1 ]]; then
+            env+=(RL_FAULT_SKIP_CACHED_ODD_ONLY=1)
+        else
+            env+=(RL_FAULT_SKIP_BACKWARD_STORE_BELOW_EPOCH="${SEAT_EPOCH:-999}")
+        fi
         [[ $TEARDOWN_DELAY_MS -gt 0 ]] && env+=(RL_FAULT_TEARDOWN_DELAY_MS="$TEARDOWN_DELAY_MS")
     # other validators can anchor early-epoch headers on an older block, which widens the window.
     elif [[ $STALE_ROUNDS -gt 0 && $name == validator-* ]]; then
