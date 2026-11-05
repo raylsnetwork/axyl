@@ -52,7 +52,7 @@ jobs:
   production:
     name: production (default features + warm cache)
     if: github.event_name != 'pull_request' || (github.event.action == 'labeled' && github.event.label.name == 'run-ci')
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
       - name: Checkout repository
@@ -95,7 +95,7 @@ jobs:
   variants:
     name: build (${{ matrix.name }})
     needs: production
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 60
     strategy:
       fail-fast: false
