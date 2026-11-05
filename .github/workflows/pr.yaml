@@ -33,7 +33,7 @@ jobs:
   fmt:
     name: Format
     if: github.event_name != 'pull_request' || (github.event.action == 'labeled' && github.event.label.name == 'run-ci')
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       # - name: Check if draft PR
       #   run: |
@@ -81,7 +81,7 @@ jobs:
   tests:
     name: Tests (${{ matrix.name }})
     if: github.event_name != 'pull_request' || (github.event.action == 'labeled' && github.event.label.name == 'run-ci')
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
@@ -138,7 +138,7 @@ jobs:
   # ===========================================================================
   tests-gate:
     name: Tests
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: tests
     if: always()
     steps:
@@ -160,7 +160,7 @@ jobs:
   security-scan:
     name: Security Scan
     if: github.event_name != 'pull_request' || (github.event.action == 'labeled' && github.event.label.name == 'run-ci')
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
       pull-requests: write
@@ -247,7 +247,7 @@ jobs:
   contracts-tests:
     name: Contracts Tests
     if: github.event_name != 'pull_request' || (github.event.action == 'labeled' && github.event.label.name == 'run-ci')
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
       pull-requests: write

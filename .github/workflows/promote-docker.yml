@@ -66,7 +66,7 @@ jobs:
   # ===========================================================================
   plan:
     name: Plan ${{ inputs.version }} -> ${{ inputs.target }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
       id-token: write
@@ -221,7 +221,7 @@ jobs:
   approval:
     name: Manual approval
     needs: plan
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     if: ${{ vars.ENABLE_MANUAL_APPROVAL == 'true' }}
     permissions:
       issues: write
@@ -246,7 +246,7 @@ jobs:
   retag:
     name: Re-tag (no rebuild)
     needs: [plan, approval]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # Runs when approval passed OR was skipped (gate disabled). !failure() blocks
     # this if approval was denied (the approval job fails on rejection).
     if: ${{ !failure() && !cancelled() && needs.plan.outputs.mode == 'retag' }}
@@ -337,7 +337,7 @@ jobs:
     name: Tag promoted commit
     needs: [plan, retag, rebuild]
     if: ${{ !failure() && !cancelled() && (needs.retag.result == 'success' || needs.rebuild.result == 'success') }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: write
     steps:

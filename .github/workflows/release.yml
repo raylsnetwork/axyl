@@ -34,7 +34,7 @@ permissions:
 jobs:
   bump:
     name: Bump ${{ inputs.bump }} and push release branch
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # Fork guard: only run on the canonical org repo. Who may trigger is already
     # bounded by workflow_dispatch's write-access requirement (i.e. org members
     # / collaborators with write), so no separate actor allowlist is enforced.
