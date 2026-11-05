@@ -1257,7 +1257,67 @@ fn test_missing_cert_slots_outlive_cancelled_requests() {
     });
 }
 
-/// Slots follow the epoch committee: a member's pool in one epoch is an outsider pool in the next.
+/// The handler gives a previous committee's member a member's slots.
+/// The only blocking thread is kept busy, so jobs stay queued.
+#[test]
+fn test_missing_cert_slots_include_the_previous_committee() {
+    use crate::network::handler::MISSING_CERT_JOBS_PER_PEER;
+    use rand::{rngs::StdRng, SeedableRng};
+    use rayls_infrastructure_storage::EpochStore;
+    use rayls_infrastructure_types::EpochRecord;
+
+    let former = *BlsKeypair::generate(&mut StdRng::from_os_rng()).public();
+    let record = EpochRecord { epoch: 0, committee: vec![former], ..Default::default() };
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .max_blocking_threads(1)
+        .enable_all()
+        .build()
+        .expect("runtime");
+    runtime.block_on(async {
+        // Each node's store holds the record of the previous epoch.
+        let fixture = CommitteeFixture::builder(|| {
+            let db = MemDatabase::default();
+            db.save_epoch_record(&record).expect("record");
+            db
+        })
+        .epoch(1)
+        .build();
+        let primary = fixture.authorities().next().unwrap();
+        let previous = primary.consensus_config().previous_committee().map(|p| p.keys().to_vec());
+        assert_eq!(previous, Some(vec![former]));
+        let cb = ConsensusBus::new();
+        let task_manager = TaskManager::default();
+        let synchronizer = StateSynchronizer::new(
+            primary.consensus_config(),
+            cb.clone(),
+            task_manager.get_spawner(),
+        );
+        let handler = RequestHandler::new(primary.consensus_config(), cb.clone(), synchronizer);
+
+        // Keep the only blocking thread busy.
+        let (release, hold) = std::sync::mpsc::channel::<()>();
+        let blocker = tokio::task::spawn_blocking(move || {
+            let _ = hold.recv();
+        });
+
+        // A member's share, not an outsider's single job.
+        for _ in 0..MISSING_CERT_JOBS_PER_PEER {
+            assert!(start_then_cancel(&handler, former).await.is_none());
+        }
+        let next = start_then_cancel(&handler, former).await;
+        assert!(matches!(next, Some(Err(PrimaryNetworkError::Busy))), "got {next:?}");
+        let refused = &cb.primary_metrics().node_metrics.missing_cert_requests_busy;
+        for (limit, count) in [("member", 1), ("outsider", 0)] {
+            assert_eq!(refused.with_label_values(&[limit]).get(), count, "{limit} refusals");
+        }
+
+        release.send(()).expect("release the blocking thread");
+        blocker.await.expect("blocker");
+    });
+}
+
+/// Slots follow the committee: a member that leaves keeps a member's
+/// share for one epoch, while it may still be finishing its last one.
 ///
 /// The committee pool is shared across epochs, so jobs from an old epoch still count.
 #[test]
@@ -1272,11 +1332,13 @@ fn test_missing_cert_slots_follow_the_epoch_committee() {
             .committee_size(NonZeroUsize::new(committee_size).unwrap())
             .build()
     };
-    let old = fixture();
-    let new = fixture();
+    let keys = |fixture: &CommitteeFixture<MemDatabase>| {
+        fixture.authorities().map(|member| member.primary_public_key()).collect::<Vec<_>>()
+    };
+    let (old, new, later) = (fixture(), fixture(), fixture());
     let limits = MissingCertLimits::new();
     let free_at_start = limits.free_committee_slots();
-    let old_slots = limits.for_committee(&old.committee());
+    let old_slots = limits.for_committees(&old.committee(), &[]);
 
     // A member of the old committee uses all of its slots.
     let former = old.authorities().next().unwrap().primary_public_key();
@@ -1287,22 +1349,30 @@ fn test_missing_cert_slots_follow_the_epoch_committee() {
     assert!(matches!(next, Err(BusyLimit::Member)), "got {next:?}");
 
     // The next epoch's committee pool still counts the old jobs.
-    let new_slots = limits.for_committee(&new.committee());
+    let new_slots = limits.for_committees(&new.committee(), &keys(&old));
     assert_eq!(limits.free_committee_slots(), free_at_start - MISSING_CERT_JOBS_PER_PEER);
 
-    // In the new epoch the former member has an outsider's limit.
-    let outsider_jobs: Vec<_> = (0..MISSING_CERT_JOBS_PER_OUTSIDER)
-        .map(|_| new_slots.acquire(former).expect("slot in the shared pool"))
+    // For one epoch the former member keeps a member's share.
+    let former_jobs: Vec<_> = (0..MISSING_CERT_JOBS_PER_PEER)
+        .map(|_| new_slots.acquire(former).expect("slot for a former member"))
         .collect();
     let next = new_slots.acquire(former);
-    assert!(matches!(next, Err(BusyLimit::Outsider)), "got {next:?}");
+    assert!(matches!(next, Err(BusyLimit::Member)), "got {next:?}");
 
     // New members have their own slots.
     let member = new.authorities().next().unwrap().primary_public_key();
     let member_job = new_slots.acquire(member).expect("slot for a new member");
 
+    // Two epochs on, the former member has an outsider's limit.
+    let later_slots = limits.for_committees(&later.committee(), &keys(&new));
+    let outsider_jobs: Vec<_> = (0..MISSING_CERT_JOBS_PER_OUTSIDER)
+        .map(|_| later_slots.acquire(former).expect("slot in the shared pool"))
+        .collect();
+    let next = later_slots.acquire(former);
+    assert!(matches!(next, Err(BusyLimit::Outsider)), "got {next:?}");
+
     // Slots come back once the jobs end.
-    drop((old_jobs, outsider_jobs, member_job));
+    drop((old_jobs, former_jobs, member_job, outsider_jobs));
     assert_eq!(limits.free_committee_slots(), free_at_start);
 }
 
@@ -1318,7 +1388,7 @@ fn test_missing_cert_slots_limit_each_outsider() {
         .committee_size(NonZeroUsize::new(4).unwrap())
         .build();
     let limits = MissingCertLimits::new();
-    let slots = limits.for_committee(&fixture.committee());
+    let slots = limits.for_committees(&fixture.committee(), &[]);
     let outsider = |seed: u64| *BlsKeypair::generate(&mut StdRng::seed_from_u64(seed)).public();
 
     // One outsider at its limit is refused while the pool has room.
@@ -1361,7 +1431,7 @@ fn test_missing_cert_slots_limit_each_outsider_under_races() {
 
     let fixture = CommitteeFixture::builder(MemDatabase::default).build();
     let limits = MissingCertLimits::new();
-    let slots = limits.for_committee(&fixture.committee());
+    let slots = limits.for_committees(&fixture.committee(), &[]);
     let greedy = *BlsKeypair::generate(&mut StdRng::seed_from_u64(0)).public();
     let running = AtomicUsize::new(0);
     let most_running = AtomicUsize::new(0);
@@ -1403,7 +1473,7 @@ fn test_missing_cert_slots_at_limit_outsider_leaves_the_pool_alone() {
 
     let fixture = CommitteeFixture::builder(MemDatabase::default).build();
     let limits = MissingCertLimits::new();
-    let slots = limits.for_committee(&fixture.committee());
+    let slots = limits.for_committees(&fixture.committee(), &[]);
     let outsider = |seed: u64| *BlsKeypair::generate(&mut StdRng::seed_from_u64(seed)).public();
     let (greedy, honest) = (outsider(0), outsider(1));
     let greedy_jobs: Vec<_> = (0..MISSING_CERT_JOBS_PER_OUTSIDER)
@@ -1432,7 +1502,7 @@ fn test_missing_cert_slots_at_limit_outsider_leaves_the_pool_alone() {
     drop(greedy_jobs);
 }
 
-/// Every member of a large committee can use its own share of jobs.
+/// Members of a large committee and the previous one each get a share.
 ///
 /// Otherwise faulty members could hold the whole committee pool.
 #[test]
@@ -1447,26 +1517,35 @@ fn test_missing_cert_slots_grow_with_the_committee() {
             .committee_size(NonZeroUsize::new(committee_size).unwrap())
             .build()
     };
-    let (fixture, next_fixture) = (fixture(), fixture());
+    let (previous, fixture, next_fixture) = (fixture(), fixture(), fixture());
+    let previous_keys: Vec<_> =
+        previous.authorities().map(|member| member.primary_public_key()).collect();
     let limits = MissingCertLimits::new();
-    let slots = limits.for_committee(&fixture.committee());
+    let slots = limits.for_committees(&fixture.committee(), &previous_keys);
 
     let jobs: Vec<_> = fixture
         .authorities()
+        .chain(previous.authorities())
         .flat_map(|member| {
             let key = member.primary_public_key();
             (0..MISSING_CERT_JOBS_PER_PEER).map(move |_| key)
         })
         .map(|key| slots.acquire(key).expect("slot for every member"))
         .collect();
-    assert_eq!(jobs.len(), committee_size * MISSING_CERT_JOBS_PER_PEER);
+    assert_eq!(jobs.len(), 2 * committee_size * MISSING_CERT_JOBS_PER_PEER);
     assert_eq!(limits.free_committee_slots(), 0);
 
     // While those jobs run, a member of the next committee waits for the pool.
-    let next_slots = limits.for_committee(&next_fixture.committee());
+    let next_slots = limits.for_committees(&next_fixture.committee(), &[]);
     let next_member = next_fixture.authorities().next().unwrap().primary_public_key();
     let next = next_slots.acquire(next_member);
     assert!(matches!(next, Err(BusyLimit::Committee)), "got {next:?}");
+
+    // A member of both committees counts once.
+    let keys: Vec<_> = fixture.authorities().map(|member| member.primary_public_key()).collect();
+    let overlap = MissingCertLimits::new();
+    let _overlap_slots = overlap.for_committees(&fixture.committee(), &keys);
+    assert_eq!(overlap.free_committee_slots(), committee_size * MISSING_CERT_JOBS_PER_PEER);
 }
 
 /// Only `Busy` is a recoverable answer to a missing-certificates request.
