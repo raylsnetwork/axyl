@@ -9,6 +9,7 @@ use crate::{
 use consensus_metrics::{monitored_future, monitored_scope};
 use futures::{stream::FuturesUnordered, StreamExt};
 use rand::{rngs::ThreadRng, seq::SliceRandom};
+use rayls_consensus_network::{error::NetworkError, OutboundFailure};
 use rayls_consensus_primary_metrics::PrimaryMetrics;
 use rayls_infrastructure_config::ConsensusConfig;
 use rayls_infrastructure_network_types::FetchCertificatesResponse;
@@ -42,9 +43,9 @@ const PARALLEL_FETCH_REQUEST_INTERVAL_SECS: Duration = Duration::from_secs(5);
 /// num peers * PARALLEL_FETCH_REQUEST_INTERVAL_SECS + PARALLEL_FETCH_REQUEST_ADDITIONAL_TIMEOUT
 const PARALLEL_FETCH_REQUEST_ADDITIONAL_TIMEOUT: Duration = Duration::from_secs(15);
 /// Clear skip_rounds after this many consecutive failures.
-const STALE_SKIP_ROUNDS_FALLBACK_THRESHOLD: u32 = 5;
+pub(crate) const STALE_SKIP_ROUNDS_FALLBACK_THRESHOLD: u32 = 5;
 /// Lower threshold for CvvInactive mode where speed matters more.
-const STALE_SKIP_ROUNDS_CATCHUP_THRESHOLD: u32 = 2;
+pub(crate) const STALE_SKIP_ROUNDS_CATCHUP_THRESHOLD: u32 = 2;
 /// Backoff when all fetched certs are from a future epoch.
 /// The node cannot make progress until epoch transition completes,
 /// so polling aggressively wastes bandwidth. 30s balances responsiveness
@@ -62,6 +63,67 @@ enum FetchOutcome {
     PartialProgress,
     /// All certificates from a non-matching epoch.
     EpochMismatch,
+    /// Every peer that answered was busy.
+    Busy,
+}
+
+/// Why a round of fetch requests brought back no certificates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FetchFailure {
+    /// Every peer that answered was busy.
+    Busy,
+    /// Peers failed, had nothing to send, or none answered.
+    Failed,
+}
+
+/// The answers seen in one round of fetch requests.
+#[derive(Debug, Default)]
+struct FetchAnswers {
+    /// A peer answered that it was busy.
+    busy: bool,
+    /// A peer failed, or had nothing to send.
+    failed: bool,
+}
+
+impl FetchAnswers {
+    /// Record a peer that had no certificates to send.
+    fn record_empty(&mut self) {
+        self.failed = true;
+    }
+
+    /// Record a failed request.
+    fn record_error(&mut self, error: &NetworkError) {
+        match error {
+            NetworkError::PeerBusy(_) => self.busy = true,
+            // An IO error may be a malformed answer, so it counts, as before.
+            NetworkError::Outbound(OutboundFailure::Io(_)) => self.failed = true,
+            // A peer we could not reach says nothing about our request.
+            NetworkError::Outbound(_)
+            | NetworkError::Dial(_)
+            | NetworkError::DialBannedPeer(_)
+            | NetworkError::Timeout
+            | NetworkError::Disconnected
+            | NetworkError::PeerNotConnected
+            | NetworkError::PeerMissing
+            | NetworkError::NoPeers
+            // Our own network task failed, which says nothing about the peer.
+            | NetworkError::RequestQueueOverflow
+            | NetworkError::AckChannelClosed(_)
+            | NetworkError::ChannelSender(_)
+            | NetworkError::MpscTrySend(_) => {}
+            // Anything else counts as a failure, as it did before busy answers.
+            _ => self.failed = true,
+        }
+    }
+
+    /// Why the round brought back no certificates.
+    fn failure(&self) -> FetchFailure {
+        if self.busy && !self.failed {
+            FetchFailure::Busy
+        } else {
+            FetchFailure::Failed
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -105,6 +167,10 @@ pub(crate) struct CertificateFetcher<DB> {
     max_rpc_message_size: usize,
     /// Track consecutive fetch failures for exponential backoff.
     consecutive_failures: u32,
+    /// Consecutive rounds, while active, in which every peer that answered was busy.
+    /// They grow the backoff, but not toward the stale-session fallback.
+    /// As with failures, only a success or nothing left to fetch resets them.
+    consecutive_busy: u32,
     /// Last fetch attempt time for rate limiting.
     last_fetch_attempt: Option<Instant>,
     /// Suppresses probes until this instant after an epoch-mismatch outcome.
@@ -160,6 +226,7 @@ impl<DB: Database> CertificateFetcher<DB> {
                         fetch_certificates_task: JoinSet::new(),
                         max_rpc_message_size,
                         consecutive_failures: 0,
+                        consecutive_busy: 0,
                         last_fetch_attempt: None,
                         epoch_mismatch_until: None,
                     }
@@ -258,6 +325,7 @@ impl<DB: Database> CertificateFetcher<DB> {
                             match outcome {
                                 FetchOutcome::Success => {
                                     self.consecutive_failures = 0;
+                                    self.consecutive_busy = 0;
                                     self.epoch_mismatch_until = None;
                                 }
                                 FetchOutcome::HardFailure => {
@@ -265,6 +333,19 @@ impl<DB: Database> CertificateFetcher<DB> {
                                 }
                                 FetchOutcome::PartialProgress => {
                                     // not a real failure - don't count toward stale-session fallback
+                                }
+                                FetchOutcome::Busy => {
+                                    // Busy peers ask us to slow down, so this grows the backoff.
+                                    // The stale-session fallback would only add to their load.
+                                    // Counted only while active, since catching up never backs off.
+                                    if self.consensus_bus.node_mode().borrow().is_active_cvv() {
+                                        self.consecutive_busy = self.consecutive_busy.saturating_add(1);
+                                    }
+                                    self.consensus_bus
+                                        .primary_metrics()
+                                        .node_metrics
+                                        .certificate_fetcher_busy_rounds
+                                        .inc();
                                 }
                                 FetchOutcome::EpochMismatch => {
                                     // suppress probes while peers return future-epoch certs;
@@ -320,6 +401,7 @@ impl<DB: Database> CertificateFetcher<DB> {
         let is_active = self.consensus_bus.node_mode().borrow().is_active_cvv();
         if is_active && self.targets.is_empty() {
             self.consecutive_failures = 0;
+            self.consecutive_busy = 0;
             info!(target: "primary::cert_fetcher", gc_round = self.gc_round(), "targets empty and active - nothing to fetch");
             return;
         }
@@ -345,22 +427,28 @@ impl<DB: Database> CertificateFetcher<DB> {
         }
 
         // NOTE: skip backoff in CvvInactive mode for fast catch-up
+        // Busy rounds too: a busy peer refuses at once, which costs it little.
         let is_active = self.consensus_bus.node_mode().borrow().is_active_cvv();
 
         // exponential backoff on consecutive failures (1.5x multiplier)
         let backoff = self.calculate_backoff();
+        // Set on every probe, so the gauges drop back to 0 after a success.
+        self.consensus_bus
+            .primary_metrics()
+            .node_metrics
+            .certificate_fetcher_backoff_ms
+            .set(backoff.as_millis() as i64);
+        self.consensus_bus
+            .primary_metrics()
+            .node_metrics
+            .certificate_fetcher_consecutive_failures
+            .set(self.consecutive_failures as i64);
+        self.consensus_bus
+            .primary_metrics()
+            .node_metrics
+            .certificate_fetcher_consecutive_busy
+            .set(self.consecutive_busy as i64);
         if backoff > Duration::ZERO {
-            self.consensus_bus
-                .primary_metrics()
-                .node_metrics
-                .certificate_fetcher_backoff_ms
-                .set(backoff.as_millis() as i64);
-            self.consensus_bus
-                .primary_metrics()
-                .node_metrics
-                .certificate_fetcher_consecutive_failures
-                .set(self.consecutive_failures as i64);
-
             // only enforce backoff in CvvActive mode
             if is_active {
                 if let Some(last_attempt) = self.last_fetch_attempt {
@@ -369,6 +457,7 @@ impl<DB: Database> CertificateFetcher<DB> {
                         trace!(
                             target: "primary::cert_fetcher",
                             failures = self.consecutive_failures,
+                            busy = self.consecutive_busy,
                             "Backoff active, skipping fetch. Wait {:?} more",
                             backoff.saturating_sub(elapsed)
                         );
@@ -379,6 +468,7 @@ impl<DB: Database> CertificateFetcher<DB> {
                 trace!(
                     target: "primary::cert_fetcher",
                     failures = self.consecutive_failures,
+                    busy = self.consecutive_busy,
                     "Skipping backoff - node in catch-up mode (CvvInactive)"
                 );
             }
@@ -530,6 +620,14 @@ impl<DB: Database> CertificateFetcher<DB> {
                 );
                 FetchOutcome::PartialProgress
             }
+            Err(CertManagerError::PeersBusy) => {
+                info!(
+                    target: "primary::cert_fetcher",
+                    "every peer that answered was busy, elapsed = {}s",
+                    now.elapsed().as_secs_f64()
+                );
+                FetchOutcome::Busy
+            }
             Err(CertManagerError::FutureEpoch { ours, theirs, count }) => {
                 warn!(
                     target: "primary::cert_fetcher",
@@ -566,16 +664,19 @@ impl<DB: Database> CertificateFetcher<DB> {
     }
 
     /// Calculate exponential backoff (1.5x multiplier, 100ms base, 60s cap).
+    ///
+    /// Failed and busy rounds both count.
     fn calculate_backoff(&self) -> Duration {
         const BASE_TIMEOUT: Duration = Duration::from_millis(100);
         const MAX_TIMEOUT: Duration = Duration::from_secs(60);
 
-        if self.consecutive_failures == 0 {
+        let rounds = self.consecutive_failures.saturating_add(self.consecutive_busy);
+        if rounds == 0 {
             return Duration::ZERO;
         }
 
         let mut timeout = BASE_TIMEOUT;
-        for _ in 0..self.consecutive_failures.min(20) {
+        for _ in 0..rounds.min(20) {
             timeout = timeout + timeout / 2; // 1.5x multiplier
         }
         timeout.min(MAX_TIMEOUT)
@@ -609,7 +710,7 @@ async fn run_fetch_task<DB: Database>(
         .set_bounds(effective_lower_bound, pruned_written_rounds)
         .map_err(|e| CertManagerError::RequestBounds(e.to_string()))?
         .set_max_response_size(max_response_size);
-    let Some(response) = fetch_certificates_helper(
+    let response = match fetch_certificates_helper(
         state.authority_id.as_ref(),
         state.network.clone(),
         &committee,
@@ -618,9 +719,13 @@ async fn run_fetch_task<DB: Database>(
         fetch_epoch,
     )
     .await
-    else {
-        error!(target: "primary::cert_fetcher", "error awaiting fetch_certificates_helper");
-        return Err(CertManagerError::NoCertificateFetched);
+    {
+        Ok(response) => response,
+        Err(FetchFailure::Busy) => return Err(CertManagerError::PeersBusy),
+        Err(FetchFailure::Failed) => {
+            error!(target: "primary::cert_fetcher", "error awaiting fetch_certificates_helper");
+            return Err(CertManagerError::NoCertificateFetched);
+        }
     };
 
     // filter out certificates from future epochs before verification.
@@ -719,7 +824,7 @@ async fn fetch_certificates_helper(
     request: MissingCertificatesRequest,
     merge_all_peers: bool,
     fetch_epoch: Option<Epoch>,
-) -> Option<FetchCertificatesResponse> {
+) -> Result<FetchCertificatesResponse, FetchFailure> {
     let _scope = monitored_scope("FetchingCertificatesFromPeers");
     trace!(target: "primary::cert_fetcher", "Start sending fetch certificates requests");
     let request_interval = PARALLEL_FETCH_REQUEST_INTERVAL_SECS;
@@ -735,6 +840,9 @@ async fn fetch_certificates_helper(
             * peers.len().try_into().expect("usize into secs duration")
             + PARALLEL_FETCH_REQUEST_ADDITIONAL_TIMEOUT
     };
+    // Kept outside the timeout, so a timed-out round keeps its answers.
+    let mut round = FetchAnswers::default();
+    let answers = &mut round;
     let fetch_callback = async move {
         debug!(target: "primary::cert_fetcher", "Starting to fetch certificates");
 
@@ -760,19 +868,23 @@ async fn fetch_certificates_helper(
             let mut seen = std::collections::BTreeSet::new();
             let mut merged = Vec::new();
             while let Some(result) = multi_fut.next().await {
-                if let Ok(certs) = result {
-                    for cert in certs {
-                        let digest = cert.digest();
-                        if seen.insert(digest) {
-                            merged.push(cert);
+                match result {
+                    Ok(certs) if certs.is_empty() => answers.record_empty(),
+                    Ok(certs) => {
+                        for cert in certs {
+                            let digest = cert.digest();
+                            if seen.insert(digest) {
+                                merged.push(cert);
+                            }
                         }
                     }
+                    Err(e) => answers.record_error(&e),
                 }
             }
             if merged.is_empty() {
                 warn!(target: "primary::cert_fetcher", "all peers exhausted (multi-peer), no certificates fetched");
                 sleep(request_interval).await;
-                return None;
+                return Err(answers.failure());
             }
             // sort by round for causal processing order
             merged.sort_by_key(|c| c.round());
@@ -782,7 +894,7 @@ async fn fetch_certificates_helper(
                 unique_rounds = merged.iter().map(|c| c.round()).collect::<std::collections::BTreeSet<_>>().len(),
                 "merged certificates from all peers"
             );
-            return Some(FetchCertificatesResponse { certificates: merged });
+            return Ok(FetchCertificatesResponse { certificates: merged });
         }
 
         // single-peer mode: return first non-empty response (original behavior)
@@ -812,13 +924,15 @@ async fn fetch_certificates_helper(
                     Some(Ok(certificates)) => {
                         if certificates.is_empty() {
                             info!(target: "primary::cert_fetcher", "peer returned empty certificate list, trying next");
+                            answers.record_empty();
                             continue;
                         }
                         info!(target: "primary::cert_fetcher", "received {} certificates from peer", certificates.len());
-                        return Some(FetchCertificatesResponse { certificates });
+                        return Ok(FetchCertificatesResponse { certificates });
                     }
                     Some(Err(e)) => {
                         warn!(target: "primary::cert_fetcher", "Failed to fetch certificates: {e}");
+                        answers.record_error(&e);
                         // Issue request to another primary immediately.
                         continue;
                     }
@@ -827,7 +941,7 @@ async fn fetch_certificates_helper(
                         // Last or all requests to peers may have failed immediately, so wait
                         // before returning to avoid retrying fetching immediately.
                         sleep(request_interval).await;
-                        return None;
+                        return Err(answers.failure());
                     }
                 },
                 _ = &mut interval => {
@@ -837,9 +951,10 @@ async fn fetch_certificates_helper(
             }
         }
     };
-    timeout(fetch_timeout, fetch_callback).await.unwrap_or_else(|e| {
+    let result = timeout(fetch_timeout, fetch_callback).await;
+    result.unwrap_or_else(|e| {
         debug!(target: "primary::cert_fetcher", "Timed out fetching certificates: {e}");
-        None
+        Err(round.failure())
     })
 }
 
