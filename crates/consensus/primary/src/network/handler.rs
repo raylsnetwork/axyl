@@ -19,7 +19,8 @@ use parking_lot::Mutex;
 use rayls_consensus_network::GossipMessage;
 use rayls_infrastructure_config::{ConsensusConfig, LibP2pConfig};
 use rayls_infrastructure_storage::{
-    tables::ConsensusBlocks, CertScope, ConsensusStore, EpochStore, ProposerStore, VoteDigestStore,
+    tables::ConsensusBlocks, CertScope, CertificateStore, ConsensusStore, EpochStore,
+    ProposerStore, VoteDigestStore,
 };
 use rayls_infrastructure_types::{
     ensure,
@@ -241,6 +242,26 @@ where
                     topic.to_string().eq(&LibP2pConfig::primary_topic()),
                     PrimaryNetworkError::InvalidTopic
                 );
+                // Memory-tier lookup before any work, never a persistent-tier read. Gossip
+                // delivers each certificate more than once (every node sees ~1.5 re-deliveries
+                // per new certificate in steady state, and 150-300/s once re-forwarding past the
+                // duplicate cache sets in, as on mainnet 2026-10-26). The duplicate check inside
+                // `process_peer_certificate` comes after the BLS verification and the
+                // `ConsensusBlocks` read in `behind_consensus`, so without this gate every
+                // re-delivery costs both, scaled by cache occupancy. A re-delivery is recent, so
+                // the cache holds it; a miss just continues down the usual path. A skipped copy
+                // is unverified and does not feed `behind_consensus`: that signal keeps sampling
+                // on first-seen certificates, which is where the round information is.
+                let digest = cert.digest();
+                if self.consensus_config.node_storage().contains_in_memory(&digest) {
+                    trace!(target: "primary", ?digest, "gossiped certificate already stored, skipping");
+                    self.consensus_bus
+                        .primary_metrics()
+                        .node_metrics
+                        .gossip_certificates_skipped_in_memory
+                        .inc();
+                    return Ok(());
+                }
                 let unverified_cert = cert.validate_received().map_err(CertManagerError::from)?;
 
                 let epoch = unverified_cert.header().epoch;
