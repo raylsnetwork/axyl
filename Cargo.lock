@@ -8323,6 +8323,7 @@ dependencies = [
  "consensus-metrics",
  "eyre",
  "futures",
+ "rand 0.9.3",
  "rayls-consensus-network",
  "rayls-consensus-primary",
  "rayls-consensus-state-sync",
