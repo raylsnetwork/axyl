@@ -463,6 +463,24 @@ impl ExecutionNodeInner {
         self.reth_env.epoch_state_from_canonical_tip()
     }
 
+    /// Read the BLS keys of every registered (not exited) validator in the registry.
+    pub(super) fn registered_validators(&self) -> eyre::Result<Vec<BlsPublicKey>> {
+        let raw = self.reth_env.registered_validators()?;
+        let mut keys = Vec::with_capacity(raw.len());
+        for v in &raw {
+            match BlsPublicKey::from_literal_bytes(v.blsPubkey.as_ref()) {
+                Ok(k) => keys.push(k),
+                Err(e) => error!(
+                    target: "engine",
+                    addr = ?v.validatorAddress,
+                    pubkey_len = v.blsPubkey.len(),
+                    "registered_validators: BLS key parsing failed, key skipped: {e:?}",
+                ),
+            }
+        }
+        Ok(keys)
+    }
+
     /// Read committee validator keys for epoch.
     ///
     /// Keys are returned sorted by `BlsPublicKey` byte order to match the `BTreeMap` ordering

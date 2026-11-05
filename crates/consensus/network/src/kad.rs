@@ -154,6 +154,17 @@ pub enum KadStoreType {
     Worker,
 }
 
+/// The value size the store refuses with `Error::ValueTooLarge`: the libp2p memory-store
+/// default (64 KiB). One constant, read by [`KadStore`] for its limit and by the kad behaviour
+/// to tell a genuinely oversize value apart from a DB failure that the store reports under the
+/// same variant, so the two cannot drift apart.
+pub(crate) const MAX_VALUE_BYTES: usize = 65 * 1024;
+
+/// See [`MAX_VALUE_BYTES`].
+pub(crate) fn max_value_bytes() -> usize {
+    MAX_VALUE_BYTES
+}
+
 /// Provide a persistant store for kademlia data.
 /// Wraps around the consensus DB.
 #[derive(Clone, Debug)]
@@ -178,7 +189,10 @@ impl<DB: Database> KadStore<DB> {
     pub fn new(db: DB, key_config: &KeyConfig, kad_type: KadStoreType) -> Self {
         let node_key = RecordKey::new(&encode(&key_config.primary_public_key()));
         // Defaults for sanity.
-        let config = MemoryStoreConfig::default();
+        // The value limit comes from the one helper the kad behaviour also reads, so the check
+        // that tells an oversize value from a DB failure cannot drift from what `put` enforces.
+        let mut config = MemoryStoreConfig::default();
+        config.max_value_bytes = max_value_bytes();
         // Count records within a properly scoped read transaction
         // to ensure MDBX can reclaim dirty pages after completion
         let (num_records, num_providers) = db
@@ -262,14 +276,8 @@ impl<DB: Database> RecordStore for KadStore<DB> {
                 self.db.get::<KadWorkerRecords>(&key).map_err(|_| Error::ValueTooLarge)?.is_none()
             }
         };
-        // We have a new record so go ahead and inc num_records.
-        // Should be safe since a failure to insert indicates a fatal DB condition.
-        if new_record {
-            if self.num_records >= self.config.max_records {
-                return Err(Error::MaxRecords);
-            } else {
-                self.num_records = self.num_records.saturating_add(1);
-            }
+        if new_record && self.num_records >= self.config.max_records {
+            return Err(Error::MaxRecords);
         }
         match self.kad_type {
             KadStoreType::Primary => self
@@ -281,11 +289,25 @@ impl<DB: Database> RecordStore for KadStore<DB> {
                 .insert::<KadWorkerRecords>(&key, &encode(&kr))
                 .map_err(|_| Error::ValueTooLarge)?,
         }
+        // Count the record only once it is in the DB: a failed insert is reported to the caller
+        // as a store error and retried later, and must not use up a slot each time.
+        if new_record {
+            self.num_records = self.num_records.saturating_add(1);
+        }
         Ok(())
     }
 
     fn remove(&mut self, k: &RecordKey) {
         let key = self.key_to_hash(k);
+        // The DB reports success for a key that was not there, so check first: the count must
+        // only drop for a record that was actually removed.
+        let existed = match self.kad_type {
+            KadStoreType::Primary => self.db.get::<KadRecords>(&key).ok().flatten().is_some(),
+            KadStoreType::Worker => self.db.get::<KadWorkerRecords>(&key).ok().flatten().is_some(),
+        };
+        if !existed {
+            return;
+        }
         if match self.kad_type {
             KadStoreType::Primary => self.db.remove::<KadRecords>(&key),
             KadStoreType::Worker => self.db.remove::<KadWorkerRecords>(&key),
@@ -757,5 +779,40 @@ mod test {
         // Should be full now so get max errors.
         assert!(matches!(kad_store.put(rec.clone()), Err(Error::MaxRecords)));
         assert!(matches!(kad_store_worker.put(rec.clone()), Err(Error::MaxRecords)));
+    }
+
+    /// `num_records` must follow what is actually in the DB: removing a key that is not there
+    /// (the expiry job may ask twice) must not decrement it, or the count drifts below the real
+    /// size and the cap stops protecting the store.
+    #[test]
+    fn test_kad_remove_absent_key_keeps_the_count() {
+        let tmp_dir = TempDir::new().expect("temp dir");
+        let db = open_db(tmp_dir.path());
+        let key_config =
+            KeyConfig::new_with_testing_key(BlsKeypair::generate(&mut StdRng::from_os_rng()));
+        let mut kad_store = KadStore::new(db, &key_config, KadStoreType::Primary);
+
+        let rec = test_record(false);
+        kad_store.put(rec.clone()).expect("put record");
+        assert_eq!(kad_store.num_records, 1);
+
+        // a key that was never stored, twice
+        let absent = test_record(false);
+        kad_store.remove(&absent.key);
+        kad_store.remove(&absent.key);
+        assert_eq!(kad_store.num_records, 1, "removing an absent key must not decrement");
+
+        // the stored key, twice: one decrement
+        kad_store.remove(&rec.key);
+        kad_store.remove(&rec.key);
+        assert_eq!(kad_store.num_records, 0);
+        assert!(kad_store.get(&rec.key).is_none());
+    }
+
+    /// The store's value limit and the behaviour's oversize-vs-DB-failure split read the same
+    /// constant; it is the libp2p memory-store default, which is what the store used before.
+    #[test]
+    fn test_max_value_bytes_matches_the_store_default() {
+        assert_eq!(MAX_VALUE_BYTES, MemoryStoreConfig::default().max_value_bytes);
     }
 }
