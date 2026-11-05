@@ -250,13 +250,18 @@ fn crash_header(number: u64, honest: &ConsensusHeader) -> Option<ConsensusHeader
     Some(crafted)
 }
 
+/// How many blocks from `RL_BYZ_PROBE_NUMBER` upwards the crash-probe hook searches for a block
+/// that carries batches.
+const PROBE_SEARCH_BLOCKS: u64 = 64;
+
 /// True when this node is armed for the "crash-probe" delivery route (the backwards-walk route).
 fn crash_probe_armed() -> bool {
     std::env::var("RL_BYZ_GAP_MODE").ok().as_deref() == Some("crash-probe")
 }
 
-/// Build the crash-probe poison once and keep it: this node's real block `RL_BYZ_PROBE_NUMBER`,
-/// which must be from an older epoch and carry batches, with the extra certificate added. It is
+/// Build the crash-probe poison once and keep it: this node's first real block at or above
+/// `RL_BYZ_PROBE_NUMBER` that is from an older epoch and carries batches (many blocks carry none,
+/// even under load), with the extra certificate added. It is
 /// served on a follower's "latest" probe and on a by-hash request for its own digest, so the
 /// poison reaches the follower through the backwards walk rather than a by-number request.
 fn probe_poison<DB: Database>(db: &DB) -> Option<&'static ConsensusHeader> {
@@ -264,20 +269,25 @@ fn probe_poison<DB: Database>(db: &DB) -> Option<&'static ConsensusHeader> {
     if let Some(poison) = POISON.get() {
         return Some(poison);
     }
-    let number: u64 = std::env::var("RL_BYZ_PROBE_NUMBER").ok()?.parse().ok()?;
+    let first: u64 = std::env::var("RL_BYZ_PROBE_NUMBER").ok()?.parse().ok()?;
     let extra = extra_certificate()?;
-    let honest = db.get_consensus_by_number(number)?;
-    if honest.sub_dag.leader_epoch() >= extra.epoch() || honest.sub_dag.num_primary_blocks() == 0 {
+    let usable = |block: &ConsensusHeader| {
+        block.sub_dag.leader_epoch() < extra.epoch() && block.sub_dag.num_primary_blocks() > 0
+    };
+    let Some(honest) = (first..first + PROBE_SEARCH_BLOCKS)
+        .map_while(|number| db.get_consensus_by_number(number))
+        .find(|block| usable(block))
+    else {
         warn!(
             target: "primary::byzantine",
-            number,
-            header_epoch = honest.sub_dag.leader_epoch(),
+            first,
+            searched = PROBE_SEARCH_BLOCKS,
             cert_epoch = extra.epoch(),
-            batches = honest.sub_dag.num_primary_blocks(),
-            "BYZANTINE PROBE: block is not a usable crash target (needs an older epoch and batches)"
+            "BYZANTINE PROBE: no usable crash target (needs an older epoch and batches)"
         );
         return None;
-    }
+    };
+    let number = honest.number;
     let mut sub_dag = honest.sub_dag.clone();
     sub_dag.certificates.push(extra.clone());
     let crafted = ConsensusHeader {

@@ -369,7 +369,7 @@ done
 # Fast kill so the anchor does not advance past A between here and shutdown.
 kill -KILL "${PIDS[$VICTIM]}" 2>/dev/null; wait "${PIDS[$VICTIM]}" 2>/dev/null; unset "PIDS[$VICTIM]"
 PROBE_NUMBER=$((A + 1))
-log "observer stopped at block $A; it will be served poison labelled block $PROBE_NUMBER"
+log "observer stopped at block $A; it will be served poison at block $PROBE_NUMBER or the first block above it that carries batches"
 if [[ $ECLIPSE == 1 ]]; then
     eclipse_observer_committee || fail "could not route the observer to the attacker"
     log "routed the observer's committee connections to $ATTACKER (eclipse)"
@@ -398,7 +398,7 @@ fi
 
 # Arm the attacker now that the certificate exists and the target number is known.
 if [[ $ADD != off ]]; then
-    log "arming $ATTACKER to serve poison on the probe (block $PROBE_NUMBER plus the certificate)"
+    log "arming $ATTACKER to serve poison on the probe (from block $PROBE_NUMBER up, plus the certificate)"
     stop_node "$ATTACKER"
     start_node "$ATTACKER" armed
     sleep 3
@@ -428,6 +428,12 @@ for attempt in $(seq 1 "$RESTARTS"); do
             break
             ;;
         *)
+            # After a crash, the observer may hold the part of the poisoned block it executed. With
+            # honest peers (-n) it then gets the real block, which does not match, and stays stuck.
+            if [[ $panics -gt 0 ]]; then
+                log "restart $attempt: the observer neither stopped nor caught up within ${SYNC_SECS}s after the earlier crash"
+                break
+            fi
             fail "the observer neither stopped nor caught up within ${SYNC_SECS}s"
             ;;
     esac
