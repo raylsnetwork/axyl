@@ -126,7 +126,7 @@ pub(crate) struct RequestHandler<DB> {
     epoch_votes_seen: Arc<Mutex<BTreeMap<Epoch, HashSet<BlsPublicKey>>>>,
     /// The pending (uncertified) epoch records by digest, as last read from the table.
     pending_records: Arc<Mutex<PendingRecordCache>>,
-    /// Missing-certificate job slots for this epoch's committee.
+    /// Missing-certificate job slots for this and the previous committee.
     missing_cert_slots: Arc<MissingCertSlots>,
 }
 
@@ -170,8 +170,19 @@ where
                 "committee is larger than a missing-certificates request may name, so missing-certificates requests between members will be refused"
             );
         }
+        // Without a previous committee, former members are outsiders.
+        let previous = consensus_config.previous_committee().map_or(&[][..], |prev| prev.keys());
+        debug!(
+            target: "primary::handler",
+            epoch = consensus_config.committee().epoch(),
+            committee = consensus_config.committee().size(),
+            previous = previous.len(),
+            "missing-certificate slots for this epoch"
+        );
         let missing_cert_slots = Arc::new(
-            consensus_bus.missing_cert_limits().for_committee(consensus_config.committee()),
+            consensus_bus
+                .missing_cert_limits()
+                .for_committees(consensus_config.committee(), previous),
         );
         Self {
             consensus_config,
@@ -1226,7 +1237,7 @@ pub(crate) const MISSING_CERT_JOBS_PER_PEER: usize = 2;
 /// It only refuses while jobs from an earlier epoch are still running.
 pub(crate) const MISSING_CERT_JOBS_COMMITTEE: usize = 64;
 /// Missing-certificate jobs that other peers may have running at once, in total.
-/// A full pool delays observers and members of the next or previous epoch (#357).
+/// A full pool delays every peer outside both committees (#357).
 pub(crate) const MISSING_CERT_JOBS_OTHERS: usize = 4;
 /// Missing-certificate jobs one outside peer may have running at once.
 /// Honest nodes send each peer one request at a time.
@@ -1260,25 +1271,33 @@ impl MissingCertLimits {
         }
     }
 
-    /// Job slots for one epoch, with a pool for each member of its committee.
+    /// Job slots for one epoch: a pool per member of its committee and of
+    /// `previous`, whose members may still be finishing their last epoch.
     ///
-    /// A member that stays in the next committee gets a new pool there.
-    /// For one epoch change it may run twice its share, still within the committee pool.
-    pub(crate) fn for_committee(&self, committee: &Committee) -> MissingCertSlots {
+    /// Pools are rebuilt each epoch, so a member may briefly run twice its
+    /// share, still within the committee pool.
+    pub(crate) fn for_committees(
+        &self,
+        committee: &Committee,
+        previous: &[BlsPublicKey],
+    ) -> MissingCertSlots {
+        let members: HashSet<BlsPublicKey> = committee
+            .authorities()
+            .iter()
+            .map(|authority| *authority.protocol_key())
+            .chain(previous.iter().copied())
+            .collect();
         // Faulty members must never hold the whole pool.
         // It only grows, so jobs from an earlier epoch keep their permits.
-        let needed = MISSING_CERT_JOBS_PER_PEER * committee.size();
+        let needed = MISSING_CERT_JOBS_PER_PEER * members.len();
         // Racing callers each add only the part they grew.
         let before = self.committee_capacity.fetch_max(needed, Ordering::SeqCst);
         if needed > before {
             self.committee.add_permits(needed - before);
         }
-        let per_peer = committee
-            .authorities()
-            .iter()
-            .map(|authority| {
-                (*authority.protocol_key(), Arc::new(Semaphore::new(MISSING_CERT_JOBS_PER_PEER)))
-            })
+        let per_peer = members
+            .into_iter()
+            .map(|key| (key, Arc::new(Semaphore::new(MISSING_CERT_JOBS_PER_PEER))))
             .collect();
         MissingCertSlots {
             committee: self.committee.clone(),
@@ -1312,7 +1331,7 @@ pub(crate) struct MissingCertSlots {
     others: Arc<Semaphore>,
     /// Outside peers' running jobs, shared with every epoch.
     outsiders: Arc<OutsiderSlots>,
-    /// A pool for each member of this epoch's committee.
+    /// A pool per member of this and the previous committee.
     per_peer: HashMap<BlsPublicKey, Arc<Semaphore>>,
 }
 
@@ -1391,7 +1410,7 @@ impl BusyLimit {
 }
 
 /// The permits one missing-certificate job holds until it ends.
-/// Fields drop in order, so an outsider's slot is freed before its permit.
+/// Keep the field order: an outsider's slot must drop before its permit.
 /// A request that races a drop may be refused as busy, and retries later.
 #[derive(Debug)]
 pub(crate) struct MissingCertPermits {
