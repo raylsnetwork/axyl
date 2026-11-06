@@ -229,6 +229,9 @@ pub fn get_rayls_network_binary() -> &'static CargoRun {
         // crate is itself built with `--features dev`.
         #[cfg(feature = "dev-single-node-setup")]
         let build = build.features("dev-single-node-setup");
+        // e2e tests that inject faults need the binary built with its test hooks
+        #[cfg(feature = "test-hooks")]
+        let build = build.features("test-hooks");
         build.run().expect("Failed to build rayls-network binary")
     })
 }

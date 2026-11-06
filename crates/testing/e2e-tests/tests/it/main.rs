@@ -16,5 +16,7 @@ mod faucet;
 mod genesis_tests;
 #[cfg(not(feature = "dev-single-node-setup"))]
 mod restarts;
+#[cfg(all(feature = "test-hooks", not(feature = "dev-single-node-setup")))]
+mod vote_retry_behind_epoch;
 
 fn main() {}

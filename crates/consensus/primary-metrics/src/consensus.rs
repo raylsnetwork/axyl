@@ -60,8 +60,8 @@ pub struct ConsensusMetrics {
     /// are rejections that were *not* counted toward peer demotion: a too-old rejection, or an
     /// epoch rejection while one epoch behind, received while the node was still within its
     /// rejection grace (it had certified a header of its own less than the grace ago),
-    /// or an epoch rejection from a peer that is itself stale — tracked under distinct reasons so
-    /// the raw rejection rate stays visible.
+    /// or an epoch rejection from a peer two or more epochs behind ours, which is asked again.
+    /// They are tracked under distinct reasons so the raw rejection rate stays visible.
     pub vote_request_rejections: IntCounterVec,
     /// Size of the committee for the current epoch.
     pub committee_size: IntGauge,
