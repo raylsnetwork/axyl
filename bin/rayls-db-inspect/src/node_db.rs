@@ -797,7 +797,7 @@ pub fn recover(consensus_db: &Path) -> eyre::Result<()> {
 /// Splits `LABEL=PATH` into its parts; a bare path has no label.
 ///
 /// Only splits on a `=` that comes before any path separator, so paths containing `=` still work.
-fn split_label(spec: &str) -> (Option<&str>, &str) {
+pub(crate) fn split_label(spec: &str) -> (Option<&str>, &str) {
     match spec.split_once('=') {
         Some((label, path)) if !label.is_empty() && !label.contains(['/', '\\']) => {
             (Some(label), path)
@@ -819,7 +819,7 @@ fn resolve_consensus_db(path: &Path) -> eyre::Result<PathBuf> {
 }
 
 /// `<parent>/<dir>` of the resolved path, enough to tell nodes apart in a table.
-fn default_label(path: &Path) -> String {
+pub(crate) fn default_label(path: &Path) -> String {
     let mut parts = path.components().rev().filter_map(|c| match c {
         std::path::Component::Normal(s) => Some(s.to_string_lossy().into_owned()),
         _ => None,
