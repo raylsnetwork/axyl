@@ -87,6 +87,10 @@ pub fn run(cli: &Cli) -> eyre::Result<Report> {
         Command::Participation { epoch, .. } => {
             Report::Participation(report::participation::participation(&open_all()?, *epoch)?)
         }
+        // Reads reth's datadir, not the consensus-db, so it resolves the paths itself.
+        Command::StateRootCheck { .. } => {
+            Report::StateRootCheck(report::state_root::state_root_check(&dbs)?)
+        }
         Command::Summary { .. } => Report::Summary(report::summary::summary(&open_all()?)?),
     })
 }

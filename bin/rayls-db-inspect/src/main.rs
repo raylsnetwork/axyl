@@ -15,7 +15,12 @@ use eyre as _;
 use rayls_infrastructure_storage as _;
 use rayls_infrastructure_types as _;
 use rayls_infrastructure_utils as _;
+use reth_db as _;
+use reth_ethereum_primitives as _;
 use reth_libmdbx as _;
+use reth_provider as _;
+use reth_trie as _;
+use reth_trie_db as _;
 use serde as _;
 
 fn main() {

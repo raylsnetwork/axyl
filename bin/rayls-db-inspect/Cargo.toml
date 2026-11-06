@@ -23,7 +23,12 @@ clap = { workspace = true, features = ["derive"] }
 comfy-table = { workspace = true }
 const-hex = { workspace = true }
 eyre = { workspace = true }
+reth-db = { workspace = true }
+reth-ethereum-primitives = { workspace = true }
 reth-libmdbx = { workspace = true }
+reth-provider = { workspace = true }
+reth-trie = { workspace = true }
+reth-trie-db = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["env-filter", "fmt"] }
@@ -33,6 +38,7 @@ rayls-execution-evm = { workspace = true, features = ["test-utils"] }
 rayls-infrastructure-config = { workspace = true }
 rayls-testing-test-utils = { workspace = true }
 indexmap = { workspace = true }
+reth-primitives-traits = { workspace = true }
 roaring = { workspace = true }
 tempfile = { workspace = true }
 

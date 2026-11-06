@@ -116,7 +116,8 @@ impl Command {
             | Self::GetTx { nodes, .. }
             | Self::Summary { nodes }
             | Self::HeaderCheck { nodes, .. }
-            | Self::Participation { nodes, .. } => nodes,
+            | Self::Participation { nodes, .. }
+            | Self::StateRootCheck { nodes } => nodes,
         }
     }
 }
@@ -264,6 +265,19 @@ pub enum Command {
         /// The epoch to tally.
         #[arg(value_name = "EPOCH", value_parser = number::<u32>)]
         epoch: u32,
+        #[command(flatten)]
+        nodes: NodeArgs,
+    },
+
+    /// Rebuild the execution state root from the hashed leaves and compare it with the root
+    /// sealed in the last persisted header.
+    ///
+    /// Reads the node's reth datadir (`db/` and `static_files/`), not its consensus-db. The
+    /// rebuild uses no stored trie node, so a root the node computed by reusing a stale or
+    /// mis-skipped branch node shows up as a mismatch. One sequential pass over the hashed
+    /// tables: minutes on a large state, flat memory. The verdict is `BROKEN` when any node's
+    /// sealed root differs from its leaves.
+    StateRootCheck {
         #[command(flatten)]
         nodes: NodeArgs,
     },
