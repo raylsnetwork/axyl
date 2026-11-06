@@ -110,56 +110,56 @@ secp256k1 = { version = "0.31", default-features = false, features = [
 rpassword = "7.5.4"
 
 # execution
-reth = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.0" }
-reth-primitives = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.0" }
-reth-primitives-traits = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.0" }
-reth-chainspec = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.0" }
-reth-chain-state = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.0" }
-reth-config = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.0" }
-reth-db = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.0" }
-reth-storage-api = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.0" }
-reth-trie = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.0" }
-reth-trie-db = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.0" }
-reth-trie-parallel = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.0" }
-reth-db-common = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.0" }
-reth-db-api = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.0" }
-reth-engine-primitives = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.0" }
-reth-engine-tree = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.0" }
-reth-ethereum-engine-primitives = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.0" }
-reth-ethereum-primitives = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.0" }
-reth-evm-ethereum = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.0" }
-reth-network = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.0" }
-reth-network-api = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.0" }
-reth-network-peers = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.0" }
-reth-evm = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.0" }
-reth-execution-types = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.0" }
-reth-revm = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.0" }
-reth-rpc = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.0" }
-reth-rpc-eth-types = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.0" }
-reth-tracing = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.0" }
-reth-provider = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.0", features = ["rocksdb"] }
-reth-tasks = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.0" }
-reth-transaction-pool = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.0" }
-reth-consensus = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.0" }
-reth-node-builder = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.0" }
-reth-node-core = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.0" }
-reth-node-ethereum = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.0" }
-reth-node-types = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.0" }
-reth-node-metrics = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.0" }
-reth-discv4 = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.0" }
-reth-eth-wire = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.0" }
-reth-cli-util = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.0" }
-reth-errors = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.0" }
-reth-libmdbx = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.0" }
-reth-nippy-jar = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.0" }
-reth-stages = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.0", features=["rocksdb"] }
-reth-downloaders = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.0" }
-reth-static-file = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.0" }
-reth-prune = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.0" }
-reth-prune-types = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.0" }
-reth-exex-types = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.0" }
-reth-stages-api = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.0" }
-reth-tokio-util = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.0" }
+reth = { git = "https://github.com/raylsnetwork/reth", tag = "v1.11.0-rayls.1" }
+reth-primitives = { git = "https://github.com/raylsnetwork/reth", tag = "v1.11.0-rayls.1" }
+reth-primitives-traits = { git = "https://github.com/raylsnetwork/reth", tag = "v1.11.0-rayls.1" }
+reth-chainspec = { git = "https://github.com/raylsnetwork/reth", tag = "v1.11.0-rayls.1" }
+reth-chain-state = { git = "https://github.com/raylsnetwork/reth", tag = "v1.11.0-rayls.1" }
+reth-config = { git = "https://github.com/raylsnetwork/reth", tag = "v1.11.0-rayls.1" }
+reth-db = { git = "https://github.com/raylsnetwork/reth", tag = "v1.11.0-rayls.1" }
+reth-storage-api = { git = "https://github.com/raylsnetwork/reth", tag = "v1.11.0-rayls.1" }
+reth-trie = { git = "https://github.com/raylsnetwork/reth", tag = "v1.11.0-rayls.1" }
+reth-trie-db = { git = "https://github.com/raylsnetwork/reth", tag = "v1.11.0-rayls.1" }
+reth-trie-parallel = { git = "https://github.com/raylsnetwork/reth", tag = "v1.11.0-rayls.1" }
+reth-db-common = { git = "https://github.com/raylsnetwork/reth", tag = "v1.11.0-rayls.1" }
+reth-db-api = { git = "https://github.com/raylsnetwork/reth", tag = "v1.11.0-rayls.1" }
+reth-engine-primitives = { git = "https://github.com/raylsnetwork/reth", tag = "v1.11.0-rayls.1" }
+reth-engine-tree = { git = "https://github.com/raylsnetwork/reth", tag = "v1.11.0-rayls.1" }
+reth-ethereum-engine-primitives = { git = "https://github.com/raylsnetwork/reth", tag = "v1.11.0-rayls.1" }
+reth-ethereum-primitives = { git = "https://github.com/raylsnetwork/reth", tag = "v1.11.0-rayls.1" }
+reth-evm-ethereum = { git = "https://github.com/raylsnetwork/reth", tag = "v1.11.0-rayls.1" }
+reth-network = { git = "https://github.com/raylsnetwork/reth", tag = "v1.11.0-rayls.1" }
+reth-network-api = { git = "https://github.com/raylsnetwork/reth", tag = "v1.11.0-rayls.1" }
+reth-network-peers = { git = "https://github.com/raylsnetwork/reth", tag = "v1.11.0-rayls.1" }
+reth-evm = { git = "https://github.com/raylsnetwork/reth", tag = "v1.11.0-rayls.1" }
+reth-execution-types = { git = "https://github.com/raylsnetwork/reth", tag = "v1.11.0-rayls.1" }
+reth-revm = { git = "https://github.com/raylsnetwork/reth", tag = "v1.11.0-rayls.1" }
+reth-rpc = { git = "https://github.com/raylsnetwork/reth", tag = "v1.11.0-rayls.1" }
+reth-rpc-eth-types = { git = "https://github.com/raylsnetwork/reth", tag = "v1.11.0-rayls.1" }
+reth-tracing = { git = "https://github.com/raylsnetwork/reth", tag = "v1.11.0-rayls.1" }
+reth-provider = { git = "https://github.com/raylsnetwork/reth", tag = "v1.11.0-rayls.1", features = ["rocksdb"] }
+reth-tasks = { git = "https://github.com/raylsnetwork/reth", tag = "v1.11.0-rayls.1" }
+reth-transaction-pool = { git = "https://github.com/raylsnetwork/reth", tag = "v1.11.0-rayls.1" }
+reth-consensus = { git = "https://github.com/raylsnetwork/reth", tag = "v1.11.0-rayls.1" }
+reth-node-builder = { git = "https://github.com/raylsnetwork/reth", tag = "v1.11.0-rayls.1" }
+reth-node-core = { git = "https://github.com/raylsnetwork/reth", tag = "v1.11.0-rayls.1" }
+reth-node-ethereum = { git = "https://github.com/raylsnetwork/reth", tag = "v1.11.0-rayls.1" }
+reth-node-types = { git = "https://github.com/raylsnetwork/reth", tag = "v1.11.0-rayls.1" }
+reth-node-metrics = { git = "https://github.com/raylsnetwork/reth", tag = "v1.11.0-rayls.1" }
+reth-discv4 = { git = "https://github.com/raylsnetwork/reth", tag = "v1.11.0-rayls.1" }
+reth-eth-wire = { git = "https://github.com/raylsnetwork/reth", tag = "v1.11.0-rayls.1" }
+reth-cli-util = { git = "https://github.com/raylsnetwork/reth", tag = "v1.11.0-rayls.1" }
+reth-errors = { git = "https://github.com/raylsnetwork/reth", tag = "v1.11.0-rayls.1" }
+reth-libmdbx = { git = "https://github.com/raylsnetwork/reth", tag = "v1.11.0-rayls.1" }
+reth-nippy-jar = { git = "https://github.com/raylsnetwork/reth", tag = "v1.11.0-rayls.1" }
+reth-stages = { git = "https://github.com/raylsnetwork/reth", tag = "v1.11.0-rayls.1", features=["rocksdb"] }
+reth-downloaders = { git = "https://github.com/raylsnetwork/reth", tag = "v1.11.0-rayls.1" }
+reth-static-file = { git = "https://github.com/raylsnetwork/reth", tag = "v1.11.0-rayls.1" }
+reth-prune = { git = "https://github.com/raylsnetwork/reth", tag = "v1.11.0-rayls.1" }
+reth-prune-types = { git = "https://github.com/raylsnetwork/reth", tag = "v1.11.0-rayls.1" }
+reth-exex-types = { git = "https://github.com/raylsnetwork/reth", tag = "v1.11.0-rayls.1" }
+reth-stages-api = { git = "https://github.com/raylsnetwork/reth", tag = "v1.11.0-rayls.1" }
+reth-tokio-util = { git = "https://github.com/raylsnetwork/reth", tag = "v1.11.0-rayls.1" }
 
 # eth
 alloy = { version = "1.4.3", features = ["full"] }
