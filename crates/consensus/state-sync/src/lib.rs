@@ -749,11 +749,16 @@ async fn catch_up_consensus_from_to<DB: Database>(
             ConsensusHeader::digest_from_parts(parent_hash, &consensus_header.sub_dag, number);
         if last_parent != consensus_header.digest() {
             // `number` does not chain onto the header at `number - 1`. Held by-number replies are
-            // simply dropped with this return; a non-canonical cache row is removed to force a
-            // re-fetch. Never drop a canonical row: a mismatch there is a real fork (needs an
-            // operator restore), and removing history the walk cannot rebuild loses state silently.
+            // simply dropped with this return. Only when both sides are stored rows can the row at
+            // `number - 1` be the bad one: then a non-canonical cache row is removed to force a
+            // re-fetch. When a by-number reply is on either side, that reply is the suspect and
+            // the stored row stays. Never drop a canonical row: a mismatch there is a real fork
+            // (needs an operator restore), and removing history the walk cannot rebuild loses
+            // state silently.
             let poisoned_parent_number = number - 1;
-            if poisoned_parent_number > last_consensus_height
+            if !from_gap_fetch
+                && unproven.is_empty()
+                && poisoned_parent_number > last_consensus_height
                 && db
                     .get::<ConsensusBlocks>(&poisoned_parent_number)
                     .ok()
