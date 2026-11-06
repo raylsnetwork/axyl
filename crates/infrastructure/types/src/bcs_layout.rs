@@ -50,6 +50,13 @@ pub enum BcsLayoutError {
         /// Offending byte.
         byte: u8,
     },
+
+    /// A length-prefixed roaring bitmap payload did not deserialize.
+    #[error("invalid roaring bitmap in {type_name}")]
+    InvalidBitmap {
+        /// Source type for the error message.
+        type_name: &'static str,
+    },
 }
 
 /// Advance past the BCS encoding of `Self` without constructing it.
@@ -331,8 +338,16 @@ impl<A: BcsLayout, B: BcsLayout> BcsLayout for (A, B) {
 /// `String`, RoaringBitmap via `RoaringBitmapSerde`). Used by hand-written
 /// impls for types serialized as raw bytes.
 pub fn skip_bytes(c: &mut BcsCursor<'_>) -> Result<(), BcsLayoutError> {
+    take_bytes(c).map(drop)
+}
+
+/// Reads a length-prefixed byte blob, returning its payload span.
+///
+/// Companion to [`skip_bytes`], which delegates here: the two advance the cursor identically, so a
+/// projection that needs the bytes cannot drift from the skip that ignores them.
+pub fn take_bytes<'a>(c: &mut BcsCursor<'a>) -> Result<&'a [u8], BcsLayoutError> {
     let n = c.read_len()?;
-    c.take(n).map(drop)
+    c.take(n)
 }
 
 #[cfg(test)]
@@ -433,6 +448,32 @@ mod tests {
         let mut c = BcsCursor::new(&bytes);
         skip_bytes(&mut c).unwrap();
         assert!(c.is_empty());
+    }
+
+    /// `take_bytes` must return the payload *without* the ULEB128 length prefix, and must leave
+    /// the cursor exactly where `skip_bytes` would. A span that included the prefix, or an
+    /// off-by-one, would hand a corrupt roaring bitmap to the participation projection — which
+    /// feeds `state_root`, so the failure is a chain split rather than a wrong reward number.
+    #[test]
+    fn take_bytes_returns_payload_and_consumes_as_much_as_skip_bytes() {
+        // A multi-byte ULEB128 length (300 > 127) so a prefix-handling bug cannot hide.
+        for len in [0usize, 1, 200, 300] {
+            let v: Vec<u8> = (0..len).map(|i| i as u8).collect();
+            let bytes = enc(&v);
+
+            let mut taken = BcsCursor::new(&bytes);
+            let span = take_bytes(&mut taken).unwrap();
+            assert_eq!(span, &v[..], "payload mismatch at len {len}");
+            assert!(taken.is_empty(), "take_bytes left trailing input at len {len}");
+
+            let mut skipped = BcsCursor::new(&bytes);
+            skip_bytes(&mut skipped).unwrap();
+            assert_eq!(
+                taken.remaining(),
+                skipped.remaining(),
+                "take_bytes and skip_bytes diverged at len {len}",
+            );
+        }
     }
 
     #[test]

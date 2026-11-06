@@ -4,7 +4,7 @@
 //! of peers.
 
 use crate::{
-    bcs_layout::{skip_bytes, BcsCursor, BcsLayout, BcsLayoutError},
+    bcs_layout::{take_bytes, BcsCursor, BcsLayout, BcsLayoutError},
     crypto::{
         self, to_intent_message, BlsAggregateSignature, BlsPublicKey, BlsSignature,
         ValidatorAggregateSignature,
@@ -333,7 +333,13 @@ impl Certificate {
         self.signature_verification_state = state;
     }
 
-    /// The bitmap of authorities, in committee order, whose votes form the aggregate signature.
+    /// The bitmap of authorities whose votes form the aggregate signature.
+    ///
+    /// Indices address authorities **sorted by BLS public key** — [`crate::Committee::bls_keys`]
+    /// order, which is what [`Self::signed_by`] resolves against. It is NOT
+    /// `Committee::authorities()` order, which sorts by [`AuthorityIdentifier`]; resolving
+    /// against that one returns a plausible set of authorities rather than an error, so the
+    /// mistake is silent. See [`Self::skip_with_header_and_signers_span`].
     pub fn signed_authorities(&self) -> &roaring::RoaringBitmap {
         &self.signed_authorities
     }
@@ -381,11 +387,26 @@ impl Certificate {
     /// Skips one BCS-encoded certificate, returning the embedded header's byte span (the range
     /// [`Header::digest`] hashes, and therefore the certificate's digest preimage).
     pub fn skip_with_header_span<'a>(c: &mut BcsCursor<'a>) -> Result<&'a [u8], BcsLayoutError> {
+        Self::skip_with_header_and_signers_span(c).map(|(header, _)| header)
+    }
+
+    /// Skips one BCS-encoded certificate, returning the embedded header's byte span and the
+    /// `signed_authorities` roaring-bitmap payload.
+    ///
+    /// The single canonical walk over a certificate; [`Self::skip_with_header_span`] and
+    /// [`BcsLayout::skip`] both delegate here, so a field added to `Certificate` updates every
+    /// caller at once. The bitmap indexes authorities **sorted by BLS public key** — the order
+    /// [`Certificate::new_unverified`] enumerates when building it, and the order
+    /// [`crate::Committee::bls_keys`] returns. It is NOT `Committee::authorities()` order, which
+    /// sorts by [`AuthorityIdentifier`]; resolving against that one silently yields a permutation.
+    pub fn skip_with_header_and_signers_span<'a>(
+        c: &mut BcsCursor<'a>,
+    ) -> Result<(&'a [u8], &'a [u8]), BcsLayoutError> {
         let header = c.take_span::<Header>()?;
         c.skip::<SignatureVerificationState>()?;
-        skip_bytes(c)?;
+        let signers = take_bytes(c)?;
         c.skip::<TimestampSec>()?;
-        Ok(header)
+        Ok((header, signers))
     }
 }
 
@@ -578,6 +599,60 @@ mod tests {
             signature_verification_state: state,
             signed_authorities: roaring::RoaringBitmap::from_iter([0u32, 1, 2]),
             created_at: 1000,
+        }
+    }
+
+    /// Pins the canonical certificate walk: it must consume exactly one encoded certificate and
+    /// hand back a `signed_authorities` span that deserializes to the original bitmap.
+    ///
+    /// Both spans feed the participation projection behind `tally_hybrid`, which feeds
+    /// `state_root` and `withdrawals_root` — a walk that under- or over-consumes desyncs every
+    /// following certificate in the sub-dag and splits the chain rather than mis-paying a
+    /// validator. Run across every `SignatureVerificationState` because the variants have
+    /// different encoded widths (`Genesis` carries no signature), so a mis-skip of that field
+    /// shows up on some variants and not others.
+    #[test]
+    #[allow(deprecated)]
+    fn skip_with_header_and_signers_span_consumes_exactly_one_certificate() {
+        use crate::bcs_layout::BcsCursor;
+
+        let sig = BlsSignature::default();
+        let variants = [
+            ("Unsigned", SignatureVerificationState::Unsigned(sig)),
+            ("Unverified", SignatureVerificationState::Unverified(sig)),
+            ("VerifiedDirectly", SignatureVerificationState::VerifiedDirectly(sig)),
+            ("VerifiedIndirectly", SignatureVerificationState::VerifiedIndirectly(sig)),
+            ("Genesis", SignatureVerificationState::Genesis),
+        ];
+
+        for (name, state) in variants {
+            let cert = make_test_certificate(state);
+            let bytes: Vec<u8> = (&cert).into();
+
+            let mut c = BcsCursor::new(&bytes);
+            let (header_span, signers_span) =
+                Certificate::skip_with_header_and_signers_span(&mut c).unwrap();
+            assert!(c.is_empty(), "{name}: walk did not consume the whole certificate");
+
+            let signers = roaring::RoaringBitmap::deserialize_from(signers_span)
+                .unwrap_or_else(|e| panic!("{name}: signers span is not a roaring bitmap: {e}"));
+            assert_eq!(signers, *cert.signed_authorities(), "{name}: signer set mismatch");
+
+            // The header span is the digest preimage, so it must hash to the same digest the
+            // fully-decoded certificate reports.
+            let header: Header = crate::decode(header_span);
+            assert_eq!(header.digest(), cert.header().digest(), "{name}: header span mismatch");
+
+            // Two certificates back to back: the second only decodes correctly if the first
+            // consumed its exact width, which is the property the sub-dag walk relies on.
+            let mut pair = bytes.clone();
+            pair.extend_from_slice(&bytes);
+            let mut c = BcsCursor::new(&pair);
+            Certificate::skip_with_header_and_signers_span(&mut c).unwrap();
+            let (_, second_signers) =
+                Certificate::skip_with_header_and_signers_span(&mut c).unwrap();
+            assert!(c.is_empty(), "{name}: second certificate left trailing bytes");
+            assert_eq!(second_signers, signers_span, "{name}: second certificate desynced");
         }
     }
 
