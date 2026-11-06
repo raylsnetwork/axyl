@@ -37,7 +37,10 @@ updates:
       include: scope
     groups:
       # Group reth-* into one PR — they always need to move together
-      # because we depend on them with a shared `tag = "v1.11.0"` pin.
+      # because we depend on them with a shared tag pin. The pin currently
+      # points at our fork (`raylsnetwork/reth`, tag `v1.11.0-rayls.1`), so
+      # Dependabot cannot track upstream reth; bumps are manual (see the reth
+      # block in Cargo.toml).
       reth:
         patterns:
           - "reth*"

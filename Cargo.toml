@@ -110,6 +110,15 @@ secp256k1 = { version = "0.31", default-features = false, features = [
 rpassword = "7.5.4"
 
 # execution
+#
+# reth is pinned to our fork, not upstream: `v1.11.0-rayls.1` is upstream
+# `v1.11.0` plus the backport of paradigmxyz/reth#28264 (trie iterator seek
+# boundary: `key == &seek_prefix` in crates/trie/trie/src/node_iter.rs). The
+# incremental state-root walk in v1.11.0 can skip a newly inserted leaf and
+# seal a wrong root; upstream only fixed it in v2.10.0. Every reth crate must
+# come from the same source. Go back to `paradigmxyz/reth` once we move to
+# reth >= v2.10.0. `etc/state-sum` and `crates/testing/fuzz-targets` have
+# their own lockfiles and must be switched together with this block.
 reth = { git = "https://github.com/raylsnetwork/reth", tag = "v1.11.0-rayls.1" }
 reth-primitives = { git = "https://github.com/raylsnetwork/reth", tag = "v1.11.0-rayls.1" }
 reth-primitives-traits = { git = "https://github.com/raylsnetwork/reth", tag = "v1.11.0-rayls.1" }
