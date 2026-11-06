@@ -5,50 +5,16 @@
 //! author up in its own committee to pay block rewards. An author outside that committee is a
 //! fatal `UnexpectedAuthority`, which panics the subscriber task.
 
-use rand::{rngs::StdRng, SeedableRng as _};
-use rayls_consensus_network::types::{MessageId, NetworkCommand};
-use rayls_consensus_primary::{network::PrimaryNetworkHandle, ConsensusBus, NodeMode};
-use rayls_infrastructure_config::ConsensusConfig;
-use rayls_infrastructure_network_types::MockPrimaryToWorkerClient;
+use super::committee_change::{batches, committees, send_until_taken, spawn, WAIT};
+use rayls_consensus_primary::{ConsensusBus, NodeMode};
 use rayls_infrastructure_storage::mem_db::MemDatabase;
 use rayls_infrastructure_types::{
-    now, test_chain_spec_arc, AuthorityIdentifier, B256Map, Batch, Certificate, CommittedSubDag,
-    ConsensusHeader, ConsensusOutput, Epoch, HeaderBuilder, Notifier, RaylsReceiver,
-    RaylsSender as _, ReputationScores, Round, TaskManager, B256,
+    now, AuthorityIdentifier, Batch, Certificate, CommittedSubDag, ConsensusHeader,
+    ConsensusOutput, Epoch, HeaderBuilder, Notifier, RaylsReceiver, RaylsSender as _,
+    ReputationScores, Round, B256,
 };
-use rayls_middleware_bridge::subscriber::spawn_subscriber;
 use rayls_testing_test_utils::CommitteeFixture;
-use std::{collections::BTreeSet, num::NonZeroUsize, sync::Arc, time::Duration};
-use tokio::{sync::mpsc, time::timeout};
-
-/// Seed shared by both fixtures, so the epoch-1 committee keeps the four epoch-0 validators.
-const SEED: u64 = 0x5eed;
-
-/// How long the subscriber gets to take a commit or to stop.
-const WAIT: Duration = Duration::from_secs(10);
-
-fn committees(
-) -> (CommitteeFixture<MemDatabase>, CommitteeFixture<MemDatabase>, AuthorityIdentifier) {
-    let before = CommitteeFixture::builder(MemDatabase::default)
-        .epoch(0)
-        .with_rng(StdRng::seed_from_u64(SEED))
-        .build();
-    let after = CommitteeFixture::builder(MemDatabase::default)
-        .committee_size(NonZeroUsize::new(5).expect("non-zero"))
-        .epoch(1)
-        .with_rng(StdRng::seed_from_u64(SEED))
-        .build();
-    let old_members: BTreeSet<_> = before.authorities().map(|a| a.id()).collect();
-    let kept = after.authorities().filter(|a| old_members.contains(&a.id())).count();
-    assert_eq!(kept, 4, "the epoch-1 committee must keep the four epoch-0 validators");
-    let joined = after
-        .authorities()
-        .find(|a| !old_members.contains(&a.id()))
-        .expect("one validator joined in epoch 1")
-        .id();
-    assert!(before.committee().authority(&joined).is_none());
-    (before, after, joined)
-}
+use tokio::time::timeout;
 
 /// An epoch-0 leader certificate by `author` at `round`, carrying `batch`.
 fn leader(
@@ -117,69 +83,6 @@ fn selfless_joined_cert(
     Certificate::new_unverified(&before.committee(), header, votes).expect("quorum")
 }
 
-fn batches(count: usize) -> Vec<Batch> {
-    (0..count).map(|_| rayls_execution_evm::test_utils::batch(test_chain_spec_arc())).collect()
-}
-
-fn spawn(
-    config: &ConsensusConfig<MemDatabase>,
-    mode: NodeMode,
-    batches: &[Batch],
-    consensus_bus: &ConsensusBus,
-) -> TaskManager {
-    let mut served = B256Map::default();
-    for batch in batches {
-        served.insert(batch.digest(), batch.clone());
-    }
-    config.local_network().set_primary_to_worker_local_handler(Arc::new(
-        MockPrimaryToWorkerClient { batches: served },
-    ));
-    let (tx, mut rx) = mpsc::channel(5);
-    tokio::spawn(async move {
-        while let Some(com) = rx.recv().await {
-            if let NetworkCommand::Publish { topic: _, msg: _, reply } = com {
-                let _ = reply.send(Ok(MessageId::new(&[0])));
-            }
-        }
-    });
-    let network = PrimaryNetworkHandle::new_for_test(tx);
-    consensus_bus.node_mode().send_replace(mode);
-    let mut task_manager = TaskManager::new("mixed-epoch-cert-test");
-    task_manager.set_join_wait(0);
-    let (to_engine, _engine_rx) = mpsc::channel(100);
-    spawn_subscriber(
-        config.clone(),
-        config.shutdown().subscribe(),
-        consensus_bus.clone(),
-        &task_manager,
-        network,
-        to_engine,
-        tokio::sync::watch::channel(()).0,
-    );
-    task_manager
-}
-
-async fn send_until_taken(
-    consensus_bus: &ConsensusBus,
-    outputs: &mut impl RaylsReceiver<ConsensusOutput>,
-    headers: Vec<ConsensusHeader>,
-) -> eyre::Result<ConsensusOutput> {
-    let streamer_bus = consensus_bus.clone();
-    let streamer = tokio::spawn(async move {
-        loop {
-            for header in &headers {
-                let _ = streamer_bus.consensus_header().send(header.clone()).await;
-            }
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-    });
-    let taken = timeout(WAIT, outputs.recv()).await;
-    streamer.abort();
-    taken
-        .map_err(|_| eyre::eyre!("no commit was taken in time"))?
-        .ok_or_else(|| eyre::eyre!("consensus output channel closed"))
-}
-
 /// Sends commit 1 (control) then commit 2 carrying `extra`, and reports whether the subscriber
 /// task stopped (crashed) or took a commit 2.
 async fn run(mode: NodeMode, extra: Certificate) -> eyre::Result<Result<ConsensusOutput, String>> {
@@ -238,7 +141,7 @@ async fn honest_joined_cert_is_rejected_not_fatal() -> eyre::Result<()> {
 /// quorum of the epoch-0 keys. Its author is outside that committee, so it must be rejected at
 /// verification rather than stop the follower's subscriber fatally on the author lookup.
 #[tokio::test]
-async fn selfless_joined_cert_crashes_follower() -> eyre::Result<()> {
+async fn selfless_joined_cert_does_not_crash_follower() -> eyre::Result<()> {
     for mode in [NodeMode::Observer, NodeMode::CvvInactive] {
         let (before, after, joined) = committees();
         let cert = selfless_joined_cert(&before, &after, &joined);
