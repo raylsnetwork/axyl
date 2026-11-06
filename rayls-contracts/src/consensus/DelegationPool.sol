@@ -759,6 +759,43 @@ contract DelegationPool is
     }
 
     /// @inheritdoc IDelegationPool
+    function getSelfDelegatedStake(
+        address validatorAddress
+    ) external view override returns (uint256) {
+        return _getSelfDelegatedStake(validatorAddress);
+    }
+
+    /// @inheritdoc IDelegationPool
+    function getDelegationComposition(
+        address validatorAddress
+    ) external view override returns (
+        uint256 selfDelegated,
+        uint256 thirdPartyDelegated,
+        uint256 totalDelegated
+    ) {
+        ValidatorPool storage pool = _getDelegationPoolStorage().validatorPools[validatorAddress];
+        totalDelegated = pool.totalDelegated + pool.openTierDelegated;
+        selfDelegated = _getSelfDelegatedStake(validatorAddress);
+        // Saturating: `selfDelegated` is settled to its post-slash value with the per-position
+        // ceiling rounding, while `totalDelegated` carries the pool's un-rounded figure. The two
+        // can disagree by dust after a slash, and an underflow revert here would take out a
+        // reporting view over an amount nobody can spend.
+        thirdPartyDelegated = totalDelegated > selfDelegated
+            ? totalDelegated - selfDelegated
+            : 0;
+    }
+
+    /// @dev Validator's own effective position in its own pool. Shares `_getEffectivePosition`
+    ///      with every other position read, so self-stake settles on exactly the same slash and
+    ///      reward arithmetic as third-party stake rather than a parallel copy of it.
+    function _getSelfDelegatedStake(
+        address validatorAddress
+    ) internal view returns (uint256) {
+        (uint256 effectiveAmount, ) = _getEffectivePosition(validatorAddress, validatorAddress);
+        return effectiveAmount;
+    }
+
+    /// @inheritdoc IDelegationPool
     function getPendingRewards(
         address validatorAddress,
         address delegator
