@@ -1,7 +1,7 @@
 use crate::{
-    catch_up_consensus_from_to, certified_consensus_checkpoint, consensus_chain_tip,
-    get_missing_consensus, highest_executed_anchor, prime_consensus, save_consensus,
-    stream_missing_consensus,
+    attempt_catch_up, catch_up_consensus_from_to, certified_consensus_checkpoint,
+    consensus_chain_tip, get_missing_consensus, highest_executed_anchor, prime_consensus,
+    save_consensus, store_consensus_header_in_cache, stream_missing_consensus, MAX_UNPROVEN_GAP,
 };
 use rayls_consensus_primary::{
     network::{
@@ -9,6 +9,7 @@ use rayls_consensus_primary::{
     },
     ConsensusBus, WaitForExecutionError,
 };
+use rayls_infrastructure_config::ConsensusConfig;
 use rayls_infrastructure_storage::{
     mem_db::MemDatabase,
     tables::{ConsensusBlockNumbersByDigest, ConsensusBlocks, ConsensusBlocksCache},
@@ -20,7 +21,14 @@ use rayls_infrastructure_types::{
     SealedHeader, B256,
 };
 use rayls_testing_test_utils_committee::CommitteeFixture;
-use std::{collections::BTreeMap, num::NonZeroUsize, sync::Arc};
+use std::{
+    collections::BTreeMap,
+    num::NonZeroUsize,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
+};
 
 /// A network handle with a dropped receiver: every fetch fails fast. Used where catch-up
 /// must resolve everything from the local DB and must never block on a peer.
@@ -34,12 +42,22 @@ fn no_peer_network() -> PrimaryNetworkHandle {
 /// `SendRequestAny` `ConsensusHeader { number, .. }` requests like a peer's
 /// `get_header_by_number`. A number absent from the map yields an `RPCError`.
 fn serving_network(headers: BTreeMap<u64, ConsensusHeader>) -> PrimaryNetworkHandle {
+    counting_serving_network(headers).0
+}
+
+/// [`serving_network`] that also counts the consensus-header requests it receives.
+fn counting_serving_network(
+    headers: BTreeMap<u64, ConsensusHeader>,
+) -> (PrimaryNetworkHandle, Arc<AtomicUsize>) {
+    let requests = Arc::new(AtomicUsize::new(0));
+    let counter = requests.clone();
     let (tx, mut rx) =
         tokio::sync::mpsc::channel::<NetworkCommand<PrimaryRequest, PrimaryResponse>>(64);
     tokio::spawn(async move {
         while let Some(cmd) = rx.recv().await {
             let NetworkCommand::SendRequestAny { request, reply } = cmd else { continue };
             let PrimaryRequest::ConsensusHeader { number, .. } = request else { continue };
+            counter.fetch_add(1, Ordering::Relaxed);
             let response = match number.and_then(|n| headers.get(&n)) {
                 Some(header) => Ok(PrimaryResponse::ConsensusHeader(Arc::new(header.clone()))),
                 None => Err(NetworkError::RPCError("no such header".to_string())),
@@ -47,7 +65,7 @@ fn serving_network(headers: BTreeMap<u64, ConsensusHeader>) -> PrimaryNetworkHan
             let _ = reply.send(response);
         }
     });
-    PrimaryNetworkHandle::new_for_test(tx)
+    (PrimaryNetworkHandle::new_for_test(tx), requests)
 }
 
 fn create_consensus_header_at_number(
@@ -561,7 +579,7 @@ async fn test_catch_up_fills_gap_by_number_when_db_is_empty() {
 
 /// Regression: a mis-chained by-number gap fetch must NOT be cached before the digest-chain guard
 /// runs (the fetch only checks the number). Caching earlier poisons the row, so every retry
-/// re-reads it and re-fails the guard, wedging catch-up at that number.
+/// re-reads it and re-fails the guard, stalling catch-up at that number.
 #[tokio::test]
 async fn test_gap_fetch_does_not_cache_mischained_header() {
     let fixture = CommitteeFixture::builder(MemDatabase::default)
@@ -655,7 +673,7 @@ async fn test_catch_up_mismatch_preserves_canonical_block() {
 
 /// Regression: a byzantine gap fetch can return a header with correct parent_hash/number but a
 /// fabricated sub_dag, which caches then fails to link to the real successor. Without dropping the
-/// poisoned non-canonical row on mismatch, every retry re-reads it and wedges forward catch-up.
+/// poisoned non-canonical row on mismatch, every retry re-reads it and stalls forward catch-up.
 #[tokio::test]
 async fn test_catch_up_drops_poisoned_gap_row_and_recovers() {
     let fixture = CommitteeFixture::builder(MemDatabase::default)
@@ -710,7 +728,7 @@ async fn test_catch_up_drops_poisoned_gap_row_and_recovers() {
     // broken code it stays cached and every retry re-reads it.
     assert!(
         db.get_consensus_by_number(101).is_none(),
-        "poisoned gap cache row must be dropped on the mismatch, not left to wedge every retry"
+        "poisoned gap cache row must be dropped on the mismatch, not left to stall every retry"
     );
 
     // Pass 2: an honest peer now serves the real 101; catch-up must reach the target. On the broken
@@ -771,8 +789,8 @@ async fn test_catch_up_from_to_halts_on_prior_epoch_leak() {
     );
 }
 
-/// A closed-epoch leak wedged in the DB blocks the *legitimate* current-epoch headers stacked above
-/// it: catch-up halts at the leak and refuses to stream 102..=105 even though those are valid
+/// A closed-epoch leak stalled in the DB blocks the *legitimate* current-epoch headers stacked
+/// above it: catch-up halts at the leak and refuses to stream 102..=105 even though those are valid
 /// epoch-1 outputs. This is deliberate -- executing past an unresolved leak forks the chain -- and
 /// the node self-heals once the backwards walk overwrites the leaked row. Documents that the guard
 /// gates on the *first* leak in the range, not only on a leak that is itself the catch-up target.
@@ -954,4 +972,437 @@ async fn test_wait_for_execution_bounded_tolerates_slow_progress() {
         cb.wait_for_execution_bounded(target, idle).await.is_ok(),
         "steady progress under the idle bound must return Ok"
     );
+}
+
+/// The four-validator fixture the catch-up tests below run on.
+fn catch_up_fixture() -> CommitteeFixture<MemDatabase> {
+    CommitteeFixture::builder(MemDatabase::default)
+        .randomize_ports(true)
+        .committee_size(NonZeroUsize::new(4).unwrap())
+        .build()
+}
+
+/// Stores `header` as an executed consensus block, like the streamer's anchor.
+fn store_executed<DB: Database>(db: &DB, header: &ConsensusHeader) {
+    db.with_write_txn(|txn| {
+        txn.insert::<ConsensusBlocks>(&header.number, header)?;
+        txn.insert::<ConsensusBlockNumbersByDigest>(&header.digest(), &header.number)?;
+        Ok(())
+    })
+    .unwrap();
+}
+
+/// A header at `number` with a real parent link and a made-up sub-dag, as a bad peer serves it.
+/// Its leader's `latest_execution_block` is the default, so the execution gate passes.
+fn fabricated_header(number: u64, parent_hash: B256) -> ConsensusHeader {
+    let mut fake_leader = Certificate::default();
+    fake_leader.header.created_at = 123_456;
+    let sub_dag = CommittedSubDag::new(vec![], fake_leader, 0, ReputationScores::default(), None);
+    ConsensusHeader { parent_hash, sub_dag, number, extra: B256::default() }
+}
+
+/// Retries catch-up against `network` up to five times, as the streamer does, and returns the
+/// target if it is still pending.
+async fn retry_catch_up<DB: Database>(
+    config: &ConsensusConfig<DB>,
+    cb: &ConsensusBus,
+    network: &PrimaryNetworkHandle,
+    last_header: &mut ConsensusHeader,
+    last_height: &mut u64,
+    target: ConsensusHeader,
+) -> Option<ConsensusHeader> {
+    let mut pending = Some(target);
+    for _ in 0..5 {
+        let Some(t) = pending.clone() else { break };
+        pending =
+            attempt_catch_up(config, cb, network, last_header, last_height, t, "test retry").await;
+    }
+    pending
+}
+
+/// A by-number gap fetch is checked only on number, so a byzantine peer can serve a header at N
+/// with the real parent_hash and a fabricated sub_dag. If the next number then cannot be fetched,
+/// the call returns Ok(fake) and `attempt_catch_up` promotes the fake to the in-memory anchor.
+/// From then on every retry fails the digest guard at N+1, and the poison-clear guard skips N
+/// because N is the anchor (`poisoned_parent_number > last_consensus_height` is false). The
+/// streamer must recover once honest peers serve the real chain; on main it stays stalled at N.
+#[tokio::test]
+async fn test_forward_streamer_does_not_stall_on_gap_fetch_fake() {
+    let fixture = catch_up_fixture();
+    let primary = fixture.authorities().next().unwrap();
+    let config = primary.consensus_config();
+    let db = config.node_storage();
+    let committee = fixture.committee();
+
+    // Canonical executed anchor at 100 and the honest chain 101 -> 102 -> 103.
+    let anchor = chained_header(100, B256::default(), &committee);
+    store_executed(db, &anchor);
+    let real_101 = chained_header(101, anchor.digest(), &committee);
+    let real_102 = chained_header(102, real_101.digest(), &committee);
+    let target = chained_header(103, real_102.digest(), &committee);
+
+    // Fake 101: real parent link and number, fabricated sub_dag. Its leader's
+    // latest_execution_block is the default (0, 0x0), below the seeded window, so the execution
+    // gate passes.
+    let fake_101 = fabricated_header(101, anchor.digest());
+    assert_ne!(fake_101.digest(), real_101.digest(), "precondition: fake diverges");
+
+    let cb = ConsensusBus::new();
+    seed_recently_executed_blocks(&cb);
+    let mut rx = cb.consensus_header().subscribe();
+
+    // Streamer state as `spawn_stream_consensus_headers` seeds it (lib.rs:507-508).
+    let mut last_header = anchor.clone();
+    let mut last_height = anchor.number;
+
+    // Pass 1: the byzantine peer answers 101; nobody answers 102 (all 3 attempts fail).
+    let byzantine = serving_network(BTreeMap::from([(101u64, fake_101.clone())]));
+    let pending = attempt_catch_up(
+        &config,
+        &cb,
+        &byzantine,
+        &mut last_header,
+        &mut last_height,
+        target.clone(),
+        "test",
+    )
+    .await;
+    assert!(pending.is_some(), "incomplete catch-up keeps the target pending");
+    // On main the fake became the in-memory anchor here. It must stay held: never promoted to the
+    // anchor and never forwarded, since nothing trusted has linked onto it.
+    assert_eq!(last_height, 100, "an unproven by-number reply must not become the anchor");
+    assert_eq!(last_header.digest(), anchor.digest());
+    assert!(rx.try_recv().is_err(), "an unproven by-number reply must not be forwarded");
+
+    // Passes 2..: honest peers now serve the real 101 and 102. A correct streamer recovers.
+    let honest =
+        serving_network(BTreeMap::from([(101u64, real_101.clone()), (102u64, real_102.clone())]));
+    let pending =
+        retry_catch_up(&config, &cb, &honest, &mut last_header, &mut last_height, target.clone())
+            .await;
+    // FAILS on main: last_height stays 101, last_header stays fake_101, pending stays Some.
+    assert_eq!(
+        last_height, 103,
+        "forward streamer must recover from a gap-fetched fake once honest peers serve the chain"
+    );
+    assert_eq!(last_header.digest(), target.digest());
+    assert!(pending.is_none());
+}
+
+/// Same stall, but the byzantine peer controls both gap fetches and no honest fetch has to fail:
+/// it answers N with a parent-linked fake and N+1 with any header whose leader_epoch < epoch.
+/// The epoch halt (lib.rs:703) runs before the digest guard and returns Ok(fake N).
+#[tokio::test]
+async fn test_forward_streamer_does_not_stall_via_closed_epoch_reply_after_fake() {
+    let fixture = CommitteeFixture::builder(MemDatabase::default)
+        .randomize_ports(true)
+        .committee_size(NonZeroUsize::new(4).unwrap())
+        .epoch(1)
+        .build();
+    let primary = fixture.authorities().next().unwrap();
+    let config = primary.consensus_config();
+
+    let anchor = header_for_epoch(100, 1, 5_000);
+    let mut real_101 = header_for_epoch(101, 1, 5_001);
+    real_101.parent_hash = anchor.digest();
+    let mut real_102 = header_for_epoch(102, 1, 5_002);
+    real_102.parent_hash = real_101.digest();
+    let mut target = header_for_epoch(103, 1, 5_003);
+    target.parent_hash = real_102.digest();
+
+    let mut fake_101 = header_for_epoch(101, 1, 999_999);
+    fake_101.parent_hash = anchor.digest();
+    let closed_epoch_102 = header_for_epoch(102, 0, 1); // unchained; never digest-checked
+
+    let cb = ConsensusBus::new();
+    seed_recently_executed_blocks(&cb);
+    let _rx = cb.consensus_header().subscribe();
+    let mut last_header = anchor.clone();
+    let mut last_height = anchor.number;
+
+    let byzantine =
+        serving_network(BTreeMap::from([(101u64, fake_101.clone()), (102u64, closed_epoch_102)]));
+    let _ = attempt_catch_up(
+        &config,
+        &cb,
+        &byzantine,
+        &mut last_header,
+        &mut last_height,
+        target.clone(),
+        "test",
+    )
+    .await;
+    // On main the epoch halt promoted the fake here; it must stay held instead.
+    assert_eq!(
+        last_header.digest(),
+        anchor.digest(),
+        "fake must not be promoted via the epoch halt"
+    );
+
+    let honest = serving_network(BTreeMap::from([(101u64, real_101), (102u64, real_102)]));
+    let _ = retry_catch_up(&config, &cb, &honest, &mut last_header, &mut last_height, target).await;
+    // FAILS on main: stalled at 101.
+    assert_eq!(last_height, 103, "streamer must not stay anchored on a fake gap-fetched header");
+}
+
+/// A gap-fetched header can carry a REAL, quorum-signed leader with a tampered, unsigned field
+/// (commit_timestamp; the certificate list works too). It passes the streamer's digest guard,
+/// the execution gate, and the subscriber's BLS re-verify (`verify_header_with_keys`), yet its
+/// digest differs from the canonical header. The streamer forwards it before it ever checks N+1,
+/// so the subscriber would execute it. A non-canonical header must never be forwarded.
+#[tokio::test]
+async fn test_gap_fetch_does_not_forward_bls_valid_tampered_subdag() {
+    let fixture = catch_up_fixture();
+    let primary = fixture.authorities().next().unwrap();
+    let config = primary.consensus_config();
+    let db = config.node_storage();
+    let committee = fixture.committee();
+
+    let anchor = chained_header(100, B256::default(), &committee);
+    store_executed(db, &anchor);
+
+    // Real, quorum-signed leader certificate (3 of 4 votes).
+    let signed_leader = fixture.certificate(&fixture.header_from_last_authority());
+    let real_sub_dag =
+        CommittedSubDag::new(vec![], signed_leader.clone(), 0, ReputationScores::default(), None);
+    let real_101 = ConsensusHeader {
+        parent_hash: anchor.digest(),
+        sub_dag: real_sub_dag,
+        number: 101,
+        extra: B256::default(),
+    };
+    let target = chained_header(102, real_101.digest(), &committee);
+
+    // Tamper only commit_timestamp (private, set via `previous_sub_dag`: max(prev, leader)).
+    let later = header_for_epoch(0, 0, *signed_leader.header().created_at() + 1_000_000);
+    let tampered_sub_dag = CommittedSubDag::new(
+        vec![],
+        signed_leader,
+        0,
+        ReputationScores::default(),
+        Some(&later.sub_dag),
+    );
+    let tampered_101 = ConsensusHeader { sub_dag: tampered_sub_dag, ..real_101.clone() };
+    assert_ne!(tampered_101.digest(), real_101.digest(), "precondition: non-canonical");
+    // Precondition (holds on main): the subscriber's re-verify accepts it.
+    tampered_101
+        .clone()
+        .verify_header_with_keys(&committee.bls_keys())
+        .expect("tampered header carries a valid quorum-signed leader");
+
+    let cb = ConsensusBus::new();
+    seed_recently_executed_blocks(&cb);
+    let mut rx = cb.consensus_header().subscribe();
+
+    let byzantine = serving_network(BTreeMap::from([(101u64, tampered_101.clone())]));
+    let _ = catch_up_consensus_from_to(&config, &cb, &byzantine, anchor, target).await;
+
+    let mut forwarded = Vec::new();
+    while let Ok(h) = rx.try_recv() {
+        forwarded.push(h.digest());
+    }
+    // FAILS on main: tampered_101 was forwarded before the mismatch at 102 was seen.
+    assert!(
+        !forwarded.contains(&tampered_101.digest()),
+        "a gap-fetched header not proven canonical must not be forwarded for execution"
+    );
+}
+
+/// A by-number reply can only be proven by a trusted header linking onto it, so the streamer must
+/// not fetch a gap with no trusted header within reach above it (it would hold replies it cannot
+/// prove). Once the backwards walk caches a header within reach, the gap fills and streams.
+#[tokio::test]
+async fn test_catch_up_waits_for_walk_when_gap_out_of_reach() {
+    let fixture = catch_up_fixture();
+    let primary = fixture.authorities().next().unwrap();
+    let config = primary.consensus_config();
+    let db = config.node_storage();
+    let committee = fixture.committee();
+
+    let n = 100u64;
+    let m = n + MAX_UNPROVEN_GAP + 2;
+    let anchor = chained_header(n, B256::default(), &committee);
+    store_executed(db, &anchor);
+    let mut chain: BTreeMap<u64, ConsensusHeader> = BTreeMap::new();
+    let mut parent = anchor.digest();
+    for number in n + 1..=m {
+        let header = chained_header(number, parent, &committee);
+        parent = header.digest();
+        chain.insert(number, header);
+    }
+    let target = chain[&m].clone();
+    let (net, requests) = counting_serving_network(chain.clone());
+
+    let cb = ConsensusBus::new();
+    seed_recently_executed_blocks(&cb);
+    let mut rx = cb.consensus_header().subscribe();
+
+    // Nothing trusted within reach of 101: return at the anchor without streaming anything.
+    let first = catch_up_consensus_from_to(&config, &cb, &net, anchor.clone(), target.clone())
+        .await
+        .expect("an out-of-reach gap waits for the walk, it is not an error");
+    assert_eq!(first.number, n);
+    assert!(rx.try_recv().is_err(), "nothing may stream before a trusted header is in reach");
+    assert!(db.get_consensus_by_number(n + 1).is_none(), "no unproven reply may be cached");
+    assert_eq!(requests.load(Ordering::Relaxed), 0, "no by-number fetch for a gap it cannot prove");
+
+    // The walk caches a header within reach; the gap below it is proven and the rest follows.
+    store_consensus_header_in_cache(db, &chain[&(n + MAX_UNPROVEN_GAP / 2)]);
+    let second = catch_up_consensus_from_to(&config, &cb, &net, anchor, target)
+        .await
+        .expect("catch-up must fill the gap once a trusted header is in reach");
+    assert_eq!(second.number, m);
+    let mut streamed = Vec::new();
+    while let Ok(header) = rx.try_recv() {
+        streamed.push(header.number);
+    }
+    assert_eq!(streamed, (n + 1..=m).collect::<Vec<_>>());
+}
+
+/// A bad by-number reply fails a link: either the trusted header above it does not link onto it,
+/// or it does not link onto the stored row below it. The headers this call already proved and
+/// streamed must stay as the new anchor, so a peer that answers some numbers with bad headers
+/// cannot send every retry back to the same anchor. The stored row below a bad reply is good and
+/// must not be cleared.
+#[tokio::test]
+async fn test_catch_up_keeps_proven_progress_on_mismatch() {
+    let fixture = catch_up_fixture();
+    let primary = fixture.authorities().next().unwrap();
+    let config = primary.consensus_config();
+    let db = config.node_storage();
+    let committee = fixture.committee();
+
+    let anchor = chained_header(100, B256::default(), &committee);
+    store_executed(db, &anchor);
+    // Real chain 101..=110. The walk has cached the even numbers; the odd ones are fetched by
+    // number.
+    let mut chain: BTreeMap<u64, ConsensusHeader> = BTreeMap::new();
+    let mut parent = anchor.digest();
+    for number in 101..=110u64 {
+        let header = chained_header(number, parent, &committee);
+        parent = header.digest();
+        if number % 2 == 0 {
+            store_consensus_header_in_cache(db, &header);
+        }
+        chain.insert(number, header);
+    }
+    let target = chain[&110].clone();
+
+    let cb = ConsensusBus::new();
+    seed_recently_executed_blocks(&cb);
+    let _rx = cb.consensus_header().subscribe();
+    let mut last_header = anchor.clone();
+    let mut last_height = anchor.number;
+
+    // Two bad replies, each with a made-up sub_dag. The one at 105 has the real parent link, so
+    // the stored row 106 fails to link onto it. The one at 107 does not link onto the stored row
+    // 106 streamed in the same pass. Either way the headers proven before the reply become the
+    // anchor, and the stored row below the reply is good and must stay.
+    let bad_replies = [
+        (fabricated_header(105, chain[&104].digest()), 104u64),
+        (fabricated_header(107, B256::repeat_byte(0xab)), 106u64),
+    ];
+    for (bad, proven) in bad_replies {
+        let mut served = chain.clone();
+        served.insert(bad.number, bad);
+        let pending = attempt_catch_up(
+            &config,
+            &cb,
+            &serving_network(served),
+            &mut last_header,
+            &mut last_height,
+            target.clone(),
+            "test",
+        )
+        .await;
+        assert!(pending.is_some(), "the bad reply keeps the target pending");
+        assert_eq!(last_height, proven, "headers proven before the bad reply become the anchor");
+        assert_eq!(last_header.digest(), chain[&proven].digest());
+        assert!(db.get::<ConsensusBlocksCache>(&proven).unwrap().is_some(), "good row must stay");
+        assert_eq!(
+            db.get::<ConsensusBlockNumbersByDigest>(&chain[&proven].digest()).unwrap(),
+            Some(proven),
+            "the digest index of the good row must stay"
+        );
+    }
+
+    let pending = attempt_catch_up(
+        &config,
+        &cb,
+        &serving_network(chain),
+        &mut last_header,
+        &mut last_height,
+        target.clone(),
+        "test retry",
+    )
+    .await;
+    assert!(pending.is_none());
+    assert_eq!(last_height, 110);
+}
+
+/// When both sides of a failed link are stored rows, the row below the link may be the bad one
+/// (a stale row from another fork). The anchor must not advance onto it, so the row is cleared and
+/// a later pass can replace it, even when headers below it were already streamed.
+#[tokio::test]
+async fn test_catch_up_does_not_anchor_on_stale_stored_row() {
+    let fixture = catch_up_fixture();
+    let primary = fixture.authorities().next().unwrap();
+    let config = primary.consensus_config();
+    let db = config.node_storage();
+    let committee = fixture.committee();
+
+    let anchor = chained_header(100, B256::default(), &committee);
+    store_executed(db, &anchor);
+    let mut chain: BTreeMap<u64, ConsensusHeader> = BTreeMap::new();
+    let mut parent = anchor.digest();
+    for number in 101..=105u64 {
+        let header = chained_header(number, parent, &committee);
+        parent = header.digest();
+        chain.insert(number, header);
+    }
+    let target = chain[&105].clone();
+
+    // Stored rows 101..=104, with a stale row at 103: real parent link, different sub_dag.
+    let stale_103 = fabricated_header(103, chain[&102].digest());
+    for header in [&chain[&101], &chain[&102], &stale_103, &chain[&104]] {
+        store_consensus_header_in_cache(db, header);
+    }
+
+    let cb = ConsensusBus::new();
+    seed_recently_executed_blocks(&cb);
+    let _rx = cb.consensus_header().subscribe();
+    let mut last_header = anchor.clone();
+    let mut last_height = anchor.number;
+
+    let pending = attempt_catch_up(
+        &config,
+        &cb,
+        &no_peer_network(),
+        &mut last_header,
+        &mut last_height,
+        target.clone(),
+        "test",
+    )
+    .await;
+    assert!(pending.is_some());
+    assert_eq!(
+        last_height, 100,
+        "the anchor must not advance onto a row the failed link implicates"
+    );
+    assert!(db.get_consensus_by_number(103).is_none(), "the stale row must be cleared");
+
+    // The walk refills 103; the next pass reaches the target.
+    store_consensus_header_in_cache(db, &chain[&103]);
+    let pending = attempt_catch_up(
+        &config,
+        &cb,
+        &no_peer_network(),
+        &mut last_header,
+        &mut last_height,
+        target,
+        "test retry",
+    )
+    .await;
+    assert!(pending.is_none());
+    assert_eq!(last_height, 105);
 }
