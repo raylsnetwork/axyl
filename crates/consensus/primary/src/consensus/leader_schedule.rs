@@ -18,6 +18,10 @@ use tracing::{debug, trace};
 #[path = "tests/leader_schedule_tests.rs"]
 mod leader_schedule_tests;
 
+#[cfg(test)]
+#[path = "tests/subdag_verify_tests.rs"]
+mod subdag_verify_tests;
+
 #[derive(Default, Clone)]
 pub struct LeaderSwapTable {
     /// The round on which the leader swap table get into effect.
