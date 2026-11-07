@@ -18,7 +18,7 @@ use reth_db_common::init::init_genesis_with_settings;
 use reth_downloaders::{bodies::noop::NoopBodiesDownloader, headers::noop::NoopHeaderDownloader};
 use reth_engine_primitives::DEFAULT_PERSISTENCE_THRESHOLD;
 use reth_engine_tree::tree::{precompile_cache::PrecompileCacheMap, PayloadProcessor};
-use reth_node_core::args::{EngineArgs, StorageArgs};
+use reth_node_core::args::{DatabaseArgs, EngineArgs, StorageArgs};
 use reth_provider::{
     providers::{BlockchainProvider, RocksDBBuilder, StaticFileProvider},
     BlockNumReader, ChainSpecProvider, DatabaseProviderFactory, ProviderFactory,
@@ -34,6 +34,9 @@ use tracing::{debug, error, info, warn};
 
 // Page-size rules and detection shared with the other node database so both stay in sync.
 use rayls_infrastructure_utils::mdbx::open_page_size;
+
+/// Test reth database size cap; reth's 8 TiB default exhausts address space in parallel tests.
+pub const TEST_DB_MAX_SIZE: usize = 64 * 1024 * 1024 * 1024;
 
 impl RethEnv {
     /// Create a new Reth DB.
@@ -267,6 +270,7 @@ impl RethEnv {
             },
             chain,
             storage: StorageArgs { v2: true },
+            db: DatabaseArgs { max_size: Some(TEST_DB_MAX_SIZE), ..Default::default() },
             ..NodeConfig::default()
         };
         let reth_config = RethConfig(node_config);
