@@ -66,6 +66,8 @@ interface IConsensusRegistry {
     event ValidatorRetired(ValidatorInfo validator);
     event ValidatorSlashed(Slash slash);
     event NewEpoch(EpochInfo epoch);
+    // Adding `indexed` changes the emitted log layout and ConsensusRegistry bytecode (needs a hardfork).
+    // slither-disable-next-line unindexed-event-address
     event RewardsClaimed(address claimant, uint256 rewards);
     event ValidatorAllowlisted(address indexed validatorAddress);
     event ValidatorDelisted(address indexed validatorAddress);

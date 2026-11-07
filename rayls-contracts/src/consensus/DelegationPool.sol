@@ -719,12 +719,16 @@ contract DelegationPool is
         // Derive actualSlash from the rounded value so the transfer matches what
         // the accumulator records. Dust stays in the contract as a solvency buffer,
         // preventing balance < aggregate claims over many slashes.
+        // Intentional: actualSlash is derived from the rounded per-share value (see above).
+        // slither-disable-next-line divide-before-multiply
         uint256 slashPerShare = (effectiveSlash * PRECISION) / totalAll;
         uint256 actualSlash = (slashPerShare * totalAll) / PRECISION;
 
         pool.slashPerShareAccum += slashPerShare;
 
         // Reduce each track proportionally so their totals stay accurate for reward distribution.
+        // Splits the already-rounded actualSlash across tracks; slashB takes the remainder.
+        // slither-disable-next-line divide-before-multiply
         uint256 slashA = (actualSlash * pool.totalDelegated) / totalAll;
         uint256 slashB = actualSlash - slashA;
         pool.totalDelegated -= slashA;
@@ -734,6 +738,8 @@ contract DelegationPool is
         $.rls.safeTransfer(address($.consensusRegistry), actualSlash);
 
         // return actualSlash so ConsensusRegistry.slashedFunds tracks what was received
+        // Named return first holds the capped request, then the rounded amount actually transferred.
+        // slither-disable-next-line write-after-write
         effectiveSlash = actualSlash;
 
         emit PoolSlashed(validatorAddress, effectiveSlash);
