@@ -19,6 +19,11 @@ rayls-infrastructure-config = { workspace = true }
 rayls-consensus-primary = { workspace = true }
 consensus-metrics.workspace = true
 
+[features]
+# Test-only fault injection (restrict the tip probe to one peer) for multi-node regression tests.
+# NOT FOR PRODUCTION.
+fault-injection-test-hooks = []
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "macros", "test-util"] }
 rayls-infrastructure-storage = { workspace = true }

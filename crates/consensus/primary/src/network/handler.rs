@@ -880,6 +880,31 @@ where
             return Ok(PrimaryResponse::ConsensusHeader(Arc::new(fake)));
         }
 
+        // Test-only fork-probe route (compiled out of production, inert unless armed): the same
+        // probe answer can instead be a copy of this node's own real latest block with the commit
+        // timestamp raised, which stays BLS-valid but executes to a different block. Served on the
+        // "latest" probe and on a by-hash request for the forged copy's own digest, checked before
+        // the honest lookup so the unknown forged digest is still served.
+        #[cfg(feature = "byzantine-test-hooks")]
+        match (number, hash) {
+            (_, Some(hash)) => {
+                if let Some(forged) = super::tip_probe_byzantine::override_by_hash_fork(
+                    self.consensus_config.node_storage(),
+                    hash,
+                ) {
+                    return Ok(PrimaryResponse::ConsensusHeader(Arc::new(forged)));
+                }
+            }
+            (None, None) => {
+                if let Some(forged) = super::tip_probe_byzantine::override_latest_fork(
+                    self.consensus_config.node_storage(),
+                ) {
+                    return Ok(PrimaryResponse::ConsensusHeader(Arc::new(forged)));
+                }
+            }
+            _ => {}
+        }
+
         let header = match (number, hash) {
             (_, Some(hash)) => self.get_header_by_hash(hash)?,
             (Some(number), _) => self.get_header_by_number(number)?,

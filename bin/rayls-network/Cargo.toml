@@ -33,6 +33,9 @@ jemalloc = ["tikv-jemallocator"]
 dev-single-node-setup = ["rayls-network-cli/dev-single-node-setup"]
 # Test-only Byzantine behaviour for multi-node regression tests. NOT FOR PRODUCTION.
 byzantine-test-hooks = ["rayls-network-cli/byzantine-test-hooks"]
+# Test-only fault injection (faulty proposers, slow nodes) for multi-node regression tests.
+# NOT FOR PRODUCTION.
+fault-injection-test-hooks = ["rayls-network-cli/fault-injection-test-hooks"]
 
 [lints]
 workspace = true

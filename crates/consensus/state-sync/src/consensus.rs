@@ -323,10 +323,25 @@ async fn probe_peers_for_latest<DB: ReDatabase>(
     config: &ConsensusConfig<DB>,
     network: &PrimaryNetworkHandle,
 ) -> Option<ConsensusHeader> {
+    // Test-only fault: restrict the probe to a single named peer, to model the startup window in
+    // which the attacker is the peer that answers the follower's first probe (before honest peers
+    // respond). Without this the live harness would depend on connection-order timing. Honest
+    // otherwise, and compiled out of production builds.
+    #[cfg(feature = "fault-injection-test-hooks")]
+    let only_peer = std::env::var("RL_FAULT_PROBE_ONLY_PEER").ok();
     let mut inflight: FuturesUnordered<_> = config
         .committee()
         .others_primaries_by_id(config.authority_id().as_ref())
         .into_iter()
+        .filter(|(_, peer)| {
+            #[cfg(feature = "fault-injection-test-hooks")]
+            if let Some(ref only) = only_peer {
+                return peer.to_string() == *only;
+            }
+            #[cfg(not(feature = "fault-injection-test-hooks"))]
+            let _ = peer;
+            true
+        })
         .map(|(_, peer)| network.request_consensus_from_peer(peer, None, None))
         .collect();
     let mut best: Option<ConsensusHeader> = None;
@@ -752,6 +767,122 @@ mod tests {
             requested,
             Epoch::MAX,
             "an unverified header's epoch drove requested_missing_epoch"
+        );
+    }
+
+    /// A forged copy of `honest`: the same block number and the same committee-signed leader and
+    /// certificates, with only the commit timestamp raised. The commit timestamp is hashed into the
+    /// header digest but is not covered by any committee signature, so the copy still verifies yet
+    /// has a different digest and would execute to a different block. This is the fork forgery.
+    fn forged_copy(honest: &ConsensusHeader) -> ConsensusHeader {
+        let mut higher_leader = Certificate::default();
+        higher_leader.header.created_at = honest.sub_dag.commit_timestamp() + 1_000_000;
+        let higher = CommittedSubDag::new(vec![], higher_leader, 0, ReputationScores::default(), None);
+        let tampered_sub_dag = CommittedSubDag::new(
+            honest.sub_dag.certificates.clone(),
+            honest.sub_dag.leader.clone(),
+            0,
+            honest.sub_dag.reputation_score.clone(),
+            Some(&higher),
+        );
+        ConsensusHeader {
+            parent_hash: honest.parent_hash,
+            sub_dag: tampered_sub_dag,
+            number: honest.number,
+            extra: honest.extra,
+        }
+    }
+
+    /// One committee member answering the tip probe with a forged copy of the real latest header
+    /// (same number, same signatures, bumped commit timestamp) must not be taken over the header the
+    /// rest of the committee agree on. The probe keeps answers only by number, so on `main` the lone
+    /// forged copy can win and the follower would walk, store, and execute it, forking the chain.
+    #[tokio::test(start_paused = true)]
+    async fn tip_probe_fork_copy_is_not_taken_over_the_committee_agreed_header() {
+        let fixture = CommitteeFixture::builder(MemDatabase::default)
+            .randomize_ports(true)
+            .committee_size(NonZeroUsize::new(4).unwrap())
+            .build();
+        let primary = fixture.authorities().next().unwrap();
+        let config = primary.consensus_config();
+        let adversary =
+            config.committee().others_primaries_by_id(config.authority_id().as_ref())[0].1;
+        let honest = honest_tip(&fixture);
+        let forged = forged_copy(&honest);
+
+        // The forged copy is a real block with its commit timestamp raised: same number, verifies
+        // against the committee, but a different digest. That is exactly what makes it a fork.
+        let keys = config.get_committee_keys_for_epoch(0).expect("current committee");
+        assert!(
+            honest.clone().verify_header_with_keys(&keys).is_ok(),
+            "precondition: the honest tip verifies"
+        );
+        assert!(
+            forged.clone().verify_header_with_keys(&keys).is_ok(),
+            "precondition: the forged copy keeps the real signatures, so it still verifies"
+        );
+        assert_eq!(forged.number, honest.number, "precondition: the copy shares the real number");
+        assert_ne!(
+            forged.digest(),
+            honest.digest(),
+            "precondition: the bumped commit timestamp changes the digest"
+        );
+
+        let network = forged_tip_network(adversary, forged.clone(), honest.clone());
+        let picked = probe_peers_for_latest(0, &config, &network).await.expect("peers answered");
+
+        assert_eq!(
+            picked.digest(),
+            honest.digest(),
+            "the probe took one validator's forged copy over the three honest, agreed answers"
+        );
+    }
+
+    /// End to end over the tracker: with one validator forging a same-number copy on the probe and
+    /// the rest honest, the follower must settle on the committee-agreed header, not store or
+    /// republish the forged copy. On `main` the forged copy is stored and republished as the tip.
+    #[tokio::test(start_paused = true)]
+    async fn forged_tip_copy_is_not_stored_or_republished_by_the_follower() {
+        let fixture = CommitteeFixture::builder(MemDatabase::default)
+            .randomize_ports(true)
+            .committee_size(NonZeroUsize::new(4).unwrap())
+            .build();
+        let primary = fixture.authorities().next().unwrap();
+        let config = primary.consensus_config();
+        let adversary =
+            config.committee().others_primaries_by_id(config.authority_id().as_ref())[0].1;
+        let honest = honest_tip(&fixture);
+        let forged = forged_copy(&honest);
+
+        let consensus_bus = ConsensusBus::new();
+        let network = forged_tip_network(adversary, forged.clone(), honest.clone());
+        tokio::spawn(spawn_track_recent_consensus(
+            config.clone(),
+            consensus_bus.clone(),
+            network,
+        ));
+
+        // No gossip arrives; only the startup probe and the 10s idle probes find the tip. The
+        // honest tip (number 1) should become the published header, never the forged copy.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+        while consensus_bus.last_consensus_header().borrow().number < 1
+            && tokio::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let published = consensus_bus.last_consensus_header().borrow().clone();
+        let stored_forged = config.node_storage().get_consensus_by_hash(forged.digest()).is_some();
+        config.shutdown().notify();
+
+        assert_eq!(published.number, 1, "the follower never settled on the honest tip");
+        assert_eq!(
+            published.digest(),
+            honest.digest(),
+            "the follower published the forged copy as its latest consensus header"
+        );
+        assert!(
+            !stored_forged,
+            "the follower stored the forged copy in its consensus cache"
         );
     }
 }

@@ -47,6 +47,9 @@ cold-storage = ["rayls-middleware-orchestrator/cold-storage"]
 dev-single-node-setup = ["dep:ethereum-tx-sign", "rayls-middleware-orchestrator/dev-single-node-setup"]
 # Test-only Byzantine behaviour. NOT FOR PRODUCTION.
 byzantine-test-hooks = ["rayls-middleware-orchestrator/byzantine-test-hooks"]
+# Test-only fault injection (faulty proposers, slow nodes) for multi-node regression tests.
+# NOT FOR PRODUCTION.
+fault-injection-test-hooks = ["rayls-middleware-orchestrator/fault-injection-test-hooks"]
 
 [dev-dependencies]
 tokio = { workspace = true, features = [

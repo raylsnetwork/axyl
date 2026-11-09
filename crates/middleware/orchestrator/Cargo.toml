@@ -65,6 +65,9 @@ dev-single-node-setup = [
 ]
 # Test-only Byzantine behaviour. NOT FOR PRODUCTION.
 byzantine-test-hooks = ["rayls-consensus-primary/byzantine-test-hooks"]
+# Test-only fault injection (faulty proposers, slow nodes) for multi-node regression tests.
+# NOT FOR PRODUCTION.
+fault-injection-test-hooks = ["rayls-consensus-primary/fault-injection-test-hooks", "rayls-consensus-state-sync/fault-injection-test-hooks"]
 
 [dev-dependencies]
 rand = { workspace = true }
