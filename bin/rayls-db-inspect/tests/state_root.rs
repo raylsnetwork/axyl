@@ -90,7 +90,6 @@ fn sealed_root_matching_leaves_is_ok() {
     let node = &report.nodes[0];
     assert_eq!(node.node, "good");
     assert_eq!(node.block_number, 1);
-    assert_eq!(node.block_source, "checkpoint");
     assert_eq!(node.header_root, root);
     assert_eq!(node.leaves_root, root);
     assert_eq!(node.accounts, 2);
@@ -113,14 +112,24 @@ fn sealed_root_disagreeing_with_leaves_is_broken() {
     assert!(!node.matches);
 }
 
+/// The highest static-file header can be ahead of the hashed state, so without the `Finish`
+/// checkpoint there is no safe block to compare: an error, never a guessed verdict.
 #[test]
-fn falls_back_to_highest_static_file_header_without_checkpoint() {
+fn missing_finish_checkpoint_is_an_error() {
     let dir = tempfile::tempdir().unwrap();
     build_datadir(dir.path(), false, false);
-    let report = state_root_check(&[dir.path().display().to_string()]).unwrap();
-    assert_eq!(report.verdict.code, code::OK);
-    assert_eq!(report.nodes[0].block_number, 1);
-    assert_eq!(report.nodes[0].block_source, "static-files");
+    let err = state_root_check(&[dir.path().display().to_string()]).unwrap_err();
+    assert!(format!("{err:#}").contains("no Finish stage checkpoint"), "{err:#}");
+}
+
+/// A database another handle holds (a running node) is refused, as by every other subcommand.
+#[test]
+fn held_database_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    build_datadir(dir.path(), false, true);
+    let _held = init_db(dir.path().join("db"), DatabaseArguments::default()).unwrap();
+    let err = state_root_check(&[dir.path().display().to_string()]).unwrap_err();
+    assert!(format!("{err:#}").contains("stop it or use a copy"), "{err:#}");
 }
 
 #[test]
@@ -144,4 +153,14 @@ fn wrong_path_and_duplicate_datadir_are_errors() {
     let spec = dir.path().display().to_string();
     let err = state_root_check(&[format!("a={spec}"), format!("b={spec}")]).unwrap_err();
     assert!(err.to_string().contains("given twice"), "{err}");
+}
+
+#[test]
+fn duplicate_label_is_an_error() {
+    let (a, b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    build_datadir(a.path(), false, true);
+    build_datadir(b.path(), false, true);
+    let specs = [format!("n1={}", a.path().display()), format!("n1={}", b.path().display())];
+    let err = state_root_check(&specs).unwrap_err();
+    assert!(err.to_string().contains("node label n1 used twice"), "{err}");
 }

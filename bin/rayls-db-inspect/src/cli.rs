@@ -275,8 +275,10 @@ pub enum Command {
     /// Reads the node's reth datadir (`db/` and `static_files/`), not its consensus-db. The
     /// rebuild uses no stored trie node, so a root the node computed by reusing a stale or
     /// mis-skipped branch node shows up as a mismatch. One sequential pass over the hashed
-    /// tables: minutes on a large state, flat memory. The verdict is `BROKEN` when any node's
-    /// sealed root differs from its leaves.
+    /// tables: minutes on a large state, flat memory. Like every other subcommand it opens the
+    /// database read-only and exclusively, so stop the node or use a copy. Compares the block
+    /// of the `Finish` stage checkpoint; a datadir without one is an error. The verdict is
+    /// `BROKEN` when any node's sealed root differs from its leaves.
     StateRootCheck {
         #[command(flatten)]
         nodes: NodeArgs,

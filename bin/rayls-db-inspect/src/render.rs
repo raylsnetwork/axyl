@@ -111,7 +111,6 @@ fn render_state_root(r: &StateRootReport, out: &mut String) {
     let mut t = Table::new(&[
         "node",
         "block",
-        "block from",
         "header root",
         "leaves root",
         "accounts",
@@ -123,7 +122,6 @@ fn render_state_root(r: &StateRootReport, out: &mut String) {
         t.row(vec![
             n.node.clone(),
             n.block_number.to_string(),
-            n.block_source.to_owned(),
             b256(&n.header_root),
             b256(&n.leaves_root),
             n.accounts.to_string(),
