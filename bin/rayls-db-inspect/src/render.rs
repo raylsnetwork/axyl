@@ -8,6 +8,7 @@ use crate::{
         epoch::{describe_position, EpochCheckReport, EpochReport, EpochStatus, EpochsReport},
         header::{describe_absent, CertReport, HeaderCheckReport, HeaderReport, SignatureCheck},
         participation::{EpochState, ParticipationReport},
+        state_root::StateRootReport,
         summary::SummaryReport,
         Report,
     },
@@ -96,12 +97,43 @@ pub fn render(report: &Report) -> String {
         Report::GetTx(r) => render_tx(r, &mut out),
         Report::HeaderCheck(r) => render_header_check(r, &mut out),
         Report::Participation(r) => render_participation(r, &mut out),
+        Report::StateRootCheck(r) => render_state_root(r, &mut out),
         Report::Summary(r) => render_summary(r, &mut out),
     }
     if let Some(v) = report.verdict() {
         let _ = writeln!(out, "\nverdict: {v}");
     }
     out
+}
+
+fn render_state_root(r: &StateRootReport, out: &mut String) {
+    let _ = writeln!(out, "state-root-check");
+    let mut t = Table::new(&[
+        "node",
+        "block",
+        "header root",
+        "leaves root",
+        "accounts",
+        "slots",
+        "match",
+        "took",
+    ]);
+    for n in &r.nodes {
+        t.row(vec![
+            n.node.clone(),
+            n.block_number.to_string(),
+            b256(&n.header_root),
+            b256(&n.leaves_root),
+            n.accounts.to_string(),
+            n.storage_slots.to_string(),
+            if n.matches { "ok" } else { "MISMATCH" }.to_owned(),
+            format!("{} ms", n.elapsed_ms),
+        ]);
+    }
+    out.push_str(&t.render());
+    for n in &r.nodes {
+        let _ = writeln!(out, "\n[{}] {}", n.node, n.path);
+    }
 }
 
 fn render_epoch(r: &EpochReport, out: &mut String) {

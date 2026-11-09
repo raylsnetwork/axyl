@@ -5,6 +5,7 @@ pub mod batch;
 pub mod epoch;
 pub mod header;
 pub mod participation;
+pub mod state_root;
 pub mod summary;
 
 use serde::{ser::SerializeMap as _, Serialize, Serializer};
@@ -330,6 +331,7 @@ pub enum Report {
     GetTx(batch::TxReport),
     HeaderCheck(header::HeaderCheckReport),
     Participation(participation::ParticipationReport),
+    StateRootCheck(state_root::StateRootReport),
     Summary(summary::SummaryReport),
 }
 
@@ -346,6 +348,7 @@ impl Report {
             Self::GetTx(r) => Some(&r.verdict),
             Self::HeaderCheck(r) => Some(&r.verdict),
             Self::Participation(r) => Some(&r.verdict),
+            Self::StateRootCheck(r) => Some(&r.verdict),
             Self::Summary(_) => None,
         }
     }
