@@ -800,12 +800,27 @@ async fn catch_up_consensus_from_to<DB: Database>(
             // verification failure, drop the held replies and let the hash-verified walk bring a
             // trusted copy down.
             let Some(keys) = config.get_committee_keys_for_epoch(leader_epoch) else {
-                debug!(
-                    target: "rayls-consensus-state-sync",
-                    number,
-                    leader_epoch,
-                    "catch_up_from_to: committee keys unavailable for a by-number reply, returning early (awaiting backwards walk)"
-                );
+                // Missing keys for a past epoch is a normal catch-up condition: this node has not
+                // synced that epoch record yet, and the backwards walk waits for it. An epoch
+                // beyond the current one, on a header below the target, is a peer
+                // naming a bogus epoch, so surface that at warn rather than letting
+                // it trigger this path unseen.
+                if leader_epoch > epoch {
+                    warn!(
+                        target: "rayls-consensus-state-sync",
+                        number,
+                        leader_epoch,
+                        current_epoch = epoch,
+                        "catch_up_from_to: by-number reply names an epoch beyond ours, dropping held replies (awaiting backwards walk)"
+                    );
+                } else {
+                    debug!(
+                        target: "rayls-consensus-state-sync",
+                        number,
+                        leader_epoch,
+                        "catch_up_from_to: committee keys for a past epoch not available yet, returning early (awaiting backwards walk)"
+                    );
+                }
                 return Ok(result_header);
             };
             match consensus_header.verify_header_with_keys(&keys) {
