@@ -1244,8 +1244,10 @@ pub(crate) enum BusyLimit {
     Member,
     /// The committee pool is full, with jobs from an earlier epoch.
     Committee,
-    /// The outside peer is at its limit, or the outsider pool is full.
+    /// The outside peer already runs its share of jobs.
     Outsider,
+    /// The pool shared by outside peers is full (#357).
+    Others,
 }
 
 impl BusyLimit {
@@ -1255,6 +1257,7 @@ impl BusyLimit {
             Self::Member => "member",
             Self::Committee => "committee",
             Self::Outsider => "outsider",
+            Self::Others => "others",
         }
     }
 }
@@ -1310,7 +1313,7 @@ impl MissingCertSlots {
         if self.outsiders.running(tag) >= MISSING_CERT_JOBS_PER_OUTSIDER {
             return Err(BusyLimit::Outsider);
         }
-        let pool = self.others.clone().try_acquire_owned().map_err(|_| BusyLimit::Outsider)?;
+        let pool = self.others.clone().try_acquire_owned().map_err(|_| BusyLimit::Others)?;
         // If a racing request won, the pool permit is dropped and so given back.
         let job = self.outsiders.claim(tag).ok_or(BusyLimit::Outsider)?;
         Ok(MissingCertPermits { _peer: None, _outsider: Some(job), _pool: pool })

@@ -1241,7 +1241,7 @@ fn test_missing_cert_slots_outlive_cancelled_requests() {
 
         // Each refusal is counted under the limit that refused it.
         let refused = &cb.primary_metrics().node_metrics.missing_cert_requests_busy;
-        for (limit, count) in [("member", 1), ("committee", 0), ("outsider", 1)] {
+        for (limit, count) in [("member", 1), ("committee", 0), ("outsider", 0), ("others", 1)] {
             assert_eq!(refused.with_label_values(&[limit]).get(), count, "{limit} refusals");
         }
 
@@ -1405,7 +1405,7 @@ fn test_missing_cert_slots_limit_each_outsider() {
         .map(|seed| slots.acquire(outsider(seed)).expect("slot in the shared pool"))
         .collect();
     let next = slots.acquire(outsider(u64::MAX));
-    assert!(matches!(next, Err(BusyLimit::Outsider)), "got {next:?}");
+    assert!(matches!(next, Err(BusyLimit::Others)), "got {next:?}");
 
     // Only outsiders with a running job are tracked.
     assert_eq!(limits.tracked_outsiders(), 1 + other_jobs.len());
