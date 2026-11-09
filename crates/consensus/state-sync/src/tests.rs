@@ -1459,7 +1459,7 @@ async fn test_catch_up_does_not_anchor_on_stale_stored_row() {
 
     let cb = ConsensusBus::new();
     seed_recently_executed_blocks(&cb);
-    let _rx = cb.consensus_header().subscribe();
+    let mut rx = cb.consensus_header().subscribe();
     let mut last_header = anchor.clone();
     let mut last_height = anchor.number;
 
@@ -1479,6 +1479,19 @@ async fn test_catch_up_does_not_anchor_on_stale_stored_row() {
         "the anchor must not advance onto a row the failed link implicates"
     );
     assert!(db.get_consensus_by_number(103).is_none(), "the stale row must be cleared");
+
+    // A stored cache row is trusted transitively, so 101, 102 and the stale 103 are forwarded
+    // before the mismatch at 104 is found. Pin that the stale row still reaches the consumer here,
+    // where the real subscriber then rejects it on BLS. Holding cache rows until linked would close
+    // this, which is pre-existing and close to #370.
+    let mut forwarded = Vec::new();
+    while let Ok(h) = rx.try_recv() {
+        forwarded.push(h.digest());
+    }
+    assert!(
+        forwarded.contains(&stale_103.digest()),
+        "a stored cache row is forwarded transitively before the mismatch is found"
+    );
 
     // The walk refills 103; the next pass reaches the target.
     store_consensus_header_in_cache(db, &chain[&103]);
