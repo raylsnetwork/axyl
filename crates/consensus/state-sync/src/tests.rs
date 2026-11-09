@@ -500,6 +500,15 @@ fn chained_header(
     ConsensusHeader { parent_hash, sub_dag, number, extra: B256::default() }
 }
 
+/// Like [`chained_header`] but with a real quorum-signed `leader`, so the by-number BLS check in
+/// catch-up accepts it. One signed leader is reused across a chain: only `parent_hash` and `number`
+/// vary the digest, which is all the digest-chain guard checks.
+fn signed_chained_header(number: u64, parent_hash: B256, leader: &Certificate) -> ConsensusHeader {
+    let sub_dag =
+        CommittedSubDag::new(vec![], leader.clone(), 0, ReputationScores::default(), None);
+    ConsensusHeader { parent_hash, sub_dag, number, extra: B256::default() }
+}
+
 /// Push one recent execution block above genesis so `wait_for_execution` treats the genesis-
 /// subdag base block (number 0) as already executed and returns immediately.
 fn seed_recently_executed_blocks(cb: &ConsensusBus) {
@@ -533,12 +542,14 @@ async fn test_catch_up_fills_gap_by_number_when_db_is_empty() {
     })
     .unwrap();
 
-    // Each header links onto the prior digest, so the catch-up digest guard accepts them.
+    // Each header links onto the prior digest, so the catch-up digest guard accepts them, and
+    // carries a real quorum-signed leader so the by-number BLS check accepts them too.
+    let leader = fixture.certificate(&fixture.header_from_last_authority());
     let mut served: BTreeMap<u64, ConsensusHeader> = BTreeMap::new();
     let mut parent = anchor.digest();
     let mut target = anchor.clone();
     for number in n + 1..=m {
-        let header = chained_header(number, parent, &committee);
+        let header = signed_chained_header(number, parent, &leader);
         parent = header.digest();
         served.insert(number, header.clone());
         target = header;
@@ -694,8 +705,10 @@ async fn test_catch_up_drops_poisoned_gap_row_and_recovers() {
     })
     .unwrap();
 
-    // The honest header at 101 chains onto the anchor; the target at 102 chains onto it.
-    let real_101 = chained_header(101, anchor.digest(), &committee);
+    // The honest header at 101 chains onto the anchor and carries a real quorum-signed leader; the
+    // target at 102 chains onto it.
+    let leader = fixture.certificate(&fixture.header_from_last_authority());
+    let real_101 = signed_chained_header(101, anchor.digest(), &leader);
     let target = chained_header(102, real_101.digest(), &committee);
 
     // The byzantine header at 101 carries the correct parent_hash and number but a fabricated
@@ -718,17 +731,25 @@ async fn test_catch_up_drops_poisoned_gap_row_and_recovers() {
     // A live subscriber keeps the broadcast `send` from erroring while headers stream.
     let _rx = cb.consensus_header().subscribe();
 
-    // Pass 1: the byzantine peer poisons the cache at 101, so catch-up fails at 102.
+    // Pass 1: the byzantine peer serves a fabricated sub_dag at 101. Its leader is not quorum-
+    // signed, so the by-number BLS check rejects the reply and catch-up returns at the anchor
+    // without caching it. The digest excludes signatures, so the reply still links by hash: only
+    // the BLS check stops it.
     let byzantine = serving_network(BTreeMap::from([(101u64, bogus_101.clone())]));
     let first =
-        catch_up_consensus_from_to(&config, &cb, &byzantine, anchor.clone(), target.clone()).await;
-    assert!(first.is_err(), "a fabricated gap header must fail the digest-chain guard at 102");
+        catch_up_consensus_from_to(&config, &cb, &byzantine, anchor.clone(), target.clone())
+            .await
+            .expect("a BLS-invalid reply is dropped, not a hard error: catch-up awaits the walk");
+    assert_eq!(
+        first.number, 100,
+        "catch-up must not advance past the anchor on a BLS-invalid reply"
+    );
 
-    // The poisoned, non-canonical cache row must be gone so the next retry re-fetches it; on the
-    // broken code it stays cached and every retry re-reads it.
+    // The rejected reply must never be cached, so the next retry re-fetches it; on the broken code
+    // it stays cached and every retry re-reads it.
     assert!(
         db.get_consensus_by_number(101).is_none(),
-        "poisoned gap cache row must be dropped on the mismatch, not left to stall every retry"
+        "a BLS-invalid gap reply must not be cached, or every retry re-reads it and stalls"
     );
 
     // Pass 2: an honest peer now serves the real 101; catch-up must reach the target. On the broken
@@ -1034,12 +1055,14 @@ async fn test_forward_streamer_does_not_stall_on_gap_fetch_fake() {
     let db = config.node_storage();
     let committee = fixture.committee();
 
-    // Canonical executed anchor at 100 and the honest chain 101 -> 102 -> 103.
+    // Canonical executed anchor at 100 and the honest chain 101 -> 102 -> 103, each with a real
+    // quorum-signed leader so the by-number BLS check accepts the honest replies.
+    let leader = fixture.certificate(&fixture.header_from_last_authority());
     let anchor = chained_header(100, B256::default(), &committee);
     store_executed(db, &anchor);
-    let real_101 = chained_header(101, anchor.digest(), &committee);
-    let real_102 = chained_header(102, real_101.digest(), &committee);
-    let target = chained_header(103, real_102.digest(), &committee);
+    let real_101 = signed_chained_header(101, anchor.digest(), &leader);
+    let real_102 = signed_chained_header(102, real_101.digest(), &leader);
+    let target = signed_chained_header(103, real_102.digest(), &leader);
 
     // Fake 101: real parent link and number, fabricated sub_dag. Its leader's
     // latest_execution_block is the default (0, 0x0), below the seeded window, so the execution
@@ -1102,13 +1125,13 @@ async fn test_forward_streamer_does_not_stall_via_closed_epoch_reply_after_fake(
     let primary = fixture.authorities().next().unwrap();
     let config = primary.consensus_config();
 
+    // The honest 101..=103 carry a real quorum-signed epoch-1 leader so the by-number BLS check
+    // accepts them on the recovery pass.
+    let leader = fixture.certificate(&fixture.header_from_last_authority());
     let anchor = header_for_epoch(100, 1, 5_000);
-    let mut real_101 = header_for_epoch(101, 1, 5_001);
-    real_101.parent_hash = anchor.digest();
-    let mut real_102 = header_for_epoch(102, 1, 5_002);
-    real_102.parent_hash = real_101.digest();
-    let mut target = header_for_epoch(103, 1, 5_003);
-    target.parent_hash = real_102.digest();
+    let real_101 = signed_chained_header(101, anchor.digest(), &leader);
+    let real_102 = signed_chained_header(102, real_101.digest(), &leader);
+    let target = signed_chained_header(103, real_102.digest(), &leader);
 
     let mut fake_101 = header_for_epoch(101, 1, 999_999);
     fake_101.parent_hash = anchor.digest();
@@ -1136,7 +1159,7 @@ async fn test_forward_streamer_does_not_stall_via_closed_epoch_reply_after_fake(
     assert_eq!(
         last_header.digest(),
         anchor.digest(),
-        "fake must not be promoted via the epoch halt"
+        "fake must not be promoted (the by-number BLS check rejects it before the epoch halt)"
     );
 
     let honest = serving_network(BTreeMap::from([(101u64, real_101), (102u64, real_102)]));
@@ -1208,6 +1231,70 @@ async fn test_gap_fetch_does_not_forward_bls_valid_tampered_subdag() {
     );
 }
 
+/// A by-number reply links by digest, and the digest excludes the certificate signatures. So a peer
+/// can serve the real header at N with an under-signed leader: it has the same digest as the honest
+/// header and links onto the anchor, yet fails BLS. It must be rejected before it is cached, or the
+/// subscriber discards it downstream and every retry re-reads the stored row and stalls, across
+/// restarts too.
+#[tokio::test]
+async fn test_gap_fetch_rejects_bls_invalid_reply() {
+    let fixture = catch_up_fixture();
+    let primary = fixture.authorities().next().unwrap();
+    let config = primary.consensus_config();
+    let db = config.node_storage();
+    let committee = fixture.committee();
+
+    let anchor = chained_header(100, B256::default(), &committee);
+    store_executed(db, &anchor);
+
+    // One leader header, signed two ways: a full quorum (honest) and a single vote (under quorum).
+    // Both carry the same leader header, so their consensus-header digests are identical; only BLS
+    // verification tells them apart.
+    let leader_header = fixture.header_from_last_authority();
+    let honest_leader = fixture.certificate(&leader_header);
+    let one_vote: Vec<_> = fixture
+        .votes(&leader_header)
+        .into_iter()
+        .take(1)
+        .map(|v| (v.author().clone(), *v.signature()))
+        .collect();
+    let under_signed_leader =
+        Certificate::new_unsigned_for_test(&committee, leader_header, one_vote).unwrap();
+
+    let honest_101 = signed_chained_header(101, anchor.digest(), &honest_leader);
+    let invalid_101 = signed_chained_header(101, anchor.digest(), &under_signed_leader);
+    assert_eq!(
+        invalid_101.digest(),
+        honest_101.digest(),
+        "precondition: same digest, differ only in signatures"
+    );
+    let target = chained_header(102, honest_101.digest(), &committee);
+
+    let cb = ConsensusBus::new();
+    seed_recently_executed_blocks(&cb);
+    let mut rx = cb.consensus_header().subscribe();
+
+    // Pass 1: the BLS-invalid reply must not be cached or forwarded, and catch-up must not pass it.
+    let byzantine = serving_network(BTreeMap::from([(101u64, invalid_101.clone())]));
+    let first =
+        catch_up_consensus_from_to(&config, &cb, &byzantine, anchor.clone(), target.clone())
+            .await
+            .expect("a BLS-invalid reply is dropped, not a hard error");
+    assert_eq!(
+        first.number, 100,
+        "catch-up must not advance past the anchor on a BLS-invalid reply"
+    );
+    assert!(db.get_consensus_by_number(101).is_none(), "a BLS-invalid reply must not be cached");
+    assert!(rx.try_recv().is_err(), "a BLS-invalid reply must not be forwarded for execution");
+
+    // Pass 2: an honest peer serves the quorum-signed 101, and catch-up reaches the target.
+    let honest = serving_network(BTreeMap::from([(101u64, honest_101.clone())]));
+    let second = catch_up_consensus_from_to(&config, &cb, &honest, anchor, target)
+        .await
+        .expect("catch-up recovers once an honest peer serves a BLS-valid reply");
+    assert_eq!(second.number, 102, "catch-up must reach the target after recovery");
+}
+
 /// A by-number reply can only be proven by a trusted header linking onto it, so the streamer must
 /// not fetch a gap with no trusted header within reach above it (it would hold replies it cannot
 /// prove). Once the backwards walk caches a header within reach, the gap fills and streams.
@@ -1223,10 +1310,11 @@ async fn test_catch_up_waits_for_walk_when_gap_out_of_reach() {
     let m = n + MAX_UNPROVEN_GAP + 2;
     let anchor = chained_header(n, B256::default(), &committee);
     store_executed(db, &anchor);
+    let leader = fixture.certificate(&fixture.header_from_last_authority());
     let mut chain: BTreeMap<u64, ConsensusHeader> = BTreeMap::new();
     let mut parent = anchor.digest();
     for number in n + 1..=m {
-        let header = chained_header(number, parent, &committee);
+        let header = signed_chained_header(number, parent, &leader);
         parent = header.digest();
         chain.insert(number, header);
     }
@@ -1274,12 +1362,13 @@ async fn test_catch_up_keeps_proven_progress_on_mismatch() {
 
     let anchor = chained_header(100, B256::default(), &committee);
     store_executed(db, &anchor);
-    // Real chain 101..=110. The walk has cached the even numbers; the odd ones are fetched by
-    // number.
+    // Real chain 101..=110, each with a real quorum-signed leader so the by-number BLS check
+    // accepts it. The walk has cached the even numbers; the odd ones are fetched by number.
+    let leader = fixture.certificate(&fixture.header_from_last_authority());
     let mut chain: BTreeMap<u64, ConsensusHeader> = BTreeMap::new();
     let mut parent = anchor.digest();
     for number in 101..=110u64 {
-        let header = chained_header(number, parent, &committee);
+        let header = signed_chained_header(number, parent, &leader);
         parent = header.digest();
         if number % 2 == 0 {
             store_consensus_header_in_cache(db, &header);

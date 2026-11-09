@@ -791,8 +791,38 @@ async fn catch_up_consensus_from_to<DB: Database>(
         }
 
         if from_gap_fetch {
-            unproven.push(consensus_header);
-            continue;
+            // The digest link just checked proves the contents chain, but the digest excludes the
+            // certificate signatures (see output.rs). So a by-number reply can be the real header
+            // carrying a corrupted signature or a re-laid signer bitmap: it links on, yet fails
+            // BLS downstream. Caching it would persist a row the subscriber then discards, and
+            // every retry would read it back and stall the node, across restarts too. BLS-verify
+            // the reply before holding it, as the backwards walk does. On missing keys or a
+            // verification failure, drop the held replies and let the hash-verified walk bring a
+            // trusted copy down.
+            let Some(keys) = config.get_committee_keys_for_epoch(leader_epoch) else {
+                debug!(
+                    target: "rayls-consensus-state-sync",
+                    number,
+                    leader_epoch,
+                    "catch_up_from_to: committee keys unavailable for a by-number reply, returning early (awaiting backwards walk)"
+                );
+                return Ok(result_header);
+            };
+            match consensus_header.verify_header_with_keys(&keys) {
+                Ok(verified) => {
+                    unproven.push(verified);
+                    continue;
+                }
+                Err(e) => {
+                    warn!(
+                        target: "rayls-consensus-state-sync",
+                        number,
+                        leader_epoch,
+                        "catch_up_from_to: by-number reply failed BLS verification, dropping held replies (awaiting backwards walk): {e}"
+                    );
+                    return Ok(result_header);
+                }
+            }
         }
         // A trusted header linked on, so every held reply below it is canonical.
         for header in &unproven {
