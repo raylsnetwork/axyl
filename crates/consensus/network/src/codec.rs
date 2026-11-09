@@ -28,15 +28,13 @@ pub trait RLMessage:
 
 /// The Rayls Network request/response codec for consensus messages between peers.
 ///
-/// The codec reuses pre-allocated buffers to asynchronously read messages per the libp2p [Codec]
-/// trait. All messages include a 4-byte prefix that indicates the message's uncompressed length.
-/// Peers use this prefix to safely decompress and decode messages from peers.
+/// The codec is stateless apart from the maximum message size. Each read or write allocates
+/// temporary buffers for that message only, so memory is released as soon as the call completes
+/// or is cancelled. All messages include a 4-byte prefix that indicates the message's
+/// uncompressed length. Buffers grow only as data is produced, so a peer that sends only the
+/// length prefix reserves no buffer.
 #[derive(Clone, Debug)]
 pub struct RLCodec<Req, Res> {
-    /// The fixed-size buffer for compressed messages.
-    compressed_buffer: Vec<u8>,
-    /// The fixed-size buffer for requests.
-    decode_buffer: Vec<u8>,
     /// The maximum size (bytes) for a single message.
     ///
     /// The 4-byte message prefix does not count towards this value.
@@ -46,20 +44,11 @@ pub struct RLCodec<Req, Res> {
 }
 
 impl<Req, Res> RLCodec<Req, Res> {
-    /// Create a new instance of Self.
     pub fn new(max_chunk_size: usize) -> Self {
-        // create buffer from max possible compression length based on max request size
-        let max_compress_len = snap::raw::max_compress_len(max_chunk_size);
-        let compressed_buffer = Vec::with_capacity(max_compress_len);
-        // allocate capacity for decoding max message size
-        let decode_buffer = Vec::with_capacity(max_chunk_size);
-
-        Self {
-            compressed_buffer,
-            decode_buffer,
-            max_chunk_size,
-            _phantom: PhantomData::<(Req, Res)>,
-        }
+        // Buffers are allocated per message rather than stored here: libp2p clones the codec
+        // for every substream, and a substream exchanges only one request/response, so reuse
+        // would be minimal while large buffers would be retained between calls.
+        Self { max_chunk_size, _phantom: PhantomData::<(Req, Res)> }
     }
 
     /// Convenience method to keep READ logic DRY.
@@ -71,41 +60,59 @@ impl<Req, Res> RLCodec<Req, Res> {
         T: AsyncRead + Unpin + Send,
         M: RLMessage,
     {
-        // clear buffers
-        self.compressed_buffer.clear();
-        self.decode_buffer.clear();
+        // Scoped to this message so a large or partially-read message does not pin memory on
+        // the codec after the call completes or is cancelled.
+        let mut compressed_buffer: Vec<u8> = Vec::new();
 
-        // retrieve prefix for uncompressed message length
         let mut prefix = [0; 4];
         io.read_exact(&mut prefix).await?;
 
         // NOTE: cast u32 to usize is safe
         let length = u32::from_le_bytes(prefix) as usize;
 
-        // ensure message length within bounds
         if length > self.max_chunk_size {
             return Err(std::io::Error::other("prefix indicates message size is too large"));
         }
-
-        // resize buffer to reported message size
-        //
-        // NOTE: this should not reallocate
-        self.decode_buffer.resize(length, 0);
 
         // take max possible compression size based on reported length
         // this is used to limit the amount read in case peer used malicious prefix
         //
         // NOTE: usize -> u64 won't lose precision (even on 32bit system)
         let max_compress_len = snap::raw::max_compress_len(length);
-        io.take(max_compress_len as u64).read_to_end(&mut self.compressed_buffer).await?;
+        io.take(max_compress_len as u64).read_to_end(&mut compressed_buffer).await?;
 
-        // decompress bytes
-        let reader = std::io::Cursor::new(&mut self.compressed_buffer);
-        let mut snappy_decoder = FrameDecoder::new(reader);
-        snappy_decoder.read_exact(&mut self.decode_buffer)?;
+        // The body has arrived, so no `.await` remains between allocating the output buffer and
+        // dropping it: the rest of this function is synchronous. Sizing from the prefix here
+        // therefore cannot pin memory across the stream timeout or a cancellation. Reject an
+        // empty body first so a prefix-only request still allocates nothing.
+        if length > 0 && compressed_buffer.is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "empty body for non-zero declared length",
+            ));
+        }
 
-        // decode bytes
-        bcs::from_bytes(&self.decode_buffer).map_err(std::io::Error::other)
+        // Decompress into `decode_buffer`, capping the output at the declared length so snappy
+        // amplification can't exceed it. The exact capacity avoids `read_to_end` doubling to
+        // ~2x the declared size when the output is a power of two (e.g. the 2 MiB limit).
+        let mut decode_buffer = Vec::with_capacity(length);
+        let reader = std::io::Cursor::new(&compressed_buffer);
+        let snappy_decoder = FrameDecoder::new(reader);
+        snappy_decoder.take(length as u64).read_to_end(&mut decode_buffer)?;
+
+        // Decompression is complete and the decoder no longer borrows `compressed_buffer`.
+        // Release it before `bcs::from_bytes` allocates the owned message on top of it.
+        drop(compressed_buffer);
+
+        // the prefix declares the exact uncompressed length; shorter data is a protocol violation
+        if decode_buffer.len() < length {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "decompressed data smaller than declared prefix",
+            ));
+        }
+
+        bcs::from_bytes(&decode_buffer).map_err(std::io::Error::other)
     }
 
     /// Convenience method to keep WRITE logic DRY.
@@ -117,34 +124,47 @@ impl<Req, Res> RLCodec<Req, Res> {
         T: AsyncWrite + Unpin + Send,
         M: RLMessage,
     {
-        // clear buffers
-        self.compressed_buffer.clear();
-        self.decode_buffer.clear();
+        // Build and compress the message before touching the wire. Locals in an async fn stay in
+        // the future's state across `.await` points unless dropped, so this keeps `msg` and
+        // `encoded` from being pinned while waiting for a slow peer.
+        let mut encoded: Vec<u8> = Vec::new();
 
-        // encode into allocated buffer
-        encode_into_buffer(&mut self.decode_buffer, &msg).map_err(|e| {
+        encode_into_buffer(&mut encoded, &msg).map_err(|e| {
             let error = format!("encode into buffer: {e}");
             std::io::Error::other(error)
         })?;
 
-        // ensure encoded bytes are within bounds
-        if self.decode_buffer.len() > self.max_chunk_size {
+        // `msg` is no longer needed. Release it before compression and I/O.
+        drop(msg);
+
+        if encoded.len() > self.max_chunk_size {
             return Err(std::io::Error::other("encode data > max_chunk_size"));
         }
 
         // length prefix for uncompressed bytes
         //
         // NOTE: 32bit max 4,294,967,295
-        let prefix = (self.decode_buffer.len() as u32).to_le_bytes();
+        let prefix = (encoded.len() as u32).to_le_bytes();
+
+        // `encoded` is our own size-checked message, so the maximum compressed size is known.
+        // Allocate once to avoid repeated reallocations for large messages.
+        let mut compressed_buffer = Vec::with_capacity(snap::raw::max_compress_len(encoded.len()));
+
+        // Scoped so the encoder's mutable borrow of `compressed_buffer` ends before the write.
+        {
+            let mut encoder = snap::write::FrameEncoder::new(&mut compressed_buffer);
+            encoder.write_all(&encoded)?;
+            encoder.flush()?;
+        }
+
+        // Release the uncompressed buffer before awaiting. Only the prefix and compressed bytes
+        // are needed from here on.
+        drop(encoded);
+
+        // Do I/O only after compression succeeds, so a compression failure cannot leave a stray
+        // length prefix on the stream.
         io.write_all(&prefix).await?;
-
-        // compress data using allocated buffer
-        let mut encoder = snap::write::FrameEncoder::new(&mut self.compressed_buffer);
-        encoder.write_all(&self.decode_buffer)?;
-        encoder.flush()?;
-
-        // add compressed bytes to prefix
-        io.write_all(encoder.get_ref()).await?;
+        io.write_all(&compressed_buffer).await?;
 
         Ok(())
     }
