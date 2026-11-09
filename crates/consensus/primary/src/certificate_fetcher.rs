@@ -97,7 +97,7 @@ impl FetchAnswers {
             NetworkError::PeerBusy(_) => self.busy = true,
             // An IO error may be a malformed answer, so it counts, as before.
             NetworkError::Outbound(OutboundFailure::Io(_)) => self.failed = true,
-            // A peer we could not reach says nothing about our request.
+            // An unreachable or timed-out peer says nothing about our request.
             NetworkError::Outbound(_)
             | NetworkError::Dial(_)
             | NetworkError::DialBannedPeer(_)
