@@ -10,9 +10,10 @@ description = "Audit tool: sum native (USDR) balances and read the stored totalS
 [workspace]
 
 [dependencies]
-reth-db = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.0" }
-reth-db-api = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.0" }
-reth-primitives-traits = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.0" }
+# Same fork and tag as the root Cargo.toml reth block; keep them in step.
+reth-db = { git = "https://github.com/raylsnetwork/reth", tag = "v1.11.0-rayls.1" }
+reth-db-api = { git = "https://github.com/raylsnetwork/reth", tag = "v1.11.0-rayls.1" }
+reth-primitives-traits = { git = "https://github.com/raylsnetwork/reth", tag = "v1.11.0-rayls.1" }
 alloy-primitives = { version = "1", features = ["map"] }
 eyre = "0.6"
 # Event-replay phase: HTTP client and JSON parsing for the Blockscout API,
