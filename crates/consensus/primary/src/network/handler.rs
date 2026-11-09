@@ -1220,14 +1220,20 @@ impl OutsiderSlots {
 
     /// Claim a slot for the peer with `tag`, unless it is at its limit.
     /// The caller holds a pool permit, so a slot is free, but a race may miss it.
-    fn claim(self: &Arc<Self>, tag: u64) -> Option<OutsiderJob> {
-        let index = self.slots.iter().position(|slot| {
-            slot.compare_exchange(FREE_SLOT, tag, Ordering::SeqCst, Ordering::SeqCst).is_ok()
-        })?;
+    fn claim(self: &Arc<Self>, tag: u64) -> Result<OutsiderJob, BusyLimit> {
+        let index = self
+            .slots
+            .iter()
+            .position(|slot| {
+                slot.compare_exchange(FREE_SLOT, tag, Ordering::SeqCst, Ordering::SeqCst).is_ok()
+            })
+            .ok_or(BusyLimit::Others)?;
         let job = OutsiderJob { index, outsiders: self.clone() };
         // Claim first and count after, so racing claims cannot both pass.
         // If both see each other, both are refused and retry later.
-        (self.running(tag) <= MISSING_CERT_JOBS_PER_OUTSIDER).then_some(job)
+        (self.running(tag) <= MISSING_CERT_JOBS_PER_OUTSIDER)
+            .then_some(job)
+            .ok_or(BusyLimit::Outsider)
     }
 
     /// Slots in use.
@@ -1315,7 +1321,7 @@ impl MissingCertSlots {
         }
         let pool = self.others.clone().try_acquire_owned().map_err(|_| BusyLimit::Others)?;
         // If a racing request won, the pool permit is dropped and so given back.
-        let job = self.outsiders.claim(tag).ok_or(BusyLimit::Outsider)?;
+        let job = self.outsiders.claim(tag)?;
         Ok(MissingCertPermits { _peer: None, _outsider: Some(job), _pool: pool })
     }
 }
