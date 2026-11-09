@@ -445,3 +445,48 @@ async fn test_leader_schedule_from_store() {
 
     assert_ne!(leader_2.id(), new_leader_2.id());
 }
+
+/// A consensus header's `reputation_score` is not covered by the header digest
+/// (`CommittedSubDag::digest` skips it). A peer that serves a header by number or by hash, or
+/// that answers the latest-block probe, can therefore set it to anything while keeping a hash a
+/// following node accepts. `LeaderSwapTable::new` divides by `auths_by_score.len()` without
+/// guarding zero, so an empty `scores_per_authority` with `final_of_schedule = true`, which no
+/// honest node ever produces, panics the node. This is the crash primitive behind the persisted
+/// crash-loop in the test below.
+#[test]
+#[should_panic(expected = "divide by zero")]
+fn tampered_final_scores_divide_by_zero_in_leader_swap_table() {
+    let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+    let committee = fixture.committee();
+
+    // What a peer can serve: marked final (so it is used as the schedule's scores) with no
+    // authorities (so the standard-deviation step divides by zero).
+    let poisoned =
+        ReputationScores { scores_per_authority: Default::default(), final_of_schedule: true };
+
+    let _ = LeaderSwapTable::new(&committee, 2, &poisoned, 33);
+}
+
+/// End to end on the stored row: a following node that caches a peer's consensus header keeps the
+/// peer's `reputation_score`, and that row is promoted to `ConsensusBlocks`. On the next start,
+/// `LeaderSchedule::from_store` reads the newest final-of-schedule row and builds the swap table
+/// from it. A poisoned row makes startup panic, and since the row is persisted the node panics on
+/// every restart until an operator clears its consensus database.
+#[test]
+#[should_panic(expected = "divide by zero")]
+fn stored_tampered_final_scores_crash_leader_schedule_from_store() {
+    let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+    let committee = fixture.committee();
+    let store = MemDatabase::default();
+
+    // A committed sub-dag at the committee's epoch, marked final, with an empty score map: what a
+    // peer serves and a following node stores after caching the header.
+    let leader = Certificate::genesis(&committee).into_iter().next().unwrap();
+    let poisoned =
+        ReputationScores { scores_per_authority: Default::default(), final_of_schedule: true };
+    let sub_dag = CommittedSubDag::new(vec![], leader, 0, poisoned, None);
+    store.write_subdag_for_test(1, sub_dag);
+
+    // Startup rebuild of the leader schedule reads that row and panics.
+    let _ = LeaderSchedule::from_store(committee, store, 33);
+}

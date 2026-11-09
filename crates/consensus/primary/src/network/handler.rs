@@ -878,6 +878,14 @@ where
             (None, None) => self.get_latest_output()?,
         };
 
+        // Test-only: any consensus-header reply, by number, by hash or latest, may be overridden
+        // with a crafted header to reproduce the reputation-score crash (finding N1). Compiled out
+        // of production builds, and inert unless the serving process is armed by environment.
+        #[cfg(feature = "byzantine-test-hooks")]
+        if let Some(crafted) = super::gap_fetch_byzantine::override_header(&header) {
+            return Ok(PrimaryResponse::ConsensusHeader(Arc::new(crafted)));
+        }
+
         Ok(PrimaryResponse::ConsensusHeader(Arc::new(header)))
     }
 

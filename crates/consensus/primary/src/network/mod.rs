@@ -40,6 +40,10 @@ mod message;
 use crate::network::state::AuthVoteState;
 pub use message::ConsensusResult;
 
+// Test-only Byzantine gap-fetch override, compiled only with `byzantine-test-hooks`.
+#[cfg(feature = "byzantine-test-hooks")]
+pub(crate) mod gap_fetch_byzantine;
+
 pub mod state;
 
 #[cfg(test)]
