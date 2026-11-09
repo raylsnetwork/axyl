@@ -230,6 +230,11 @@ impl Certificate {
 
     /// Verifies the aggregate signature against `committee`, resetting the verification state
     /// first so an already-verified certificate is re-checked.
+    ///
+    /// The author-in-committee check below mirrors the one `Header::validate` runs on the
+    /// `validate_and_verify` route. This keys-only route does not call `Header::validate`, so the
+    /// check is made explicit here to close the crash on a certificate authored outside the
+    /// verifying committee.
     pub fn verify_cert(mut self, committee: &[BlsPublicKey]) -> CertificateResult<Certificate> {
         // A quorum of `committee` can sign a header authored outside it (a validator that joined
         // later, leaving out its own vote); such a certificate is not valid for this committee.
@@ -585,6 +590,31 @@ mod tests {
             signed_authorities: roaring::RoaringBitmap::from_iter([0u32, 1, 2]),
             created_at: 1000,
         }
+    }
+
+    /// A certificate authored outside the verifying committee must be rejected before any signature
+    /// work. This closes the #276 crash where a quorum of an older committee signs a header
+    /// authored by a validator that is not in that committee.
+    #[test]
+    #[allow(deprecated)]
+    fn verify_cert_rejects_author_outside_committee() {
+        use crate::BlsKeypair;
+        use rand::rng;
+
+        let cert =
+            make_test_certificate(SignatureVerificationState::Unverified(BlsSignature::default()));
+        let outsider = *BlsKeypair::generate(&mut rng()).public();
+        assert_ne!(
+            AuthorityIdentifier::from(outsider),
+            *cert.origin(),
+            "precondition: the committee key must not derive the cert's author"
+        );
+
+        let err = cert.verify_cert(&[outsider]).unwrap_err();
+        assert!(
+            matches!(err, CertificateError::Header(HeaderError::UnknownAuthority(_))),
+            "a cert authored outside the verifying committee must be rejected, got {err:?}"
+        );
     }
 
     /// Verifies the BCS roundtrip for every SignatureVerificationState variant.
