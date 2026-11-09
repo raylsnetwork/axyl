@@ -1107,8 +1107,11 @@ where
     /// Put votes taken off the queue but not processed back on it, in order, for the next
     /// collection. Dropping them would close their senders' channels, which the gossip handler
     /// logs as an error per vote. A vote that does not fit (queue full) is acked so its sender is
-    /// not penalised for our backlog, and logged, since it is lost to the next collection.
+    /// not penalised for our backlog, and the lot is logged once, since they are lost to the next
+    /// collection. One line, not one per vote: a collection can now end with a backlog in hand.
     fn requeue_epoch_votes(consensus_bus: &ConsensusBus, votes: VecDeque<QueuedVote>) {
+        let mut lost = 0usize;
+        let mut first_lost = None;
         for item in votes {
             if let Err(err) = consensus_bus.new_epoch_votes().try_send(item) {
                 let (vote, vote_tx) = match err {
@@ -1116,14 +1119,19 @@ where
                     | rayls_infrastructure_types::TrySendError::Closed(item)
                     | rayls_infrastructure_types::TrySendError::Broadcast(item) => item,
                 };
-                warn!(
-                    target: "epoch-manager",
-                    digest = %vote.epoch_hash,
-                    signer = ?vote.public_key,
-                    "epoch vote queue full; an unsettled vote could not be requeued and is lost to the next collection",
-                );
+                lost += 1;
+                first_lost.get_or_insert((vote.epoch_hash, vote.public_key));
                 let _ = vote_tx.send(Ok(()));
             }
+        }
+        if let Some((digest, signer)) = first_lost {
+            warn!(
+                target: "epoch-manager",
+                lost,
+                first_digest = %digest,
+                first_signer = ?signer,
+                "epoch vote queue full; unsettled votes could not be requeued and are lost to the next collection",
+            );
         }
     }
 
@@ -1519,7 +1527,8 @@ where
             let timeout = Duration::from_secs(5);
             // The fallback below (DB check, own-vote republish, cap then peer fetch) runs on a
             // fixed schedule. A per-recv timeout would be reset by every arriving vote, so a
-            // steady stream of unhelpful votes could postpone it indefinitely.
+            // steady stream of unhelpful votes could postpone it indefinitely; the backlog
+            // check at the top of the loop keeps queued votes from doing the same.
             let mut next_fallback = tokio::time::Instant::now() + timeout;
             let mut timeouts = 0;
             let mut alt_recs: B256Map<VotesAggregator<EpochVote>> = B256Map::default();
@@ -1533,12 +1542,17 @@ where
                 // Break promptly when the consumer phase is signalled, rather than only
                 // noticing at the fallback deadline. `biased` so shutdown wins over a vote
                 // arriving.
-                let next = if let Some(queued_vote) = queued.pop_front() {
-                    // Votes in hand must not outrank the shutdown the transition waits on.
-                    if vote_shutdown.noticed() {
-                        let _ = queued_vote.1.send(Ok(()));
-                        break;
-                    }
+                // Votes in hand must not outrank the shutdown the transition waits on, and a
+                // backlog must not postpone the fallback: the deadline is checked before each
+                // queued vote, so a queue full of unhelpful votes (a flood, or honest votes that
+                // piled up while this node was not collecting) delays the DB check, the republish
+                // and the peer fetch by one vote, not by the whole backlog.
+                let next = if !queued.is_empty() && vote_shutdown.noticed() {
+                    break;
+                } else if !queued.is_empty() && tokio::time::Instant::now() >= next_fallback {
+                    next_fallback = tokio::time::Instant::now() + timeout;
+                    Next::Fallback
+                } else if let Some(queued_vote) = queued.pop_front() {
                     Next::Vote(queued_vote)
                 } else {
                     tokio::select! {
@@ -1769,7 +1783,7 @@ where
                     Next::Fallback => {
                         // Deadline reached, whether or not votes kept arriving.
                         // Failed after a minute: break and try to request the certs instead.
-                        // (Shutdown is handled by the select arm above, not polled here.)
+                        // (Shutdown is checked at the top of the loop, not polled here.)
                         if timeouts > 12 {
                             break;
                         }
