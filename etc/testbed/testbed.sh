@@ -51,7 +51,8 @@ restore_nodes() {
             rm -f "$DATA/$n.stopping"
         fi
         resume_node "$n"
-        start_node "$n"
+        # one node that cannot start must not stop the others from being restored
+        start_node "$n" || true
     done
 }
 
@@ -73,6 +74,16 @@ lock() {
     done
 }
 
+# record what this testbed runs with, for lib.sh to reuse; the epoch length is the one fixed at genesis
+save_env() {
+    local v
+    {
+        printf '[[ -n $RAYLS_BIN$BUILD_CONFIG ]] || REMEMBERED_BIN=%q\n' "$BIN"
+        for v in HTTP_ADDR NODE_ARGS LOG_LEVEL; do printf '[[ -n ${%s+x} ]] || %s=%q\n' "$v" "$v" "${!v}"; done
+        printf 'SAVED_EPOCH_SECS=%q\n[[ -n ${EPOCH_SECS+x} ]] || EPOCH_SECS=$SAVED_EPOCH_SECS\n' "${SAVED_EPOCH_SECS:-$EPOCH_SECS}"
+    } > "$DATA/env"
+}
+
 up() {
     command -v cast > /dev/null || die "Foundry 'cast' is required (https://getfoundry.sh)"
     if [[ -z $RAYLS_BIN && $BIN == "$ROOT"/target/*/rayls-network ]]; then
@@ -84,7 +95,7 @@ up() {
     fi
     [[ -x $BIN ]] || die "binary not found: $BIN"
     [[ -f $DATA/genesis/genesis.yaml ]] || genesis
-    echo "$BIN" > "$DATA/bin"
+    save_env
     start_all
     wait_for 120 "the first block" at_height validator-1 1
     status
