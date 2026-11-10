@@ -6,9 +6,9 @@ ROOT="$(cd "$TESTBED/../.." && pwd)"
 # Settings (override via env)
 DATA="${TESTBED_DATA:-$TESTBED/data}"
 [[ $DATA == /* ]] || DATA=$PWD/$DATA
-# `up` remembers the binary it ran in $DATA/bin. Later commands, node restarts in tests included, reuse it
-# unless RAYLS_BIN or BUILD_CONFIG is given, so one testbed never mixes builds.
-[[ -n $RAYLS_BIN || -n $BUILD_CONFIG || ! -f $DATA/bin ]] || REMEMBERED_BIN=$(<"$DATA/bin")
+# What `up` ran with (data/env: binary, bind address, node flags, epoch length). Later commands, node
+# restarts in tests included, reuse it unless a value is given explicitly, so a testbed never mixes settings.
+[[ ! -f $DATA/env ]] || source "$DATA/env"
 BUILD_CONFIG="${BUILD_CONFIG:-release}"
 BIN="${RAYLS_BIN:-${REMEMBERED_BIN:-$ROOT/target/$BUILD_CONFIG/rayls-network}}"
 EPOCH_SECS="${EPOCH_SECS:-30}"
@@ -78,9 +78,13 @@ start_node() {
     ) >> "$DATA/$n.log" 2>&1 &
     echo $! > "$DATA/$n.pid"
     set +m
-    # until the exec, ps shows the shell's command line and running() is false; wait for it
-    for ((t = 0; t < 50; t++)); do running "$n" && return 0; sleep 0.1; done
+    # until the exec, ps shows the shell's command line and running() is false; wait for it, then give
+    # the node a second to fail fast (bad flags, a locked datadir) so that is reported here
+    for ((t = 0; t < 50; t++)); do running "$n" && break; sleep 0.1; done
+    sleep 1
+    running "$n" && return 0
     echo "  $n did not start, see $DATA/$n.log" >&2
+    return 1
 }
 
 # SIGTERM only, never SIGKILL: a node must shut down cleanly, and one that hangs is a bug to fix.
@@ -190,7 +194,9 @@ TPS_CHECKER_REF="${TPS_CHECKER_REF:-d7ea8e4}"
 tps_setup() {
     [[ -x $TPS_CHECKER ]] && return 0
     if [[ ! -d $TPS_CHECKER_DIR ]]; then
-        git clone -q "$TPS_CHECKER_REPO" "$TPS_CHECKER_DIR" && git -C "$TPS_CHECKER_DIR" checkout -q "$TPS_CHECKER_REF" || return 1
+        git clone -q "$TPS_CHECKER_REPO" "$TPS_CHECKER_DIR" || return 1
+        # never leave an unpinned clone behind for the next run to pick up
+        git -C "$TPS_CHECKER_DIR" checkout -q "$TPS_CHECKER_REF" || { rm -rf "$TPS_CHECKER_DIR"; return 1; }
     fi
     (cd "$TPS_CHECKER_DIR" && cargo build --release -q)
 }
@@ -254,18 +260,26 @@ collide_loop() {
 }
 
 # Steady load: tps-checker in continuous mode at LOAD_TPS (default 200) through the rpc nodes (it fails
-# over between them), logged to load.log, plus collide_loop. tps-checker is restarted whenever it exits
-# and, with LOAD_CYCLE_SECS, on purpose every that many seconds (another source of nonce races).
+# over between them), logged to load.log, plus collide_loop. tps-checker is restarted whenever it exits,
+# when rpc nodes are added (so new ones get load too) and, with LOAD_CYCLE_SECS, every that many seconds
+# (another source of nonce races).
 load_loop() {
     set +m
-    local keys
+    local keys urls tc
     keys=$(load_keys)
     collide_loop >> "$DATA/load.log" 2>&1 &
     while :; do
-        echo "--- $(date '+%F %T') tps-checker at ${LOAD_TPS:-200} tps"
-        tps_checker --private-keys "$keys" --rpc-urls "$(load_urls)" --continuous \
+        urls=$(load_urls)
+        echo "--- $(date '+%F %T') tps-checker at ${LOAD_TPS:-200} tps through $urls"
+        tps_checker --private-keys "$keys" --rpc-urls "$urls" --continuous \
             --target-tps "${LOAD_TPS:-200}" --num-transactions 1000000000 --report-interval-secs 30 \
-            --duration-secs "${LOAD_CYCLE_SECS:-0}" || true
+            --duration-secs "${LOAD_CYCLE_SECS:-0}" &
+        tc=$!
+        while kill -0 "$tc" 2> /dev/null; do
+            sleep 10
+            [[ $(load_urls) == "$urls" ]] || kill "$tc" 2> /dev/null || true
+        done
+        wait "$tc" || true
         sleep 2
     done >> "$DATA/load.log" 2>&1
 }
