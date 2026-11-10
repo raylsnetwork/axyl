@@ -112,9 +112,14 @@ After `extended` adds validator-5 and rpc-3, every plan includes them.
 
 ## Settings
 
+`up` records the binary, `HTTP_ADDR`, `NODE_ARGS`, `LOG_LEVEL` and the genesis `EPOCH_SECS` in `data/env`.
+Every later command, node restarts during tests included, reuses them unless you set a value
+explicitly. So `HTTP_ADDR=0.0.0.0 ./etc/testbed/testbed.sh up` on the VM keeps restarted nodes
+reachable from outside, and a debug testbed stays on debug.
+
 | Variable | Default | Purpose |
 |---|---|---|
-| `BUILD_CONFIG` | `release` | Cargo profile to build and run: `debug`, or another workspace profile such as `profiling`. `up` remembers the binary (`data/bin`), so later commands and node restarts use the same one |
+| `BUILD_CONFIG` | `release` | Cargo profile to build and run: `debug`, or another workspace profile such as `profiling`. Remembered by `up` (see below) |
 | `RAYLS_BIN` | builds `target/$BUILD_CONFIG/rayls-network` | Use this binary instead of building |
 | `RPC_NODES` | `2` | RPC (observer) nodes created at genesis |
 | `TESTBED_DATA` | `etc/testbed/data` | Data and log directory |
