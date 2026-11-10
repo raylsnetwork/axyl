@@ -1,7 +1,7 @@
 //! The ouput from consensus (bullshark)
 //! See test_utils output_tests.rs for this modules tests.
 
-use super::{CertificateDigest, ConsensusHeader};
+use super::{committee_ids, CertificateDigest, ConsensusHeader};
 use crate::{
     bcs_layout::{BcsCursor, BcsLayout, BcsLayoutError},
     crypto, encode,
@@ -326,7 +326,8 @@ impl CommittedSubDag {
     /// Verify all certificates using raw BLS public keys.
     pub fn verify_certificates_with_keys(self, keys: &[BlsPublicKey]) -> CertificateResult<Self> {
         let Self { mut certificates, leader, reputation_score, commit_timestamp } = self;
-        let leader = leader.verify_cert(keys)?;
+        let ids = committee_ids(keys);
+        let leader = leader.verify_cert_with_ids(keys, &ids)?;
         let mut verified_certs: HashSet<CertificateDigest> =
             leader.header.parents().iter().copied().collect();
         let mut new_certs = Vec::new();
@@ -339,7 +340,7 @@ impl CommittedSubDag {
             if verified_certs.contains(&digest) {
                 new_certs.push(cert);
             } else {
-                let cert = cert.verify_cert(keys)?;
+                let cert = cert.verify_cert_with_ids(keys, &ids)?;
                 verified_certs.insert(cert.digest());
                 new_certs.push(cert);
             }
