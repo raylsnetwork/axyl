@@ -1,12 +1,13 @@
 # Testbed
 
-`testbed.sh` starts a local Rayls network (4 validators as native processes) and runs test plans
+`testbed.sh` starts a local Rayls network (4 validators + 2 RPC nodes as native processes) and runs test plans
 against it. It works the same on a laptop and on the Proxmox VM. Chain id, accounts and ports are
 fixed.
 
 **Requirements**
 
-- A Rust toolchain, or `RAYLS_BIN` pointing to a prebuilt binary.
+- A Rust toolchain, or `RAYLS_BIN` pointing to a prebuilt binary. `BUILD_CONFIG=debug` builds and
+  runs a debug binary. It is slower, but you get more detail when something breaks.
 - Foundry `cast` and `curl`.
 - `jq`, for the ERC-20 test.
 - [tps-checker](https://github.com/raylsnetwork/tps-checker) next to this repo (`../tps-checker`),
@@ -15,7 +16,7 @@ fixed.
 ## Usage
 
 ```sh
-./etc/testbed/testbed.sh up                  # build, genesis on first run, start 4 validators
+./etc/testbed/testbed.sh up                  # build, genesis on first run, start 4 validators + rpc-1, rpc-2
 ./etc/testbed/testbed.sh test                # basic plan, ~30s
 ./etc/testbed/testbed.sh test chaos          # stop / pause / restart scenarios, ~5 min
 ./etc/testbed/testbed.sh test all            # basic, chaos, extended, then basic and chaos again, ~15 min
@@ -26,6 +27,8 @@ fixed.
 LOAD=1 ./etc/testbed/testbed.sh test chaos   # any plan with steady tps-checker load underneath
 SOAK_MINUTES=720 ./etc/testbed/testbed.sh test soak 2>&1 | tee soak.log   # overnight (run in tmux)
 HTTP_ADDR=0.0.0.0 ./etc/testbed/testbed.sh up   # on the VM: RPCs reachable at <vm-ip>:8545..
+BUILD_CONFIG=debug ./etc/testbed/testbed.sh up  # debug build (switch only on a stopped testbed)
+SOAK_VICTIMS=validator-5 ./etc/testbed/testbed.sh test soak   # keep bouncing just the added validator
 ```
 
 ## Commands
@@ -35,9 +38,9 @@ HTTP_ADDR=0.0.0.0 ./etc/testbed/testbed.sh up   # on the VM: RPCs reachable at <
 | `up` | Build, run genesis if needed, start all nodes, wait for the first block |
 | `down` / `clean` | Stop all nodes (SIGTERM) / stop them and delete the data |
 | `status` | PID, RPC, block, epoch and role of each node |
-| `start\|stop\|pause\|resume <node>` | One node: `1`..`5` or `rpc`. `stop` = SIGTERM, `pause`/`resume` = SIGSTOP/SIGCONT |
+| `start\|stop\|pause\|resume <node>` | One node: `1`..`5` or `rpc-N`. `stop` = SIGTERM, `pause`/`resume` = SIGSTOP/SIGCONT |
 | `add-validator` | Add validator-5 and stake it into the committee (fund, mint RLS, allowlist, stake, activate) |
-| `add-rpc` | Add an RPC (observer) node |
+| `add-rpc` | Add another RPC (observer) node to the running chain (`rpc-3`, ...) |
 | `logs <node>` | Follow a node's log (`data/<node>.log`) |
 | `load` | Steady tps-checker load until Ctrl-C (`data/load.log`) |
 | `test [plan\|plan/test ...]` | Run plans or single tests (default `basic`) |
@@ -50,7 +53,7 @@ Each test is one small file in `tests/<plan>/` and runs in file order.
 |---|---|---|
 | basic | `01-liveness` | Every node is up and its chain grows |
 | | `02-consistency` | All nodes have the same block hashes |
-| | `03-node-status` | Validators `active_cvv`, rpc `observer`, all caught up, same epoch |
+| | `03-node-status` | Validators `active_cvv`, RPC nodes `observer`, all caught up, same epoch |
 | | `04-transfer` | A transfer sent through each node lands, and all nodes see it |
 | | `05-restart` | Restart one validator; the chain continues and the node catches up |
 | | `06-epoch` | An epoch closes and its certified record is served |
@@ -65,20 +68,22 @@ Each test is one small file in `tests/<plan>/` and runs in file order.
 | | `09-stop-at-epoch-boundary` | Stop a validator right after an epoch change |
 | | `10-restart-loop` | Stop/start once caught up, `CYCLES` times |
 | extended | `01-add-validator` | validator-5 is staked, becomes `active_cvv`, and the committee has 5 members |
-| | `02-rpc-node` | RPC node syncs from genesis, relays a transfer, survives a restart |
-| | `03-faults-with-new-nodes` | `chaos/01` and `chaos/02` with 5 validators and the RPC node |
+| | `02-rpc-node` | A late RPC node joins, syncs from genesis, relays a transfer, survives a restart |
+| | `03-faults-with-new-nodes` | `chaos/01` and `chaos/02` with 5 validators and 3 RPC nodes |
 | | `04-erc20-precompile` | `etc/test-network/erc20_precompile_test.sh` against validator-1 |
-| | `05-tps` | tps-checker burst; every transfer is accepted and lands on-chain (checked by nonces) |
-| soak | `01-faults-under-load` | Steady load, and each round stops or freezes a random node (not validator-1). Stops at the first fork, stall or load gap |
+| | `05-tps` | tps-checker burst through the RPC nodes; every transfer is accepted and lands on-chain (checked by nonces) |
+| soak | `01-faults-under-load` | Steady load, and each round stops or freezes a random node (any node except rpc-1, the reference). Stops at the first fork, stall or load gap |
 | rust | `e2e`, `chaos` | The `e2e-tests` and `chaos-framework` crates. `chaos` needs Linux and root |
 
-After `extended` adds validator-5 and the RPC node, every plan includes them.
+After `extended` adds validator-5 and rpc-3, every plan includes them.
 
 ## Settings
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `RAYLS_BIN` | builds `target/release/rayls-network` | Use this binary instead of building |
+| `BUILD_CONFIG` | `release` | `debug` builds and runs `target/debug/rayls-network` |
+| `RAYLS_BIN` | builds `target/$BUILD_CONFIG/rayls-network` | Use this binary instead of building |
+| `RPC_NODES` | `2` | RPC (observer) nodes created at genesis |
 | `TESTBED_DATA` | `etc/testbed/data` | Data and log directory |
 | `EPOCH_SECS` | `30` | Epoch length; applied at genesis |
 | `HTTP_ADDR` | `127.0.0.1` | RPC bind address (`0.0.0.0` on the VM) |
@@ -88,6 +93,7 @@ After `extended` adds validator-5 and the RPC node, every plan includes them.
 | `COLLIDE_SECS` | `10` | Average seconds between deliberate nonce collisions; `0` = off |
 | `LOAD_CYCLE_SECS` | `0` | Restart tps-checker every N seconds; `0` = only when it exits |
 | `SOAK_MINUTES` / `SOAK_INTERVAL` | `480` / `60` | Soak length and seconds between rounds |
+| `SOAK_VICTIMS` | all but rpc-1 | Nodes the soak may stop or freeze, e.g. `validator-5` |
 | `TPS_TXS` / `CYCLES` | `3000` / `3` | Burst size in `extended/05`; loops in `chaos/10` |
 | `TPS_CHECKER_DIR` / `TPS_CHECKER_BIN` | `../tps-checker` | Where tps-checker lives |
 
@@ -96,13 +102,15 @@ After `extended` adds validator-5 and the RPC node, every plan includes them.
 - **No SIGKILL, ever.** Nodes are stopped with SIGTERM and must shut down cleanly. If a node is
   still running after `STOP_TIMEOUT`, the stop fails. The node is left running for inspection, and
   `clean` refuses to delete its data.
-- **Load.** tps-checker runs in continuous mode through validator-1. Its wallets come from the test
+- **Load goes through the RPC nodes only, as real users' traffic does.** tps-checker runs in
+  continuous mode across all RPC nodes and fails over between them. Its wallets come from the test
   mnemonic starting at index 10, are funded up front, and pay twice the base fee. If tps-checker
-  exits, it is restarted.
+  exits, it is restarted. Validators get no load, so the soak can fault any of them, validator-1
+  included.
 - **Nonce collisions.** Every ~`COLLIDE_SECS`, `cast` sends a transfer from the same wallet
   tps-checker is using. Rejections in `load.log` are expected; the chain must not care.
-- **Network.** RPC ports: validator-N is on `8546-N` and rpc on `8540`. Consensus metrics:
-  validator-N is on `9099+N`. The dev/admin account is anvil #0 (`0xf39F…2266`). Validator
+- **Network.** RPC ports: validator-N is on `8546-N`, and rpc-N on `8540-(N-1)` (rpc-1 = 8540,
+  rpc-2 = 8539). Consensus metrics are on `9100` and up, in the same order. The dev/admin account is anvil #0 (`0xf39F…2266`). Validator
   operators are anvil #5–#9.
 - **Rust plan.** `rust/e2e` stops the testbed while it runs, because it uses ports 8545–8542. Run
   `rust/chaos` with the testbed stopped, via `sudo -E env "PATH=$PATH" ./etc/testbed/testbed.sh test rust/chaos`.

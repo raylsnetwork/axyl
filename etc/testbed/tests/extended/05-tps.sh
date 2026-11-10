@@ -1,4 +1,4 @@
-# Burst load with tps-checker: TPS_TXS transfers (default 3000) from 3 wallets over validators 1-3 all land.
+# Burst load with tps-checker: TPS_TXS transfers (default 3000) from 3 wallets through the rpc nodes all land.
 tps_setup || skip "tps-checker not available; clone github.com/raylsnetwork/tps-checker next to this repo"
 txs=${TPS_TXS:-3000}
 keys=$(wallet_keys 20 3)
@@ -11,7 +11,7 @@ landed() {
     echo "$sum"
 }
 before=$(landed)
-out=$(with_timeout 300 tps_checker --private-keys "$keys" --rpc-urls "$(url validator-1),$(url validator-2),$(url validator-3)" \
+out=$(with_timeout 300 tps_checker --private-keys "$keys" --rpc-urls "$(load_urls)" \
     --num-transactions "$txs" --funder-private-key "$ADMIN_KEY" 2>&1) || fail "tps-checker failed: $(echo "$out" | tail -3)"
 echo "$out" | grep -E 'Transactions: .* sent|Avg Confirm TPS|TPS \(block\)' | sed 's/^ */  /'
 echo "$out" | grep -q 'Transactions: [0-9]* sent / 0 failed' || fail "some transactions were rejected"

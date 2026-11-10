@@ -178,8 +178,9 @@ Manual, bash + docker — parallel to the Rust chaos framework but driven via `d
 
 ## 8. Local testbed (`etc/testbed/`)
 
-`testbed.sh` starts a 4-validator network as native processes, on a laptop or on the Proxmox VM.
-`add-validator` and `add-rpc` add a staked 5th validator and an RPC node. Test plans then run
+`testbed.sh` starts 4 validators and 2 RPC (observer) nodes as native processes, on a laptop or on
+the Proxmox VM; release or debug builds. `add-validator` and `add-rpc` add a staked 5th validator
+and more RPC nodes. Load goes through the RPC nodes only. Test plans then run
 against the live network: `basic` (liveness, consistency, node status, transfers, restart, epoch),
 `chaos` (pause, quorum loss, flicker, rolling/full restart, rapid restart, stop during sync,
 long downtime, stop at an epoch boundary, restart soak; nodes are only ever stopped with SIGTERM) and `extended` (5th validator, RPC node,

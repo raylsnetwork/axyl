@@ -8,18 +8,20 @@ fi
 nonce_above() { local n; n=$(load_nonce) && ((n > $1)); }
 wait_for 300 "the load to land its first transactions" nonce_above "$start"
 end=$((SECONDS + ${SOAK_MINUTES:-480} * 60))
+# the first rpc node is the reference (what a user sees) and is never faulted; SOAK_VICTIMS narrows the
+# targets, e.g. SOAK_VICTIMS=validator-5 keeps bouncing only the added validator
+ref=$(ref_node)
+victims=(${SOAK_VICTIMS:-$(nodes | grep -vx "$ref")})
 round=0
 actions=(stop pause)
 while ((SECONDS < end)); do
     round=$((round + 1))
-    # validator-1 carries the load and is the reference, so every other node is fair game
-    victims=($(nodes | grep -vx validator-1))
     v=${victims[RANDOM % ${#victims[@]}]}
     a=${actions[RANDOM % 2]}
     nonce=$(load_nonce) || fail "could not read the load account nonce"
-    log "round $round $(date '+%F %T'): $a $v at block $(height validator-1), epoch $(epoch validator-1)"
+    log "round $round $(date '+%F %T'): $a $v at block $(height "$ref"), epoch $(epoch "$ref")"
     "${a}_node" "$v"
-    wait_blocks validator-1 5 120
+    wait_blocks "$ref" 5 120
     sleep $((RANDOM % 30))
     if [[ $a == pause ]]; then resume_node "$v"; else start_node "$v"; fi
     wait_synced "$v"
