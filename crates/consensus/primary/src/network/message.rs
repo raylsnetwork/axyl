@@ -274,26 +274,6 @@ fn max_skip_bitmap_len(max_rounds: usize) -> usize {
     HEADER + PER_CONTAINER * MAX_SKIP_ROUND_CONTAINERS + size_of::<u16>() * max_rounds
 }
 
-/// Number of containers a serialized roaring bitmap declares, or `None` for an unknown header.
-fn roaring_container_count(bytes: &[u8]) -> Option<usize> {
-    // Header of a bitmap without run containers: this cookie, then the container count.
-    const SERIAL_COOKIE_NO_RUNCONTAINER: u32 = 12346;
-    // Header of a bitmap with run containers: this cookie, then the container count minus one.
-    const SERIAL_COOKIE: u16 = 12347;
-    const WORD: usize = size_of::<u32>();
-    let word = |at: usize| -> Option<u32> {
-        Some(u32::from_le_bytes(bytes.get(at..at + WORD)?.try_into().ok()?))
-    };
-    let cookie = word(0)?;
-    if cookie as u16 == SERIAL_COOKIE {
-        Some((cookie >> u16::BITS) as usize + 1)
-    } else if cookie == SERIAL_COOKIE_NO_RUNCONTAINER {
-        Some(word(WORD)? as usize)
-    } else {
-        None
-    }
-}
-
 impl MissingCertificatesRequest {
     /// Deserialize the [RoaringBitmap] representing the difference between the requesting peer's
     /// lower boundary and their GC round.
@@ -317,10 +297,13 @@ impl MissingCertificatesRequest {
             if !keep(k) || skip_rounds.contains_key(k) {
                 continue;
             }
-            let containers = roaring_container_count(serialized).ok_or_else(|| {
-                std::io::Error::new(std::io::ErrorKind::InvalidData, "unknown skip bitmap")
-            })?;
-            if containers > MAX_SKIP_ROUND_CONTAINERS {
+            // The portable header is parsed by the same helper the signer-bitmap bound uses, so
+            // both bounds track the roaring format in one place.
+            let (containers, _) = rayls_infrastructure_types::serde::roaring_header(serialized)
+                .ok_or_else(|| {
+                    std::io::Error::new(std::io::ErrorKind::InvalidData, "unknown skip bitmap")
+                })?;
+            if containers as usize > MAX_SKIP_ROUND_CONTAINERS {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
                     "skip bitmap declares too many containers",
