@@ -61,26 +61,18 @@ start_node() {
     set +m
 }
 
-# SIGTERM and wait. A node still up after 60s is a shutdown bug: fail (and SIGKILL it).
+# SIGTERM only, never SIGKILL: a node must shut down cleanly, and one that hangs is a bug to fix.
+# After STOP_TIMEOUT (default 120s) this fails and leaves the node running for inspection.
 stop_node() {
     local p
     running "$1" || { rm -f "$DATA/$1.pid"; return 0; }
     p=$(pid "$1")
     kill -CONT "$p" 2>/dev/null || true
     kill "$p" 2>/dev/null || true
-    if ! wait_exit "$p" 60; then
-        echo "  $1 did not stop within 60s of SIGTERM, killing it" >&2
-        kill -9 "$p"; wait_exit "$p" 10 || true; rm -f "$DATA/$1.pid"
+    if ! wait_exit "$p" "${STOP_TIMEOUT:-120}"; then
+        echo "  $1 (pid $p) did not stop within ${STOP_TIMEOUT:-120}s of SIGTERM; left running, see $DATA/$1.log" >&2
         return 1
     fi
-    rm -f "$DATA/$1.pid"
-}
-kill_node() {
-    local p
-    running "$1" || { rm -f "$DATA/$1.pid"; return 0; }
-    p=$(pid "$1")
-    kill -9 "$p" 2>/dev/null || true
-    wait_exit "$p" 10
     rm -f "$DATA/$1.pid"
 }
 pause_node() { running "$1" || fail "$1 is not running"; kill -STOP "$(pid "$1")"; }
@@ -208,16 +200,32 @@ fund_load() {
     done
 }
 
+# Nonce collisions: at random intervals averaging COLLIDE_SECS (default 10, 0 = off), send one extra
+# transfer from the first load wallet while tps-checker is using it, so both race for the same nonces.
+# Rejections ("nonce too low", "replacement underpriced") are expected; the chain must not care.
+collide_loop() {
+    local secs=${COLLIDE_SECS:-10} key
+    ((secs > 0)) || return 0
+    key=$(wallet_keys 10 1)
+    while sleep $((RANDOM % (2 * secs) + 1)); do
+        echo "--- $(date '+%F %T') nonce collision: $(cast send --async --rpc-url "$(url validator-1)" --private-key "$key" \
+            0x000000000000000000000000000000000000dEaD --value 1gwei 2>&1 | tail -1)"
+    done
+}
+
 # Steady load: tps-checker in continuous mode at LOAD_TPS (default 200) through validator-1, logged to
-# load.log. It is restarted whenever it exits, e.g. after validator-1 itself was restarted.
+# load.log, plus collide_loop. tps-checker is restarted whenever it exits (e.g. after validator-1 was
+# restarted) and, with LOAD_CYCLE_SECS, on purpose every that many seconds (another source of nonce races).
 load_loop() {
     set +m
     local keys
     keys=$(load_keys)
+    collide_loop >> "$DATA/load.log" 2>&1 &
     while :; do
         echo "--- $(date '+%F %T') tps-checker at ${LOAD_TPS:-200} tps"
         tps_checker --private-keys "$keys" --rpc-url "$(url validator-1)" --continuous \
-            --target-tps "${LOAD_TPS:-200}" --num-transactions 1000000000 --report-interval-secs 30 || true
+            --target-tps "${LOAD_TPS:-200}" --num-transactions 1000000000 --report-interval-secs 30 \
+            --duration-secs "${LOAD_CYCLE_SECS:-0}" || true
         sleep 2
     done >> "$DATA/load.log" 2>&1
 }

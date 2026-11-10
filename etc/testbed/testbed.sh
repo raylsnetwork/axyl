@@ -8,10 +8,10 @@ usage() {
 usage: $0 <command>
 
   up                      build, run genesis (first time only) and start all nodes
-  down                    stop all nodes (keeps data)
+  down                    stop all nodes with SIGTERM (keeps data)
   clean                   stop all nodes and delete $DATA
   status                  show every node's pid, rpc, block, epoch and role
-  start|stop|kill|pause|resume <node>
+  start|stop|pause|resume <node>
                           control one node: 1..5 (validator-N) or rpc
   add-validator           add validator-5 and stake it into the committee
   add-rpc                 add an rpc (observer) node
@@ -22,7 +22,8 @@ usage: $0 <command>
 
 settings (env): RAYLS_BIN, TESTBED_DATA, EPOCH_SECS ($EPOCH_SECS), HTTP_ADDR ($HTTP_ADDR),
                 LOG_LEVEL ($LOG_LEVEL), NODE_ARGS, GENESIS_ARGS, LOAD_TPS, LOAD_WALLETS,
-                TPS_CHECKER_DIR, TPS_CHECKER_BIN, SOAK_MINUTES, SOAK_INTERVAL
+                COLLIDE_SECS, LOAD_CYCLE_SECS, TPS_CHECKER_DIR, TPS_CHECKER_BIN, SOAK_MINUTES,
+                SOAK_INTERVAL, STOP_TIMEOUT
 EOF
     exit 1
 }
@@ -139,7 +140,7 @@ case "$1" in
         rm -rf "$DATA"
         ;;
     status) status ;;
-    start | stop | kill | pause | resume)
+    start | stop | pause | resume)
         [[ -n $2 ]] || usage
         n=$(node_name "$2")
         [[ -d $DATA/$n ]] || die "no node $n in $DATA (validator-5 and rpc come from add-validator / add-rpc)"

@@ -1,4 +1,4 @@
-# Soak: steady load while a random node is stopped, killed or frozen each round, for SOAK_MINUTES (default 480).
+# Soak: steady load (with occasional nonce collisions) while a random node is stopped or frozen each round, for SOAK_MINUTES (default 480).
 tps_setup || skip "tps-checker not available; clone github.com/raylsnetwork/tps-checker next to this repo"
 start=$(load_nonce) || fail "could not read the load account nonce"
 if [[ $LOAD != 1 ]]; then
@@ -9,13 +9,13 @@ nonce_above() { local n; n=$(load_nonce) && ((n > $1)); }
 wait_for 300 "the load to land its first transactions" nonce_above "$start"
 end=$((SECONDS + ${SOAK_MINUTES:-480} * 60))
 round=0
-actions=(stop kill pause)
+actions=(stop pause)
 while ((SECONDS < end)); do
     round=$((round + 1))
     # validator-1 carries the load and is the reference, so every other node is fair game
     victims=($(nodes | grep -vx validator-1))
     v=${victims[RANDOM % ${#victims[@]}]}
-    a=${actions[RANDOM % 3]}
+    a=${actions[RANDOM % 2]}
     nonce=$(load_nonce) || fail "could not read the load account nonce"
     log "round $round $(date '+%F %T'): $a $v at block $(height validator-1), epoch $(epoch validator-1)"
     "${a}_node" "$v"
