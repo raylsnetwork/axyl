@@ -235,11 +235,23 @@ impl Certificate {
     /// `validate_and_verify` route. This keys-only route does not call `Header::validate`, so the
     /// check is made explicit here to close the crash on a certificate authored outside the
     /// verifying committee.
-    pub fn verify_cert(mut self, committee: &[BlsPublicKey]) -> CertificateResult<Certificate> {
+    pub fn verify_cert(self, committee: &[BlsPublicKey]) -> CertificateResult<Certificate> {
+        let ids = committee_ids(committee);
+        self.verify_cert_with_ids(committee, &ids)
+    }
+
+    /// [`Self::verify_cert`] with the committee's ids already computed by [`committee_ids`], so
+    /// a caller checking many certificates against one committee hashes its keys once.
+    pub fn verify_cert_with_ids(
+        mut self,
+        committee: &[BlsPublicKey],
+        ids: &[AuthorityIdentifier],
+    ) -> CertificateResult<Certificate> {
+        debug_assert_eq!(committee.len(), ids.len(), "ids must come from committee_ids(committee)");
         // A quorum of `committee` can sign a header authored outside it (a validator that joined
         // later, leaving out its own vote); such a certificate is not valid for this committee.
         ensure!(
-            committee.iter().any(|key| AuthorityIdentifier::from(*key) == *self.origin()),
+            ids.contains(self.origin()),
             CertificateError::from(HeaderError::UnknownAuthority(self.origin().to_string()))
         );
         self = self.validate_received()?;
@@ -451,6 +463,11 @@ impl BcsLayout for SignatureVerificationState {
     }
 }
 
+/// The authority id of each key in `committee`, in the same order.
+pub fn committee_ids(committee: &[BlsPublicKey]) -> Vec<AuthorityIdentifier> {
+    committee.iter().map(|key| AuthorityIdentifier::from(*key)).collect()
+}
+
 /// Marks a received certificate as unverified so it must pass signature verification.
 pub fn validate_received_certificate(
     mut certificate: Certificate,
@@ -610,10 +627,17 @@ mod tests {
             "precondition: the committee key must not derive the cert's author"
         );
 
-        let err = cert.verify_cert(&[outsider]).unwrap_err();
+        let err = cert.clone().verify_cert(&[outsider]).unwrap_err();
         assert!(
             matches!(err, CertificateError::Header(HeaderError::UnknownAuthority(_))),
             "a cert authored outside the verifying committee must be rejected, got {err:?}"
+        );
+
+        // the same check holds when the committee ids are computed once by the caller
+        let err = cert.verify_cert_with_ids(&[outsider], &committee_ids(&[outsider])).unwrap_err();
+        assert!(
+            matches!(err, CertificateError::Header(HeaderError::UnknownAuthority(_))),
+            "verify_cert_with_ids must reject the same cert, got {err:?}"
         );
     }
 
