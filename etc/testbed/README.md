@@ -13,6 +13,39 @@ fixed.
 - [tps-checker](https://github.com/raylsnetwork/tps-checker) next to this repo (`../tps-checker`),
   for load, soak and the TPS test. If it isn't there, the testbed clones and builds it.
 
+## Overnight run (the main use case)
+
+```sh
+tmux new -s overnight                        # keeps running after you log out; detach with Ctrl-b d
+./etc/testbed/testbed.sh clean && ./etc/testbed/testbed.sh up
+LOAD=1 SOAK_MINUTES=600 ./etc/testbed/testbed.sh test all soak 2>&1 | tee overnight.log
+```
+
+1. The whole suite runs first (`all`: 37 tests, ~20 min).
+2. Then the soak runs for `SOAK_MINUTES` on the extended network, 5 validators and 3 RPC nodes.
+   Every round it stops or freezes a random node and checks that it comes back, nothing forks, and
+   the load keeps landing.
+3. Steady tps-checker load with occasional nonce collisions runs underneath the whole time.
+
+The run doesn't stop at a failing test. The soak itself stops at its first problem and prints the
+round, the time and the reason.
+
+Optional variations:
+
+- `BUILD_CONFIG=debug` on `up`, for a debug build.
+- `SOAK_VICTIMS=validator-5`, to bounce only the added validator.
+- `LOAD_TPS=1000`, for heavier load.
+
+In the morning:
+
+- `tail overnight.log` shows the last line, `passed: N skipped: N failed: N ...`.
+- `./etc/testbed/testbed.sh status` shows the state of each node.
+- `tail etc/testbed/data/load.log` shows the TPS reports.
+- `etc/testbed/data/<node>.log` holds each node's log, which you can read around a failure time.
+
+Don't loop `test all` instead: `extended` adds a new RPC node on every run. The soak is the part
+meant to run for hours.
+
 ## Usage
 
 ```sh
@@ -25,7 +58,7 @@ fixed.
 ./etc/testbed/testbed.sh clean               # stop and delete all data
 
 LOAD=1 ./etc/testbed/testbed.sh test chaos   # any plan with steady tps-checker load underneath
-SOAK_MINUTES=720 ./etc/testbed/testbed.sh test soak 2>&1 | tee soak.log   # overnight (run in tmux)
+SOAK_MINUTES=60 ./etc/testbed/testbed.sh test soak   # soak only, without the rest of the suite
 HTTP_ADDR=0.0.0.0 ./etc/testbed/testbed.sh up   # on the VM: RPCs reachable at <vm-ip>:8545..
 BUILD_CONFIG=debug ./etc/testbed/testbed.sh up  # debug build (switch only on a stopped testbed)
 SOAK_VICTIMS=validator-5 ./etc/testbed/testbed.sh test soak   # keep bouncing just the added validator
