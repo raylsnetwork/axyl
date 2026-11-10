@@ -7,6 +7,7 @@ victims=()
 for v in ${SOAK_VICTIMS:-$(nodes | grep -vx "$ref")}; do
     [[ $v =~ ^[0-9]+$ ]] && v=validator-$v
     [[ -d $DATA/$v ]] || fail "unknown SOAK_VICTIMS node: $v"
+    [[ $v != "$ref" ]] || fail "SOAK_VICTIMS cannot include the reference node $ref"
     victims+=("$v")
 done
 start=$(load_nonce) || fail "could not read the load account nonce"
