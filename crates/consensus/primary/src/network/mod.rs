@@ -532,9 +532,15 @@ where
         let task_name = format!("ProcessGossip-{}-{gossip_source}", msg.topic);
         // spawn task to process gossip
         self.task_spawner.spawn_task(task_name, async move {
-            if let Err(ref e) = request_handler.process_gossip(&msg).await {
-                // pending certificates are expected when they arrive before parents
-                if matches!(e, PrimaryNetworkError::Certificate(CertManagerError::Pending(_))) {
+            if let Err(ref e) = request_handler.process_gossip(&msg, gossip_source).await {
+                // pending certificates are expected when they arrive before parents; a signer
+                // mismatch is one line per forged message from a publisher that may be a
+                // penalty-exempt committee member, so it must not be able to fill the log
+                if matches!(
+                    e,
+                    PrimaryNetworkError::Certificate(CertManagerError::Pending(_))
+                        | PrimaryNetworkError::GossipAuthorMismatch { .. }
+                ) {
                     debug!(target: "primary::network", ?e, "process_gossip");
                 } else {
                     warn!(target: "primary::network", ?e, "process_gossip");

@@ -232,7 +232,16 @@ where
     }
 
     /// Process gossip from the committee.
-    pub(super) async fn process_gossip(&self, msg: &GossipMessage) -> PrimaryNetworkResult<()> {
+    ///
+    /// `author` is the BLS key of the peer that published the message, resolved by the network
+    /// layer from the signed gossipsub frame. A consensus result or epoch vote must name that
+    /// same key as its signer: honest nodes publish only their own, so a mismatch is a forgery
+    /// by the publisher and is rejected before any signature work.
+    pub(super) async fn process_gossip(
+        &self,
+        msg: &GossipMessage,
+        author: BlsPublicKey,
+    ) -> PrimaryNetworkResult<()> {
         let GossipMessage { data, topic, .. } = msg;
         let gossip = try_decode(data)?;
 
@@ -296,6 +305,18 @@ where
                     // We have already dealt with this hash or we are past this output.
                     return Ok(());
                 }
+                // The signer must be the publisher. Checked before the committee lookup and the
+                // BLS verify: a peer naming another validator's key would otherwise cost every
+                // receiver a verify for a Mild penalty. Kept after the dedup above on purpose:
+                // a forged result with an old number is dropped for free rather than penalized,
+                // and the dedup is the cheaper check.
+                ensure!(
+                    key == author,
+                    PrimaryNetworkError::GossipAuthorMismatch {
+                        author: Box::new(author),
+                        claimed: Box::new(key)
+                    }
+                );
                 if let Some(committee) = self.get_committee(epoch) {
                     ensure!(
                         committee.contains(&key),
@@ -354,6 +375,16 @@ where
                 ensure!(
                     topic.to_string().eq(&LibP2pConfig::epoch_vote_topic()),
                     PrimaryNetworkError::InvalidTopic
+                );
+                // The signer must be the publisher, checked before the vote is queued: the
+                // collector's committee check reads `vote.public_key`, which the publisher
+                // writes, and only runs at the next epoch close.
+                ensure!(
+                    vote.public_key == author,
+                    PrimaryNetworkError::GossipAuthorMismatch {
+                        author: Box::new(author),
+                        claimed: Box::new(vote.public_key)
+                    }
                 );
                 let (tx, rx) = oneshot::channel();
                 let _ = self.consensus_bus.new_epoch_votes().send((*vote, tx)).await;
