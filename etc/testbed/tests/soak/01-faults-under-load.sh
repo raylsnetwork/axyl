@@ -1,5 +1,14 @@
 # Soak: steady load (with occasional nonce collisions) while a random node is stopped or frozen each round, for SOAK_MINUTES (default 480).
 tps_setup || skip "tps-checker not available; clone github.com/raylsnetwork/tps-checker next to this repo"
+# the first rpc node is the reference (what a user sees) and is never faulted; SOAK_VICTIMS narrows the
+# targets, e.g. SOAK_VICTIMS=validator-5 keeps bouncing only the added validator
+ref=$(ref_node)
+victims=()
+for v in ${SOAK_VICTIMS:-$(nodes | grep -vx "$ref")}; do
+    [[ $v =~ ^[0-9]+$ ]] && v=validator-$v
+    [[ -d $DATA/$v ]] || fail "unknown SOAK_VICTIMS node: $v"
+    victims+=("$v")
+done
 start=$(load_nonce) || fail "could not read the load account nonce"
 if [[ $LOAD != 1 ]]; then
     start_load
@@ -8,10 +17,6 @@ fi
 nonce_above() { local n; n=$(load_nonce) && ((n > $1)); }
 wait_for 300 "the load to land its first transactions" nonce_above "$start"
 end=$((SECONDS + ${SOAK_MINUTES:-480} * 60))
-# the first rpc node is the reference (what a user sees) and is never faulted; SOAK_VICTIMS narrows the
-# targets, e.g. SOAK_VICTIMS=validator-5 keeps bouncing only the added validator
-ref=$(ref_node)
-victims=(${SOAK_VICTIMS:-$(nodes | grep -vx "$ref")})
 round=0
 actions=(stop pause)
 while ((SECONDS < end)); do

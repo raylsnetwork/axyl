@@ -1,7 +1,8 @@
 # Burst load with tps-checker: TPS_TXS transfers (default 3000) from 3 wallets through the rpc nodes all land.
 tps_setup || skip "tps-checker not available; clone github.com/raylsnetwork/tps-checker next to this repo"
 txs=${TPS_TXS:-3000}
-keys=$(wallet_keys 20 3)
+# wallets 100+ stay clear of the load's wallets (10 .. 10+LOAD_WALLETS)
+keys=$(wallet_keys 100 3)
 # tps-checker can report success when submissions were rejected, so count what reached the chain
 landed() {
     local k sum=0

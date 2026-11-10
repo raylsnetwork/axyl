@@ -41,11 +41,16 @@ not_busy() {
     fi
 }
 
-# stop the running test's whole process group and let its own EXIT trap (e.g. stop_load) finish
+# bring back every node that was running before the current test, if the test left it paused or stopped
+restore_nodes() { local n; for n in $BEFORE; do resume_node "$n"; start_node "$n"; done; }
+
+# stop the running test's whole process group, let its own EXIT trap (e.g. stop_load) finish, and
+# restore the nodes it may have left down, so an interrupted run does not leave a broken network
 stop_test() {
     if [[ -n $TEST_PID ]]; then
         kill -TERM -- -"$TEST_PID" 2> /dev/null || true
         wait "$TEST_PID" 2> /dev/null || true
+        restore_nodes
     fi
 }
 
@@ -60,7 +65,10 @@ lock() {
 up() {
     command -v cast > /dev/null || die "Foundry 'cast' is required (https://getfoundry.sh)"
     if [[ -z $RAYLS_BIN ]]; then
-        (cd "$ROOT" && cargo build -p rayls-network --bin rayls-network $([[ $BUILD_CONFIG != release ]] || echo --release))
+        # cargo calls the debug profile "dev"; every other profile (release, profiling) builds into target/<name>
+        local profile=$BUILD_CONFIG
+        [[ $profile != debug ]] || profile=dev
+        (cd "$ROOT" && cargo build -p rayls-network --bin rayls-network --profile "$profile")
     fi
     [[ -x $BIN ]] || die "binary not found: $BIN"
     [[ -f $DATA/genesis/genesis.yaml ]] || genesis
@@ -82,16 +90,13 @@ status() {
 }
 
 run_tests() {
-    local files=() f p n name rc t0 before passed=0 skipped=0 failed=()
+    local plans=() files=() f p n name rc t0 passed=0 skipped=0 failed=()
     [[ $# -gt 0 ]] || set -- basic
-    # basic + chaos first, extended adds validator-5 and another rpc node, then basic + chaos again with them
-    [[ $* == all ]] && set -- basic chaos extended basic chaos
-    [[ -f $DATA/genesis/genesis.yaml ]] || die "no testbed in $DATA, start one with: $0 up"
-    lock
-    trap 'stop_test; stop_load; rm -f "$DATA/test.lock"' EXIT
-    trap 'exit 130' INT TERM HUP
-    if [[ $LOAD == 1 ]]; then start_load; fi
+    # all = basic + chaos, extended (adds validator-5 and another rpc node), then basic + chaos again with them
     for p in "$@"; do
+        if [[ $p == all ]]; then plans+=(basic chaos extended basic chaos); else plans+=("$p"); fi
+    done
+    for p in "${plans[@]}"; do
         if [[ -d $TESTBED/tests/$p ]]; then
             files+=("$TESTBED/tests/$p"/*.sh)
         elif [[ -f $TESTBED/tests/$p.sh ]]; then
@@ -100,11 +105,16 @@ run_tests() {
             die "unknown plan or test: $p"
         fi
     done
+    [[ -f $DATA/genesis/genesis.yaml ]] || die "no testbed in $DATA, start one with: $0 up"
+    lock
+    trap 'stop_test; stop_load; rm -f "$DATA/test.lock"' EXIT
+    trap 'exit 130' INT TERM HUP
+    if [[ $LOAD == 1 ]]; then start_load; fi
     for f in "${files[@]}"; do
         name=${f#"$TESTBED/tests/"}
         name=${name%.sh}
         echo "=== $name: $(sed -n 's/^# //p;q' "$f")"
-        before=$(running_nodes)
+        BEFORE=$(running_nodes)
         t0=$SECONDS
         rc=0
         # own process group, so stopping the runner (Ctrl-C or kill <pid>) also stops the running test
@@ -121,8 +131,8 @@ run_tests() {
                 failed+=("$name")
                 echo "--- FAIL $name ($((SECONDS - t0))s)"
                 # bring back whatever the test left paused or stopped, and let it catch up before the next test
-                for n in $before; do resume_node "$n"; start_node "$n"; done
-                for n in $before; do (wait_synced "$n") || echo "  recovery: $n did not catch up" >&2; done
+                restore_nodes
+                for n in $BEFORE; do (wait_synced "$n") || echo "  recovery: $n did not catch up" >&2; done
                 ;;
         esac
     done
@@ -157,10 +167,12 @@ case "$1" in
         ;;
     logs) tail -f "$DATA/$(node_name "${2:?node}").log" ;;
     load)
-        tps_setup
-        fund_load
-        echo "sending load through validator-1, see $DATA/load.log (Ctrl-C to stop)"
-        load_loop
+        # same machinery as LOAD=1, so Ctrl-C stops the whole load (tps-checker and the collision sender)
+        trap stop_load EXIT
+        trap 'exit 130' INT TERM HUP
+        start_load
+        echo "load going through the rpc nodes ($(load_urls)); Ctrl-C to stop"
+        wait "$LOAD_PID"
         ;;
     test) shift; run_tests "$@" ;;
     *) usage ;;
