@@ -645,7 +645,7 @@ fn trusted_header_within_reach<DB: Database>(db: &DB, number: u64, target: u64) 
 }
 
 /// Applies consensus output from (exclusive) to max_consensus_height (inclusive).
-/// Returns the last applied ConsensusHeader.
+/// Returns the last applied ConsensusHeader, or the executed anchor when `from` proves stale.
 async fn catch_up_consensus_from_to<DB: Database>(
     config: &ConsensusConfig<DB>,
     consensus_bus: &ConsensusBus,
@@ -653,8 +653,9 @@ async fn catch_up_consensus_from_to<DB: Database>(
     from: ConsensusHeader,
     max_consensus: ConsensusHeader,
 ) -> eyre::Result<ConsensusHeader> {
-    // `from` is the streamer's anchor, seeded from the executed-anchor SSOT and only ever advanced
-    // to digest-verified headers, so its digest is the true parent of header `from.number + 1`.
+    // `from` is the streamer's anchor, seeded from the executed-anchor SSOT and advanced to headers
+    // that linked in an earlier pass. A stored row it advanced onto can still turn out stale; the
+    // mismatch branch below rewinds the anchor when its own child does not link.
     let mut last_parent = from.digest();
 
     let last_consensus_height = from.number;
@@ -786,6 +787,38 @@ async fn catch_up_consensus_from_to<DB: Database>(
             // and let the clear above remove that row.
             if streamed > 0 && (from_gap_fetch || !unproven.is_empty()) {
                 return Ok(result_header);
+            }
+            // The anchor's own child does not link onto it. A canonical anchor stays: the child is
+            // a bad reply or a real fork. Any other anchor came from an earlier pass that streamed
+            // a stored row, and that row may be stale (another fork's row the walk has since
+            // replaced). Every later pass would chain onto it and fail here until a restart, so
+            // rewind to the executed anchor as a restart does, and let the next pass re-read the
+            // repaired rows. Nothing is cleared, so a bad reply cannot evict good walk rows. Only a
+            // stored row or the target counts against the anchor. A by-number reply never does,
+            // even one that passes BLS: BLS covers the certificates, not the number or the parent
+            // link, so any peer can wrap a real sub-dag from elsewhere and force a rewind. Against
+            // a stale anchor, the walk stores the real child by hash and the next pass
+            // rewinds.
+            if number == last_consensus_height + 1 {
+                let anchor_is_canonical = db
+                    .get::<ConsensusBlocks>(&last_consensus_height)
+                    .ok()
+                    .flatten()
+                    .map(|h| h.digest())
+                    == Some(parent_hash);
+                let executed = consensus_bus.executed_anchor().borrow().clone();
+                if !anchor_is_canonical
+                    && executed.number < last_consensus_height
+                    && !from_gap_fetch
+                {
+                    warn!(
+                        target: "rayls-consensus-state-sync",
+                        anchor = last_consensus_height,
+                        executed = executed.number,
+                        "catch_up_from_to: the anchor's child does not link onto it, rewinding to the executed anchor"
+                    );
+                    return Ok(executed);
+                }
             }
             return Err(eyre::eyre!("consensus header digest mismatch at number {number}"));
         }
