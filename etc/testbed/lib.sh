@@ -6,8 +6,11 @@ ROOT="$(cd "$TESTBED/../.." && pwd)"
 # Settings (override via env)
 DATA="${TESTBED_DATA:-$TESTBED/data}"
 [[ $DATA == /* ]] || DATA=$PWD/$DATA
+# `up` remembers the binary it ran in $DATA/bin. Later commands, node restarts in tests included, reuse it
+# unless RAYLS_BIN or BUILD_CONFIG is given, so one testbed never mixes builds.
+[[ -n $RAYLS_BIN || -n $BUILD_CONFIG || ! -f $DATA/bin ]] || REMEMBERED_BIN=$(<"$DATA/bin")
 BUILD_CONFIG="${BUILD_CONFIG:-release}"
-BIN="${RAYLS_BIN:-$ROOT/target/$BUILD_CONFIG/rayls-network}"
+BIN="${RAYLS_BIN:-${REMEMBERED_BIN:-$ROOT/target/$BUILD_CONFIG/rayls-network}}"
 EPOCH_SECS="${EPOCH_SECS:-30}"
 HTTP_ADDR="${HTTP_ADDR:-127.0.0.1}"
 LOG_LEVEL="${LOG_LEVEL:-vvv}"
@@ -40,11 +43,20 @@ pid() { cat "$DATA/$1.pid" 2>/dev/null; }
 # trust a pid file only while that pid is still this node (pids get reused over long soaks)
 running() { local p; p=$(pid "$1") && [[ $(ps -ww -p "$p" -o command= 2>/dev/null) == *"--datadir $DATA/$1 "* ]]; }
 running_nodes() { local n; for n in $(nodes); do running "$n" && echo "$n"; done; return 0; }
+# Fixed p2p ports: primary 31000+instance, worker 31100+instance. They sit below the OS ephemeral
+# ranges (macOS 49152+, Linux 32768+), so no node is handed a port another node or socket already holds;
+# keytool's random default once gave two validators the same port.
+p2p_port() { echo $(($1 + $(instance "$2"))); }
+p2p_args() {
+    echo "--external-primary-addr /ip4/127.0.0.1/udp/$(p2p_port 31000 "$1")/quic-v1" \
+        "--external-worker-addrs /ip4/127.0.0.1/udp/$(p2p_port 31100 "$1")/quic-v1"
+}
 
 start_node() {
     local n=$1 i t
     i=$(instance "$n")
     running "$n" && return 0
+    [[ -x $BIN ]] || fail "binary not found: $BIN"
     # own process group, so Ctrl-C on the test runner does not reach the node
     set -m
     (
@@ -54,8 +66,8 @@ start_node() {
         set --
         if [[ $n == rpc-* ]]; then
             # observer keys advertise no dialable address, so it needs explicit listeners
-            export PRIMARY_LISTENER_MULTIADDR=/ip4/127.0.0.1/udp/$((49000 + i))/quic-v1
-            export WORKER_LISTENER_MULTIADDR=/ip4/127.0.0.1/udp/$((49100 + i))/quic-v1
+            export PRIMARY_LISTENER_MULTIADDR=/ip4/127.0.0.1/udp/$(p2p_port 31000 "$n")/quic-v1
+            export WORKER_LISTENER_MULTIADDR=/ip4/127.0.0.1/udp/$(p2p_port 31100 "$n")/quic-v1
             set -- --observer
         fi
         # txpool sized for load tests like local-testnet.sh (reth's default is 16 pending txs per sender)
@@ -68,21 +80,24 @@ start_node() {
     set +m
     # until the exec, ps shows the shell's command line and running() is false; wait for it
     for ((t = 0; t < 50; t++)); do running "$n" && return 0; sleep 0.1; done
+    echo "  $n did not start, see $DATA/$n.log" >&2
 }
 
 # SIGTERM only, never SIGKILL: a node must shut down cleanly, and one that hangs is a bug to fix.
 # After STOP_TIMEOUT (default 120s) this fails and leaves the node running for inspection.
 stop_node() {
     local p
-    running "$1" || { rm -f "$DATA/$1.pid"; return 0; }
+    running "$1" || { rm -f "$DATA/$1.pid" "$DATA/$1.stopping"; return 0; }
     p=$(pid "$1")
+    # marks a stop in progress, so an interrupted runner waits for it before restarting the node
+    touch "$DATA/$1.stopping"
     kill -CONT "$p" 2>/dev/null || true
     kill "$p" 2>/dev/null || true
     if ! wait_exit "$p" "${STOP_TIMEOUT:-120}"; then
         echo "  $1 (pid $p) did not stop within ${STOP_TIMEOUT:-120}s of SIGTERM; left running, see $DATA/$1.log" >&2
         return 1
     fi
-    rm -f "$DATA/$1.pid"
+    rm -f "$DATA/$1.pid" "$DATA/$1.stopping"
 }
 pause_node() { running "$1" || fail "$1 is not running"; kill -STOP "$(pid "$1")"; }
 resume_node() { if running "$1"; then kill -CONT "$(pid "$1")"; fi; }
@@ -102,7 +117,8 @@ genesis() {
     local i
     mkdir -p "$DATA/genesis/validators"
     for i in 1 2 3 4; do
-        "$BIN" keytool generate validator --datadir "$DATA/validator-$i" --address "${OPERATORS[i - 1]}" > /dev/null
+        "$BIN" keytool generate validator --datadir "$DATA/validator-$i" --address "${OPERATORS[i - 1]}" \
+            $(p2p_args "validator-$i") > /dev/null
         cp "$DATA/validator-$i/node-info.yaml" "$DATA/genesis/validators/validator-$i.yaml"
     done
     "$BIN" genesis --datadir "$DATA" --chain-id 487 --epoch-duration-in-secs "$EPOCH_SECS" \
@@ -125,7 +141,7 @@ v5_status() {
 add_validator() {
     local n=validator-5 op=${OPERATORS[4]} status stake calldata
     if [[ ! -d $DATA/$n ]]; then
-        "$BIN" keytool generate validator --datadir "$DATA/$n" --address "$op" > /dev/null
+        "$BIN" keytool generate validator --datadir "$DATA/$n" --address "$op" $(p2p_args "$n") > /dev/null
         copy_genesis "$n"
     fi
     start_node "$n"
@@ -267,9 +283,12 @@ start_load() {
 }
 stop_load() { if [[ -n $LOAD_PID ]]; then kill -- -"$LOAD_PID" 2> /dev/null || true; fi; }
 # transactions landed so far from all load wallets
+# transactions landed so far from the load wallets the collision sender does not use (#11 on), so a dead
+# tps-checker cannot hide behind collision sends (with a single load wallet, that one is counted)
 load_nonce() {
-    local key n sum=0
-    for key in $(load_keys | tr , ' '); do
+    local key n sum=0 first=11 count=$((${LOAD_WALLETS:-4} - 1))
+    ((count > 0)) || { first=10; count=1; }
+    for key in $(wallet_keys "$first" "$count" | tr , ' '); do
         n=$(cast nonce "$(cast wallet address --private-key "$key")" --rpc-url "$(url "$(ref_node)")") || return 1
         sum=$((sum + n))
     done
@@ -345,18 +364,20 @@ assert_stalled() {
 # all running nodes have the same block hashes at the last 3 common heights
 check_consistency() {
     local n h min="" from hash ref
-    for n in $(running_nodes); do
+    for n in $(nodes); do
+        # a node that crashed on its own must not be skipped
+        running "$n" || fail "$n is not running; did it crash? see $DATA/$n.log"
         h=$(height "$n") || fail "$n is not responding"
         if [[ -z $min ]] || ((h < min)); then min=$h; fi
     done
     from=$((min > 2 ? min - 2 : 0))
     for ((h = from; h <= min; h++)); do
         ref=""
-        for n in $(running_nodes); do
+        for n in $(nodes); do
             hash=$(block_hash "$n" "$h") || fail "$n has no block $h"
             ref=${ref:-$hash}
             [[ $hash == "$ref" ]] || fail "fork at block $h: $n has $hash, expected $ref"
         done
     done
-    log "$(running_nodes | wc -l | tr -d ' ') nodes agree on blocks $from-$min"
+    log "$(nodes | wc -l | tr -d ' ') nodes agree on blocks $from-$min"
 }

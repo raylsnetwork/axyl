@@ -42,7 +42,18 @@ not_busy() {
 }
 
 # bring back every node that was running before the current test, if the test left it paused or stopped
-restore_nodes() { local n; for n in $BEFORE; do resume_node "$n"; start_node "$n"; done; }
+restore_nodes() {
+    local n
+    for n in $BEFORE; do
+        # a stop the test had already started is waited out, or start_node would see it still running
+        if [[ -f $DATA/$n.stopping ]]; then
+            wait_exit "$(pid "$n")" "${STOP_TIMEOUT:-120}" || true
+            rm -f "$DATA/$n.stopping"
+        fi
+        resume_node "$n"
+        start_node "$n"
+    done
+}
 
 # stop the running test's whole process group, let its own EXIT trap (e.g. stop_load) finish, and
 # restore the nodes it may have left down, so an interrupted run does not leave a broken network
@@ -64,14 +75,16 @@ lock() {
 
 up() {
     command -v cast > /dev/null || die "Foundry 'cast' is required (https://getfoundry.sh)"
-    if [[ -z $RAYLS_BIN ]]; then
-        # cargo calls the debug profile "dev"; every other profile (release, profiling) builds into target/<name>
-        local profile=$BUILD_CONFIG
+    if [[ -z $RAYLS_BIN && $BIN == "$ROOT"/target/*/rayls-network ]]; then
+        # build the profile this testbed runs (target/<profile>); cargo calls the debug profile "dev"
+        local profile
+        profile=$(basename "$(dirname "$BIN")")
         [[ $profile != debug ]] || profile=dev
         (cd "$ROOT" && cargo build -p rayls-network --bin rayls-network --profile "$profile")
     fi
     [[ -x $BIN ]] || die "binary not found: $BIN"
     [[ -f $DATA/genesis/genesis.yaml ]] || genesis
+    echo "$BIN" > "$DATA/bin"
     start_all
     wait_for 120 "the first block" at_height validator-1 1
     status

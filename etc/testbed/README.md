@@ -60,7 +60,7 @@ meant to run for hours.
 LOAD=1 ./etc/testbed/testbed.sh test chaos   # any plan with steady tps-checker load underneath
 SOAK_MINUTES=60 ./etc/testbed/testbed.sh test soak   # soak only, without the rest of the suite
 HTTP_ADDR=0.0.0.0 ./etc/testbed/testbed.sh up   # on the VM: RPCs reachable at <vm-ip>:8545..
-BUILD_CONFIG=debug ./etc/testbed/testbed.sh up  # debug build (switch only on a stopped testbed)
+BUILD_CONFIG=debug ./etc/testbed/testbed.sh up  # debug build; later commands keep using it (switch on a stopped testbed)
 SOAK_VICTIMS=validator-5 ./etc/testbed/testbed.sh test soak   # keep bouncing just the added validator
 ```
 
@@ -114,7 +114,7 @@ After `extended` adds validator-5 and rpc-3, every plan includes them.
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `BUILD_CONFIG` | `release` | Cargo profile to build and run: `debug`, or another workspace profile such as `profiling` |
+| `BUILD_CONFIG` | `release` | Cargo profile to build and run: `debug`, or another workspace profile such as `profiling`. `up` remembers the binary (`data/bin`), so later commands and node restarts use the same one |
 | `RAYLS_BIN` | builds `target/$BUILD_CONFIG/rayls-network` | Use this binary instead of building |
 | `RPC_NODES` | `2` | RPC (observer) nodes created at genesis |
 | `TESTBED_DATA` | `etc/testbed/data` | Data and log directory |
@@ -133,6 +133,8 @@ After `extended` adds validator-5 and rpc-3, every plan includes them.
 
 ## Notes
 
+- **Crashes are caught.** Every consistency check (most tests, every soak round) fails if any node
+  is not running, so a node that dies on its own is reported instead of skipped.
 - **No SIGKILL, ever.** Nodes are stopped with SIGTERM and must shut down cleanly. If a node is
   still running after `STOP_TIMEOUT`, the stop fails. The node is left running for inspection, and
   `clean` refuses to delete its data.
@@ -144,7 +146,9 @@ After `extended` adds validator-5 and rpc-3, every plan includes them.
 - **Nonce collisions.** Every ~`COLLIDE_SECS`, `cast` sends a transfer from the same wallet
   tps-checker is using. Rejections in `load.log` are expected; the chain must not care.
 - **Network.** RPC ports: validator-N is on `8546-N`, and rpc-N on `8540-(N-1)` (rpc-1 = 8540,
-  rpc-2 = 8539). Consensus metrics are on `9100` and up, in the same order. The dev/admin account is anvil #0 (`0xf39F…2266`). Validator
+  rpc-2 = 8539). Consensus metrics are on `9100` and up, in the same order. p2p (UDP): validator-N
+  uses `31000+N` (primary) and `31100+N` (worker), and rpc-N uses `31005+N` / `31105+N`. These sit
+  below the OS ephemeral port ranges, so no two nodes can end up on the same port. The dev/admin account is anvil #0 (`0xf39F…2266`). Validator
   operators are anvil #5–#9.
 - **Rust plan.** `rust/e2e` stops the testbed while it runs, because it uses ports 8545–8542. Run
   `rust/chaos` with the testbed stopped, via `sudo -E env "PATH=$PATH" ./etc/testbed/testbed.sh test rust/chaos`.
