@@ -2732,3 +2732,37 @@ fn test_decide_node_mode_observer_sole_member_stays_observer() {
     assert_eq!(mode, NodeMode::Observer);
     assert_eq!(reason, "observer-flag");
 }
+
+// ---------------------------------------------------------------------------
+// Gossip publisher lists installed each epoch
+// ---------------------------------------------------------------------------
+// A topic missing from `gossip_publisher_lists` is subscribed open, and nothing else notices:
+// `verify_gossip` would accept any publisher on it again. Pin the three topics and their sets.
+
+#[test]
+fn test_gossip_publisher_lists_cover_the_three_committee_topics() {
+    use crate::epoch_manager::gossip_publisher_lists;
+    use rand::{rngs::StdRng, SeedableRng as _};
+    use rayls_infrastructure_config::LibP2pConfig;
+    use rayls_infrastructure_types::{BlsKeypair, BlsPublicKey};
+    use std::collections::{HashMap, HashSet};
+
+    let mut rng = StdRng::seed_from_u64(7);
+    let key = |rng: &mut StdRng| *BlsKeypair::generate(rng).public();
+    let (a, b, c) = (key(&mut rng), key(&mut rng), key(&mut rng));
+    // b sits on the committee; c is registered but not seated
+    let committee: HashSet<BlsPublicKey> = [a, b].into();
+    let registered: HashSet<BlsPublicKey> = [b, c].into();
+
+    let lists: HashMap<String, HashSet<BlsPublicKey>> =
+        gossip_publisher_lists(committee.clone(), &registered).into_iter().collect();
+
+    assert_eq!(lists.len(), 3, "three topics, no duplicates");
+    assert_eq!(lists[&LibP2pConfig::primary_topic()], committee, "certificates: committee only");
+    assert_eq!(
+        lists[&LibP2pConfig::consensus_output_topic()],
+        registered,
+        "consensus output: registered set"
+    );
+    assert_eq!(lists[&LibP2pConfig::epoch_vote_topic()], registered, "epoch votes: registered set");
+}

@@ -8,7 +8,7 @@ use crate::{
 use libp2p::gossipsub::{Event as GossipEvent, Message as GossipMessage};
 use rayls_infrastructure_config::GOSSIP_TOPIC_TXN;
 use rayls_infrastructure_types::{Database, RaylsSender};
-use tracing::{error, info, trace, warn};
+use tracing::{debug, error, info, trace, warn};
 
 impl<Req, Res, DB, Events> ConsensusNetwork<Req, Res, DB, Events>
 where
@@ -57,7 +57,10 @@ where
                         } else {
                             let known_peerids_len =
                                 self.swarm.behaviour().peer_manager.known_peerids_len();
-                            warn!(
+                            // debug, not warn: reachable per message through the known-validator
+                            // fallback and on a topic that is still open, so a peer must not be
+                            // able to fill the log through it
+                            debug!(
                                 target: "network::gossip",
                                 ?gossip_source,
                                 ?propagation_source,

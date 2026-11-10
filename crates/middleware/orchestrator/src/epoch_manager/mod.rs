@@ -35,3 +35,6 @@ pub(crate) use state::{hydrate_prev_epoch_record, resolve_local_prev_epoch_recor
 
 #[cfg(test)]
 pub(crate) use transition::select_recovery_checkpoint;
+
+#[cfg(test)]
+pub(crate) use primary::gossip_publisher_lists;

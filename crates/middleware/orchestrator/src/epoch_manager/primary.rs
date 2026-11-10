@@ -158,13 +158,13 @@ where
         // genesis committee only, so a member that joined later is bound on the nodes it
         // connected to directly; a node behind the rotation that is not among them stops
         // relaying that member's output, where before it forwarded blind what it could not
-        // process.
-        let topics = [
-            (LibP2pConfig::primary_topic(), committee_keys),
-            (LibP2pConfig::consensus_output_topic(), self.registered_validators.clone()),
-            (LibP2pConfig::epoch_vote_topic(), self.registered_validators.clone()),
-        ];
-        for (topic, publishers) in topics {
+        // process. One more edge: a member that left the registry while an epoch it voted in
+        // is still uncertified has its retried votes ignored once it is out of the departing
+        // committee too. That needs a stall longer than an epoch and an exit in the same
+        // window, and the vote fetch covers that case, so it is accepted here.
+        for (topic, publishers) in
+            gossip_publisher_lists(committee_keys, &self.registered_validators)
+        {
             info!(target: "epoch-manager", topic=?topic, publishers = publishers.len(), "updating authorized publishers for gossip");
             debug!(target: "epoch-manager", topic=?topic, ?publishers, "authorized publishers");
 
@@ -274,4 +274,21 @@ where
 
         Ok(())
     }
+}
+
+/// The gossip topics the primary subscribes to each epoch, each with the set of BLS keys
+/// allowed to publish on it. Certificates come from the current committee; consensus output
+/// and epoch votes come from any registered validator (see the caller for why the wider set).
+///
+/// Kept as one function so the wiring is testable: a topic missing from here is subscribed
+/// open, and nothing else would notice.
+pub(crate) fn gossip_publisher_lists(
+    committee_keys: HashSet<BlsPublicKey>,
+    registered_validators: &HashSet<BlsPublicKey>,
+) -> [(String, HashSet<BlsPublicKey>); 3] {
+    [
+        (LibP2pConfig::primary_topic(), committee_keys),
+        (LibP2pConfig::consensus_output_topic(), registered_validators.clone()),
+        (LibP2pConfig::epoch_vote_topic(), registered_validators.clone()),
+    ]
 }
