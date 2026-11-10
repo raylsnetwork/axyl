@@ -167,6 +167,9 @@ impl PrimaryNetworkHandle {
             PrimaryResponse::PeerExchange { .. } => Err(NetworkError::RPCError(
                 "Got wrong response, not a vote is peer exchange!".to_string(),
             )),
+            PrimaryResponse::Busy => {
+                Err(NetworkError::RPCError("Got wrong response, not a vote is busy!".to_string()))
+            }
         }
     }
 
@@ -186,9 +189,10 @@ impl PrimaryNetworkHandle {
         let res = res.await??;
         match res {
             PrimaryResponse::RequestedCertificates(certs) => Ok(certs),
-            // Only a busy node sends a recoverable error here (see `missing_certs_answer`).
-            // A fake one counts only if no other peer answers, when no fallback helps.
-            PrimaryResponse::RecoverableError(PrimaryRPCError(s)) => Err(NetworkError::PeerBusy(s)),
+            // A fake busy answer counts only if no other peer answers, when no fallback helps.
+            PrimaryResponse::Busy => {
+                Err(NetworkError::PeerBusy(PrimaryNetworkError::Busy.to_string()))
+            }
             PrimaryResponse::Error(PrimaryRPCError(s)) => Err(NetworkError::RPCError(s)),
             _ => Err(NetworkError::RPCError("Got wrong response, not a certificate!".to_string())),
         }
@@ -462,7 +466,7 @@ where
                         }
                     }
 
-                    let response = PrimaryResponse::missing_certs_answer(result);
+                    let response = result.into_response();
                     let _ = network_handle.handle.send_response(response, channel).await;
                 }
                 // cancel notification from network layer
