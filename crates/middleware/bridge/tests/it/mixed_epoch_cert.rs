@@ -11,7 +11,7 @@ use rayls_infrastructure_storage::mem_db::MemDatabase;
 use rayls_infrastructure_types::{
     now, AuthorityIdentifier, Batch, Certificate, CommittedSubDag, ConsensusHeader,
     ConsensusOutput, Epoch, HeaderBuilder, Notifier, RaylsReceiver, RaylsSender as _,
-    ReputationScores, Round, B256,
+    ReputationScores, Round, StreamedConsensusHeader, B256,
 };
 use rayls_testing_test_utils::CommitteeFixture;
 use tokio::time::timeout;
@@ -106,8 +106,8 @@ async fn run(mode: NodeMode, extra: Certificate) -> eyre::Result<Result<Consensu
     let taken = send_until_taken(&consensus_bus, &mut outputs, vec![control]).await?;
     assert_eq!(taken.number, 1, "the control commit must be taken");
 
-    consensus_bus.consensus_header().send(mixed).await?;
-    consensus_bus.consensus_header().send(clean).await?;
+    consensus_bus.consensus_header().send(StreamedConsensusHeader::unverified(mixed)).await?;
+    consensus_bus.consensus_header().send(StreamedConsensusHeader::unverified(clean)).await?;
     let result = tokio::select! {
         exited = task_manager.join(Notifier::new()) => Err(format!("{exited:?}")),
         output = timeout(WAIT, outputs.recv()) => {
