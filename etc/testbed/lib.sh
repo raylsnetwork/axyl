@@ -42,12 +42,15 @@ running() { local p; p=$(pid "$1") && [[ $(ps -ww -p "$p" -o command= 2>/dev/nul
 running_nodes() { local n; for n in $(nodes); do running "$n" && echo "$n"; done; return 0; }
 
 start_node() {
-    local n=$1 i
+    local n=$1 i t
     i=$(instance "$n")
     running "$n" && return 0
     # own process group, so Ctrl-C on the test runner does not reach the node
     set -m
     (
+        # a paused node must survive its launching shell exiting: an orphaned process group with a
+        # stopped member gets SIGHUP, which would end the node without a clean shutdown
+        trap '' HUP
         set --
         if [[ $n == rpc-* ]]; then
             # observer keys advertise no dialable address, so it needs explicit listeners
@@ -63,6 +66,8 @@ start_node() {
     ) >> "$DATA/$n.log" 2>&1 &
     echo $! > "$DATA/$n.pid"
     set +m
+    # until the exec, ps shows the shell's command line and running() is false; wait for it
+    for ((t = 0; t < 50; t++)); do running "$n" && return 0; sleep 0.1; done
 }
 
 # SIGTERM only, never SIGKILL: a node must shut down cleanly, and one that hangs is a bug to fix.
@@ -161,11 +166,16 @@ add_rpc() {
 
 TPS_CHECKER_DIR="${TPS_CHECKER_DIR:-$(dirname "$ROOT")/tps-checker}"
 TPS_CHECKER="${TPS_CHECKER_BIN:-$TPS_CHECKER_DIR/target/release/tps-checker}"
+TPS_CHECKER_REPO="${TPS_CHECKER_REPO:-git@github.com:raylsnetwork/tps-checker.git}"
+# a fresh clone is pinned to the version this testbed was validated with; an existing checkout is used as is
+TPS_CHECKER_REF="${TPS_CHECKER_REF:-d7ea8e4}"
 
-# Use an existing tps-checker build, or clone and build it next to this repo
+# Use an existing tps-checker build, or clone (pinned) and build it next to this repo
 tps_setup() {
     [[ -x $TPS_CHECKER ]] && return 0
-    [[ -d $TPS_CHECKER_DIR ]] || git clone -q git@github.com:raylsnetwork/tps-checker.git "$TPS_CHECKER_DIR" || return 1
+    if [[ ! -d $TPS_CHECKER_DIR ]]; then
+        git clone -q "$TPS_CHECKER_REPO" "$TPS_CHECKER_DIR" && git -C "$TPS_CHECKER_DIR" checkout -q "$TPS_CHECKER_REF" || return 1
+    fi
     (cd "$TPS_CHECKER_DIR" && cargo build --release -q)
 }
 
