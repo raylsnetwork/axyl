@@ -14,6 +14,8 @@ use std::{ops::ControlFlow, sync::LazyLock, time::Duration};
 use tokio::sync::watch;
 use tracing::{error, info, warn};
 
+use crate::verified::VerifiedSender;
+
 const COMMITTEE_KEYS_TIMEOUT: Duration = Duration::from_secs(30);
 const COMMITTEE_KEYS_POLL_INTERVAL: Duration = Duration::from_millis(500);
 /// How long to wait for a gossip tip before actively probing peers for the network head.
@@ -124,6 +126,7 @@ async fn get_consensus_header<DB: ReDatabase>(
     consensus_bus: &ConsensusBus,
     network: &PrimaryNetworkHandle,
     shutdown: &Noticer,
+    verified_tx: Option<&VerifiedSender>,
 ) -> Option<(B256, u64)> {
     let db = config.node_storage();
     // Stop only at the canonical anchor (never an unverified cache row); its per-row digest==hash
@@ -165,6 +168,9 @@ async fn get_consensus_header<DB: ReDatabase>(
                 };
                 let parent = verified.parent_hash;
                 store_consensus_header_in_cache(db, &verified);
+                if let Some(tx) = verified_tx {
+                    tx.record(&verified);
+                }
                 republish_if_higher(consensus_bus, &verified);
                 return Some((parent, verified.number));
             }
@@ -245,6 +251,8 @@ pub(crate) struct WalkSession<DB> {
     /// re-descending. Cleared on an incomplete walk (stale rows may lie below it), then
     /// re-derived.
     covered: Option<B256>,
+    /// Tells the forward streamer which headers this walk verified.
+    verified: Option<VerifiedSender>,
 }
 
 impl<DB: ReDatabase> WalkSession<DB> {
@@ -255,7 +263,13 @@ impl<DB: ReDatabase> WalkSession<DB> {
         network: PrimaryNetworkHandle,
     ) -> Self {
         let shutdown = config.shutdown().subscribe();
-        Self { config, consensus_bus, network, shutdown, covered: None }
+        Self { config, consensus_bus, network, shutdown, covered: None, verified: None }
+    }
+
+    /// Report each header this session verifies to `verified`.
+    pub(crate) fn with_verified(mut self, verified: Option<VerifiedSender>) -> Self {
+        self.verified = verified;
+        self
     }
 
     /// Walk backwards from `start_hash` to local coverage, recording the result for the next call.
@@ -307,6 +321,7 @@ impl<DB: ReDatabase> WalkSession<DB> {
                 &self.consensus_bus,
                 &self.network,
                 &self.shutdown,
+                self.verified.as_ref(),
             )
             .await
             {
@@ -417,6 +432,9 @@ impl<DB: ReDatabase> WalkSession<DB> {
             }
             let full_round = checked.len() as u64 == above - low;
             store_consensus_headers_in_cache(db, &checked);
+            if let Some(tx) = self.verified.as_ref() {
+                checked.iter().for_each(|header| tx.record(header));
+            }
             stored += checked.len() as u64;
             if !full_round {
                 break;
@@ -507,10 +525,12 @@ pub(crate) async fn spawn_track_recent_consensus<DB: ReDatabase>(
     config: ConsensusConfig<DB>,
     consensus_bus: ConsensusBus,
     network: PrimaryNetworkHandle,
+    verified: Option<VerifiedSender>,
 ) -> eyre::Result<()> {
     let rx_shutdown = config.shutdown().subscribe();
     let mut rx_gossip_update = consensus_bus.last_published_consensus_num_hash().subscribe();
-    let mut session = WalkSession::new(config.clone(), consensus_bus.clone(), network.clone());
+    let mut session = WalkSession::new(config.clone(), consensus_bus.clone(), network.clone())
+        .with_verified(verified);
 
     // Probe at startup so the first walk begins without waiting for a gossip tip.
     let current = consensus_bus.last_consensus_header().borrow().number;
@@ -608,7 +628,8 @@ mod tests {
         let shutdown = config.shutdown().subscribe();
 
         let parent =
-            get_consensus_header(stale_digest, &config, &consensus_bus, &network, &shutdown).await;
+            get_consensus_header(stale_digest, &config, &consensus_bus, &network, &shutdown, None)
+                .await;
 
         let after = consensus_bus.last_consensus_header().borrow().number;
         assert_eq!(
@@ -653,7 +674,8 @@ mod tests {
         let shutdown = config.shutdown().subscribe();
 
         let next =
-            get_consensus_header(cached_digest, &config, &consensus_bus, &network, &shutdown).await;
+            get_consensus_header(cached_digest, &config, &consensus_bus, &network, &shutdown, None)
+                .await;
 
         assert_eq!(
             next,
