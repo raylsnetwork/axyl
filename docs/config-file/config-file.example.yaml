@@ -66,3 +66,4 @@ networks:
       EpochCloseSeedV2: 0
       CertificateFetchEpochV2: 0
       Erc20PrecompileDirectCall: 0
+      HeaderParentSigners: 0

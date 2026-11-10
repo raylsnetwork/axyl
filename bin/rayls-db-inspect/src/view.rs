@@ -79,6 +79,10 @@ pub struct CertificateView {
     pub created_at: u64,
     pub signers: Vec<u32>,
     pub signer_count: u64,
+    /// The header's own-parent signer claim: who the author says signed its previous-round
+    /// certificate, as committee indices. `None` for a pre-fork header (no claim field);
+    /// `Some(empty)` when the author's previous certificate was not among its parents.
+    pub claimed_signers: Option<Vec<u32>>,
     pub signature: Option<String>,
     pub verification_state: &'static str,
     /// The certificate as stored, in the wire type's own JSON form (`-v`).
@@ -94,6 +98,10 @@ impl CertificateView {
             created_at: *cert.created_at(),
             signers: cert.signed_authorities().iter().collect(),
             signer_count: cert.signed_authorities().len(),
+            claimed_signers: cert
+                .header()
+                .own_parent_signers()
+                .map(|claim| claim.signers.iter().collect()),
             signature: cert.aggregated_signature().map(|s| signature(&s)),
             verification_state: verification_state_name(cert.signature_verification_state()),
             raw: verbose.then(|| cert.clone()),

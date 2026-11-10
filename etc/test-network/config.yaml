@@ -40,6 +40,7 @@ networks:
       EpochCloseSeedV2: never
       CertificateFetchEpochV2: never
       Erc20PrecompileDirectCall: never
+      HeaderParentSigners: never
   local:
     chain_id: 487
     hardforks:
@@ -62,3 +63,4 @@ networks:
       EpochCloseSeedV2: 0
       CertificateFetchEpochV2: 0
       Erc20PrecompileDirectCall: 0
+      HeaderParentSigners: 0
