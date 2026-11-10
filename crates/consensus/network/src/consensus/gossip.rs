@@ -24,7 +24,6 @@ where
                 trace!(target: "network", topic=?self.authorized_publishers.keys(), ?propagation_source, ?message_id, ?message, "message received from publisher");
                 // verify message was published by authorized node
                 let msg_acceptance = self.verify_gossip(&message);
-                let valid = msg_acceptance.is_accepted();
                 trace!(target: "network", ?msg_acceptance, "gossip message verification status");
 
                 // report message validation results to propagate valid messages
@@ -37,51 +36,73 @@ where
                 }
 
                 // process gossip in application layer
-                if valid {
-                    // We should not be able to receive a message from an unknown peer so this
-                    // should always work.
-                    let gossip_source = message.source.unwrap_or(propagation_source);
+                match msg_acceptance {
+                    GossipAcceptance::Accept => {
+                        // We should not be able to receive a message from an unknown peer so this
+                        // should always work.
+                        let gossip_source = message.source.unwrap_or(propagation_source);
 
-                    if let Some(bls) =
-                        self.swarm.behaviour().peer_manager.peer_to_bls(&gossip_source)
-                    {
-                        // forward gossip to handler
-                        if let Err(e) =
-                            self.event_stream.try_send(NetworkEvent::Gossip(message, bls))
+                        if let Some(bls) =
+                            self.swarm.behaviour().peer_manager.peer_to_bls(&gossip_source)
                         {
-                            error!(target: "network", topics=?self.authorized_publishers.keys(), ?gossip_source, ?message_id, ?e, "failed to forward gossip!");
-                            // ignore failures at the epoch boundary
-                            // During epoch change the event_stream receiver can be closed.
-                            return Ok(());
+                            // forward gossip to handler
+                            if let Err(e) =
+                                self.event_stream.try_send(NetworkEvent::Gossip(message, bls))
+                            {
+                                error!(target: "network", topics=?self.authorized_publishers.keys(), ?gossip_source, ?message_id, ?e, "failed to forward gossip!");
+                                // ignore failures at the epoch boundary
+                                // During epoch change the event_stream receiver can be closed.
+                                return Ok(());
+                            }
+                        } else {
+                            let known_peerids_len =
+                                self.swarm.behaviour().peer_manager.known_peerids_len();
+                            warn!(
+                                target: "network::gossip",
+                                ?gossip_source,
+                                ?propagation_source,
+                                topic = %message.topic,
+                                known_peerids_len,
+                                "dropping valid gossip, no BLS mapping for propagation source"
+                            );
                         }
-                    } else {
-                        let known_peerids_len =
-                            self.swarm.behaviour().peer_manager.known_peerids_len();
-                        warn!(
-                            target: "network::gossip",
-                            ?gossip_source,
+                    }
+                    GossipAcceptance::Ignore => {
+                        let GossipMessage { source: gossip_source, topic, .. } = message;
+                        // the topic label is bounded because gossipsub delivers only the topics
+                        // this node subscribed to; keep this counter behind that filter
+                        self.network_metrics
+                            .gossip_ignored
+                            .with_label_values(&[topic.as_str(), self.network_label])
+                            .inc();
+                        // trace, not debug: nothing stops a peer from streaming these, and the
+                        // counter above is the signal
+                        trace!(
+                            target: "network",
+                            author = ?gossip_source,
+                            ?topic,
                             ?propagation_source,
-                            topic = %message.topic,
-                            known_peerids_len,
-                            "dropping valid gossip, no BLS mapping for propagation source"
+                            "dropping gossip from an unauthorized or unbound publisher"
                         );
                     }
-                } else {
-                    let GossipMessage { source: gossip_source, topic, .. } = message;
-                    warn!(
-                        target: "network",
-                        author = ?gossip_source,
-                        ?topic,
-                        ?propagation_source,
-                        "applying fatal penalty to message author"
-                    );
-                    // Penalize the message author only, never the forwarding propagation source; a
-                    // relayer must not be banned for an invalid message it merely gossiped on.
-                    if let Some(peer_id) = gossip_source {
-                        self.swarm
-                            .behaviour_mut()
-                            .peer_manager
-                            .process_penalty(peer_id, Penalty::Fatal);
+                    GossipAcceptance::Reject => {
+                        let GossipMessage { source: gossip_source, topic, .. } = message;
+                        warn!(
+                            target: "network",
+                            author = ?gossip_source,
+                            ?topic,
+                            ?propagation_source,
+                            "applying fatal penalty to message author"
+                        );
+                        // Penalize the message author only, never the forwarding propagation
+                        // source; a relayer must not be banned for an invalid message it merely
+                        // gossiped on.
+                        if let Some(peer_id) = gossip_source {
+                            self.swarm
+                                .behaviour_mut()
+                                .peer_manager
+                                .process_penalty(peer_id, Penalty::Fatal);
+                        }
                     }
                 }
             }
@@ -140,13 +161,21 @@ where
 
     /// Specific logic to accept gossip messages.
     ///
-    /// Messages are only published by current committee nodes and must be within max size.
+    /// Messages must come from a publisher on the topic's list (the committee, or the registered
+    /// validators for consensus output and epoch votes) and must be within max size.
     ///
     /// Rayls: During startup, there's a race condition where `authorized_publishers` may be empty
-    /// or `peer_to_bls()` mappings may not be established yet. To prevent valid committee
-    /// members from being penalized, we accept messages from known validators (peers marked
-    /// as important) when authorization checks would otherwise fail.
-    fn verify_gossip(&self, gossip: &GossipMessage) -> GossipAcceptance {
+    /// or `peer_to_bls()` mappings may not be established yet. So that committee traffic is
+    /// still forwarded and processed, messages from known validators (peers marked as important,
+    /// the current and departing committee) are accepted when the list check would otherwise
+    /// fail.
+    ///
+    /// The rule: an oversize message is rejected (a fault of the message itself, so its author is
+    /// penalized); a publisher that is unlisted or unbound is ignored, neither forwarded nor
+    /// penalized. The lists are this node's own view, so an unlisted publisher may be an honest
+    /// validator the node is behind on, and gossipsub has already done the frame work that an
+    /// ignored message costs. Nothing else here penalizes a publisher.
+    pub(super) fn verify_gossip(&self, gossip: &GossipMessage) -> GossipAcceptance {
         // verify message size
         // do not punish if gossip is tx batch
         if gossip.data.len() > self.config.max_gossip_message_size
@@ -158,8 +187,8 @@ where
         let GossipMessage { topic, .. } = gossip;
 
         // Rayls: Startup grace period: If no authorization config for this topic,
-        // accept messages from known validators to avoid penalizing committee
-        // during initialization race conditions
+        // accept messages from known validators so committee traffic is still
+        // delivered during initialization race conditions
         let auth_config = self.authorized_publishers.get(topic.as_str());
         if auth_config.is_none() {
             if let Some(source_id) = gossip.source {
@@ -199,7 +228,7 @@ where
                     return GossipAcceptance::Accept;
                 }
             }
-            GossipAcceptance::Reject
+            GossipAcceptance::Ignore
         }
     }
 }

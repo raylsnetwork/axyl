@@ -86,6 +86,12 @@ pub struct NetworkMetrics {
     /// to and has had a circuit through; a `registered` that grows on its own is the signature
     /// of a peer id being granted relay status without a circuit.
     pub relay_peer_addr_set_size: IntGaugeVec,
+    /// Gossip messages dropped by `verify_gossip` because the author was not on the topic's
+    /// publisher list or had no peer id to BLS binding, per `(topic, kad_type)`. Neither
+    /// forwarded nor penalized. On a node behind a committee rotation this is the sign that it
+    /// is dropping its new committee's traffic; on a node under attack it counts the forged
+    /// messages that reached it.
+    pub gossip_ignored: IntCounterVec,
 }
 
 impl NetworkMetrics {
@@ -209,6 +215,12 @@ impl NetworkMetrics {
                 "relay_peer_addr_set_size",
                 "Size of the peer manager's relay peer addr sets (registered, configured, pending, circuits)",
                 &["set", "swarm"],
+                registry
+            )?,
+            gossip_ignored: register_int_counter_vec_with_registry!(
+                "gossip_ignored",
+                "Gossip dropped without forwarding or penalty: author not on the topic's publisher list or unbound",
+                &["topic", "kad_type"],
                 registry
             )?,
         })
