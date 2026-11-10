@@ -52,6 +52,11 @@ fn normalize(raw: roaring::RoaringBitmap) -> std::io::Result<roaring::RoaringBit
 /// handful of wire bytes but expands to 8 KiB in memory, and a crafted bitmap can name billions of
 /// values in under a MiB (issue #256). Bounding the span to one block caps the decode at 65,536
 /// values (~8 KiB), so a small request cannot stand for a huge allocation.
+///
+/// The constant bounds both parts of that span: a signer bitmap may declare at most this many
+/// containers, and every container key must sit below it (keys `0..MAX_SIGNER_BITMAP_BLOCKS`).
+/// With 1 the two rules coincide - a single container at key 0; a bump to N would mean N
+/// containers spanning blocks 0 to N-1.
 pub const MAX_SIGNER_BITMAP_BLOCKS: u32 = 1;
 
 // Portable roaring header cookies (mirror `roaring`'s `serialization.rs`, whose copies are
@@ -74,10 +79,16 @@ const ROARING_COOKIE_RUN: u16 = 12347;
 /// Single home for the portable header format; other bounds (e.g. the skip-round container cap in
 /// the primary crate) read it through here rather than parsing the header again.
 pub fn roaring_header(bytes: &[u8]) -> Option<(u32, usize)> {
-    let cookie = u32::from_le_bytes(bytes.get(..4)?.try_into().ok()?);
+    // Slice patterns keep the header reads infallible: a slice too short simply yields `None`.
+    let Some(&[a, b, c, d]) = bytes.get(..4) else {
+        return None;
+    };
+    let cookie = u32::from_le_bytes([a, b, c, d]);
     if cookie == ROARING_COOKIE_NO_RUN {
-        let count = u32::from_le_bytes(bytes.get(4..8)?.try_into().ok()?);
-        Some((count, 8))
+        let Some(&[a, b, c, d]) = bytes.get(4..8) else {
+            return None;
+        };
+        Some((u32::from_le_bytes([a, b, c, d]), 8))
     } else if (cookie as u16) == ROARING_COOKIE_RUN {
         let count = (cookie >> 16) + 1;
         Some((count, 4 + count.div_ceil(8) as usize))
@@ -91,16 +102,19 @@ pub fn roaring_header(bytes: &[u8]) -> Option<(u32, usize)> {
 ///
 /// Reads only the portable header (via [`roaring_header`]) and the per-container keys, so it is
 /// allocation-free and linear in the input size: a crafted bitmap is refused while it is still
-/// tiny on the wire, before [`deserialize_normalized`] expands it. `Ok` means the bitmap is within
-/// the bound, or the bytes are not a recognizable portable header (the deserializer rejects
-/// those); `Err` carries the reason for refusal - the declared container count is over the bound,
-/// or a container sits past the first block (the highest-key rule).
+/// tiny on the wire, before [`deserialize_normalized`] expands it.
+///
+/// Fails closed: `Ok(())` only for a complete header within the bound. An unrecognized cookie, a
+/// header truncated before its container keys, a container count over the bound, or a container
+/// past the first block (the highest-key rule) each return `Err` naming the reason. This node
+/// only ever writes the two portable cookies, so refusing what [`roaring_header`] cannot read
+/// costs nothing and keeps the bound independent of what roaring happens to accept.
 fn check_signer_bitmap_block_bound(bytes: &[u8]) -> Result<(), String> {
     let max_blocks = MAX_SIGNER_BITMAP_BLOCKS;
     let Some((count, desc_start)) = roaring_header(bytes) else {
-        // Unknown or truncated header: leave these bytes for the deserializer to reject rather
-        // than deciding here.
-        return Ok(());
+        // Fail closed: only the two portable cookies are ever written here, so bytes this node
+        // could not have produced are refused without consulting the deserializer.
+        return Err("signer bitmap has no recognizable portable header".into());
     };
 
     // A second container is already beyond the allowed span; refuse without reading anything else.
@@ -114,11 +128,10 @@ fn check_signer_bitmap_block_bound(bytes: &[u8]) -> Result<(), String> {
     // a high key (values from 65,536 on) is refused too.
     for i in 0..count as usize {
         let at = desc_start + i * 4;
-        let Some(w) = bytes.get(at..at + 2) else {
-            // Truncated header: the deserializer rejects it.
-            return Ok(());
+        let Some(&[lo, hi]) = bytes.get(at..at + 2) else {
+            return Err("signer bitmap is truncated before its container keys".into());
         };
-        let key = u16::from_le_bytes(w.try_into().unwrap());
+        let key = u16::from_le_bytes([lo, hi]);
         if (key as u32) >= max_blocks {
             return Err(format!(
                 "signer bitmap spans block {key}, outside the {max_blocks}-block bound"
@@ -131,10 +144,10 @@ fn check_signer_bitmap_block_bound(bytes: &[u8]) -> Result<(), String> {
 /// Serde interface to a certificate signer bitmap, according to the roaring bitmap on-disk
 /// standard.
 ///
-/// Decode applies the signer-bitmap rules: at most [`MAX_SIGNER_BITMAP_BLOCKS`] container, at key
-/// 0 (issue #256). Its users are the signer bitmaps of `Certificate` and `EpochCertificate`; it is
-/// not a general roaring serde, and a bitmap that legitimately spans more blocks (e.g. rounds)
-/// must not use it.
+/// Decode applies the signer-bitmap rules: at most [`MAX_SIGNER_BITMAP_BLOCKS`] container(s), at
+/// key 0 (issue #256). Its users are the signer bitmaps of `Certificate` and `EpochCertificate`;
+/// it is not a general roaring serde, and a bitmap that legitimately spans more blocks (e.g.
+/// rounds) must not use it.
 pub(crate) struct SignerBitmapSerde;
 
 impl SerializeAs<roaring::RoaringBitmap> for SignerBitmapSerde {
@@ -393,6 +406,20 @@ mod tests {
         assert_eq!(cert.signed_authorities().len(), 0);
     }
 
+    /// A certificate whose signer bitmap carries an unknown cookie must be refused by the bound
+    /// itself (fail closed), before roaring is consulted: the error names the header, not a
+    /// roaring decode failure.
+    #[test]
+    fn signer_bitmap_garbage_cookie_is_refused_by_the_bound() {
+        let garbage = [99_u8, 9, 9, 9];
+        let err = bcs::from_bytes::<Certificate>(&certificate_bytes_with_bitmap(&garbage))
+            .expect_err("garbage cookie must be refused");
+        assert!(
+            err.to_string().contains("no recognizable portable header"),
+            "the bound itself must produce the refusal: {err}"
+        );
+    }
+
     /// Epoch certificates use the same signer-bitmap decoder; a two-block bitmap must be refused
     /// there as well.
     #[test]
@@ -457,18 +484,26 @@ mod tests {
         assert!(check_signer_bitmap_block_bound(&bytes).is_err());
     }
 
-    /// An unknown cookie is not a recognizable header: the bound does not decide, so it returns
-    /// `Ok` and leaves rejection to the deserializer.
+    /// The bound fails closed: an unknown cookie is refused, not left for the deserializer.
     #[test]
-    fn bound_ignores_unknown_cookie() {
-        assert!(check_signer_bitmap_block_bound(&[99, 9, 9, 9]).is_ok());
+    fn bound_rejects_unknown_cookie() {
+        assert!(check_signer_bitmap_block_bound(&[99, 9, 9, 9]).is_err());
     }
 
-    /// A byte slice too short for a header is not a recognizable header: the bound returns `Ok` and
-    /// leaves rejection to the deserializer.
+    /// The bound fails closed: a byte slice too short for a header is refused too.
     #[test]
-    fn bound_ignores_truncated_header() {
-        assert!(check_signer_bitmap_block_bound(&[0, 1]).is_ok());
+    fn bound_rejects_truncated_header() {
+        assert!(check_signer_bitmap_block_bound(&[0, 1]).is_err());
+    }
+
+    /// A recognizable no-run header declaring one container but carrying no description bytes is
+    /// truncated before its container key: refused.
+    #[test]
+    fn bound_rejects_missing_container_key() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&12346_u32.to_le_bytes());
+        bytes.extend_from_slice(&1_u32.to_le_bytes());
+        assert!(check_signer_bitmap_block_bound(&bytes).is_err());
     }
 
     // --- Unit tests for the shared header parser ---------------------------------------------
