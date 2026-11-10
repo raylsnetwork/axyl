@@ -1548,27 +1548,14 @@ fn test_missing_cert_slots_grow_with_the_committee() {
     assert_eq!(overlap.free_committee_slots(), committee_size * MISSING_CERT_JOBS_PER_PEER);
 }
 
-/// Only `Busy` is a recoverable answer to a missing-certificates request.
-///
-/// The requester reads a recoverable answer to that request as busy.
+/// Busy has its own answer, after every variant older nodes know.
 #[test]
-fn test_only_busy_is_a_recoverable_missing_certs_answer() {
-    use rayls_infrastructure_types::error::StoreError;
+fn test_busy_answer_keeps_older_variant_indexes() {
+    let busy = PrimaryResponse::into_error_ref(&PrimaryNetworkError::Busy);
+    assert!(matches!(busy, PrimaryResponse::Busy), "got {busy:?}");
 
-    // Errors a missing-certificates request returns, and one recoverable elsewhere.
-    let errors = [
-        PrimaryNetworkError::Busy,
-        PrimaryNetworkError::InvalidHeader(HeaderError::InvalidEpoch { ours: 1, theirs: 2 }),
-        PrimaryNetworkError::TooManyAuthorities(2, 1),
-        PrimaryNetworkError::InvalidRequest("bad request".into()),
-        PrimaryNetworkError::Internal("join error".into()),
-        PrimaryNetworkError::Storage(StoreError::msg("read failed")),
-    ];
-    for error in errors {
-        let busy = matches!(error, PrimaryNetworkError::Busy);
-        let name = error.to_string();
-        let answer = PrimaryResponse::missing_certs_answer(Err(error));
-        let recoverable = matches!(answer, PrimaryResponse::RecoverableError(_));
-        assert_eq!(recoverable, busy, "{name} answered as {answer:?}");
-    }
+    // `EpochMismatch` is the last variant older nodes know, at index 9.
+    let mismatch = PrimaryResponse::EpochMismatch { expected: 1, received: 2 };
+    assert_eq!(bcs::to_bytes(&mismatch).expect("encode")[0], 9);
+    assert_eq!(bcs::to_bytes(&busy).expect("encode"), [10]);
 }
