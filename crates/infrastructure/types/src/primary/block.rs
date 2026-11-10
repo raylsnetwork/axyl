@@ -70,6 +70,32 @@ impl ConsensusHeader {
     }
 }
 
+/// A consensus header that state-sync hands to the subscriber for execution.
+#[derive(Clone, Debug)]
+pub struct StreamedConsensusHeader {
+    /// The header.
+    pub header: ConsensusHeader,
+    /// True only when this process has run [`ConsensusHeader::verify_header_with_keys`] on this
+    /// exact header with the committee keys of its leader epoch, so the subscriber can skip that
+    /// check. Never set for a header read back from disk or received from a peer unverified.
+    pub verified: bool,
+}
+
+impl StreamedConsensusHeader {
+    /// A header the subscriber must still verify.
+    pub fn unverified(header: ConsensusHeader) -> Self {
+        Self { header, verified: false }
+    }
+}
+
+impl std::ops::Deref for StreamedConsensusHeader {
+    type Target = ConsensusHeader;
+
+    fn deref(&self) -> &ConsensusHeader {
+        &self.header
+    }
+}
+
 impl Default for ConsensusHeader {
     fn default() -> Self {
         let sub_dag = CommittedSubDag::new(

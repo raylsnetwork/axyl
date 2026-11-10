@@ -15,16 +15,18 @@ use rayls_infrastructure_storage::{
 };
 use rayls_infrastructure_types::{
     AuthorityIdentifier, ConsensusHeader, ConsensusOutput, Database, DbTx, DbTxMut, Epoch,
-    RaylsSender, SealedHeader, TaskSpawner, B256,
+    RaylsSender, SealedHeader, StreamedConsensusHeader, TaskSpawner, B256,
 };
 use tracing::{debug, error, info, trace, warn};
 
 mod epoch;
 pub use epoch::{epoch_committee_valid, epoch_record_valid, spawn_epoch_record_collector};
 mod consensus;
+mod verified;
 
 pub use consensus::store_consensus_header_in_cache;
 use consensus::{spawn_track_recent_consensus, store_consensus_headers_in_cache};
+use verified::VerifiedHeaders;
 
 /// Populate startup-relevant watch channels on `ConsensusBus` from the DB.
 /// Must run before any consensus task spawns.
@@ -150,12 +152,15 @@ pub fn spawn_state_sync<DB: Database>(
             // The forward streamer fills gaps by number directly from peers, so both tasks need a
             // handle.
             let network_clone = network.clone();
+            // The walk tells the streamer which headers it verified, so the subscriber does not
+            // verify them again.
+            let (verified_tx, verified) = VerifiedHeaders::channel();
             task_manager.spawn_task(
                 "state sync: track latest consensus header from peers",
                 monitored_future!(
                     async move {
                         info!(target: "rayls-consensus-state-sync", "Starting state sync: track latest consensus header from peers");
-                        if let Err(e) = spawn_track_recent_consensus(config_clone, consensus_bus_clone, network_clone).await {
+                        if let Err(e) = spawn_track_recent_consensus(config_clone, consensus_bus_clone, network_clone, Some(verified_tx)).await {
                             error!(target: "rayls-consensus-state-sync", "Error tracking latest consensus headers: {e}");
                         }
                     },
@@ -167,7 +172,7 @@ pub fn spawn_state_sync<DB: Database>(
                 monitored_future!(
                     async move {
                         info!(target: "rayls-consensus-state-sync", "Starting state sync: stream consensus header from peers");
-                        if let Err(e) = spawn_stream_consensus_headers(config, consensus_bus, network, last_streamed_number).await {
+                        if let Err(e) = spawn_stream_consensus_headers(config, consensus_bus, network, last_streamed_number, verified).await {
                             error!(target: "rayls-consensus-state-sync", "Error streaming consensus headers: {e}");
                         }
                     },
@@ -358,7 +363,10 @@ pub async fn stream_missing_consensus<DB: Database>(
             last_db_block.number,
         ) {
             let number = consensus_header.number;
-            consensus_bus.consensus_header().send(consensus_header).await?;
+            consensus_bus
+                .consensus_header()
+                .send(StreamedConsensusHeader::unverified(consensus_header))
+                .await?;
             last_streamed_number = number;
         }
         info!(
@@ -498,6 +506,7 @@ async fn spawn_stream_consensus_headers<DB: Database>(
     consensus_bus: ConsensusBus,
     network: PrimaryNetworkHandle,
     last_streamed_number: u64,
+    mut verified: VerifiedHeaders,
 ) -> eyre::Result<()> {
     let rx_shutdown = config.shutdown().subscribe();
 
@@ -541,7 +550,7 @@ async fn spawn_stream_consensus_headers<DB: Database>(
                     pending_catch_up_target = attempt_catch_up(
                         &config, &consensus_bus, &network,
                         &mut last_consensus_header, &mut last_consensus_height,
-                        header, "forward streamer",
+                        header, "forward streamer", &mut verified,
                     ).await;
                 }
             }
@@ -554,7 +563,7 @@ async fn spawn_stream_consensus_headers<DB: Database>(
                         pending_catch_up_target = attempt_catch_up(
                             &config, &consensus_bus, &network,
                             &mut last_consensus_header, &mut last_consensus_height,
-                            target, "forward streamer retry",
+                            target, "forward streamer retry", &mut verified,
                         ).await;
                     } else {
                         pending_catch_up_target = None;
@@ -587,6 +596,7 @@ async fn attempt_catch_up<DB: Database>(
     last_height: &mut u64,
     target: ConsensusHeader,
     label: &str,
+    verified: &mut VerifiedHeaders,
 ) -> Option<ConsensusHeader> {
     match catch_up_consensus_from_to(
         config,
@@ -594,6 +604,7 @@ async fn attempt_catch_up<DB: Database>(
         network,
         last_header.clone(),
         target.clone(),
+        verified,
     )
     .await
     {
@@ -652,6 +663,7 @@ async fn catch_up_consensus_from_to<DB: Database>(
     network: &PrimaryNetworkHandle,
     from: ConsensusHeader,
     max_consensus: ConsensusHeader,
+    verified: &mut VerifiedHeaders,
 ) -> eyre::Result<ConsensusHeader> {
     // `from` is the streamer's anchor, seeded from the executed-anchor SSOT and advanced to headers
     // that linked in an earlier pass. A stored row it advanced onto can still turn out stale; the
@@ -864,7 +876,13 @@ async fn catch_up_consensus_from_to<DB: Database>(
         }
         // A trusted header linked on, so every held reply below it is canonical.
         store_consensus_headers_in_cache(db, &unproven);
-        for consensus_header in unproven.drain(..).chain(std::iter::once(consensus_header)) {
+        // Held replies passed BLS in this pass. A stored row or the target counts as verified only
+        // when the walk verified exactly that header in this process.
+        let last_verified = verified.take(&consensus_header);
+        let run = unproven.drain(..).map(|header| (header, true));
+        for (consensus_header, verified) in
+            run.chain(std::iter::once((consensus_header, last_verified)))
+        {
             let number = consensus_header.number;
             let base_execution_block =
                 consensus_header.sub_dag.leader.header().latest_execution_block;
@@ -921,7 +939,10 @@ async fn catch_up_consensus_from_to<DB: Database>(
                     recent_len
                 ));
             }
-            consensus_bus.consensus_header().send(consensus_header.clone()).await?;
+            consensus_bus
+                .consensus_header()
+                .send(StreamedConsensusHeader { header: consensus_header.clone(), verified })
+                .await?;
             streamed += 1;
             result_header = consensus_header;
         }
