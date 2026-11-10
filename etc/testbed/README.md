@@ -81,7 +81,7 @@ After `extended` adds validator-5 and rpc-3, every plan includes them.
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `BUILD_CONFIG` | `release` | `debug` builds and runs `target/debug/rayls-network` |
+| `BUILD_CONFIG` | `release` | Cargo profile to build and run: `debug`, or another workspace profile such as `profiling` |
 | `RAYLS_BIN` | builds `target/$BUILD_CONFIG/rayls-network` | Use this binary instead of building |
 | `RPC_NODES` | `2` | RPC (observer) nodes created at genesis |
 | `TESTBED_DATA` | `etc/testbed/data` | Data and log directory |
@@ -95,7 +95,8 @@ After `extended` adds validator-5 and rpc-3, every plan includes them.
 | `SOAK_MINUTES` / `SOAK_INTERVAL` | `480` / `60` | Soak length and seconds between rounds |
 | `SOAK_VICTIMS` | all but rpc-1 | Nodes the soak may stop or freeze, e.g. `validator-5` |
 | `TPS_TXS` / `CYCLES` | `3000` / `3` | Burst size in `extended/05`; loops in `chaos/10` |
-| `TPS_CHECKER_DIR` / `TPS_CHECKER_BIN` | `../tps-checker` | Where tps-checker lives |
+| `TPS_CHECKER_DIR` / `TPS_CHECKER_BIN` | `../tps-checker` | Where tps-checker lives; an existing checkout is used as is |
+| `TPS_CHECKER_REPO` / `TPS_CHECKER_REF` | GitHub (SSH) / `d7ea8e4` | Clone URL and commit used when the testbed clones it |
 
 ## Notes
 
