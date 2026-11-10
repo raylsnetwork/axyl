@@ -30,7 +30,10 @@ pub fn store_consensus_header_in_cache<DB: ReDatabase>(db: &DB, header: &Consens
 }
 
 /// Cache consensus headers in persistent storage in one write transaction.
-fn store_consensus_headers_in_cache<DB: ReDatabase>(db: &DB, headers: &[ConsensusHeader]) {
+pub(crate) fn store_consensus_headers_in_cache<DB: ReDatabase>(
+    db: &DB,
+    headers: &[ConsensusHeader],
+) {
     if headers.is_empty() {
         return;
     }
