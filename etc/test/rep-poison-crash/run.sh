@@ -39,6 +39,16 @@
 #                      logged after every step, so a halt shows up as a height that stops moving.
 #                      With -l the armed validators are then stopped for that many seconds and
 #                      restarted, to show whether the liar can halt the chain and whether it resumes.
+#   rolling-recover    the rolling restart, then the operator recovery, to find which recovery works
+#                      while the attacker stays armed. Each crash-looped validator is reset to a full
+#                      from-genesis resync: the bulk sync runs over the streaming path, lands on the
+#                      real chain tip and rejoins clean, since the attacker can poison only existing
+#                      numbers, not fabricate a higher tip. Each recovered validator is then given a
+#                      brief restart, the small catch-up a bare restart or a snapshot restore leaves,
+#                      and takes the poison again over the by-number path and crash-loops again. So a
+#                      full from-genesis resync is the only recovery, and the node is offline for the
+#                      whole resync. With -a off nothing crash-loops. By default it rolls f
+#                      validators, the whole fault budget, where the committee is 3f+1.
 #   rolling-observer-attacker
 #                      the same rolling restart, but every validator is honest and the attacker is
 #                      one armed observer with a dialable address, as in observer-attacker.
@@ -61,6 +71,8 @@ Usage: $0 [-s SCENARIO] [-a on|off] [-n VALIDATORS] [-k ARMED_VALIDATORS] [-v RO
       observer           armed validators, the victim is the observer
       observer-attacker  honest validators, an armed second observer, the victim is the observer
       rolling            armed validators 1..K, rolling restart of the validators given by -v
+      rolling-recover    rolling restart, then reset each crash-looped validator for a full resync
+                         and give it a brief restart, to find which recovery survives the attacker
       rolling-observer-attacker
                          honest validators, an armed observer, rolling restart of the validators
                          given by -v
@@ -88,6 +100,7 @@ EOF
 
 SCENARIO=observer
 ROLLED=2,3
+V_GIVEN=0
 ARMED=on
 N=4
 K=""
@@ -100,7 +113,7 @@ INSTANCE_BASE=40
 while getopts "s:a:n:k:v:b:d:g:r:l:i:h" opt; do
     case "$opt" in
         s) SCENARIO=$OPTARG ;;
-        v) ROLLED=$OPTARG ;;
+        v) ROLLED=$OPTARG; V_GIVEN=1 ;;
         a) ARMED=$OPTARG ;;
         n) N=$OPTARG ;;
         k) K=$OPTARG ;;
@@ -122,10 +135,16 @@ for value in "${GAP:-0}" "$RESTARTS" "$LIAR_STOP" "$INSTANCE_BASE"; do
 done
 [[ $RESTARTS -ge 1 ]] || { echo "need at least one restart"; usage; }
 case "$SCENARIO" in
-    observer | observer-attacker | rolling | rolling-observer-attacker) ;;
+    observer | observer-attacker | rolling | rolling-recover | rolling-observer-attacker) ;;
     *) echo "unknown -s: $SCENARIO"; usage ;;
 esac
-[[ $LIAR_STOP -eq 0 || $SCENARIO == rolling ]] || { echo "-l needs -s rolling"; usage; }
+[[ $LIAR_STOP -eq 0 || $SCENARIO == rolling || $SCENARIO == rolling-recover ]] || { echo "-l needs -s rolling or -s rolling-recover"; usage; }
+# rolling-recover rolls the whole fault budget f by default, where the committee is 3f+1, so that
+# the healthy set sits at exactly quorum 2f+1 and the recovery of the crash-looped nodes is what a
+# return to any fault margin would need.
+if [[ $SCENARIO == rolling-recover && $V_GIVEN -eq 0 ]]; then
+    ROLLED=$(seq -s, 2 $((1 + (N - 1) / 3)))
+fi
 # The attacker is an observer in the two observer-attacker scenarios, otherwise validators 1..K.
 OBS_ATTACKER=0
 [[ $SCENARIO == *observer-attacker ]] && OBS_ATTACKER=1
@@ -168,6 +187,12 @@ ulimit -c 0
 
 declare -A PIDS
 OBS_PID=""
+# validators that crash-looped in the roll, recovered one by one in the rolling-recover scenario
+CRASHED=()
+RECOVERED_LIST=()
+RECOVER_REABORTED=0
+RECOVER_RECOVERED=0
+REVULN_RECRASHED=0
 log() { echo "$(date -u +%T) $*" | tee -a "$RUN/summary.txt"; }
 fail() { log "INCONCLUSIVE: $*"; echo "logs and datadirs: $RUN"; exit 2; }
 
@@ -518,6 +543,79 @@ liar_step() {
     watch_chain 15 "after the liar restart"
 }
 
+# Data stores an operator reset wipes. The node keeps its keys, genesis and config (node-keys,
+# genesis, schedule-record.yaml, network-config, parameters.yaml, node-info.yaml) and re-syncs
+# everything else from peers. Clearing only consensus-db and keeping the execution DB instead wedges
+# catch-up on a hash mismatch between the kept execution blocks and the re-streamed consensus, which
+# is a partial-wipe artifact, not this bug, so the reset is a full data reset.
+RESET_STORES=(consensus-db db rocksdb static_files blobstore)
+
+# Operator recovery after the roll. For every crash-looped validator, reset its databases the way an
+# operator would, keeping only its keys and genesis, then restart it with the attacker still armed.
+# The node re-syncs the whole chain from genesis. That bulk sync runs over the streaming path, which
+# lands the node's newest row on the real chain tip, so the node rejoins clean even though the liar
+# is still serving the poison on the by-number path: the attacker can only poison existing block
+# numbers, never fabricate a tip above the real one. A full from-genesis resync therefore recovers
+# the node. The expensive part is that this is the only recovery that works: a bare restart leaves
+# the poison in place, and a snapshot restore or any other recovery that leaves only a small catch-up
+# gap is served over the by-number path and re-poisons the node, which revuln_check shows. With -a
+# off nothing crash-looped, so there is nothing to recover and this is a no-op.
+recover_step() {
+    local v store logfile h_before h_after reaborted=0 recovered=0 other=0
+    if [[ ${#CRASHED[@]} -eq 0 ]]; then
+        log "recovery: no validator crash-looped in the roll, nothing to recover"
+        return
+    fi
+    h_before=$(max_val_height)
+    log "recovery: operator resets the databases of crash-looped validators ${CRASHED[*]}, keeping keys and genesis, and restarts them for a full from-genesis resync, attacker still armed; chain at $h_before, healthy set is $((N - ${#CRASHED[@]})) of $N"
+    for v in "${CRASHED[@]}"; do
+        [[ -n ${PIDS[$v]:-} ]] && { stop_pid "${PIDS[$v]}"; unset "PIDS[$v]"; }
+        for store in "${RESET_STORES[@]}"; do rm -rf "$RUN/validator-$v/$store"; done
+        log "  validator $v: databases reset (${RESET_STORES[*]} cleared, keys and genesis kept)"
+    done
+    for v in "${CRASHED[@]}"; do
+        logfile="$RUN/validator-$v-recover.log"
+        start_validator "$v" "$logfile"
+        await_validator "$v" "$logfile"
+        log "  validator $v after a full database reset and from-genesis resync: $OUTCOME"
+        case "$OUTCOME" in
+            ABORTED*) reaborted=$((reaborted + 1)); RECOVER_REABORTED=$((RECOVER_REABORTED + 1)) ;;
+            rejoined*) recovered=$((recovered + 1)); RECOVER_RECOVERED=$((RECOVER_RECOVERED + 1)); RECOVERED_LIST+=("$v") ;;
+            *) other=$((other + 1)) ;;
+        esac
+    done
+    watch_chain 20 "after recovery"
+    h_after=$(max_val_height)
+    log "recovery result: $recovered of ${#CRASHED[@]} full-resync recoveries rejoined, $reaborted re-aborted, $other neither; chain $h_before to $h_after"
+    revuln_check
+}
+
+# A node recovered by a full from-genesis resync is immediately re-vulnerable. The cheap recoveries
+# an operator reaches for first, a bare restart or a snapshot or DB restore, leave the node only a
+# small catch-up gap, which is served over the by-number path, so it takes the poison again and
+# crash-loops again. This stops each recovered validator briefly, lets the chain move a small gap on,
+# restarts it and checks whether that small catch-up re-poisons it. It shows that the full resync is
+# not only the slow recovery but the only one, so a node is down for a whole from-genesis resync.
+revuln_check() {
+    local v logfile stop_h recrashed=0 stayed=0
+    [[ ${#RECOVERED_LIST[@]} -gt 0 ]] || return
+    log "re-vulnerability check: each recovered validator is stopped briefly and restarted, the small catch-up a bare restart or a snapshot restore leaves, attacker still armed"
+    for v in "${RECOVERED_LIST[@]}"; do
+        [[ -n ${PIDS[$v]:-} ]] && { stop_pid "${PIDS[$v]}"; unset "PIDS[$v]"; }
+        stop_h=$(max_val_height)
+        wait_for $((120 + GAP)) val_reached $((stop_h + GAP)) >/dev/null
+        logfile="$RUN/validator-$v-revuln.log"
+        start_validator "$v" "$logfile"
+        await_validator "$v" "$logfile"
+        log "  validator $v after a brief restart and small catch-up: $OUTCOME"
+        case "$OUTCOME" in
+            ABORTED*) recrashed=$((recrashed + 1)); REVULN_RECRASHED=$((REVULN_RECRASHED + 1)) ;;
+            *) stayed=$((stayed + 1)) ;;
+        esac
+    done
+    log "re-vulnerability: $recrashed of ${#RECOVERED_LIST[@]} recovered validators re-crashed on a small catch-up; a bare restart or snapshot restore re-poisons, only a full from-genesis resync escapes"
+}
+
 run_rolling() {
     local seq v start stop_h stop_wait logfile outcomes=() aborted=0 rejoined=0 t_from t_to
     local w_from w_to w v_aborted v_starts v_streak verdict victims=()
@@ -589,7 +687,10 @@ run_rolling() {
             verdict="not crash-looped"
         fi
         victims+=("validator $v: served $w altered replies, numbers $lo..$hi, aborted $v_aborted of $v_starts starts, $verdict")
+        # A validator whose last start aborted is down holding the poison, a recovery target.
+        [[ $v_streak -ge 1 ]] && CRASHED+=("$v")
     done
+    [[ $SCENARIO == rolling-recover ]] && recover_step
     [[ $LIAR_STOP -gt 0 ]] && liar_step
     watch_chain 30 "final"
 
@@ -601,6 +702,10 @@ run_rolling() {
     log "halts in heights.log, at least ${HALT_MIN_SECS}s without a new block:"
     report_halts
     log "armed nodes served $(poison_served) altered replies in total"
+    if [[ $SCENARIO == rolling-recover ]]; then
+        log "recovery summary: ${#CRASHED[@]} validators crash-looped in the roll; of these $RECOVER_RECOVERED rejoined after a full from-genesis resync and $RECOVER_REABORTED re-aborted; $REVULN_RECRASHED of ${#RECOVERED_LIST[@]} recovered validators then re-crashed on a small catch-up after a brief restart"
+        log "  a bare restart does not clear the poison and a small-gap recovery re-poisons; the only recovery is a full from-genesis resync, during which the node is offline and the chain holds zero fault margin"
+    fi
     echo "logs and datadirs: $RUN"
     if [[ $aborted -ge 1 ]]; then
         log "ISSUE REPRODUCED: $aborted validator starts aborted on the divide-by-zero"
