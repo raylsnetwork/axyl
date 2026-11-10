@@ -1483,7 +1483,7 @@ async fn test_catch_up_does_not_anchor_on_stale_stored_row() {
     // A stored cache row is trusted transitively, so 101, 102 and the stale 103 are forwarded
     // before the mismatch at 104 is found. Pin that the stale row still reaches the consumer here,
     // where the real subscriber then rejects it on BLS. Holding cache rows until linked would close
-    // this, which is pre-existing and close to #370.
+    // this, tracked in #380.
     let mut forwarded = Vec::new();
     while let Ok(h) = rx.try_recv() {
         forwarded.push(h.digest());
@@ -1499,6 +1499,165 @@ async fn test_catch_up_does_not_anchor_on_stale_stored_row() {
         &config,
         &cb,
         &no_peer_network(),
+        &mut last_header,
+        &mut last_height,
+        target,
+        "test retry",
+    )
+    .await;
+    assert!(pending.is_none());
+    assert_eq!(last_height, 105);
+}
+
+/// A stale stored row directly below an honest by-number reply can become the anchor, because the
+/// failed link blames the reply. Once the walk stores the real child by hash, the next pass fails
+/// on the anchor's own stored child and must rewind to the executed anchor, so the pass after the
+/// walk repairs the row reaches the target instead of staying stuck until a restart.
+#[tokio::test]
+async fn test_catch_up_rewinds_stale_anchor_below_gap_fetch() {
+    let fixture = catch_up_fixture();
+    let primary = fixture.authorities().next().unwrap();
+    let config = primary.consensus_config();
+    let db = config.node_storage();
+    let committee = fixture.committee();
+
+    let anchor = chained_header(100, B256::default(), &committee);
+    store_executed(db, &anchor);
+    let leader = fixture.certificate(&fixture.header_from_last_authority());
+    let mut chain: BTreeMap<u64, ConsensusHeader> = BTreeMap::new();
+    let mut parent = anchor.digest();
+    for number in 101..=105u64 {
+        let header = signed_chained_header(number, parent, &leader);
+        parent = header.digest();
+        chain.insert(number, header);
+    }
+    let target = chain[&105].clone();
+
+    // Stored rows 101, 102 and a stale 103 with the real parent link. 104 is not stored, so it is
+    // fetched by number, and the honest reply does not link onto the stale 103.
+    let stale_103 = fabricated_header(103, chain[&102].digest());
+    for header in [&chain[&101], &chain[&102], &stale_103] {
+        store_consensus_header_in_cache(db, header);
+    }
+
+    let cb = ConsensusBus::new();
+    seed_recently_executed_blocks(&cb);
+    cb.executed_anchor().send_replace(anchor.clone());
+    let _rx = cb.consensus_header().subscribe();
+    let mut last_header = anchor.clone();
+    let mut last_height = anchor.number;
+
+    // Both passes blame the by-number reply, so the stale 103 stays the anchor: a by-number reply
+    // is never evidence against it.
+    for label in ["test", "test retry"] {
+        let pending = attempt_catch_up(
+            &config,
+            &cb,
+            &serving_network(chain.clone()),
+            &mut last_header,
+            &mut last_height,
+            target.clone(),
+            label,
+        )
+        .await;
+        assert!(pending.is_some(), "{label}: the failed link keeps the target pending");
+        assert_eq!(last_height, 103, "{label}: a by-number reply must not rewind the anchor");
+    }
+
+    // The walk stores the real 104 by hash. The next pass fails on the anchor's own stored child
+    // and must rewind.
+    store_consensus_header_in_cache(db, &chain[&104]);
+    let pending = attempt_catch_up(
+        &config,
+        &cb,
+        &serving_network(chain.clone()),
+        &mut last_header,
+        &mut last_height,
+        target.clone(),
+        "test walk stored 104",
+    )
+    .await;
+    assert!(pending.is_some());
+    assert_eq!(last_height, 100, "the stale anchor must rewind to the executed anchor");
+    assert_eq!(last_header.digest(), anchor.digest());
+    assert_eq!(
+        db.get::<ConsensusBlocksCache>(&103).unwrap().map(|h| h.digest()),
+        Some(stale_103.digest()),
+        "a by-number reply must not evict a stored row"
+    );
+
+    // The walk repairs 103; the next pass reaches the target.
+    store_consensus_header_in_cache(db, &chain[&103]);
+    let pending = attempt_catch_up(
+        &config,
+        &cb,
+        &serving_network(chain),
+        &mut last_header,
+        &mut last_height,
+        target,
+        "test repaired",
+    )
+    .await;
+    assert!(pending.is_none(), "the repaired row must let the next pass reach the target");
+    assert_eq!(last_height, 105);
+}
+
+/// A by-number reply for the anchor's child is not evidence against the anchor, even one that
+/// passes BLS: BLS covers the certificates, not the number or parent link, so any peer can wrap a
+/// real sub-dag with a junk parent. A good stored-row anchor must stay, not rewind to the executed
+/// anchor.
+#[tokio::test]
+async fn test_catch_up_junk_reply_does_not_rewind_anchor() {
+    let fixture = catch_up_fixture();
+    let primary = fixture.authorities().next().unwrap();
+    let config = primary.consensus_config();
+    let db = config.node_storage();
+    let committee = fixture.committee();
+
+    let anchor = chained_header(100, B256::default(), &committee);
+    store_executed(db, &anchor);
+    let leader = fixture.certificate(&fixture.header_from_last_authority());
+    let mut chain: BTreeMap<u64, ConsensusHeader> = BTreeMap::new();
+    let mut parent = anchor.digest();
+    for number in 101..=105u64 {
+        let header = signed_chained_header(number, parent, &leader);
+        parent = header.digest();
+        chain.insert(number, header);
+    }
+    let target = chain[&105].clone();
+    for header in [&chain[&101], &chain[&102]] {
+        store_consensus_header_in_cache(db, header);
+    }
+
+    let cb = ConsensusBus::new();
+    seed_recently_executed_blocks(&cb);
+    cb.executed_anchor().send_replace(anchor.clone());
+    let _rx = cb.consensus_header().subscribe();
+    // An earlier pass left the anchor on the good stored row 102.
+    let mut last_header = chain[&102].clone();
+    let mut last_height = 102;
+
+    // 103 is served by number as a real quorum-signed sub-dag wrapped with a junk parent link.
+    let mut served = chain.clone();
+    served.insert(103, signed_chained_header(103, B256::repeat_byte(0xab), &leader));
+    let pending = attempt_catch_up(
+        &config,
+        &cb,
+        &serving_network(served),
+        &mut last_header,
+        &mut last_height,
+        target.clone(),
+        "test",
+    )
+    .await;
+    assert!(pending.is_some(), "the junk reply keeps the target pending");
+    assert_eq!(last_height, 102, "a junk reply must not rewind the anchor");
+    assert_eq!(last_header.digest(), chain[&102].digest());
+
+    let pending = attempt_catch_up(
+        &config,
+        &cb,
+        &serving_network(chain),
         &mut last_header,
         &mut last_height,
         target,
