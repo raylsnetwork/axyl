@@ -445,6 +445,9 @@ where
         let consensus_output_topic = LibP2pConfig::consensus_output_topic();
         info!(target: "epoch-manager::gossipsub", ?epoch_vote_topic, ?consensus_output_topic, "subscribing to node-level gossipsub topics");
 
+        // Both open until the first epoch's primary network sets the registered validators as
+        // their publishers (`spawn_primary_network_for_epoch`). An empty list here would drop
+        // the output and votes of validators that arrive before the registered set is known.
         primary_network_handle.inner_handle().subscribe(epoch_vote_topic.clone()).await?;
         primary_network_handle.inner_handle().subscribe(consensus_output_topic.clone()).await?;
 
