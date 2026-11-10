@@ -23,8 +23,8 @@ mod epoch;
 pub use epoch::{epoch_committee_valid, epoch_record_valid, spawn_epoch_record_collector};
 mod consensus;
 
-use consensus::spawn_track_recent_consensus;
 pub use consensus::store_consensus_header_in_cache;
+use consensus::{spawn_track_recent_consensus, store_consensus_headers_in_cache};
 
 /// Populate startup-relevant watch channels on `ConsensusBus` from the DB.
 /// Must run before any consensus task spawns.
@@ -863,9 +863,7 @@ async fn catch_up_consensus_from_to<DB: Database>(
             }
         }
         // A trusted header linked on, so every held reply below it is canonical.
-        for header in &unproven {
-            store_consensus_header_in_cache(db, header);
-        }
+        store_consensus_headers_in_cache(db, &unproven);
         for consensus_header in unproven.drain(..).chain(std::iter::once(consensus_header)) {
             let number = consensus_header.number;
             let base_execution_block =
