@@ -242,7 +242,7 @@ impl Certificate {
 
     /// [`Self::verify_cert`] with the committee's ids already computed by [`committee_ids`], so
     /// a caller checking many certificates against one committee hashes its keys once.
-    pub fn verify_cert_with_ids(
+    pub(crate) fn verify_cert_with_ids(
         mut self,
         committee: &[BlsPublicKey],
         ids: &[AuthorityIdentifier],
@@ -464,7 +464,7 @@ impl BcsLayout for SignatureVerificationState {
 }
 
 /// The authority id of each key in `committee`, in the same order.
-pub fn committee_ids(committee: &[BlsPublicKey]) -> Vec<AuthorityIdentifier> {
+pub(crate) fn committee_ids(committee: &[BlsPublicKey]) -> Vec<AuthorityIdentifier> {
     committee.iter().map(|key| AuthorityIdentifier::from(*key)).collect()
 }
 

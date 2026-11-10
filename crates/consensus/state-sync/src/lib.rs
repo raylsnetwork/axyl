@@ -883,6 +883,10 @@ async fn catch_up_consensus_from_to<DB: Database>(
         for (consensus_header, verified) in
             run.chain(std::iter::once((consensus_header, last_verified)))
         {
+            // Only the current committee's keys are the ones the subscriber would use itself. A
+            // header of another epoch was checked against record or lookahead keys, so leave it
+            // for the subscriber to judge.
+            let verified = verified && consensus_header.sub_dag.leader_epoch() == config.epoch();
             let number = consensus_header.number;
             let base_execution_block =
                 consensus_header.sub_dag.leader.header().latest_execution_block;

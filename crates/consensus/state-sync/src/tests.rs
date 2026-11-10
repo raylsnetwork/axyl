@@ -1430,9 +1430,23 @@ async fn test_catch_up_flags_only_headers_verified_in_this_process() {
     assert_eq!(streamed(), vec![(101, false), (102, false)], "other signatures than verified");
 
     // the walk records the verified header it stores, so record the stored row
-    walk.record(&db.get_consensus_by_number(101).expect("101 is stored"));
-    catch_up_consensus_from_to(&config, &cb, &net, anchor, target, &mut verified).await.unwrap();
+    let stored_101 = db.get_consensus_by_number(101).expect("101 is stored");
+    walk.record(&stored_101);
+    catch_up_consensus_from_to(&config, &cb, &net, anchor.clone(), target.clone(), &mut verified)
+        .await
+        .unwrap();
     assert_eq!(streamed(), vec![(101, true), (102, false)]);
+
+    // a header of another epoch was checked with record or lookahead keys, not the ones the
+    // subscriber uses, so it stays unflagged even when the walk verified those exact bytes
+    let mut next_epoch = target;
+    next_epoch.sub_dag.leader.header.epoch = config.epoch() + 1;
+    walk.record(&stored_101);
+    walk.record(&next_epoch);
+    catch_up_consensus_from_to(&config, &cb, &net, anchor, next_epoch, &mut verified)
+        .await
+        .unwrap();
+    assert_eq!(streamed(), vec![(101, true), (102, false)], "next epoch's keys are not ours");
 }
 
 /// A by-number reply can only be proven by a trusted header linking onto it, so the streamer must

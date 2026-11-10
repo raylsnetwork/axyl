@@ -75,9 +75,9 @@ impl ConsensusHeader {
 pub struct StreamedConsensusHeader {
     /// The header.
     pub header: ConsensusHeader,
-    /// True only when this process has run [`ConsensusHeader::verify_header_with_keys`] on this
-    /// exact header with the committee keys of its leader epoch, so the subscriber can skip that
-    /// check. Never set for a header read back from disk or received from a peer unverified.
+    /// True only when this process has run [`ConsensusHeader::verify_header_with_keys`] on these
+    /// exact bytes with the current committee's keys, so the subscriber can skip that check. A
+    /// stored row or peer reply is never flagged unless this process verified those exact bytes.
     pub verified: bool,
 }
 
