@@ -6,7 +6,8 @@ ROOT="$(cd "$TESTBED/../.." && pwd)"
 # Settings (override via env)
 DATA="${TESTBED_DATA:-$TESTBED/data}"
 [[ $DATA == /* ]] || DATA=$PWD/$DATA
-BIN="${RAYLS_BIN:-$ROOT/target/release/rayls-network}"
+BUILD_CONFIG="${BUILD_CONFIG:-release}"
+BIN="${RAYLS_BIN:-$ROOT/target/$BUILD_CONFIG/rayls-network}"
 EPOCH_SECS="${EPOCH_SECS:-30}"
 HTTP_ADDR="${HTTP_ADDR:-127.0.0.1}"
 LOG_LEVEL="${LOG_LEVEL:-vvv}"
@@ -24,13 +25,16 @@ MNEMONIC="test test test test test test test test test test test junk"
 REGISTRY=0x07E17e17E17e17E17e17E17E17E17e17e17E17e1
 RLS=0x07E17e17E17e17E17e17E17E17E17e17e17E17eA
 
-# --- nodes: validator-N runs as --instance N (rpc port 8546-N), the rpc node as instance 6 ---
+# --- nodes: validator-N runs as --instance N, rpc-N (observer) as instance 5+N; rpc port is 8546-instance ---
 
-instance() { if [[ $1 == rpc ]]; then echo 6; else echo "${1#validator-}"; fi; }
+instance() { case $1 in rpc-*) echo $((5 + ${1#rpc-})) ;; *) echo "${1#validator-}" ;; esac; }
 # clients connect to HTTP_ADDR, or to loopback when the nodes listen on every interface
 url() { local h=$HTTP_ADDR; [[ $h != 0.0.0.0 ]] || h=127.0.0.1; echo "http://$h:$((8546 - $(instance "$1")))"; }
 validators() { local d; for d in "$DATA"/validator-*; do [[ -d $d ]] && basename "$d"; done; return 0; }
-nodes() { validators; if [[ -d $DATA/rpc ]]; then echo rpc; fi; }
+rpc_nodes() { local d; for d in "$DATA"/rpc-*; do [[ -d $d ]] && basename "$d"; done; return 0; }
+nodes() { validators; rpc_nodes; }
+# where clients and the load connect: the first rpc node, like a user's RPC (validator-1 if there is none)
+ref_node() { local r; r=$(rpc_nodes | head -1); echo "${r:-validator-1}"; }
 quorum() { local n; n=$(validators | wc -l); echo $((2 * n / 3 + 1)); }
 pid() { cat "$DATA/$1.pid" 2>/dev/null; }
 # trust a pid file only while that pid is still this node (pids get reused over long soaks)
@@ -45,10 +49,10 @@ start_node() {
     set -m
     (
         set --
-        if [[ $n == rpc ]]; then
+        if [[ $n == rpc-* ]]; then
             # observer keys advertise no dialable address, so it needs explicit listeners
-            export PRIMARY_LISTENER_MULTIADDR=/ip4/127.0.0.1/udp/49006/quic-v1
-            export WORKER_LISTENER_MULTIADDR=/ip4/127.0.0.1/udp/49106/quic-v1
+            export PRIMARY_LISTENER_MULTIADDR=/ip4/127.0.0.1/udp/$((49000 + i))/quic-v1
+            export WORKER_LISTENER_MULTIADDR=/ip4/127.0.0.1/udp/$((49100 + i))/quic-v1
             set -- --observer
         fi
         # txpool sized for load tests like local-testnet.sh (reth's default is 16 pending txs per sender)
@@ -100,14 +104,15 @@ genesis() {
         --dev-funded-account "$ADMIN" --consensus-registry-owner "$ADMIN" --network-admin "$ADMIN" \
         --fee-aggregator-admin "$ADMIN" --max-header-delay-ms 1000 --min-header-delay-ms 500 $GENESIS_ARGS > /dev/null
     for i in 1 2 3 4; do copy_genesis "validator-$i"; done
+    for ((i = 1; i <= ${RPC_NODES:-2}; i++)); do new_rpc "rpc-$i"; done
 }
 
-tx() { cast send --rpc-url "$(url validator-1)" "$@" > /dev/null; }
+tx() { cast send --rpc-url "$(url "$(ref_node)")" "$@" > /dev/null; }
 
 # validator-5 in the registry: 0 undefined, 1 staked, 2 pending activation, 3 active
 v5_status() {
     cast call "$REGISTRY" 'getValidator(address)((bytes,address,uint32,uint32,uint8,bool,bool,uint8))' \
-        "${OPERATORS[4]}" --rpc-url "$(url validator-1)" | cut -d, -f5 | tr -d ' '
+        "${OPERATORS[4]}" --rpc-url "$(url "$(ref_node)")" | cut -d, -f5 | tr -d ' '
 }
 
 # 5th validator: start it as a follower, then fund, allowlist, stake and activate it on-chain.
@@ -122,7 +127,7 @@ add_validator() {
     status=$(v5_status)
     [[ $status =~ ^[0-9]$ ]] || fail "could not read validator-5 status from the registry: '$status'"
     if [[ $status == 0 ]]; then
-        stake=$(cast call "$REGISTRY" 'getCurrentStakeConfig()(uint256,uint256,uint32)' --rpc-url "$(url validator-1)" | head -1 | cut -d' ' -f1)
+        stake=$(cast call "$REGISTRY" 'getCurrentStakeConfig()(uint256,uint256,uint32)' --rpc-url "$(url "$(ref_node)")" | head -1 | cut -d' ' -f1)
         calldata=$("$BIN" keytool stake-calldata --datadir "$DATA/$n" | awk '/Calldata:/ {print $2}')
         tx --private-key "$ADMIN_KEY" --value 10ether "$op"
         tx --private-key "$ADMIN_KEY" "$RLS" 'mint(address,uint256)' "$op" "$stake"
@@ -137,13 +142,19 @@ add_validator() {
 }
 
 # RPC node: an observer that follows the committee and serves JSON-RPC
+new_rpc() {
+    "$BIN" keytool generate observer --datadir "$DATA/$1" \
+        --address 0x0000000000000000000000000000000000000000 --advertise-identity-only > /dev/null
+    copy_genesis "$1"
+}
+
+# add and start the next rpc-N on a running chain; prints its name
 add_rpc() {
-    if [[ ! -d $DATA/rpc ]]; then
-        "$BIN" keytool generate observer --datadir "$DATA/rpc" \
-            --address 0x0000000000000000000000000000000000000000 --advertise-identity-only > /dev/null
-        copy_genesis rpc
-    fi
-    start_node rpc
+    local i=1
+    while [[ -d $DATA/rpc-$i ]]; do i=$((i + 1)); done
+    new_rpc "rpc-$i"
+    start_node "rpc-$i"
+    echo "rpc-$i"
 }
 
 # --- load (tps-checker, github.com/raylsnetwork/tps-checker, checked out next to this repo) ---
@@ -163,7 +174,7 @@ tps_setup() {
 # would ratchet up because it follows the prices the load itself pays.
 tps_checker() {
     local fee
-    fee=$(cast base-fee --rpc-url "$(url validator-1)") || return 1
+    fee=$(cast base-fee --rpc-url "$(url "$(ref_node)")") || return 1
     (cd "$DATA" && exec "$TPS_CHECKER" --chain-id 487 --gas-price $((fee * 2)) "$@")
 }
 
@@ -174,6 +185,8 @@ wallet_keys() {
 }
 # load wallets start at index 10, clear of the admin (#0), test (#1-#4) and operator (#5-#9) accounts
 load_keys() { wallet_keys 10 "${LOAD_WALLETS:-4}"; }
+# the rpc nodes as one comma list; the load only goes through them, like real users
+load_urls() { local n u=""; for n in $(rpc_nodes); do u="$u${u:+,}$(url "$n")"; done; echo "${u:-$(url validator-1)}"; }
 
 # with_timeout <secs> <cmd...>: kill cmd (and its children) if it runs longer
 with_timeout() {
@@ -190,32 +203,33 @@ with_timeout() {
     return $rc
 }
 
-# Fund the load wallets once. validator-1 may be restarting, so fund only after a real balance read.
+# Fund the load wallets once. Nodes may be restarting, so fund only after a real balance read.
 fund_load() {
     local key addr balance
     for key in $(load_keys | tr , ' '); do
         addr=$(cast wallet address --private-key "$key")
-        until balance=$(cast balance "$addr" --rpc-url "$(url validator-1)" 2> /dev/null); do sleep 2; done
+        until balance=$(cast balance "$addr" --rpc-url "$(url "$(ref_node)")" 2> /dev/null); do sleep 2; done
         [[ $balance != 0 ]] || tx --private-key "$ADMIN_KEY" --value 1000000ether "$addr"
     done
 }
 
 # Nonce collisions: at random intervals averaging COLLIDE_SECS (default 10, 0 = off), send one extra
-# transfer from the first load wallet while tps-checker is using it, so both race for the same nonces.
+# transfer from the first load wallet through the same rpc node tps-checker uses for it, so both race
+# for the same nonces.
 # Rejections ("nonce too low", "replacement underpriced") are expected; the chain must not care.
 collide_loop() {
     local secs=${COLLIDE_SECS:-10} key
     ((secs > 0)) || return 0
     key=$(wallet_keys 10 1)
     while sleep $((RANDOM % (2 * secs) + 1)); do
-        echo "--- $(date '+%F %T') nonce collision: $(cast send --async --rpc-url "$(url validator-1)" --private-key "$key" \
+        echo "--- $(date '+%F %T') nonce collision: $(cast send --async --rpc-url "$(url "$(ref_node)")" --private-key "$key" \
             0x000000000000000000000000000000000000dEaD --value 1gwei 2>&1 | tail -1)"
     done
 }
 
-# Steady load: tps-checker in continuous mode at LOAD_TPS (default 200) through validator-1, logged to
-# load.log, plus collide_loop. tps-checker is restarted whenever it exits (e.g. after validator-1 was
-# restarted) and, with LOAD_CYCLE_SECS, on purpose every that many seconds (another source of nonce races).
+# Steady load: tps-checker in continuous mode at LOAD_TPS (default 200) through the rpc nodes (it fails
+# over between them), logged to load.log, plus collide_loop. tps-checker is restarted whenever it exits
+# and, with LOAD_CYCLE_SECS, on purpose every that many seconds (another source of nonce races).
 load_loop() {
     set +m
     local keys
@@ -223,7 +237,7 @@ load_loop() {
     collide_loop >> "$DATA/load.log" 2>&1 &
     while :; do
         echo "--- $(date '+%F %T') tps-checker at ${LOAD_TPS:-200} tps"
-        tps_checker --private-keys "$keys" --rpc-url "$(url validator-1)" --continuous \
+        tps_checker --private-keys "$keys" --rpc-urls "$(load_urls)" --continuous \
             --target-tps "${LOAD_TPS:-200}" --num-transactions 1000000000 --report-interval-secs 30 \
             --duration-secs "${LOAD_CYCLE_SECS:-0}" || true
         sleep 2
@@ -242,7 +256,15 @@ start_load() {
     log "load running (pid $LOAD_PID), see $DATA/load.log"
 }
 stop_load() { if [[ -n $LOAD_PID ]]; then kill -- -"$LOAD_PID" 2> /dev/null || true; fi; }
-load_nonce() { cast nonce "$(cast wallet address --private-key "$(wallet_keys 10 1)")" --rpc-url "$(url validator-1)"; }
+# transactions landed so far from all load wallets
+load_nonce() {
+    local key n sum=0
+    for key in $(load_keys | tr , ' '); do
+        n=$(cast nonce "$(cast wallet address --private-key "$key")" --rpc-url "$(url "$(ref_node)")") || return 1
+        sum=$((sum + n))
+    done
+    echo "$sum"
+}
 
 # --- RPC queries ---
 

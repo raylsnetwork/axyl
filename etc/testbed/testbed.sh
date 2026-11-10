@@ -12,15 +12,16 @@ usage: $0 <command>
   clean                   stop all nodes and delete $DATA
   status                  show every node's pid, rpc, block, epoch and role
   start|stop|pause|resume <node>
-                          control one node: 1..5 (validator-N) or rpc
+                          control one node: 1..5 (validator-N) or rpc-N
   add-validator           add validator-5 and stake it into the committee
-  add-rpc                 add an rpc (observer) node
+  add-rpc                 add another rpc (observer) node to the running chain
   logs <node>             follow a node's log
   load                    send a steady stream of tps-checker transfers until Ctrl-C
   test [plan|plan/test]   run tests (default: basic). Plans: $(ls "$TESTBED/tests" | tr '\n' ' ')
                           'all' = basic chaos extended basic chaos; LOAD=1 runs them under load
 
-settings (env): RAYLS_BIN, TESTBED_DATA, EPOCH_SECS ($EPOCH_SECS), HTTP_ADDR ($HTTP_ADDR),
+settings (env): BUILD_CONFIG ($BUILD_CONFIG), RAYLS_BIN, TESTBED_DATA, RPC_NODES (2), EPOCH_SECS ($EPOCH_SECS),
+                HTTP_ADDR ($HTTP_ADDR), SOAK_VICTIMS,
                 LOG_LEVEL ($LOG_LEVEL), NODE_ARGS, GENESIS_ARGS, LOAD_TPS, LOAD_WALLETS,
                 COLLIDE_SECS, LOAD_CYCLE_SECS, TPS_CHECKER_DIR, TPS_CHECKER_BIN, SOAK_MINUTES,
                 SOAK_INTERVAL, STOP_TIMEOUT
@@ -59,7 +60,7 @@ lock() {
 up() {
     command -v cast > /dev/null || die "Foundry 'cast' is required (https://getfoundry.sh)"
     if [[ -z $RAYLS_BIN ]]; then
-        (cd "$ROOT" && cargo build --release -p rayls-network --bin rayls-network)
+        (cd "$ROOT" && cargo build -p rayls-network --bin rayls-network $([[ $BUILD_CONFIG != release ]] || echo --release))
     fi
     [[ -x $BIN ]] || die "binary not found: $BIN"
     [[ -f $DATA/genesis/genesis.yaml ]] || genesis
@@ -83,7 +84,7 @@ status() {
 run_tests() {
     local files=() f p n name rc t0 before passed=0 skipped=0 failed=()
     [[ $# -gt 0 ]] || set -- basic
-    # basic + chaos on 4 validators, extended adds validator-5 and rpc, then basic + chaos again on those
+    # basic + chaos first, extended adds validator-5 and another rpc node, then basic + chaos again with them
     [[ $* == all ]] && set -- basic chaos extended basic chaos
     [[ -f $DATA/genesis/genesis.yaml ]] || die "no testbed in $DATA, start one with: $0 up"
     lock
@@ -143,7 +144,7 @@ case "$1" in
     start | stop | pause | resume)
         [[ -n $2 ]] || usage
         n=$(node_name "$2")
-        [[ -d $DATA/$n ]] || die "no node $n in $DATA (validator-5 and rpc come from add-validator / add-rpc)"
+        [[ -d $DATA/$n ]] || die "no node $n in $DATA (validator-5 and extra rpc nodes come from add-validator / add-rpc)"
         "$1_node" "$n"
         ;;
     add-validator)
@@ -151,8 +152,8 @@ case "$1" in
         echo "validator-5 staked; it joins the committee within a few epochs"
         ;;
     add-rpc)
-        add_rpc
-        echo "rpc node started at $(url rpc)"
+        n=$(add_rpc)
+        echo "$n started at $(url "$n")"
         ;;
     logs) tail -f "$DATA/$(node_name "${2:?node}").log" ;;
     load)
