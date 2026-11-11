@@ -328,7 +328,7 @@ impl<A: BcsLayout, B: BcsLayout> BcsLayout for (A, B) {
 }
 
 /// Skip a BCS `bytes` field: ULEB128-prefixed raw byte slice (e.g. `Vec<u8>`,
-/// `String`, RoaringBitmap via `RoaringBitmapSerde`). Used by hand-written
+/// `String`, RoaringBitmap via `SignerBitmapSerde`). Used by hand-written
 /// impls for types serialized as raw bytes.
 pub fn skip_bytes(c: &mut BcsCursor<'_>) -> Result<(), BcsLayoutError> {
     let n = c.read_len()?;

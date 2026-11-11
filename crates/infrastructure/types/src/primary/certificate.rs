@@ -12,7 +12,7 @@ use crate::{
     ensure,
     error::{CertificateError, CertificateResult, DagError, DagResult, HeaderError},
     now, quorum_threshold,
-    serde::RoaringBitmapSerde,
+    serde::SignerBitmapSerde,
     Authority, AuthorityIdentifier, BlockHash, Committee, Digest, Epoch, Hash, Header, Round,
     TimestampSec, VotingPower,
 };
@@ -30,7 +30,7 @@ pub struct Certificate {
     /// The aggregate signature over the header and how far it has been verified.
     pub signature_verification_state: SignatureVerificationState,
     /// Bitmap that indicates which authorities from committee signed this certificate.
-    #[serde_as(as = "RoaringBitmapSerde")]
+    #[serde_as(as = "SignerBitmapSerde")]
     signed_authorities: roaring::RoaringBitmap,
     /// Timestamp for certificate creation.
     ///

@@ -6,7 +6,7 @@
 //! can allow trustless syncing of meta-data (the consensus chain) in order to
 //! execute with known correct consensus outputs.
 use crate::{
-    crypto, encode, serde::RoaringBitmapSerde, AuthorityIdentifier, BlockHash,
+    crypto, encode, serde::SignerBitmapSerde, AuthorityIdentifier, BlockHash,
     BlsAggregateSignature, BlsPublicKey, BlsSignature, BlsSigner, Epoch, Intent, IntentMessage,
     IntentScope, ValidatorAggregateSignature as _, Votable, B256,
 };
@@ -180,7 +180,7 @@ pub struct EpochCertificate {
     /// Signatures of a quorum of committee member for the epoch.
     pub signature: BlsSignature,
     /// Bitmap defining which committee members signed this certificate.
-    #[serde_as(as = "RoaringBitmapSerde")]
+    #[serde_as(as = "SignerBitmapSerde")]
     pub signed_authorities: roaring::RoaringBitmap,
 }
 

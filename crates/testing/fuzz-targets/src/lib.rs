@@ -20,7 +20,7 @@
 //!   on out-of-range indices from a Byzantine peer
 //! - `bcs_roundtrip`: serde round-trip stability for Certificate, Header,
 //!   and SealedBatch — catches inconsistencies in Axyl's custom serde
-//!   implementations (RoaringBitmapSerde, serde(skip), OnceCell digest)
+//!   implementations (SignerBitmapSerde, serde(skip), OnceCell digest)
 //!   that would cause validators to disagree on digests
 
 /// Re-export infrastructure types used by fuzz targets.
