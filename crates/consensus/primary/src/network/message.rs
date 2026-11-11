@@ -3,9 +3,11 @@
 use crate::error::{PrimaryNetworkError, PrimaryNetworkResult};
 use rayls_consensus_network::{types::IntoRpcError, PeerExchangeMap, RLMessage};
 use rayls_infrastructure_types::{
-    error::HeaderError, AuthorityIdentifier, BlockHash, BlsPublicKey, BlsSignature, Certificate,
-    CertificateDigest, ConsensusHeader, DefaultHashFunction, Epoch, EpochCertificate, EpochRecord,
-    EpochVote, Header, Round, Votable, Vote, B256,
+    error::HeaderError,
+    serde::{deserialize_normalized_bounded, roaring_header},
+    AuthorityIdentifier, BlockHash, BlsPublicKey, BlsSignature, Certificate, CertificateDigest,
+    ConsensusHeader, DefaultHashFunction, Epoch, EpochCertificate, EpochRecord, EpochVote, Header,
+    Round, Votable, Vote, B256,
 };
 use roaring::RoaringBitmap;
 use serde::{Deserialize, Serialize};
@@ -299,10 +301,9 @@ impl MissingCertificatesRequest {
             }
             // The portable header is parsed by the same helper the signer-bitmap bound uses, so
             // both bounds track the roaring format in one place.
-            let (containers, _) = rayls_infrastructure_types::serde::roaring_header(serialized)
-                .ok_or_else(|| {
-                    std::io::Error::new(std::io::ErrorKind::InvalidData, "unknown skip bitmap")
-                })?;
+            let (containers, _) = roaring_header(serialized).ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "unknown skip bitmap")
+            })?;
             if containers as usize > MAX_SKIP_ROUND_CONTAINERS {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
@@ -315,10 +316,7 @@ impl MissingCertificatesRequest {
             }
             // A crafted bitmap can stand for many more rounds than it has bytes.
             // The count is checked before the bitmap is expanded.
-            let Some(bitmap) = rayls_infrastructure_types::serde::deserialize_normalized_bounded(
-                &serialized[..],
-                max_rounds as u64,
-            )?
+            let Some(bitmap) = deserialize_normalized_bounded(&serialized[..], max_rounds as u64)?
             else {
                 return Err(PrimaryNetworkError::InvalidRequest(
                     "Request for rounds out of bounds".into(),
