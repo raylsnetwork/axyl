@@ -35,6 +35,14 @@ pub const DEFAULT_PRIMARY_PORT: u16 = 44894;
 /// same list (good or bad) not unfairly be punished while another node is rewarded.
 pub const DEFAULT_BAD_NODES_STAKE_THRESHOLD: u64 = 33;
 
+/// The number of committed sub dags in one leader schedule window. Reputation scores reset at the
+/// start of every window and the leader swap table changes at its end. 60 rotates the reputations
+/// about every 10 minutes with 10 second commits (based on 5 second round times).
+///
+/// NOTE: Changing this value WILL REQUIRE A FORK. All nodes must agree on the schedule change, and
+/// a catching-up node recomputes the scores it stores with this value instead of trusting a peer.
+pub const CONSENSUS_SCHEDULE_CHANGE_SUB_DAGS: u32 = 60;
+
 /// The round number.
 /// Becomes the lower 32 bits of a nonce (with epoch the high bits).
 pub type Round = u32;
