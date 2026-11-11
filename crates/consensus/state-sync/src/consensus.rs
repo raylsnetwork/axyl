@@ -10,7 +10,7 @@ use rayls_infrastructure_types::{
     BlsPublicKey, ConsensusHeader, ConsensusHeaderChainMeta, Database as ReDatabase, DbTxMut as _,
     Epoch, Noticer, B256,
 };
-use std::{ops::ControlFlow, sync::LazyLock, time::Duration};
+use std::{collections::HashMap, ops::ControlFlow, sync::LazyLock, time::Duration};
 use tokio::sync::watch;
 use tracing::{error, info, warn};
 
@@ -158,10 +158,12 @@ async fn get_consensus_header<DB: ReDatabase>(
                     );
                     return None;
                 };
+                // The digest does not cover the signatures, so a peer can send the right header
+                // with bad ones. Ask another peer rather than end the walk.
                 let Ok(verified) = header.verify_header_with_keys(&keys).inspect_err(|e| {
-                    warn!(target: "state-sync", ?hash, "BLS verification failed, discarding header: {e}");
+                    warn!(target: "state-sync", ?hash, attempt, "BLS verification failed, discarding header: {e}");
                 }) else {
-                    return None;
+                    continue;
                 };
                 let parent = verified.parent_hash;
                 store_consensus_header_in_cache(db, &verified);
@@ -304,6 +306,9 @@ impl<DB: ReDatabase> WalkSession<DB> {
         let covered_hash = self.covered;
         let mut current = start_hash;
         let mut depth = 0u64;
+        // Prefetched replies not yet linked, kept across walk steps so a bad reply costs only a
+        // fetch of that one header by hash, not a refetch of the replies below it.
+        let mut held = HashMap::new();
         let outcome = loop {
             if self.shutdown.noticed() {
                 return WalkOutcome::Shutdown;
@@ -323,7 +328,7 @@ impl<DB: ReDatabase> WalkSession<DB> {
             .await
             {
                 Some((parent, number)) => {
-                    let (next, prefetched) = self.prefetch_below(parent, number).await;
+                    let (next, prefetched) = self.prefetch_below(parent, number, &mut held).await;
                     current = next;
                     let before = depth;
                     depth += 1 + prefetched;
@@ -368,43 +373,63 @@ impl<DB: ReDatabase> WalkSession<DB> {
     /// stored header is still hash-linked to a trusted one above it, as with a fetch by hash. A
     /// full round goes on to the next; the first missing, mismatched or unverifiable reply ends
     /// prefetching, and the walk fetches that header by hash from another peer. Nothing at or
-    /// below the canonical tip is requested.
+    /// below the canonical tip or the session's covered anchor is requested.
+    ///
+    /// Replies below the bad one stay in `held` and are checked again once the walk has fetched
+    /// the bad one by hash, so they are not requested twice. `held` only holds numbers in the
+    /// current round, so it never has more than [`WALK_PREFETCH`] headers.
     ///
     /// Returns the parent hash to continue descending from and how many headers were stored.
-    async fn prefetch_below(&self, mut expected: B256, mut above: u64) -> (B256, u64) {
+    async fn prefetch_below(
+        &self,
+        mut expected: B256,
+        mut above: u64,
+        held: &mut HashMap<u64, ConsensusHeader>,
+    ) -> (B256, u64) {
         let db = self.config.node_storage();
-        let floor = db.last_record::<ConsensusBlocks>().map_or(0, |(number, _)| number) + 1;
+        // Anything at or above `above` is settled: stored, or fetched by hash.
+        held.retain(|number, _| *number < above);
+        let mut floor = None;
         let mut stored = 0u64;
         loop {
             if self.shutdown.noticed() || self.is_local(expected) {
                 break;
             }
+            // Below the canonical tip and the covered anchor the walk needs nothing from a peer.
+            let floor = *floor.get_or_insert_with(|| {
+                let canonical = db.last_record::<ConsensusBlocks>().map_or(0, |(number, _)| number);
+                let covered = self
+                    .covered
+                    .and_then(|hash| db.get_consensus_by_hash(hash))
+                    .map_or(0, |header| header.number);
+                canonical.max(covered) + 1
+            });
             let low = above.saturating_sub(WALK_PREFETCH).max(floor);
             if low >= above {
                 break;
             }
             let network = &self.network;
             let mut fetches: FuturesUnordered<_> = (low..above)
+                .filter(|number| !held.contains_key(number))
                 .map(|number| async move {
                     (number, network.request_consensus(Some(number), None).await.ok())
                 })
                 .collect();
-            let mut replies = std::collections::HashMap::new();
             while let Some((number, reply)) = fetches.next().await {
                 if let Some(header) = reply {
-                    replies.insert(number, header);
+                    held.insert(number, header);
                 }
             }
 
             // Link check first, from the top down: it is cheap and fixes which replies can be
-            // stored at all.
+            // stored at all. A reply that does not link is dropped.
             let mut linked = Vec::new();
             let mut next = expected;
             for number in (low..above).rev() {
                 if self.is_local(next) {
                     break;
                 }
-                let Some(header) = replies.remove(&number) else { break };
+                let Some(header) = held.remove(&number) else { break };
                 if header.digest() != next {
                     break;
                 }
@@ -419,11 +444,16 @@ impl<DB: ReDatabase> WalkSession<DB> {
                     keys.and_then(|keys| header.verify_header_with_keys(&keys).ok())
                 })
             });
-            let checked: Vec<ConsensusHeader> = futures::future::join_all(verifications)
+            let mut results = futures::future::join_all(verifications)
                 .await
                 .into_iter()
-                .map_while(|verified| verified.ok().flatten())
-                .collect();
+                .map(|verified| verified.ok().flatten());
+            let checked: Vec<ConsensusHeader> = results.by_ref().map_while(|v| v).collect();
+            // Headers below one that failed BLS still link to the trusted chain, since the failed
+            // one has the right digest. Hold them for the next pass instead of fetching them again.
+            for header in results.flatten() {
+                held.insert(header.number, header);
+            }
             if let Some(lowest) = checked.last() {
                 expected = lowest.parent_hash;
             }
@@ -754,25 +784,31 @@ mod tests {
         assert_eq!(first, second, "derive must be stable across calls on an unchanged cache");
     }
 
-    /// Requests a [`walk_network`] received: fetches by hash, and the lowest number asked for.
+    /// Requests a [`walk_network`] received: fetches by hash and by number, and the lowest number
+    /// asked for.
     struct WalkRequests {
         by_hash: Arc<AtomicUsize>,
+        by_number: Arc<AtomicUsize>,
         lowest_number: Arc<AtomicU64>,
     }
 
     /// A network that answers `ConsensusHeader` requests by number from `by_number` and by hash
-    /// from `by_hash`, like a peer, and records what it was asked.
+    /// from `by_hash`, like a peer, and records what it was asked. The first request for a digest
+    /// in `first_by_hash` gets that header instead, like a bad peer answering first.
     fn walk_network(
         by_number: BTreeMap<u64, ConsensusHeader>,
         by_hash: &BTreeMap<u64, ConsensusHeader>,
+        mut first_by_hash: HashMap<B256, ConsensusHeader>,
     ) -> (PrimaryNetworkHandle, WalkRequests) {
         let by_digest: HashMap<B256, ConsensusHeader> =
             by_hash.values().map(|h| (h.digest(), h.clone())).collect();
         let requests = WalkRequests {
             by_hash: Arc::new(AtomicUsize::new(0)),
+            by_number: Arc::new(AtomicUsize::new(0)),
             lowest_number: Arc::new(AtomicU64::new(u64::MAX)),
         };
-        let (hash_count, lowest) = (requests.by_hash.clone(), requests.lowest_number.clone());
+        let (hash_count, number_count, lowest) =
+            (requests.by_hash.clone(), requests.by_number.clone(), requests.lowest_number.clone());
         let (tx, mut rx) =
             tokio::sync::mpsc::channel::<NetworkCommand<PrimaryRequest, PrimaryResponse>>(64);
         tokio::spawn(async move {
@@ -782,16 +818,17 @@ mod tests {
                 let header = match (hash, number) {
                     (Some(hash), _) => {
                         hash_count.fetch_add(1, Ordering::Relaxed);
-                        by_digest.get(&hash)
+                        first_by_hash.remove(&hash).or_else(|| by_digest.get(&hash).cloned())
                     }
                     (None, Some(number)) => {
+                        number_count.fetch_add(1, Ordering::Relaxed);
                         lowest.fetch_min(number, Ordering::Relaxed);
-                        by_number.get(&number)
+                        by_number.get(&number).cloned()
                     }
                     (None, None) => None,
                 };
                 let response = match header {
-                    Some(h) => Ok(PrimaryResponse::ConsensusHeader(Arc::new(h.clone()))),
+                    Some(h) => Ok(PrimaryResponse::ConsensusHeader(Arc::new(h))),
                     None => Err(NetworkError::RPCError("no such header".to_string())),
                 };
                 let _ = reply.send(response);
@@ -847,7 +884,7 @@ mod tests {
         let leader = fixture.certificate(&fixture.header_from_last_authority());
         let chain = canonical_tip_and_chain(db, &leader, 140);
 
-        let (network, requests) = walk_network(chain.clone(), &chain);
+        let (network, requests) = walk_network(chain.clone(), &chain, HashMap::new());
         let session = WalkSession::new(config.clone(), ConsensusBus::new(), network);
 
         assert_eq!(session.walk(chain[&140].digest()).await, WalkOutcome::Covered);
@@ -860,7 +897,8 @@ mod tests {
     }
 
     /// A reply with the real parent link but changed contents ends prefetching. Only the checked
-    /// run above it is stored, the walk fetches that header by hash, and prefetching resumes below.
+    /// run above it is stored, the walk fetches that header by hash, and prefetching resumes below
+    /// with the replies it already holds.
     #[tokio::test]
     async fn walk_prefetch_stops_at_a_mismatched_reply() {
         let fixture = CommitteeFixture::builder(MemDatabase::default)
@@ -881,7 +919,7 @@ mod tests {
         };
         assert_ne!(changed.digest(), chain[&120].digest(), "precondition: contents differ");
         served.insert(120, changed);
-        let (network, requests) = walk_network(served, &chain);
+        let (network, requests) = walk_network(served, &chain, HashMap::new());
         let session = WalkSession::new(config.clone(), ConsensusBus::new(), network);
 
         assert_eq!(session.walk(chain[&140].digest()).await, WalkOutcome::Covered);
@@ -890,6 +928,11 @@ mod tests {
             requests.by_hash.load(Ordering::Relaxed),
             2,
             "the mismatched header is fetched by hash, then prefetching resumes"
+        );
+        assert_eq!(
+            requests.by_number.load(Ordering::Relaxed),
+            39,
+            "each of 101..=139 is asked for by number once: the replies below 120 are kept"
         );
     }
 
@@ -924,7 +967,7 @@ mod tests {
 
         let mut served = chain.clone();
         served.insert(120, invalid);
-        let (network, requests) = walk_network(served, &chain);
+        let (network, requests) = walk_network(served, &chain, HashMap::new());
         let session = WalkSession::new(config.clone(), ConsensusBus::new(), network);
 
         assert_eq!(session.walk(chain[&140].digest()).await, WalkOutcome::Covered);
@@ -933,5 +976,78 @@ mod tests {
         let keys = config.get_committee_keys_for_epoch(0).unwrap();
         let stored = db.get::<ConsensusBlocksCache>(&120).unwrap().unwrap();
         assert!(stored.verify_header_with_keys(&keys).is_ok(), "the stored 120 must pass BLS");
+        assert_eq!(
+            requests.by_number.load(Ordering::Relaxed),
+            39,
+            "each of 101..=139 is asked for by number once: the replies below 120 are kept"
+        );
+    }
+
+    /// A fetch by hash whose reply fails BLS asks another peer instead of ending the walk.
+    #[tokio::test]
+    async fn walk_refetches_a_bls_invalid_reply_by_hash() {
+        let fixture = CommitteeFixture::builder(MemDatabase::default)
+            .randomize_ports(true)
+            .committee_size(NonZeroUsize::new(4).unwrap())
+            .build();
+        let primary = fixture.authorities().next().unwrap();
+        let config = primary.consensus_config();
+        let db = config.node_storage();
+        let leader_header = fixture.header_from_last_authority();
+        let leader = fixture.certificate(&leader_header);
+        let chain = canonical_tip_and_chain(db, &leader, 110);
+
+        let one_vote: Vec<_> = fixture
+            .votes(&leader_header)
+            .into_iter()
+            .take(1)
+            .map(|v| (v.author().clone(), *v.signature()))
+            .collect();
+        let under_signed =
+            Certificate::new_unsigned_for_test(&fixture.committee(), leader_header, one_vote)
+                .unwrap();
+        let mut invalid = chain[&110].clone();
+        invalid.sub_dag =
+            CommittedSubDag::new(vec![], under_signed, 0, ReputationScores::default(), None);
+        assert_eq!(invalid.digest(), chain[&110].digest(), "precondition: same digest");
+
+        let first = HashMap::from([(invalid.digest(), invalid)]);
+        let (network, requests) = walk_network(chain.clone(), &chain, first);
+        let session = WalkSession::new(config.clone(), ConsensusBus::new(), network);
+
+        assert_eq!(session.walk(chain[&110].digest()).await, WalkOutcome::Covered);
+        assert_chain_cached(db, &chain);
+        assert_eq!(requests.by_hash.load(Ordering::Relaxed), 2, "110 is asked for again by hash");
+    }
+
+    /// Nothing at or below the session's covered anchor is asked for by number: a walk toward a
+    /// tip just above the anchor asks only for the headers in between.
+    #[tokio::test]
+    async fn walk_prefetch_stops_at_the_covered_anchor() {
+        let fixture = CommitteeFixture::builder(MemDatabase::default)
+            .randomize_ports(true)
+            .committee_size(NonZeroUsize::new(4).unwrap())
+            .build();
+        let primary = fixture.authorities().next().unwrap();
+        let config = primary.consensus_config();
+        let db = config.node_storage();
+        let leader = fixture.certificate(&fixture.header_from_last_authority());
+        let chain = canonical_tip_and_chain(db, &leader, 140);
+        for header in chain.range(..=130).map(|(_, h)| h) {
+            store_consensus_header_in_cache(db, header);
+        }
+
+        let (network, requests) = walk_network(chain.clone(), &chain, HashMap::new());
+        let mut session = WalkSession::new(config.clone(), ConsensusBus::new(), network);
+        session.covered = Some(chain[&130].digest());
+
+        assert_eq!(session.walk(chain[&140].digest()).await, WalkOutcome::Covered);
+        assert_chain_cached(db, &chain);
+        assert_eq!(requests.lowest_number.load(Ordering::Relaxed), 131);
+        assert_eq!(
+            requests.by_number.load(Ordering::Relaxed),
+            9,
+            "only 131..=139 are asked for by number"
+        );
     }
 }
