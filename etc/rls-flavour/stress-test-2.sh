@@ -18,10 +18,10 @@ ADDRS=(0x9965507D1a55bcC2695C58ba16FB37d819B0A4dc
        0x23618e81E3f5cdF7f54C3d65f7FBc0aBf5B21E8f
        0xa0Ee7A142d267C1f36714E4a8F75612F20a79720)
 
-rpc() { curl -s -X POST "$1" -H 'content-type: application/json' -d "$2"; }
-rls() { cast call "$RLS" "balanceOf(address)(uint256)" "$1" --rpc-url "$NODE" | awk '{print $1}'; }
-receipt() { rpc "$NODE" "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"eth_getTransactionReceipt\",\"params\":[\"$1\"]}" | jq -c .result; }
-pause() { perl -e "select(undef,undef,undef,$1)"; }
+rpc() { local url=$1 body=$2; curl -s -X POST "$url" -H 'content-type: application/json' -d "$body"; }
+rls() { local account=$1; cast call "$RLS" "balanceOf(address)(uint256)" "$account" --rpc-url "$NODE" | awk '{print $1}'; }
+receipt() { local hash=$1; rpc "$NODE" "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"eth_getTransactionReceipt\",\"params\":[\"$hash\"]}" | jq -c .result; }
+pause() { local seconds=$1; perl -e "select(undef,undef,undef,$seconds)"; }
 
 echo "== setup: three senders get RLS (from the RLS-only user) and USDr (from the dev account)"
 for a in "${ADDRS[@]}"; do

@@ -14,11 +14,11 @@ USER=0x70997970C51812dc3A010C7d01b50e0d17dc79C8
 RECIPIENT=0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC
 FRESH=0x976EA74026E726554dB657fA54763abd0C3a0aa9
 
-rls() { cast call "$RLS" "balanceOf(address)(uint256)" "$1" --rpc-url "$NODE" | awk '{print $1}'; }
-rpc() { curl -s -X POST "$1" -H 'content-type: application/json' -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"$2\",\"params\":$3}"; }
-send_raw() { rpc "$NODE" eth_sendRawTransaction "[\"$1\"]" | jq -c '.result // .error.message'; }
+rls() { local account=$1; cast call "$RLS" "balanceOf(address)(uint256)" "$account" --rpc-url "$NODE" | awk '{print $1}'; }
+rpc() { local url=$1 method=$2 params=$3; curl -s -X POST "$url" -H 'content-type: application/json' -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"$method\",\"params\":$params}"; }
+send_raw() { local raw=$1; rpc "$NODE" eth_sendRawTransaction "[\"$raw\"]" | jq -c '.result // .error.message'; }
 wait_blocks() { perl -e 'select(undef,undef,undef,4)'; }
-status() { rpc "$NODE" eth_getTransactionReceipt "[\"$1\"]" | jq -r 'if .result then (if .result.status == "0x1" then "mined ok" else "mined, reverted" end) else "not mined" end'; }
+status() { local hash=$1; rpc "$NODE" eth_getTransactionReceipt "[\"$hash\"]" | jq -r 'if .result then (if .result.status == "0x1" then "mined ok" else "mined, reverted" end) else "not mined" end'; }
 
 echo "== A. overflow: value = 2^256-1 from the RLS chain id"
 MAX=115792089237316195423570985008687907853269984665640564039457584007913129639935

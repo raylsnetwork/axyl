@@ -32,7 +32,7 @@ async function upstream(method, params) {
       break;
     } catch (err) {
       if (attempt === 3) throw err;
-      await new Promise((r) => setTimeout(r, 200 * attempt));
+      await new Promise((r) => setTimeout(r, 200 * attempt)); // NOSONAR: retries are sequential on purpose
     }
   }
   const body = await res.json();
@@ -90,7 +90,9 @@ const handlers = {
     const baseFee = BigInt(block.baseFeePerGas) * RLS_PER_USDR;
     const maxFee = BigInt(tx.maxFeePerGas ?? tx.gasPrice);
     const tip = BigInt(tx.maxPriorityFeePerGas ?? tx.gasPrice);
-    const price = tx.maxFeePerGas ? (maxFee < baseFee + tip ? maxFee : baseFee + tip) : maxFee;
+    // EIP-1559: min(max fee, base fee + tip); legacy: the gas price
+    let price = maxFee;
+    if (tx.maxFeePerGas && baseFee + tip < maxFee) price = baseFee + tip;
     return { ...receipt, effectiveGasPrice: hex(price) };
   },
 };

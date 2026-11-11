@@ -204,6 +204,71 @@ fn drop_unpayable_rls_txns(
 }
 
 impl RlsFlavourValidator {
+    /// The stateless checks reth's validator runs (`EthTransactionValidator::validate_stateless`)
+    /// except the chain id and the local USDr fee cap. A transaction that passes the pool but fails
+    /// in revm is skipped without paying, so these must match.
+    fn stateless_checks(
+        &self,
+        origin: TransactionOrigin,
+        transaction: &EthPooledTransaction,
+    ) -> Result<(), InvalidPoolTransactionError> {
+        let inner = &self.inner;
+        // EIP-7702 works as in the USDr flavour: inside an RLS-flavour transaction revm checks
+        // each authorization's chain id against the RLS chain id (or 0)
+        if !matches!(
+            transaction.ty(),
+            LEGACY_TX_TYPE_ID | EIP2930_TX_TYPE_ID | EIP1559_TX_TYPE_ID | EIP7702_TX_TYPE_ID
+        ) {
+            return Err(InvalidTransactionError::TxTypeNotSupported.into());
+        }
+        let tx_size = transaction.encoded_length();
+        if tx_size > inner.max_tx_input_bytes() {
+            return Err(InvalidPoolTransactionError::OversizedData {
+                size: tx_size,
+                limit: inner.max_tx_input_bytes(),
+            });
+        }
+        let fork_tracker = inner.fork_tracker();
+        if fork_tracker.is_shanghai_activated() {
+            let max_initcode_size = fork_tracker.max_initcode_size.load(Ordering::Relaxed);
+            transaction.ensure_max_init_code_size(max_initcode_size)?;
+        }
+        let gas_limit = transaction.gas_limit();
+        if gas_limit > inner.block_gas_limit() {
+            return Err(InvalidPoolTransactionError::ExceedsGasLimit(
+                gas_limit,
+                inner.block_gas_limit(),
+            ));
+        }
+        let tx_gas_limit_cap = fork_tracker.tx_gas_limit_cap.load(Ordering::Relaxed);
+        if tx_gas_limit_cap != 0 && gas_limit > tx_gas_limit_cap {
+            return Err(InvalidPoolTransactionError::MaxTxGasLimitExceeded(
+                gas_limit,
+                tx_gas_limit_cap,
+            ));
+        }
+        if transaction.max_priority_fee_per_gas() > Some(transaction.max_fee_per_gas()) {
+            return Err(InvalidTransactionError::TipAboveFeeCap.into());
+        }
+        if !matches!(origin, TransactionOrigin::Local)
+            && transaction.is_dynamic_fee()
+            && transaction.max_priority_fee_per_gas() < *inner.minimum_priority_fee()
+        {
+            return Err(InvalidPoolTransactionError::PriorityFeeBelowMinimum {
+                minimum_priority_fee: inner.minimum_priority_fee().unwrap_or_default(),
+            });
+        }
+        if transaction.ty() == EIP7702_TX_TYPE_ID {
+            if !fork_tracker.is_prague_activated() {
+                return Err(InvalidTransactionError::TxTypeNotSupported.into());
+            }
+            if transaction.authorization_list().is_none_or(|list| list.is_empty()) {
+                return Err(Eip7702PoolTransactionError::MissingEip7702AuthorizationList.into());
+            }
+        }
+        ensure_intrinsic_gas(transaction, fork_tracker)
+    }
+
     /// Checks an RLS-flavour transaction: the same nonce, gas and fee rules, with the cost
     /// checked against the sender's RLS instead of USDr.
     fn validate_rls(
@@ -216,74 +281,7 @@ impl RlsFlavourValidator {
             TransactionValidationOutcome::Invalid(transaction, err)
         };
 
-        // EIP-7702 works as in the USDr flavour: inside an RLS-flavour transaction revm checks
-        // each authorization's chain id against the RLS chain id (or 0)
-        if !matches!(
-            transaction.ty(),
-            LEGACY_TX_TYPE_ID | EIP2930_TX_TYPE_ID | EIP1559_TX_TYPE_ID | EIP7702_TX_TYPE_ID
-        ) {
-            return invalid(transaction, InvalidTransactionError::TxTypeNotSupported.into());
-        }
-        // The same stateless checks reth's validator runs (`EthTransactionValidator::
-        // validate_stateless`), except the chain id and the local USDr fee cap. A transaction
-        // that passes the pool but fails in revm is skipped without paying, so these must match.
-        let tx_size = transaction.encoded_length();
-        if tx_size > inner.max_tx_input_bytes() {
-            return invalid(
-                transaction,
-                InvalidPoolTransactionError::OversizedData {
-                    size: tx_size,
-                    limit: inner.max_tx_input_bytes(),
-                },
-            );
-        }
-        let fork_tracker = inner.fork_tracker();
-        if fork_tracker.is_shanghai_activated() {
-            let max_initcode_size = fork_tracker.max_initcode_size.load(Ordering::Relaxed);
-            if let Err(err) = transaction.ensure_max_init_code_size(max_initcode_size) {
-                return invalid(transaction, err);
-            }
-        }
-        let gas_limit = transaction.gas_limit();
-        if gas_limit > inner.block_gas_limit() {
-            return invalid(
-                transaction,
-                InvalidPoolTransactionError::ExceedsGasLimit(gas_limit, inner.block_gas_limit()),
-            );
-        }
-        let tx_gas_limit_cap = fork_tracker.tx_gas_limit_cap.load(Ordering::Relaxed);
-        if tx_gas_limit_cap != 0 && gas_limit > tx_gas_limit_cap {
-            return invalid(
-                transaction,
-                InvalidPoolTransactionError::MaxTxGasLimitExceeded(gas_limit, tx_gas_limit_cap),
-            );
-        }
-        if transaction.max_priority_fee_per_gas() > Some(transaction.max_fee_per_gas()) {
-            return invalid(transaction, InvalidTransactionError::TipAboveFeeCap.into());
-        }
-        if !matches!(origin, TransactionOrigin::Local)
-            && transaction.is_dynamic_fee()
-            && transaction.max_priority_fee_per_gas() < *inner.minimum_priority_fee()
-        {
-            return invalid(
-                transaction,
-                InvalidPoolTransactionError::PriorityFeeBelowMinimum {
-                    minimum_priority_fee: inner.minimum_priority_fee().unwrap_or_default(),
-                },
-            );
-        }
-        if transaction.ty() == EIP7702_TX_TYPE_ID {
-            if !fork_tracker.is_prague_activated() {
-                return invalid(transaction, InvalidTransactionError::TxTypeNotSupported.into());
-            }
-            if transaction.authorization_list().is_none_or(|list| list.is_empty()) {
-                return invalid(
-                    transaction,
-                    Eip7702PoolTransactionError::MissingEip7702AuthorizationList.into(),
-                );
-            }
-        }
-        if let Err(err) = ensure_intrinsic_gas(&transaction, fork_tracker) {
+        if let Err(err) = self.stateless_checks(origin, &transaction) {
             return invalid(transaction, err);
         }
         // The pool ranks fees against the USDr base fee, so an RLS fee under the RLS base fee

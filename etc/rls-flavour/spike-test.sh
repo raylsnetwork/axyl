@@ -17,11 +17,12 @@ SPENDER=0x15d34AAf54267DB7D7c367839AAf71A00a2C6A65
 
 pass=0 fail=0
 check() { # check <label> <actual> <expected>
-  if [[ "$2" == "$3" ]]; then echo "PASS  $1"; pass=$((pass + 1));
-  else echo "FAIL  $1: got $2, expected $3"; fail=$((fail + 1)); fi
+  local label=$1 actual=$2 expected=$3
+  if [[ "$actual" == "$expected" ]]; then echo "PASS  $label"; pass=$((pass + 1));
+  else echo "FAIL  $label: got $actual, expected $expected"; fail=$((fail + 1)); fi
 }
-rls() { cast call "$RLS" "balanceOf(address)(uint256)" "$1" --rpc-url "$NODE" | awk '{print $1}'; }
-usdr() { cast balance "$1" --rpc-url "$NODE"; }
+rls() { local account=$1; cast call "$RLS" "balanceOf(address)(uint256)" "$account" --rpc-url "$NODE" | awk '{print $1}'; }
+usdr() { local account=$1; cast balance "$account" --rpc-url "$NODE"; }
 add() { python3 -I -c "import sys; print(sum(int(a) for a in sys.argv[1:]))" "$@"; }
 
 NODE_CHAIN=$(cast chain-id --rpc-url "$NODE")
@@ -63,10 +64,11 @@ domain=$(cast call "$RLS" "eip712Domain()(bytes1,string,string,uint256,address,b
 name=$(sed -n 2p <<<"$domain" | tr -d '"'); version=$(sed -n 3p <<<"$domain" | tr -d '"')
 nonce=$(cast call "$RLS" "nonces(address)(uint256)" "$USER" --rpc-url "$NODE")
 permit_json() { # permit_json <chainId>
+  local chain_id=$1
   cat <<EOF
 {"types":{"EIP712Domain":[{"name":"name","type":"string"},{"name":"version","type":"string"},{"name":"chainId","type":"uint256"},{"name":"verifyingContract","type":"address"}],
 "Permit":[{"name":"owner","type":"address"},{"name":"spender","type":"address"},{"name":"value","type":"uint256"},{"name":"nonce","type":"uint256"},{"name":"deadline","type":"uint256"}]},
-"primaryType":"Permit","domain":{"name":"$name","version":"$version","chainId":$1,"verifyingContract":"$RLS"},
+"primaryType":"Permit","domain":{"name":"$name","version":"$version","chainId":$chain_id,"verifyingContract":"$RLS"},
 "message":{"owner":"$USER","spender":"$SPENDER","value":"777","nonce":"$nonce","deadline":"99999999999"}}
 EOF
 }

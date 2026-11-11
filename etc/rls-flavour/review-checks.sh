@@ -12,9 +12,9 @@ DEV_KEY=0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80
 RECIPIENT=0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC
 
 pass=0 fail=0
-check() { if [[ "$2" == "$3" ]]; then echo "PASS  $1"; pass=$((pass + 1)); else echo "FAIL  $1: got $2, expected $3"; fail=$((fail + 1)); fi; }
-send_raw() { curl -s -X POST "$NODE" -H 'content-type: application/json' -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"eth_sendRawTransaction\",\"params\":[\"$1\"]}" | jq -r '.result // .error.message'; }
-refused() { [[ "$1" == 0x* ]] && echo "accepted" || echo "refused"; }
+check() { local label=$1 actual=$2 expected=$3; if [[ "$actual" == "$expected" ]]; then echo "PASS  $label"; pass=$((pass + 1)); else echo "FAIL  $label: got $actual, expected $expected"; fail=$((fail + 1)); fi; }
+send_raw() { local raw=$1; curl -s -X POST "$NODE" -H 'content-type: application/json' -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"eth_sendRawTransaction\",\"params\":[\"$raw\"]}" | jq -r '.result // .error.message'; }
+refused() { local result=$1; [[ "$result" == 0x* ]] && echo "accepted" || echo "refused"; }
 nonce=$(cast nonce $USER --rpc-url $NODE)
 
 echo "== intrinsic gas: 21,000 gas with 2 KB of calldata (needs more)"

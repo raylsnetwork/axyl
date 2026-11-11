@@ -74,10 +74,10 @@ const captions = [];
 const recorder = (async () => {
   while (recording) {
     try {
-      await active.screenshot({ path: `${videoDir}/frames/${String(frame).padStart(5, "0")}.png` });
+      await active.screenshot({ path: `${videoDir}/frames/${String(frame).padStart(5, "0")}.png` }); // NOSONAR: UI steps run one after another on purpose
       captions.push(caption); frame++;
     } catch {}
-    await pause(250);
+    await pause(250); // NOSONAR: UI steps run one after another on purpose
   }
 })();
 const say = async (text, hold = 1500) => { caption = text; await pause(hold); };
@@ -91,7 +91,7 @@ const openConfirm = async () => {
   // MetaMask may open its own notification window; use it, else open one.
   for (let i = 0; i < 6 && !confirmPage; i++) {
     confirmPage = ctx.pages().find((p) => p.url().includes("/notification.html")) ?? null;
-    if (!confirmPage) await pause(500);
+    if (!confirmPage) await pause(500); // NOSONAR: UI steps run one after another on purpose
   }
   if (!confirmPage) {
     confirmPage = await ctx.newPage();
@@ -111,14 +111,14 @@ const press = async (label, wait = 3500) => {
 const tidy = async () => {
   // close buttons without accessible names: the news card's X and the backup toast's X
   if (await wallet.getByText("Back up now").count()) { await wallet.mouse.click(360, 716); await wallet.waitForTimeout(600); }
-  for (let i = 0; i < 3 && (await wallet.getByText("Add").count()) && (await wallet.locator("text=/IPO|Competition|Join the/").count()); i++) {
-    await wallet.mouse.click(376, 388); await wallet.waitForTimeout(800);
+  for (let i = 0; i < 3 && (await wallet.getByText("Add").count()) && (await wallet.locator("text=/IPO|Competition|Join the/").count()); i++) { // NOSONAR: UI steps run one after another on purpose
+    await wallet.mouse.click(376, 388); await wallet.waitForTimeout(800); // NOSONAR: UI steps run one after another on purpose
   }
   for (let i = 0; i < 4; i++) {
     const close = wallet.getByRole("button", { name: /close|dismiss/i });
     if (!(await close.count())) break;
-    await close.first().click({ timeout: 3000 }).catch(() => {});
-    await wallet.waitForTimeout(600);
+    await close.first().click({ timeout: 3000 }).catch(() => {}); // NOSONAR: UI steps run one after another on purpose
+    await wallet.waitForTimeout(600); // NOSONAR: UI steps run one after another on purpose
   }
 };
 const home = async () => { await wallet.goto(`${EXT}/home.html#/`); await wallet.waitForTimeout(4000); await tidy(); await wallet.waitForTimeout(800); };
@@ -144,7 +144,7 @@ await openConfirm(); await shot("add-usdr-network"); await press("Confirm", 4000
 await home(); await say("Chain 487: the native coin is USDr", 3000); await shot("home-usdr");
 const send = async (asset, amount) => {
   await wallet.getByText("Send", { exact: true }).first().click(); await wallet.waitForTimeout(3500);
-  await wallet.getByText(new RegExp(`^[\\d.,]+ ${asset}$`)).last().click(); await wallet.waitForTimeout(3500);
+  await wallet.getByText(new RegExp(String.raw`^[\d.,]+ ${asset}$`)).last().click(); await wallet.waitForTimeout(3500);
   await wallet.getByPlaceholder("Enter or paste an address or name").fill(TO); await wallet.waitForTimeout(1500);
   await wallet.getByPlaceholder("0", { exact: true }).pressSequentially(amount, { delay: 150 }); await wallet.waitForTimeout(2000);
   await shot(`send-${asset}-form`);
