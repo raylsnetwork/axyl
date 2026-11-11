@@ -828,10 +828,12 @@ async fn catch_up_consensus_from_to<DB: Database>(
                 recent_len
             ));
         }
-        consensus_bus
-            .consensus_header()
-            .send(StreamedConsensusHeader { header: consensus_header.clone(), verified })
-            .await?;
+        let message = if verified {
+            StreamedConsensusHeader::verified_in_process(consensus_header.clone())
+        } else {
+            StreamedConsensusHeader::unverified(consensus_header.clone())
+        };
+        consensus_bus.consensus_header().send(message).await?;
         streamed += 1;
         result_header = consensus_header;
     }

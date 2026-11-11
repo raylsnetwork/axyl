@@ -12,7 +12,7 @@ use rayls_infrastructure_types::{
 };
 use std::{collections::HashMap, ops::ControlFlow, sync::LazyLock, time::Duration};
 use tokio::sync::watch;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::verified::VerifiedSender;
 
@@ -375,16 +375,17 @@ impl<DB: ReDatabase> WalkSession<DB> {
     /// prefetching, and the walk fetches that header by hash from another peer. Nothing at or
     /// below the canonical tip or the session's covered anchor is requested.
     ///
-    /// Replies below the bad one stay in `held` and are checked again once the walk has fetched
-    /// the bad one by hash, so they are not requested twice. `held` only holds numbers in the
-    /// current round, so it never has more than [`WALK_PREFETCH`] headers.
+    /// Replies below the bad one stay in `held` and are linked again once the walk has fetched
+    /// the bad one by hash, so they are not requested twice. Each is held with whether it already
+    /// passed BLS, so one that did is not verified twice. `held` only holds numbers in the current
+    /// round, so it never has more than [`WALK_PREFETCH`] headers.
     ///
     /// Returns the parent hash to continue descending from and how many headers were stored.
     async fn prefetch_below(
         &self,
         mut expected: B256,
         mut above: u64,
-        held: &mut HashMap<u64, ConsensusHeader>,
+        held: &mut HashMap<u64, (ConsensusHeader, bool)>,
     ) -> (B256, u64) {
         let db = self.config.node_storage();
         // Anything at or above `above` is settled: stored, or fetched by hash.
@@ -412,12 +413,15 @@ impl<DB: ReDatabase> WalkSession<DB> {
             let mut fetches: FuturesUnordered<_> = (low..above)
                 .filter(|number| !held.contains_key(number))
                 .map(|number| async move {
-                    (number, network.request_consensus(Some(number), None).await.ok())
+                    (number, network.request_consensus(Some(number), None).await)
                 })
                 .collect();
             while let Some((number, reply)) = fetches.next().await {
-                if let Some(header) = reply {
-                    held.insert(number, header);
+                match reply {
+                    Ok(header) => {
+                        held.insert(number, (header, false));
+                    }
+                    Err(e) => debug!(target: "state-sync", number, ?e, "prefetch: no reply"),
                 }
             }
 
@@ -429,30 +433,56 @@ impl<DB: ReDatabase> WalkSession<DB> {
                 if self.is_local(next) {
                     break;
                 }
-                let Some(header) = held.remove(&number) else { break };
+                let Some((header, verified)) = held.remove(&number) else { break };
                 if header.digest() != next {
+                    warn!(
+                        target: "state-sync",
+                        number,
+                        "prefetch: reply does not link to the header above, fetching it by hash"
+                    );
                     break;
                 }
                 next = header.parent_hash;
-                linked.push(header);
+                linked.push((header, verified));
             }
             // BLS dominates the walk's cost (a pairing check per certificate in each sub-dag), so
             // verify the linked run in parallel and keep the prefix that verifies.
-            let verifications = linked.into_iter().map(|header| {
-                let keys = self.config.get_committee_keys_for_epoch(header.sub_dag.leader_epoch());
-                tokio::task::spawn_blocking(move || {
-                    keys.and_then(|keys| header.verify_header_with_keys(&keys).ok())
-                })
+            let verifications = linked.into_iter().map(|(header, verified)| {
+                let (number, epoch) = (header.number, header.sub_dag.leader_epoch());
+                let keys = self.config.get_committee_keys_for_epoch(epoch);
+                async move {
+                    let result = match keys {
+                        _ if verified => Ok(header),
+                        None => Err(format!("no committee keys for epoch {epoch}")),
+                        Some(keys) => tokio::task::spawn_blocking(move || {
+                            header.verify_header_with_keys(&keys).map_err(|e| e.to_string())
+                        })
+                        .await
+                        .unwrap_or_else(|e| Err(format!("verification task failed: {e}"))),
+                    };
+                    (number, epoch, result)
+                }
             });
-            let mut results = futures::future::join_all(verifications)
-                .await
-                .into_iter()
-                .map(|verified| verified.ok().flatten());
+            let mut results = futures::future::join_all(verifications).await.into_iter().map(
+                |(number, epoch, result)| {
+                    result
+                        .inspect_err(|e| {
+                            warn!(
+                                target: "state-sync",
+                                number,
+                                epoch,
+                                "prefetch: reply failed verification, fetching it by hash: {e}"
+                            )
+                        })
+                        .ok()
+                },
+            );
             let checked: Vec<ConsensusHeader> = results.by_ref().map_while(|v| v).collect();
             // Headers below one that failed BLS still link to the trusted chain, since the failed
-            // one has the right digest. Hold them for the next pass instead of fetching them again.
+            // one has the right digest. Hold them, marked verified, for the next pass instead of
+            // fetching and verifying them again.
             for header in results.flatten() {
-                held.insert(header.number, header);
+                held.insert(header.number, (header, true));
             }
             if let Some(lowest) = checked.last() {
                 expected = lowest.parent_hash;
