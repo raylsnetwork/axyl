@@ -3,32 +3,50 @@
 //! Keeps reth pool internals out of the batch builder and RPC paths, and owns the pieces reth
 //! does not: the in-flight mark tracker.
 
+use crate::rls_flavour;
+use alloy::{
+    consensus::{
+        constants::{
+            EIP1559_TX_TYPE_ID, EIP2930_TX_TYPE_ID, EIP7702_TX_TYPE_ID, LEGACY_TX_TYPE_ID,
+        },
+        BlockHeader as _, Transaction as _,
+    },
+    eips::Typed2718 as _,
+};
 use eyre::Error;
 use futures::StreamExt as _;
 use rayls_infrastructure_types::{
     Address, B256Set, EnvKzgSettings, Recovered, TaskSpawner, TransactionSigned, TxHash,
-    MIN_PROTOCOL_BASE_FEE,
+    MIN_PROTOCOL_BASE_FEE, U256,
 };
 use reth::transaction_pool::{
     blobstore::DiskFileBlobStore, BlockInfo as RethBlockInfo, TransactionValidationTaskExecutor,
 };
 use reth_chainspec::ChainSpec;
 use reth_node_builder::{NodeConfig, RethTransactionPoolConfig};
-use reth_primitives_traits::SignedTransaction;
+use reth_primitives_traits::{
+    transaction::error::InvalidTransactionError, GotExpected, SealedBlock, SignedTransaction,
+};
 use reth_provider::{
-    providers::BlockchainProvider, CanonStateSubscriptions as _, ChainSpecProvider,
+    providers::BlockchainProvider, AccountReader as _, BlockReaderIdExt as _,
+    CanonStateSubscriptions as _, ChainSpecProvider, StateProvider as _, StateProviderFactory as _,
 };
 use reth_rpc_eth_types::utils::recover_raw_transaction as reth_recover_raw_transaction;
 use reth_transaction_pool::{
-    error::{Eip4844PoolTransactionError, InvalidPoolTransactionError, PoolError, PoolErrorKind},
+    error::{
+        Eip4844PoolTransactionError, InvalidPoolTransactionError, PoolError, PoolErrorKind,
+        PoolTransactionError,
+    },
     identifier::TransactionId,
     maintain::{maintain_transaction_pool_future, MaintainPoolConfig},
+    validate::ValidTransaction,
     AddedTransactionOutcome, BestTransactions, CoinbaseTipOrdering, EthPooledTransaction, Pool,
     PoolSize, PoolTransaction, TransactionEvents, TransactionListenerKind, TransactionOrigin,
-    TransactionPool as _, TransactionPoolExt as _, ValidPoolTransaction,
+    TransactionPool as _, TransactionPoolExt as _, TransactionValidationOutcome,
+    TransactionValidator, ValidPoolTransaction,
 };
 use std::{
-    sync::Arc,
+    sync::{Arc, OnceLock},
     time::{Duration, Instant},
 };
 use tracing::{debug, info};
@@ -104,7 +122,258 @@ type EthValidator = reth_transaction_pool::EthTransactionValidator<
 >;
 
 /// The validator wrapped in reth's validation task executor.
-type RaylsValidator = TransactionValidationTaskExecutor<EthValidator>;
+type RaylsValidator = TransactionValidationTaskExecutor<RlsFlavourValidator>;
+
+/// Validates RLS-flavour transactions itself and hands every other transaction to reth's
+/// validator, which rejects any chain id but the chain's own.
+#[derive(Debug)]
+pub struct RlsFlavourValidator {
+    inner: EthValidator,
+    /// The pool this validator feeds, set once the pool exists. Used to refuse a replacement
+    /// that switches flavour at the same nonce.
+    pool: Arc<OnceLock<RaylsTransactionPool>>,
+}
+
+/// Why an RLS-flavour transaction was refused, where reth has no matching error.
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+struct RlsFlavourError(&'static str);
+
+impl PoolTransactionError for RlsFlavourError {
+    fn is_bad_transaction(&self) -> bool {
+        false
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
+/// The most RLS an RLS-flavour transaction can take: max fee for its gas limit plus its value.
+/// `U256::MAX` if that overflows, which no balance covers.
+fn rls_max_cost(transaction: &EthPooledTransaction) -> U256 {
+    // gas_limit (u64) times max fee (u128) fits in a U256; adding the value can overflow
+    (U256::from(transaction.gas_limit()) * U256::from(transaction.max_fee_per_gas()))
+        .checked_add(transaction.value())
+        .unwrap_or(U256::MAX)
+}
+
+/// Drops waiting RLS-flavour transactions whose sender can no longer pay for them, in nonce
+/// order. Reth's pool re-checks balances after each block, but only USDr ones.
+fn drop_unpayable_rls_txns(
+    pool: &RaylsTransactionPool,
+    provider: &BlockchainProvider<RaylsNode>,
+) -> eyre::Result<usize> {
+    let rls_chain = rls_flavour::rls_chain_id(provider.chain_spec().chain().id());
+    let mut by_sender: std::collections::BTreeMap<Address, Vec<Arc<PoolTxn>>> = Default::default();
+    for tx in pool.pending_transactions().into_iter().chain(pool.queued_transactions()) {
+        if tx.transaction.chain_id() == Some(rls_chain) {
+            by_sender.entry(tx.sender()).or_default().push(tx);
+        }
+    }
+    if by_sender.is_empty() {
+        return Ok(0);
+    }
+    let state = provider.latest()?;
+    let mut unpayable = Vec::new();
+    for (sender, mut txs) in by_sender {
+        txs.sort_by_key(|t| t.nonce());
+        let balance = state
+            .storage(rls_flavour::RLS_TOKEN, rls_flavour::balance_slot(sender).into())?
+            .unwrap_or_default();
+        let mut spent = U256::ZERO;
+        for tx in txs {
+            spent = spent.saturating_add(rls_max_cost(&tx.transaction));
+            if spent > balance {
+                unpayable.push(*tx.hash());
+            }
+        }
+    }
+    let dropped = unpayable.len();
+    if dropped > 0 {
+        pool.remove_transactions(unpayable);
+    }
+    Ok(dropped)
+}
+
+impl RlsFlavourValidator {
+    /// Checks an RLS-flavour transaction: the same nonce, gas and fee rules, with the cost
+    /// checked against the sender's RLS instead of USDr.
+    fn validate_rls(
+        &self,
+        origin: TransactionOrigin,
+        mut transaction: EthPooledTransaction,
+    ) -> TransactionValidationOutcome<EthPooledTransaction> {
+        let inner = &self.inner;
+        let invalid = |transaction, err: InvalidPoolTransactionError| {
+            TransactionValidationOutcome::Invalid(transaction, err)
+        };
+
+        // EIP-7702 works as in the USDr flavour: inside an RLS-flavour transaction revm checks
+        // each authorization's chain id against the RLS chain id (or 0)
+        if !matches!(
+            transaction.ty(),
+            LEGACY_TX_TYPE_ID | EIP2930_TX_TYPE_ID | EIP1559_TX_TYPE_ID | EIP7702_TX_TYPE_ID
+        ) {
+            return invalid(transaction, InvalidTransactionError::TxTypeNotSupported.into());
+        }
+        let gas_limit = transaction.gas_limit();
+        if gas_limit > inner.block_gas_limit() {
+            return invalid(
+                transaction,
+                InvalidPoolTransactionError::ExceedsGasLimit(gas_limit, inner.block_gas_limit()),
+            );
+        }
+        if gas_limit < 21_000 {
+            return invalid(transaction, InvalidPoolTransactionError::IntrinsicGasTooLow);
+        }
+        // The pool ranks fees against the USDr base fee, so an RLS fee under the RLS base fee
+        // would sit as executable and then fail. Refuse it here instead.
+        let usdr_base_fee = match inner.client().latest_header() {
+            Ok(header) => {
+                header.and_then(|h| h.base_fee_per_gas()).unwrap_or(MIN_PROTOCOL_BASE_FEE)
+            }
+            Err(err) => {
+                return TransactionValidationOutcome::Error(*transaction.hash(), Box::new(err))
+            }
+        };
+        if transaction.max_fee_per_gas() < rls_flavour::rls_base_fee(usdr_base_fee) {
+            return invalid(transaction, InvalidTransactionError::FeeCapTooLow.into());
+        }
+
+        let state = match inner.client().latest() {
+            Ok(state) => state,
+            Err(err) => {
+                return TransactionValidationOutcome::Error(*transaction.hash(), Box::new(err))
+            }
+        };
+        let account = match state.basic_account(transaction.sender_ref()) {
+            Ok(account) => account.unwrap_or_default(),
+            Err(err) => {
+                return TransactionValidationOutcome::Error(*transaction.hash(), Box::new(err))
+            }
+        };
+        match inner.validate_sender_bytecode(&transaction, &account, &state) {
+            Err(outcome) => return outcome,
+            Ok(Err(err)) => return invalid(transaction, err),
+            Ok(Ok(())) => {}
+        }
+        if let Err(err) = inner.validate_sender_nonce(&transaction, &account) {
+            return invalid(transaction, err);
+        }
+
+        let slot = rls_flavour::balance_slot(*transaction.sender_ref());
+        let rls_balance = match state.storage(rls_flavour::RLS_TOKEN, slot.into()) {
+            Ok(balance) => balance.unwrap_or_default(),
+            Err(err) => {
+                return TransactionValidationOutcome::Error(*transaction.hash(), Box::new(err))
+            }
+        };
+        // The sender's other waiting RLS-flavour transactions are paid from the same balance,
+        // which the pool cannot see (it follows USDr). Count them too.
+        let rls_chain = rls_flavour::rls_chain_id(inner.chain_id());
+        let waiting = self.pool.get().map_or(U256::ZERO, |pool| {
+            pool.get_transactions_by_sender(*transaction.sender_ref())
+                .iter()
+                .filter(|t| {
+                    t.transaction.chain_id() == Some(rls_chain)
+                        && t.transaction.nonce() != transaction.nonce()
+                })
+                .fold(U256::ZERO, |sum, t| sum.saturating_add(rls_max_cost(&t.transaction)))
+        });
+        let needed = rls_max_cost(&transaction).saturating_add(waiting);
+        if rls_balance < needed || needed == U256::MAX {
+            return invalid(
+                transaction,
+                InvalidTransactionError::InsufficientFunds(
+                    GotExpected { got: rls_balance, expected: needed }.into(),
+                )
+                .into(),
+            );
+        }
+
+        if !transaction.value().is_zero() {
+            // msg.value stays USDr inside the EVM, so RLS value only goes to accounts without code
+            let has_code = match transaction.to() {
+                None => true,
+                Some(to) => match state.basic_account(&to) {
+                    Ok(account) => account.and_then(|a| a.bytecode_hash).is_some(),
+                    Err(err) => {
+                        return TransactionValidationOutcome::Error(
+                            *transaction.hash(),
+                            Box::new(err),
+                        )
+                    }
+                },
+            };
+            if has_code {
+                return invalid(
+                    transaction,
+                    InvalidPoolTransactionError::Other(Box::new(RlsFlavourError(
+                        "RLS value can only go to an account without code",
+                    ))),
+                );
+            }
+        }
+
+        // the pool tracks the accounts a 7702 transaction delegates, as reth's validator does
+        let authorities = transaction.authorization_list().map(|auths| {
+            auths.iter().filter_map(|auth| auth.recover_authority().ok()).collect::<Vec<_>>()
+        });
+
+        // the pool weighs `cost` against the sender's USDr; this transaction spends none
+        transaction.cost = U256::ZERO;
+        TransactionValidationOutcome::Valid {
+            balance: account.balance,
+            state_nonce: account.nonce,
+            bytecode_hash: account.bytecode_hash,
+            transaction: ValidTransaction::Valid(transaction),
+            propagate: matches!(origin, TransactionOrigin::External),
+            authorities,
+        }
+    }
+}
+
+impl TransactionValidator for RlsFlavourValidator {
+    type Transaction = EthPooledTransaction;
+    type Block = <EthValidator as TransactionValidator>::Block;
+
+    async fn validate_transaction(
+        &self,
+        origin: TransactionOrigin,
+        transaction: Self::Transaction,
+    ) -> TransactionValidationOutcome<Self::Transaction> {
+        // Both flavours share one nonce per account, and a wallet keeps a separate network entry
+        // for each. A transaction waiting at this nonce in the other flavour would otherwise be
+        // replaced (or this one silently dropped), so refuse with a clear error instead.
+        let other_flavour_waiting = self
+            .pool
+            .get()
+            .and_then(|pool| {
+                pool.get_transaction_by_sender_and_nonce(
+                    *transaction.sender_ref(),
+                    transaction.nonce(),
+                )
+            })
+            .is_some_and(|waiting| waiting.transaction.chain_id() != transaction.chain_id());
+        if other_flavour_waiting {
+            return TransactionValidationOutcome::Invalid(
+                transaction,
+                InvalidPoolTransactionError::Other(Box::new(RlsFlavourError(
+                    "a transaction with this nonce is waiting on the other Rayls network; wait for it to land or replace it from that network",
+                ))),
+            );
+        }
+        if transaction.chain_id() == Some(rls_flavour::rls_chain_id(self.inner.chain_id())) {
+            return self.validate_rls(origin, transaction);
+        }
+        self.inner.validate_transaction(origin, transaction).await
+    }
+
+    fn on_new_head_block(&self, new_tip_block: &SealedBlock<Self::Block>) {
+        self.inner.on_new_head_block(new_tip_block)
+    }
+}
 
 /// The concrete pool type used by Rayls workers.
 pub type RaylsTransactionPool =
@@ -144,16 +413,19 @@ impl WorkerTxPool {
         let blob_store = DiskFileBlobStore::open(data_dir.blobstore(), Default::default())?;
         let evm_config =
             crate::evm::RaylsEvmConfig::new(blockchain_provider.chain_spec(), Default::default());
+        let pool_handle = Arc::new(OnceLock::new());
         let task_executor =
             TransactionValidationTaskExecutor::eth_builder(blockchain_provider.clone(), evm_config)
                 .kzg_settings(EnvKzgSettings::Default)
                 .with_local_transactions_config(pool_config.local_transactions_config.clone())
                 .with_additional_tasks(node_config.txpool.additional_validation_tasks)
                 .with_max_tx_input_bytes(node_config.txpool.max_tx_input_bytes)
-                .build_with_tasks(task_spawner.clone(), blob_store.clone());
+                .build_with_tasks(task_spawner.clone(), blob_store.clone())
+                .map(|inner| RlsFlavourValidator { inner, pool: pool_handle.clone() });
 
         let transaction_pool =
             Pool::new(task_executor, CoinbaseTipOrdering::default(), blob_store, pool_config);
+        let _ = pool_handle.set(transaction_pool.clone());
 
         info!(target: "rayls::execution", "Transaction pool initialized");
 
@@ -176,6 +448,20 @@ impl WorkerTxPool {
             },
         );
         task_spawner.spawn_critical_task("maintain txn pool", maintain_fut);
+
+        // After each block, drop RLS-flavour transactions their senders can no longer pay for.
+        let mut rls_stream = blockchain_provider.canonical_state_stream();
+        let rls_pool = this.pool.clone();
+        let rls_provider = blockchain_provider.clone();
+        task_spawner.spawn_critical_task("rls flavour pool re-check", async move {
+            while rls_stream.next().await.is_some() {
+                match drop_unpayable_rls_txns(&rls_pool, &rls_provider) {
+                    Ok(0) => {}
+                    Ok(dropped) => debug!(target: "rayls::execution", dropped, "dropped unpayable RLS-flavour transactions"),
+                    Err(err) => debug!(target: "rayls::execution", %err, "RLS-flavour pool re-check failed"),
+                }
+            }
+        });
 
         // Release in-flight marks once maintenance drops the sealed transactions from the
         // pending sub-pool. A separate subscription: the maintenance future consumes its own

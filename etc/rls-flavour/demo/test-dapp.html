@@ -1,0 +1,32 @@
+<!doctype html>
+<meta charset="utf-8" />
+<title>RLS flavour test dapp</title>
+<h1>RLS flavour test dapp</h1>
+<pre id="log"></pre>
+<script>
+  // Every call stores its outcome in window.R[name] so the test runner can read it after
+  // clicking through MetaMask's popup.
+  window.R = {};
+  const log = (m) => (document.getElementById("log").textContent += m + "\n");
+  const req = (method, params) => window.ethereum.request({ method, params });
+  window.run = (name, method, params) => {
+    window.R[name] = { pending: true };
+    req(method, params).then(
+      (result) => { window.R[name] = { result }; log(`${name}: ok ${JSON.stringify(result)}`); },
+      (e) => { window.R[name] = { error: e.message, code: e.code }; log(`${name}: ERROR ${e.message}`); },
+    );
+    return "started";
+  };
+  window.RLS_NET = {
+    chainId: "0x1307",
+    chainName: "Rayls (RLS gas) local",
+    nativeCurrency: { name: "Rayls", symbol: "RLS", decimals: 18 },
+    rpcUrls: ["http://127.0.0.1:8645"],
+  };
+  window.USDR_NET = {
+    chainId: "0x1e7",
+    chainName: "Rayls (USDr gas) local",
+    nativeCurrency: { name: "USD Rayls", symbol: "USDr", decimals: 18 },
+    rpcUrls: ["http://127.0.0.1:8543"],
+  };
+</script>
