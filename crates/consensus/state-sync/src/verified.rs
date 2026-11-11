@@ -4,9 +4,13 @@ use rayls_infrastructure_types::{encode, keccak256, ConsensusHeader, B256};
 use std::collections::BTreeSet;
 use tokio::sync::mpsc;
 
-/// Most verified headers remembered at once, about 2.6 MB of keys. The walk records from the top
-/// down and the streamer reads them from the bottom up once streaming starts, so on a larger gap
-/// the lowest records do not fit and the subscriber verifies those headers itself.
+/// Most records the channel holds, and most the streamer's set keeps. A record is 40 bytes, so the
+/// two together stay under about 5 MB plus the set's node overhead.
+///
+/// The walk records from the top down and the streamer reads from the bottom up. On a gap larger
+/// than this the channel fills before the lowest records arrive, and those are dropped. When the
+/// set overflows it drops its highest records, which the streamer reaches last. Either way the
+/// subscriber verifies a header that has no record itself, so a dropped record costs only time.
 const MAX_VERIFIED_HEADERS: usize = 65_536;
 
 /// Records each header the backwards walk verifies, for the forward streamer.
@@ -35,8 +39,11 @@ impl VerifiedHeaders {
         (VerifiedSender(tx), Self { rx: Some(rx), seen: BTreeSet::new() })
     }
 
-    /// True when this process verified exactly `header`, signatures included. Forgets it and every
-    /// lower record, since the streamer moves up, so a header streamed again is verified again.
+    /// True when this process verified exactly `header`, signatures included.
+    ///
+    /// Moves new records from the channel into the set first. Then forgets the record for
+    /// `header` and every record with a lower number, since the streamer only moves up. So each
+    /// record is used at most once: a header streamed again is verified again by the subscriber.
     pub(crate) fn take(&mut self, header: &ConsensusHeader) -> bool {
         if let Some(rx) = self.rx.as_mut() {
             while let Ok(record) = rx.try_recv() {

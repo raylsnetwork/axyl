@@ -22,8 +22,8 @@ use rayls_infrastructure_storage::CertificateStore;
 use rayls_infrastructure_types::{
     Address, AuthorityIdentifier, B256Map, B256Set, Batch, BlockHash, CameFrom, CertifiedBatch,
     CommittedSubDag, Committee, ConsensusHeader, ConsensusOutput, Database, Epoch, Hash as _,
-    Noticer, RaylsReceiver, RaylsSender, Round, StreamedConsensusHeader, TaskKind, TaskManager,
-    TaskSpawner, Timestamp, TimestampSec, B256,
+    Noticer, RaylsReceiver, RaylsSender, Round, TaskKind, TaskManager, TaskSpawner, Timestamp,
+    TimestampSec, B256,
 };
 // production-only: signing the consensus result for gossip
 #[cfg(not(feature = "dev-single-node-setup"))]
@@ -780,7 +780,16 @@ impl<DB: Database> Subscriber<DB> {
                 Some((number, verified)) = verifying.next(), if !verifying.is_empty() => {
                     // decided against the processed watermark, so a header in flight that failed
                     // verification cannot skip the honest one queued after it
-                    if should_process_consensus_header(number, last_processed_number) {
+                    if number > last_processed_number + 1 {
+                        // a header before it was rejected while this one was in flight; it is
+                        // taken again from the stream once that number is processed
+                        debug!(
+                            target: "subscriber",
+                            number,
+                            expected = last_processed_number + 1,
+                            "dropping a verified header queued behind a rejected one"
+                        );
+                    } else if should_process_consensus_header(number, last_processed_number) {
                         // bind position: a commit replayed at a wrong number does not advance, so
                         // reject it before execution. advance the watermark only on accept.
                         match verified {
@@ -881,7 +890,7 @@ impl<DB: Database> Subscriber<DB> {
                                 "stream_and_follow: received header, verifying"
                             );
                             last_queued_number = last_queued_number.max(number);
-                            let StreamedConsensusHeader { header, verified } = streamed;
+                            let (header, verified) = streamed.into_parts();
                             if verified {
                                 // state-sync already ran this exact check in this process
                                 let ready = std::future::ready((number, Some(header)));

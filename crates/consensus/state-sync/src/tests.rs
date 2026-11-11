@@ -1176,7 +1176,7 @@ async fn test_catch_up_flags_only_headers_verified_in_this_process() {
     let mut streamed = || {
         let mut flags = Vec::new();
         while let Ok(header) = rx.try_recv() {
-            flags.push((header.number, header.verified));
+            flags.push((header.number, header.is_verified()));
         }
         flags
     };
