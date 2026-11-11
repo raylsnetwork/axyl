@@ -47,5 +47,23 @@ high=$(cast mktx --rpc-url "$NODE" --private-key "$DEV_KEY" "$RECIPIENT" --value
 o1=$(send_raw "$low"); o2=$(send_raw "$high"); echo "   first: ${o1:0:20}…; replacement: ${o2:0:90}"
 check "a same-flavour fee bump is not refused as 'other Rayls network'" "$([[ "$o2" == *"other Rayls network"* ]] && echo refused || echo ok)" "ok"
 
+echo "== a waiting RLS value tx is dropped once its recipient gains code (EIP-7702 delegation)"
+fresh=$(cast wallet new --json); fresh_key=$(jq -r '(.data // .)[0].private_key' <<<"$fresh"); fresh_addr=$(jq -r '(.data // .)[0].address' <<<"$fresh")
+un=$(cast nonce $USER --rpc-url $NODE)
+# nonce gap: the tx waits in the queued sub-pool
+gapped=$(cast mktx --rpc-url "$RLS_RPC" --private-key "$USER_KEY" "$fresh_addr" --value 1 --gas-limit 21000 --nonce $((un + 1)))
+gh=$(send_raw "$gapped"); echo "   queued: ${gh:0:20}…"
+check "RLS value to an account without code is admitted" "$(refused "$gh")" "accepted"
+in_txpool() { curl -s -X POST "$NODE" -H 'content-type: application/json' -d '{"jsonrpc":"2.0","id":1,"method":"txpool_content","params":[]}' | jq --arg h "$1" '[.result[][][] | select(.hash == $h)] | length'; }
+check "it waits in the pool" "$(in_txpool "$gh")" "1"
+auth=$(cast wallet sign-auth "$RLS" --private-key "$fresh_key" --nonce 0 --chain 487 --rpc-url "$NODE")
+# the fee-bump check above leaves a dev tx pending: let it land first
+for _ in $(seq 1 20); do (( $(cast nonce 0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266 --rpc-url $NODE) > dn )) && break; perl -e 'select(undef,undef,undef,1)'; done
+st=$(cast send --force --rpc-url "$NODE" --private-key "$DEV_KEY" "$fresh_addr" --auth "$auth" --json 2>&1 | tail -1)
+echo "   delegation tx: $(jq -r '.status // empty' <<<"$st" 2>/dev/null || echo "${st:0:120}")"
+check "the recipient is now delegated" "$(cast code "$fresh_addr" --rpc-url "$NODE" | cut -c1-8)" "0xef0100"
+perl -e 'select(undef,undef,undef,3)'
+check "the waiting tx is dropped after the block" "$(in_txpool "$gh")" "0"
+
 echo "== $pass passed, $fail failed"
 [[ $fail == 0 ]]

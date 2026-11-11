@@ -8,7 +8,7 @@ use rayls_infrastructure_types::{Address, TxKind};
 use reth_revm::{
     context_interface::{
         journaled_state::account::JournaledAccountTr,
-        result::{HaltReason, InvalidTransaction},
+        result::{EVMError, HaltReason, InvalidTransaction},
         Block, ContextTr, JournalTr, LocalContextTr, Transaction,
     },
     handler::{post_execution, pre_execution, EvmTr, FrameResult, FrameTr, Handler},
@@ -58,28 +58,47 @@ impl<EVM> Default for RaylsEvmHandler<EVM> {
     }
 }
 
-/// Adds `delta` to `owner`'s RLS balance, or takes it away. Fails if the balance is short.
-fn move_rls<J: JournalTr>(
+/// The error type the RLS balance helpers return: the handler's own error type.
+type RlsError<J> = EVMError<<<J as JournalTr>::Database as Database>::Error, InvalidTransaction>;
+
+/// Reads `owner`'s RLS balance slot.
+fn rls_balance<J: JournalTr>(journal: &mut J, owner: Address) -> Result<U256, RlsError<J>> {
+    journal.load_account(RLS_TOKEN)?;
+    Ok(journal.sload(RLS_TOKEN, balance_slot(owner))?.data)
+}
+
+/// Takes `amount` from `owner`'s RLS. A short balance makes the transaction invalid, like a short
+/// USDr balance for gas.
+fn debit_rls<J: JournalTr>(
     journal: &mut J,
     owner: Address,
-    delta: U256,
-    credit: bool,
-) -> Result<(), RlsMoveError<<J::Database as Database>::Error>> {
-    journal.load_account(RLS_TOKEN).map_err(RlsMoveError::Db)?;
-    let slot = balance_slot(owner);
-    let balance = journal.sload(RLS_TOKEN, slot).map_err(RlsMoveError::Db)?.data;
-    let new_balance = if credit {
-        balance.saturating_add(delta)
-    } else {
-        balance.checked_sub(delta).ok_or(RlsMoveError::Short { balance, needed: delta })?
+    amount: U256,
+) -> Result<(), RlsError<J>> {
+    let balance = rls_balance(journal, owner)?;
+    let Some(new_balance) = balance.checked_sub(amount) else {
+        return Err(InvalidTransaction::LackOfFundForMaxFee {
+            fee: Box::new(amount),
+            balance: Box::new(balance),
+        }
+        .into());
     };
-    journal.sstore(RLS_TOKEN, slot, new_balance).map_err(RlsMoveError::Db)?;
+    journal.sstore(RLS_TOKEN, balance_slot(owner), new_balance)?;
     Ok(())
 }
 
-enum RlsMoveError<DbError> {
-    Db(DbError),
-    Short { balance: U256, needed: U256 },
+/// Adds `amount` to `owner`'s RLS. Overflow cannot happen within RLS's supply cap; if it ever did,
+/// it is reported instead of saturating, since this is consensus code.
+fn credit_rls<J: JournalTr>(
+    journal: &mut J,
+    owner: Address,
+    amount: U256,
+) -> Result<(), RlsError<J>> {
+    let balance = rls_balance(journal, owner)?;
+    let new_balance = balance
+        .checked_add(amount)
+        .ok_or_else(|| EVMError::Custom("RLS balance overflow".into()))?;
+    journal.sstore(RLS_TOKEN, balance_slot(owner), new_balance)?;
+    Ok(())
 }
 
 impl<EVM> Handler for RaylsEvmHandler<EVM>
@@ -94,10 +113,7 @@ where
     >,
 {
     type Evm = EVM;
-    type Error = reth_revm::context_interface::result::EVMError<
-        <<EVM::Context as ContextTr>::Db as Database>::Error,
-        InvalidTransaction,
-    >;
+    type Error = EVMError<<<EVM::Context as ContextTr>::Db as Database>::Error, InvalidTransaction>;
     type HaltReason = HaltReason;
 
     // RLS flavour: take the maximum gas fee and the value in RLS before execution
@@ -141,21 +157,9 @@ where
         let Some(needed) = max_fee.checked_add(rls.value) else {
             return Err(InvalidTransaction::OverflowPaymentInTransaction.into());
         };
-        match move_rls(journal, caller, needed, false) {
-            Ok(()) => {}
-            Err(RlsMoveError::Db(err)) => return Err(err.into()),
-            Err(RlsMoveError::Short { balance, needed }) => {
-                return Err(InvalidTransaction::LackOfFundForMaxFee {
-                    fee: Box::new(needed),
-                    balance: Box::new(balance),
-                }
-                .into())
-            }
-        }
+        debit_rls(journal, caller, needed)?;
         if let Some(to) = recipient.filter(|_| !rls.value.is_zero()) {
-            if let Err(RlsMoveError::Db(err)) = move_rls(journal, to, rls.value, true) {
-                return Err(err.into());
-            }
+            credit_rls(journal, to, rls.value)?;
             journal.log(transfer_log(caller, to, rls.value));
         }
         Ok(())
@@ -174,12 +178,7 @@ where
         let unused = U256::from(gas.remaining() + gas.refunded() as u64);
         let (_, tx, _, journal, _, _) = evm.ctx().all_mut();
         let caller = tx.caller();
-        if let Err(RlsMoveError::Db(err)) =
-            move_rls(journal, caller, unused * U256::from(rls.price), true)
-        {
-            return Err(err.into());
-        }
-        Ok(())
+        credit_rls(journal, caller, unused * U256::from(rls.price))
     }
 
     // overwrite the default basefee logic
@@ -200,12 +199,11 @@ where
         // RLS flavour: the gas paid in RLS goes to staker rewards
         if let Some(rls) = self.rls {
             let fee = U256::from(gas_used) * U256::from(rls.price);
-            if let Err(RlsMoveError::Db(err)) = move_rls(journal, RLS_FEE_RECIPIENT, fee, true) {
-                return Err(err.into());
-            }
-            // One Transfer for the gas actually paid, so balances rebuilt from events add up (the
-            // up-front debit and the refund net out to this). Like any log, it is dropped from
-            // the receipt of a reverted transaction.
+            credit_rls(journal, RLS_FEE_RECIPIENT, fee)?;
+            // One Transfer for the gas actually paid, so balances rebuilt from events add up for
+            // successful transactions (the up-front debit and the refund net out to this). A
+            // reverted or halted transaction keeps no logs, so its gas (and any RLS value, which
+            // moved before execution) has no Transfer: an open item for indexers.
             journal.log(transfer_log(tx.caller(), RLS_FEE_RECIPIENT, fee));
             return Ok(());
         }

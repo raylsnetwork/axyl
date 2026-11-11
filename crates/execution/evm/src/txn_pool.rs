@@ -159,10 +159,30 @@ fn rls_max_cost(transaction: &EthPooledTransaction) -> U256 {
         .unwrap_or(U256::MAX)
 }
 
+/// Whether `to` may receive RLS value: a call (not a creation) to an account without code that is
+/// not a precompile. The handler applies the same rule at execution.
+fn rls_value_recipient_ok(
+    state: &dyn reth_provider::StateProvider,
+    to: Option<Address>,
+) -> reth_provider::ProviderResult<bool> {
+    let Some(to) = to else { return Ok(false) };
+    if rls_flavour::is_precompile_range(to) {
+        return Ok(false);
+    }
+    let code_hash = state.basic_account(&to)?.and_then(|a| a.bytecode_hash);
+    Ok(code_hash.is_none_or(|hash| hash == KECCAK_EMPTY))
+}
+
 /// Drops waiting RLS-flavour transactions that can no longer execute: those their sender can no
-/// longer pay for (in nonce order), and those whose fee cap fell under the current RLS base fee.
-/// Reth's pool re-checks balances and fee caps after each block, but against USDr only.
-fn drop_unpayable_rls_txns(
+/// longer pay for (in nonce order), those whose fee cap fell under the current RLS base fee, and
+/// those whose value recipient has gained code (a CREATE2 deploy or an EIP-7702 delegation).
+/// Reth's pool re-checks balances and fee caps after each block, but against USDr only, and an
+/// RLS transaction that fails at execution is skipped without paying and would stay pending.
+///
+/// Transactions below the sender's state nonce were just mined and are skipped: this task and
+/// reth's maintenance task read separate canonical streams, so they may still be in the pool, and
+/// counting them again would drop the sender's next, payable, transactions.
+fn drop_unexecutable_rls_txns(
     pool: &RaylsTransactionPool,
     provider: &BlockchainProvider<RaylsNode>,
 ) -> eyre::Result<usize> {
@@ -182,23 +202,26 @@ fn drop_unpayable_rls_txns(
         .unwrap_or(MIN_PROTOCOL_BASE_FEE);
     let rls_base_fee = rls_flavour::rls_base_fee(usdr_base_fee);
     let state = provider.latest()?;
-    let mut unpayable = Vec::new();
+    let mut unexecutable = Vec::new();
     for (sender, mut txs) in by_sender {
         txs.sort_by_key(|t| t.nonce());
+        let state_nonce = state.basic_account(&sender)?.map_or(0, |a| a.nonce);
         let balance = state
             .storage(rls_flavour::RLS_TOKEN, rls_flavour::balance_slot(sender).into())?
             .unwrap_or_default();
         let mut spent = U256::ZERO;
-        for tx in txs {
+        for tx in txs.into_iter().filter(|t| t.nonce() >= state_nonce) {
             spent = spent.saturating_add(rls_max_cost(&tx.transaction));
-            if spent > balance || tx.transaction.max_fee_per_gas() < rls_base_fee {
-                unpayable.push(*tx.hash());
+            let recipient_ok = tx.transaction.value().is_zero()
+                || rls_value_recipient_ok(state.as_ref(), tx.transaction.to())?;
+            if spent > balance || tx.transaction.max_fee_per_gas() < rls_base_fee || !recipient_ok {
+                unexecutable.push(*tx.hash());
             }
         }
     }
-    let dropped = unpayable.len();
+    let dropped = unexecutable.len();
     if dropped > 0 {
-        pool.remove_transactions(unpayable);
+        pool.remove_transactions(unexecutable);
     }
     Ok(dropped)
 }
@@ -335,6 +358,8 @@ impl RlsFlavourValidator {
                 .filter(|t| {
                     rls_flavour::is_rls(t.transaction.chain_id(), chain_id)
                         && t.transaction.nonce() != transaction.nonce()
+                        // mined but not yet removed by reth's maintenance task
+                        && t.transaction.nonce() >= account.nonce
                 })
                 .fold(U256::ZERO, |sum, t| sum.saturating_add(rls_max_cost(&t.transaction)))
         });
@@ -352,20 +377,11 @@ impl RlsFlavourValidator {
         if !transaction.value().is_zero() {
             // msg.value stays USDr inside the EVM, so RLS value only goes to accounts without code
             // that are not precompiles: the same rule the handler applies at execution
-            let refused = match transaction.to() {
-                None => true,
-                Some(to) if rls_flavour::is_precompile_range(to) => true,
-                Some(to) => match state.basic_account(&to) {
-                    Ok(account) => account
-                        .and_then(|a| a.bytecode_hash)
-                        .is_some_and(|hash| hash != KECCAK_EMPTY),
-                    Err(err) => {
-                        return TransactionValidationOutcome::Error(
-                            *transaction.hash(),
-                            Box::new(err),
-                        )
-                    }
-                },
+            let refused = match rls_value_recipient_ok(state.as_ref(), transaction.to()) {
+                Ok(ok) => !ok,
+                Err(err) => {
+                    return TransactionValidationOutcome::Error(*transaction.hash(), Box::new(err))
+                }
             };
             if refused {
                 return invalid(
@@ -516,15 +532,22 @@ impl WorkerTxPool {
         );
         task_spawner.spawn_critical_task("maintain txn pool", maintain_fut);
 
-        // After each block, drop RLS-flavour transactions their senders can no longer pay for.
+        // After each block, drop RLS-flavour transactions that can no longer execute. The scan
+        // reads state, so it runs on the blocking pool, off the async runtime.
         let mut rls_stream = blockchain_provider.canonical_state_stream();
         let rls_pool = this.pool.clone();
         let rls_provider = blockchain_provider.clone();
         task_spawner.spawn_critical_task("rls flavour pool re-check", async move {
             while rls_stream.next().await.is_some() {
-                match drop_unpayable_rls_txns(&rls_pool, &rls_provider) {
+                let pool = rls_pool.clone();
+                let provider = rls_provider.clone();
+                let result =
+                    tokio::task::spawn_blocking(move || drop_unexecutable_rls_txns(&pool, &provider))
+                        .await
+                        .unwrap_or_else(|err| Err(eyre::eyre!(err)));
+                match result {
                     Ok(0) => {}
-                    Ok(dropped) => debug!(target: "rayls::execution", dropped, "dropped unpayable RLS-flavour transactions"),
+                    Ok(dropped) => debug!(target: "rayls::execution", dropped, "dropped RLS-flavour transactions that can no longer execute"),
                     Err(err) => debug!(target: "rayls::execution", %err, "RLS-flavour pool re-check failed"),
                 }
             }

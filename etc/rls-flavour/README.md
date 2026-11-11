@@ -30,7 +30,9 @@ in USDr on chain 487, switches to chain 4871 and pays gas in RLS from the same a
   transactions.
 - Their USDr `cost` is set to 0.
 - A same-nonce replacement that switches flavour is refused.
-- A task after each block drops waiting RLS transactions that can no longer pay.
+- A task after each block (on the blocking pool) drops waiting RLS transactions that can no longer
+  execute: unpayable, fee cap under the RLS base fee, or a value recipient that has gained code.
+  Nonces the sender has already used are skipped, both there and in the admission sum.
 
 Further points:
 - **No Reth fork and no second native token.** All changes use extension points Reth and revm already
@@ -77,6 +79,7 @@ public dev keys. `demo/record-metamask.mjs` drives MetaMask with Playwright. The
 | | Fee under the RLS base fee; sender without RLS; RLS value to a contract or a precompile (`0x0400`) | Refused |
 | | 21,000 gas with 2 KB of calldata (intrinsic gas) | Refused at the pool, by the same stateless checks reth runs (size, init code, gas caps, tip ≤ fee cap, min tip, 7702 auth list, intrinsic gas) |
 | | A waiting RLS tx whose fee cap falls under the RLS base fee | Dropped after the block (same task as the balance re-check) |
+| | A waiting RLS value tx whose recipient gets an EIP-7702 delegation | Dropped after the block |
 | | `value = 2^256-1` | Refused (overflow checked) |
 | Consensus | 120 txs from 3 senders, alternating flavours, sent at once | 120/120 mined, 0 reverted; 4 of 5 blocks held both flavours |
 | | State roots | Identical on 4 validators + observer |
@@ -84,7 +87,7 @@ public dev keys. `demo/record-metamask.mjs` drives MetaMask with Playwright. The
 | Tracing | `debug_traceTransaction` of an RLS-flavour tx | Same gas as the receipt (34,182) |
 | | `eth_estimateGas` vs actual (`approve`) | 34,541 vs 34,182 |
 | Tests | `cargo test --release -p rayls-execution-evm --lib` | 224 passed (218 existing + 6 new) |
-| | `review-checks.sh` (review fixes on #386) | 5/5 |
+| | `review-checks.sh` (review fixes on #386, both rounds) | 9/9 |
 
 ### Real MetaMask
 
@@ -125,8 +128,20 @@ imported.
    chainlist must register the RLS chain id.
 9. **Nonce guard race.** The cross-flavour nonce guard is check-then-insert. Two transactions
    validated at the same moment can both pass, so it belongs in the pool's insert path.
-10. **RLS chain id.** It's derived (`chain_id * 10 + 1`). It should be a configured constant
-    registered on chainlist.
-11. **Failed transactions.** They pay gas in RLS, but like every log, the gas `Transfer` is dropped
-    from a reverted receipt.
-12. **Not measured.** State-root cost at mainnet load; MetaMask Mobile.
+10. **RLS chain id.** It's derived (`chain_id * 10 + 1`, unchecked, and it can collide with another
+    network's id). It should be a configured constant, registered on chainlist and checked at
+    startup against the chain's own id.
+11. **Failed transactions and indexers.** A reverted or halted RLS tx still pays its gas, and its
+    `value` has already moved before execution, but a failed receipt keeps no logs, so neither
+    `Transfer` is visible. Indexers that rebuild RLS balances from events drift. Fix: emit the logs
+    outside the reverted frame, or have indexers read balances.
+12. **Gas differs slightly between flavours.** The handler touches the sender's RLS balance slot
+    before execution, so a contract that then reads RLS balances finds that slot warm and pays less
+    gas than the same call in a USDr tx. Deterministic on every node, but `eth_estimateGas` from the
+    other flavour is off by up to ~2,000 gas per slot.
+13. **Re-check cost.** The after-block task scans every pending and queued RLS tx. Limit it to
+    senders touched by the block, or keep an index of RLS txs, before mainnet load.
+14. **Execution fallback.** The pool re-check catches the known ways an RLS tx becomes
+    unexecutable. A tx that still fails the handler's checks at execution is skipped without paying
+    and waits until it's dropped. Dropping it in `execute_batch` would close this generally.
+15. **Not measured.** State-root cost at mainnet load; MetaMask Mobile.
