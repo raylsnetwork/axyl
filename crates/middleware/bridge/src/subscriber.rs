@@ -18,12 +18,12 @@ use rayls_infrastructure_config::ConsensusConfig;
 #[cfg(not(feature = "dev-single-node-setup"))]
 use rayls_infrastructure_config::LibP2pConfig;
 use rayls_infrastructure_network_types::{local::LocalNetwork, PrimaryToWorkerClient};
-use rayls_infrastructure_storage::CertificateStore;
+use rayls_infrastructure_storage::{CertificateStore, ConsensusStore};
 use rayls_infrastructure_types::{
     Address, AuthorityIdentifier, B256Map, B256Set, Batch, BlockHash, CameFrom, CertifiedBatch,
     CommittedSubDag, Committee, ConsensusHeader, ConsensusOutput, Database, Epoch, Hash as _,
-    Noticer, RaylsReceiver, RaylsSender, Round, TaskKind, TaskManager, TaskSpawner, Timestamp,
-    TimestampSec, B256,
+    Noticer, RaylsReceiver, RaylsSender, ReputationScores, Round, TaskKind, TaskManager,
+    TaskSpawner, Timestamp, TimestampSec, B256, CONSENSUS_SCHEDULE_CHANGE_SUB_DAGS,
 };
 // production-only: signing the consensus result for gossip
 #[cfg(not(feature = "dev-single-node-setup"))]
@@ -193,6 +193,33 @@ pub fn spawn_subscriber<DB: Database>(
             );
         }
     }
+}
+
+/// Recomputes the reputation scores of a sub dag received during catch-up.
+///
+/// The scores a peer sends are not covered by the consensus block digest or any signature, so a
+/// peer can set them to anything. They are recomputed here from covered data instead: the sub
+/// dag's own certificates and leader, and the previous sub dag, read back from this node's
+/// canonical row at `parent_hash`. A parent in an earlier epoch, or no parent, starts from fresh
+/// scores, as Bullshark does at the first commit of an epoch.
+fn catchup_reputation_score<DB: ConsensusStore>(
+    db: &DB,
+    committee: &Committee,
+    parent_hash: B256,
+    sub_dag: &CommittedSubDag,
+    num_sub_dags_per_schedule: u32,
+) -> ReputationScores {
+    let previous = db
+        .get_canonical_consensus_by_hash(parent_hash)
+        .map(|parent| parent.sub_dag)
+        .filter(|previous| previous.leader_epoch() == sub_dag.leader_epoch());
+    ReputationScores::resolve(
+        committee,
+        previous.as_ref(),
+        &sub_dag.certificates,
+        sub_dag.leader.nonce(),
+        num_sub_dags_per_schedule,
+    )
 }
 
 /// Returns true if `number` is the next consensus header to process.
@@ -447,7 +474,28 @@ impl<DB: Database> Subscriber<DB> {
     }
 
     /// Persist a fetched consensus output and forward it to the engine.
-    async fn commit_catchup_output(&self, output: ConsensusOutput) -> SubscriberResult<()> {
+    async fn commit_catchup_output(&self, mut output: ConsensusOutput) -> SubscriberResult<()> {
+        // Store locally computed reputation scores, never the peer's: a leader schedule rebuilt
+        // from the peer's scores could crash this node or elect different leaders than the rest
+        // of the committee once it rejoins consensus (#377).
+        let local_scores = catchup_reputation_score(
+            self.config.node_storage(),
+            &self.inner.committee,
+            output.parent_hash,
+            &output.sub_dag,
+            CONSENSUS_SCHEDULE_CHANGE_SUB_DAGS,
+        );
+        if output.sub_dag.reputation_score != local_scores {
+            warn!(
+                target: "subscriber",
+                number = output.number,
+                received = ?output.sub_dag.reputation_score,
+                local = ?local_scores,
+                "catch-up: peer sent reputation scores that differ from the local computation, storing the local scores"
+            );
+            Arc::make_mut(&mut output.sub_dag).reputation_score = local_scores;
+        }
+
         // persist individual certificates for consensus rejoin (BLS-verified before scheduling)
         if let Err(e) = self.config.node_storage().write(output.sub_dag.leader.clone()) {
             warn!(target: "subscriber", ?e, "failed to write leader cert to store");
@@ -1539,5 +1587,141 @@ mod tests {
         let mut cut = EpochCut::default();
         let out = output_committed_at(u64::MAX - 1);
         assert_eq!(cut.classify(&out, u64::MAX), CutAction::Keep);
+    }
+}
+
+#[cfg(test)]
+mod catchup_reputation_tests {
+    use super::*;
+    use rayls_consensus_primary::{
+        consensus::{Bullshark, ConsensusMetrics, ConsensusState, LeaderSchedule, LeaderSwapTable},
+        test_utils::make_certificates_with_slow_nodes,
+    };
+    use rayls_infrastructure_storage::mem_db::MemDatabase;
+    use rayls_infrastructure_types::{Certificate, DEFAULT_BAD_NODES_STAKE_THRESHOLD};
+    use rayls_testing_test_utils::CommitteeFixture;
+
+    /// What a peer can send: no authorities, marked final of schedule (#377).
+    fn poisoned() -> ReputationScores {
+        ReputationScores { scores_per_authority: Default::default(), final_of_schedule: true }
+    }
+
+    /// Save `sub_dag` as the canonical row `number` on top of `parent_hash`, as the catch-up does,
+    /// and return the stored header's digest.
+    fn save_row(
+        db: &MemDatabase,
+        number: u64,
+        parent_hash: B256,
+        sub_dag: CommittedSubDag,
+    ) -> B256 {
+        let output = ConsensusOutput {
+            sub_dag: Arc::new(sub_dag),
+            parent_hash,
+            number,
+            ..Default::default()
+        };
+        save_consensus(db, output, &None).expect("save consensus row").digest()
+    }
+
+    /// A committed sub dag whose leader commits at `(epoch, round)`, with no certificates.
+    fn subdag_at(epoch: Epoch, round: Round, scores: ReputationScores) -> CommittedSubDag {
+        let mut leader = Certificate::default();
+        leader.header.epoch = epoch;
+        leader.header.round = round;
+        CommittedSubDag::new(vec![], leader, 0, scores, None)
+    }
+
+    /// Bullshark commits a DAG with a slow node, so scores differ between authorities and span
+    /// several schedule windows. Each sub dag then arrives at a catching-up node carrying poisoned
+    /// scores, chained on the rows the node stored before it. The recomputed scores must equal the
+    /// ones Bullshark stored, sub dag by sub dag, whatever the peer sent.
+    #[tokio::test]
+    async fn catchup_scores_match_bullshark_whatever_the_peer_sends() {
+        const WINDOW: u32 = 3;
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let committee = fixture.committee();
+        let ids: Vec<_> = fixture.authorities().map(|a| a.id()).collect();
+
+        let slow_nodes = [(ids[ids.len() - 1].clone(), 0.5_f64)];
+        let (certificates, _) = make_certificates_with_slow_nodes(
+            &committee,
+            1..=60,
+            Certificate::genesis(&committee),
+            &ids,
+            &slow_nodes,
+        );
+        let metrics = Arc::new(ConsensusMetrics::default());
+        let mut state = ConsensusState::new(metrics.clone(), 50);
+        let mut bullshark = Bullshark::new(
+            committee.clone(),
+            metrics,
+            WINDOW,
+            LeaderSchedule::new(committee.clone(), LeaderSwapTable::default()),
+            DEFAULT_BAD_NODES_STAKE_THRESHOLD,
+        );
+        let mut honest = Vec::new();
+        for certificate in certificates {
+            let (_, committed) = bullshark.process_certificate(&mut state, certificate).unwrap();
+            honest.extend(committed);
+        }
+        assert!(honest.len() > 3 * WINDOW as usize, "the DAG spans several schedule windows");
+        assert!(
+            honest.iter().any(|s| {
+                let mut scores = s.reputation_score.scores_per_authority.values();
+                let first = scores.next().copied();
+                scores.any(|v| Some(*v) != first)
+            }),
+            "precondition: some committed scores differ between authorities"
+        );
+
+        let db = MemDatabase::default();
+        let mut parent_hash = ConsensusHeader::default().digest();
+        for (i, expected) in honest.iter().enumerate() {
+            let number = i as u64 + 1;
+            let mut received = expected.clone();
+            received.reputation_score = poisoned();
+
+            let local = catchup_reputation_score(&db, &committee, parent_hash, &received, WINDOW);
+            assert_eq!(local, expected.reputation_score, "sub dag {number}");
+
+            received.reputation_score = local;
+            parent_hash = save_row(&db, number, parent_hash, received);
+        }
+    }
+
+    /// Scores carry over only from a parent of the same epoch. A parent of an earlier epoch, a
+    /// missing parent, or a parent holding a set that does not match the committee all start from
+    /// fresh scores.
+    #[test]
+    fn catchup_scores_carry_over_only_from_a_matching_same_epoch_parent() {
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let committee = fixture.committee();
+        let window = CONSENSUS_SCHEDULE_CHANGE_SUB_DAGS;
+        let db = MemDatabase::default();
+        let genesis = ConsensusHeader::default().digest();
+
+        // Rounds 10 and 12 of epochs 4 and 5 are all mid-window and not final with a 60 window.
+        let mut carried = ReputationScores::new(&committee);
+        for authority in committee.authorities() {
+            carried.add_score(&authority.id(), 7);
+        }
+        let parent = save_row(&db, 1, genesis, subdag_at(4, 10, carried.clone()));
+
+        let same_epoch = subdag_at(4, 12, poisoned());
+        let local = catchup_reputation_score(&db, &committee, parent, &same_epoch, window);
+        assert_eq!(local, carried, "same-epoch parent: scores carry over");
+
+        let next_epoch = subdag_at(5, 12, poisoned());
+        let local = catchup_reputation_score(&db, &committee, parent, &next_epoch, window);
+        assert_eq!(local, ReputationScores::new(&committee), "earlier-epoch parent: fresh scores");
+
+        let local =
+            catchup_reputation_score(&db, &committee, B256::repeat_byte(0xAB), &same_epoch, window);
+        assert_eq!(local, ReputationScores::new(&committee), "missing parent: fresh scores");
+
+        let poisoned_parent = save_row(&db, 2, parent, subdag_at(4, 12, poisoned()));
+        let child = subdag_at(4, 14, poisoned());
+        let local = catchup_reputation_score(&db, &committee, poisoned_parent, &child, window);
+        assert_eq!(local, ReputationScores::new(&committee), "mismatched parent: fresh scores");
     }
 }
