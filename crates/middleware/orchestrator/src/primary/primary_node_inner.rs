@@ -6,7 +6,7 @@ use rayls_consensus_primary::{
 use rayls_infrastructure_config::ConsensusConfig;
 use rayls_infrastructure_types::{
     CameFrom, ConsensusOutput, Database as ConsensusDatabase, TaskManager,
-    DEFAULT_BAD_NODES_STAKE_THRESHOLD,
+    CONSENSUS_SCHEDULE_CHANGE_SUB_DAGS, DEFAULT_BAD_NODES_STAKE_THRESHOLD,
 };
 use rayls_middleware_bridge::{Executor, SubscriberResult};
 use tokio::sync::mpsc;
@@ -23,13 +23,6 @@ pub(super) struct PrimaryNodeInner<CDB> {
 }
 
 impl<CDB: ConsensusDatabase> PrimaryNodeInner<CDB> {
-    /// The window where the schedule change takes place in consensus. It represents number
-    /// of committed sub dags.
-    /// 60 should rotate the reputations about every 10 minutes with 10 second commits (based on 5
-    /// second round times).
-    /// NOTE: Changing this value WILL REQUIRE A FORK.  All nodes must agree on the schedule change.
-    const CONSENSUS_SCHEDULE_CHANGE_SUB_DAGS: u32 = 60;
-
     /// Starts the primary node with the provided info. If the node is already running then this
     /// method will return an error instead.
     pub(super) async fn start(
@@ -90,7 +83,7 @@ impl<CDB: ConsensusDatabase> PrimaryNodeInner<CDB> {
         let ordering_engine = Bullshark::new(
             self.consensus_config.committee().clone(),
             self.consensus_bus.consensus_metrics().clone(),
-            Self::CONSENSUS_SCHEDULE_CHANGE_SUB_DAGS,
+            CONSENSUS_SCHEDULE_CHANGE_SUB_DAGS,
             leader_schedule.clone(),
             DEFAULT_BAD_NODES_STAKE_THRESHOLD,
         );

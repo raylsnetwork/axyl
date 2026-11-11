@@ -12,7 +12,7 @@ use std::{
     fmt::{Debug, Formatter},
     sync::Arc,
 };
-use tracing::{debug, trace};
+use tracing::{debug, trace, warn};
 
 #[cfg(test)]
 #[path = "tests/leader_schedule_tests.rs"]
@@ -67,6 +67,20 @@ impl LeaderSwapTable {
     ) -> Self {
         assert!((0..=33).contains(&bad_nodes_percent_threshold), "The bad_nodes_percent_threshold should be in range [0 - 33], out of bounds parameter detected");
         assert!(reputation_scores.final_of_schedule, "Only reputation scores that have been calculated on the end of a schedule are accepted");
+
+        // Scores are not covered by the block digest, so a set read back from storage may come
+        // from a peer. Refuse any set that is not exactly one entry per committee member and fall
+        // back to the plain round-robin schedule, instead of dividing by zero on an empty set.
+        if !reputation_scores.matches_committee(committee) {
+            warn!(
+                target: "consensus::leader_schedule",
+                round,
+                scored = reputation_scores.total_authorities(),
+                committee_size = committee.size(),
+                "refusing reputation scores that do not match the committee, no leader swaps"
+            );
+            return Self { round, good_nodes: vec![], bad_nodes: HashMap::default() };
+        }
 
         let auths_by_score = reputation_scores.authorities_by_score_desc();
         let list_threshold =
