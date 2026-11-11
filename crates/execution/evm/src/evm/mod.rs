@@ -45,13 +45,17 @@ fn rls_gas(
     usdr_base_fee: u64,
     simulating: bool,
 ) -> Result<Option<RlsGas>, InvalidTransaction> {
-    if tx.chain_id != Some(rls_flavour::rls_chain_id(chain_id)) {
+    if !rls_flavour::is_rls(tx.chain_id, chain_id) {
         return Ok(None);
     }
     let base_fee = rls_flavour::rls_base_fee(usdr_base_fee);
     // `gas_price` is the max fee per gas for EIP-1559 transactions
     if tx.gas_price < base_fee && !simulating {
         return Err(InvalidTransaction::GasPriceLessThanBasefee);
+    }
+    // revm cannot see this once the fee fields are zeroed below; same rule as the USDr flavour
+    if tx.gas_priority_fee.is_some_and(|tip| tip > tx.gas_price) {
+        return Err(InvalidTransaction::PriorityFeeGreaterThanMaxFee);
     }
     let price = match tx.gas_priority_fee {
         Some(tip) => tx.gas_price.min(base_fee.saturating_add(tip)),

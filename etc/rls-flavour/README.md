@@ -61,7 +61,7 @@ public dev keys. `demo/record-metamask.mjs` drives MetaMask with Playwright. The
 
 | Area | Check | Result |
 |---|---|---|
-| Basics | Native send of 1 RLS from an account with 0 USDr | Recipient +1 RLS; sender paid 21,000 × 26,496 gwei = 0.556 RLS; USDr untouched; RLS `Transfer` event |
+| Basics | Native send of 1 RLS from an account with 0 USDr | Recipient +1 RLS; sender paid 21,000 × 26,496 gwei = 0.556 RLS; USDr untouched; two RLS `Transfer` events: the value, and the gas paid to the fee recipient |
 | | Dapp call (`approve`), contract deploy, legacy type-0 tx from the RLS chain id | Work; `msg.sender` is the user; gas in RLS |
 | | USDr transactions | Unchanged |
 | EIP-712 | CHAINID | 4871 in RLS-flavour txs, 487 in USDr txs |
@@ -74,14 +74,17 @@ public dev keys. `demo/record-metamask.mjs` drives MetaMask with Playwright. The
 | | MetaMask (see below) | Takes nonces in order across both networks and handles one network's confirmations at a time |
 | Pool | Two RLS sends that each fit but together exceed the balance | Second refused at admission |
 | | A waiting RLS send made unpayable by an ERC-20 transfer | Dropped from the pool after the block (no stuck tx) |
-| | Fee under the RLS base fee; sender without RLS; RLS value to a contract | Refused |
+| | Fee under the RLS base fee; sender without RLS; RLS value to a contract or a precompile (`0x0400`) | Refused |
+| | 21,000 gas with 2 KB of calldata (intrinsic gas) | Refused at the pool, by the same stateless checks reth runs (size, init code, gas caps, tip ≤ fee cap, min tip, 7702 auth list, intrinsic gas) |
+| | A waiting RLS tx whose fee cap falls under the RLS base fee | Dropped after the block (same task as the balance re-check) |
 | | `value = 2^256-1` | Refused (overflow checked) |
 | Consensus | 120 txs from 3 senders, alternating flavours, sent at once | 120/120 mined, 0 reverted; 4 of 5 blocks held both flavours |
 | | State roots | Identical on 4 validators + observer |
 | | Observer wiped and re-synced from genesis | All 71 non-empty blocks identical (58 with RLS txs, 157 RLS txs incl. 7 type-4, 8 mixed blocks) |
 | Tracing | `debug_traceTransaction` of an RLS-flavour tx | Same gas as the receipt (34,182) |
 | | `eth_estimateGas` vs actual (`approve`) | 34,541 vs 34,182 |
-| Tests | `cargo test --release -p rayls-execution-evm --lib` | 222 passed (218 existing + 4 new) |
+| Tests | `cargo test --release -p rayls-execution-evm --lib` | 224 passed (218 existing + 6 new) |
+| | `review-checks.sh` (review fixes on #386) | 5/5 |
 
 ### Real MetaMask
 
@@ -120,4 +123,10 @@ imported.
 7. **Pool ordering.** Tips in RLS units sort against tips in USDr units.
 8. **Explorer.** Blockscout and indexers must read the tx `chainId` to label RLS sends and fees.
    chainlist must register the RLS chain id.
-9. **Not measured.** State-root cost at mainnet load; MetaMask Mobile.
+9. **Nonce guard race.** The cross-flavour nonce guard is check-then-insert. Two transactions
+   validated at the same moment can both pass, so it belongs in the pool's insert path.
+10. **RLS chain id.** It's derived (`chain_id * 10 + 1`). It should be a configured constant
+    registered on chainlist.
+11. **Failed transactions.** They pay gas in RLS, but like every log, the gas `Transfer` is dropped
+    from a reverted receipt.
+12. **Not measured.** State-root cost at mainnet load; MetaMask Mobile.

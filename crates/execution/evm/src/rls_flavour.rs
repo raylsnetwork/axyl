@@ -35,6 +35,19 @@ pub const fn rls_chain_id(chain_id: u64) -> u64 {
     chain_id * 10 + 1
 }
 
+/// Whether a transaction signed with `tx_chain_id` is an RLS-flavour transaction on a chain with
+/// id `chain_id`. Pre-EIP-155 transactions (no chain id) are always the USDr flavour.
+pub const fn is_rls(tx_chain_id: Option<u64>, chain_id: u64) -> bool {
+    matches!(tx_chain_id, Some(id) if id == rls_chain_id(chain_id))
+}
+
+/// Precompiles (Ethereum's and Rayls' own, such as the USDr precompile at `0x0400`) all sit below
+/// `0x10000`. They have no code hash, but a call to them can still fail, and RLS value moves before
+/// execution and is not reverted, so they cannot receive RLS value.
+pub fn is_precompile_range(address: Address) -> bool {
+    address.as_slice()[..18].iter().all(|byte| *byte == 0)
+}
+
 /// The RLS base fee per gas for a block whose USDr base fee is `usdr_base_fee`.
 pub const fn rls_base_fee(usdr_base_fee: u64) -> u128 {
     usdr_base_fee as u128 * RLS_PER_USDR
@@ -78,6 +91,22 @@ mod tests {
         assert_eq!(rls_chain_id(487), 4871);
         assert_eq!(rls_chain_id(72957), 729571);
         assert_ne!(rls_chain_id(72957), 72957);
+    }
+
+    #[test]
+    fn flavour_comes_from_the_signed_chain_id() {
+        assert!(is_rls(Some(4871), 487));
+        assert!(!is_rls(Some(487), 487));
+        assert!(!is_rls(None, 487));
+    }
+
+    #[test]
+    fn precompile_range_covers_low_addresses_only() {
+        assert!(is_precompile_range(address!("0000000000000000000000000000000000000001")));
+        assert!(is_precompile_range(address!("0000000000000000000000000000000000000400")));
+        assert!(is_precompile_range(address!("000000000000000000000000000000000000ffff")));
+        assert!(!is_precompile_range(address!("0000000000000000000000000000000000010000")));
+        assert!(!is_precompile_range(address!("3C44CdDdB6a900fa2b585dd299e03d12FA4293BC")));
     }
 
     #[test]

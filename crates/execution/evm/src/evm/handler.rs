@@ -2,7 +2,7 @@
 
 use crate::{
     reth_env::types::basefee_address,
-    rls_flavour::{balance_slot, transfer_log, RLS_FEE_RECIPIENT, RLS_TOKEN},
+    rls_flavour::{balance_slot, is_precompile_range, transfer_log, RLS_FEE_RECIPIENT, RLS_TOKEN},
 };
 use rayls_infrastructure_types::{Address, TxKind};
 use reth_revm::{
@@ -125,9 +125,14 @@ where
                 )
                 .into());
             };
-            if journal.load_account_with_code(to)?.data.info.code_hash != KECCAK_EMPTY {
+            // precompiles have no code hash but can fail, and this value moves before execution
+            // and is not reverted with the call, so they are refused too (the pool does the same)
+            if is_precompile_range(to)
+                || journal.load_account_with_code(to)?.data.info.code_hash != KECCAK_EMPTY
+            {
                 return Err(InvalidTransaction::Str(
-                    "RLS value can only go to an account without code".into(),
+                    "RLS value can only go to an account without code that is not a precompile"
+                        .into(),
                 )
                 .into());
             }
@@ -194,14 +199,14 @@ where
 
         // RLS flavour: the gas paid in RLS goes to staker rewards
         if let Some(rls) = self.rls {
-            if let Err(RlsMoveError::Db(err)) = move_rls(
-                journal,
-                RLS_FEE_RECIPIENT,
-                U256::from(gas_used) * U256::from(rls.price),
-                true,
-            ) {
+            let fee = U256::from(gas_used) * U256::from(rls.price);
+            if let Err(RlsMoveError::Db(err)) = move_rls(journal, RLS_FEE_RECIPIENT, fee, true) {
                 return Err(err.into());
             }
+            // One Transfer for the gas actually paid, so balances rebuilt from events add up (the
+            // up-front debit and the refund net out to this). Like any log, it is dropped from
+            // the receipt of a reverted transaction.
+            journal.log(transfer_log(tx.caller(), RLS_FEE_RECIPIENT, fee));
             return Ok(());
         }
 

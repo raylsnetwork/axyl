@@ -31,22 +31,23 @@ use reth_provider::{
     providers::BlockchainProvider, AccountReader as _, BlockReaderIdExt as _,
     CanonStateSubscriptions as _, ChainSpecProvider, StateProvider as _, StateProviderFactory as _,
 };
+use reth_revm::primitives::KECCAK_EMPTY;
 use reth_rpc_eth_types::utils::recover_raw_transaction as reth_recover_raw_transaction;
 use reth_transaction_pool::{
     error::{
-        Eip4844PoolTransactionError, InvalidPoolTransactionError, PoolError, PoolErrorKind,
-        PoolTransactionError,
+        Eip4844PoolTransactionError, Eip7702PoolTransactionError, InvalidPoolTransactionError,
+        PoolError, PoolErrorKind, PoolTransactionError,
     },
     identifier::TransactionId,
     maintain::{maintain_transaction_pool_future, MaintainPoolConfig},
-    validate::ValidTransaction,
+    validate::{ensure_intrinsic_gas, ValidTransaction},
     AddedTransactionOutcome, BestTransactions, CoinbaseTipOrdering, EthPooledTransaction, Pool,
     PoolSize, PoolTransaction, TransactionEvents, TransactionListenerKind, TransactionOrigin,
     TransactionPool as _, TransactionPoolExt as _, TransactionValidationOutcome,
     TransactionValidator, ValidPoolTransaction,
 };
 use std::{
-    sync::{Arc, OnceLock},
+    sync::{atomic::Ordering, Arc, OnceLock},
     time::{Duration, Instant},
 };
 use tracing::{debug, info};
@@ -158,22 +159,28 @@ fn rls_max_cost(transaction: &EthPooledTransaction) -> U256 {
         .unwrap_or(U256::MAX)
 }
 
-/// Drops waiting RLS-flavour transactions whose sender can no longer pay for them, in nonce
-/// order. Reth's pool re-checks balances after each block, but only USDr ones.
+/// Drops waiting RLS-flavour transactions that can no longer execute: those their sender can no
+/// longer pay for (in nonce order), and those whose fee cap fell under the current RLS base fee.
+/// Reth's pool re-checks balances and fee caps after each block, but against USDr only.
 fn drop_unpayable_rls_txns(
     pool: &RaylsTransactionPool,
     provider: &BlockchainProvider<RaylsNode>,
 ) -> eyre::Result<usize> {
-    let rls_chain = rls_flavour::rls_chain_id(provider.chain_spec().chain().id());
+    let chain_id = provider.chain_spec().chain().id();
     let mut by_sender: std::collections::BTreeMap<Address, Vec<Arc<PoolTxn>>> = Default::default();
     for tx in pool.pending_transactions().into_iter().chain(pool.queued_transactions()) {
-        if tx.transaction.chain_id() == Some(rls_chain) {
+        if rls_flavour::is_rls(tx.transaction.chain_id(), chain_id) {
             by_sender.entry(tx.sender()).or_default().push(tx);
         }
     }
     if by_sender.is_empty() {
         return Ok(0);
     }
+    let usdr_base_fee = provider
+        .latest_header()?
+        .and_then(|h| h.base_fee_per_gas())
+        .unwrap_or(MIN_PROTOCOL_BASE_FEE);
+    let rls_base_fee = rls_flavour::rls_base_fee(usdr_base_fee);
     let state = provider.latest()?;
     let mut unpayable = Vec::new();
     for (sender, mut txs) in by_sender {
@@ -184,7 +191,7 @@ fn drop_unpayable_rls_txns(
         let mut spent = U256::ZERO;
         for tx in txs {
             spent = spent.saturating_add(rls_max_cost(&tx.transaction));
-            if spent > balance {
+            if spent > balance || tx.transaction.max_fee_per_gas() < rls_base_fee {
                 unpayable.push(*tx.hash());
             }
         }
@@ -217,6 +224,26 @@ impl RlsFlavourValidator {
         ) {
             return invalid(transaction, InvalidTransactionError::TxTypeNotSupported.into());
         }
+        // The same stateless checks reth's validator runs (`EthTransactionValidator::
+        // validate_stateless`), except the chain id and the local USDr fee cap. A transaction
+        // that passes the pool but fails in revm is skipped without paying, so these must match.
+        let tx_size = transaction.encoded_length();
+        if tx_size > inner.max_tx_input_bytes() {
+            return invalid(
+                transaction,
+                InvalidPoolTransactionError::OversizedData {
+                    size: tx_size,
+                    limit: inner.max_tx_input_bytes(),
+                },
+            );
+        }
+        let fork_tracker = inner.fork_tracker();
+        if fork_tracker.is_shanghai_activated() {
+            let max_initcode_size = fork_tracker.max_initcode_size.load(Ordering::Relaxed);
+            if let Err(err) = transaction.ensure_max_init_code_size(max_initcode_size) {
+                return invalid(transaction, err);
+            }
+        }
         let gas_limit = transaction.gas_limit();
         if gas_limit > inner.block_gas_limit() {
             return invalid(
@@ -224,8 +251,40 @@ impl RlsFlavourValidator {
                 InvalidPoolTransactionError::ExceedsGasLimit(gas_limit, inner.block_gas_limit()),
             );
         }
-        if gas_limit < 21_000 {
-            return invalid(transaction, InvalidPoolTransactionError::IntrinsicGasTooLow);
+        let tx_gas_limit_cap = fork_tracker.tx_gas_limit_cap.load(Ordering::Relaxed);
+        if tx_gas_limit_cap != 0 && gas_limit > tx_gas_limit_cap {
+            return invalid(
+                transaction,
+                InvalidPoolTransactionError::MaxTxGasLimitExceeded(gas_limit, tx_gas_limit_cap),
+            );
+        }
+        if transaction.max_priority_fee_per_gas() > Some(transaction.max_fee_per_gas()) {
+            return invalid(transaction, InvalidTransactionError::TipAboveFeeCap.into());
+        }
+        if !matches!(origin, TransactionOrigin::Local)
+            && transaction.is_dynamic_fee()
+            && transaction.max_priority_fee_per_gas() < *inner.minimum_priority_fee()
+        {
+            return invalid(
+                transaction,
+                InvalidPoolTransactionError::PriorityFeeBelowMinimum {
+                    minimum_priority_fee: inner.minimum_priority_fee().unwrap_or_default(),
+                },
+            );
+        }
+        if transaction.ty() == EIP7702_TX_TYPE_ID {
+            if !fork_tracker.is_prague_activated() {
+                return invalid(transaction, InvalidTransactionError::TxTypeNotSupported.into());
+            }
+            if transaction.authorization_list().is_none_or(|list| list.is_empty()) {
+                return invalid(
+                    transaction,
+                    Eip7702PoolTransactionError::MissingEip7702AuthorizationList.into(),
+                );
+            }
+        }
+        if let Err(err) = ensure_intrinsic_gas(&transaction, fork_tracker) {
+            return invalid(transaction, err);
         }
         // The pool ranks fees against the USDr base fee, so an RLS fee under the RLS base fee
         // would sit as executable and then fail. Refuse it here instead.
@@ -271,12 +330,12 @@ impl RlsFlavourValidator {
         };
         // The sender's other waiting RLS-flavour transactions are paid from the same balance,
         // which the pool cannot see (it follows USDr). Count them too.
-        let rls_chain = rls_flavour::rls_chain_id(inner.chain_id());
+        let chain_id = inner.chain_id();
         let waiting = self.pool.get().map_or(U256::ZERO, |pool| {
             pool.get_transactions_by_sender(*transaction.sender_ref())
                 .iter()
                 .filter(|t| {
-                    t.transaction.chain_id() == Some(rls_chain)
+                    rls_flavour::is_rls(t.transaction.chain_id(), chain_id)
                         && t.transaction.nonce() != transaction.nonce()
                 })
                 .fold(U256::ZERO, |sum, t| sum.saturating_add(rls_max_cost(&t.transaction)))
@@ -294,10 +353,14 @@ impl RlsFlavourValidator {
 
         if !transaction.value().is_zero() {
             // msg.value stays USDr inside the EVM, so RLS value only goes to accounts without code
-            let has_code = match transaction.to() {
+            // that are not precompiles: the same rule the handler applies at execution
+            let refused = match transaction.to() {
                 None => true,
+                Some(to) if rls_flavour::is_precompile_range(to) => true,
                 Some(to) => match state.basic_account(&to) {
-                    Ok(account) => account.and_then(|a| a.bytecode_hash).is_some(),
+                    Ok(account) => account
+                        .and_then(|a| a.bytecode_hash)
+                        .is_some_and(|hash| hash != KECCAK_EMPTY),
                     Err(err) => {
                         return TransactionValidationOutcome::Error(
                             *transaction.hash(),
@@ -306,11 +369,11 @@ impl RlsFlavourValidator {
                     }
                 },
             };
-            if has_code {
+            if refused {
                 return invalid(
                     transaction,
                     InvalidPoolTransactionError::Other(Box::new(RlsFlavourError(
-                        "RLS value can only go to an account without code",
+                        "RLS value can only go to an account without code that is not a precompile",
                     ))),
                 );
             }
@@ -355,7 +418,13 @@ impl TransactionValidator for RlsFlavourValidator {
                     transaction.nonce(),
                 )
             })
-            .is_some_and(|waiting| waiting.transaction.chain_id() != transaction.chain_id());
+            .is_some_and(|waiting| {
+                let chain_id = self.inner.chain_id();
+                rls_flavour::is_rls(waiting.transaction.chain_id(), chain_id)
+                    != rls_flavour::is_rls(transaction.chain_id(), chain_id)
+            });
+        // Check-then-insert: two such transactions validated at the same moment can both pass.
+        // A production version moves this guard into the pool's insert path.
         if other_flavour_waiting {
             return TransactionValidationOutcome::Invalid(
                 transaction,
@@ -364,7 +433,7 @@ impl TransactionValidator for RlsFlavourValidator {
                 ))),
             );
         }
-        if transaction.chain_id() == Some(rls_flavour::rls_chain_id(self.inner.chain_id())) {
+        if rls_flavour::is_rls(transaction.chain_id(), self.inner.chain_id()) {
             return self.validate_rls(origin, transaction);
         }
         self.inner.validate_transaction(origin, transaction).await
