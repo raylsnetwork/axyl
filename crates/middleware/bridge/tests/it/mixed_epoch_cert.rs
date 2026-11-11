@@ -150,11 +150,11 @@ async fn selfless_joined_cert_does_not_crash_follower() -> eyre::Result<()> {
             "a certificate authored outside the epoch-0 committee must fail the epoch-0 keys"
         );
         let result = run(mode, cert).await?;
-        assert!(
-            result.is_ok(),
-            "{mode:?} subscriber stopped on a certificate by validator {joined} from epoch 1: {}",
-            result.err().unwrap_or_default()
-        );
+        let output = result.unwrap_or_else(|e| {
+            panic!("{mode:?} subscriber stopped on a certificate by validator {joined} from epoch 1: {e}")
+        });
+        assert_eq!(output.number, 2);
+        assert_eq!(output.sub_dag.certificates.len(), 1, "{mode:?} took the mixed commit");
     }
     Ok(())
 }
