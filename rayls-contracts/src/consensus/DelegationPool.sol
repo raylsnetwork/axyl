@@ -524,6 +524,106 @@ contract DelegationPool is
     }
 
     /// @inheritdoc IDelegationPool
+    /// @dev No RLS transfer at all — the whole operation is accounting-only within this
+    ///      contract, which is precisely why it can skip the unbonding wait that
+    ///      requestUndelegation/completeUndelegation enforce for an actual withdrawal.
+    function transferStake(
+        address fromValidator,
+        address toValidator,
+        uint256 amount
+    ) external override nonReentrant {
+        if (fromValidator == toValidator) revert SameValidator();
+        if (amount == 0) revert ZeroAmount();
+
+        DelegationPoolStorage storage $ = _getDelegationPoolStorage();
+
+        if (!$.poolRegistered[fromValidator]) revert PoolNotRegistered(fromValidator);
+        if (!$.poolRegistered[toValidator]) revert PoolNotRegistered(toValidator);
+
+        // Destination must still be allowlisted and accepting — same checks _delegate runs
+        // for a fresh delegation into it. The source is deliberately not re-checked: a
+        // delegator must always be able to move stake AWAY from a de-allowlisted or
+        // closed-to-new-delegations validator.
+        if (!$.consensusRegistry.isAllowlisted(toValidator))
+            revert NotAllowlisted(toValidator);
+
+        ValidatorPool storage fromPool = $.validatorPools[fromValidator];
+        ValidatorPool storage toPool = $.validatorPools[toValidator];
+        if (!toPool.acceptingDelegations)
+            revert PoolNotAcceptingDelegations(toValidator);
+
+        DelegatorPosition storage fromPos = $.positions[fromValidator][msg.sender];
+
+        // settle pending rewards/slashes before computing the movable balance
+        _settlePosition(fromPool, fromPos);
+
+        uint32 currentEpoch = $.consensusRegistry.getCurrentEpoch();
+        // Stored 1-based (currentEpoch + 1): 0 must unambiguously mean "never transferred",
+        // and epoch 0 is itself a legitimate real epoch, so storing it raw would make a
+        // position's very first transfer at epoch 0 collide with the default and
+        // false-positive as already used.
+        if (fromPos.lastTransferEpoch == uint64(currentEpoch) + 1)
+            revert TransferAlreadyUsedThisEpoch(currentEpoch);
+
+        if (fromPos.amount < amount)
+            revert InsufficientBalance(amount, fromPos.amount);
+
+        // reduce the source position and its track total
+        fromPos.amount -= amount;
+        uint256 fromAccum = fromPos.openTier ? fromPool.openRewardPerShareAccum : fromPool.rewardPerShareAccum;
+        fromPos.rewardDebt = (fromPos.amount * fromAccum) / PRECISION;
+        // Ceiling division for slashDebt — counterpart to ceiling in _settlePosition
+        fromPos.slashDebt = (fromPos.amount * fromPool.slashPerShareAccum + PRECISION - 1) / PRECISION;
+        fromPos.lastTransferEpoch = uint64(currentEpoch) + 1;
+
+        if (fromPos.openTier) {
+            fromPool.openTierDelegated -= amount;
+        } else {
+            fromPool.totalDelegated -= amount;
+        }
+
+        // Settle the destination position, then credit it. Tier resolution mirrors
+        // _delegate's existing precedent: a pre-existing destination position keeps its own
+        // tier; a brand-new one takes the source's.
+        DelegatorPosition storage toPos = $.positions[toValidator][msg.sender];
+        bool toOpenTier = toPos.amount > 0 ? toPos.openTier : fromPos.openTier;
+
+        _settlePosition(toPool, toPos);
+
+        // check per-delegator max on the destination (post-settlement amount)
+        uint256 newDelegatorTotal = toPos.amount + amount;
+        if (newDelegatorTotal > $.config.maxDelegation)
+            revert ExceedsMaxDelegation(newDelegatorTotal, $.config.maxDelegation);
+
+        // check destination's combined pool cap (Track A + Track B together)
+        uint256 combinedPoolTotal = toPool.totalDelegated + toPool.openTierDelegated;
+        if (combinedPoolTotal + amount > $.config.maxValidatorDelegation)
+            revert ExceedsMaxValidatorDelegation(
+                combinedPoolTotal + amount,
+                $.config.maxValidatorDelegation
+            );
+
+        toPos.amount = newDelegatorTotal;
+        toPos.openTier = toOpenTier;
+
+        uint256 toAccum = toOpenTier ? toPool.openRewardPerShareAccum : toPool.rewardPerShareAccum;
+        toPos.rewardDebt = (toPos.amount * toAccum) / PRECISION;
+        // Ceiling division for slashDebt — counterpart to ceiling in _settlePosition
+        toPos.slashDebt = (toPos.amount * toPool.slashPerShareAccum + PRECISION - 1) / PRECISION;
+        // Same-epoch reward exclusion applies to moved-in stake exactly as it would to a
+        // fresh delegation.
+        toPos.lastDelegateEpoch = uint64(currentEpoch);
+
+        if (toOpenTier) {
+            toPool.openTierDelegated += amount;
+        } else {
+            toPool.totalDelegated += amount;
+        }
+
+        emit StakeTransferred(fromValidator, toValidator, msg.sender, amount);
+    }
+
+    /// @inheritdoc IDelegationPool
     /// @dev SLASH PROTECTION: Returns the full undelegateAmount without deducting post-exit slashes.
     ///      Unbonding tokens were removed from pool.totalDelegated at request time, so
     ///      slashPerShareAccum increases during the unbonding period do not affect this amount.
