@@ -153,7 +153,7 @@ async function mapLimit(items, limit, fn) {
   const worker = async () => {
     while (next < items.length) {
       const i = next++;
-      results[i] = await fn(items[i]);
+      results[i] = await fn(items[i]); // NOSONAR: each worker runs its share one at a time on purpose
     }
   };
   await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
@@ -199,9 +199,12 @@ http
         res.statusCode = 400;
         return res.end();
       }
-      if (Array.isArray(payload) && payload.length > MAX_BATCH) {
-        res.statusCode = 413;
-        return res.end();
+      // A bad batch is a JSON-RPC error, not an HTTP one, so clients can show it (as geth does);
+      // JSON-RPC 2.0 section 6 answers an empty batch with a single Invalid Request error.
+      if (Array.isArray(payload) && (payload.length === 0 || payload.length > MAX_BATCH)) {
+        const message = payload.length === 0 ? "Invalid Request" : `batch too large (max ${MAX_BATCH})`;
+        res.setHeader("content-type", "application/json");
+        return res.end(JSON.stringify({ jsonrpc: "2.0", id: null, error: { code: -32600, message } }));
       }
       const reply = Array.isArray(payload)
         ? await mapLimit(payload, BATCH_CONCURRENCY, handle)
