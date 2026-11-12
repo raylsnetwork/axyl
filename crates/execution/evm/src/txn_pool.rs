@@ -47,7 +47,8 @@ use reth_transaction_pool::{
     TransactionValidator, ValidPoolTransaction,
 };
 use std::{
-    sync::{atomic::Ordering, Arc, OnceLock},
+    collections::HashMap,
+    sync::{atomic::Ordering, Arc, Mutex, OnceLock, Weak},
     time::{Duration, Instant},
 };
 use tracing::{debug, info, warn};
@@ -131,8 +132,24 @@ type RaylsValidator = TransactionValidationTaskExecutor<RlsFlavourValidator>;
 pub struct RlsFlavourValidator {
     inner: EthValidator,
     /// The pool this validator feeds, set once the pool exists. Used to refuse a replacement
-    /// that switches flavour at the same nonce.
-    pool: Arc<OnceLock<RaylsTransactionPool>>,
+    /// that switches flavour at the same nonce, and to count the sender's waiting RLS. Weak: the
+    /// pool owns this validator, so a strong handle would be a reference cycle and the pool would
+    /// never drop. [`WorkerTxPool`] holds the strong one.
+    pool: Arc<OnceLock<Weak<RaylsTransactionPool>>>,
+    /// Senders this validator admitted RLS-flavour transactions for; the after-block re-check
+    /// walks only these instead of the whole pool.
+    rls_senders: RlsSenders,
+}
+
+/// Senders with RLS-flavour transactions, and when the validator last admitted one for each.
+type RlsSenders = Arc<Mutex<HashMap<Address, Instant>>>;
+
+/// How long a sender stays tracked with no RLS-flavour transaction in the pool. It covers the gap
+/// between validation and insertion into the pool, so a just-admitted transaction isn't missed.
+const RLS_SENDER_GRACE: Duration = Duration::from_secs(60);
+
+fn lock_senders(senders: &RlsSenders) -> std::sync::MutexGuard<'_, HashMap<Address, Instant>> {
+    senders.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// Why an RLS-flavour transaction was refused, where reth has no matching error.
@@ -204,15 +221,42 @@ fn rls_value_recipient_ok(
 /// Removal is by hash, so the sender's later transactions (either flavour) are left nonce-gapped
 /// in the queued sub-pool until a replacement fills the gap or `max_tx_lifetime` (5 min) evicts
 /// them. MetaMask fills the gap itself: it reads the latest-block nonce for the next send.
+///
+/// Only the senders the validator tracks are walked, so a block costs nothing when no RLS
+/// transaction is waiting. A sender with no RLS transaction left is untracked once
+/// [`RLS_SENDER_GRACE`] has passed since its last admission.
 fn drop_unexecutable_rls_txns(
     pool: &RaylsTransactionPool,
     provider: &BlockchainProvider<RaylsNode>,
+    senders: &RlsSenders,
 ) -> eyre::Result<usize> {
+    let tracked: Vec<(Address, Instant)> =
+        lock_senders(senders).iter().map(|(sender, at)| (*sender, *at)).collect();
+    if tracked.is_empty() {
+        return Ok(0);
+    }
     let chain_id = provider.chain_spec().chain().id();
     let mut by_sender: std::collections::BTreeMap<Address, Vec<Arc<PoolTxn>>> = Default::default();
-    for tx in pool.pending_transactions().into_iter().chain(pool.queued_transactions()) {
-        if rls_flavour::is_rls(tx.transaction.chain_id(), chain_id) {
-            by_sender.entry(tx.sender()).or_default().push(tx);
+    let mut idle = Vec::new();
+    for (sender, admitted_at) in tracked {
+        let txs: Vec<_> = pool
+            .get_transactions_by_sender(sender)
+            .into_iter()
+            .filter(|tx| rls_flavour::is_rls(tx.transaction.chain_id(), chain_id))
+            .collect();
+        if !txs.is_empty() {
+            by_sender.insert(sender, txs);
+        } else if admitted_at.elapsed() > RLS_SENDER_GRACE {
+            idle.push((sender, admitted_at));
+        }
+    }
+    {
+        let mut senders = lock_senders(senders);
+        for (sender, admitted_at) in idle {
+            // untrack only if nothing was admitted for this sender since the snapshot
+            if senders.get(&sender) == Some(&admitted_at) {
+                senders.remove(&sender);
+            }
         }
     }
     if by_sender.is_empty() {
@@ -375,9 +419,10 @@ impl RlsFlavourValidator {
             }
         };
         // The sender's other waiting RLS-flavour transactions are paid from the same balance,
-        // which the pool cannot see (it follows USDr). Count them too.
+        // which the pool cannot see (it follows USDr). Count them too. Check-then-insert: a
+        // transaction validated at the same moment isn't waiting yet (see `validate_transaction`).
         let chain_id = inner.chain_id();
-        let waiting = self.pool.get().map_or(U256::ZERO, |pool| {
+        let waiting = self.pool.get().and_then(Weak::upgrade).map_or(U256::ZERO, |pool| {
             pool.get_transactions_by_sender(*transaction.sender_ref())
                 .iter()
                 .filter(|t| {
@@ -434,6 +479,7 @@ impl RlsFlavourValidator {
 
         // the pool weighs `cost` against the sender's USDr; this transaction spends none
         transaction.cost = U256::ZERO;
+        lock_senders(&self.rls_senders).insert(*transaction.sender_ref(), Instant::now());
         TransactionValidationOutcome::Valid {
             balance: account.balance,
             state_nonce: account.nonce,
@@ -460,6 +506,7 @@ impl TransactionValidator for RlsFlavourValidator {
         let other_flavour_waiting = self
             .pool
             .get()
+            .and_then(Weak::upgrade)
             .and_then(|pool| {
                 pool.get_transaction_by_sender_and_nonce(
                     *transaction.sender_ref(),
@@ -471,8 +518,10 @@ impl TransactionValidator for RlsFlavourValidator {
                 rls_flavour::is_rls(waiting.transaction.chain_id(), chain_id)
                     != rls_flavour::is_rls(transaction.chain_id(), chain_id)
             });
-        // Check-then-insert: two such transactions validated at the same moment can both pass.
-        // A production version moves this guard into the pool's insert path.
+        // Check-then-insert, like the RLS balance check in `validate_rls`: reth validates on
+        // several tasks at once, so two transactions from one sender validated at the same moment
+        // can both pass either check. A production version moves both into the pool's insert
+        // path (or holds a per-sender lock across validate and insert).
         if other_flavour_waiting {
             return TransactionValidationOutcome::Invalid(
                 transaction,
@@ -505,6 +554,8 @@ pub struct WorkerTxPool {
     /// what it sealed so the next round skips it, the forwarder marks what it sent so it does not
     /// re-send before the mark is due. Handed out via [`WorkerTxPool::in_flight`].
     in_flight_tracker: InFlightTracker,
+    /// The strong handle behind the RLS-flavour validator's weak one.
+    _rls_validator_pool: Arc<RaylsTransactionPool>,
 }
 
 impl From<WorkerTxPool> for RaylsTransactionPool {
@@ -531,6 +582,7 @@ impl WorkerTxPool {
         let evm_config =
             crate::evm::RaylsEvmConfig::new(blockchain_provider.chain_spec(), Default::default());
         let pool_handle = Arc::new(OnceLock::new());
+        let rls_senders = RlsSenders::default();
         let task_executor =
             TransactionValidationTaskExecutor::eth_builder(blockchain_provider.clone(), evm_config)
                 .kzg_settings(EnvKzgSettings::Default)
@@ -538,15 +590,24 @@ impl WorkerTxPool {
                 .with_additional_tasks(node_config.txpool.additional_validation_tasks)
                 .with_max_tx_input_bytes(node_config.txpool.max_tx_input_bytes)
                 .build_with_tasks(task_spawner.clone(), blob_store.clone())
-                .map(|inner| RlsFlavourValidator { inner, pool: pool_handle.clone() });
+                .map(|inner| RlsFlavourValidator {
+                    inner,
+                    pool: pool_handle.clone(),
+                    rls_senders: rls_senders.clone(),
+                });
 
         let transaction_pool =
             Pool::new(task_executor, CoinbaseTipOrdering::default(), blob_store, pool_config);
-        let _ = pool_handle.set(transaction_pool.clone());
+        let rls_validator_pool = Arc::new(transaction_pool.clone());
+        let _ = pool_handle.set(Arc::downgrade(&rls_validator_pool));
 
         info!(target: "rayls::execution", "Transaction pool initialized");
 
-        let this = Self { pool: transaction_pool, in_flight_tracker: in_flight };
+        let this = Self {
+            pool: transaction_pool,
+            in_flight_tracker: in_flight,
+            _rls_validator_pool: rls_validator_pool,
+        };
 
         // reth's maintenance future drains mined transactions, reloads changed accounts, and
         // updates the pending base fee on every commit. `no_local_exemptions` holds locally
@@ -575,8 +636,11 @@ impl WorkerTxPool {
             while rls_stream.next().await.is_some() {
                 let pool = rls_pool.clone();
                 let provider = rls_provider.clone();
+                let senders = rls_senders.clone();
                 let result =
-                    tokio::task::spawn_blocking(move || drop_unexecutable_rls_txns(&pool, &provider))
+                    tokio::task::spawn_blocking(move || {
+                        drop_unexecutable_rls_txns(&pool, &provider, &senders)
+                    })
                         .await
                         .unwrap_or_else(|err| Err(eyre::eyre!(err)));
                 match result {

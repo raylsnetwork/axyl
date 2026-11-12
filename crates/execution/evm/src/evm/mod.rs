@@ -63,7 +63,7 @@ fn rls_gas(
         Some(tip) => tx.gas_price.min(base_fee.saturating_add(tip)),
         None => tx.gas_price,
     };
-    let rls = RlsGas { price, value: tx.value };
+    let rls = RlsGas { price, max_fee: tx.gas_price, value: tx.value };
     tx.gas_price = 0;
     tx.gas_priority_fee = tx.gas_priority_fee.map(|_| 0);
     tx.value = U256::ZERO;

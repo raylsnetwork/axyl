@@ -21,7 +21,7 @@ in USDr on chain 487, switches to chain 4871 and pays gas in RLS from the same a
 |---|---|
 | `crates/execution/evm/src/rls_flavour.rs` (new) | RLS chain id, RLS base fee (USDr base fee × `RLS_PER_USDR`), RLS balance slots, `Transfer` log, unit tests |
 | `crates/execution/evm/src/evm/mod.rs` | `transact_raw`: a tx signed for the RLS chain id runs with gas price and value 0. CHAINID = RLS chain id, base fee 0 for that tx |
-| `crates/execution/evm/src/evm/handler.rs` | revm `Handler` hooks: take max fee + value in RLS before execution (checked arithmetic), refund unused gas, pay gas to the RLSAccumulator |
+| `crates/execution/evm/src/evm/handler.rs` | revm `Handler` hooks: check the sender holds gas limit × signed max fee + value in RLS (EIP-1559's rule), take gas limit × effective price + value before execution (checked arithmetic), refund unused gas, pay gas to the RLSAccumulator |
 | `crates/execution/evm/src/txn_pool.rs` | See below |
 | `etc/rls-flavour/rpc-proxy.mjs` | Wallet-facing RPC for the RLS chain id (balance and gas prices in RLS). Production would serve this from the node |
 
@@ -133,8 +133,14 @@ imported.
    Traces don't help them: the inspector sees the transaction after `rls_gas` zeroed it, so
    `callTracer` reports an RLS send's top frame as `value: 0x0` (and misses the RLS `Transfer`
    logs). Explorers that build native transfers from traces will show RLS sends as 0-value calls.
-9. **Nonce guard race.** The cross-flavour nonce guard is check-then-insert. Two transactions
-   validated at the same moment can both pass, so it belongs in the pool's insert path.
+9. **Check-then-insert races.** Reth validates transactions on several tasks at once, and two
+   pool checks here read the pool before the transaction is in it: the cross-flavour nonce guard,
+   and the sender's RLS balance against their other waiting RLS transactions. Two transactions
+   from one sender validated at the same moment can both pass either check, for example nonces n
+   and n+1 that together overspend (`stress-test.sh` C only covers them arriving one after the
+   other). The after-block re-check drops the unpayable one, but until then it can be packed and
+   skipped at execution without paying. Both checks belong in the pool's insert path, or RLS
+   validation needs a per-sender lock held across validate and insert.
 10. **RLS chain ids must stay unique.** If another chain uses a network's RLS id, a transaction a
     user signs there is also a valid RLS-flavour transaction here (same key, matching nonce) and
     moves RLS. A derived `chain_id * 10 + 1` already collided: devnet's 5031 is Somnia Mainnet. The
@@ -154,8 +160,10 @@ imported.
     the same balance back, so the slot is warm but not dirty: an RLS `eth_estimateGas` for a call
     that writes the sender's RLS balance comes out a little above the real RLS execution (the safe
     direction, not estimator error).
-13. **Re-check cost.** The after-block task scans every pending and queued RLS tx. Limit it to
-    senders touched by the block, or keep an index of RLS txs, before mainnet load.
+13. **Re-check cost.** The after-block task walks only senders the validator admitted RLS txs
+    for (untracked a minute after their last one leaves the pool), so a block with no RLS txs
+    waiting costs nothing. With many RLS senders waiting it still reads each one's state every
+    block; limiting it to senders touched by the block is the next step.
 14. **Execution fallback.** The pool re-check catches the known ways an RLS tx becomes
     unexecutable. A tx that still fails the handler's checks at execution is skipped without paying
     and waits until it's dropped. Dropping it in `execute_batch` would close this generally.

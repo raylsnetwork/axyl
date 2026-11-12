@@ -87,6 +87,7 @@ fn price_and_zeroed_fields() {
     let mut tx = rls_tx(base * 2, Some(10), value);
     let rls = rls_gas(&mut tx, CHAIN, USDR_BASE_FEE, false).unwrap().unwrap();
     assert_eq!(rls.price, base + 10);
+    assert_eq!(rls.max_fee, base * 2, "the signed max fee is kept for the affordability check");
     assert_eq!(rls.value, value);
     assert_eq!((tx.gas_price, tx.gas_priority_fee, tx.value), (0, Some(0), U256::ZERO));
     let mut tx = rls_tx(base + 5, Some(10), value);
@@ -250,4 +251,27 @@ fn failed_rls_debit_leaves_no_trace() {
     assert_eq!(after[0], before[0], "the failed sender's RLS is untouched");
     assert_eq!(state.basic(USER).unwrap().map_or(0, |a| a.nonce), 0, "its nonce is not bumped");
     assert_eq!(total(before), total(after));
+}
+
+#[test]
+fn affordability_uses_the_signed_max_fee() {
+    let base = rls_flavour::rls_base_fee(USDR_BASE_FEE);
+    // max fee 3× the base fee: the sender can pay the effective price (base) but not the max
+    let max_fee = base * 3;
+    let effective_cost = U256::from(21_000u128 * base);
+    let mut state = test_state(effective_cost * U256::from(2));
+    let before = rls_balances(&mut state);
+    let results = run_all(&mut state, vec![rls_tx(max_fee, Some(0), U256::ZERO)]);
+    assert!(
+        matches!(results[0], Err(InvalidTransaction::LackOfFundForMaxFee { .. })),
+        "{:?}",
+        results[0]
+    );
+    assert_eq!(rls_balances(&mut state), before);
+    // with enough for gas limit × max fee it runs, and only the effective price is taken
+    let mut state = test_state(U256::from(21_000u128 * max_fee));
+    let before = rls_balances(&mut state);
+    let results = run_all(&mut state, vec![rls_tx(max_fee, Some(0), U256::ZERO)]);
+    assert!(results[0].as_ref().is_ok_and(|r| r.is_success()));
+    assert_eq!(rls_balances(&mut state)[0], before[0] - effective_cost);
 }

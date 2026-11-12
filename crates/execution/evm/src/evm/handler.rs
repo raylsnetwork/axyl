@@ -24,8 +24,11 @@ use reth_revm::{
 /// handler moves RLS around it.
 #[derive(Debug, Clone, Copy)]
 pub(super) struct RlsGas {
-    /// RLS charged per unit of gas.
+    /// RLS charged per unit of gas: the effective price, `min(max_fee, base fee + tip)`.
     pub(super) price: u128,
+    /// The signed max fee per gas, in RLS. The sender must hold `gas_limit × max_fee + value`
+    /// (EIP-1559's affordability rule, which the pool applies too), though only `price` is taken.
+    pub(super) max_fee: u128,
     /// RLS sent to the recipient.
     pub(super) value: U256,
 }
@@ -116,7 +119,8 @@ where
     type Error = EVMError<<<EVM::Context as ContextTr>::Db as Database>::Error, InvalidTransaction>;
     type HaltReason = HaltReason;
 
-    // RLS flavour: take the maximum gas fee and the value in RLS before execution
+    // RLS flavour: take the upfront gas cost (gas limit × effective price) and the value in RLS
+    // before execution, once the sender is shown to afford gas limit × max fee + value
     fn validate_against_state_and_deduct_caller(
         &self,
         evm: &mut Self::Evm,
@@ -127,7 +131,9 @@ where
         let Some(rls) = self.rls else { return Ok(()) };
         let (_, tx, _, journal, _, _) = evm.ctx().all_mut();
         let caller = tx.caller();
-        let max_fee = U256::from(tx.gas_limit()) * U256::from(rls.price);
+        let gas_limit = U256::from(tx.gas_limit());
+        let upfront_gas = gas_limit * U256::from(rls.price);
+        let max_gas = gas_limit * U256::from(rls.max_fee);
 
         let recipient = match tx.kind() {
             TxKind::Call(to) => Some(to),
@@ -162,10 +168,20 @@ where
             }
         }
 
-        let Some(needed) = max_fee.checked_add(rls.value) else {
+        let (Some(max_cost), Some(upfront)) =
+            (max_gas.checked_add(rls.value), upfront_gas.checked_add(rls.value))
+        else {
             return Err(InvalidTransaction::OverflowPaymentInTransaction.into());
         };
-        debit_rls(journal, caller, needed)?;
+        let balance = rls_balance(journal, caller)?;
+        if balance < max_cost {
+            return Err(InvalidTransaction::LackOfFundForMaxFee {
+                fee: Box::new(max_cost),
+                balance: Box::new(balance),
+            }
+            .into());
+        }
+        debit_rls(journal, caller, upfront)?;
         if let Some(to) = recipient.filter(|_| !rls.value.is_zero()) {
             credit_rls(journal, to, rls.value)?;
             journal.log(transfer_log(caller, to, rls.value));
