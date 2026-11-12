@@ -67,7 +67,7 @@ fi
 # consensus prometheus --metrics port is NOT instance-derived, so set it explicitly. The p2p swarm
 # port is auto-picked by keygen (get_available_udp_port), so it never collides.
 INSTANCE="$NODE_NUM"
-METRICS_PORT=$((9100 + NODE_NUM))
+METRICS_PORT=$((9100 + NODE_NUM - 1))
 HTTP_PORT=$((8545 - (NODE_NUM - 1)))
 WS_PORT=$((8546 - (NODE_NUM - 1)))
 NODE_NAME="observer-${NODE_NUM}"
