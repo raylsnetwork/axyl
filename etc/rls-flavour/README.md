@@ -76,6 +76,7 @@ public dev keys. `demo/record-metamask.mjs` drives MetaMask with Playwright. The
 | Nonce | Same nonce in both flavours, either order | Second is refused: "a transaction with this nonce is waiting on the other Rayls network…" |
 | | MetaMask (see below) | Takes nonces in order across both networks and handles one network's confirmations at a time |
 | Pool | Two RLS sends that each fit but together exceed the balance | Second refused at admission |
+| | A lower nonce filled after a higher one already waits, together too much | Lower nonce admitted and mined; the higher one dropped after the block (nonce order, as execution and reth's USDr pool) |
 | | A waiting RLS send made unpayable by an ERC-20 transfer | Dropped from the pool after the block (no stuck tx) |
 | | Fee under the RLS base fee; sender without RLS; RLS value to a contract or a precompile (`0x0400`); RLS value in a type-4 tx | Refused |
 | | 21,000 gas with 2 KB of calldata (intrinsic gas) | Refused at the pool, by the same stateless checks reth runs (size, init code, gas caps, tip ≤ fee cap, min tip, 7702 auth list, intrinsic gas) |
@@ -88,7 +89,7 @@ public dev keys. `demo/record-metamask.mjs` drives MetaMask with Playwright. The
 | Tracing | `debug_traceTransaction` of an RLS-flavour tx | Same gas as the receipt (34,182) |
 | | `eth_estimateGas` vs actual (`approve`) | 34,541 vs 34,182 |
 | Tests | `cargo test --release -p rayls-execution-evm --lib` | 233 passed (218 existing + 15 new: RLS chain ids, `rls_gas` pricing, max-fee affordability, and RLS conservation through `transact_raw` for a send, a revert, a gas refund and a failed debit) |
-| | `review-checks.sh` (review fixes on #386, all rounds) | 10/10 |
+| | `review-checks.sh` (review fixes on #386, all rounds) | 13/13 |
 
 ### Real MetaMask
 
@@ -121,7 +122,12 @@ imported.
    accumulator to another token; read the token address from the same config.
 4. **Receipts and gas suggestions.** The node's `effectiveGasPrice` for RLS txs uses the USDr base
    fee, and RLS tips appear in USDr `eth_feeHistory`. Both need to filter or convert by chain id in
-   the node RPC; the proxy fixes receipts only. The RLS `Transfer` logs are added to the journal
+   the node RPC; the proxy fixes receipts only. Tip suggestions are mixed too: the node's reward
+   percentiles take RLS-flavour txs' tips in RLS units and USDr txs' tips in USDr units. The proxy
+   passes them through unconverted (scaling them would compound 552× per round once RLS txs fill
+   blocks), so on USDr-heavy blocks MetaMask's suggested RLS tip is ~552× too small, which matters
+   once a minimum tip is set. The reverse hits USDr wallets on the plain RPC: a block of legacy RLS
+   txs makes the suggested USDr tip ~551× the base fee, and `feeHistory.reward` is uncapped. The RLS `Transfer` logs are added to the journal
    directly, so inspector `log` hooks don't see them: `callTracer` with `withLog` shows fewer logs
    than the receipt.
 5. **Writes to RLS storage.** These bypass the token's `paused` flag and hooks. Add the

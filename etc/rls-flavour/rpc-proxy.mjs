@@ -72,18 +72,13 @@ const handlers = {
   async eth_gasPrice() {
     return toRls(await upstream("eth_gasPrice", []));
   },
-  // Tips are suggested in RLS per gas, the unit the pool's (scaled) minimum tip uses. The node's
-  // reward percentiles still mix both flavours' tips (open item: convert by chain id in the node).
-  async eth_maxPriorityFeePerGas() {
-    return toRls(await upstream("eth_maxPriorityFeePerGas", []));
-  },
+  // Tips (eth_maxPriorityFeePerGas, feeHistory.reward) pass through unconverted: the node's
+  // percentiles already hold RLS-flavour txs' tips in RLS units, so scaling them by 552 would
+  // compound every round once RLS txs fill blocks. USDr txs' tips in them stay in USDr units (open
+  // item: compute tips per flavour in the node RPC).
   async eth_feeHistory(params) {
     const history = await upstream("eth_feeHistory", params);
-    return {
-      ...history,
-      baseFeePerGas: history.baseFeePerGas.map(toRls),
-      reward: history.reward?.map((block) => block.map(toRls)),
-    };
+    return { ...history, baseFeePerGas: history.baseFeePerGas.map(toRls) };
   },
   async eth_getBlockByNumber(params) {
     return withRlsBaseFee(await upstream("eth_getBlockByNumber", params));

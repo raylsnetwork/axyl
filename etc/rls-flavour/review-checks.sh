@@ -75,5 +75,19 @@ out=$(send_raw "$tx"); echo "   $out"
 type4=$(refused "$out"); [[ "$out" == *"EIP-7702"* ]] || type4="wrong reason: $out"
 check "RLS value in a type-4 tx is refused" "$type4" "$REFUSED"
 
+echo "== overspend is settled in nonce order: a lower nonce filled after a higher one waits is admitted"
+f3=$(cast wallet new --json); f3_key=$(jq -r '(.data // .)[0].private_key' <<<"$f3"); f3_addr=$(jq -r '(.data // .)[0].address' <<<"$f3")
+cast send --rpc-url "$RLS_RPC" --private-key "$USER_KEY" "$f3_addr" --value 3ether >/dev/null
+# nonce 1 first (queued behind the gap): max cost ~1 RLS value + ~1.1 RLS max gas
+later=$(cast mktx --rpc-url "$RLS_RPC" --private-key "$f3_key" "$RECIPIENT" --value 1ether --gas-limit 21000 --nonce 1)
+lh=$(send_raw "$later"); echo "   nonce 1: ${lh:0:20}…"
+# then nonce 0: fits on its own, but not together with nonce 1
+first=$(cast mktx --rpc-url "$RLS_RPC" --private-key "$f3_key" "$RECIPIENT" --value 0.5ether --gas-limit 21000 --nonce 0)
+fh=$(send_raw "$first"); echo "   nonce 0: ${fh:0:20}…"
+check "the earlier nonce is admitted though a later one waits" "$(refused "$fh")" "accepted"
+perl -e 'select(undef,undef,undef,4)'
+check "the earlier nonce is mined" "$(cast receipt "$fh" --rpc-url "$NODE" --json 2>/dev/null | jq -r .status)" "0x1"
+check "the later one, which no longer fits, is dropped after the block" "$(in_txpool "$lh")" "0"
+
 echo "== $pass passed, $fail failed"
 [[ $fail == 0 ]]

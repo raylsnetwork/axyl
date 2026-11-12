@@ -426,8 +426,11 @@ impl RlsFlavourValidator {
             pool.get_transactions_by_sender(*transaction.sender_ref())
                 .iter()
                 .filter(|t| {
+                    // only the earlier nonces, which execute first: like execution, the
+                    // after-block re-check and reth's USDr pool, the earlier tx wins and a later
+                    // one that no longer fits is dropped after the block
                     rls_flavour::is_rls(t.transaction.chain_id(), chain_id)
-                        && t.transaction.nonce() != transaction.nonce()
+                        && t.transaction.nonce() < transaction.nonce()
                         // mined but not yet removed by reth's maintenance task
                         && t.transaction.nonce() >= account.nonce
                 })
