@@ -355,6 +355,23 @@ impl<DB: Database> ExecutorEngine<DB> {
     }
 }
 
+impl<DB: Database> ExecutorEngine<DB> {
+    /// Whether shutdown has been requested, re-reading the signal if the cached flag is clear.
+    ///
+    /// `poll` reads `rx_shutdown` first and the input channel second, and the orchestrator
+    /// notifies shutdown first and closes the input second, but the two pairs are not atomic
+    /// against each other: the notify and the close can both land between this task's two
+    /// reads, so a closed channel shows up with the cached flag still false. A `Noticer` keeps
+    /// its flag once set, so consulting it again here before treating a close as a fault
+    /// turns that interleaving back into the clean exit it is.
+    fn shutdown_in_progress(&mut self) -> bool {
+        if !self.shutdown_requested && self.rx_shutdown.noticed() {
+            self.shutdown_requested = true;
+        }
+        self.shutdown_requested
+    }
+}
+
 /// The [`ExecutorEngine`] is a future that loops through:
 /// - receive messages from consensus
 /// - add these messages to a queue
@@ -507,7 +524,7 @@ impl<DB: Database> Future for ExecutorEngine<DB> {
                     if this.pending_task.is_none() && this.queued.is_empty() {
                         // During shutdown the producers dropping their senders is the normal
                         // teardown path, so exit cleanly rather than as a fault.
-                        if this.shutdown_requested {
+                        if this.shutdown_in_progress() {
                             return Poll::Ready(Ok(()));
                         }
                         return Poll::Ready(Err(RLEngineError::ConsensusOutputStreamClosed));
@@ -543,7 +560,7 @@ impl<DB: Database> Future for ExecutorEngine<DB> {
                             // finalized. Every other error - including ConsensusFork - propagates
                             // even during shutdown, and a closed channel outside shutdown (the
                             // execution task panicked) is a real fault.
-                            Err(RLEngineError::ChannelClosed) if this.shutdown_requested => {
+                            Err(RLEngineError::ChannelClosed) if this.shutdown_in_progress() => {
                                 info!(
                                     target: "engine",
                                     "execution result channel closed during shutdown; exiting cleanly"
