@@ -20,7 +20,9 @@ import {SystemCallable} from "../consensus/SystemCallable.sol";
  *
  * @notice Distributes ERC-20 RLS staking rewards to validators and delegators
  * @dev Receives ERC-20 RLS from FeeAggregator (after USDr → RLS swap) and distributes
- * @dev Falls back to pure stake-based distribution if no performance data is available
+ * @dev Distribution is stake- and target-APY-derived by default. Optionally blends in
+ * @dev ConsensusRegistry's hybrid performance weights via performanceWeightBps (0 = disabled,
+ * @dev the default; 10_000 = fully performance-proportional).
  * @dev UUPS upgradeable with AccessControl
  * @dev RLS is an ERC-20 token; USDr is ERC-20 stablecoin
  */
@@ -72,6 +74,12 @@ contract RewardDistributor is
         /// @notice RewardCurve driving Track B's target APY. address(0) = disabled, falls back
         ///         to openTierTargetApyBps.
         address openTierRewardCurve;
+        /// @notice Influence of ConsensusRegistry's hybrid performance weights (participation +
+        ///         anchor + stake tier) on the target split, in basis points. 0 (default) =
+        ///         disabled — distribution stays purely stake-derived, byte-identical to behavior
+        ///         before this field existed. 10_000 = fully performance-proportional. See
+        ///         _applyPerformanceWeight.
+        uint256 performanceWeightBps;
     }
 
     // keccak256(abi.encode(uint256(keccak256("rewarddistributor.storage.v1")) - 1)) & ~bytes32(uint256(0xff))
@@ -161,10 +169,21 @@ contract RewardDistributor is
         uint256 trackBDelegated;
     }
 
+    /// @dev Per-epoch rate/config context for the target-distribution path, bundled into one
+    ///      struct purely to keep several small functions' stack depth under the EVM's limit now
+    ///      that performance-weight data flows through them too.
+    struct EpochRateConfig {
+        uint256 epochSecs;
+        uint256 targetApyBpsValue;
+        uint256 openTierTargetApyBpsValue;
+        uint256 performanceWeightBps;
+    }
+
     /// @inheritdoc IRewardDistributor
     /// @dev Distributes all pending rewards in a single call.
     ///      Every validator's target reward is computed directly from its own stake at the
-    ///      configured target APY
+    ///      configured target APY, optionally blended with ConsensusRegistry's hybrid
+    ///      performance weights when performanceWeightBps > 0 (see _applyPerformanceWeight).
     function distributeRewards() external override onlySystemCall nonReentrant {
         RewardDistributorStorage storage $ = _getRewardDistributorStorage();
 
@@ -200,20 +219,56 @@ contract RewardDistributor is
             return;
         }
 
-        uint256 distributed = totalTarget > 0
-            ? _distributeByTarget(
-                activeValidators,
-                stakes,
-                totalRewards,
-                totalTarget,
-                epochSecs,
-                effectiveTargetApyBps,
-                effectiveOpenTierApyBps
-            )
-            : _distributeByStake(activeValidators, stakes, totalRewards);
+        uint256 distributed = _finalizeDistribution(
+            activeValidators,
+            stakes,
+            totalRewards,
+            totalTarget,
+            epochSecs,
+            effectiveTargetApyBps,
+            effectiveOpenTierApyBps
+        );
 
         $.totalPending -= totalRewards;
         emit RewardsDistributed(distributed, len);
+    }
+
+    /// @dev Split out of distributeRewards() purely to relieve stack depth: fetching the
+    ///      (optional) performance weights and branching between the target/stake distribution
+    ///      strategies needs its own stack frame once performanceWeightBps exists.
+    function _finalizeDistribution(
+        IConsensusRegistry.ValidatorInfo[] memory activeValidators,
+        ValidatorStakes[] memory stakes,
+        uint256 totalRewards,
+        uint256 totalTarget,
+        uint256 epochSecs,
+        uint256 targetApyBpsValue,
+        uint256 openTierTargetApyBpsValue
+    ) internal returns (uint256) {
+        if (totalTarget == 0) {
+            return _distributeByStake(activeValidators, stakes, totalRewards);
+        }
+
+        RewardDistributorStorage storage $ = _getRewardDistributorStorage();
+        EpochRateConfig memory cfg = EpochRateConfig(
+            epochSecs, targetApyBpsValue, openTierTargetApyBpsValue, $.performanceWeightBps
+        );
+
+        // Only fetched when opted in, so the (default) disabled path makes no extra external
+        // call. try/catch mirrors _resolveApyBps's defensive idiom: a broken or reverting
+        // registry read can never block distribution on this onlySystemCall path.
+        IConsensusRegistry.PerformanceWeights memory perf;
+        if (cfg.performanceWeightBps > 0) {
+            try $.consensusRegistry.getEpochPerformanceWeights() returns (
+                IConsensusRegistry.PerformanceWeights memory p
+            ) {
+                perf = p;
+            } catch {
+                emit PerformanceWeightFetchFailed();
+            }
+        }
+
+        return _distributeByTarget(activeValidators, stakes, totalRewards, totalTarget, perf, cfg);
     }
 
     /// @dev Fetches ownStake/Track A/Track B for every active validator in one pass, summing
@@ -278,35 +333,108 @@ contract RewardDistributor is
     }
 
     /// @dev Scales each validator's pre-fetched target by totalRewards/totalTarget and
-    ///      distributes. 
+    ///      distributes. When performanceWeightBps > 0, each validator's stake-derived target is
+    ///      first blended with a performance-proportional share of the same totalTarget (see
+    ///      _applyPerformanceWeight) — the pot size (totalTarget) never changes, only the split.
     function _distributeByTarget(
         IConsensusRegistry.ValidatorInfo[] memory activeValidators,
         ValidatorStakes[] memory stakes,
         uint256 totalRewards,
         uint256 totalTarget,
-        uint256 epochSecs,
-        uint256 targetApyBpsValue,
-        uint256 openTierTargetApyBpsValue
+        IConsensusRegistry.PerformanceWeights memory perf,
+        EpochRateConfig memory cfg
     ) internal returns (uint256 distributed) {
         uint256 len = activeValidators.length;
         for (uint256 i; i < len; ++i) {
             ValidatorStakes memory s = stakes[i];
-            (uint256 priorityTarget, uint256 trackBTarget) = _splitTarget(
-                s.ownStake,
-                s.trackADelegated,
-                s.trackBDelegated,
-                epochSecs,
-                targetApyBpsValue,
-                openTierTargetApyBpsValue
-            );
-
-            uint256 priorityReward = (totalRewards * priorityTarget) / totalTarget;
-            uint256 trackBReward = (totalRewards * trackBTarget) / totalTarget;
+            address validatorAddr = activeValidators[i].validatorAddress;
+            // Resolved once here (needs the full `perf` struct + address) and passed down as
+            // plain scalars — keeps _rewardForValidator's own stack frame small.
+            uint256 weight = cfg.performanceWeightBps > 0 ? _weightOf(perf, validatorAddr) : 0;
+            (uint256 priorityReward, uint256 trackBReward) =
+                _rewardForValidator(s, totalTarget, totalRewards, weight, perf.totalWeight, cfg);
             if (priorityReward == 0 && trackBReward == 0) continue;
             distributed += _distributeToValidator(
-                activeValidators[i].validatorAddress, priorityReward, trackBReward, s.ownStake, s.trackADelegated
+                validatorAddr, priorityReward, trackBReward, s.ownStake, s.trackADelegated
             );
         }
+    }
+
+    /// @dev Computes one validator's final priority/trackB reward: stake-derived target (as
+    ///      before), optionally blended with its performance-proportional share, then scaled by
+    ///      totalRewards/totalTarget. Takes the validator's already-resolved weight/totalWeight
+    ///      as plain scalars (rather than the full PerformanceWeights struct) purely to keep
+    ///      this function's stack depth under the EVM's 16-slot limit.
+    function _rewardForValidator(
+        ValidatorStakes memory s,
+        uint256 totalTarget,
+        uint256 totalRewards,
+        uint256 weight,
+        uint256 totalWeight,
+        EpochRateConfig memory cfg
+    ) internal pure returns (uint256 priorityReward, uint256 trackBReward) {
+        (uint256 priorityTarget, uint256 trackBTarget) = _splitTarget(
+            s.ownStake,
+            s.trackADelegated,
+            s.trackBDelegated,
+            cfg.epochSecs,
+            cfg.targetApyBpsValue,
+            cfg.openTierTargetApyBpsValue
+        );
+
+        if (cfg.performanceWeightBps > 0 && totalWeight > 0) {
+            (priorityTarget, trackBTarget) = _applyPerformanceWeight(
+                priorityTarget, trackBTarget, totalTarget, cfg.performanceWeightBps, weight, totalWeight
+            );
+        }
+
+        priorityReward = (totalRewards * priorityTarget) / totalTarget;
+        trackBReward = (totalRewards * trackBTarget) / totalTarget;
+    }
+
+    /// @dev Blends a validator's stake-derived target with a performance-proportional share of
+    ///      the SAME totalTarget (`totalTarget * weight / totalWeight`), weighted by
+    ///      performanceWeightBps (0 = pure stake, 10_000 = pure performance). Re-splits the
+    ///      blended total back into priority/trackB at the stake-derived ratio, so the two
+    ///      returned values stay meaningful for _distributeToValidator's own-stake-vs-pool split.
+    ///      A validator absent from `perf.validators` (weight 0, e.g. zero participation this
+    ///      epoch) earns nothing from the performance side — intentional, matching the hybrid
+    ///      model's own "absent participation earns nothing" semantics.
+    function _applyPerformanceWeight(
+        uint256 priorityTarget,
+        uint256 trackBTarget,
+        uint256 totalTarget,
+        uint256 influenceBps,
+        uint256 weight,
+        uint256 totalWeight
+    ) internal pure returns (uint256 newPriorityTarget, uint256 newTrackBTarget) {
+        uint256 stakeTarget = priorityTarget + trackBTarget;
+        if (stakeTarget == 0) return (0, 0);
+
+        uint256 perfTarget = (totalTarget * weight) / totalWeight;
+        uint256 blendedTarget = ((MAX_APY_BPS - influenceBps) * stakeTarget + influenceBps * perfTarget)
+            / MAX_APY_BPS;
+
+        // Intentional: computing newPriorityTarget by division and newTrackBTarget by subtraction
+        // (rather than dividing both) guarantees newPriorityTarget + newTrackBTarget ==
+        // blendedTarget exactly, at the cost of any 1-wei rounding remainder landing on Track B
+        // rather than Track A. Track A is treated as the more sensitive path.
+        newPriorityTarget = (blendedTarget * priorityTarget) / stakeTarget;
+        newTrackBTarget = blendedTarget - newPriorityTarget;
+    }
+
+    /// @dev Linear search for `validator`'s weight in `perf.validators` (sparse, unordered —
+    ///      excludes retired/zero-participation/below-floor validators). Returns 0 if absent.
+    ///      O(n*m) is fine at current validator-set sizes; revisit if that changes materially.
+    function _weightOf(
+        IConsensusRegistry.PerformanceWeights memory perf,
+        address validator
+    ) internal pure returns (uint256) {
+        uint256 len = perf.validators.length;
+        for (uint256 i; i < len; ++i) {
+            if (perf.validators[i] == validator) return perf.weights[i];
+        }
+        return 0;
     }
 
     /// @dev Pre-tier fallback: distributes purely proportional to combined stake (own + Track A +
@@ -598,7 +726,24 @@ contract RewardDistributor is
         emit OpenTierRewardCurveUpdated(oldCurve, newCurve);
     }
 
-    /// @dev Pull RLS from the RLSAccumulator to cover the shortfall between fees and the per-validator 
+    /// @inheritdoc IRewardDistributor
+    function performanceWeightBps() external view override returns (uint256) {
+        return _getRewardDistributorStorage().performanceWeightBps;
+    }
+
+    /// @inheritdoc IRewardDistributor
+    /// @dev 0 (default) = distribution stays purely stake-derived, byte-identical to behavior
+    ///      before this field existed. 10_000 = fully performance-proportional. See
+    ///      _applyPerformanceWeight for the blend formula.
+    function setPerformanceWeightBps(uint256 newBps) external override onlyRole(DEFAULT_ADMIN_ROLE) {
+        if (newBps > MAX_APY_BPS) revert InvalidPerformanceWeightBps();
+        RewardDistributorStorage storage $ = _getRewardDistributorStorage();
+        uint256 oldBps = $.performanceWeightBps;
+        $.performanceWeightBps = newBps;
+        emit PerformanceWeightBpsUpdated(oldBps, newBps);
+    }
+
+    /// @dev Pull RLS from the RLSAccumulator to cover the shortfall between fees and the per-validator
     ///      target reward for the current epoch.
     function _pullAccumulatorTopUp(
         uint256 currentRewards,
