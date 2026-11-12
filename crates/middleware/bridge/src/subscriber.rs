@@ -956,9 +956,17 @@ impl<DB: Database> Subscriber<DB> {
         // so catch-up replay is serialized BEFORE the live relay starts (no dual delivery).
         execution_replay_done.send_replace(());
 
-        // Signal that execution replay is complete. The proposer waits for this before
-        // creating headers, ensuring recently_executed_blocks contains up-to-date execution state
-        // rather than stale MDBX data from before replay. (FIX: XL-C3)
+        // Signal that execution replay is complete. The proposer waits for this before creating
+        // headers, so recently_executed_blocks holds replayed execution state rather than stale
+        // MDBX data from before replay. (FIX: XL-C3)
+        //
+        // The guarantee is "the engine has executed every replayed output", not "the list already
+        // holds the last replayed block": the engine advances `executed_anchor` on its own task,
+        // while the list is pushed by the engine-update task after reth's head notification, so
+        // the list can trail the anchor by a scheduler hop here. That is the same lag the header
+        // builder sees in live operation, and peers tolerate it: a vote refuses a header only for
+        // an anchor whose hash differs from their own block at that number, and a canonical block
+        // one output behind matches.
         self.consensus_bus.execution_replay_complete().send_replace(true);
 
         // It's important to have the futures in ordered fashion as we want
