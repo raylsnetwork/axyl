@@ -273,11 +273,14 @@ async fn replay_completes_on_executed_anchor_without_block_tick() -> eyre::Resul
 
     // Mock engine: advance the anchor to the replayed output and nothing else - no block, no
     // `recently_executed_blocks` tick - exactly what a dropped duplicate looks like from here.
+    // What the mock received is reported back and asserted in the test body: a panic inside the
+    // spawned task would only surface as the replay timeout below.
     let (to_engine, mut from_subscriber) = mpsc::channel::<(CameFrom, ConsensusOutput)>(100);
+    let (seen_tx, mut seen_rx) = mpsc::channel::<(CameFrom, u64)>(100);
     let engine_bus = consensus_bus.clone();
     tokio::spawn(async move {
         while let Some((came_from, output)) = from_subscriber.recv().await {
-            assert_eq!(came_from, CameFrom::GetMissingConsensus);
+            let _ = seen_tx.send((came_from, output.number)).await;
             engine_bus.executed_anchor().send_replace(ConsensusHeader {
                 parent_hash: output.parent_hash,
                 sub_dag: (*output.sub_dag).clone(),
@@ -302,6 +305,11 @@ async fn replay_completes_on_executed_anchor_without_block_tick() -> eyre::Resul
         "replay did not complete: subscriber waited on a block tick instead of the anchor",
     )?;
     assert!(*replay_complete_rx.borrow());
+    let seen = timeout(Duration::from_secs(1), seen_rx.recv())
+        .await
+        .expect("mock engine received nothing")
+        .expect("mock engine channel closed");
+    assert_eq!(seen, (CameFrom::GetMissingConsensus, 1));
 
     Ok(())
 }

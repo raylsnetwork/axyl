@@ -884,11 +884,12 @@ impl<DB: Database> Subscriber<DB> {
         // Every output produces at least one block, and the engine advances `executed_anchor` to
         // the output once that block is in. Replay waits on the anchor, not on the
         // `recently_executed_blocks` tick: `wait_for` reads the current value before it sleeps,
-        // so an anchor the engine advanced before this task subscribed still counts, and so does
-        // an output the engine dropped as an already-admitted duplicate, whose anchor is then
-        // already at or past it. The tick covered neither case: fired before the subscribe it
-        // was lost, and a dropped duplicate never ticked, so replay parked for good and the node
-        // stayed on its epoch with SIGTERM unanswered.
+        // so an anchor the engine advanced before this task subscribed still counts. An output the
+        // engine drops as an already-admitted duplicate is covered too: the anchor reaches it when
+        // the original admission finishes executing, which `wait_for` observes whenever it lands.
+        // The tick covered neither case: fired before the subscribe it was lost, and a dropped
+        // duplicate never ticked, so replay parked for good and the node stayed on its epoch with
+        // SIGTERM unanswered.
         let mut executed_anchor_sub = self.consensus_bus.executed_anchor().subscribe();
 
         if !missing.is_empty() {
