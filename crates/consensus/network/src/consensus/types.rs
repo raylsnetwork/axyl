@@ -41,20 +41,19 @@ pub(super) enum RecordInvalidReason {
 /// Enum if the received gossip is initially accepted for further processing.
 ///
 /// This is necessary because libp2p does not impl `PartialEq` on [MessageAcceptance].
-/// This impl does not map to `MessageAcceptance::Ignore`.
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub(super) enum GossipAcceptance {
     /// The message is considered valid, and it should be delivered and forwarded to the network.
     Accept,
     /// The message is considered invalid, and it should be rejected and trigger the P₄ penalty.
     Reject,
-}
-
-impl GossipAcceptance {
-    /// Helper method indicating if the gossip message was accepted.
-    pub(super) fn is_accepted(&self) -> bool {
-        *self == GossipAcceptance::Accept
-    }
+    /// The message is dropped without being forwarded, and its author is not penalized.
+    ///
+    /// For a publisher this node cannot vouch for: not on the topic's list, or with no peer id to
+    /// BLS binding yet. That is what an attacker looks like, but also what an honest validator
+    /// looks like to a node behind a committee rotation, so the message is not relayed and the
+    /// author is not banned.
+    Ignore,
 }
 
 impl From<GossipAcceptance> for MessageAcceptance {
@@ -62,6 +61,7 @@ impl From<GossipAcceptance> for MessageAcceptance {
         match value {
             GossipAcceptance::Accept => MessageAcceptance::Accept,
             GossipAcceptance::Reject => MessageAcceptance::Reject,
+            GossipAcceptance::Ignore => MessageAcceptance::Ignore,
         }
     }
 }

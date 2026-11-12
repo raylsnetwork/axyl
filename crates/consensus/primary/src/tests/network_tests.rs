@@ -3,20 +3,21 @@
 use crate::{
     error::PrimaryNetworkError,
     network::{
-        handler::fetch_scope, message::PrimaryGossip, MissingCertificatesRequest, PrimaryRequest,
-        RequestHandler,
+        handler::fetch_scope,
+        message::{ConsensusResult, PrimaryGossip},
+        MissingCertificatesRequest, PrimaryRequest, RequestHandler,
     },
     state_sync::StateSynchronizer,
     ConsensusBus,
 };
 use assert_matches::assert_matches;
-use rayls_consensus_network::{GossipMessage, TopicHash};
+use rayls_consensus_network::{GossipMessage, Penalty, TopicHash};
 use rayls_consensus_primary::test_utils::make_optimal_signed_certificates;
 use rayls_infrastructure_config::LibP2pConfig;
 use rayls_infrastructure_storage::{mem_db::MemDatabase, CertScope, CertificateStore as _};
 use rayls_infrastructure_types::{
     encode, error::HeaderError, now, AuthorityIdentifier, BlockHash, BlockHeader, BlockNumHash,
-    BlsPublicKey, Certificate, CertificateDigest, ExecHeader, Hash as _, RaylsReceiver,
+    BlsPublicKey, Certificate, CertificateDigest, EpochVote, ExecHeader, Hash as _, RaylsReceiver,
     RaylsSender, SealedHeader, TaskManager,
 };
 use rayls_testing_test_utils_committee::CommitteeFixture;
@@ -363,6 +364,7 @@ async fn test_gossip_duplicate_certificate_skips_verification() -> eyre::Result<
     let (mut certs, _) =
         make_optimal_signed_certificates(1..=1, &genesis, &committee.committee(), &keys);
     let stored = certs.pop_front().expect("one round of certificates");
+    let author = *committee.first_authority().authority().protocol_key();
 
     // the node accepted this certificate earlier
     committee.first_authority().consensus_config().node_storage().write(stored.clone())?;
@@ -381,7 +383,7 @@ async fn test_gossip_duplicate_certificate_skips_verification() -> eyre::Result<
     let metrics = &consensus_bus.primary_metrics().node_metrics;
     let skipped = metrics.gossip_certificates_skipped_in_memory.get();
     let verified_duplicates = metrics.duplicate_certificates_processed.get();
-    handler.process_gossip(&msg).await?;
+    handler.process_gossip(&msg, author).await?;
     assert_eq!(
         metrics.gossip_certificates_skipped_in_memory.get(),
         skipped + 1,
@@ -393,7 +395,7 @@ async fn test_gossip_duplicate_certificate_skips_verification() -> eyre::Result<
     let data = encode(&PrimaryGossip::Certificate(Box::new(stored)));
     let topic = TopicHash::from_raw(LibP2pConfig::primary_topic());
     let msg = GossipMessage { source: None, data, sequence_number: None, topic };
-    handler.process_gossip(&msg).await?;
+    handler.process_gossip(&msg, author).await?;
     assert_eq!(metrics.gossip_certificates_skipped_in_memory.get(), skipped + 2);
     assert_eq!(
         metrics.duplicate_certificates_processed.get(),
@@ -415,12 +417,14 @@ async fn test_primary_batch_gossip_topics() {
         }
     });
 
+    // the default payloads name the default key as their signer, so they are published under it
+    let author = BlsPublicKey::default();
     let gossip = PrimaryGossip::Certificate(Box::default());
     let data = encode(&gossip);
     let topic = TopicHash::from_raw(LibP2pConfig::primary_topic());
     let goodish_msg =
         GossipMessage { source: None, data: data.clone(), sequence_number: None, topic };
-    let res = handler.process_gossip(&goodish_msg).await;
+    let res = handler.process_gossip(&goodish_msg, author).await;
     // This will be rejected for other reasons, but make sure not for an invalid topic.
     assert!(!matches!(res, Err(PrimaryNetworkError::InvalidTopic)));
 
@@ -428,19 +432,19 @@ async fn test_primary_batch_gossip_topics() {
     let data = encode(&gossip);
     let topic = TopicHash::from_raw(LibP2pConfig::consensus_output_topic());
     let good_msg = GossipMessage { source: None, data: data.clone(), sequence_number: None, topic };
-    assert!(handler.process_gossip(&good_msg).await.is_ok());
+    assert!(handler.process_gossip(&good_msg, author).await.is_ok());
 
     let gossip = PrimaryGossip::EpochVote(Box::default());
     let data = encode(&gossip);
     let topic = TopicHash::from_raw(LibP2pConfig::epoch_vote_topic());
     let good_msg = GossipMessage { source: None, data: data.clone(), sequence_number: None, topic };
-    assert!(handler.process_gossip(&good_msg).await.is_ok());
+    assert!(handler.process_gossip(&good_msg, author).await.is_ok());
 
     let gossip = PrimaryGossip::Certificate(Box::default());
     let data = encode(&gossip);
     let topic = TopicHash::from_raw(LibP2pConfig::epoch_vote_topic());
     let bad_msg = GossipMessage { source: None, data: data.clone(), sequence_number: None, topic };
-    let res = handler.process_gossip(&bad_msg).await;
+    let res = handler.process_gossip(&bad_msg, author).await;
     // This will be rejected for other reasons, but make sure it is for an invalid topic.
     assert!(matches!(res, Err(PrimaryNetworkError::InvalidTopic)));
 
@@ -448,13 +452,59 @@ async fn test_primary_batch_gossip_topics() {
     let data = encode(&gossip);
     let topic = TopicHash::from_raw(LibP2pConfig::primary_topic());
     let bad_msg = GossipMessage { source: None, data: data.clone(), sequence_number: None, topic };
-    assert!(handler.process_gossip(&bad_msg).await.is_err());
+    assert!(handler.process_gossip(&bad_msg, author).await.is_err());
 
     let gossip = PrimaryGossip::EpochVote(Box::default());
     let data = encode(&gossip);
     let topic = TopicHash::from_raw(LibP2pConfig::consensus_output_topic());
     let bad_msg = GossipMessage { source: None, data: data.clone(), sequence_number: None, topic };
-    assert!(handler.process_gossip(&bad_msg).await.is_err());
+    assert!(handler.process_gossip(&bad_msg, author).await.is_err());
+}
+
+/// A consensus result or epoch vote whose signer is not the peer that published it is rejected
+/// before the committee lookup and the BLS verify, with a Fatal penalty: honest nodes publish
+/// only under their own key, so the mismatch is the publisher's forgery, not a laggard's view.
+#[tokio::test]
+async fn test_gossip_signer_must_be_publisher() -> eyre::Result<()> {
+    let TestTypes { committee, handler, task_manager: _task_manager, .. } = create_test_types();
+    let mut authorities = committee.authorities();
+    let signer = *authorities.next().expect("first authority").authority().protocol_key();
+    let publisher = *authorities.next().expect("second authority").authority().protocol_key();
+
+    // a result naming `signer`, with a junk signature, published by someone else
+    let result = ConsensusResult {
+        epoch: 0,
+        round: 1,
+        number: 1,
+        hash: BlockHash::random(),
+        validator: signer,
+        ..Default::default()
+    };
+    let data = encode(&PrimaryGossip::Consensus(Box::new(result)));
+    let topic = TopicHash::from_raw(LibP2pConfig::consensus_output_topic());
+    let msg = GossipMessage { source: None, data, sequence_number: None, topic };
+    let res = handler.process_gossip(&msg, publisher).await;
+    assert_matches!(
+        &res,
+        Err(PrimaryNetworkError::GossipAuthorMismatch { author, claimed })
+            if **author == publisher && **claimed == signer
+    );
+    assert_matches!(Option::<Penalty>::from(&res.unwrap_err()), Some(Penalty::Fatal));
+
+    // the same result published by its signer gets as far as the signature, which is junk
+    let res = handler.process_gossip(&msg, signer).await;
+    assert_matches!(res, Err(PrimaryNetworkError::UnknownConsensusHeaderCert(_)));
+
+    // an epoch vote is checked the same way, before it is queued
+    let vote = EpochVote { public_key: signer, ..Default::default() };
+    let data = encode(&PrimaryGossip::EpochVote(Box::new(vote)));
+    let topic = TopicHash::from_raw(LibP2pConfig::epoch_vote_topic());
+    let msg = GossipMessage { source: None, data, sequence_number: None, topic };
+    assert_matches!(
+        handler.process_gossip(&msg, publisher).await,
+        Err(PrimaryNetworkError::GossipAuthorMismatch { .. })
+    );
+    Ok(())
 }
 
 #[test]

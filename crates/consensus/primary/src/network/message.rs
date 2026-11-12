@@ -491,6 +491,7 @@ impl PrimaryResponse {
             | PrimaryNetworkError::UnavailableEpoch(_)
             | PrimaryNetworkError::UnavailableEpochDigest(_)
             | PrimaryNetworkError::InvalidTopic
+            | PrimaryNetworkError::GossipAuthorMismatch { .. }
             | PrimaryNetworkError::UnknownConsensusHeaderNumber(_)
             | PrimaryNetworkError::UnknownConsensusHeaderDigest(_)
             | PrimaryNetworkError::UnknownConsensusHeaderCert(_)

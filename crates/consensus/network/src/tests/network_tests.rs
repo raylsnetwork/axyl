@@ -6,6 +6,7 @@ use crate::{
         create_multiaddr, TestPrimaryRequest, TestPrimaryResponse, TestWorkerRequest,
         TestWorkerResponse, TEST_HEARTBEAT_INTERVAL,
     },
+    consensus::types::GossipAcceptance,
     error::NetworkError,
     kad::KadStoreType,
     types::{NetworkHandle, NetworkInfo},
@@ -652,6 +653,7 @@ async fn test_msg_verification_ignores_unauthorized_publisher() -> eyre::Result<
         network_handle: nvv,
         network_events: mut nvv_network_events,
         network,
+        network_metrics: nvv_metrics,
         ..
     } = peer2;
     tokio::spawn(async move {
@@ -705,9 +707,25 @@ async fn test_msg_verification_ignores_unauthorized_publisher() -> eyre::Result<
     let timeout = timeout(Duration::from_secs(2), nvv_network_events.recv()).await;
     assert!(timeout.is_err());
 
-    // assert fatal score
-    let score = nvv.peer_score(cvv_id).await?;
-    assert_eq!(score, Some(config_2.network_config().peer_config().score_config.min_score));
+    // The publisher is ignored, not penalized: the lists are built from this node's own epoch
+    // state, so an unlisted publisher may be an honest validator this node is behind on, and a
+    // rejection banned it. The score stays above the disconnect threshold (not asserted equal to
+    // the default: an unrelated Mild penalty during the wait must not fail this) and the peer
+    // stays connected.
+    let score = nvv.peer_score(cvv_id).await?.expect("cvv is a known peer");
+    let disconnect =
+        config_2.network_config().peer_config().score_config.min_score_before_disconnect;
+    assert!(
+        score > disconnect,
+        "score {score} must stay above the disconnect threshold {disconnect}"
+    );
+    assert!(nvv.connected_peer_ids().await?.contains(&cvv_id), "ignored publisher stays connected");
+    // and it was the ignore path that dropped it, not a penalty that stayed under the threshold
+    assert_eq!(
+        nvv_metrics.gossip_ignored.with_label_values(&[TEST_TOPIC, "primary"]).get(),
+        1,
+        "the second publish was counted as ignored"
+    );
 
     Ok(())
 }
@@ -1730,6 +1748,71 @@ async fn test_newer_kad_record_replaced() -> eyre::Result<()> {
         .get(&peer2_new_record.key)
         .expect("peer2 record in local kad store");
     assert_eq!(*store_record, peer2_new_record);
+
+    Ok(())
+}
+
+/// `verify_gossip` accepts only a bound publisher on the topic's list, ignores (no forward, no
+/// penalty) a publisher that is unbound or off the list, and still rejects an oversize message.
+#[tokio::test]
+async fn test_verify_gossip_ignores_unlisted_publisher_and_rejects_oversize() -> eyre::Result<()> {
+    let TestTypes { peer1, peer2, .. } =
+        create_test_types::<TestWorkerRequest, TestWorkerResponse>();
+    let mut network = peer1.network;
+    let topic = TopicHash::from_raw(TEST_TOPIC);
+    let message = |source: Option<PeerId>, data: Vec<u8>| GossipMessage {
+        source,
+        data,
+        sequence_number: Some(1),
+        topic: topic.clone(),
+    };
+
+    // peer2 is bound (its record arrived over its own connection) but not on the list yet
+    let peer2_bls = peer2.config.key_config().primary_public_key();
+    let peer2_net = peer2.config.primary_networkkey();
+    let peer2_id: PeerId = peer2_net.clone().into();
+    network.swarm.behaviour_mut().peer_manager.add_known_peer(
+        peer2_bls,
+        NetworkInfo { pubkey: peer2_net, multiaddrs: vec![], timestamp: now() },
+    );
+    network.authorized_publishers.insert(TEST_TOPIC.into(), Some(HashSet::new()));
+    assert_eq!(
+        network.verify_gossip(&message(Some(peer2_id), vec![1])),
+        GossipAcceptance::Ignore,
+        "a bound publisher off the list is ignored, not rejected"
+    );
+
+    // an unbound peer id, whatever the list says
+    network.authorized_publishers.insert(TEST_TOPIC.into(), Some([peer2_bls].into()));
+    assert_eq!(
+        network.verify_gossip(&message(Some(PeerId::random()), vec![1])),
+        GossipAcceptance::Ignore,
+        "an unbound publisher is ignored"
+    );
+
+    // bound and listed
+    assert_eq!(network.verify_gossip(&message(Some(peer2_id), vec![1])), GossipAcceptance::Accept);
+
+    // an open topic (subscribed, no list) accepts an unbound publisher: the node-level
+    // consensus-output subscribe relies on this until the first epoch installs its list
+    network.authorized_publishers.insert(TEST_TOPIC.into(), None);
+    assert_eq!(
+        network.verify_gossip(&message(Some(PeerId::random()), vec![1])),
+        GossipAcceptance::Accept
+    );
+
+    // a topic this node has no entry for at all: ignored unless the source is a known validator
+    network.authorized_publishers.remove(TEST_TOPIC);
+    assert_eq!(
+        network.verify_gossip(&message(Some(peer2_id), vec![1])),
+        GossipAcceptance::Ignore,
+        "no entry for the topic and the source is not a committee peer"
+    );
+    network.authorized_publishers.insert(TEST_TOPIC.into(), Some([peer2_bls].into()));
+
+    // an oversize message is the message's own fault and is still rejected
+    let oversize = vec![0u8; network.config.max_gossip_message_size + 1];
+    assert_eq!(network.verify_gossip(&message(Some(peer2_id), oversize)), GossipAcceptance::Reject);
 
     Ok(())
 }

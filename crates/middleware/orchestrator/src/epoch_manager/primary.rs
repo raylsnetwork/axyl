@@ -143,16 +143,37 @@ where
             }
         }
 
-        // update the authorized publishers for gossip every epoch
-        let committee_keys = committee_keys.into_iter().collect::<HashSet<_>>();
-        let topic = LibP2pConfig::primary_topic();
-        info!(target: "epoch-manager", topic=?topic, committee=?committee_keys, "updating authorized publishers for gossip");
+        // Update the authorized publishers for gossip every epoch.
+        //
+        // Consensus output and epoch votes are published only by committee members (the CVV
+        // subscriber and the epoch-vote collector). Without a list, `verify_gossip` accepted and
+        // relayed any peer's message, and every node the publisher had connected to paid for
+        // it: a BLS verify for an output, a parked task until the next epoch close for a vote.
+        // Their list is the registered validators (registry, committee and lookahead) rather
+        // than this epoch's committee: a syncing node behind a committee rotation still has to
+        // accept the network head from the new committee, votes for an epoch are published and
+        // retried after its committee has rotated out, and an unlisted publisher's message is
+        // neither forwarded nor processed. The list is necessary, not sufficient: `verify_gossip`
+        // also needs the author's peer id bound to its BLS key. Configured bindings cover the
+        // genesis committee only, so a member that joined later is bound on the nodes it
+        // connected to directly; a node behind the rotation that is not among them stops
+        // relaying that member's output, where before it forwarded blind what it could not
+        // process. One more edge: a member that left the registry while an epoch it voted in
+        // is still uncertified has its retried votes ignored once it is out of the departing
+        // committee too. That needs a stall longer than an epoch and an exit in the same
+        // window, and the vote fetch covers that case, so it is accepted here.
+        for (topic, publishers) in
+            gossip_publisher_lists(committee_keys, &self.registered_validators)
+        {
+            info!(target: "epoch-manager", topic=?topic, publishers = publishers.len(), "updating authorized publishers for gossip");
+            debug!(target: "epoch-manager", topic=?topic, ?publishers, "authorized publishers");
 
-        let result = network_handle
-            .inner_handle()
-            .subscribe_with_publishers(topic.clone(), committee_keys.into_iter().collect())
-            .await?;
-        info!(target: "epoch-manager", topic=?topic, result=?result, "subscribed to gossip");
+            let result = network_handle
+                .inner_handle()
+                .subscribe_with_publishers(topic.clone(), publishers)
+                .await?;
+            info!(target: "epoch-manager", topic=?topic, result=?result, "subscribed to gossip");
+        }
 
         // quorum for active CVVs, any 1 peer for observers
         let is_active_cvv = self.consensus_bus.node_mode().borrow().is_active_cvv();
@@ -253,4 +274,21 @@ where
 
         Ok(())
     }
+}
+
+/// The gossip topics the primary subscribes to each epoch, each with the set of BLS keys
+/// allowed to publish on it. Certificates come from the current committee; consensus output
+/// and epoch votes come from any registered validator (see the caller for why the wider set).
+///
+/// Kept as one function so the wiring is testable: a topic missing from here is subscribed
+/// open, and nothing else would notice.
+pub(crate) fn gossip_publisher_lists(
+    committee_keys: HashSet<BlsPublicKey>,
+    registered_validators: &HashSet<BlsPublicKey>,
+) -> [(String, HashSet<BlsPublicKey>); 3] {
+    [
+        (LibP2pConfig::primary_topic(), committee_keys),
+        (LibP2pConfig::consensus_output_topic(), registered_validators.clone()),
+        (LibP2pConfig::epoch_vote_topic(), registered_validators.clone()),
+    ]
 }

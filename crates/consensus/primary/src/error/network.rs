@@ -60,6 +60,15 @@ pub(crate) enum PrimaryNetworkError {
     /// Invalid topic- something was published to the wrong topic.
     #[error("Gossip was published to the wrong topic")]
     InvalidTopic,
+    /// A gossiped consensus result or epoch vote names a signer other than the peer that
+    /// published it. Honest nodes publish only under their own key, and gossipsub carries the
+    /// publisher's identity with the frame, so a mismatch is a forgery by the publisher: the
+    /// one gossip fault that cannot be an honest validator this node is behind on. The
+    /// protection is the early rejection, before any BLS work. The Fatal penalty reaches only a
+    /// publisher outside the current committee (registered but unseated, or departing); a
+    /// sitting member is exempt from penalties in the peer manager.
+    #[error("Gossip published by {author} names {claimed} as its signer")]
+    GossipAuthorMismatch { author: Box<BlsPublicKey>, claimed: Box<BlsPublicKey> },
     /// A missing-certificates request names more authorities than any honest node sends.
     #[error("Request names {0} authorities, the limit is {1}")]
     TooManyAuthorities(usize, usize),
@@ -115,6 +124,7 @@ impl From<&PrimaryNetworkError> for Option<Penalty> {
             PrimaryNetworkError::InvalidEpochRequest
                 | PrimaryNetworkError::StdIo(_) => Some(Penalty::Medium),
             PrimaryNetworkError::InvalidTopic
+                | PrimaryNetworkError::GossipAuthorMismatch { .. }
                 | PrimaryNetworkError::Decode(_) => Some(Penalty::Fatal),
             PrimaryNetworkError::TooManyAuthorities(..) => Some(Penalty::Mild),
             PrimaryNetworkError::UnavailableEpoch(_)  // A node might not have this yet...
