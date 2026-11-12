@@ -50,7 +50,7 @@ use std::{
     sync::{atomic::Ordering, Arc, OnceLock},
     time::{Duration, Instant},
 };
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::{error::RaylsRethResult, in_flight::InFlightTracker, traits::RaylsNode};
 
@@ -182,6 +182,10 @@ fn rls_value_recipient_ok(
 /// Transactions below the sender's state nonce were just mined and are skipped: this task and
 /// reth's maintenance task read separate canonical streams, so they may still be in the pool, and
 /// counting them again would drop the sender's next, payable, transactions.
+///
+/// Removal is by hash, so the sender's later transactions (either flavour) are left nonce-gapped
+/// in the queued sub-pool until a replacement fills the gap or `max_tx_lifetime` (5 min) evicts
+/// them. MetaMask fills the gap itself: it reads the latest-block nonce for the next send.
 fn drop_unexecutable_rls_txns(
     pool: &RaylsTransactionPool,
     provider: &BlockchainProvider<RaylsNode>,
@@ -211,11 +215,17 @@ fn drop_unexecutable_rls_txns(
             .unwrap_or_default();
         let mut spent = U256::ZERO;
         for tx in txs.into_iter().filter(|t| t.nonce() >= state_nonce) {
-            spent = spent.saturating_add(rls_max_cost(&tx.transaction));
+            let with_this = spent.saturating_add(rls_max_cost(&tx.transaction));
             let recipient_ok = tx.transaction.value().is_zero()
                 || rls_value_recipient_ok(state.as_ref(), tx.transaction.to())?;
-            if spent > balance || tx.transaction.max_fee_per_gas() < rls_base_fee || !recipient_ok {
+            if with_this > balance
+                || tx.transaction.max_fee_per_gas() < rls_base_fee
+                || !recipient_ok
+            {
+                // a dropped transaction spends nothing, so later ones are judged without it
                 unexecutable.push(*tx.hash());
+            } else {
+                spent = with_this;
             }
         }
     }
@@ -557,7 +567,7 @@ impl WorkerTxPool {
                 match result {
                     Ok(0) => {}
                     Ok(dropped) => debug!(target: "rayls::execution", dropped, "dropped RLS-flavour transactions that can no longer execute"),
-                    Err(err) => debug!(target: "rayls::execution", %err, "RLS-flavour pool re-check failed"),
+                    Err(err) => warn!(target: "rayls::execution", %err, "RLS-flavour pool re-check failed"),
                 }
             }
         });
