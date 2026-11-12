@@ -881,10 +881,18 @@ impl<DB: Database> Subscriber<DB> {
         // before the last shutdown.  We need to execute it now so that everything will be
         // in sync, otherwise we could get out of order execution racing with Bullshark.
         let missing = get_missing_consensus(&self.config, &self.consensus_bus).await?;
-        // Every output now produces at least one block, so replay waits solely on
-        // recently_executed_blocks, which ticks whenever a block is produced.
-        let mut recently_executed_blocks_sub =
-            self.consensus_bus.recently_executed_blocks().subscribe();
+        // Every output produces at least one block, and the engine advances `executed_anchor` to
+        // the output once that block is in. Replay waits on the anchor, not on the
+        // `recently_executed_blocks` tick: `wait_for` reads the current value before it sleeps,
+        // so an anchor the engine advanced before this task subscribed still counts. An output the
+        // engine drops as an already-admitted duplicate is covered too: the anchor reaches it when
+        // the original admission finishes executing, which `wait_for` observes whenever it lands.
+        // The same holds for an output listed as missing by `number` (which can drift) whose
+        // position is already at or below the anchor: the engine drops it as stale, and the
+        // anchor is past it from the start. The tick covered none of these: fired before the
+        // subscribe it was lost, and a dropped duplicate or stale output never ticked, so replay
+        // parked for good and the node stayed on its epoch with SIGTERM unanswered.
+        let mut executed_anchor_sub = self.consensus_bus.executed_anchor().subscribe();
 
         if !missing.is_empty() {
             info!(
@@ -923,15 +931,23 @@ impl<DB: Database> Subscriber<DB> {
                 break;
             }
 
+            let target = AcceptedPosition::from_sub_dag(&consensus_output.sub_dag);
             if let Err(e) = to_engine.send((CameFrom::GetMissingConsensus, consensus_output)).await
             {
                 error!(target: "subscriber", "error broadcasting consensus output for authority {:?}: {}", self.inner.authority_id, e);
                 return Err(SubscriberError::ClosedChannel("consensus_output".to_string()));
             }
-            // wait until execution advances: a block landed (recently_executed_blocks ticks),
-            // or shutdown fires, in which case we bail.
+            // wait until the engine's execution anchor reaches this output (by `(epoch, round)`,
+            // the position the engine dedups on), or shutdown fires, in which case we bail.
             tokio::select! {
-                _ = recently_executed_blocks_sub.changed() => {}
+                reached = executed_anchor_sub
+                    .wait_for(|anchor| AcceptedPosition::from_sub_dag(&anchor.sub_dag) >= target) =>
+                {
+                    if reached.is_err() {
+                        error!(target: "subscriber", "executed_anchor channel closed during replay for authority {:?}", self.inner.authority_id);
+                        return Err(SubscriberError::ClosedChannel("executed_anchor".to_string()));
+                    }
+                }
                 _ = &rx_shutdown => return Ok(()),
             }
         }
@@ -940,9 +956,17 @@ impl<DB: Database> Subscriber<DB> {
         // so catch-up replay is serialized BEFORE the live relay starts (no dual delivery).
         execution_replay_done.send_replace(());
 
-        // Signal that execution replay is complete. The proposer waits for this before
-        // creating headers, ensuring recently_executed_blocks contains up-to-date execution state
-        // rather than stale MDBX data from before replay. (FIX: XL-C3)
+        // Signal that execution replay is complete. The proposer waits for this before creating
+        // headers, so recently_executed_blocks holds replayed execution state rather than stale
+        // MDBX data from before replay. (FIX: XL-C3)
+        //
+        // The guarantee is "the engine has executed every replayed output", not "the list already
+        // holds the last replayed block": the engine advances `executed_anchor` on its own task,
+        // while the list is pushed by the engine-update task after reth's head notification, so
+        // the list can trail the anchor by a scheduler hop here. That is the same lag the header
+        // builder sees in live operation, and peers tolerate it: a vote refuses a header only for
+        // an anchor whose hash differs from their own block at that number, and a canonical block
+        // one output behind matches.
         self.consensus_bus.execution_replay_complete().send_replace(true);
 
         // It's important to have the futures in ordered fashion as we want
