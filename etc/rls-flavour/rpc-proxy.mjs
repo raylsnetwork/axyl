@@ -160,6 +160,9 @@ async function mapLimit(items, limit, fn) {
   return results;
 }
 
+// geth's rule for what a call (or notification) carries: a non-empty string method
+const isMethodName = (method) => typeof method === "string" && method !== "";
+
 async function handle(request) {
   // JSON-RPC 2.0 section 5.1 (and geth): anything but an object is an Invalid Request
   if (request === null || typeof request !== "object" || Array.isArray(request)) {
@@ -169,7 +172,7 @@ async function handle(request) {
   const { id = null, method, params = [] } = request;
   // a non-string method would pass the allowlist through string coercion
   // (["eth_x", "admin_peers"] -> "eth_x,admin_peers") and be forwarded as is
-  if (typeof method !== "string") {
+  if (!isMethodName(method)) {
     return { jsonrpc: "2.0", id, error: { code: -32600, message: "Invalid Request" } };
   }
   if (!Object.hasOwn(handlers, method) && !FORWARDED.test(method)) {
@@ -219,7 +222,7 @@ http
       // like geth: a one-element batch reply carrying the first call's id
       if (Array.isArray(payload) && payload.length > MAX_BATCH) {
         // geth takes the id of the first entry that is a call (has an id and a method)
-        const firstCall = payload.find((m) => m && typeof m === "object" && m.id !== undefined && m.method !== undefined);
+        const firstCall = payload.find((m) => m && typeof m === "object" && m.id !== undefined && isMethodName(m.method));
         return rpcError([error(firstCall?.id ?? null, -32600, `batch too large (max ${MAX_BATCH})`)]);
       }
       const reply = Array.isArray(payload)
