@@ -126,7 +126,8 @@ const handlers = {
 
 async function handle(request) {
   // `null` (or a non-object batch entry) must not throw: any open webpage can POST one
-  const { id, method, params = [] } = request ?? {};
+  // JSON-RPC 2.0: an id that can't be determined is replied to as null
+  const { id = null, method, params = [] } = request ?? {};
   if (!Object.hasOwn(handlers, method) && !FORWARDED.test(String(method))) {
     return { jsonrpc: "2.0", id, error: { code: -32601, message: "Method not found" } };
   }
@@ -140,33 +141,42 @@ async function handle(request) {
 
 http
   .createServer(async (req, res) => {
-    res.setHeader("access-control-allow-origin", "*");
-    res.setHeader("access-control-allow-headers", "content-type");
-    if (req.method === "OPTIONS") return res.end();
-    let body = "";
-    for await (const chunk of req) {
-      body += chunk;
-      if (body.length > MAX_BODY_BYTES) {
-        res.statusCode = 413;
+    // One try around everything, body read included: an aborted upload rejects the read, and an
+    // unhandled rejection would exit Node.
+    try {
+      res.setHeader("access-control-allow-origin", "*");
+      res.setHeader("access-control-allow-headers", "content-type");
+      if (req.method === "OPTIONS") return res.end();
+      // collect bytes, then decode once: the cap counts bytes, and a UTF-8 character split
+      // across chunks stays intact
+      const chunks = [];
+      let size = 0;
+      for await (const chunk of req) {
+        size += chunk.length;
+        if (size > MAX_BODY_BYTES) {
+          res.statusCode = 413;
+          res.setHeader("connection", "close");
+          return res.end();
+        }
+        chunks.push(chunk);
+      }
+      let payload;
+      try {
+        payload = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+      } catch {
+        res.statusCode = 400;
         return res.end();
       }
-    }
-    let payload;
-    try {
-      payload = JSON.parse(body);
-    } catch {
-      res.statusCode = 400;
-      return res.end();
-    }
-    try {
       const reply = Array.isArray(payload) ? await Promise.all(payload.map(handle)) : await handle(payload);
+      if (res.destroyed) return;
       res.setHeader("content-type", "application/json");
       res.end(JSON.stringify(reply));
     } catch (err) {
-      // never let a bad request reject the listener: an unhandled rejection exits Node
-      console.error("request failed:", err);
-      res.statusCode = 500;
-      res.end();
+      console.error("request failed:", err.message ?? err);
+      if (!res.destroyed && !res.headersSent) {
+        res.statusCode = 500;
+        res.end();
+      }
     }
   })
   .listen(PORT, HOST, () => console.log(`RLS-flavour RPC on ${HOST}:${PORT} (chain ${RLS_CHAIN_ID}) -> ${UPSTREAM}`));

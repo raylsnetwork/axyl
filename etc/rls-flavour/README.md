@@ -189,25 +189,27 @@ imported.
     for (untracked a minute after their last one leaves the pool), so a block with no RLS txs
     waiting costs nothing. With many RLS senders waiting it still reads each one's state every
     block; limiting it to senders touched by the block is the next step.
-14. **RLS spent by USDr-flavour txs (DoS).** The pool only sees RLS spent by RLS-flavour txs. A
-    USDr tx from the same sender (`RLS.transfer`), or a third party through `transferFrom`, can
-    drain the RLS that waiting RLS txs were admitted against. Example: nonce 0 is a USDr
-    `RLS.transfer(alt, B)`, and nonces 1..N are RLS sends that together fit `B`. All are sealed in
-    one batch; nonce 0 runs, and 1..N fail the handler's balance check and are skipped without
-    paying. The re-check drops them only after the block, and `alt` sends the RLS back for the next
-    round, so each round wastes up to `max_account_slots − 1` batch slots for one USDr tx's gas.
+14. **RLS spent outside the pool's view (DoS).** The pool counts an RLS tx's RLS cost as gas limit
+    × max fee + `value`, so it can't see RLS that a tx moves by running code. Any earlier tx from
+    the sender that calls RLS can drain the RLS later RLS txs were admitted against: a USDr-flavour
+    `RLS.transfer(alt, B)`, a zero-value RLS-flavour `RLS.transfer(alt, B − gas)` (no USDr
+    needed at all), a router's `transferFrom` under an approval, or a third party's `transferFrom`.
+    Example: nonce 0 drains `B`, and nonces 1..N are RLS sends that together fit `B`. All are
+    sealed, nonce 0 runs, and 1..N fail the handler's balance check and are skipped without paying.
+    The re-check drops them only after the block, and `alt` sends the RLS back for the next round,
+    so each round wastes up to `max_account_slots − 1` batch slots for one tx's gas.
     The pool can't close this; the fix is on the execution side. The batch builder must simulate
-    RLS txs before they take a slot, against the batch's own earlier txs (the draining USDr tx is
-    usually in the same batch), not only the latest state. That also covers `transferFrom`.
-    Charging a skipped RLS tx's intrinsic gas in USDr would work too, but brings back the USDr
-    requirement for the 0-USDr users this flavour exists for. Bumping its nonce only stops the same
-    tx being sealed again: the attacker signs new txs every round, so it bounds retries, not the
-    DoS. Splitting the drain into another batch is not enough on its own: the builder seals up
-    to `MAX_SEAL_AHEAD` (4) batches ahead of execution and skips only in-flight txs, not their
-    descendants, so the RLS txs go into the next batch while the USDr drain is still unexecuted,
-    and the re-check never runs in between. A partial mitigation would have to cover every
-    in-flight batch: don't seal a sender's RLS txs while any of their USDr txs is sealed but not
-    yet executed (one round trip of latency for mixed-flavour senders; still not `transferFrom`).
+    RLS txs before they take a slot, against the batch's own earlier txs (the drain is usually in
+    the same batch), not only the latest state; that covers every variant. Charging a skipped RLS
+    tx's intrinsic gas in USDr would work too, but brings back the USDr requirement for the 0-USDr
+    users this flavour exists for. Bumping its nonce only stops the same tx being sealed again:
+    the attacker signs new txs every round, so it bounds retries, not the DoS. Splitting the drain
+    into another batch doesn't help either: the builder seals up to `MAX_SEAL_AHEAD` (4) batches
+    ahead of execution and skips only in-flight txs, not their descendants, so the re-check never
+    runs in between. A partial mitigation would have to hold back a sender's RLS txs while any of
+    their sealed, unexecuted txs can run code (a call to an account with code, or a create) in
+    either flavour; only plain RLS sends to accounts without code can be counted by `value`. It
+    still wouldn't cover a third party's `transferFrom`.
 15. **Execution fallback.** The pool re-check catches the known ways an RLS tx becomes
     unexecutable. A tx that still fails the handler's checks at execution is skipped without paying
     and waits until it's dropped. Dropping it in `execute_batch` would close this generally.
