@@ -70,6 +70,49 @@ impl ConsensusHeader {
     }
 }
 
+/// A consensus header that state-sync hands to the subscriber for execution.
+#[derive(Clone, Debug)]
+pub struct StreamedConsensusHeader {
+    /// The header.
+    pub header: ConsensusHeader,
+    /// See [`Self::verified_in_process`]. Private so a struct literal cannot set it by mistake.
+    verified: bool,
+}
+
+impl StreamedConsensusHeader {
+    /// A header the subscriber must still verify.
+    pub fn unverified(header: ConsensusHeader) -> Self {
+        Self { header, verified: false }
+    }
+
+    /// A header the subscriber may execute without checking its signatures again.
+    ///
+    /// Use only when this process has run [`ConsensusHeader::verify_header_with_keys`] on these
+    /// exact bytes with the current committee's keys. A stored row or a peer reply qualifies only
+    /// if this process verified those exact bytes.
+    pub fn verified_in_process(header: ConsensusHeader) -> Self {
+        Self { header, verified: true }
+    }
+
+    /// True when built with [`Self::verified_in_process`].
+    pub fn is_verified(&self) -> bool {
+        self.verified
+    }
+
+    /// The header, and whether it was built with [`Self::verified_in_process`].
+    pub fn into_parts(self) -> (ConsensusHeader, bool) {
+        (self.header, self.verified)
+    }
+}
+
+impl std::ops::Deref for StreamedConsensusHeader {
+    type Target = ConsensusHeader;
+
+    fn deref(&self) -> &ConsensusHeader {
+        &self.header
+    }
+}
+
 impl Default for ConsensusHeader {
     fn default() -> Self {
         let sub_dag = CommittedSubDag::new(

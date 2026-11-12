@@ -18,7 +18,7 @@ use rayls_infrastructure_types::{
     now, test_chain_spec_arc, AuthorityIdentifier, B256Map, Batch, CertificateDigest,
     CommittedSubDag, ConsensusHeader, ConsensusOutput, Database, DbTxMut, Epoch, EpochRecord,
     Hash as _, HeaderBuilder, Notifier, RaylsReceiver, RaylsSender as _, ReputationScores, Round,
-    TaskManager, B256,
+    StreamedConsensusHeader, TaskManager, B256,
 };
 use rayls_middleware_bridge::subscriber::spawn_subscriber;
 use rayls_testing_test_utils::CommitteeFixture;
@@ -29,7 +29,7 @@ use tokio::{sync::mpsc, time::timeout};
 const SEED: u64 = 0x5eed;
 
 /// How long the subscriber gets to take a commit or to stop.
-const WAIT: Duration = Duration::from_secs(10);
+pub(super) const WAIT: Duration = Duration::from_secs(10);
 
 /// A commit at `number` whose leader is `author`'s certificate of `(epoch, round)`, carrying
 /// `batch`.
@@ -56,7 +56,7 @@ fn commit(
 }
 
 /// The two fixtures: epoch 0 with four validators, and epoch 1 where a fifth one joined.
-fn committees(
+pub(super) fn committees(
 ) -> (CommitteeFixture<MemDatabase>, CommitteeFixture<MemDatabase>, AuthorityIdentifier) {
     let before = CommitteeFixture::builder(MemDatabase::default)
         .epoch(0)
@@ -93,12 +93,12 @@ fn epoch_0_record(
 }
 
 /// Test batches, one per commit.
-fn batches(count: usize) -> Vec<Batch> {
+pub(super) fn batches(count: usize) -> Vec<Batch> {
     (0..count).map(|_| rayls_execution_evm::test_utils::batch(test_chain_spec_arc())).collect()
 }
 
 /// Spawns the subscriber of the node with `config` on `consensus_bus`, served `batches` by peers.
-fn spawn(
+pub(super) fn spawn(
     config: &ConsensusConfig<MemDatabase>,
     mode: NodeMode,
     batches: &[Batch],
@@ -141,7 +141,7 @@ fn spawn(
 }
 
 /// Resends `headers` until the subscriber outputs one: a broadcast with no listener is lost.
-async fn send_until_taken(
+pub(super) async fn send_until_taken(
     consensus_bus: &ConsensusBus,
     outputs: &mut impl RaylsReceiver<ConsensusOutput>,
     headers: Vec<ConsensusHeader>,
@@ -150,7 +150,10 @@ async fn send_until_taken(
     let streamer = tokio::spawn(async move {
         loop {
             for header in &headers {
-                let _ = streamer_bus.consensus_header().send(header.clone()).await;
+                let _ = streamer_bus
+                    .consensus_header()
+                    .send(StreamedConsensusHeader::unverified(header.clone()))
+                    .await;
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
@@ -216,8 +219,11 @@ async fn sync_across_validator_join(mode: NodeMode, next_epoch_keys: bool) -> ey
 
     // the epoch-1 commit must be dropped without using its number: commit 2 is the epoch-0 one
     let expected = same_number.sub_dag.leader.digest();
-    consensus_bus.consensus_header().send(joined_commit).await?;
-    consensus_bus.consensus_header().send(same_number).await?;
+    consensus_bus
+        .consensus_header()
+        .send(StreamedConsensusHeader::unverified(joined_commit))
+        .await?;
+    consensus_bus.consensus_header().send(StreamedConsensusHeader::unverified(same_number)).await?;
     tokio::select! {
         exited = task_manager.join(Notifier::new()) => panic!(
             "{mode:?} subscriber exited on the first epoch-1 commit (authored by validator \
