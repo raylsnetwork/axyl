@@ -135,10 +135,15 @@ imported.
     `value` has already moved before execution, but a failed receipt keeps no logs, so neither
     `Transfer` is visible. Indexers that rebuild RLS balances from events drift. Fix: emit the logs
     outside the reverted frame, or have indexers read balances.
-12. **Gas differs slightly between flavours.** The handler touches the sender's RLS balance slot
-    before execution, so a contract that then reads RLS balances finds that slot warm and pays less
-    gas than the same call in a USDr tx. Deterministic on every node, but `eth_estimateGas` from the
-    other flavour is off by up to ~2,000 gas per slot.
+12. **Gas differs between flavours.** The handler debits the sender's RLS balance slot before
+    execution, so in an RLS tx that slot is warm and dirty, and the `RLS_TOKEN` account is warm. An
+    `RLS.transfer` from the sender then costs ~200 gas for that slot instead of ~5,000 (cold
+    `SLOAD` 2,100 + clean `SSTORE` 2,900), plus ~2,500 less when a contract calls RLS internally.
+    Deterministic on every node, but an estimate made in the other flavour is off by up to
+    ~5,000 gas per slot written plus ~2,500 for the account. Simulation without a gas price writes
+    the same balance back, so the slot is warm but not dirty: an RLS `eth_estimateGas` for a call
+    that writes the sender's RLS balance comes out a little above the real RLS execution (the safe
+    direction, not estimator error).
 13. **Re-check cost.** The after-block task scans every pending and queued RLS tx. Limit it to
     senders touched by the block, or keep an index of RLS txs, before mainnet load.
 14. **Execution fallback.** The pool re-check catches the known ways an RLS tx becomes
