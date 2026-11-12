@@ -451,6 +451,9 @@ pub enum PrimaryResponse {
         /// The epoch of the proposed header.
         received: Epoch,
     },
+    /// Too many jobs are running, so ask another peer and retry later.
+    /// Last, so the other variants keep their BCS indexes.
+    Busy,
 }
 
 impl PrimaryResponse {
@@ -461,6 +464,7 @@ impl PrimaryResponse {
             PrimaryResponse::Error(_)
                 | PrimaryResponse::TooOld { .. }
                 | PrimaryResponse::EpochMismatch { .. }
+                | PrimaryResponse::Busy
         )
     }
 
@@ -498,6 +502,7 @@ impl PrimaryResponse {
             | PrimaryNetworkError::TooManyAuthorities(..) => {
                 Self::Error(PrimaryRPCError(error.to_string()))
             }
+            PrimaryNetworkError::Busy => Self::Busy,
         }
     }
 }

@@ -167,6 +167,9 @@ impl PrimaryNetworkHandle {
             PrimaryResponse::PeerExchange { .. } => Err(NetworkError::RPCError(
                 "Got wrong response, not a vote is peer exchange!".to_string(),
             )),
+            PrimaryResponse::Busy => {
+                Err(NetworkError::RPCError("Got wrong response, not a vote is busy!".to_string()))
+            }
         }
     }
 
@@ -186,6 +189,10 @@ impl PrimaryNetworkHandle {
         let res = res.await??;
         match res {
             PrimaryResponse::RequestedCertificates(certs) => Ok(certs),
+            // A fake busy answer counts only if no other peer answers, when no fallback helps.
+            PrimaryResponse::Busy => {
+                Err(NetworkError::PeerBusy(PrimaryNetworkError::Busy.to_string()))
+            }
             PrimaryResponse::Error(PrimaryRPCError(s)) => Err(NetworkError::RPCError(s)),
             _ => Err(NetworkError::RPCError("Got wrong response, not a certificate!".to_string())),
         }
@@ -451,7 +458,7 @@ where
         let task_name = format!("MissingCertsReq-{peer}");
         self.task_spawner.spawn_task(task_name, async move {
             tokio::select! {
-                result = request_handler.retrieve_missing_certs(request, requested_epoch) => {
+                result = request_handler.retrieve_missing_certs(peer, request, requested_epoch) => {
                     // report penalty if any
                     if let Err(ref e) = result {
                         if let Some(penalty) = e.into() {
