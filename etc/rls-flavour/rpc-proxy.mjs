@@ -167,7 +167,12 @@ async function handle(request) {
   }
   // an id that can't be determined is replied to as null
   const { id = null, method, params = [] } = request;
-  if (!Object.hasOwn(handlers, method) && !FORWARDED.test(String(method))) {
+  // a non-string method would pass the allowlist through string coercion
+  // (["eth_x", "admin_peers"] -> "eth_x,admin_peers") and be forwarded as is
+  if (typeof method !== "string") {
+    return { jsonrpc: "2.0", id, error: { code: -32600, message: "Invalid Request" } };
+  }
+  if (!Object.hasOwn(handlers, method) && !FORWARDED.test(method)) {
     return { jsonrpc: "2.0", id, error: { code: -32601, message: "Method not found" } };
   }
   try {
