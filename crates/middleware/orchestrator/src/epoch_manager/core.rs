@@ -531,11 +531,13 @@ where
         let sigterm_trigger = self.sigterm_trigger.clone();
         // Keep one `to_engine` sender alive past `run_epochs` so the engine's input does NOT close
         // until we say so. `run_epochs` owns the other senders, so its return would close the input
-        // BEFORE `node_shutdown.notify()` below sets the engine's `shutdown_requested` - and the
-        // engine faults (`ConsensusOutputStreamClosed`) on an input close while that flag is false
-        // (a TOCTOU on its shutdown check). We drop this only AFTER `notify()`, making notify()
-        // strictly happen-before the close: the engine polls rx_shutdown before its input, so it
-        // sees shutdown_requested=true and exits Ok. Cheap mpsc clone, held for run()'s lifetime.
+        // BEFORE `node_shutdown.notify()` below, and the engine faults
+        // (`ConsensusOutputStreamClosed`) on an input close it cannot attribute to shutdown. We
+        // drop this only AFTER `notify()`, so the shutdown flag is set by the time the close is
+        // observable. That ordering alone is not enough: the engine reads its flag and its input
+        // in two steps, and both the notify and the close can land between them, so on seeing
+        // the close it re-reads the flag (`shutdown_in_progress`) before deciding. Cheap mpsc
+        // clone, held for run()'s lifetime.
         let engine_input_keepalive = to_engine.clone();
         // A consensus-DB write error is fatal WITHOUT a panic: the durable state is the last
         // known valid data, and the mem cache plus any uncommitted mdbx transaction are safe
@@ -606,9 +608,10 @@ where
         // that rare hang is bounded externally by the supervisor's SIGKILL and is fork-safe
         // (the unflushed tail replays deterministically on restart).
         self.node_shutdown.notify();
-        // Now that `shutdown_requested` is being set, release the engine's input. The close is
-        // observed by the engine only after `notify()` (program order: this drop is after the
-        // notify), so it exits Ok via its shutdown path rather than faulting.
+        // Now that the shutdown flag is set, release the engine's input. The close becomes
+        // observable only after `notify()` (program order: this drop is after the notify), and
+        // the engine re-reads the flag when it sees the close, so it exits Ok via its shutdown
+        // path rather than faulting.
         drop(engine_input_keepalive);
 
         match engine_done_rx.await {

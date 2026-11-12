@@ -353,9 +353,7 @@ impl<DB: Database> ExecutorEngine<DB> {
     pub fn push_back_queued_for_test(&mut self, output: ConsensusOutput) {
         self.queued.push_back((CameFrom::Test, output))
     }
-}
 
-impl<DB: Database> ExecutorEngine<DB> {
     /// Whether shutdown has been requested, re-reading the signal if the cached flag is clear.
     ///
     /// `poll` reads `rx_shutdown` first and the input channel second, and the orchestrator
@@ -516,7 +514,7 @@ impl<DB: Database> Future for ExecutorEngine<DB> {
                 }
                 Poll::Ready(None) => {
                     // the stream has ended
-                    error!(target: "engine", "ConsensusOutput channel closed. Shutting down...");
+                    info!(target: "engine", "ConsensusOutput channel closed. Shutting down...");
 
                     // only return if there are no current tasks and the queue is empty
                     // otherwise, let the loop continue so any remaining tasks and queued output is
@@ -527,6 +525,10 @@ impl<DB: Database> Future for ExecutorEngine<DB> {
                         if this.shutdown_in_progress() {
                             return Poll::Ready(Ok(()));
                         }
+                        error!(
+                            target: "engine",
+                            "ConsensusOutput channel closed with no shutdown requested - halting"
+                        );
                         return Poll::Ready(Err(RLEngineError::ConsensusOutputStreamClosed));
                     }
                 }
