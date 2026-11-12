@@ -887,9 +887,11 @@ impl<DB: Database> Subscriber<DB> {
         // so an anchor the engine advanced before this task subscribed still counts. An output the
         // engine drops as an already-admitted duplicate is covered too: the anchor reaches it when
         // the original admission finishes executing, which `wait_for` observes whenever it lands.
-        // The tick covered neither case: fired before the subscribe it was lost, and a dropped
-        // duplicate never ticked, so replay parked for good and the node stayed on its epoch with
-        // SIGTERM unanswered.
+        // The same holds for an output listed as missing by `number` (which can drift) whose
+        // position is already at or below the anchor: the engine drops it as stale, and the
+        // anchor is past it from the start. The tick covered none of these: fired before the
+        // subscribe it was lost, and a dropped duplicate or stale output never ticked, so replay
+        // parked for good and the node stayed on its epoch with SIGTERM unanswered.
         let mut executed_anchor_sub = self.consensus_bus.executed_anchor().subscribe();
 
         if !missing.is_empty() {
