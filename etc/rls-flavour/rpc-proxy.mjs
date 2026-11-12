@@ -17,6 +17,10 @@ const HOST = process.env.HOST ?? "127.0.0.1";
 const FORWARDED = /^(eth|net|web3)_/;
 const MAX_BODY_BYTES = 1 << 20;
 const MAX_DRAIN_BYTES = 8 << 20;
+// A 1 MiB body still fits ~35k tiny batch entries, each an upstream fetch: cap the batch and run
+// its entries a few at a time.
+const MAX_BATCH = 100;
+const BATCH_CONCURRENCY = 8;
 // Must match crates/execution/evm/src/rls_flavour.rs.
 const RLS_TOKEN = "0x07e17e17e17e17e17e17e17e17e17e17e17e17ea";
 const RLS_PER_USDR = 552n;
@@ -142,6 +146,20 @@ async function readBody(req) {
   return { body: Buffer.concat(chunks).toString("utf8") };
 }
 
+// Like Promise.all(items.map(fn)), with at most `limit` calls running at once; keeps order.
+async function mapLimit(items, limit, fn) {
+  const results = new Array(items.length);
+  let next = 0;
+  const worker = async () => {
+    while (next < items.length) {
+      const i = next++;
+      results[i] = await fn(items[i]);
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
+  return results;
+}
+
 async function handle(request) {
   // `null` (or a non-object batch entry) must not throw: any open webpage can POST one
   // JSON-RPC 2.0: an id that can't be determined is replied to as null
@@ -181,7 +199,13 @@ http
         res.statusCode = 400;
         return res.end();
       }
-      const reply = Array.isArray(payload) ? await Promise.all(payload.map(handle)) : await handle(payload);
+      if (Array.isArray(payload) && payload.length > MAX_BATCH) {
+        res.statusCode = 413;
+        return res.end();
+      }
+      const reply = Array.isArray(payload)
+        ? await mapLimit(payload, BATCH_CONCURRENCY, handle)
+        : await handle(payload);
       if (res.destroyed) return;
       res.setHeader("content-type", "application/json");
       res.end(JSON.stringify(reply));
