@@ -125,6 +125,23 @@ const handlers = {
   },
 };
 
+// Reads the request body as bytes and decodes it once (the cap counts bytes, and a UTF-8
+// character split across chunks stays intact). Past MAX_BODY_BYTES it keeps reading and discarding,
+// so the 413 the caller sends afterwards lands on a socket the client is still reading from, up to
+// MAX_DRAIN_BYTES, where it gives up and resets the connection.
+async function readBody(req) {
+  const chunks = [];
+  let size = 0;
+  for await (const chunk of req) {
+    size += chunk.length;
+    if (size > MAX_DRAIN_BYTES) return { tooLarge: true }; // leaving the loop destroys `req`
+    if (size <= MAX_BODY_BYTES) chunks.push(chunk);
+    else chunks.length = 0;
+  }
+  if (size > MAX_BODY_BYTES) return { tooLarge: true };
+  return { body: Buffer.concat(chunks).toString("utf8") };
+}
+
 async function handle(request) {
   // `null` (or a non-object batch entry) must not throw: any open webpage can POST one
   // JSON-RPC 2.0: an id that can't be determined is replied to as null
@@ -148,32 +165,18 @@ http
       res.setHeader("access-control-allow-origin", "*");
       res.setHeader("access-control-allow-headers", "content-type");
       if (req.method === "OPTIONS") return res.end();
-      // collect bytes, then decode once: the cap counts bytes, and a UTF-8 character split
-      // across chunks stays intact
-      const chunks = [];
-      let size = 0;
-      let tooLarge = false;
-      for await (const chunk of req) {
-        size += chunk.length;
-        if (tooLarge) {
-          // keep draining so the 413 reaches the client (leaving the loop would reset the socket
-          // first), up to a hard limit
-          if (size > MAX_DRAIN_BYTES) return req.destroy();
-          continue;
-        }
-        if (size > MAX_BODY_BYTES) {
-          tooLarge = true;
+      const { body, tooLarge } = await readBody(req);
+      if (tooLarge) {
+        if (!res.destroyed) {
           res.statusCode = 413;
           res.setHeader("connection", "close");
           res.end();
-          continue;
         }
-        chunks.push(chunk);
+        return;
       }
-      if (tooLarge) return;
       let payload;
       try {
-        payload = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+        payload = JSON.parse(body);
       } catch {
         res.statusCode = 400;
         return res.end();
