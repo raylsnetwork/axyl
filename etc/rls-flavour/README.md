@@ -189,13 +189,23 @@ imported.
     for (untracked a minute after their last one leaves the pool), so a block with no RLS txs
     waiting costs nothing. With many RLS senders waiting it still reads each one's state every
     block; limiting it to senders touched by the block is the next step.
-14. **Execution fallback.** The pool re-check catches the known ways an RLS tx becomes
+14. **RLS spent by USDr-flavour txs (DoS).** The pool only sees RLS spent by RLS-flavour txs. A
+    USDr tx from the same sender (`RLS.transfer`), or a third party through `transferFrom`, can
+    drain the RLS that waiting RLS txs were admitted against. Example: nonce 0 is a USDr
+    `RLS.transfer(alt, B)`, and nonces 1..N are RLS sends that together fit `B`. All are sealed in
+    one batch; nonce 0 runs, and 1..N fail the handler's balance check and are skipped without
+    paying. The re-check drops them only after the block, and `alt` sends the RLS back for the next
+    round, so each round wastes up to `max_account_slots − 1` batch slots for one USDr tx's gas.
+    The pool can't close this. The fix is on the execution side: an RLS tx that can't pay must
+    still cost something (charge its intrinsic gas in USDr, or bump the nonce), or the batch
+    builder must simulate RLS txs before they take a slot.
+15. **Execution fallback.** The pool re-check catches the known ways an RLS tx becomes
     unexecutable. A tx that still fails the handler's checks at execution is skipped without paying
     and waits until it's dropped. Dropping it in `execute_batch` would close this generally.
-15. **Delegated accounts can't receive native RLS.** An EIP-7702-delegated EOA has code
+16. **Delegated accounts can't receive native RLS.** An EIP-7702-delegated EOA has code
     (`0xef0100‖address`), so a native RLS send to it is refused. That includes MetaMask smart-account
     users, whom MetaMask prompts to upgrade: their wallet shows RLS sends to them as failing. They
     can still receive RLS as an ERC-20 `transfer`. Type-4 transactions can't carry RLS value either,
     because revm applies their authorizations after the recipient check. The precompile rule also
     refuses the burn address `0x…dead`. Integrator docs must say all this.
-16. **Not measured.** State-root cost at mainnet load; MetaMask Mobile.
+17. **Not measured.** State-root cost at mainnet load; MetaMask Mobile.

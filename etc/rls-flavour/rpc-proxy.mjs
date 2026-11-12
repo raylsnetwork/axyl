@@ -76,7 +76,11 @@ const handlers = {
       upstream("eth_getBlockByNumber", ["latest", false]),
       upstream("eth_maxPriorityFeePerGas", []),
     ]);
-    return hex(BigInt(block.baseFeePerGas) * RLS_PER_USDR + BigInt(tip));
+    // The pool checks the fee cap against the *next* block's base fee, which can be up to 1/8 above
+    // the latest (BaseFeeParams::ethereum(), as RaylsChainSpec uses). A legacy sender pays the whole
+    // gas price, so price for the worst case, rounding up, like reth's own oracle margin.
+    const nextBase = (BigInt(block.baseFeePerGas) * 9n + 7n) / 8n;
+    return hex(nextBase * RLS_PER_USDR + BigInt(tip));
   },
   // Tips (eth_maxPriorityFeePerGas, feeHistory.reward) pass through unconverted: the node's
   // percentiles already hold RLS-flavour txs' tips in RLS units, so scaling them by 552 would
