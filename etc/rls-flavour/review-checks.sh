@@ -14,24 +14,25 @@ RECIPIENT=0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC
 pass=0 fail=0
 check() { local label=$1 actual=$2 expected=$3; if [[ "$actual" == "$expected" ]]; then echo "PASS  $label"; pass=$((pass + 1)); else echo "FAIL  $label: got $actual, expected $expected"; fail=$((fail + 1)); fi; }
 send_raw() { local raw=$1; curl -s -X POST "$NODE" -H 'content-type: application/json' -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"eth_sendRawTransaction\",\"params\":[\"$raw\"]}" | jq -r '.result // .error.message'; }
-refused() { local result=$1; [[ "$result" == 0x* ]] && echo "accepted" || echo "refused"; }
+REFUSED=refused
+refused() { local result=$1; [[ "$result" == 0x* ]] && echo "accepted" || echo "$REFUSED"; }
 nonce=$(cast nonce $USER --rpc-url $NODE)
 
 echo "== intrinsic gas: 21,000 gas with 2 KB of calldata (needs more)"
 data=0x$(printf 'ab%.0s' $(seq 1 2048))
 tx=$(cast mktx --rpc-url "$RLS_RPC" --private-key "$USER_KEY" "$RECIPIENT" "$data" --gas-limit 21000 --nonce $nonce 2>&1)
 out=$(send_raw "$tx"); echo "   $out"
-check "too little gas for the calldata is refused at the pool" "$(refused "$out")" "refused"
+check "too little gas for the calldata is refused at the pool" "$(refused "$out")" "$REFUSED"
 
 echo "== tip above the fee cap"
 tx=$(cast mktx --rpc-url "$RLS_RPC" --private-key "$USER_KEY" "$RECIPIENT" --value 1 --gas-price 30000gwei --priority-gas-price 40000gwei --nonce $nonce 2>&1)
-if [[ "$tx" == 0x* ]]; then out=$(send_raw "$tx"); echo "   $out"; check "tip > max fee is refused at the pool" "$(refused "$out")" "refused";
+if [[ "$tx" == 0x* ]]; then out=$(send_raw "$tx"); echo "   $out"; check "tip > max fee is refused at the pool" "$(refused "$out")" "$REFUSED";
 else echo "   cast would not sign it: ${tx:0:100}"; fi
 
 echo "== RLS value to a precompile (0x0400, the USDr precompile)"
 tx=$(cast mktx --rpc-url "$RLS_RPC" --private-key "$USER_KEY" 0x0000000000000000000000000000000000000400 --value 1 --gas-limit 30000 --nonce $nonce)
 out=$(send_raw "$tx"); echo "   $out"
-check "RLS value to a precompile is refused" "$(refused "$out")" "refused"
+check "RLS value to a precompile is refused" "$(refused "$out")" "$REFUSED"
 
 echo "== the gas paid shows as an RLS Transfer to the fee recipient"
 r=$(cast send --rpc-url "$RLS_RPC" --private-key "$USER_KEY" "$RECIPIENT" --value 1ether --json)
@@ -45,7 +46,7 @@ dn=$(cast nonce 0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266 --rpc-url $NODE)
 low=$(cast mktx --rpc-url "$NODE" --private-key "$DEV_KEY" "$RECIPIENT" --value 1 --legacy --gas-price 48gwei --nonce $dn)
 high=$(cast mktx --rpc-url "$NODE" --private-key "$DEV_KEY" "$RECIPIENT" --value 1 --gas-price 96gwei --priority-gas-price 48gwei --nonce $dn)
 o1=$(send_raw "$low"); o2=$(send_raw "$high"); echo "   first: ${o1:0:20}…; replacement: ${o2:0:90}"
-check "a same-flavour fee bump is not refused as 'other Rayls network'" "$([[ "$o2" == *"other Rayls network"* ]] && echo refused || echo ok)" "ok"
+check "a same-flavour fee bump is not refused as 'other Rayls network'" "$([[ "$o2" == *"other Rayls network"* ]] && echo "$REFUSED" || echo ok)" "ok"
 
 echo "== a waiting RLS value tx is dropped once its recipient gains code (EIP-7702 delegation)"
 fresh=$(cast wallet new --json); fresh_key=$(jq -r '(.data // .)[0].private_key' <<<"$fresh"); fresh_addr=$(jq -r '(.data // .)[0].address' <<<"$fresh")
@@ -54,7 +55,7 @@ un=$(cast nonce $USER --rpc-url $NODE)
 gapped=$(cast mktx --rpc-url "$RLS_RPC" --private-key "$USER_KEY" "$fresh_addr" --value 1 --gas-limit 21000 --nonce $((un + 1)))
 gh=$(send_raw "$gapped"); echo "   queued: ${gh:0:20}…"
 check "RLS value to an account without code is admitted" "$(refused "$gh")" "accepted"
-in_txpool() { curl -s -X POST "$NODE" -H 'content-type: application/json' -d '{"jsonrpc":"2.0","id":1,"method":"txpool_content","params":[]}' | jq --arg h "$1" '[.result[][][] | select(.hash == $h)] | length'; }
+in_txpool() { local hash=$1; curl -s -X POST "$NODE" -H 'content-type: application/json' -d '{"jsonrpc":"2.0","id":1,"method":"txpool_content","params":[]}' | jq --arg h "$hash" '[.result[][][] | select(.hash == $h)] | length'; }
 check "it waits in the pool" "$(in_txpool "$gh")" "1"
 auth=$(cast wallet sign-auth "$RLS" --private-key "$fresh_key" --nonce 0 --chain 487 --rpc-url "$NODE")
 # the fee-bump check above leaves a dev tx pending: let it land first
@@ -71,7 +72,8 @@ auth2=$(cast wallet sign-auth "$RLS" --private-key "$f2_key" --nonce 0 --chain 4
 nonce=$(cast nonce $USER --rpc-url $NODE)
 tx=$(yes | cast mktx --rpc-url "$RLS_RPC" --private-key "$USER_KEY" "$f2_addr" --value 1 --auth "$auth2" --gas-limit 60000 --nonce $nonce 2>&1 | tail -1)
 out=$(send_raw "$tx"); echo "   $out"
-check "RLS value in a type-4 tx is refused" "$([[ "$out" == *"EIP-7702"* ]] && echo refused || echo "$(refused "$out")")" "refused"
+type4=$(refused "$out"); [[ "$out" == *"EIP-7702"* ]] || type4="wrong reason: $out"
+check "RLS value in a type-4 tx is refused" "$type4" "$REFUSED"
 
 echo "== $pass passed, $fail failed"
 [[ $fail == 0 ]]

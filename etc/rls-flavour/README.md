@@ -115,10 +115,14 @@ imported.
 2. **Gas price inside the EVM.** BASEFEE (and GASPRICE) read 0 inside RLS-flavour txs. Divide the
    signed fee fields by the rate before revm instead, so they keep their USDr meaning.
 3. **Rate and fee recipient are constants.** Read the rate from onchain config, governance-set and
-   whole-number ≥ 1. Pay the fee to FeeAggregator / validators with the RLS split.
+   whole-number ≥ 1. Pay the fee to FeeAggregator / validators with the RLS split. The node
+   always credits the fixed `RLS_TOKEN`, while `RLSAccumulator.setRlsToken` can repoint the
+   accumulator to another token; read the token address from the same config.
 4. **Receipts and gas suggestions.** The node's `effectiveGasPrice` for RLS txs uses the USDr base
    fee, and RLS tips appear in USDr `eth_feeHistory`. Both need to filter or convert by chain id in
-   the node RPC; the proxy fixes receipts only.
+   the node RPC; the proxy fixes receipts only. The RLS `Transfer` logs are added to the journal
+   directly, so inspector `log` hooks don't see them: `callTracer` with `withLog` shows fewer logs
+   than the receipt.
 5. **Writes to RLS storage.** These bypass the token's `paused` flag and hooks. Add the
    implementation/pause guard, and coordinate RLS upgrades with node releases.
 6. **USDr precompile (`0x0400`).** Its EIP-712 domain is fixed at node start, so USDr EIP-3009
