@@ -140,7 +140,8 @@ imported.
 5. **Writes to RLS storage.** `RLS.pause()` is enforced: the handler, the pool and the after-block
    re-check read OZ's ERC-7201 `Pausable` slot and refuse RLS-flavour txs (gas included) while it's
    set. Before this, a native RLS send went through while RLS was paused (shown on a local
-   devnet). Still bypassed: any other logic in `RLS._update` (hooks, a future blocklist). Add an
+   devnet). A paused token refuses zero-value RLS-flavour calls too, so an admin must send
+   `RLS.unpause()` from the USDr network (the integrator and ops docs must say so). Still bypassed: any other logic in `RLS._update` (hooks, a future blocklist). Add an
    implementation guard (refuse if the proxy's implementation isn't a known one), and coordinate
    RLS upgrades with node releases.
 6. **USDr precompile (`0x0400`).** Its EIP-712 domain is fixed at node start, so USDr EIP-3009
@@ -177,8 +178,10 @@ imported.
     execution, so in an RLS tx that slot is warm and dirty, and the `RLS_TOKEN` account is warm. An
     `RLS.transfer` from the sender then costs ~200 gas for that slot instead of ~5,000 (cold
     `SLOAD` 2,100 + clean `SSTORE` 2,900), plus ~2,500 less when a contract calls RLS internally.
-    Deterministic on every node, but an estimate made in the other flavour is off by up to
-    ~5,000 gas per slot written plus ~2,500 for the account. Simulation without a gas price writes
+    The pause check also reads RLS's `Pausable` slot before execution, so the `paused()` read in
+    `RLS._update` is warm in an RLS tx (100 gas) and cold in a USDr one (2,100): another ~2,000 per
+    RLS call. Deterministic on every node, but an estimate made in the other flavour is off by up
+    to ~5,000 gas per slot written, plus ~2,500 for the account and ~2,000 for the pause slot. Simulation without a gas price writes
     the same balance back, so the slot is warm but not dirty: an RLS `eth_estimateGas` for a call
     that writes the sender's RLS balance comes out a little above the real RLS execution (the safe
     direction, not estimator error).
