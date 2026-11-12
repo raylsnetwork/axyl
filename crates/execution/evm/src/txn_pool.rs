@@ -305,6 +305,16 @@ fn drop_unexecutable_rls_txns(
 }
 
 impl RlsFlavourValidator {
+    /// Whether `transaction`'s nonce is below its sender's current state nonce. A state read
+    /// error counts as not mined, so the caller's guard still applies.
+    fn nonce_already_mined(&self, transaction: &EthPooledTransaction) -> bool {
+        self.inner
+            .client()
+            .latest()
+            .and_then(|state| state.basic_account(transaction.sender_ref()))
+            .is_ok_and(|account| transaction.nonce() < account.map_or(0, |a| a.nonce))
+    }
+
     /// The stateless checks reth's validator runs (`EthTransactionValidator::validate_stateless`)
     /// except the chain id and the local USDr fee cap. A transaction that passes the pool but fails
     /// in revm is skipped without paying, so these must match.
@@ -558,7 +568,11 @@ impl TransactionValidator for RlsFlavourValidator {
                 let chain_id = self.inner.chain_id();
                 rls_flavour::is_rls(waiting.transaction.chain_id(), chain_id)
                     != rls_flavour::is_rls(transaction.chain_id(), chain_id)
-            });
+            })
+            // A waiting tx at an already-mined nonce is one reth's maintenance hasn't removed
+            // yet: let normal validation answer "nonce too low" (which forwarders treat as
+            // stale) instead of this guard. State is read only when a conflict was found.
+            && !self.nonce_already_mined(&transaction);
         // Check-then-insert, like the RLS balance check in `validate_rls`: reth validates on
         // several tasks at once, so two transactions from one sender validated at the same moment
         // can both pass either check. A production version moves both into the pool's insert

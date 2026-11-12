@@ -11,6 +11,11 @@ import http from "node:http";
 
 const UPSTREAM = process.env.UPSTREAM ?? "http://127.0.0.1:8545";
 const PORT = Number(process.env.PORT ?? 8645);
+// Demo tooling: listen on this machine only, and forward only the wallet namespaces, so a webpage or
+// a LAN peer can't reach the node's admin_/debug_/txpool_ methods through this proxy.
+const HOST = process.env.HOST ?? "127.0.0.1";
+const FORWARDED = /^(eth|net|web3)_/;
+const MAX_BODY_BYTES = 1 << 20;
 // Must match crates/execution/evm/src/rls_flavour.rs.
 const RLS_TOKEN = "0x07e17e17e17e17e17e17e17e17e17e17e17e17ea";
 const RLS_PER_USDR = 552n;
@@ -121,6 +126,9 @@ const handlers = {
 
 async function handle(request) {
   const { id, method, params = [] } = request;
+  if (!Object.hasOwn(handlers, method) && !FORWARDED.test(String(method))) {
+    return { jsonrpc: "2.0", id, error: { code: -32601, message: "Method not found" } };
+  }
   try {
     const result = Object.hasOwn(handlers, method) ? await handlers[method](params) : await upstream(method, params);
     return { jsonrpc: "2.0", id, result };
@@ -135,7 +143,13 @@ http
     res.setHeader("access-control-allow-headers", "content-type");
     if (req.method === "OPTIONS") return res.end();
     let body = "";
-    for await (const chunk of req) body += chunk;
+    for await (const chunk of req) {
+      body += chunk;
+      if (body.length > MAX_BODY_BYTES) {
+        res.statusCode = 413;
+        return res.end();
+      }
+    }
     let payload;
     try {
       payload = JSON.parse(body);
@@ -147,4 +161,4 @@ http
     res.setHeader("content-type", "application/json");
     res.end(JSON.stringify(reply));
   })
-  .listen(PORT, () => console.log(`RLS-flavour RPC on :${PORT} (chain ${RLS_CHAIN_ID}) -> ${UPSTREAM}`));
+  .listen(PORT, HOST, () => console.log(`RLS-flavour RPC on ${HOST}:${PORT} (chain ${RLS_CHAIN_ID}) -> ${UPSTREAM}`));

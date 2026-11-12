@@ -196,9 +196,15 @@ imported.
     one batch; nonce 0 runs, and 1..N fail the handler's balance check and are skipped without
     paying. The re-check drops them only after the block, and `alt` sends the RLS back for the next
     round, so each round wastes up to `max_account_slots − 1` batch slots for one USDr tx's gas.
-    The pool can't close this. The fix is on the execution side: an RLS tx that can't pay must
-    still cost something (charge its intrinsic gas in USDr, or bump the nonce), or the batch
-    builder must simulate RLS txs before they take a slot.
+    The pool can't close this; the fix is on the execution side. The batch builder must simulate
+    RLS txs before they take a slot, against the batch's own earlier txs (the draining USDr tx is
+    usually in the same batch), not only the latest state. That also covers `transferFrom`.
+    Charging a skipped RLS tx's intrinsic gas in USDr would work too, but brings back the USDr
+    requirement for the 0-USDr users this flavour exists for. Bumping its nonce only stops the same
+    tx being sealed again: the attacker signs new txs every round, so it bounds retries, not the
+    DoS. A cheaper partial fix: never seal a sender's RLS txs after one of their USDr txs in the
+    same batch, so the self-drain needs two batches and the re-check catches it (not
+    `transferFrom`).
 15. **Execution fallback.** The pool re-check catches the known ways an RLS tx becomes
     unexecutable. A tx that still fails the handler's checks at execution is skipped without paying
     and waits until it's dropped. Dropping it in `execute_batch` would close this generally.
