@@ -76,7 +76,7 @@ public dev keys. `demo/record-metamask.mjs` drives MetaMask with Playwright. The
 | | MetaMask (see below) | Takes nonces in order across both networks and handles one network's confirmations at a time |
 | Pool | Two RLS sends that each fit but together exceed the balance | Second refused at admission |
 | | A waiting RLS send made unpayable by an ERC-20 transfer | Dropped from the pool after the block (no stuck tx) |
-| | Fee under the RLS base fee; sender without RLS; RLS value to a contract or a precompile (`0x0400`) | Refused |
+| | Fee under the RLS base fee; sender without RLS; RLS value to a contract or a precompile (`0x0400`); RLS value in a type-4 tx | Refused |
 | | 21,000 gas with 2 KB of calldata (intrinsic gas) | Refused at the pool, by the same stateless checks reth runs (size, init code, gas caps, tip ≤ fee cap, min tip, 7702 auth list, intrinsic gas) |
 | | A waiting RLS tx whose fee cap falls under the RLS base fee | Dropped after the block (same task as the balance re-check) |
 | | A waiting RLS value tx whose recipient gets an EIP-7702 delegation | Dropped after the block |
@@ -144,4 +144,10 @@ imported.
 14. **Execution fallback.** The pool re-check catches the known ways an RLS tx becomes
     unexecutable. A tx that still fails the handler's checks at execution is skipped without paying
     and waits until it's dropped. Dropping it in `execute_batch` would close this generally.
-15. **Not measured.** State-root cost at mainnet load; MetaMask Mobile.
+15. **Delegated accounts can't receive native RLS.** An EIP-7702-delegated EOA has code
+    (`0xef0100‖address`), so a native RLS send to it is refused. That includes MetaMask smart-account
+    users, whom MetaMask prompts to upgrade: their wallet shows RLS sends to them as failing. They
+    can still receive RLS as an ERC-20 `transfer`. Type-4 transactions can't carry RLS value either,
+    because revm applies their authorizations after the recipient check. The precompile rule also
+    refuses the burn address `0x…dead`. Integrator docs must say all this.
+16. **Not measured.** State-root cost at mainnet load; MetaMask Mobile.

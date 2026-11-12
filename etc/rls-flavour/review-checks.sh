@@ -65,5 +65,13 @@ check "the recipient is now delegated" "$(cast code "$fresh_addr" --rpc-url "$NO
 perl -e 'select(undef,undef,undef,3)'
 check "the waiting tx is dropped after the block" "$(in_txpool "$gh")" "0"
 
+echo "== RLS value in a type-4 tx whose own authorization delegates the recipient"
+f2=$(cast wallet new --json); f2_key=$(jq -r '(.data // .)[0].private_key' <<<"$f2"); f2_addr=$(jq -r '(.data // .)[0].address' <<<"$f2")
+auth2=$(cast wallet sign-auth "$RLS" --private-key "$f2_key" --nonce 0 --chain 4871 --rpc-url "$RLS_RPC" 2>&1 | tail -1)
+nonce=$(cast nonce $USER --rpc-url $NODE)
+tx=$(yes | cast mktx --rpc-url "$RLS_RPC" --private-key "$USER_KEY" "$f2_addr" --value 1 --auth "$auth2" --gas-limit 60000 --nonce $nonce 2>&1 | tail -1)
+out=$(send_raw "$tx"); echo "   $out"
+check "RLS value in a type-4 tx is refused" "$([[ "$out" == *"EIP-7702"* ]] && echo refused || echo "$(refused "$out")")" "refused"
+
 echo "== $pass passed, $fail failed"
 [[ $fail == 0 ]]

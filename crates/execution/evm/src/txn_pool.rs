@@ -374,6 +374,15 @@ impl RlsFlavourValidator {
             );
         }
 
+        if !transaction.value().is_zero() && transaction.ty() == EIP7702_TX_TYPE_ID {
+            // the handler checks the recipient before revm applies this tx's own authorizations
+            return invalid(
+                transaction,
+                InvalidPoolTransactionError::Other(Box::new(RlsFlavourError(
+                    "RLS value cannot be sent in an EIP-7702 transaction",
+                ))),
+            );
+        }
         if !transaction.value().is_zero() {
             // msg.value stays USDr inside the EVM, so RLS value only goes to accounts without code
             // that are not precompiles: the same rule the handler applies at execution

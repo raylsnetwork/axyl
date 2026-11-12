@@ -141,6 +141,14 @@ where
                 )
                 .into());
             };
+            // revm applies a type-4 transaction's authorizations after this hook, so the code
+            // check below would see `to` before its own delegation: refuse value on type 4
+            if tx.authorization_list_len() > 0 {
+                return Err(InvalidTransaction::Str(
+                    "RLS value cannot be sent in an EIP-7702 transaction".into(),
+                )
+                .into());
+            }
             // precompiles have no code hash but can fail, and this value moves before execution
             // and is not reverted with the call, so they are refused too (the pool does the same)
             if is_precompile_range(to)
@@ -199,6 +207,10 @@ where
         // RLS flavour: the gas paid in RLS goes to staker rewards
         if let Some(rls) = self.rls {
             let fee = U256::from(gas_used) * U256::from(rls.price);
+            if fee.is_zero() {
+                // simulation with no gas price: nothing paid, no log
+                return Ok(());
+            }
             credit_rls(journal, RLS_FEE_RECIPIENT, fee)?;
             // One Transfer for the gas actually paid, so balances rebuilt from events add up for
             // successful transactions (the up-front debit and the refund net out to this). A

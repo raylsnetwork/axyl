@@ -100,7 +100,7 @@ const handlers = {
 async function handle(request) {
   const { id, method, params = [] } = request;
   try {
-    const result = handlers[method] ? await handlers[method](params) : await upstream(method, params);
+    const result = Object.hasOwn(handlers, method) ? await handlers[method](params) : await upstream(method, params);
     return { jsonrpc: "2.0", id, result };
   } catch (err) {
     return { jsonrpc: "2.0", id, error: err.rpc ?? { code: -32603, message: String(err.message) } };
