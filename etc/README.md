@@ -9,6 +9,7 @@ runbooks, and ancillary test helpers.
 | Path | Purpose |
 |---|---|
 | [`docker-network/compose.yaml`](docker-network/compose.yaml) | Docker Compose file for the local 4-validator network (driven by `make up` / `make down`). |
+| [`catchup-bench/`](catchup-bench/) | Catch-up benchmark: observers fall behind and catch up on a local network with a real round trip between nodes, comparing binaries. See [`catchup-bench/README.md`](catchup-bench/README.md). |
 | [`debug-network/`](debug-network/) | Scripts for a 4-validator local network where validator #1 is launched manually in a debugger via `.vscode/launch.json`. |
 | [`docker-network/`](docker-network/) | Dockerfile + per-validator setup scripts referenced by `etc/docker-network/compose.yaml`. See [`docker-network/README.md`](docker-network/README.md). |
 | [`manage/`](manage/) | `manage.sh` — orchestrates the full bring-up of a new network from scratch over SSH to a fleet of pre-provisioned machines (Docker-based). See [`manage/README.md`](manage/README.md). |
