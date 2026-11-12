@@ -1452,3 +1452,35 @@ async fn not_enough_support_and_missing_leaders_and_gc() {
 
     assert!(committed);
 }
+
+/// A rejoining node restores its last committed sub dag from storage, and after a catch-up that
+/// row's `reputation_score` came from a peer and is not covered by the block digest. Mid-schedule,
+/// `resolve_reputation_score` carries those scores over, and a set that does not match the
+/// committee used to trip the size assert on the first commit, on every restart. It must instead
+/// restart the window from zero.
+#[tokio::test]
+async fn mismatched_carried_over_scores_reset_instead_of_panicking() {
+    let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+    let committee = fixture.committee();
+    let metrics = Arc::new(ConsensusMetrics::default());
+
+    let mut state = ConsensusState::new(metrics.clone(), 50);
+    let leader = Certificate::genesis(&committee).into_iter().next().unwrap();
+    let poisoned =
+        ReputationScores { scores_per_authority: Default::default(), final_of_schedule: false };
+    state.last_committed_sub_dag = Some(CommittedSubDag::new(vec![], leader, 0, poisoned, None));
+
+    let bullshark = Bullshark::new(
+        committee.clone(),
+        metrics,
+        NUM_SUB_DAGS_PER_SCHEDULE,
+        LeaderSchedule::new(committee.clone(), LeaderSwapTable::default()),
+        DEFAULT_BAD_NODES_STAKE_THRESHOLD,
+    );
+
+    // Index 2 is mid-schedule, so the last scores would be carried over.
+    let scores = bullshark.resolve_reputation_score(&mut state, &[], 2);
+    assert_eq!(scores.total_authorities() as usize, committee.size());
+    assert!(scores.all_zero());
+    assert!(!scores.final_of_schedule);
+}

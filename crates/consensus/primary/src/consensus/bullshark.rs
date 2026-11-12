@@ -68,38 +68,13 @@ impl Bullshark {
         committed_sequence: &[Certificate],
         sub_dag_index: u64,
     ) -> ReputationScores {
-        // we reset the scores for every schedule change window, or initialise when it's the first
-        // sub dag we are going to create.
-        // sub_dag_index is based on epoch and round so / 2 so this check works on commit rounds
-        // (every other one).
-        let mut reputation_score =
-            if (sub_dag_index / 2).is_multiple_of(self.num_sub_dags_per_schedule as u64) {
-                ReputationScores::new(&self.committee)
-            } else if let Some(last) = state.last_committed_sub_dag.as_ref() {
-                last.reputation_score.clone()
-            } else {
-                ReputationScores::new(&self.committee)
-            };
-
-        // update the score for the previous leader. If no previous leader exists,
-        // then this is the first time we commit a leader, so no score update takes place
-        if let Some(last_committed_sub_dag) = state.last_committed_sub_dag.as_ref() {
-            let leader_digest = last_committed_sub_dag.leader.digest();
-            let leader_round = last_committed_sub_dag.leader.round();
-            for certificate in committed_sequence.iter().filter(|c| c.round() == leader_round + 1) {
-                if certificate.header().parents().contains(&leader_digest) {
-                    reputation_score.add_score(certificate.origin(), 1);
-                }
-            }
-        }
-
-        // we check if this is the last sub dag of the current schedule. If yes then we mark the
-        // scores as final_of_schedule = true so any downstream user can now that those are the last
-        // ones calculated for the current schedule.
-        // sub_dag_index is based on epoch and round so / 2 so this check works on commit rounds
-        // (every other one).
-        reputation_score.final_of_schedule =
-            ((sub_dag_index / 2) + 1).is_multiple_of(self.num_sub_dags_per_schedule as u64);
+        let reputation_score = ReputationScores::resolve(
+            &self.committee,
+            state.last_committed_sub_dag.as_ref(),
+            committed_sequence,
+            sub_dag_index,
+            self.num_sub_dags_per_schedule,
+        );
 
         // Always ensure that all the authorities are present in the reputation scores - even
         // when score is zero.
