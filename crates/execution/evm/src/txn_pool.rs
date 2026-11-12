@@ -449,11 +449,13 @@ impl RlsFlavourValidator {
             pool.get_transactions_by_sender(*transaction.sender_ref())
                 .iter()
                 .filter(|t| {
-                    // only the earlier nonces, which execute first: like execution, the
-                    // after-block re-check and reth's USDr pool, the earlier tx wins and a later
-                    // one that no longer fits is dropped after the block
+                    // Every other waiting RLS tx, later nonces included. Counting only earlier
+                    // ones would let txs submitted in reverse nonce order each pass against the
+                    // full balance; once a gap is filled they'd all be sealed together and all
+                    // but the first skipped without paying. The cost: a lower nonce can be
+                    // refused while a later one waits behind a gap (replace the later one).
                     rls_flavour::is_rls(t.transaction.chain_id(), chain_id)
-                        && t.transaction.nonce() < transaction.nonce()
+                        && t.transaction.nonce() != transaction.nonce()
                         // mined but not yet removed by reth's maintenance task
                         && t.transaction.nonce() >= account.nonce
                 })

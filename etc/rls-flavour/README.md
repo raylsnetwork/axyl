@@ -76,7 +76,7 @@ public dev keys. `demo/record-metamask.mjs` drives MetaMask with Playwright. The
 | Nonce | Same nonce in both flavours, either order | Second is refused: "a transaction with this nonce is waiting on the other Rayls network…" |
 | | MetaMask (see below) | Takes nonces in order across both networks and handles one network's confirmations at a time |
 | Pool | Two RLS sends that each fit but together exceed the balance | Second refused at admission |
-| | A lower nonce filled after a higher one already waits, together too much | Lower nonce admitted and mined; the higher one dropped after the block (nonce order, as execution and reth's USDr pool) |
+| | RLS txs staged in reverse nonce order behind a gap, together more than the balance | Only the first is admitted; after the gap is filled, nothing unpaid is sealed |
 | | A waiting RLS send made unpayable by an ERC-20 transfer | Dropped from the pool after the block (no stuck tx) |
 | | RLS paused (`RLS.pause()`) | RLS sends refused at the pool (and in the handler); work again after `unpause()` |
 | | Fee under the RLS base fee; sender without RLS; RLS value to a contract or a precompile (`0x0400`); RLS value in a type-4 tx | Refused |
@@ -90,7 +90,7 @@ public dev keys. `demo/record-metamask.mjs` drives MetaMask with Playwright. The
 | Tracing | `debug_traceTransaction` of an RLS-flavour tx | Same gas as the receipt (34,182) |
 | | `eth_estimateGas` vs actual (`approve`) | 34,541 vs 34,182 |
 | Tests | `cargo test --release -p rayls-execution-evm --lib` | 238 passed (218 existing + 20 new: RLS chain ids, the pause slot, `rls_gas` pricing, max-fee affordability, refusals (pause, contract/precompile recipient, type-4 value), the chain id and base fee restored for a USDr tx after an RLS one, and RLS conservation through `transact_raw` for a send, a revert, a gas refund and a failed debit) |
-| | `review-checks.sh` (review fixes on #386, all rounds) | 15/15 |
+| | `review-checks.sh` (review fixes on #386, all rounds) | 16/16 |
 
 ### Real MetaMask
 
@@ -131,8 +131,9 @@ imported.
    the node RPC; the proxy fixes receipts only. Tip suggestions are mixed too: the node's reward
    percentiles take RLS-flavour txs' tips in RLS units and USDr txs' tips in USDr units. The proxy
    passes them through unconverted (scaling them would compound 552× per round once RLS txs fill
-   blocks), so on USDr-heavy blocks MetaMask's suggested RLS tip is ~552× too small, which matters
-   once a minimum tip is set. The reverse hits USDr wallets on the plain RPC: a block of legacy RLS
+   blocks), so on USDr-heavy blocks MetaMask's suggested RLS tip is ~552× too small: with
+   `--txpool.minimum-priority-fee` set, the pool's scaled minimum would refuse those txs.
+   `eth_gasPrice` scales only the base fee and adds the same tip. The reverse hits USDr wallets on the plain RPC: a block of legacy RLS
    txs makes the suggested USDr tip ~551× the base fee, and `feeHistory.reward` is uncapped. The RLS `Transfer` logs are added to the journal
    directly, so inspector `log` hooks don't see them: `callTracer` with `withLog` shows fewer logs
    than the receipt.
@@ -156,7 +157,12 @@ imported.
    and n+1 that together overspend (`stress-test.sh` C only covers them arriving one after the
    other). The after-block re-check drops the unpayable one, but until then it can be packed and
    skipped at execution without paying. Both checks belong in the pool's insert path, or RLS
-   validation needs a per-sender lock held across validate and insert.
+   validation needs a per-sender lock held across validate and insert. Admission counts every
+   other waiting RLS tx from the sender, later nonces included. Counting only earlier ones would
+   let txs submitted in reverse nonce order each pass against the full balance and then be sealed
+   together once a gap is filled. The cost: a lower nonce can be refused while a later one waits
+   behind a gap; the user replaces the later one, or waits for it to be evicted. Reth's USDr pool
+   avoids both by re-checking every descendant on insert; the production version should do that.
 10. **RLS chain ids must stay unique.** If another chain uses a network's RLS id, a transaction a
     user signs there is also a valid RLS-flavour transaction here (same key, matching nonce) and
     moves RLS. A derived `chain_id * 10 + 1` already collided: devnet's 5031 is Somnia Mainnet. The

@@ -75,19 +75,21 @@ out=$(send_raw "$tx"); echo "   $out"
 type4=$(refused "$out"); [[ "$out" == *"EIP-7702"* ]] || type4="wrong reason: $out"
 check "RLS value in a type-4 tx is refused" "$type4" "$REFUSED"
 
-echo "== overspend is settled in nonce order: a lower nonce filled after a higher one waits is admitted"
+echo "== reverse nonce order can't stage more RLS spend than the balance covers"
 f3=$(cast wallet new --json); f3_key=$(jq -r '(.data // .)[0].private_key' <<<"$f3"); f3_addr=$(jq -r '(.data // .)[0].address' <<<"$f3")
 cast send --rpc-url "$RLS_RPC" --private-key "$USER_KEY" "$f3_addr" --value 3ether >/dev/null
-# nonce 1 first (queued behind the gap): max cost ~1 RLS value + ~1.1 RLS max gas
-later=$(cast mktx --rpc-url "$RLS_RPC" --private-key "$f3_key" "$RECIPIENT" --value 1ether --gas-limit 21000 --nonce 1)
-lh=$(send_raw "$later"); echo "   nonce 1: ${lh:0:20}…"
-# then nonce 0: fits on its own, but not together with nonce 1
-first=$(cast mktx --rpc-url "$RLS_RPC" --private-key "$f3_key" "$RECIPIENT" --value 0.5ether --gas-limit 21000 --nonce 0)
-fh=$(send_raw "$first"); echo "   nonce 0: ${fh:0:20}…"
-check "the earlier nonce is admitted though a later one waits" "$(refused "$fh")" "accepted"
+cast send --rpc-url "$NODE" --private-key "$DEV_KEY" "$f3_addr" --value 1ether >/dev/null
+# nonces 2 then 1, behind a gap at 0, each ~1.5 RLS value + ~1.1 RLS max gas: together > 3 RLS
+n2=$(send_raw "$(cast mktx --rpc-url "$RLS_RPC" --private-key "$f3_key" "$RECIPIENT" --value 1.5ether --gas-limit 21000 --nonce 2)")
+n1=$(send_raw "$(cast mktx --rpc-url "$RLS_RPC" --private-key "$f3_key" "$RECIPIENT" --value 1.5ether --gas-limit 21000 --nonce 1)")
+echo "   nonce 2: ${n2:0:20}…; nonce 1: ${n1:0:90}"
+check "the first staged RLS tx is admitted" "$(refused "$n2")" "accepted"
+check "the second, which together overspends, is refused" "$(refused "$n1")" "$REFUSED"
+# fill the gap with a cheap USDr tx: only the one admitted RLS tx can become pending
+n0=$(send_raw "$(cast mktx --rpc-url "$NODE" --private-key "$f3_key" "$RECIPIENT" --value 1 --gas-limit 21000 --nonce 0)")
 perl -e 'select(undef,undef,undef,4)'
-check "the earlier nonce is mined" "$(cast receipt "$fh" --rpc-url "$NODE" --json 2>/dev/null | jq -r .status)" "0x1"
-check "the later one, which no longer fits, is dropped after the block" "$(in_txpool "$lh")" "0"
+check "the gap-filling USDr tx is mined" "$(cast receipt "$n0" --rpc-url "$NODE" --json 2>/dev/null | jq -r .status)" "0x1"
+check "nonce 1 never entered the pool, so nothing runs after the USDr tx" "$(cast nonce "$f3_addr" --rpc-url "$NODE")" "1"
 
 echo "== RLS.pause() stops RLS-flavour transactions too (the node reads the OZ Pausable slot)"
 cast send --rpc-url "$NODE" --private-key "$DEV_KEY" "$RLS" "pause()" >/dev/null

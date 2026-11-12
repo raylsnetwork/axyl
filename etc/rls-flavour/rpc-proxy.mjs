@@ -69,8 +69,14 @@ const handlers = {
     const data = "0x70a08231" + address.slice(2).toLowerCase().padStart(64, "0");
     return hex(BigInt(await upstream("eth_call", [{ to: RLS_TOKEN, data }, tag])));
   },
+  // The node's gas price is base fee + oracle tip, and the oracle tip already holds RLS-flavour
+  // txs' tips in RLS units: scale only the base fee, or the tip compounds 552x per round.
   async eth_gasPrice() {
-    return toRls(await upstream("eth_gasPrice", []));
+    const [block, tip] = await Promise.all([
+      upstream("eth_getBlockByNumber", ["latest", false]),
+      upstream("eth_maxPriorityFeePerGas", []),
+    ]);
+    return hex(BigInt(block.baseFeePerGas) * RLS_PER_USDR + BigInt(tip));
   },
   // Tips (eth_maxPriorityFeePerGas, feeHistory.reward) pass through unconverted: the node's
   // percentiles already hold RLS-flavour txs' tips in RLS units, so scaling them by 552 would
