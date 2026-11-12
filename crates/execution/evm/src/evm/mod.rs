@@ -176,7 +176,9 @@ where
             Err(err) => return Err(EVMError::Transaction(err)),
         };
         // RLS flavour: CHAINID returns the RLS chain id, and the zero gas price needs no base fee
-        let mut chain_id = rls_flavour::rls_chain_id(self.cfg.chain_id);
+        // `rls` is only set on a Rayls network, which always has an RLS chain id
+        let mut chain_id =
+            rls_flavour::rls_chain_id(self.cfg.chain_id).unwrap_or(self.cfg.chain_id);
         let mut basefee = 0;
         if rls.is_some() {
             core::mem::swap(&mut self.cfg.chain_id, &mut chain_id);

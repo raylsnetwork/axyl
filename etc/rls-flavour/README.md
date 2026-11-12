@@ -1,7 +1,8 @@
 # RLS-flavour transactions (proof of concept)
 
-The node accepts a second chain id, the **RLS flavour** (`chain_id * 10 + 1`: 487 → 4871 locally,
-72957 → 729571 on mainnet). A transaction signed for it pays gas in RLS, and its `value` moves RLS.
+The node accepts a second chain id, the **RLS flavour**: an explicit one per network (`RLS_CHAIN_IDS`:
+487 → 4871 locally, 503 → 50301 on devnet, 7295799 → 72957991 on testnet, 72957 → 729571 on
+mainnet). A transaction signed for it pays gas in RLS, and its `value` moves RLS.
 USDr stays the only native token; a transaction signed for the chain's own id works exactly as
 today. Plain MetaMask on the RLS chain id shows RLS as the native coin, its Send button moves RLS,
 dapps see the user's own address, and nothing needs a relayer, approval or gas station.
@@ -86,7 +87,7 @@ public dev keys. `demo/record-metamask.mjs` drives MetaMask with Playwright. The
 | | Observer wiped and re-synced from genesis | All 71 non-empty blocks identical (58 with RLS txs, 157 RLS txs incl. 7 type-4, 8 mixed blocks) |
 | Tracing | `debug_traceTransaction` of an RLS-flavour tx | Same gas as the receipt (34,182) |
 | | `eth_estimateGas` vs actual (`approve`) | 34,541 vs 34,182 |
-| Tests | `cargo test --release -p rayls-execution-evm --lib` | 230 passed (218 existing + 12 new: `rls_gas` pricing and RLS conservation through `transact_raw`) |
+| Tests | `cargo test --release -p rayls-execution-evm --lib` | 232 passed (218 existing + 14 new: RLS chain ids, `rls_gas` pricing, and RLS conservation through `transact_raw` for a send, a revert, a gas refund and a failed debit) |
 | | `review-checks.sh` (review fixes on #386, all rounds) | 10/10 |
 
 ### Real MetaMask
@@ -129,12 +130,17 @@ imported.
    signatures made on the RLS chain id don't verify.
 7. **Pool ordering.** Tips in RLS units sort against tips in USDr units.
 8. **Explorer.** Blockscout and indexers must read the tx `chainId` to label RLS sends and fees.
-   chainlist must register the RLS chain id.
+   Traces don't help them: the inspector sees the transaction after `rls_gas` zeroed it, so
+   `callTracer` reports an RLS send's top frame as `value: 0x0` (and misses the RLS `Transfer`
+   logs). Explorers that build native transfers from traces will show RLS sends as 0-value calls.
 9. **Nonce guard race.** The cross-flavour nonce guard is check-then-insert. Two transactions
    validated at the same moment can both pass, so it belongs in the pool's insert path.
-10. **RLS chain id.** It's derived (`chain_id * 10 + 1`, unchecked, and it can collide with another
-    network's id). It should be a configured constant, registered on chainlist and checked at
-    startup against the chain's own id.
+10. **RLS chain ids must stay unique.** If another chain uses a network's RLS id, a transaction a
+    user signs there is also a valid RLS-flavour transaction here (same key, matching nonce) and
+    moves RLS. A derived `chain_id * 10 + 1` already collided: devnet's 5031 is Somnia Mainnet. The
+    ids are now an explicit table (`RLS_CHAIN_IDS`), each unused on chainlist on 2026-11-12, with a
+    unit test that they're unique and not on a list of known taken ids. All four must be
+    registered on chainlist before anyone relies on them; an unknown chain has no RLS flavour.
 11. **Failed transactions and indexers.** A reverted or halted RLS tx still pays its gas, and its
     `value` has already moved before execution, but a failed receipt keeps no logs, so neither
     `Transfer` is visible. Indexers that rebuild RLS balances from events drift. Fix: emit the logs

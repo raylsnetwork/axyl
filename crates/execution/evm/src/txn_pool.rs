@@ -192,7 +192,7 @@ fn rls_value_recipient_ok(
 }
 
 /// Drops waiting RLS-flavour transactions that can no longer execute: those their sender can no
-/// longer pay for (in nonce order), those whose fee cap fell under the current RLS base fee, and
+/// longer pay for (in nonce order), those whose fee cap is under the next block's RLS base fee, and
 /// those whose value recipient has gained code (a CREATE2 deploy or an EIP-7702 delegation).
 /// Reth's pool re-checks balances and fee caps after each block, but against USDr only, and an
 /// RLS transaction that fails at execution is skipped without paying and would stay pending.

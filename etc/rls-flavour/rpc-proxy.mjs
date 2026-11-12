@@ -14,7 +14,14 @@ const PORT = Number(process.env.PORT ?? 8645);
 // Must match crates/execution/evm/src/rls_flavour.rs.
 const RLS_TOKEN = "0x07e17e17e17e17e17e17e17e17e17e17e17e17ea";
 const RLS_PER_USDR = 552n;
-const rlsChainId = (chainId) => chainId * 10n + 1n;
+// RLS chain id per Rayls network (RLS_CHAIN_IDS in rls_flavour.rs). Explicit, not derived: each
+// must be unused by every other chain, or transactions signed there would replay here.
+const RLS_CHAIN_IDS = new Map([
+  [72957n, 729571n], // mainnet
+  [7295799n, 72957991n], // testnet
+  [503n, 50301n], // devnet
+  [487n, 4871n], // local
+]);
 
 const hex = (n) => "0x" + n.toString(16);
 let nextId = 1;
@@ -41,7 +48,8 @@ async function upstream(method, params) {
 }
 
 const nodeChainId = BigInt(await upstream("eth_chainId", []));
-const RLS_CHAIN_ID = rlsChainId(nodeChainId);
+const RLS_CHAIN_ID = RLS_CHAIN_IDS.get(nodeChainId);
+if (RLS_CHAIN_ID === undefined) throw new Error(`chain ${nodeChainId} is not a Rayls network with an RLS flavour`);
 
 const toRls = (usdrPerGas) => (usdrPerGas == null ? usdrPerGas : hex(BigInt(usdrPerGas) * RLS_PER_USDR));
 const withRlsBaseFee = (block) => block && { ...block, baseFeePerGas: toRls(block.baseFeePerGas) };
@@ -64,9 +72,18 @@ const handlers = {
   async eth_gasPrice() {
     return toRls(await upstream("eth_gasPrice", []));
   },
+  // Tips are suggested in RLS per gas, the unit the pool's (scaled) minimum tip uses. The node's
+  // reward percentiles still mix both flavours' tips (open item: convert by chain id in the node).
+  async eth_maxPriorityFeePerGas() {
+    return toRls(await upstream("eth_maxPriorityFeePerGas", []));
+  },
   async eth_feeHistory(params) {
     const history = await upstream("eth_feeHistory", params);
-    return { ...history, baseFeePerGas: history.baseFeePerGas.map(toRls) };
+    return {
+      ...history,
+      baseFeePerGas: history.baseFeePerGas.map(toRls),
+      reward: history.reward?.map((block) => block.map(toRls)),
+    };
   },
   async eth_getBlockByNumber(params) {
     return withRlsBaseFee(await upstream("eth_getBlockByNumber", params));

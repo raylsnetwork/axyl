@@ -28,7 +28,9 @@ add() { python3 -I -c "import sys; print(sum(int(a) for a in sys.argv[1:]))" "$@
 NODE_CHAIN=$(cast chain-id --rpc-url "$NODE")
 RLS_CHAIN=$(cast chain-id --rpc-url "$RLS_RPC")
 echo "node chain $NODE_CHAIN, RLS chain $RLS_CHAIN"
-check "RLS chain id is node chain id * 10 + 1" "$RLS_CHAIN" "$((NODE_CHAIN * 10 + 1))"
+# RLS_CHAIN_IDS in rls_flavour.rs (bash 3.2 has no associative arrays)
+case $NODE_CHAIN in 72957) want=729571 ;; 7295799) want=72957991 ;; 503) want=50301 ;; 487) want=4871 ;; *) want=none ;; esac
+check "RLS chain id is this network's entry in RLS_CHAIN_IDS" "$RLS_CHAIN" "$want"
 check "wallet sees RLS as the native balance" "$(cast balance $USER --rpc-url $RLS_RPC)" "$(rls $USER)"
 
 echo "== 1. native send of 1 RLS from an account with no USDr"

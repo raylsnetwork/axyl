@@ -1,7 +1,7 @@
 //! RLS-flavour transactions (spike).
 //!
-//! A transaction signed for [`rls_chain_id`] instead of the chain's own id runs as an "RLS
-//! flavour" transaction: gas is charged in RLS instead of native USDr, and the transaction's
+//! A transaction signed for its network's [`rls_chain_id`] instead of the chain's own id runs as an
+//! "RLS flavour" transaction: gas is charged in RLS instead of native USDr, and the transaction's
 //! `value` moves RLS instead of USDr. Inside it, CHAINID returns the RLS chain id, so EIP-712
 //! signatures made for that chain id verify.
 //!
@@ -11,7 +11,7 @@
 //! Spike constants: a production version reads the RLS gas price and the fee recipient from
 //! onchain configuration instead.
 
-use rayls_infrastructure_types::{address, Address, U256};
+use rayls_infrastructure_types::{address, Address, RaylsNetwork, U256};
 use reth_revm::primitives::{b256, keccak256, Log, LogData, B256};
 
 /// The RLS ERC-20 proxy.
@@ -30,15 +30,39 @@ const ERC20_BASE: B256 = b256!("52c63247e1f47db19d5ce0460030c497f067ca4cebf71ba9
 const TRANSFER_TOPIC: B256 =
     b256!("ddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef");
 
-/// The chain id that selects the RLS flavour on a chain with id `chain_id`.
-pub const fn rls_chain_id(chain_id: u64) -> u64 {
-    chain_id * 10 + 1
+/// The RLS chain id of each Rayls network. Each one must be unused by every other EVM chain: a
+/// transaction signed for that id elsewhere would otherwise be a valid RLS-flavour transaction
+/// here (same key, matching nonce) and move RLS. All four were unused on chainlist on 2026-11-12;
+/// they must be registered there. A derived id is not safe: `503 * 10 + 1 = 5031` is Somnia
+/// Mainnet.
+pub const RLS_CHAIN_IDS: [(RaylsNetwork, u64); 4] = [
+    (RaylsNetwork::Mainnet, 729_571),
+    (RaylsNetwork::Testnet, 72_957_991),
+    (RaylsNetwork::Devnet, 50_301),
+    (RaylsNetwork::Local, 4_871),
+];
+
+/// The chain id that selects the RLS flavour on the Rayls network with id `chain_id`, or `None`
+/// on any other chain (the RLS flavour is off there).
+pub const fn rls_chain_id(chain_id: u64) -> Option<u64> {
+    let mut i = 0;
+    while i < RLS_CHAIN_IDS.len() {
+        let (network, rls_id) = RLS_CHAIN_IDS[i];
+        if network.chain_id() == chain_id {
+            return Some(rls_id);
+        }
+        i += 1;
+    }
+    None
 }
 
 /// Whether a transaction signed with `tx_chain_id` is an RLS-flavour transaction on a chain with
 /// id `chain_id`. Pre-EIP-155 transactions (no chain id) are always the USDr flavour.
 pub const fn is_rls(tx_chain_id: Option<u64>, chain_id: u64) -> bool {
-    matches!(tx_chain_id, Some(id) if id == rls_chain_id(chain_id))
+    match (tx_chain_id, rls_chain_id(chain_id)) {
+        (Some(id), Some(rls_id)) => id == rls_id,
+        _ => false,
+    }
 }
 
 /// Precompiles (Ethereum's and Rayls' own, such as the USDr precompile at `0x0400`) all sit below
@@ -88,9 +112,24 @@ mod tests {
 
     #[test]
     fn rls_chain_id_is_distinct_and_fixed() {
-        assert_eq!(rls_chain_id(487), 4871);
-        assert_eq!(rls_chain_id(72957), 729571);
-        assert_ne!(rls_chain_id(72957), 72957);
+        assert_eq!(rls_chain_id(487), Some(4871));
+        assert_eq!(rls_chain_id(72957), Some(729571));
+        assert_eq!(rls_chain_id(7295799), Some(72957991));
+        assert_eq!(rls_chain_id(503), Some(50301));
+        // not a Rayls network: no RLS flavour
+        assert_eq!(rls_chain_id(1), None);
+        assert!(!is_rls(Some(11), 1));
+        // every RLS id is unique and is no Rayls network's own id
+        for (i, (_, rls_id)) in RLS_CHAIN_IDS.iter().enumerate() {
+            for (j, (network, other)) in RLS_CHAIN_IDS.iter().enumerate() {
+                assert_ne!(*rls_id, network.chain_id());
+                assert!(i == j || rls_id != other);
+            }
+        }
+        // ids registered by other chains on chainlist (2026-11-12) that a derived id would hit
+        for taken in [5031 /* Somnia Mainnet */, 1, 56, 137, 8453, 42161] {
+            assert!(RLS_CHAIN_IDS.iter().all(|(_, rls_id)| *rls_id != taken));
+        }
     }
 
     #[test]

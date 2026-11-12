@@ -14,7 +14,10 @@ use reth_chainspec::EthChainSpec;
 use reth_evm::EvmEnv;
 use reth_revm::{
     bytecode::Bytecode,
-    context::{result::ExecutionResult, BlockEnv, CfgEnv, TxEnv},
+    context::{
+        result::{EVMError, ExecutionResult},
+        BlockEnv, CfgEnv, TxEnv,
+    },
     context_interface::result::InvalidTransaction,
     db::{CacheDB, EmptyDBTyped},
     primitives::hardfork::SpecId,
@@ -28,6 +31,7 @@ const USDR_BASE_FEE: u64 = 48_000_000_000;
 const USER: Address = address!("70997970C51812dc3A010C7d01b50e0d17dc79C8");
 const RECIPIENT: Address = address!("3C44CdDdB6a900fa2b585dd299e03d12FA4293BC");
 const REVERTER: Address = address!("00000000000000000000000000000000000dead1");
+const CLEARER: Address = address!("00000000000000000000000000000000000dead2");
 
 fn rls_tx(max_fee: u128, tip: Option<u128>, value: U256) -> TxEnv {
     TxEnv {
@@ -38,7 +42,7 @@ fn rls_tx(max_fee: u128, tip: Option<u128>, value: U256) -> TxEnv {
         gas_limit: 21_000,
         gas_price: max_fee,
         gas_priority_fee: tip,
-        chain_id: Some(rls_flavour::rls_chain_id(CHAIN)),
+        chain_id: rls_flavour::rls_chain_id(CHAIN),
         ..Default::default()
     }
 }
@@ -100,38 +104,42 @@ fn rls_balances(state: &mut State<CacheDB<EmptyDBTyped<Infallible>>>) -> [U256; 
         .map(|owner| state.storage(RLS_TOKEN, balance_slot(owner)).expect("in-memory db"))
 }
 
-/// Runs one RLS-flavour tx through `transact_raw` and the commit step, returning the result and
-/// the RLS balances before and after.
-fn run(tx: TxEnv) -> (ExecutionResult, [U256; 4], [U256; 4]) {
+/// An in-memory chain state with the RLS token (with code, like production, so EIP-161 never
+/// clears its storage), a contract that reverts, a contract that clears storage slot 0 (set to
+/// 1), and `user_rls` RLS for [`USER`].
+fn test_state(user_rls: U256) -> State<CacheDB<EmptyDBTyped<Infallible>>> {
+    let mut db = CacheDB::new(EmptyDBTyped::<Infallible>::default());
+    let code = |bytes: &'static [u8]| AccountInfo {
+        code: Some(Bytecode::new_raw(Bytes::from_static(bytes))),
+        ..Default::default()
+    };
+    db.insert_account_info(RLS_TOKEN, code(&[0x00]));
+    // PUSH1 0 PUSH1 0 REVERT
+    db.insert_account_info(REVERTER, code(&[0x60, 0x00, 0x60, 0x00, 0xfd]));
+    // PUSH1 0 PUSH1 0 SSTORE STOP: clears slot 0, which earns a gas refund
+    db.insert_account_info(CLEARER, code(&[0x60, 0x00, 0x60, 0x00, 0x55, 0x00]));
+    db.insert_account_storage(CLEARER, U256::ZERO, U256::from(1)).unwrap();
+    db.insert_account_storage(RLS_TOKEN, balance_slot(USER), user_rls).unwrap();
+    db.insert_account_storage(RLS_TOKEN, balance_slot(RECIPIENT), U256::from(10u128.pow(21)))
+        .unwrap();
+    let mut state =
+        State::builder().with_database(db).with_bundle_update().without_state_clear().build();
+    state.set_state_clear_flag(true);
+    state
+}
+
+/// Runs `txs` in order on one EVM (as a block does), committing each result like
+/// `RaylsBlockExecutor::commit_transaction`, and returns each result or error.
+fn run_all(
+    state: &mut State<CacheDB<EmptyDBTyped<Infallible>>>,
+    txs: Vec<TxEnv>,
+) -> Vec<Result<ExecutionResult, InvalidTransaction>> {
     let chain_spec = test_chain_spec_arc();
     let _ = initialize_erc20_precompile(Erc20Precompile::new(
         Erc20TokenConfig::default(),
         ERC20_PRECOMPILE_ADDRESS,
         chain_spec.chain_id(),
     ));
-    let mut db = CacheDB::new(EmptyDBTyped::<Infallible>::default());
-    // like production, the token has code, so EIP-161 never clears its storage
-    db.insert_account_info(
-        RLS_TOKEN,
-        AccountInfo {
-            code: Some(Bytecode::new_raw(Bytes::from_static(&[0x00]))),
-            ..Default::default()
-        },
-    );
-    // PUSH1 0 PUSH1 0 REVERT
-    db.insert_account_info(
-        REVERTER,
-        AccountInfo {
-            code: Some(Bytecode::new_raw(Bytes::from_static(&[0x60, 0x00, 0x60, 0x00, 0xfd]))),
-            ..Default::default()
-        },
-    );
-    db.insert_account_storage(RLS_TOKEN, balance_slot(USER), U256::from(10u128.pow(21))).unwrap();
-    let mut state =
-        State::builder().with_database(db).with_bundle_update().without_state_clear().build();
-    state.set_state_clear_flag(true);
-    let before = rls_balances(&mut state);
-
     let mut cfg = CfgEnv::new().with_spec_and_mainnet_gas_params(SpecId::PRAGUE);
     cfg.chain_id = CHAIN;
     let env = EvmEnv::new(
@@ -139,13 +147,30 @@ fn run(tx: TxEnv) -> (ExecutionResult, [U256; 4], [U256; 4]) {
         BlockEnv { number: U256::from(1), basefee: USDR_BASE_FEE, ..Default::default() },
     );
     let chain_spec = Arc::new(RaylsChainSpec::builder(chain_spec).build());
-    let mut evm =
-        RaylsEvmFactory::new(chain_spec).create_evm_with_native_erc20_only(&mut state, env);
-    let out = evm.transact_raw(tx).expect("an RLS tx the sender can pay for executes");
-    drop(evm);
-    state.commit(out.state);
+    let mut evm = RaylsEvmFactory::new(chain_spec).create_evm_with_native_erc20_only(state, env);
+    let mut results = Vec::new();
+    for tx in txs {
+        match evm.transact_raw(tx) {
+            Ok(out) => {
+                evm.db_mut().commit(out.state);
+                results.push(Ok(out.result));
+            }
+            Err(EVMError::Transaction(err)) => results.push(Err(err)),
+            Err(err) => panic!("unexpected EVM error: {err:?}"),
+        }
+    }
+    results
+}
+
+/// Runs one RLS-flavour tx the sender can pay for, returning the result and the RLS balances
+/// before and after.
+fn run(tx: TxEnv) -> (ExecutionResult, [U256; 4], [U256; 4]) {
+    let mut state = test_state(U256::from(10u128.pow(21)));
+    let before = rls_balances(&mut state);
+    let result =
+        run_all(&mut state, vec![tx]).remove(0).expect("an RLS tx the sender can pay for executes");
     let after = rls_balances(&mut state);
-    (out.result, before, after)
+    (result, before, after)
 }
 
 fn total(balances: [U256; 4]) -> U256 {
@@ -162,7 +187,7 @@ fn successful_send_conserves_rls() {
     assert_eq!(total(before), total(after));
     let fee = U256::from(gas_used) * U256::from(base + 1);
     assert_eq!(after[0], before[0] - value - fee, "sender pays value + gas used × price");
-    assert_eq!(after[1], value, "recipient gets the value");
+    assert_eq!(after[1], before[1] + value, "recipient gets the value");
     assert_eq!(after[2], fee, "fee recipient gets the gas actually used");
     // the value and the gas each emit one Transfer
     assert_eq!(result.logs().len(), 2);
@@ -180,4 +205,49 @@ fn reverted_call_still_pays_gas_and_conserves_rls() {
     let fee = U256::from(result.gas_used()) * U256::from(base);
     assert_eq!(after[0], before[0] - fee, "unused gas is refunded");
     assert_eq!(after[2], fee);
+}
+
+#[test]
+fn gas_refund_is_paid_back_in_rls() {
+    let base = rls_flavour::rls_base_fee(USDR_BASE_FEE);
+    let mut tx = rls_tx(base, Some(0), U256::ZERO);
+    tx.kind = TxKind::Call(CLEARER);
+    tx.gas_limit = 60_000;
+    let (result, before, after) = run(tx);
+    let ExecutionResult::Success { gas_refunded, gas_used, .. } = result else {
+        panic!("clearing a slot succeeds: {result:?}");
+    };
+    assert!(gas_refunded > 0, "clearing a set slot earns a refund");
+    assert_eq!(total(before), total(after));
+    // gas_used is net of the refund; the sender pays exactly that, the rest comes back
+    let fee = U256::from(gas_used) * U256::from(base);
+    assert_eq!(after[0], before[0] - fee);
+    assert_eq!(after[2], before[2] + fee);
+}
+
+#[test]
+fn failed_rls_debit_leaves_no_trace() {
+    let base = rls_flavour::rls_base_fee(USDR_BASE_FEE);
+    // max fee 21,000 × base, plus 1 RLS of value, against 1 RLS: the debit fails
+    let mut state = test_state(U256::from(10u128.pow(18)));
+    let before = rls_balances(&mut state);
+    let unpayable = rls_tx(base, Some(0), U256::from(10u128.pow(18)));
+    // a payable tx after it, from another sender, on the same EVM: if the failed tx left journal
+    // entries behind (the nonce bump before the debit), they would be committed with this one
+    let mut next = rls_tx(base, Some(0), U256::from(5));
+    next.caller = RECIPIENT;
+    next.kind = TxKind::Call(REVERTER);
+    next.value = U256::ZERO;
+    next.gas_limit = 50_000;
+    let results = run_all(&mut state, vec![unpayable, next]);
+    assert!(
+        matches!(results[0], Err(InvalidTransaction::LackOfFundForMaxFee { .. })),
+        "{:?}",
+        results[0]
+    );
+    assert!(results[1].is_ok());
+    let after = rls_balances(&mut state);
+    assert_eq!(after[0], before[0], "the failed sender's RLS is untouched");
+    assert_eq!(state.basic(USER).unwrap().map_or(0, |a| a.nonce), 0, "its nonce is not bumped");
+    assert_eq!(total(before), total(after));
 }

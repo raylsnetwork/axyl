@@ -25,7 +25,9 @@ pause() { local seconds=$1; perl -e "select(undef,undef,undef,$seconds)"; }
 
 echo "== setup: three senders get RLS (from the RLS-only user) and USDr (from the dev account)"
 for a in "${ADDRS[@]}"; do
-  cast send --rpc-url "$RLS_RPC" --private-key "$USER_KEY" "$a" --value 50ether >/dev/null
+  # 20 waiting RLS txs reserve 21,000 gas x max fee (~2x the RLS base fee) each: ~22 RLS per
+  # sender, and the pool refuses whatever the sender's RLS can't cover
+  cast send --rpc-url "$RLS_RPC" --private-key "$USER_KEY" "$a" --value 25ether >/dev/null
   cast send --rpc-url "$NODE" --private-key "$DEV_KEY" "$a" --value 50ether >/dev/null
 done
 
@@ -42,8 +44,10 @@ for i in 0 1 2; do
   done
 done
 batch="${batch%,}]"
-accepted=$(rpc "$NODE" "$batch" | jq '[.[] | select(.result)] | length')
+replies=$(rpc "$NODE" "$batch")
+accepted=$(jq '[.[] | select(.result)] | length' <<<"$replies")
 echo "   submitted ${#hashes[@]}, pool accepted $accepted"
+jq -r '[.[] | .error.message // empty] | group_by(.) | .[] | "   refused \(length): \(.[0][0:140])"' <<<"$replies"
 pause 12
 mined=0; failed=0; blocks=()
 for h in "${hashes[@]}"; do
