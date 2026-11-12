@@ -222,6 +222,90 @@ async fn test_missing_consensus_beyond_epoch_boundary() -> eyre::Result<()> {
     Ok(())
 }
 
+/// Regression for the lost replay wakeup: a missing output the engine finishes (or has already
+/// admitted, so it drops the replayed copy as a duplicate) advances `executed_anchor` but may never
+/// tick `recently_executed_blocks` for the subscriber. Replay must complete off the anchor alone.
+#[tokio::test]
+async fn replay_completes_on_executed_anchor_without_block_tick() -> eyre::Result<()> {
+    let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+    let primary = fixture.authorities().next().unwrap();
+    let mut config = primary.consensus_config().clone();
+    let consensus_store = config.node_storage().clone();
+    let task_manager = TaskManager::new("replay-anchor-test");
+    let rx_shutdown = config.shutdown().subscribe();
+    let consensus_bus = ConsensusBus::new();
+
+    let mut replay_complete_rx = consensus_bus.execution_replay_complete().subscribe();
+
+    // Mock network.
+    let (tx, mut rx) = mpsc::channel(5);
+    tokio::spawn(async move {
+        while let Some(com) = rx.recv().await {
+            if let NetworkCommand::Publish { topic: _, msg: _, reply } = com {
+                let _ = reply.send(Ok(MessageId::new(&[0])));
+            }
+        }
+    });
+    let network = PrimaryNetworkHandle::new_for_test(tx);
+
+    // A within-epoch output (committed_at below the boundary) at round 5, so its `(epoch, round)`
+    // is strictly above the default anchor's `(0, 0)`.
+    let mut leader = Certificate::default();
+    leader.header.round = 5;
+    leader.header.created_at = 10;
+    let sub_dag = CommittedSubDag::new(vec![], leader, 0, ReputationScores::default(), None);
+    config.set_epoch_boundary(1000);
+
+    // Saved at number 1 while the SSOT `executed_anchor` is still at its default (number 0), so
+    // get_missing_consensus lists it for replay.
+    let header = ConsensusHeader {
+        parent_hash: B256::default(),
+        sub_dag,
+        number: 1,
+        extra: B256::default(),
+    };
+    let digest = header.digest();
+    consensus_store.with_write_txn(|txn| {
+        txn.insert::<ConsensusBlocks>(&header.number, &header)?;
+        txn.insert::<ConsensusBlockNumbersByDigest>(&digest, &header.number)?;
+        Ok(())
+    })?;
+
+    // Mock engine: advance the anchor to the replayed output and nothing else - no block, no
+    // `recently_executed_blocks` tick - exactly what a dropped duplicate looks like from here.
+    let (to_engine, mut from_subscriber) = mpsc::channel::<(CameFrom, ConsensusOutput)>(100);
+    let engine_bus = consensus_bus.clone();
+    tokio::spawn(async move {
+        while let Some((came_from, output)) = from_subscriber.recv().await {
+            assert_eq!(came_from, CameFrom::GetMissingConsensus);
+            engine_bus.executed_anchor().send_replace(ConsensusHeader {
+                parent_hash: output.parent_hash,
+                sub_dag: (*output.sub_dag).clone(),
+                number: output.number,
+                extra: B256::default(),
+            });
+        }
+    });
+
+    spawn_subscriber(
+        config,
+        rx_shutdown,
+        consensus_bus.clone(),
+        &task_manager,
+        network,
+        to_engine,
+        tokio::sync::watch::channel(()).0,
+    );
+
+    // Without the anchor-based wait this parks forever on a tick that never comes.
+    timeout(Duration::from_secs(10), replay_complete_rx.changed()).await.expect(
+        "replay did not complete: subscriber waited on a block tick instead of the anchor",
+    )?;
+    assert!(*replay_complete_rx.borrow());
+
+    Ok(())
+}
+
 /// Regression for the epoch-boundary leak fork: the subscriber cuts the epoch deterministically
 /// (first output reaching `epoch_boundary` = closing block, saved + broadcast; later outputs
 /// dropped), not via the drain signal. With no drain signal sent, a post-boundary output must still

@@ -881,10 +881,15 @@ impl<DB: Database> Subscriber<DB> {
         // before the last shutdown.  We need to execute it now so that everything will be
         // in sync, otherwise we could get out of order execution racing with Bullshark.
         let missing = get_missing_consensus(&self.config, &self.consensus_bus).await?;
-        // Every output now produces at least one block, so replay waits solely on
-        // recently_executed_blocks, which ticks whenever a block is produced.
-        let mut recently_executed_blocks_sub =
-            self.consensus_bus.recently_executed_blocks().subscribe();
+        // Every output produces at least one block, and the engine advances `executed_anchor` to
+        // the output once that block is in. Replay waits on the anchor, not on the
+        // `recently_executed_blocks` tick: `wait_for` reads the current value before it sleeps,
+        // so an anchor the engine advanced before this task subscribed still counts, and so does
+        // an output the engine dropped as an already-admitted duplicate, whose anchor is then
+        // already at or past it. The tick covered neither case: fired before the subscribe it
+        // was lost, and a dropped duplicate never ticked, so replay parked for good and the node
+        // stayed on its epoch with SIGTERM unanswered.
+        let mut executed_anchor_sub = self.consensus_bus.executed_anchor().subscribe();
 
         if !missing.is_empty() {
             info!(
@@ -923,15 +928,23 @@ impl<DB: Database> Subscriber<DB> {
                 break;
             }
 
+            let target = AcceptedPosition::from_sub_dag(&consensus_output.sub_dag);
             if let Err(e) = to_engine.send((CameFrom::GetMissingConsensus, consensus_output)).await
             {
                 error!(target: "subscriber", "error broadcasting consensus output for authority {:?}: {}", self.inner.authority_id, e);
                 return Err(SubscriberError::ClosedChannel("consensus_output".to_string()));
             }
-            // wait until execution advances: a block landed (recently_executed_blocks ticks),
-            // or shutdown fires, in which case we bail.
+            // wait until the engine's execution anchor reaches this output (by `(epoch, round)`,
+            // the position the engine dedups on), or shutdown fires, in which case we bail.
             tokio::select! {
-                _ = recently_executed_blocks_sub.changed() => {}
+                reached = executed_anchor_sub
+                    .wait_for(|anchor| AcceptedPosition::from_sub_dag(&anchor.sub_dag) >= target) =>
+                {
+                    if reached.is_err() {
+                        error!(target: "subscriber", "executed_anchor channel closed during replay for authority {:?}", self.inner.authority_id);
+                        return Err(SubscriberError::ClosedChannel("executed_anchor".to_string()));
+                    }
+                }
                 _ = &rx_shutdown => return Ok(()),
             }
         }
