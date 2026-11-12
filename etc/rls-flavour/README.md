@@ -199,17 +199,21 @@ imported.
     The re-check drops them only after the block, and `alt` sends the RLS back for the next round,
     so each round wastes up to `max_account_slots − 1` batch slots for one tx's gas.
     The pool can't close this; the fix is on the execution side. The batch builder must simulate
-    RLS txs before they take a slot, against the batch's own earlier txs (the drain is usually in
-    the same batch), not only the latest state; that covers every variant. Charging a skipped RLS
+    RLS txs before they take a slot, on top of every sealed batch that hasn't executed yet and the
+    current batch's earlier txs (the drain is usually there), not only the latest state; that
+    covers every variant. Charging a skipped RLS
     tx's intrinsic gas in USDr would work too, but brings back the USDr requirement for the 0-USDr
     users this flavour exists for. Bumping its nonce only stops the same tx being sealed again:
     the attacker signs new txs every round, so it bounds retries, not the DoS. Splitting the drain
     into another batch doesn't help either: the builder seals up to `MAX_SEAL_AHEAD` (4) batches
     ahead of execution and skips only in-flight txs, not their descendants, so the re-check never
     runs in between. A partial mitigation would have to hold back a sender's RLS txs while any of
-    their sealed, unexecuted txs can run code (a call to an account with code, or a create) in
-    either flavour; only plain RLS sends to accounts without code can be counted by `value`. It
-    still wouldn't cover a third party's `transferFrom`.
+    their sealed, unexecuted txs can run code in either flavour: a call to an account with code, a
+    create, any type-4 tx (a zero-value type-4 tx to the sender itself runs the delegate it just
+    installed), or a call to an account that any sealed, unexecuted type-4 tx (from anyone)
+    delegates, since that account has no code yet when the batch is sealed. Only plain sends that
+    fail all of those can be counted by `value`, and it still wouldn't cover a third party's
+    `transferFrom`. That is fragile enough that simulation is the fix to build.
 15. **Execution fallback.** The pool re-check catches the known ways an RLS tx becomes
     unexecutable. A tx that still fails the handler's checks at execution is skipped without paying
     and waits until it's dropped. Dropping it in `execute_batch` would close this generally.

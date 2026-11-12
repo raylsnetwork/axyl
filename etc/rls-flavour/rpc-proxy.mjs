@@ -16,6 +16,7 @@ const PORT = Number(process.env.PORT ?? 8645);
 const HOST = process.env.HOST ?? "127.0.0.1";
 const FORWARDED = /^(eth|net|web3)_/;
 const MAX_BODY_BYTES = 1 << 20;
+const MAX_DRAIN_BYTES = 8 << 20;
 // Must match crates/execution/evm/src/rls_flavour.rs.
 const RLS_TOKEN = "0x07e17e17e17e17e17e17e17e17e17e17e17e17ea";
 const RLS_PER_USDR = 552n;
@@ -151,15 +152,25 @@ http
       // across chunks stays intact
       const chunks = [];
       let size = 0;
+      let tooLarge = false;
       for await (const chunk of req) {
         size += chunk.length;
+        if (tooLarge) {
+          // keep draining so the 413 reaches the client (leaving the loop would reset the socket
+          // first), up to a hard limit
+          if (size > MAX_DRAIN_BYTES) return req.destroy();
+          continue;
+        }
         if (size > MAX_BODY_BYTES) {
+          tooLarge = true;
           res.statusCode = 413;
           res.setHeader("connection", "close");
-          return res.end();
+          res.end();
+          continue;
         }
         chunks.push(chunk);
       }
+      if (tooLarge) return;
       let payload;
       try {
         payload = JSON.parse(Buffer.concat(chunks).toString("utf8"));
