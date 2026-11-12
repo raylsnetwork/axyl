@@ -78,6 +78,7 @@ public dev keys. `demo/record-metamask.mjs` drives MetaMask with Playwright. The
 | Pool | Two RLS sends that each fit but together exceed the balance | Second refused at admission |
 | | A lower nonce filled after a higher one already waits, together too much | Lower nonce admitted and mined; the higher one dropped after the block (nonce order, as execution and reth's USDr pool) |
 | | A waiting RLS send made unpayable by an ERC-20 transfer | Dropped from the pool after the block (no stuck tx) |
+| | RLS paused (`RLS.pause()`) | RLS sends refused at the pool (and in the handler); work again after `unpause()` |
 | | Fee under the RLS base fee; sender without RLS; RLS value to a contract or a precompile (`0x0400`); RLS value in a type-4 tx | Refused |
 | | 21,000 gas with 2 KB of calldata (intrinsic gas) | Refused at the pool, by the same stateless checks reth runs (size, init code, gas caps, tip ≤ fee cap, min tip, 7702 auth list, intrinsic gas) |
 | | A waiting RLS tx whose fee cap falls under the RLS base fee | Dropped after the block (same task as the balance re-check) |
@@ -88,8 +89,8 @@ public dev keys. `demo/record-metamask.mjs` drives MetaMask with Playwright. The
 | | Observer wiped and re-synced from genesis | All 71 non-empty blocks identical (58 with RLS txs, 157 RLS txs incl. 7 type-4, 8 mixed blocks) |
 | Tracing | `debug_traceTransaction` of an RLS-flavour tx | Same gas as the receipt (34,182) |
 | | `eth_estimateGas` vs actual (`approve`) | 34,541 vs 34,182 |
-| Tests | `cargo test --release -p rayls-execution-evm --lib` | 233 passed (218 existing + 15 new: RLS chain ids, `rls_gas` pricing, max-fee affordability, and RLS conservation through `transact_raw` for a send, a revert, a gas refund and a failed debit) |
-| | `review-checks.sh` (review fixes on #386, all rounds) | 13/13 |
+| Tests | `cargo test --release -p rayls-execution-evm --lib` | 238 passed (218 existing + 20 new: RLS chain ids, the pause slot, `rls_gas` pricing, max-fee affordability, refusals (pause, contract/precompile recipient, type-4 value), the chain id and base fee restored for a USDr tx after an RLS one, and RLS conservation through `transact_raw` for a send, a revert, a gas refund and a failed debit) |
+| | `review-checks.sh` (review fixes on #386, all rounds) | 15/15 |
 
 ### Real MetaMask
 
@@ -113,11 +114,16 @@ imported.
 
 ## What this does not do yet
 
-1. **Fork gate.** It's active from genesis. Gate it behind a `RaylsHardFork`.
+1. **Fork gate (required).** It's active from genesis. Before this change a validator skips any
+   tx signed for an RLS chain id as invalid; after it, the tx executes. Mixed-version validators,
+   or re-executing history that contains such a tx, would diverge. Gate `rls_gas` and the pool
+   behind a `RaylsHardFork`.
 2. **Gas price inside the EVM.** BASEFEE (and GASPRICE) read 0 inside RLS-flavour txs. Divide the
    signed fee fields by the rate before revm instead, so they keep their USDr meaning.
 3. **Rate and fee recipient are constants.** Read the rate from onchain config, governance-set and
-   whole-number ≥ 1. Pay the fee to FeeAggregator / validators with the RLS split. The node
+   whole-number ≥ 1, and refuse 0 when it's set: a rate of 0 makes RLS gas free and would turn
+   the `effective_tip_per_gas(...).expect(...)` in `reth_env/execution.rs` into a consensus-path
+   panic. Pay the fee to FeeAggregator / validators with the RLS split. The node
    always credits the fixed `RLS_TOKEN`, while `RLSAccumulator.setRlsToken` can repoint the
    accumulator to another token; read the token address from the same config.
 4. **Receipts and gas suggestions.** The node's `effectiveGasPrice` for RLS txs uses the USDr base
@@ -130,8 +136,12 @@ imported.
    txs makes the suggested USDr tip ~551× the base fee, and `feeHistory.reward` is uncapped. The RLS `Transfer` logs are added to the journal
    directly, so inspector `log` hooks don't see them: `callTracer` with `withLog` shows fewer logs
    than the receipt.
-5. **Writes to RLS storage.** These bypass the token's `paused` flag and hooks. Add the
-   implementation/pause guard, and coordinate RLS upgrades with node releases.
+5. **Writes to RLS storage.** `RLS.pause()` is enforced: the handler, the pool and the after-block
+   re-check read OZ's ERC-7201 `Pausable` slot and refuse RLS-flavour txs (gas included) while it's
+   set. Before this, a native RLS send went through while RLS was paused (shown on a local
+   devnet). Still bypassed: any other logic in `RLS._update` (hooks, a future blocklist). Add an
+   implementation guard (refuse if the proxy's implementation isn't a known one), and coordinate
+   RLS upgrades with node releases.
 6. **USDr precompile (`0x0400`).** Its EIP-712 domain is fixed at node start, so USDr EIP-3009
    signatures made on the RLS chain id don't verify.
 7. **Pool ordering.** Tips in RLS units sort against tips in USDr units.

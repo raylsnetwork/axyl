@@ -146,6 +146,9 @@ type RlsSenders = Arc<Mutex<HashMap<Address, Instant>>>;
 
 /// How long a sender stays tracked with no RLS-flavour transaction in the pool. It covers the gap
 /// between validation and insertion into the pool, so a just-admitted transaction isn't missed.
+/// A sender whose insert then failed (underpriced replacement, full pool) also stays tracked this
+/// long. Untracking only runs after a block, so with no blocks the set only grows (bounded by how
+/// many funded RLS senders get validated).
 const RLS_SENDER_GRACE: Duration = Duration::from_secs(60);
 
 fn lock_senders(senders: &RlsSenders) -> std::sync::MutexGuard<'_, HashMap<Address, Instant>> {
@@ -178,7 +181,9 @@ fn rls_max_cost(transaction: &EthPooledTransaction) -> U256 {
 
 /// The RLS base fee of the next block: the USDr base fee execution will use (computed from the
 /// latest header, as `resolve_base_fee` does) times the rate. The latest header's own base fee can
-/// be up to 12.5% lower, which would let through fee caps that then fail at execution.
+/// be up to 12.5% lower, which would let through fee caps that then fail at execution. (On a chain
+/// without EIP-1559, `resolve_base_fee` uses the batch's base fee instead; every Rayls network has
+/// EIP-1559 active.)
 fn next_rls_base_fee(
     provider: &BlockchainProvider<RaylsNode>,
 ) -> reth_provider::ProviderResult<u128> {
@@ -264,6 +269,10 @@ fn drop_unexecutable_rls_txns(
     }
     let rls_base_fee = next_rls_base_fee(provider)?;
     let state = provider.latest()?;
+    // while RLS is paused, no RLS-flavour transaction can execute
+    let paused = rls_flavour::is_paused(
+        state.storage(rls_flavour::RLS_TOKEN, rls_flavour::PAUSED_SLOT.into())?.unwrap_or_default(),
+    );
     let mut unexecutable = Vec::new();
     for (sender, mut txs) in by_sender {
         txs.sort_by_key(|t| t.nonce());
@@ -276,7 +285,8 @@ fn drop_unexecutable_rls_txns(
             let with_this = spent.saturating_add(rls_max_cost(&tx.transaction));
             let recipient_ok = tx.transaction.value().is_zero()
                 || rls_value_recipient_ok(state.as_ref(), tx.transaction.to())?;
-            if with_this > balance
+            if paused
+                || with_this > balance
                 || tx.transaction.max_fee_per_gas() < rls_base_fee
                 || !recipient_ok
             {
@@ -369,6 +379,7 @@ impl RlsFlavourValidator {
         &self,
         origin: TransactionOrigin,
         mut transaction: EthPooledTransaction,
+        pool: Option<&RaylsTransactionPool>,
     ) -> TransactionValidationOutcome<EthPooledTransaction> {
         let inner = &self.inner;
         let invalid = |transaction, err: InvalidPoolTransactionError| {
@@ -411,6 +422,18 @@ impl RlsFlavourValidator {
             return invalid(transaction, err);
         }
 
+        match state.storage(rls_flavour::RLS_TOKEN, rls_flavour::PAUSED_SLOT.into()) {
+            Ok(paused) if rls_flavour::is_paused(paused.unwrap_or_default()) => {
+                return invalid(
+                    transaction,
+                    InvalidPoolTransactionError::Other(Box::new(RlsFlavourError("RLS is paused"))),
+                )
+            }
+            Ok(_) => {}
+            Err(err) => {
+                return TransactionValidationOutcome::Error(*transaction.hash(), Box::new(err))
+            }
+        }
         let slot = rls_flavour::balance_slot(*transaction.sender_ref());
         let rls_balance = match state.storage(rls_flavour::RLS_TOKEN, slot.into()) {
             Ok(balance) => balance.unwrap_or_default(),
@@ -422,7 +445,7 @@ impl RlsFlavourValidator {
         // which the pool cannot see (it follows USDr). Count them too. Check-then-insert: a
         // transaction validated at the same moment isn't waiting yet (see `validate_transaction`).
         let chain_id = inner.chain_id();
-        let waiting = self.pool.get().and_then(Weak::upgrade).map_or(U256::ZERO, |pool| {
+        let waiting = pool.map_or(U256::ZERO, |pool| {
             pool.get_transactions_by_sender(*transaction.sender_ref())
                 .iter()
                 .filter(|t| {
@@ -506,10 +529,23 @@ impl TransactionValidator for RlsFlavourValidator {
         // Both flavours share one nonce per account, and a wallet keeps a separate network entry
         // for each. A transaction waiting at this nonce in the other flavour would otherwise be
         // replaced (or this one silently dropped), so refuse with a clear error instead.
-        let other_flavour_waiting = self
-            .pool
-            .get()
-            .and_then(Weak::upgrade)
+        // Before the pool exists there is nothing waiting to check against. Once it has been set,
+        // a dead handle means the pool is being torn down: refuse rather than skip both guards.
+        let pool = match self.pool.get().map(Weak::upgrade) {
+            None => None,
+            Some(Some(pool)) => Some(pool),
+            Some(None) => {
+                warn!(target: "rayls::txpool", "transaction pool handle is gone; refusing transaction");
+                return TransactionValidationOutcome::Invalid(
+                    transaction,
+                    InvalidPoolTransactionError::Other(Box::new(RlsFlavourError(
+                        "the transaction pool is shutting down",
+                    ))),
+                );
+            }
+        };
+        let other_flavour_waiting = pool
+            .as_deref()
             .and_then(|pool| {
                 pool.get_transaction_by_sender_and_nonce(
                     *transaction.sender_ref(),
@@ -534,7 +570,7 @@ impl TransactionValidator for RlsFlavourValidator {
             );
         }
         if rls_flavour::is_rls(transaction.chain_id(), self.inner.chain_id()) {
-            return self.validate_rls(origin, transaction);
+            return self.validate_rls(origin, transaction, pool.as_deref());
         }
         self.inner.validate_transaction(origin, transaction).await
     }
@@ -557,7 +593,11 @@ pub struct WorkerTxPool {
     /// what it sealed so the next round skips it, the forwarder marks what it sent so it does not
     /// re-send before the mark is due. Handed out via [`WorkerTxPool::in_flight`].
     in_flight_tracker: InFlightTracker,
-    /// The strong handle behind the RLS-flavour validator's weak one.
+    /// The strong handle behind the RLS-flavour validator's weak one. Every clone of this
+    /// `WorkerTxPool` shares it, so it lives while any does (the node's components and the
+    /// in-flight release task hold clones). Converting to a bare [`RaylsTransactionPool`] drops
+    /// it; once every `WorkerTxPool` is gone the validator refuses transactions (and warns)
+    /// instead of skipping its pool checks.
     _rls_validator_pool: Arc<RaylsTransactionPool>,
 }
 

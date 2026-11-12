@@ -77,6 +77,19 @@ pub const fn rls_base_fee(usdr_base_fee: u64) -> u128 {
     usdr_base_fee as u128 * RLS_PER_USDR
 }
 
+/// ERC-7201 slot of `openzeppelin.storage.Pausable`: `_paused` is its first field, and
+/// `RLS.pause()` sets it (verified on a local devnet). While it's set, RLS's own `_update` reverts,
+/// so the node must not move RLS either, or a pause during an incident would not stop RLS-flavour
+/// sends.
+pub const PAUSED_SLOT: U256 = U256::from_be_bytes(
+    b256!("cd5ed15c6e187e77e9aee88184c21f4f2182ab5827cb3b7e07fbedcd63f03300").0,
+);
+
+/// Whether the value stored at [`PAUSED_SLOT`] means paused (`_paused` is a bool in the low byte).
+pub fn is_paused(paused_slot_value: U256) -> bool {
+    paused_slot_value.byte(0) != 0
+}
+
 /// Storage slot of `_balances[owner]` in the RLS contract.
 pub fn balance_slot(owner: Address) -> U256 {
     let mut preimage = [0u8; 64];
@@ -108,6 +121,18 @@ mod tests {
             b256!("bec4543cf8dffc230fdc1a0e7ebd59a8e1295dd40c8379a775cb0ce08caa64d0").0,
         );
         assert_eq!(balance_slot(admin), expected);
+    }
+
+    #[test]
+    fn paused_slot_is_the_erc7201_pausable_slot() {
+        // keccak256(abi.encode(uint256(keccak256("openzeppelin.storage.Pausable")) - 1)) & ~0xff
+        let namespace = U256::from_be_bytes(keccak256("openzeppelin.storage.Pausable").0);
+        let slot =
+            U256::from_be_bytes(keccak256((namespace - U256::from(1)).to_be_bytes::<32>()).0)
+                & !U256::from(0xff);
+        assert_eq!(slot, PAUSED_SLOT);
+        assert!(is_paused(U256::from(1)));
+        assert!(!is_paused(U256::ZERO));
     }
 
     #[test]

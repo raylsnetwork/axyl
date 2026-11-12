@@ -18,7 +18,11 @@ use reth_revm::{
         result::{EVMError, ExecutionResult},
         BlockEnv, CfgEnv, TxEnv,
     },
-    context_interface::result::InvalidTransaction,
+    context_interface::{
+        either::Either,
+        result::InvalidTransaction,
+        transaction::{Authorization, RecoveredAuthority, RecoveredAuthorization},
+    },
     db::{CacheDB, EmptyDBTyped},
     primitives::hardfork::SpecId,
     state::AccountInfo,
@@ -32,6 +36,7 @@ const USER: Address = address!("70997970C51812dc3A010C7d01b50e0d17dc79C8");
 const RECIPIENT: Address = address!("3C44CdDdB6a900fa2b585dd299e03d12FA4293BC");
 const REVERTER: Address = address!("00000000000000000000000000000000000dead1");
 const CLEARER: Address = address!("00000000000000000000000000000000000dead2");
+const USDR_SENDER: Address = address!("90F79bf6EB2c4f870365E785982E1f101E93b906");
 
 fn rls_tx(max_fee: u128, tip: Option<u128>, value: U256) -> TxEnv {
     TxEnv {
@@ -121,6 +126,10 @@ fn test_state(user_rls: U256) -> State<CacheDB<EmptyDBTyped<Infallible>>> {
     db.insert_account_info(CLEARER, code(&[0x60, 0x00, 0x60, 0x00, 0x55, 0x00]));
     db.insert_account_storage(CLEARER, U256::ZERO, U256::from(1)).unwrap();
     db.insert_account_storage(RLS_TOKEN, balance_slot(USER), user_rls).unwrap();
+    db.insert_account_info(
+        USDR_SENDER,
+        AccountInfo { balance: U256::from(10u128.pow(21)), ..Default::default() },
+    );
     db.insert_account_storage(RLS_TOKEN, balance_slot(RECIPIENT), U256::from(10u128.pow(21)))
         .unwrap();
     let mut state =
@@ -235,10 +244,9 @@ fn failed_rls_debit_leaves_no_trace() {
     let unpayable = rls_tx(base, Some(0), U256::from(10u128.pow(18)));
     // a payable tx after it, from another sender, on the same EVM: if the failed tx left journal
     // entries behind (the nonce bump before the debit), they would be committed with this one
-    let mut next = rls_tx(base, Some(0), U256::from(5));
+    let mut next = rls_tx(base, Some(0), U256::ZERO);
     next.caller = RECIPIENT;
     next.kind = TxKind::Call(REVERTER);
-    next.value = U256::ZERO;
     next.gas_limit = 50_000;
     let results = run_all(&mut state, vec![unpayable, next]);
     assert!(
@@ -274,4 +282,94 @@ fn affordability_uses_the_signed_max_fee() {
     let results = run_all(&mut state, vec![rls_tx(max_fee, Some(0), U256::ZERO)]);
     assert!(results[0].as_ref().is_ok_and(|r| r.is_success()));
     assert_eq!(rls_balances(&mut state)[0], before[0] - effective_cost);
+}
+
+/// Runs `tx` against a funded user and asserts it is refused with `reason`, leaving RLS untouched.
+fn assert_refused(mut state: State<CacheDB<EmptyDBTyped<Infallible>>>, tx: TxEnv, reason: &str) {
+    let before = rls_balances(&mut state);
+    let results = run_all(&mut state, vec![tx]);
+    assert!(
+        matches!(&results[0], Err(InvalidTransaction::Str(msg)) if msg == reason),
+        "{:?}",
+        results[0]
+    );
+    assert_eq!(rls_balances(&mut state), before);
+    assert_eq!(state.basic(USER).unwrap().map_or(0, |a| a.nonce), 0);
+}
+
+#[test]
+fn rls_value_to_a_contract_or_precompile_is_refused() {
+    let base = rls_flavour::rls_base_fee(USDR_BASE_FEE);
+    let reason = "RLS value can only go to an account without code that is not a precompile";
+    for to in [REVERTER, address!("0000000000000000000000000000000000000400")] {
+        let mut tx = rls_tx(base, Some(0), U256::from(1));
+        tx.kind = TxKind::Call(to);
+        tx.gas_limit = 50_000;
+        assert_refused(test_state(U256::from(10u128.pow(21))), tx, reason);
+    }
+}
+
+#[test]
+fn rls_value_in_a_type_4_tx_is_refused() {
+    let base = rls_flavour::rls_base_fee(USDR_BASE_FEE);
+    let mut tx = rls_tx(base, Some(0), U256::from(1));
+    tx.tx_type = 4;
+    tx.gas_limit = 60_000;
+    // the recipient delegates itself in this same tx
+    tx.authorization_list = vec![Either::Right(RecoveredAuthorization::new_unchecked(
+        Authorization {
+            chain_id: U256::from(rls_flavour::rls_chain_id(CHAIN).unwrap()),
+            address: REVERTER,
+            nonce: 0,
+        },
+        RecoveredAuthority::Valid(RECIPIENT),
+    ))];
+    assert_refused(
+        test_state(U256::from(10u128.pow(21))),
+        tx,
+        "RLS value cannot be sent in an EIP-7702 transaction",
+    );
+}
+
+#[test]
+fn paused_rls_refuses_rls_flavour_transactions() {
+    let base = rls_flavour::rls_base_fee(USDR_BASE_FEE);
+    let mut state = test_state(U256::from(10u128.pow(21)));
+    state.insert_account_with_storage(
+        RLS_TOKEN,
+        AccountInfo {
+            code: Some(Bytecode::new_raw(Bytes::from_static(&[0x00]))),
+            ..Default::default()
+        },
+        [
+            (rls_flavour::PAUSED_SLOT, U256::from(1)),
+            (balance_slot(USER), U256::from(10u128.pow(21))),
+        ]
+        .into_iter()
+        .collect(),
+    );
+    assert_refused(state, rls_tx(base, Some(0), U256::from(1)), "RLS is paused");
+}
+
+#[test]
+fn usdr_tx_after_an_rls_tx_sees_the_chain_id_and_base_fee_restored() {
+    let base = rls_flavour::rls_base_fee(USDR_BASE_FEE);
+    let mut state = test_state(U256::from(10u128.pow(21)));
+    let usdr = TxEnv {
+        tx_type: 2,
+        caller: USDR_SENDER,
+        kind: TxKind::Call(RECIPIENT),
+        value: U256::from(1),
+        gas_limit: 21_000,
+        gas_price: USDR_BASE_FEE as u128 * 2,
+        gas_priority_fee: Some(0),
+        chain_id: Some(CHAIN),
+        ..Default::default()
+    };
+    let usdr_before = state.basic(USDR_SENDER).unwrap().unwrap().balance;
+    let results = run_all(&mut state, vec![rls_tx(base, Some(0), U256::from(1)), usdr]);
+    assert!(results.iter().all(|r| r.as_ref().is_ok_and(|r| r.is_success())), "{results:?}");
+    // the USDr tx passed the chain id check (487, not 4871) and paid the USDr base fee, not 0
+    let paid = usdr_before - state.basic(USDR_SENDER).unwrap().unwrap().balance;
+    assert_eq!(paid, U256::from(21_000u128 * USDR_BASE_FEE as u128 + 1));
 }

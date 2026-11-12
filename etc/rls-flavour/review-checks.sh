@@ -89,5 +89,13 @@ perl -e 'select(undef,undef,undef,4)'
 check "the earlier nonce is mined" "$(cast receipt "$fh" --rpc-url "$NODE" --json 2>/dev/null | jq -r .status)" "0x1"
 check "the later one, which no longer fits, is dropped after the block" "$(in_txpool "$lh")" "0"
 
+echo "== RLS.pause() stops RLS-flavour transactions too (the node reads the OZ Pausable slot)"
+cast send --rpc-url "$NODE" --private-key "$DEV_KEY" "$RLS" "pause()" >/dev/null
+out=$(send_raw "$(cast mktx --rpc-url "$RLS_RPC" --private-key "$USER_KEY" "$RECIPIENT" --value 1 --gas-limit 21000 --nonce "$(cast nonce $USER --rpc-url $NODE)")"); echo "   while paused: $out"
+check "an RLS send is refused while RLS is paused" "$([[ "$out" == *"RLS is paused"* ]] && echo "$REFUSED" || echo "$out")" "$REFUSED"
+cast send --rpc-url "$NODE" --private-key "$DEV_KEY" "$RLS" "unpause()" >/dev/null
+st=$(cast send --rpc-url "$RLS_RPC" --private-key "$USER_KEY" "$RECIPIENT" --value 1 --json | jq -r .status)
+check "after unpause() RLS sends work again" "$st" "0x1"
+
 echo "== $pass passed, $fail failed"
 [[ $fail == 0 ]]

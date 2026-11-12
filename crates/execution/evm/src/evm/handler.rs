@@ -70,6 +70,15 @@ fn rls_balance<J: JournalTr>(journal: &mut J, owner: Address) -> Result<U256, Rl
     Ok(journal.sload(RLS_TOKEN, balance_slot(owner))?.data)
 }
 
+/// Whether the RLS token is paused. A paused token refuses every RLS-flavour transaction, gas
+/// included, as `RLS._update` would.
+fn rls_paused<J: JournalTr>(journal: &mut J) -> Result<bool, RlsError<J>> {
+    journal.load_account(RLS_TOKEN)?;
+    Ok(crate::rls_flavour::is_paused(
+        journal.sload(RLS_TOKEN, crate::rls_flavour::PAUSED_SLOT)?.data,
+    ))
+}
+
 /// Takes `amount` from `owner`'s RLS. A short balance makes the transaction invalid, like a short
 /// USDr balance for gas.
 fn debit_rls<J: JournalTr>(
@@ -99,7 +108,10 @@ fn credit_rls<J: JournalTr>(
     let balance = rls_balance(journal, owner)?;
     let new_balance = balance
         .checked_add(amount)
-        .ok_or_else(|| EVMError::Custom("RLS balance overflow".into()))?;
+        // an invalid transaction is skipped; a custom error would fail the whole block
+        .ok_or_else(|| {
+            EVMError::Transaction(InvalidTransaction::Str("RLS balance overflow".into()))
+        })?;
     journal.sstore(RLS_TOKEN, balance_slot(owner), new_balance)?;
     Ok(())
 }
@@ -130,6 +142,9 @@ where
 
         let Some(rls) = self.rls else { return Ok(()) };
         let (_, tx, _, journal, _, _) = evm.ctx().all_mut();
+        if rls_paused(journal)? {
+            return Err(InvalidTransaction::Str("RLS is paused".into()).into());
+        }
         let caller = tx.caller();
         let gas_limit = U256::from(tx.gas_limit());
         let upfront_gas = gas_limit * U256::from(rls.price);
