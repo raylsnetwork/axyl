@@ -192,19 +192,25 @@ http
         }
         return;
       }
+      // Bad input is answered as a JSON-RPC error, not an HTTP one, so clients can show it.
+      const rpcError = (reply) => {
+        res.setHeader("content-type", "application/json");
+        return res.end(JSON.stringify(reply));
+      };
+      const error = (id, code, message) => ({ jsonrpc: "2.0", id, error: { code, message } });
       let payload;
       try {
         payload = JSON.parse(body);
       } catch {
-        res.statusCode = 400;
-        return res.end();
+        return rpcError(error(null, -32700, "Parse error"));
       }
-      // A bad batch is a JSON-RPC error, not an HTTP one, so clients can show it (as geth does);
-      // JSON-RPC 2.0 section 6 answers an empty batch with a single Invalid Request error.
-      if (Array.isArray(payload) && (payload.length === 0 || payload.length > MAX_BATCH)) {
-        const message = payload.length === 0 ? "Invalid Request" : `batch too large (max ${MAX_BATCH})`;
-        res.setHeader("content-type", "application/json");
-        return res.end(JSON.stringify({ jsonrpc: "2.0", id: null, error: { code: -32600, message } }));
+      // JSON-RPC 2.0 section 6: an empty batch gets a single Invalid Request object
+      if (Array.isArray(payload) && payload.length === 0) {
+        return rpcError(error(null, -32600, "Invalid Request"));
+      }
+      // like geth: a one-element batch reply carrying the first call's id
+      if (Array.isArray(payload) && payload.length > MAX_BATCH) {
+        return rpcError([error(payload[0]?.id ?? null, -32600, `batch too large (max ${MAX_BATCH})`)]);
       }
       const reply = Array.isArray(payload)
         ? await mapLimit(payload, BATCH_CONCURRENCY, handle)
