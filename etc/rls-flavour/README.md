@@ -202,9 +202,12 @@ imported.
     Charging a skipped RLS tx's intrinsic gas in USDr would work too, but brings back the USDr
     requirement for the 0-USDr users this flavour exists for. Bumping its nonce only stops the same
     tx being sealed again: the attacker signs new txs every round, so it bounds retries, not the
-    DoS. A cheaper partial fix: never seal a sender's RLS txs after one of their USDr txs in the
-    same batch, so the self-drain needs two batches and the re-check catches it (not
-    `transferFrom`).
+    DoS. Splitting the drain into another batch is not enough on its own: the builder seals up
+    to `MAX_SEAL_AHEAD` (4) batches ahead of execution and skips only in-flight txs, not their
+    descendants, so the RLS txs go into the next batch while the USDr drain is still unexecuted,
+    and the re-check never runs in between. A partial mitigation would have to cover every
+    in-flight batch: don't seal a sender's RLS txs while any of their USDr txs is sealed but not
+    yet executed (one round trip of latency for mixed-flavour senders; still not `transferFrom`).
 15. **Execution fallback.** The pool re-check catches the known ways an RLS tx becomes
     unexecutable. A tx that still fails the handler's checks at execution is skipped without paying
     and waits until it's dropped. Dropping it in `execute_batch` would close this generally.

@@ -125,7 +125,8 @@ const handlers = {
 };
 
 async function handle(request) {
-  const { id, method, params = [] } = request;
+  // `null` (or a non-object batch entry) must not throw: any open webpage can POST one
+  const { id, method, params = [] } = request ?? {};
   if (!Object.hasOwn(handlers, method) && !FORWARDED.test(String(method))) {
     return { jsonrpc: "2.0", id, error: { code: -32601, message: "Method not found" } };
   }
@@ -157,8 +158,15 @@ http
       res.statusCode = 400;
       return res.end();
     }
-    const reply = Array.isArray(payload) ? await Promise.all(payload.map(handle)) : await handle(payload);
-    res.setHeader("content-type", "application/json");
-    res.end(JSON.stringify(reply));
+    try {
+      const reply = Array.isArray(payload) ? await Promise.all(payload.map(handle)) : await handle(payload);
+      res.setHeader("content-type", "application/json");
+      res.end(JSON.stringify(reply));
+    } catch (err) {
+      // never let a bad request reject the listener: an unhandled rejection exits Node
+      console.error("request failed:", err);
+      res.statusCode = 500;
+      res.end();
+    }
   })
   .listen(PORT, HOST, () => console.log(`RLS-flavour RPC on ${HOST}:${PORT} (chain ${RLS_CHAIN_ID}) -> ${UPSTREAM}`));
