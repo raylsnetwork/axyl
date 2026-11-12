@@ -86,7 +86,7 @@ public dev keys. `demo/record-metamask.mjs` drives MetaMask with Playwright. The
 | | Observer wiped and re-synced from genesis | All 71 non-empty blocks identical (58 with RLS txs, 157 RLS txs incl. 7 type-4, 8 mixed blocks) |
 | Tracing | `debug_traceTransaction` of an RLS-flavour tx | Same gas as the receipt (34,182) |
 | | `eth_estimateGas` vs actual (`approve`) | 34,541 vs 34,182 |
-| Tests | `cargo test --release -p rayls-execution-evm --lib` | 224 passed (218 existing + 6 new) |
+| Tests | `cargo test --release -p rayls-execution-evm --lib` | 230 passed (218 existing + 12 new: `rls_gas` pricing and RLS conservation through `transact_raw`) |
 | | `review-checks.sh` (review fixes on #386, all rounds) | 10/10 |
 
 ### Real MetaMask

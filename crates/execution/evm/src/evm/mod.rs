@@ -24,6 +24,8 @@ mod context;
 mod factory;
 mod handler;
 mod hardforks;
+#[cfg(test)]
+mod rls_tests;
 pub(crate) use block::*;
 pub(crate) use config::*;
 pub(crate) use context::*;

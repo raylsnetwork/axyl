@@ -159,6 +159,24 @@ fn rls_max_cost(transaction: &EthPooledTransaction) -> U256 {
         .unwrap_or(U256::MAX)
 }
 
+/// The RLS base fee of the next block: the USDr base fee execution will use (computed from the
+/// latest header, as `resolve_base_fee` does) times the rate. The latest header's own base fee can
+/// be up to 12.5% lower, which would let through fee caps that then fail at execution.
+fn next_rls_base_fee(
+    provider: &BlockchainProvider<RaylsNode>,
+) -> reth_provider::ProviderResult<u128> {
+    let usdr_base_fee = match provider.latest_header()? {
+        Some(header) => provider.chain_spec().compute_next_base_fee(
+            header.gas_used(),
+            header.gas_limit(),
+            header.base_fee_per_gas(),
+            header.number() + 1,
+        ),
+        None => MIN_PROTOCOL_BASE_FEE,
+    };
+    Ok(rls_flavour::rls_base_fee(usdr_base_fee))
+}
+
 /// Whether `to` may receive RLS value: a call (not a creation) to an account without code that is
 /// not a precompile. The handler applies the same rule at execution.
 fn rls_value_recipient_ok(
@@ -200,11 +218,7 @@ fn drop_unexecutable_rls_txns(
     if by_sender.is_empty() {
         return Ok(0);
     }
-    let usdr_base_fee = provider
-        .latest_header()?
-        .and_then(|h| h.base_fee_per_gas())
-        .unwrap_or(MIN_PROTOCOL_BASE_FEE);
-    let rls_base_fee = rls_flavour::rls_base_fee(usdr_base_fee);
+    let rls_base_fee = next_rls_base_fee(provider)?;
     let state = provider.latest()?;
     let mut unexecutable = Vec::new();
     for (sender, mut txs) in by_sender {
@@ -283,12 +297,15 @@ impl RlsFlavourValidator {
         if transaction.max_priority_fee_per_gas() > Some(transaction.max_fee_per_gas()) {
             return Err(InvalidTransactionError::TipAboveFeeCap.into());
         }
+        // the minimum is set in USDr per gas; an RLS tip is in RLS per gas
+        let minimum_rls_tip =
+            inner.minimum_priority_fee().map(|min| min.saturating_mul(rls_flavour::RLS_PER_USDR));
         if !matches!(origin, TransactionOrigin::Local)
             && transaction.is_dynamic_fee()
-            && transaction.max_priority_fee_per_gas() < *inner.minimum_priority_fee()
+            && transaction.max_priority_fee_per_gas() < minimum_rls_tip
         {
             return Err(InvalidPoolTransactionError::PriorityFeeBelowMinimum {
-                minimum_priority_fee: inner.minimum_priority_fee().unwrap_or_default(),
+                minimum_priority_fee: minimum_rls_tip.unwrap_or_default(),
             });
         }
         if transaction.ty() == EIP7702_TX_TYPE_ID {
@@ -319,15 +336,13 @@ impl RlsFlavourValidator {
         }
         // The pool ranks fees against the USDr base fee, so an RLS fee under the RLS base fee
         // would sit as executable and then fail. Refuse it here instead.
-        let usdr_base_fee = match inner.client().latest_header() {
-            Ok(header) => {
-                header.and_then(|h| h.base_fee_per_gas()).unwrap_or(MIN_PROTOCOL_BASE_FEE)
-            }
+        let rls_base_fee = match next_rls_base_fee(inner.client()) {
+            Ok(fee) => fee,
             Err(err) => {
                 return TransactionValidationOutcome::Error(*transaction.hash(), Box::new(err))
             }
         };
-        if transaction.max_fee_per_gas() < rls_flavour::rls_base_fee(usdr_base_fee) {
+        if transaction.max_fee_per_gas() < rls_base_fee {
             return invalid(transaction, InvalidTransactionError::FeeCapTooLow.into());
         }
 
