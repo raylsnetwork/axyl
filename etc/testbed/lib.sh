@@ -202,7 +202,9 @@ tps_setup() {
         # never leave an unpinned clone behind for the next run to pick up
         git -C "$TPS_CHECKER_DIR" checkout -q "$TPS_CHECKER_REF" || { rm -rf "$TPS_CHECKER_DIR"; return 1; }
     fi
-    (cd "$TPS_CHECKER_DIR" && cargo build --release -q)
+    # into the checkout's own target/, whatever CARGO_TARGET_DIR says
+    (cd "$TPS_CHECKER_DIR" && cargo build --release -q --target-dir target) || return 1
+    [[ -x $TPS_CHECKER ]] || { echo "  tps-checker built, but $TPS_CHECKER is missing (check TPS_CHECKER_BIN)" >&2; return 1; }
 }
 
 # tps-checker against this chain. Runs from the data dir so no stray .env is picked up. The gas
