@@ -173,14 +173,18 @@ new_rpc() {
     copy_genesis "$1"
 }
 
-# add and start the next rpc-N on a running chain; prints its name
+# add and start the next rpc-N on a running chain; prints its name, also when it does not start
 add_rpc() {
     local i=1
     while [[ -d $DATA/rpc-$i ]]; do i=$((i + 1)); done
     new_rpc "rpc-$i"
-    start_node "rpc-$i"
     echo "rpc-$i"
+    start_node "rpc-$i"
 }
+
+# Node lists come from the data dirs, so an added node that failed would fail every later test.
+# Stop it and keep its data as failed-<node>-<time>, out of the testbed.
+set_aside() { stop_node "$1" && mv "$DATA/$1" "$DATA/failed-$1-$(date +%s)" && log "set $1 aside in $DATA"; }
 
 # --- load (tps-checker, github.com/raylsnetwork/tps-checker, checked out next to this repo) ---
 
@@ -237,10 +241,15 @@ with_timeout() {
 
 # Fund the load wallets once. Nodes may be restarting, so fund only after a real balance read.
 fund_load() {
-    local key addr balance
+    local key addr balance t
     for key in $(load_keys | tr , ' '); do
         addr=$(cast wallet address --private-key "$key")
-        until balance=$(cast balance "$addr" --rpc-url "$(url "$(ref_node)")" 2> /dev/null); do sleep 2; done
+        balance=""
+        for ((t = 0; t < 60; t++)); do
+            balance=$(cast balance "$addr" --rpc-url "$(url "$(ref_node)")" 2> /dev/null) && break
+            sleep 2
+        done
+        [[ -n $balance ]] || fail "$(ref_node) did not answer for 2 min; is the testbed up?"
         [[ $balance != 0 ]] || tx --private-key "$ADMIN_KEY" --value 1000000ether "$addr"
     done
 }
@@ -277,7 +286,8 @@ load_loop() {
         tc=$!
         while kill -0 "$tc" 2> /dev/null; do
             sleep 10
-            [[ $(load_urls) == "$urls" ]] || kill "$tc" 2> /dev/null || true
+            # tps-checker runs as a child of the function's subshell; end both
+            [[ $(load_urls) == "$urls" ]] || { pkill -P "$tc"; kill "$tc"; } 2> /dev/null || true
         done
         wait "$tc" || true
         sleep 2
@@ -296,7 +306,6 @@ start_load() {
     log "load running (pid $LOAD_PID), see $DATA/load.log"
 }
 stop_load() { if [[ -n $LOAD_PID ]]; then kill -- -"$LOAD_PID" 2> /dev/null || true; fi; }
-# transactions landed so far from all load wallets
 # transactions landed so far from the load wallets the collision sender does not use (#11 on), so a dead
 # tps-checker cannot hide behind collision sends (with a single load wallet, that one is counted)
 load_nonce() {

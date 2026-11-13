@@ -155,7 +155,8 @@ Not covered here:
 `up` records the binary, `HTTP_ADDR`, `NODE_ARGS`, `LOG_LEVEL` and the genesis `EPOCH_SECS` in `data/env`.
 Every later command, node restarts during tests included, reuses them unless you set a value
 explicitly. So `HTTP_ADDR=0.0.0.0 ./etc/testbed/testbed.sh up` on the VM keeps restarted nodes
-reachable from outside, and a debug testbed stays on debug.
+reachable from outside, and a debug testbed stays on debug. To change them, run `down` first:
+`up` refuses new settings while nodes are running.
 
 | Variable | Default | Purpose |
 |---|---|---|
@@ -200,6 +201,10 @@ reachable from outside, and a debug testbed stays on debug.
   Afterwards it hands `target/` back to your user.
 - **One run at a time.** `data/test.lock` stops a second `test`, `down` or `clean` while a run is
   active. Killing the runner also stops its test and load.
+- **Failed additions are set aside.** If `extended` fails to bring up rpc-N, or validator-5 before
+  it is staked, the node is stopped and its data moved to `data/failed-<node>-<time>`. The rest of
+  the run then sees the network that is actually there. A validator-5 that was already staked
+  stays, because it is on-chain.
 - **Adding a test.** Drop a file into `tests/<plan>/`. Its first line is a `# description`. Each
   test runs with `set -e` and `lib.sh` loaded, using helpers such as `wait_blocks`, `wait_synced`,
   `check_consistency`, `stop_node`, `fail` and `skip`. After a failure, the runner restores the
