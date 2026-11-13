@@ -32,9 +32,11 @@ round, the time and the reason.
 
 Optional variations:
 
-- `BUILD_CONFIG=debug` on `up`, for a debug build.
-- `SOAK_VICTIMS=validator-5`, to bounce only the added validator.
-- `LOAD_TPS=1000`, for heavier load.
+```sh
+BUILD_CONFIG=debug ./etc/testbed/testbed.sh up        # debug build (on a cleaned testbed)
+LOAD=1 SOAK_MINUTES=600 SOAK_VICTIMS=validator-5 ./etc/testbed/testbed.sh test all soak   # bounce only the added validator
+LOAD=1 LOAD_TPS=1000 SOAK_MINUTES=600 ./etc/testbed/testbed.sh test all soak             # heavier load
+```
 
 In the morning:
 
@@ -90,7 +92,7 @@ Each test is one small file in `tests/<plan>/` and runs in file order.
 | | `04-transfer` | A transfer sent through each node lands, and all nodes see it |
 | | `05-restart` | Restart one validator; the chain continues and the node catches up |
 | | `06-epoch` | An epoch closes and its certified record is served |
-| chaos | `01-pause` | Freeze one validator (stands in for a partition), then resume it |
+| chaos | `01-pause` | Freeze one validator (SIGSTOP), then resume it |
 | | `02-lose-quorum` | Stop enough validators to break quorum; the chain halts, then resumes without a fork |
 | | `03-flicker` | 5 quick freeze/resume cycles |
 | | `04-rolling-restart` | Restart every validator in turn; the chain never stops |
@@ -109,6 +111,44 @@ Each test is one small file in `tests/<plan>/` and runs in file order.
 | rust | `e2e`, `chaos` | The `e2e-tests` and `chaos-framework` crates. `chaos` needs Linux and root |
 
 After `extended` adds validator-5 and rpc-3, every plan includes them.
+
+## Where the scenarios come from
+
+The testbed takes its scenarios from these scripts, which stay as they are. Paths are relative to
+the repo root.
+
+| Existing script | Testbed command | Difference |
+|---|---|---|
+| `etc/test-network/local-testnet.sh` (plain mode), `etc/test-network/start-local-validator.sh`, `etc/test-network/start-local-observer.sh`, `etc/test-network/clear-datadir.sh`, `etc/test-network/clear-validators-db.sh` | `./etc/testbed/testbed.sh up`, `start`, `stop`, `add-rpc`, `clean` | |
+| `etc/chaos-network/scripts/run-chaos.sh rapid-cycling` | `./etc/testbed/testbed.sh test chaos/06-rapid-restart` | SIGTERM, not `docker kill` |
+| `etc/chaos-network/scripts/run-chaos.sh full-restart` | `./etc/testbed/testbed.sh test chaos/05-full-restart` | `docker stop -t 3` sends SIGKILL after 3s; the testbed waits up to `STOP_TIMEOUT` |
+| `etc/chaos-network/scripts/run-chaos.sh kill-during-sync` | `./etc/testbed/testbed.sh test chaos/07-stop-during-sync` | SIGTERM, not `docker kill` |
+| `etc/test/edge-cases/net-01.sh` | `./etc/testbed/testbed.sh test chaos/01-pause` | net-01 cuts one node off the network; the testbed freezes it |
+| `etc/test/edge-cases/net-02.sh` | `./etc/testbed/testbed.sh test chaos/02-lose-quorum` | net-02 cuts a third of the nodes off; the testbed stops enough validators to lose quorum |
+| `etc/test/edge-cases/net-04.sh` | `./etc/testbed/testbed.sh test chaos/03-flicker` | net-04 cuts a quarter of the nodes off and reconnects them 5 times; the testbed freezes one node 5 times |
+| `fork_test_configs/kill.sh` | `CYCLES=10 ./etc/testbed/testbed.sh test chaos/10-restart-loop` | SIGTERM only, no SIGKILL fallback |
+| `fork_test_configs/bounce-node.sh` | `SOAK_VICTIMS=validator-5 ./etc/testbed/testbed.sh test extended soak` | |
+| `etc/test-network/stake-relay-node.sh`, `etc/validator/create-validator.sh` (staking) | `./etc/testbed/testbed.sh add-validator` | |
+| `etc/test-network/erc20_precompile_test.sh` | `./etc/testbed/testbed.sh test extended/04-erc20-precompile` | Runs the same script |
+| `etc/tps` | `./etc/testbed/testbed.sh test extended/05-tps` | tps-checker instead of `etc/tps` |
+| `crates/testing/e2e-tests`, `crates/testing/chaos-framework` | `./etc/testbed/testbed.sh test rust` | Runs the same crates |
+
+**A freeze or a stop is not a network cut.** The `net-*` scripts disconnect a running node's
+container, so the node keeps running, keeps its state, and sees the outage. A frozen node (SIGSTOP)
+runs nothing until it is resumed, and a stopped node restarts from disk. The testbed runs every node
+on one host without root, so it can't cut one off.
+
+Not covered here:
+
+- **Network cuts.** The `net-*` scripts need a docker network and a `net.env` that isn't in the
+  repo. `rust/chaos` (`test_network_partition_single_node`, Linux and root) and
+  `etc/chaos-network/scripts/run-chaos.sh partition` cut one node off. Nothing else cuts half of the
+  nodes off the way `etc/test/edge-cases/net-03.sh` does. `chaos/02-lose-quorum` takes the same 2 of
+  4 validators away, but by stopping them.
+- **Latency and packet loss.** Use `rust/chaos` or `etc/chaos-network/scripts/run-chaos.sh latency`
+  / `packet-loss`.
+- **Clock skew:** `etc/test/edge-cases/clk-01.sh`.
+- **Relay and `/dnsaddr` topologies:** `etc/test-network/local-testnet.sh --relay` / `--relay-dns`.
 
 ## Settings
 
