@@ -1,4 +1,5 @@
 # A late rpc node joins the running chain, syncs from genesis, relays a transfer and survives a restart.
+trap '[[ $? == 0 || -z $n ]] || set_aside "$n"' EXIT
 n=$(add_rpc)
 wait_synced "$n"
 has_role "$n" observer || fail "$n is $(role "$n"), want observer"
