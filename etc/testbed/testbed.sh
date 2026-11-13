@@ -68,24 +68,31 @@ stop_test() {
 
 # create the lock atomically (noclobber), replacing it only if its runner is gone
 lock() {
+    local p
     until (set -C; echo $$ > "$DATA/test.lock") 2> /dev/null; do
         not_busy
-        rm -f "$DATA/test.lock"
+        # remove it only while it still holds the dead runner's pid: another runner may have just taken it
+        p=$(cat "$DATA/test.lock" 2> /dev/null) || continue
+        kill -0 "$p" 2> /dev/null || [[ $(cat "$DATA/test.lock" 2> /dev/null) != "$p" ]] || rm -f "$DATA/test.lock"
     done
 }
 
-# record what this testbed runs with, for lib.sh to reuse; the epoch length is the one fixed at genesis
-save_env() {
+# what this testbed runs with, saved to data/env for lib.sh to reuse; the epoch length is the one fixed at genesis
+env_file() {
     local v
-    {
-        printf '[[ -n $RAYLS_BIN$BUILD_CONFIG ]] || REMEMBERED_BIN=%q\n' "$BIN"
-        for v in HTTP_ADDR NODE_ARGS LOG_LEVEL; do printf '[[ -n ${%s+x} ]] || %s=%q\n' "$v" "$v" "${!v}"; done
-        printf 'SAVED_EPOCH_SECS=%q\n[[ -n ${EPOCH_SECS+x} ]] || EPOCH_SECS=$SAVED_EPOCH_SECS\n' "${SAVED_EPOCH_SECS:-$EPOCH_SECS}"
-    } > "$DATA/env"
+    printf '[[ -n $RAYLS_BIN$BUILD_CONFIG ]] || REMEMBERED_BIN=%q\n' "$BIN"
+    for v in HTTP_ADDR NODE_ARGS LOG_LEVEL; do printf '[[ -n ${%s+x} ]] || %s=%q\n' "$v" "$v" "${!v}"; done
+    printf 'SAVED_EPOCH_SECS=%q\n[[ -n ${EPOCH_SECS+x} ]] || EPOCH_SECS=$SAVED_EPOCH_SECS\n' "${SAVED_EPOCH_SECS:-$EPOCH_SECS}"
 }
 
 up() {
+    local env
     command -v cast > /dev/null || die "Foundry 'cast' is required (https://getfoundry.sh)"
+    # running nodes keep their settings, so changing them now would mix old and new nodes
+    env=$(env_file)
+    if [[ -f $DATA/env && $(< "$DATA/env") != "$env" && -n $(running_nodes) ]]; then
+        die "nodes are running with other settings; run '$0 down' first, then up again"
+    fi
     if [[ -z $RAYLS_BIN && $BIN == "$ROOT"/target/*/rayls-network ]]; then
         # build the profile this testbed runs (target/<profile>); cargo calls the debug profile "dev"
         local profile
@@ -95,7 +102,7 @@ up() {
     fi
     [[ -x $BIN ]] || die "binary not found: $BIN"
     [[ -f $DATA/genesis/genesis.yaml ]] || genesis
-    save_env
+    echo "$env" > "$DATA/env"
     start_all
     wait_for 120 "the first block" at_height validator-1 1
     status
@@ -131,7 +138,8 @@ run_tests() {
     done
     [[ -f $DATA/genesis/genesis.yaml ]] || die "no testbed in $DATA, start one with: $0 up"
     lock
-    trap 'stop_test; stop_load; rm -f "$DATA/test.lock"' EXIT
+    # the load first, since it needs nothing else; then a second Ctrl-C must not cut the restore short
+    trap 'stop_load; trap : INT TERM HUP; stop_test; rm -f "$DATA/test.lock"' EXIT
     trap 'exit 130' INT TERM HUP
     if [[ $LOAD == 1 ]]; then start_load; fi
     for f in "${files[@]}"; do
