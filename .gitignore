@@ -28,6 +28,8 @@ etc/manage/config/accounts.yaml
 etc/manage/config/rls-accounts.yaml
 etc/test-network/accounts.yaml
 etc/test-network/rls-accounts.yaml
+etc/testbed/data
+etc/testbed/*.log
 local-validator
 etc/validator/validator-bundle.tar.gz
 node_modules

@@ -1,0 +1,211 @@
+#!/usr/bin/env bash
+# Local Rayls testbed: a 4-validator network as native processes, plus test plans. See README.md.
+set -eo pipefail
+source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
+
+usage() {
+    cat << EOF
+usage: $0 <command>
+
+  up                      build, run genesis (first time only) and start all nodes
+  down                    stop all nodes with SIGTERM (keeps data)
+  clean                   stop all nodes and delete $DATA
+  status                  show every node's pid, rpc, block, epoch and role
+  start|stop|pause|resume <node>
+                          control one node: 1..5 (validator-N) or rpc-N
+  add-validator           add validator-5 and stake it into the committee
+  add-rpc                 add another rpc (observer) node to the running chain
+  logs <node>             follow a node's log
+  load                    send a steady stream of tps-checker transfers until Ctrl-C
+  test [plan|plan/test]   run tests (default: basic). Plans: $(ls "$TESTBED/tests" | tr '\n' ' ')
+                          'all' = basic chaos extended basic chaos; LOAD=1 runs them under load
+
+settings (env): BUILD_CONFIG ($BUILD_CONFIG), RAYLS_BIN, TESTBED_DATA, RPC_NODES (2), EPOCH_SECS ($EPOCH_SECS),
+                HTTP_ADDR ($HTTP_ADDR), SOAK_VICTIMS,
+                LOG_LEVEL ($LOG_LEVEL), NODE_ARGS, GENESIS_ARGS, LOAD_TPS, LOAD_WALLETS,
+                COLLIDE_SECS, LOAD_CYCLE_SECS, TPS_CHECKER_DIR, TPS_CHECKER_BIN, SOAK_MINUTES,
+                SOAK_INTERVAL, STOP_TIMEOUT
+EOF
+    exit 1
+}
+
+die() { echo "error: $*" >&2; exit 1; }
+
+node_name() { if [[ $1 =~ ^[0-9]+$ ]]; then echo "validator-$1"; else echo "$1"; fi; }
+
+# one test run at a time: test.lock holds the runner's pid
+not_busy() {
+    local p
+    if p=$(cat "$DATA/test.lock" 2> /dev/null) && kill -0 "$p" 2> /dev/null; then
+        die "test run $p is using this testbed; stop it first"
+    fi
+}
+
+# bring back every node that was running before the current test, if the test left it paused or stopped
+restore_nodes() {
+    local n
+    for n in $BEFORE; do
+        # a stop the test had already started is waited out, or start_node would see it still running
+        if [[ -f $DATA/$n.stopping ]]; then
+            wait_exit "$(pid "$n")" "${STOP_TIMEOUT:-120}" || true
+            rm -f "$DATA/$n.stopping"
+        fi
+        resume_node "$n"
+        # one node that cannot start must not stop the others from being restored
+        start_node "$n" || true
+    done
+}
+
+# stop the running test's whole process group, let its own EXIT trap (e.g. stop_load) finish, and
+# restore the nodes it may have left down, so an interrupted run does not leave a broken network
+stop_test() {
+    if [[ -n $TEST_PID ]]; then
+        kill -TERM -- -"$TEST_PID" 2> /dev/null || true
+        wait "$TEST_PID" 2> /dev/null || true
+        restore_nodes
+    fi
+}
+
+# create the lock atomically (noclobber), replacing it only if its runner is gone
+lock() {
+    local p
+    until (set -C; echo $$ > "$DATA/test.lock") 2> /dev/null; do
+        not_busy
+        # remove it only while it still holds the dead runner's pid: another runner may have just taken it
+        p=$(cat "$DATA/test.lock" 2> /dev/null) || continue
+        kill -0 "$p" 2> /dev/null || [[ $(cat "$DATA/test.lock" 2> /dev/null) != "$p" ]] || rm -f "$DATA/test.lock"
+    done
+}
+
+# what this testbed runs with, saved to data/env for lib.sh to reuse; the epoch length is the one fixed at genesis
+env_file() {
+    local v
+    printf '[[ -n $RAYLS_BIN$BUILD_CONFIG ]] || REMEMBERED_BIN=%q\n' "$BIN"
+    for v in HTTP_ADDR NODE_ARGS LOG_LEVEL; do printf '[[ -n ${%s+x} ]] || %s=%q\n' "$v" "$v" "${!v}"; done
+    printf 'SAVED_EPOCH_SECS=%q\n[[ -n ${EPOCH_SECS+x} ]] || EPOCH_SECS=$SAVED_EPOCH_SECS\n' "${SAVED_EPOCH_SECS:-$EPOCH_SECS}"
+}
+
+up() {
+    local env
+    command -v cast > /dev/null || die "Foundry 'cast' is required (https://getfoundry.sh)"
+    # running nodes keep their settings, so changing them now would mix old and new nodes
+    env=$(env_file)
+    if [[ -f $DATA/env && $(< "$DATA/env") != "$env" && -n $(running_nodes) ]]; then
+        die "nodes are running with other settings; run '$0 down' first, then up again"
+    fi
+    if [[ -z $RAYLS_BIN && $BIN == "$ROOT"/target/*/rayls-network ]]; then
+        # build the profile this testbed runs (target/<profile>); cargo calls the debug profile "dev"
+        local profile
+        profile=$(basename "$(dirname "$BIN")")
+        [[ $profile != debug ]] || profile=dev
+        (cd "$ROOT" && cargo build -p rayls-network --bin rayls-network --profile "$profile")
+    fi
+    [[ -x $BIN ]] || die "binary not found: $BIN"
+    [[ -f $DATA/genesis/genesis.yaml ]] || genesis
+    echo "$env" > "$DATA/env"
+    start_all
+    wait_for 120 "the first block" at_height validator-1 1
+    status
+}
+
+status() {
+    local n f='%-12s %-7s %-23s %-7s %-6s %s\n'
+    printf "$f" NODE PID RPC BLOCK EPOCH ROLE
+    for n in $(nodes); do
+        if running "$n"; then
+            printf "$f" "$n" "$(pid "$n")" "$(url "$n")" "$(height "$n" || echo -)" "$(epoch "$n" || echo -)" "$(role "$n" || echo -)"
+        else
+            printf "$f" "$n" down "$(url "$n")" - - -
+        fi
+    done
+}
+
+run_tests() {
+    local plans=() files=() f p n name rc t0 passed=0 skipped=0 failed=()
+    [[ $# -gt 0 ]] || set -- basic
+    # all = basic + chaos, extended (adds validator-5 and another rpc node), then basic + chaos again with them
+    for p in "$@"; do
+        if [[ $p == all ]]; then plans+=(basic chaos extended basic chaos); else plans+=("$p"); fi
+    done
+    for p in "${plans[@]}"; do
+        if [[ -d $TESTBED/tests/$p ]]; then
+            files+=("$TESTBED/tests/$p"/*.sh)
+        elif [[ -f $TESTBED/tests/$p.sh ]]; then
+            files+=("$TESTBED/tests/$p.sh")
+        else
+            die "unknown plan or test: $p"
+        fi
+    done
+    [[ -f $DATA/genesis/genesis.yaml ]] || die "no testbed in $DATA, start one with: $0 up"
+    lock
+    # the load first, since it needs nothing else; then a second Ctrl-C must not cut the restore short
+    trap 'stop_load; trap : INT TERM HUP; stop_test; rm -f "$DATA/test.lock"' EXIT
+    trap 'exit 130' INT TERM HUP
+    if [[ $LOAD == 1 ]]; then start_load; fi
+    for f in "${files[@]}"; do
+        name=${f#"$TESTBED/tests/"}
+        name=${name%.sh}
+        echo "=== $name: $(sed -n 's/^# //p;q' "$f")"
+        BEFORE=$(running_nodes)
+        t0=$SECONDS
+        rc=0
+        # own process group, so stopping the runner (Ctrl-C or kill <pid>) also stops the running test
+        set -m
+        bash -c 'set -eo pipefail; trap "exit 143" INT TERM; source "$1"; source "$2"' _ "$TESTBED/lib.sh" "$f" &
+        TEST_PID=$!
+        set +m
+        wait "$TEST_PID" || rc=$?
+        TEST_PID=""
+        case $rc in
+            0) passed=$((passed + 1)); echo "--- PASS $name ($((SECONDS - t0))s)" ;;
+            77) skipped=$((skipped + 1)); echo "--- SKIP $name" ;;
+            *)
+                failed+=("$name")
+                echo "--- FAIL $name ($((SECONDS - t0))s)"
+                # bring back whatever the test left paused or stopped, and let it catch up before the next test
+                restore_nodes
+                for n in $BEFORE; do (wait_synced "$n") || echo "  recovery: $n did not catch up" >&2; done
+                ;;
+        esac
+    done
+    echo
+    echo "passed: $passed  skipped: $skipped  failed: ${#failed[@]} ${failed[*]}"
+    [[ ${#failed[@]} -eq 0 ]]
+}
+
+case "$1" in
+    up) up ;;
+    down) not_busy; stop_all ;;
+    clean)
+        not_busy
+        [[ ! -e $DATA || -d $DATA/genesis ]] || die "$DATA does not look like a testbed, refusing to delete it"
+        stop_all
+        rm -rf "$DATA"
+        ;;
+    status) status ;;
+    start | stop | pause | resume)
+        [[ -n $2 ]] || usage
+        n=$(node_name "$2")
+        [[ -d $DATA/$n ]] || die "no node $n in $DATA (validator-5 and extra rpc nodes come from add-validator / add-rpc)"
+        "$1_node" "$n"
+        ;;
+    add-validator)
+        add_validator
+        echo "validator-5 staked; it joins the committee within a few epochs"
+        ;;
+    add-rpc)
+        n=$(add_rpc)
+        echo "$n started at $(url "$n")"
+        ;;
+    logs) tail -f "$DATA/$(node_name "${2:?node}").log" ;;
+    load)
+        # same machinery as LOAD=1, so Ctrl-C stops the whole load (tps-checker and the collision sender)
+        trap stop_load EXIT
+        trap 'exit 130' INT TERM HUP
+        start_load
+        echo "load going through the rpc nodes ($(load_urls)); Ctrl-C to stop"
+        wait "$LOAD_PID"
+        ;;
+    test) shift; run_tests "$@" ;;
+    *) usage ;;
+esac
