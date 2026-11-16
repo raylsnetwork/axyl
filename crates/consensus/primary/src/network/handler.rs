@@ -199,11 +199,15 @@ where
     /// Check and claim in one step, since every gossip message runs on its own task.
     fn claim_epoch_vote(&self, epoch: Epoch, signer: BlsPublicKey) -> bool {
         let mut seen = self.epoch_votes_seen.lock();
-        let first = seen.entry(epoch).or_default().insert(signer);
-        while seen.len() > EPOCH_VOTES_SEEN_EPOCHS {
+        if seen.len() >= EPOCH_VOTES_SEEN_EPOCHS && !seen.contains_key(&epoch) {
+            // Only the newest epochs are tracked. A vote for one older than all of them is
+            // admitted without dedup rather than claimed and forgotten in the same call.
+            if seen.first_key_value().is_some_and(|(oldest, _)| epoch < *oldest) {
+                return true;
+            }
             seen.pop_first();
         }
-        first
+        seen.entry(epoch).or_default().insert(signer)
     }
 
     /// Give back the admission claimed by [`Self::claim_epoch_vote`]: the queue refused the

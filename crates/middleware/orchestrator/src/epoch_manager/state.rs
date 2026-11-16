@@ -249,7 +249,10 @@ where
         self.consensus_db
             .save_pending_epoch_record(&epoch_rec)
             .map_err(|e| eyre!("failed to persist pending epoch record for epoch {epoch}: {e}"))?;
-        // The gossip handler admits votes against its cached view of the pending table.
+        // The gossip handler admits votes against its cached view of the pending table. This
+        // runs after the closing epoch's network has been torn down and before the next one is
+        // built, so the next handler finds the row on its first read; the bump is for a handler
+        // that is alive while a row is written, which none is today.
         self.consensus_bus.pending_epoch_records_changed().send_modify(|version| *version += 1);
         self.epoch_record = Some(epoch_rec);
         Ok(())

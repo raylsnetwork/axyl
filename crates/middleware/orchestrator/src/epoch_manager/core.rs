@@ -1482,13 +1482,20 @@ where
                         }
                         timeouts += 1;
 
-                        // Still short of quorum after the first 5 s: the votes may have gone
-                        // by before this node had its record (it closed late, and peers that
-                        // certified do not republish). Wake the epoch record collector now, so
-                        // a late node has the certificate from a peer within seconds instead
-                        // of after the whole fallback schedule.
+                        // Not one peer vote counted in the first 5 s: the votes went by before
+                        // this node had its record (it closed late, and peers that certified
+                        // do not republish). Wake the epoch record collector now, so a late
+                        // node has the certificate from a peer within seconds instead of after
+                        // the whole fallback schedule. A record with some votes in is a slow
+                        // close, not a missed one: it keeps collecting, since the wake would
+                        // start the collector's retry loop on every member at once while no
+                        // peer has a certificate to serve yet.
                         if timeouts == 1 {
-                            for state in states.iter().filter(|s| !s.done) {
+                            let missed = |s: &PendingCertification| {
+                                !s.done
+                                    && s.signed_authorities.len() <= u64::from(s.my_vote.is_some())
+                            };
+                            for state in states.iter().filter(|s| missed(s)) {
                                 let epoch = state.record.epoch;
                                 consensus_bus.requested_missing_epoch().send_if_modified(
                                     |current| {
