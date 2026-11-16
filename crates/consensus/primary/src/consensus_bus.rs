@@ -209,6 +209,9 @@ struct ConsensusBusAppInner {
     /// An epoch we need an epoch record for.
     tx_requested_missing_epoch: watch::Sender<Epoch>,
 
+    /// Changes after the epoch record collector finishes a pass that may have stored records.
+    tx_epoch_records_collected: watch::Sender<()>,
+
     /// Signals a new round
     tx_primary_round_updates: watch::Sender<Round>,
 
@@ -286,6 +289,7 @@ impl ConsensusBusAppInner {
         let (tx_committed_round_updates, _) = watch::channel(Round::default());
         let (tx_gc_round_updates, _) = watch::channel(Round::default());
         let (tx_requested_missing_epoch, _) = watch::channel(Epoch::default());
+        let (tx_epoch_records_collected, _) = watch::channel(());
         let (tx_primary_round_updates, _) = watch::channel(0u32);
         let (tx_last_consensus_header, _) = watch::channel(ConsensusHeader::default());
         let (tx_last_published_consensus_num_hash, _) = watch::channel((0, BlockHash::default()));
@@ -309,6 +313,7 @@ impl ConsensusBusAppInner {
             tx_committed_round_updates,
             tx_gc_round_updates,
             tx_requested_missing_epoch,
+            tx_epoch_records_collected,
             tx_primary_round_updates,
             tx_recently_executed_blocks,
             tx_executed_anchor,
@@ -570,6 +575,12 @@ impl ConsensusBus {
     /// Contains the last requested epoch to retrieve a record.
     pub fn requested_missing_epoch(&self) -> &watch::Sender<Epoch> {
         &self.inner_app.tx_requested_missing_epoch
+    }
+
+    /// Changes after the epoch record collector finishes a pass that may have stored records. It
+    /// carries no data: a receiver reads the record table again to see what is there.
+    pub fn epoch_records_collected(&self) -> &watch::Sender<()> {
+        &self.inner_app.tx_epoch_records_collected
     }
 
     /// Signals a new round
