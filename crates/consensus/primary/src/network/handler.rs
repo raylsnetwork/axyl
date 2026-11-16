@@ -126,6 +126,11 @@ pub(crate) struct RequestHandler<DB> {
 /// for any other digest, which is what a flood of invented digests is, costs one map lookup.
 /// Certification removes a row without bumping the counter, so a hit is confirmed against the
 /// certified records before it is trusted; hits are bounded by the dedup, so that is cheap.
+///
+/// Today the counter moves only between handlers: the row for a close is written after the
+/// epoch's network has been torn down and before the next one starts, so each handler reads
+/// the table once, on its first vote. The counter is the guard for a writer that one day runs
+/// while a handler is alive, not something a reader should expect to see move.
 #[derive(Debug, Default)]
 struct PendingRecordCache {
     /// Value of `pending_epoch_records_changed` the map was read at.
@@ -486,13 +491,12 @@ where
                     debug!(target: "primary", signer = ?author, epoch, "dropping a repeated epoch vote");
                     return Ok(());
                 }
-                ensure!(
-                    vote.check_signature(),
-                    PrimaryNetworkError::InvalidHeader(HeaderError::PeerNotAuthor)
-                );
                 // The cache can lag certification (the row is removed without bumping the
                 // counter), so a hit is confirmed against the certified records, by epoch: the
                 // record certified for it may be another node's, not the one voted for here.
+                // Checked after the claim, so it runs once per signer and epoch, and before the
+                // signature, so a node that is already done pays no verify for the republishes
+                // of members still collecting.
                 if self
                     .consensus_config
                     .node_storage()
@@ -502,6 +506,10 @@ where
                     debug!(target: "primary", signer = ?author, epoch, "dropping epoch vote for an epoch certified since the table was read");
                     return Ok(());
                 }
+                ensure!(
+                    vote.check_signature(),
+                    PrimaryNetworkError::InvalidHeader(HeaderError::PeerNotAuthor)
+                );
                 match self.consensus_bus.new_epoch_votes().try_send(*vote) {
                     Ok(()) => {}
                     // bounded by committee x pending epochs, so this is a bug, not load

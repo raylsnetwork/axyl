@@ -1095,10 +1095,16 @@ where
     /// Whether `state`'s epoch is certified on disk by now, by the epoch record collector or a
     /// peer's certificate landing in the background. Says so, and warns when the certified
     /// record is not the one this node built: the one sign of a diverged close.
-    fn certification_landed(consensus_db: &DB, state: &PendingCertification, when: &str) -> bool {
+    fn certification_landed(
+        consensus_db: &DB,
+        consensus_bus: &ConsensusBus,
+        state: &PendingCertification,
+        when: &str,
+    ) -> bool {
         let Some((record, Some(_))) = consensus_db.get_epoch_by_number(state.record.epoch) else {
             return false;
         };
+        consensus_bus.consensus_metrics().epoch_certified_by_fetch.inc();
         if record.digest() == state.epoch_hash {
             info!(
                 target: "epoch-manager",
@@ -1122,7 +1128,11 @@ where
     /// Aggregate and save the certificate for a record that reached quorum. `false` means the
     /// signatures did not aggregate or verify, or the write failed; the record stays pending and
     /// is retried.
-    fn persist_certificate(consensus_db: &DB, state: &PendingCertification) -> bool {
+    fn persist_certificate(
+        consensus_db: &DB,
+        consensus_bus: &ConsensusBus,
+        state: &PendingCertification,
+    ) -> bool {
         let epoch_hash = state.epoch_hash;
         let Some(cert) = state.certificate() else {
             error!(
@@ -1138,6 +1148,7 @@ where
                     epoch = state.record.epoch,
                     "reached quorum on epoch close for {epoch_hash}",
                 );
+                consensus_bus.consensus_metrics().epoch_certified_by_quorum.inc();
                 true
             }
             Err(err) => {
@@ -1223,6 +1234,7 @@ where
                         %epoch_hash,
                         "pending epoch certified from a peer's certificate; no vote collection needed"
                     );
+                    self.consensus_bus.consensus_metrics().epoch_certified_by_fetch.inc();
                     continue;
                 }
             }
@@ -1346,7 +1358,9 @@ where
         loop {
             // Certified by someone else while we were backing off (a peer's backfill/fetch, or a
             // previous attempt's peer fetch landing late): nothing left to do for those.
-            states.retain(|s| !Self::certification_landed(&consensus_db, s, "before collecting"));
+            states.retain(|s| {
+                !Self::certification_landed(&consensus_db, &consensus_bus, s, "before collecting")
+            });
             forget_certified_attempts(&certification_attempts, &certified);
             if states.is_empty() {
                 return;
@@ -1449,7 +1463,8 @@ where
                         // Persist the moment quorum is reached: a 2f+1 cert is a valid cert,
                         // and waiting for stragglers would hold this record's cert hostage to
                         // the slowest of the others.
-                        if state.reached_quorum() && Self::persist_certificate(&consensus_db, state)
+                        if state.reached_quorum()
+                            && Self::persist_certificate(&consensus_db, &consensus_bus, state)
                         {
                             state.done = true;
                         }
@@ -1493,6 +1508,7 @@ where
                         for state in states.iter_mut().filter(|s| !s.done) {
                             if Self::certification_landed(
                                 &consensus_db,
+                                &consensus_bus,
                                 state,
                                 "during vote collection",
                             ) {
@@ -1532,12 +1548,17 @@ where
             let mut remaining = Vec::with_capacity(states.len());
             for state in states.drain(..) {
                 if state.done
-                    || Self::certification_landed(&consensus_db, &state, "after the collection")
+                    || Self::certification_landed(
+                        &consensus_db,
+                        &consensus_bus,
+                        &state,
+                        "after the collection",
+                    )
                 {
                     continue;
                 }
                 if state.reached_quorum() {
-                    if Self::persist_certificate(&consensus_db, &state) {
+                    if Self::persist_certificate(&consensus_db, &consensus_bus, &state) {
                         continue;
                     }
                     // Keep it: the signatures stay counted and the write is retried next round.
@@ -1575,7 +1596,12 @@ where
             'retry: loop {
                 attempts += 1;
                 states.retain(|s| {
-                    !Self::certification_landed(&consensus_db, s, "while retrying the fetch")
+                    !Self::certification_landed(
+                        &consensus_db,
+                        &consensus_bus,
+                        s,
+                        "while retrying the fetch",
+                    )
                 });
                 if states.is_empty() {
                     return;
