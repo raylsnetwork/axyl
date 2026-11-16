@@ -1401,6 +1401,10 @@ where
             // check at the top of the loop keeps queued votes from doing the same.
             let mut next_fallback = tokio::time::Instant::now() + timeout;
             let mut timeouts = 0;
+            // Votes counted per record at the previous fallback, to tell a close that is still
+            // receiving votes from one whose votes have stopped coming.
+            let mut counted_at_last_fallback: Vec<u64> =
+                states.iter().map(|s| s.signed_authorities.len()).collect();
             loop {
                 // With votes in hand, the shutdown notice and then the fallback deadline are
                 // checked before each one: the transition must not wait behind a backlog, and
@@ -1482,32 +1486,35 @@ where
                         }
                         timeouts += 1;
 
-                        // Not one peer vote counted in the first 5 s: the votes went by before
-                        // this node had its record (it closed late, and peers that certified
-                        // do not republish). Wake the epoch record collector now, so a late
-                        // node has the certificate from a peer within seconds instead of after
-                        // the whole fallback schedule. A record with some votes in is a slow
-                        // close, not a missed one: it keeps collecting, since the wake would
-                        // start the collector's retry loop on every member at once while no
-                        // peer has a certificate to serve yet.
-                        if timeouts == 1 {
-                            let missed = |s: &PendingCertification| {
-                                !s.done
-                                    && s.signed_authorities.len() <= u64::from(s.my_vote.is_some())
-                            };
-                            for state in states.iter().filter(|s| missed(s)) {
-                                let epoch = state.record.epoch;
-                                consensus_bus.requested_missing_epoch().send_if_modified(
-                                    |current| {
-                                        if epoch > *current {
-                                            *current = epoch;
-                                            true
-                                        } else {
-                                            false
-                                        }
-                                    },
-                                );
+                        // No vote counted since the previous fallback: the votes this record
+                        // still needs went by before this node had its record (it closed after
+                        // those peers, and a peer that certified does not republish). Wake the
+                        // epoch record collector now, so the certificate comes from a peer
+                        // within seconds instead of after the whole fallback schedule. A record
+                        // whose count moved in the last 5 s is a slow close, not a missed one:
+                        // it keeps collecting, since the wake would start the collector's retry
+                        // loop on every member at once while no peer has a certificate yet.
+                        // A node that missed every vote wakes at the first fallback, one that
+                        // closed in the middle of the order and got only the later ones at the
+                        // second.
+                        for (state, counted) in
+                            states.iter().zip(counted_at_last_fallback.iter_mut())
+                        {
+                            let now = state.signed_authorities.len();
+                            let stalled = !state.done && now == *counted;
+                            *counted = now;
+                            if !stalled {
+                                continue;
                             }
+                            let epoch = state.record.epoch;
+                            consensus_bus.requested_missing_epoch().send_if_modified(|current| {
+                                if epoch > *current {
+                                    *current = epoch;
+                                    true
+                                } else {
+                                    false
+                                }
+                            });
                         }
 
                         // The epoch record collector may have certified some of these in the

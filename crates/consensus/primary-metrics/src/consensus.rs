@@ -29,7 +29,9 @@ pub struct ConsensusMetrics {
     /// Epoch records this node certified from a quorum of collected votes
     pub epoch_certified_by_quorum: IntCounter,
     /// Epoch records this node certified from a peer's certificate instead of collected votes:
-    /// the fast path at a close it reached late, or a certificate that landed while collecting
+    /// the fast path at a close it reached late, or a certificate that landed while collecting.
+    /// A certificate for a record other than the one this node built counts here too; the
+    /// collector warns about that case in the log
     pub epoch_certified_by_fetch: IntCounter,
     /// The latency between two successful commit rounds
     pub commit_rounds_latency: Histogram,
