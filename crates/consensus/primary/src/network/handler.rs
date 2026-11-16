@@ -171,11 +171,13 @@ where
         }
     }
 
-    /// The epoch and committee of the pending record with `digest`, from the cached table.
-    fn pending_record(&self, digest: &B256) -> Option<(Epoch, Vec<BlsPublicKey>)> {
+    /// The epoch of the pending record with `digest`, and whether `signer` is in its committee,
+    /// from the cached table.
+    fn pending_record(&self, digest: &B256, signer: &BlsPublicKey) -> Option<(Epoch, bool)> {
         let version = *self.consensus_bus.pending_epoch_records_changed().borrow();
         let mut cache = self.pending_records.lock();
-        if cache.version != Some(version) {
+        // `<`, not `!=`: a reader that read the counter earlier must not undo a newer read.
+        if cache.version.is_none_or(|read| read < version) {
             cache.by_digest = self
                 .consensus_config
                 .node_storage()
@@ -185,7 +187,7 @@ where
                 .collect();
             cache.version = Some(version);
         }
-        cache.by_digest.get(digest).cloned()
+        cache.by_digest.get(digest).map(|(epoch, committee)| (*epoch, committee.contains(signer)))
     }
 
     /// Claim the one admission a vote by `signer` for `epoch` gets; `false` when it is taken.
@@ -462,12 +464,15 @@ where
                 // removes the row in the same transaction: not pending means unknown here or
                 // already certified, and either way the vote is of no use. The table is read
                 // through a cache (see `PendingRecordCache`), so this is a map lookup.
-                let Some((epoch, committee)) = self.pending_record(&vote.epoch_hash) else {
+                // A registered validator outside the committee can send votes for invented
+                // digests at no penalty; each costs a decode, a lock and this lookup.
+                let Some((epoch, is_member)) = self.pending_record(&vote.epoch_hash, &author)
+                else {
                     debug!(target: "primary", signer = ?author, digest = %vote.epoch_hash, "dropping epoch vote for a record this node does not hold pending");
                     return Ok(());
                 };
                 ensure!(
-                    committee.contains(&author),
+                    is_member,
                     PrimaryNetworkError::InvalidHeader(HeaderError::UnknownAuthority(format!(
                         "{author} not in the committee for epoch {epoch}"
                     )))
@@ -486,14 +491,15 @@ where
                     PrimaryNetworkError::InvalidHeader(HeaderError::PeerNotAuthor)
                 );
                 // The cache can lag certification (the row is removed without bumping the
-                // counter), so a hit is confirmed against the certified records.
+                // counter), so a hit is confirmed against the certified records, by epoch: the
+                // record certified for it may be another node's, not the one voted for here.
                 if self
                     .consensus_config
                     .node_storage()
-                    .get_epoch_by_hash(vote.epoch_hash)
+                    .get_epoch_by_number(epoch)
                     .is_some_and(|(_, cert)| cert.is_some())
                 {
-                    debug!(target: "primary", signer = ?author, epoch, "dropping epoch vote for a record certified since the table was read");
+                    debug!(target: "primary", signer = ?author, epoch, "dropping epoch vote for an epoch certified since the table was read");
                     return Ok(());
                 }
                 match self.consensus_bus.new_epoch_votes().try_send(*vote) {

@@ -1092,6 +1092,33 @@ where
         }
     }
 
+    /// Whether `state`'s epoch is certified on disk by now, by the epoch record collector or a
+    /// peer's certificate landing in the background. Says so, and warns when the certified
+    /// record is not the one this node built: the one sign of a diverged close.
+    fn certification_landed(consensus_db: &DB, state: &PendingCertification, when: &str) -> bool {
+        let Some((record, Some(_))) = consensus_db.get_epoch_by_number(state.record.epoch) else {
+            return false;
+        };
+        if record.digest() == state.epoch_hash {
+            info!(
+                target: "epoch-manager",
+                epoch = state.record.epoch,
+                when,
+                "epoch cert appeared in the DB",
+            );
+        } else {
+            warn!(
+                target: "epoch-manager",
+                epoch = state.record.epoch,
+                ours = %state.epoch_hash,
+                certified = %record.digest(),
+                when,
+                "the network certified a different record for the epoch; ours is dropped",
+            );
+        }
+        true
+    }
+
     /// Aggregate and save the certificate for a record that reached quorum. `false` means the
     /// signatures did not aggregate or verify, or the write failed; the record stays pending and
     /// is retried.
@@ -1319,7 +1346,7 @@ where
         loop {
             // Certified by someone else while we were backing off (a peer's backfill/fetch, or a
             // previous attempt's peer fetch landing late): nothing left to do for those.
-            states.retain(|s| !certified(s.record.epoch));
+            states.retain(|s| !Self::certification_landed(&consensus_db, s, "while backing off"));
             forget_certified_attempts(&certification_attempts, &certified);
             if states.is_empty() {
                 return;
@@ -1464,29 +1491,13 @@ where
                         // The epoch record collector may have certified some of these in the
                         // background. Those are done; the others keep collecting undisturbed.
                         for state in states.iter_mut().filter(|s| !s.done) {
-                            let Some((record, Some(_))) =
-                                consensus_db.get_epoch_by_number(state.record.epoch)
-                            else {
-                                continue;
-                            };
-                            if record.digest() == state.epoch_hash {
-                                info!(
-                                    target: "epoch-manager",
-                                    epoch = state.record.epoch,
-                                    "epoch cert appeared in the DB during vote collection",
-                                );
-                            } else {
-                                // The network certified a record this node did not build:
-                                // the one sign of a diverged close, so say so.
-                                warn!(
-                                    target: "epoch-manager",
-                                    epoch = state.record.epoch,
-                                    ours = %state.epoch_hash,
-                                    certified = %record.digest(),
-                                    "the network certified a different record for the epoch being collected; ours is dropped",
-                                );
+                            if Self::certification_landed(
+                                &consensus_db,
+                                state,
+                                "during vote collection",
+                            ) {
+                                state.done = true;
                             }
-                            state.done = true;
                         }
                         if states.iter().all(|s| s.done) {
                             break;
@@ -1520,7 +1531,9 @@ where
             // reached quorum but could not be saved, and keep everything still uncertified.
             let mut remaining = Vec::with_capacity(states.len());
             for state in states.drain(..) {
-                if state.done || certified(state.record.epoch) {
+                if state.done
+                    || Self::certification_landed(&consensus_db, &state, "after the collection")
+                {
                     continue;
                 }
                 if state.reached_quorum() {
@@ -1562,15 +1575,7 @@ where
             'retry: loop {
                 attempts += 1;
                 states.retain(|s| {
-                    let done = certified(s.record.epoch);
-                    if done {
-                        info!(
-                            target: "epoch-manager",
-                            epoch = s.record.epoch,
-                            "epoch record appeared in the DB while retrying the fetch",
-                        );
-                    }
-                    !done
+                    !Self::certification_landed(&consensus_db, s, "while retrying the fetch")
                 });
                 if states.is_empty() {
                     return;

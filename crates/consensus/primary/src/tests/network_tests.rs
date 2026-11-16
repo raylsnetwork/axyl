@@ -489,6 +489,7 @@ async fn test_epoch_vote_admission() -> eyre::Result<()> {
     let mut rng = StdRng::seed_from_u64(5);
     let member = TestSigner(Arc::new(BlsKeypair::generate(&mut rng)));
     let other_member = TestSigner(Arc::new(BlsKeypair::generate(&mut rng)));
+    let third_member = TestSigner(Arc::new(BlsKeypair::generate(&mut rng)));
     let outsider = TestSigner(Arc::new(BlsKeypair::generate(&mut rng)));
     let topic = TopicHash::from_raw(LibP2pConfig::epoch_vote_topic());
     let gossip = |vote: EpochVote| GossipMessage {
@@ -497,7 +498,8 @@ async fn test_epoch_vote_admission() -> eyre::Result<()> {
         sequence_number: None,
         topic: topic.clone(),
     };
-    let committee_keys = vec![member.public_key(), other_member.public_key()];
+    let committee_keys =
+        vec![member.public_key(), other_member.public_key(), third_member.public_key()];
     // the close writes the uncertified record to the pending table and announces it
     let pending_written =
         || consensus_bus.pending_epoch_records_changed().send_modify(|version| *version += 1);
@@ -537,20 +539,27 @@ async fn test_epoch_vote_admission() -> eyre::Result<()> {
     handler.process_gossip(&gossip(vote), member.public_key()).await?;
     assert!(queue.try_recv().is_err());
 
-    // once the record is certified here, further votes for it are dropped
+    // once the epoch is certified here, further votes for its record are dropped: the
+    // certificate write removes the pending row without touching the counter, so the handler's
+    // cache still holds the record, and the drop comes from the certified check on a hit
     let cert = EpochCertificate {
         epoch_hash: pending.digest(),
         signature: Default::default(),
         signed_authorities: Default::default(),
     };
     db.save_epoch_record_with_cert(&pending, &cert)?;
+    handler
+        .process_gossip(&gossip(pending.sign_vote(&third_member)), third_member.public_key())
+        .await?;
+    assert!(queue.try_recv().is_err(), "certified epoch, stale cache: dropped");
+    // and once the table is re-read, from the lookup itself
     let late = EpochRecord { epoch: 9, committee: committee_keys, ..Default::default() };
     db.save_pending_epoch_record(&late)?;
     pending_written();
     handler
         .process_gossip(&gossip(pending.sign_vote(&other_member)), other_member.public_key())
         .await?;
-    assert!(queue.try_recv().is_err(), "certified record: dropped");
+    assert!(queue.try_recv().is_err(), "certified record, fresh cache: dropped");
     handler
         .process_gossip(&gossip(late.sign_vote(&other_member)), other_member.public_key())
         .await?;
