@@ -242,6 +242,18 @@ impl PrimaryNetworkHandle {
         number: Option<u64>,
         hash: Option<BlockHash>,
     ) -> NetworkResult<ConsensusHeader> {
+        // Test-only: a victim armed with RL_BYZ_ASK_FIRST asks that one peer first, so the test
+        // decides which peer serves the header instead of the any-peer rotation.
+        #[cfg(feature = "byzantine-test-hooks")]
+        if let Some(first) = gap_fetch_byzantine::ask_first() {
+            if let Ok(peers) = self.handle.connected_peers().await {
+                if let Some(peer) = peers.into_iter().find(|p| p.to_string() == first) {
+                    if let Ok(header) = self.request_consensus_from_peer(peer, number, hash).await {
+                        return Ok(header);
+                    }
+                }
+            }
+        }
         let request = PrimaryRequest::ConsensusHeader { number, hash };
         // Try up to three times (from three peers) to get consensus.
         // This could be a lot more complicated but this KISS method should work fine.
@@ -488,7 +500,7 @@ where
         self.task_spawner.spawn_task(task_name, async move {
             tokio::select! {
                 header =
-                    request_handler.retrieve_consensus_header(number, hash) => {
+                    request_handler.retrieve_consensus_header(number, hash, peer) => {
                         let response = header.into_response();
                         // TODO: penalize peer's reputation for bad request
                         // if response.is_err() { }

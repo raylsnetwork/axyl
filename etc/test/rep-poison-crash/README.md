@@ -51,6 +51,16 @@ hook only rewrites replies served to a follower.
   a height that stops moving. With `-l <seconds>` the armed validators 1 to K are then stopped for
   that long while the chain height is watched, and started again. This shows whether the liar can
   halt the chain once the victims are down and whether the chain resumes when it returns.
+- `rolling-halt`: the `rolling` restart with a validator attacker, then one more step for the
+  last validator in `-v`, the one past the fault budget f. Once f validators crash-loop, stopping
+  one more halts the chain, so a plain restart leaves it nothing to catch up on and it is never
+  poisoned. Here it comes back behind instead: at its first stop the harness keeps an offline copy
+  of its datadir, and after its restarts it is restored from that copy, as after a restore from
+  backup. It is started with `RL_BYZ_ASK_FIRST` set to validator 1's key, so it asks the attacker
+  first for every header it is missing, by number and by hash. That takes the any-peer rotation out
+  of the test. It aborts at the switch to voting and on every restart, and with f+1 validators down
+  the chain stays halted while the attacker keeps running and voting. The run checks that the chain
+  does not move for 120 seconds. With `-a off` the restored validator catches up and rejoins.
 - `rolling-observer-attacker`: the same rolling restart, but every validator is honest. The
   attacker is one armed observer with a dialable address, set up as in `observer-attacker`.
 
@@ -63,9 +73,9 @@ In the rolling scenarios every validator height is sampled every five seconds in
 The summary ends with a line per start, a line per victim and every halt found in `heights.log`.
 A victim line gives the altered replies the armed nodes logged from the moment the victim was
 stopped to the end of its last start, the block numbers those replies covered, how many starts
-aborted and whether the victim crash-looped. The hook does not log who asked, so this count
-belongs to the victim only while no other node is catching up, which holds when the roll is one
-validator at a time. A start that aborts names the panic site, `leader_schedule.rs:93:9` for this
+aborted and whether the victim crash-looped. The count is by time window, so it belongs to the
+victim only while no other node is catching up. Each altered reply is also logged with the route,
+by-number, by-hash or latest, and the requester's key, which gives the exact count per node. A start that aborts names the panic site, `leader_schedule.rs:93:9` for this
 bug. A halt is any stretch of at least 20 seconds in which the highest height did not grow.
 
 ## Run
@@ -94,6 +104,13 @@ etc/test/rep-poison-crash/run.sh -s rolling -k 1 -r 2 -a off
 # the liar for three minutes and start it again
 etc/test/rep-poison-crash/run.sh -s rolling -n 7 -k 1 -v 2,3 -r 1 -l 180
 
+# seven validators, one lying validator: f crash-loop, then the (f+1)th comes back behind, asks the
+# liar first and crash-loops too, so the chain halts for good with the liar running
+etc/test/rep-poison-crash/run.sh -s rolling-halt -n 7 -k 1 -v 2,3,4
+
+# control for the permanent halt: every validator honest, the restored validator rejoins
+etc/test/rep-poison-crash/run.sh -s rolling-halt -n 7 -k 1 -v 2,3,4 -a off
+
 # seven honest validators, one armed observer, roll f plus one validators
 etc/test/rep-poison-crash/run.sh -s rolling-observer-attacker -n 7 -v 2,3,4 -r 1
 ```
@@ -115,6 +132,8 @@ Under `target/rep-poison-crash/<timestamp>`:
   validator, start 0 being the catch-up start.
 - `validator-<n>-liar-restart.log`: with `-l`, the log of the armed validator started again after
   the liar step.
+- `validator-<n>-halt-<m>.log`: in `rolling-halt`, the log of each start of the restored validator.
+- `validator-<n>.backup`: in `rolling-halt`, the offline datadir copy it is restored from.
 - `heights.log`: in the rolling scenarios, one line per sample with the epoch second, the UTC
   time, the highest height and every validator height.
 - every node's datadir, stopped at the end of the run, so the observer's consensus DB can be

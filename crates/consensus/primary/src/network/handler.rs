@@ -902,7 +902,10 @@ where
         &self,
         number: Option<u64>,
         hash: Option<BlockHash>,
+        requester: BlsPublicKey,
     ) -> PrimaryNetworkResult<PrimaryResponse> {
+        #[cfg(not(feature = "byzantine-test-hooks"))]
+        let _ = requester;
         let header = match (number, hash) {
             (_, Some(hash)) => self.get_header_by_hash(hash)?,
             (Some(number), _) => self.get_header_by_number(number)?,
@@ -913,7 +916,15 @@ where
         // with a crafted header to reproduce the reputation-score crash (finding N1). Compiled out
         // of production builds, and inert unless the serving process is armed by environment.
         #[cfg(feature = "byzantine-test-hooks")]
-        if let Some(crafted) = super::gap_fetch_byzantine::override_header(&header) {
+        if let Some(crafted) = super::gap_fetch_byzantine::override_header(
+            &header,
+            match (number, hash) {
+                (_, Some(_)) => "by-hash",
+                (Some(_), _) => "by-number",
+                (None, None) => "latest",
+            },
+            &requester,
+        ) {
             return Ok(PrimaryResponse::ConsensusHeader(Arc::new(crafted)));
         }
 

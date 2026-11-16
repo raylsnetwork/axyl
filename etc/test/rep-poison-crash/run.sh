@@ -39,6 +39,13 @@
 #                      logged after every step, so a halt shows up as a height that stops moving.
 #                      With -l the armed validators are then stopped for that many seconds and
 #                      restarted, to show whether the liar can halt the chain and whether it resumes.
+#   rolling-halt       the rolling restart, then the last rolled validator, the one past the fault
+#                      budget, comes back behind: it is restored from an offline copy of its own
+#                      datadir taken at its first stop, as after a restore from backup. It is armed
+#                      with RL_BYZ_ASK_FIRST, so it asks the attacker, validator 1, first for every
+#                      header it is missing. That takes the any-peer rotation out of the test. It
+#                      takes the poison, crash-loops, and with f+1 validators down the chain stays
+#                      halted while the attacker keeps running and voting.
 #   rolling-recover    the rolling restart, then the operator recovery, to find which recovery works
 #                      while the attacker stays armed. Each crash-looped validator is reset to a full
 #                      from-genesis resync: the bulk sync runs over the streaming path, lands on the
@@ -71,6 +78,8 @@ Usage: $0 [-s SCENARIO] [-a on|off] [-n VALIDATORS] [-k ARMED_VALIDATORS] [-v RO
       observer           armed validators, the victim is the observer
       observer-attacker  honest validators, an armed second observer, the victim is the observer
       rolling            armed validators 1..K, rolling restart of the validators given by -v
+      rolling-halt       rolling restart, then the last rolled validator restarts from an older copy
+                         of its datadir and asks validator 1 first for the headers it is missing
       rolling-recover    rolling restart, then reset each crash-looped validator for a full resync
                          and give it a brief restart, to find which recovery survives the attacker
       rolling-observer-attacker
@@ -135,7 +144,7 @@ for value in "${GAP:-0}" "$RESTARTS" "$LIAR_STOP" "$INSTANCE_BASE"; do
 done
 [[ $RESTARTS -ge 1 ]] || { echo "need at least one restart"; usage; }
 case "$SCENARIO" in
-    observer | observer-attacker | rolling | rolling-recover | rolling-observer-attacker) ;;
+    observer | observer-attacker | rolling | rolling-halt | rolling-recover | rolling-observer-attacker) ;;
     *) echo "unknown -s: $SCENARIO"; usage ;;
 esac
 [[ $LIAR_STOP -eq 0 || $SCENARIO == rolling || $SCENARIO == rolling-recover ]] || { echo "-l needs -s rolling or -s rolling-recover"; usage; }
@@ -248,7 +257,7 @@ start_validator() {
         RL_BYZ_GAP_TARGET="$ARM_RANGE" RL_BYZ_GAP_MODE=rep-poison \
             "$BIN" "${NODE_ARGS[@]}" >>"$logfile" 2>&1 &
     else
-        "$BIN" "${NODE_ARGS[@]}" >>"$logfile" 2>&1 &
+        RL_BYZ_ASK_FIRST="${ASK_FIRST:-}" "$BIN" "${NODE_ARGS[@]}" >>"$logfile" 2>&1 &
     fi
     PIDS[$seq]=$!
 }
@@ -616,6 +625,50 @@ revuln_check() {
     log "re-vulnerability: $recrashed of ${#RECOVERED_LIST[@]} recovered validators re-crashed on a small catch-up; a bare restart or snapshot restore re-poisons, only a full from-genesis resync escapes"
 }
 
+# rolling-halt: the last rolled validator, the (f+1)th, comes back behind and asks the attacker
+# first for every missing header. Without the restore it has nothing to catch up on, since the
+# chain stops as soon as it goes down. Without RL_BYZ_ASK_FIRST it asks its peers in turn and may
+# miss the attacker. The check: it crash-loops, and the chain does not move for HALT_HOLD seconds
+# although the attacker keeps running and voting. Uses run_rolling's outcomes, aborted, rejoined.
+SNAP_H=""
+HALT_RESULT=""
+HALT_HOLD=120
+halt_step() {
+    local v=${ROLLED_LIST[-1]} liar_key h0 h1 logfile start crashes=0 starts=0 seq up=""
+    liar_key=$(sed -n 's/^bls_public_key:[[:space:]]*//p' "$RUN/validator-1/node-info.yaml")
+    [[ -n $liar_key ]] || fail "no BLS key for validator 1"
+    [[ -d $RUN/validator-$v.backup ]] || fail "no datadir copy for validator $v"
+    [[ -n ${PIDS[$v]:-} ]] && { stop_pid "${PIDS[$v]}"; unset "PIDS[$v]"; }
+    h0=$(max_val_height)
+    log "halt step: validator $v stopped, chain at $h0; restoring its datadir copy from chain $SNAP_H"
+    rm -rf "$RUN/validator-$v"
+    cp -a "$RUN/validator-$v.backup" "$RUN/validator-$v" || fail "could not restore validator $v"
+    for start in $(seq 0 "$RESTARTS"); do
+        [[ -n ${PIDS[$v]:-} ]] && { stop_pid "${PIDS[$v]}"; unset "PIDS[$v]"; }
+        logfile="$RUN/validator-$v-halt-$start.log"
+        ASK_FIRST=$liar_key
+        start_validator "$v" "$logfile"
+        ASK_FIRST=""
+        await_validator "$v" "$logfile"
+        log "validator $v halt start $start, asks validator 1 first: $OUTCOME"
+        outcomes+=("v$v halt start $start: $OUTCOME")
+        starts=$((starts + 1))
+        [[ $OUTCOME == ABORTED* ]] && { crashes=$((crashes + 1)); aborted=$((aborted + 1)); }
+        [[ $OUTCOME == rejoined* ]] && rejoined=$((rejoined + 1))
+        watch_chain 15 "after validator $v halt start $start"
+    done
+    for seq in $(seq 1 "$N"); do [[ -n $(height "$seq") ]] && up+="$seq "; done
+    h0=$(max_val_height)
+    sleep "$HALT_HOLD"
+    h1=$(max_val_height)
+    log "  halt check: validators answering RPC ${up:-none}; chain $h0 then $h1 after ${HALT_HOLD}s: $(heights_line)"
+    if [[ $crashes -eq $starts && $h1 -eq $h0 && -n $(height 1) ]]; then
+        HALT_RESULT="PERMANENT HALT: validator $v aborted $crashes of $starts starts, the chain stayed at $h1 for ${HALT_HOLD}s with validator 1, the attacker, running"
+    else
+        HALT_RESULT="NO PERMANENT HALT: validator $v aborted $crashes of $starts starts, chain $h0 then $h1 after ${HALT_HOLD}s"
+    fi
+}
+
 run_rolling() {
     local seq v start stop_h stop_wait logfile outcomes=() aborted=0 rejoined=0 t_from t_to
     local w_from w_to w v_aborted v_starts v_streak verdict victims=()
@@ -649,6 +702,12 @@ run_rolling() {
         stop_pid "${PIDS[$v]:-}"; unset "PIDS[$v]"
         stop_h=$(max_val_height)
         log "validator $v stopped, chain at $stop_h"
+        if [[ $SCENARIO == rolling-halt && $v == "${ROLLED_LIST[-1]}" && -z $SNAP_H ]]; then
+            rm -rf "$RUN/validator-$v.backup"
+            cp -a "$RUN/validator-$v" "$RUN/validator-$v.backup" || fail "could not copy the datadir of validator $v"
+            SNAP_H=$stop_h
+            log "  kept an offline copy of validator $v's datadir, chain at $SNAP_H"
+        fi
         if wait_for "$stop_wait" val_reached $((stop_h + GAP)); then
             log "  chain advanced $GAP blocks with validator $v down: $(heights_line)"
         else
@@ -691,6 +750,7 @@ run_rolling() {
         [[ $v_streak -ge 1 ]] && CRASHED+=("$v")
     done
     [[ $SCENARIO == rolling-recover ]] && recover_step
+    [[ $SCENARIO == rolling-halt ]] && halt_step
     [[ $LIAR_STOP -gt 0 ]] && liar_step
     watch_chain 30 "final"
 
@@ -707,6 +767,19 @@ run_rolling() {
         log "  a bare restart does not clear the poison and a small-gap recovery re-poisons; the only recovery is a full from-genesis resync, during which the node is offline and the chain holds zero fault margin"
     fi
     echo "logs and datadirs: $RUN"
+    if [[ $SCENARIO == rolling-halt ]]; then
+        log "$HALT_RESULT"
+        if [[ $HALT_RESULT == PERMANENT* ]]; then
+            log "ISSUE REPRODUCED: the chain is halted for good with the attacker running"
+            exit 1
+        fi
+        if [[ $aborted -eq 0 && $rejoined -eq ${#outcomes[@]} ]]; then
+            log "HEALTHY: every restarted validator rejoined, the restored one included"
+            exit 0
+        fi
+        log "INCONCLUSIVE: no permanent halt, but not every start rejoined"
+        exit 2
+    fi
     if [[ $aborted -ge 1 ]]; then
         log "ISSUE REPRODUCED: $aborted validator starts aborted on the divide-by-zero"
         exit 1

@@ -9,6 +9,12 @@
 //!                                    reputation_score replaced by an empty, final-of-schedule
 //!                                    score map
 //!
+//! and, on the victim, so the test decides which peer serves a header instead of the any-peer
+//! rotation:
+//!
+//!   RL_BYZ_ASK_FIRST=<BLS key>       ask this peer first for every consensus header fetched by
+//!                                    number or by hash, as printed in its node-info.yaml
+//!
 //! reputation_score is excluded from the consensus block digest on purpose (see output.rs, "skip
 //! reputation for stable hashes"), so the reply keeps the honest digest and parent link and passes
 //! every hash and parent check a follower makes. The override keys on the real block's number and
@@ -25,10 +31,20 @@
 use rayls_infrastructure_types::{ConsensusHeader, ReputationScores};
 use tracing::warn;
 
+/// Victim side: the BLS public key, as printed, of the one peer to ask first for every consensus
+/// header fetched by number or by hash, from RL_BYZ_ASK_FIRST. None when unset.
+pub(crate) fn ask_first() -> Option<String> {
+    std::env::var("RL_BYZ_ASK_FIRST").ok().filter(|key| !key.trim().is_empty())
+}
+
 /// Returns a crafted header to serve back for any consensus-header request, or None to serve the
 /// honest header. `honest` is the real header read from local storage, whatever route asked for it.
 /// The decision is made on the honest header's own block number against the armed range.
-pub(super) fn override_header(honest: &ConsensusHeader) -> Option<ConsensusHeader> {
+pub(super) fn override_header(
+    honest: &ConsensusHeader,
+    route: &str,
+    requester: &rayls_infrastructure_types::BlsPublicKey,
+) -> Option<ConsensusHeader> {
     let spec = std::env::var("RL_BYZ_GAP_TARGET").ok()?;
     let (lo, hi) = match spec.split_once('-') {
         Some((a, b)) => (a.trim().parse().ok()?, b.trim().parse().ok()?),
@@ -46,13 +62,18 @@ pub(super) fn override_header(honest: &ConsensusHeader) -> Option<ConsensusHeade
         warn!(target: "primary::byzantine", mode, number, "unknown RL_BYZ_GAP_MODE, serving honest header");
         return None;
     }
-    Some(rep_poison_header(number, honest))
+    Some(rep_poison_header(number, honest, route, requester))
 }
 
 /// Keep the honest header byte for byte, only replace the sub-dag reputation scores with an empty
 /// final-of-schedule map. Scores are not part of the header digest, so the digest is unchanged and
 /// the reply links exactly like the honest block.
-fn rep_poison_header(number: u64, honest: &ConsensusHeader) -> ConsensusHeader {
+fn rep_poison_header(
+    number: u64,
+    honest: &ConsensusHeader,
+    route: &str,
+    requester: &rayls_infrastructure_types::BlsPublicKey,
+) -> ConsensusHeader {
     let mut poison_scores = ReputationScores::default();
     poison_scores.final_of_schedule = true;
     let mut sub_dag = honest.sub_dag.clone();
@@ -66,6 +87,8 @@ fn rep_poison_header(number: u64, honest: &ConsensusHeader) -> ConsensusHeader {
     warn!(
         target: "primary::byzantine",
         number,
+        route,
+        %requester,
         honest_digest = ?honest.digest(),
         poison_digest = ?poison.digest(),
         "BYZANTINE GAP-FETCH: serving rep-poison header (empty final-of-schedule reputation scores)"
