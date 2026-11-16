@@ -98,9 +98,9 @@ impl VoteFailureTracker {
         self.evaluate(count)
     }
 
-    /// Record an epoch-mismatch rejection from a peer that is at a newer
-    /// epoch than ours. Rejections from stale peers must be filtered out
-    /// by the caller before calling this method.
+    /// Record an epoch-mismatch rejection from a peer that is at our epoch
+    /// or a newer one. Rejections from stale peers never reach here: the
+    /// certifier keeps asking a peer behind us instead.
     pub(crate) fn record_epoch_mismatch(&self, peer: AuthorityIdentifier) -> RejectionOutcome {
         let count = {
             let mut guard = self.inner.lock().expect("vote failure tracker mutex poisoned");

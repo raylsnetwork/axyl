@@ -8,7 +8,7 @@ use crate::{
 };
 use consensus_metrics::monitored_future;
 use rayls_consensus_network::error::NetworkError;
-use rayls_consensus_primary_metrics::PrimaryMetrics;
+use rayls_consensus_primary_metrics::{ConsensusMetrics, PrimaryMetrics};
 use rayls_infrastructure_config::{ConsensusConfig, KeyConfig};
 use rayls_infrastructure_storage::CertificateStore;
 use rayls_infrastructure_types::{
@@ -150,6 +150,7 @@ impl<DB: Database> Certifier<DB> {
         certificate_store: DB,
         network: PrimaryNetworkHandle,
         committee: Committee,
+        consensus_metrics: Arc<ConsensusMetrics>,
         cancel_proposal: Noticer,
         quorum_reached: Noticer,
     ) -> DagResult<Vote> {
@@ -243,6 +244,38 @@ impl<DB: Database> Certifier<DB> {
                                 limit_round,
                             });
                         }
+                        // A peer behind the header refuses until it enters the header's epoch:
+                        // one epoch behind answers `Recoverable`, further behind `EpochMismatch`.
+                        // Keep asking on the retry schedule below. Nothing else would: a
+                        // re-proposal of this header is deduplicated while this proposal is in
+                        // flight, and with exactly a quorum up this peer's vote is needed.
+                        Ok(RequestVoteResult::Recoverable(reason)) => {
+                            warn!(
+                                target: "primary::certifier",
+                                ?authority, ?header, attempt, %reason,
+                                "peer refused with a recoverable error, retrying vote request"
+                            );
+                            missing_parents = None;
+                        }
+                        Ok(RequestVoteResult::EpochMismatch { expected, received })
+                            if !VoteFailureTracker::should_count_epoch_rejection(
+                                expected, received,
+                            ) =>
+                        {
+                            warn!(
+                                target: "primary::certifier",
+                                ?authority, ?header, attempt,
+                                peer_epoch = expected, our_epoch = received,
+                                "peer is behind our epoch, retrying vote request"
+                            );
+                            // a stale peer cannot demote us; keep its refusals visible
+                            let peer = authority.to_string();
+                            consensus_metrics
+                                .vote_request_rejections
+                                .with_label_values(&[&peer, "epoch_mismatch_stale"])
+                                .inc();
+                            missing_parents = None;
+                        }
                         Ok(RequestVoteResult::EpochMismatch { expected, received }) => {
                             return Err(DagError::EpochRejectedByPeer {
                                 peer_id: authority,
@@ -252,13 +285,7 @@ impl<DB: Database> Certifier<DB> {
                         }
                         Err(error) => {
                             if let NetworkError::RPCError(ref error_msg) = error {
-                                if error_msg.contains("Invalid epoch") {
-                                    error!(
-                                        target: "primary::certifier",
-                                        ?authority, ?header,
-                                        "epoch mismatch detected, stopping vote requests for stale header: {error_msg}"
-                                    );
-                                } else if error_msg.contains("too old") {
+                                if error_msg.contains("too old") {
                                     // legacy format from older peers
                                     return Err(DagError::TooOldRejectedByPeers {
                                         peer_id: authority,
@@ -429,25 +456,9 @@ impl<DB: Database> Certifier<DB> {
                 }
             }
             DagError::EpochRejectedByPeer { peer_id, peer_epoch, our_epoch } => {
-                // A peer at an older epoch is itself stale; ignore its rejection
-                // so one lagging validator cannot demote the honest majority.
-                if !VoteFailureTracker::should_count_epoch_rejection(*peer_epoch, *our_epoch) {
-                    warn!(
-                        target: "primary::certifier",
-                        auth=?self.authority_id,
-                        peer=?peer_id,
-                        peer_epoch, our_epoch,
-                        "ignoring epoch rejection from stale peer"
-                    );
-                    // Count it under a distinct reason even though a stale peer can't demote us —
-                    // mirrors `too_old_skipped`, keeping the raw rejection rate visible.
-                    self.consensus_bus
-                        .consensus_metrics()
-                        .vote_request_rejections
-                        .with_label_values(&[&peer_id.to_string(), "epoch_mismatch_stale"])
-                        .inc();
-                    return VoteErrorAction::Continue;
-                }
+                // Only a peer at our epoch or ahead gets here: `request_vote` keeps asking a
+                // peer behind us (it is the stale one, and cannot demote the honest majority),
+                // counting its refusals as `epoch_mismatch_stale`.
 
                 // One epoch behind the peer means we are at the boundary: our own epoch manager
                 // transitions us the moment the boundary output commits, typically within a
@@ -586,6 +597,7 @@ impl<DB: Database> Certifier<DB> {
             let network = self.network.clone();
             let certificate_store = self.certificate_store.clone();
             let committee = self.committee.clone();
+            let consensus_metrics = self.consensus_bus.consensus_metrics();
             let cancel_proposal = self.new_proposal.subscribe();
             let quorum_reached = quorum_notifier.subscribe();
             let task_name = format!("vote-{header:?}-{name}");
@@ -602,6 +614,7 @@ impl<DB: Database> Certifier<DB> {
                             certificate_store,
                             network,
                             committee,
+                            consensus_metrics,
                             cancel_proposal,
                             quorum_reached,
                         )
