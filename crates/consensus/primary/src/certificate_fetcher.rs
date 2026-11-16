@@ -94,7 +94,7 @@ impl FetchAnswers {
     /// Record a failed request.
     fn record_error(&mut self, error: &NetworkError) {
         match error {
-            NetworkError::PeerBusy(_) => self.busy = true,
+            NetworkError::PeerBusy => self.busy = true,
             // An IO error may be a malformed answer, so it counts, as before.
             NetworkError::Outbound(OutboundFailure::Io(_)) => self.failed = true,
             // An unreachable or timed-out peer says nothing about our request.
@@ -432,7 +432,7 @@ impl<DB: Database> CertificateFetcher<DB> {
 
         // exponential backoff on consecutive failures (1.5x multiplier)
         let backoff = self.calculate_backoff();
-        // Set on every probe, so the gauges drop back to 0 after a success.
+        // Set on every probe, so the gauges read 0 from the probe after a success.
         self.consensus_bus
             .primary_metrics()
             .node_metrics
