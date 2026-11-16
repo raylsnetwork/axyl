@@ -1062,9 +1062,11 @@ where
             return false;
         }
         info!(target: "epoch-manager", epoch = epoch_rec.epoch, "fast-path: fetched epoch cert from peer");
-        // Save the peer's record (matching the verified cert), not our local copy.
+        // Save the peer's record (matching the verified cert), not our local copy. A failed
+        // write leaves the row pending, so the record goes to collection like any other.
         if let Err(e) = self.consensus_db.save_epoch_record_with_cert(&peer_rec, &cert) {
             error!(target: "epoch-manager", "failed to save fast-path epoch record and cert: {e}");
+            return false;
         }
         true
     }
@@ -1402,9 +1404,10 @@ where
             let mut next_fallback = tokio::time::Instant::now() + timeout;
             let mut timeouts = 0;
             // Votes counted per record at the previous fallback, to tell a close that is still
-            // receiving votes from one whose votes have stopped coming.
-            let mut counted_at_last_fallback: Vec<u64> =
-                states.iter().map(|s| s.signed_authorities.len()).collect();
+            // receiving votes from one whose votes have stopped coming, and whether the record
+            // collector was already woken for the record this attempt.
+            let mut counted_at_last_fallback: Vec<(u64, bool)> =
+                states.iter().map(|s| (s.signed_authorities.len(), false)).collect();
             loop {
                 // With votes in hand, the shutdown notice and then the fallback deadline are
                 // checked before each one: the transition must not wait behind a backlog, and
@@ -1497,15 +1500,19 @@ where
                         // A node that missed every vote wakes at the first fallback, one that
                         // closed in the middle of the order and got only the later ones at the
                         // second.
-                        for (state, counted) in
+                        // Once per record and attempt: the collector's own reset lowers the
+                        // watch again, so repeating the wake would cancel its retry loop and
+                        // restart its walk at every fallback.
+                        for (state, (counted, woken)) in
                             states.iter().zip(counted_at_last_fallback.iter_mut())
                         {
                             let now = state.signed_authorities.len();
-                            let stalled = !state.done && now == *counted;
+                            let stalled = !state.done && now == *counted && !*woken;
                             *counted = now;
                             if !stalled {
                                 continue;
                             }
+                            *woken = true;
                             let epoch = state.record.epoch;
                             consensus_bus.requested_missing_epoch().send_if_modified(|current| {
                                 if epoch > *current {
@@ -1625,6 +1632,7 @@ where
                     if Self::fetch_pending_cert_from_peers(
                         &primary_network,
                         &consensus_db,
+                        &consensus_bus,
                         &states[i],
                     )
                     .await
@@ -1681,6 +1689,7 @@ where
     async fn fetch_pending_cert_from_peers(
         primary_network: &PrimaryNetworkHandle,
         consensus_db: &DB,
+        consensus_bus: &ConsensusBus,
         state: &PendingCertification,
     ) -> bool {
         let epoch = state.record.epoch;
@@ -1715,20 +1724,26 @@ where
                     "retrieved cert for epoch {new_epoch_hash} from a peer",
                 );
             } else {
-                // Humm, we got another epoch record than the one we expected...
-                // The network came to quorum on this one so lets go with it...
+                // The network came to quorum on a record this node did not build; it is the
+                // certified one, so adopt it.
                 warn!(
                     target: "epoch-manager",
-                    "Received wrong epoch record: {new_epoch_hash}, expected {epoch_hash}",
+                    epoch,
+                    ours = %epoch_hash,
+                    certified = %new_epoch_hash,
+                    "the network certified a different record for the epoch; ours is dropped",
                 );
             }
+            // A failed write leaves the row pending for the next attempt.
             if let Err(err) = consensus_db.save_epoch_record_with_cert(&new_epoch_rec, &cert) {
                 error!(
                     target: "epoch-manager",
                     ?err,
                     "Failed to insert epoch record and cert for {new_epoch_hash}",
                 );
+                return false;
             }
+            consensus_bus.consensus_metrics().epoch_certified_by_fetch.inc();
             return true;
         }
         false
