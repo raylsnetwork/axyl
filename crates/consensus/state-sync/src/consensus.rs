@@ -32,6 +32,39 @@ const WALK_PREFETCH: u64 = 8;
 /// records whenever one silent peer is asked first.
 const EPOCH_RECORDS_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Test hook for #397, compiled only with the `epoch-end-fault` feature. With `RL_EPOCH_END_FAULT`
+/// set, the first walk to an epoch end fails its fetch of that header once: each of the 3 attempts
+/// fails at once, as if every peer refused it, with the real backoff between them. After that the
+/// header can be fetched again. Every other fetch works as usual.
+#[cfg(feature = "epoch-end-fault")]
+mod epoch_end_fault {
+    use super::*;
+    use std::sync::{
+        atomic::{AtomicBool, AtomicU32, Ordering},
+        OnceLock,
+    };
+
+    static ARMED: AtomicBool = AtomicBool::new(true);
+    static FAILING: OnceLock<B256> = OnceLock::new();
+    static FAILS_LEFT: AtomicU32 = AtomicU32::new(3);
+
+    /// Called before each walk to an epoch end; picks the first one.
+    pub(super) fn arm(checkpoint: B256) {
+        if std::env::var_os("RL_EPOCH_END_FAULT").is_some() && ARMED.swap(false, Ordering::SeqCst) {
+            let _ = FAILING.set(checkpoint);
+            warn!(target: "state-sync", ?checkpoint, "EPOCH END FAULT: failing the fetch of this epoch end once");
+        }
+    }
+
+    /// Whether this fetch attempt for `hash` must fail.
+    pub(super) fn fails(hash: B256) -> bool {
+        FAILING.get() == Some(&hash)
+            && FAILS_LEFT
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                .is_ok()
+    }
+}
+
 /// Cache a consensus header in persistent storage.
 pub fn store_consensus_header_in_cache<DB: ReDatabase>(db: &DB, header: &ConsensusHeader) {
     store_consensus_headers_in_cache(db, std::slice::from_ref(header));
@@ -149,6 +182,11 @@ async fn get_consensus_header<DB: ReDatabase>(
         }
         if shutdown.noticed() {
             return None;
+        }
+        #[cfg(feature = "epoch-end-fault")]
+        if epoch_end_fault::fails(hash) {
+            warn!(target: "state-sync", ?hash, attempt, "EPOCH END FAULT: failed one fetch attempt");
+            continue;
         }
         match network.request_consensus(None, Some(hash)).await {
             Ok(header) => {
@@ -402,6 +440,8 @@ impl<DB: ReDatabase> WalkSession<DB> {
             let checkpoint = record.parent_consensus;
             if !self.is_local(checkpoint) {
                 info!(target: "state-sync", epoch = current, "backwards walk: walking to the end of an epoch");
+                #[cfg(feature = "epoch-end-fault")]
+                epoch_end_fault::arm(checkpoint);
                 match self.walk(checkpoint).await {
                     WalkOutcome::Covered => self.covered = Some(checkpoint),
                     // Rows this walk stored lie above the covered anchor, so the anchor holds.

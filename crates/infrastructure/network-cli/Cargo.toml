@@ -45,6 +45,8 @@ cold-storage = ["rayls-middleware-orchestrator/cold-storage"]
 # dashboard). NOT FOR PRODUCTION — excluded from default/release builds; enable
 # with `--features dev-single-node-setup`.
 dev-single-node-setup = ["dep:ethereum-tx-sign", "rayls-middleware-orchestrator/dev-single-node-setup"]
+# Test hook for #397 (a failed walk to an epoch end). NOT FOR PRODUCTION.
+epoch-end-fault = ["rayls-middleware-orchestrator/epoch-end-fault"]
 
 [dev-dependencies]
 tokio = { workspace = true, features = [

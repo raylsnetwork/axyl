@@ -63,6 +63,8 @@ dev-single-node-setup = [
     "rayls-middleware-bridge/dev-single-node-setup",
     "rayls-infrastructure-types/dev-single-node-setup",
 ]
+# Test hook for #397 (a failed walk to an epoch end). NOT FOR PRODUCTION.
+epoch-end-fault = ["rayls-consensus-state-sync/epoch-end-fault"]
 
 [dev-dependencies]
 rand = { workspace = true }

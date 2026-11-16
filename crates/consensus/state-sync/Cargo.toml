@@ -29,3 +29,8 @@ roaring = { workspace = true }
 
 [lints]
 workspace = true
+
+[features]
+# Test hook for #397: with RL_EPOCH_END_FAULT set, the first walk to an epoch end fails its
+# fetch of that header once. NOT FOR PRODUCTION.
+epoch-end-fault = []
