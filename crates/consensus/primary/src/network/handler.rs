@@ -113,7 +113,9 @@ pub(crate) struct RequestHandler<DB> {
     /// Commit-progress tracker gating demotion to `CvvInactive` (see [`behind_consensus`]).
     behind_tracker: Arc<Mutex<BehindTracker>>,
     /// Signers whose epoch vote was already queued, per epoch: one vote per signer and epoch
-    /// reaches the collector. Pruned to the newest few epochs.
+    /// reaches the collector. Not pruned: a claim is only taken for an epoch whose record is
+    /// pending, so the map is bounded by the pending table, and the handler is rebuilt with it
+    /// at every epoch.
     epoch_votes_seen: Arc<Mutex<BTreeMap<Epoch, HashSet<BlsPublicKey>>>>,
     /// The pending (uncertified) epoch records by digest, as last read from the table.
     pending_records: Arc<Mutex<PendingRecordCache>>,
@@ -138,11 +140,6 @@ struct PendingRecordCache {
     /// Epoch and committee of each pending record, by digest.
     by_digest: HashMap<B256, (Epoch, Vec<BlsPublicKey>)>,
 }
-
-/// Epochs of queued epoch votes remembered for dedup; older ones are forgotten. The handler is
-/// rebuilt every epoch, so this only matters with more epochs pending at once than this, and
-/// then the oldest lose their dedup and a republish for them costs a signature check again.
-const EPOCH_VOTES_SEEN_EPOCHS: usize = 8;
 
 impl<DB> RequestHandler<DB>
 where
@@ -198,16 +195,7 @@ where
     /// Claim the one admission a vote by `signer` for `epoch` gets; `false` when it is taken.
     /// Check and claim in one step, since every gossip message runs on its own task.
     fn claim_epoch_vote(&self, epoch: Epoch, signer: BlsPublicKey) -> bool {
-        let mut seen = self.epoch_votes_seen.lock();
-        if seen.len() >= EPOCH_VOTES_SEEN_EPOCHS && !seen.contains_key(&epoch) {
-            // Only the newest epochs are tracked. A vote for one older than all of them is
-            // admitted without dedup rather than claimed and forgotten in the same call.
-            if seen.first_key_value().is_some_and(|(oldest, _)| epoch < *oldest) {
-                return true;
-            }
-            seen.pop_first();
-        }
-        seen.entry(epoch).or_default().insert(signer)
+        self.epoch_votes_seen.lock().entry(epoch).or_default().insert(signer)
     }
 
     /// Give back the admission claimed by [`Self::claim_epoch_vote`]: the queue refused the

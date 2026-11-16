@@ -565,7 +565,7 @@ async fn test_epoch_vote_admission() -> eyre::Result<()> {
         "epoch certified under another record, stale cache: dropped"
     );
     // and once the table is re-read, from the lookup itself: the row is gone
-    let late = EpochRecord { epoch: 9, committee: committee_keys, ..Default::default() };
+    let late = EpochRecord { epoch: 9, committee: committee_keys.clone(), ..Default::default() };
     db.save_pending_epoch_record(&late)?;
     pending_written();
     handler
@@ -586,6 +586,22 @@ async fn test_epoch_vote_admission() -> eyre::Result<()> {
     while queue.try_recv().is_ok() {}
     handler.process_gossip(&gossip(vote), member.public_key()).await?;
     assert_eq!(queue.try_recv().ok(), Some(vote), "republished after the refusal: queued");
+
+    // a long stall leaves many epochs pending; dedup still holds for the oldest of them, so a
+    // member cannot flood the queue with repeats of its vote for an early epoch
+    let stalled: Vec<EpochRecord> = (20..30)
+        .map(|epoch| EpochRecord { epoch, committee: committee_keys.clone(), ..Default::default() })
+        .collect();
+    for record in &stalled {
+        db.save_pending_epoch_record(record)?;
+        pending_written();
+        let vote = record.sign_vote(&third_member);
+        handler.process_gossip(&gossip(vote), third_member.public_key()).await?;
+        assert_eq!(queue.try_recv().ok(), Some(vote), "first vote for epoch {}", record.epoch);
+    }
+    let oldest = stalled[0].sign_vote(&third_member);
+    handler.process_gossip(&gossip(oldest), third_member.public_key()).await?;
+    assert!(queue.try_recv().is_err(), "repeat for the oldest of ten pending epochs: dropped");
     Ok(())
 }
 

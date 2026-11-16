@@ -1499,7 +1499,9 @@ where
                         // loop on every member at once while no peer has a certificate yet.
                         // A node that missed every vote wakes at the first fallback, one that
                         // closed in the middle of the order and got only the later ones at the
-                        // second.
+                        // second. The first node to close also wakes at the first fallback when
+                        // its peers are more than 5 s behind, since it too has only its own vote;
+                        // that costs one retry loop of peer requests until they certify.
                         // Once per record and attempt: the collector's own reset lowers the
                         // watch again, so repeating the wake would cancel its retry loop and
                         // restart its walk at every fallback.
