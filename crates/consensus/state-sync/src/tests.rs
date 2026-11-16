@@ -1383,3 +1383,168 @@ async fn test_catch_up_rewinds_stale_anchor() {
     );
     assert_eq!(last_height, 105);
 }
+
+/// A stale row just above a stored epoch end makes the mismatch branch clear the real epoch end
+/// below it, which the walk then does not fetch again (it stops at its covered anchor there). The
+/// node is not stuck: the cleared row was streamed in the same pass, so the subscriber executes
+/// it and saves it as a canonical block, and the streamer reads canonical blocks too.
+#[tokio::test]
+async fn test_catch_up_recovers_after_clearing_a_streamed_epoch_end() {
+    let fixture = catch_up_fixture();
+    let primary = fixture.authorities().next().unwrap();
+    let config = primary.consensus_config();
+    let db = config.node_storage();
+    let committee = fixture.committee();
+
+    let anchor = chained_header(100, B256::default(), &committee);
+    store_executed(db, &anchor);
+    let mut chain: BTreeMap<u64, ConsensusHeader> = BTreeMap::new();
+    let mut parent = anchor.digest();
+    for number in 101..=105u64 {
+        let header = chained_header(number, parent, &committee);
+        parent = header.digest();
+        chain.insert(number, header);
+    }
+    let target = chain[&105].clone();
+
+    // The walk to the epoch end at 102 stored 101 and 102. A stale row from older code sits at
+    // 103, above the epoch end, and does not link to it.
+    let stale_103 = fabricated_header(103, B256::repeat_byte(0x99));
+    for header in [&chain[&101], &chain[&102], &stale_103] {
+        store_consensus_header_in_cache(db, header);
+    }
+
+    let cb = ConsensusBus::new();
+    seed_recently_executed_blocks(&cb);
+    cb.executed_anchor().send_replace(anchor.clone());
+    let mut rx = cb.consensus_header().subscribe();
+    let mut last_header = anchor.clone();
+    let mut last_height = anchor.number;
+
+    let pending = attempt_catch_up(
+        &config,
+        &cb,
+        &mut last_header,
+        &mut last_height,
+        target.clone(),
+        "stale 103",
+        &mut VerifiedHeaders::default(),
+    )
+    .await;
+    assert!(pending.is_some());
+    assert!(db.get_consensus_by_number(102).is_none(), "precondition: the real 102 is cleared");
+    let mut streamed = Vec::new();
+    while let Ok(h) = rx.try_recv() {
+        streamed.push(h.digest());
+    }
+    assert!(streamed.contains(&chain[&102].digest()), "102 was streamed before it was cleared");
+
+    // The walk to the target replaces 103 and stores 104, and stops at 102 without fetching it.
+    store_consensus_header_in_cache(db, &chain[&103]);
+    store_consensus_header_in_cache(db, &chain[&104]);
+    let pending = attempt_catch_up(
+        &config,
+        &cb,
+        &mut last_header,
+        &mut last_height,
+        target.clone(),
+        "before 102 executes",
+        &mut VerifiedHeaders::default(),
+    )
+    .await;
+    assert!(pending.is_some());
+    assert_eq!(last_height, 101, "the streamer waits at 102 until it is stored again");
+
+    // The subscriber executes the streamed 102 and saves it as a canonical block.
+    store_executed(db, &chain[&102]);
+    let pending = attempt_catch_up(
+        &config,
+        &cb,
+        &mut last_header,
+        &mut last_height,
+        target,
+        "after 102 executes",
+        &mut VerifiedHeaders::default(),
+    )
+    .await;
+    assert!(pending.is_none(), "catch-up reaches the target without a restart");
+    assert_eq!(last_height, 105);
+}
+
+/// When the streamer clears a stored row the walk covered, and the subscriber never saves that
+/// row (it drops a header queued behind one it rejected), nothing else stores it again. The
+/// walk stops at its covered anchor without checking the rows below it, so the streamer would
+/// wait at the cleared row until a restart. The streamer tells the walk, which derives its
+/// coverage again and fetches the row.
+#[tokio::test]
+async fn test_catch_up_refetches_a_row_the_streamer_cleared() {
+    let fixture = catch_up_fixture();
+    let primary = fixture.authorities().next().unwrap();
+    let config = primary.consensus_config();
+    let db = config.node_storage();
+    let committee = fixture.committee();
+    let leader = fixture.certificate(&fixture.header_from_last_authority());
+
+    let anchor = chained_header(100, B256::default(), &committee);
+    store_executed(db, &anchor);
+    let mut chain: BTreeMap<u64, ConsensusHeader> = BTreeMap::new();
+    let mut parent = anchor.digest();
+    for number in 101..=105u64 {
+        let header = signed_chained_header(number, parent, &leader);
+        parent = header.digest();
+        chain.insert(number, header);
+    }
+    let target = chain[&105].clone();
+    let honest: Vec<_> = chain.values().cloned().collect();
+    let (network, _by_number) = peer_network(chain.clone(), &honest);
+
+    let cb = ConsensusBus::new();
+    seed_recently_executed_blocks(&cb);
+    cb.executed_anchor().send_replace(anchor.clone());
+    let _rx = cb.consensus_header().subscribe();
+    let (walk_tx, mut verified) = VerifiedHeaders::channel();
+    let mut session =
+        WalkSession::new(config.clone(), cb.clone(), network).with_verified(Some(walk_tx));
+
+    // The walk covers 101 and 102, as a walk to an epoch end at 102 does. A stale row from older
+    // code sits at 103 and does not link to 102.
+    assert!(session.sync_to(chain[&102].digest()).await.is_continue());
+    store_consensus_header_in_cache(db, &fabricated_header(103, B256::repeat_byte(0x99)));
+
+    // The streamer streams 101 and 102, finds 103 does not link, and clears 102. The subscriber
+    // drops 102, so it is never saved as a canonical block.
+    let mut last_header = anchor.clone();
+    let mut last_height = anchor.number;
+    let pending = attempt_catch_up(
+        &config,
+        &cb,
+        &mut last_header,
+        &mut last_height,
+        target.clone(),
+        "stale 103",
+        &mut verified,
+    )
+    .await;
+    assert!(pending.is_some());
+    assert!(db.get_consensus_by_number(102).is_none(), "precondition: 102 is cleared");
+
+    // The walk to the target replaces 103 and must fetch 102 again.
+    assert!(session.sync_to(target.digest()).await.is_continue());
+    assert_eq!(
+        db.get_consensus_by_number(102).map(|h| h.digest()),
+        Some(chain[&102].digest()),
+        "the walk must store the cleared row again"
+    );
+    let pending = attempt_catch_up(
+        &config,
+        &cb,
+        &mut last_header,
+        &mut last_height,
+        target,
+        "after the walk",
+        &mut verified,
+    )
+    .await;
+    assert!(pending.is_none(), "catch-up reaches the target without a restart");
+    assert_eq!(last_height, 105);
+}

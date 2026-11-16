@@ -305,6 +305,8 @@ impl<DB: ReDatabase> WalkSession<DB> {
         if !self.is_local(start_hash) {
             return ControlFlow::Continue(());
         }
+        // The streamer may have cleared a row while the epoch ends were walked.
+        self.refresh_coverage().await;
         match self.walk(start_hash).await {
             // `start_hash` now heads a verified chain to canonical; stop here next time.
             WalkOutcome::Covered => {
@@ -320,12 +322,25 @@ impl<DB: ReDatabase> WalkSession<DB> {
         }
     }
 
-    /// Recover coverage from the persisted cache when the session has none (fresh task, or a prior
-    /// walk cleared it), so this walk stops at the top of the cached run rather than re-descending
-    /// it. Derivation sweeps and hashes every cached row, so it runs on a blocking thread to keep
-    /// the async worker responsive through a long catch-up stall; a join failure just leaves the
-    /// anchor unset and re-derives next call.
+    /// Drop the covered anchor when the forward streamer has cleared a stored row since the last
+    /// check, then recover coverage from the persisted cache when the session has none.
+    ///
+    /// A walk stops at the anchor without checking that the rows below it are still stored, so a
+    /// row the streamer cleared below it would never be fetched again. Derivation stops below
+    /// the cleared row, so the next walk fetches it. The epoch ends are walked again from the
+    /// node's epoch too; the stored ones cost one lookup each.
+    ///
+    /// Without an anchor (fresh task, or a prior walk cleared it), derivation lets this walk stop
+    /// at the top of the cached run rather than re-descending it. It sweeps and hashes every
+    /// cached row, so it runs on a blocking thread to keep the async worker responsive through
+    /// a long catch-up stall; a join failure just leaves the anchor unset and re-derives next
+    /// call.
     async fn refresh_coverage(&mut self) {
+        if self.verified.as_ref().is_some_and(VerifiedSender::take_row_cleared) {
+            info!(target: "state-sync", "backwards walk: the streamer cleared a stored row, deriving coverage again");
+            self.covered = None;
+            self.next_checkpoint = 0;
+        }
         if self.covered.is_none() {
             let db = self.config.node_storage().clone();
             self.covered = tokio::task::spawn_blocking(move || derive_covered_anchor(&db))
