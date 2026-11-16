@@ -735,6 +735,7 @@ async fn catch_up_consensus_from_to<DB: Database>(
                     let _ = txn.remove::<ConsensusBlockNumbersByDigest>(&parent_hash);
                     Ok(())
                 });
+                verified.row_cleared();
             }
             warn!(
                 target: "rayls-consensus-state-sync",

@@ -1,7 +1,16 @@
 //! Headers this process has already BLS-verified, so the subscriber does not verify them again.
+//!
+//! The same link carries one signal back, from the forward streamer to the walk: that the streamer
+//! cleared a stored row, so the walk must not trust its covered anchor any more.
 
 use rayls_infrastructure_types::{encode, keccak256, ConsensusHeader, B256};
-use std::collections::BTreeSet;
+use std::{
+    collections::BTreeSet,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+};
 use tokio::sync::mpsc;
 
 /// Most records the channel holds, and most the streamer's set keeps. A record is 40 bytes, so the
@@ -15,13 +24,22 @@ const MAX_VERIFIED_HEADERS: usize = 65_536;
 
 /// Records each header the backwards walk verifies, for the forward streamer.
 #[derive(Clone, Debug)]
-pub(crate) struct VerifiedSender(mpsc::Sender<(u64, B256)>);
+pub(crate) struct VerifiedSender {
+    tx: mpsc::Sender<(u64, B256)>,
+    /// Set by the streamer when it clears a stored row; see [`VerifiedHeaders::row_cleared`].
+    row_cleared: Arc<AtomicBool>,
+}
 
 impl VerifiedSender {
     /// Record `header`, which has just passed `verify_header_with_keys`. Drops the record when the
     /// streamer is behind: the subscriber then verifies that header itself.
     pub(crate) fn record(&self, header: &ConsensusHeader) {
-        let _ = self.0.try_send((header.number, full_hash(header)));
+        let _ = self.tx.try_send((header.number, full_hash(header)));
+    }
+
+    /// True when the streamer has cleared a stored row since the last call.
+    pub(crate) fn take_row_cleared(&self) -> bool {
+        self.row_cleared.swap(false, Ordering::AcqRel)
     }
 }
 
@@ -30,13 +48,25 @@ impl VerifiedSender {
 pub(crate) struct VerifiedHeaders {
     rx: Option<mpsc::Receiver<(u64, B256)>>,
     seen: BTreeSet<(u64, B256)>,
+    row_cleared: Arc<AtomicBool>,
 }
 
 impl VerifiedHeaders {
     /// A connected sender and receiver.
     pub(crate) fn channel() -> (VerifiedSender, Self) {
         let (tx, rx) = mpsc::channel(MAX_VERIFIED_HEADERS);
-        (VerifiedSender(tx), Self { rx: Some(rx), seen: BTreeSet::new() })
+        let row_cleared = Arc::new(AtomicBool::new(false));
+        let sender = VerifiedSender { tx, row_cleared: row_cleared.clone() };
+        (sender, Self { rx: Some(rx), seen: BTreeSet::new(), row_cleared })
+    }
+
+    /// Tell the walk that the streamer cleared a stored row.
+    ///
+    /// The walk stops at its covered anchor without checking that the rows below it are still
+    /// stored. A cleared row there would never be fetched again, so the walk drops the anchor and
+    /// derives it again from the stored rows, which stops below the cleared one.
+    pub(crate) fn row_cleared(&self) {
+        self.row_cleared.store(true, Ordering::Release);
     }
 
     /// True when this process verified exactly `header`, signatures included.
