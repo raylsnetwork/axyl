@@ -249,6 +249,8 @@ where
         self.consensus_db
             .save_pending_epoch_record(&epoch_rec)
             .map_err(|e| eyre!("failed to persist pending epoch record for epoch {epoch}: {e}"))?;
+        // The gossip handler admits votes against its cached view of the pending table.
+        self.consensus_bus.pending_epoch_records_changed().send_modify(|version| *version += 1);
         self.epoch_record = Some(epoch_rec);
         Ok(())
     }

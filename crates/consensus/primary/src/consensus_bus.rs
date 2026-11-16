@@ -12,9 +12,9 @@ use rayls_consensus_network::{types::NetworkEvent, NetworkMetrics};
 use rayls_consensus_primary_metrics::{ChannelMetrics, ConsensusMetrics, ExecutorMetrics, Metrics};
 use rayls_infrastructure_config::Parameters;
 use rayls_infrastructure_types::{
-    batch_tracker::BatchTracker, error::HeaderError, BlockHash, BlockNumHash, Certificate,
-    CertificateDigest, CommittedSubDag, ConsensusHeader, ConsensusOutput, Epoch, EpochVote, Header,
-    RaylsReceiver, RaylsSender, Round, SendError, TryRecvError, TrySendError, CHANNEL_CAPACITY,
+    batch_tracker::BatchTracker, BlockHash, BlockNumHash, Certificate, CertificateDigest,
+    CommittedSubDag, ConsensusHeader, ConsensusOutput, Epoch, EpochVote, Header, RaylsReceiver,
+    RaylsSender, Round, SendError, TryRecvError, TrySendError, CHANNEL_CAPACITY,
 };
 
 /// Gate for re-promotion to CvvActive after a DAG-behind demotion.
@@ -208,6 +208,10 @@ struct ConsensusBusAppInner {
     /// An epoch we need an epoch record for.
     tx_requested_missing_epoch: watch::Sender<Epoch>,
 
+    /// Bumped whenever a pending (uncertified) epoch record is written, so a reader that caches
+    /// the pending table knows when to re-read it.
+    tx_pending_epoch_records_changed: watch::Sender<u64>,
+
     /// Signals a new round
     tx_primary_round_updates: watch::Sender<Round>,
 
@@ -243,7 +247,7 @@ struct ConsensusBusAppInner {
     /// Status of sync?
     tx_sync_status: watch::Sender<NodeMode>,
     /// Produce new epoch certs as they are recieved.
-    new_epoch_votes: QueChannel<(EpochVote, oneshot::Sender<Result<(), HeaderError>>)>,
+    new_epoch_votes: QueChannel<EpochVote>,
     /// The que channel for primary network events.
     primary_network_events: QueChannel<NetworkEvent<crate::network::Req, crate::network::Res>>,
 
@@ -285,6 +289,7 @@ impl ConsensusBusAppInner {
         let (tx_committed_round_updates, _) = watch::channel(Round::default());
         let (tx_gc_round_updates, _) = watch::channel(Round::default());
         let (tx_requested_missing_epoch, _) = watch::channel(Epoch::default());
+        let (tx_pending_epoch_records_changed, _) = watch::channel(0u64);
         let (tx_primary_round_updates, _) = watch::channel(0u32);
         let (tx_last_consensus_header, _) = watch::channel(ConsensusHeader::default());
         let (tx_last_published_consensus_num_hash, _) = watch::channel((0, BlockHash::default()));
@@ -308,6 +313,7 @@ impl ConsensusBusAppInner {
             tx_committed_round_updates,
             tx_gc_round_updates,
             tx_requested_missing_epoch,
+            tx_pending_epoch_records_changed,
             tx_primary_round_updates,
             tx_recently_executed_blocks,
             tx_executed_anchor,
@@ -571,6 +577,12 @@ impl ConsensusBus {
         &self.inner_app.tx_requested_missing_epoch
     }
 
+    /// A counter bumped whenever a pending (uncertified) epoch record is written. The gossip
+    /// handler caches the pending table and re-reads it only when this has moved.
+    pub fn pending_epoch_records_changed(&self) -> &watch::Sender<u64> {
+        &self.inner_app.tx_pending_epoch_records_changed
+    }
+
     /// Signals a new round
     pub fn primary_round_updates(&self) -> &watch::Sender<Round> {
         &self.inner_app.tx_primary_round_updates
@@ -801,9 +813,7 @@ impl ConsensusBus {
     }
 
     /// New epoch certs as they are recieved.
-    pub fn new_epoch_votes(
-        &self,
-    ) -> &impl RaylsSender<(EpochVote, oneshot::Sender<Result<(), HeaderError>>)> {
+    pub fn new_epoch_votes(&self) -> &impl RaylsSender<EpochVote> {
         &self.inner_app.new_epoch_votes
     }
 
@@ -811,10 +821,7 @@ impl ConsensusBus {
     ///
     /// Returns `None` while the receiver is held (a running vote collection owns it), so a caller
     /// that only wants to drop stale queued votes can no-op instead of panicking.
-    pub fn try_subscribe_epoch_votes(
-        &self,
-    ) -> Option<impl RaylsReceiver<(EpochVote, oneshot::Sender<Result<(), HeaderError>>)> + 'static>
-    {
+    pub fn try_subscribe_epoch_votes(&self) -> Option<impl RaylsReceiver<EpochVote> + 'static> {
         self.inner_app.new_epoch_votes.try_subscribe()
     }
 

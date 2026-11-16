@@ -28,14 +28,14 @@ use rayls_infrastructure_types::{
     now, to_intent_message, try_decode, AuthorityIdentifier, B256Map, BlockHash, BlockNumHash,
     BlsPublicKey, Certificate, CertificateDigest, ConsensusHeader, Database, Epoch,
     EpochCertificate, EpochRecord, Hash as _, Header, ProtocolSignature, RaylsSender as _, Round,
-    SignatureVerificationState, Vote, VotesAggregator,
+    SignatureVerificationState, Vote, VotesAggregator, B256,
 };
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     sync::Arc,
     time::Duration,
 };
-use tokio::{sync::oneshot, time::Instant};
+use tokio::time::Instant;
 use tracing::{debug, error, info, trace, warn};
 
 const MAX_AUTH_LAST_VOTE_ENTRIES: usize = 1000;
@@ -112,7 +112,32 @@ pub(crate) struct RequestHandler<DB> {
     consensus_certs: Arc<Mutex<B256Map<VotesAggregator<ConsensusResult>>>>,
     /// Commit-progress tracker gating demotion to `CvvInactive` (see [`behind_consensus`]).
     behind_tracker: Arc<Mutex<BehindTracker>>,
+    /// Signers whose epoch vote was already queued, per epoch: one vote per signer and epoch
+    /// reaches the collector. Pruned to the newest few epochs.
+    epoch_votes_seen: Arc<Mutex<BTreeMap<Epoch, HashSet<BlsPublicKey>>>>,
+    /// The pending (uncertified) epoch records by digest, as last read from the table.
+    pending_records: Arc<Mutex<PendingRecordCache>>,
 }
+
+/// The gossip handler's view of the pending epoch record table.
+///
+/// Reading the table decodes every row's committees, so it is done only when the epoch manager
+/// has written a row since the last read (`pending_epoch_records_changed` on the bus). A vote
+/// for any other digest, which is what a flood of invented digests is, costs one map lookup.
+/// Certification removes a row without bumping the counter, so a hit is confirmed against the
+/// certified records before it is trusted; hits are bounded by the dedup, so that is cheap.
+#[derive(Debug, Default)]
+struct PendingRecordCache {
+    /// Value of `pending_epoch_records_changed` the map was read at.
+    version: Option<u64>,
+    /// Epoch and committee of each pending record, by digest.
+    by_digest: HashMap<B256, (Epoch, Vec<BlsPublicKey>)>,
+}
+
+/// Epochs of queued epoch votes remembered for dedup; older ones are forgotten. The handler is
+/// rebuilt every epoch, so this only matters with more epochs pending at once than this, and
+/// then the oldest lose their dedup and a republish for them costs a signature check again.
+const EPOCH_VOTES_SEEN_EPOCHS: usize = 8;
 
 impl<DB> RequestHandler<DB>
 where
@@ -141,6 +166,44 @@ where
             auth_last_vote: Default::default(),
             consensus_certs: Default::default(),
             behind_tracker: Default::default(),
+            epoch_votes_seen: Default::default(),
+            pending_records: Default::default(),
+        }
+    }
+
+    /// The epoch and committee of the pending record with `digest`, from the cached table.
+    fn pending_record(&self, digest: &B256) -> Option<(Epoch, Vec<BlsPublicKey>)> {
+        let version = *self.consensus_bus.pending_epoch_records_changed().borrow();
+        let mut cache = self.pending_records.lock();
+        if cache.version != Some(version) {
+            cache.by_digest = self
+                .consensus_config
+                .node_storage()
+                .pending_epoch_records()
+                .into_iter()
+                .map(|record| (record.digest(), (record.epoch, record.committee)))
+                .collect();
+            cache.version = Some(version);
+        }
+        cache.by_digest.get(digest).cloned()
+    }
+
+    /// Claim the one admission a vote by `signer` for `epoch` gets; `false` when it is taken.
+    /// Check and claim in one step, since every gossip message runs on its own task.
+    fn claim_epoch_vote(&self, epoch: Epoch, signer: BlsPublicKey) -> bool {
+        let mut seen = self.epoch_votes_seen.lock();
+        let first = seen.entry(epoch).or_default().insert(signer);
+        while seen.len() > EPOCH_VOTES_SEEN_EPOCHS {
+            seen.pop_first();
+        }
+        first
+    }
+
+    /// Give back the admission claimed by [`Self::claim_epoch_vote`]: the queue refused the
+    /// vote, so a republished copy must get another chance.
+    fn release_epoch_vote(&self, epoch: Epoch, signer: &BlsPublicKey) {
+        if let Some(signers) = self.epoch_votes_seen.lock().get_mut(&epoch) {
+            signers.remove(signer);
         }
     }
 
@@ -376,9 +439,8 @@ where
                     topic.to_string().eq(&LibP2pConfig::epoch_vote_topic()),
                     PrimaryNetworkError::InvalidTopic
                 );
-                // The signer must be the publisher, checked before the vote is queued: the
-                // collector's committee check reads `vote.public_key`, which the publisher
-                // writes, and only runs at the next epoch close.
+                // The signer must be the publisher: `vote.public_key` is what the committee
+                // check below reads, and the publisher writes it.
                 ensure!(
                     vote.public_key == author,
                     PrimaryNetworkError::GossipAuthorMismatch {
@@ -386,12 +448,61 @@ where
                         claimed: Box::new(vote.public_key)
                     }
                 );
-                let (tx, rx) = oneshot::channel();
-                let _ = self.consensus_bus.new_epoch_votes().send((*vote, tx)).await;
-                match rx.await {
-                    Ok(res) => res?,
-                    // do not punish peer for an internal channel issue
-                    Err(e) => error!(target: "primary", "error waiting on epoch vote result: {e}"),
+                // A vote is admitted here or dropped here; nothing waits on the collector. What
+                // reaches the queue is a verified committee signature over the digest of a
+                // record this node holds uncertified, one per signer and epoch, so the queue
+                // holds at most a committee's worth of votes per pending epoch and a flood of
+                // invented digests or repeated copies never gets past this point. A vote that
+                // arrives before this node has built the record is dropped too: the author
+                // republishes at each fallback while it collects, and a node that missed them
+                // asks for the certificate at its first fallback.
+                //
+                // An uncertified record lives in the pending table (one row per epoch still
+                // being certified, normally one) until its certificate is written, which
+                // removes the row in the same transaction: not pending means unknown here or
+                // already certified, and either way the vote is of no use. The table is read
+                // through a cache (see `PendingRecordCache`), so this is a map lookup.
+                let Some((epoch, committee)) = self.pending_record(&vote.epoch_hash) else {
+                    debug!(target: "primary", signer = ?author, digest = %vote.epoch_hash, "dropping epoch vote for a record this node does not hold pending");
+                    return Ok(());
+                };
+                ensure!(
+                    committee.contains(&author),
+                    PrimaryNetworkError::InvalidHeader(HeaderError::UnknownAuthority(format!(
+                        "{author} not in the committee for epoch {epoch}"
+                    )))
+                );
+                // One admission per signer and epoch. The claim is taken before the signature
+                // check and kept on a bad signature: only the signer itself can publish a vote
+                // naming it, so a bad copy spends its own admission, and that caps what a
+                // member can cost this node at one failed verify per epoch. A refused send
+                // gives the claim back so a republished copy is admitted.
+                if !self.claim_epoch_vote(epoch, author) {
+                    debug!(target: "primary", signer = ?author, epoch, "dropping a repeated epoch vote");
+                    return Ok(());
+                }
+                ensure!(
+                    vote.check_signature(),
+                    PrimaryNetworkError::InvalidHeader(HeaderError::PeerNotAuthor)
+                );
+                // The cache can lag certification (the row is removed without bumping the
+                // counter), so a hit is confirmed against the certified records.
+                if self
+                    .consensus_config
+                    .node_storage()
+                    .get_epoch_by_hash(vote.epoch_hash)
+                    .is_some_and(|(_, cert)| cert.is_some())
+                {
+                    debug!(target: "primary", signer = ?author, epoch, "dropping epoch vote for a record certified since the table was read");
+                    return Ok(());
+                }
+                match self.consensus_bus.new_epoch_votes().try_send(*vote) {
+                    Ok(()) => {}
+                    // bounded by committee x pending epochs, so this is a bug, not load
+                    Err(e) => {
+                        self.release_epoch_vote(epoch, &author);
+                        error!(target: "primary", ?e, epoch, "epoch vote queue refused a vote")
+                    }
                 }
             }
         }
