@@ -379,8 +379,10 @@ impl<DB: Database> Subscriber<DB> {
                 );
                 None
             }
+            // A panic here used to crash the node; the header is now dropped instead, so keep it
+            // loud enough to reach alerting.
             Err(e) => {
-                warn!(target: "subscriber", number, "BLS verification task failed: {e}");
+                error!(target: "subscriber", number, "BLS verification task failed: {e}");
                 None
             }
         }

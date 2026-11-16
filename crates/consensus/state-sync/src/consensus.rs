@@ -172,10 +172,11 @@ async fn get_consensus_header<DB: ReDatabase>(
                     continue;
                 };
                 let parent = verified.parent_hash;
-                store_consensus_header_in_cache(db, &verified);
+                // Record before storing, as in `prefetch_below`.
                 if let Some(tx) = verified_tx {
                     tx.record(&verified);
                 }
+                store_consensus_header_in_cache(db, &verified);
                 republish_if_higher(consensus_bus, &verified);
                 return Some((parent, verified.number));
             }
@@ -631,7 +632,10 @@ impl<DB: ReDatabase> WalkSession<DB> {
                             header.verify_header_with_keys(&keys).map_err(|e| e.to_string())
                         })
                         .await
-                        .unwrap_or_else(|e| Err(format!("verification task failed: {e}"))),
+                        .unwrap_or_else(|e| {
+                            error!(target: "state-sync", number, "prefetch: verification task failed: {e}");
+                            Err(format!("verification task failed: {e}"))
+                        }),
                     };
                     (number, epoch, result)
                 }
@@ -644,7 +648,7 @@ impl<DB: ReDatabase> WalkSession<DB> {
                                 target: "state-sync",
                                 number,
                                 epoch,
-                                "prefetch: reply failed verification, fetching it by hash: {e}"
+                                "prefetch: could not verify reply, fetching it by hash: {e}"
                             )
                         })
                         .ok()
@@ -661,10 +665,12 @@ impl<DB: ReDatabase> WalkSession<DB> {
                 expected = lowest.parent_hash;
             }
             let full_round = checked.len() as u64 == above - low;
-            store_consensus_headers_in_cache(db, &checked);
+            // Record before storing, so the streamer never reads a stored header whose record
+            // has not been sent yet.
             if let Some(tx) = self.verified.as_ref() {
                 checked.iter().for_each(|header| tx.record(header));
             }
+            store_consensus_headers_in_cache(db, &checked);
             stored += checked.len() as u64;
             if !full_round {
                 break;
