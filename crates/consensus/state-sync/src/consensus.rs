@@ -26,6 +26,12 @@ const PROBE_INTERVAL: Duration = Duration::from_secs(10);
 /// after a stalled network restarts, do not flood the validators.
 const WALK_PREFETCH: u64 = 8;
 
+/// How long a walk waits for the records of the epochs in its gap, once per target epoch. The
+/// collector asks up to three peers for each record, and a peer that does not answer holds a
+/// request for the network's 10 second request timeout, so a shorter wait gives up on the
+/// records whenever one silent peer is asked first.
+const EPOCH_RECORDS_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Cache a consensus header in persistent storage.
 pub fn store_consensus_header_in_cache<DB: ReDatabase>(db: &DB, header: &ConsensusHeader) {
     store_consensus_headers_in_cache(db, std::slice::from_ref(header));
@@ -255,6 +261,8 @@ pub(crate) struct WalkSession<DB> {
     /// Lowest epoch whose end may still need a checkpoint walk; every epoch below it ends at or
     /// below a header a checkpoint walk already covered.
     next_checkpoint: Epoch,
+    /// Highest target epoch whose records this session has asked the collector for.
+    records_requested: Epoch,
 }
 
 impl<DB: ReDatabase> WalkSession<DB> {
@@ -273,6 +281,7 @@ impl<DB: ReDatabase> WalkSession<DB> {
             covered: None,
             verified: None,
             next_checkpoint: 0,
+            records_requested: 0,
         }
     }
 
@@ -287,19 +296,14 @@ impl<DB: ReDatabase> WalkSession<DB> {
     /// [`Self::walk_epoch_checkpoints`]). Returns `Break` when shutdown was noticed and the
     /// tracker must exit.
     pub(crate) async fn sync_to(&mut self, start_hash: B256) -> ControlFlow<()> {
-        // Recover coverage from the persisted cache when the session has none yet (fresh task, or a
-        // prior walk cleared it), so this walk stops at the top of the cached run rather than
-        // re-descending it. Derivation sweeps and hashes every cached row, so it runs on a blocking
-        // thread to keep the async worker responsive through a long catch-up stall; a join failure
-        // just leaves the anchor unset and re-derives next call.
-        if self.covered.is_none() {
-            let db = self.config.node_storage().clone();
-            self.covered = tokio::task::spawn_blocking(move || derive_covered_anchor(&db))
-                .await
-                .unwrap_or(None);
-        }
+        self.refresh_coverage().await;
         if self.walk_epoch_checkpoints(start_hash).await.is_break() {
             return ControlFlow::Break(());
+        }
+        // The target could not be fetched. Walking to it would only ask for it again, so leave the
+        // rest of the gap to the next tip.
+        if !self.is_local(start_hash) {
+            return ControlFlow::Continue(());
         }
         match self.walk(start_hash).await {
             // `start_hash` now heads a verified chain to canonical; stop here next time.
@@ -316,6 +320,20 @@ impl<DB: ReDatabase> WalkSession<DB> {
         }
     }
 
+    /// Recover coverage from the persisted cache when the session has none (fresh task, or a prior
+    /// walk cleared it), so this walk stops at the top of the cached run rather than re-descending
+    /// it. Derivation sweeps and hashes every cached row, so it runs on a blocking thread to keep
+    /// the async worker responsive through a long catch-up stall; a join failure just leaves the
+    /// anchor unset and re-derives next call.
+    async fn refresh_coverage(&mut self) {
+        if self.covered.is_none() {
+            let db = self.config.node_storage().clone();
+            self.covered = tokio::task::spawn_blocking(move || derive_covered_anchor(&db))
+                .await
+                .unwrap_or(None);
+        }
+    }
+
     /// Walk to the last header of each closed epoch first, oldest first, so the forward streamer
     /// can execute one epoch while the walk fetches the next.
     ///
@@ -325,53 +343,117 @@ impl<DB: ReDatabase> WalkSession<DB> {
     /// epoch's last consensus header, which makes it a trusted start for a walk, as `start_hash`
     /// is. Walking to each in turn stores the gap one epoch at a time from the bottom.
     ///
-    /// An epoch with no certified record is covered by the next walk. A walk that does not
-    /// complete ends this pass, and the walk to `start_hash` covers the rest, as without records.
+    /// An epoch with no certified record is covered by the next walk. A walk to an epoch end that
+    /// does not complete ends this, and the walk to `start_hash` covers the rest, as without
+    /// records.
     async fn walk_epoch_checkpoints(&mut self, start_hash: B256) -> ControlFlow<()> {
-        if self.is_local(start_hash) {
-            return ControlFlow::Continue(());
-        }
-        // The committee keys for the target's epoch come from the records below it, so fetching
-        // the target first makes the record collector fetch those records. The walk to the target
-        // then finds it stored.
-        if get_consensus_header(
-            start_hash,
-            &self.config,
-            &self.consensus_bus,
-            &self.network,
-            &self.shutdown,
-            self.verified.as_ref(),
-        )
-        .await
-        .is_none()
-        {
-            return if self.shutdown.noticed() {
-                ControlFlow::Break(())
-            } else {
-                ControlFlow::Continue(())
-            };
-        }
         let db = self.config.node_storage().clone();
+        // Fetching the target stores it for the walk to the target, and makes the record collector
+        // fetch the records below it when the target's committee keys are missing. The walks to
+        // the epoch ends need only the records already stored, so a failed fetch does not stop
+        // them.
+        if !self.is_local(start_hash)
+            && get_consensus_header(
+                start_hash,
+                &self.config,
+                &self.consensus_bus,
+                &self.network,
+                &self.shutdown,
+                self.verified.as_ref(),
+            )
+            .await
+            .is_none()
+            && self.shutdown.noticed()
+        {
+            return ControlFlow::Break(());
+        }
         let tip_epoch =
             db.last_record::<ConsensusBlocks>().map_or(0, |(_, tip)| tip.sub_dag.leader_epoch());
-        let Some((last_epoch, _)) = db.last_record::<EpochRecords>() else {
-            return ControlFlow::Continue(());
-        };
-        for epoch in tip_epoch.max(self.next_checkpoint)..=last_epoch {
+        if let Some(target) = db.get_consensus_by_hash(start_hash) {
+            let target_epoch = target.sub_dag.leader_epoch();
+            if self.wait_for_epoch_records(target_epoch, tip_epoch).await.is_break() {
+                return ControlFlow::Break(());
+            }
+        }
+        let mut epoch = tip_epoch.max(self.next_checkpoint);
+        // Records the collector stores meanwhile are walked too.
+        while db.last_record::<EpochRecords>().is_some_and(|(last, _)| epoch <= last) {
+            let current = epoch;
+            epoch += 1;
             // Only a certified record is trusted. The collector stores one only once it anchors
             // to the record before it, or a super-quorum of that epoch's committee attests it.
-            let Some((record, Some(_))) = db.get_epoch_by_number(epoch) else { continue };
+            let Some((record, Some(_))) = db.get_epoch_by_number(current) else { continue };
             let checkpoint = record.parent_consensus;
             if !self.is_local(checkpoint) {
-                info!(target: "state-sync", epoch, "backwards walk: walking to the end of an epoch");
+                info!(target: "state-sync", epoch = current, "backwards walk: walking to the end of an epoch");
                 match self.walk(checkpoint).await {
                     WalkOutcome::Covered => self.covered = Some(checkpoint),
                     // Rows this walk stored lie above the covered anchor, so the anchor holds.
-                    WalkOutcome::Incomplete => return ControlFlow::Continue(()),
+                    WalkOutcome::Incomplete => break,
                     WalkOutcome::Shutdown => return ControlFlow::Break(()),
                 }
             }
-            self.next_checkpoint = epoch + 1;
+            self.next_checkpoint = current + 1;
+        }
+        ControlFlow::Continue(())
+    }
+
+    /// Make the record collector fetch the records from the node's epoch up to the target's, and
+    /// wait for them up to [`EPOCH_RECORDS_TIMEOUT`], once per target epoch.
+    ///
+    /// Fetching the target asks the collector for records only when the target's committee keys
+    /// are missing. A node one or two epochs behind already has those keys from the committee
+    /// lookahead, so without this it would never fetch the records for its gap, and would get no
+    /// walk to an epoch end in the most common case.
+    async fn wait_for_epoch_records(
+        &mut self,
+        target_epoch: Epoch,
+        tip_epoch: Epoch,
+    ) -> ControlFlow<()> {
+        // The last epoch that closed below the target, whose record ends the node's gap.
+        let Some(last_closed) = target_epoch.checked_sub(1) else {
+            return ControlFlow::Continue(());
+        };
+        if last_closed < tip_epoch || self.records_requested >= target_epoch {
+            return ControlFlow::Continue(());
+        }
+        self.records_requested = target_epoch;
+        let db = self.config.node_storage();
+        let certified = || matches!(db.get_epoch_by_number(last_closed), Some((_, Some(_))));
+        // Subscribed before the first check, so a pass that ends after it still wakes the wait.
+        let mut collected = self.consensus_bus.epoch_records_collected().subscribe();
+        if certified() {
+            return ControlFlow::Continue(());
+        }
+        // The collector fetches every record from the last one it holds upward, so asking for
+        // this one also fetches those below it. It acts only on an epoch above the last record it
+        // holds, which counts as 0 when it holds none, so epoch 0's record is asked for as
+        // epoch 1. The collector then also tries epoch 1's record, which may not exist yet, a
+        // bounded number of times, as it does when a key wait asks for the target's epoch.
+        let request = last_closed.max(1);
+        self.consensus_bus.requested_missing_epoch().send_if_modified(|current| {
+            let raise = request > *current;
+            if raise {
+                *current = request;
+            }
+            raise
+        });
+        info!(target: "state-sync", epoch = last_closed, "backwards walk: waiting for epoch records");
+        let arrived = async {
+            while !certified() {
+                // The bus holds the sender for the life of the node.
+                if collected.changed().await.is_err() {
+                    return;
+                }
+            }
+        };
+        tokio::select! {
+            _ = &self.shutdown => return ControlFlow::Break(()),
+            waited = tokio::time::timeout(EPOCH_RECORDS_TIMEOUT, arrived) => {
+                if waited.is_err() {
+                    info!(target: "state-sync", epoch = last_closed, "backwards walk: epoch records not fetched in time, walking without them");
+                }
+            }
         }
         ControlFlow::Continue(())
     }
@@ -1264,5 +1346,240 @@ mod tests {
         assert!(session.sync_to(chain[&120].digest()).await.is_continue());
         assert_chain_cached(db, &chain);
         assert_eq!(requests.hashes(), vec![chain[&120].digest()], "only the target by hash");
+    }
+
+    /// The hashes asked for after the last request for `target`, with every request for
+    /// `target` before them.
+    fn hashes_after_target(requests: &mut WalkRequests, target: B256) -> Vec<B256> {
+        let hashes = requests.hashes();
+        let last = hashes.iter().rposition(|h| *h == target).expect("the target was asked for");
+        hashes[last + 1..].to_vec()
+    }
+
+    /// A node one or two epochs behind finds the target's committee keys without the record
+    /// collector, from the committee lookahead (or, as here, the current committee). The walk must
+    /// still ask the collector for the records of its gap, and use them, or it gets no walk to an
+    /// epoch end in the most common case.
+    #[tokio::test(start_paused = true)]
+    async fn walk_requests_the_records_when_the_keys_did_not_need_them() {
+        let fixture = CommitteeFixture::builder(MemDatabase::default)
+            .randomize_ports(true)
+            .committee_size(NonZeroUsize::new(4).unwrap())
+            .epoch(2)
+            .build();
+        let primary = fixture.authorities().next().unwrap();
+        let config = primary.consensus_config();
+        let db = config.node_storage();
+        let leader = fixture.certificate(&fixture.header_from_last_authority());
+        let chain = canonical_tip_and_chain(db, &leader, 140);
+        assert_eq!(chain[&140].sub_dag.leader_epoch(), 2, "precondition: the target is in epoch 2");
+        assert!(
+            config.get_committee_keys_for_epoch(2).is_some(),
+            "precondition: the target's keys need no record"
+        );
+
+        // Stands in for the record collector: stores the records of the gap once asked.
+        let bus = ConsensusBus::new();
+        let mut asked = bus.requested_missing_epoch().subscribe();
+        let collected = bus.epoch_records_collected().clone();
+        let collector_config = config.clone();
+        let ends = (chain[&110].digest(), chain[&125].digest());
+        tokio::spawn(async move {
+            if asked.changed().await.is_ok() {
+                let (db, key) = (collector_config.node_storage(), collector_config.key_config());
+                certify_epoch_end(db, key, 0, ends.0);
+                certify_epoch_end(db, key, 1, ends.1);
+                collected.send_replace(());
+            }
+        });
+
+        let (network, mut requests) = walk_network(chain.clone(), &chain, HashMap::new());
+        let mut session = WalkSession::new(config.clone(), bus.clone(), network);
+
+        let start = tokio::time::Instant::now();
+        assert!(session.sync_to(chain[&140].digest()).await.is_continue());
+        assert_eq!(start.elapsed(), Duration::ZERO, "woken by the collector, not by a timer");
+        assert_chain_cached(db, &chain);
+        assert_eq!(*bus.requested_missing_epoch().borrow(), 1, "the records up to epoch 1");
+        assert_eq!(
+            requests.hashes(),
+            vec![chain[&140].digest(), chain[&110].digest(), chain[&125].digest()],
+            "the target, then each epoch end oldest first"
+        );
+    }
+
+    /// A failed fetch of the target does not skip the walks to the epoch ends below it, which
+    /// need only the stored records. The target is not asked for again in the same pass.
+    #[tokio::test]
+    async fn walk_goes_through_epoch_ends_when_the_target_fetch_fails() {
+        let fixture = CommitteeFixture::builder(MemDatabase::default)
+            .randomize_ports(true)
+            .committee_size(NonZeroUsize::new(4).unwrap())
+            .build();
+        let primary = fixture.authorities().next().unwrap();
+        let config = primary.consensus_config();
+        let db = config.node_storage();
+        let leader = fixture.certificate(&fixture.header_from_last_authority());
+        let chain = canonical_tip_and_chain(db, &leader, 140);
+        let key = config.key_config();
+        certify_epoch_end(db, key, 0, chain[&110].digest());
+        certify_epoch_end(db, key, 1, chain[&125].digest());
+
+        // No peer serves the target by hash.
+        let mut by_hash = chain.clone();
+        by_hash.remove(&140);
+        let (network, mut requests) = walk_network(chain.clone(), &by_hash, HashMap::new());
+        let mut session = WalkSession::new(config.clone(), ConsensusBus::new(), network);
+
+        assert!(session.sync_to(chain[&140].digest()).await.is_continue());
+        assert_chain_cached(db, &chain.range(..=125).map(|(n, h)| (*n, h.clone())).collect());
+        assert_eq!(session.covered, Some(chain[&125].digest()));
+        assert_eq!(
+            hashes_after_target(&mut requests, chain[&140].digest()),
+            vec![chain[&110].digest(), chain[&125].digest()],
+            "each epoch end oldest first, and the target is not asked for again"
+        );
+    }
+
+    /// A walk to an epoch end that does not complete ends the walks to epoch ends for this pass:
+    /// the later ones are not tried, and the walk to the target covers the rest of the gap.
+    #[tokio::test]
+    async fn walk_stops_at_an_unavailable_epoch_end() {
+        let fixture = CommitteeFixture::builder(MemDatabase::default)
+            .randomize_ports(true)
+            .committee_size(NonZeroUsize::new(4).unwrap())
+            .build();
+        let primary = fixture.authorities().next().unwrap();
+        let config = primary.consensus_config();
+        let db = config.node_storage();
+        let leader = fixture.certificate(&fixture.header_from_last_authority());
+        let chain = canonical_tip_and_chain(db, &leader, 140);
+        let key = config.key_config();
+        let unavailable = B256::repeat_byte(0x77);
+        certify_epoch_end(db, key, 0, unavailable);
+        certify_epoch_end(db, key, 1, chain[&125].digest());
+
+        let (network, mut requests) = walk_network(chain.clone(), &chain, HashMap::new());
+        let mut session = WalkSession::new(config.clone(), ConsensusBus::new(), network);
+
+        assert!(session.sync_to(chain[&140].digest()).await.is_continue());
+        assert_chain_cached(db, &chain);
+        let after_target = hashes_after_target(&mut requests, chain[&140].digest());
+        assert!(!after_target.is_empty(), "the missing epoch end was tried");
+        assert!(after_target.iter().all(|h| *h == unavailable), "and no later epoch end");
+        assert_eq!(session.next_checkpoint, 0, "no epoch end was covered");
+        assert_eq!(session.covered, Some(chain[&140].digest()));
+    }
+
+    /// A target already stored, for example by an earlier pass that did not finish, still gets
+    /// the walks to the epoch ends below it.
+    #[tokio::test]
+    async fn walk_goes_through_epoch_ends_when_the_target_is_stored() {
+        let fixture = CommitteeFixture::builder(MemDatabase::default)
+            .randomize_ports(true)
+            .committee_size(NonZeroUsize::new(4).unwrap())
+            .build();
+        let primary = fixture.authorities().next().unwrap();
+        let config = primary.consensus_config();
+        let db = config.node_storage();
+        let leader = fixture.certificate(&fixture.header_from_last_authority());
+        let chain = canonical_tip_and_chain(db, &leader, 140);
+        store_consensus_header_in_cache(db, &chain[&140]);
+        let key = config.key_config();
+        certify_epoch_end(db, key, 0, chain[&110].digest());
+        certify_epoch_end(db, key, 1, chain[&125].digest());
+
+        let (network, mut requests) = walk_network(chain.clone(), &chain, HashMap::new());
+        let mut session = WalkSession::new(config.clone(), ConsensusBus::new(), network);
+
+        assert!(session.sync_to(chain[&140].digest()).await.is_continue());
+        assert_chain_cached(db, &chain);
+        assert_eq!(
+            requests.hashes(),
+            vec![chain[&110].digest(), chain[&125].digest()],
+            "each epoch end oldest first"
+        );
+    }
+
+    /// When the collector does not deliver the records of the gap in time, the walk goes on
+    /// without them and walks to the target. It waits only once per target epoch, so a later pass
+    /// toward the same epoch does not wait again.
+    #[tokio::test(start_paused = true)]
+    async fn walk_waits_for_epoch_records_once_then_walks_without_them() {
+        let fixture = CommitteeFixture::builder(MemDatabase::default)
+            .randomize_ports(true)
+            .committee_size(NonZeroUsize::new(4).unwrap())
+            .epoch(2)
+            .build();
+        let primary = fixture.authorities().next().unwrap();
+        let config = primary.consensus_config();
+        let db = config.node_storage();
+        let leader = fixture.certificate(&fixture.header_from_last_authority());
+        let chain = canonical_tip_and_chain(db, &leader, 140);
+
+        // No collector answers the request.
+        let bus = ConsensusBus::new();
+        let (network, mut requests) = walk_network(chain.clone(), &chain, HashMap::new());
+        let mut session = WalkSession::new(config.clone(), bus.clone(), network);
+
+        let start = tokio::time::Instant::now();
+        assert!(session.sync_to(chain[&130].digest()).await.is_continue());
+        assert!(start.elapsed() >= EPOCH_RECORDS_TIMEOUT, "the walk waited for the records");
+        assert_eq!(*bus.requested_missing_epoch().borrow(), 1, "the records were asked for");
+        assert_chain_cached(db, &chain.range(..=130).map(|(n, h)| (*n, h.clone())).collect());
+        assert_eq!(requests.hashes(), vec![chain[&130].digest()], "then the target, by hash");
+        assert_eq!(session.covered, Some(chain[&130].digest()));
+
+        let start = tokio::time::Instant::now();
+        assert!(session.sync_to(chain[&140].digest()).await.is_continue());
+        assert!(start.elapsed() < EPOCH_RECORDS_TIMEOUT, "no second wait for the same epoch");
+        assert_chain_cached(db, &chain);
+    }
+
+    /// A node still in epoch 0 with the target in epoch 1 needs epoch 0's record. The collector
+    /// acts only on an epoch above the last record it holds, which counts as 0 when it holds
+    /// none, so the walk must ask for epoch 1 to get it.
+    #[tokio::test(start_paused = true)]
+    async fn walk_gets_epoch_0_record_for_a_target_in_epoch_1() {
+        let fixture = CommitteeFixture::builder(MemDatabase::default)
+            .randomize_ports(true)
+            .committee_size(NonZeroUsize::new(4).unwrap())
+            .epoch(1)
+            .build();
+        let primary = fixture.authorities().next().unwrap();
+        let config = primary.consensus_config();
+        let db = config.node_storage();
+        let leader = fixture.certificate(&fixture.header_from_last_authority());
+        let chain = canonical_tip_and_chain(db, &leader, 140);
+        assert_eq!(chain[&140].sub_dag.leader_epoch(), 1, "precondition: the target is in epoch 1");
+
+        // Stands in for the record collector, which acts only on an epoch above 0 here.
+        let bus = ConsensusBus::new();
+        let mut asked = bus.requested_missing_epoch().subscribe();
+        let collected = bus.epoch_records_collected().clone();
+        let collector_config = config.clone();
+        let end = chain[&110].digest();
+        tokio::spawn(async move {
+            while asked.changed().await.is_ok() {
+                if *asked.borrow_and_update() > 0 {
+                    let (db, key) =
+                        (collector_config.node_storage(), collector_config.key_config());
+                    certify_epoch_end(db, key, 0, end);
+                    collected.send_replace(());
+                    return;
+                }
+            }
+        });
+
+        let (network, mut requests) = walk_network(chain.clone(), &chain, HashMap::new());
+        let mut session = WalkSession::new(config.clone(), bus.clone(), network);
+
+        assert!(session.sync_to(chain[&140].digest()).await.is_continue());
+        assert_chain_cached(db, &chain);
+        assert_eq!(
+            requests.hashes(),
+            vec![chain[&140].digest(), chain[&110].digest()],
+            "the target, then epoch 0's end"
+        );
     }
 }
