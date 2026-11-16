@@ -1346,7 +1346,7 @@ where
         loop {
             // Certified by someone else while we were backing off (a peer's backfill/fetch, or a
             // previous attempt's peer fetch landing late): nothing left to do for those.
-            states.retain(|s| !Self::certification_landed(&consensus_db, s, "while backing off"));
+            states.retain(|s| !Self::certification_landed(&consensus_db, s, "before collecting"));
             forget_certified_attempts(&certification_attempts, &certified);
             if states.is_empty() {
                 return;
