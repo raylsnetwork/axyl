@@ -347,6 +347,9 @@ library BlsG1 {
 
         {
             // b_1 = H(b_0 || I2OSP(1, 1) || DST_prime)
+            // RFC 9380 concatenation: b0 is 32 bytes and I2OSP(1, 1) is always 1 byte, so dstPrime is the
+            // only variable-length part and the packing is unambiguous.
+            // slither-disable-next-line encode-packed-collision
             bytes32 b1 = sha256(abi.encodePacked(b0, I2OSP(1, 1), dstPrime));
 
             // produce uniformly random byte string ie `uniform_bytes = b_1 || ..b_i.. || b_ell`
