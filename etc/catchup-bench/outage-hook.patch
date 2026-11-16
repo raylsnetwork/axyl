@@ -1,0 +1,56 @@
+diff --git a/crates/consensus/primary/src/network/mod.rs b/crates/consensus/primary/src/network/mod.rs
+index 836bfd25..58f6a585 100644
+--- a/crates/consensus/primary/src/network/mod.rs
++++ b/crates/consensus/primary/src/network/mod.rs
+@@ -18,6 +18,31 @@ pub use message::{MissingCertificatesRequest, PrimaryRequest, PrimaryResponse, S
+ use message::{PrimaryGossip, PrimaryRPCError};
+ #[doc(hidden)]
+ pub use rayls_consensus_network::{error::NetworkError, types::NetworkCommand};
++
++// BENCH OUTAGE HOOK (throwaway, never in a PR). With RL_BENCH_OUTAGE_START_MS and
++// RL_BENCH_OUTAGE_MS set, every consensus header request attempt made in the window
++// [first request + START, + DURATION] fails. With RL_BENCH_OUTAGE_SILENT set, each failing attempt
++// first hangs for 10 s, the network's request timeout, like a peer that does not answer.
++static BENCH_FIRST_REQUEST: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
++
++async fn bench_outage() -> bool {
++    let env = |k: &str| std::env::var(k).ok().and_then(|v| v.parse::<u64>().ok());
++    let (Some(start), Some(dur)) = (env("RL_BENCH_OUTAGE_START_MS"), env("RL_BENCH_OUTAGE_MS"))
++    else {
++        return false;
++    };
++    let first = *BENCH_FIRST_REQUEST.get_or_init(std::time::Instant::now);
++    let at = first.elapsed().as_millis() as u64;
++    if at < start || at >= start + dur {
++        return false;
++    }
++    let silent = std::env::var_os("RL_BENCH_OUTAGE_SILENT").is_some();
++    tracing::warn!(target: "state-sync", at_ms = at, silent, "BENCH OUTAGE: failing a consensus header request");
++    if silent {
++        tokio::time::sleep(std::time::Duration::from_secs(10)).await;
++    }
++    true
++}
+ use rayls_consensus_network::{
+     types::{IntoResponse as _, NetworkEvent, NetworkHandle, NetworkResult},
+     GossipMessage, Penalty, ResponseChannel,
+@@ -200,6 +225,9 @@ impl PrimaryNetworkHandle {
+         hash: Option<BlockHash>,
+     ) -> NetworkResult<ConsensusHeader> {
+         let request = PrimaryRequest::ConsensusHeader { number, hash };
++        if bench_outage().await {
++            return Err(NetworkError::RPCError("bench outage".to_string()));
++        }
+         let res = self.handle.send_request(request, peer).await?;
+         let res = res.await??;
+         match res {
+@@ -242,6 +270,9 @@ impl PrimaryNetworkHandle {
+         // Try up to three times (from three peers) to get consensus.
+         // This could be a lot more complicated but this KISS method should work fine.
+         for _ in 0..3 {
++            if bench_outage().await {
++                continue;
++            }
+             let res = self.handle.send_request_any(request.clone()).await?;
+             let res = res.await?;
+             if let Ok(PrimaryResponse::ConsensusHeader(header)) = res {

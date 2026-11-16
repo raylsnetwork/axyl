@@ -9,17 +9,18 @@
 # See README.md.
 set -uo pipefail
 
-usage() { echo "usage: $0 -v VALIDATOR_BIN -b LABEL=BIN [-b ...] -d WORKDIR [-g GAP] [-r ROUNDS] [-m OBSERVERS] [-t TX_PER_SEC] [-e EPOCH_SECS] [-c CAST]"; exit 2; }
-GAP=300; ROUNDS=1; M=1; TPS=0; EPOCH_SECS=36000; CAST=cast; INSTANCE_BASE=70; VBIN=""; RUN=""; LABELS=(); declare -A BINS
-while getopts "v:b:d:g:r:m:t:e:c:" opt; do
+usage() { echo "usage: $0 -v VALIDATOR_BIN -b LABEL=BIN [-b ...] [-x LABEL=VAR=VAL[,VAR=VAL...] ...] -d WORKDIR [-g GAP] [-r ROUNDS] [-m OBSERVERS] [-t TX_PER_SEC] [-e EPOCH_SECS] [-c CAST]"; exit 2; }
+GAP=300; ROUNDS=1; M=1; TPS=0; EPOCH_SECS=36000; CAST=cast; INSTANCE_BASE=70; VBIN=""; RUN=""; LABELS=(); declare -A BINS ENVS
+while getopts "v:b:x:d:g:r:m:t:e:c:" opt; do
     case "$opt" in
         v) VBIN=$OPTARG ;; b) LABELS+=("${OPTARG%%=*}"); BINS[${OPTARG%%=*}]=${OPTARG#*=} ;; d) RUN=$OPTARG ;;
         g) GAP=$OPTARG ;; r) ROUNDS=$OPTARG ;; m) M=$OPTARG ;; t) TPS=$OPTARG ;; e) EPOCH_SECS=$OPTARG ;;
-        c) CAST=$OPTARG ;; *) usage ;;
+        x) ENVS[${OPTARG%%=*}]=${OPTARG#*=} ;; c) CAST=$OPTARG ;; *) usage ;;
     esac
 done
 [[ -x $VBIN && -n $RUN && ${#LABELS[@]} -gt 0 ]] || usage
 for l in "${LABELS[@]}"; do [[ -x ${BINS[$l]} ]] || { echo "not executable: $l=${BINS[$l]}"; exit 2; }; done
+for l in "${!ENVS[@]}"; do [[ -n ${BINS[$l]:-} ]] || { echo "-x for unknown label: $l"; exit 2; }; done
 [[ -d $RUN && -n $(ls -A "$RUN" 2>/dev/null) ]] && { echo "not empty: $RUN"; exit 2; }
 [[ $TPS == 0 ]] || CAST=$(command -v "$CAST") || { echo "cast not found (part of Foundry); needed for -t"; exit 2; }
 
@@ -65,10 +66,12 @@ start_validator() {
         --log.stdout.filter "info,network=debug" --http.api all >>"$RUN/validator-$seq.log" 2>&1 &
     PIDS[$seq]=$!
 }
+# start_observer I BIN LOGFILE [VAR=VAL,...]: the optional list (from -x) is set for this observer only.
 start_observer() {
-    local i=$1 bin=$2 logfile=$3 inst
+    local i=$1 bin=$2 logfile=$3 inst vars=()
+    [[ -n ${4:-} ]] && IFS=, read -ra vars <<<"$4"
     inst=$(obs_instance "$i")
-    PRIMARY_LISTENER_MULTIADDR="/ip4/0.0.0.0/udp/$((49000 + inst))/quic-v1" \
+    env "${vars[@]}" PRIMARY_LISTENER_MULTIADDR="/ip4/0.0.0.0/udp/$((49000 + inst))/quic-v1" \
     WORKER_LISTENER_MULTIADDR="/ip4/0.0.0.0/udp/$((49100 + inst))/quic-v1" \
         "$bin" node --datadir "$RUN/observer-$i" --network local --observer --instance "$inst" \
         --log.stdout.format log-fmt --full --storage.v2 --db.growth-step 1MB --consensus-db.growth-step 1MB \
@@ -214,7 +217,7 @@ for round in $(seq 1 "$ROUNDS"); do
         txs=0; step=$(( (tip - stop_at) / 20 )); (( step < 1 )) && step=1; n=0
         for b in $(seq $((stop_at + 1)) "$step" "$tip"); do txs=$((txs + $(block_txs "$b"))); n=$((n + 1)); done
         t0=$(date +%s%3N)
-        for i in $(seq 1 "$M"); do start_observer "$i" "$bin" "$RUN/observer-$i-$round-$label.log"; done
+        for i in $(seq 1 "$M"); do start_observer "$i" "$bin" "$RUN/observer-$i-$round-$label.log" "${ENVS[$label]:-}"; done
         trace="$RUN/progress-$round-$label.tsv"; echo -e "ms\tobs1_height" >"$trace"
         declare -A first=(); rc=1; last_trace=0
         for _ in $(seq 1 72000); do

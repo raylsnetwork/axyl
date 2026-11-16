@@ -46,6 +46,33 @@ etc/catchup-bench/run.sh 50 /tmp/bench-1500 -v "$HOME/bins/main" \
 
 `matrix.sh OUTDIR LABEL=BIN [LABEL=BIN ...]` runs the cases behind the numbers in PR #371 (about 3 hours).
 
+`-x LABEL=VAR=VAL[,VAR=VAL...]` sets environment variables for that label's observers only. Repeat it for other labels. Labels may share a binary.
+
+## Outage case
+
+Compares how two binaries catch up while the observer's network fails for a while, as in the "Fault tolerance" table of PR #371.
+
+1. In each checkout to compare, apply the hook and build:
+
+   ```sh
+   git apply /path/to/etc/catchup-bench/outage-hook.patch
+   cargo build --release -p rayls-network
+   cp target/release/rayls-network "$HOME/bins/<name>-outage"
+   git checkout -- crates/consensus/primary/src/network/mod.rs
+   ```
+
+   The hook is off unless its variables are set, so the same binary also runs the case without an outage and the validators. When two checkouts share a `CARGO_TARGET_DIR`, cargo can reuse one checkout's crates for the other: use separate target directories, or check each binary (for example, only a #371 build contains the string `walking to the end of an epoch`).
+
+2. Run both:
+
+   ```sh
+   etc/catchup-bench/outage.sh /tmp/bench-outage main="$HOME/bins/main-outage" pr="$HOME/bins/pr-outage"
+   ```
+
+   Each round runs six labels in turn: each binary with no outage, with requests failing at once (`-fast`), and with requests hanging first (`-silent`). The default is 2 rounds, about an hour; a third argument sets the number.
+
+The hook, in `request_consensus` and `request_consensus_from_peer` (`crates/consensus/primary/src/network/mod.rs`), fails every consensus header request attempt made between `RL_BENCH_OUTAGE_START_MS` and `RL_BENCH_OUTAGE_START_MS + RL_BENCH_OUTAGE_MS` after the node's first such request. With `RL_BENCH_OUTAGE_SILENT` set, each failing attempt first waits 10 s, the network's request timeout, like a peer that does not answer. Each failed attempt logs `BENCH OUTAGE`; `outage.sh` prints the count per run, which should be similar for both binaries.
+
 ## Output
 
 Each round prints one line and appends it to `WORKDIR/summary.txt`:
