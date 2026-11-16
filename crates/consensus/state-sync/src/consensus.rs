@@ -1377,6 +1377,70 @@ mod tests {
         hashes[last + 1..].to_vec()
     }
 
+    /// #398: once the record collector stores the record that carries an epoch's keys and sends
+    /// `epoch_records_collected`, the key wait should return at once. Today it checks again only
+    /// every `COMMITTEE_KEYS_POLL_INTERVAL` (500 ms), so this fails until the wait listens to the
+    /// signal.
+    #[tokio::test(start_paused = true)]
+    async fn committee_key_wait_returns_when_the_record_is_stored() {
+        let fixture = CommitteeFixture::builder(MemDatabase::default)
+            .randomize_ports(true)
+            .committee_size(NonZeroUsize::new(4).unwrap())
+            .build();
+        let primary = fixture.authorities().next().unwrap();
+        let config = primary.consensus_config();
+        // An epoch far from the node's, so its keys can only come from a stored record.
+        let epoch = 10;
+        assert!(config.get_committee_keys_for_epoch(epoch).is_none(), "precondition: no keys yet");
+        let keys = config.committee_pub_keys().into_iter().collect::<Vec<_>>();
+
+        // Stands in for the record collector: stores the record once asked, then signals.
+        let bus = ConsensusBus::new();
+        let mut asked = bus.requested_missing_epoch().subscribe();
+        let collected = bus.epoch_records_collected().clone();
+        let collector_config = config.clone();
+        let record_keys = keys.clone();
+        tokio::spawn(async move {
+            if asked.changed().await.is_ok() {
+                let record = EpochRecord { epoch, committee: record_keys, ..Default::default() };
+                collector_config.node_storage().save_epoch_record(&record).unwrap();
+                collected.send_replace(());
+            }
+        });
+
+        let shutdown = config.shutdown().subscribe();
+        let start = tokio::time::Instant::now();
+        let found = wait_for_committee_keys(epoch, &config, &bus, &shutdown).await;
+        // Compared as sets: the order of a committee's keys does not matter here.
+        let found: Option<std::collections::HashSet<_>> =
+            found.map(|keys| keys.into_iter().collect());
+        assert_eq!(found, Some(keys.into_iter().collect()), "the keys from the stored record");
+        assert_eq!(
+            start.elapsed(),
+            Duration::ZERO,
+            "the wait returns when the record is stored, not at its next timer tick"
+        );
+    }
+
+    /// The key wait still gives up after `COMMITTEE_KEYS_TIMEOUT` when no record comes. Passes
+    /// today; a fix for #398 must keep it passing.
+    #[tokio::test(start_paused = true)]
+    async fn committee_key_wait_gives_up_after_the_timeout() {
+        let fixture = CommitteeFixture::builder(MemDatabase::default)
+            .randomize_ports(true)
+            .committee_size(NonZeroUsize::new(4).unwrap())
+            .build();
+        let primary = fixture.authorities().next().unwrap();
+        let config = primary.consensus_config();
+        let shutdown = config.shutdown().subscribe();
+
+        let start = tokio::time::Instant::now();
+        let found = wait_for_committee_keys(10, &config, &ConsensusBus::new(), &shutdown).await;
+        assert_eq!(found, None, "no record, no keys");
+        assert!(start.elapsed() >= COMMITTEE_KEYS_TIMEOUT, "it waited the whole timeout");
+        assert!(start.elapsed() < COMMITTEE_KEYS_TIMEOUT + Duration::from_secs(1), "and no longer");
+    }
+
     /// A node one or two epochs behind finds the target's committee keys without the record
     /// collector, from the committee lookahead (or, as here, the current committee). The walk must
     /// still ask the collector for the records of its gap, and use them, or it gets no walk to an
