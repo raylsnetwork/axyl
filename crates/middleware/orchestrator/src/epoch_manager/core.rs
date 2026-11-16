@@ -1181,9 +1181,6 @@ where
         primary: &PrimaryNode<DB>,
         epoch_task_manager: &TaskManager,
     ) {
-        let certified = |epoch: Epoch| {
-            self.consensus_db.get_epoch_by_number(epoch).is_some_and(|(_, c)| c.is_some())
-        };
         let catching_up = !self.consensus_bus.node_mode().borrow().is_active_cvv();
         let me = self.builder.rayls_infrastructure_config.primary_bls_key();
         let primary_network = primary.network_handle().await;
@@ -1201,8 +1198,14 @@ where
         let mut states: Vec<PendingCertification> = Vec::new();
         for record in pending {
             let epoch = record.epoch;
-            if certified(epoch) {
-                // Certified since the row was written (e.g. by a peer's backfill); tidy up.
+            // Certified since the row was written (e.g. by a peer's backfill): counted and
+            // checked against our record like any other certificate that lands, then tidied up.
+            if Self::certification_landed(
+                &self.consensus_db,
+                &self.consensus_bus,
+                &PendingCertification::new(record.clone()),
+                "before resuming",
+            ) {
                 info!(
                     target: PENDING_RECORD_LOG_TARGET,
                     epoch,
