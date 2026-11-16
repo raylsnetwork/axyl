@@ -190,9 +190,7 @@ impl PrimaryNetworkHandle {
         match res {
             PrimaryResponse::RequestedCertificates(certs) => Ok(certs),
             // A fake busy answer counts only if no other peer answers, when no fallback helps.
-            PrimaryResponse::Busy => {
-                Err(NetworkError::PeerBusy(PrimaryNetworkError::Busy.to_string()))
-            }
+            PrimaryResponse::Busy => Err(NetworkError::PeerBusy),
             PrimaryResponse::Error(PrimaryRPCError(s)) => Err(NetworkError::RPCError(s)),
             _ => Err(NetworkError::RPCError("Got wrong response, not a certificate!".to_string())),
         }
