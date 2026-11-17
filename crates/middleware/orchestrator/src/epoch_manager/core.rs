@@ -1513,7 +1513,8 @@ where
 
                         // No vote counted since the previous fallback: the votes this record
                         // still needs went by before this node had its record (it closed after
-                        // those peers, and a peer that certified does not republish). Wake the
+                        // those peers, and after the copies they send in the 4 s following
+                        // their quorum). Wake the
                         // epoch record collector now, so the certificate comes from a peer
                         // within seconds instead of after the whole fallback schedule. A record
                         // whose count moved in the last 5 s is a slow close, not a missed one:
@@ -1580,8 +1581,9 @@ where
                 }
             }
             // Every record is done. Peers that closed the epoch after this node dropped the
-            // votes that went by before they had their record, and nodes that certified do not
-            // republish, so send ours again on a short schedule for each record this node
+            // votes that went by before they had their record, and nodes that certified no
+            // longer republish at the fallback, so send ours again on a short schedule for each
+            // record this node
             // certified by quorum: a late peer then counts a copy instead of fetching the
             // certificate. Shutdown cuts the schedule short between copies; a publish already
             // under way runs to the end, as at the fallback republish. Runs only when every

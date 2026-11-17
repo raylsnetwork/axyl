@@ -454,8 +454,9 @@ where
                 // holds at most a committee's worth of votes per pending epoch and a flood of
                 // invented digests or repeated copies never gets past this point. A vote that
                 // arrives before this node has built the record is dropped too: the author
-                // republishes at each fallback while it collects, and a node that missed them
-                // asks for the certificate at its first fallback.
+                // republishes at each fallback while it collects and, once certified, at 1, 2
+                // and 4 s after its quorum; a node that missed those asks a peer for the
+                // certificate once its vote count stops moving across a fallback.
                 //
                 // An uncertified record lives in the pending table (one row per epoch still
                 // being certified, normally one) until its certificate is written, which
