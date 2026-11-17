@@ -82,18 +82,19 @@ SOAK_VICTIMS=validator-5 ./etc/testbed/testbed.sh test soak   # keep bouncing ju
 
 ## Test cases
 
-Each test is one small file in `tests/<plan>/` and runs in file order.
+Each test is one small file in `tests/<plan>/` and runs in file order. The committee comes from the
+registry. Tests that fault one validator pick its last member, which is validator-5 once it has joined.
 
 | Plan | Test | Checks |
 |---|---|---|
 | basic | `01-liveness` | Every node is up and its chain grows |
 | | `02-consistency` | All nodes have the same block hashes |
-| | `03-node-status` | Validators `active_cvv`, RPC nodes `observer`, all caught up, same epoch |
+| | `03-node-status` | Committee members `active_cvv`, all other nodes `observer`, all caught up, same epoch |
 | | `04-transfer` | A transfer sent through each node lands, and all nodes see it |
 | | `05-restart` | Restart one validator; the chain continues and the node catches up |
 | | `06-epoch` | An epoch closes and its certified record is served |
 | chaos | `01-pause` | Freeze one validator (SIGSTOP), then resume it |
-| | `02-lose-quorum` | Stop enough validators to break quorum; the chain halts, then resumes without a fork |
+| | `02-lose-quorum` | Stop enough committee members to break quorum; the chain halts, then resumes without a fork |
 | | `03-flicker` | 5 quick freeze/resume cycles |
 | | `04-rolling-restart` | Restart every validator in turn; the chain never stops |
 | | `05-full-restart` | Stop and start all nodes; the chain resumes from the same height |
@@ -158,6 +159,11 @@ explicitly. So `HTTP_ADDR=0.0.0.0 ./etc/testbed/testbed.sh up` on the VM keeps r
 reachable from outside, and a debug testbed stays on debug. To change them, run `down` first:
 `up` refuses new settings while nodes are running.
 
+Nodes run a copy of the binary, `data/bin/rayls-network`, that `up` makes while no node is running.
+A `cargo build` during a run, after a `git pull` or on another branch, therefore never puts restarted
+nodes on a different build. `up` on a running testbed only starts the nodes that are down, with the
+same copy. For a new build, run `down`, then `up`.
+
 | Variable | Default | Purpose |
 |---|---|---|
 | `BUILD_CONFIG` | `release` | Cargo profile to build and run: `debug`, or another workspace profile such as `profiling`. Remembered by `up` (see below) |
@@ -198,13 +204,16 @@ reachable from outside, and a debug testbed stays on debug. To change them, run 
   operators are anvil #5–#9.
 - **Rust plan.** `rust/e2e` stops the testbed while it runs, because it uses ports 8545–8542. Run
   `rust/chaos` with the testbed stopped, via `sudo -E env "PATH=$PATH" ./etc/testbed/testbed.sh test rust/chaos`.
-  Afterwards it hands `target/` back to your user.
+  It refuses to start while testbed nodes run, because its `tc netem` faults on `lo` would hit them
+  too. Afterwards it hands `target/` back to your user.
 - **One run at a time.** `data/test.lock` stops a second `test`, `down` or `clean` while a run is
   active. Killing the runner also stops its test and load.
 - **Failed additions are set aside.** If `extended` fails to bring up rpc-N, or validator-5 before
-  it is staked, the node is stopped and its data moved to `data/failed-<node>-<time>`. The rest of
-  the run then sees the network that is actually there. A validator-5 that was already staked
-  stays, because it is on-chain.
+  its stake is sent, the node is stopped. Its data and log are moved to `data/failed-<node>-<time>`
+  (the log as `node.log`). The rest of the run then sees the network that is actually there. Once
+  validator-5's stake is sent, it stays, because the stake can land on-chain at any time. If it
+  never joins the committee, the tests that need the committee leave it out. An interrupted run
+  sets nothing aside.
 - **Adding a test.** Drop a file into `tests/<plan>/`. Its first line is a `# description`. Each
   test runs with `set -e` and `lib.sh` loaded, using helpers such as `wait_blocks`, `wait_synced`,
   `check_consistency`, `stop_node`, `fail` and `skip`. After a failure, the runner restores the

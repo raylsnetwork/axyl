@@ -1,5 +1,5 @@
 # Stop a validator while it is catching up after downtime; it shuts down cleanly and still recovers.
-v=$(validators | tail -1)
+v=$(victim)
 stop_node "$v"
 wait_blocks validator-1 30
 start_node "$v"

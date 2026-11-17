@@ -1,5 +1,5 @@
 # Stop a validator right after an epoch boundary; it recovers into the new epoch.
-v=$(validators | tail -1)
+v=$(victim)
 e=$(epoch validator-1)
 wait_for $((EPOCH_SECS * 2)) "epoch $((e + 1))" at_epoch validator-1 $((e + 1))
 stop_node "$v"

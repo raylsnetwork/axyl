@@ -11,6 +11,9 @@ DATA="${TESTBED_DATA:-$TESTBED/data}"
 [[ ! -f $DATA/env ]] || source "$DATA/env"
 BUILD_CONFIG="${BUILD_CONFIG:-release}"
 BIN="${RAYLS_BIN:-${REMEMBERED_BIN:-$ROOT/target/$BUILD_CONFIG/rayls-network}}"
+# Nodes and keytool run the copy of BIN that `up` makes while no node is running, so a cargo build
+# during a run (a git pull, another branch) never puts restarted nodes on a different build.
+NODE_BIN=$DATA/bin/rayls-network
 EPOCH_SECS="${EPOCH_SECS:-30}"
 HTTP_ADDR="${HTTP_ADDR:-127.0.0.1}"
 LOG_LEVEL="${LOG_LEVEL:-vvv}"
@@ -38,7 +41,19 @@ rpc_nodes() { local d; for d in "$DATA"/rpc-*; do [[ -d $d ]] && basename "$d"; 
 nodes() { validators; rpc_nodes; }
 # where clients and the load connect: the first rpc node, like a user's RPC (validator-1 if there is none)
 ref_node() { local r; r=$(rpc_nodes | head -1); echo "${r:-validator-1}"; }
-quorum() { local n; n=$(validators | wc -l); echo $((2 * n / 3 + 1)); }
+# validators in the current committee, from the registry. One that is staked but has not joined yet
+# (validator-5 early on) is not in it, so it neither counts towards quorum nor is expected to vote.
+committee() {
+    local members i
+    members=$(cast call "$REGISTRY" 'getCurrentEpochInfo()((address[],uint64,uint32,uint8))' \
+        --rpc-url "$(url "$(ref_node)")" | tr A-F a-f) || return 1
+    for i in 1 2 3 4 5; do
+        [[ -d $DATA/validator-$i && ${members%%]*} == *$(echo "${OPERATORS[i - 1]}" | tr A-F a-f)* ]] && echo "validator-$i"
+    done
+    return 0
+}
+# the validator single-validator faults hit: the last committee member, so validator-5 once it has joined
+victim() { local c; c=$(committee) && [[ -n $c ]] || fail "could not read the committee from the registry"; echo "$c" | tail -1; }
 pid() { cat "$DATA/$1.pid" 2>/dev/null; }
 # trust a pid file only while that pid is still this node (pids get reused over long soaks)
 running() { local p; p=$(pid "$1") && [[ $(ps -ww -p "$p" -o command= 2>/dev/null) == *"--datadir $DATA/$1 "* ]]; }
@@ -56,7 +71,7 @@ start_node() {
     local n=$1 i t
     i=$(instance "$n")
     running "$n" && return 0
-    [[ -x $BIN ]] || fail "binary not found: $BIN"
+    [[ -x $NODE_BIN ]] || fail "no $NODE_BIN; run testbed.sh up"
     # own process group, so Ctrl-C on the test runner does not reach the node
     set -m
     (
@@ -71,7 +86,7 @@ start_node() {
             set -- --observer
         fi
         # txpool sized for load tests like local-testnet.sh (reth's default is 16 pending txs per sender)
-        exec "$BIN" node "$@" --datadir "$DATA/$n" --instance "$i" --metrics "127.0.0.1:$((9099 + i))" \
+        exec "$NODE_BIN" node "$@" --datadir "$DATA/$n" --instance "$i" --metrics "127.0.0.1:$((9099 + i))" \
             --http --http.addr "$HTTP_ADDR" --http.api all --full --storage.v2 --log.stdout.format log-fmt \
             --txpool.minimal-protocol-fee 0 --txpool.max-account-slots 50000 --txpool.pending-max-count 50000 \
             --txpool.queued-max-count 50000 --txpool.basefee-max-count 50000 -"$LOG_LEVEL" $NODE_ARGS
@@ -121,11 +136,11 @@ genesis() {
     local i
     mkdir -p "$DATA/genesis/validators"
     for i in 1 2 3 4; do
-        "$BIN" keytool generate validator --datadir "$DATA/validator-$i" --address "${OPERATORS[i - 1]}" \
+        "$NODE_BIN" keytool generate validator --datadir "$DATA/validator-$i" --address "${OPERATORS[i - 1]}" \
             $(p2p_args "validator-$i") > /dev/null
         cp "$DATA/validator-$i/node-info.yaml" "$DATA/genesis/validators/validator-$i.yaml"
     done
-    "$BIN" genesis --datadir "$DATA" --chain-id 487 --epoch-duration-in-secs "$EPOCH_SECS" \
+    "$NODE_BIN" genesis --datadir "$DATA" --chain-id 487 --epoch-duration-in-secs "$EPOCH_SECS" \
         --dev-funded-account "$ADMIN" --consensus-registry-owner "$ADMIN" --network-admin "$ADMIN" \
         --fee-aggregator-admin "$ADMIN" --max-header-delay-ms 1000 --min-header-delay-ms 500 $GENESIS_ARGS > /dev/null
     for i in 1 2 3 4; do copy_genesis "validator-$i"; done
@@ -145,7 +160,7 @@ v5_status() {
 add_validator() {
     local n=validator-5 op=${OPERATORS[4]} status stake calldata
     if [[ ! -d $DATA/$n ]]; then
-        "$BIN" keytool generate validator --datadir "$DATA/$n" --address "$op" $(p2p_args "$n") > /dev/null
+        "$NODE_BIN" keytool generate validator --datadir "$DATA/$n" --address "$op" $(p2p_args "$n") > /dev/null
         copy_genesis "$n"
     fi
     start_node "$n"
@@ -153,11 +168,13 @@ add_validator() {
     [[ $status =~ ^[0-9]$ ]] || fail "could not read validator-5 status from the registry: '$status'"
     if [[ $status == 0 ]]; then
         stake=$(cast call "$REGISTRY" 'getCurrentStakeConfig()(uint256,uint256,uint32)' --rpc-url "$(url "$(ref_node)")" | head -1 | cut -d' ' -f1)
-        calldata=$("$BIN" keytool stake-calldata --datadir "$DATA/$n" | awk '/Calldata:/ {print $2}')
+        calldata=$("$NODE_BIN" keytool stake-calldata --datadir "$DATA/$n" | awk '/Calldata:/ {print $2}')
         tx --private-key "$ADMIN_KEY" --value 10ether "$op"
         tx --private-key "$ADMIN_KEY" "$RLS" 'mint(address,uint256)' "$op" "$stake"
         tx --private-key "$ADMIN_KEY" "$REGISTRY" 'allowlistValidator(address)' "$op"
         tx --private-key "$V5_KEY" "$RLS" 'approve(address,uint256)' "$REGISTRY" "$stake"
+        # from here the stake may land at any time, even if this send fails, so these keys must stay
+        touch "$DATA/$n/stake-sent"
         tx --private-key "$V5_KEY" "$REGISTRY" "$calldata"
         status=$(v5_status)
     fi
@@ -168,7 +185,7 @@ add_validator() {
 
 # RPC node: an observer that follows the committee and serves JSON-RPC
 new_rpc() {
-    "$BIN" keytool generate observer --datadir "$DATA/$1" \
+    "$NODE_BIN" keytool generate observer --datadir "$DATA/$1" \
         --address 0x0000000000000000000000000000000000000000 --advertise-identity-only > /dev/null
     copy_genesis "$1"
 }
@@ -183,8 +200,14 @@ add_rpc() {
 }
 
 # Node lists come from the data dirs, so an added node that failed would fail every later test.
-# Stop it and keep its data as failed-<node>-<time>, out of the testbed.
-set_aside() { stop_node "$1" && mv "$DATA/$1" "$DATA/failed-$1-$(date +%s)" && log "set $1 aside in $DATA"; }
+# Stop it and keep its data as failed-<node>-<time>, out of the testbed. Its log goes along, as node.log,
+# or the next node with the same name would append to it.
+set_aside() {
+    local to=$DATA/failed-$1-$(date +%s)
+    stop_node "$1" && mv "$DATA/$1" "$to" || return 1
+    [[ ! -f $DATA/$1.log ]] || mv "$DATA/$1.log" "$to/node.log"
+    log "set $1 aside as $to"
+}
 
 # --- load (tps-checker, github.com/raylsnetwork/tps-checker, checked out next to this repo) ---
 
