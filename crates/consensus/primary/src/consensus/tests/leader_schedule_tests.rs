@@ -479,8 +479,8 @@ fn partial_final_scores_are_refused_by_leader_swap_table() {
 
     // One authority with a high score and one with zero: as the only two entries they would
     // otherwise produce a bad node and a good node.
-    let mut partial = ReputationScores::default();
-    partial.final_of_schedule = true;
+    let mut partial =
+        ReputationScores { scores_per_authority: Default::default(), final_of_schedule: true };
     partial.add_score(&ids[0], 100);
     partial.add_score(&ids[1], 0);
 

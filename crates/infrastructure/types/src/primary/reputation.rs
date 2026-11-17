@@ -110,7 +110,7 @@ impl ReputationScores {
     /// peer and is not covered by the block digest, so callers check this before trusting it.
     pub fn matches_committee(&self, committee: &Committee) -> bool {
         self.scores_per_authority.len() == committee.size()
-            && self.scores_per_authority.keys().all(|id| committee.authority(id).is_some())
+            && self.scores_per_authority.keys().all(|id| committee.is_authority(id))
     }
 
     /// Boolean if any authority reputations are above 0.
