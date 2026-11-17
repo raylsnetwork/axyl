@@ -238,6 +238,17 @@ pub struct SyncConfig {
     ///
     /// This value is used by `CertificateValidator::requires_direct_verification`
     pub certificate_verification_chunk_size: usize,
+    /// Missing-certificate jobs a node runs at once for one committee member.
+    /// Older config files lack it, so it falls back to the default.
+    #[serde(default = "SyncConfig::default_max_missing_cert_jobs_per_peer")]
+    pub max_missing_cert_jobs_per_peer: NonZeroUsize,
+}
+
+impl SyncConfig {
+    /// One live lookup per member, plus one it gave up on that is still running.
+    fn default_max_missing_cert_jobs_per_peer() -> NonZeroUsize {
+        NonZeroUsize::new(2).expect("2 is not zero")
+    }
 }
 
 impl Default for SyncConfig {
@@ -252,6 +263,7 @@ impl Default for SyncConfig {
             max_num_missing_certs_within_gc_round: 50,
             certificate_verification_round_interval: 50,
             certificate_verification_chunk_size: 50,
+            max_missing_cert_jobs_per_peer: SyncConfig::default_max_missing_cert_jobs_per_peer(),
         }
     }
 }
@@ -530,5 +542,40 @@ mod protocol_vec {
                 Ok((protocol, support))
             })
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn network_config_without_missing_cert_jobs_per_peer_uses_the_default() {
+        // Every node already has a network-config file written before this field.
+        let yaml = serde_yaml::to_string(&NetworkConfig::default()).expect("serializes");
+        let old_file: String = yaml
+            .lines()
+            .filter(|line| !line.contains("max_missing_cert_jobs_per_peer"))
+            .map(|line| format!("{line}\n"))
+            .collect();
+        assert_ne!(old_file, yaml, "the field must be missing from the old file");
+        let config: NetworkConfig = serde_yaml::from_str(&old_file).expect("parses an old file");
+        assert_eq!(config.sync_config().max_missing_cert_jobs_per_peer.get(), 2);
+    }
+
+    #[test]
+    fn network_config_reads_missing_cert_jobs_per_peer_and_refuses_zero() {
+        let yaml = serde_yaml::to_string(&NetworkConfig::default()).expect("serializes");
+        let with = |value: &str| {
+            let file = yaml.replace(
+                "max_missing_cert_jobs_per_peer: 2",
+                &format!("max_missing_cert_jobs_per_peer: {value}"),
+            );
+            assert_ne!(file, yaml, "the field must be in the file");
+            file
+        };
+        let config: NetworkConfig = serde_yaml::from_str(&with("3")).expect("parses 3");
+        assert_eq!(config.sync_config().max_missing_cert_jobs_per_peer.get(), 3);
+        assert!(serde_yaml::from_str::<NetworkConfig>(&with("0")).is_err(), "0 must be refused");
     }
 }
