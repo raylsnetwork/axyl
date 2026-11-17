@@ -200,8 +200,13 @@ pub fn spawn_subscriber<DB: Database>(
 /// The scores a peer sends are not covered by the consensus block digest or any signature, so a
 /// peer can set them to anything. They are recomputed here from covered data instead: the sub
 /// dag's own certificates and leader, and the previous sub dag, read back from this node's
-/// canonical row at `parent_hash`. A parent in an earlier epoch, or no parent, starts from fresh
-/// scores, as Bullshark does at the first commit of an epoch.
+/// canonical row at `parent_hash`. A parent in an earlier epoch, or the genesis parent, starts
+/// from fresh scores, as Bullshark does at the first commit of an epoch.
+///
+/// A same-epoch parent that is simply absent locally (an unusual DB state, e.g. the consensus DB
+/// cleared while the execution DB is ahead) is indistinguishable from the earlier-epoch case and
+/// also starts fresh, which gives the wrong scores for the rest of the window. That mid-window gap
+/// is logged at `error!` so an operator can resync, instead of passing silently.
 fn catchup_reputation_score<DB: ConsensusStore>(
     db: &DB,
     committee: &Committee,
@@ -209,8 +214,17 @@ fn catchup_reputation_score<DB: ConsensusStore>(
     sub_dag: &CommittedSubDag,
     num_sub_dags_per_schedule: u32,
 ) -> ReputationScores {
-    let previous = db
-        .get_canonical_consensus_by_hash(parent_hash)
+    let parent = db.get_canonical_consensus_by_hash(parent_hash);
+    if parent.is_none() && parent_hash != B256::default() {
+        error!(
+            target: "subscriber",
+            ?parent_hash,
+            epoch = sub_dag.leader_epoch(),
+            round = sub_dag.leader_round(),
+            "catch-up: canonical parent row is missing, recomputing reputation scores from zero: if the parent is in this epoch the recomputed scores will diverge from the committee and this node should be resynced from a trusted snapshot"
+        );
+    }
+    let previous = parent
         .map(|parent| parent.sub_dag)
         .filter(|previous| previous.leader_epoch() == sub_dag.leader_epoch());
     ReputationScores::resolve(
