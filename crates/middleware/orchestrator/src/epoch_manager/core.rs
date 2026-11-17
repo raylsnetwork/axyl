@@ -1087,8 +1087,12 @@ where
     }
 
     /// Put votes taken off the queue but not processed back on it, in order, for the next
-    /// collection. A vote that does not fit (queue full) is lost to that collection; the lot is
-    /// logged once, not once per vote.
+    /// collection. A vote that does not fit (queue full) is lost for the rest of the epoch, not
+    /// just the next collection: the gossip handler already holds its signer's admission for the
+    /// epoch, so republished copies are dropped as repeats until the network is rebuilt at the
+    /// next transition, and the record can then only certify through the fetch. The queue holds
+    /// at most a committee's worth of votes per pending epoch, so this should never happen; the
+    /// lot is logged once, not once per vote.
     fn requeue_epoch_votes(consensus_bus: &ConsensusBus, votes: VecDeque<EpochVote>) {
         let mut lost = 0usize;
         let mut first_lost = None;
@@ -1104,7 +1108,7 @@ where
                 lost,
                 first_digest = %digest,
                 first_signer = ?signer,
-                "epoch vote queue full; votes could not be requeued and are lost to the next collection",
+                "epoch vote queue full; votes could not be requeued and are lost for this epoch, certification falls back to the fetch",
             );
         }
     }
@@ -1579,7 +1583,10 @@ where
             // votes that went by before they had their record, and nodes that certified do not
             // republish, so send ours again on a short schedule for each record this node
             // certified by quorum: a late peer then counts a copy instead of fetching the
-            // certificate. Shutdown cuts the schedule short.
+            // certificate. Shutdown cuts the schedule short between copies; a publish already
+            // under way runs to the end, as at the fallback republish. Runs only when every
+            // record is done: with several epochs pending (a long stall), a record that
+            // certified while a sibling did not gets no copies, and its late peers fetch.
             if states.iter().all(|s| s.done) && !vote_shutdown.noticed() {
                 let ours: Vec<EpochVote> = states
                     .iter()
