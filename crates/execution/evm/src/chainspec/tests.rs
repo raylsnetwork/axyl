@@ -81,8 +81,6 @@ mod schedule {
             (RaylsNetwork::Testnet, RaylsHardFork::Erc20PrecompileBytecode),
             (RaylsNetwork::Testnet, RaylsHardFork::UsdrSupplyCorrection),
             (RaylsNetwork::Testnet, RaylsHardFork::HybridRewards),
-            (RaylsNetwork::Testnet, RaylsHardFork::EpochCloseSeedV2),
-            (RaylsNetwork::Testnet, RaylsHardFork::CertificateFetchEpochV2),
             (RaylsNetwork::Mainnet, RaylsHardFork::AdminTransfer),
             (RaylsNetwork::Mainnet, RaylsHardFork::RlsStorage),
             (RaylsNetwork::Mainnet, RaylsHardFork::Tokenomics),
@@ -227,9 +225,9 @@ mod schedule {
                 (RaylsHardFork::OutputSeqNormalization, ForkCondition::Block(17_300_000)),
                 (RaylsHardFork::SenderAffinityLoadBalancing, ForkCondition::Block(17_300_000)),
                 (RaylsHardFork::Eip161EmptyAccountGuard, ForkCondition::Block(22_075_500)),
-                (RaylsHardFork::EpochCloseSeedV2, ForkCondition::Never),
-                (RaylsHardFork::CertificateFetchEpochV2, ForkCondition::Never),
-                (RaylsHardFork::Erc20PrecompileDirectCall, ForkCondition::Never),
+                (RaylsHardFork::EpochCloseSeedV2, ForkCondition::Block(24_525_000)),
+                (RaylsHardFork::CertificateFetchEpochV2, ForkCondition::Block(24_525_000)),
+                (RaylsHardFork::Erc20PrecompileDirectCall, ForkCondition::Block(24_525_000)),
             ],
         );
     }
