@@ -1,15 +1,22 @@
 //! Certificate fetcher tests
 
 use crate::{
-    certificate_fetcher::CertificateFetcher,
+    certificate_fetcher::{
+        CertificateFetcher, STALE_SKIP_ROUNDS_CATCHUP_THRESHOLD,
+        STALE_SKIP_ROUNDS_FALLBACK_THRESHOLD,
+    },
     consensus_bus::NodeMode,
-    error::CertManagerError,
+    error::{CertManagerError, PrimaryNetworkError},
     network::{PrimaryRequest, PrimaryResponse},
     state_sync::StateSynchronizer,
     ConsensusBus,
 };
 use assert_matches::assert_matches;
-use rayls_consensus_network::types::{NetworkCommand, NetworkHandle};
+use rayls_consensus_network::{
+    error::NetworkError,
+    types::{NetworkCommand, NetworkHandle},
+    OutboundFailure,
+};
 use rayls_infrastructure_storage::{mem_db::MemDatabase, CertificateStore, PayloadStore};
 use rayls_infrastructure_types::{
     BlsSignature, Certificate, Hash as _, Header, Round, SignatureVerificationState, TaskManager,
@@ -443,16 +450,21 @@ fn epoch_stamp_follows_the_fork_at_the_next_block() {
     assert_eq!(epoch_stamp(Some(u64::MAX), u64::MAX, 1), Some(1));
 }
 
+/// The highest round the fetcher under test already has from every authority.
+const STORED_ROUND: Round = 1;
+
 /// A certificate fetcher for the first authority, and the requests it sends.
 struct FetcherUnderTest {
     /// Requests the fetcher sends to peers.
     requests: mpsc::Receiver<NetworkCommand<PrimaryRequest, PrimaryResponse>>,
+    /// The fetcher's bus, to change its node mode.
+    consensus_bus: ConsensusBus,
     /// Keeps the fetcher's tasks running.
     _task_manager: TaskManager,
 }
 
 impl FetcherUnderTest {
-    /// Start a fetcher that already has its low rounds from every authority, plus `extra`.
+    /// Start a fetcher that has round [STORED_ROUND] from every authority, plus `extra`.
     ///
     /// It then receives a certificate whose parents it lacks, so it starts fetching.
     async fn start(
@@ -510,7 +522,7 @@ impl FetcherUnderTest {
         let result = synchronizer.process_peer_certificate(trigger).await;
         assert_matches!(result, Err(CertManagerError::Pending(_)));
 
-        Self { requests, _task_manager: task_manager }
+        Self { requests, consensus_bus: cb, _task_manager: task_manager }
     }
 
     /// The next missing-certificates request, with the channel for its answer.
@@ -554,4 +566,170 @@ async fn fetch_request_names_only_committee_members() {
     let committee = fixture.committee();
     assert_eq!(skip_rounds.len(), committee.size());
     assert!(skip_rounds.keys().all(|origin| committee.is_authority(origin)));
+}
+
+/// Busy peers are not failures, so the fetcher keeps its skip rounds.
+///
+/// Repeated failures make the fetcher drop its skip rounds and ask for everything.
+/// Doing that because peers are busy would only add to their load.
+/// An active node asks one peer at a time, and a catching-up node asks every peer at once.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn busy_peers_do_not_trigger_the_stale_session_fallback() {
+    let fixture = CommitteeFixture::builder(MemDatabase::default).randomize_ports(true).build();
+    let peers = fixture.committee().size() - 1;
+    // Answer busy for more fetch rounds than the fallback needs, in either node mode.
+    let threshold = STALE_SKIP_ROUNDS_FALLBACK_THRESHOLD.max(STALE_SKIP_ROUNDS_CATCHUP_THRESHOLD);
+    let busy_answers = (threshold as usize + 1) * peers;
+
+    for mode in [NodeMode::CvvActive, NodeMode::CvvInactive] {
+        let mut fetcher = FetcherUnderTest::start(&fixture, vec![], mode).await;
+        for _ in 0..busy_answers {
+            let (request, reply) = fetcher.next_request().await;
+            let (lower_bound, _) = request.get_bounds(max_skip_rounds(), |_| true).unwrap();
+            assert_eq!(lower_bound, STORED_ROUND, "{mode:?}: busy answers dropped the skip rounds");
+            let _ = reply.send(Ok(PrimaryResponse::into_error_ref(&PrimaryNetworkError::Busy)));
+        }
+    }
+}
+
+/// Busy rounds slow an active node down, as failed rounds do.
+///
+/// Otherwise one member that always answers busy would stop it from backing off.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn busy_rounds_grow_the_backoff() {
+    // Enough rounds for the backoff to outlast one fetch round.
+    const ROUNDS: usize = 12;
+
+    let fixture = CommitteeFixture::builder(MemDatabase::default).randomize_ports(true).build();
+    let peers = fixture.committee().size() - 1;
+    let mut fetcher = FetcherUnderTest::start(&fixture, vec![], NodeMode::CvvActive).await;
+
+    // When each fetch round sends its first request.
+    let mut starts = vec![];
+    for _ in 0..ROUNDS {
+        for peer in 0..peers {
+            let (_, reply) = fetcher.next_request().await;
+            if peer == 0 {
+                starts.push(tokio::time::Instant::now());
+            }
+            let _ = reply.send(Ok(PrimaryResponse::into_error_ref(&PrimaryNetworkError::Busy)));
+        }
+    }
+    let gaps: Vec<_> = starts.windows(2).map(|pair| pair[1] - pair[0]).collect();
+    assert!(gaps.last() > gaps.first(), "busy rounds did not grow the backoff: {gaps:?}");
+    let metrics = &fetcher.consensus_bus.primary_metrics().node_metrics;
+    assert!(metrics.certificate_fetcher_consecutive_busy.get() > 0, "busy rounds not shown");
+}
+
+/// Busy rounds while catching up do not delay the first fetch once active.
+///
+/// Catching up never backs off, so those rounds must not count once active.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn busy_rounds_while_catching_up_do_not_delay_the_active_node() {
+    // Enough rounds to reach the backoff cap, had they counted.
+    const ROUNDS: usize = 20;
+    // Well under the backoff cap, and above one fetch round.
+    const FIRST_FETCH_WITHIN: Duration = Duration::from_secs(20);
+
+    let fixture = CommitteeFixture::builder(MemDatabase::default).randomize_ports(true).build();
+    let peers = fixture.committee().size() - 1;
+    let mut fetcher = FetcherUnderTest::start(&fixture, vec![], NodeMode::CvvInactive).await;
+    let busy = || Ok(PrimaryResponse::into_error_ref(&PrimaryNetworkError::Busy));
+
+    // A catching-up node asks every peer at once, and every peer is busy.
+    for _ in 0..ROUNDS * peers {
+        let (_, reply) = fetcher.next_request().await;
+        let _ = reply.send(busy());
+    }
+
+    // The node becomes active, e.g. from certificates it got by gossip.
+    fetcher.consensus_bus.node_mode().send_replace(NodeMode::CvvActive);
+    let switched = tokio::time::Instant::now();
+    let _ = fetcher.next_request().await;
+    let waited = switched.elapsed();
+    assert!(waited < FIRST_FETCH_WITHIN, "first active fetch waited {waited:?}");
+}
+
+/// One busy peer does not hide that the other peers sent nothing usable.
+///
+/// Peers that have nothing to send is the case the stale-session fallback is for.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn one_busy_peer_does_not_hide_empty_answers() {
+    let fixture = CommitteeFixture::builder(MemDatabase::default).randomize_ports(true).build();
+    let peers = fixture.committee().size() - 1;
+
+    // The other peers send an empty answer, or one we cannot decode.
+    for malformed in [false, true] {
+        let mut fetcher = FetcherUnderTest::start(&fixture, vec![], NodeMode::CvvInactive).await;
+
+        // A catching-up node asks every peer at once, so each fetch round is `peers` requests.
+        // The first peer of each round is busy.
+        // Nothing is garbage collected in this test, so the fallback asks from round 0.
+        let gc_round = 0;
+        'rounds: for fetch_round in 0..=STALE_SKIP_ROUNDS_CATCHUP_THRESHOLD {
+            for peer in 0..peers {
+                let (request, reply) = fetcher.next_request().await;
+                let (lower_bound, _) = request.get_bounds(max_skip_rounds(), |_| true).unwrap();
+                if fetch_round == STALE_SKIP_ROUNDS_CATCHUP_THRESHOLD {
+                    assert_eq!(lower_bound, gc_round, "no fallback, malformed {malformed}");
+                    break 'rounds;
+                }
+                assert_eq!(lower_bound, STORED_ROUND);
+                let answer = if peer == 0 {
+                    Ok(PrimaryResponse::into_error_ref(&PrimaryNetworkError::Busy))
+                } else if malformed {
+                    let io = std::io::Error::new(std::io::ErrorKind::InvalidData, "bad answer");
+                    Err(NetworkError::Outbound(OutboundFailure::Io(io)))
+                } else {
+                    Ok(PrimaryResponse::RequestedCertificates(vec![]))
+                };
+                let _ = reply.send(answer);
+            }
+        }
+    }
+}
+
+/// An unreachable peer or a local send error does not hide busy answers.
+///
+/// One validator down is common, often while the others are busy.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn an_unreachable_peer_does_not_hide_busy_answers() {
+    let fixture = CommitteeFixture::builder(MemDatabase::default).randomize_ports(true).build();
+    let peers = fixture.committee().size() - 1;
+    let threshold = STALE_SKIP_ROUNDS_FALLBACK_THRESHOLD.max(STALE_SKIP_ROUNDS_CATCHUP_THRESHOLD);
+
+    // How the first peer fails: no error means it never answers.
+    type Failure = fn() -> Option<NetworkError>;
+    let failures: [(&str, Failure); 6] = [
+        ("disconnected", || Some(NetworkError::Disconnected)),
+        ("dial", || Some(NetworkError::Dial("refused".into()))),
+        ("channel closed", || Some(NetworkError::ChannelSender("closed".into()))),
+        ("queue overflow", || Some(NetworkError::RequestQueueOverflow)),
+        ("ack closed", || Some(NetworkError::AckChannelClosed("dropped".into()))),
+        ("silent", || None),
+    ];
+
+    for mode in [NodeMode::CvvActive, NodeMode::CvvInactive] {
+        for (case, failure) in failures {
+            let mut fetcher = FetcherUnderTest::start(&fixture, vec![], mode).await;
+            // Requests the silent peer never answers, kept open so they time out.
+            let mut unanswered = vec![];
+            // In each fetch round the first peer is unreachable and the rest busy.
+            for _ in 0..=threshold {
+                for peer in 0..peers {
+                    let (request, reply) = fetcher.next_request().await;
+                    let (lower_bound, _) = request.get_bounds(max_skip_rounds(), |_| true).unwrap();
+                    assert_eq!(lower_bound, STORED_ROUND, "{mode:?}, {case}");
+                    if peer > 0 {
+                        let busy = PrimaryResponse::into_error_ref(&PrimaryNetworkError::Busy);
+                        let _ = reply.send(Ok(busy));
+                    } else if let Some(error) = failure() {
+                        let _ = reply.send(Err(error));
+                    } else {
+                        unanswered.push(reply);
+                    }
+                }
+            }
+        }
+    }
 }

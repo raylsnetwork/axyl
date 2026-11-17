@@ -10,7 +10,7 @@ use rayls_execution_evm::reth_env::RethDb;
 
 #[cfg(feature = "cold-storage")]
 use super::cold_archive::ColdArchival;
-use rayls_infrastructure_config::KeyConfig;
+use rayls_infrastructure_config::{KeyConfig, NetworkConfig};
 use rayls_infrastructure_types::{BlsPublicKey, Epoch, EpochRecord, Notifier};
 use std::{
     collections::{HashMap, HashSet},
@@ -49,6 +49,8 @@ pub(crate) struct EpochManager<P, DB> {
     pub(super) worker_network_handle: Option<WorkerNetworkHandle>,
     /// Key config - loaded once for application lifetime.
     pub(super) key_config: KeyConfig,
+    /// Network config - loaded once for application lifetime.
+    pub(super) network_config: NetworkConfig,
     /// The epoch manager's [Notifier] to shutdown all node processes.
     pub(super) node_shutdown: Notifier,
     /// Trigger for a graceful, ordered wind-down of the epoch loop, fired when the node is
