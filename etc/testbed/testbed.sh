@@ -33,10 +33,12 @@ die() { echo "error: $*" >&2; exit 1; }
 
 node_name() { if [[ $1 =~ ^[0-9]+$ ]]; then echo "validator-$1"; else echo "$1"; fi; }
 
-# one test run at a time: test.lock holds the runner's pid
+# one test run at a time: test.lock holds the runner's pid. ps, not kill -0, which fails for another
+# user's process (a sudo rust/chaos run); the command line guards against pid reuse.
+runner_alive() { [[ -n $1 && $(ps -ww -p "$1" -o command= 2> /dev/null) == *testbed.sh* ]]; }
 not_busy() {
     local p
-    if p=$(cat "$DATA/test.lock" 2> /dev/null) && kill -0 "$p" 2> /dev/null; then
+    if p=$(cat "$DATA/test.lock" 2> /dev/null) && runner_alive "$p"; then
         die "test run $p is using this testbed; stop it first"
     fi
 }
@@ -61,19 +63,22 @@ restore_nodes() {
 stop_test() {
     if [[ -n $TEST_PID ]]; then
         kill -TERM -- -"$TEST_PID" 2> /dev/null || true
-        wait "$TEST_PID" 2> /dev/null || true
+        # a further Ctrl-C ends wait early (the signal is trapped), so wait until the test is really gone
+        while kill -0 "$TEST_PID" 2> /dev/null; do wait "$TEST_PID" 2> /dev/null || true; done
         restore_nodes
     fi
 }
 
 # create the lock atomically (noclobber), replacing it only if its runner is gone
 lock() {
-    local p
+    local p t=0
     until (set -C; echo $$ > "$DATA/test.lock") 2> /dev/null; do
         not_busy
-        # remove it only while it still holds the dead runner's pid: another runner may have just taken it
         p=$(cat "$DATA/test.lock" 2> /dev/null) || continue
-        kill -0 "$p" 2> /dev/null || [[ $(cat "$DATA/test.lock" 2> /dev/null) != "$p" ]] || rm -f "$DATA/test.lock"
+        # an empty lock was just created and its pid is still being written; give it 2s
+        if [[ -z $p ]] && ((t++ < 20)); then sleep 0.1; continue; fi
+        # remove it only while it still holds the dead runner's pid: another runner may have just taken it
+        runner_alive "$p" || [[ $(cat "$DATA/test.lock" 2> /dev/null) != "$p" ]] || rm -f "$DATA/test.lock"
     done
 }
 
@@ -88,19 +93,27 @@ env_file() {
 up() {
     local env
     command -v cast > /dev/null || die "Foundry 'cast' is required (https://getfoundry.sh)"
-    # running nodes keep their settings, so changing them now would mix old and new nodes
     env=$(env_file)
-    if [[ -f $DATA/env && $(< "$DATA/env") != "$env" && -n $(running_nodes) ]]; then
-        die "nodes are running with other settings; run '$0 down' first, then up again"
+    if [[ -n $(running_nodes) ]]; then
+        # running nodes keep their settings and their build, and the nodes still to start get the same,
+        # so the testbed never mixes old and new nodes
+        [[ ! -f $DATA/env || $(< "$DATA/env") == "$env" ]] || die "nodes are running with other settings; run '$0 down' first, then up again"
+        [[ -x $NODE_BIN ]] || die "nodes are running, but $NODE_BIN is missing; run '$0 down' first, then up again"
+        echo "nodes are running, so they keep the build in $NODE_BIN; for a new build, run '$0 down' first" >&2
+    else
+        if [[ -z $RAYLS_BIN && $BIN == "$ROOT"/target/*/rayls-network ]]; then
+            # build the profile this testbed runs (target/<profile>); cargo calls the debug profile "dev"
+            local profile
+            profile=$(basename "$(dirname "$BIN")")
+            [[ $profile != debug ]] || profile=dev
+            (cd "$ROOT" && cargo build -p rayls-network --bin rayls-network --profile "$profile")
+        fi
+        [[ -x $BIN ]] || die "binary not found: $BIN"
+        # a new file rather than overwriting in place: macOS kills a process whose binary changed under its
+        # cached code signature
+        mkdir -p "$DATA/bin"
+        cp "$BIN" "$NODE_BIN.new" && mv -f "$NODE_BIN.new" "$NODE_BIN"
     fi
-    if [[ -z $RAYLS_BIN && $BIN == "$ROOT"/target/*/rayls-network ]]; then
-        # build the profile this testbed runs (target/<profile>); cargo calls the debug profile "dev"
-        local profile
-        profile=$(basename "$(dirname "$BIN")")
-        [[ $profile != debug ]] || profile=dev
-        (cd "$ROOT" && cargo build -p rayls-network --bin rayls-network --profile "$profile")
-    fi
-    [[ -x $BIN ]] || die "binary not found: $BIN"
     [[ -f $DATA/genesis/genesis.yaml ]] || genesis
     echo "$env" > "$DATA/env"
     start_all

@@ -1,7 +1,8 @@
 # A 5th validator is staked and activated on-chain, joins the committee and keeps up with it.
-# a validator-5 that never got staked is set aside, so the rest of the run keeps the 4-validator
-# network; once staked it is on-chain and stays
-trap '[[ $? == 0 || $(v5_status) != 0 ]] || set_aside validator-5' EXIT
+# A validator-5 whose stake was never sent is set aside, so the rest of the run keeps the 4-validator
+# network. Once sent, the stake can land at any time, so it stays. An interrupt sets nothing aside.
+trap 'rc=$?; [[ $rc == 0 || $rc == 130 || $rc == 143 || -f $DATA/validator-5/stake-sent || $(v5_status) != 0 ]] ||
+    set_aside validator-5' EXIT
 add_validator
 wait_for $((EPOCH_SECS * 6)) "validator-5 to become active_cvv" has_role validator-5 active_cvv
 wait_synced validator-5
