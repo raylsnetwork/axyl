@@ -1153,8 +1153,8 @@ async fn start_then_cancel(
 /// Without a limit, every request is queued, so no request is ever refused.
 #[test]
 fn test_missing_cert_slots_outlive_cancelled_requests() {
-    use crate::network::handler::MISSING_CERT_JOBS_OTHERS;
     use rand::{rngs::StdRng, SeedableRng};
+    use rayls_infrastructure_config::SyncConfig;
 
     // A committee large enough for one busy member, two others, and this node.
     const COMMITTEE_SIZE: usize = 4;
@@ -1229,7 +1229,7 @@ fn test_missing_cert_slots_outlive_cancelled_requests() {
         assert!(start_then_cancel(&handler, member(2)).await.is_none());
 
         // Peers outside the committee share one pool.
-        for _ in 0..MISSING_CERT_JOBS_OTHERS {
+        for _ in 0..SyncConfig::default().max_missing_cert_jobs_others.get() {
             assert!(start_then_cancel(&handler, outsider()).await.is_none());
         }
         let next = start_then_cancel(&handler, outsider()).await;
@@ -1401,7 +1401,7 @@ fn test_missing_cert_slots_follow_the_epoch_committee() {
         fixture.authorities().map(|member| member.primary_public_key()).collect::<Vec<_>>()
     };
     let (old, new, later) = (fixture(), fixture(), fixture());
-    let limits = MissingCertLimits::new();
+    let limits = MissingCertLimits::new(SyncConfig::default().max_missing_cert_jobs_others);
     let free_at_start = limits.free_committee_slots();
     let old_slots = limits.for_committees(&old.committee(), &[], jobs_per_peer);
 
@@ -1444,16 +1444,14 @@ fn test_missing_cert_slots_follow_the_epoch_committee() {
 /// One outside peer cannot fill the shared outsider pool.
 #[test]
 fn test_missing_cert_slots_limit_each_outsider() {
-    use crate::network::handler::{
-        BusyLimit, MissingCertLimits, MISSING_CERT_JOBS_OTHERS, MISSING_CERT_JOBS_PER_OUTSIDER,
-    };
+    use crate::network::handler::{BusyLimit, MissingCertLimits, MISSING_CERT_JOBS_PER_OUTSIDER};
     use rand::{rngs::StdRng, SeedableRng};
     use rayls_infrastructure_config::SyncConfig;
 
     let fixture = CommitteeFixture::builder(MemDatabase::default)
         .committee_size(NonZeroUsize::new(4).unwrap())
         .build();
-    let limits = MissingCertLimits::new();
+    let limits = MissingCertLimits::new(SyncConfig::default().max_missing_cert_jobs_others);
     let jobs_per_peer = SyncConfig::default().max_missing_cert_jobs_per_peer;
     let slots = limits.for_committees(&fixture.committee(), &[], jobs_per_peer);
     let outsider = |seed: u64| *BlsKeypair::generate(&mut StdRng::seed_from_u64(seed)).public();
@@ -1468,7 +1466,10 @@ fn test_missing_cert_slots_limit_each_outsider() {
 
     // Other outsiders get the rest of the pool, until it is full.
     let other_jobs: Vec<_> = (1..)
-        .take(MISSING_CERT_JOBS_OTHERS - MISSING_CERT_JOBS_PER_OUTSIDER)
+        .take(
+            SyncConfig::default().max_missing_cert_jobs_others.get()
+                - MISSING_CERT_JOBS_PER_OUTSIDER,
+        )
         .map(|seed| slots.acquire(outsider(seed)).expect("slot in the shared pool"))
         .collect();
     let next = slots.acquire(outsider(u64::MAX));
@@ -1498,7 +1499,7 @@ fn test_missing_cert_slots_limit_each_outsider_under_races() {
     const ROUNDS: usize = 20_000;
 
     let fixture = CommitteeFixture::builder(MemDatabase::default).build();
-    let limits = MissingCertLimits::new();
+    let limits = MissingCertLimits::new(SyncConfig::default().max_missing_cert_jobs_others);
     let jobs_per_peer = SyncConfig::default().max_missing_cert_jobs_per_peer;
     let slots = limits.for_committees(&fixture.committee(), &[], jobs_per_peer);
     let greedy = *BlsKeypair::generate(&mut StdRng::seed_from_u64(0)).public();
@@ -1542,7 +1543,7 @@ fn test_missing_cert_slots_at_limit_outsider_leaves_the_pool_alone() {
     const HONEST_REQUESTS: usize = 20_000;
 
     let fixture = CommitteeFixture::builder(MemDatabase::default).build();
-    let limits = MissingCertLimits::new();
+    let limits = MissingCertLimits::new(SyncConfig::default().max_missing_cert_jobs_others);
     let jobs_per_peer = SyncConfig::default().max_missing_cert_jobs_per_peer;
     let slots = limits.for_committees(&fixture.committee(), &[], jobs_per_peer);
     let outsider = |seed: u64| *BlsKeypair::generate(&mut StdRng::seed_from_u64(seed)).public();
@@ -1591,7 +1592,7 @@ fn test_missing_cert_slots_grow_with_the_committee() {
     let (previous, fixture, next_fixture) = (fixture(), fixture(), fixture());
     let previous_keys: Vec<_> =
         previous.authorities().map(|member| member.primary_public_key()).collect();
-    let limits = MissingCertLimits::new();
+    let limits = MissingCertLimits::new(SyncConfig::default().max_missing_cert_jobs_others);
     let slots = limits.for_committees(&fixture.committee(), &previous_keys, jobs_per_peer);
 
     let jobs: Vec<_> = fixture
@@ -1614,7 +1615,7 @@ fn test_missing_cert_slots_grow_with_the_committee() {
 
     // A member of both committees counts once.
     let keys: Vec<_> = fixture.authorities().map(|member| member.primary_public_key()).collect();
-    let overlap = MissingCertLimits::new();
+    let overlap = MissingCertLimits::new(SyncConfig::default().max_missing_cert_jobs_others);
     let _overlap_slots = overlap.for_committees(&fixture.committee(), &keys, jobs_per_peer);
     assert_eq!(overlap.free_committee_slots(), committee_size * jobs_per_peer.get());
 }
@@ -1633,7 +1634,7 @@ fn test_missing_cert_slots_follow_the_configured_member_limit() {
     let fixture = CommitteeFixture::builder(MemDatabase::default)
         .committee_size(NonZeroUsize::new(committee_size).unwrap())
         .build();
-    let limits = MissingCertLimits::new();
+    let limits = MissingCertLimits::new(SyncConfig::default().max_missing_cert_jobs_others);
     let slots = limits.for_committees(&fixture.committee(), &[], jobs_per_peer);
     assert_eq!(limits.free_committee_slots(), committee_size * jobs_per_peer.get());
 
@@ -1643,6 +1644,36 @@ fn test_missing_cert_slots_follow_the_configured_member_limit() {
         .collect();
     let next = slots.acquire(member);
     assert!(matches!(next, Err(BusyLimit::Member)), "got {next:?}");
+    drop(jobs);
+}
+
+/// A bus made with a larger outsider pool admits that many outside peers at once.
+#[tokio::test]
+async fn test_missing_cert_slots_follow_the_configured_outsider_pool() {
+    use crate::{network::handler::BusyLimit, NodeMode};
+    use rand::{rngs::StdRng, SeedableRng};
+    use rayls_infrastructure_config::{Parameters, SyncConfig};
+
+    let sync_config = SyncConfig::default();
+    let jobs_others = sync_config.max_missing_cert_jobs_others.saturating_add(2);
+    let bus = ConsensusBus::new_with_args(
+        NodeMode::CvvActive,
+        Parameters::default_gc_depth(),
+        jobs_others,
+    );
+    let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+    let slots = bus.missing_cert_limits().for_committees(
+        &fixture.committee(),
+        &[],
+        sync_config.max_missing_cert_jobs_per_peer,
+    );
+    let outsider = |seed: u64| *BlsKeypair::generate(&mut StdRng::seed_from_u64(seed)).public();
+
+    let jobs: Vec<_> = (0..jobs_others.get() as u64)
+        .map(|seed| slots.acquire(outsider(seed)).expect("slot in the configured pool"))
+        .collect();
+    let next = slots.acquire(outsider(u64::MAX));
+    assert!(matches!(next, Err(BusyLimit::Others)), "got {next:?}");
     drop(jobs);
 }
 

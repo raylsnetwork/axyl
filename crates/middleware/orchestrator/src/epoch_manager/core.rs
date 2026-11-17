@@ -238,6 +238,8 @@ where
     ) -> eyre::Result<Self> {
         // create key config for lifetime of the app
         let key_config = KeyConfig::read_config(&rayls_datadir, passphrase)?;
+        // read the network config or use the default, for the lifetime of the app
+        let network_config = NetworkConfig::read_config(&rayls_datadir)?;
 
         // shutdown long-running node components
         let node_shutdown = Notifier::new();
@@ -250,6 +252,7 @@ where
         let consensus_bus = ConsensusBus::new_with_args(
             initial_mode,
             builder.rayls_infrastructure_config.parameters.gc_depth,
+            network_config.sync_config().max_missing_cert_jobs_others,
         );
         let worker_event_stream = QueChannel::new();
 
@@ -267,6 +270,7 @@ where
             primary_network_handle: None,
             worker_network_handle: None,
             key_config,
+            network_config,
             node_shutdown,
             sigterm_trigger: Notifier::new(),
             fatal_db_error,
@@ -433,8 +437,7 @@ where
         debug!(target: "epoch-manager", ?epoch, "retrieved epoch state from canonical tip");
         catchup_accumulator(&self.consensus_db, engine.get_reth_env().await, &gas_accumulator)?;
 
-        // read the network config or use the default
-        let network_config = NetworkConfig::read_config(&self.rayls_datadir)?;
+        let network_config = self.network_config.clone();
         self.spawn_node_networks(
             node_task_spawner,
             &network_config,
