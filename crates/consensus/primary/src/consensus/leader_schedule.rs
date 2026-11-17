@@ -12,7 +12,7 @@ use std::{
     fmt::{Debug, Formatter},
     sync::Arc,
 };
-use tracing::{debug, trace, warn};
+use tracing::{debug, error, trace};
 
 #[cfg(test)]
 #[path = "tests/leader_schedule_tests.rs"]
@@ -72,12 +72,12 @@ impl LeaderSwapTable {
         // from a peer. Refuse any set that is not exactly one entry per committee member and fall
         // back to the plain round-robin schedule, instead of dividing by zero on an empty set.
         if !reputation_scores.matches_committee(committee) {
-            warn!(
+            error!(
                 target: "consensus::leader_schedule",
                 round,
                 scored = reputation_scores.total_authorities(),
                 committee_size = committee.size(),
-                "refusing reputation scores that do not match the committee, no leader swaps"
+                "stored reputation scores do not match the committee, falling back to round-robin: this node may elect different leaders than the committee and should be resynced from a trusted snapshot"
             );
             return Self { round, good_nodes: vec![], bad_nodes: HashMap::default() };
         }

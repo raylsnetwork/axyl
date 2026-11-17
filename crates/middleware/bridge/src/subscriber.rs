@@ -428,8 +428,10 @@ impl<DB: Database> Subscriber<DB> {
             warn!(
                 target: "subscriber",
                 number = output.number,
-                received = ?output.sub_dag.reputation_score,
-                local = ?local_scores,
+                received_len = output.sub_dag.reputation_score.total_authorities(),
+                received_final = output.sub_dag.reputation_score.final_of_schedule,
+                local_len = local_scores.total_authorities(),
+                local_final = local_scores.final_of_schedule,
                 "catch-up: peer sent reputation scores that differ from the local computation, storing the local scores"
             );
             Arc::make_mut(&mut output.sub_dag).reputation_score = local_scores;
