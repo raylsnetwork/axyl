@@ -160,7 +160,7 @@ async fn get_consensus_header<DB: ReDatabase>(
                         target: "state-sync",
                         ?hash,
                         epoch = leader_epoch,
-                        "committee keys unavailable, stopping walk"
+                        "committee keys unavailable, cannot verify the header"
                     );
                     return None;
                 };
@@ -421,6 +421,11 @@ impl<DB: ReDatabase> WalkSession<DB> {
     /// are missing. A node one or two epochs behind already has those keys from the committee
     /// lookahead, so without this it would never fetch the records for its gap, and would get no
     /// walk to an epoch end in the most common case.
+    ///
+    /// A node that closed that epoch itself, which it has when it runs a later one, has already
+    /// executed the epoch's last header, where the record would send the walk. It does not wait,
+    /// so a node that follows the tip does not stop at each epoch change for a record it does not
+    /// need, and that its epoch manager is still certifying.
     async fn wait_for_epoch_records(
         &mut self,
         target_epoch: Epoch,
@@ -430,7 +435,9 @@ impl<DB: ReDatabase> WalkSession<DB> {
         let Some(last_closed) = target_epoch.checked_sub(1) else {
             return ControlFlow::Continue(());
         };
-        if last_closed < tip_epoch || self.records_requested >= target_epoch {
+        // The node holds the end of every epoch below its tip's and below the one it runs.
+        let node_epoch = tip_epoch.max(self.config.epoch());
+        if last_closed < node_epoch || self.records_requested >= target_epoch {
             return ControlFlow::Continue(());
         }
         self.records_requested = target_epoch;
@@ -812,7 +819,8 @@ mod tests {
     };
     use rayls_infrastructure_storage::{mem_db::MemDatabase, tables::ConsensusBlocks};
     use rayls_infrastructure_types::{
-        BlsSigner, Certificate, CommittedSubDag, EpochCertificate, EpochRecord, ReputationScores,
+        BlsPublicKey, BlsSigner, Certificate, CommittedSubDag, CommitteeLookahead,
+        EpochCertificate, EpochRecord, ReputationScores,
     };
     use rayls_testing_test_utils_committee::CommitteeFixture;
     use std::{
@@ -1066,7 +1074,22 @@ mod tests {
         leader: &Certificate,
         top: u64,
     ) -> BTreeMap<u64, ConsensusHeader> {
-        let tip = ConsensusHeader { number: 100, ..Default::default() };
+        canonical_chain_above(
+            db,
+            ConsensusHeader { number: 100, ..Default::default() },
+            leader,
+            top,
+        )
+    }
+
+    /// [`canonical_tip_and_chain`] with the given header as the canonical tip at 100.
+    fn canonical_chain_above<DB: ReDatabase>(
+        db: &DB,
+        tip: ConsensusHeader,
+        leader: &Certificate,
+        top: u64,
+    ) -> BTreeMap<u64, ConsensusHeader> {
+        assert_eq!(tip.number, 100, "the chain starts at 101");
         db.with_write_txn(|txn| {
             txn.insert::<ConsensusBlocks>(&tip.number, &tip)?;
             txn.insert::<ConsensusBlockNumbersByDigest>(&tip.digest(), &tip.number)?;
@@ -1273,9 +1296,41 @@ mod tests {
         );
     }
 
+    /// The fixture's node still running the epoch before the fixture's, as a node that has not
+    /// closed that epoch yet does: the fixture's committee, which signs the chain, is known from
+    /// the committee lookahead.
+    fn one_epoch_behind(config: &ConsensusConfig<MemDatabase>) -> ConsensusConfig<MemDatabase> {
+        let committee = config.committee();
+        let ahead = committee.epoch();
+        ConsensusConfig::new_for_epoch(
+            config.config().clone(),
+            config.node_storage().clone(),
+            config.key_config().clone(),
+            committee.advance_epoch_for_test(ahead - 1),
+            CommitteeLookahead::from_entries([(ahead, committee.bls_keys())]),
+            config.network_config().clone(),
+            u64::MAX,
+            true,
+        )
+        .unwrap()
+    }
+
     /// Store a certified record for `epoch` whose last consensus header is `end`.
     fn certify_epoch_end<DB: ReDatabase, S: BlsSigner>(db: &DB, key: &S, epoch: Epoch, end: B256) {
-        let record = EpochRecord { epoch, parent_consensus: end, ..Default::default() };
+        certify_epoch_end_naming(db, key, epoch, end, vec![]);
+    }
+
+    /// [`certify_epoch_end`] for a record that names `next_committee`, which a node reads the next
+    /// epoch's committee keys from when it does not run that epoch.
+    fn certify_epoch_end_naming<DB: ReDatabase, S: BlsSigner>(
+        db: &DB,
+        key: &S,
+        epoch: Epoch,
+        end: B256,
+        next_committee: Vec<BlsPublicKey>,
+    ) {
+        let record =
+            EpochRecord { epoch, parent_consensus: end, next_committee, ..Default::default() };
         let mut signed_authorities = roaring::RoaringBitmap::new();
         signed_authorities.push(0);
         let cert = EpochCertificate {
@@ -1377,10 +1432,9 @@ mod tests {
         hashes[last + 1..].to_vec()
     }
 
-    /// A node one or two epochs behind finds the target's committee keys without the record
-    /// collector, from the committee lookahead (or, as here, the current committee). The walk must
-    /// still ask the collector for the records of its gap, and use them, or it gets no walk to an
-    /// epoch end in the most common case.
+    /// A node one epoch behind finds the target's committee keys without the record collector,
+    /// from the committee lookahead. The walk must still ask the collector for the records of its
+    /// gap, and use them, or it gets no walk to an epoch end in the most common case.
     #[tokio::test(start_paused = true)]
     async fn walk_requests_the_records_when_the_keys_did_not_need_them() {
         let fixture = CommitteeFixture::builder(MemDatabase::default)
@@ -1389,10 +1443,11 @@ mod tests {
             .epoch(2)
             .build();
         let primary = fixture.authorities().next().unwrap();
-        let config = primary.consensus_config();
+        let config = one_epoch_behind(&primary.consensus_config());
         let db = config.node_storage();
         let leader = fixture.certificate(&fixture.header_from_last_authority());
         let chain = canonical_tip_and_chain(db, &leader, 140);
+        assert_eq!(config.epoch(), 1, "precondition: the node runs epoch 1");
         assert_eq!(chain[&140].sub_dag.leader_epoch(), 2, "precondition: the target is in epoch 2");
         assert!(
             config.get_committee_keys_for_epoch(2).is_some(),
@@ -1404,12 +1459,14 @@ mod tests {
         let mut asked = bus.requested_missing_epoch().subscribe();
         let collected = bus.epoch_records_collected().clone();
         let collector_config = config.clone();
-        let ends = (chain[&110].digest(), chain[&125].digest());
+        // The node runs epoch 1, so epoch 0 ended at its tip; epoch 1 ends inside the gap.
+        let ends = (chain[&101].parent_hash, chain[&125].digest());
+        let next_committee = fixture.committee().bls_keys();
         tokio::spawn(async move {
             if asked.changed().await.is_ok() {
                 let (db, key) = (collector_config.node_storage(), collector_config.key_config());
                 certify_epoch_end(db, key, 0, ends.0);
-                certify_epoch_end(db, key, 1, ends.1);
+                certify_epoch_end_naming(db, key, 1, ends.1, next_committee);
                 collected.send_replace(());
             }
         });
@@ -1424,8 +1481,8 @@ mod tests {
         assert_eq!(*bus.requested_missing_epoch().borrow(), 1, "the records up to epoch 1");
         assert_eq!(
             requests.hashes(),
-            vec![chain[&140].digest(), chain[&110].digest(), chain[&125].digest()],
-            "the target, then each epoch end oldest first"
+            vec![chain[&140].digest(), chain[&125].digest()],
+            "the target, then the end of the epoch in the gap"
         );
     }
 
@@ -1533,7 +1590,7 @@ mod tests {
             .epoch(2)
             .build();
         let primary = fixture.authorities().next().unwrap();
-        let config = primary.consensus_config();
+        let config = one_epoch_behind(&primary.consensus_config());
         let db = config.node_storage();
         let leader = fixture.certificate(&fixture.header_from_last_authority());
         let chain = canonical_tip_and_chain(db, &leader, 140);
@@ -1568,7 +1625,7 @@ mod tests {
             .epoch(1)
             .build();
         let primary = fixture.authorities().next().unwrap();
-        let config = primary.consensus_config();
+        let config = one_epoch_behind(&primary.consensus_config());
         let db = config.node_storage();
         let leader = fixture.certificate(&fixture.header_from_last_authority());
         let chain = canonical_tip_and_chain(db, &leader, 140);
@@ -1580,12 +1637,13 @@ mod tests {
         let collected = bus.epoch_records_collected().clone();
         let collector_config = config.clone();
         let end = chain[&110].digest();
+        let next_committee = fixture.committee().bls_keys();
         tokio::spawn(async move {
             while asked.changed().await.is_ok() {
                 if *asked.borrow_and_update() > 0 {
                     let (db, key) =
                         (collector_config.node_storage(), collector_config.key_config());
-                    certify_epoch_end(db, key, 0, end);
+                    certify_epoch_end_naming(db, key, 0, end, next_committee);
                     collected.send_replace(());
                     return;
                 }
@@ -1602,5 +1660,49 @@ mod tests {
             vec![chain[&140].digest(), chain[&110].digest()],
             "the target, then epoch 0's end"
         );
+    }
+
+    /// A node that follows the tip and has just moved to epoch 2 has executed epoch 1's last
+    /// header itself: its tip is that header. Its first target in epoch 2 must not wait for epoch
+    /// 1's record, which its epoch manager is still certifying, or the node stops at every epoch
+    /// change.
+    #[tokio::test(start_paused = true)]
+    async fn walk_does_not_wait_for_the_record_of_an_epoch_the_node_closed() {
+        let fixture = CommitteeFixture::builder(MemDatabase::default)
+            .randomize_ports(true)
+            .committee_size(NonZeroUsize::new(4).unwrap())
+            .epoch(2)
+            .build();
+        let primary = fixture.authorities().next().unwrap();
+        let config = primary.consensus_config();
+        let db = config.node_storage();
+        let last_of_epoch_1 =
+            fixture.certificate(&fixture.header_builder_last_authority().epoch(1).build());
+        let tip = ConsensusHeader {
+            number: 100,
+            sub_dag: CommittedSubDag::new(
+                vec![],
+                last_of_epoch_1,
+                0,
+                ReputationScores::default(),
+                None,
+            ),
+            ..Default::default()
+        };
+        let leader = fixture.certificate(&fixture.header_from_last_authority());
+        let chain = canonical_chain_above(db, tip, &leader, 101);
+        assert_eq!(config.epoch(), 2, "precondition: the node runs epoch 2");
+        assert_eq!(chain[&101].sub_dag.leader_epoch(), 2, "precondition: the target is in epoch 2");
+
+        // No collector answers, and epoch 1's record is not stored yet.
+        let bus = ConsensusBus::new();
+        let (network, _requests) = walk_network(chain.clone(), &chain, HashMap::new());
+        let mut session = WalkSession::new(config.clone(), bus.clone(), network);
+
+        let start = tokio::time::Instant::now();
+        assert!(session.sync_to(chain[&101].digest()).await.is_continue());
+        assert_eq!(start.elapsed(), Duration::ZERO, "no wait for epoch 1's record");
+        assert_eq!(*bus.requested_missing_epoch().borrow(), 0, "no record was asked for");
+        assert_chain_cached(db, &chain);
     }
 }
