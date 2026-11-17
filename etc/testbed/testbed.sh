@@ -93,6 +93,8 @@ env_file() {
 up() {
     local env
     command -v cast > /dev/null || die "Foundry 'cast' is required (https://getfoundry.sh)"
+    # a test may have stopped every node on purpose (rust/e2e, chaos/05); a build or start now would cut in
+    not_busy
     env=$(env_file)
     if [[ -n $(running_nodes) ]]; then
         # running nodes keep their settings and their build, and the nodes still to start get the same,

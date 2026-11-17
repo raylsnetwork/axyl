@@ -206,8 +206,8 @@ same copy. For a new build, run `down`, then `up`.
   `rust/chaos` with the testbed stopped, via `sudo -E env "PATH=$PATH" ./etc/testbed/testbed.sh test rust/chaos`.
   It refuses to start while testbed nodes run, because its `tc netem` faults on `lo` would hit them
   too. Afterwards it hands `target/` back to your user.
-- **One run at a time.** `data/test.lock` stops a second `test`, `down` or `clean` while a run is
-  active. Killing the runner also stops its test and load.
+- **One run at a time.** `data/test.lock` stops a second `test`, `up`, `down` or `clean` while a run
+  is active. Killing the runner also stops its test and load.
 - **Failed additions are set aside.** If `extended` fails to bring up rpc-N, or validator-5 before
   its stake is sent, the node is stopped. Its data and log are moved to `data/failed-<node>-<time>`
   (the log as `node.log`). The rest of the run then sees the network that is actually there. Once
