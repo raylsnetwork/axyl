@@ -2,7 +2,7 @@
 # An observer's is_caught_up can blink false while a new tip propagates, so it is polled, not read once.
 caught_up() { [[ $(status_field "$1" is_caught_up) == true ]]; }
 e=$(epoch validator-1) || fail "validator-1 did not report its epoch"
-members=$(committee) || fail "could not read the committee from the registry"
+members=$(committee) && [[ -n $members ]] || fail "could not read the committee from the registry"
 for n in $(nodes); do
     # rpc nodes, and a validator that is staked but not in the committee yet, follow it as observers
     want=observer
