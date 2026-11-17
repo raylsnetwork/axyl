@@ -33,6 +33,9 @@ default = []
 # Single-node / local dev chain behavior (skip gossip on sole-member committee).
 # Must match the feature name used by all crates in the dependency graph.
 dev-single-node-setup = []
+# Test-only fault injection (delay the catch-up save) for multi-node regression tests.
+# NOT FOR PRODUCTION.
+fault-injection-test-hooks = []
 
 [lints]
 workspace = true

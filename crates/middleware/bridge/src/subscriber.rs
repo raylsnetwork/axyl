@@ -465,6 +465,16 @@ impl<DB: Database> Subscriber<DB> {
             .max()
             .unwrap_or_else(|| output.sub_dag.leader.round());
 
+        // Test-only fault: hold the save so it can land inside the forward streamer's delete
+        // window. Compiled out of production builds, and inert unless armed by environment.
+        #[cfg(feature = "fault-injection-test-hooks")]
+        if let Some(ms) = std::env::var("RL_FAULT_SUBSCRIBER_SAVE_DELAY_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+        }
+
         // promote to canonical ConsensusBlocks table
         self.save_and_publish(output.clone())?;
 

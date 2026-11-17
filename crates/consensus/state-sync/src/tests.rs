@@ -1,7 +1,7 @@
 use crate::{
-    catch_up_consensus_from_to, certified_consensus_checkpoint, consensus_chain_tip,
-    get_missing_consensus, highest_executed_anchor, prime_consensus, save_consensus,
-    stream_missing_consensus,
+    catch_up_consensus_from_to, certified_consensus_checkpoint, clear_race_hook,
+    consensus_chain_tip, get_missing_consensus, highest_executed_anchor, prime_consensus,
+    save_consensus, store_consensus_header_in_cache, stream_missing_consensus,
 };
 use rayls_consensus_primary::{
     network::{
@@ -720,6 +720,75 @@ async fn test_catch_up_drops_poisoned_gap_row_and_recovers() {
         .await
         .expect("catch-up must recover once the poisoned row is cleared and an honest peer serves");
     assert_eq!(second.number, 102, "catch-up must reach the target after recovering");
+}
+
+/// Race: on a header that does not link, the streamer checks that the row below is not canonical,
+/// then deletes that row and its by-hash index entry in a separate write. The row below is the one
+/// it streamed to the subscriber a moment earlier. If the subscriber saves it between the check and
+/// the delete, the delete removes the index entry the saved block shares with the cache row, and
+/// the node holds a canonical block it can no longer find by hash.
+#[tokio::test]
+async fn test_catch_up_mismatch_keeps_index_of_row_saved_in_the_window() {
+    let fixture = CommitteeFixture::builder(MemDatabase::default)
+        .randomize_ports(true)
+        .committee_size(NonZeroUsize::new(4).unwrap())
+        .build();
+    let primary = fixture.authorities().next().unwrap();
+    let config = primary.consensus_config();
+    let db = config.node_storage();
+    let committee = fixture.committee();
+
+    // Executed anchor at 100. The real 101 is in the cache, as the backwards walk stores it.
+    let anchor = chained_header(100, B256::default(), &committee);
+    db.with_write_txn(|txn| {
+        txn.insert::<ConsensusBlocks>(&anchor.number, &anchor)?;
+        txn.insert::<ConsensusBlockNumbersByDigest>(&anchor.digest(), &anchor.number)?;
+        Ok(())
+    })
+    .unwrap();
+    let real_101 = chained_header(101, anchor.digest(), &committee);
+    store_consensus_header_in_cache(db, &real_101);
+    let real_102 = chained_header(102, real_101.digest(), &committee);
+    let target = chained_header(103, real_102.digest(), &committee);
+
+    // 102 is not stored, so the streamer fetches it by number. A peer answers with a 102 that
+    // does not link to the real 101.
+    let unlinked_102 = chained_header(102, B256::repeat_byte(0xBD), &committee);
+    let net = serving_network(BTreeMap::from([(102u64, unlinked_102)]));
+
+    let cb = ConsensusBus::new();
+    seed_recently_executed_blocks(&cb);
+    let mut rx = cb.consensus_header().subscribe();
+
+    // In the window, the subscriber saves the 101 it was sent, as `save_consensus` does.
+    let subscriber_db = db.clone();
+    let output_101 = ConsensusOutput {
+        sub_dag: Arc::new(real_101.sub_dag.clone()),
+        parent_hash: real_101.parent_hash,
+        number: real_101.number,
+        extra: real_101.extra,
+        ..Default::default()
+    };
+    clear_race_hook::set_in_window(move || {
+        save_consensus(&subscriber_db, output_101, &None).expect("subscriber save of 101");
+    });
+
+    let result = catch_up_consensus_from_to(&config, &cb, &net, anchor, target).await;
+    assert!(result.is_err(), "the unlinked 102 must fail the digest-chain guard");
+
+    // Preconditions: 101 was streamed before the mismatch, and the save in the window landed.
+    assert_eq!(rx.try_recv().map(|h| h.number).ok(), Some(101), "101 must be streamed first");
+    assert_eq!(
+        db.get::<ConsensusBlocks>(&101).unwrap().map(|h| h.digest()),
+        Some(real_101.digest()),
+        "the subscriber's save must have made 101 canonical"
+    );
+
+    // The saved block must still be found by hash.
+    assert!(
+        db.get_canonical_consensus_by_hash(real_101.digest()).is_some(),
+        "canonical block 101, saved between the check and the delete, lost its by-hash index entry"
+    );
 }
 
 /// Regression for the epoch-boundary leak fork: the forward-streamer catch-up

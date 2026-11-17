@@ -40,6 +40,10 @@ mod message;
 use crate::network::state::AuthVoteState;
 pub use message::ConsensusResult;
 
+// Test-only Byzantine by-number override, compiled only with `byzantine-test-hooks`.
+#[cfg(feature = "byzantine-test-hooks")]
+mod unlink_byzantine;
+
 pub mod state;
 
 #[cfg(test)]

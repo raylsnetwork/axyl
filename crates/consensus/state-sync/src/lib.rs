@@ -22,6 +22,9 @@ use tracing::{debug, error, info, trace, warn};
 mod epoch;
 pub use epoch::{epoch_committee_valid, epoch_record_valid, spawn_epoch_record_collector};
 mod consensus;
+// Test-only hooks around the catch-up delete branch; never in a production build.
+#[cfg(any(test, feature = "fault-injection-test-hooks"))]
+mod clear_race_hook;
 
 use consensus::spawn_track_recent_consensus;
 pub use consensus::store_consensus_header_in_cache;
@@ -668,15 +671,25 @@ async fn catch_up_consensus_from_to<DB: Database>(
         // after the digest-chain guard below links it onto the verified parent; caching earlier
         // poisons every retry until the backwards walk overwrites it.
         let mut from_gap_fetch = false;
+        // Test-only fault: ignore some stored rows so they are fetched by number (see
+        // `clear_race_hook`). Compiled out of production builds.
+        #[cfg(feature = "fault-injection-test-hooks")]
+        let skip_stored = clear_race_hook::skip_stored_row(number, last_consensus_height + 1);
+        #[cfg(not(feature = "fault-injection-test-hooks"))]
+        let skip_stored = false;
         let consensus_header = if number == max_consensus_height {
             max_consensus.clone()
-        } else if let Some(block) = db.get_consensus_by_number(number) {
+        } else if let Some(block) = db.get_consensus_by_number(number).filter(|_| !skip_stored) {
             block
         } else {
             // The backwards walk has not refilled this number yet; fetch it by number rather than
             // wedge behind one slow hash. Safety rests on the later gates (the digest-chain guard
             // below, and the subscriber's BLS re-verify before execution), not this fetch.
-            match network.request_consensus(Some(number), None).await {
+            #[cfg(feature = "fault-injection-test-hooks")]
+            let fetched = clear_race_hook::request_by_number(config, network, number).await;
+            #[cfg(not(feature = "fault-injection-test-hooks"))]
+            let fetched = network.request_consensus(Some(number), None).await;
+            match fetched {
                 Ok(header) => {
                     from_gap_fetch = true;
                     header
@@ -734,11 +747,16 @@ async fn catch_up_consensus_from_to<DB: Database>(
                     .map(|h| h.digest())
                     != Some(parent_hash)
             {
+                // Test-only: runs between the check above and the delete below.
+                #[cfg(any(test, feature = "fault-injection-test-hooks"))]
+                clear_race_hook::in_window(poisoned_parent_number, parent_hash).await;
                 let _ = db.with_write_txn(|txn| {
                     let _ = txn.remove::<ConsensusBlocksCache>(&poisoned_parent_number);
                     let _ = txn.remove::<ConsensusBlockNumbersByDigest>(&parent_hash);
                     Ok(())
                 });
+                #[cfg(feature = "fault-injection-test-hooks")]
+                clear_race_hook::after_clear(db, poisoned_parent_number, parent_hash);
             }
             warn!(
                 target: "rayls-consensus-state-sync",

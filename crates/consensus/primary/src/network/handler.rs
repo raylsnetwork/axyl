@@ -909,6 +909,16 @@ where
             (None, None) => self.get_latest_output()?,
         };
 
+        // Test-only: a by-number reply may be replaced with a header that does not link to the
+        // real one below. Compiled out of production builds, and inert unless the serving process
+        // is armed by environment. By-hash and latest replies are untouched.
+        #[cfg(feature = "byzantine-test-hooks")]
+        if let (Some(number), None) = (number, hash) {
+            if let Some(unlinked) = super::unlink_byzantine::override_by_number(number, &header) {
+                return Ok(PrimaryResponse::ConsensusHeader(Arc::new(unlinked)));
+            }
+        }
+
         Ok(PrimaryResponse::ConsensusHeader(Arc::new(header)))
     }
 
