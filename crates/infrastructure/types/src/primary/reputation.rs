@@ -61,28 +61,29 @@ impl ReputationScores {
         num_sub_dags_per_schedule: u32,
     ) -> Self {
         // sub_dag_index is based on epoch and round, so / 2 counts commit rounds (every other one).
-        let mut reputation_score =
-            if (sub_dag_index / 2).is_multiple_of(num_sub_dags_per_schedule as u64) {
-                Self::new(committee)
-            } else if let Some(last) = previous {
-                // The previous sub dag may have been read back from storage, where an older node
-                // may have kept scores sent by a peer. Carry them over only when they have the
-                // shape every locally computed set has, otherwise restart the window from zero.
-                if last.reputation_score.matches_committee(committee) {
-                    last.reputation_score.clone()
-                } else {
-                    error!(
-                        target: "consensus::reputation",
-                        sub_dag_index,
-                        scored = last.reputation_score.total_authorities(),
-                        committee_size = committee.size(),
-                        "stored previous reputation scores do not match the committee, restarting the window from zero: this node may compute different final scores than the committee and should be resynced from a trusted snapshot"
-                    );
-                    Self::new(committee)
-                }
+        let mut reputation_score = if (sub_dag_index / 2)
+            .is_multiple_of(num_sub_dags_per_schedule as u64)
+        {
+            Self::new(committee)
+        } else if let Some(last) = previous {
+            // The previous sub dag may have been read back from storage, where an older node
+            // may have kept scores sent by a peer. Carry them over only when they have the
+            // shape every locally computed set has, otherwise restart the window from zero.
+            if last.reputation_score.matches_committee(committee) {
+                last.reputation_score.clone()
             } else {
+                error!(
+                    target: "consensus::reputation",
+                    sub_dag_index,
+                    scored = last.reputation_score.total_authorities(),
+                    committee_size = committee.size(),
+                    "stored previous reputation scores do not match the committee, restarting the window from zero: this node may compute different final scores than the committee and should be resynced from a trusted snapshot"
+                );
                 Self::new(committee)
-            };
+            }
+        } else {
+            Self::new(committee)
+        };
 
         // Score the previous leader. Without a previous sub dag this is the first commit, so
         // there is nothing to score.
