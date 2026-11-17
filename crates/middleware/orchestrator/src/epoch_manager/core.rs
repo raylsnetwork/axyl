@@ -69,6 +69,21 @@ const CERTIFICATION_RETRY_BACKOFF: Duration = Duration::from_secs(30);
 /// requests per hour instead of a hundred every two minutes, while the retry itself never stops.
 const MAX_CERTIFICATION_RETRY_BACKOFF: Duration = Duration::from_secs(15 * 60);
 
+/// When, after this node certifies a record from its own quorum, it republishes its vote again,
+/// measured from the end of the collection: the moment of quorum when one record is being
+/// certified, which is the normal case. A node that closed the epoch later than the others drops
+/// the votes that reach it before it has written its record, and the nodes that certified stop
+/// republishing; without these copies it would have to fetch the certificate, which it starts at
+/// its first 5 s fallback. Spaced so a node up to about four seconds behind gets a copy after it
+/// has its record and before that fallback; one further behind takes the fetch either way.
+///
+/// One side effect, accepted: a node about four seconds behind can receive some peers' last
+/// copies but not a quorum of them. Its count then moves in its first window, so it wakes the
+/// record collector at its second fallback rather than its first, five seconds later than it
+/// would have without the copies.
+const FINAL_VOTE_REPUBLISH_SCHEDULE: [Duration; 3] =
+    [Duration::from_secs(1), Duration::from_secs(2), Duration::from_secs(4)];
+
 /// Backoff before certification attempt `attempt + 1`, after `attempt` (1-based) failed:
 /// [`CERTIFICATION_RETRY_BACKOFF`] doubled per failed attempt, capped at
 /// [`MAX_CERTIFICATION_RETRY_BACKOFF`].
@@ -1555,6 +1570,38 @@ where
                                         vote.epoch_hash,
                                     );
                                 }
+                            }
+                        }
+                    }
+                }
+            }
+            // Every record is done. Peers that closed the epoch after this node dropped the
+            // votes that went by before they had their record, and nodes that certified do not
+            // republish, so send ours again on a short schedule for each record this node
+            // certified by quorum: a late peer then counts a copy instead of fetching the
+            // certificate. Shutdown cuts the schedule short.
+            if states.iter().all(|s| s.done) && !vote_shutdown.noticed() {
+                let ours: Vec<EpochVote> = states
+                    .iter()
+                    .filter(|s| s.reached_quorum())
+                    .filter_map(|s| s.my_vote)
+                    .collect();
+                if !ours.is_empty() {
+                    let done_at = tokio::time::Instant::now();
+                    for after in FINAL_VOTE_REPUBLISH_SCHEDULE {
+                        tokio::select! {
+                            biased;
+                            _ = &vote_shutdown => break,
+                            _ = tokio::time::sleep_until(done_at + after) => {}
+                        }
+                        for vote in &ours {
+                            if let Err(err) = primary_network.publish_epoch_vote(*vote).await {
+                                error!(
+                                    target: "epoch-manager",
+                                    ?err,
+                                    "failed to republish epoch vote after quorum for {}",
+                                    vote.epoch_hash,
+                                );
                             }
                         }
                     }
