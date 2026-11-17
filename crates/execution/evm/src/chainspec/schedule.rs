@@ -87,10 +87,7 @@ impl RaylsHardFork {
             ScheduledFork::new(Self::OutputSeqNormalization, ForkCondition::Block(17_300_000)),
             ScheduledFork::new(Self::SenderAffinityLoadBalancing, ForkCondition::Block(17_300_000)),
             ScheduledFork::new(Self::Eip161EmptyAccountGuard, ForkCondition::Block(22_075_500)),
-            // v1.5.2 forks: block 24_525_000 is ~2026-11-19 15:30 EET (13:30 UTC) at
-            // ~0.591 s/block. Every testnet node must run v1.5.2+ before this block:
-            // CertificateFetchEpochV2 switches a network request format that older nodes
-            // cannot decode.
+            // v1.5.2 forks
             ScheduledFork::new(Self::EpochCloseSeedV2, ForkCondition::Block(24_525_000)),
             ScheduledFork::new(Self::CertificateFetchEpochV2, ForkCondition::Block(24_525_000)),
             ScheduledFork::new(Self::Erc20PrecompileDirectCall, ForkCondition::Block(24_525_000)),
