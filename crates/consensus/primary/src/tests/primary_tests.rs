@@ -1153,7 +1153,7 @@ async fn start_then_cancel(
 /// Without a limit, every request is queued, so no request is ever refused.
 #[test]
 fn test_missing_cert_slots_outlive_cancelled_requests() {
-    use crate::network::handler::{MISSING_CERT_JOBS_OTHERS, MISSING_CERT_JOBS_PER_PEER};
+    use crate::network::handler::MISSING_CERT_JOBS_OTHERS;
     use rand::{rngs::StdRng, SeedableRng};
 
     // A committee large enough for one busy member, two others, and this node.
@@ -1206,7 +1206,9 @@ fn test_missing_cert_slots_outlive_cancelled_requests() {
 
         // Cancelled requests from one member still hold all of its slots.
         let busy_member = member(1);
-        for _ in 0..MISSING_CERT_JOBS_PER_PEER {
+        let jobs_per_peer =
+            primary.consensus_config().network_config().sync_config().max_missing_cert_jobs_per_peer;
+        for _ in 0..jobs_per_peer.get() {
             assert!(start_then_cancel(&handler, busy_member).await.is_none());
         }
         let next = start_then_cancel(&handler, busy_member).await;
@@ -1261,7 +1263,6 @@ fn test_missing_cert_slots_outlive_cancelled_requests() {
 /// The only blocking thread is kept busy, so jobs stay queued.
 #[test]
 fn test_missing_cert_slots_include_the_previous_committee() {
-    use crate::network::handler::MISSING_CERT_JOBS_PER_PEER;
     use rand::{rngs::StdRng, SeedableRng};
     use rayls_infrastructure_storage::EpochStore;
     use rayls_infrastructure_types::EpochRecord;
@@ -1301,7 +1302,12 @@ fn test_missing_cert_slots_include_the_previous_committee() {
         });
 
         // A member's share, not an outsider's single job.
-        for _ in 0..MISSING_CERT_JOBS_PER_PEER {
+        let jobs_per_peer = primary
+            .consensus_config()
+            .network_config()
+            .sync_config()
+            .max_missing_cert_jobs_per_peer;
+        for _ in 0..jobs_per_peer.get() {
             assert!(start_then_cancel(&handler, former).await.is_none());
         }
         let next = start_then_cancel(&handler, former).await;
@@ -1316,16 +1322,75 @@ fn test_missing_cert_slots_include_the_previous_committee() {
     });
 }
 
+/// A member limit raised in the node's network-config file reaches the handler.
+/// The only blocking thread is kept busy, so jobs stay queued.
+#[test]
+fn test_missing_cert_slots_use_the_member_limit_from_the_config_file() {
+    use rayls_consensus_primary::test_utils::temp_dir;
+    use rayls_infrastructure_config::{NetworkConfig, RaylsDirs, SyncConfig};
+
+    // Raise the limit in the config file, as an operator would.
+    let default = SyncConfig::default().max_missing_cert_jobs_per_peer;
+    let raised = default.saturating_add(1);
+    let datadir = temp_dir();
+    NetworkConfig::default().write_config(&datadir).expect("write the config file");
+    let path = datadir.network_config_path();
+    let file = std::fs::read_to_string(&path).expect("read the config file");
+    let edited = file.replace(
+        &format!("max_missing_cert_jobs_per_peer: {default}"),
+        &format!("max_missing_cert_jobs_per_peer: {raised}"),
+    );
+    assert_ne!(edited, file, "the limit must be in the config file");
+    std::fs::write(&path, edited).expect("edit the config file");
+    let network_config = NetworkConfig::read_config(&datadir).expect("load the config file");
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .max_blocking_threads(1)
+        .enable_all()
+        .build()
+        .expect("runtime");
+    runtime.block_on(async {
+        let fixture = CommitteeFixture::builder(MemDatabase::default)
+            .with_network_config(network_config)
+            .build();
+        let primary = fixture.authorities().next().unwrap();
+        let cb = ConsensusBus::new();
+        let task_manager = TaskManager::default();
+        let synchronizer = StateSynchronizer::new(
+            primary.consensus_config(),
+            cb.clone(),
+            task_manager.get_spawner(),
+        );
+        let handler = RequestHandler::new(primary.consensus_config(), cb, synchronizer);
+        let member = fixture.authorities().nth(1).unwrap().primary_public_key();
+
+        // Keep the only blocking thread busy.
+        let (release, hold) = std::sync::mpsc::channel::<()>();
+        let blocker = tokio::task::spawn_blocking(move || {
+            let _ = hold.recv();
+        });
+
+        for _ in 0..raised.get() {
+            assert!(start_then_cancel(&handler, member).await.is_none());
+        }
+        let next = start_then_cancel(&handler, member).await;
+        assert!(matches!(next, Some(Err(PrimaryNetworkError::Busy))), "got {next:?}");
+
+        release.send(()).expect("release the blocking thread");
+        blocker.await.expect("blocker");
+    });
+}
+
 /// Slots follow the committee: a member that leaves keeps a member's
 /// share for one epoch, while it may still be finishing its last one.
 ///
 /// The committee pool is shared across epochs, so jobs from an old epoch still count.
 #[test]
 fn test_missing_cert_slots_follow_the_epoch_committee() {
-    use crate::network::handler::{
-        BusyLimit, MissingCertLimits, MISSING_CERT_JOBS_PER_OUTSIDER, MISSING_CERT_JOBS_PER_PEER,
-    };
+    use crate::network::handler::{BusyLimit, MissingCertLimits, MISSING_CERT_JOBS_PER_OUTSIDER};
+    use rayls_infrastructure_config::SyncConfig;
 
+    let jobs_per_peer = SyncConfig::default().max_missing_cert_jobs_per_peer;
     let committee_size = 4;
     let fixture = || {
         CommitteeFixture::builder(MemDatabase::default)
@@ -1338,22 +1403,22 @@ fn test_missing_cert_slots_follow_the_epoch_committee() {
     let (old, new, later) = (fixture(), fixture(), fixture());
     let limits = MissingCertLimits::new();
     let free_at_start = limits.free_committee_slots();
-    let old_slots = limits.for_committees(&old.committee(), &[]);
+    let old_slots = limits.for_committees(&old.committee(), &[], jobs_per_peer);
 
     // A member of the old committee uses all of its slots.
     let former = old.authorities().next().unwrap().primary_public_key();
-    let old_jobs: Vec<_> = (0..MISSING_CERT_JOBS_PER_PEER)
+    let old_jobs: Vec<_> = (0..jobs_per_peer.get())
         .map(|_| old_slots.acquire(former).expect("slot in the old epoch"))
         .collect();
     let next = old_slots.acquire(former);
     assert!(matches!(next, Err(BusyLimit::Member)), "got {next:?}");
 
     // The next epoch's committee pool still counts the old jobs.
-    let new_slots = limits.for_committees(&new.committee(), &keys(&old));
-    assert_eq!(limits.free_committee_slots(), free_at_start - MISSING_CERT_JOBS_PER_PEER);
+    let new_slots = limits.for_committees(&new.committee(), &keys(&old), jobs_per_peer);
+    assert_eq!(limits.free_committee_slots(), free_at_start - jobs_per_peer.get());
 
     // For one epoch the former member keeps a member's share.
-    let former_jobs: Vec<_> = (0..MISSING_CERT_JOBS_PER_PEER)
+    let former_jobs: Vec<_> = (0..jobs_per_peer.get())
         .map(|_| new_slots.acquire(former).expect("slot for a former member"))
         .collect();
     let next = new_slots.acquire(former);
@@ -1364,7 +1429,7 @@ fn test_missing_cert_slots_follow_the_epoch_committee() {
     let member_job = new_slots.acquire(member).expect("slot for a new member");
 
     // Two epochs on, the former member has an outsider's limit.
-    let later_slots = limits.for_committees(&later.committee(), &keys(&new));
+    let later_slots = limits.for_committees(&later.committee(), &keys(&new), jobs_per_peer);
     let outsider_jobs: Vec<_> = (0..MISSING_CERT_JOBS_PER_OUTSIDER)
         .map(|_| later_slots.acquire(former).expect("slot in the shared pool"))
         .collect();
@@ -1383,12 +1448,14 @@ fn test_missing_cert_slots_limit_each_outsider() {
         BusyLimit, MissingCertLimits, MISSING_CERT_JOBS_OTHERS, MISSING_CERT_JOBS_PER_OUTSIDER,
     };
     use rand::{rngs::StdRng, SeedableRng};
+    use rayls_infrastructure_config::SyncConfig;
 
     let fixture = CommitteeFixture::builder(MemDatabase::default)
         .committee_size(NonZeroUsize::new(4).unwrap())
         .build();
     let limits = MissingCertLimits::new();
-    let slots = limits.for_committees(&fixture.committee(), &[]);
+    let jobs_per_peer = SyncConfig::default().max_missing_cert_jobs_per_peer;
+    let slots = limits.for_committees(&fixture.committee(), &[], jobs_per_peer);
     let outsider = |seed: u64| *BlsKeypair::generate(&mut StdRng::seed_from_u64(seed)).public();
 
     // One outsider at its limit is refused while the pool has room.
@@ -1421,6 +1488,7 @@ fn test_missing_cert_slots_limit_each_outsider() {
 fn test_missing_cert_slots_limit_each_outsider_under_races() {
     use crate::network::handler::{MissingCertLimits, MISSING_CERT_JOBS_PER_OUTSIDER};
     use rand::{rngs::StdRng, SeedableRng};
+    use rayls_infrastructure_config::SyncConfig;
     use std::sync::{
         atomic::{AtomicUsize, Ordering},
         Barrier,
@@ -1431,7 +1499,8 @@ fn test_missing_cert_slots_limit_each_outsider_under_races() {
 
     let fixture = CommitteeFixture::builder(MemDatabase::default).build();
     let limits = MissingCertLimits::new();
-    let slots = limits.for_committees(&fixture.committee(), &[]);
+    let jobs_per_peer = SyncConfig::default().max_missing_cert_jobs_per_peer;
+    let slots = limits.for_committees(&fixture.committee(), &[], jobs_per_peer);
     let greedy = *BlsKeypair::generate(&mut StdRng::seed_from_u64(0)).public();
     let running = AtomicUsize::new(0);
     let most_running = AtomicUsize::new(0);
@@ -1466,6 +1535,7 @@ fn test_missing_cert_slots_limit_each_outsider_under_races() {
 fn test_missing_cert_slots_at_limit_outsider_leaves_the_pool_alone() {
     use crate::network::handler::{MissingCertLimits, MISSING_CERT_JOBS_PER_OUTSIDER};
     use rand::{rngs::StdRng, SeedableRng};
+    use rayls_infrastructure_config::SyncConfig;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     const SPAMMERS: usize = 7;
@@ -1473,7 +1543,8 @@ fn test_missing_cert_slots_at_limit_outsider_leaves_the_pool_alone() {
 
     let fixture = CommitteeFixture::builder(MemDatabase::default).build();
     let limits = MissingCertLimits::new();
-    let slots = limits.for_committees(&fixture.committee(), &[]);
+    let jobs_per_peer = SyncConfig::default().max_missing_cert_jobs_per_peer;
+    let slots = limits.for_committees(&fixture.committee(), &[], jobs_per_peer);
     let outsider = |seed: u64| *BlsKeypair::generate(&mut StdRng::seed_from_u64(seed)).public();
     let (greedy, honest) = (outsider(0), outsider(1));
     let greedy_jobs: Vec<_> = (0..MISSING_CERT_JOBS_PER_OUTSIDER)
@@ -1507,11 +1578,11 @@ fn test_missing_cert_slots_at_limit_outsider_leaves_the_pool_alone() {
 /// Otherwise faulty members could hold the whole committee pool.
 #[test]
 fn test_missing_cert_slots_grow_with_the_committee() {
-    use crate::network::handler::{
-        BusyLimit, MissingCertLimits, MISSING_CERT_JOBS_COMMITTEE, MISSING_CERT_JOBS_PER_PEER,
-    };
+    use crate::network::handler::{BusyLimit, MissingCertLimits, MISSING_CERT_JOBS_COMMITTEE};
+    use rayls_infrastructure_config::SyncConfig;
 
-    let committee_size = MISSING_CERT_JOBS_COMMITTEE / MISSING_CERT_JOBS_PER_PEER + 1;
+    let jobs_per_peer = SyncConfig::default().max_missing_cert_jobs_per_peer;
+    let committee_size = MISSING_CERT_JOBS_COMMITTEE / jobs_per_peer.get() + 1;
     let fixture = || {
         CommitteeFixture::builder(MemDatabase::default)
             .committee_size(NonZeroUsize::new(committee_size).unwrap())
@@ -1521,22 +1592,22 @@ fn test_missing_cert_slots_grow_with_the_committee() {
     let previous_keys: Vec<_> =
         previous.authorities().map(|member| member.primary_public_key()).collect();
     let limits = MissingCertLimits::new();
-    let slots = limits.for_committees(&fixture.committee(), &previous_keys);
+    let slots = limits.for_committees(&fixture.committee(), &previous_keys, jobs_per_peer);
 
     let jobs: Vec<_> = fixture
         .authorities()
         .chain(previous.authorities())
         .flat_map(|member| {
             let key = member.primary_public_key();
-            (0..MISSING_CERT_JOBS_PER_PEER).map(move |_| key)
+            (0..jobs_per_peer.get()).map(move |_| key)
         })
         .map(|key| slots.acquire(key).expect("slot for every member"))
         .collect();
-    assert_eq!(jobs.len(), 2 * committee_size * MISSING_CERT_JOBS_PER_PEER);
+    assert_eq!(jobs.len(), 2 * committee_size * jobs_per_peer.get());
     assert_eq!(limits.free_committee_slots(), 0);
 
     // While those jobs run, a member of the next committee waits for the pool.
-    let next_slots = limits.for_committees(&next_fixture.committee(), &[]);
+    let next_slots = limits.for_committees(&next_fixture.committee(), &[], jobs_per_peer);
     let next_member = next_fixture.authorities().next().unwrap().primary_public_key();
     let next = next_slots.acquire(next_member);
     assert!(matches!(next, Err(BusyLimit::Committee)), "got {next:?}");
@@ -1544,8 +1615,35 @@ fn test_missing_cert_slots_grow_with_the_committee() {
     // A member of both committees counts once.
     let keys: Vec<_> = fixture.authorities().map(|member| member.primary_public_key()).collect();
     let overlap = MissingCertLimits::new();
-    let _overlap_slots = overlap.for_committees(&fixture.committee(), &keys);
-    assert_eq!(overlap.free_committee_slots(), committee_size * MISSING_CERT_JOBS_PER_PEER);
+    let _overlap_slots = overlap.for_committees(&fixture.committee(), &keys, jobs_per_peer);
+    assert_eq!(overlap.free_committee_slots(), committee_size * jobs_per_peer.get());
+}
+
+/// A member limit set above the default gives each member more jobs,
+/// and the committee pool grows to match.
+#[test]
+fn test_missing_cert_slots_follow_the_configured_member_limit() {
+    use crate::network::handler::{BusyLimit, MissingCertLimits, MISSING_CERT_JOBS_COMMITTEE};
+    use rayls_infrastructure_config::SyncConfig;
+
+    let default = SyncConfig::default().max_missing_cert_jobs_per_peer;
+    let jobs_per_peer = default.saturating_add(1);
+    // Large enough that the pool must grow past its minimum size.
+    let committee_size = MISSING_CERT_JOBS_COMMITTEE / jobs_per_peer.get() + 1;
+    let fixture = CommitteeFixture::builder(MemDatabase::default)
+        .committee_size(NonZeroUsize::new(committee_size).unwrap())
+        .build();
+    let limits = MissingCertLimits::new();
+    let slots = limits.for_committees(&fixture.committee(), &[], jobs_per_peer);
+    assert_eq!(limits.free_committee_slots(), committee_size * jobs_per_peer.get());
+
+    let member = fixture.authorities().next().unwrap().primary_public_key();
+    let jobs: Vec<_> = (0..jobs_per_peer.get())
+        .map(|_| slots.acquire(member).expect("slot within the configured limit"))
+        .collect();
+    let next = slots.acquire(member);
+    assert!(matches!(next, Err(BusyLimit::Member)), "got {next:?}");
+    drop(jobs);
 }
 
 /// Busy has its own answer, after every variant older nodes know.

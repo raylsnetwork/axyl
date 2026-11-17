@@ -33,6 +33,7 @@ use rayls_infrastructure_types::{
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     hash::{BuildHasher, RandomState},
+    num::NonZeroUsize,
     sync::{
         atomic::{AtomicU64, AtomicUsize, Ordering},
         Arc,
@@ -151,11 +152,13 @@ where
             previous = previous.len(),
             "missing-certificate slots for this epoch"
         );
-        let missing_cert_slots = Arc::new(
-            consensus_bus
-                .missing_cert_limits()
-                .for_committees(consensus_config.committee(), previous),
-        );
+        let jobs_per_peer =
+            consensus_config.network_config().sync_config().max_missing_cert_jobs_per_peer;
+        let missing_cert_slots = Arc::new(consensus_bus.missing_cert_limits().for_committees(
+            consensus_config.committee(),
+            previous,
+            jobs_per_peer,
+        ));
         Self {
             consensus_config,
             consensus_bus,
@@ -1112,8 +1115,6 @@ pub(crate) fn max_requested_authorities(committee_size: usize) -> usize {
 // `clamp` panics if its floor is above its ceiling, so this is checked when building.
 const _: () = assert!(MIN_REQUESTED_AUTHORITIES <= MAX_SKIP_ROUND_AUTHORITIES);
 
-/// Missing-certificate jobs one committee peer may have running at once.
-pub(crate) const MISSING_CERT_JOBS_PER_PEER: usize = 2;
 /// Smallest committee pool, grown so every member can use its share.
 /// It only refuses while jobs from an earlier epoch are still running.
 pub(crate) const MISSING_CERT_JOBS_COMMITTEE: usize = 64;
@@ -1152,13 +1153,15 @@ impl MissingCertLimits {
     /// Job slots for one epoch: a pool per member of its committee and of
     /// `previous`, whose members may still be finishing their last epoch.
     ///
-    /// Pools are rebuilt each epoch, so a member may briefly run twice its
-    /// share, still within the committee pool.
+    /// Each member may run `jobs_per_peer` jobs at once. Pools are rebuilt each
+    /// epoch, so a member may briefly run twice that, still within the committee pool.
     pub(crate) fn for_committees(
         &self,
         committee: &Committee,
         previous: &[BlsPublicKey],
+        jobs_per_peer: NonZeroUsize,
     ) -> MissingCertSlots {
+        let jobs_per_peer = jobs_per_peer.get();
         let members: HashSet<BlsPublicKey> = committee
             .authorities()
             .iter()
@@ -1167,16 +1170,14 @@ impl MissingCertLimits {
             .collect();
         // Faulty members must never hold the whole pool.
         // It only grows, so jobs from an earlier epoch keep their permits.
-        let needed = MISSING_CERT_JOBS_PER_PEER * members.len();
+        let needed = jobs_per_peer * members.len();
         // Racing callers each add only the part they grew.
         let before = self.committee_capacity.fetch_max(needed, Ordering::SeqCst);
         if needed > before {
             self.committee.add_permits(needed - before);
         }
-        let per_peer = members
-            .into_iter()
-            .map(|key| (key, Arc::new(Semaphore::new(MISSING_CERT_JOBS_PER_PEER))))
-            .collect();
+        let per_peer =
+            members.into_iter().map(|key| (key, Arc::new(Semaphore::new(jobs_per_peer)))).collect();
         MissingCertSlots {
             committee: self.committee.clone(),
             outsiders: self.outsiders.clone(),
