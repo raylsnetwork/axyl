@@ -11,7 +11,7 @@ use consensus_metrics::metered_channel::{self, channel_with_total_sender, Metere
 use parking_lot::Mutex;
 use rayls_consensus_network::{types::NetworkEvent, NetworkMetrics};
 use rayls_consensus_primary_metrics::{ChannelMetrics, ConsensusMetrics, ExecutorMetrics, Metrics};
-use rayls_infrastructure_config::Parameters;
+use rayls_infrastructure_config::{Parameters, SyncConfig};
 use rayls_infrastructure_types::{
     batch_tracker::BatchTracker, error::HeaderError, BlockHash, BlockNumHash, Certificate,
     CertificateDigest, CommittedSubDag, ConsensusHeader, ConsensusOutput, Epoch, EpochVote, Header,
@@ -51,7 +51,7 @@ impl PromotionBarrier {
         }
     }
 }
-use std::sync::Arc;
+use std::{num::NonZeroUsize, sync::Arc};
 use tokio::{
     sync::{
         broadcast, mpsc, oneshot,
@@ -279,7 +279,11 @@ struct ConsensusBusAppInner {
 }
 
 impl ConsensusBusAppInner {
-    fn new(initial_mode: NodeMode, recently_executed_blocks: u32) -> Self {
+    fn new(
+        initial_mode: NodeMode,
+        recently_executed_blocks: u32,
+        missing_cert_jobs_others: NonZeroUsize,
+    ) -> Self {
         let network_metrics = Arc::new(NetworkMetrics::default());
         let consensus_metrics = Arc::new(ConsensusMetrics::default());
         let primary_metrics = Arc::new(Metrics::default()); // Initialize the metrics
@@ -333,7 +337,7 @@ impl ConsensusBusAppInner {
             mode_transition,
             cert_store_round: watch::channel(0).0,
             promotion_barrier: watch::channel(None).0,
-            missing_cert_limits: Arc::new(MissingCertLimits::new()),
+            missing_cert_limits: Arc::new(MissingCertLimits::new(missing_cert_jobs_others)),
         }
     }
 
@@ -508,12 +512,25 @@ impl Default for ConsensusBus {
 impl ConsensusBus {
     /// Create a test-only bus seeded as `CvvActive` to preserve prior test behavior.
     pub fn new() -> Self {
-        Self::new_with_args(NodeMode::CvvActive, Parameters::default_gc_depth())
+        Self::new_with_args(
+            NodeMode::CvvActive,
+            Parameters::default_gc_depth(),
+            SyncConfig::default().max_missing_cert_jobs_others,
+        )
     }
 
     /// Create a bus with an explicit initial mode.
-    pub fn new_with_args(initial_mode: NodeMode, recently_executed_blocks: u32) -> Self {
-        let inner_app = Arc::new(ConsensusBusAppInner::new(initial_mode, recently_executed_blocks));
+    /// Peers outside both committees share `missing_cert_jobs_others` jobs at once.
+    pub fn new_with_args(
+        initial_mode: NodeMode,
+        recently_executed_blocks: u32,
+        missing_cert_jobs_others: NonZeroUsize,
+    ) -> Self {
+        let inner_app = Arc::new(ConsensusBusAppInner::new(
+            initial_mode,
+            recently_executed_blocks,
+            missing_cert_jobs_others,
+        ));
         let inner_epoch = Arc::new(ConsensusBusEpochInner::new(&inner_app));
         Self { inner_app, inner_epoch }
     }

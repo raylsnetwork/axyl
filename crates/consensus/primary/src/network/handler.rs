@@ -1118,15 +1118,9 @@ const _: () = assert!(MIN_REQUESTED_AUTHORITIES <= MAX_SKIP_ROUND_AUTHORITIES);
 /// Smallest committee pool, grown so every member can use its share.
 /// It only refuses while jobs from an earlier epoch are still running.
 pub(crate) const MISSING_CERT_JOBS_COMMITTEE: usize = 64;
-/// Missing-certificate jobs that other peers may have running at once, in total.
-/// A full pool delays every peer outside both committees (#357).
-pub(crate) const MISSING_CERT_JOBS_OTHERS: usize = 4;
 /// Missing-certificate jobs one outside peer may have running at once.
 /// Honest nodes send each peer one request at a time.
 pub(crate) const MISSING_CERT_JOBS_PER_OUTSIDER: usize = 1;
-
-// One outside peer must not fill the shared pool.
-const _: () = assert!(MISSING_CERT_JOBS_PER_OUTSIDER < MISSING_CERT_JOBS_OTHERS);
 
 /// Concurrency limits for missing-certificate jobs, shared by every epoch.
 ///
@@ -1142,11 +1136,13 @@ pub(crate) struct MissingCertLimits {
 }
 
 impl MissingCertLimits {
-    pub(crate) fn new() -> Self {
+    /// Peers outside both committees share `jobs_others` jobs at once.
+    /// A full pool delays every one of them (#357).
+    pub(crate) fn new(jobs_others: NonZeroUsize) -> Self {
         Self {
             committee: Arc::new(Semaphore::new(MISSING_CERT_JOBS_COMMITTEE)),
             committee_capacity: AtomicUsize::new(MISSING_CERT_JOBS_COMMITTEE),
-            outsiders: Arc::new(OutsiderSlots::new()),
+            outsiders: Arc::new(OutsiderSlots::new(jobs_others)),
         }
     }
 
@@ -1221,15 +1217,15 @@ const FREE_SLOT: u64 = 0;
 #[derive(Debug)]
 struct OutsiderSlots {
     /// The slots, claimed with compare-and-swap.
-    slots: [AtomicU64; MISSING_CERT_JOBS_OTHERS],
+    slots: Box<[AtomicU64]>,
     /// Hashes peer keys with a salt random to this node.
     hasher: RandomState,
 }
 
 impl OutsiderSlots {
-    fn new() -> Self {
+    fn new(size: NonZeroUsize) -> Self {
         Self {
-            slots: std::array::from_fn(|_| AtomicU64::new(FREE_SLOT)),
+            slots: (0..size.get()).map(|_| AtomicU64::new(FREE_SLOT)).collect(),
             hasher: RandomState::new(),
         }
     }
