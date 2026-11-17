@@ -129,10 +129,11 @@ pub(crate) struct RequestHandler<DB> {
 /// Certification removes a row without bumping the counter, so a hit is confirmed against the
 /// certified records before it is trusted; hits are bounded by the dedup, so that is cheap.
 ///
-/// Today the counter moves only between handlers: the row for a close is written after the
-/// epoch's network has been torn down and before the next one starts, so each handler reads
-/// the table once, on its first vote. The counter is the guard for a writer that one day runs
-/// while a handler is alive, not something a reader should expect to see move.
+/// At a normal close the row is written after the epoch's network has been torn down and before
+/// the next one starts, so the handler reads the table once, on its first vote. The counter
+/// matters for the other writer: `recover_partial_transition`, after a crash mid-transition,
+/// writes the row while this epoch's handler is already running, and the bump is what makes
+/// that handler see it.
 #[derive(Debug, Default)]
 struct PendingRecordCache {
     /// Value of `pending_epoch_records_changed` the map was read at.

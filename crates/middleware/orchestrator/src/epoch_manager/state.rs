@@ -249,10 +249,12 @@ where
         self.consensus_db
             .save_pending_epoch_record(&epoch_rec)
             .map_err(|e| eyre!("failed to persist pending epoch record for epoch {epoch}: {e}"))?;
-        // The gossip handler admits votes against its cached view of the pending table. This
-        // runs after the closing epoch's network has been torn down and before the next one is
-        // built, so the next handler finds the row on its first read; the bump is for a handler
-        // that is alive while a row is written, which none is today.
+        // The gossip handler admits votes against its cached view of the pending table, and
+        // re-reads it when this counter moves. At a normal close the row is written between one
+        // epoch's handler and the next, so the next handler finds it on its first read. But
+        // `recover_partial_transition` writes the row from inside `run_epoch`, after this
+        // epoch's network and handler are already running: without the bump that handler would
+        // keep a cached table without the row and drop every vote for the recovered close.
         self.consensus_bus.pending_epoch_records_changed().send_modify(|version| *version += 1);
         self.epoch_record = Some(epoch_rec);
         Ok(())
