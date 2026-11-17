@@ -6,7 +6,7 @@ use crate::{
 };
 use serde::{Deserialize, Serialize};
 use std::{cmp::Ordering, collections::HashMap};
-use tracing::warn;
+use tracing::error;
 
 /// The reputation scores for authorities participating in consensus.
 #[derive(Serialize, Deserialize, Clone, Debug, Default, Eq, PartialEq)]
@@ -71,12 +71,12 @@ impl ReputationScores {
                 if last.reputation_score.matches_committee(committee) {
                     last.reputation_score.clone()
                 } else {
-                    warn!(
+                    error!(
                         target: "consensus::reputation",
                         sub_dag_index,
                         scored = last.reputation_score.total_authorities(),
                         committee_size = committee.size(),
-                        "previous reputation scores do not match the committee, resetting"
+                        "stored previous reputation scores do not match the committee, restarting the window from zero: this node may compute different final scores than the committee and should be resynced from a trusted snapshot"
                     );
                     Self::new(committee)
                 }
