@@ -1153,8 +1153,7 @@ async fn test_record_attribution_follows_registered_set_and_newest_record() {
     assert_eq!(peer_manager.gossip_publisher_bls(&old_id), Some(bls));
 
     // a newer record under the same key names a new network key
-    let (_, mut rotated, new_id) = record_info(now() + 1);
-    rotated.timestamp = now() + 1;
+    let (_, rotated, new_id) = record_info(now() + 1);
     peer_manager.add_known_peer_addrs(bls, rotated);
     assert_eq!(peer_manager.gossip_publisher_bls(&old_id), None);
     assert_eq!(peer_manager.gossip_publisher_bls(&new_id), Some(bls));

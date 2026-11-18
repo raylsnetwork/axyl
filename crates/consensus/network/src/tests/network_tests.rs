@@ -730,12 +730,17 @@ async fn test_msg_verification_ignores_unauthorized_publisher() -> eyre::Result<
     Ok(())
 }
 
-/// A node with no connection to a committee member still accepts that member's gossip relayed by
-/// a peer, attributed from the member's record. Only `relay` listens, so `follower` learns the
-/// `publisher`'s record through `relay` but neither can connect to the other; before record
-/// attribution `follower` ignored every message the member published.
+/// A node with no connection to a registered validator still accepts that validator's gossip
+/// relayed by a peer, attributed from the validator's record. Only `relay` listens, so `follower`
+/// learns the `publisher`'s record through `relay` but neither can connect to the other; before
+/// record attribution `follower` ignored every message the validator published.
+///
+/// To `follower` the publisher is registered but not seated, so it is not an important peer and
+/// the `peer_is_important` fallback in `verify_gossip` cannot admit it: both the publisher-list
+/// check and the forwarding lookup have to attribute it from the record.
 #[tokio::test]
-async fn test_relayed_gossip_from_unconnected_committee_member_is_accepted() -> eyre::Result<()> {
+async fn test_relayed_gossip_from_unconnected_registered_validator_is_accepted() -> eyre::Result<()>
+{
     let mut network_config = NetworkConfig::default();
     network_config.peer_config_mut().heartbeat_interval = TEST_HEARTBEAT_INTERVAL;
     // the relay hands the follower's record query the publisher's outbound address, which never
@@ -749,7 +754,11 @@ async fn test_relayed_gossip_from_unconnected_committee_member_is_accepted() -> 
         );
     let mut follower = others.pop().expect("follower");
     let mut publisher = others.pop().expect("publisher");
-    let committee = relay.config.committee_pub_keys();
+    let registered = relay.config.committee_pub_keys();
+    let publisher_bls = publisher.config.key_config().primary_public_key();
+    let publisher_id: PeerId = publisher.config.primary_networkkey().into();
+    let follower_committee: HashSet<_> =
+        registered.iter().filter(|key| **key != publisher_bls).copied().collect();
     for peer in [&mut relay, &mut publisher, &mut follower] {
         let network = peer.network.take().expect("network is some");
         tokio::spawn(async move {
@@ -764,40 +773,50 @@ async fn test_relayed_gossip_from_unconnected_committee_member_is_accepted() -> 
     relay.network_handle.start_listening(relay.config.primary_address()).await?;
     let relay_addr =
         relay.network_handle.listeners().await?.first().expect("relay listens").clone();
-    relay.network_handle.new_epoch(committee.clone(), committee.clone()).await?;
+    relay.network_handle.new_epoch(registered.clone(), registered.clone()).await?;
     let relay_bls = relay.config.key_config().primary_public_key();
     let relay_net = relay.config.primary_networkkey();
-    for peer in [&publisher, &follower] {
+    for (peer, committee) in [(&publisher, &registered), (&follower, &follower_committee)] {
         peer.network_handle
             .add_trusted_peer_and_dial(relay_bls, relay_net.clone(), relay_addr.clone())
             .await?;
-        peer.network_handle.new_epoch(committee.clone(), committee.clone()).await?;
+        peer.network_handle.new_epoch(committee.clone(), registered.clone()).await?;
     }
+    // the topic is open to the registered set, as the consensus-output and epoch-vote topics are
     for peer in [&relay, &publisher, &follower] {
-        peer.network_handle.subscribe_with_publishers(TEST_TOPIC.into(), committee.clone()).await?;
+        peer.network_handle
+            .subscribe_with_publishers(TEST_TOPIC.into(), registered.clone())
+            .await?;
     }
     tokio::time::sleep(Duration::from_secs(TEST_HEARTBEAT_INTERVAL)).await;
 
-    // the follower learns the publisher's record from the relay, a third party
-    let publisher_bls = publisher.config.key_config().primary_public_key();
-    let publisher_id: PeerId = publisher.config.primary_networkkey().into();
+    // the follower learns the publisher's record from the relay, a third party. It is admitted
+    // when the follower's query closes, so publish until a message gets through.
     follower.network_handle.find_authorities(vec![publisher_bls]).await?;
-    tokio::time::sleep(Duration::from_secs(TEST_HEARTBEAT_INTERVAL * 3)).await;
-    assert!(
-        !follower.network_handle.connected_peer_ids().await?.contains(&publisher_id),
-        "the follower must not reach the publisher directly"
-    );
-
-    let data = Vec::from("relayed from a committee member".as_bytes());
-    publisher.network_handle.publish(TEST_TOPIC.into(), data.clone()).await?;
-    match timeout(Duration::from_secs(5), follower._network_events.recv()).await {
-        Ok(Some(NetworkEvent::Gossip(msg, bls))) => {
+    let data = Vec::from("relayed from a registered validator".as_bytes());
+    let event = timeout(Duration::from_secs(20), async {
+        loop {
+            publisher.network_handle.publish(TEST_TOPIC.into(), data.clone()).await?;
+            if let Ok(event) =
+                timeout(Duration::from_secs(1), follower._network_events.recv()).await
+            {
+                return eyre::Ok(event);
+            }
+        }
+    })
+    .await??;
+    match event {
+        Some(NetworkEvent::Gossip(msg, bls)) => {
             assert_eq!(msg.source, Some(publisher_id));
             assert_eq!(msg.data, data);
             assert_eq!(bls, publisher_bls, "attributed to the publisher's key");
         }
         other => return Err(eyre!("expected the relayed gossip, got {other:?}")),
     }
+    assert!(
+        !follower.network_handle.connected_peer_ids().await?.contains(&publisher_id),
+        "the follower must not have reached the publisher directly"
+    );
 
     Ok(())
 }

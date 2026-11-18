@@ -168,16 +168,17 @@ where
     /// validators for consensus output and epoch votes) and must be within max size.
     ///
     /// Rayls: During startup, there's a race condition where `authorized_publishers` may be empty
-    /// or `peer_to_bls()` mappings may not be established yet. So that committee traffic is
+    /// or `gossip_publisher_bls()` may not resolve the publisher yet. So that committee traffic is
     /// still forwarded and processed, messages from known validators (peers marked as important,
     /// the current and departing committee) are accepted when the list check would otherwise
     /// fail.
     ///
     /// The rule: an oversize message is rejected (a fault of the message itself, so its author is
-    /// penalized); a publisher that is unlisted or unbound is ignored, neither forwarded nor
-    /// penalized. The lists are this node's own view, so an unlisted publisher may be an honest
-    /// validator the node is behind on, and gossipsub has already done the frame work that an
-    /// ignored message costs. Nothing else here penalizes a publisher.
+    /// penalized); a publisher that is unlisted, or that neither a binding nor a registered
+    /// validator's record attributes, is ignored, neither forwarded nor penalized. The lists are
+    /// this node's own view, so an unlisted publisher may be an honest validator the node is
+    /// behind on, and gossipsub has already done the frame work that an ignored message costs.
+    /// Nothing else here penalizes a publisher.
     pub(super) fn verify_gossip(&self, gossip: &GossipMessage) -> GossipAcceptance {
         // verify message size
         // do not punish if gossip is tx batch

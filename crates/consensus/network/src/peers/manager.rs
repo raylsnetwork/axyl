@@ -84,9 +84,9 @@ pub(crate) struct PeerManager {
     /// `known_peers` entry per peer id until replaced or evicted, and is never persisted.
     registered_validators: HashSet<BlsPublicKey>,
     /// PeerId -> BlsPublicKey for registered validators, taken from the record this node holds
-    /// for each one, whoever delivered it. Used to attribute gossip only, never requests or
-    /// penalties: see [`Self::gossip_publisher_bls`]. Rebuilt by
-    /// [`Self::rebuild_registered_record_peerids`].
+    /// for each one, whoever delivered it. Used to attribute gossip only, never requests, and a
+    /// penalty is never resolved to the peer id a record names: see
+    /// [`Self::gossip_publisher_bls`]. Rebuilt by [`Self::rebuild_registered_record_peerids`].
     registered_record_peerids: HashMap<PeerId, BlsPublicKey>,
     /// A queue of events that the `PeerManager` is waiting to produce.
     events: VecDeque<PeerEvent>,
@@ -958,10 +958,11 @@ impl PeerManager {
     /// record is that validator's own claim. If the network key it names is the validator's own,
     /// the attribution is right; if nobody holds that key, nothing is ever published from it. If
     /// it names another validator's network key, that is the re-mapping attack from a registered
-    /// key: a peer id named by two registered keys is attributed to neither, a direct binding
-    /// always wins, and this attribution never routes a penalty ([`Self::bound_auth_to_peer`]
-    /// reads direct bindings only). The worst case is the victim's gossip ignored, which is what
-    /// happens to it without the fallback.
+    /// key: a peer id named by two registered keys is attributed to neither, and a direct binding
+    /// always wins. A penalty for a message attributed this way is charged to the attributed key
+    /// and resolved through [`Self::bound_auth_to_peer`], which reads direct bindings only: it
+    /// lands on that key's own connection, never on the peer id the record names. The worst case
+    /// is the victim's gossip ignored, which is what happens to it without the fallback.
     pub(crate) fn gossip_publisher_bls(&self, peer_id: &PeerId) -> Option<BlsPublicKey> {
         self.peer_to_bls(peer_id).or_else(|| self.registered_record_peerids.get(peer_id).copied())
     }
