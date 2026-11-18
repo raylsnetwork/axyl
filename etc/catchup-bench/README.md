@@ -50,7 +50,7 @@ etc/catchup-bench/run.sh 50 /tmp/bench-1500 -v "$HOME/bins/main" \
 
 ## Outage case
 
-Compares how two binaries catch up while the observer's network fails for a while, as in the "Fault tolerance" table of PR #371.
+Compares how two binaries catch up while the observer's network fails for a while.
 
 1. In each checkout to compare, apply the hook and build:
 

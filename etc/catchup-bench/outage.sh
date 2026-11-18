@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# The fault-tolerance case in PR #371: two binaries, each built with outage-hook.patch, catch up
+# A fault-tolerance case: two binaries, each built with outage-hook.patch, catch up
 # 1500 blocks with 60 s epochs (100 ms round trip, 50 tx/s, 1 observer) three ways: with no outage,
 # with every consensus header request failing at once for 10 s, and with each request hanging for
 # the 10 s request timeout before it fails. The outage starts 5 s after the observer's first
