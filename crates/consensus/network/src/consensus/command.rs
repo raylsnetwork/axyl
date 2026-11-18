@@ -386,7 +386,11 @@ where
                 let peers = self.swarm.behaviour_mut().peer_manager.peers_for_exchange();
                 send_or_log_error!(reply, peers, "PeersForExchange");
             }
-            NetworkCommand::NewEpoch { committee, registered } => {
+            NetworkCommand::NewEpoch { committee, previous, registered } => {
+                // Members of this and the previous committee get their own share of each
+                // admitted request class; the previous ones may still be finishing their epoch.
+                let members = committee.union(&previous).copied().collect();
+                self.request_slots = self.request_limits.for_members(&members);
                 // at the start of a new epoch, each node needs to know:
                 // - the current committee, so its members are never banned
                 // - every registered validator, so their node records (and only theirs) are

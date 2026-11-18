@@ -311,8 +311,6 @@ pub struct PrimaryMetrics {
     pub certificate_fetcher_consecutive_busy: IntGauge,
     /// Fetch rounds in which every peer that answered was busy.
     pub certificate_fetcher_busy_rounds: IntCounter,
-    /// Requests refused because too many jobs were running, by request class and limit.
-    pub request_admission_busy: IntCounterVec,
     /// count number of duplicate certificates that the node processed (others + own)
     pub duplicate_certificates_processed: IntCounter,
     /// gossiped certificates dropped before verification because the memory tier already held
@@ -452,12 +450,6 @@ impl PrimaryMetrics {
             certificate_fetcher_busy_rounds: register_int_counter_with_registry!(
                 "certificate_fetcher_busy_rounds",
                 "Certificate fetch rounds in which every peer that answered was busy",
-                registry
-            )?,
-            request_admission_busy: register_int_counter_vec_with_registry!(
-                "request_admission_busy",
-                "Requests refused because too many jobs were running",
-                &["class", "limit"],
                 registry
             )?,
             duplicate_certificates_processed: register_int_counter_with_registry!(

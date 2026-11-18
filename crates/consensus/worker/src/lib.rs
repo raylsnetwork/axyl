@@ -4,7 +4,9 @@
 mod batch_fetcher;
 mod network;
 mod worker;
-pub use network::{WorkerNetwork, WorkerNetworkHandle, WorkerRequest, WorkerResponse};
+pub use network::{
+    admission_classes, WorkerNetwork, WorkerNetworkHandle, WorkerRequest, WorkerResponse,
+};
 pub mod quorum_waiter;
 
 pub mod metrics;
