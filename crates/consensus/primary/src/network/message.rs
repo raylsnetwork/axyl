@@ -503,7 +503,6 @@ impl PrimaryResponse {
             | PrimaryNetworkError::TooManyAuthorities(..) => {
                 Self::Error(PrimaryRPCError(error.to_string()))
             }
-            PrimaryNetworkError::Busy => Self::Busy,
         }
     }
 }

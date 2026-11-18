@@ -6,7 +6,7 @@ use crate::{
         STALE_SKIP_ROUNDS_FALLBACK_THRESHOLD,
     },
     consensus_bus::NodeMode,
-    error::{CertManagerError, PrimaryNetworkError},
+    error::CertManagerError,
     network::{PrimaryRequest, PrimaryResponse},
     state_sync::StateSynchronizer,
     ConsensusBus,
@@ -587,7 +587,7 @@ async fn busy_peers_do_not_trigger_the_stale_session_fallback() {
             let (request, reply) = fetcher.next_request().await;
             let (lower_bound, _) = request.get_bounds(max_skip_rounds(), |_| true).unwrap();
             assert_eq!(lower_bound, STORED_ROUND, "{mode:?}: busy answers dropped the skip rounds");
-            let _ = reply.send(Ok(PrimaryResponse::into_error_ref(&PrimaryNetworkError::Busy)));
+            let _ = reply.send(Ok(PrimaryResponse::Busy));
         }
     }
 }
@@ -612,7 +612,7 @@ async fn busy_rounds_grow_the_backoff() {
             if peer == 0 {
                 starts.push(tokio::time::Instant::now());
             }
-            let _ = reply.send(Ok(PrimaryResponse::into_error_ref(&PrimaryNetworkError::Busy)));
+            let _ = reply.send(Ok(PrimaryResponse::Busy));
         }
     }
     let gaps: Vec<_> = starts.windows(2).map(|pair| pair[1] - pair[0]).collect();
@@ -634,7 +634,7 @@ async fn busy_rounds_while_catching_up_do_not_delay_the_active_node() {
     let fixture = CommitteeFixture::builder(MemDatabase::default).randomize_ports(true).build();
     let peers = fixture.committee().size() - 1;
     let mut fetcher = FetcherUnderTest::start(&fixture, vec![], NodeMode::CvvInactive).await;
-    let busy = || Ok(PrimaryResponse::into_error_ref(&PrimaryNetworkError::Busy));
+    let busy = || Ok(PrimaryResponse::Busy);
 
     // A catching-up node asks every peer at once, and every peer is busy.
     for _ in 0..ROUNDS * peers {
@@ -676,7 +676,7 @@ async fn one_busy_peer_does_not_hide_empty_answers() {
                 }
                 assert_eq!(lower_bound, STORED_ROUND);
                 let answer = if peer == 0 {
-                    Ok(PrimaryResponse::into_error_ref(&PrimaryNetworkError::Busy))
+                    Ok(PrimaryResponse::Busy)
                 } else if malformed {
                     let io = std::io::Error::new(std::io::ErrorKind::InvalidData, "bad answer");
                     Err(NetworkError::Outbound(OutboundFailure::Io(io)))
@@ -721,7 +721,7 @@ async fn an_unreachable_peer_does_not_hide_busy_answers() {
                     let (lower_bound, _) = request.get_bounds(max_skip_rounds(), |_| true).unwrap();
                     assert_eq!(lower_bound, STORED_ROUND, "{mode:?}, {case}");
                     if peer > 0 {
-                        let busy = PrimaryResponse::into_error_ref(&PrimaryNetworkError::Busy);
+                        let busy = PrimaryResponse::Busy;
                         let _ = reply.send(Ok(busy));
                     } else if let Some(error) = failure() {
                         let _ = reply.send(Err(error));
