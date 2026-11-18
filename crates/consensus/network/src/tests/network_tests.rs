@@ -789,8 +789,11 @@ async fn test_relayed_gossip_from_unconnected_registered_validator_is_accepted()
             .await?;
     }
 
-    // the follower learns the publisher's record from the relay, a third party. It is admitted
-    // when the follower's query closes. Neither the mesh nor the query is ready on a schedule,
+    // the follower learns the publisher's record from the relay, a third party. The explicit
+    // lookup stands in for the one a node makes for the upcoming committees at each epoch, which
+    // is how it already holds the records of members it does not count as committee yet or any
+    // more. The record is admitted when the query closes. Neither the mesh nor the query is ready
+    // on a schedule,
     // so query and publish until a message gets through; an early query or publish that finds
     // no peers yet is retried on the next round.
     let data = Vec::from("relayed from a registered validator".as_bytes());

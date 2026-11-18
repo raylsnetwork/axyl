@@ -1112,10 +1112,14 @@ async fn test_unregistered_record_never_attributes_gossip() {
     // the attacker's record, its own and one naming the victim's network key
     peer_manager.add_known_peer_addrs(attacker_bls, forged.clone());
     assert_eq!(peer_manager.gossip_publisher_bls(&attacker_id), None);
-    forged.pubkey = victim_info.pubkey;
+    forged.pubkey = victim_info.pubkey.clone();
     forged.timestamp += 1;
     peer_manager.add_known_peer_addrs(attacker_bls, forged);
     assert_eq!(peer_manager.gossip_publisher_bls(&victim_id), None);
+
+    // nor can its claim contest the victim's own record: only registered keys' claims count
+    peer_manager.add_known_peer_addrs(victim_bls, victim_info);
+    assert_eq!(peer_manager.gossip_publisher_bls(&victim_id), Some(victim_bls));
 }
 
 /// A registered key naming another validator's network key: once both records are known, the

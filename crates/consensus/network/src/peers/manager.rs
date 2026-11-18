@@ -1059,7 +1059,9 @@ impl PeerManager {
     ///
     /// For records learned through third parties (see [`Self::add_known_peer`]). The addresses
     /// are dial hints: this node can dial the authority and, once connected, the peer pushes its
-    /// own record over the authenticated connection, which is when the binding is made.
+    /// own record over the authenticated connection, which is when the binding is made. For a
+    /// registered key the record also attributes gossip, never requests or penalties (see
+    /// [`Self::gossip_publisher_bls`]).
     pub(crate) fn add_known_peer_addrs(&mut self, bls_key: BlsPublicKey, info: NetworkInfo) {
         self.add_known_peer_inner(bls_key, info, false);
     }
@@ -1101,7 +1103,9 @@ impl PeerManager {
         // A third-party record naming a network key this node already tracks under another BLS
         // key must not touch that peer's entry: `upsert_peer` would relabel the entry with the
         // record's BLS key and append the record's addresses to it, and the unban below would act
-        // on the named peer. The record stays a dial hint for its own BLS key, nothing more.
+        // on the named peer. The record stays a dial hint for its own BLS key and, when that key
+        // is registered, a gossip-attribution claim (contested if another registered key names
+        // the same network key, see `gossip_publisher_bls`), nothing more.
         let relabels_tracked_peer = !bind
             && self
                 .peers
@@ -1131,12 +1135,15 @@ impl PeerManager {
             }
         }
 
-        self.known_peers.insert(bls_key, info.clone());
+        let previous = self.known_peers.insert(bls_key, info.clone());
         self.known_peers_time_added.insert(bls_key, now());
         if bind {
             self.bind_peer_id(peer_id, bls_key);
         }
-        if self.is_registered(&bls_key) {
+        // the record map depends only on which network key a registered key names, so a re-push
+        // of an unchanged record (every connect, every replication round) leaves it as it is
+        let names_new_key = previous.is_none_or(|previous| previous.pubkey != info.pubkey);
+        if names_new_key && self.is_registered(&bls_key) {
             self.rebuild_registered_record_peerids();
         }
 
