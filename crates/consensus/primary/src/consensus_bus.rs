@@ -14,8 +14,7 @@ use rayls_infrastructure_config::Parameters;
 use rayls_infrastructure_types::{
     batch_tracker::BatchTracker, error::HeaderError, BlockHash, BlockNumHash, Certificate,
     CertificateDigest, CommittedSubDag, ConsensusHeader, ConsensusOutput, Epoch, EpochVote, Header,
-    RaylsReceiver, RaylsSender, Round, SendError, StreamedConsensusHeader, TryRecvError,
-    TrySendError, CHANNEL_CAPACITY,
+    RaylsReceiver, RaylsSender, Round, SendError, TryRecvError, TrySendError, CHANNEL_CAPACITY,
 };
 
 /// Gate for re-promotion to CvvActive after a DAG-behind demotion.
@@ -240,7 +239,7 @@ struct ConsensusBusAppInner {
     consensus_output: broadcast::Sender<ConsensusOutput>,
     /// Consensus header.  Note this can be used to create consensus output to execute for non
     /// validators.
-    consensus_header: broadcast::Sender<StreamedConsensusHeader>,
+    consensus_header: broadcast::Sender<ConsensusHeader>,
     /// Status of sync?
     tx_sync_status: watch::Sender<NodeMode>,
     /// Produce new epoch certs as they are recieved.
@@ -715,7 +714,7 @@ impl ConsensusBus {
 
     /// Broadcast channel with consensus header.
     /// This is useful pre-consensus output when not participating in consensus.
-    pub fn consensus_header(&self) -> &impl RaylsSender<StreamedConsensusHeader> {
+    pub fn consensus_header(&self) -> &impl RaylsSender<ConsensusHeader> {
         &self.inner_app.consensus_header
     }
 

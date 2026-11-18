@@ -853,11 +853,11 @@ impl<DB: Database> Subscriber<DB> {
                     && waiting.len() + verifying.len() < Self::MAX_CATCHUP_PIPELINE
                     && verifying.len() < Self::MAX_PARALLEL_VERIFY => {
                     match result {
-                        Some(streamed) => {
-                            let number = streamed.number;
+                        Some(consensus_header) => {
+                            let number = consensus_header.number;
                             // other epoch: drop unverified, never touch the watermark (see #295);
                             // no older one is expected past the anchor, so dropping loses nothing
-                            let epoch = streamed.sub_dag.leader_epoch();
+                            let epoch = consensus_header.sub_dag.leader_epoch();
                             let current_epoch = self.inner.committee.epoch();
                             if epoch != current_epoch {
                                 other_epoch_drops += 1;
@@ -892,14 +892,7 @@ impl<DB: Database> Subscriber<DB> {
                                 "stream_and_follow: received header, verifying"
                             );
                             last_queued_number = last_queued_number.max(number);
-                            let (header, verified) = streamed.into_parts();
-                            if verified {
-                                // state-sync already ran this exact check in this process
-                                let ready = std::future::ready((number, Some(header)));
-                                verifying.push_back(Box::pin(ready));
-                            } else {
-                                verifying.push_back(self.schedule_verification(header));
-                            }
+                            verifying.push_back(self.schedule_verification(consensus_header));
                         }
                         None => {
                             info!(target: "subscriber", "stream_and_follow: channel closed");

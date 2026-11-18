@@ -1,8 +1,8 @@
 use crate::{
     attempt_catch_up, catch_up_consensus_from_to, certified_consensus_checkpoint,
     consensus::WalkSession, consensus_chain_tip, get_missing_consensus, highest_executed_anchor,
-    prime_consensus, save_consensus, store_consensus_header_in_cache, stream_missing_consensus,
-    verified::VerifiedHeaders,
+    prime_consensus, row_cleared::RowCleared, save_consensus, store_consensus_header_in_cache,
+    stream_missing_consensus,
 };
 use rayls_consensus_primary::{
     network::{
@@ -78,9 +78,7 @@ async fn walk_to(
 
 /// Asserts `header` was never streamed for execution, draining what was.
 fn assert_never_streamed(
-    rx: &mut impl rayls_infrastructure_types::RaylsReceiver<
-        rayls_infrastructure_types::StreamedConsensusHeader,
-    >,
+    rx: &mut impl rayls_infrastructure_types::RaylsReceiver<ConsensusHeader>,
     header: &ConsensusHeader,
 ) {
     while let Ok(streamed) = rx.try_recv() {
@@ -573,7 +571,7 @@ async fn test_catch_up_streams_only_stored_rows() {
         &cb,
         anchor.clone(),
         target.clone(),
-        &mut VerifiedHeaders::default(),
+        &RowCleared::default(),
     )
     .await
     .expect("a gap the walk has not stored yet is not an error");
@@ -584,10 +582,9 @@ async fn test_catch_up_streams_only_stored_rows() {
     for header in &chain[..chain.len() - 1] {
         store_consensus_header_in_cache(db, header);
     }
-    let second =
-        catch_up_consensus_from_to(&config, &cb, anchor, target, &mut VerifiedHeaders::default())
-            .await
-            .expect("catch-up streams the gap once the walk has stored it");
+    let second = catch_up_consensus_from_to(&config, &cb, anchor, target, &RowCleared::default())
+        .await
+        .expect("catch-up streams the gap once the walk has stored it");
     assert_eq!(second.number, m);
     let mut streamed = Vec::new();
     while let Ok(header) = rx.try_recv() {
@@ -638,7 +635,7 @@ async fn test_catch_up_mismatch_preserves_canonical_block() {
         &cb,
         anchor.clone(),
         target.clone(),
-        &mut VerifiedHeaders::default(),
+        &RowCleared::default(),
     )
     .await;
     assert!(result.is_err(), "a digest mismatch must surface an error");
@@ -679,7 +676,7 @@ async fn test_catch_up_drops_poisoned_cache_row_and_recovers() {
         &cb,
         anchor.clone(),
         target.clone(),
-        &mut VerifiedHeaders::default(),
+        &RowCleared::default(),
     )
     .await;
     assert!(first.is_err(), "the target does not link onto the stale row");
@@ -690,10 +687,9 @@ async fn test_catch_up_drops_poisoned_cache_row_and_recovers() {
 
     // The walk stores the real 101; the next pass reaches the target.
     store_consensus_header_in_cache(db, &real_101);
-    let second =
-        catch_up_consensus_from_to(&config, &cb, anchor, target, &mut VerifiedHeaders::default())
-            .await
-            .expect("catch-up recovers once the walk stores the real row");
+    let second = catch_up_consensus_from_to(&config, &cb, anchor, target, &RowCleared::default())
+        .await
+        .expect("catch-up recovers once the walk stores the real row");
     assert_eq!(second.number, 102, "catch-up must reach the target after recovering");
 }
 
@@ -734,7 +730,7 @@ async fn test_catch_up_from_to_halts_on_prior_epoch_leak() {
         &cb,
         anchor.clone(),
         leak.clone(),
-        &mut VerifiedHeaders::default(),
+        &RowCleared::default(),
     )
     .await
     .expect("catch-up must return Ok (halt), not error, on a closed-epoch leak");
@@ -794,15 +790,10 @@ async fn test_catch_up_from_to_leak_blocks_later_valid_headers() {
     seed_recently_executed_blocks(&cb);
     let mut rx = cb.consensus_header().subscribe();
 
-    let result = catch_up_consensus_from_to(
-        &config,
-        &cb,
-        anchor.clone(),
-        target,
-        &mut VerifiedHeaders::default(),
-    )
-    .await
-    .expect("catch-up must return Ok (halt), not error, when a leak blocks later headers");
+    let result =
+        catch_up_consensus_from_to(&config, &cb, anchor.clone(), target, &RowCleared::default())
+            .await
+            .expect("catch-up must return Ok (halt), not error, when a leak blocks later headers");
 
     assert_eq!(
         result.number, anchor.number,
@@ -987,7 +978,7 @@ async fn retry_catch_up<DB: Database>(
             last_height,
             t,
             "test retry",
-            &mut VerifiedHeaders::default(),
+            &RowCleared::default(),
         )
         .await;
     }
@@ -1128,91 +1119,12 @@ async fn test_gap_fetch_does_not_forward_bls_valid_tampered_subdag() {
     walk_to(&config, &cb, byzantine, &target).await;
     assert!(by_number.load(Ordering::Relaxed) > 0, "precondition: the peer was asked by number");
 
-    let result = catch_up_consensus_from_to(
-        &config,
-        &cb,
-        anchor,
-        target.clone(),
-        &mut VerifiedHeaders::default(),
-    )
-    .await
-    .expect("catch-up reaches the target on the walk's rows");
+    let result =
+        catch_up_consensus_from_to(&config, &cb, anchor, target.clone(), &RowCleared::default())
+            .await
+            .expect("catch-up reaches the target on the walk's rows");
     assert_eq!(result.digest(), target.digest());
     assert_never_streamed(&mut rx, &tampered_101);
-}
-
-/// The subscriber skips BLS only for a header flagged verified, so the flag must mean the walk in
-/// this process verified exactly that header, with the current committee's keys. A stored row the
-/// walk did not record, or with other signatures than the walk verified, stays unflagged.
-#[tokio::test]
-async fn test_catch_up_flags_only_headers_verified_in_this_process() {
-    let fixture = catch_up_fixture();
-    let primary = fixture.authorities().next().unwrap();
-    let config = primary.consensus_config();
-    let db = config.node_storage();
-    let committee = fixture.committee();
-
-    let anchor = chained_header(100, B256::default(), &committee);
-    store_executed(db, &anchor);
-    let leader_header = fixture.header_from_last_authority();
-    let honest_leader = fixture.certificate(&leader_header);
-    let one_vote: Vec<_> = fixture
-        .votes(&leader_header)
-        .into_iter()
-        .take(1)
-        .map(|v| (v.author().clone(), *v.signature()))
-        .collect();
-    let under_signed_leader =
-        Certificate::new_unsigned_for_test(&committee, leader_header, one_vote).unwrap();
-    let honest_101 = signed_chained_header(101, anchor.digest(), &honest_leader);
-    let under_signed_101 = signed_chained_header(101, anchor.digest(), &under_signed_leader);
-    let target = chained_header(102, honest_101.digest(), &committee);
-    store_consensus_header_in_cache(db, &honest_101);
-    let stored_101 = db.get_consensus_by_number(101).expect("101 is stored");
-
-    let cb = ConsensusBus::new();
-    seed_recently_executed_blocks(&cb);
-    let mut rx = cb.consensus_header().subscribe();
-    let mut streamed = || {
-        let mut flags = Vec::new();
-        while let Ok(header) = rx.try_recv() {
-            flags.push((header.number, header.is_verified()));
-        }
-        flags
-    };
-    let (walk, mut verified) = VerifiedHeaders::channel();
-
-    // a stored row the walk did not record in this process, such as one from before a restart
-    catch_up_consensus_from_to(&config, &cb, anchor.clone(), target.clone(), &mut verified)
-        .await
-        .unwrap();
-    assert_eq!(streamed(), vec![(101, false), (102, false)]);
-
-    // the walk verified the same header with other signatures
-    walk.record(&under_signed_101);
-    catch_up_consensus_from_to(&config, &cb, anchor.clone(), target.clone(), &mut verified)
-        .await
-        .unwrap();
-    assert_eq!(streamed(), vec![(101, false), (102, false)], "other signatures than verified");
-
-    // the walk verified exactly the stored row, and the target
-    walk.record(&stored_101);
-    walk.record(&target);
-    catch_up_consensus_from_to(&config, &cb, anchor.clone(), target.clone(), &mut verified)
-        .await
-        .unwrap();
-    assert_eq!(streamed(), vec![(101, true), (102, true)]);
-
-    // a header of another epoch was checked with record or lookahead keys, not the ones the
-    // subscriber uses, so it stays unflagged even when the walk verified those exact bytes
-    let mut next_epoch = target;
-    next_epoch.sub_dag.leader.header.epoch = config.epoch() + 1;
-    walk.record(&stored_101);
-    walk.record(&next_epoch);
-    catch_up_consensus_from_to(&config, &cb, anchor.clone(), next_epoch, &mut verified)
-        .await
-        .unwrap();
-    assert_eq!(streamed(), vec![(101, true), (102, false)], "next epoch's keys are not ours");
 }
 
 /// When both sides of a failed link are stored rows, the row below the link may be the bad one
@@ -1256,7 +1168,7 @@ async fn test_catch_up_does_not_anchor_on_stale_stored_row() {
         &mut last_height,
         target.clone(),
         "test",
-        &mut VerifiedHeaders::default(),
+        &RowCleared::default(),
     )
     .await;
     assert!(pending.is_some());
@@ -1288,7 +1200,7 @@ async fn test_catch_up_does_not_anchor_on_stale_stored_row() {
         &mut last_height,
         target,
         "test retry",
-        &mut VerifiedHeaders::default(),
+        &RowCleared::default(),
     )
     .await;
     assert!(pending.is_none());
@@ -1340,7 +1252,7 @@ async fn test_catch_up_rewinds_stale_anchor() {
             &mut last_height,
             target.clone(),
             "test",
-            &mut VerifiedHeaders::default(),
+            &RowCleared::default(),
         )
         .await
         .is_some(),
@@ -1358,7 +1270,7 @@ async fn test_catch_up_rewinds_stale_anchor() {
         &mut last_height,
         target.clone(),
         "test walk stored 104",
-        &mut VerifiedHeaders::default(),
+        &RowCleared::default(),
     )
     .await
     .is_some());
@@ -1375,7 +1287,7 @@ async fn test_catch_up_rewinds_stale_anchor() {
             &mut last_height,
             target.clone(),
             "test repaired",
-            &mut VerifiedHeaders::default(),
+            &RowCleared::default(),
         )
         .await
         .is_none(),
@@ -1428,7 +1340,7 @@ async fn test_catch_up_recovers_after_clearing_a_streamed_epoch_end() {
         &mut last_height,
         target.clone(),
         "stale 103",
-        &mut VerifiedHeaders::default(),
+        &RowCleared::default(),
     )
     .await;
     assert!(pending.is_some());
@@ -1449,7 +1361,7 @@ async fn test_catch_up_recovers_after_clearing_a_streamed_epoch_end() {
         &mut last_height,
         target.clone(),
         "before 102 executes",
-        &mut VerifiedHeaders::default(),
+        &RowCleared::default(),
     )
     .await;
     assert!(pending.is_some());
@@ -1464,7 +1376,7 @@ async fn test_catch_up_recovers_after_clearing_a_streamed_epoch_end() {
         &mut last_height,
         target,
         "after 102 executes",
-        &mut VerifiedHeaders::default(),
+        &RowCleared::default(),
     )
     .await;
     assert!(pending.is_none(), "catch-up reaches the target without a restart");
@@ -1502,9 +1414,9 @@ async fn test_catch_up_refetches_a_row_the_streamer_cleared() {
     seed_recently_executed_blocks(&cb);
     cb.executed_anchor().send_replace(anchor.clone());
     let _rx = cb.consensus_header().subscribe();
-    let (walk_tx, mut verified) = VerifiedHeaders::channel();
+    let row_cleared = RowCleared::default();
     let mut session =
-        WalkSession::new(config.clone(), cb.clone(), network).with_verified(Some(walk_tx));
+        WalkSession::new(config.clone(), cb.clone(), network).with_row_cleared(row_cleared.clone());
 
     // The walk covers 101 and 102, as a walk to an epoch end at 102 does. A stale row from older
     // code sits at 103 and does not link to 102.
@@ -1522,7 +1434,7 @@ async fn test_catch_up_refetches_a_row_the_streamer_cleared() {
         &mut last_height,
         target.clone(),
         "stale 103",
-        &mut verified,
+        &row_cleared,
     )
     .await;
     assert!(pending.is_some());
@@ -1542,7 +1454,7 @@ async fn test_catch_up_refetches_a_row_the_streamer_cleared() {
         &mut last_height,
         target,
         "after the walk",
-        &mut verified,
+        &row_cleared,
     )
     .await;
     assert!(pending.is_none(), "catch-up reaches the target without a restart");
