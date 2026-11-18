@@ -776,7 +776,7 @@ async fn catch_up_consensus_from_to<DB: Database>(
         // Verified only when the walk verified exactly this header in this process, with the keys
         // the subscriber would use itself: the current committee's. A header of another epoch was
         // checked against record or lookahead keys, so leave it for the subscriber to judge.
-        let verified = verified.take(&consensus_header) && leader_epoch == epoch;
+        let walk_verified = verified.take(&consensus_header) && leader_epoch == epoch;
         let base_execution_block = consensus_header.sub_dag.leader.header().latest_execution_block;
         if streamed.is_multiple_of(100) {
             let recent_latest =
@@ -831,7 +831,7 @@ async fn catch_up_consensus_from_to<DB: Database>(
                 recent_len
             ));
         }
-        let message = if verified {
+        let message = if walk_verified {
             StreamedConsensusHeader::verified_in_process(consensus_header.clone())
         } else {
             StreamedConsensusHeader::unverified(consensus_header.clone())
