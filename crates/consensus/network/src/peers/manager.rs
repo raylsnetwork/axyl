@@ -983,7 +983,24 @@ impl PeerManager {
         for bls_key in &self.registered_validators {
             let Some(info) = self.known_peers.get(bls_key) else { continue };
             let peer_id: PeerId = info.pubkey.clone().into();
-            claims.entry(peer_id).and_modify(|claim| *claim = None).or_insert(Some(*bls_key));
+            claims
+                .entry(peer_id)
+                .and_modify(|claim| {
+                    // warn, not debug: a misconfiguration or a re-mapping attempt by a
+                    // registered key, and rebuilds are too rare for it to flood the log. Logged
+                    // once per contested peer id, for its first two claimants.
+                    if let Some(first) = claim.take() {
+                        warn!(
+                            target: "peer-manager",
+                            ?peer_id,
+                            ?first,
+                            second = ?bls_key,
+                            "two registered validators' records name the same network key; \
+                             attributing its gossip to neither",
+                        );
+                    }
+                })
+                .or_insert(Some(*bls_key));
         }
         self.registered_record_peerids = claims
             .into_iter()

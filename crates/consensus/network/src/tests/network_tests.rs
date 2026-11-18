@@ -793,30 +793,36 @@ async fn test_relayed_gossip_from_unconnected_registered_validator_is_accepted()
     // lookup stands in for the one a node makes for the upcoming committees at each epoch, which
     // is how it already holds the records of members it does not count as committee yet or any
     // more. The record is admitted when the query closes. Neither the mesh nor the query is ready
-    // on a schedule,
-    // so query and publish until a message gets through; an early query or publish that finds
-    // no peers yet is retried on the next round.
+    // on a schedule, so query and publish until a message gets through; an early query or
+    // publish that finds no peers yet is retried on the next round. Every round also checks the
+    // follower never reached the publisher: a direct connection would bind it through its own
+    // record and pass the test without the record path.
     let data = Vec::from("relayed from a registered validator".as_bytes());
-    let event = timeout(Duration::from_secs(20), async {
+    let (msg, bls) = timeout(Duration::from_secs(20), async {
         loop {
+            if follower.network_handle.connected_peer_ids().await?.contains(&publisher_id) {
+                return Err(eyre!("the follower reached the publisher directly"));
+            }
             let _ = follower.network_handle.find_authorities(vec![publisher_bls]).await;
             let _ = publisher.network_handle.publish(TEST_TOPIC.into(), data.clone()).await;
-            if let Ok(event) =
-                timeout(Duration::from_secs(1), follower._network_events.recv()).await
-            {
-                return event;
+            let round = tokio::time::sleep(Duration::from_secs(1));
+            tokio::pin!(round);
+            loop {
+                tokio::select! {
+                    _ = &mut round => break,
+                    event = follower._network_events.recv() => match event {
+                        Some(NetworkEvent::Gossip(msg, bls)) => return eyre::Ok((msg, bls)),
+                        Some(_) => continue,
+                        None => return Err(eyre!("follower event stream closed")),
+                    },
+                }
             }
         }
     })
-    .await?;
-    match event {
-        Some(NetworkEvent::Gossip(msg, bls)) => {
-            assert_eq!(msg.source, Some(publisher_id));
-            assert_eq!(msg.data, data);
-            assert_eq!(bls, publisher_bls, "attributed to the publisher's key");
-        }
-        other => return Err(eyre!("expected the relayed gossip, got {other:?}")),
-    }
+    .await??;
+    assert_eq!(msg.source, Some(publisher_id));
+    assert_eq!(msg.data, data);
+    assert_eq!(bls, publisher_bls, "attributed to the publisher's key");
     assert!(
         !follower.network_handle.connected_peer_ids().await?.contains(&publisher_id),
         "the follower must not have reached the publisher directly"

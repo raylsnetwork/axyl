@@ -178,7 +178,8 @@ where
     /// validator's record attributes, is ignored, neither forwarded nor penalized. The lists are
     /// this node's own view, so an unlisted publisher may be an honest validator the node is
     /// behind on, and gossipsub has already done the frame work that an ignored message costs.
-    /// Nothing else here penalizes a publisher.
+    /// Nothing else here penalizes a publisher. Accepting a message also forwards it, so a
+    /// publisher attributed from its record is relayed by nodes it never connected to.
     pub(super) fn verify_gossip(&self, gossip: &GossipMessage) -> GossipAcceptance {
         // verify message size
         // do not punish if gossip is tx batch
