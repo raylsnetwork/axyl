@@ -213,9 +213,6 @@ struct ConsensusBusAppInner {
     /// the pending table knows when to re-read it.
     tx_pending_epoch_records_changed: watch::Sender<u64>,
 
-    /// Changes after the epoch record collector finishes a pass that may have stored records.
-    tx_epoch_records_collected: watch::Sender<()>,
-
     /// Signals a new round
     tx_primary_round_updates: watch::Sender<Round>,
 
@@ -294,7 +291,6 @@ impl ConsensusBusAppInner {
         let (tx_gc_round_updates, _) = watch::channel(Round::default());
         let (tx_requested_missing_epoch, _) = watch::channel(Epoch::default());
         let (tx_pending_epoch_records_changed, _) = watch::channel(0u64);
-        let (tx_epoch_records_collected, _) = watch::channel(());
         let (tx_primary_round_updates, _) = watch::channel(0u32);
         let (tx_last_consensus_header, _) = watch::channel(ConsensusHeader::default());
         let (tx_last_published_consensus_num_hash, _) = watch::channel((0, BlockHash::default()));
@@ -319,7 +315,6 @@ impl ConsensusBusAppInner {
             tx_gc_round_updates,
             tx_requested_missing_epoch,
             tx_pending_epoch_records_changed,
-            tx_epoch_records_collected,
             tx_primary_round_updates,
             tx_recently_executed_blocks,
             tx_executed_anchor,
@@ -587,12 +582,6 @@ impl ConsensusBus {
     /// handler caches the pending table and re-reads it only when this has moved.
     pub fn pending_epoch_records_changed(&self) -> &watch::Sender<u64> {
         &self.inner_app.tx_pending_epoch_records_changed
-    }
-
-    /// Changes after the epoch record collector finishes a pass that may have stored records. It
-    /// carries no data: a receiver reads the record table again to see what is there.
-    pub fn epoch_records_collected(&self) -> &watch::Sender<()> {
-        &self.inner_app.tx_epoch_records_collected
     }
 
     /// Signals a new round

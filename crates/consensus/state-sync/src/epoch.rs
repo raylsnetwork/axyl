@@ -12,7 +12,6 @@ use std::{
     collections::{BTreeSet, HashMap, HashSet},
     time::Duration,
 };
-use tokio::sync::watch;
 use tracing::info;
 
 /// How long a committee attestation waits for each validator's answer. The requests run
@@ -242,14 +241,10 @@ async fn committee_attested_record(
 /// ([`committee_attested_record`]) lets the walk continue past the hole. The hole itself stays
 /// queued: the nodes that closed it hold it pending and certify it, and the backfill passes keep
 /// asking until it lands.
-///
-/// `collected` changes after each record it stores, so a waiter does not wait for the rest of the
-/// walk, which ends by asking for a record that does not exist yet.
 async fn collect_epoch_records<DB>(
     last_epoch: Epoch,
     db: &DB,
     primary_handle: &PrimaryNetworkHandle,
-    collected: &watch::Sender<()>,
 ) -> Epoch
 where
     DB: ReDatabase,
@@ -261,10 +256,7 @@ where
             continue;
         }
         match fetch_and_save_epoch(epoch, db, primary_handle).await {
-            FetchOutcome::Saved => {
-                result_epoch = epoch;
-                collected.send_replace(());
-            }
+            FetchOutcome::Saved => result_epoch = epoch,
             FetchOutcome::Rejected | FetchOutcome::Unavailable => {
                 // the committee of the missing epoch: what its parent, which we hold, names
                 let Ok((_, committee)) = get_committee(db, epoch) else { break };
@@ -289,7 +281,6 @@ where
                     epoch + 1,
                 );
                 result_epoch = epoch + 1;
-                collected.send_replace(());
             }
         }
     }
@@ -437,15 +428,7 @@ where
             let requested_epoch =
                 (*epoch_rx.borrow_and_update()).max(retry_target.map_or(0, |(epoch, _)| epoch));
             if requested_epoch > last_epoch {
-                last_epoch = collect_epoch_records(
-                    last_epoch,
-                    &db,
-                    &primary_handle,
-                    consensus_bus.epoch_records_collected(),
-                )
-                .await;
-                // Also covers records another writer stored during the walk, which it skipped.
-                consensus_bus.epoch_records_collected().send_replace(());
+                last_epoch = collect_epoch_records(last_epoch, &db, &primary_handle).await;
                 if last_epoch < requested_epoch {
                     retry_target = match retry_target {
                         Some((epoch, rounds)) if epoch == requested_epoch => {
@@ -483,9 +466,6 @@ where
                             COLLECTOR_RETRY_BUDGET,
                         ) => landed,
                     };
-                    if landed {
-                        consensus_bus.epoch_records_collected().send_replace(());
-                    }
                     // Landed: the target is done (keeping it would re-run the walk, tip probes
                     // included, once per remaining round). Otherwise count the round and go on.
                     retry_target = if landed { None } else { Some((target, rounds + 1)) };
@@ -496,16 +476,13 @@ where
             // Fill holes left below the tip by closes this node could not collect a record for.
             if tokio::time::Instant::now() >= next_backfill {
                 backfill_pass += 1;
-                let saved = backfill_missing_records(
+                backfill_missing_records(
                     &db,
                     &primary_handle,
                     &mut backfill_attempts,
                     backfill_pass,
                 )
                 .await;
-                if saved > 0 {
-                    consensus_bus.epoch_records_collected().send_replace(());
-                }
                 next_backfill = tokio::time::Instant::now() + COLLECTOR_BACKFILL_INTERVAL;
             }
             // Retry on a timer while behind instead of waiting for the watch to change (which
@@ -951,99 +928,6 @@ mod tests {
         assert!(seen < 2 * walk, "collector kept walking after the record landed: {seen} requests");
     }
 
-    /// The collector signals once a pass has stored the records it was asked for, so a waiter
-    /// such as the backwards walk wakes when they land instead of checking on a timer.
-    #[tokio::test(start_paused = true)]
-    async fn collector_signals_after_storing_the_requested_records() {
-        let (db, chain) = test_db_and_chain(3);
-        let (record, cert) = &chain[0];
-        db.save_epoch_record_with_cert(record, cert).unwrap();
-        let network = serving_network(chain.iter().cloned().map(|rc| (rc.0.epoch, rc)).collect());
-        let bus = ConsensusBus::new();
-        let mut collected = bus.epoch_records_collected().subscribe();
-        let task_manager = TaskManager::new("collector-test");
-        let shutdown = Notifier::new();
-        spawn_epoch_record_collector(
-            db.clone(),
-            network,
-            bus.clone(),
-            task_manager.get_spawner(),
-            shutdown.subscribe(),
-        )
-        .await
-        .unwrap();
-        bus.requested_missing_epoch().send_replace(2);
-
-        tokio::time::timeout(Duration::from_secs(1), collected.changed())
-            .await
-            .expect("the collector signals")
-            .unwrap();
-        shutdown.notify();
-        for epoch in [1, 2] {
-            assert!(
-                matches!(db.get_epoch_by_number(epoch), Some((_, Some(_)))),
-                "epoch {epoch} is stored before the signal"
-            );
-        }
-    }
-
-    /// The collector signals each record as soon as it is stored, not when its pass ends: the pass
-    /// goes on to ask for the next epoch's record, which may not exist yet, and that can take a
-    /// while. Here no peer ever answers for the next epoch, so the pass never ends.
-    #[tokio::test(start_paused = true)]
-    async fn collector_signals_each_record_before_its_pass_ends() {
-        let (db, chain) = test_db_and_chain(3);
-        let (record, cert) = &chain[0];
-        db.save_epoch_record_with_cert(record, cert).unwrap();
-        let served: BTreeMap<_, _> =
-            chain[..2].iter().cloned().map(|rc| (rc.0.epoch, rc)).collect();
-        let (tx, mut rx) =
-            tokio::sync::mpsc::channel::<NetworkCommand<PrimaryRequest, PrimaryResponse>>(64);
-        tokio::spawn(async move {
-            // Replies for epochs it does not serve are kept, unanswered, like a peer that hangs.
-            let mut unanswered = Vec::new();
-            while let Some(cmd) = rx.recv().await {
-                let NetworkCommand::SendRequestAny {
-                    request: PrimaryRequest::EpochRecord { epoch, .. },
-                    reply,
-                } = cmd
-                else {
-                    continue;
-                };
-                match epoch.and_then(|e| served.get(&e)) {
-                    Some((record, certificate)) => {
-                        let _ = reply.send(Ok(PrimaryResponse::EpochRecord {
-                            record: record.clone(),
-                            certificate: certificate.clone(),
-                        }));
-                    }
-                    None => unanswered.push(reply),
-                }
-            }
-        });
-        let bus = ConsensusBus::new();
-        let mut collected = bus.epoch_records_collected().subscribe();
-        let task_manager = TaskManager::new("collector-test");
-        let shutdown = Notifier::new();
-        spawn_epoch_record_collector(
-            db.clone(),
-            PrimaryNetworkHandle::new_for_test(tx),
-            bus.clone(),
-            task_manager.get_spawner(),
-            shutdown.subscribe(),
-        )
-        .await
-        .unwrap();
-        bus.requested_missing_epoch().send_replace(1);
-
-        tokio::time::timeout(Duration::from_secs(1), collected.changed())
-            .await
-            .expect("signalled while the pass still waits on epoch 2")
-            .unwrap();
-        shutdown.notify();
-        assert!(matches!(db.get_epoch_by_number(1), Some((_, Some(_)))), "epoch 1 is stored");
-    }
-
     /// Validation used by every path that writes a fetched record: anchored to the parent, always.
     #[test]
     fn record_validation_anchors_to_the_parent_when_it_is_held() {
@@ -1123,7 +1007,7 @@ mod tests {
         // two of four serve record 3: below the super-quorum of three
         let (db, _, network) = hole_at_two(&[0, 1]);
 
-        let reached = collect_epoch_records(1, &db, &network, &watch::channel(()).0).await;
+        let reached = collect_epoch_records(1, &db, &network).await;
 
         assert_eq!(reached, 1, "the walk stops at the hole");
         for epoch in 2..6 {
@@ -1138,7 +1022,7 @@ mod tests {
     async fn walk_continues_past_a_hole_the_committee_attests_across() {
         let (db, chain, network) = hole_at_two(&[0, 1, 2]);
 
-        let reached = collect_epoch_records(1, &db, &network, &watch::channel(()).0).await;
+        let reached = collect_epoch_records(1, &db, &network).await;
 
         assert_eq!(reached, 5, "records 3, 4 and 5 land");
         assert!(db.get_epoch_by_number(2).is_none(), "the hole is not invented");
@@ -1168,7 +1052,7 @@ mod tests {
         let network =
             attesting_network(BTreeMap::from([(3, (forged, forged_cert))]), BTreeMap::new());
 
-        let reached = collect_epoch_records(1, &db, &network, &watch::channel(()).0).await;
+        let reached = collect_epoch_records(1, &db, &network).await;
 
         assert_eq!(reached, 1);
         assert!(db.get_epoch_by_number(3).is_none(), "the forgery is never stored");
