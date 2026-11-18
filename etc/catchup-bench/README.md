@@ -93,6 +93,6 @@ round 1 pr: 3 obs, gap 1516 blocks (202s offline, ~6 tx/block), first new block 
 
 - Other load on the machine changes the timings. Check `uptime` before trusting a run, and repeat a run that looks off.
 - The request counts come from the validators' debug `request received` log line (`crates/consensus/network/src/consensus/reqres.rs`). If that line changes, the counts read 0.
-- `first new block` counts from the higher of the observer's height just before it stops and the height it reports when its RPC first answers after the restart, since it keeps running blocks until it stops. A block it runs while booting, before its RPC answers, is therefore counted up to one poll late.
+- An observer's stop height is the highest block in its `block built` log lines (target `engine`), since it keeps running blocks after its height is read and runs the unsaved ones again on restart. If that line changes, `first new block` can count a block run again as new.
 - All nodes share one machine and one delay. This adds real round trips, but not bandwidth limits, packet loss, or different delays per peer.
 - The keys and funded accounts are local test keys, for this benchmark only.
