@@ -19,7 +19,7 @@ use std::{
 use tokio::sync::watch;
 use tracing::{debug, error, info, warn};
 
-use crate::verified::VerifiedSender;
+use crate::row_cleared::RowCleared;
 
 const COMMITTEE_KEYS_TIMEOUT: Duration = Duration::from_secs(30);
 const COMMITTEE_KEYS_POLL_INTERVAL: Duration = Duration::from_millis(500);
@@ -128,7 +128,6 @@ async fn get_consensus_header<DB: ReDatabase>(
     consensus_bus: &ConsensusBus,
     network: &PrimaryNetworkHandle,
     shutdown: &Noticer,
-    verified_tx: Option<&VerifiedSender>,
 ) -> Option<(B256, u64)> {
     let db = config.node_storage();
     // Stop only at the canonical anchor (never an unverified cache row); its per-row digest==hash
@@ -172,9 +171,6 @@ async fn get_consensus_header<DB: ReDatabase>(
                 };
                 let parent = verified.parent_hash;
                 // Record before storing, as in `prefetch_below`.
-                if let Some(tx) = verified_tx {
-                    tx.record(&verified);
-                }
                 store_consensus_header_in_cache(db, &verified);
                 republish_if_higher(consensus_bus, &verified);
                 return Some((parent, verified.number));
@@ -259,8 +255,8 @@ pub(crate) struct WalkSession<DB> {
     /// re-descending. Cleared on an incomplete walk (stale rows may lie below it), then
     /// re-derived.
     covered: Option<B256>,
-    /// Tells the forward streamer which headers this walk verified.
-    verified: Option<VerifiedSender>,
+    /// Set by the forward streamer when it clears a stored row.
+    row_cleared: RowCleared,
     /// Lowest epoch whose end may still need a checkpoint walk; every epoch below it ends at or
     /// below a header a checkpoint walk already covered.
     next_checkpoint: Epoch,
@@ -285,16 +281,16 @@ impl<DB: ReDatabase> WalkSession<DB> {
             network,
             shutdown,
             covered: None,
-            verified: None,
+            row_cleared: RowCleared::default(),
             next_checkpoint: 0,
             records_requested: 0,
             divert: None,
         }
     }
 
-    /// Report each header this session verifies to `verified`.
-    pub(crate) fn with_verified(mut self, verified: Option<VerifiedSender>) -> Self {
-        self.verified = verified;
+    /// Learn from `row_cleared` when the forward streamer clears a stored row.
+    pub(crate) fn with_row_cleared(mut self, row_cleared: RowCleared) -> Self {
+        self.row_cleared = row_cleared;
         self
     }
 
@@ -353,7 +349,7 @@ impl<DB: ReDatabase> WalkSession<DB> {
     /// a long catch-up stall; a join failure just leaves the anchor unset and re-derives next
     /// call.
     async fn refresh_coverage(&mut self) {
-        if self.verified.as_ref().is_some_and(VerifiedSender::take_row_cleared) {
+        if self.row_cleared.take() {
             info!(target: "state-sync", "backwards walk: the streamer cleared a stored row, deriving coverage again");
             self.covered = None;
             self.next_checkpoint = 0;
@@ -392,7 +388,6 @@ impl<DB: ReDatabase> WalkSession<DB> {
                 &self.consensus_bus,
                 &self.network,
                 &self.shutdown,
-                self.verified.as_ref(),
             )
             .await
             .is_none()
@@ -528,7 +523,6 @@ impl<DB: ReDatabase> WalkSession<DB> {
                 &self.consensus_bus,
                 &self.network,
                 &self.shutdown,
-                self.verified.as_ref(),
             )
             .await
             {
@@ -701,11 +695,6 @@ impl<DB: ReDatabase> WalkSession<DB> {
                 expected = lowest.parent_hash;
             }
             let full_round = checked.len() as u64 == above - low;
-            // Record before storing, so the streamer never reads a stored header whose record
-            // has not been sent yet.
-            if let Some(tx) = self.verified.as_ref() {
-                checked.iter().for_each(|header| tx.record(header));
-            }
             store_consensus_headers_in_cache(db, &checked);
             stored += checked.len() as u64;
             if !full_round {
@@ -797,12 +786,12 @@ pub(crate) async fn spawn_track_recent_consensus<DB: ReDatabase>(
     config: ConsensusConfig<DB>,
     consensus_bus: ConsensusBus,
     network: PrimaryNetworkHandle,
-    verified: Option<VerifiedSender>,
+    row_cleared: RowCleared,
 ) -> eyre::Result<()> {
     let rx_shutdown = config.shutdown().subscribe();
     let mut rx_gossip_update = consensus_bus.last_published_consensus_num_hash().subscribe();
     let mut session = WalkSession::new(config.clone(), consensus_bus.clone(), network.clone())
-        .with_verified(verified);
+        .with_row_cleared(row_cleared);
 
     // Probe at startup so the first walk begins without waiting for a gossip tip.
     let current = consensus_bus.last_consensus_header().borrow().number;
@@ -903,8 +892,7 @@ mod tests {
         let shutdown = config.shutdown().subscribe();
 
         let parent =
-            get_consensus_header(stale_digest, &config, &consensus_bus, &network, &shutdown, None)
-                .await;
+            get_consensus_header(stale_digest, &config, &consensus_bus, &network, &shutdown).await;
 
         let after = consensus_bus.last_consensus_header().borrow().number;
         assert_eq!(
@@ -949,8 +937,7 @@ mod tests {
         let shutdown = config.shutdown().subscribe();
 
         let next =
-            get_consensus_header(cached_digest, &config, &consensus_bus, &network, &shutdown, None)
-                .await;
+            get_consensus_header(cached_digest, &config, &consensus_bus, &network, &shutdown).await;
 
         assert_eq!(
             next,
