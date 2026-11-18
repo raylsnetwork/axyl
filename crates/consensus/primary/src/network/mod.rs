@@ -9,6 +9,7 @@ use crate::{
     state_sync::StateSynchronizer,
     ConsensusBus,
 };
+use admission::{RequestAdmission, RequestClass};
 use handler::RequestHandler;
 #[cfg(test)]
 pub(crate) use message::MAX_SKIP_ROUND_AUTHORITIES;
@@ -35,6 +36,7 @@ use rayls_infrastructure_types::{
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, warn};
+pub(crate) mod admission;
 pub mod handler;
 mod message;
 use crate::network::state::AuthVoteState;
@@ -328,6 +330,8 @@ pub struct PrimaryNetwork<DB, Events> {
     network_handle: PrimaryNetworkHandle,
     /// Request handler to process requests and return responses.
     request_handler: RequestHandler<DB>,
+    /// Permits taken before a request that costs real work is handed to the handler.
+    admission: Arc<RequestAdmission>,
     /// The type to spawn tasks.
     task_spawner: TaskSpawner,
 }
@@ -346,12 +350,13 @@ where
         rayls_consensus_state_sync: StateSynchronizer<DB>,
         task_spawner: TaskSpawner,
     ) -> Self {
+        let admission = Arc::new(RequestAdmission::new(&consensus_config, &consensus_bus));
         let request_handler = RequestHandler::new(
             consensus_config,
             consensus_bus,
             rayls_consensus_state_sync.clone(),
         );
-        Self { network_events, network_handle, request_handler, task_spawner }
+        Self { network_events, network_handle, request_handler, admission, task_spawner }
     }
 
     pub fn handle(&self) -> &PrimaryNetworkHandle {
@@ -442,6 +447,9 @@ where
     }
 
     /// Attempt to retrieve certificates for a peer that's missing them.
+    ///
+    /// The job takes its permits here and keeps them until its storage scan ends,
+    /// so a cancelled request still holds its slots while the scan runs.
     fn process_request_for_missing_certs(
         &self,
         peer: BlsPublicKey,
@@ -451,12 +459,24 @@ where
         cancel: oneshot::Receiver<()>,
     ) {
         // clone for spawned tasks
-        let request_handler = self.request_handler.clone();
         let network_handle = self.network_handle.clone();
+        let permits = match self.admission.acquire(RequestClass::MissingCerts, peer) {
+            Ok(permits) => permits,
+            // Counted and logged by the admission; no penalty, the requester asks another peer.
+            Err(_) => {
+                let task_name = format!("MissingCertsBusy-{peer}");
+                self.task_spawner.spawn_task(task_name, async move {
+                    let _ =
+                        network_handle.handle.send_response(PrimaryResponse::Busy, channel).await;
+                });
+                return;
+            }
+        };
+        let request_handler = self.request_handler.clone();
         let task_name = format!("MissingCertsReq-{peer}");
         self.task_spawner.spawn_task(task_name, async move {
             tokio::select! {
-                result = request_handler.retrieve_missing_certs(peer, request, requested_epoch) => {
+                result = request_handler.retrieve_missing_certs(request, requested_epoch, permits) => {
                     // report penalty if any
                     if let Err(ref e) = result {
                         if let Some(penalty) = e.into() {

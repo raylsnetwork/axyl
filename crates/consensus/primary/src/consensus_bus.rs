@@ -4,7 +4,7 @@
 
 use crate::{
     certificate_fetcher::CertificateFetcherCommand, consensus::ConsensusRound,
-    network::handler::MissingCertLimits, proposer::OurDigestMessage,
+    network::admission::RequestLimits, proposer::OurDigestMessage,
     state_sync::CertificateManagerCommand, RecentlyExecutedBlocks,
 };
 use consensus_metrics::metered_channel::{self, channel_with_total_sender, MeteredMpscChannel};
@@ -278,8 +278,8 @@ struct ConsensusBusAppInner {
     /// Blocks re-promotion until the cert store covers the barrier round.
     /// `None` means no barrier active. Set atomically via `send_modify`.
     promotion_barrier: watch::Sender<Option<PromotionBarrier>>,
-    /// Limits on the missing-certificate jobs this node runs for its peers.
-    missing_cert_limits: Arc<MissingCertLimits>,
+    /// Limits on the jobs this node runs for its peers' requests.
+    request_limits: Arc<RequestLimits>,
 }
 
 impl ConsensusBusAppInner {
@@ -343,7 +343,7 @@ impl ConsensusBusAppInner {
             mode_transition,
             cert_store_round: watch::channel(0).0,
             promotion_barrier: watch::channel(None).0,
-            missing_cert_limits: Arc::new(MissingCertLimits::new(missing_cert_jobs_others)),
+            request_limits: Arc::new(RequestLimits::new(missing_cert_jobs_others)),
         }
     }
 
@@ -583,9 +583,9 @@ impl ConsensusBus {
         &self.inner_epoch.parents
     }
 
-    /// Limits on the missing-certificate jobs this node runs for its peers.
-    pub(crate) fn missing_cert_limits(&self) -> &MissingCertLimits {
-        &self.inner_app.missing_cert_limits
+    /// Limits on the jobs this node runs for its peers' requests.
+    pub(crate) fn request_limits(&self) -> &RequestLimits {
+        &self.inner_app.request_limits
     }
 
     /// Contains the highest committed round & corresponding gc_round for consensus.
