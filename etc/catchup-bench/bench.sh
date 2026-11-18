@@ -33,7 +33,7 @@ DEV_ACCOUNT=0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266
 DEV_KEY=0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80
 export RL_BLS_PASSPHRASE="catchup-bench-local-only"
 declare -A PIDS
-declare -A OBS_PIDS OBS_LOGS STOP_H
+declare -A OBS_PIDS STOP_H
 SENDER_PIDS=()
 mkdir -p "$RUN"
 log() { echo "$(date -u +%T) $*" | tee -a "$RUN/summary.txt"; }
@@ -78,7 +78,7 @@ start_observer() {
         --log.stdout.format log-fmt --full --storage.v2 --db.growth-step 1MB --consensus-db.growth-step 1MB \
         --txpool.minimal-protocol-fee 0 --gpo.default-suggested-fee 0 -vvv --http --http.addr 127.0.0.1 \
         --http.api all >>"$logfile" 2>&1 &
-    OBS_PIDS[$i]=$!; OBS_LOGS[$i]=$logfile
+    OBS_PIDS[$i]=$!
 }
 stop_pid() {
     local pid=$1; [[ -z $pid ]] && return 0
@@ -89,18 +89,6 @@ stop_pid() {
 stop_observers() {
     local i; for i in "${!OBS_PIDS[@]}"; do kill -TERM "${OBS_PIDS[$i]}" 2>/dev/null; done
     for i in "${!OBS_PIDS[@]}"; do stop_pid "${OBS_PIDS[$i]}"; done; OBS_PIDS=(); return 0
-}
-# stop_heights: STOP_H[i] = the block observer i holds once stopped. An observer keeps running blocks
-# between the last height read and its stop, so take the higher of that read (already in STOP_H) and
-# the block its shutdown log says it saved ("in-flight persistence completed", target "persistence").
-stop_heights() {
-    local i saved
-    for i in $(seq 1 "$M"); do
-        saved=$(grep -o 'in-flight persistence completed" persisted="NumHash { number: [0-9]*' "${OBS_LOGS[$i]}" |
-            tail -1 | grep -o '[0-9]*$')
-        [[ -n $saved && $saved -gt ${STOP_H[$i]:-0} ]] && STOP_H[$i]=$saved
-    done
-    return 0
 }
 stop_all() {
     local p; for p in "${SENDER_PIDS[@]}"; do kill -TERM "$p" 2>/dev/null; done
@@ -227,7 +215,6 @@ for round in $(seq 1 "$ROUNDS"); do
         wait_for 1200 all_obs_reached "$live_tip" || fail "observers did not reach $live_tip before round $round $label"
         for i in $(seq 1 "$M"); do STOP_H[$i]=$(height "obs$i"); done
         stop_observers
-        stop_heights
         stop_at=${STOP_H[1]:-$(max_val_height)}
         t_stop=$(date +%s)
         wait_for 14400 val_reached $((stop_at + GAP)) || fail "validators did not advance"
@@ -238,12 +225,18 @@ for round in $(seq 1 "$ROUNDS"); do
         t0=$(date +%s%3N)
         for i in $(seq 1 "$M"); do start_observer "$i" "$bin" "$RUN/observer-$i-$round-$label.log" "${ENVS[$label]:-}"; done
         trace="$RUN/progress-$round-$label.tsv"; echo -e "ms\tobs1_height" >"$trace"
-        declare -A first=(); rc=1; last_trace=0
+        # An observer keeps running blocks between the height read above and its stop, so a new block
+        # is one above the higher of that read and the height it reports when its RPC first answers.
+        declare -A first=() base=(); rc=1; last_trace=0
         for _ in $(seq 1 72000); do
             now=$(date +%s%3N)
             for i in $(seq 1 "$M"); do
                 [[ -n ${first[$i]:-} ]] && continue
-                obs_reached "$i" $((${STOP_H[$i]:-$stop_at} + 1)) && first[$i]=$((now - t0))
+                if [[ -z ${base[$i]:-} ]]; then
+                    h=$(height "obs$i"); [[ -n $h ]] || continue
+                    base[$i]=$(( h > ${STOP_H[$i]:-0} ? h : ${STOP_H[$i]:-0} ))
+                fi
+                obs_reached "$i" $((base[$i] + 1)) && first[$i]=$((now - t0))
             done
             if (( now - last_trace >= 2000 )); then echo -e "$((now - t0))\t$(height obs1)" >>"$trace"; last_trace=$now; fi
             if all_obs_reached "$tip"; then
