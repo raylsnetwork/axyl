@@ -788,23 +788,24 @@ async fn test_relayed_gossip_from_unconnected_registered_validator_is_accepted()
             .subscribe_with_publishers(TEST_TOPIC.into(), registered.clone())
             .await?;
     }
-    tokio::time::sleep(Duration::from_secs(TEST_HEARTBEAT_INTERVAL)).await;
 
     // the follower learns the publisher's record from the relay, a third party. It is admitted
-    // when the follower's query closes, so publish until a message gets through.
-    follower.network_handle.find_authorities(vec![publisher_bls]).await?;
+    // when the follower's query closes. Neither the mesh nor the query is ready on a schedule,
+    // so query and publish until a message gets through; an early query or publish that finds
+    // no peers yet is retried on the next round.
     let data = Vec::from("relayed from a registered validator".as_bytes());
     let event = timeout(Duration::from_secs(20), async {
         loop {
-            publisher.network_handle.publish(TEST_TOPIC.into(), data.clone()).await?;
+            let _ = follower.network_handle.find_authorities(vec![publisher_bls]).await;
+            let _ = publisher.network_handle.publish(TEST_TOPIC.into(), data.clone()).await;
             if let Ok(event) =
                 timeout(Duration::from_secs(1), follower._network_events.recv()).await
             {
-                return eyre::Ok(event);
+                return event;
             }
         }
     })
-    .await??;
+    .await?;
     match event {
         Some(NetworkEvent::Gossip(msg, bls)) => {
             assert_eq!(msg.source, Some(publisher_id));

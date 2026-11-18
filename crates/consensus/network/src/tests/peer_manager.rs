@@ -1142,6 +1142,22 @@ async fn test_contested_peer_id_is_attributed_to_neither_and_direct_binding_wins
     assert_eq!(peer_manager.gossip_publisher_bls(&victim_id), Some(victim_bls));
 }
 
+/// A direct binding wins over a registered record even when the bound key is not registered: an
+/// observer connected as itself keeps its own peer id, whatever a registered key's record claims,
+/// and its gossip then fails the publisher list as before.
+#[tokio::test]
+async fn test_unregistered_direct_binding_wins_over_a_registered_record() {
+    let mut peer_manager = create_test_peer_manager(None);
+    let (observer_bls, observer_info, observer_id) = record_info(now());
+    let (liar_bls, mut liar_info, _) = record_info(now());
+    liar_info.pubkey = observer_info.pubkey.clone();
+    peer_manager.set_registered_validators(HashSet::from([liar_bls]));
+
+    peer_manager.add_known_peer(observer_bls, observer_info);
+    peer_manager.add_known_peer_addrs(liar_bls, liar_info);
+    assert_eq!(peer_manager.gossip_publisher_bls(&observer_id), Some(observer_bls));
+}
+
 /// The attribution follows the registered set and the newest record: a key that leaves the set
 /// is dropped, and a record naming a new network key moves the attribution to the new peer id.
 #[tokio::test]

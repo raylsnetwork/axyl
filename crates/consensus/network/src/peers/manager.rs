@@ -961,8 +961,11 @@ impl PeerManager {
     /// key: a peer id named by two registered keys is attributed to neither, and a direct binding
     /// always wins. A penalty for a message attributed this way is charged to the attributed key
     /// and resolved through [`Self::bound_auth_to_peer`], which reads direct bindings only: it
-    /// lands on that key's own connection, never on the peer id the record names. The worst case
-    /// is the victim's gossip ignored, which is what happens to it without the fallback.
+    /// lands on that key's own connection, never on the peer id the record names. So the victim
+    /// loses only what it loses without the fallback: while the liar's claim is the only one this
+    /// node holds, the victim's gossip is attributed to the liar, and whatever checks its author
+    /// rejects it as a mismatch charged to the liar; once both records are held, it is ignored.
+    /// Nothing can be published as the victim either way.
     pub(crate) fn gossip_publisher_bls(&self, peer_id: &PeerId) -> Option<BlsPublicKey> {
         self.peer_to_bls(peer_id).or_else(|| self.registered_record_peerids.get(peer_id).copied())
     }
@@ -970,7 +973,8 @@ impl PeerManager {
     /// Rebuild [`Self::registered_record_peerids`] from the `known_peers` entries of registered
     /// validators. Every such entry is this node's configuration or a record whose BLS signature
     /// was verified against the key it is stored under. A peer id named by more than one key is
-    /// left out.
+    /// left out. A direct binding of the same peer id to another key is not checked here: it wins
+    /// at lookup, in [`Self::gossip_publisher_bls`].
     ///
     /// Called when the registered set changes and when a registered key's entry changes. The set
     /// is bounded by governance and stake, so a full rebuild is cheap.
