@@ -93,5 +93,6 @@ round 1 pr: 3 obs, gap 1516 blocks (202s offline, ~6 tx/block), first new block 
 
 - Other load on the machine changes the timings. Check `uptime` before trusting a run, and repeat a run that looks off.
 - The request counts come from the validators' debug `request received` log line (`crates/consensus/network/src/consensus/reqres.rs`). If that line changes, the counts read 0.
+- An observer's stop height is the higher of its last reported height and the block its shutdown log line `in-flight persistence completed` says it saved (`crates/execution/evm/src/reth_env/persistence.rs`). If that line changes, a block run just before the stop can count as the first new block.
 - All nodes share one machine and one delay. This adds real round trips, but not bandwidth limits, packet loss, or different delays per peer.
 - The keys and funded accounts are local test keys, for this benchmark only.
