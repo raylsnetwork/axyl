@@ -43,7 +43,7 @@ where
                         let gossip_source = message.source.unwrap_or(propagation_source);
 
                         if let Some(bls) =
-                            self.swarm.behaviour().peer_manager.peer_to_bls(&gossip_source)
+                            self.swarm.behaviour().peer_manager.gossip_publisher_bls(&gossip_source)
                         {
                             // forward gossip to handler
                             if let Err(e) =
@@ -207,9 +207,10 @@ where
             }
         }
 
-        // ensure publisher is authorized
+        // ensure publisher is authorized: the publisher need not be connected to this node, see
+        // `gossip_publisher_bls`
         if gossip.source.is_some_and(|id| {
-            let bls_key = self.swarm.behaviour().peer_manager.peer_to_bls(&id);
+            let bls_key = self.swarm.behaviour().peer_manager.gossip_publisher_bls(&id);
             auth_config.is_some_and(|auth| {
                 auth.is_none()
                     || (bls_key.is_some()

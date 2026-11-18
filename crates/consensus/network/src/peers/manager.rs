@@ -83,6 +83,11 @@ pub(crate) struct PeerManager {
     /// its connection alone: an owner-delivered record binds its peer id, holds one
     /// `known_peers` entry per peer id until replaced or evicted, and is never persisted.
     registered_validators: HashSet<BlsPublicKey>,
+    /// PeerId -> BlsPublicKey for registered validators, taken from the record this node holds
+    /// for each one, whoever delivered it. Used to attribute gossip only, never requests or
+    /// penalties: see [`Self::gossip_publisher_bls`]. Rebuilt by
+    /// [`Self::rebuild_registered_record_peerids`].
+    registered_record_peerids: HashMap<PeerId, BlsPublicKey>,
     /// A queue of events that the `PeerManager` is waiting to produce.
     events: VecDeque<PeerEvent>,
     /// A queue of peers to dial.
@@ -173,6 +178,7 @@ impl PeerManager {
             known_peers_time_added: Default::default(),
             known_peerids: Default::default(),
             registered_validators: Default::default(),
+            registered_record_peerids: Default::default(),
             events: Default::default(),
             dial_requests: Default::default(),
             isolation_streak: 0,
@@ -935,6 +941,49 @@ impl PeerManager {
     /// use it directly.
     pub(crate) fn set_registered_validators(&mut self, registered: HashSet<BlsPublicKey>) {
         self.registered_validators = registered;
+        self.rebuild_registered_record_peerids();
+    }
+
+    /// The BLS key a gossip message's original publisher is attributed to.
+    ///
+    /// The binding from the publisher's own connection first ([`Self::peer_to_bls`]). Failing
+    /// that, a registered validator whose record names this peer id. Gossip reaches a node over
+    /// any mesh path, so its publisher is often not connected here; without this fallback, a node
+    /// with no direct link to a committee member ignores all of that member's gossip, however
+    /// many honest peers relay it.
+    ///
+    /// Why this is safe when binding from a third-party record is not: it covers registered keys
+    /// only. The re-mapping attack needs a record signed under the attacker's own key that names
+    /// a validator's network key, and an observer's key is not registered. A registered key's
+    /// record is that validator's own claim. If the network key it names is the validator's own,
+    /// the attribution is right; if nobody holds that key, nothing is ever published from it. If
+    /// it names another validator's network key, that is the re-mapping attack from a registered
+    /// key: a peer id named by two registered keys is attributed to neither, a direct binding
+    /// always wins, and this attribution never routes a penalty ([`Self::bound_auth_to_peer`]
+    /// reads direct bindings only). The worst case is the victim's gossip ignored, which is what
+    /// happens to it without the fallback.
+    pub(crate) fn gossip_publisher_bls(&self, peer_id: &PeerId) -> Option<BlsPublicKey> {
+        self.peer_to_bls(peer_id).or_else(|| self.registered_record_peerids.get(peer_id).copied())
+    }
+
+    /// Rebuild [`Self::registered_record_peerids`] from the `known_peers` entries of registered
+    /// validators. Every such entry is this node's configuration or a record whose BLS signature
+    /// was verified against the key it is stored under. A peer id named by more than one key is
+    /// left out.
+    ///
+    /// Called when the registered set changes and when a registered key's entry changes. The set
+    /// is bounded by governance and stake, so a full rebuild is cheap.
+    fn rebuild_registered_record_peerids(&mut self) {
+        let mut claims: HashMap<PeerId, Option<BlsPublicKey>> = HashMap::new();
+        for bls_key in &self.registered_validators {
+            let Some(info) = self.known_peers.get(bls_key) else { continue };
+            let peer_id: PeerId = info.pubkey.clone().into();
+            claims.entry(peer_id).and_modify(|claim| *claim = None).or_insert(Some(*bls_key));
+        }
+        self.registered_record_peerids = claims
+            .into_iter()
+            .filter_map(|(peer_id, claim)| claim.map(|bls_key| (peer_id, bls_key)))
+            .collect();
     }
 
     /// Update the committee and the registered-validator set for the new epoch.
@@ -1081,6 +1130,9 @@ impl PeerManager {
         self.known_peers_time_added.insert(bls_key, now());
         if bind {
             self.bind_peer_id(peer_id, bls_key);
+        }
+        if self.is_registered(&bls_key) {
+            self.rebuild_registered_record_peerids();
         }
 
         // The circuit addresses in `info` are dial hints for reaching this peer, nothing more.

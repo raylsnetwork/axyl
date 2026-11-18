@@ -1064,6 +1064,106 @@ async fn test_third_party_record_cannot_remap_a_bound_peer() {
     );
 }
 
+/// A fresh BLS key and the record info naming a fresh network key, with that key's peer id.
+fn record_info(timestamp: u64) -> (BlsPublicKey, NetworkInfo, PeerId) {
+    let bls = *BlsKeypair::generate(&mut rand::rng()).public();
+    let netkey: NetworkPublicKey = NetworkKeypair::generate_ed25519().public().into();
+    let peer_id: PeerId = netkey.clone().into();
+    (
+        bls,
+        NetworkInfo { pubkey: netkey, multiaddrs: vec![create_multiaddr(None)], timestamp },
+        peer_id,
+    )
+}
+
+/// A registered validator's record learned through a third party attributes that validator's
+/// gossip, so a node with no direct link to the validator still accepts what honest peers relay
+/// from it. It is attribution only: no binding, and so no request attribution and no penalty
+/// target. The order of the record and the registered set must not matter.
+#[tokio::test]
+async fn test_registered_record_attributes_gossip_without_a_connection() {
+    let mut peer_manager = create_test_peer_manager(None);
+    let (bls, info, peer_id) = record_info(now());
+
+    // record first, then the key becomes registered
+    peer_manager.add_known_peer_addrs(bls, info);
+    assert_eq!(peer_manager.gossip_publisher_bls(&peer_id), None, "not registered yet");
+    peer_manager.set_registered_validators(HashSet::from([bls]));
+    assert_eq!(peer_manager.gossip_publisher_bls(&peer_id), Some(bls));
+    assert_eq!(peer_manager.peer_to_bls(&peer_id), None, "no binding from a third-party record");
+    assert_eq!(peer_manager.bound_auth_to_peer(bls), None, "no penalty target either");
+
+    // registered first, then the record arrives
+    let (other_bls, other_info, other_id) = record_info(now());
+    peer_manager.set_registered_validators(HashSet::from([bls, other_bls]));
+    peer_manager.add_known_peer_addrs(other_bls, other_info);
+    assert_eq!(peer_manager.gossip_publisher_bls(&other_id), Some(other_bls));
+}
+
+/// The re-mapping attacker is an observer: its key is not registered, so its record naming a
+/// validator's network key attributes nothing.
+#[tokio::test]
+async fn test_unregistered_record_never_attributes_gossip() {
+    let mut peer_manager = create_test_peer_manager(None);
+    let (victim_bls, victim_info, victim_id) = record_info(now());
+    let (attacker_bls, mut forged, attacker_id) = record_info(now());
+    peer_manager.set_registered_validators(HashSet::from([victim_bls]));
+
+    // the attacker's record, its own and one naming the victim's network key
+    peer_manager.add_known_peer_addrs(attacker_bls, forged.clone());
+    assert_eq!(peer_manager.gossip_publisher_bls(&attacker_id), None);
+    forged.pubkey = victim_info.pubkey;
+    forged.timestamp += 1;
+    peer_manager.add_known_peer_addrs(attacker_bls, forged);
+    assert_eq!(peer_manager.gossip_publisher_bls(&victim_id), None);
+}
+
+/// A registered key naming another validator's network key: once both records are known, the
+/// contested peer id is attributed to neither, and a direct binding always wins over a record.
+#[tokio::test]
+async fn test_contested_peer_id_is_attributed_to_neither_and_direct_binding_wins() {
+    let mut peer_manager = create_test_peer_manager(None);
+    let (victim_bls, victim_info, victim_id) = record_info(now());
+    let (liar_bls, mut liar_info, _) = record_info(now());
+    liar_info.pubkey = victim_info.pubkey.clone();
+    peer_manager.set_registered_validators(HashSet::from([victim_bls, liar_bls]));
+
+    // until the victim's record is known, the liar's claim attributes the victim's peer id to
+    // the liar; a direct binding or the victim's record ends that (below)
+    peer_manager.add_known_peer_addrs(liar_bls, liar_info);
+    assert_eq!(peer_manager.gossip_publisher_bls(&victim_id), Some(liar_bls));
+
+    // the victim's record arrives: contested, attributed to neither
+    peer_manager.add_known_peer_addrs(victim_bls, victim_info.clone());
+    assert_eq!(peer_manager.gossip_publisher_bls(&victim_id), None);
+
+    // the victim connects and pushes its own record: the direct binding decides
+    peer_manager.add_known_peer(victim_bls, victim_info);
+    assert_eq!(peer_manager.gossip_publisher_bls(&victim_id), Some(victim_bls));
+}
+
+/// The attribution follows the registered set and the newest record: a key that leaves the set
+/// is dropped, and a record naming a new network key moves the attribution to the new peer id.
+#[tokio::test]
+async fn test_record_attribution_follows_registered_set_and_newest_record() {
+    let mut peer_manager = create_test_peer_manager(None);
+    let (bls, info, old_id) = record_info(now());
+    peer_manager.set_registered_validators(HashSet::from([bls]));
+    peer_manager.add_known_peer_addrs(bls, info);
+    assert_eq!(peer_manager.gossip_publisher_bls(&old_id), Some(bls));
+
+    // a newer record under the same key names a new network key
+    let (_, mut rotated, new_id) = record_info(now() + 1);
+    rotated.timestamp = now() + 1;
+    peer_manager.add_known_peer_addrs(bls, rotated);
+    assert_eq!(peer_manager.gossip_publisher_bls(&old_id), None);
+    assert_eq!(peer_manager.gossip_publisher_bls(&new_id), Some(bls));
+
+    // the key leaves the registered set
+    peer_manager.set_registered_validators(HashSet::new());
+    assert_eq!(peer_manager.gossip_publisher_bls(&new_id), None);
+}
+
 /// Evicting the attacker's dial entry must not take the victim's binding with it. The old
 /// eviction followed the evicted entry's network key to find the binding to drop, and a forged
 /// entry pointed that at the victim, so a full `known_peers` table silently unbound the victim on
