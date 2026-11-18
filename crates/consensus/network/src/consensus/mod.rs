@@ -3,6 +3,7 @@
 //! This network is used by workers and primaries to reliably send consensus messages.
 
 use crate::{
+    admission::{RequestLimits, RequestSlots},
     codec::{RLCodec, RLMessage},
     consensus::behaviour::RLBehavior,
     types::{ConnectionPath, KadQuery, NetworkCommand, NetworkEvent, NetworkResult, NodeRecord},
@@ -90,6 +91,10 @@ where
     /// data. Peers that send messages that fail to decode must receive an application score
     /// penalty.
     inbound_requests: HashMap<InboundRequestId, oneshot::Sender<()>>,
+    /// The limits of every admitted request class, for the node's life.
+    request_limits: RequestLimits,
+    /// The slots of every admitted request class for this epoch, rebuilt at each `NewEpoch`.
+    request_slots: RequestSlots,
     /// The collection of kademlia record requests.
     ///
     /// When the application layer makes a request, the swarm stores the kad::QueryId and the

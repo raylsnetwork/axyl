@@ -1,4 +1,5 @@
 use crate::{
+    admission::BusyLimit,
     codec::RLMessage,
     peers::Penalty,
     types::{NetworkEvent, NetworkResult, NexthopFmt},
@@ -54,6 +55,44 @@ where
                         // network that we can ignore and it should not
                         // cause any lasting damage if triggered.
                         if let Some(bls) = self.swarm.behaviour().peer_manager.peer_to_bls(&peer) {
+                            // A request with an admission class takes its permits here, so a
+                            // refused one never reaches the application. No penalty either way.
+                            let permits = match request.admission_class() {
+                                None => None,
+                                Some(class) => match self.request_slots.acquire(class, bls) {
+                                    Ok(permits) => Some(permits),
+                                    // The application declared the class but gave this swarm
+                                    // no values for it: a code mismatch, counted and logged,
+                                    // that must not stop the request from being served.
+                                    Err(BusyLimit::Undeclared) => {
+                                        warn!(
+                                            target: "network",
+                                            class = class.name(),
+                                            "request class declared without values; forwarding unlimited"
+                                        );
+                                        None
+                                    }
+                                    Err(_) => {
+                                        match Res::busy() {
+                                            Some(busy) => {
+                                                let _ = self
+                                                    .swarm
+                                                    .behaviour_mut()
+                                                    .req_res
+                                                    .send_response(channel, busy);
+                                            }
+                                            // Dropping the channel fails the request on the
+                                            // requester's side.
+                                            None => error!(
+                                                target: "network",
+                                                class = class.name(),
+                                                "admitted request class without a busy answer"
+                                            ),
+                                        }
+                                        return Ok(());
+                                    }
+                                },
+                            };
                             let (notify, cancel) = oneshot::channel();
                             // forward request to handler without blocking other events
                             if let Err(e) = self.event_stream.try_send(NetworkEvent::Request {
@@ -61,6 +100,7 @@ where
                                 request,
                                 channel,
                                 cancel,
+                                permits,
                             }) {
                                 error!(target: "network", topics=?self.authorized_publishers.keys(), ?request_id, ?e, "failed to forward request!");
                                 // ignore failures at the epoch boundary

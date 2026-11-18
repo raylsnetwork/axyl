@@ -251,7 +251,6 @@ where
         let consensus_bus = ConsensusBus::new_with_args(
             initial_mode,
             builder.rayls_infrastructure_config.parameters.gc_depth,
-            network_config.sync_config().max_missing_cert_jobs_others,
         );
         let worker_event_stream = QueChannel::new();
 

@@ -9,20 +9,22 @@ use crate::{
     state_sync::StateSynchronizer,
     ConsensusBus,
 };
-use admission::{RequestAdmission, RequestClass};
 use handler::RequestHandler;
 #[cfg(test)]
 pub(crate) use message::MAX_SKIP_ROUND_AUTHORITIES;
-pub use message::{MissingCertificatesRequest, PrimaryRequest, PrimaryResponse, SkipRoundList};
+pub use message::{
+    admission_classes, MissingCertificatesRequest, PrimaryRequest, PrimaryResponse, SkipRoundList,
+};
 // Re-exported so downstream crates (state-sync) can build a `PrimaryNetworkHandle` test mock that
 // answers `NetworkCommand`s without taking a direct dependency on the network crate.
 use message::{PrimaryGossip, PrimaryRPCError};
-#[doc(hidden)]
-pub use rayls_consensus_network::{error::NetworkError, types::NetworkCommand};
 use rayls_consensus_network::{
+    admission::RequestPermits,
     types::{IntoResponse as _, NetworkEvent, NetworkHandle, NetworkResult},
     GossipMessage, Penalty, ResponseChannel,
 };
+#[doc(hidden)]
+pub use rayls_consensus_network::{error::NetworkError, types::NetworkCommand};
 use rayls_infrastructure_config::{ConsensusConfig, LibP2pConfig};
 use rayls_infrastructure_network_types::{
     WorkerOthersBatchMessage, WorkerOwnBatchMessage, WorkerToPrimaryClient,
@@ -35,8 +37,7 @@ use rayls_infrastructure_types::{
 };
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
 use tokio::sync::{mpsc, oneshot};
-use tracing::{debug, warn};
-pub(crate) mod admission;
+use tracing::{debug, error, warn};
 pub mod handler;
 mod message;
 use crate::network::state::AuthVoteState;
@@ -330,8 +331,6 @@ pub struct PrimaryNetwork<DB, Events> {
     network_handle: PrimaryNetworkHandle,
     /// Request handler to process requests and return responses.
     request_handler: RequestHandler<DB>,
-    /// Permits taken before a request that costs real work is handed to the handler.
-    admission: Arc<RequestAdmission>,
     /// The type to spawn tasks.
     task_spawner: TaskSpawner,
 }
@@ -350,13 +349,12 @@ where
         rayls_consensus_state_sync: StateSynchronizer<DB>,
         task_spawner: TaskSpawner,
     ) -> Self {
-        let admission = Arc::new(RequestAdmission::new(&consensus_config, &consensus_bus));
         let request_handler = RequestHandler::new(
             consensus_config,
             consensus_bus,
             rayls_consensus_state_sync.clone(),
         );
-        Self { network_events, network_handle, request_handler, admission, task_spawner }
+        Self { network_events, network_handle, request_handler, task_spawner }
     }
 
     pub fn handle(&self) -> &PrimaryNetworkHandle {
@@ -380,7 +378,7 @@ where
     fn process_network_event(&mut self, event: NetworkEvent<Req, Res>) {
         // match event
         match event {
-            NetworkEvent::Request { peer, request, channel, cancel } => match request {
+            NetworkEvent::Request { peer, request, channel, cancel, permits } => match request {
                 PrimaryRequest::Vote { header, parents } => {
                     self.process_vote_request(
                         peer,
@@ -390,11 +388,17 @@ where
                         cancel,
                     );
                 }
-                PrimaryRequest::MissingCertificates { inner } => {
-                    self.process_request_for_missing_certs(peer, inner, None, channel, cancel)
-                }
+                PrimaryRequest::MissingCertificates { inner } => self
+                    .process_request_for_missing_certs(peer, inner, None, permits, channel, cancel),
                 PrimaryRequest::MissingCertificatesInEpoch { inner, epoch } => self
-                    .process_request_for_missing_certs(peer, inner, Some(epoch), channel, cancel),
+                    .process_request_for_missing_certs(
+                        peer,
+                        inner,
+                        Some(epoch),
+                        permits,
+                        channel,
+                        cancel,
+                    ),
                 PrimaryRequest::ConsensusHeader { number, hash } => {
                     self.process_consensus_output_request(peer, number, hash, channel, cancel)
                 }
@@ -448,30 +452,26 @@ where
 
     /// Attempt to retrieve certificates for a peer that's missing them.
     ///
-    /// The job takes its permits here and keeps them until its storage scan ends,
-    /// so a cancelled request still holds its slots while the scan runs.
+    /// The network took `permits` for this request before forwarding it. The job keeps
+    /// them until its storage scan ends, so a cancelled request still holds its slots
+    /// while the scan runs.
     fn process_request_for_missing_certs(
         &self,
         peer: BlsPublicKey,
         request: MissingCertificatesRequest,
         requested_epoch: Option<Epoch>,
+        permits: Option<RequestPermits>,
         channel: ResponseChannel<PrimaryResponse>,
         cancel: oneshot::Receiver<()>,
     ) {
+        // The network admits this request class, so a request without permits is a bug.
+        // Dropping the channel fails the request on the requester's side, with no penalty.
+        let Some(permits) = permits else {
+            error!(target: "primary::network", %peer, "missing-certificates request forwarded without permits");
+            return;
+        };
         // clone for spawned tasks
         let network_handle = self.network_handle.clone();
-        let permits = match self.admission.acquire(RequestClass::MissingCerts, peer) {
-            Ok(permits) => permits,
-            // Counted and logged by the admission; no penalty, the requester asks another peer.
-            Err(_) => {
-                let task_name = format!("MissingCertsBusy-{peer}");
-                self.task_spawner.spawn_task(task_name, async move {
-                    let _ =
-                        network_handle.handle.send_response(PrimaryResponse::Busy, channel).await;
-                });
-                return;
-            }
-        };
         let request_handler = self.request_handler.clone();
         let task_name = format!("MissingCertsReq-{peer}");
         self.task_spawner.spawn_task(task_name, async move {

@@ -1,6 +1,6 @@
 //! Fixtures used in multiple tests.
 
-use crate::{PeerExchangeMap, RLMessage};
+use crate::{admission::AdmissionClass, PeerExchangeMap, RLMessage};
 use libp2p::Multiaddr;
 use rand::prelude::*;
 use rayls_infrastructure_types::{
@@ -21,10 +21,22 @@ impl RLMessage for TestWorkerRequest {
             _ => None,
         }
     }
+
+    /// Missing batches stand in for an admitted class, for tests of the swarm's gate.
+    fn admission_class(&self) -> Option<AdmissionClass> {
+        match self {
+            Self::MissingBatches(_) => Some(AdmissionClass::MissingCertificates),
+            _ => None,
+        }
+    }
 }
 impl RLMessage for TestWorkerResponse {
     fn peer_exchange_msg(&self) -> Option<PeerExchangeMap> {
         None
+    }
+
+    fn busy() -> Option<Self> {
+        Some(Self::Busy)
     }
 }
 impl RLMessage for TestPrimaryRequest {
@@ -63,6 +75,8 @@ pub(super) enum TestWorkerResponse {
     },
     /// Peer exchange.
     PeerExchange(PeerExchangeMap),
+    /// The swarm refused the request: too many of its class were running.
+    Busy,
 }
 
 /// Requests from Primary.

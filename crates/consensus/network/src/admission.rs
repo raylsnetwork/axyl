@@ -1,18 +1,24 @@
-//! Admission of peer requests that cost this node real work.
+//! Admission of inbound requests that cost the node real work.
 //!
-//! Each request class has its own pools: a share per committee member, a pool
-//! for the committee as a whole, and a small pool shared by every other peer.
-//! The dispatch takes a permit before it hands a request to its handler, and the
-//! handler keeps the permit until its work ends, so a cancelled request cannot
-//! free a slot its job still uses.
+//! A request type the application declares as an admission class takes a permit in the swarm
+//! loop before it is forwarded, and the application keeps the permit until the work behind the
+//! request ends. A refused request is answered with the response type's busy answer and never
+//! reaches the application.
 //!
-//! Only missing-certificate requests are admitted this way so far. A new class
-//! adds a variant, a field in [RequestLimits] and [RequestAdmission], and its
-//! own values; the pools and the refusal path are shared.
+//! Each class has its own pools: a share per committee member, a pool for the committee as a
+//! whole, and a small pool shared by every other peer. The pools live for the node's life, so
+//! jobs left over from an earlier epoch still count; the per-member shares follow the committee
+//! and are rebuilt at every epoch from the current and the previous committee.
+//!
+//! The application declares which of its requests belong to which [`AdmissionClass`] through
+//! [`RLMessage::admission_class`], its busy answer through [`RLMessage::busy`], and each
+//! class's values through the [`ClassValues`] it hands the network when the swarm is built.
+//!
+//! [`RLMessage::admission_class`]: crate::RLMessage::admission_class
+//! [`RLMessage::busy`]: crate::RLMessage::busy
 
-use rayls_consensus_primary_metrics::Metrics;
-use rayls_infrastructure_config::ConsensusConfig;
-use rayls_infrastructure_types::{BlsPublicKey, Committee, Database};
+use crate::NetworkMetrics;
+use rayls_infrastructure_types::BlsPublicKey;
 use std::{
     collections::{HashMap, HashSet},
     hash::{BuildHasher, RandomState},
@@ -25,120 +31,149 @@ use std::{
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tracing::debug;
 
-use crate::ConsensusBus;
-
 /// Smallest committee pool, grown so every member can use its share.
 /// It only refuses while jobs from an earlier epoch are still running.
-pub(crate) const JOBS_COMMITTEE_FLOOR: usize = 64;
+pub const JOBS_COMMITTEE_FLOOR: usize = 64;
 /// Jobs one outside peer may have running at once, in any class.
 /// Honest nodes send each peer one request at a time.
-pub(crate) const JOBS_PER_OUTSIDER: usize = 1;
+pub const JOBS_PER_OUTSIDER: usize = 1;
 
-/// The classes of request this node admits through [RequestAdmission].
+/// The classes of request the network admits per peer, across both networks.
+///
+/// A class indexes its pools by its discriminant, so admitting a request costs no hashing.
+/// A new class adds a variant and its name here, the requests it covers in the application's
+/// [`RLMessage::admission_class`], and its values in the list the application hands the swarm.
+///
+/// [`RLMessage::admission_class`]: crate::RLMessage::admission_class
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum RequestClass {
-    /// A missing-certificates request, served by a storage scan on a blocking thread.
-    MissingCerts,
+pub enum AdmissionClass {
+    /// Missing-certificates requests on the primary: each one is a storage scan on a blocking
+    /// thread.
+    MissingCertificates,
 }
 
-impl RequestClass {
-    /// The label of this class in the refusal metric.
-    fn label(self) -> &'static str {
+impl AdmissionClass {
+    /// The name of this class in the refusal metric.
+    pub fn name(self) -> &'static str {
         match self {
-            Self::MissingCerts => "missing_certs",
+            Self::MissingCertificates => "missing_certificates",
         }
+    }
+
+    /// The index of this class's pools.
+    fn index(self) -> usize {
+        self as usize
     }
 }
 
-/// Concurrency limits for every request class, shared by every epoch.
-///
-/// The node keeps one for its whole life, so jobs left over from an earlier epoch still count.
+/// The values of one class.
+#[derive(Debug, Clone, Copy)]
+pub struct ClassValues {
+    /// Jobs one committee member, or last epoch's member, may have running at once.
+    pub jobs_per_peer: NonZeroUsize,
+    /// Jobs every peer outside both committees may have running at once, in total.
+    pub jobs_others: NonZeroUsize,
+}
+
+/// The limits of every class, shared by every epoch of one swarm.
 #[derive(Debug)]
-pub(crate) struct RequestLimits {
-    /// Limits on the missing-certificate jobs this node runs for its peers.
-    missing_certs: ClassLimits,
+pub struct RequestLimits {
+    /// Each class's node-wide pools and its member share, at the class's index.
+    classes: Vec<Option<(ClassLimits, NonZeroUsize)>>,
+    /// Counts refusals.
+    metrics: Arc<NetworkMetrics>,
+    /// The swarm these limits belong to, for the refusal metric.
+    swarm: &'static str,
 }
 
 impl RequestLimits {
-    /// Peers outside both committees share `missing_cert_jobs_others` missing-certificate
-    /// jobs at once.
-    pub(crate) fn new(missing_cert_jobs_others: NonZeroUsize) -> Self {
-        Self { missing_certs: ClassLimits::new(missing_cert_jobs_others) }
-    }
-
-    /// The limits of one class.
-    pub(crate) fn class(&self, class: RequestClass) -> &ClassLimits {
-        match class {
-            RequestClass::MissingCerts => &self.missing_certs,
-        }
-    }
-}
-
-/// Permits for one epoch's requests, taken by the dispatch before a handler runs.
-#[derive(Debug)]
-pub(crate) struct RequestAdmission {
-    /// Slots for missing-certificate jobs.
-    missing_certs: ClassSlots,
-    /// Counts refusals, by class and limit.
-    metrics: Arc<Metrics>,
-}
-
-impl RequestAdmission {
-    /// Slots for the epoch of `consensus_config`, drawn from the bus's node-wide limits.
-    pub(crate) fn new<DB: Database>(
-        consensus_config: &ConsensusConfig<DB>,
-        consensus_bus: &ConsensusBus,
+    /// Limits for `classes`, counted on `metrics` under `swarm`.
+    pub fn new(
+        classes: impl IntoIterator<Item = (AdmissionClass, ClassValues)>,
+        metrics: Arc<NetworkMetrics>,
+        swarm: &'static str,
     ) -> Self {
-        // Without a previous committee, former members are outsiders.
-        let previous = consensus_config.previous_committee().map_or(&[][..], |prev| prev.keys());
-        debug!(
-            target: "primary::admission",
-            epoch = consensus_config.committee().epoch(),
-            committee = consensus_config.committee().size(),
-            previous = previous.len(),
-            "request slots for this epoch"
-        );
-        let sync_config = consensus_config.network_config().sync_config();
-        let limits = consensus_bus.request_limits();
-        let missing_certs = limits.class(RequestClass::MissingCerts).for_committees(
-            consensus_config.committee(),
-            previous,
-            sync_config.max_missing_cert_jobs_per_peer,
-        );
-        Self { missing_certs, metrics: consensus_bus.primary_metrics() }
+        let mut table: Vec<Option<(ClassLimits, NonZeroUsize)>> = Vec::new();
+        for (class, values) in classes {
+            if table.len() <= class.index() {
+                table.resize_with(class.index() + 1, || None);
+            }
+            table[class.index()] =
+                Some((ClassLimits::new(values.jobs_others), values.jobs_per_peer));
+        }
+        Self { classes: table, metrics, swarm }
     }
 
+    /// The slots of one epoch, with a member share for each of `members`.
+    ///
+    /// Members are the current committee and the previous one, whose members may still be
+    /// finishing their last epoch. Every other peer draws on the shared pool.
+    pub fn for_members(&self, members: &HashSet<BlsPublicKey>) -> RequestSlots {
+        let classes = self
+            .classes
+            .iter()
+            .map(|class| {
+                class
+                    .as_ref()
+                    .map(|(limits, jobs_per_peer)| limits.for_members(members, *jobs_per_peer))
+            })
+            .collect();
+        RequestSlots { classes, metrics: self.metrics.clone(), swarm: self.swarm }
+    }
+
+    /// The limits of one class, if declared.
+    pub fn class(&self, class: AdmissionClass) -> Option<&ClassLimits> {
+        self.classes.get(class.index()).and_then(Option::as_ref).map(|(limits, _)| limits)
+    }
+}
+
+/// The slots of every class for one epoch of one swarm.
+#[derive(Debug)]
+pub struct RequestSlots {
+    /// Each class's slots, at the class's index.
+    classes: Vec<Option<ClassSlots>>,
+    /// Counts refusals.
+    metrics: Arc<NetworkMetrics>,
+    /// The swarm these slots belong to, for the refusal metric.
+    swarm: &'static str,
+}
+
+impl RequestSlots {
     /// Take the permits for one job of `class` from `peer`, or name the full limit.
     ///
     /// Never waits. A refusal is counted under the class and the limit that refused it.
-    pub(crate) fn acquire(
+    /// A class this swarm was not given values for is refused with [BusyLimit::Undeclared],
+    /// and the caller decides whether to forward the request without permits.
+    pub fn acquire(
         &self,
-        class: RequestClass,
+        class: AdmissionClass,
         peer: BlsPublicKey,
     ) -> Result<RequestPermits, BusyLimit> {
-        let slots = match class {
-            RequestClass::MissingCerts => &self.missing_certs,
-        };
-        slots.acquire(peer).inspect_err(|limit| {
-            self.metrics
-                .node_metrics
-                .request_admission_busy
-                .with_label_values(&[class.label(), limit.label()])
-                .inc();
-            debug!(
-                target: "primary::admission",
-                %peer,
-                ?class,
-                ?limit,
-                "too many requests in progress"
-            );
-        })
+        self.classes
+            .get(class.index())
+            .and_then(Option::as_ref)
+            .ok_or(BusyLimit::Undeclared)
+            .and_then(|slots| slots.acquire(peer))
+            .inspect_err(|limit| {
+                self.metrics
+                    .request_admission_busy
+                    .with_label_values(&[class.name(), limit.label(), self.swarm])
+                    .inc();
+                debug!(
+                    target: "network::admission",
+                    %peer,
+                    class = class.name(),
+                    ?limit,
+                    swarm = self.swarm,
+                    "too many requests in progress"
+                );
+            })
     }
 }
 
 /// Concurrency limits of one request class, shared by every epoch.
 #[derive(Debug)]
-pub(crate) struct ClassLimits {
+pub struct ClassLimits {
     /// Pool for committee peers.
     committee: Arc<Semaphore>,
     /// Permits the committee pool was made with, including any growth.
@@ -149,8 +184,8 @@ pub(crate) struct ClassLimits {
 
 impl ClassLimits {
     /// Peers outside both committees share `jobs_others` jobs at once.
-    /// A full pool delays every one of them (#357).
-    pub(crate) fn new(jobs_others: NonZeroUsize) -> Self {
+    /// A full pool delays every one of them.
+    pub fn new(jobs_others: NonZeroUsize) -> Self {
         Self {
             committee: Arc::new(Semaphore::new(JOBS_COMMITTEE_FLOOR)),
             committee_capacity: AtomicUsize::new(JOBS_COMMITTEE_FLOOR),
@@ -158,24 +193,16 @@ impl ClassLimits {
         }
     }
 
-    /// Job slots for one epoch: a pool per member of its committee and of
-    /// `previous`, whose members may still be finishing their last epoch.
+    /// Job slots for one epoch: a pool per member.
     ///
     /// Each member may run `jobs_per_peer` jobs at once. Pools are rebuilt each
     /// epoch, so a member may briefly run twice that, still within the committee pool.
-    pub(crate) fn for_committees(
+    pub fn for_members(
         &self,
-        committee: &Committee,
-        previous: &[BlsPublicKey],
+        members: &HashSet<BlsPublicKey>,
         jobs_per_peer: NonZeroUsize,
     ) -> ClassSlots {
         let jobs_per_peer = jobs_per_peer.get();
-        let members: HashSet<BlsPublicKey> = committee
-            .authorities()
-            .iter()
-            .map(|authority| *authority.protocol_key())
-            .chain(previous.iter().copied())
-            .collect();
         // Faulty members must never hold the whole pool.
         // It only grows, so jobs from an earlier epoch keep their permits.
         let needed = jobs_per_peer * members.len();
@@ -185,7 +212,7 @@ impl ClassLimits {
             self.committee.add_permits(needed - before);
         }
         let per_peer =
-            members.into_iter().map(|key| (key, Arc::new(Semaphore::new(jobs_per_peer)))).collect();
+            members.iter().map(|key| (*key, Arc::new(Semaphore::new(jobs_per_peer)))).collect();
         ClassSlots {
             committee: self.committee.clone(),
             outsiders: self.outsiders.clone(),
@@ -194,23 +221,21 @@ impl ClassLimits {
     }
 
     /// Free slots in the committee pool.
-    #[cfg(test)]
-    pub(crate) fn free_committee_slots(&self) -> usize {
+    pub fn free_committee_slots(&self) -> usize {
         self.committee.available_permits()
     }
 
     /// Slots held by outside peers' running jobs.
-    #[cfg(test)]
-    pub(crate) fn tracked_outsiders(&self) -> usize {
+    pub fn tracked_outsiders(&self) -> usize {
         self.outsiders.held()
     }
 }
 
 /// Job slots of one request class for one epoch.
 ///
-/// The committee is fixed for the epoch, so the pools are made once and read without a lock.
+/// The members are fixed for the epoch, so the pools are made once and read without a lock.
 #[derive(Debug)]
-pub(crate) struct ClassSlots {
+pub struct ClassSlots {
     /// Pool for committee peers, shared with every epoch.
     committee: Arc<Semaphore>,
     /// Pool for every other peer, shared with every epoch.
@@ -269,7 +294,6 @@ impl OutsiderSlots {
     }
 
     /// Slots in use.
-    #[cfg(test)]
     fn held(&self) -> usize {
         self.slots.iter().filter(|slot| slot.load(Ordering::SeqCst) != FREE_SLOT).count()
     }
@@ -277,15 +301,18 @@ impl OutsiderSlots {
 
 /// The limit that refused a job.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum BusyLimit {
+pub enum BusyLimit {
     /// A member, or last epoch's member, already runs its share of jobs.
     Member,
     /// The committee pool is full, with jobs from an earlier epoch.
     Committee,
     /// The outside peer already runs its share of jobs.
     Outsider,
-    /// The pool shared by outside peers is full (#357).
+    /// The pool shared by outside peers is full.
     Others,
+    /// The class was never declared to this swarm, so it has no pools. The swarm loop
+    /// forwards such a request without permits, as a code mismatch must not stop it.
+    Undeclared,
 }
 
 impl BusyLimit {
@@ -296,13 +323,14 @@ impl BusyLimit {
             Self::Committee => "committee",
             Self::Outsider => "outsider",
             Self::Others => "others",
+            Self::Undeclared => "undeclared",
         }
     }
 }
 
 /// The permits one job holds until it ends.
 #[derive(Debug)]
-pub(crate) enum RequestPermits {
+pub enum RequestPermits {
     /// A member's own permit and its permit from the committee pool.
     Member { _peer: OwnedSemaphorePermit, _pool: OwnedSemaphorePermit },
     /// An outside peer's slot in the shared pool.
@@ -311,8 +339,8 @@ pub(crate) enum RequestPermits {
 
 impl RequestPermits {
     /// Permits from a pool nothing else draws on, for tests of the work behind them.
-    #[cfg(test)]
-    pub(crate) fn unbounded() -> Self {
+    #[doc(hidden)]
+    pub fn unbounded_for_tests() -> Self {
         let outsiders = Arc::new(OutsiderSlots::new(NonZeroUsize::MIN));
         let job = outsiders.claim(FREE_SLOT + 1).expect("a fresh pool has a free slot");
         Self::Outsider { _job: job }
@@ -321,7 +349,7 @@ impl RequestPermits {
 
 /// One running job of an outside peer, whose slot is freed on drop.
 #[derive(Debug)]
-pub(crate) struct OutsiderJob {
+pub struct OutsiderJob {
     /// The slot the job holds.
     index: usize,
     /// The slots it was claimed from.
@@ -339,7 +367,7 @@ impl ClassSlots {
     ///
     /// A committee peer takes a permit from its own pool and from the committee pool.
     /// Any other peer takes a slot in the shared pool, within its own limit.
-    pub(crate) fn acquire(&self, peer: BlsPublicKey) -> Result<RequestPermits, BusyLimit> {
+    pub fn acquire(&self, peer: BlsPublicKey) -> Result<RequestPermits, BusyLimit> {
         let Some(own) = self.per_peer.get(&peer) else {
             return self.acquire_outsider(peer);
         };
@@ -361,3 +389,7 @@ impl ClassSlots {
         Ok(RequestPermits::Outsider { _job: job })
     }
 }
+
+#[cfg(test)]
+#[path = "tests/admission_tests.rs"]
+mod admission_tests;

@@ -9,7 +9,6 @@ use super::{
 use crate::{
     error::{CertManagerError, PrimaryNetworkError, PrimaryNetworkResult},
     network::{
-        admission::RequestPermits,
         message::PrimaryGossip,
         state::{AuthVoteState, InFlightGuard, IN_FLIGHT_TTL},
     },
@@ -17,7 +16,7 @@ use crate::{
     ConsensusBus, NodeMode, RecentlyExecutedBlocks,
 };
 use parking_lot::Mutex;
-use rayls_consensus_network::GossipMessage;
+use rayls_consensus_network::{admission::RequestPermits, GossipMessage};
 use rayls_infrastructure_config::{ConsensusConfig, LibP2pConfig};
 use rayls_infrastructure_storage::{
     tables::ConsensusBlocks, CertScope, CertificateStore, ConsensusStore, EpochStore,
@@ -869,7 +868,7 @@ where
     ///
     /// A request we cannot serve is answered empty.
     /// The request is checked for size before any bitmap decoding or storage read.
-    /// `permits` were taken by the dispatch, which limits how many of these jobs run
+    /// `permits` were taken by the network, which limits how many of these jobs run
     /// at once, per peer and in total. The blocking job holds them until it ends,
     /// even if the request is cancelled.
     pub(crate) async fn retrieve_missing_certs(
