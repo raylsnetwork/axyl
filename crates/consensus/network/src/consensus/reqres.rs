@@ -61,18 +61,17 @@ where
                                 None => None,
                                 Some(class) => match self.request_slots.acquire(class, bls) {
                                     Ok(permits) => Some(permits),
-                                    // The application declared the class but gave this swarm
-                                    // no values for it: a code mismatch, counted and logged,
-                                    // that must not stop the request from being served.
-                                    Err(BusyLimit::Undeclared) => {
-                                        warn!(
-                                            target: "network",
-                                            class = class.name(),
-                                            "request class declared without values; forwarding unlimited"
-                                        );
-                                        None
-                                    }
-                                    Err(_) => {
+                                    Err(limit) => {
+                                        // The application maps the class but gave this swarm
+                                        // no values for it: a code mismatch, refused like a
+                                        // full limit so no job ever runs without permits.
+                                        if limit == BusyLimit::Undeclared {
+                                            error!(
+                                                target: "network",
+                                                class = class.name(),
+                                                "request class mapped without values; refused"
+                                            );
+                                        }
                                         match Res::busy() {
                                             Some(busy) => {
                                                 let _ = self

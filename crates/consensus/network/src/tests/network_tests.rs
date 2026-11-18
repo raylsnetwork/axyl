@@ -146,10 +146,20 @@ where
     Req: RLMessage,
     Res: RLMessage,
 {
-    create_test_types_with_admission(Vec::new())
+    create_test_types_with_admission(roomy_admission())
 }
 
-/// Like [create_test_types], with peer2's swarm admitting `admission`.
+/// Values for every class the test request types map, with room for any test: a swarm
+/// refuses a mapped class it has no values for.
+fn roomy_admission() -> Vec<(AdmissionClass, ClassValues)> {
+    let roomy = NonZeroUsize::new(64).expect("non-zero");
+    vec![(
+        AdmissionClass::MissingCertificates,
+        ClassValues { jobs_per_peer: roomy, jobs_others: roomy },
+    )]
+}
+
+/// Like [create_test_types], with peer2's swarm admitting `admission` and peer1 roomy values.
 fn create_test_types_with_admission<Req, Res>(
     admission: Vec<(AdmissionClass, ClassValues)>,
 ) -> TestTypes<Req, Res>
@@ -187,7 +197,7 @@ where
             KadStoreType::Primary,
             config_1.primary_address(),
             metrics_1.clone(),
-            Vec::new(),
+            roomy_admission(),
         )
         .expect("peer1 network created");
     let network_handle_1 = peer1_network.network_handle();

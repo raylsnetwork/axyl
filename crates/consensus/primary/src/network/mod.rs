@@ -464,8 +464,9 @@ where
         channel: ResponseChannel<PrimaryResponse>,
         cancel: oneshot::Receiver<()>,
     ) {
-        // The network admits this request class, so a request without permits is a bug.
-        // Dropping the channel fails the request on the requester's side, with no penalty.
+        // The network admits this request class and refuses one it has no values for, so a
+        // request without permits is a bug. Dropping the channel fails the request on the
+        // requester's side, with no penalty.
         let Some(permits) = permits else {
             error!(target: "primary::network", %peer, "missing-certificates request forwarded without permits");
             return;

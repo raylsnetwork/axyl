@@ -142,8 +142,7 @@ impl RequestSlots {
     /// Take the permits for one job of `class` from `peer`, or name the full limit.
     ///
     /// Never waits. A refusal is counted under the class and the limit that refused it.
-    /// A class this swarm was not given values for is refused with [BusyLimit::Undeclared],
-    /// and the caller decides whether to forward the request without permits.
+    /// A class this swarm was not given values for is refused with [BusyLimit::Undeclared].
     pub fn acquire(
         &self,
         class: AdmissionClass,
@@ -311,7 +310,7 @@ pub enum BusyLimit {
     /// The pool shared by outside peers is full.
     Others,
     /// The class was never declared to this swarm, so it has no pools. The swarm loop
-    /// forwards such a request without permits, as a code mismatch must not stop it.
+    /// refuses such a request like any other, so a code mismatch never runs an unlimited job.
     Undeclared,
 }
 
@@ -339,7 +338,7 @@ pub enum RequestPermits {
 
 impl RequestPermits {
     /// Permits from a pool nothing else draws on, for tests of the work behind them.
-    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-utils"))]
     pub fn unbounded_for_tests() -> Self {
         let outsiders = Arc::new(OutsiderSlots::new(NonZeroUsize::MIN));
         let job = outsiders.claim(FREE_SLOT + 1).expect("a fresh pool has a free slot");
