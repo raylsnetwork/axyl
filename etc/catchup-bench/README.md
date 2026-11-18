@@ -2,7 +2,7 @@
 
 Measures how fast observers catch up after falling behind, on a local network where every message between nodes pays a real round trip. Use it to compare catch-up changes against `main` (see #276, #369 and PR #371).
 
-A run starts 4 validators and 1 or more observers in one container. The container's loopback adds a fixed delay with netem. Optional senders keep transactions flowing. For each round and each binary under test, in turn, the observers stop, fall behind by the given number of blocks, and restart together on that binary.
+A run starts 4 validators and 1 or more observers in one container. The container's loopback adds a fixed delay with netem. Optional senders keep transactions flowing. For each round and each binary under test, in turn, the observers reach the validators' height, stop, fall behind by the given number of blocks, and restart together on that binary.
 
 ## Requirements
 

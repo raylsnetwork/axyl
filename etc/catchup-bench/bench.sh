@@ -2,7 +2,8 @@
 # Catch-up benchmark: a local network of 4 validators and M observers. Run it through run.sh, which
 # starts it in a container whose loopback adds a fixed delay, so every message between nodes pays a
 # real round trip. Optional senders keep transactions flowing. For each round and each -b LABEL=BIN
-# in turn, the observers stop, fall GAP blocks behind, and restart on that binary together.
+# in turn, the observers reach the validators' height, stop, fall GAP blocks behind, and restart on
+# that binary together.
 # Per round it reports: time to the first new block, time until every observer reaches the
 # validators' height at restart, transactions per block in the gap, the consensus-header requests
 # the validators served, and whether every observer has the validators' block hash.
@@ -208,6 +209,10 @@ log "warm-up done: validators $(max_val_height), ~$((${busy:-0} / 10)) tx/block;
 for round in $(seq 1 "$ROUNDS"); do
     for label in "${LABELS[@]}"; do
         bin=${BINS[$label]}
+        # Stop only observers that have also run the blocks made during the previous catch-up, or
+        # this binary starts on blocks the previous one fetched but did not run.
+        live_tip=$(max_val_height)
+        wait_for 1200 all_obs_reached "$live_tip" || fail "observers did not reach $live_tip before round $round $label"
         stop_at=$(height obs1); stop_at=${stop_at:-$(max_val_height)}
         stop_observers
         t_stop=$(date +%s)
