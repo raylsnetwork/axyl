@@ -170,7 +170,6 @@ async fn get_consensus_header<DB: ReDatabase>(
                     continue;
                 };
                 let parent = verified.parent_hash;
-                // Record before storing, as in `prefetch_below`.
                 store_consensus_header_in_cache(db, &verified);
                 republish_if_higher(consensus_bus, &verified);
                 return Some((parent, verified.number));
