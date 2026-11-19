@@ -791,6 +791,79 @@ async fn test_catch_up_mismatch_keeps_index_of_row_saved_in_the_window() {
     );
 }
 
+/// On a mismatch, catch-up checks that the row below is not canonical, then deletes the cache row
+/// at that number in a separate write. It does not check that the row is still the one it read.
+/// If the walk stores the real row there in between, the real row is deleted.
+#[tokio::test]
+async fn test_catch_up_mismatch_keeps_real_row_stored_in_the_window() {
+    let fixture = CommitteeFixture::builder(MemDatabase::default)
+        .randomize_ports(true)
+        .committee_size(NonZeroUsize::new(4).unwrap())
+        .build();
+    let primary = fixture.authorities().next().unwrap();
+    let config = primary.consensus_config();
+    let db = config.node_storage();
+    let committee = fixture.committee();
+
+    // Executed anchor at 100.
+    let anchor = chained_header(100, B256::default(), &committee);
+    db.with_write_txn(|txn| {
+        txn.insert::<ConsensusBlocks>(&anchor.number, &anchor)?;
+        txn.insert::<ConsensusBlockNumbersByDigest>(&anchor.digest(), &anchor.number)?;
+        Ok(())
+    })
+    .unwrap();
+
+    // A stale row at 101 links onto the anchor but is not the real 101.
+    let other_leader = Certificate::genesis(&committee)[1].clone();
+    let stale_101 = ConsensusHeader {
+        parent_hash: anchor.digest(),
+        sub_dag: CommittedSubDag::new(vec![], other_leader, 0, ReputationScores::default(), None),
+        number: 101,
+        extra: B256::default(),
+    };
+    store_consensus_header_in_cache(db, &stale_101);
+    let real_101 = chained_header(101, anchor.digest(), &committee);
+    assert_ne!(
+        stale_101.digest(),
+        real_101.digest(),
+        "precondition: stale 101 is not the real 101"
+    );
+    let real_102 = chained_header(102, real_101.digest(), &committee);
+    let target = chained_header(103, real_102.digest(), &committee);
+
+    // An honest peer serves the real 102.
+    let net = serving_network(BTreeMap::from([(102u64, real_102.clone())]));
+
+    // In the window, the walk stores the real 101 over the stale row.
+    let walk_db = db.clone();
+    let walk_101 = real_101.clone();
+    clear_race_hook::set_in_window(move || store_consensus_header_in_cache(&walk_db, &walk_101));
+
+    let cb = ConsensusBus::new();
+    seed_recently_executed_blocks(&cb);
+    let mut rx = cb.consensus_header().subscribe();
+
+    let result = catch_up_consensus_from_to(&config, &cb, &net, anchor, target).await;
+    assert!(result.is_err(), "the real 102 must not link to the stale 101");
+
+    // Preconditions: catch-up streamed the stale 101.
+    // The walk stored the real 101 in the window (its by-hash entry is not deleted).
+    assert_eq!(rx.try_recv().map(|h| h.digest()).ok(), Some(stale_101.digest()));
+    assert_eq!(
+        db.get::<ConsensusBlockNumbersByDigest>(&real_101.digest()).unwrap(),
+        Some(101),
+        "the walk must have stored the real 101"
+    );
+
+    // The real 101 the walk stored must still be there.
+    assert_eq!(
+        db.get::<ConsensusBlocksCache>(&101).unwrap().map(|h| h.digest()),
+        Some(real_101.digest()),
+        "the real 101 stored by the walk was deleted"
+    );
+}
+
 /// Regression for the epoch-boundary leak fork: the forward-streamer catch-up
 /// (`catch_up_consensus_from_to`) must HALT when it reaches an output committed by a *closed* epoch
 /// (`leader_epoch < current epoch`), not forward it for execution. Without this a lagging node
