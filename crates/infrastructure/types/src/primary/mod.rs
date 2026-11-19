@@ -4,23 +4,27 @@ use std::time::{Duration, SystemTime};
 mod block;
 mod certificate;
 mod epoch;
+mod fork;
 mod header;
 mod header_meta;
 mod info;
 mod output;
 mod participation_meta;
 mod reputation;
+mod signer_claim;
 mod vote;
 
 pub use block::*;
 pub use certificate::*;
 pub use epoch::*;
+pub use fork::*;
 pub use header::*;
 pub use header_meta::*;
 pub use info::*;
 pub use output::*;
 pub use participation_meta::*;
 pub use reputation::*;
+pub use signer_claim::*;
 pub use vote::*;
 
 /// The default primary udp port for consensus messages.

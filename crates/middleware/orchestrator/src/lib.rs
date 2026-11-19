@@ -36,6 +36,12 @@ pub fn launch_node<P>(
 where
     P: RaylsDirs + Clone + 'static,
 {
+    // Chainspec's SignerClaims activation epoch goes into `types`' handle here, above every other
+    // step: this opens the consensus DB, and both `EpochManager::new` (pending epoch record) and
+    // `run()` (tip read, catch-up walk) decode consensus rows before any consensus component exists
+    // (see `epoch_manager::apply_signer_claims_activation`).
+    epoch_manager::apply_signer_claims_activation(builder.profile.schedule());
+
     // Held for the node's lifetime (declared before the runtime, so it drops after it): an
     // offline `cold-migrate` or a second node on the same datadir fails closed instead of
     // interleaving with archival on the shared consensus DB and cold jars.
@@ -94,6 +100,10 @@ pub fn run_cold_migration<P>(
 where
     P: RaylsDirs + Clone + 'static,
 {
+    // Same boot order as `launch_node`: the anchor recovery below decodes consensus headers, and
+    // this CLI path owns nothing else that would seed the handle.
+    epoch_manager::apply_signer_claims_activation(builder.profile.schedule());
+
     // Exclusive from the first consensus-DB touch through the optional compaction (declared
     // first, so it drops last): a live node holds the same lock for its lifetime, so a migration
     // beside it (or a second migration) fails here instead of interleaving with archival or

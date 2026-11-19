@@ -248,14 +248,72 @@ impl NodeDb {
         })?;
 
         let cold = Self::open_cold(&label, &path)?;
-        Ok(Self {
+        let node = Self {
             label,
             path,
             recovered: opts.recover,
             db,
             cold,
             tables: std::sync::Mutex::new(HashMap::new()),
-        })
+        };
+        node.check_header_era()?;
+        Ok(node)
+    }
+
+    // Raw bytes of the newest canonical consensus header: hot tier first, then the cold tier's
+    // newest archived one; `None` when neither holds a row.
+    fn raw_tip_consensus_bytes(&self) -> eyre::Result<Option<Vec<u8>>> {
+        let bytes = if self.table_present::<ConsensusBlocks>()? {
+            self.db.reverse_raw_iter::<ConsensusBlocks>().next().map(|(_, v)| v.into_owned())
+        } else {
+            None
+        };
+        if let Some(bytes) = bytes {
+            return Ok(Some(bytes));
+        }
+        let Some((cold, number)) = self.cold_tip()? else { return Ok(None) };
+        let bytes = cold
+            .read_consensus_block_checked(number)
+            .map_err(|e| eyre!("{}: cold read of consensus block {number}: {e}", self.label))?;
+        Ok(bytes)
+    }
+
+    // Refuses a database whose newest canonical header this process cannot decode.
+    //
+    // Nothing in this tool sets the SignerClaims activation handle, so it stays at its "never"
+    // default and every header here is read through the pre-activation layout. Over a row written
+    // after that activation the layout is wrong in both directions: the typed decode below fails,
+    // and the raw projections (`ConsensusHeaderMeta::from_bytes`, `leader_epoch_and_batch_digests`)
+    // stop after the leader header's first three fields with a cursor shifted *inside* the claims
+    // region, which yields an error or plausible-looking garbage for leader author/round/epoch —
+    // and garbage leader counts feed the gas report silently. This tool has no chainspec to learn
+    // the scheduled epoch from, so it cannot inspect such a database: probe the tip and refuse it
+    // instead of reporting projections built on the wrong era.
+    //
+    // The tip is a sufficient probe when it can be read: `ConsensusBlocks` is keyed by block number
+    // and epochs only increase with it, so any post-activation canonical row makes the newest
+    // canonical row one too. What it cannot claim is the converse over an unreadable tip: a damaged
+    // env or a truncated jar is not an era verdict, and this tool's existing per-command error
+    // reporting is what surfaces those.
+    fn check_header_era(&self) -> eyre::Result<()> {
+        // Only a *successful read* whose *typed decode* fails is an era verdict. A tip this process
+        // cannot even read (damaged env, truncated jar) is not evidence about the era, and refusing
+        // on it would turn databases MDBX still opens — which this tool reports per command — into
+        // ones it will not open at all.
+        let bytes = match self.raw_tip_consensus_bytes() {
+            Ok(Some(bytes)) => bytes,
+            Ok(None) | Err(_) => return Ok(()),
+        };
+        try_decode::<ConsensusHeader>(&bytes).map_err(|e| eyre!(
+            "{}: its newest consensus header does not decode here ({e}). This process reads every \
+             header with the pre-activation layout (nothing sets the SignerClaims activation handle: \
+             this tool has no chainspec to read the scheduled epoch from), so a database written \
+             after that activation cannot be inspected at all: the raw leader projections would \
+             return an error or plausible garbage rather than only an error, and reporting those \
+             numbers is worse than refusing",
+            self.label
+        ))?;
+        Ok(())
     }
 
     /// Opens the cold tier under `path` if it exists. Opening a cold store creates its
@@ -463,24 +521,7 @@ impl NodeDb {
     /// Epoch of the latest canonical consensus header, read from a projection of its raw bytes.
     /// Falls back to the newest archived header when the hot table is empty.
     pub fn current_epoch(&self) -> eyre::Result<Option<Epoch>> {
-        let bytes = if self.table_present::<ConsensusBlocks>()? {
-            self.db.reverse_raw_iter::<ConsensusBlocks>().next().map(|(_, v)| v.into_owned())
-        } else {
-            None
-        };
-        let bytes = match bytes {
-            Some(bytes) => bytes,
-            None => {
-                let Some((cold, number)) = self.cold_tip()? else { return Ok(None) };
-                let Some(bytes) = cold.read_consensus_block_checked(number).map_err(|e| {
-                    eyre!("{}: cold read of consensus block {number}: {e}", self.label)
-                })?
-                else {
-                    return Ok(None);
-                };
-                bytes
-            }
-        };
+        let Some(bytes) = self.raw_tip_consensus_bytes()? else { return Ok(None) };
         let meta = ConsensusHeaderMeta::from_bytes(&bytes)
             .map_err(|e| eyre!("{}: project latest consensus header: {e}", self.label))?;
         Ok(Some(meta.leader_epoch))

@@ -181,3 +181,88 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod region_tests {
+    use super::*;
+    use crate::{
+        bcs_layout::BcsLayout, decode, BlsSignature, CertificateDigest, CommittedSubDag,
+        ConsensusHeader, HeaderBuilder, ReputationScores, SignerClaim, WorkerId,
+    };
+    use alloy::primitives::BlockHash as AlloyBlockHash;
+    use indexmap::IndexMap;
+    use std::collections::BTreeSet;
+
+    fn post_cert(author: u8, round: u32, claims: Vec<SignerClaim>) -> crate::Certificate {
+        let mut p = IndexMap::<AlloyBlockHash, WorkerId>::new();
+        p.insert(AlloyBlockHash::repeat_byte(1), 0);
+        let mut parents = BTreeSet::<CertificateDigest>::new();
+        parents.insert(CertificateDigest::new([7u8; 32]));
+        let header = HeaderBuilder::default()
+            .author(AuthorityIdentifier::dummy_for_test(author))
+            .round(round)
+            .epoch(u32::MAX)
+            .created_at(1_700_000_000)
+            .payload(p)
+            .parents(parents)
+            .build()
+            .with_signer_claims(claims);
+        let mut cert = crate::Certificate::default();
+        cert.update_header_for_test(header);
+        cert
+    }
+
+    #[test]
+    fn test_span_readers_ignore_region() {
+        let leader = post_cert(
+            0xEE,
+            14,
+            vec![SignerClaim {
+                target_digest: CertificateDigest::new([1; 32]),
+                target_epoch: u32::MAX,
+                target_round: 5,
+                ranks: vec![0],
+                signature: BlsSignature::default(),
+            }],
+        );
+        let certs = vec![
+            post_cert(0x01, 13, vec![]),
+            post_cert(
+                0x02,
+                13,
+                vec![SignerClaim {
+                    target_digest: CertificateDigest::new([2; 32]),
+                    target_epoch: u32::MAX,
+                    target_round: 6,
+                    ranks: vec![1, 0],
+                    signature: BlsSignature::default(),
+                }],
+            ),
+        ];
+        let sub_dag = CommittedSubDag::new(certs, leader, 0, ReputationScores::default(), None);
+        let h = ConsensusHeader {
+            parent_hash: AlloyBlockHash::repeat_byte(0xAB),
+            sub_dag,
+            number: 100,
+            extra: AlloyBlockHash::ZERO,
+        };
+        let bytes = crate::encode(&h);
+        let decoded: ConsensusHeader = decode(&bytes);
+
+        let p = ConsensusHeaderParticipation::from_bytes(&bytes).unwrap();
+        assert_eq!(p.leader_author, *decoded.sub_dag.leader.header().author());
+        assert_eq!(p.leader_round, decoded.sub_dag.leader.header().round());
+        assert_eq!(p.leader_epoch, decoded.sub_dag.leader.header().epoch());
+        let expected: Vec<AuthorityIdentifier> = decoded
+            .sub_dag
+            .certificates
+            .iter()
+            .map(|cert| cert.header().author().clone())
+            .collect();
+        assert_eq!(p.participants, expected, "participant projection must survive the region");
+
+        let mut c = BcsCursor::new(&bytes);
+        ConsensusHeader::skip(&mut c).unwrap();
+        assert!(c.is_empty(), "region must not leave bytes unconsumed");
+    }
+}

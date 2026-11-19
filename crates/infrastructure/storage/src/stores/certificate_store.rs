@@ -662,3 +662,69 @@ mod prev_epoch_tail_tests {
         assert!(db.read_by_index_in(CertScope::PrevEpoch, &a0, 3).expect("read").is_none());
     }
 }
+
+#[cfg(test)]
+mod region_tests {
+    use super::*;
+    use crate::{layered_db::LayeredDatabase, mem_db::MemDatabase, open_default_tables};
+    use rayls_infrastructure_types::{
+        encode, BlsSignature, CertificateDigest, HeaderBuilder, SignerClaim,
+    };
+
+    fn claims(seed: u8) -> Vec<SignerClaim> {
+        vec![SignerClaim {
+            target_digest: CertificateDigest::new([seed; 32]),
+            target_epoch: u32::MAX,
+            target_round: 5,
+            ranks: vec![0, 1, 2],
+            signature: BlsSignature::default(),
+        }]
+    }
+
+    fn post_cert(author: u8, claims: Vec<SignerClaim>) -> Certificate {
+        let mut cert = Certificate::default();
+        cert.header = HeaderBuilder::default()
+            .author(AuthorityIdentifier::dummy_for_test(author))
+            .round(4)
+            .epoch(u32::MAX)
+            .created_at(1_700_000_000)
+            .payload(Default::default())
+            .parents(Default::default())
+            .build()
+            .with_signer_claims(claims);
+        cert
+    }
+
+    #[test]
+    fn test_cert_store_roundtrip_preserves_digest_post_activation() {
+        let mut db = LayeredDatabase::open(MemDatabase::new());
+        open_default_tables(&mut db).expect("open tables");
+
+        let with = post_cert(0x11, claims(1));
+        let without = post_cert(0x12, Vec::new());
+        let with_digest = with.digest();
+        let without_digest = without.digest();
+        db.write(with.clone()).expect("write");
+        db.write(without.clone()).expect("write");
+
+        let back_with = db.read(with_digest).unwrap().expect("stored");
+        assert_eq!(
+            back_with.digest(),
+            with_digest,
+            "a certificate read back must re-digest to the digest it was stored under"
+        );
+        assert_eq!(back_with.header().signer_claims, claims(1));
+        assert_eq!(encode(&back_with), encode(&with));
+
+        let back_without = db.read(without_digest).unwrap().expect("stored");
+        assert_eq!(back_without.digest(), without_digest);
+        assert!(back_without.header().signer_claims.is_empty());
+        assert_eq!(encode(&back_without), encode(&without));
+        assert_ne!(encode(&back_with), encode(&back_without), "regions must not alias empty ones");
+
+        let bytes = encode(&with);
+        let raw: Certificate = rayls_infrastructure_types::decode(&bytes);
+        assert_eq!(raw.digest(), with_digest);
+        assert_eq!(raw.header().signer_claims, claims(1));
+    }
+}

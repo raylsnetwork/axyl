@@ -1,12 +1,15 @@
 use rayls_consensus_state_sync::{highest_executed_anchor, last_executed_consensus_from_anchor};
-use rayls_execution_evm::reth_env::RethEnv;
+use rayls_execution_evm::{
+    chainspec::{RaylsChainHardforks, ScheduledFork},
+    reth_env::RethEnv,
+};
 use rayls_infrastructure_config::RaylsDirs;
 use rayls_infrastructure_storage::{
     mdbx::MdbxConfig, open_db_with_consensus_config, tables::ConsensusBlocks, DatabaseType,
 };
 use rayls_infrastructure_types::{
-    gas_accumulator::GasAccumulator, AuthorityIdentifier, ConsensusHeader, ConsensusHeaderMeta,
-    Database, DbTx, WALK_PROGRESS_LOG_EVERY,
+    gas_accumulator::GasAccumulator, init_signer_claims_activation_epoch, AuthorityIdentifier,
+    ConsensusHeader, ConsensusHeaderMeta, Database, DbTx, WALK_PROGRESS_LOG_EVERY,
 };
 // production-only: the hardcoded protocol base-fee floor used to seed the accumulator
 #[cfg(not(feature = "dev-single-node-setup"))]
@@ -23,6 +26,23 @@ use tracing::info;
 /// taking the max-nonce block recovers the true highest executed output's consensus-header digest.
 /// Sized well above any plausible reorder/park run.
 const LAST_EXECUTED_SCAN_DEPTH: u64 = 200;
+
+// The one place the node boot pushes the SignerClaims activation epoch into `types`' handle.
+// Chainspec owns the number (`RaylsChainHardforks::signer_claims_activation_epoch`) and this is its
+// only caller inside the node: a process that legitimately needed two different schedules would
+// fight the handle's write-once rule, and that is a bug, not a supported case.
+//
+// It must run before the first consensus row is read, not merely before consensus starts. `run()`
+// decodes rows long before any consensus component is built: `last_record::<ConsensusBlocks>`
+// (`epoch_manager/core.rs`) and this module's `catchup_accumulator` walk, whose `skip` of the
+// certificates region depends on the handle matching the bytes on disk. Seeding it later lets a
+// restart over post-activation rows fail (or mis-walk) at boot. I16 in
+// `tests/boot_signer_claims_activation.rs` pins this order.
+pub fn apply_signer_claims_activation(schedule: impl IntoIterator<Item = ScheduledFork>) {
+    init_signer_claims_activation_epoch(
+        RaylsChainHardforks::new(schedule).signer_claims_activation_epoch(),
+    );
+}
 
 /// Recovers the EL execution anchor at boot: the consensus header committed by the highest-nonce
 /// EVM block in the recent window, or `None` when no executed block anchors to a known header.

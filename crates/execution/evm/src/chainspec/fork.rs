@@ -64,6 +64,7 @@ hardfork!(
         /// logic with `target_address != bytecode_address`; gating keeps pre-fork blocks replaying
         /// unchanged while new blocks reject the frame.
         Erc20PrecompileDirectCall,
+        SignerClaims,
     }
 );
 
@@ -90,6 +91,7 @@ impl RaylsHardFork {
             Self::EpochCloseSeedV2 => 0x11,
             Self::CertificateFetchEpochV2 => 0x12,
             Self::Erc20PrecompileDirectCall => 0x13,
+            Self::SignerClaims => 0x14,
         }
     }
 

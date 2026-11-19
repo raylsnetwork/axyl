@@ -9,8 +9,10 @@
 
 #![no_main]
 use libfuzzer_sys::fuzz_target;
-use rayls_infrastructure_types::{Certificate, Header, SealedBatch};
+use rayls_infrastructure_types::{header_canonical_bytes, Certificate, Header, SealedBatch};
 
+// This harness has no chainspec, so the activation handle stays at its never default and every
+// target here fuzzes the pre-activation era (plus the `epoch == Epoch::MAX` sentinel).
 fuzz_target!(|data: &[u8]| {
     // Try decoding as each consensus type and verify round-trip stability.
 
@@ -25,10 +27,10 @@ fuzz_target!(|data: &[u8]| {
 
     // --- Header ---
     if let Ok(header) = bcs::from_bytes::<Header>(data) {
-        let encoded = bcs::to_bytes(&header).expect("encode must succeed");
+        let encoded = header_canonical_bytes(&header);
         let decoded: Header =
             bcs::from_bytes(&encoded).expect("re-decode must succeed");
-        let re_encoded = bcs::to_bytes(&decoded).expect("re-encode must succeed");
+        let re_encoded = header_canonical_bytes(&decoded);
         assert_eq!(encoded, re_encoded, "Header round-trip produced different bytes");
     }
 

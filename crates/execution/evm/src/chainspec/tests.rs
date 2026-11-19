@@ -91,6 +91,10 @@ mod schedule {
             (RaylsNetwork::Mainnet, RaylsHardFork::EpochCloseSeedV2),
             (RaylsNetwork::Mainnet, RaylsHardFork::CertificateFetchEpochV2),
             (RaylsNetwork::Local, RaylsHardFork::UsdrSupplyCorrection),
+            (RaylsNetwork::Devnet, RaylsHardFork::SignerClaims),
+            (RaylsNetwork::Testnet, RaylsHardFork::SignerClaims),
+            (RaylsNetwork::Mainnet, RaylsHardFork::SignerClaims),
+            (RaylsNetwork::Local, RaylsHardFork::SignerClaims),
         ];
         for (network, fork) in never_forks {
             let hardforks = RaylsChainHardforks::for_network(network);
@@ -113,6 +117,7 @@ mod schedule {
                 RaylsHardFork::Erc20PrecompileBytecode
                     | RaylsHardFork::HybridRewards
                     | RaylsHardFork::UsdrSupplyCorrection
+                    | RaylsHardFork::SignerClaims
             );
             assert_eq!(
                 hardforks.is_rayls_fork_active_at_block(*fork, 0),
@@ -163,6 +168,89 @@ mod schedule {
     }
 
     #[test]
+    fn test_activation_epoch_flows_from_chainspec() {
+        use rayls_infrastructure_types::{
+            header_canonical_bytes, init_signer_claims_activation_epoch,
+            signer_claims_region_bytes, AuthorityIdentifier, BlsSignature, CertificateDigest, Hash,
+            HeaderBuilder, SignerClaim,
+        };
+
+        // main's digest of this fixture at 7ea68c68 — the value types pins in header.rs's
+        // FIXTURES table. Scheduling the fork in chainspec must not move it.
+        const EPOCH7_GOLDEN_DIGEST: &str =
+            "456b8cb94821ceccb0655ccfc866c4774531a1712a77bdb9a441bd7d3f2e7d33";
+        const ACTIVATION_EPOCH: rayls_infrastructure_types::Epoch = 5_000;
+
+        let mut schedule = RaylsHardFork::devnet();
+        let idx = RaylsHardFork::VARIANTS
+            .iter()
+            .position(|fork| *fork == RaylsHardFork::SignerClaims)
+            .expect("SignerClaims is a variant");
+        schedule[idx] = ScheduledFork::new(RaylsHardFork::SignerClaims, ForkCondition::Never)
+            .with_epoch_activation(ACTIVATION_EPOCH);
+        let activation = RaylsChainHardforks::new(schedule).signer_claims_activation_epoch();
+        assert_eq!(
+            activation, ACTIVATION_EPOCH,
+            "the epoch a header's era is decided from must come out of chainspec"
+        );
+        assert!(ACTIVATION_EPOCH > 7, "the golden fixture has to sit below the activation");
+
+        init_signer_claims_activation_epoch(activation);
+
+        let build_at = |epoch| {
+            HeaderBuilder::default()
+                .author(AuthorityIdentifier::dummy_for_test(0xAA))
+                .round(4)
+                .epoch(epoch)
+                .created_at(1_700_000_000)
+                .payload(Default::default())
+                .parents(std::collections::BTreeSet::new())
+                .build()
+        };
+
+        let pre = build_at(7);
+        let pre_bytes = header_canonical_bytes(&pre);
+        assert_eq!(
+            alloy::hex::encode(Hash::digest(&pre).as_ref()),
+            EPOCH7_GOLDEN_DIGEST,
+            "a header below the epoch chainspec scheduled must keep main's digest"
+        );
+
+        // The same header at the epoch chainspec scheduled is post-activation: identical struct
+        // fields (bcs writes `epoch` as 4 fixed bytes), plus the claims region.
+        let empty = build_at(activation);
+        let empty_bytes = header_canonical_bytes(&empty);
+        assert_eq!(
+            empty_bytes.len(),
+            pre_bytes.len() + 1,
+            "the scheduled epoch adds only the claims region"
+        );
+        assert_eq!(
+            empty_bytes.last(),
+            Some(&0),
+            "the region is present even when it carries no claims"
+        );
+
+        let claims = vec![SignerClaim {
+            target_digest: CertificateDigest::new([9; 32]),
+            target_epoch: ACTIVATION_EPOCH,
+            target_round: 5,
+            ranks: vec![0, 1, 2],
+            signature: BlsSignature::default(),
+        }];
+        let regionless = empty.clone();
+        let post = empty.with_signer_claims(claims.clone());
+        let mut expected = empty_bytes[..empty_bytes.len() - 1].to_vec();
+        expected.extend(signer_claims_region_bytes(&claims));
+        assert_eq!(
+            header_canonical_bytes(&post),
+            expected,
+            "the region is appended to the header's own struct bytes"
+        );
+        assert_ne!(post.digest(), regionless.digest(), "the region is inside the digest");
+    }
+
+    #[test]
     fn builder_overrides_batch_digest_v2_activation() {
         let genesis = rayls_infrastructure_types::test_genesis();
         let chain_spec: ChainSpec = genesis.into();
@@ -200,6 +288,7 @@ mod schedule {
                 (RaylsHardFork::EpochCloseSeedV2, ForkCondition::Never),
                 (RaylsHardFork::CertificateFetchEpochV2, ForkCondition::Never),
                 (RaylsHardFork::Erc20PrecompileDirectCall, ForkCondition::Never),
+                (RaylsHardFork::SignerClaims, ForkCondition::Never),
             ],
         );
     }
@@ -230,6 +319,7 @@ mod schedule {
                 (RaylsHardFork::EpochCloseSeedV2, ForkCondition::Never),
                 (RaylsHardFork::CertificateFetchEpochV2, ForkCondition::Never),
                 (RaylsHardFork::Erc20PrecompileDirectCall, ForkCondition::Never),
+                (RaylsHardFork::SignerClaims, ForkCondition::Never),
             ],
         );
     }
@@ -237,7 +327,7 @@ mod schedule {
     fn expect_schedule(network: RaylsNetwork, expected: &[(RaylsHardFork, ForkCondition)]) {
         let actual = RaylsHardFork::for_network(network);
         assert_eq!(actual.len(), expected.len(), "{network}: fork count");
-        for (ScheduledFork { fork, condition }, (want_fork, want_condition)) in
+        for (ScheduledFork { fork, condition, .. }, (want_fork, want_condition)) in
             actual.iter().zip(expected.iter())
         {
             assert_eq!(fork, want_fork, "{network}: fork order");

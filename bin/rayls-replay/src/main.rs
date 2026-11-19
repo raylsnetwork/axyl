@@ -6,6 +6,7 @@
 use clap::Parser;
 use eyre::{eyre, Context};
 use rayls_execution_evm::{
+    chainspec::RaylsChainHardforks,
     reth_env::{RethCommand, RethConfig, RethEnv},
     verify_datadir_chain_id, verify_datadir_schedule_record, verify_schedule_shape, FileSchedule,
     NetworkProfile, SelectedSchedule,
@@ -13,7 +14,8 @@ use rayls_execution_evm::{
 use rayls_infrastructure_config::Parameters;
 use rayls_infrastructure_storage::open_db;
 use rayls_infrastructure_types::{
-    rewards::RewardsCounter, Address, Genesis, RaylsNetwork, TaskManager,
+    init_signer_claims_activation_epoch, rewards::RewardsCounter, Address, Genesis, RaylsNetwork,
+    TaskManager,
 };
 use rayls_replay::{
     rewards::{BoundedHybridWalker, HybridTallySource, SnapshotRewardsBackend, SnapshotTallyStore},
@@ -204,6 +206,13 @@ async fn run(cli: Cli) -> eyre::Result<()> {
         chain_id = selected.profile.chain_id,
         hardforks = ?selected.profile.hardforks,
         "hardfork schedule selected"
+    );
+    // Chainspec owns the SignerClaims activation epoch; types only holds the handle it is pushed
+    // into, and this process must see it before it decodes or digests a stored header. The node and
+    // cold-migrate take this through the orchestrator's `apply_signer_claims_activation`; this bin
+    // has no dependency on that crate, so it runs the same two steps here.
+    init_signer_claims_activation_epoch(
+        RaylsChainHardforks::new(selected.profile.schedule()).signer_claims_activation_epoch(),
     );
     let NetworkParams { basefee_address, min_base_fee } = network_params(&parameters_path)?;
     info!(

@@ -282,3 +282,121 @@ mod bcs_layout_tests {
         }
     }
 }
+#[cfg(test)]
+mod region_tests {
+    use super::*;
+    use crate::{
+        decode, encode, AuthorityIdentifier, BlsSignature, Certificate, CertificateDigest, Header,
+        HeaderBuilder, ReputationScores, SignerClaim, WorkerId,
+    };
+    use indexmap::IndexMap;
+    use std::collections::BTreeSet;
+
+    // main's bytes at 7ea68c68, captured in the step-1 spike against the unpatched crate.
+    const ENVELOPES: &[(&str, &str)] = &[
+    ("default_cert", "000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000002000000000000000000000000000000000000000000000000000000000000000000030c00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000083a300000000000000000000000000000"),
+    ("consensus_header", "20abababababababababababababababababababababababababababababababab01000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000002000000000000000000000000000000000000000000000000000000000000000000030c00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000083a300000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000002000000000000000000000000000000000000000000000000000000000000000000030c00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000083a300000000000000000000000000000000000000000000000006400000000000000200000000000000000000000000000000000000000000000000000000000000000"),
+    ("sub_dag", "01000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000002000000000000000000000000000000000000000000000000000000000000000000030c00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000083a300000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000002000000000000000000000000000000000000000000000000000000000000000000030c00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000083a30000000000000000000000000000000000000000000000000"),
+    ("header_default", "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000200000000000000000000000000000000000000000000000000000000000000000"),
+    ];
+
+    fn post_cert(author: u8, round: u32, claims: Vec<SignerClaim>) -> Certificate {
+        let mut payload = IndexMap::<BlockHash, WorkerId>::new();
+        payload.insert(BlockHash::repeat_byte(1), 0);
+        let mut parents = BTreeSet::<CertificateDigest>::new();
+        parents.insert(CertificateDigest::new([7u8; 32]));
+        let header = HeaderBuilder::default()
+            .author(AuthorityIdentifier::dummy_for_test(author))
+            .round(round)
+            .epoch(u32::MAX)
+            .created_at(1_700_000_000)
+            .payload(payload)
+            .parents(parents)
+            .build()
+            .with_signer_claims(claims);
+        let mut cert = Certificate::default();
+        cert.update_header_for_test(header);
+        cert
+    }
+
+    fn claim9() -> SignerClaim {
+        SignerClaim {
+            target_digest: CertificateDigest::new([9; 32]),
+            target_epoch: u32::MAX,
+            target_round: 5,
+            ranks: vec![0, 1, 2],
+            signature: BlsSignature::default(),
+        }
+    }
+
+    fn golden(name: &str) -> Vec<u8> {
+        for (n, hexed) in ENVELOPES {
+            if *n == name {
+                return hex::decode(hexed).expect("golden");
+            }
+        }
+        panic!("no golden for {name}");
+    }
+
+    #[test]
+    fn test_wire_messages_unchanged_when_inactive() {
+        assert_eq!(encode(&Header::default()), golden("header_default"));
+        assert_eq!(encode(&Certificate::default()), golden("default_cert"));
+        let certs = vec![Certificate::default()];
+        let sub_dag = CommittedSubDag::new(
+            certs.clone(),
+            certs[0].clone(),
+            0,
+            ReputationScores::default(),
+            None,
+        );
+        assert_eq!(encode(&sub_dag), golden("sub_dag"));
+        let ch = ConsensusHeader {
+            parent_hash: BlockHash::repeat_byte(0xAB),
+            sub_dag,
+            number: 100,
+            extra: BlockHash::ZERO,
+        };
+        assert_eq!(encode(&ch), golden("consensus_header"));
+    }
+
+    #[test]
+    fn test_v1_row_still_decodes() {
+        let bytes = golden("consensus_header");
+        let back: ConsensusHeader = decode(&bytes);
+        assert_eq!(encode(&back), bytes, "main's row value re-encodes unchanged");
+        assert_eq!(
+            back.digest(),
+            ConsensusHeader::digest_from_parts(back.parent_hash, &back.sub_dag, back.number)
+        );
+        assert!(back.sub_dag.certificates.iter().all(|c| c.header().signer_claims.is_empty()));
+        assert!(back.sub_dag.leader.header().signer_claims.is_empty());
+        let mut c = crate::bcs_layout::BcsCursor::new(&bytes);
+        ConsensusHeader::skip(&mut c).unwrap();
+        assert!(c.is_empty(), "the v1 span must still end exactly at the row end");
+    }
+
+    #[test]
+    fn test_post_activation_row_survives_restart() {
+        let certs = vec![post_cert(0x11, 3, vec![claim9()]), post_cert(0x22, 3, vec![])];
+        let leader = post_cert(0xAA, 4, vec![claim9()]);
+        let leader_digest = leader.digest();
+        let sub_dag = CommittedSubDag::new(certs, leader, 7, ReputationScores::default(), None);
+        let row = ConsensusHeader {
+            parent_hash: BlockHash::repeat_byte(0xAB),
+            sub_dag,
+            number: 1234,
+            extra: BlockHash::ZERO,
+        };
+        let bytes = encode(&row);
+        let back: ConsensusHeader = decode(&bytes);
+        assert_eq!(encode(&back), bytes, "post row re-encodes byte-identically");
+        assert_eq!(back.digest(), row.digest());
+        assert_eq!(back.sub_dag.leader.digest(), leader_digest);
+        assert_eq!(back.sub_dag.certificates[0].header().signer_claims, vec![claim9()]);
+        assert!(back.sub_dag.certificates[1].header().signer_claims.is_empty());
+        let mut c = crate::bcs_layout::BcsCursor::new(&bytes);
+        ConsensusHeader::skip(&mut c).unwrap();
+        assert!(c.is_empty(), "post row span must end exactly at the row end");
+    }
+}

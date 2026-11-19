@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use rayls_infrastructure_types::RaylsNetwork;
+use rayls_infrastructure_types::{Epoch, RaylsNetwork};
 use reth_chainspec::ForkCondition;
 
 use super::{fork::RaylsHardFork, schedule::ScheduledFork, spec::RaylsChainSpec};
@@ -52,6 +52,16 @@ impl RaylsChainHardforks {
     /// Create with the schedule for the given network.
     pub fn for_network(network: RaylsNetwork) -> Self {
         Self::new(RaylsHardFork::for_network(network))
+    }
+
+    // The only accessor for the epoch `SignerClaims` fires at, and the only place its value is
+    // read: the wiring layer pushes it into `types`' handle. `Epoch::MAX` means never. A schedule
+    // that does not list the fork reads as never too.
+    pub fn signer_claims_activation_epoch(&self) -> Epoch {
+        self.forks
+            .binary_search_by(|entry| entry.fork.cmp(&RaylsHardFork::SignerClaims))
+            .ok()
+            .map_or(Epoch::MAX, |idx| self.forks[idx].epoch_activation)
     }
 }
 
@@ -195,6 +205,10 @@ pub trait RaylsHardforks {
     /// Return true if the Erc20PrecompileDirectCall fork is active at `block`.
     fn is_erc20_precompile_direct_call_active_at_block(&self, block: u64) -> bool {
         self.is_rayls_fork_active_at_block(RaylsHardFork::Erc20PrecompileDirectCall, block)
+    }
+
+    fn is_signer_claims_active_at_block(&self, block: u64) -> bool {
+        self.is_rayls_fork_active_at_block(RaylsHardFork::SignerClaims, block)
     }
 
     /// Return the block `fork` activates at, or `None` when it is not block-scheduled (`Never`).

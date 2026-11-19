@@ -6646,7 +6646,7 @@ dependencies = [
 
 [[package]]
 name = "rayls-infrastructure-types"
-version = "1.5.1"
+version = "1.5.2"
 dependencies = [
  "alloy",
  "async-trait",

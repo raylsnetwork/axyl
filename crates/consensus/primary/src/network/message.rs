@@ -524,3 +524,116 @@ impl From<PeerExchangeMap> for PrimaryResponse {
         Self::PeerExchange { peers: value }
     }
 }
+
+#[cfg(test)]
+mod wire_region_tests {
+    use super::*;
+    use libp2p::{request_response::Codec as _, StreamProtocol};
+    use rayls_consensus_network::RLCodec;
+    use rayls_infrastructure_types::{
+        BlsSignature, CommittedSubDag, ConsensusHeader, Hash as _, HeaderBuilder, ReputationScores,
+        SignerClaim,
+    };
+
+    fn claims(seed: u8) -> Vec<SignerClaim> {
+        vec![SignerClaim {
+            target_digest: CertificateDigest::new([seed; 32]),
+            target_epoch: u32::MAX,
+            target_round: 5,
+            ranks: vec![0, 1, 2],
+            signature: BlsSignature::default(),
+        }]
+    }
+
+    fn post_header(author: u8, region: Vec<SignerClaim>) -> Header {
+        HeaderBuilder::default()
+            .author(AuthorityIdentifier::dummy_for_test(author))
+            .round(4)
+            .epoch(u32::MAX)
+            .created_at(1_700_000_000)
+            .payload(Default::default())
+            .parents(Default::default())
+            .build()
+            .with_signer_claims(region)
+    }
+
+    fn post_cert(author: u8, region: Vec<SignerClaim>) -> Certificate {
+        let mut cert = Certificate::default();
+        cert.header = post_header(author, region);
+        cert
+    }
+
+    #[tokio::test]
+    async fn test_wire_roundtrip_preserves_digest_post_activation() {
+        let mut codec = RLCodec::<PrimaryRequest, PrimaryResponse>::new(8 * 1024 * 1024);
+        let protocol = StreamProtocol::new("/rayls-test");
+
+        let header = Arc::new(post_header(0xAA, claims(1)));
+        let parents = vec![post_cert(0x11, claims(2)), post_cert(0x12, Vec::new())];
+        let header_digest = header.digest();
+        let parent_digests: Vec<CertificateDigest> = parents.iter().map(|c| c.digest()).collect();
+        let request = PrimaryRequest::Vote { header: header.clone(), parents: parents.clone() };
+
+        let mut wire = Vec::new();
+        codec.write_request(&protocol, &mut wire, request.clone()).await.expect("send");
+        let received = codec.read_request(&protocol, &mut wire.as_slice()).await.expect("receive");
+        assert_eq!(received, request, "the whole request must survive one codec pass");
+        let PrimaryRequest::Vote { header, parents } = &received else {
+            panic!("wrong variant: {received:?}");
+        };
+        assert_eq!(header.digest(), header_digest, "embedded header digest must survive");
+        assert_eq!(header.signer_claims, claims(1));
+        assert_eq!(
+            parents.iter().map(|c| c.digest()).collect::<Vec<_>>(),
+            parent_digests,
+            "I12: parent certificate digests must survive"
+        );
+        assert_eq!(parents[0].header().signer_claims, claims(2));
+
+        let certs = vec![post_cert(0x33, claims(3)), post_cert(0x44, Vec::new())];
+        let response = PrimaryResponse::RequestedCertificates(certs.clone());
+        let mut wire = Vec::new();
+        codec.write_response(&protocol, &mut wire, response.clone()).await.expect("send");
+        let answer = codec.read_response(&protocol, &mut wire.as_slice()).await.expect("receive");
+        assert_eq!(answer, response);
+        let PrimaryResponse::RequestedCertificates(answered) = answer else {
+            panic!("wrong variant");
+        };
+        assert_eq!(answered[0].digest(), certs[0].digest());
+        assert_eq!(answered[0].header().signer_claims, claims(3));
+
+        let row = ConsensusHeader {
+            parent_hash: BlockHash::repeat_byte(0xAB),
+            sub_dag: CommittedSubDag::new(
+                vec![post_cert(0x55, claims(5))],
+                post_cert(0x66, claims(6)),
+                0,
+                ReputationScores::default(),
+                None,
+            ),
+            number: 100,
+            extra: BlockHash::ZERO,
+        };
+        let response = PrimaryResponse::ConsensusHeader(Arc::new(row.clone()));
+        let mut wire = Vec::new();
+        codec.write_response(&protocol, &mut wire, response.clone()).await.expect("send");
+        let answer = codec.read_response(&protocol, &mut wire.as_slice()).await.expect("receive");
+        assert_eq!(answer, response);
+        let PrimaryResponse::ConsensusHeader(back) = answer else { panic!("wrong variant") };
+        assert_eq!(back.digest(), row.digest());
+        assert_eq!(back.sub_dag.certificates[0].header().signer_claims, claims(5));
+
+        let gossiped = post_cert(0x77, claims(7));
+        let gossiped_digest = gossiped.digest();
+        let gossip = PrimaryGossip::Certificate(Box::new(gossiped));
+        let bytes = rayls_infrastructure_types::encode(&gossip);
+        let back: PrimaryGossip = rayls_infrastructure_types::decode(&bytes);
+        let PrimaryGossip::Certificate(cert) = back else { panic!("wrong variant") };
+        assert_eq!(
+            cert.digest(),
+            gossiped_digest,
+            "gossiped certificate must re-digest to the digest it left with"
+        );
+        assert_eq!(cert.header().signer_claims, claims(7));
+    }
+}

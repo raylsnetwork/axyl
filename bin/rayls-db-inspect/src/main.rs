@@ -34,6 +34,12 @@ fn main() {
         .with_writer(std::io::stderr)
         .init();
 
+    // This tool has no chainspec, so nothing here sets the SignerClaims activation handle: it stays
+    // at its never default and every header is read with the pre-activation layout. That is not
+    // safe over a database written after the activation, where the raw leader projections can
+    // return plausible garbage rather than only an error, so `NodeDb::open` probes the newest
+    // header and refuses such a database instead of reporting projections built on the wrong
+    // era.
     let report = match run(&cli) {
         Ok(report) => report,
         Err(err) => {

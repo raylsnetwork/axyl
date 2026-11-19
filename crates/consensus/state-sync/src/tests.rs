@@ -15,9 +15,10 @@ use rayls_infrastructure_storage::{
     ConsensusStore, EpochStore,
 };
 use rayls_infrastructure_types::{
-    Certificate, CommittedSubDag, ConsensusHeader, ConsensusOutput, Database, DbTxMut, Epoch,
-    EpochCertificate, EpochRecord, ExecHeader, RaylsReceiver as _, RaylsSender, ReputationScores,
-    SealedHeader, B256,
+    AuthorityIdentifier, BlsSignature, Certificate, CertificateDigest, CommittedSubDag,
+    ConsensusHeader, ConsensusOutput, Database, DbTxMut, Epoch, EpochCertificate, EpochRecord,
+    ExecHeader, Header, HeaderBuilder, RaylsReceiver as _, RaylsSender, ReputationScores,
+    SealedHeader, SignerClaim, B256,
 };
 use rayls_testing_test_utils_committee::CommitteeFixture;
 use std::{collections::BTreeMap, num::NonZeroUsize, sync::Arc};
@@ -891,7 +892,92 @@ async fn test_save_consensus_prunes_superseded_bydigest_on_layered_db() {
     );
 }
 
+// I6: `save_consensus` is the only production writer of `ConsensusBlocks`; a pre-activation
+// row and a post-activation row whose headers carry claims must both survive save + reopen.
+#[test]
+fn test_consensus_block_roundtrip_both_eras() {
+    use rayls_consensus_primary::test_utils::temp_dir;
+    use rayls_infrastructure_storage::open_db;
+
+    fn header(author: u8, epoch: Epoch, claims: Vec<SignerClaim>) -> Header {
+        HeaderBuilder::default()
+            .author(AuthorityIdentifier::dummy_for_test(author))
+            .round(4)
+            .epoch(epoch)
+            .created_at(1_700_000_000)
+            .payload(Default::default())
+            .parents(Default::default())
+            .build()
+            .with_signer_claims(claims)
+    }
+
+    fn cert(author: u8, epoch: Epoch, claims: Vec<SignerClaim>) -> Certificate {
+        let mut cert = Certificate::default();
+        cert.header = header(author, epoch, claims);
+        cert
+    }
+
+    fn claims(seed: u8) -> Vec<SignerClaim> {
+        vec![SignerClaim {
+            target_digest: CertificateDigest::new([seed; 32]),
+            target_epoch: u32::MAX,
+            target_round: 5,
+            ranks: vec![0, 1, 2],
+            signature: BlsSignature::default(),
+        }]
+    }
+
+    fn row(number: u64, epoch: Epoch, claims_with: bool) -> ConsensusHeader {
+        let c = |i: u8| {
+            let cl = if claims_with && i == 1 { claims(i) } else { vec![] };
+            cert(0x10 + i, epoch, cl)
+        };
+        let certs = vec![c(1), c(2)];
+        let leader = cert(0xAA, epoch, if claims_with { claims(9) } else { vec![] });
+        let sub_dag = CommittedSubDag::new(certs, leader, 0, ReputationScores::default(), None);
+        ConsensusHeader {
+            parent_hash: B256::repeat_byte(0xAB),
+            sub_dag,
+            number,
+            extra: B256::default(),
+        }
+    }
+
+    let dir = temp_dir();
+    let pre = row(100, 7, false);
+    let post = row(101, u32::MAX, true);
+    {
+        let db = open_db(dir.path());
+        for h in [&pre, &post] {
+            let output = ConsensusOutput {
+                sub_dag: Arc::new(h.sub_dag.clone()),
+                parent_hash: h.parent_hash,
+                number: h.number,
+                extra: h.extra,
+                ..Default::default()
+            };
+            save_consensus(&db, output, &None).unwrap();
+        }
+    }
+
+    let db = open_db(dir.path());
+    for (saved, claims_with) in [(pre, false), (post, true)] {
+        let back: ConsensusHeader = db.get::<ConsensusBlocks>(&saved.number).unwrap().unwrap();
+        assert_eq!(back.digest(), saved.digest(), "row digest must survive save + reopen");
+        assert_eq!(
+            back.sub_dag.certificates[0].header.signer_claims,
+            if claims_with { claims(1) } else { vec![] },
+            "the claims region must survive save + reopen"
+        );
+        assert_eq!(
+            back.sub_dag.leader.header.signer_claims,
+            if claims_with { claims(9) } else { vec![] }
+        );
+    }
+}
+
 /// Regression: a target that never executes trips the bounded wait instead of hanging forever,
+
 /// returning `Stalled`. The outer guard timeout is far longer than the idle bound, so
 /// `Ok(Err(Stalled))` proves the method itself returned (a stall), not the guard.
 #[tokio::test(flavor = "current_thread", start_paused = true)]

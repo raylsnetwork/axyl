@@ -419,3 +419,101 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod region_tests {
+    use super::*;
+    use crate::{
+        bcs_layout::BcsLayout, decode, BlsSignature, CertificateDigest, CommittedSubDag,
+        ConsensusHeader, HeaderBuilder, ReputationScores, SignerClaim, WorkerId,
+    };
+    use indexmap::IndexMap;
+    use std::collections::BTreeSet;
+
+    fn claim(i: u32) -> SignerClaim {
+        SignerClaim {
+            target_digest: CertificateDigest::new([i as u8 + 1; 32]),
+            target_epoch: u32::MAX,
+            target_round: 5,
+            ranks: vec![0, 1, 2],
+            signature: BlsSignature::default(),
+        }
+    }
+
+    fn post_cert(
+        author: u8,
+        round: u32,
+        payload: Vec<(BlockHash, WorkerId)>,
+        claims: Vec<SignerClaim>,
+    ) -> Certificate {
+        let mut p = IndexMap::<BlockHash, WorkerId>::new();
+        for (d, w) in payload {
+            p.insert(d, w);
+        }
+        let mut parents = BTreeSet::<CertificateDigest>::new();
+        parents.insert(CertificateDigest::new([7u8; 32]));
+        let header = HeaderBuilder::default()
+            .author(AuthorityIdentifier::dummy_for_test(author))
+            .round(round)
+            .epoch(u32::MAX)
+            .created_at(1_700_000_000)
+            .payload(p)
+            .parents(parents)
+            .build()
+            .with_signer_claims(claims);
+        let mut cert = Certificate::default();
+        cert.update_header_for_test(header);
+        cert
+    }
+
+    fn post_row() -> ConsensusHeader {
+        let leader = post_cert(0xEE, 14, vec![(BlockHash::repeat_byte(1), 0)], vec![claim(1)]);
+        let certs = vec![
+            post_cert(
+                0x01,
+                13,
+                vec![(BlockHash::repeat_byte(2), 1), (BlockHash::repeat_byte(3), 2)],
+                vec![claim(2), claim(3)],
+            ),
+            post_cert(0x02, 13, vec![(BlockHash::repeat_byte(4), 3)], vec![]),
+        ];
+        let sub_dag = CommittedSubDag::new(certs, leader, 7, ReputationScores::default(), None);
+        ConsensusHeader {
+            parent_hash: BlockHash::repeat_byte(0xCD),
+            sub_dag,
+            number: 4242,
+            extra: BlockHash::ZERO,
+        }
+    }
+
+    #[test]
+    fn test_span_readers_ignore_region() {
+        let h = post_row();
+        let bytes = crate::encode(&h);
+        let decoded: ConsensusHeader = decode(&bytes);
+
+        let m = ConsensusHeaderMeta::from_bytes(&bytes).unwrap();
+        assert_eq!(m.leader_author, *decoded.sub_dag.leader.header().author());
+        assert_eq!(m.leader_round, decoded.sub_dag.leader.header().round());
+        assert_eq!(m.leader_epoch, decoded.sub_dag.leader.header().epoch());
+
+        let c = ConsensusHeaderChainMeta::from_bytes(&bytes).unwrap();
+        assert_eq!(c.parent_hash, h.parent_hash);
+        assert_eq!(c.number, h.number);
+        assert_eq!(c.digest, h.digest(), "projection digest must match the decoded digest");
+
+        let (epoch, digests) = leader_epoch_and_batch_digests(&bytes).unwrap();
+        assert_eq!(epoch, decoded.sub_dag.leader.header().epoch());
+        let full: Vec<BlockHash> = decoded
+            .sub_dag
+            .certificates
+            .iter()
+            .flat_map(|cert| cert.header().payload().keys().copied())
+            .collect();
+        assert_eq!(digests, full, "batch projection must survive the region");
+
+        let mut cur = BcsCursor::new(&bytes);
+        ConsensusHeader::skip(&mut cur).unwrap();
+        assert!(cur.is_empty(), "region must not leave bytes unconsumed");
+    }
+}

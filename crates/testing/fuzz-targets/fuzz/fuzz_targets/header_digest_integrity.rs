@@ -13,10 +13,14 @@
 #![no_main]
 use libfuzzer_sys::fuzz_target;
 use rayls_infrastructure_types::{
-    AuthorityIdentifier, BlockHash, BlockNumHash, CertificateDigest, Hash, Header,
+    header_canonical_bytes, AuthorityIdentifier, BlockHash, BlockNumHash, CertificateDigest, Hash,
+    Header,
 };
 use indexmap::IndexMap;
 use std::collections::BTreeSet;
+
+// This harness has no chainspec, so the activation handle stays at its never default: every
+// header built here is pre-activation except the `epoch == u32::MAX` sentinel.
 
 #[derive(arbitrary::Arbitrary, Debug)]
 struct FuzzHeader {
@@ -72,6 +76,7 @@ fuzz_target!(|input: FuzzHeader| {
         parents: parents.clone(),
         latest_execution_block,
         digest: Default::default(),
+        signer_claims: Vec::new(),
     };
 
     let digest1 = header.digest();
@@ -82,14 +87,14 @@ fuzz_target!(|input: FuzzHeader| {
 
     // Avalanche: mutating a field must change the digest.
     // Serialize, flip a byte, check if the digest changed.
-    let encoded = bcs::to_bytes(&header).expect("encode succeeds");
+    let encoded = header_canonical_bytes(&header);
     if encoded.len() > 1 {
         let mut mutated = encoded.clone();
         let idx = (input.mutate_byte as usize) % mutated.len();
         mutated[idx] = mutated[idx].wrapping_add(1);
 
         if let Ok(mutated_header) = bcs::from_bytes::<Header>(&mutated) {
-            let re_encoded = bcs::to_bytes(&mutated_header).expect("re-encode");
+            let re_encoded = header_canonical_bytes(&mutated_header);
             // Only assert if the bytes actually differ after round-trip.
             if re_encoded != encoded {
                 let mutated_digest = Hash::digest(&mutated_header);

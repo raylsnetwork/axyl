@@ -13,7 +13,7 @@
 //! when ready. See `crates/execution/evm/src/evm/hardforks/usdr_supply_correction.rs`.
 
 use super::fork::RaylsHardFork;
-use rayls_infrastructure_types::RaylsNetwork;
+use rayls_infrastructure_types::{Epoch, RaylsNetwork};
 use reth_chainspec::ForkCondition;
 
 /// One entry of a Rayls hardfork schedule: a fork and its activation condition.
@@ -25,11 +25,22 @@ use reth_chainspec::ForkCondition;
 pub struct ScheduledFork {
     pub fork: RaylsHardFork,
     pub condition: ForkCondition,
+    // Epoch-keyed activation, for the forks whose rule must be evaluable from a header's own
+    // epoch (`ForkCondition` is reth's and keys on blocks only). `Epoch::MAX` means never, and
+    // `RaylsChainHardforks::signer_claims_activation_epoch` is its only reader.
+    pub epoch_activation: Epoch,
 }
 
 impl ScheduledFork {
     pub const fn new(fork: RaylsHardFork, condition: ForkCondition) -> Self {
-        Self { fork, condition }
+        Self { fork, condition, epoch_activation: Epoch::MAX }
+    }
+
+    // Attach an epoch activation to an entry, leaving its block condition as declared. Only
+    // `SignerClaims` uses this today; its block predicate has no call sites.
+    pub const fn with_epoch_activation(mut self, epoch: Epoch) -> Self {
+        self.epoch_activation = epoch;
+        self
     }
 }
 
@@ -63,6 +74,9 @@ impl RaylsHardFork {
             // delegate frames into 0x0400, so replaying pre-activation history must keep accepting
             // them.
             ScheduledFork::new(Self::Erc20PrecompileDirectCall, ForkCondition::Never),
+            // Epoch-gated: `epoch_activation` is the activation and `Epoch::MAX` (never) is what
+            // the networks run on today; the block condition stays unused.
+            ScheduledFork::new(Self::SignerClaims, ForkCondition::Never),
         ]
     }
 
@@ -95,6 +109,9 @@ impl RaylsHardFork {
             // Never until SRE schedules an activation block: changes the state transition for
             // delegate frames into 0x0400 (see devnet note).
             ScheduledFork::new(Self::Erc20PrecompileDirectCall, ForkCondition::Never),
+            // Epoch-gated: `epoch_activation` is the activation and `Epoch::MAX` (never) is what
+            // the networks run on today; the block condition stays unused.
+            ScheduledFork::new(Self::SignerClaims, ForkCondition::Never),
         ]
     }
 
@@ -127,6 +144,9 @@ impl RaylsHardFork {
             // Never until SRE schedules an activation block: changes the state transition for
             // delegate frames into 0x0400 (see devnet note).
             ScheduledFork::new(Self::Erc20PrecompileDirectCall, ForkCondition::Never),
+            // Epoch-gated: `epoch_activation` is the activation and `Epoch::MAX` (never) is what
+            // the networks run on today; the block condition stays unused.
+            ScheduledFork::new(Self::SignerClaims, ForkCondition::Never),
         ]
     }
 
@@ -163,6 +183,9 @@ impl RaylsHardFork {
             ScheduledFork::new(Self::CertificateFetchEpochV2, ForkCondition::Block(0)),
             // Local is ephemeral: activate from genesis so the direct-call guard is exercised.
             ScheduledFork::new(Self::Erc20PrecompileDirectCall, ForkCondition::Block(0)),
+            // Epoch-gated: `epoch_activation` is the activation and `Epoch::MAX` (never) is what
+            // the networks run on today; the block condition stays unused.
+            ScheduledFork::new(Self::SignerClaims, ForkCondition::Never),
         ]
     }
 
