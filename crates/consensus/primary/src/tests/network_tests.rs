@@ -13,13 +13,13 @@ use crate::{
 use assert_matches::assert_matches;
 use rayls_consensus_network::{GossipMessage, Penalty, TopicHash};
 use rayls_consensus_primary::test_utils::make_optimal_signed_certificates;
-use rayls_infrastructure_config::LibP2pConfig;
+use rayls_infrastructure_config::{ConsensusConfig, LibP2pConfig};
 use rayls_infrastructure_storage::{mem_db::MemDatabase, CertScope, CertificateStore as _};
 use rayls_infrastructure_types::{
     encode, error::HeaderError, now, to_intent_message, AuthorityIdentifier, BlockHash,
     BlockHeader, BlockNumHash, BlsPublicKey, Certificate, CertificateDigest, CertifiedTip,
-    EpochVote, ExecHeader, Hash as _, RaylsReceiver, RaylsSender, SealedHeader, Signer as _,
-    TaskManager,
+    CommitteeLookahead, EpochVote, ExecHeader, Hash as _, RaylsReceiver, RaylsSender, SealedHeader,
+    Signer as _, TaskManager,
 };
 use rayls_testing_test_utils_committee::CommitteeFixture;
 use std::collections::{BTreeMap, BTreeSet};
@@ -735,6 +735,60 @@ async fn test_quorum_keeps_certified_tip() -> eyre::Result<()> {
         restarted.process_gossip(&msg, key).await?;
     }
     assert_eq!(served().await.map(|tip| tip.hash), Some(nine), "kept across a restart");
+    Ok(())
+}
+
+/// f+1 results for the next epoch, checked against a lookahead that still lists a key ejected
+/// since it was read, are not kept as a certified tip: its bitmap would index the lookahead, not
+/// the committee followers verify against. The tip waits until that committee is settled.
+#[tokio::test]
+async fn certified_tip_is_not_built_over_a_stale_lookahead() -> eyre::Result<()> {
+    let committee = CommitteeFixture::builder(MemDatabase::default).randomize_ports(true).build();
+    let base = committee.first_authority().consensus_config();
+    let keys: Vec<BlsPublicKey> =
+        committee.authorities().map(|a| *a.authority().protocol_key()).collect();
+    // an ejected key sorting below every member shifts every bitmap index
+    let ejected = std::iter::repeat_with(|| {
+        let other = CommitteeFixture::builder(MemDatabase::default).build();
+        *other.first_authority().authority().protocol_key()
+    })
+    .find(|key| keys.iter().all(|member| key < member))
+    .expect("a lower key");
+    let mut stale = keys.clone();
+    stale.push(ejected);
+    let config = ConsensusConfig::new_for_epoch(
+        base.config().clone(),
+        base.node_storage().clone(),
+        base.key_config().clone(),
+        base.committee().clone(),
+        CommitteeLookahead::from_entries([(1, stale)]),
+        base.network_config().clone(),
+        u64::MAX,
+        true,
+    )?;
+    assert!(config.get_settled_committee_keys_for_epoch(1).is_none(), "precondition");
+    let consensus_bus = ConsensusBus::new();
+    let task_manager = TaskManager::default();
+    let synchronizer =
+        StateSynchronizer::new(config.clone(), consensus_bus.clone(), task_manager.get_spawner());
+    let handler = RequestHandler::new(config, consensus_bus, synchronizer);
+
+    let topic = TopicHash::from_raw(LibP2pConfig::consensus_output_topic());
+    let hash = BlockHash::random();
+    let digest = ConsensusResult::digest_data(1, 1, 5, hash);
+    for signer in committee.authorities().skip(1).take(CertifiedTip::quorum(keys.len())) {
+        let key = *signer.authority().protocol_key();
+        let signature = signer.keypair().sign(&encode(&to_intent_message(digest)));
+        let result =
+            ConsensusResult { epoch: 1, round: 1, number: 5, hash, validator: key, signature };
+        let data = encode(&PrimaryGossip::Consensus(Box::new(result)));
+        let msg = GossipMessage { source: None, data, sequence_number: None, topic: topic.clone() };
+        handler.process_gossip(&msg, key).await?;
+    }
+    assert_matches!(
+        handler.retrieve_certified_tip().await,
+        Ok(PrimaryResponse::CertifiedTip(None))
+    );
     Ok(())
 }
 

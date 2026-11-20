@@ -446,7 +446,7 @@ where
                         }
                     };
                     if let Some(signatures) = quorum {
-                        self.save_certified_tip(epoch, round, number, hash, &committee, signatures);
+                        self.save_certified_tip(epoch, round, number, hash, signatures);
                         if self.behind_consensus(epoch, round, Some(number)).await {
                             self.consensus_certs.lock().clear();
                             return Ok(());
@@ -1092,17 +1092,25 @@ where
     /// the row outlives restarts, so f+1 keys of a retired committee could otherwise pin a
     /// forged high number from their epoch for good. The previous epoch still counts, so a
     /// chain halted on its last header keeps a tip.
+    ///
+    /// The bitmap indexes the committee the epoch ran with, the one followers verify against,
+    /// never the lookahead the gossip check may have used: a key ejected since the lookahead was
+    /// read would shift every index after it and leave a tip nobody can verify. Nothing is
+    /// stored until that committee is settled.
     fn save_certified_tip(
         &self,
         epoch: Epoch,
         round: Round,
         number: u64,
         hash: BlockHash,
-        committee: &[BlsPublicKey],
         signatures: Vec<(BlsPublicKey, BlsSignature)>,
     ) {
+        let Some(committee) = self.consensus_config.get_settled_committee_keys_for_epoch(epoch)
+        else {
+            return;
+        };
         let Some(tip) =
-            CertifiedTip::from_signatures(epoch, round, number, hash, committee, signatures)
+            CertifiedTip::from_signatures(epoch, round, number, hash, &committee, signatures)
         else {
             return;
         };
