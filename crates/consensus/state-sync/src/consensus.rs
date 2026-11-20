@@ -402,6 +402,11 @@ async fn probe_peers_for_certified_tip<DB: ReDatabase>(
 
 /// Probe all committee peers concurrently, return the highest header above `current`.
 /// BLS is re-verified downstream in `get_consensus_header`.
+///
+/// Never call this once `CertifiedTipV1` is active (see [`uses_certified_tip`]): the answer of one
+/// member is taken on its own, and a header carries no signature of its own, so one member can
+/// serve a forged copy of a real header and fork or strand the node (#370, #312). It stays only
+/// for nodes before the fork, which still talk to peers that cannot serve a certified tip.
 async fn probe_peers_for_latest<DB: ReDatabase>(
     current: u64,
     config: &ConsensusConfig<DB>,
