@@ -349,6 +349,8 @@ async fn probe_for_head<DB: ReDatabase>(
 /// one above `current` that verifies against its epoch's committee. One valid answer is enough;
 /// asking every peer only guards against peers that are down, on an older release, or behind.
 /// Answers that have not arrived within [`CERTIFIED_TIP_PROBE_DEADLINE`] are not waited for.
+/// A peer whose tip fails against a committee this node knows is penalized: the tip names that
+/// committee, so it is forged, and each one costs this node a verify.
 /// A tip from before this node's previous epoch is dropped: f+1 keys of a retired committee
 /// could sign any number, and the previous epoch counts so a chain halted on its last header can
 /// still be found.
@@ -364,15 +366,17 @@ async fn probe_peers_for_certified_tip<DB: ReDatabase>(
     network: &PrimaryNetworkHandle,
 ) -> Option<(u64, B256)> {
     let peers = network.inner_handle().connected_peers().await.ok()?;
-    let mut inflight: FuturesUnordered<_> =
-        peers.into_iter().map(|peer| network.request_certified_tip_from_peer(peer)).collect();
+    let mut inflight: FuturesUnordered<_> = peers
+        .into_iter()
+        .map(|peer| async move { (peer, network.request_certified_tip_from_peer(peer).await) })
+        .collect();
     let floor = config.epoch().saturating_sub(1);
     let mut candidates = Vec::new();
     let _ = tokio::time::timeout(CERTIFIED_TIP_PROBE_DEADLINE, async {
-        while let Some(result) = inflight.next().await {
+        while let Some((peer, result)) = inflight.next().await {
             if let Ok(Some(tip)) = result {
                 if tip.number > current && tip.epoch >= floor {
-                    candidates.push(tip);
+                    candidates.push((peer, tip));
                 }
             }
         }
@@ -380,12 +384,9 @@ async fn probe_peers_for_certified_tip<DB: ReDatabase>(
     .await;
     // epoch first: a high number signed by f+1 retired keys of an earlier epoch must not rank
     // above an honest tip from a later one
-    candidates.sort_by(|a, b| (b.epoch, b.number).cmp(&(a.epoch, a.number)));
-    // whole-struct: a copy with the honest number and hash but a bad signature must not stand
-    // in for the honest ones
-    candidates.dedup();
+    candidates.sort_by(|(_, a), (_, b)| (b.epoch, b.number).cmp(&(a.epoch, a.number)));
     let mut collector_asked = false;
-    for tip in candidates {
+    for (peer, tip) in candidates {
         let Some(committee) = config.get_committee_keys_for_epoch(tip.epoch) else {
             // the same record is next for every such tip, so ask once
             if !collector_asked {
@@ -410,10 +411,12 @@ async fn probe_peers_for_certified_tip<DB: ReDatabase>(
         }
         warn!(
             target: "state-sync",
+            %peer,
             number = tip.number,
             epoch = tip.epoch,
-            "probe: certified tip did not verify against its committee, skipping"
+            "probe: certified tip did not verify against its committee, penalizing the peer"
         );
+        network.report_invalid_certified_tip(peer).await;
     }
     None
 }
@@ -859,6 +862,7 @@ mod tests {
     struct Asked {
         latest: AtomicUsize,
         certified_tip: AtomicUsize,
+        penalized: std::sync::Mutex<Vec<BlsPublicKey>>,
     }
 
     /// Connected `peers`, serving every header in `headers` by hash.
@@ -915,6 +919,9 @@ mod tests {
                                 .map(|h| PrimaryResponse::ConsensusHeader(Arc::new(h)))
                                 .ok_or_else(unknown),
                         );
+                    }
+                    NetworkCommand::ReportPenalty { peer, .. } => {
+                        counts.penalized.lock().unwrap().push(peer);
                     }
                     _ => {}
                 }
@@ -1038,7 +1045,7 @@ mod tests {
     }
 
     /// A copy of the honest top tip with a bad signature, answered before the honest ones, does
-    /// not stand in for them.
+    /// not stand in for them, and its sender alone is penalized.
     #[tokio::test(start_paused = true)]
     async fn a_bad_copy_of_the_top_tip_does_not_hide_the_honest_ones() {
         let fixture = committee_of_four();
@@ -1064,12 +1071,13 @@ mod tests {
             })
             .collect();
         peers.push(Peer::new(observer, Some(bad), &honest));
-        let (network, _) = peer_network(peers, vec![honest.clone()]);
+        let (network, asked) = peer_network(peers, vec![honest.clone()]);
         let consensus_bus = ConsensusBus::new();
         tokio::spawn(spawn_track_recent_consensus(config.clone(), consensus_bus.clone(), network));
 
         assert!(reaches(&consensus_bus, 1, Duration::from_secs(5)).await, "walks to the tip");
         config.shutdown().notify();
+        assert_eq!(*asked.penalized.lock().unwrap(), vec![observer], "only the bad copy's sender");
     }
 
     /// A connected peer that does not answer within the request timeout does not hold up the
