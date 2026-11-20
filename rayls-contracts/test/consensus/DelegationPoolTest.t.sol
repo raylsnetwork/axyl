@@ -1068,6 +1068,95 @@ contract DelegationPoolTest is Test {
         pool.transferStake(validator1, validator2, 20e18);
     }
 
+    function testRevert_transferStake_belowMinDelegation() public {
+        // Transfers must meet minDelegation, like a new delegation.
+        _registerBothValidators();
+        vm.prank(delegator1);
+        pool.delegate(validator1, 100e18);
+
+        vm.prank(delegator1);
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                IDelegationPool.InsufficientDelegation.selector, MIN_DELEGATION - 1, MIN_DELEGATION
+            )
+        );
+        pool.transferStake(validator1, validator2, MIN_DELEGATION - 1);
+    }
+
+    function test_transferStake_exactlyMinDelegation() public {
+        // The floor is inclusive.
+        _registerBothValidators();
+        vm.prank(delegator1);
+        pool.delegate(validator1, 100e18);
+
+        vm.prank(delegator1);
+        pool.transferStake(validator1, validator2, MIN_DELEGATION);
+
+        assertEq(pool.getDelegatorPosition(validator2, delegator1).amount, MIN_DELEGATION);
+        assertEq(pool.getDelegatorPosition(validator1, delegator1).amount, 100e18 - MIN_DELEGATION);
+        assertEq(rls.balanceOf(address(pool)), 100e18);
+    }
+
+    function testRevert_transferStake_belowRaisedMinDelegation() public {
+        // The floor comes from live config, not a constant.
+        _registerBothValidators();
+        vm.prank(delegator1);
+        pool.delegate(validator1, 100e18);
+
+        IDelegationPool.DelegationConfig memory raisedConfig = defaultConfig;
+        raisedConfig.minDelegation = 50e18;
+        vm.prank(owner);
+        pool.updateConfig(raisedConfig);
+
+        vm.prank(delegator1);
+        vm.expectRevert(abi.encodeWithSelector(IDelegationPool.InsufficientDelegation.selector, 40e18, 50e18));
+        pool.transferStake(validator1, validator2, 40e18);
+
+        // Above the raised floor, the transfer succeeds.
+        vm.prank(delegator1);
+        pool.transferStake(validator1, validator2, 50e18);
+        assertEq(pool.getTotalDelegatedStake(validator2), 50e18);
+    }
+
+    function test_transferStake_leavesSubMinRemainderAtSource() public {
+        // The floor gates the moved amount, not the leftover at the source.
+        _registerBothValidators();
+        vm.prank(delegator1);
+        pool.delegate(validator1, MIN_DELEGATION + 1);
+
+        vm.prank(delegator1);
+        pool.transferStake(validator1, validator2, MIN_DELEGATION);
+
+        IDelegationPool.DelegatorPosition memory fromPos = pool.getDelegatorPosition(validator1, delegator1);
+        assertEq(fromPos.amount, 1);
+        assertEq(pool.getDelegatorPosition(validator2, delegator1).amount, MIN_DELEGATION);
+
+        // The dust is still exitable via the normal unbonding path.
+        registry.setCurrentEpoch(5);
+        vm.prank(delegator1);
+        pool.requestUndelegation(validator1, 1);
+        registry.setCurrentEpoch(5 + UNBONDING_EPOCHS);
+        vm.prank(delegator1);
+        pool.completeUndelegation(validator1);
+        assertEq(rls.balanceOf(delegator1), 10_000_000e18 - (MIN_DELEGATION + 1) + 1);
+    }
+
+    function testRevert_transferStake_structuralErrorsPrecedeMinDelegation() public {
+        // Structural checks come first, mirroring _delegate.
+        _registerBothValidators();
+        vm.prank(delegator1);
+        pool.delegate(validator1, 100e18);
+
+        vm.prank(validator2);
+        pool.setAcceptingDelegations(false);
+
+        vm.prank(delegator1);
+        vm.expectRevert(
+            abi.encodeWithSelector(IDelegationPool.PoolNotAcceptingDelegations.selector, validator2)
+        );
+        pool.transferStake(validator1, validator2, MIN_DELEGATION - 1);
+    }
+
     function testRevert_transferStake_exceedsMaxDelegation() public {
         IDelegationPool.DelegationConfig memory smallConfig = IDelegationPool.DelegationConfig({
             minDelegation: 1e18,

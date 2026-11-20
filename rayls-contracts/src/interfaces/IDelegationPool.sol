@@ -218,9 +218,10 @@ interface IDelegationPool {
     ///      still governs actual withdrawal exactly as before. Rate-limited per SOURCE position
     ///      (`fromValidator`, caller), so a delegator with positions at several validators may
     ///      transfer out of each of them once in the same epoch.
+    /// @dev The moved `amount` must be at least `config.minDelegation`, the same floor `delegate` applies.
     /// @param fromValidator The validator to move stake away from
     /// @param toValidator The validator to move stake to
-    /// @param amount The amount of already-delegated RLS to move
+    /// @param amount The amount of already-delegated RLS to move (>= `config.minDelegation`)
     function transferStake(
         address fromValidator,
         address toValidator,

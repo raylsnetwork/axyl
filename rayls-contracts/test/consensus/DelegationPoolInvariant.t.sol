@@ -140,9 +140,10 @@ contract DelegationPoolHandler is Test {
         uint256 actorRoom = MAX_DELEGATION - toPos.amount;
         uint256 cap = poolRoom < actorRoom ? poolRoom : actorRoom;
         if (cap > fromPos.amount) cap = fromPos.amount;
-        if (cap == 0) return;
+        // transferStake enforces minDelegation; skip sub-floor amounts rather than reverting
+        if (cap < MIN_DELEGATION) return;
 
-        amount = bound(amount, 1, cap);
+        amount = bound(amount, MIN_DELEGATION, cap);
         vm.prank(d);
         pool.transferStake(from, to, amount);
     }

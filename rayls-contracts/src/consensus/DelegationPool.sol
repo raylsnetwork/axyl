@@ -527,6 +527,7 @@ contract DelegationPool is
     /// @dev No RLS transfer at all — the whole operation is accounting-only within this
     ///      contract, which is precisely why it can skip the unbonding wait that
     ///      requestUndelegation/completeUndelegation enforce for an actual withdrawal.
+    /// @dev The moved amount must meet `config.minDelegation`, like a new delegation.
     function transferStake(
         address fromValidator,
         address toValidator,
@@ -551,6 +552,10 @@ contract DelegationPool is
         ValidatorPool storage toPool = $.validatorPools[toValidator];
         if (!toPool.acceptingDelegations)
             revert PoolNotAcceptingDelegations(toValidator);
+
+        // Same floor as _delegate. The source remainder is deliberately not floored.
+        if (amount < $.config.minDelegation)
+            revert InsufficientDelegation(amount, $.config.minDelegation);
 
         DelegatorPosition storage fromPos = $.positions[fromValidator][msg.sender];
 
