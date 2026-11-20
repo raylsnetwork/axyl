@@ -412,9 +412,7 @@ async fn test_primary_batch_gossip_topics() {
 
     task_manager.spawn_task("process-gossip-test", async move {
         let mut rx = consensus_bus.new_epoch_votes().subscribe();
-        while let Some((_, tx)) = rx.recv().await {
-            let _ = tx.send(Ok(()));
-        }
+        while rx.recv().await.is_some() {}
     });
 
     // the default payloads name the default key as their signer, so they are published under it
@@ -459,6 +457,152 @@ async fn test_primary_batch_gossip_topics() {
     let topic = TopicHash::from_raw(LibP2pConfig::consensus_output_topic());
     let bad_msg = GossipMessage { source: None, data: data.clone(), sequence_number: None, topic };
     assert!(handler.process_gossip(&bad_msg, author).await.is_err());
+}
+
+/// An epoch vote is queued only as a verified committee signature over the digest of a record
+/// this node holds uncertified, once per signer and epoch. Unknown or certified records and
+/// repeats are dropped without a penalty, outsiders and bad signatures are rejected with one,
+/// and the handler never waits on the collector.
+#[tokio::test]
+async fn test_epoch_vote_admission() -> eyre::Result<()> {
+    use rand::{rngs::StdRng, SeedableRng};
+    use rayls_infrastructure_storage::EpochStore as _;
+    use rayls_infrastructure_types::{
+        BlsKeypair, BlsSignature, BlsSigner, EpochCertificate, EpochRecord, Signer as _, B256,
+    };
+    use std::sync::Arc;
+
+    #[derive(Clone)]
+    struct TestSigner(Arc<BlsKeypair>);
+    impl BlsSigner for TestSigner {
+        fn request_signature_direct(&self, msg: &[u8]) -> BlsSignature {
+            self.0.sign(msg)
+        }
+        fn public_key(&self) -> BlsPublicKey {
+            *self.0.public()
+        }
+    }
+
+    let TestTypes { handler, committee, consensus_bus, .. } = create_test_types();
+    let db = committee.first_authority().consensus_config().node_storage().clone();
+    let mut queue = consensus_bus.new_epoch_votes().subscribe();
+    let mut rng = StdRng::seed_from_u64(5);
+    let member = TestSigner(Arc::new(BlsKeypair::generate(&mut rng)));
+    let other_member = TestSigner(Arc::new(BlsKeypair::generate(&mut rng)));
+    let third_member = TestSigner(Arc::new(BlsKeypair::generate(&mut rng)));
+    let fourth_member = TestSigner(Arc::new(BlsKeypair::generate(&mut rng)));
+    let outsider = TestSigner(Arc::new(BlsKeypair::generate(&mut rng)));
+    let topic = TopicHash::from_raw(LibP2pConfig::epoch_vote_topic());
+    let gossip = |vote: EpochVote| GossipMessage {
+        source: None,
+        data: encode(&PrimaryGossip::EpochVote(Box::new(vote))),
+        sequence_number: None,
+        topic: topic.clone(),
+    };
+    let committee_keys = vec![
+        member.public_key(),
+        other_member.public_key(),
+        third_member.public_key(),
+        fourth_member.public_key(),
+    ];
+    // the close writes the uncertified record to the pending table and announces it
+    let pending_written =
+        || consensus_bus.pending_epoch_records_changed().send_modify(|version| *version += 1);
+    let pending = EpochRecord { epoch: 7, committee: committee_keys.clone(), ..Default::default() };
+    db.save_pending_epoch_record(&pending)?;
+    pending_written();
+
+    // a record this node does not hold: dropped, no penalty
+    let unknown = EpochRecord { epoch: 8, committee: committee_keys.clone(), ..Default::default() };
+    handler.process_gossip(&gossip(unknown.sign_vote(&member)), member.public_key()).await?;
+    assert!(queue.try_recv().is_err());
+
+    // not in the record's committee: rejected with a penalty
+    let res =
+        handler.process_gossip(&gossip(pending.sign_vote(&outsider)), outsider.public_key()).await;
+    assert_matches!(Option::<Penalty>::from(&res.unwrap_err()), Some(Penalty::Fatal));
+    assert!(queue.try_recv().is_err());
+
+    // a member's bad signature: rejected with a penalty, and it spends that signer's one
+    // admission for the epoch (only the signer can publish a vote naming it), so a member
+    // cannot cost this node more than one failed verify per epoch
+    let mut forged = pending.sign_vote(&other_member);
+    forged.signature = unknown.sign_vote(&other_member).signature;
+    let res = handler.process_gossip(&gossip(forged), other_member.public_key()).await;
+    assert_matches!(Option::<Penalty>::from(&res.unwrap_err()), Some(Penalty::Fatal));
+    assert!(queue.try_recv().is_err());
+    let valid = pending.sign_vote(&other_member);
+    handler.process_gossip(&gossip(valid), other_member.public_key()).await?;
+    assert!(queue.try_recv().is_err(), "dropped as a repeat after the signer's own bad copy");
+
+    // the member's vote: queued as is, and the handler returned without anyone reading it
+    let vote = pending.sign_vote(&member);
+    handler.process_gossip(&gossip(vote), member.public_key()).await?;
+    assert_eq!(queue.try_recv().ok(), Some(vote));
+
+    // a repeat from the same signer: dropped, no penalty
+    handler.process_gossip(&gossip(vote), member.public_key()).await?;
+    assert!(queue.try_recv().is_err());
+
+    // once the epoch is certified here, further votes for the local record are dropped, even
+    // when the network certified a different record for it. The certificate write removes the
+    // pending row without touching the counter, so the handler's cache still holds the local
+    // record, and the drop comes from the certified-by-epoch check on a hit.
+    let networks =
+        EpochRecord { epoch: 7, parent_hash: B256::repeat_byte(0xAB), ..pending.clone() };
+    assert_ne!(networks.digest(), pending.digest());
+    let cert = EpochCertificate {
+        epoch_hash: networks.digest(),
+        signature: Default::default(),
+        signed_authorities: Default::default(),
+    };
+    db.save_epoch_record_with_cert(&networks, &cert)?;
+    handler
+        .process_gossip(&gossip(pending.sign_vote(&third_member)), third_member.public_key())
+        .await?;
+    assert!(
+        queue.try_recv().is_err(),
+        "epoch certified under another record, stale cache: dropped"
+    );
+    // and once the table is re-read, from the lookup itself: the row is gone
+    let late = EpochRecord { epoch: 9, committee: committee_keys.clone(), ..Default::default() };
+    db.save_pending_epoch_record(&late)?;
+    pending_written();
+    handler
+        .process_gossip(&gossip(pending.sign_vote(&fourth_member)), fourth_member.public_key())
+        .await?;
+    assert!(queue.try_recv().is_err(), "record no longer pending, fresh cache: dropped");
+    handler
+        .process_gossip(&gossip(late.sign_vote(&other_member)), other_member.public_key())
+        .await?;
+    assert!(queue.try_recv().is_ok(), "the same signer's vote for a pending record is queued");
+
+    // a full queue refuses the vote without spending the signer's dedup slot, so a republish
+    // after the collector drains the queue is admitted
+    let filler = late.sign_vote(&other_member);
+    while consensus_bus.new_epoch_votes().try_send(filler).is_ok() {}
+    let vote = late.sign_vote(&member);
+    handler.process_gossip(&gossip(vote), member.public_key()).await?;
+    while queue.try_recv().is_ok() {}
+    handler.process_gossip(&gossip(vote), member.public_key()).await?;
+    assert_eq!(queue.try_recv().ok(), Some(vote), "republished after the refusal: queued");
+
+    // a long stall leaves many epochs pending; dedup still holds for the oldest of them, so a
+    // member cannot flood the queue with repeats of its vote for an early epoch
+    let stalled: Vec<EpochRecord> = (20..30)
+        .map(|epoch| EpochRecord { epoch, committee: committee_keys.clone(), ..Default::default() })
+        .collect();
+    for record in &stalled {
+        db.save_pending_epoch_record(record)?;
+        pending_written();
+        let vote = record.sign_vote(&third_member);
+        handler.process_gossip(&gossip(vote), third_member.public_key()).await?;
+        assert_eq!(queue.try_recv().ok(), Some(vote), "first vote for epoch {}", record.epoch);
+    }
+    let oldest = stalled[0].sign_vote(&third_member);
+    handler.process_gossip(&gossip(oldest), third_member.public_key()).await?;
+    assert!(queue.try_recv().is_err(), "repeat for the oldest of ten pending epochs: dropped");
+    Ok(())
 }
 
 /// A consensus result or epoch vote whose signer is not the peer that published it is rejected

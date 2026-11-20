@@ -12,10 +12,6 @@ use crate::{
             NODE_TASK_MANAGER,
         },
         utils::{catchup_accumulator, recover_executed_anchor},
-        vote_triage::{
-            backfill_candidate, classify_fetched_record, split_settled_votes, triage_vote,
-            ForeignVote, QueuedVote, VoteAction,
-        },
     },
     primary::PrimaryNode,
     types::{HealthcheckServer, InitialBatchSeq, RunningOutcome, TransitionCtx},
@@ -25,9 +21,7 @@ use consensus_metrics::start_prometheus_server;
 use eyre::eyre;
 use futures::FutureExt;
 use rayls_consensus_primary::{network::PrimaryNetworkHandle, ConsensusBus, NodeMode, QueChannel};
-use rayls_consensus_state_sync::{
-    epoch_committee_valid, epoch_record_valid, spawn_epoch_record_collector,
-};
+use rayls_consensus_state_sync::{epoch_committee_valid, spawn_epoch_record_collector};
 use rayls_consensus_worker::{quorum_waiter::QuorumWaiterTrait, Worker};
 use rayls_execution_evm::{reth_env::RethEnv, system_calls::EpochState};
 use rayls_infrastructure_config::{KeyConfig, LibP2pConfig, NetworkConfig, RaylsDirs};
@@ -35,10 +29,10 @@ use rayls_infrastructure_storage::{
     tables::ConsensusBlocks, EpochStore as _, PENDING_RECORD_LOG_TARGET,
 };
 use rayls_infrastructure_types::{
-    error::HeaderError, gas_accumulator::GasAccumulator, B256Map, BlsAggregateSignature,
-    BlsPublicKey, BlsSignature, CameFrom, ConsensusOutput, Database as ReDatabase, Epoch,
-    EpochCertificate, EpochRecord, EpochVote, Noticer, Notifier, RaylsReceiver, RaylsSender,
-    TaskJoinError, TaskKind, TaskManager, VotesAggregator, B256,
+    gas_accumulator::GasAccumulator, B256Map, BlsAggregateSignature, BlsPublicKey, BlsSignature,
+    CameFrom, ConsensusOutput, Database as ReDatabase, Epoch, EpochCertificate, EpochRecord,
+    EpochVote, Noticer, Notifier, RaylsReceiver, RaylsSender, TaskJoinError, TaskKind, TaskManager,
+    B256,
 };
 use rayls_middleware_processor::{batch::BatchOrdering, reconstruct_batch_digests};
 use std::{
@@ -74,6 +68,21 @@ const CERTIFICATION_RETRY_BACKOFF: Duration = Duration::from_secs(30);
 /// epoch whose committee can never reach quorum again (its members left for good) costs a few
 /// requests per hour instead of a hundred every two minutes, while the retry itself never stops.
 const MAX_CERTIFICATION_RETRY_BACKOFF: Duration = Duration::from_secs(15 * 60);
+
+/// When, after this node certifies a record from its own quorum, it republishes its vote again,
+/// measured from the end of the collection: the moment of quorum when one record is being
+/// certified, which is the normal case. A node that closed the epoch later than the others drops
+/// the votes that reach it before it has written its record, and the nodes that certified stop
+/// republishing; without these copies it would have to fetch the certificate, which it starts at
+/// its first 5 s fallback. Spaced so a node up to about four seconds behind gets a copy after it
+/// has its record and before that fallback; one further behind takes the fetch either way.
+///
+/// One side effect, accepted: a node about four seconds behind can receive some peers' last
+/// copies but not a quorum of them. Its count then moves in its first window, so it wakes the
+/// record collector at its second fallback rather than its first, five seconds later than it
+/// would have without the copies.
+const FINAL_VOTE_REPUBLISH_SCHEDULE: [Duration; 3] =
+    [Duration::from_secs(1), Duration::from_secs(2), Duration::from_secs(4)];
 
 /// Backoff before certification attempt `attempt + 1`, after `attempt` (1-based) failed:
 /// [`CERTIFICATION_RETRY_BACKOFF`] doubled per failed attempt, capped at
@@ -118,18 +127,10 @@ pub(crate) fn forget_certified_attempts(
     attempts.retain(|epoch, _| !certified(*epoch));
 }
 
-/// Time allowed for placing one unknown epoch record digest seen in a vote.
-const DIGEST_RESOLVE_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// How many unknown digests one collection may ask peers about. Beyond this, unknown digests take
-/// the alternate-record path (bounded by `MAX_ALT_RECS`), so a peer flooding fresh digests cannot
-/// turn a collection into an unbounded series of network requests.
-const MAX_DIGEST_RESOLUTIONS: usize = 8;
-
 /// What one turn of the epoch vote collection loop in `certify_pending_epochs` has to act on.
 enum Next {
-    /// A vote to triage, from the backlog or the live queue.
-    Vote(QueuedVote),
+    /// A vote to count, from the backlog or the live queue.
+    Vote(EpochVote),
     /// The periodic fallback is due.
     Fallback,
     /// The vote queue closed.
@@ -1076,61 +1077,83 @@ where
             return false;
         }
         info!(target: "epoch-manager", epoch = epoch_rec.epoch, "fast-path: fetched epoch cert from peer");
-        // Save the peer's record (matching the verified cert), not our local copy.
+        // Save the peer's record (matching the verified cert), not our local copy. A failed
+        // write leaves the row pending, so the record goes to collection like any other.
         if let Err(e) = self.consensus_db.save_epoch_record_with_cert(&peer_rec, &cert) {
             error!(target: "epoch-manager", "failed to save fast-path epoch record and cert: {e}");
+            return false;
         }
         true
     }
 
-    /// Ack and drop queued epoch votes whose record is already certified locally.
-    ///
-    /// The vote queue is only read while a "Collect Epoch Signatures" task runs. On the catch-up
-    /// fast path no such task runs, so that close's votes would stay queued and be read by a
-    /// later collection as votes for a different record. Returns the number of votes dropped.
-    async fn drain_settled_epoch_votes(&self) -> usize {
-        // Only drain when the receiver is free: a running collection owns the queue and drains
-        // it itself.
-        let Some(mut rx) = self.consensus_bus.try_subscribe_epoch_votes() else {
-            return 0;
-        };
-        let (dropped, kept) = split_settled_votes(&mut rx, &self.consensus_db);
-        // Anything we could not settle goes back on the now-empty queue, in order, for the next
-        // collection to read.
-        Self::requeue_epoch_votes(&self.consensus_bus, kept);
-        if dropped > 0 {
-            debug!(target: "epoch-manager", dropped, "dropped settled epoch votes from the queue");
-        }
-        dropped
-    }
-
     /// Put votes taken off the queue but not processed back on it, in order, for the next
-    /// collection. Dropping them would close their senders' channels, which the gossip handler
-    /// logs as an error per vote. A vote that does not fit (queue full) is acked so its sender is
-    /// not penalised for our backlog, and logged, since it is lost to the next collection.
-    fn requeue_epoch_votes(consensus_bus: &ConsensusBus, votes: VecDeque<QueuedVote>) {
-        for item in votes {
-            if let Err(err) = consensus_bus.new_epoch_votes().try_send(item) {
-                let (vote, vote_tx) = match err {
-                    rayls_infrastructure_types::TrySendError::Full(item)
-                    | rayls_infrastructure_types::TrySendError::Closed(item)
-                    | rayls_infrastructure_types::TrySendError::Broadcast(item) => item,
-                };
-                warn!(
-                    target: "epoch-manager",
-                    digest = %vote.epoch_hash,
-                    signer = ?vote.public_key,
-                    "epoch vote queue full; an unsettled vote could not be requeued and is lost to the next collection",
-                );
-                let _ = vote_tx.send(Ok(()));
+    /// collection. A vote that does not fit (queue full) is lost for the rest of the epoch, not
+    /// just the next collection: the gossip handler already holds its signer's admission for the
+    /// epoch, so republished copies are dropped as repeats until the network is rebuilt at the
+    /// next transition, and the record can then only certify through the fetch. The queue holds
+    /// at most a committee's worth of votes per pending epoch, so this should never happen; the
+    /// lot is logged once, not once per vote.
+    fn requeue_epoch_votes(consensus_bus: &ConsensusBus, votes: VecDeque<EpochVote>) {
+        let mut lost = 0usize;
+        let mut first_lost = None;
+        for vote in votes {
+            if consensus_bus.new_epoch_votes().try_send(vote).is_err() {
+                lost += 1;
+                first_lost.get_or_insert((vote.epoch_hash, vote.public_key));
             }
         }
+        if let Some((digest, signer)) = first_lost {
+            warn!(
+                target: "epoch-manager",
+                lost,
+                first_digest = %digest,
+                first_signer = ?signer,
+                "epoch vote queue full; votes could not be requeued and are lost for this epoch, certification falls back to the fetch",
+            );
+        }
+    }
+
+    /// Whether `state`'s epoch is certified on disk by now, by the epoch record collector or a
+    /// peer's certificate landing in the background. Says so, and warns when the certified
+    /// record is not the one this node built: the one sign of a diverged close.
+    fn certification_landed(
+        consensus_db: &DB,
+        consensus_bus: &ConsensusBus,
+        state: &PendingCertification,
+        when: &str,
+    ) -> bool {
+        let Some((record, Some(_))) = consensus_db.get_epoch_by_number(state.record.epoch) else {
+            return false;
+        };
+        consensus_bus.consensus_metrics().epoch_certified_by_fetch.inc();
+        if record.digest() == state.epoch_hash {
+            info!(
+                target: "epoch-manager",
+                epoch = state.record.epoch,
+                when,
+                "epoch cert appeared in the DB",
+            );
+        } else {
+            warn!(
+                target: "epoch-manager",
+                epoch = state.record.epoch,
+                ours = %state.epoch_hash,
+                certified = %record.digest(),
+                when,
+                "the network certified a different record for the epoch; ours is dropped",
+            );
+        }
+        true
     }
 
     /// Aggregate and save the certificate for a record that reached quorum. `false` means the
     /// signatures did not aggregate or verify, or the write failed; the record stays pending and
     /// is retried.
-    fn persist_certificate(consensus_db: &DB, state: &PendingCertification) -> bool {
+    fn persist_certificate(
+        consensus_db: &DB,
+        consensus_bus: &ConsensusBus,
+        state: &PendingCertification,
+    ) -> bool {
         let epoch_hash = state.epoch_hash;
         let Some(cert) = state.certificate() else {
             error!(
@@ -1146,6 +1169,7 @@ where
                     epoch = state.record.epoch,
                     "reached quorum on epoch close for {epoch_hash}",
                 );
+                consensus_bus.consensus_metrics().epoch_certified_by_quorum.inc();
                 true
             }
             Err(err) => {
@@ -1159,117 +1183,6 @@ where
         }
     }
 
-    /// Log a bad epoch vote and answer the gossip handler, so it can penalise the sender.
-    fn reject_epoch_vote(
-        vote: &EpochVote,
-        vote_tx: oneshot::Sender<Result<(), HeaderError>>,
-        err: HeaderError,
-    ) {
-        error!(
-            target: "epoch-manager",
-            ?err,
-            "Received an invalid epoch cert from {} for {}.",
-            vote.public_key,
-            vote.epoch_hash,
-        );
-        if let Err(err) = vote_tx.send(Err(err)) {
-            error!(
-                target: "epoch-manager",
-                ?err,
-                "Failed to send error for invalid epoch cert from {} for {}.",
-                vote.public_key,
-                vote.epoch_hash,
-            );
-        }
-    }
-
-    /// Resolve a foreign epoch record digest seen in a vote by asking a peer for that record.
-    ///
-    /// A record for an epoch *older* than the one being collected is stale gossip, and if we do
-    /// not hold that record it is also a hole in our record chain: save it while we have it.
-    /// A record for the epoch being collected is a genuine competing record that the network
-    /// already certified; it is saved too, which ends our collection for that epoch (the cert
-    /// check sees it) instead of rejecting every honest vote for it until an alternate quorum.
-    /// A digest that cannot be resolved stays `Unknown`.
-    ///
-    /// So this function has a side effect: any certified record it fetches and validates is
-    /// written to `EpochRecords`.
-    async fn resolve_foreign_digest(
-        primary_network: &PrimaryNetworkHandle,
-        consensus_db: &DB,
-        digest: B256,
-        current_epoch: Epoch,
-    ) -> ForeignVote {
-        let Ok((record, cert)) = primary_network.request_epoch_cert(None, Some(digest)).await
-        else {
-            return ForeignVote::Unknown;
-        };
-        if record.digest() != digest {
-            return ForeignVote::Unknown;
-        }
-        // Same validation the collector applies: the record must anchor to the parent we hold.
-        if !epoch_record_valid(consensus_db, record.epoch, &record, &cert) {
-            return ForeignVote::Unknown;
-        }
-        let class = classify_fetched_record(record.epoch, current_epoch);
-        let already_certified =
-            consensus_db.get_epoch_by_number(record.epoch).is_some_and(|(_, cert)| cert.is_some());
-        match class {
-            ForeignVote::Stale { .. } => {
-                if backfill_candidate(record.epoch, current_epoch, already_certified) {
-                    match consensus_db.save_epoch_record_with_cert(&record, &cert) {
-                        Ok(()) => info!(
-                            target: "epoch-manager",
-                            epoch = record.epoch,
-                            "backfilled a missing epoch record found through a stale vote",
-                        ),
-                        Err(err) => error!(
-                            target: "epoch-manager",
-                            ?err,
-                            epoch = record.epoch,
-                            "failed to save a backfilled epoch record",
-                        ),
-                    }
-                }
-            }
-            ForeignVote::Competing if !already_certified => {
-                // The network came to quorum on a record for this epoch that is not the one we
-                // built. Its cert verified above, so adopt it: this also deletes our pending row
-                // and ends our collection for the epoch. Reported as `Adopted` so the vote that
-                // led here, and every later vote for the digest, is acked rather than rejected
-                // as a competing record now that the record is on disk.
-                match consensus_db.save_epoch_record_with_cert(&record, &cert) {
-                    Ok(()) => {
-                        warn!(
-                            target: "epoch-manager",
-                            epoch = record.epoch,
-                            %digest,
-                            "network certified a different record for the epoch being collected; adopted it",
-                        );
-                        info!(
-                            target: PENDING_RECORD_LOG_TARGET,
-                            epoch = record.epoch,
-                            adopted = %digest,
-                            "pending record replaced: the network's certified record was adopted and our pending row removed"
-                        );
-                        return ForeignVote::Adopted;
-                    }
-                    Err(err) => error!(
-                        target: "epoch-manager",
-                        ?err,
-                        epoch = record.epoch,
-                        "failed to save the network's certified record for the epoch being collected",
-                    ),
-                }
-            }
-            // Competing and already certified here: the collector landed the network's record
-            // in the background. `triage_vote` sees it certified on disk and adopts it from the
-            // local lookup, so nothing to do.
-            ForeignVote::Competing | ForeignVote::Adopted | ForeignVote::Unknown => {}
-        }
-        class
-    }
-
     /// Certify every closed epoch whose record was built but has no certificate yet.
     ///
     /// The work set is the `PendingEpochRecord` table: `write_epoch_record` adds the epoch that
@@ -1279,8 +1192,7 @@ where
     ///
     /// All of them are collected by ONE task. The epoch-vote queue is single-consumer
     /// (`QueChannel::subscribe` panics on a second subscriber) and every pending epoch's votes
-    /// arrive on it interleaved, so a task per epoch would crash on subscribe and, even alone,
-    /// would read its siblings' honest votes as competing records and punish their senders.
+    /// arrive on it interleaved, so a task per epoch would crash on subscribe.
     ///
     /// Cheap and a no-op when nothing is pending.
     pub(super) async fn resume_pending_certification(
@@ -1288,9 +1200,6 @@ where
         primary: &PrimaryNode<DB>,
         epoch_task_manager: &TaskManager,
     ) {
-        let certified = |epoch: Epoch| {
-            self.consensus_db.get_epoch_by_number(epoch).is_some_and(|(_, c)| c.is_some())
-        };
         let catching_up = !self.consensus_bus.node_mode().borrow().is_active_cvv();
         let me = self.builder.rayls_infrastructure_config.primary_bls_key();
         let primary_network = primary.network_handle().await;
@@ -1306,11 +1215,16 @@ where
             );
         }
         let mut states: Vec<PendingCertification> = Vec::new();
-        let mut fast_pathed = false;
         for record in pending {
             let epoch = record.epoch;
-            if certified(epoch) {
-                // Certified since the row was written (e.g. by a peer's backfill); tidy up.
+            // Certified since the row was written (e.g. by a peer's backfill): counted and
+            // checked against our record like any other certificate that lands, then tidied up.
+            if Self::certification_landed(
+                &self.consensus_db,
+                &self.consensus_bus,
+                &PendingCertification::new(record.clone()),
+                "before resuming",
+            ) {
                 info!(
                     target: PENDING_RECORD_LOG_TARGET,
                     epoch,
@@ -1344,7 +1258,7 @@ where
                         %epoch_hash,
                         "pending epoch certified from a peer's certificate; no vote collection needed"
                     );
-                    fast_pathed = true;
+                    self.consensus_bus.consensus_metrics().epoch_certified_by_fetch.inc();
                     continue;
                 }
             }
@@ -1395,11 +1309,18 @@ where
         }
 
         if states.is_empty() {
-            if fast_pathed {
-                // The records are certified locally now and no collection task will run, so
-                // nothing would ever read the votes the committee gossiped for them. Drop them
-                // (acked) before they can be read as votes for an alternate record.
-                self.drain_settled_epoch_votes().await;
+            // No collection will run, so nothing would ever read the votes admitted for the
+            // records just certified on the fast path. Drop them, or on a node that never
+            // collects (an observer) they would fill the queue over the epochs. Only when
+            // nothing is pending: a fast-path certificate whose write failed leaves its row,
+            // and its votes must wait for the collection that will pick the row up.
+            if self.consensus_db.pending_epoch_records().is_empty() {
+                if let Some(mut rx) = self.consensus_bus.try_subscribe_epoch_votes() {
+                    let dropped = std::iter::from_fn(|| rx.try_recv().ok()).count();
+                    if dropped > 0 {
+                        debug!(target: "epoch-manager", dropped, "dropped queued epoch votes for records certified without a collection");
+                    }
+                }
             }
             return;
         }
@@ -1461,7 +1382,9 @@ where
         loop {
             // Certified by someone else while we were backing off (a peer's backfill/fetch, or a
             // previous attempt's peer fetch landing late): nothing left to do for those.
-            states.retain(|s| !certified(s.record.epoch));
+            states.retain(|s| {
+                !Self::certification_landed(&consensus_db, &consensus_bus, s, "before collecting")
+            });
             forget_certified_attempts(&certification_attempts, &certified);
             if states.is_empty() {
                 return;
@@ -1485,306 +1408,156 @@ where
                     }
                 }
             }
-            // The newest pending epoch is the reference for placing a digest that matches none
-            // of the records being collected: a record of an older epoch is stale gossip, one
-            // for the newest epoch is a competing record.
-            let reference = &states[states.len() - 1];
-            let reference_hash = reference.epoch_hash;
-            let reference_epoch = reference.record.epoch;
-            let alt_quorum = reference.quorum;
             let by_digest: B256Map<usize> =
                 states.iter().enumerate().map(|(i, s)| (s.epoch_hash, i)).collect();
-            // Committee membership for a vote that matches no pending record: any of theirs.
-            let union_committee: Vec<BlsPublicKey> = states
-                .iter()
-                .flat_map(|s| s.committee.iter().copied())
-                .collect::<HashSet<_>>()
-                .into_iter()
-                .collect();
 
             let mut rx = consensus_bus.new_epoch_votes().subscribe();
-            // Votes left over from closes this node did not collect for are settled: their
-            // record is already certified here, so they can only confuse this collection. Ack
-            // and drop them, and hand the rest to the loop to process before it waits on the
-            // queue.
-            let (settled_votes, mut queued): (usize, VecDeque<QueuedVote>) =
-                split_settled_votes(&mut rx, &consensus_db);
-            if settled_votes > 0 {
-                debug!(
-                    target: "epoch-manager",
-                    settled_votes,
-                    "dropped settled epoch votes before collecting",
-                );
-            }
+            // The gossip handler admits a vote only as a verified committee signature over the
+            // digest of a record this node holds uncertified, one per signer and epoch, so the
+            // queue holds at most a committee's worth per pending epoch. What is queued now is
+            // the backlog: taken in hand so the deadline check below applies to it too.
+            let mut queued: VecDeque<EpochVote> =
+                std::iter::from_fn(|| rx.try_recv().ok()).collect();
             let timeout = Duration::from_secs(5);
             // The fallback below (DB check, own-vote republish, cap then peer fetch) runs on a
             // fixed schedule. A per-recv timeout would be reset by every arriving vote, so a
-            // steady stream of unhelpful votes could postpone it indefinitely.
+            // steady stream of unhelpful votes could postpone it indefinitely; the backlog
+            // check at the top of the loop keeps queued votes from doing the same.
             let mut next_fallback = tokio::time::Instant::now() + timeout;
             let mut timeouts = 0;
-            let mut alt_recs: B256Map<VotesAggregator<EpochVote>> = B256Map::default();
-            // Unplaceable digests already warned about this attempt (once per digest).
-            let mut warned_unresolvable: HashSet<B256> = HashSet::new();
-            // Digests resolved over the network, so one unknown digest costs one request, and a
-            // hard cap on how many such requests one collection may make.
-            let mut resolved_digests: B256Map<ForeignVote> = B256Map::default();
-            let mut resolutions = 0usize;
+            // Votes counted per record at the previous fallback, to tell a close that is still
+            // receiving votes from one whose votes have stopped coming, and whether the record
+            // collector was already woken for the record this attempt.
+            let mut counted_at_last_fallback: Vec<(u64, bool)> =
+                states.iter().map(|s| (s.signed_authorities.len(), false)).collect();
             loop {
-                // Break promptly when the consumer phase is signalled, rather than only
-                // noticing at the fallback deadline. `biased` so shutdown wins over a vote
-                // arriving.
-                let next = if let Some(queued_vote) = queued.pop_front() {
-                    // Votes in hand must not outrank the shutdown the transition waits on.
-                    if vote_shutdown.noticed() {
-                        let _ = queued_vote.1.send(Ok(()));
-                        break;
-                    }
-                    Next::Vote(queued_vote)
+                // With votes in hand, the shutdown notice and then the fallback deadline are
+                // checked before each one: the transition must not wait behind a backlog, and
+                // a backlog delays each fallback (the DB check and the republish, and the peer
+                // fetch after the thirteenth) by one vote, not by its length. With none in
+                // hand, the `select!` below waits for whichever comes first, `biased` so a
+                // shutdown wins over a vote arriving.
+                let next = if !queued.is_empty() && vote_shutdown.noticed() {
+                    break;
+                } else if !queued.is_empty() && tokio::time::Instant::now() >= next_fallback {
+                    next_fallback = tokio::time::Instant::now() + timeout;
+                    Next::Fallback
                 } else {
-                    tokio::select! {
-                        biased;
-                        _ = &vote_shutdown => break,
-                        _ = tokio::time::sleep_until(next_fallback) => {
-                            next_fallback = tokio::time::Instant::now() + timeout;
-                            Next::Fallback
-                        }
-                        maybe = rx.recv() => match maybe {
-                            Some(vote) => Next::Vote(vote),
-                            None => Next::Closed,
+                    match queued.pop_front() {
+                        Some(queued_vote) => Next::Vote(queued_vote),
+                        None => tokio::select! {
+                            biased;
+                            _ = &vote_shutdown => break,
+                            _ = tokio::time::sleep_until(next_fallback) => {
+                                next_fallback = tokio::time::Instant::now() + timeout;
+                                Next::Fallback
+                            }
+                            maybe = rx.recv() => match maybe {
+                                Some(vote) => Next::Vote(vote),
+                                None => Next::Closed,
+                            },
                         },
                     }
                 };
                 match next {
-                    Next::Vote((vote, vote_tx)) => {
-                        // A vote for one of the records being collected: count it there.
-                        if let Some(&i) = by_digest.get(&vote.epoch_hash) {
-                            let state = &mut states[i];
-                            if triage_vote(
-                                &vote,
-                                state.epoch_hash,
-                                state.record.epoch,
-                                &state.committee,
-                                None,
-                                None,
-                            ) == VoteAction::Count
-                            {
-                                let _ = vote_tx.send(Ok(())); // If we lost this channel somehow then no big deal.
-                                if state.done {
-                                    // A straggler for a record we already certified.
-                                    continue;
-                                }
-                                state.count(&vote);
-                                // Persist the moment quorum is reached: a 2f+1 cert is a valid
-                                // cert, and waiting for stragglers would hold this record's cert
-                                // hostage to the slowest of the others.
-                                if state.reached_quorum()
-                                    && Self::persist_certificate(&consensus_db, state)
-                                {
-                                    state.done = true;
-                                }
-                                if states.iter().all(|s| s.done) {
-                                    break;
-                                }
-                            } else {
-                                // Send an error back to punish the peer that sent a bad epoch
-                                // vote.
-                                let err = if state.committee.contains(&vote.public_key) {
-                                    HeaderError::UnknownAuthority(format!(
-                                        "{} not in the committee for epoch {}",
-                                        vote.public_key, state.epoch_hash
-                                    ))
-                                } else {
-                                    HeaderError::PeerNotAuthor
-                                };
-                                Self::reject_epoch_vote(&vote, vote_tx, err);
-                            }
+                    Next::Vote(vote) => {
+                        // Admission guarantees a committee signature over the digest of a
+                        // record this node holds uncertified, so the only question is which.
+                        let Some(&i) = by_digest.get(&vote.epoch_hash) else {
+                            // Not one of the records this collection started with, so it was
+                            // certified since: a new pending row is only written after this
+                            // task has been drained at the transition. Nothing to do.
+                            continue;
+                        };
+                        let state = &mut states[i];
+                        // Done, or a signer already counted (a republished copy that got past
+                        // the handler's dedup, which is rebuilt with the network at each
+                        // transition): nothing to add.
+                        if state.done || !state.committee_keys.contains(&vote.public_key) {
                             continue;
                         }
-
-                        // Place a foreign digest before it can feed any aggregator: stale gossip
-                        // from an earlier close must not look like a competing record.
-                        let local_record = |digest| {
-                            consensus_db
-                                .get_epoch_by_hash(digest)
-                                .map(|(rec, cert)| (rec.epoch, cert.is_some()))
-                        };
-                        let mut action = triage_vote(
-                            &vote,
-                            reference_hash,
-                            reference_epoch,
-                            &union_committee,
-                            local_record(vote.epoch_hash),
-                            resolved_digests.get(&vote.epoch_hash).copied(),
-                        );
-                        if action == VoteAction::NeedsResolve {
-                            // Bounded on every axis: one request per digest, a few per
-                            // collection, a short timeout each, and a shutdown always wins.
-                            let resolved = if resolutions >= MAX_DIGEST_RESOLUTIONS {
-                                ForeignVote::Unknown
-                            } else {
-                                resolutions += 1;
-                                tokio::select! {
-                                    biased;
-                                    _ = &vote_shutdown => {
-                                        let _ = vote_tx.send(Ok(()));
-                                        break;
-                                    }
-                                    resolved = tokio::time::timeout(
-                                        DIGEST_RESOLVE_TIMEOUT,
-                                        Self::resolve_foreign_digest(
-                                            &primary_network,
-                                            &consensus_db,
-                                            vote.epoch_hash,
-                                            reference_epoch,
-                                        ),
-                                    ) => resolved.unwrap_or(ForeignVote::Unknown),
-                                }
-                            };
-                            resolved_digests.insert(vote.epoch_hash, resolved);
-                            action = triage_vote(
-                                &vote,
-                                reference_hash,
-                                reference_epoch,
-                                &union_committee,
-                                local_record(vote.epoch_hash),
-                                Some(resolved),
+                        // The handler verified it, so this is a second verify per vote, at most
+                        // a committee's worth per close: cheap insurance, since a bad signature
+                        // here would make the aggregate fail and the record never certify.
+                        if !vote.check_signature() {
+                            warn!(
+                                target: "epoch-manager",
+                                signer = ?vote.public_key,
+                                digest = %vote.epoch_hash,
+                                "a queued epoch vote failed signature verification; ignoring it",
                             );
+                            continue;
                         }
-
-                        match action {
-                            // `Count` cannot happen here (the digest matched no pending record),
-                            // but treat it like honest gossip rather than punishing anyone.
-                            VoteAction::Count => {
-                                let _ = vote_tx.send(Ok(()));
-                            }
-                            VoteAction::IgnoreStale { epoch: stale_epoch } => {
-                                debug!(
-                                    target: "epoch-manager",
-                                    stale_epoch,
-                                    digest = %vote.epoch_hash,
-                                    "ignoring a stale epoch vote from an earlier close",
-                                );
-                                // Honest gossip: ack it so the peer is not punished.
-                                let _ = vote_tx.send(Ok(()));
-                            }
-                            VoteAction::Adopted => {
-                                // The network's certified record for the epoch being collected,
-                                // not ours: adopted while resolving this digest, or landed by
-                                // the record collector. The vote is honest, and the collection
-                                // for that epoch is over now that its certificate is on disk.
-                                let _ = vote_tx.send(Ok(()));
-                                for state in states
-                                    .iter_mut()
-                                    .filter(|s| !s.done && s.record.epoch == reference_epoch)
-                                {
-                                    info!(
-                                        target: PENDING_RECORD_LOG_TARGET,
-                                        epoch = reference_epoch,
-                                        ours = %state.epoch_hash,
-                                        adopted = %vote.epoch_hash,
-                                        "collection ended: the network certified a different record for the epoch"
-                                    );
-                                    state.done = true;
-                                }
-                                if states.iter().all(|s| s.done) {
-                                    break;
-                                }
-                            }
-                            VoteAction::Alternate
-                            | VoteAction::Unresolvable
-                            | VoteAction::NeedsResolve => {
-                                // `NeedsResolve` cannot survive the resolution above; if it
-                                // did, nothing was proven, so treat it as unresolvable.
-                                let competing = action == VoteAction::Alternate;
-                                // track votes on alternate epoch records per-validator;
-                                // break on quorum. per-validator tracking prevents inflation.
-                                const MAX_ALT_RECS: usize = 100;
-                                let reached_alt_quorum = if alt_recs.len() < MAX_ALT_RECS
-                                    || alt_recs.contains_key(&vote.epoch_hash)
-                                {
-                                    let agg = alt_recs
-                                        .entry(vote.epoch_hash)
-                                        .or_insert_with(|| VotesAggregator::new(alt_quorum));
-                                    agg.append(vote, 1).unwrap_or(false)
-                                } else {
-                                    false
-                                };
-                                if reached_alt_quorum {
-                                    if competing {
-                                        error!(
-                                            target: "epoch-manager",
-                                            "Reached quorum on epoch record {} instead of {}.",
-                                            vote.epoch_hash,
-                                            reference_hash,
-                                        );
-                                        if let Err(err) =
-                                            vote_tx.send(Err(HeaderError::InvalidHeaderDigest))
-                                        {
-                                            error!(
-                                                target: "epoch-manager",
-                                                ?err,
-                                                "Failed to send error for invalid epoch record {} from {}.",
-                                                vote.epoch_hash,
-                                                vote.public_key,
-                                            );
-                                        }
-                                        break;
-                                    }
-                                    // Not a fork signal we can act on: a quorum of committee
-                                    // members signing a digest nobody can place is what their
-                                    // re-votes for an uncertified earlier epoch look like to a
-                                    // node that never built that record. Keep collecting; the
-                                    // fetch fallback covers a real competing record anyway.
-                                    if warned_unresolvable.insert(vote.epoch_hash) {
-                                        warn!(
-                                            target: "epoch-manager",
-                                            digest = %vote.epoch_hash,
-                                            "a quorum of committee members signed an epoch record digest this node cannot place",
-                                        );
-                                    }
-                                }
-                                if competing {
-                                    Self::reject_epoch_vote(
-                                        &vote,
-                                        vote_tx,
-                                        HeaderError::InvalidHeaderDigest,
-                                    );
-                                } else {
-                                    // A valid committee signature over a digest nobody can
-                                    // explain is not evidence of misbehaviour: ack it so the
-                                    // sender is not punished (#142).
-                                    let _ = vote_tx.send(Ok(()));
-                                }
-                            }
-                            VoteAction::Reject => {
-                                Self::reject_epoch_vote(
-                                    &vote,
-                                    vote_tx,
-                                    HeaderError::InvalidHeaderDigest,
-                                );
-                            }
+                        state.count(&vote);
+                        // Persist the moment quorum is reached: a 2f+1 cert is a valid cert,
+                        // and waiting for stragglers would hold this record's cert hostage to
+                        // the slowest of the others.
+                        if state.reached_quorum()
+                            && Self::persist_certificate(&consensus_db, &consensus_bus, state)
+                        {
+                            state.done = true;
+                        }
+                        if states.iter().all(|s| s.done) {
+                            break;
                         }
                     }
                     Next::Closed => break, // channel issues...
                     Next::Fallback => {
                         // Deadline reached, whether or not votes kept arriving.
                         // Failed after a minute: break and try to request the certs instead.
-                        // (Shutdown is handled by the select arm above, not polled here.)
+                        // (Shutdown is checked at the top of the loop, not polled here.)
                         if timeouts > 12 {
                             break;
                         }
                         timeouts += 1;
 
-                        // The epoch record collector, or a peer's record adopted while resolving
-                        // a digest, may have certified some of these in the background. Those
-                        // are done; the others keep collecting undisturbed.
+                        // No vote counted since the previous fallback: the votes this record
+                        // still needs went by before this node had its record (it closed after
+                        // those peers, and after the copies they send in the 4 s following
+                        // their quorum). Wake the
+                        // epoch record collector now, so the certificate comes from a peer
+                        // within seconds instead of after the whole fallback schedule. A record
+                        // whose count moved in the last 5 s is a slow close, not a missed one:
+                        // it keeps collecting, since the wake would start the collector's retry
+                        // loop on every member at once while no peer has a certificate yet.
+                        // A node that missed every vote wakes at the first fallback, one that
+                        // closed in the middle of the order and got only the later ones at the
+                        // second. The first node to close also wakes at the first fallback when
+                        // its peers are more than 5 s behind, since it too has only its own vote;
+                        // that costs one retry loop of peer requests until they certify.
+                        // Once per record and attempt: the collector's own reset lowers the
+                        // watch again, so repeating the wake would cancel its retry loop and
+                        // restart its walk at every fallback.
+                        for (state, (counted, woken)) in
+                            states.iter().zip(counted_at_last_fallback.iter_mut())
+                        {
+                            let now = state.signed_authorities.len();
+                            let stalled = !state.done && now == *counted && !*woken;
+                            *counted = now;
+                            if !stalled {
+                                continue;
+                            }
+                            *woken = true;
+                            let epoch = state.record.epoch;
+                            consensus_bus.requested_missing_epoch().send_if_modified(|current| {
+                                if epoch > *current {
+                                    *current = epoch;
+                                    true
+                                } else {
+                                    false
+                                }
+                            });
+                        }
+
+                        // The epoch record collector may have certified some of these in the
+                        // background. Those are done; the others keep collecting undisturbed.
                         for state in states.iter_mut().filter(|s| !s.done) {
-                            if certified(state.record.epoch) {
-                                info!(
-                                    target: "epoch-manager",
-                                    epoch = state.record.epoch,
-                                    "epoch cert appeared in the DB during vote collection",
-                                );
+                            if Self::certification_landed(
+                                &consensus_db,
+                                &consensus_bus,
+                                state,
+                                "during vote collection",
+                            ) {
                                 state.done = true;
                             }
                         }
@@ -1807,8 +1580,47 @@ where
                     }
                 }
             }
-            // Votes taken off the queue but not processed (shutdown, abort, or everything done)
-            // go back for the next collection; dropping them would close their senders' channels.
+            // Every record is done. Peers that closed the epoch after this node dropped the
+            // votes that went by before they had their record, and nodes that certified no
+            // longer republish at the fallback, so send ours again on a short schedule for each
+            // record this node
+            // certified by quorum: a late peer then counts a copy instead of fetching the
+            // certificate. Shutdown cuts the schedule short between copies; a publish already
+            // under way runs to the end, as at the fallback republish. Runs only when every
+            // record is done: with several epochs pending (a long stall), a record that
+            // certified while a sibling did not gets no copies, and its late peers fetch.
+            if states.iter().all(|s| s.done) && !vote_shutdown.noticed() {
+                let ours: Vec<EpochVote> = states
+                    .iter()
+                    .filter(|s| s.reached_quorum())
+                    .filter_map(|s| s.my_vote)
+                    .collect();
+                if !ours.is_empty() {
+                    let done_at = tokio::time::Instant::now();
+                    for after in FINAL_VOTE_REPUBLISH_SCHEDULE {
+                        tokio::select! {
+                            biased;
+                            _ = &vote_shutdown => break,
+                            _ = tokio::time::sleep_until(done_at + after) => {}
+                        }
+                        for vote in &ours {
+                            if let Err(err) = primary_network.publish_epoch_vote(*vote).await {
+                                error!(
+                                    target: "epoch-manager",
+                                    ?err,
+                                    "failed to republish epoch vote after quorum for {}",
+                                    vote.epoch_hash,
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+            // Votes taken off the queue but not processed go back for the next collection,
+            // unless every record is done: then they can only be for certified records.
+            if states.iter().all(|s| s.done) {
+                queued.clear();
+            }
             Self::requeue_epoch_votes(&consensus_bus, queued);
             // Release the single-consumer queue while fetching and backing off.
             drop(rx);
@@ -1817,11 +1629,18 @@ where
             // reached quorum but could not be saved, and keep everything still uncertified.
             let mut remaining = Vec::with_capacity(states.len());
             for state in states.drain(..) {
-                if state.done || certified(state.record.epoch) {
+                if state.done
+                    || Self::certification_landed(
+                        &consensus_db,
+                        &consensus_bus,
+                        &state,
+                        "after the collection",
+                    )
+                {
                     continue;
                 }
                 if state.reached_quorum() {
-                    if Self::persist_certificate(&consensus_db, &state) {
+                    if Self::persist_certificate(&consensus_db, &consensus_bus, &state) {
                         continue;
                     }
                     // Keep it: the signatures stay counted and the write is retried next round.
@@ -1859,15 +1678,12 @@ where
             'retry: loop {
                 attempts += 1;
                 states.retain(|s| {
-                    let done = certified(s.record.epoch);
-                    if done {
-                        info!(
-                            target: "epoch-manager",
-                            epoch = s.record.epoch,
-                            "epoch record appeared in the DB while retrying the fetch",
-                        );
-                    }
-                    !done
+                    !Self::certification_landed(
+                        &consensus_db,
+                        &consensus_bus,
+                        s,
+                        "while retrying the fetch",
+                    )
                 });
                 if states.is_empty() {
                     return;
@@ -1877,6 +1693,7 @@ where
                     if Self::fetch_pending_cert_from_peers(
                         &primary_network,
                         &consensus_db,
+                        &consensus_bus,
                         &states[i],
                     )
                     .await
@@ -1933,6 +1750,7 @@ where
     async fn fetch_pending_cert_from_peers(
         primary_network: &PrimaryNetworkHandle,
         consensus_db: &DB,
+        consensus_bus: &ConsensusBus,
         state: &PendingCertification,
     ) -> bool {
         let epoch = state.record.epoch;
@@ -1967,20 +1785,26 @@ where
                     "retrieved cert for epoch {new_epoch_hash} from a peer",
                 );
             } else {
-                // Humm, we got another epoch record than the one we expected...
-                // The network came to quorum on this one so lets go with it...
+                // The network came to quorum on a record this node did not build; it is the
+                // certified one, so adopt it.
                 warn!(
                     target: "epoch-manager",
-                    "Received wrong epoch record: {new_epoch_hash}, expected {epoch_hash}",
+                    epoch,
+                    ours = %epoch_hash,
+                    certified = %new_epoch_hash,
+                    "the network certified a different record for the epoch; ours is dropped",
                 );
             }
+            // A failed write leaves the row pending for the next attempt.
             if let Err(err) = consensus_db.save_epoch_record_with_cert(&new_epoch_rec, &cert) {
                 error!(
                     target: "epoch-manager",
                     ?err,
                     "Failed to insert epoch record and cert for {new_epoch_hash}",
                 );
+                return false;
             }
+            consensus_bus.consensus_metrics().epoch_certified_by_fetch.inc();
             return true;
         }
         false

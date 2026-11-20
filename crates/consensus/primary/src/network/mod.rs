@@ -28,9 +28,9 @@ use rayls_infrastructure_network_types::{
 };
 use rayls_infrastructure_storage::PayloadStore;
 use rayls_infrastructure_types::{
-    encode, AuthorityIdentifier, BlockHash, BlsPublicKey, BlsSignature, Certificate,
-    CertificateDigest, ConsensusHeader, Database, Epoch, EpochCertificate, EpochRecord, EpochVote,
-    Header, RaylsReceiver, RaylsSender, Round, TaskKind, TaskSpawner, Vote,
+    encode, error::HeaderError, AuthorityIdentifier, BlockHash, BlsPublicKey, BlsSignature,
+    Certificate, CertificateDigest, ConsensusHeader, Database, Epoch, EpochCertificate,
+    EpochRecord, EpochVote, Header, RaylsReceiver, RaylsSender, Round, TaskKind, TaskSpawner, Vote,
 };
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
 use tokio::sync::{mpsc, oneshot};
@@ -534,12 +534,15 @@ where
         self.task_spawner.spawn_task(task_name, async move {
             if let Err(ref e) = request_handler.process_gossip(&msg, gossip_source).await {
                 // pending certificates are expected when they arrive before parents; a signer
-                // mismatch is one line per forged message from a publisher that may be a
-                // penalty-exempt committee member, so it must not be able to fill the log
+                // mismatch, and an epoch vote from a signer outside the record's committee
+                // (refused before the per-signer dedup), are one line per forged message from a
+                // publisher that may be a penalty-exempt committee member, so they must not be
+                // able to fill the log. The penalty below still applies.
                 if matches!(
                     e,
                     PrimaryNetworkError::Certificate(CertManagerError::Pending(_))
                         | PrimaryNetworkError::GossipAuthorMismatch { .. }
+                        | PrimaryNetworkError::InvalidHeader(HeaderError::UnknownAuthority(_))
                 ) {
                     debug!(target: "primary::network", ?e, "process_gossip");
                 } else {
