@@ -22,9 +22,11 @@ use tracing::{debug, error, info, trace, warn};
 mod epoch;
 pub use epoch::{epoch_committee_valid, epoch_record_valid, spawn_epoch_record_collector};
 mod consensus;
+mod row_cleared;
 
 use consensus::spawn_track_recent_consensus;
 pub use consensus::store_consensus_header_in_cache;
+use row_cleared::RowCleared;
 
 /// Populate startup-relevant watch channels on `ConsensusBus` from the DB.
 /// Must run before any consensus task spawns.
@@ -147,15 +149,15 @@ pub fn spawn_state_sync<DB: Database>(
         NodeMode::CvvInactive | NodeMode::Observer => {
             // If we are not an active CVV then follow latest consensus from peers.
             let (config_clone, consensus_bus_clone) = (config.clone(), consensus_bus.clone());
-            // The forward streamer fills gaps by number directly from peers, so both tasks need a
-            // handle.
-            let network_clone = network.clone();
+            // The streamer tells the walk when it clears a stored row.
+            let row_cleared = RowCleared::default();
+            let walk_row_cleared = row_cleared.clone();
             task_manager.spawn_task(
                 "state sync: track latest consensus header from peers",
                 monitored_future!(
                     async move {
                         info!(target: "rayls-consensus-state-sync", "Starting state sync: track latest consensus header from peers");
-                        if let Err(e) = spawn_track_recent_consensus(config_clone, consensus_bus_clone, network_clone).await {
+                        if let Err(e) = spawn_track_recent_consensus(config_clone, consensus_bus_clone, network, walk_row_cleared).await {
                             error!(target: "rayls-consensus-state-sync", "Error tracking latest consensus headers: {e}");
                         }
                     },
@@ -167,7 +169,7 @@ pub fn spawn_state_sync<DB: Database>(
                 monitored_future!(
                     async move {
                         info!(target: "rayls-consensus-state-sync", "Starting state sync: stream consensus header from peers");
-                        if let Err(e) = spawn_stream_consensus_headers(config, consensus_bus, network, last_streamed_number).await {
+                        if let Err(e) = spawn_stream_consensus_headers(config, consensus_bus, last_streamed_number, row_cleared).await {
                             error!(target: "rayls-consensus-state-sync", "Error streaming consensus headers: {e}");
                         }
                     },
@@ -496,8 +498,8 @@ const CATCH_UP_RETRY_INTERVAL_MS: u64 = 500;
 async fn spawn_stream_consensus_headers<DB: Database>(
     config: ConsensusConfig<DB>,
     consensus_bus: ConsensusBus,
-    network: PrimaryNetworkHandle,
     last_streamed_number: u64,
+    row_cleared: RowCleared,
 ) -> eyre::Result<()> {
     let rx_shutdown = config.shutdown().subscribe();
 
@@ -539,9 +541,9 @@ async fn spawn_stream_consensus_headers<DB: Database>(
 
                 if header.number > last_consensus_height {
                     pending_catch_up_target = attempt_catch_up(
-                        &config, &consensus_bus, &network,
+                        &config, &consensus_bus,
                         &mut last_consensus_header, &mut last_consensus_height,
-                        header, "forward streamer",
+                        header, "forward streamer", &row_cleared,
                     ).await;
                 }
             }
@@ -552,9 +554,9 @@ async fn spawn_stream_consensus_headers<DB: Database>(
                 if let Some(target) = pending_catch_up_target.clone() {
                     if target.number > last_consensus_height {
                         pending_catch_up_target = attempt_catch_up(
-                            &config, &consensus_bus, &network,
+                            &config, &consensus_bus,
                             &mut last_consensus_header, &mut last_consensus_height,
-                            target, "forward streamer retry",
+                            target, "forward streamer retry", &row_cleared,
                         ).await;
                     } else {
                         pending_catch_up_target = None;
@@ -582,18 +584,18 @@ async fn spawn_stream_consensus_headers<DB: Database>(
 async fn attempt_catch_up<DB: Database>(
     config: &ConsensusConfig<DB>,
     consensus_bus: &ConsensusBus,
-    network: &PrimaryNetworkHandle,
     last_header: &mut ConsensusHeader,
     last_height: &mut u64,
     target: ConsensusHeader,
     label: &str,
+    row_cleared: &RowCleared,
 ) -> Option<ConsensusHeader> {
     match catch_up_consensus_from_to(
         config,
         consensus_bus,
-        network,
         last_header.clone(),
         target.clone(),
+        row_cleared,
     )
     .await
     {
@@ -632,16 +634,17 @@ async fn attempt_catch_up<DB: Database>(
 }
 
 /// Applies consensus output from (exclusive) to max_consensus_height (inclusive).
-/// Returns the last applied ConsensusHeader.
+/// Returns the last applied ConsensusHeader, or the executed anchor when `from` proves stale.
 async fn catch_up_consensus_from_to<DB: Database>(
     config: &ConsensusConfig<DB>,
     consensus_bus: &ConsensusBus,
-    network: &PrimaryNetworkHandle,
     from: ConsensusHeader,
     max_consensus: ConsensusHeader,
+    row_cleared: &RowCleared,
 ) -> eyre::Result<ConsensusHeader> {
-    // `from` is the streamer's anchor, seeded from the executed-anchor SSOT and only ever advanced
-    // to digest-verified headers, so its digest is the true parent of header `from.number + 1`.
+    // `from` is the streamer's anchor, seeded from the executed-anchor SSOT and advanced to headers
+    // that linked in an earlier pass. A stored row it advanced onto can still turn out stale; the
+    // mismatch branch below rewinds the anchor when its own child does not link.
     let mut last_parent = from.digest();
 
     let last_consensus_height = from.number;
@@ -663,41 +666,33 @@ async fn catch_up_consensus_from_to<DB: Database>(
     let epoch = config.epoch();
     let mut result_header = from;
     let mut streamed = 0u64;
+    // Only stored rows and the target are streamed. The streamer never asks a peer for a header by
+    // number: such a reply proves only its number, and any peer can make one up. The backwards
+    // walk hash-links and BLS-verifies every header it stores, but a stored row can also predate
+    // this process, for example one an older version cached unchecked, so the subscriber still
+    // verifies every header.
     for number in last_consensus_height + 1..=max_consensus_height {
-        // A by-number gap fetch is unverified (only the number is checked), so it is cached only
-        // after the digest-chain guard below links it onto the verified parent; caching earlier
-        // poisons every retry until the backwards walk overwrites it.
-        let mut from_gap_fetch = false;
         let consensus_header = if number == max_consensus_height {
             max_consensus.clone()
         } else if let Some(block) = db.get_consensus_by_number(number) {
             block
         } else {
-            // The backwards walk has not refilled this number yet; fetch it by number rather than
-            // wedge behind one slow hash. Safety rests on the later gates (the digest-chain guard
-            // below, and the subscriber's BLS re-verify before execution), not this fetch.
-            match network.request_consensus(Some(number), None).await {
-                Ok(header) => {
-                    from_gap_fetch = true;
-                    header
-                }
-                Err(_) => {
-                    warn!(
-                        target: "rayls-consensus-state-sync",
-                        number,
-                        streamed,
-                        remaining = max_consensus_height - number + 1,
-                        "catch_up_from_to: header not in DB and by-number fetch failed, returning early (awaiting backwards walk)"
-                    );
-                    return Ok(result_header);
-                }
-            }
+            // The walk has not stored this number yet. Return what streamed so far; the retry
+            // resumes from here once the walk has come down.
+            debug!(
+                target: "rayls-consensus-state-sync",
+                number,
+                streamed,
+                remaining = max_consensus_height - number + 1,
+                "catch_up_from_to: header not stored yet, returning early (awaiting backwards walk)"
+            );
+            return Ok(result_header);
         };
         // A streamed output whose subdag belongs to a CLOSED epoch is a post-boundary leak: this
         // node has already transitioned past it, so re-executing it forks the chain (the live
         // subscriber's cut and the DB-replay path in `collect_replayable_headers` both drop it).
-        // The forward streamer fetches by number and only chains by digest, so without this guard a
-        // lagging node keeps replaying epoch-tail stragglers into the new epoch. Halt here and let
+        // The forward streamer only chains by digest, so without this guard a lagging node keeps
+        // replaying epoch-tail stragglers into the new epoch. Halt here and let
         // the streamer resume from the executed anchor for the current epoch.
         let leader_epoch = consensus_header.sub_dag.leader_epoch();
         if leader_epoch < epoch {
@@ -720,11 +715,11 @@ async fn catch_up_consensus_from_to<DB: Database>(
         last_parent =
             ConsensusHeader::digest_from_parts(parent_hash, &consensus_header.sub_dag, number);
         if last_parent != consensus_header.digest() {
-            // `number` does not chain onto the row at `number - 1`. A gap fetch proves only the
-            // reply's parent_hash and number, not its sub_dag, so a bad peer can plant a row the
-            // next real header cannot link to; drop that poisoned non-canonical row to force a
-            // re-fetch. Never drop a canonical row: a mismatch there is a real fork (needs an
-            // operator restore), and removing history the walk cannot rebuild loses state silently.
+            // `number` does not chain onto the header at `number - 1`, so the row at `number - 1`
+            // may be the bad one (a stale row from another fork): a non-canonical cache row is
+            // removed to force the walk to re-fetch it. Never drop a canonical row: a mismatch
+            // there is a real fork (needs an operator restore), and removing history the walk
+            // cannot rebuild loses state silently.
             let poisoned_parent_number = number - 1;
             if poisoned_parent_number > last_consensus_height
                 && db
@@ -739,6 +734,7 @@ async fn catch_up_consensus_from_to<DB: Database>(
                     let _ = txn.remove::<ConsensusBlockNumbersByDigest>(&parent_hash);
                     Ok(())
                 });
+                row_cleared.mark();
             }
             warn!(
                 target: "rayls-consensus-state-sync",
@@ -747,12 +743,31 @@ async fn catch_up_consensus_from_to<DB: Database>(
                 actual = ?consensus_header.digest(),
                 "consensus header digest mismatch - retrying (a non-canonical poison row is cleared to self-heal; a canonical fork needs a DB restore)"
             );
+            // The anchor's own child does not link onto it. A canonical anchor stays: the child is
+            // a stale row or a real fork. Any other anchor came from an earlier pass that stopped
+            // on a stored row, and that row may be stale (another fork's row the walk has since
+            // replaced). Every later pass would chain onto it and fail here until a restart, so
+            // rewind to the executed anchor as a restart does, and let the next pass re-read the
+            // repaired rows.
+            if number == last_consensus_height + 1 {
+                let anchor_is_canonical = db
+                    .get::<ConsensusBlocks>(&last_consensus_height)
+                    .ok()
+                    .flatten()
+                    .map(|h| h.digest())
+                    == Some(parent_hash);
+                let executed = consensus_bus.executed_anchor().borrow().clone();
+                if !anchor_is_canonical && executed.number < last_consensus_height {
+                    warn!(
+                        target: "rayls-consensus-state-sync",
+                        anchor = last_consensus_height,
+                        executed = executed.number,
+                        "catch_up_from_to: the anchor's child does not link onto it, rewinding to the executed anchor"
+                    );
+                    return Ok(executed);
+                }
+            }
             return Err(eyre::eyre!("consensus header digest mismatch at number {number}"));
-        }
-
-        // Guard passed; persist a gap-fetched header now (DB-hit and max_consensus are stored).
-        if from_gap_fetch {
-            store_consensus_header_in_cache(db, &consensus_header);
         }
 
         let base_execution_block = consensus_header.sub_dag.leader.header().latest_execution_block;
@@ -768,15 +783,15 @@ async fn catch_up_consensus_from_to<DB: Database>(
                 "catch_up_from_to: streaming progress"
             );
         }
-        // Gate streaming on execution so we never outrun it and miss a fork. Bounded so a target
-        // that never executes errors out instead of parking forever; the error is surfaced to
-        // retry.
+        // Gate streaming on execution so we never outrun it and miss a fork. Bounded so a
+        // target that never executes errors out instead of parking forever; the error is
+        // surfaced to retry.
         if let Err(wait_err) = consensus_bus
             .wait_for_execution_bounded(base_execution_block, EXECUTION_STALL_TIMEOUT)
             .await
         {
-            // A genuine `Forked` recurs and needs an operator DB restore: catch-up cannot rebuild
-            // forked committed history.
+            // A genuine `Forked` recurs and needs an operator DB restore: catch-up cannot
+            // rebuild forked committed history.
             let recent = consensus_bus.recently_executed_blocks().borrow();
             let recent_oldest = recent.oldest_block_number();
             let recent_latest = recent.latest_block_num_hash();
