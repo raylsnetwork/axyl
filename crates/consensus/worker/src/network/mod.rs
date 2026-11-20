@@ -4,8 +4,8 @@ use crate::batch_fetcher::BatchFetcher;
 use error::WorkerNetworkError;
 use futures::{stream::FuturesUnordered, StreamExt};
 use handler::RequestHandler;
+pub use message::{admission_classes, WorkerRequest, WorkerResponse};
 use message::{WorkerGossip, WorkerRPCError};
-pub use message::{WorkerRequest, WorkerResponse};
 use rayls_consensus_network::{
     error::NetworkError,
     types::{NetworkEvent, NetworkHandle, NetworkResult},
@@ -390,7 +390,7 @@ where
     /// Dispatch one network event to a task so the event loop never blocks on handling.
     fn process_network_event(&self, event: NetworkEvent<Req, Res>) {
         match event {
-            NetworkEvent::Request { peer, request, channel, cancel } => match request {
+            NetworkEvent::Request { peer, request, channel, cancel, permits: _ } => match request {
                 WorkerRequest::ReportBatch { sealed_batch } => {
                     self.process_report_batch(peer, sealed_batch, channel, cancel);
                 }

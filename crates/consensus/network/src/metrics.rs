@@ -92,6 +92,9 @@ pub struct NetworkMetrics {
     /// is dropping its new committee's traffic; on a node under attack it counts the forged
     /// messages that reached it.
     pub gossip_ignored: IntCounterVec,
+    /// Requests refused by admission because too many jobs were running, by class, by the limit
+    /// that refused them, and by swarm (primary/worker).
+    pub request_admission_busy: IntCounterVec,
 }
 
 impl NetworkMetrics {
@@ -221,6 +224,12 @@ impl NetworkMetrics {
                 "gossip_ignored",
                 "Gossip dropped without forwarding or penalty: author not on the topic's publisher list or unbound",
                 &["topic", "kad_type"],
+                registry
+            )?,
+            request_admission_busy: register_int_counter_vec_with_registry!(
+                "request_admission_busy",
+                "Requests refused by admission because too many jobs were running",
+                &["class", "limit", "swarm"],
                 registry
             )?,
         })

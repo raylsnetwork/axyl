@@ -4,7 +4,10 @@ use rayls_consensus_network::{
     types::{circuit_relay_peer_id, is_dnsaddr, NetworkHandle},
     ConsensusNetwork, NetworkMetrics, RLMessage,
 };
-use rayls_consensus_primary::{network::PrimaryNetworkHandle, ConsensusBus, NodeMode};
+use rayls_consensus_primary::{
+    network::{admission_classes, PrimaryNetworkHandle},
+    ConsensusBus, NodeMode,
+};
 use rayls_consensus_state_sync::prime_consensus;
 use rayls_consensus_worker::WorkerNetworkHandle;
 use rayls_infrastructure_config::{ConsensusConfig, NetworkConfig, RaylsDirs};
@@ -129,6 +132,7 @@ where
             node_task_spawner.clone(),
             self.builder.rayls_infrastructure_config.node_info.primary_network_address().clone(),
             network_metrics,
+            admission_classes(network_config.sync_config()),
         )?;
         let primary_network_handle = primary_network.network_handle();
         let node_shutdown = self.node_shutdown.subscribe();
@@ -167,6 +171,7 @@ where
             node_task_spawner.clone(),
             self.builder.rayls_infrastructure_config.node_info.worker_network_address().clone(),
             network_metrics,
+            rayls_consensus_worker::admission_classes(network_config.sync_config()),
         )?;
         let worker_network_handle = worker_network.network_handle();
         let node_shutdown = self.node_shutdown.subscribe();

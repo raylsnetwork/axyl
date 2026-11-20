@@ -101,6 +101,11 @@ where
             .into_iter()
             .map(|a| *a.protocol_key())
             .collect();
+        // Last epoch's members keep a member's share of admitted requests while they finish it.
+        let previous_keys: HashSet<BlsPublicKey> = consensus_config
+            .previous_committee()
+            .map(|previous| previous.keys().iter().copied().collect())
+            .unwrap_or_default();
 
         // Rayls: Always rebuild identity mappings (known_peers, known_peerids) every epoch.
         // This fixes the race condition where gossip arrives before identity mappings exist,
@@ -122,7 +127,7 @@ where
         // registered set is in place before the first inbound put can arrive.
         network_handle
             .inner_handle()
-            .new_epoch(committee_keys.clone(), self.registered_validators.clone())
+            .new_epoch(committee_keys.clone(), previous_keys, self.registered_validators.clone())
             .await?;
 
         // start listening if the network needs to be initialized

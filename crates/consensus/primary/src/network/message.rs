@@ -1,7 +1,12 @@
 //! Messages exchanged between primaries.
 
 use crate::error::{PrimaryNetworkError, PrimaryNetworkResult};
-use rayls_consensus_network::{types::IntoRpcError, PeerExchangeMap, RLMessage};
+use rayls_consensus_network::{
+    admission::{AdmissionClass, ClassValues},
+    types::IntoRpcError,
+    PeerExchangeMap, RLMessage,
+};
+use rayls_infrastructure_config::SyncConfig;
 use rayls_infrastructure_types::{
     error::HeaderError,
     serde::{deserialize_normalized_bounded, roaring_header},
@@ -80,6 +85,21 @@ pub(super) enum PrimaryGossip {
     EpochVote(Box<EpochVote>),
 }
 
+/// The classes the primary network admits, with their values from `sync_config`.
+///
+/// Handed to the primary swarm when it is built, so the limits follow the node's network
+/// config file. A new class adds its entry here and the requests it covers in
+/// `PrimaryRequest::admission_class` below.
+pub fn admission_classes(sync_config: &SyncConfig) -> Vec<(AdmissionClass, ClassValues)> {
+    vec![(
+        AdmissionClass::MissingCertificates,
+        ClassValues {
+            jobs_per_peer: sync_config.max_missing_cert_jobs_per_peer,
+            jobs_others: sync_config.max_missing_cert_jobs_others,
+        },
+    )]
+}
+
 // impl RLMessage trait for types
 impl RLMessage for PrimaryRequest {
     fn peer_exchange_msg(&self) -> Option<PeerExchangeMap> {
@@ -88,10 +108,23 @@ impl RLMessage for PrimaryRequest {
             _ => None,
         }
     }
+
+    fn admission_class(&self) -> Option<AdmissionClass> {
+        match self {
+            Self::MissingCertificates { .. } | Self::MissingCertificatesInEpoch { .. } => {
+                Some(AdmissionClass::MissingCertificates)
+            }
+            _ => None,
+        }
+    }
 }
 impl RLMessage for PrimaryResponse {
     fn peer_exchange_msg(&self) -> Option<PeerExchangeMap> {
         None
+    }
+
+    fn busy() -> Option<Self> {
+        Some(Self::Busy)
     }
 }
 
@@ -451,6 +484,9 @@ pub enum PrimaryResponse {
         /// The epoch of the proposed header.
         received: Epoch,
     },
+    /// Too many jobs are running, so ask another peer and retry later.
+    /// Last, so the other variants keep their BCS indexes.
+    Busy,
 }
 
 impl PrimaryResponse {
@@ -461,6 +497,7 @@ impl PrimaryResponse {
             PrimaryResponse::Error(_)
                 | PrimaryResponse::TooOld { .. }
                 | PrimaryResponse::EpochMismatch { .. }
+                | PrimaryResponse::Busy
         )
     }
 

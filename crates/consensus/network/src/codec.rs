@@ -1,6 +1,6 @@
 //! Codec for encoding/decoding consensus network messages.
 
-use crate::PeerExchangeMap;
+use crate::{admission::AdmissionClass, PeerExchangeMap};
 use async_trait::async_trait;
 use futures::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use libp2p::{request_response::Codec, StreamProtocol};
@@ -24,6 +24,23 @@ pub trait RLMessage:
     /// Function to intercept peer exchange messages at the network layer before passing to the
     /// application layer. Only the network layer needs peer exchange messages.
     fn peer_exchange_msg(&self) -> Option<PeerExchangeMap>;
+
+    /// The admission class of this message, for a request the network limits per peer.
+    ///
+    /// Such a request takes a permit in the swarm loop before it is forwarded, and the
+    /// application keeps the permit until the work behind the request ends. Requests
+    /// without a class are forwarded as they come.
+    fn admission_class(&self) -> Option<AdmissionClass> {
+        None
+    }
+
+    /// The answer to a request refused by admission, for a response type that has one.
+    ///
+    /// A request whose class is declared but whose response type has no busy answer is
+    /// dropped on refusal, which the requester sees as a failed request.
+    fn busy() -> Option<Self> {
+        None
+    }
 }
 
 /// The Rayls Network request/response codec for consensus messages between peers.

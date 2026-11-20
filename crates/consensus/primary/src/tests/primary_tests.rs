@@ -3,20 +3,25 @@
 use crate::{
     error::PrimaryNetworkError,
     network::{
-        handler::RequestHandler, MissingCertificatesRequest, PrimaryRequest, PrimaryResponse,
+        admission_classes, handler::RequestHandler, MissingCertificatesRequest, PrimaryRequest,
+        PrimaryResponse,
     },
     state_sync::StateSynchronizer,
     ConsensusBus,
+};
+use rayls_consensus_network::admission::{
+    AdmissionClass, BusyLimit, RequestLimits, RequestPermits, RequestSlots,
 };
 use rayls_consensus_primary::test_utils::make_optimal_signed_certificates;
 use rayls_execution_evm::test_utils::fixture_batch_with_transactions;
 use rayls_infrastructure_network_types::MockPrimaryToWorkerClient;
 use rayls_infrastructure_storage::{mem_db::MemDatabase, CertificateStore, PayloadStore};
 use rayls_infrastructure_types::{
-    encode, error::HeaderError, now, AuthorityIdentifier, BlockNumHash, Certificate, Committee,
-    ExecHeader, Hash as _, SealedHeader, SignatureVerificationState, TaskManager,
+    encode, error::HeaderError, now, AuthorityIdentifier, BlockNumHash, BlsKeypair, BlsPublicKey,
+    Certificate, Committee, ExecHeader, Hash as _, SealedHeader, SignatureVerificationState,
+    TaskManager,
 };
-use rayls_testing_test_utils_committee::CommitteeFixture;
+use rayls_testing_test_utils_committee::{AuthorityFixture, CommitteeFixture};
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     num::NonZeroUsize,
@@ -729,7 +734,10 @@ async fn test_fetch_certificates_handler() {
             )
             .expect("boundary set")
             .set_max_response_size(response_size);
-        let resp = handler.retrieve_missing_certs(missing_req, None).await.unwrap();
+        let resp = handler
+            .retrieve_missing_certs(missing_req, None, RequestPermits::unbounded_for_tests())
+            .await
+            .unwrap();
         if let PrimaryResponse::RequestedCertificates(certs) = resp {
             assert_eq!(certs.iter().map(|cert| cert.round()).collect::<Vec<_>>(), *expected_rounds);
         } else {
@@ -750,7 +758,9 @@ async fn test_fetch_certificates_handler() {
             )
             .expect("boundary set")
             .set_max_response_size(0);
-        let resp = handler.retrieve_missing_certs(too_big, None).await;
+        let resp = handler
+            .retrieve_missing_certs(too_big, None, RequestPermits::unbounded_for_tests())
+            .await;
         assert!(resp.is_err());
     }
 }
@@ -893,7 +903,10 @@ async fn test_fetch_certificates_handler_survives_max_lower_bound() {
         exclusive_upper_bound: None,
     };
 
-    let resp = handler.retrieve_missing_certs(crafted, None).await.expect("served, not aborted");
+    let resp = handler
+        .retrieve_missing_certs(crafted, None, RequestPermits::unbounded_for_tests())
+        .await
+        .expect("served, not aborted");
     assert!(matches!(resp, PrimaryResponse::RequestedCertificates(certs) if certs.is_empty()));
 }
 
@@ -946,12 +959,17 @@ async fn test_missing_certs_request_with_too_many_authorities_is_rejected() {
     };
 
     // At the limit, unknown authorities are skipped and nothing is returned.
-    let resp = handler.retrieve_missing_certs(request(limit), None).await.expect("within limit");
+    let resp = handler
+        .retrieve_missing_certs(request(limit), None, RequestPermits::unbounded_for_tests())
+        .await
+        .expect("within limit");
     assert!(matches!(resp, PrimaryResponse::RequestedCertificates(certs) if certs.is_empty()));
 
     // One more is refused, with a penalty.
-    let err =
-        handler.retrieve_missing_certs(request(limit + 1), None).await.expect_err("over limit");
+    let err = handler
+        .retrieve_missing_certs(request(limit + 1), None, RequestPermits::unbounded_for_tests())
+        .await
+        .expect_err("over limit");
     assert!(
         matches!(err, PrimaryNetworkError::TooManyAuthorities(n, l) if n == limit + 1 && l == limit)
     );
@@ -981,7 +999,10 @@ async fn test_missing_certs_request_with_too_many_authorities_is_rejected() {
     let Ok(PrimaryRequest::MissingCertificates { inner }) = received else {
         panic!("the receiving node did not get the request: {received:?}");
     };
-    let err = handler.retrieve_missing_certs(inner, None).await.expect_err("over limit");
+    let err = handler
+        .retrieve_missing_certs(inner, None, RequestPermits::unbounded_for_tests())
+        .await
+        .expect_err("over limit");
     assert!(
         matches!(err, PrimaryNetworkError::TooManyAuthorities(n, l) if n == named && l == limit),
         "got {err:?}"
@@ -1014,7 +1035,7 @@ async fn test_missing_certs_limit_follows_the_served_epoch() {
     };
     use rand::{rngs::StdRng, SeedableRng};
     use rayls_infrastructure_storage::EpochStore;
-    use rayls_infrastructure_types::{BlsKeypair, BlsPublicKey, EpochRecord};
+    use rayls_infrastructure_types::EpochRecord;
 
     let committee_size = 4;
     // A handler at epoch 1 of a 4-member committee, with `previous` as the record of epoch 0.
@@ -1067,36 +1088,400 @@ async fn test_missing_certs_limit_follows_the_served_epoch() {
     let (handler, _tasks) = handler_with(Some(previous));
 
     // A previous-epoch request is sized for the previous committee.
-    handler.retrieve_missing_certs(request(previous_limit), Some(0)).await.expect("within limit");
-    let err = handler.retrieve_missing_certs(request(previous_limit + 1), Some(0)).await;
+    handler
+        .retrieve_missing_certs(
+            request(previous_limit),
+            Some(0),
+            RequestPermits::unbounded_for_tests(),
+        )
+        .await
+        .expect("within limit");
+    let err = handler
+        .retrieve_missing_certs(
+            request(previous_limit + 1),
+            Some(0),
+            RequestPermits::unbounded_for_tests(),
+        )
+        .await;
     assert!(refused_at(err.expect_err("over limit"), previous_limit));
 
     // A current-epoch request is sized for the current committee.
-    handler.retrieve_missing_certs(request(current_limit), Some(1)).await.expect("within limit");
-    let err = handler.retrieve_missing_certs(request(current_limit + 1), Some(1)).await;
+    handler
+        .retrieve_missing_certs(
+            request(current_limit),
+            Some(1),
+            RequestPermits::unbounded_for_tests(),
+        )
+        .await
+        .expect("within limit");
+    let err = handler
+        .retrieve_missing_certs(
+            request(current_limit + 1),
+            Some(1),
+            RequestPermits::unbounded_for_tests(),
+        )
+        .await;
     assert!(refused_at(err.expect_err("over limit"), current_limit));
 
     // An unstamped request (before the CertificateFetchEpochV2 fork) may come from a node still
     // in the previous epoch, so it is sized for the larger committee.
-    handler.retrieve_missing_certs(request(previous_limit), None).await.expect("within limit");
-    let err = handler.retrieve_missing_certs(request(previous_limit + 1), None).await;
+    handler
+        .retrieve_missing_certs(
+            request(previous_limit),
+            None,
+            RequestPermits::unbounded_for_tests(),
+        )
+        .await
+        .expect("within limit");
+    let err = handler
+        .retrieve_missing_certs(
+            request(previous_limit + 1),
+            None,
+            RequestPermits::unbounded_for_tests(),
+        )
+        .await;
     assert!(refused_at(err.expect_err("over limit"), previous_limit));
 
     // Without a record of the previous committee, a previous-epoch request gets the decoding cap.
     let (handler, _tasks) = handler_with(None);
     let cap = MAX_SKIP_ROUND_AUTHORITIES;
-    let resp = handler.retrieve_missing_certs(request(cap), Some(0)).await.expect("within cap");
+    let resp = handler
+        .retrieve_missing_certs(request(cap), Some(0), RequestPermits::unbounded_for_tests())
+        .await
+        .expect("within cap");
     assert!(matches!(resp, PrimaryResponse::RequestedCertificates(certs) if certs.is_empty()));
-    let err = handler.retrieve_missing_certs(request(cap + 1), Some(0)).await;
+    let err = handler
+        .retrieve_missing_certs(request(cap + 1), Some(0), RequestPermits::unbounded_for_tests())
+        .await;
     assert!(refused_at(err.expect_err("over cap"), cap));
     // The current epoch is still sized for the current committee, and so is an unstamped request.
-    let err = handler.retrieve_missing_certs(request(current_limit + 1), Some(1)).await;
+    let err = handler
+        .retrieve_missing_certs(
+            request(current_limit + 1),
+            Some(1),
+            RequestPermits::unbounded_for_tests(),
+        )
+        .await;
     assert!(refused_at(err.expect_err("over limit"), current_limit));
-    let err = handler.retrieve_missing_certs(request(current_limit + 1), None).await;
+    let err = handler
+        .retrieve_missing_certs(
+            request(current_limit + 1),
+            None,
+            RequestPermits::unbounded_for_tests(),
+        )
+        .await;
     assert!(refused_at(err.expect_err("over limit"), current_limit));
 
     // A peer already in the next epoch names that epoch's committee, and is not refused for it.
-    let resp =
-        handler.retrieve_missing_certs(request(cap + 1), Some(2)).await.expect("not refused");
+    let resp = handler
+        .retrieve_missing_certs(request(cap + 1), Some(2), RequestPermits::unbounded_for_tests())
+        .await
+        .expect("not refused");
     assert!(matches!(resp, PrimaryResponse::RequestedCertificates(certs) if certs.is_empty()));
+}
+
+/// How long a request runs before the test cancels it, as a timed-out peer would.
+const CANCEL_AFTER: Duration = Duration::from_millis(50);
+
+/// A valid request that asks for no authorities.
+fn empty_request() -> MissingCertificatesRequest {
+    MissingCertificatesRequest::default()
+        .set_bounds(0, BTreeMap::new())
+        .expect("bounds")
+        .set_max_response_size(
+            rayls_infrastructure_config::LibP2pConfig::default().max_rpc_message_size,
+        )
+}
+
+/// The primary swarm's request slots for `primary`'s epoch, as the network builds them: the
+/// classes and values from the node's network config, and a member share for this and the
+/// previous committee.
+fn slots_for(primary: &AuthorityFixture<MemDatabase>, cb: &ConsensusBus) -> RequestSlots {
+    let config = primary.consensus_config();
+    let limits = RequestLimits::new(
+        admission_classes(config.network_config().sync_config()),
+        cb.network_metrics(),
+        "primary",
+    );
+    let members = config
+        .committee()
+        .authorities()
+        .iter()
+        .map(|authority| *authority.protocol_key())
+        .chain(config.previous_committee().into_iter().flat_map(|prev| prev.keys().iter().copied()))
+        .collect();
+    limits.for_members(&members)
+}
+
+/// Admit a missing-certificates request from `peer` as the network does, then serve it.
+async fn serve(
+    slots: &RequestSlots,
+    handler: &RequestHandler<MemDatabase>,
+    peer: BlsPublicKey,
+) -> Result<Result<PrimaryResponse, PrimaryNetworkError>, BusyLimit> {
+    let permits = slots.acquire(AdmissionClass::MissingCertificates, peer)?;
+    Ok(handler.retrieve_missing_certs(empty_request(), None, permits).await)
+}
+
+/// Start a missing-certificates request from `peer`, and cancel it after [CANCEL_AFTER].
+///
+/// Returns the answer if it came in time, or `None` if the request was cancelled.
+async fn start_then_cancel(
+    slots: &RequestSlots,
+    handler: &RequestHandler<MemDatabase>,
+    peer: BlsPublicKey,
+) -> Option<Result<Result<PrimaryResponse, PrimaryNetworkError>, BusyLimit>> {
+    timeout(CANCEL_AFTER, serve(slots, handler, peer)).await.ok()
+}
+
+/// A cancelled request keeps its slot until its job ends, and each pool is limited on its own.
+///
+/// The runtime has one blocking thread and the test keeps it busy, so every job stays queued.
+/// Without a limit, every request is queued, so no request is ever refused.
+#[test]
+fn test_missing_cert_slots_outlive_cancelled_requests() {
+    use rand::{rngs::StdRng, SeedableRng};
+    use rayls_infrastructure_config::SyncConfig;
+
+    // A committee large enough for one busy member, two others, and this node.
+    const COMMITTEE_SIZE: usize = 4;
+    // How long the queued jobs may take to run once the blocking thread is free.
+    const SLOTS_FREED_WITHIN: Duration = Duration::from_secs(10);
+    // How often to retry while the slots are still taken.
+    const RETRY_EVERY: Duration = Duration::from_millis(10);
+
+    /// Retry a request from `peer` while it is refused as busy.
+    async fn answer_once_free(
+        slots: &RequestSlots,
+        handler: &RequestHandler<MemDatabase>,
+        peer: BlsPublicKey,
+    ) -> PrimaryResponse {
+        loop {
+            match serve(slots, handler, peer).await {
+                Ok(answer) => return answer.expect("served"),
+                Err(_) => tokio::time::sleep(RETRY_EVERY).await,
+            }
+        }
+    }
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .max_blocking_threads(1)
+        .enable_all()
+        .build()
+        .expect("runtime");
+    runtime.block_on(async {
+        let fixture = CommitteeFixture::builder(MemDatabase::default)
+            .committee_size(NonZeroUsize::new(COMMITTEE_SIZE).unwrap())
+            .build();
+        let primary = fixture.authorities().next().unwrap();
+        let cb = ConsensusBus::new();
+        let task_manager = TaskManager::default();
+        let synchronizer = StateSynchronizer::new(
+            primary.consensus_config(),
+            cb.clone(),
+            task_manager.get_spawner(),
+        );
+        let admission = slots_for(primary, &cb);
+        let handler = RequestHandler::new(primary.consensus_config(), cb.clone(), synchronizer);
+        let member = |i: usize| fixture.authorities().nth(i).unwrap().primary_public_key();
+        let outsider = || *BlsKeypair::generate(&mut StdRng::from_os_rng()).public();
+
+        // Keep the only blocking thread busy.
+        let (release, hold) = std::sync::mpsc::channel::<()>();
+        let blocker = tokio::task::spawn_blocking(move || {
+            let _ = hold.recv();
+        });
+
+        // Cancelled requests from one member still hold all of its slots.
+        let busy_member = member(1);
+        let jobs_per_peer =
+            primary.consensus_config().network_config().sync_config().max_missing_cert_jobs_per_peer;
+        for _ in 0..jobs_per_peer.get() {
+            assert!(start_then_cancel(&admission, &handler, busy_member).await.is_none());
+        }
+        let next = start_then_cancel(&admission, &handler, busy_member).await;
+        assert!(
+            matches!(next, Some(Err(BusyLimit::Member))),
+            "a member's extra request was not refused: {next:?}"
+        );
+
+        // An out-of-epoch request is answered empty, once admitted.
+        let ahead = primary.consensus_config().committee().epoch() + 2;
+        let permits = admission.acquire(AdmissionClass::MissingCertificates, member(2)).expect("admitted");
+        let answer = handler.retrieve_missing_certs(empty_request(), Some(ahead), permits).await;
+        assert!(
+            matches!(&answer, Ok(PrimaryResponse::RequestedCertificates(certs)) if certs.is_empty()),
+            "a request outside our epoch was not answered empty: {answer:?}"
+        );
+
+        // Another member has its own slots.
+        assert!(start_then_cancel(&admission, &handler, member(2)).await.is_none());
+
+        // Peers outside the committee share one pool.
+        for _ in 0..SyncConfig::default().max_missing_cert_jobs_others.get() {
+            assert!(start_then_cancel(&admission, &handler, outsider()).await.is_none());
+        }
+        let next = start_then_cancel(&admission, &handler, outsider()).await;
+        assert!(
+            matches!(next, Some(Err(BusyLimit::Others))),
+            "an outsider's extra request was not refused: {next:?}"
+        );
+
+        // A full outsider pool does not affect members.
+        assert!(start_then_cancel(&admission, &handler, member(3)).await.is_none());
+
+        // Each refusal is counted under the class, the limit that refused it, and the swarm.
+        let refused = &cb.network_metrics().request_admission_busy;
+        for (limit, count) in [("member", 1), ("committee", 0), ("outsider", 0), ("others", 1)] {
+            let count_for = refused.with_label_values(&["missing_certificates", limit, "primary"]).get();
+            assert_eq!(count_for, count, "{limit} refusals");
+        }
+
+        // Once the queued jobs run, the member's and the outsiders' slots are free again.
+        release.send(()).expect("release the blocking thread");
+        blocker.await.expect("blocker");
+        for (peer, who) in [(busy_member, "the busy member"), (outsider(), "an outsider")] {
+            let freed = timeout(SLOTS_FREED_WITHIN, answer_once_free(&admission, &handler, peer))
+                .await
+                .unwrap_or_else(|_| panic!("{who} got no slot after the jobs ran"));
+            assert!(matches!(freed, PrimaryResponse::RequestedCertificates(_)), "{who}: {freed:?}");
+        }
+    });
+}
+
+/// A previous committee's member gets a member's slots.
+/// The only blocking thread is kept busy, so jobs stay queued.
+#[test]
+fn test_missing_cert_slots_include_the_previous_committee() {
+    use rand::{rngs::StdRng, SeedableRng};
+    use rayls_infrastructure_storage::EpochStore;
+    use rayls_infrastructure_types::EpochRecord;
+
+    let former = *BlsKeypair::generate(&mut StdRng::from_os_rng()).public();
+    let record = EpochRecord { epoch: 0, committee: vec![former], ..Default::default() };
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .max_blocking_threads(1)
+        .enable_all()
+        .build()
+        .expect("runtime");
+    runtime.block_on(async {
+        // Each node's store holds the record of the previous epoch.
+        let fixture = CommitteeFixture::builder(|| {
+            let db = MemDatabase::default();
+            db.save_epoch_record(&record).expect("record");
+            db
+        })
+        .epoch(1)
+        .build();
+        let primary = fixture.authorities().next().unwrap();
+        let previous = primary.consensus_config().previous_committee().map(|p| p.keys().to_vec());
+        assert_eq!(previous, Some(vec![former]));
+        let cb = ConsensusBus::new();
+        let task_manager = TaskManager::default();
+        let synchronizer = StateSynchronizer::new(
+            primary.consensus_config(),
+            cb.clone(),
+            task_manager.get_spawner(),
+        );
+        let admission = slots_for(primary, &cb);
+        let handler = RequestHandler::new(primary.consensus_config(), cb.clone(), synchronizer);
+
+        // Keep the only blocking thread busy.
+        let (release, hold) = std::sync::mpsc::channel::<()>();
+        let blocker = tokio::task::spawn_blocking(move || {
+            let _ = hold.recv();
+        });
+
+        // A member's share, not an outsider's single job.
+        let jobs_per_peer = primary
+            .consensus_config()
+            .network_config()
+            .sync_config()
+            .max_missing_cert_jobs_per_peer;
+        for _ in 0..jobs_per_peer.get() {
+            assert!(start_then_cancel(&admission, &handler, former).await.is_none());
+        }
+        let next = start_then_cancel(&admission, &handler, former).await;
+        assert!(matches!(next, Some(Err(BusyLimit::Member))), "got {next:?}");
+        let refused = &cb.network_metrics().request_admission_busy;
+        for (limit, count) in [("member", 1), ("outsider", 0)] {
+            let count_for =
+                refused.with_label_values(&["missing_certificates", limit, "primary"]).get();
+            assert_eq!(count_for, count, "{limit} refusals");
+        }
+
+        release.send(()).expect("release the blocking thread");
+        blocker.await.expect("blocker");
+    });
+}
+
+/// A member limit raised in the node's network-config file reaches the slots.
+/// The only blocking thread is kept busy, so jobs stay queued.
+#[test]
+fn test_missing_cert_slots_use_the_member_limit_from_the_config_file() {
+    use rayls_consensus_primary::test_utils::temp_dir;
+    use rayls_infrastructure_config::{NetworkConfig, RaylsDirs, SyncConfig};
+
+    // Raise the limit in the config file, as an operator would.
+    let default = SyncConfig::default().max_missing_cert_jobs_per_peer;
+    let raised = default.saturating_add(1);
+    let datadir = temp_dir();
+    NetworkConfig::default().write_config(&datadir).expect("write the config file");
+    let path = datadir.network_config_path();
+    let file = std::fs::read_to_string(&path).expect("read the config file");
+    let edited = file.replace(
+        &format!("max_missing_cert_jobs_per_peer: {default}"),
+        &format!("max_missing_cert_jobs_per_peer: {raised}"),
+    );
+    assert_ne!(edited, file, "the limit must be in the config file");
+    std::fs::write(&path, edited).expect("edit the config file");
+    let network_config = NetworkConfig::read_config(&datadir).expect("load the config file");
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .max_blocking_threads(1)
+        .enable_all()
+        .build()
+        .expect("runtime");
+    runtime.block_on(async {
+        let fixture = CommitteeFixture::builder(MemDatabase::default)
+            .with_network_config(network_config)
+            .build();
+        let primary = fixture.authorities().next().unwrap();
+        let cb = ConsensusBus::new();
+        let task_manager = TaskManager::default();
+        let synchronizer = StateSynchronizer::new(
+            primary.consensus_config(),
+            cb.clone(),
+            task_manager.get_spawner(),
+        );
+        let admission = slots_for(primary, &cb);
+        let handler = RequestHandler::new(primary.consensus_config(), cb, synchronizer);
+        let member = fixture.authorities().nth(1).unwrap().primary_public_key();
+
+        // Keep the only blocking thread busy.
+        let (release, hold) = std::sync::mpsc::channel::<()>();
+        let blocker = tokio::task::spawn_blocking(move || {
+            let _ = hold.recv();
+        });
+
+        for _ in 0..raised.get() {
+            assert!(start_then_cancel(&admission, &handler, member).await.is_none());
+        }
+        let next = start_then_cancel(&admission, &handler, member).await;
+        assert!(matches!(next, Some(Err(BusyLimit::Member))), "got {next:?}");
+
+        release.send(()).expect("release the blocking thread");
+        blocker.await.expect("blocker");
+    });
+}
+
+/// Busy has its own answer, after every variant older nodes know.
+#[test]
+fn test_busy_answer_keeps_older_variant_indexes() {
+    let busy = PrimaryResponse::Busy;
+
+    // `EpochMismatch` is the last variant older nodes know, at index 9.
+    let mismatch = PrimaryResponse::EpochMismatch { expected: 1, received: 2 };
+    assert_eq!(bcs::to_bytes(&mismatch).expect("encode")[0], 9);
+    assert_eq!(bcs::to_bytes(&busy).expect("encode"), [10]);
 }
