@@ -427,7 +427,6 @@ async fn after_the_fork_a_forged_copy_cannot_fork_the_follower() {
     let mut alone = certified(&fixture, &forged);
     let (_, own) = signatures(&fixture, 1, &forged)[0];
     alone.signature = BlsAggregateSignature::aggregate(&[own], true).unwrap().to_signature();
-    let alone = CertifiedTip { number: forged.number, ..alone };
     assert!(!alone.verify(&keys), "precondition: one signer is not f+1");
 
     let members: Vec<_> = config.committee().others_primaries_by_id(config.authority_id().as_ref());
