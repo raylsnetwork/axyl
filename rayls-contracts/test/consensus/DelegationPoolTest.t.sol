@@ -2342,9 +2342,8 @@ contract DelegationPoolTest is Test {
     ///
     /// The figure is derived as `total - self`. Per-position slashes round up
     /// while the pool total does not, so `self` settles marginally low and the
-    /// remainder runs marginally high. Documented as such on the interface, and
-    /// asserted here because a reader who assumes the opposite would trust a
-    /// third-party figure that is never actually short.
+    /// remainder runs marginally high. Over a single slash that gap is rounding
+    /// dust; repeated slashes are pinned in the test below.
     function test_selfStake_thirdPartyRoundsHighNeverShortAfterSlash() public {
         vm.prank(validator1);
         pool.registerPool(1000);
@@ -2368,6 +2367,71 @@ contract DelegationPoolTest is Test {
         assertGe(thirdParty, d1Effective, "third-party figure must never come up short");
         // dust only: bounded by per-position ceiling rounding, not a real discrepancy
         assertLe(thirdParty - d1Effective, 1e6, "discrepancy must stay wei-scale");
+    }
+
+    /// @notice Two slashes with no settle in between push the split far past dust.
+    ///
+    /// `applyPoolSlash` takes its fraction of the stake left in the pool, while a
+    /// position pays the accumulated slash against the stake it had when it last
+    /// settled. Nothing settled here between the two 20% slashes, so self pays 40%
+    /// of 300e18 (180e18) instead of the compounded 192e18, and the remainder
+    /// reports 76e18 against a sole third-party position of 60e18. That
+    /// over-slash is pre-existing slashing behaviour; this pins it so the reported
+    /// split stays honest instead of being read as exact.
+    function test_selfStake_repeatedSlashesDivergeFromPositions() public {
+        vm.prank(validator1);
+        pool.registerPool(1000);
+        _fundValidator(validator1, 500e18);
+
+        vm.prank(validator1);
+        pool.delegate(validator1, 300e18);
+        vm.prank(delegator1);
+        pool.delegate(validator1, 100e18);
+
+        vm.prank(address(registry));
+        pool.applyPoolSlash(validator1, 80e18); // 20% of 400e18
+        vm.prank(address(registry));
+        pool.applyPoolSlash(validator1, 64e18); // 20% of what is left
+
+        (uint256 self, uint256 thirdParty, uint256 total) =
+            pool.getDelegationComposition(validator1);
+        (uint256 selfEffective, ) = pool.getEffectivePosition(validator1, validator1);
+        (uint256 d1Effective, ) = pool.getEffectivePosition(validator1, delegator1);
+
+        assertEq(total, 256e18, "pool total decays 400 -> 320 -> 256");
+        assertEq(self, 180e18, "self pays the slash sum, not the compounded slash");
+        assertEq(selfEffective, self, "composition must match the position read");
+        assertEq(d1Effective, 60e18, "the only third-party position");
+        assertLe(self, total, "self can never exceed the pool total");
+        assertEq(self + thirdParty, total, "split still reconciles against the total");
+        assertEq(thirdParty - d1Effective, 16e18, "remainder absorbs the over-slash");
+        assertGt(thirdParty - d1Effective, 1e6, "the gap is not wei-scale dust");
+    }
+
+    /// @notice The worst case of the same drift: a validator-backed pool can report
+    ///      all of its stake as third-party.
+    ///
+    /// Two 50% slashes reach an accumulated slash of 1.0, so the self position
+    /// settles to zero while the pool total still reads 100e18 — there is no
+    /// third party at all behind that figure.
+    function test_selfStake_repeatedSlashesCanReportAllStakeAsThirdParty() public {
+        vm.prank(validator1);
+        pool.registerPool(1000);
+        _fundValidator(validator1, 500e18);
+
+        vm.prank(validator1);
+        pool.delegate(validator1, 400e18);
+
+        vm.prank(address(registry));
+        pool.applyPoolSlash(validator1, 200e18);
+        vm.prank(address(registry));
+        pool.applyPoolSlash(validator1, 100e18);
+
+        (uint256 self, uint256 thirdParty, uint256 total) =
+            pool.getDelegationComposition(validator1);
+        assertEq(self, 0, "accumulated slash of 1.0 wipes the self position");
+        assertEq(total, 100e18, "pool total still tracks stake nobody holds");
+        assertEq(thirdParty, 100e18, "entire pool reported as third-party backing");
     }
 
     /// @dev Capital the validator supplies from a different address is not

@@ -286,12 +286,17 @@ interface IDelegationPool {
     /// @notice Split a validator's delegated backing into its own capital and everyone else's
     /// @dev Reporting only — reward, commission, slashing and stake-tier maths are unchanged and
     ///      still treat self-delegated capital exactly like third-party delegation.
+    /// @dev The split is approximate, not per-holder. A slash takes its fraction of the stake
+    ///      still in the pool, while a position pays the accumulated slash against the stake it
+    ///      held when it last settled, so anything unsettled between slashes is over-slashed and
+    ///      `total - self` absorbs the difference. After one slash that gap is rounding dust;
+    ///      after several it can be a real amount — slash a validator-only pool 50% twice and
+    ///      this reports self=0 with the whole pool as third-party. Use `getEffectivePosition`
+    ///      for what a holder actually has.
     /// @param validatorAddress The validator whose pool to query
     /// @return selfDelegated Validator's own effective stake (see `getSelfDelegatedStake`)
-    /// @return thirdPartyDelegated Everyone else's stake, derived as `total - self`. Per-position
-    ///         slashes round up while the pool total does not, so `self` settles marginally low
-    ///         and this figure runs marginally HIGH — wei-scale dust after a slash, never a
-    ///         shortfall. Treat `selfDelegated` as the exact number and this as the remainder
+    /// @return thirdPartyDelegated Everyone else's stake, derived as `total - self`; see the
+    ///         note above for how far it can drift from the sum of the third-party positions
     /// @return totalDelegated Pool total across both tiers, as `getTotalDelegatedStake` reports
     function getDelegationComposition(
         address validatorAddress
