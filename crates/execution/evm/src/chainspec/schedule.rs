@@ -63,8 +63,8 @@ impl RaylsHardFork {
             // delegate frames into 0x0400, so replaying pre-activation history must keep accepting
             // them.
             ScheduledFork::new(Self::Erc20PrecompileDirectCall, ForkCondition::Never),
-            // Never until SRE schedules an activation block at an epoch boundary, after every
-            // node runs a release that serves its certified tip.
+            // Never until SRE schedules an activation block, any one after every node runs a
+            // release that serves its certified tip.
             ScheduledFork::new(Self::CertifiedTipV1, ForkCondition::Never),
         ]
     }
@@ -98,8 +98,8 @@ impl RaylsHardFork {
             // Never until SRE schedules an activation block: changes the state transition for
             // delegate frames into 0x0400 (see devnet note).
             ScheduledFork::new(Self::Erc20PrecompileDirectCall, ForkCondition::Never),
-            // Never until SRE schedules an activation block at an epoch boundary, after every
-            // node runs a release that serves its certified tip.
+            // Never until SRE schedules an activation block, any one after every node runs a
+            // release that serves its certified tip.
             ScheduledFork::new(Self::CertifiedTipV1, ForkCondition::Never),
         ]
     }
@@ -133,8 +133,8 @@ impl RaylsHardFork {
             // Never until SRE schedules an activation block: changes the state transition for
             // delegate frames into 0x0400 (see devnet note).
             ScheduledFork::new(Self::Erc20PrecompileDirectCall, ForkCondition::Never),
-            // Never until SRE schedules an activation block at an epoch boundary, after every
-            // node runs a release that serves its certified tip.
+            // Never until SRE schedules an activation block, any one after every node runs a
+            // release that serves its certified tip.
             ScheduledFork::new(Self::CertifiedTipV1, ForkCondition::Never),
         ]
     }
