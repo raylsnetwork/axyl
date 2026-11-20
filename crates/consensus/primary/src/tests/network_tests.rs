@@ -749,7 +749,11 @@ fn certified_tip_only_moves_up_within_or_past_its_epoch() {
     assert!(replaces_certified_tip(Some((20, 5000)), 20, 20, 5001), "higher, same epoch");
     assert!(replaces_certified_tip(Some((20, 5000)), 20, 21, 5001), "higher, next epoch");
     assert!(!replaces_certified_tip(Some((20, 5000)), 20, 20, 5000), "the same tip");
-    assert!(!replaces_certified_tip(Some((20, 5000)), 20, 21, 4999), "lower");
+    assert!(!replaces_certified_tip(Some((20, 5000)), 20, 20, 4999), "lower, same epoch");
+    assert!(
+        replaces_certified_tip(Some((20, u64::MAX)), 20, 21, 5001),
+        "a later epoch replaces a forged high number"
+    );
     assert!(!replaces_certified_tip(Some((20, 5000)), 0, 3, 9_999_999), "earlier epoch");
 }
 
