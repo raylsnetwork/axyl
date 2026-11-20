@@ -680,7 +680,8 @@ impl<DB: ReDatabase> WalkSession<DB> {
 
 /// Whether this node finds the network head from peers' certified tips: once the `CertifiedTipV1`
 /// fork is active at the next block to execute, the point every other fork check uses.
-/// `activation` is the fork's block, `None` while it is `Never`.
+/// `activation` is the fork's block, `None` while it is `Never`. Not before: a peer on an older
+/// release cannot decode the request.
 fn uses_certified_tip(activation: Option<u64>, executed_tip: u64) -> bool {
     activation.is_some_and(|block| executed_tip.saturating_add(1) >= block)
 }
@@ -729,7 +730,9 @@ async fn probe_peers_for_certified_tip<DB: ReDatabase>(
         }
     }
     candidates.sort_by(|a, b| b.number.cmp(&a.number));
-    candidates.dedup_by(|a, b| a.number == b.number && a.hash == b.hash);
+    // whole-struct: a copy with the honest number and hash but a bad signature must not stand
+    // in for the honest ones
+    candidates.dedup();
     for tip in candidates {
         let Some(committee) = config.get_committee_keys_for_epoch(tip.epoch) else {
             let next = config
