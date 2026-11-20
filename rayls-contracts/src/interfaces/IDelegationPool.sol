@@ -219,6 +219,7 @@ interface IDelegationPool {
     ///      (`fromValidator`, caller), so a delegator with positions at several validators may
     ///      transfer out of each of them once in the same epoch.
     /// @dev The moved `amount` must be at least `config.minDelegation`, the same floor `delegate` applies.
+    /// @dev Destination tier: an existing position keeps its own, a new one gets what `delegate` would give.
     /// @param fromValidator The validator to move stake away from
     /// @param toValidator The validator to move stake to
     /// @param amount The amount of already-delegated RLS to move (>= `config.minDelegation`)
