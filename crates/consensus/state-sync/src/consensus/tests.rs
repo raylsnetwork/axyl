@@ -535,6 +535,63 @@ async fn a_silent_peer_does_not_hold_up_the_probe() {
     config.shutdown().notify();
 }
 
+/// An honest tip from the next epoch is not checked against the lookahead, which can still
+/// list a key ejected since it was read and then fails the tip. The tip waits for the
+/// certified record naming that committee, and the collector is asked for it.
+#[tokio::test(start_paused = true)]
+async fn a_stale_lookahead_does_not_reject_an_honest_tip() {
+    let fixture = committee_of_four();
+    let base = fixture.authorities().next().unwrap().consensus_config();
+    let keys: Vec<_> = fixture.authorities().map(|a| *a.authority().protocol_key()).collect();
+    // an ejected key sorting below every member shifts every bitmap index
+    let ejected = std::iter::repeat_with(|| {
+        *committee_of_four().authorities().next().unwrap().authority().protocol_key()
+    })
+    .find(|key| keys.iter().all(|member| key < member))
+    .unwrap();
+    let mut stale = keys.clone();
+    stale.push(ejected);
+    let config = ConsensusConfig::new_for_epoch(
+        base.config().clone(),
+        base.node_storage().clone(),
+        base.key_config().clone(),
+        base.committee().clone(),
+        CommitteeLookahead::from_entries([(1, stale.clone())]),
+        base.network_config().clone(),
+        u64::MAX,
+        true,
+    )
+    .unwrap()
+    .with_certified_tip_v1_block(Some(0));
+
+    // f+1 of the committee sign a header of epoch 1
+    let hash = B256::repeat_byte(7);
+    let digest = CertifiedTip::digest_data(1, 2, 5, hash);
+    let signed = fixture.authorities().take(CertifiedTip::quorum(keys.len())).map(|a| {
+        (*a.authority().protocol_key(), a.keypair().sign(&encode(&to_intent_message(digest))))
+    });
+    let tip = CertifiedTip::from_signatures(1, 2, 5, hash, &keys, signed).unwrap();
+    assert!(tip.verify(&keys), "precondition: honest");
+    assert!(!tip.verify(&stale), "precondition: fails against the stale lookahead");
+    assert!(config.get_committee_keys_for_epoch(1).is_some(), "the lookahead knows epoch 1");
+
+    let honest = honest_tip(&fixture);
+    let peers = config
+        .committee()
+        .others_primaries_by_id(config.authority_id().as_ref())
+        .into_iter()
+        .map(|(_, key)| Peer::new(key, Some(tip.clone()), &honest))
+        .collect();
+    let (network, _) = peer_network(peers, vec![]);
+    let consensus_bus = ConsensusBus::new();
+    tokio::spawn(spawn_track_recent_consensus(config.clone(), consensus_bus.clone(), network));
+
+    let mut requested = consensus_bus.requested_missing_epoch().subscribe();
+    let asked = tokio::time::timeout(Duration::from_secs(5), requested.wait_for(|e| *e >= 1));
+    assert!(asked.await.is_ok(), "the collector is asked for the record naming epoch 1");
+    config.shutdown().notify();
+}
+
 /// Before the fork the follower probes committee members' latest headers as before, and asks
 /// nobody for a certified tip.
 #[tokio::test(start_paused = true)]

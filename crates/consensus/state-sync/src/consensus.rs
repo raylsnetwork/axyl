@@ -714,9 +714,10 @@ async fn probe_for_head<DB: ReDatabase>(
 /// A tip from before this node's previous epoch is dropped: f+1 keys of a retired committee
 /// could sign any number, and the previous epoch counts so a chain halted on its last header can
 /// still be found.
-/// A tip from an epoch whose committee is not known yet is skipped, and the epoch record
-/// collector is asked for the record after the newest one held: it walks upward as far as peers
-/// serve, so a later probe can verify the tip. Neither waiting here nor requesting the tip's own
+/// A tip from an epoch whose committee is not settled yet, from config or a certified record (the
+/// lookahead does not count), is skipped, and the epoch record collector is asked for the record
+/// after the newest one held: it walks upward as far as peers serve, so a later probe can verify
+/// the tip. Neither waiting here nor requesting the tip's own
 /// epoch, which is unverified: a peer naming a far epoch would hold up the probe or send the
 /// collector chasing it.
 async fn probe_peers_for_certified_tip<DB: ReDatabase>(
@@ -748,7 +749,9 @@ async fn probe_peers_for_certified_tip<DB: ReDatabase>(
     candidates.dedup();
     let mut collector_asked = false;
     for tip in candidates {
-        let Some(committee) = config.get_committee_keys_for_epoch(tip.epoch) else {
+        // the committee the tip's epoch ran with, never the lookahead: an honest tip fails
+        // against a lookahead that still lists a key ejected since it was read
+        let Some(committee) = config.get_settled_committee_keys_for_epoch(tip.epoch) else {
             // the same record is next for every such tip, so ask once
             if !collector_asked {
                 collector_asked = true;

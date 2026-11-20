@@ -370,6 +370,14 @@ where
     /// Falls back through: in-memory committee (current epoch), in-memory previous committee,
     /// DB epoch records, then lookahead cache.
     pub fn get_committee_keys_for_epoch(&self, epoch: Epoch) -> Option<Vec<BlsPublicKey>> {
+        self.get_settled_committee_keys_for_epoch(epoch)
+            .or_else(|| self.inner.lookahead.get(epoch).map(|keys| keys.to_vec()))
+    }
+
+    /// The BLS committee keys `epoch` actually ran with: the current or previous committee, or
+    /// one named by a certified epoch record. Never the lookahead, which is read at epoch start:
+    /// a key ejected from a later committee during the epoch stays in it.
+    pub fn get_settled_committee_keys_for_epoch(&self, epoch: Epoch) -> Option<Vec<BlsPublicKey>> {
         let current = self.inner.committee.epoch();
         if epoch == current {
             return Some(self.inner.committee.bls_keys());
@@ -379,10 +387,7 @@ where
                 return Some(prev.keys.clone());
             }
         }
-        self.inner
-            .node_storage
-            .get_committee_keys(epoch)
-            .or_else(|| self.inner.lookahead.get(epoch).map(|keys| keys.to_vec()))
+        self.inner.node_storage.get_committee_keys(epoch)
     }
 
     /// Committee network peer ids.
