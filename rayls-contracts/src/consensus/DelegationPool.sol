@@ -587,11 +587,12 @@ contract DelegationPool is
             fromPool.totalDelegated -= amount;
         }
 
-        // Settle the destination position, then credit it. Tier resolution mirrors
-        // _delegate's existing precedent: a pre-existing destination position keeps its own
-        // tier; a brand-new one takes the source's.
+        // Tier resolution mirrors _delegate: an existing destination position keeps its own
+        // tier, a fresh one follows the caller's whitelist status.
         DelegatorPosition storage toPos = $.positions[toValidator][msg.sender];
-        bool toOpenTier = toPos.amount > 0 ? toPos.openTier : fromPos.openTier;
+        bool toOpenTier = toPos.amount > 0
+            ? toPos.openTier
+            : ($.whitelistEnabled && !$.whitelistVerified[msg.sender]);
 
         _settlePosition(toPool, toPos);
 

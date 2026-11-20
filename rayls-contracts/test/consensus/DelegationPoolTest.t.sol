@@ -887,6 +887,11 @@ contract DelegationPoolTest is Test {
         pool.registerPool(500);
     }
 
+    // Track A = delegated total minus open tier
+    function _trackADelegated(address validator) internal view returns (uint256) {
+        return pool.getTotalDelegatedStake(validator) - pool.getTotalOpenTierDelegatedStake(validator);
+    }
+
     function test_transferStake() public {
         _registerBothValidators();
 
@@ -974,6 +979,110 @@ contract DelegationPoolTest is Test {
         IDelegationPool.DelegatorPosition memory toPos = pool.getDelegatorPosition(validator2, delegator1);
         assertEq(toPos.amount, 50e18);
         assertFalse(toPos.openTier);
+    }
+
+    function test_transferStake_toFreshDestination_gateEnabled_unverifiedOpensTrackB() public {
+        _registerBothValidators();
+
+        // legacy Track A position, delegated while the gate was off
+        vm.prank(delegator1);
+        pool.delegate(validator1, 100e18);
+
+        _wlEnableGate();
+
+        vm.prank(delegator1);
+        pool.transferStake(validator1, validator2, 40e18);
+
+        IDelegationPool.DelegatorPosition memory toPos = pool.getDelegatorPosition(validator2, delegator1);
+        assertEq(toPos.amount, 40e18);
+        assertTrue(toPos.openTier, "Track A must not be portable to a validator with no position");
+        assertEq(_trackADelegated(validator1), 60e18);
+        assertEq(pool.getTotalOpenTierDelegatedStake(validator1), 0);
+        assertEq(_trackADelegated(validator2), 0);
+        assertEq(pool.getTotalOpenTierDelegatedStake(validator2), 40e18);
+    }
+
+    function test_transferStake_toFreshDestination_gateDisabled_opensTrackA() public {
+        _registerBothValidators();
+        _wlEnableGate();
+
+        vm.prank(delegator1);
+        pool.delegate(validator1, 100e18); // unverified -> Track B
+
+        vm.prank(owner);
+        pool.disableWhitelist();
+
+        vm.prank(delegator1);
+        pool.transferStake(validator1, validator2, 40e18);
+
+        assertFalse(pool.getDelegatorPosition(validator2, delegator1).openTier);
+        assertEq(_trackADelegated(validator1), 0);
+        assertEq(pool.getTotalOpenTierDelegatedStake(validator1), 60e18);
+        assertEq(_trackADelegated(validator2), 40e18);
+        assertEq(pool.getTotalOpenTierDelegatedStake(validator2), 0);
+    }
+
+    function test_transferStake_trackBSource_intoExistingTrackADestination_staysTrackA() public {
+        _registerBothValidators();
+        _wlEnableGate();
+
+        vm.prank(delegator1);
+        pool.delegate(validator1, 100e18); // unverified -> Track B
+        vm.prank(delegator1);
+        pool.delegateWithProof(validator2, 10e18, WL_B1, _wlProofFor(1)); // Track A
+
+        vm.prank(delegator1);
+        pool.transferStake(validator1, validator2, 40e18);
+
+        assertFalse(pool.getDelegatorPosition(validator2, delegator1).openTier);
+        assertEq(_trackADelegated(validator2), 50e18);
+        assertEq(pool.getTotalOpenTierDelegatedStake(validator2), 0);
+        assertEq(_trackADelegated(validator1), 0);
+        assertEq(pool.getTotalOpenTierDelegatedStake(validator1), 60e18);
+    }
+
+    function test_transferStake_trackASource_intoExistingTrackBDestination_staysTrackB() public {
+        _registerBothValidators();
+
+        vm.prank(delegator1);
+        pool.delegate(validator1, 100e18); // gate off -> Track A
+
+        _wlEnableGate();
+        vm.prank(delegator1);
+        pool.delegate(validator2, 10e18); // unverified -> Track B
+
+        vm.prank(delegator1);
+        pool.transferStake(validator1, validator2, 40e18);
+
+        assertTrue(pool.getDelegatorPosition(validator2, delegator1).openTier);
+        assertEq(_trackADelegated(validator2), 0);
+        assertEq(pool.getTotalOpenTierDelegatedStake(validator2), 50e18);
+        assertEq(_trackADelegated(validator1), 60e18);
+        assertEq(pool.getTotalOpenTierDelegatedStake(validator1), 0);
+    }
+
+    function test_transferStake_intoEmptiedPosition_usesCurrentGateTier() public {
+        _registerBothValidators();
+
+        vm.prank(delegator1);
+        pool.delegate(validator2, 100e18); // gate off -> Track A
+        vm.prank(delegator1);
+        pool.requestUndelegation(validator2, 100e18); // amount 0, openTier left stale
+
+        vm.prank(delegator1);
+        pool.delegate(validator1, 100e18); // gate off -> Track A
+
+        _wlEnableGate();
+
+        vm.prank(delegator1);
+        pool.transferStake(validator1, validator2, 40e18);
+
+        IDelegationPool.DelegatorPosition memory toPos = pool.getDelegatorPosition(validator2, delegator1);
+        assertTrue(toPos.openTier, "amount 0 counts as fresh, so the gate decides the tier");
+        assertEq(toPos.amount, 40e18);
+        assertEq(toPos.undelegateAmount, 100e18);
+        assertEq(_trackADelegated(validator2), 0);
+        assertEq(pool.getTotalOpenTierDelegatedStake(validator2), 40e18);
     }
 
     function test_transferStake_settlesPendingRewardsOnBothSidesFirst() public {
