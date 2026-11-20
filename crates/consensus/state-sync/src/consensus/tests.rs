@@ -304,6 +304,7 @@ impl Peer {
 struct Asked {
     latest: AtomicUsize,
     certified_tip: AtomicUsize,
+    penalized: std::sync::Mutex<Vec<BlsPublicKey>>,
 }
 
 /// Connected `peers`, serving every header in `headers` by hash.
@@ -360,6 +361,9 @@ fn peer_network(
                             .map(|h| PrimaryResponse::ConsensusHeader(Arc::new(h)))
                             .ok_or_else(unknown),
                     );
+                }
+                NetworkCommand::ReportPenalty { peer, .. } => {
+                    counts.penalized.lock().unwrap().push(peer);
                 }
                 _ => {}
             }
@@ -478,7 +482,7 @@ async fn after_the_fork_a_forged_epoch_cannot_strand_the_follower() {
 }
 
 /// A copy of the honest top tip with a bad signature, answered before the honest ones, does
-/// not stand in for them.
+/// not stand in for them, and its sender alone is penalized.
 #[tokio::test(start_paused = true)]
 async fn a_bad_copy_of_the_top_tip_does_not_hide_the_honest_ones() {
     let fixture = committee_of_four();
@@ -502,12 +506,13 @@ async fn a_bad_copy_of_the_top_tip_does_not_hide_the_honest_ones() {
         })
         .collect();
     peers.push(Peer::new(observer, Some(bad), &honest));
-    let (network, _) = peer_network(peers, vec![honest.clone()]);
+    let (network, asked) = peer_network(peers, vec![honest.clone()]);
     let consensus_bus = ConsensusBus::new();
     tokio::spawn(spawn_track_recent_consensus(config.clone(), consensus_bus.clone(), network));
 
     assert!(reaches(&consensus_bus, 1, Duration::from_secs(5)).await, "walks to the tip");
     config.shutdown().notify();
+    assert_eq!(*asked.penalized.lock().unwrap(), vec![observer], "only the bad copy's sender");
 }
 
 /// A connected peer that does not answer within the request timeout does not hold up the

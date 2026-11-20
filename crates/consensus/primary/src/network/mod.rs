@@ -292,6 +292,13 @@ impl PrimaryNetworkHandle {
         }
     }
 
+    /// Penalize `peer` for a certified tip that failed against a committee this node knows: the
+    /// tip names that committee, so the answer is forged. Mild, as for a bad consensus result
+    /// signature on gossip.
+    pub async fn report_invalid_certified_tip(&self, peer: BlsPublicKey) {
+        self.report_penalty(peer, Penalty::Mild).await;
+    }
+
     /// Request the certified epoch record for `epoch` from one specific peer.
     ///
     /// Unlike [`Self::request_epoch_cert`] this names the authority, so the answer is that
