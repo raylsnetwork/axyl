@@ -23,6 +23,9 @@ const COMMITTEE_KEYS_TIMEOUT: Duration = Duration::from_secs(30);
 const COMMITTEE_KEYS_POLL_INTERVAL: Duration = Duration::from_millis(500);
 /// How long to wait for a gossip tip before actively probing peers for the network head.
 const PROBE_INTERVAL: Duration = Duration::from_secs(10);
+/// How long a probe waits for peers' certified tips before ranking the ones that arrived. One
+/// valid tip is enough, so a silent peer must not hold every probe for the request timeout.
+const CERTIFIED_TIP_PROBE_DEADLINE: Duration = Duration::from_secs(3);
 
 /// Headers the walk prefetches per round, and so its most requests in flight at once.
 const WALK_PREFETCH: u64 = 32;
@@ -707,6 +710,7 @@ async fn probe_for_head<DB: ReDatabase>(
 /// Ask every connected peer, observers included, for its certified tip and return the highest
 /// one above `current` that verifies against its epoch's committee. One valid answer is enough;
 /// asking every peer only guards against peers that are down, on an older release, or behind.
+/// Answers that have not arrived within [`CERTIFIED_TIP_PROBE_DEADLINE`] are not waited for.
 /// A tip from before this node's previous epoch is dropped: f+1 keys of a retired committee
 /// could sign any number, and the previous epoch counts so a chain halted on its last header can
 /// still be found.
@@ -726,13 +730,16 @@ async fn probe_peers_for_certified_tip<DB: ReDatabase>(
         peers.into_iter().map(|peer| network.request_certified_tip_from_peer(peer)).collect();
     let floor = config.epoch().saturating_sub(1);
     let mut candidates = Vec::new();
-    while let Some(result) = inflight.next().await {
-        if let Ok(Some(tip)) = result {
-            if tip.number > current && tip.epoch >= floor {
-                candidates.push(tip);
+    let _ = tokio::time::timeout(CERTIFIED_TIP_PROBE_DEADLINE, async {
+        while let Some(result) = inflight.next().await {
+            if let Ok(Some(tip)) = result {
+                if tip.number > current && tip.epoch >= floor {
+                    candidates.push(tip);
+                }
             }
         }
-    }
+    })
+    .await;
     // epoch first: a high number signed by f+1 retired keys of an earlier epoch must not rank
     // above an honest tip from a later one
     candidates.sort_by(|a, b| (b.epoch, b.number).cmp(&(a.epoch, a.number)));

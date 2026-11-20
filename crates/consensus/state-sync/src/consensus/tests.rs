@@ -279,23 +279,23 @@ fn certified(fixture: &CommitteeFixture<MemDatabase>, header: &ConsensusHeader) 
 }
 
 /// One connected peer: what it answers when asked for its certified tip (`Err` for a peer on
-/// a release without the request) and for its latest header, and whether its certified tip
-/// arrives a second late.
+/// a release without the request) and for its latest header, and how late its certified tip
+/// arrives.
 struct Peer {
     key: BlsPublicKey,
     certified_tip: Result<Option<CertifiedTip>, ()>,
     latest: ConsensusHeader,
-    slow: bool,
+    delay: Duration,
 }
 
 impl Peer {
     fn new(key: BlsPublicKey, tip: Option<CertifiedTip>, latest: &ConsensusHeader) -> Self {
-        Self { key, certified_tip: Ok(tip), latest: latest.clone(), slow: false }
+        Self { key, certified_tip: Ok(tip), latest: latest.clone(), delay: Duration::ZERO }
     }
 
     /// A peer on a release without the certified tip request.
     fn old(key: BlsPublicKey, latest: &ConsensusHeader) -> Self {
-        Self { key, certified_tip: Err(()), latest: latest.clone(), slow: false }
+        Self { key, certified_tip: Err(()), latest: latest.clone(), delay: Duration::ZERO }
     }
 }
 
@@ -332,9 +332,10 @@ fn peer_network(
                                 .clone()
                                 .map(PrimaryResponse::CertifiedTip)
                                 .map_err(|()| unknown());
-                            if peer.slow {
+                            if !peer.delay.is_zero() {
+                                let delay = peer.delay;
                                 tokio::spawn(async move {
-                                    tokio::time::sleep(Duration::from_secs(1)).await;
+                                    tokio::time::sleep(delay).await;
                                     let _ = reply.send(response);
                                 });
                                 continue;
@@ -495,7 +496,10 @@ async fn a_bad_copy_of_the_top_tip_does_not_hide_the_honest_ones() {
         .committee()
         .others_primaries_by_id(config.authority_id().as_ref())
         .into_iter()
-        .map(|(_, key)| Peer { slow: true, ..Peer::new(key, Some(valid.clone()), &honest) })
+        .map(|(_, key)| Peer {
+            delay: Duration::from_secs(1),
+            ..Peer::new(key, Some(valid.clone()), &honest)
+        })
         .collect();
     peers.push(Peer::new(observer, Some(bad), &honest));
     let (network, _) = peer_network(peers, vec![honest.clone()]);
@@ -503,6 +507,31 @@ async fn a_bad_copy_of_the_top_tip_does_not_hide_the_honest_ones() {
     tokio::spawn(spawn_track_recent_consensus(config.clone(), consensus_bus.clone(), network));
 
     assert!(reaches(&consensus_bus, 1, Duration::from_secs(5)).await, "walks to the tip");
+    config.shutdown().notify();
+}
+
+/// A connected peer that does not answer within the request timeout does not hold up the
+/// probe: the tips that arrived by the deadline are enough.
+#[tokio::test(start_paused = true)]
+async fn a_silent_peer_does_not_hold_up_the_probe() {
+    let fixture = committee_of_four();
+    let config = fixture.authorities().next().unwrap().consensus_config();
+    let config = config.with_certified_tip_v1_block(Some(0));
+    let honest = honest_tip(&fixture);
+    let observer = *committee_of_four().authorities().next().unwrap().authority().protocol_key();
+    let mut peers: Vec<_> = config
+        .committee()
+        .others_primaries_by_id(config.authority_id().as_ref())
+        .into_iter()
+        .map(|(_, key)| Peer::new(key, Some(certified(&fixture, &honest)), &honest))
+        .collect();
+    peers.push(Peer { delay: Duration::from_secs(60), ..Peer::new(observer, None, &honest) });
+    let (network, _) = peer_network(peers, vec![honest.clone()]);
+    let consensus_bus = ConsensusBus::new();
+    tokio::spawn(spawn_track_recent_consensus(config.clone(), consensus_bus.clone(), network));
+
+    let limit = CERTIFIED_TIP_PROBE_DEADLINE + Duration::from_secs(2);
+    assert!(reaches(&consensus_bus, 1, limit).await, "walks to the tip by the deadline");
     config.shutdown().notify();
 }
 
