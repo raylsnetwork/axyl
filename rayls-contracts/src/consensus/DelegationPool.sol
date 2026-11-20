@@ -776,10 +776,11 @@ contract DelegationPool is
         ValidatorPool storage pool = _getDelegationPoolStorage().validatorPools[validatorAddress];
         totalDelegated = pool.totalDelegated + pool.openTierDelegated;
         selfDelegated = _getSelfDelegatedStake(validatorAddress);
-        // Saturating: `selfDelegated` is settled to its post-slash value with the per-position
-        // ceiling rounding, while `totalDelegated` carries the pool's un-rounded figure. The two
-        // can disagree by dust after a slash, and an underflow revert here would take out a
-        // reporting view over an amount nobody can spend.
+        // Self never exceeds the pool total, so this is a plain remainder; the saturation is
+        // only defence in depth (if it ever fired, self + third would stop adding up to total).
+        // The remainder is not dust: a position unsettled between slashes pays each slash
+        // against its pre-slash stake, so repeated slashes over-slash it and this absorbs the
+        // difference — see the interface note.
         thirdPartyDelegated = totalDelegated > selfDelegated
             ? totalDelegated - selfDelegated
             : 0;
