@@ -352,9 +352,10 @@ async fn probe_for_head<DB: ReDatabase>(
 /// A tip from before this node's previous epoch is dropped: f+1 keys of a retired committee
 /// could sign any number, and the previous epoch counts so a chain halted on its last header can
 /// still be found.
-/// A tip from an epoch whose committee is not known yet is skipped, and the epoch record
-/// collector is asked for the record after the newest one held: it walks upward as far as peers
-/// serve, so a later probe can verify the tip. Neither waiting here nor requesting the tip's own
+/// A tip from an epoch whose committee is not settled yet, from config or a certified record (the
+/// lookahead does not count), is skipped, and the epoch record collector is asked for the record
+/// after the newest one held: it walks upward as far as peers serve, so a later probe can verify
+/// the tip. Neither waiting here nor requesting the tip's own
 /// epoch, which is unverified: a peer naming a far epoch would hold up the probe or send the
 /// collector chasing it.
 async fn probe_peers_for_certified_tip<DB: ReDatabase>(
@@ -386,7 +387,9 @@ async fn probe_peers_for_certified_tip<DB: ReDatabase>(
     candidates.dedup();
     let mut collector_asked = false;
     for tip in candidates {
-        let Some(committee) = config.get_committee_keys_for_epoch(tip.epoch) else {
+        // the committee the tip's epoch ran with, never the lookahead: an honest tip fails
+        // against a lookahead that still lists a key ejected since it was read
+        let Some(committee) = config.get_settled_committee_keys_for_epoch(tip.epoch) else {
             // the same record is next for every such tip, so ask once
             if !collector_asked {
                 collector_asked = true;
@@ -554,7 +557,7 @@ mod tests {
     use rayls_infrastructure_storage::{mem_db::MemDatabase, tables::ConsensusBlocks};
     use rayls_infrastructure_types::{
         encode, to_intent_message, BlsAggregateSignature, BlsSignature, Certificate, CertifiedTip,
-        CommittedSubDag, ReputationScores, Signer as _,
+        CommittedSubDag, CommitteeLookahead, ReputationScores, Signer as _,
     };
     use rayls_testing_test_utils_committee::CommitteeFixture;
     use std::{
@@ -1095,6 +1098,63 @@ mod tests {
 
         let limit = CERTIFIED_TIP_PROBE_DEADLINE + Duration::from_secs(2);
         assert!(reaches(&consensus_bus, 1, limit).await, "walks to the tip by the deadline");
+        config.shutdown().notify();
+    }
+
+    /// An honest tip from the next epoch is not checked against the lookahead, which can still
+    /// list a key ejected since it was read and then fails the tip. The tip waits for the
+    /// certified record naming that committee, and the collector is asked for it.
+    #[tokio::test(start_paused = true)]
+    async fn a_stale_lookahead_does_not_reject_an_honest_tip() {
+        let fixture = committee_of_four();
+        let base = fixture.authorities().next().unwrap().consensus_config();
+        let keys: Vec<_> = fixture.authorities().map(|a| *a.authority().protocol_key()).collect();
+        // an ejected key sorting below every member shifts every bitmap index
+        let ejected = std::iter::repeat_with(|| {
+            *committee_of_four().authorities().next().unwrap().authority().protocol_key()
+        })
+        .find(|key| keys.iter().all(|member| key < member))
+        .unwrap();
+        let mut stale = keys.clone();
+        stale.push(ejected);
+        let config = ConsensusConfig::new_for_epoch(
+            base.config().clone(),
+            base.node_storage().clone(),
+            base.key_config().clone(),
+            base.committee().clone(),
+            CommitteeLookahead::from_entries([(1, stale.clone())]),
+            base.network_config().clone(),
+            u64::MAX,
+            true,
+        )
+        .unwrap()
+        .with_certified_tip_v1_block(Some(0));
+
+        // f+1 of the committee sign a header of epoch 1
+        let hash = B256::repeat_byte(7);
+        let digest = CertifiedTip::digest_data(1, 2, 5, hash);
+        let signed = fixture.authorities().take(CertifiedTip::quorum(keys.len())).map(|a| {
+            (*a.authority().protocol_key(), a.keypair().sign(&encode(&to_intent_message(digest))))
+        });
+        let tip = CertifiedTip::from_signatures(1, 2, 5, hash, &keys, signed).unwrap();
+        assert!(tip.verify(&keys), "precondition: honest");
+        assert!(!tip.verify(&stale), "precondition: fails against the stale lookahead");
+        assert!(config.get_committee_keys_for_epoch(1).is_some(), "the lookahead knows epoch 1");
+
+        let honest = honest_tip(&fixture);
+        let peers = config
+            .committee()
+            .others_primaries_by_id(config.authority_id().as_ref())
+            .into_iter()
+            .map(|(_, key)| Peer::new(key, Some(tip.clone()), &honest))
+            .collect();
+        let (network, _) = peer_network(peers, vec![]);
+        let consensus_bus = ConsensusBus::new();
+        tokio::spawn(spawn_track_recent_consensus(config.clone(), consensus_bus.clone(), network));
+
+        let mut requested = consensus_bus.requested_missing_epoch().subscribe();
+        let asked = tokio::time::timeout(Duration::from_secs(5), requested.wait_for(|e| *e >= 1));
+        assert!(asked.await.is_ok(), "the collector is asked for the record naming epoch 1");
         config.shutdown().notify();
     }
 
