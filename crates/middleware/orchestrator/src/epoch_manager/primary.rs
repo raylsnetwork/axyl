@@ -154,14 +154,14 @@ where
         // accept the network head from the new committee, votes for an epoch are published and
         // retried after its committee has rotated out, and an unlisted publisher's message is
         // neither forwarded nor processed. The list is necessary, not sufficient: `verify_gossip`
-        // also needs the author's peer id bound to its BLS key. Configured bindings cover the
-        // genesis committee only, so a member that joined later is bound on the nodes it
-        // connected to directly; a node behind the rotation that is not among them stops
-        // relaying that member's output, where before it forwarded blind what it could not
-        // process. One more edge: a member that left the registry while an epoch it voted in
-        // is still uncertified has its retried votes ignored once it is out of the departing
-        // committee too. That needs a stall longer than an epoch and an exit in the same
-        // window, and the vote fetch covers that case, so it is accepted here.
+        // also needs the author's peer id attributed to its BLS key, either by a binding from
+        // the author's own connection or by the record this node holds for a registered
+        // validator (`gossip_publisher_bls`). So a member is accepted, and relayed, by nodes it
+        // never connected to, as long as they hold its record. One more edge: a member that left
+        // the registry while an epoch it voted in is still uncertified has its retried
+        // votes ignored once it is out of the departing committee too. That needs a stall
+        // longer than an epoch and an exit in the same window, and the vote fetch covers
+        // that case, so it is accepted here.
         for (topic, publishers) in
             gossip_publisher_lists(committee_keys, &self.registered_validators)
         {

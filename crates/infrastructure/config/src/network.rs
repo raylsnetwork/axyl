@@ -50,6 +50,12 @@ impl NetworkConfig {
         &self.quic_config
     }
 
+    /// Return a mutable reference to the [QuicConfig].
+    #[cfg(feature = "test-utils")]
+    pub fn quic_config_mut(&mut self) -> &mut QuicConfig {
+        &mut self.quic_config
+    }
+
     /// Return a reference to the [PeerConfig].
     pub fn peer_config(&self) -> &PeerConfig {
         &self.peer_config

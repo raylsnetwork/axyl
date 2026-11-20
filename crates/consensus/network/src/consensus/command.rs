@@ -371,7 +371,10 @@ where
                 if let Some(peer) = self.swarm.behaviour().peer_manager.bound_auth_to_peer(peer) {
                     self.swarm.behaviour_mut().peer_manager.process_penalty(peer, penalty);
                 } else {
-                    warn!(target: "peer-manager", ?peer, "unable to assess penalty for peer");
+                    // debug, not warn: gossip attributed from a registered validator's record
+                    // reaches here once per message for a key with no binding, and a validator
+                    // must not be able to fill the log of every node it is not connected to
+                    debug!(target: "peer-manager", ?peer, "unable to assess penalty for peer");
                 }
             }
             NetworkCommand::DisconnectPeer { peer_id, reply } => {
