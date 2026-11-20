@@ -716,16 +716,19 @@ async fn test_quorum_keeps_certified_tip() -> eyre::Result<()> {
     Ok(())
 }
 
-/// The stored certified tip only moves up, and never back to an earlier epoch: a retired
-/// committee's keys must not pin a forged high number from their epoch.
+/// The stored certified tip only moves up, and never back to an earlier epoch or below the
+/// floor, even with nothing stored: a retired committee's keys must not pin a forged high number
+/// from their epoch.
 #[test]
 fn certified_tip_only_moves_up_within_or_past_its_epoch() {
-    assert!(replaces_certified_tip(None, 0, 1), "nothing stored yet");
-    assert!(replaces_certified_tip(Some((20, 5000)), 20, 5001), "higher, same epoch");
-    assert!(replaces_certified_tip(Some((20, 5000)), 21, 5001), "higher, next epoch");
-    assert!(!replaces_certified_tip(Some((20, 5000)), 20, 5000), "the same tip");
-    assert!(!replaces_certified_tip(Some((20, 5000)), 21, 4999), "lower");
-    assert!(!replaces_certified_tip(Some((20, 5000)), 3, 9_999_999), "earlier epoch");
+    assert!(replaces_certified_tip(None, 0, 0, 1), "nothing stored yet");
+    assert!(replaces_certified_tip(None, 20, 20, 1), "nothing stored, at the floor");
+    assert!(!replaces_certified_tip(None, 20, 3, 9_999_999), "nothing stored, below the floor");
+    assert!(replaces_certified_tip(Some((20, 5000)), 20, 20, 5001), "higher, same epoch");
+    assert!(replaces_certified_tip(Some((20, 5000)), 20, 21, 5001), "higher, next epoch");
+    assert!(!replaces_certified_tip(Some((20, 5000)), 20, 20, 5000), "the same tip");
+    assert!(!replaces_certified_tip(Some((20, 5000)), 20, 21, 4999), "lower");
+    assert!(!replaces_certified_tip(Some((20, 5000)), 0, 3, 9_999_999), "earlier epoch");
 }
 
 #[test]

@@ -126,13 +126,17 @@ pub(crate) struct RequestHandler<DB> {
 }
 
 /// Whether a tip certified at `epoch` and `number` replaces the stored one, `saved` as its epoch
-/// and number: only when it is higher and from the same or a later epoch.
+/// and number: only when it is from `floor` or later, and higher than the stored one and from
+/// the same or a later epoch. `floor` holds while nothing is stored yet.
 pub(super) fn replaces_certified_tip(
     saved: Option<(Epoch, u64)>,
+    floor: Epoch,
     epoch: Epoch,
     number: u64,
 ) -> bool {
-    saved.is_none_or(|(saved_epoch, saved_number)| epoch >= saved_epoch && number > saved_number)
+    epoch >= floor
+        && saved
+            .is_none_or(|(saved_epoch, saved_number)| epoch >= saved_epoch && number > saved_number)
 }
 
 /// The gossip handler's view of the pending epoch record table.
@@ -1077,8 +1081,10 @@ where
     /// Keep the f+1 signatures that just certified a header as this node's certified tip, the
     /// head it serves to peers. A higher stored tip is kept: gossip only moves forward, but a
     /// restarted node can hear a lower header reach f+1 before it catches up. So is one from a
-    /// later epoch: the row outlives restarts, so f+1 keys of a retired committee could
-    /// otherwise pin a forged high number from their epoch for good.
+    /// later epoch, and nothing from before the previous epoch is stored even when no row is:
+    /// the row outlives restarts, so f+1 keys of a retired committee could otherwise pin a
+    /// forged high number from their epoch for good. The previous epoch still counts, so a
+    /// chain halted on its last header keeps a tip.
     fn save_certified_tip(
         &self,
         epoch: Epoch,
@@ -1093,8 +1099,9 @@ where
         else {
             return;
         };
+        let floor = self.consensus_config.committee().epoch().saturating_sub(1);
         let mut saved = self.certified_tip_saved.lock();
-        if !replaces_certified_tip(*saved, epoch, number) {
+        if !replaces_certified_tip(*saved, floor, epoch, number) {
             return;
         }
         match self.consensus_config.node_storage().insert::<CertifiedTips>(&0, &tip) {

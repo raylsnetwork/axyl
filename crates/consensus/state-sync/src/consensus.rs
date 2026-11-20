@@ -707,6 +707,9 @@ async fn probe_for_head<DB: ReDatabase>(
 /// Ask every connected peer, observers included, for its certified tip and return the highest
 /// one above `current` that verifies against its epoch's committee. One valid answer is enough;
 /// asking every peer only guards against peers that are down, on an older release, or behind.
+/// A tip from before this node's previous epoch is dropped: f+1 keys of a retired committee
+/// could sign any number, and the previous epoch counts so a chain halted on its last header can
+/// still be found.
 /// A tip from an epoch whose committee is not known yet is skipped, and the epoch record
 /// collector is asked for the record after the newest one held: it walks upward as far as peers
 /// serve, so a later probe can verify the tip. Neither waiting here nor requesting the tip's own
@@ -721,10 +724,11 @@ async fn probe_peers_for_certified_tip<DB: ReDatabase>(
     let peers = network.inner_handle().connected_peers().await.ok()?;
     let mut inflight: FuturesUnordered<_> =
         peers.into_iter().map(|peer| network.request_certified_tip_from_peer(peer)).collect();
+    let floor = config.epoch().saturating_sub(1);
     let mut candidates = Vec::new();
     while let Some(result) = inflight.next().await {
         if let Ok(Some(tip)) = result {
-            if tip.number > current {
+            if tip.number > current && tip.epoch >= floor {
                 candidates.push(tip);
             }
         }
