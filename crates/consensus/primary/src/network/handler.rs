@@ -179,12 +179,17 @@ where
                 "committee is larger than a missing-certificates request may name, so missing-certificates requests between members will be refused"
             );
         }
-        let certified_tip_saved = consensus_config
-            .node_storage()
-            .get::<CertifiedTips>(&0)
-            .ok()
-            .flatten()
-            .map(|tip| (tip.epoch, tip.number));
+        let certified_tip_saved = match consensus_config.node_storage().get::<CertifiedTips>(&0) {
+            Ok(tip) => tip.map(|tip| (tip.epoch, tip.number)),
+            Err(e) => {
+                warn!(
+                    target: "primary::handler",
+                    %e,
+                    "failed to read the certified tip, only the epoch floor guards the next one"
+                );
+                None
+            }
+        };
         Self {
             certified_tip_saved: Arc::new(Mutex::new(certified_tip_saved)),
             consensus_config,
