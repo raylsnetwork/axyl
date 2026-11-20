@@ -19,16 +19,16 @@ use parking_lot::Mutex;
 use rayls_consensus_network::{admission::RequestPermits, GossipMessage};
 use rayls_infrastructure_config::{ConsensusConfig, LibP2pConfig};
 use rayls_infrastructure_storage::{
-    tables::ConsensusBlocks, CertScope, CertificateStore, ConsensusStore, EpochStore,
-    ProposerStore, VoteDigestStore,
+    tables::{CertifiedTips, ConsensusBlocks},
+    CertScope, CertificateStore, ConsensusStore, EpochStore, ProposerStore, VoteDigestStore,
 };
 use rayls_infrastructure_types::{
     ensure,
     error::{CertificateError, HeaderError, HeaderResult},
     now, to_intent_message, try_decode, AuthorityIdentifier, B256Map, BlockHash, BlockNumHash,
-    BlsPublicKey, Certificate, CertificateDigest, ConsensusHeader, Database, Epoch,
-    EpochCertificate, EpochRecord, Hash as _, Header, ProtocolSignature, RaylsSender as _, Round,
-    SignatureVerificationState, Vote, VotesAggregator, B256,
+    BlsPublicKey, BlsSignature, Certificate, CertificateDigest, CertifiedTip, ConsensusHeader,
+    Database, Epoch, EpochCertificate, EpochRecord, Hash as _, Header, ProtocolSignature,
+    RaylsSender as _, Round, SignatureVerificationState, Vote, VotesAggregator, B256,
 };
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
@@ -402,11 +402,19 @@ where
                             .entry(consensus_result_hash)
                             .or_insert_with(|| VotesAggregator::new(enough_sigs as u64));
                         match aggregator.append(*result, 1) {
-                            Ok(reached) => reached,
+                            // the signatures that reached it, read before any clear below
+                            Ok(reached) => reached.then(|| {
+                                aggregator
+                                    .votes()
+                                    .iter()
+                                    .map(|vote| (vote.validator, vote.signature))
+                                    .collect::<Vec<_>>()
+                            }),
                             Err(_) => return Ok(()),
                         }
                     };
-                    if quorum {
+                    if let Some(signatures) = quorum {
+                        self.save_certified_tip(epoch, round, number, hash, &committee, signatures);
                         if self.behind_consensus(epoch, round, Some(number)).await {
                             self.consensus_certs.lock().clear();
                             return Ok(());
@@ -1043,6 +1051,48 @@ where
         };
 
         Ok(PrimaryResponse::ConsensusHeader(Arc::new(header)))
+    }
+
+    /// Keep the f+1 signatures that just certified a header as this node's certified tip, the
+    /// head it serves to peers. A higher stored tip is kept: gossip only moves forward, but a
+    /// restarted node can hear a lower header reach f+1 before it catches up.
+    fn save_certified_tip(
+        &self,
+        epoch: Epoch,
+        round: Round,
+        number: u64,
+        hash: BlockHash,
+        committee: &[BlsPublicKey],
+        signatures: Vec<(BlsPublicKey, BlsSignature)>,
+    ) {
+        let Some(tip) =
+            CertifiedTip::from_signatures(epoch, round, number, hash, committee, signatures)
+        else {
+            return;
+        };
+        let db = self.consensus_config.node_storage();
+        if db.get::<CertifiedTips>(&0).ok().flatten().is_some_and(|stored| stored.number >= number)
+        {
+            return;
+        }
+        if let Err(e) = db.insert::<CertifiedTips>(&0, &tip) {
+            warn!(
+                target: "primary::consensus_result",
+                number,
+                %e,
+                "failed to save the certified tip"
+            );
+        }
+    }
+
+    /// Retrieve this node's certified tip from local storage, `None` while it has none.
+    pub(super) async fn retrieve_certified_tip(&self) -> PrimaryNetworkResult<PrimaryResponse> {
+        let tip = self
+            .consensus_config
+            .node_storage()
+            .get::<CertifiedTips>(&0)
+            .map_err(|e| PrimaryNetworkError::Internal(format!("certified tip read: {e}")))?;
+        Ok(PrimaryResponse::CertifiedTip(tip))
     }
 
     /// Retrieve an epoch record from local storage.

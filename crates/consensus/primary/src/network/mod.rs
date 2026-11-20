@@ -32,8 +32,9 @@ use rayls_infrastructure_network_types::{
 use rayls_infrastructure_storage::PayloadStore;
 use rayls_infrastructure_types::{
     encode, error::HeaderError, AuthorityIdentifier, BlockHash, BlsPublicKey, BlsSignature,
-    Certificate, CertificateDigest, ConsensusHeader, Database, Epoch, EpochCertificate,
-    EpochRecord, EpochVote, Header, RaylsReceiver, RaylsSender, Round, TaskKind, TaskSpawner, Vote,
+    Certificate, CertificateDigest, CertifiedTip, ConsensusHeader, Database, Epoch,
+    EpochCertificate, EpochRecord, EpochVote, Header, RaylsReceiver, RaylsSender, Round, TaskKind,
+    TaskSpawner, Vote,
 };
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
 use tokio::sync::{mpsc, oneshot};
@@ -173,6 +174,9 @@ impl PrimaryNetworkHandle {
             PrimaryResponse::Busy => {
                 Err(NetworkError::RPCError("Got wrong response, not a vote is busy!".to_string()))
             }
+            PrimaryResponse::CertifiedTip(_) => Err(NetworkError::RPCError(
+                "Got wrong response, not a vote is certified tip!".to_string(),
+            )),
         }
     }
 
@@ -273,6 +277,19 @@ impl PrimaryNetworkHandle {
             }
         }
         Err(NetworkError::RPCError("Could not get the consensus header!".to_string()))
+    }
+
+    /// Request `peer`'s certified tip, `None` while it has none. The caller verifies it against
+    /// the committee of its epoch: one valid answer is enough to trust the head.
+    pub async fn request_certified_tip_from_peer(
+        &self,
+        peer: BlsPublicKey,
+    ) -> NetworkResult<Option<CertifiedTip>> {
+        let res = self.handle.send_request(PrimaryRequest::CertifiedTip, peer).await?;
+        match res.await?? {
+            PrimaryResponse::CertifiedTip(tip) => Ok(tip),
+            _ => Err(NetworkError::RPCError("Peer did not return a certified tip!".to_string())),
+        }
     }
 
     /// Request the certified epoch record for `epoch` from one specific peer.
@@ -407,6 +424,9 @@ where
                 }
                 PrimaryRequest::EpochRecord { epoch, hash } => {
                     self.process_epoch_record_request(peer, epoch, hash, channel, cancel)
+                }
+                PrimaryRequest::CertifiedTip => {
+                    self.process_certified_tip_request(peer, channel, cancel)
                 }
             },
             NetworkEvent::Gossip(msg, gossip_source) => {
@@ -544,6 +564,28 @@ where
                         // if response.is_err() { }
                         let _ = network_handle.handle.send_response(response, channel).await;
                     }
+                // cancel notification from network layer
+                _ = cancel => (),
+            }
+        });
+    }
+
+    /// Serve this node's certified tip from the database.
+    fn process_certified_tip_request(
+        &self,
+        peer: BlsPublicKey,
+        channel: ResponseChannel<PrimaryResponse>,
+        cancel: oneshot::Receiver<()>,
+    ) {
+        let request_handler = self.request_handler.clone();
+        let network_handle = self.network_handle.clone();
+        let task_name = format!("CertifiedTipReq-{peer}");
+        self.task_spawner.spawn_task(task_name, async move {
+            tokio::select! {
+                tip = request_handler.retrieve_certified_tip() => {
+                    let response = tip.into_response();
+                    let _ = network_handle.handle.send_response(response, channel).await;
+                }
                 // cancel notification from network layer
                 _ = cancel => (),
             }

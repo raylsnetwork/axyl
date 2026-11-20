@@ -15,11 +15,11 @@ pub use stores::*;
 pub use redb::database::ReDB;
 use tables::{
     BatchOrderingState, BatchSeqCounter, Batches, CertificateDigestByOrigin,
-    CertificateDigestByRound, Certificates, ConsensusBlockNumbersByDigest, ConsensusBlocks,
-    ConsensusBlocksCache, EpochCerts, EpochRecords, EpochRecordsIndex, EpochTransitionCheckpoints,
-    KadProviderRecords, KadRecords, KadWorkerProviderRecords, KadWorkerRecords, LastProposed,
-    LastProposedByAuthority, NodeBatchesCache, NodeIdentity, Payload, PendingEpochRecord,
-    PrevEpochCertificateDigestByOrigin, PrevEpochCertificates, Votes,
+    CertificateDigestByRound, Certificates, CertifiedTips, ConsensusBlockNumbersByDigest,
+    ConsensusBlocks, ConsensusBlocksCache, EpochCerts, EpochRecords, EpochRecordsIndex,
+    EpochTransitionCheckpoints, KadProviderRecords, KadRecords, KadWorkerProviderRecords,
+    KadWorkerRecords, LastProposed, LastProposedByAuthority, NodeBatchesCache, NodeIdentity,
+    Payload, PendingEpochRecord, PrevEpochCertificateDigestByOrigin, PrevEpochCertificates, Votes,
 };
 #[cfg(feature = "cold-storage")]
 use tables::{ColdArchiveHighWaterMark, ColdBatchLocations};
@@ -70,6 +70,7 @@ const KAD_WORKER_PROVIDER_RECORD_CF: &str = "kad_worker_provider_record";
 const EPOCH_TRANSITION_CHECKPOINTS_CF: &str = "epoch_transition_checkpoints";
 const BATCH_SEQ_COUNTER_CF: &str = "batch_seq_counter";
 const NODE_IDENTITY_CF: &str = "node_identity";
+const CERTIFIED_TIP_CF: &str = "certified_tip";
 const BATCH_ORDERING_STATE_CF: &str = "batch_ordering_state";
 #[cfg(feature = "cold-storage")]
 const COLD_BATCH_LOCATIONS_CF: &str = "cold_batch_locations";
@@ -97,9 +98,9 @@ pub mod tables {
     use crate::cold::ColdLocation;
     use rayls_infrastructure_types::{
         batch_ordering::StoredBatchOrderingState as TypeStoredBatchOrderingState,
-        AuthorityIdentifier, Batch, BlockHash, Certificate, CertificateDigest, ConsensusHeader,
-        Epoch, EpochCertificate, EpochRecord, EpochTransitionCheckpoint, Header, Round, VoteInfo,
-        WorkerId, B256,
+        AuthorityIdentifier, Batch, BlockHash, Certificate, CertificateDigest, CertifiedTip,
+        ConsensusHeader, Epoch, EpochCertificate, EpochRecord, EpochTransitionCheckpoint, Header,
+        Round, VoteInfo, WorkerId, B256,
     };
 
     tables!(
@@ -148,6 +149,9 @@ pub mod tables {
         BatchSeqCounter;crate::BATCH_SEQ_COUNTER_CF;<WorkerId, u64>,
         // Node identity: stores this validator's AuthorityIdentifier for foreign DB detection.
         NodeIdentity;crate::NODE_IDENTITY_CF;<u8, AuthorityIdentifier>,
+        // The newest consensus header this node saw f+1 committee members sign, served to peers
+        // finding the network head. Keyed by 0, one row, overwritten as the chain advances.
+        CertifiedTips;crate::CERTIFIED_TIP_CF;<u8, CertifiedTip>,
         // Batch ordering state for the current epoch.
         BatchOrderingState;crate::BATCH_ORDERING_STATE_CF;<u8, TypeStoredBatchOrderingState>
     );
@@ -300,6 +304,7 @@ fn open_default_tables<DB: Database>(db: &mut DB) -> eyre::Result<()> {
     open_one::<KadWorkerProviderRecords>(db)?;
     open_one::<BatchSeqCounter>(db)?;
     open_one::<NodeIdentity>(db)?;
+    open_one::<CertifiedTips>(db)?;
     open_one::<BatchOrderingState>(db)?;
     #[cfg(feature = "cold-storage")]
     {
