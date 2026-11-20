@@ -711,8 +711,6 @@ async fn probe_for_head<DB: ReDatabase>(
 /// one above `current` that verifies against its epoch's committee. One valid answer is enough;
 /// asking every peer only guards against peers that are down, on an older release, or behind.
 /// Answers that have not arrived within [`CERTIFIED_TIP_PROBE_DEADLINE`] are not waited for.
-/// A peer whose tip fails against a committee this node knows is penalized: the tip names that
-/// committee, so it is forged, and each one costs this node a verify.
 /// A tip from before this node's previous epoch is dropped: f+1 keys of a retired committee
 /// could sign any number, and the previous epoch counts so a chain halted on its last header can
 /// still be found.
@@ -728,17 +726,15 @@ async fn probe_peers_for_certified_tip<DB: ReDatabase>(
     network: &PrimaryNetworkHandle,
 ) -> Option<(u64, B256)> {
     let peers = network.inner_handle().connected_peers().await.ok()?;
-    let mut inflight: FuturesUnordered<_> = peers
-        .into_iter()
-        .map(|peer| async move { (peer, network.request_certified_tip_from_peer(peer).await) })
-        .collect();
+    let mut inflight: FuturesUnordered<_> =
+        peers.into_iter().map(|peer| network.request_certified_tip_from_peer(peer)).collect();
     let floor = config.epoch().saturating_sub(1);
     let mut candidates = Vec::new();
     let _ = tokio::time::timeout(CERTIFIED_TIP_PROBE_DEADLINE, async {
-        while let Some((peer, result)) = inflight.next().await {
+        while let Some(result) = inflight.next().await {
             if let Ok(Some(tip)) = result {
                 if tip.number > current && tip.epoch >= floor {
-                    candidates.push((peer, tip));
+                    candidates.push(tip);
                 }
             }
         }
@@ -746,9 +742,12 @@ async fn probe_peers_for_certified_tip<DB: ReDatabase>(
     .await;
     // epoch first: a high number signed by f+1 retired keys of an earlier epoch must not rank
     // above an honest tip from a later one
-    candidates.sort_by(|(_, a), (_, b)| (b.epoch, b.number).cmp(&(a.epoch, a.number)));
+    candidates.sort_by(|a, b| (b.epoch, b.number).cmp(&(a.epoch, a.number)));
+    // whole-struct: a copy with the honest number and hash but a bad signature must not stand
+    // in for the honest ones
+    candidates.dedup();
     let mut collector_asked = false;
-    for (peer, tip) in candidates {
+    for tip in candidates {
         let Some(committee) = config.get_committee_keys_for_epoch(tip.epoch) else {
             // the same record is next for every such tip, so ask once
             if !collector_asked {
@@ -773,12 +772,10 @@ async fn probe_peers_for_certified_tip<DB: ReDatabase>(
         }
         warn!(
             target: "state-sync",
-            %peer,
             number = tip.number,
             epoch = tip.epoch,
-            "probe: certified tip did not verify against its committee, penalizing the peer"
+            "probe: certified tip did not verify against its committee, skipping"
         );
-        network.report_invalid_certified_tip(peer).await;
     }
     None
 }
