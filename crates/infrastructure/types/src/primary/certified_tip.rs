@@ -73,7 +73,8 @@ impl CertifiedTip {
         if sigs.len() < Self::quorum(committee.len()) {
             return None;
         }
-        let signature = BlsAggregateSignature::aggregate(&sigs, true).ok()?.to_signature();
+        // each signature was group-checked when it was verified on its own
+        let signature = BlsAggregateSignature::aggregate(&sigs, false).ok()?.to_signature();
         Some(Self { epoch, round, number, hash, signature, signed_authorities })
     }
 
