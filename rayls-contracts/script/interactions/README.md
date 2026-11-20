@@ -15,6 +15,8 @@ interactions/
 │   └── RewardDistributorOps.s.sol      ← status / setConfig / claim / setRecipient
 ├── rls-accumulator/
 │   └── RlsAccumulatorOps.s.sol         ← status / deposit / setConfig / refreshApproval / revokeApproval
+├── testnet-minters/                  ← TESTNET ONLY
+│   └── TestnetMinterOps.s.sol          ← status / grantRls / grantUsdr / revokeRls / revokeUsdr
 └── delegation-pool/
     ├── inspect/InspectOps.s.sol        ← status / rewardDebt
     ├── admin/AdminOps.s.sol            ← setConfig
