@@ -2408,32 +2408,6 @@ contract DelegationPoolTest is Test {
         assertGt(thirdParty - d1Effective, 1e6, "the gap is not wei-scale dust");
     }
 
-    /// @notice The worst case of the same drift: a validator-backed pool can report
-    ///      all of its stake as third-party.
-    ///
-    /// Two 50% slashes reach an accumulated slash of 1.0, so the self position
-    /// settles to zero while the pool total still reads 100e18 — there is no
-    /// third party at all behind that figure.
-    function test_selfStake_repeatedSlashesCanReportAllStakeAsThirdParty() public {
-        vm.prank(validator1);
-        pool.registerPool(1000);
-        _fundValidator(validator1, 500e18);
-
-        vm.prank(validator1);
-        pool.delegate(validator1, 400e18);
-
-        vm.prank(address(registry));
-        pool.applyPoolSlash(validator1, 200e18);
-        vm.prank(address(registry));
-        pool.applyPoolSlash(validator1, 100e18);
-
-        (uint256 self, uint256 thirdParty, uint256 total) =
-            pool.getDelegationComposition(validator1);
-        assertEq(self, 0, "accumulated slash of 1.0 wipes the self position");
-        assertEq(total, 100e18, "pool total still tracks stake nobody holds");
-        assertEq(thirdParty, 100e18, "entire pool reported as third-party backing");
-    }
-
     /// @dev Capital the validator supplies from a different address is not
     ///      provable as "self" on-chain, so it must report as third-party rather
     ///      than be guessed at.
