@@ -197,6 +197,14 @@ pub trait RaylsHardforks {
         self.is_rayls_fork_active_at_block(RaylsHardFork::Erc20PrecompileDirectCall, block)
     }
 
+    /// Return true if the CertifiedTipV1 fork is active at `block`.
+    ///
+    /// Gates how a following node finds the network head: peers' certified tips once active, a
+    /// probe of committee members' latest headers before. Serving either is not gated.
+    fn is_certified_tip_v1_active_at_block(&self, block: u64) -> bool {
+        self.is_rayls_fork_active_at_block(RaylsHardFork::CertifiedTipV1, block)
+    }
+
     /// Return the block `fork` activates at, or `None` when it is not block-scheduled (`Never`).
     fn rayls_fork_activation_block(&self, fork: RaylsHardFork) -> Option<u64> {
         match self.rayls_fork_activation(fork) {
