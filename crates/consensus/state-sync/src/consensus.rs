@@ -733,7 +733,9 @@ async fn probe_peers_for_certified_tip<DB: ReDatabase>(
             }
         }
     }
-    candidates.sort_by(|a, b| b.number.cmp(&a.number));
+    // epoch first: a high number signed by f+1 retired keys of an earlier epoch must not rank
+    // above an honest tip from a later one
+    candidates.sort_by(|a, b| (b.epoch, b.number).cmp(&(a.epoch, a.number)));
     // whole-struct: a copy with the honest number and hash but a bad signature must not stand
     // in for the honest ones
     candidates.dedup();
