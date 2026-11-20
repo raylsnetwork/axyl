@@ -384,20 +384,25 @@ async fn probe_peers_for_certified_tip<DB: ReDatabase>(
     // whole-struct: a copy with the honest number and hash but a bad signature must not stand
     // in for the honest ones
     candidates.dedup();
+    let mut collector_asked = false;
     for tip in candidates {
         let Some(committee) = config.get_committee_keys_for_epoch(tip.epoch) else {
-            let next = config
-                .node_storage()
-                .last_record::<EpochRecords>()
-                .map_or(0, |(epoch, _)| epoch)
-                .saturating_add(1);
-            consensus_bus.requested_missing_epoch().send_if_modified(|requested| {
-                let higher = next > *requested;
-                if higher {
-                    *requested = next;
-                }
-                higher
-            });
+            // the same record is next for every such tip, so ask once
+            if !collector_asked {
+                collector_asked = true;
+                let next = config
+                    .node_storage()
+                    .last_record::<EpochRecords>()
+                    .map_or(0, |(epoch, _)| epoch)
+                    .saturating_add(1);
+                consensus_bus.requested_missing_epoch().send_if_modified(|requested| {
+                    let higher = next > *requested;
+                    if higher {
+                        *requested = next;
+                    }
+                    higher
+                });
+            }
             continue;
         };
         if tip.verify(&committee) {
