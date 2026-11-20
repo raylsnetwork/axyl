@@ -236,6 +236,13 @@ impl RaylsChainSpecBuilder {
         self
     }
 
+    /// Activate CertifiedTipV1 at `block`.
+    #[must_use = "builder method result must be used"]
+    pub fn certified_tip_v1(mut self, block: u64) -> Self {
+        self.inner.hardforks.insert(RaylsHardFork::CertifiedTipV1, ForkCondition::Block(block));
+        self
+    }
+
     /// Set the minimum EIP-1559 base fee floor.
     #[must_use = "builder method result must be used"]
     pub fn min_base_fee(mut self, min_base_fee: u64) -> Self {

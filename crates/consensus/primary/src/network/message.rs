@@ -6,8 +6,8 @@ use rayls_infrastructure_types::{
     error::HeaderError,
     serde::{deserialize_normalized_bounded, roaring_header},
     AuthorityIdentifier, BlockHash, BlsPublicKey, BlsSignature, Certificate, CertificateDigest,
-    ConsensusHeader, DefaultHashFunction, Epoch, EpochCertificate, EpochRecord, EpochVote, Header,
-    Round, Votable, Vote, B256,
+    CertifiedTip, ConsensusHeader, Epoch, EpochCertificate, EpochRecord, EpochVote, Header, Round,
+    Votable, Vote,
 };
 use roaring::RoaringBitmap;
 use serde::{Deserialize, Serialize};
@@ -54,12 +54,7 @@ impl ConsensusResult {
     /// This will be the same for all validadors and is what signature signs
     /// (verifying all the data fields not just the hash).
     pub fn digest_data(epoch: Epoch, round: Round, number: u64, hash: BlockHash) -> BlockHash {
-        let mut hasher = DefaultHashFunction::new();
-        hasher.update(&epoch.to_be_bytes());
-        hasher.update(&round.to_be_bytes());
-        hasher.update(&number.to_be_bytes());
-        hasher.update(hash.as_ref());
-        B256::from_slice(hasher.finalize().as_bytes())
+        CertifiedTip::digest_data(epoch, round, number, hash)
     }
 }
 
@@ -151,6 +146,11 @@ pub enum PrimaryRequest {
         /// The epoch the request's rounds belong to.
         epoch: Epoch,
     },
+    /// Request the peer's certified tip: the newest consensus header it saw f+1 committee members
+    /// sign. Appended after every older variant for the same reason as
+    /// [`PrimaryRequest::MissingCertificatesInEpoch`]. Sent only once the `CertifiedTipV1` fork is
+    /// active; served regardless.
+    CertifiedTip,
 }
 
 // unit test for this struct in primary::src::tests::network_tests::test_missing_certs_request
@@ -451,6 +451,8 @@ pub enum PrimaryResponse {
         /// The epoch of the proposed header.
         received: Epoch,
     },
+    /// The responding peer's certified tip, `None` while it has none.
+    CertifiedTip(Option<CertifiedTip>),
 }
 
 impl PrimaryResponse {

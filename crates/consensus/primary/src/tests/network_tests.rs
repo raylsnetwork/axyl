@@ -3,9 +3,9 @@
 use crate::{
     error::PrimaryNetworkError,
     network::{
-        handler::fetch_scope,
+        handler::{fetch_scope, replaces_certified_tip},
         message::{ConsensusResult, PrimaryGossip},
-        MissingCertificatesRequest, PrimaryRequest, RequestHandler,
+        MissingCertificatesRequest, PrimaryRequest, PrimaryResponse, RequestHandler,
     },
     state_sync::StateSynchronizer,
     ConsensusBus,
@@ -13,12 +13,13 @@ use crate::{
 use assert_matches::assert_matches;
 use rayls_consensus_network::{GossipMessage, Penalty, TopicHash};
 use rayls_consensus_primary::test_utils::make_optimal_signed_certificates;
-use rayls_infrastructure_config::LibP2pConfig;
+use rayls_infrastructure_config::{ConsensusConfig, LibP2pConfig};
 use rayls_infrastructure_storage::{mem_db::MemDatabase, CertScope, CertificateStore as _};
 use rayls_infrastructure_types::{
-    encode, error::HeaderError, now, AuthorityIdentifier, BlockHash, BlockHeader, BlockNumHash,
-    BlsPublicKey, Certificate, CertificateDigest, EpochVote, ExecHeader, Hash as _, RaylsReceiver,
-    RaylsSender, SealedHeader, TaskManager,
+    encode, error::HeaderError, now, to_intent_message, AuthorityIdentifier, BlockHash,
+    BlockHeader, BlockNumHash, BlsPublicKey, Certificate, CertificateDigest, CertifiedTip,
+    CommitteeLookahead, EpochVote, ExecHeader, Hash as _, RaylsReceiver, RaylsSender, SealedHeader,
+    Signer as _, TaskManager,
 };
 use rayls_testing_test_utils_committee::CommitteeFixture;
 use std::collections::{BTreeMap, BTreeSet};
@@ -649,6 +650,180 @@ async fn test_gossip_signer_must_be_publisher() -> eyre::Result<()> {
         Err(PrimaryNetworkError::GossipAuthorMismatch { .. })
     );
     Ok(())
+}
+
+/// f+1 committee signatures on one header move the gossip tip and are kept as this node's
+/// certified tip, which verifies against the committee and is what the node serves. A lower
+/// header reaching f+1 later, as a restarted node can hear before it catches up, does not replace
+/// a higher one; a higher one does.
+#[tokio::test]
+async fn test_quorum_keeps_certified_tip() -> eyre::Result<()> {
+    let TestTypes { committee, handler, consensus_bus, task_manager: _task_manager, .. } =
+        create_test_types();
+    let keys: Vec<BlsPublicKey> =
+        committee.authorities().map(|a| *a.authority().protocol_key()).collect();
+    // the receiving node is the first authority; f+1 of the others sign
+    let quorum = CertifiedTip::quorum(keys.len());
+    let signers: Vec<_> = committee.authorities().skip(1).take(quorum).collect();
+    let topic = TopicHash::from_raw(LibP2pConfig::consensus_output_topic());
+    let certify = |number: u64, hash: BlockHash| {
+        let handler = &handler;
+        let signers = &signers;
+        let topic = topic.clone();
+        async move {
+            for signer in signers {
+                let key = *signer.authority().protocol_key();
+                let digest = ConsensusResult::digest_data(0, 1, number, hash);
+                let signature = signer.keypair().sign(&encode(&to_intent_message(digest)));
+                let result =
+                    ConsensusResult { epoch: 0, round: 1, number, hash, validator: key, signature };
+                let data = encode(&PrimaryGossip::Consensus(Box::new(result)));
+                let msg = GossipMessage {
+                    source: None,
+                    data,
+                    sequence_number: None,
+                    topic: topic.clone(),
+                };
+                handler.process_gossip(&msg, key).await?;
+            }
+            eyre::Ok(())
+        }
+    };
+    let served = || async {
+        match handler.retrieve_certified_tip().await {
+            Ok(PrimaryResponse::CertifiedTip(tip)) => tip,
+            other => panic!("not a certified tip reply: {other:?}"),
+        }
+    };
+    assert_eq!(served().await, None, "nothing certified yet");
+
+    let five = BlockHash::random();
+    certify(5, five).await?;
+    assert_eq!(*consensus_bus.last_published_consensus_num_hash().borrow(), (5, five));
+    let tip = served().await.expect("certified at quorum");
+    assert_eq!((tip.epoch, tip.round, tip.number, tip.hash), (0, 1, 5, five));
+    assert_eq!(tip.signed_authorities.len() as usize, quorum);
+    assert!(tip.verify(&keys), "the kept tip verifies against the committee");
+
+    // a restarted node's gossip watch starts empty, so a lower header can reach f+1 again
+    consensus_bus.last_published_consensus_num_hash().send_replace((0, BlockHash::ZERO));
+    certify(3, BlockHash::random()).await?;
+    assert_eq!(served().await.map(|tip| tip.hash), Some(five), "a lower tip never replaces it");
+
+    let nine = BlockHash::random();
+    certify(9, nine).await?;
+    assert_eq!(served().await.map(|tip| tip.hash), Some(nine), "a higher tip does");
+
+    // a restarted node seeds the mark from the stored row, so a lower tip still cannot replace it
+    let config = committee.first_authority().consensus_config();
+    let restarted = RequestHandler::new(
+        config.clone(),
+        consensus_bus.clone(),
+        StateSynchronizer::new(config, consensus_bus.clone(), TaskManager::default().get_spawner()),
+    );
+    consensus_bus.last_published_consensus_num_hash().send_replace((0, BlockHash::ZERO));
+    let seven = BlockHash::random();
+    for signer in &signers {
+        let key = *signer.authority().protocol_key();
+        let hash = seven;
+        let digest = ConsensusResult::digest_data(0, 1, 7, hash);
+        let signature = signer.keypair().sign(&encode(&to_intent_message(digest)));
+        let result =
+            ConsensusResult { epoch: 0, round: 1, number: 7, hash, validator: key, signature };
+        let data = encode(&PrimaryGossip::Consensus(Box::new(result)));
+        let msg = GossipMessage { source: None, data, sequence_number: None, topic: topic.clone() };
+        restarted.process_gossip(&msg, key).await?;
+    }
+    assert_eq!(served().await.map(|tip| tip.hash), Some(nine), "kept across a restart");
+    Ok(())
+}
+
+/// f+1 results for the next epoch, checked against a lookahead that still lists a key ejected
+/// since it was read, are not kept as a certified tip: its bitmap would index the lookahead, not
+/// the committee followers verify against. The tip waits until that committee is settled.
+#[tokio::test]
+async fn certified_tip_is_not_built_over_a_stale_lookahead() -> eyre::Result<()> {
+    let committee = CommitteeFixture::builder(MemDatabase::default).randomize_ports(true).build();
+    let base = committee.first_authority().consensus_config();
+    let keys: Vec<BlsPublicKey> =
+        committee.authorities().map(|a| *a.authority().protocol_key()).collect();
+    // an ejected key sorting below every member shifts every bitmap index
+    let ejected = std::iter::repeat_with(|| {
+        let other = CommitteeFixture::builder(MemDatabase::default).build();
+        *other.first_authority().authority().protocol_key()
+    })
+    .find(|key| keys.iter().all(|member| key < member))
+    .expect("a lower key");
+    let mut stale = keys.clone();
+    stale.push(ejected);
+    let config = ConsensusConfig::new_for_epoch(
+        base.config().clone(),
+        base.node_storage().clone(),
+        base.key_config().clone(),
+        base.committee().clone(),
+        CommitteeLookahead::from_entries([(1, stale)]),
+        base.network_config().clone(),
+        u64::MAX,
+        true,
+    )?;
+    assert!(config.get_settled_committee_keys_for_epoch(1).is_none(), "precondition");
+    let consensus_bus = ConsensusBus::new();
+    let task_manager = TaskManager::default();
+    let synchronizer =
+        StateSynchronizer::new(config.clone(), consensus_bus.clone(), task_manager.get_spawner());
+    let handler = RequestHandler::new(config, consensus_bus, synchronizer);
+
+    let topic = TopicHash::from_raw(LibP2pConfig::consensus_output_topic());
+    let hash = BlockHash::random();
+    let digest = ConsensusResult::digest_data(1, 1, 5, hash);
+    for signer in committee.authorities().skip(1).take(CertifiedTip::quorum(keys.len())) {
+        let key = *signer.authority().protocol_key();
+        let signature = signer.keypair().sign(&encode(&to_intent_message(digest)));
+        let result =
+            ConsensusResult { epoch: 1, round: 1, number: 5, hash, validator: key, signature };
+        let data = encode(&PrimaryGossip::Consensus(Box::new(result)));
+        let msg = GossipMessage { source: None, data, sequence_number: None, topic: topic.clone() };
+        handler.process_gossip(&msg, key).await?;
+    }
+    assert_matches!(
+        handler.retrieve_certified_tip().await,
+        Ok(PrimaryResponse::CertifiedTip(None))
+    );
+    Ok(())
+}
+
+/// The stored certified tip only moves up, and never back to an earlier epoch or below the
+/// floor, even with nothing stored: a retired committee's keys must not pin a forged high number
+/// from their epoch.
+#[test]
+fn certified_tip_only_moves_up_within_or_past_its_epoch() {
+    assert!(replaces_certified_tip(None, 0, 0, 1), "nothing stored yet");
+    assert!(replaces_certified_tip(None, 20, 20, 1), "nothing stored, at the floor");
+    assert!(!replaces_certified_tip(None, 20, 3, 9_999_999), "nothing stored, below the floor");
+    assert!(replaces_certified_tip(Some((20, 5000)), 20, 20, 5001), "higher, same epoch");
+    assert!(replaces_certified_tip(Some((20, 5000)), 20, 21, 5001), "higher, next epoch");
+    assert!(!replaces_certified_tip(Some((20, 5000)), 20, 20, 5000), "the same tip");
+    assert!(!replaces_certified_tip(Some((20, 5000)), 20, 20, 4999), "lower, same epoch");
+    assert!(
+        replaces_certified_tip(Some((20, u64::MAX)), 20, 21, 5001),
+        "a later epoch replaces a forged high number"
+    );
+    assert!(!replaces_certified_tip(Some((20, 5000)), 0, 3, 9_999_999), "earlier epoch");
+}
+
+#[test]
+fn certified_tip_request_and_reply_are_appended_last() {
+    // BCS writes the variant index first; appended variants leave every older index unchanged,
+    // so an older node still decodes everything else and fails only on these
+    assert_eq!(encode(&PrimaryRequest::CertifiedTip)[0], 6);
+    assert_eq!(encode(&PrimaryResponse::CertifiedTip(None))[0], 10);
+    let old = PrimaryResponse::EpochMismatch { expected: 2, received: 3 };
+    let old_bytes = encode(&old);
+    assert_eq!(old_bytes[0], 9, "EpochMismatch keeps its variant index");
+    assert_matches!(
+        rayls_infrastructure_types::decode::<PrimaryResponse>(&old_bytes),
+        PrimaryResponse::EpochMismatch { expected: 2, received: 3 }
+    );
 }
 
 #[test]

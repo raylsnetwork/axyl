@@ -3,7 +3,7 @@ use futures::{stream::FuturesUnordered, StreamExt};
 use rayls_consensus_primary::{network::PrimaryNetworkHandle, ConsensusBus};
 use rayls_infrastructure_config::ConsensusConfig;
 use rayls_infrastructure_storage::{
-    tables::{ConsensusBlockNumbersByDigest, ConsensusBlocks, ConsensusBlocksCache},
+    tables::{ConsensusBlockNumbersByDigest, ConsensusBlocks, ConsensusBlocksCache, EpochRecords},
     ConsensusStore,
 };
 use rayls_infrastructure_types::{
@@ -18,6 +18,9 @@ const COMMITTEE_KEYS_TIMEOUT: Duration = Duration::from_secs(30);
 const COMMITTEE_KEYS_POLL_INTERVAL: Duration = Duration::from_millis(500);
 /// How long to wait for a gossip tip before actively probing peers for the network head.
 const PROBE_INTERVAL: Duration = Duration::from_secs(10);
+/// How long a probe waits for peers' certified tips before ranking the ones that arrived. One
+/// valid tip is enough, so a silent peer must not hold every probe for the request timeout.
+const CERTIFIED_TIP_PROBE_DEADLINE: Duration = Duration::from_secs(3);
 
 /// Cache a consensus header in persistent storage.
 pub fn store_consensus_header_in_cache<DB: ReDatabase>(db: &DB, header: &ConsensusHeader) {
@@ -316,8 +319,115 @@ impl<DB: ReDatabase> WalkSession<DB> {
     }
 }
 
+/// Whether this node finds the network head from peers' certified tips: once the `CertifiedTipV1`
+/// fork is active at the next block to execute, the point every other fork check uses.
+/// `activation` is the fork's block, `None` while it is `Never`. Not before: a peer on an older
+/// release cannot decode the request.
+fn uses_certified_tip(activation: Option<u64>, executed_tip: u64) -> bool {
+    activation.is_some_and(|block| executed_tip.saturating_add(1) >= block)
+}
+
+/// Find a network head above `current` to walk to, as its number and hash. Before the
+/// `CertifiedTipV1` fork, the single highest latest header any committee member reports; after,
+/// a certified tip, which one member alone cannot forge (#370, #312).
+async fn probe_for_head<DB: ReDatabase>(
+    current: u64,
+    config: &ConsensusConfig<DB>,
+    consensus_bus: &ConsensusBus,
+    network: &PrimaryNetworkHandle,
+) -> Option<(u64, B256)> {
+    let executed_tip =
+        consensus_bus.recently_executed_blocks().borrow().latest_block_num_hash().number;
+    if uses_certified_tip(config.certified_tip_v1_block(), executed_tip) {
+        probe_peers_for_certified_tip(current, config, consensus_bus, network).await
+    } else {
+        probe_peers_for_latest(current, config, network).await.map(|h| (h.number, h.digest()))
+    }
+}
+
+/// Ask every connected peer, observers included, for its certified tip and return the highest
+/// one above `current` that verifies against its epoch's committee. One valid answer is enough;
+/// asking every peer only guards against peers that are down, on an older release, or behind.
+/// Answers that have not arrived within [`CERTIFIED_TIP_PROBE_DEADLINE`] are not waited for.
+/// A tip from before this node's previous epoch is dropped: f+1 keys of a retired committee
+/// could sign any number, and the previous epoch counts so a chain halted on its last header can
+/// still be found.
+/// A tip from an epoch whose committee is not settled yet, from config or a certified record (the
+/// lookahead does not count), is skipped, and the epoch record collector is asked for the record
+/// after the newest one held: it walks upward as far as peers serve, so a later probe can verify
+/// the tip. Neither waiting here nor requesting the tip's own
+/// epoch, which is unverified: a peer naming a far epoch would hold up the probe or send the
+/// collector chasing it.
+async fn probe_peers_for_certified_tip<DB: ReDatabase>(
+    current: u64,
+    config: &ConsensusConfig<DB>,
+    consensus_bus: &ConsensusBus,
+    network: &PrimaryNetworkHandle,
+) -> Option<(u64, B256)> {
+    let peers = network.inner_handle().connected_peers().await.ok()?;
+    let mut inflight: FuturesUnordered<_> =
+        peers.into_iter().map(|peer| network.request_certified_tip_from_peer(peer)).collect();
+    let floor = config.epoch().saturating_sub(1);
+    let mut candidates = Vec::new();
+    let _ = tokio::time::timeout(CERTIFIED_TIP_PROBE_DEADLINE, async {
+        while let Some(result) = inflight.next().await {
+            if let Ok(Some(tip)) = result {
+                if tip.number > current && tip.epoch >= floor {
+                    candidates.push(tip);
+                }
+            }
+        }
+    })
+    .await;
+    // epoch first: a high number signed by f+1 retired keys of an earlier epoch must not rank
+    // above an honest tip from a later one
+    candidates.sort_by(|a, b| (b.epoch, b.number).cmp(&(a.epoch, a.number)));
+    // whole-struct: a copy with the honest number and hash but a bad signature must not stand
+    // in for the honest ones
+    candidates.dedup();
+    let mut collector_asked = false;
+    for tip in candidates {
+        // the committee the tip's epoch ran with, never the lookahead: an honest tip fails
+        // against a lookahead that still lists a key ejected since it was read
+        let Some(committee) = config.get_settled_committee_keys_for_epoch(tip.epoch) else {
+            // the same record is next for every such tip, so ask once
+            if !collector_asked {
+                collector_asked = true;
+                let next = config
+                    .node_storage()
+                    .last_record::<EpochRecords>()
+                    .map_or(0, |(epoch, _)| epoch)
+                    .saturating_add(1);
+                consensus_bus.requested_missing_epoch().send_if_modified(|requested| {
+                    let higher = next > *requested;
+                    if higher {
+                        *requested = next;
+                    }
+                    higher
+                });
+            }
+            continue;
+        };
+        if tip.verify(&committee) {
+            return Some((tip.number, tip.hash));
+        }
+        warn!(
+            target: "state-sync",
+            number = tip.number,
+            epoch = tip.epoch,
+            "probe: certified tip did not verify against its committee, skipping"
+        );
+    }
+    None
+}
+
 /// Probe all committee peers concurrently, return the highest header above `current`.
 /// BLS is re-verified downstream in `get_consensus_header`.
+///
+/// Never call this once `CertifiedTipV1` is active (see [`uses_certified_tip`]): the answer of one
+/// member is taken on its own, and a header carries no signature of its own, so one member can
+/// serve a forged copy of a real header and fork or strand the node (#370, #312). It stays only
+/// for nodes before the fork, which still talk to peers that cannot serve a certified tip.
 async fn probe_peers_for_latest<DB: ReDatabase>(
     current: u64,
     config: &ConsensusConfig<DB>,
@@ -372,14 +482,16 @@ async fn next_walk_target<DB: ReDatabase>(
                     idle_secs = idle_intervals * PROBE_INTERVAL.as_secs(),
                     "track_recent_consensus: no gossip received, probing peers"
                 );
-                if let Some(header) = probe_peers_for_latest(current, config, network).await {
+                if let Some((number, hash)) =
+                    probe_for_head(current, config, consensus_bus, network).await
+                {
                     info!(
                         target: "state-sync",
                         current,
-                        peer_latest = header.number,
+                        peer_latest = number,
                         "probe discovered newer consensus header from peer"
                     );
-                    return Some(header.digest());
+                    return Some(hash);
                 }
                 info!(target: "state-sync", "probe: no peer returned a newer header");
             }
@@ -402,14 +514,14 @@ pub(crate) async fn spawn_track_recent_consensus<DB: ReDatabase>(
 
     // Probe at startup so the first walk begins without waiting for a gossip tip.
     let current = consensus_bus.last_consensus_header().borrow().number;
-    if let Some(header) = probe_peers_for_latest(current, &config, &network).await {
+    if let Some((number, hash)) = probe_for_head(current, &config, &consensus_bus, &network).await {
         info!(
             target: "state-sync",
             current,
-            peer_latest = header.number,
+            peer_latest = number,
             "startup probe discovered newer consensus header from peer"
         );
-        if session.sync_to(header.digest()).await.is_break() {
+        if session.sync_to(hash).await.is_break() {
             return Ok(());
         }
     }
@@ -439,9 +551,22 @@ pub(crate) async fn spawn_track_recent_consensus<DB: ReDatabase>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rayls_consensus_primary::network::{
+        NetworkCommand, NetworkError, PrimaryRequest, PrimaryResponse,
+    };
     use rayls_infrastructure_storage::{mem_db::MemDatabase, tables::ConsensusBlocks};
+    use rayls_infrastructure_types::{
+        encode, to_intent_message, BlsAggregateSignature, BlsSignature, Certificate, CertifiedTip,
+        CommittedSubDag, CommitteeLookahead, ReputationScores, Signer as _,
+    };
     use rayls_testing_test_utils_committee::CommitteeFixture;
-    use std::num::NonZeroUsize;
+    use std::{
+        num::NonZeroUsize,
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        },
+    };
 
     /// A network handle whose receiver is dropped: every fetch fails fast, so a walk can make
     /// progress only through the local DB/cache, never a peer.
@@ -610,5 +735,450 @@ mod tests {
         let second = derive_covered_anchor(db);
         assert_eq!(first, Some(child_102.digest()), "anchor must be the top of the contiguous run");
         assert_eq!(first, second, "derive must be stable across calls on an unchanged cache");
+    }
+
+    /// The switch is made against the next block to execute, like every other fork check.
+    #[test]
+    fn certified_tip_is_used_once_the_fork_is_active_at_the_next_block() {
+        assert!(!uses_certified_tip(None, 100), "Never: probe latest headers");
+        assert!(!uses_certified_tip(Some(102), 100), "next block 101 is before activation");
+        assert!(uses_certified_tip(Some(101), 100), "next block 101 is the activation block");
+        assert!(uses_certified_tip(Some(0), 0), "genesis-active");
+        assert!(uses_certified_tip(Some(u64::MAX), u64::MAX), "no overflow at the top");
+    }
+
+    fn committee_of_four() -> CommitteeFixture<MemDatabase> {
+        CommitteeFixture::builder(MemDatabase::default)
+            .randomize_ports(true)
+            .committee_size(NonZeroUsize::new(4).unwrap())
+            .build()
+    }
+
+    /// A genuine tip one block above genesis, its leader certified by the whole fixture committee.
+    fn honest_tip(fixture: &CommitteeFixture<MemDatabase>) -> ConsensusHeader {
+        let leader = fixture.certificate(&fixture.header_from_last_authority());
+        let sub_dag = CommittedSubDag::new(vec![], leader, 0, ReputationScores::default(), None);
+        ConsensusHeader { parent_hash: *GENESIS_DIGEST, sub_dag, number: 1, extra: B256::ZERO }
+    }
+
+    /// What one adversarial validator serves as its latest header: the highest number there is,
+    /// and an unsigned leader claiming an epoch no committee exists for (#370).
+    fn forged_tip() -> ConsensusHeader {
+        let mut leader = Certificate::default();
+        leader.header.epoch = Epoch::MAX;
+        let sub_dag = CommittedSubDag::new(vec![], leader, 0, ReputationScores::default(), None);
+        ConsensusHeader {
+            parent_hash: B256::repeat_byte(0xAB),
+            sub_dag,
+            number: u64::MAX,
+            extra: B256::ZERO,
+        }
+    }
+
+    /// A forged copy of `honest`: the same block number and the same committee-signed leader and
+    /// certificates, with only the commit timestamp raised. The commit timestamp is hashed into the
+    /// header digest but is not covered by any committee signature, so the copy still verifies yet
+    /// has a different digest and would execute to a different block (#312).
+    fn forged_copy(honest: &ConsensusHeader) -> ConsensusHeader {
+        let mut higher_leader = Certificate::default();
+        higher_leader.header.created_at = honest.sub_dag.commit_timestamp() + 1_000_000;
+        let higher =
+            CommittedSubDag::new(vec![], higher_leader, 0, ReputationScores::default(), None);
+        let tampered_sub_dag = CommittedSubDag::new(
+            honest.sub_dag.certificates.clone(),
+            honest.sub_dag.leader.clone(),
+            0,
+            honest.sub_dag.reputation_score.clone(),
+            Some(&higher),
+        );
+        ConsensusHeader {
+            parent_hash: honest.parent_hash,
+            sub_dag: tampered_sub_dag,
+            number: honest.number,
+            extra: honest.extra,
+        }
+    }
+
+    /// `header` as `signers` of the fixture committee sign it when they commit it.
+    fn signatures(
+        fixture: &CommitteeFixture<MemDatabase>,
+        signers: usize,
+        header: &ConsensusHeader,
+    ) -> Vec<(BlsPublicKey, BlsSignature)> {
+        let (epoch, round) = (header.sub_dag.leader_epoch(), header.sub_dag.leader_round());
+        let digest = CertifiedTip::digest_data(epoch, round, header.number, header.digest());
+        fixture
+            .authorities()
+            .take(signers)
+            .map(|a| {
+                (
+                    *a.authority().protocol_key(),
+                    a.keypair().sign(&encode(&to_intent_message(digest))),
+                )
+            })
+            .collect()
+    }
+
+    /// The certified tip f+1 of the fixture committee hold for `header`.
+    fn certified(
+        fixture: &CommitteeFixture<MemDatabase>,
+        header: &ConsensusHeader,
+    ) -> CertifiedTip {
+        let keys: Vec<_> = fixture.authorities().map(|a| *a.authority().protocol_key()).collect();
+        CertifiedTip::from_signatures(
+            header.sub_dag.leader_epoch(),
+            header.sub_dag.leader_round(),
+            header.number,
+            header.digest(),
+            &keys,
+            signatures(fixture, CertifiedTip::quorum(keys.len()), header),
+        )
+        .expect("f+1 signers")
+    }
+
+    /// One connected peer: what it answers when asked for its certified tip (`Err` for a peer on
+    /// a release without the request) and for its latest header, and how late its certified tip
+    /// arrives.
+    struct Peer {
+        key: BlsPublicKey,
+        certified_tip: Result<Option<CertifiedTip>, ()>,
+        latest: ConsensusHeader,
+        delay: Duration,
+    }
+
+    impl Peer {
+        fn new(key: BlsPublicKey, tip: Option<CertifiedTip>, latest: &ConsensusHeader) -> Self {
+            Self { key, certified_tip: Ok(tip), latest: latest.clone(), delay: Duration::ZERO }
+        }
+
+        /// A peer on a release without the certified tip request.
+        fn old(key: BlsPublicKey, latest: &ConsensusHeader) -> Self {
+            Self { key, certified_tip: Err(()), latest: latest.clone(), delay: Duration::ZERO }
+        }
+    }
+
+    /// Requests the follower sent, by kind.
+    #[derive(Default)]
+    struct Asked {
+        latest: AtomicUsize,
+        certified_tip: AtomicUsize,
+    }
+
+    /// Connected `peers`, serving every header in `headers` by hash.
+    fn peer_network(
+        peers: Vec<Peer>,
+        headers: Vec<ConsensusHeader>,
+    ) -> (PrimaryNetworkHandle, Arc<Asked>) {
+        let asked = Arc::new(Asked::default());
+        let counts = asked.clone();
+        let (tx, mut rx) =
+            tokio::sync::mpsc::channel::<NetworkCommand<PrimaryRequest, PrimaryResponse>>(64);
+        tokio::spawn(async move {
+            let unknown = || NetworkError::RPCError("unknown".to_string());
+            while let Some(cmd) = rx.recv().await {
+                match cmd {
+                    NetworkCommand::ConnectedPeers { reply } => {
+                        let _ = reply.send(peers.iter().map(|p| p.key).collect());
+                    }
+                    NetworkCommand::SendRequest { peer, request, reply } => {
+                        let Some(peer) = peers.iter().find(|p| p.key == peer) else { continue };
+                        let response = match request {
+                            PrimaryRequest::CertifiedTip => {
+                                counts.certified_tip.fetch_add(1, Ordering::SeqCst);
+                                let response = peer
+                                    .certified_tip
+                                    .clone()
+                                    .map(PrimaryResponse::CertifiedTip)
+                                    .map_err(|()| unknown());
+                                if !peer.delay.is_zero() {
+                                    let delay = peer.delay;
+                                    tokio::spawn(async move {
+                                        tokio::time::sleep(delay).await;
+                                        let _ = reply.send(response);
+                                    });
+                                    continue;
+                                }
+                                response
+                            }
+                            PrimaryRequest::ConsensusHeader { number: None, hash: None } => {
+                                counts.latest.fetch_add(1, Ordering::SeqCst);
+                                Ok(PrimaryResponse::ConsensusHeader(Arc::new(peer.latest.clone())))
+                            }
+                            _ => continue,
+                        };
+                        let _ = reply.send(response);
+                    }
+                    NetworkCommand::SendRequestAny {
+                        request: PrimaryRequest::ConsensusHeader { hash: Some(hash), .. },
+                        reply,
+                    } => {
+                        let found = headers.iter().find(|h| h.digest() == hash).cloned();
+                        let _ = reply.send(
+                            found
+                                .map(|h| PrimaryResponse::ConsensusHeader(Arc::new(h)))
+                                .ok_or_else(unknown),
+                        );
+                    }
+                    _ => {}
+                }
+            }
+        });
+        (PrimaryNetworkHandle::new_for_test(tx), asked)
+    }
+
+    /// Wait until the follower's latest header reaches `number`, or `limit` passes.
+    async fn reaches(consensus_bus: &ConsensusBus, number: u64, limit: Duration) -> bool {
+        let deadline = tokio::time::Instant::now() + limit;
+        while tokio::time::Instant::now() < deadline {
+            if consensus_bus.last_consensus_header().borrow().number >= number {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        false
+    }
+
+    /// After the fork one valid certified tip from any connected peer is enough, here an
+    /// observer outside the committee, while the other peers are on an older release or hold
+    /// none. No peer is asked for its latest header.
+    #[tokio::test(start_paused = true)]
+    async fn after_the_fork_one_peer_certified_tip_is_enough() {
+        let fixture = committee_of_four();
+        let config = fixture.authorities().next().unwrap().consensus_config();
+        let config = config.with_certified_tip_v1_block(Some(0));
+        let honest = honest_tip(&fixture);
+        let members: Vec<_> =
+            config.committee().others_primaries_by_id(config.authority_id().as_ref());
+        // a key outside the committee: another fixture's keys are freshly generated
+        let observer =
+            *committee_of_four().authorities().next().unwrap().authority().protocol_key();
+        let peers = vec![
+            Peer::old(members[0].1, &honest),
+            Peer::old(members[1].1, &honest),
+            Peer::new(members[2].1, None, &honest),
+            Peer::new(observer, Some(certified(&fixture, &honest)), &honest),
+        ];
+        let (network, asked) = peer_network(peers, vec![honest.clone()]);
+        let consensus_bus = ConsensusBus::new();
+        tokio::spawn(spawn_track_recent_consensus(config.clone(), consensus_bus.clone(), network));
+
+        assert!(reaches(&consensus_bus, 1, Duration::from_secs(5)).await, "walks to the tip");
+        let published = consensus_bus.last_consensus_header().borrow().digest();
+        config.shutdown().notify();
+        assert_eq!(published, honest.digest());
+        assert_eq!(asked.latest.load(Ordering::SeqCst), 0, "no peer is asked for its latest");
+        assert_eq!(asked.certified_tip.load(Ordering::SeqCst), 4, "every peer is asked");
+    }
+
+    /// #312 after the fork: one member serves a forged copy of the real tip, as its latest header
+    /// and as a certified tip it signed alone, its bitmap claiming f+1 signers. The follower walks
+    /// to the honest tip and never stores or publishes the copy.
+    #[tokio::test(start_paused = true)]
+    async fn after_the_fork_a_forged_copy_cannot_fork_the_follower() {
+        let fixture = committee_of_four();
+        let config = fixture.authorities().next().unwrap().consensus_config();
+        let config = config.with_certified_tip_v1_block(Some(0));
+        let honest = honest_tip(&fixture);
+        let forged = forged_copy(&honest);
+        let keys = config.get_committee_keys_for_epoch(0).expect("current committee");
+        assert!(forged.clone().verify_header_with_keys(&keys).is_ok(), "the copy still verifies");
+        assert_ne!(forged.digest(), honest.digest(), "the bumped timestamp changes the digest");
+
+        // the adversary's own signature, under a bitmap naming f+1 signers
+        let mut alone = certified(&fixture, &forged);
+        let (_, own) = signatures(&fixture, 1, &forged)[0];
+        alone.signature = BlsAggregateSignature::aggregate(&[own], true).unwrap().to_signature();
+        assert!(!alone.verify(&keys), "precondition: one signer is not f+1");
+
+        let members: Vec<_> =
+            config.committee().others_primaries_by_id(config.authority_id().as_ref());
+        let mut peers: Vec<_> = members
+            .iter()
+            .map(|(_, key)| Peer::new(*key, Some(certified(&fixture, &honest)), &honest))
+            .collect();
+        peers[0] = Peer::new(members[0].1, Some(alone), &forged);
+        let (network, asked) = peer_network(peers, vec![honest.clone(), forged.clone()]);
+        let consensus_bus = ConsensusBus::new();
+        tokio::spawn(spawn_track_recent_consensus(config.clone(), consensus_bus.clone(), network));
+
+        assert!(reaches(&consensus_bus, 1, Duration::from_secs(5)).await, "walks to the tip");
+        let published = consensus_bus.last_consensus_header().borrow().clone();
+        let stored_forged = config.node_storage().get_consensus_by_hash(forged.digest()).is_some();
+        config.shutdown().notify();
+        assert_eq!(published.digest(), honest.digest(), "the honest tip is the published header");
+        assert!(!stored_forged, "the forged copy was stored in the consensus cache");
+        assert_eq!(asked.latest.load(Ordering::SeqCst), 0, "no peer is asked for its latest");
+    }
+
+    /// #370 after the fork: one member answers with a tip at the highest number there is, from an
+    /// epoch no committee exists for. It cannot strand the follower, which walks to the honest
+    /// tip, nor send the epoch record collector chasing that epoch.
+    #[tokio::test(start_paused = true)]
+    async fn after_the_fork_a_forged_epoch_cannot_strand_the_follower() {
+        let fixture = committee_of_four();
+        let config = fixture.authorities().next().unwrap().consensus_config();
+        let config = config.with_certified_tip_v1_block(Some(0));
+        let honest = honest_tip(&fixture);
+        assert!(config.get_committee_keys_for_epoch(Epoch::MAX).is_none(), "precondition");
+        let far =
+            CertifiedTip { epoch: Epoch::MAX, number: u64::MAX, ..certified(&fixture, &honest) };
+
+        let members: Vec<_> =
+            config.committee().others_primaries_by_id(config.authority_id().as_ref());
+        let mut peers: Vec<_> = members
+            .iter()
+            .map(|(_, key)| Peer::new(*key, Some(certified(&fixture, &honest)), &honest))
+            .collect();
+        peers[0] = Peer::new(members[0].1, Some(far), &forged_tip());
+        let (network, _) = peer_network(peers, vec![honest.clone()]);
+        let consensus_bus = ConsensusBus::new();
+        tokio::spawn(spawn_track_recent_consensus(config.clone(), consensus_bus.clone(), network));
+
+        assert!(reaches(&consensus_bus, 1, Duration::from_secs(5)).await, "walks to the tip");
+        let requested = *consensus_bus.requested_missing_epoch().borrow();
+        config.shutdown().notify();
+        assert!(requested <= 1, "the collector was sent to epoch {requested}");
+    }
+
+    /// A copy of the honest top tip with a bad signature, answered before the honest ones, does
+    /// not stand in for them.
+    #[tokio::test(start_paused = true)]
+    async fn a_bad_copy_of_the_top_tip_does_not_hide_the_honest_ones() {
+        let fixture = committee_of_four();
+        let config = fixture.authorities().next().unwrap().consensus_config();
+        let config = config.with_certified_tip_v1_block(Some(0));
+        let honest = honest_tip(&fixture);
+        let valid = certified(&fixture, &honest);
+        let bad =
+            CertifiedTip { signature: signatures(&fixture, 1, &honest)[0].1, ..valid.clone() };
+        let keys = config.get_committee_keys_for_epoch(0).expect("current committee");
+        assert!(!bad.verify(&keys), "precondition: the copy does not verify");
+
+        // the honest members answer late, the bad copy from an observer first
+        let observer =
+            *committee_of_four().authorities().next().unwrap().authority().protocol_key();
+        let mut peers: Vec<_> = config
+            .committee()
+            .others_primaries_by_id(config.authority_id().as_ref())
+            .into_iter()
+            .map(|(_, key)| Peer {
+                delay: Duration::from_secs(1),
+                ..Peer::new(key, Some(valid.clone()), &honest)
+            })
+            .collect();
+        peers.push(Peer::new(observer, Some(bad), &honest));
+        let (network, _) = peer_network(peers, vec![honest.clone()]);
+        let consensus_bus = ConsensusBus::new();
+        tokio::spawn(spawn_track_recent_consensus(config.clone(), consensus_bus.clone(), network));
+
+        assert!(reaches(&consensus_bus, 1, Duration::from_secs(5)).await, "walks to the tip");
+        config.shutdown().notify();
+    }
+
+    /// A connected peer that does not answer within the request timeout does not hold up the
+    /// probe: the tips that arrived by the deadline are enough.
+    #[tokio::test(start_paused = true)]
+    async fn a_silent_peer_does_not_hold_up_the_probe() {
+        let fixture = committee_of_four();
+        let config = fixture.authorities().next().unwrap().consensus_config();
+        let config = config.with_certified_tip_v1_block(Some(0));
+        let honest = honest_tip(&fixture);
+        let observer =
+            *committee_of_four().authorities().next().unwrap().authority().protocol_key();
+        let mut peers: Vec<_> = config
+            .committee()
+            .others_primaries_by_id(config.authority_id().as_ref())
+            .into_iter()
+            .map(|(_, key)| Peer::new(key, Some(certified(&fixture, &honest)), &honest))
+            .collect();
+        peers.push(Peer { delay: Duration::from_secs(60), ..Peer::new(observer, None, &honest) });
+        let (network, _) = peer_network(peers, vec![honest.clone()]);
+        let consensus_bus = ConsensusBus::new();
+        tokio::spawn(spawn_track_recent_consensus(config.clone(), consensus_bus.clone(), network));
+
+        let limit = CERTIFIED_TIP_PROBE_DEADLINE + Duration::from_secs(2);
+        assert!(reaches(&consensus_bus, 1, limit).await, "walks to the tip by the deadline");
+        config.shutdown().notify();
+    }
+
+    /// An honest tip from the next epoch is not checked against the lookahead, which can still
+    /// list a key ejected since it was read and then fails the tip. The tip waits for the
+    /// certified record naming that committee, and the collector is asked for it.
+    #[tokio::test(start_paused = true)]
+    async fn a_stale_lookahead_does_not_reject_an_honest_tip() {
+        let fixture = committee_of_four();
+        let base = fixture.authorities().next().unwrap().consensus_config();
+        let keys: Vec<_> = fixture.authorities().map(|a| *a.authority().protocol_key()).collect();
+        // an ejected key sorting below every member shifts every bitmap index
+        let ejected = std::iter::repeat_with(|| {
+            *committee_of_four().authorities().next().unwrap().authority().protocol_key()
+        })
+        .find(|key| keys.iter().all(|member| key < member))
+        .unwrap();
+        let mut stale = keys.clone();
+        stale.push(ejected);
+        let config = ConsensusConfig::new_for_epoch(
+            base.config().clone(),
+            base.node_storage().clone(),
+            base.key_config().clone(),
+            base.committee().clone(),
+            CommitteeLookahead::from_entries([(1, stale.clone())]),
+            base.network_config().clone(),
+            u64::MAX,
+            true,
+        )
+        .unwrap()
+        .with_certified_tip_v1_block(Some(0));
+
+        // f+1 of the committee sign a header of epoch 1
+        let hash = B256::repeat_byte(7);
+        let digest = CertifiedTip::digest_data(1, 2, 5, hash);
+        let signed = fixture.authorities().take(CertifiedTip::quorum(keys.len())).map(|a| {
+            (*a.authority().protocol_key(), a.keypair().sign(&encode(&to_intent_message(digest))))
+        });
+        let tip = CertifiedTip::from_signatures(1, 2, 5, hash, &keys, signed).unwrap();
+        assert!(tip.verify(&keys), "precondition: honest");
+        assert!(!tip.verify(&stale), "precondition: fails against the stale lookahead");
+        assert!(config.get_committee_keys_for_epoch(1).is_some(), "the lookahead knows epoch 1");
+
+        let honest = honest_tip(&fixture);
+        let peers = config
+            .committee()
+            .others_primaries_by_id(config.authority_id().as_ref())
+            .into_iter()
+            .map(|(_, key)| Peer::new(key, Some(tip.clone()), &honest))
+            .collect();
+        let (network, _) = peer_network(peers, vec![]);
+        let consensus_bus = ConsensusBus::new();
+        tokio::spawn(spawn_track_recent_consensus(config.clone(), consensus_bus.clone(), network));
+
+        let mut requested = consensus_bus.requested_missing_epoch().subscribe();
+        let asked = tokio::time::timeout(Duration::from_secs(5), requested.wait_for(|e| *e >= 1));
+        assert!(asked.await.is_ok(), "the collector is asked for the record naming epoch 1");
+        config.shutdown().notify();
+    }
+
+    /// Before the fork the follower probes committee members' latest headers as before, and asks
+    /// nobody for a certified tip.
+    #[tokio::test(start_paused = true)]
+    async fn before_the_fork_the_follower_probes_latest_headers() {
+        let fixture = committee_of_four();
+        let config = fixture.authorities().next().unwrap().consensus_config();
+        assert_eq!(config.certified_tip_v1_block(), None, "precondition: the fork is Never");
+        let honest = honest_tip(&fixture);
+        let peers = config
+            .committee()
+            .others_primaries_by_id(config.authority_id().as_ref())
+            .into_iter()
+            .map(|(_, key)| Peer::new(key, Some(certified(&fixture, &honest)), &honest))
+            .collect();
+        let (network, asked) = peer_network(peers, vec![honest.clone()]);
+        let consensus_bus = ConsensusBus::new();
+        tokio::spawn(spawn_track_recent_consensus(config.clone(), consensus_bus.clone(), network));
+
+        assert!(reaches(&consensus_bus, 1, Duration::from_secs(5)).await, "walks to the tip");
+        config.shutdown().notify();
+        assert_eq!(asked.latest.load(Ordering::SeqCst), 3, "every member is probed");
+        assert_eq!(asked.certified_tip.load(Ordering::SeqCst), 0, "no certified tip is asked for");
     }
 }

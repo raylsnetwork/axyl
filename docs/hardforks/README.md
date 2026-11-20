@@ -47,6 +47,7 @@ bytecode swap) and flips the epoch-close reward ABI from 1-arg to 2-arg.
 | 17 | EpochCloseSeedV2 | behavioral | — |
 | 18 | CertificateFetchEpochV2 | behavioral | — |
 | 19 | Erc20PrecompileDirectCall | behavioral | — |
+| 20 | CertifiedTipV1 | behavioral | — |
 
 ### What each behavioral fork does
 
@@ -68,6 +69,7 @@ What each one does:
 | `EpochCloseSeedV2` | Seeds the epoch-closing block's `extra_data` with the consensus header hash, identical on every node, instead of the leader-certificate signature hash. |
 | `CertificateFetchEpochV2` | Sends certificate fetch requests stamped with the epoch their rounds refer to, so a peer that has already closed that epoch serves them from the kept tail instead of the new epoch. Gates only the request format a node sends — every node accepts both variants, but a peer that has not been upgraded cannot decode the stamped one. |
 | `Erc20PrecompileDirectCall` | Rejects `DELEGATECALL`/`CALLCODE` frames into the native ERC-20 precompile (`0x0400`); the precompile is dispatched by bytecode address, so a delegate frame would otherwise run its privileged logic with `target_address != bytecode_address`. Only direct `CALL`/`STATICCALL` are allowed once active. |
+| `CertifiedTipV1` | A following node (observer, or validator catching up) learns the network head from its peers' certified tips: a header hash with f+1 committee signatures, which every node keeps from the gossip it already collects. Before the fork it asks committee members for their latest header and trusts the single highest answer, so one member could strand or fork it (#370, #312). Once active, one valid certified tip from any peer is enough, and the header is fetched by that hash. Schedule it at any block once every node runs the release that serves the certified tip; it gates only how a node finds the head, so nodes need not switch at the same block, and serving the old request stays. |
 
 The seven migration forks' behavior is described by their set in section 2.
 
@@ -141,10 +143,10 @@ On a new chain these values are required for correctness, but the node does not 
 
 ## 3. Behavioral Changes Are Business-Logic Based
 
-The 12 behavioral forks (`Eip1559`, `BatchDigestV2`, `PrecompileGasFix`,
+The 13 behavioral forks (`Eip1559`, `BatchDigestV2`, `PrecompileGasFix`,
 `TransactionLoadBalancing`, `EmptyOutputBlock`, `DynamicCommitteeSizing`,
 `OutputSeqNormalization`, `SenderAffinityLoadBalancing`, `Eip161EmptyAccountGuard`,
-`EpochCloseSeedV2`, `CertificateFetchEpochV2`, `Erc20PrecompileDirectCall`)
+`EpochCloseSeedV2`, `CertificateFetchEpochV2`, `Erc20PrecompileDirectCall`, `CertifiedTipV1`)
 change protocol behavior without state writes.
 Their activation blocks are network-coordinated rollout or risk decisions
 (SRE), not contract-state consistency requirements.

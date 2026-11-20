@@ -79,6 +79,10 @@ pub struct ConsensusConfig<DB> {
     /// from the chain spec by the orchestrator when the epoch config is built; the certificate
     /// fetcher compares it with the executed tip to pick the request variant it sends.
     certificate_fetch_epoch_v2_block: Option<u64>,
+    /// Activation block of the `CertifiedTipV1` fork, `None` while it is `Never`. Read from the
+    /// chain spec by the orchestrator when the epoch config is built; state-sync compares it
+    /// with the executed tip to decide how it finds the network head.
+    certified_tip_v1_block: Option<u64>,
 }
 
 impl<DB> ConsensusConfig<DB>
@@ -218,12 +222,19 @@ where
             epoch_boundary,
             initial_epoch,
             certificate_fetch_epoch_v2_block: None,
+            certified_tip_v1_block: None,
         })
     }
 
     /// Install the activation block of the `CertificateFetchEpochV2` fork (`None` for `Never`).
     pub fn with_certificate_fetch_epoch_v2_block(mut self, block: Option<u64>) -> Self {
         self.certificate_fetch_epoch_v2_block = block;
+        self
+    }
+
+    /// Install the activation block of the `CertifiedTipV1` fork (`None` for `Never`).
+    pub fn with_certified_tip_v1_block(mut self, block: Option<u64>) -> Self {
+        self.certified_tip_v1_block = block;
         self
     }
 
@@ -281,6 +292,11 @@ where
     /// Activation block of the `CertificateFetchEpochV2` fork, `None` while it is `Never`.
     pub fn certificate_fetch_epoch_v2_block(&self) -> Option<u64> {
         self.certificate_fetch_epoch_v2_block
+    }
+
+    /// Activation block of the `CertifiedTipV1` fork, `None` while it is `Never`.
+    pub fn certified_tip_v1_block(&self) -> Option<u64> {
+        self.certified_tip_v1_block
     }
 
     /// Returns a reference to the node's persistent storage database for the current epoch.
@@ -354,6 +370,14 @@ where
     /// Falls back through: in-memory committee (current epoch), in-memory previous committee,
     /// DB epoch records, then lookahead cache.
     pub fn get_committee_keys_for_epoch(&self, epoch: Epoch) -> Option<Vec<BlsPublicKey>> {
+        self.get_settled_committee_keys_for_epoch(epoch)
+            .or_else(|| self.inner.lookahead.get(epoch).map(|keys| keys.to_vec()))
+    }
+
+    /// The BLS committee keys `epoch` actually ran with: the current or previous committee, or
+    /// one named by a certified epoch record. Never the lookahead, which is read at epoch start:
+    /// a key ejected from a later committee during the epoch stays in it.
+    pub fn get_settled_committee_keys_for_epoch(&self, epoch: Epoch) -> Option<Vec<BlsPublicKey>> {
         let current = self.inner.committee.epoch();
         if epoch == current {
             return Some(self.inner.committee.bls_keys());
@@ -363,10 +387,7 @@ where
                 return Some(prev.keys.clone());
             }
         }
-        self.inner
-            .node_storage
-            .get_committee_keys(epoch)
-            .or_else(|| self.inner.lookahead.get(epoch).map(|keys| keys.to_vec()))
+        self.inner.node_storage.get_committee_keys(epoch)
     }
 
     /// Committee network peer ids.
