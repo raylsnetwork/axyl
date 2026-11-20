@@ -3,7 +3,7 @@
 use crate::{
     error::PrimaryNetworkError,
     network::{
-        handler::fetch_scope,
+        handler::{fetch_scope, replaces_certified_tip},
         message::{ConsensusResult, PrimaryGossip},
         MissingCertificatesRequest, PrimaryRequest, PrimaryResponse, RequestHandler,
     },
@@ -714,6 +714,18 @@ async fn test_quorum_keeps_certified_tip() -> eyre::Result<()> {
     certify(9, nine).await?;
     assert_eq!(served().await.map(|tip| tip.hash), Some(nine), "a higher tip does");
     Ok(())
+}
+
+/// The stored certified tip only moves up, and never back to an earlier epoch: a retired
+/// committee's keys must not pin a forged high number from their epoch.
+#[test]
+fn certified_tip_only_moves_up_within_or_past_its_epoch() {
+    assert!(replaces_certified_tip(None, 0, 1), "nothing stored yet");
+    assert!(replaces_certified_tip(Some((20, 5000)), 20, 5001), "higher, same epoch");
+    assert!(replaces_certified_tip(Some((20, 5000)), 21, 5001), "higher, next epoch");
+    assert!(!replaces_certified_tip(Some((20, 5000)), 20, 5000), "the same tip");
+    assert!(!replaces_certified_tip(Some((20, 5000)), 21, 4999), "lower");
+    assert!(!replaces_certified_tip(Some((20, 5000)), 3, 9_999_999), "earlier epoch");
 }
 
 #[test]

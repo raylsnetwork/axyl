@@ -119,6 +119,20 @@ pub(crate) struct RequestHandler<DB> {
     epoch_votes_seen: Arc<Mutex<BTreeMap<Epoch, HashSet<BlsPublicKey>>>>,
     /// The pending (uncertified) epoch records by digest, as last read from the table.
     pending_records: Arc<Mutex<PendingRecordCache>>,
+    /// Epoch and number of the stored certified tip, seeded from the table. Checked and moved
+    /// in one step with the write, so two quorums completing at once cannot store the lower one
+    /// last.
+    certified_tip_saved: Arc<Mutex<Option<(Epoch, u64)>>>,
+}
+
+/// Whether a tip certified at `epoch` and `number` replaces the stored one, `saved` as its epoch
+/// and number: only when it is higher and from the same or a later epoch.
+pub(super) fn replaces_certified_tip(
+    saved: Option<(Epoch, u64)>,
+    epoch: Epoch,
+    number: u64,
+) -> bool {
+    saved.is_none_or(|(saved_epoch, saved_number)| epoch >= saved_epoch && number > saved_number)
 }
 
 /// The gossip handler's view of the pending epoch record table.
@@ -161,7 +175,14 @@ where
                 "committee is larger than a missing-certificates request may name, so missing-certificates requests between members will be refused"
             );
         }
+        let certified_tip_saved = consensus_config
+            .node_storage()
+            .get::<CertifiedTips>(&0)
+            .ok()
+            .flatten()
+            .map(|tip| (tip.epoch, tip.number));
         Self {
+            certified_tip_saved: Arc::new(Mutex::new(certified_tip_saved)),
             consensus_config,
             consensus_bus,
             rayls_consensus_state_sync,
@@ -1055,7 +1076,9 @@ where
 
     /// Keep the f+1 signatures that just certified a header as this node's certified tip, the
     /// head it serves to peers. A higher stored tip is kept: gossip only moves forward, but a
-    /// restarted node can hear a lower header reach f+1 before it catches up.
+    /// restarted node can hear a lower header reach f+1 before it catches up. So is one from a
+    /// later epoch: the row outlives restarts, so f+1 keys of a retired committee could
+    /// otherwise pin a forged high number from their epoch for good.
     fn save_certified_tip(
         &self,
         epoch: Epoch,
@@ -1070,18 +1093,18 @@ where
         else {
             return;
         };
-        let db = self.consensus_config.node_storage();
-        if db.get::<CertifiedTips>(&0).ok().flatten().is_some_and(|stored| stored.number >= number)
-        {
+        let mut saved = self.certified_tip_saved.lock();
+        if !replaces_certified_tip(*saved, epoch, number) {
             return;
         }
-        if let Err(e) = db.insert::<CertifiedTips>(&0, &tip) {
-            warn!(
+        match self.consensus_config.node_storage().insert::<CertifiedTips>(&0, &tip) {
+            Ok(()) => *saved = Some((epoch, number)),
+            Err(e) => warn!(
                 target: "primary::consensus_result",
                 number,
                 %e,
                 "failed to save the certified tip"
-            );
+            ),
         }
     }
 
