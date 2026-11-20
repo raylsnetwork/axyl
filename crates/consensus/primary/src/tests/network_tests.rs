@@ -713,6 +713,28 @@ async fn test_quorum_keeps_certified_tip() -> eyre::Result<()> {
     let nine = BlockHash::random();
     certify(9, nine).await?;
     assert_eq!(served().await.map(|tip| tip.hash), Some(nine), "a higher tip does");
+
+    // a restarted node seeds the mark from the stored row, so a lower tip still cannot replace it
+    let config = committee.first_authority().consensus_config();
+    let restarted = RequestHandler::new(
+        config.clone(),
+        consensus_bus.clone(),
+        StateSynchronizer::new(config, consensus_bus.clone(), TaskManager::default().get_spawner()),
+    );
+    consensus_bus.last_published_consensus_num_hash().send_replace((0, BlockHash::ZERO));
+    let seven = BlockHash::random();
+    for signer in &signers {
+        let key = *signer.authority().protocol_key();
+        let hash = seven;
+        let digest = ConsensusResult::digest_data(0, 1, 7, hash);
+        let signature = signer.keypair().sign(&encode(&to_intent_message(digest)));
+        let result =
+            ConsensusResult { epoch: 0, round: 1, number: 7, hash, validator: key, signature };
+        let data = encode(&PrimaryGossip::Consensus(Box::new(result)));
+        let msg = GossipMessage { source: None, data, sequence_number: None, topic: topic.clone() };
+        restarted.process_gossip(&msg, key).await?;
+    }
+    assert_eq!(served().await.map(|tip| tip.hash), Some(nine), "kept across a restart");
     Ok(())
 }
 
