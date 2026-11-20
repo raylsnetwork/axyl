@@ -164,8 +164,8 @@ fn check_signer_bitmap_block_bound(bytes: &[u8]) -> Result<(), String> {
 /// Decode applies the signer-bitmap rules: at most [`MAX_SIGNER_BITMAP_BLOCKS`] container(s), at
 /// key 0, holding at most [`MAX_SIGNER_COUNT`] signers (issue #256). Its users are the signer
 /// bitmaps of `Certificate`, `EpochCertificate` and `CertifiedTip`; it is not a general roaring
-/// serde, and a
-/// bitmap that legitimately spans more blocks or signers (e.g. rounds) must not use it.
+/// serde, and a bitmap that legitimately spans more blocks or signers (e.g. rounds) must not use
+/// it.
 pub(crate) struct SignerBitmapSerde;
 
 impl SerializeAs<RoaringBitmap> for SignerBitmapSerde {
