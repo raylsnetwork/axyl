@@ -79,6 +79,10 @@ pub struct ConsensusConfig<DB> {
     /// from the chain spec by the orchestrator when the epoch config is built; the certificate
     /// fetcher compares it with the executed tip to pick the request variant it sends.
     certificate_fetch_epoch_v2_block: Option<u64>,
+    /// Activation block of the `CertifiedTipV1` fork, `None` while it is `Never`. Read from the
+    /// chain spec by the orchestrator when the epoch config is built; state-sync compares it
+    /// with the executed tip to decide how it finds the network head.
+    certified_tip_v1_block: Option<u64>,
 }
 
 impl<DB> ConsensusConfig<DB>
@@ -218,12 +222,19 @@ where
             epoch_boundary,
             initial_epoch,
             certificate_fetch_epoch_v2_block: None,
+            certified_tip_v1_block: None,
         })
     }
 
     /// Install the activation block of the `CertificateFetchEpochV2` fork (`None` for `Never`).
     pub fn with_certificate_fetch_epoch_v2_block(mut self, block: Option<u64>) -> Self {
         self.certificate_fetch_epoch_v2_block = block;
+        self
+    }
+
+    /// Install the activation block of the `CertifiedTipV1` fork (`None` for `Never`).
+    pub fn with_certified_tip_v1_block(mut self, block: Option<u64>) -> Self {
+        self.certified_tip_v1_block = block;
         self
     }
 
@@ -281,6 +292,11 @@ where
     /// Activation block of the `CertificateFetchEpochV2` fork, `None` while it is `Never`.
     pub fn certificate_fetch_epoch_v2_block(&self) -> Option<u64> {
         self.certificate_fetch_epoch_v2_block
+    }
+
+    /// Activation block of the `CertifiedTipV1` fork, `None` while it is `Never`.
+    pub fn certified_tip_v1_block(&self) -> Option<u64> {
+        self.certified_tip_v1_block
     }
 
     /// Returns a reference to the node's persistent storage database for the current epoch.
