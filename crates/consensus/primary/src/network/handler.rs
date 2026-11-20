@@ -25,10 +25,10 @@ use rayls_infrastructure_storage::{
 use rayls_infrastructure_types::{
     ensure,
     error::{CertificateError, HeaderError, HeaderResult},
-    now, to_intent_message, try_decode, AuthorityIdentifier, B256Map, BlockHash, BlockNumHash,
-    BlsPublicKey, Certificate, CertificateDigest, ConsensusHeader, Database, Epoch,
-    EpochCertificate, EpochRecord, Hash as _, Header, ProtocolSignature, RaylsSender as _, Round,
-    SignatureVerificationState, Vote, VotesAggregator,
+    now, to_intent_message, try_decode, verify_signer_claims_region, AuthorityIdentifier, B256Map,
+    BlockHash, BlockNumHash, BlsPublicKey, Certificate, CertificateDigest, ConsensusHeader,
+    Database, Epoch, EpochCertificate, EpochRecord, Hash as _, Header, ProtocolSignature,
+    RaylsSender as _, Round, SignatureVerificationState, Vote, VotesAggregator,
 };
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -714,6 +714,24 @@ where
                 ))
             }
         };
+
+        // Claims are verified against the committee we hold, not against our own era.
+        if let Err(e) = verify_signer_claims_region(
+            &header.signer_claims,
+            header.epoch(),
+            header.round(),
+            committee,
+        ) {
+            self.consensus_bus.primary_metrics().node_metrics.claim_headers_rejected.inc();
+            warn!(
+                target: "primary::handler",
+                author = %header.author(),
+                round = header.round(),
+                epoch = header.epoch(),
+                "vote_inner: signer claims do not verify, refusing to vote"
+            );
+            return Err(PrimaryNetworkError::Internal(format!("signer claims do not verify: {e}")));
+        }
 
         let previous_vote = self
             .consensus_config

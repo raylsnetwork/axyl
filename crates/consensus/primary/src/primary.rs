@@ -3,6 +3,7 @@
 use crate::{
     certificate_fetcher::CertificateFetcher,
     certifier::Certifier,
+    claim_collector::CollectorHandle,
     consensus::LeaderSchedule,
     network::{PrimaryNetworkHandle, WorkerReceiverHandler},
     proposer::Proposer,
@@ -64,6 +65,13 @@ impl<DB: Database> Primary<DB> {
         // Probably don't need this for a non-committee member but it keeps channels drained and is
         // not a problem.
         self.rayls_consensus_state_sync.spawn(task_manager);
+
+        // Unconditional: the era gates the calls into the collector, not the task itself.
+        let collector = CollectorHandle::spawn(
+            task_manager,
+            consensus_bus.primary_metrics().node_metrics.clone(),
+        );
+        consensus_bus.set_claim_collector(collector);
 
         Certifier::spawn(
             config.clone(),

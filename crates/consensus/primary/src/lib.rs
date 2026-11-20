@@ -4,6 +4,7 @@
 mod aggregators;
 mod certificate_fetcher;
 mod certifier;
+pub mod claim_collector;
 pub mod consensus;
 mod error;
 pub mod network;

@@ -6,8 +6,8 @@ use crate::{
 use rayls_consensus_primary_metrics::PrimaryMetrics;
 use rayls_infrastructure_storage::ProposerStore;
 use rayls_infrastructure_types::{
-    now, now_in_millis, AuthorityIdentifier, Certificate, Database, Epoch, Hash as _, Header,
-    RaylsSender, Round,
+    header_is_post_activation, now, now_in_millis, AuthorityIdentifier, Certificate, Database,
+    Epoch, Hash as _, Header, RaylsSender, Round,
 };
 use std::{collections::VecDeque, sync::Arc};
 use tokio::{
@@ -71,7 +71,7 @@ impl<DB: Database> Proposer<DB> {
 
         let payload_vec: Vec<_> = digests.iter().map(|m| (m.digest, m.worker_id)).collect();
         consensus_bus.batch_tracker().digests_included_in_header(&payload_vec);
-        let header = Header::new(
+        let mut header = Header::new(
             authority_id,
             current_round,
             current_epoch,
@@ -79,6 +79,17 @@ impl<DB: Database> Proposer<DB> {
             parents.iter().map(|x| x.digest()).collect(),
             consensus_bus.recently_executed_blocks().borrow().latest_block_num_hash(),
         );
+
+        // The take belongs after the re-propose branch at header_builder.rs:276 — a reproposed
+        // header keeps its claims.
+        if header_is_post_activation(&header) {
+            let claims = consensus_bus
+                .claim_collector()
+                .map(|collector| collector.take(current_epoch, current_round))
+                .unwrap_or_default();
+            metrics.claims_carried.inc_by(claims.len() as u64);
+            header = header.with_signer_claims(claims);
+        }
 
         // update metrics before sending/storing header
         metrics.headers_proposed.with_label_values(&[&leader_and_support]).inc();
@@ -194,6 +205,13 @@ impl<DB: Database> Proposer<DB> {
         // round advances here (+1) or via process_parents on future-round parents;
         // primary_round_updates is write-only for GC/metrics, never read back
         self.round += 1;
+        if let Some(collector) = self.consensus_bus.claim_collector() {
+            collector.freeze_marker(
+                self.committee.epoch(),
+                self.round,
+                self.committee.quorum_threshold(),
+            );
+        }
         self.consensus_bus.primary_round_updates().send_replace(self.round);
 
         // Update the metrics

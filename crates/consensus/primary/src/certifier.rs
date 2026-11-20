@@ -14,10 +14,11 @@ use rayls_infrastructure_storage::CertificateStore;
 use rayls_infrastructure_types::{
     ensure,
     error::{DagError, DagResult},
-    AuthorityIdentifier, BlsPublicKey, Certificate, CertificateDigest, Committee, Database, Header,
-    HeaderDigest, Noticer, Notifier, RaylsReceiver, RaylsSender, TaskManager, TaskSpawner, Vote,
+    header_is_post_activation, AuthorityIdentifier, BlsPublicKey, Certificate, CertificateDigest,
+    Committee, Database, Header, HeaderDigest, Noticer, Notifier, RaylsReceiver, RaylsSender,
+    TaskManager, TaskSpawner, Vote, VotingPower,
 };
-use std::{sync::Arc, time::Duration};
+use std::{collections::BTreeMap, sync::Arc, time::Duration};
 use tracing::{debug, enabled, error, info, warn};
 
 #[cfg(test)]
@@ -568,10 +569,44 @@ impl<DB: Database> Certifier<DB> {
         // notifier to cancel lingering vote tasks once quorum is reached
         let quorum_notifier = Notifier::new();
 
+        // Ranks are positions in bls_keys(); authorities() is id-sorted and names other validators.
+        let claim_ranks = header_is_post_activation(&header).then(|| {
+            let ranks: BTreeMap<BlsPublicKey, u32> = self
+                .committee
+                .bls_keys()
+                .into_iter()
+                .enumerate()
+                .map(|(rank, key)| (key, rank as u32))
+                .collect();
+            self.committee
+                .authorities()
+                .iter()
+                .filter_map(|authority| {
+                    let rank = ranks.get(authority.protocol_key()).copied()?;
+                    Some((authority.id(), (rank, authority.voting_power())))
+                })
+                .collect::<BTreeMap<AuthorityIdentifier, (u32, VotingPower)>>()
+        });
+
         // reset the votes aggregator and sign own header
         let mut votes_aggregator =
             HeaderVotesAggregator::new(self.metrics.clone(), &self.committee);
         let vote = Vote::new(&header, self.authority_id.clone(), &self.signature_service);
+        let target_digest = CertificateDigest::new(header.digest().into());
+        if let (Some(collector), Some(ranks)) = (self.consensus_bus.claim_collector(), &claim_ranks)
+        {
+            match ranks.get(&vote.author) {
+                Some((rank, weight)) => collector.register(
+                    header.epoch(),
+                    target_digest,
+                    header.round(),
+                    *rank,
+                    *weight,
+                    vote.signature,
+                ),
+                None => self.metrics.claim_events_dropped.with_label_values(&["rank_miss"]).inc(),
+            }
+        }
         let mut certificate = votes_aggregator.append(vote, &self.committee, &header)?;
 
         // create a bounded channel for receiving votes from peers
@@ -633,12 +668,33 @@ impl<DB: Database> Certifier<DB> {
                         Some(Ok(vote)) => {
                             let authority_id = vote.author.clone();
                             // prevent invalid votes from derailing certification process
-                            certificate = votes_aggregator
-                                 .append(vote, &self.committee, &header)
-                                 .unwrap_or_else(|e| {
-                                     error!(target: "primary::certifier", "received an invalid vote from {authority_id:?}: {e:?}");
-                                     None
-                                 });
+                            match votes_aggregator.append(vote.clone(), &self.committee, &header) {
+                                Ok(cert) => {
+                                    if let (Some(collector), Some(ranks)) =
+                                        (self.consensus_bus.claim_collector(), &claim_ranks)
+                                    {
+                                        match ranks.get(&vote.author) {
+                                            Some((rank, weight)) => collector.add_share(
+                                                header.epoch(),
+                                                target_digest,
+                                                *rank,
+                                                vote.signature,
+                                                *weight,
+                                            ),
+                                            None => self
+                                                .metrics
+                                                .claim_events_dropped
+                                                .with_label_values(&["rank_miss"])
+                                                .inc(),
+                                        }
+                                    }
+                                    certificate = cert;
+                                }
+                                Err(e) => {
+                                    error!(target: "primary::certifier", "received an invalid vote from {authority_id:?}: {e:?}");
+                                    certificate = None;
+                                }
+                            }
                         },
 
                         Some(Err(e)) => {
@@ -688,6 +744,14 @@ impl<DB: Database> Certifier<DB> {
             }
             DagError::CouldNotFormCertificate(header.digest())
         })?;
+
+        if let Some(collector) = self.consensus_bus.claim_collector() {
+            let targets: Vec<CertificateDigest> =
+                header.signer_claims.iter().map(|claim| claim.target_digest).collect();
+            if !targets.is_empty() {
+                collector.claims_committed(header.epoch(), targets);
+            }
+        }
 
         debug!(target: "primary::certifier", auth=?self.authority_id, "Assembled {certificate:?}");
 

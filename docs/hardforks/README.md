@@ -47,10 +47,11 @@ bytecode swap) and flips the epoch-close reward ABI from 1-arg to 2-arg.
 | 17 | EpochCloseSeedV2 | behavioral | — |
 | 18 | CertificateFetchEpochV2 | behavioral | — |
 | 19 | Erc20PrecompileDirectCall | behavioral | — |
+| 20 | SignerClaims | behavioral | — |
 
 ### What each behavioral fork does
 
-The twelve behavioral forks switch client behavior without a state write; the
+The thirteen behavioral forks switch client behavior without a state write; the
 activation block is a rollout decision, not a state-consistency requirement.
 What each one does:
 
@@ -68,6 +69,7 @@ What each one does:
 | `EpochCloseSeedV2` | Seeds the epoch-closing block's `extra_data` with the consensus header hash, identical on every node, instead of the leader-certificate signature hash. |
 | `CertificateFetchEpochV2` | Sends certificate fetch requests stamped with the epoch their rounds refer to, so a peer that has already closed that epoch serves them from the kept tail instead of the new epoch. Gates only the request format a node sends — every node accepts both variants, but a peer that has not been upgraded cannot decode the stamped one. |
 | `Erc20PrecompileDirectCall` | Rejects `DELEGATECALL`/`CALLCODE` frames into the native ERC-20 precompile (`0x0400`); the precompile is dispatched by bytecode address, so a delegate frame would otherwise run its privileged logic with `target_address != bytecode_address`. Only direct `CALL`/`STATICCALL` are allowed once active. |
+| `SignerClaims` | Appends a claims region to the header's canonical bytes once active: up to `MAX_SIGNER_CLAIMS` claims, each naming a target certificate digest, its epoch and round, and the strictly ascending ranks (positions in `Committee::bls_keys()`) of the validators whose aggregate share signature covers it, lagging the carrier by `SIGNER_CLAIM_LAG_ROUNDS`. A node refuses to vote for a post-activation header whose region does not verify against the committee it holds; pre-activation headers carry an empty region and encode exactly as before. Nothing is credited from these claims yet. |
 
 The seven migration forks' behavior is described by their set in section 2.
 
@@ -161,7 +163,7 @@ This is why behavioral forks are:
 
 | layer | what it protects | where |
 |-------|-----------------|-------|
-| **CI freeze tests** | mainnet and testnet baked schedules (full 19-fork literal tables) | `chainspec/tests.rs` |
+| **CI freeze tests** | mainnet and testnet baked schedules (full 20-fork literal tables) | `chainspec/tests.rs` |
 | **Boot shape gate** (`verify_schedule_shape`) | all non-mainnet/testnet chain-ids on the relaxed rules; mainnet/testnet chain-ids always excluded | `network_profile/shape.rs` |
 | **Schedule-record gate** (`schedule-record.yaml`, trust-on-first-use) | per-datadir drift on all networks | `network_profile/verify.rs` |
 | **Genesis ceremony** | out of scope by decision | — |

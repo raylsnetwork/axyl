@@ -357,6 +357,12 @@ pub struct PrimaryMetrics {
     pub fetched_certificates_verified_directly: IntCounter,
     // Total number of fetched certificates verified indirectly.
     pub fetched_certificates_verified_indirectly: IntCounter,
+    // Headers refused because the signer claims they carried did not verify.
+    pub claim_headers_rejected: IntCounter,
+    // Claims attached to headers this node proposed, counted per claim.
+    pub claims_carried: IntCounter,
+    // Collector events that were counted instead of kept, by reason.
+    pub claim_events_dropped: IntCounterVec,
 }
 
 impl PrimaryMetrics {
@@ -561,6 +567,22 @@ impl PrimaryMetrics {
             fetched_certificates_verified_indirectly: register_int_counter_with_registry!(
                 "fetched_certificates_verified_indirectly",
                 "Total number of fetched certificates verified indirectly.",
+                registry
+            )?,
+            claim_headers_rejected: register_int_counter_with_registry!(
+                "claim_headers_rejected",
+                "Number of headers refused because their signer claims did not verify.",
+                registry
+            )?,
+            claims_carried: register_int_counter_with_registry!(
+                "claims_carried",
+                "Number of signer claims attached to headers this node proposed.",
+                registry
+            )?,
+            claim_events_dropped: register_int_counter_vec_with_registry!(
+                "claim_events_dropped",
+                "Number of signer-claim events dropped by the collector.",
+                &["reason"],
                 registry
             )?,
         })

@@ -3,8 +3,9 @@
 //! arguments.
 
 use crate::{
-    certificate_fetcher::CertificateFetcherCommand, consensus::ConsensusRound,
-    proposer::OurDigestMessage, state_sync::CertificateManagerCommand, RecentlyExecutedBlocks,
+    certificate_fetcher::CertificateFetcherCommand, claim_collector::CollectorHandle,
+    consensus::ConsensusRound, proposer::OurDigestMessage, state_sync::CertificateManagerCommand,
+    RecentlyExecutedBlocks,
 };
 use consensus_metrics::metered_channel::{self, channel_with_total_sender, MeteredMpscChannel};
 use parking_lot::Mutex;
@@ -273,6 +274,8 @@ struct ConsensusBusAppInner {
     /// Blocks re-promotion until the cert store covers the barrier round.
     /// `None` means no barrier active. Set atomically via `send_modify`.
     promotion_barrier: watch::Sender<Option<PromotionBarrier>>,
+    // Set once by `Primary::spawn`; a missing handle is a plain no-op and is not counted.
+    claim_collector: Arc<Mutex<Option<CollectorHandle>>>,
 }
 
 impl ConsensusBusAppInner {
@@ -330,6 +333,7 @@ impl ConsensusBusAppInner {
             mode_transition,
             cert_store_round: watch::channel(0).0,
             promotion_barrier: watch::channel(None).0,
+            claim_collector: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -737,6 +741,16 @@ impl ConsensusBus {
     /// Batch lifecycle tracker (app-lifetime).
     pub fn batch_tracker(&self) -> &Arc<BatchTracker> {
         &self.inner_app.batch_tracker
+    }
+
+    // Set the signer-claims collector handle. Called once, from `Primary::spawn`.
+    pub fn set_claim_collector(&self, handle: CollectorHandle) {
+        self.inner_app.claim_collector.lock().replace(handle);
+    }
+
+    // The collector handle, `None` until the primary has spawned it.
+    pub fn claim_collector(&self) -> Option<CollectorHandle> {
+        self.inner_app.claim_collector.lock().clone()
     }
 
     /// Request a mode transition. Callers use `send_replace(Some(target_mode))`
