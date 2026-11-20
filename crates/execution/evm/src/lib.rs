@@ -42,6 +42,7 @@ pub mod in_flight;
 pub mod native_erc20;
 pub(crate) mod persistence;
 pub mod reth_env;
+pub mod rls_flavour;
 pub mod rpc_server_args;
 pub mod system_calls;
 pub mod worker;
