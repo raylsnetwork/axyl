@@ -678,6 +678,87 @@ impl<DB: ReDatabase> WalkSession<DB> {
     }
 }
 
+/// Whether this node finds the network head from peers' certified tips: once the `CertifiedTipV1`
+/// fork is active at the next block to execute, the point every other fork check uses.
+/// `activation` is the fork's block, `None` while it is `Never`.
+fn uses_certified_tip(activation: Option<u64>, executed_tip: u64) -> bool {
+    activation.is_some_and(|block| executed_tip.saturating_add(1) >= block)
+}
+
+/// Find a network head above `current` to walk to, as its number and hash. Before the
+/// `CertifiedTipV1` fork, the single highest latest header any committee member reports; after,
+/// a certified tip, which one member alone cannot forge (#370, #312).
+async fn probe_for_head<DB: ReDatabase>(
+    current: u64,
+    config: &ConsensusConfig<DB>,
+    consensus_bus: &ConsensusBus,
+    network: &PrimaryNetworkHandle,
+) -> Option<(u64, B256)> {
+    let executed_tip =
+        consensus_bus.recently_executed_blocks().borrow().latest_block_num_hash().number;
+    if uses_certified_tip(config.certified_tip_v1_block(), executed_tip) {
+        probe_peers_for_certified_tip(current, config, consensus_bus, network).await
+    } else {
+        probe_peers_for_latest(current, config, network).await.map(|h| (h.number, h.digest()))
+    }
+}
+
+/// Ask every connected peer, observers included, for its certified tip and return the highest
+/// one above `current` that verifies against its epoch's committee. One valid answer is enough;
+/// asking every peer only guards against peers that are down, on an older release, or behind.
+/// A tip from an epoch whose committee is not known yet is skipped, and the epoch record
+/// collector is asked for the record after the newest one held: it walks upward as far as peers
+/// serve, so a later probe can verify the tip. Neither waiting here nor requesting the tip's own
+/// epoch, which is unverified: a peer naming a far epoch would hold up the probe or send the
+/// collector chasing it.
+async fn probe_peers_for_certified_tip<DB: ReDatabase>(
+    current: u64,
+    config: &ConsensusConfig<DB>,
+    consensus_bus: &ConsensusBus,
+    network: &PrimaryNetworkHandle,
+) -> Option<(u64, B256)> {
+    let peers = network.inner_handle().connected_peers().await.ok()?;
+    let mut inflight: FuturesUnordered<_> =
+        peers.into_iter().map(|peer| network.request_certified_tip_from_peer(peer)).collect();
+    let mut candidates = Vec::new();
+    while let Some(result) = inflight.next().await {
+        if let Ok(Some(tip)) = result {
+            if tip.number > current {
+                candidates.push(tip);
+            }
+        }
+    }
+    candidates.sort_by(|a, b| b.number.cmp(&a.number));
+    candidates.dedup_by(|a, b| a.number == b.number && a.hash == b.hash);
+    for tip in candidates {
+        let Some(committee) = config.get_committee_keys_for_epoch(tip.epoch) else {
+            let next = config
+                .node_storage()
+                .last_record::<EpochRecords>()
+                .map_or(0, |(epoch, _)| epoch)
+                .saturating_add(1);
+            consensus_bus.requested_missing_epoch().send_if_modified(|requested| {
+                let higher = next > *requested;
+                if higher {
+                    *requested = next;
+                }
+                higher
+            });
+            continue;
+        };
+        if tip.verify(&committee) {
+            return Some((tip.number, tip.hash));
+        }
+        warn!(
+            target: "state-sync",
+            number = tip.number,
+            epoch = tip.epoch,
+            "probe: certified tip did not verify against its committee, skipping"
+        );
+    }
+    None
+}
+
 /// Probe all committee peers concurrently, return the highest header above `current`.
 /// BLS is re-verified downstream in `get_consensus_header`.
 async fn probe_peers_for_latest<DB: ReDatabase>(
@@ -734,14 +815,16 @@ async fn next_walk_target<DB: ReDatabase>(
                     idle_secs = idle_intervals * PROBE_INTERVAL.as_secs(),
                     "track_recent_consensus: no gossip received, probing peers"
                 );
-                if let Some(header) = probe_peers_for_latest(current, config, network).await {
+                if let Some((number, hash)) =
+                    probe_for_head(current, config, consensus_bus, network).await
+                {
                     info!(
                         target: "state-sync",
                         current,
-                        peer_latest = header.number,
+                        peer_latest = number,
                         "probe discovered newer consensus header from peer"
                     );
-                    return Some(header.digest());
+                    return Some(hash);
                 }
                 info!(target: "state-sync", "probe: no peer returned a newer header");
             }
@@ -764,14 +847,14 @@ pub(crate) async fn spawn_track_recent_consensus<DB: ReDatabase>(
 
     // Probe at startup so the first walk begins without waiting for a gossip tip.
     let current = consensus_bus.last_consensus_header().borrow().number;
-    if let Some(header) = probe_peers_for_latest(current, &config, &network).await {
+    if let Some((number, hash)) = probe_for_head(current, &config, &consensus_bus, &network).await {
         info!(
             target: "state-sync",
             current,
-            peer_latest = header.number,
+            peer_latest = number,
             "startup probe discovered newer consensus header from peer"
         );
-        if session.sync_to(header.digest()).await.is_break() {
+        if session.sync_to(hash).await.is_break() {
             return Ok(());
         }
     }
