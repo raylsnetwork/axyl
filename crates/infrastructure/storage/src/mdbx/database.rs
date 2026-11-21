@@ -824,6 +824,10 @@ fn table_entry_counts(env: &Environment) -> eyre::Result<BTreeMap<String, usize>
 
     let mut counts = BTreeMap::new();
     for name in names {
+        // reth-libmdbx panics on a name with a NUL byte; only a damaged datafile holds one
+        if name.contains('\0') {
+            eyre::bail!("damaged MDBX datafile: table name {name:?} contains a NUL byte");
+        }
         let dbi = txn.open_db(Some(&name))?.dbi();
         counts.insert(name, txn.db_stat(dbi)?.entries());
     }
@@ -1324,6 +1328,35 @@ mod test {
         let empty = tempdir().expect("failed to create temp dir");
         let err = MdbxDatabase::open_read_only(empty.path(), false).expect_err("no datafile");
         assert!(err.to_string().contains("mdbx.dat"), "{err}");
+    }
+
+    /// A damaged table name holding a NUL byte is reported as an error, not a panic.
+    #[test]
+    fn table_entry_counts_with_nul_in_table_name_returns_error() {
+        let temp_dir = tempdir().expect("failed to create temp dir");
+        {
+            let db = open_db(temp_dir.path());
+            db.with_write_txn(|txn| txn.insert::<TestTable>(&7, &"seven".to_owned()))
+                .expect("seed row");
+        }
+
+        // put a NUL byte into the name MAIN keeps for `TestTable`, as a flipped byte would
+        let dat = temp_dir.path().join("mdbx.dat");
+        let mut bytes = std::fs::read(&dat).expect("read datafile");
+        let mut damaged = 0;
+        for i in 0..bytes.len().saturating_sub(9) {
+            if &bytes[i..i + 9] == b"TestTable" {
+                bytes[i + 4] = 0;
+                damaged += 1;
+            }
+        }
+        assert!(damaged > 0, "table name not found in the datafile");
+        std::fs::write(&dat, bytes).expect("write datafile");
+
+        let ro = MdbxDatabase::open_read_only(temp_dir.path(), false).expect("open read-only");
+        let err =
+            ro.table_entry_counts().expect_err("a table name with a NUL byte must be an error");
+        assert!(!err.to_string().is_empty());
     }
 
     /// A freshly created database uses the 16 KiB default page size.
