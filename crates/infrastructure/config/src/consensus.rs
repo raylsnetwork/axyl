@@ -370,14 +370,30 @@ where
     /// Falls back through: in-memory committee (current epoch), in-memory previous committee,
     /// DB epoch records, then lookahead cache.
     pub fn get_committee_keys_for_epoch(&self, epoch: Epoch) -> Option<Vec<BlsPublicKey>> {
-        self.get_settled_committee_keys_for_epoch(epoch)
+        self.in_memory_committee_keys(epoch)
+            .or_else(|| self.inner.node_storage.get_committee_keys(epoch))
             .or_else(|| self.inner.lookahead.get(epoch).map(|keys| keys.to_vec()))
     }
 
     /// The BLS committee keys `epoch` actually ran with: the current or previous committee, or
     /// one named by a certified epoch record. Never the lookahead, which is read at epoch start:
-    /// a key ejected from a later committee during the epoch stays in it.
+    /// a key ejected from a later committee during the epoch stays in it. Nor an unsigned record:
+    /// the epoch-0 placeholder written at startup only guesses the epoch-1 committee from genesis
+    /// until the certified record replaces it.
     pub fn get_settled_committee_keys_for_epoch(&self, epoch: Epoch) -> Option<Vec<BlsPublicKey>> {
+        let certified = |epoch| match self.inner.node_storage.get_epoch_by_number(epoch) {
+            Some((record, Some(_))) => Some(record),
+            _ => None,
+        };
+        self.in_memory_committee_keys(epoch)
+            .or_else(|| certified(epoch).map(|record| record.committee))
+            .or_else(|| {
+                epoch.checked_sub(1).and_then(&certified).map(|record| record.next_committee)
+            })
+    }
+
+    /// The current committee's keys, or the previous one's when it is held in memory.
+    fn in_memory_committee_keys(&self, epoch: Epoch) -> Option<Vec<BlsPublicKey>> {
         let current = self.inner.committee.epoch();
         if epoch == current {
             return Some(self.inner.committee.bls_keys());
@@ -387,7 +403,7 @@ where
                 return Some(prev.keys.clone());
             }
         }
-        self.inner.node_storage.get_committee_keys(epoch)
+        None
     }
 
     /// Committee network peer ids.
@@ -427,7 +443,9 @@ mod tests {
     use super::*;
     use rand::{rngs::StdRng, SeedableRng};
     use rayls_infrastructure_storage::{mem_db::MemDatabase, tables::EpochRecords, EpochStore};
-    use rayls_infrastructure_types::{Address, BlsKeypair, CommitteeBuilder, EpochRecord};
+    use rayls_infrastructure_types::{
+        Address, BlsKeypair, CommitteeBuilder, EpochCertificate, EpochRecord,
+    };
 
     /// A config for a two-member committee at `epoch` (this node and one other), built on `db`.
     fn config_at_epoch(
@@ -489,5 +507,34 @@ mod tests {
         unknown.node_storage().save_epoch_record(&record).expect("record");
         assert!(unknown.previous_committee().is_none());
         assert_eq!(unknown.get_committee_keys_for_epoch(0), Some(vec![previous]));
+    }
+
+    /// The epoch-0 placeholder written at startup names the genesis committee for epoch 1
+    /// without a certificate. It settles nothing; the certified record replacing it does.
+    #[test]
+    fn an_unsigned_epoch_record_does_not_settle_a_committee() {
+        let mut rng = StdRng::seed_from_u64(3);
+        let keypair = BlsKeypair::generate(&mut rng);
+        let config = config_at_epoch(0, MemDatabase::default(), keypair, &mut rng);
+        let genesis = config.committee().bls_keys();
+        let placeholder = EpochRecord {
+            epoch: 0,
+            committee: genesis.clone(),
+            next_committee: genesis.clone(),
+            ..Default::default()
+        };
+        config.node_storage().save_epoch_record(&placeholder).expect("placeholder");
+        assert_eq!(config.get_committee_keys_for_epoch(1), Some(genesis), "precondition");
+        assert_eq!(config.get_settled_committee_keys_for_epoch(1), None);
+
+        let next = vec![*BlsKeypair::generate(&mut rng).public()];
+        let record = EpochRecord { next_committee: next.clone(), ..placeholder };
+        let cert = EpochCertificate {
+            epoch_hash: record.digest(),
+            signature: Default::default(),
+            signed_authorities: Default::default(),
+        };
+        config.node_storage().save_epoch_record_with_cert(&record, &cert).expect("certified");
+        assert_eq!(config.get_settled_committee_keys_for_epoch(1), Some(next));
     }
 }
