@@ -60,10 +60,10 @@ jobs:
         with:
           fetch-depth: 1
 
-      - name: Install Rust 1.91.0
+      - name: Install Rust 1.93.0
         uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
         with:
-          toolchain: 1.91.0
+          toolchain: 1.93.0
 
       - name: Install build dependencies
         run: |
@@ -116,10 +116,10 @@ jobs:
         with:
           fetch-depth: 1
 
-      - name: Install Rust 1.91.0
+      - name: Install Rust 1.93.0
         uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
         with:
-          toolchain: 1.91.0
+          toolchain: 1.93.0
 
       - name: Install build dependencies
         run: |

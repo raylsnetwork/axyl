@@ -12,7 +12,7 @@ run CI on a newer commit.
 
 - Skips immediately on draft PRs (the first step exits with an error if
   `github.event.pull_request.draft == true`).
-- Pins the Rust toolchain to `1.91.0` via `dtolnay/rust-toolchain`.
+- Pins the Rust toolchain to `1.93.0` via `dtolnay/rust-toolchain`.
 - Runs the Rust workspace tests (`cargo test --workspace`, excluding `rayls-execution-faucet`
   and `e2e-tests`), `cargo fmt --check`, and `cargo clippy` against the workspace.
 

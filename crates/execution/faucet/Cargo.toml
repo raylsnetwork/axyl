@@ -17,7 +17,6 @@ tokio = { workspace = true, features = ["sync"] }
 rayls-execution-evm = { workspace = true }
 rayls-execution-rpc = { workspace = true }
 reth = { workspace = true }
-reth-primitives = { workspace = true }
 reth-tasks = { workspace = true }
 reth-transaction-pool = { workspace = true }
 clap = { workspace = true, features = ["env"] }

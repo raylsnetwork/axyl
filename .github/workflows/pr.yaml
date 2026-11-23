@@ -115,10 +115,10 @@ jobs:
           fetch-depth: 1 # Shallow clone
 
       # install rust — dtolnay action handles caching of the toolchain
-      - name: Install Rust 1.91.0
+      - name: Install Rust 1.93.0
         uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
         with:
-          toolchain: 1.91.0
+          toolchain: 1.93.0
           components: rustfmt, rust-src, clippy
 
       # cache target/ and cargo registry across PRs via shared-key (per matrix leg)
