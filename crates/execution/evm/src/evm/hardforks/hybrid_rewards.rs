@@ -37,10 +37,9 @@
 //! artifact and fails if they drift.
 
 use rayls_infrastructure_config::CONSENSUS_REGISTRY_ADDRESS;
-use rayls_infrastructure_types::Address;
 use reth_errors::BlockExecutionError;
 use reth_revm::{
-    bytecode::Bytecode, primitives::HashMap, state::Account as RevmAccount, Database, State,
+    bytecode::Bytecode, primitives::AddressMap, state::Account as RevmAccount,
 };
 
 use super::account_with_code;
@@ -140,11 +139,8 @@ fn splice_hybrid_registry_code(live: &[u8]) -> Result<Vec<u8>, BlockExecutionErr
 /// State<DB>`, like [`super::usdr_supply_correction`]); storage/nonce/balance are preserved by
 /// the dispatcher's code-replacement branch.
 pub(crate) fn hybrid_rewards_state<DB: alloy_evm::Database>(
-    db: &mut State<DB>,
-) -> Result<HashMap<Address, RevmAccount>, BlockExecutionError>
-where
-    DB::Error: core::fmt::Display,
-{
+    db: &mut DB,
+) -> Result<AddressMap<RevmAccount>, BlockExecutionError> {
     let info = db
         .basic(CONSENSUS_REGISTRY_ADDRESS)
         .map_err(|e| {
@@ -165,7 +161,7 @@ where
 
     let new_code = splice_hybrid_registry_code(live_code.original_byte_slice())?;
 
-    let mut state = HashMap::default();
+    let mut state = AddressMap::default();
     state.insert(CONSENSUS_REGISTRY_ADDRESS, account_with_code(&new_code));
     Ok(state)
 }

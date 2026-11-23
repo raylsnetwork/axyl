@@ -10,7 +10,7 @@ use crate::{
     },
 };
 use alloy::sol_types::SolCall;
-use alloy_evm::{precompiles::DynPrecompile, Database};
+use alloy_evm::{block::StateDB, precompiles::DynPrecompile, Database};
 use parking_lot::RwLock;
 use rayls_infrastructure_types::{Receipt, TransactionSigned, U256};
 use reth_evm::{
@@ -33,7 +33,7 @@ use reth_revm::{
         Precompiles,
     },
     primitives::hardfork::SpecId,
-    Context, Inspector, MainBuilder, MainContext, State,
+    Context, Inspector, MainBuilder, MainContext,
 };
 use std::sync::{Arc, OnceLock};
 use tracing::{debug, trace};
@@ -473,12 +473,12 @@ where
 
     fn create_executor<'a, DB, I>(
         &'a self,
-        evm: EvmF::Evm<&'a mut State<DB>, I>,
+        evm: EvmF::Evm<DB, I>,
         ctx: Self::ExecutionCtx<'a>,
     ) -> impl BlockExecutorFor<'a, Self, DB, I>
     where
-        DB: Database + 'a,
-        I: Inspector<EvmF::Context<&'a mut State<DB>>> + 'a,
+        DB: StateDB + 'a,
+        I: Inspector<EvmF::Context<DB>> + 'a,
     {
         RaylsBlockExecutor::new(evm, ctx, &self.spec, &self.receipt_builder)
     }

@@ -136,6 +136,7 @@ impl WorkerTxPool {
     pub fn new(
         node_config: &NodeConfig<ChainSpec>,
         task_spawner: &TaskSpawner,
+        reth_runtime: &reth_tasks::Runtime,
         blockchain_provider: &BlockchainProvider<RaylsNode>,
         in_flight: InFlightTracker,
     ) -> eyre::Result<Self> {
@@ -150,7 +151,7 @@ impl WorkerTxPool {
                 .with_local_transactions_config(pool_config.local_transactions_config.clone())
                 .with_additional_tasks(node_config.txpool.additional_validation_tasks)
                 .with_max_tx_input_bytes(node_config.txpool.max_tx_input_bytes)
-                .build_with_tasks(task_spawner.clone(), blob_store.clone());
+                .build_with_tasks(reth_runtime.clone(), blob_store.clone());
 
         let transaction_pool =
             Pool::new(task_executor, CoinbaseTipOrdering::default(), blob_store, pool_config);
@@ -166,7 +167,7 @@ impl WorkerTxPool {
             blockchain_provider.clone(),
             this.pool.clone(),
             blockchain_provider.canonical_state_stream(),
-            task_spawner.clone(),
+            reth_runtime.clone(),
             MaintainPoolConfig {
                 // bounds the queued (non-executable) sub-pool only; a pending tx is never
                 // lifetime-evicted, so this caps nonce-gapped stranding, not seal latency

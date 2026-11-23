@@ -19,9 +19,7 @@ use reth_errors::BlockExecutionError;
 use reth_evm::OnStateHook;
 use reth_revm::{
     bytecode::Bytecode,
-    db::StorageWithOriginalValues,
     state::{Account as RevmAccount, AccountInfo, AccountStatus},
-    State,
 };
 use tracing::info;
 
@@ -43,17 +41,22 @@ pub(super) fn account_with_code(bytecode: &[u8]) -> RevmAccount {
 /// change through `CacheAccount::change()` rather than `State::commit()`: commit runs the EIP-161
 /// state-clear logic (`apply_account_state`), which panics when a `Loaded` cache account is
 /// committed with empty `AccountInfo`, and hardfork migrations are not transaction outputs.
-pub(crate) fn apply_activated_migrations<DB: alloy_evm::Database>(
+///
+/// TODO(#413): temporary. alloy-evm 0.30 hands the block executor a generic `StateDB`
+/// (`Database + DatabaseCommit`), not `&mut State<DB>`, so the `State`-only calls described
+/// above cannot be made from here. Until #413 moves this call into the block-building code,
+/// the migration reads through `Database::basic` and writes through `DatabaseCommit::commit`.
+/// `commit` runs the EIP-161 branch: an account that is still empty after the merge (nonce 0,
+/// balance 0, no code) is destroyed and its migration storage is dropped, where `change()`
+/// kept it. This gives a different state for testnet block 560,539 (AdminTransfer).
+pub(crate) fn apply_activated_migrations<DB: alloy_evm::block::StateDB>(
     spec: &impl RaylsHardforks,
-    db: &mut State<DB>,
+    db: &mut DB,
     state_hook: &mut Option<Box<dyn OnStateHook>>,
     receipt_count: usize,
     parent_number: u64,
     block_number: u64,
-) -> Result<(), BlockExecutionError>
-where
-    DB::Error: core::fmt::Display,
-{
+) -> Result<(), BlockExecutionError> {
     let newly_activated_forks = spec.newly_activated_forks(parent_number, block_number);
 
     for fork in newly_activated_forks {
@@ -150,12 +153,12 @@ where
         // (e.g. the DelegationPool/RewardDistributor proxy migration) are discarded.
         // We still carry over nonce and balance from the on-chain account.
         for (address, account) in state.iter_mut() {
-            let cached = db.load_cache_account(*address).map_err(|e| {
+            let cached_info = db.basic(*address).map_err(|e| {
                 BlockExecutionError::msg(format!(
                     "Hardfork {fork:?}: failed to load account {address} into cache: {e}"
                 ))
             })?;
-            if let Some(info) = cached.account_info() {
+            if let Some(info) = cached_info {
                 if account.info.code.is_some() {
                     // Hardfork is replacing the bytecode - keep the new code
                     // but carry over nonce/balance from the on-chain account.
@@ -171,38 +174,9 @@ where
             hook.on_state(StateChangeSource::Transaction(receipt_count), &state);
         }
 
-        // Register new bytecodes in the EVM contracts cache so they can be executed.
-        for (_, account) in state.iter() {
-            if let Some(code) = &account.info.code {
-                db.cache.contracts.insert(account.info.code_hash, code.clone());
-            }
-        }
-
-        // Apply state changes by calling CacheAccount::change() directly.
-        // This bypasses State::commit() / apply_account_state() and its EIP-161 assertions,
-        // while still correctly transitioning cache-account statuses and recording transitions
-        // in the transition state (so changes are persisted to the DB at block finalization).
-        let mut transitions = Vec::with_capacity(state.len());
-        for (address, account) in state {
-            let storage_changes: StorageWithOriginalValues = account
-                .storage
-                .into_iter()
-                .filter(|(_, slot)| slot.is_changed())
-                .map(|(key, slot)| (key, slot.into()))
-                .collect();
-
-            let cache_account = db
-                .cache
-                .accounts
-                .get_mut(&address)
-                .expect("account should be in cache after pre-loading");
-
-            let transition = cache_account.change(account.info, storage_changes);
-            transitions.push((address, transition));
-        }
-
-        // Register transitions so block finalization writes all changes to the DB.
-        db.apply_transition(transitions.into_iter());
+        // TODO(#413): temporary, see the function docs. Only `commit` is reachable through
+        // `StateDB`.
+        db.commit(state);
 
         info!(target: "engine", ?fork, "Hardfork migration applied successfully");
     }

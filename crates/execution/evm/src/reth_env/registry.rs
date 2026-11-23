@@ -39,7 +39,6 @@ impl RethEnv {
         let mut db = State::builder()
             .with_database(state)
             .with_bundle_update()
-            .without_state_clear()
             .build();
         trace!(target: "engine", state=?db.bundle_state, hashes=?db.block_hashes, "retrieving epoch state from canonical tip");
         let mut rayls_evm = self
@@ -90,7 +89,6 @@ impl RethEnv {
         let mut db = State::builder()
             .with_database(state)
             .with_bundle_update()
-            .without_state_clear()
             .build();
         let mut rayls_evm = self
             .evm_config
@@ -140,7 +138,6 @@ impl RethEnv {
         let mut db = State::builder()
             .with_database(state)
             .with_bundle_update()
-            .without_state_clear()
             .build();
         let mut rayls_evm = self
             .evm_config

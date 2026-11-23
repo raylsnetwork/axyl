@@ -68,10 +68,14 @@ pub use alloy::{
     sol_types::{SolType, SolValue},
 };
 pub use libp2p::{multiaddr::Protocol, Multiaddr};
-pub use reth_primitives::{
-    Block, BlockBody, EthPrimitives, NodePrimitives, PooledTransaction, Receipt, Recovered,
-    RecoveredBlock, SealedBlock, SealedHeader, Transaction, TransactionSigned,
+pub use reth::primitives::{NodePrimitives, Recovered, SealedHeader};
+pub use reth_ethereum_primitives::{
+    Block, BlockBody, EthPrimitives, PooledTransaction, Receipt, Transaction, TransactionSigned,
 };
+/// A sealed block, with the Ethereum block as the default body type.
+pub type SealedBlock<B = Block> = reth::primitives::SealedBlock<B>;
+/// A block with recovered senders, with the Ethereum block as the default body type.
+pub type RecoveredBlock<B = Block> = reth::primitives::RecoveredBlock<B>;
 
 mod network;
 pub use network::{RaylsNetwork, MIN_RAYLS_PROTOCOL_BASE_FEE};

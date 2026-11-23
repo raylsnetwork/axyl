@@ -21,7 +21,7 @@ use alloy::primitives::{address, Bytes};
 use rayls_infrastructure_types::{Address, U256};
 use reth_revm::{
     bytecode::Bytecode,
-    primitives::HashMap,
+    primitives::AddressMap,
     state::{Account as RevmAccount, EvmStorageSlot},
 };
 
@@ -166,8 +166,8 @@ fn ensure_proxy_code(account: &mut RevmAccount) {
 // ── Migration ─────────────────────────────────────────────────────────
 
 /// Build the state changes for the Tokenomics hardfork.
-pub(crate) fn tokenomics_state() -> HashMap<Address, RevmAccount> {
-    let mut state = HashMap::default();
+pub(crate) fn tokenomics_state() -> AddressMap<RevmAccount> {
+    let mut state = AddressMap::default();
 
     // ── Part 1: Deploy RLSAccumulator implementation ──────────────────
     state.insert(RLS_ACCUMULATOR_IMPL, account_with_code(RLS_ACCUMULATOR_IMPL_BYTECODE));

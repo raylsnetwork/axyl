@@ -510,7 +510,11 @@ async fn test_genesis_alloc_hashed_and_readable_in_storage_v2() -> eyre::Result<
     let rocksdb_provider =
         RocksDBBuilder::new(datadir.join("rocksdb")).with_default_tables().build()?;
     let static_files = StaticFileProvider::read_write(datadir.join("static_files"))?;
-    let runtime = reth_tasks::Runtime::with_existing_handle(tokio::runtime::Handle::current())?;
+    let runtime = reth_tasks::RuntimeBuilder::new(
+        reth_tasks::RuntimeConfig::default()
+            .with_tokio(reth_tasks::TokioConfig::existing_handle(tokio::runtime::Handle::current())),
+    )
+    .build()?;
     let provider_factory: ProviderFactory<RaylsNode> = ProviderFactory::new(
         db,
         rayls_chain_spec.clone(),
@@ -877,7 +881,6 @@ async fn test_close_epochs() -> eyre::Result<()> {
     let mut db = State::builder()
         .with_database(cached_reads.as_db_mut(state))
         .with_bundle_update()
-        .without_state_clear()
         .build();
     let mut rayls_evm = reth_env
         .evm_config
@@ -1290,7 +1293,6 @@ async fn test_close_epochs_with_dynamic_committee() -> eyre::Result<()> {
     let mut db = State::builder()
         .with_database(cached_reads.as_db_mut(state))
         .with_bundle_update()
-        .without_state_clear()
         .build();
     let mut rayls_evm = reth_env
         .evm_config
@@ -1334,7 +1336,6 @@ async fn test_close_epochs_with_dynamic_committee() -> eyre::Result<()> {
     let mut db = State::builder()
         .with_database(cached_reads.as_db_mut(state))
         .with_bundle_update()
-        .without_state_clear()
         .build();
     let mut rayls_evm = reth_env
         .evm_config
@@ -1393,7 +1394,6 @@ async fn test_close_epochs_with_dynamic_committee() -> eyre::Result<()> {
     let mut db = State::builder()
         .with_database(cached_reads.as_db_mut(state))
         .with_bundle_update()
-        .without_state_clear()
         .build();
     let mut rayls_evm = reth_env
         .evm_config
@@ -1640,7 +1640,11 @@ async fn test_fix_genesis_history_rekeys_and_preserves_post_genesis() -> eyre::R
     let rocksdb_provider =
         RocksDBBuilder::new(datadir.join("rocksdb")).with_default_tables().build()?;
     let static_files = StaticFileProvider::read_write(datadir.join("static_files"))?;
-    let runtime = reth_tasks::Runtime::with_existing_handle(tokio::runtime::Handle::current())?;
+    let runtime = reth_tasks::RuntimeBuilder::new(
+        reth_tasks::RuntimeConfig::default()
+            .with_tokio(reth_tasks::TokioConfig::existing_handle(tokio::runtime::Handle::current())),
+    )
+    .build()?;
     let provider_factory: ProviderFactory<RaylsNode> =
         ProviderFactory::new(db, rayls_chain_spec, static_files, rocksdb_provider, runtime)?;
     let settings = StorageSettings::v2();
@@ -1799,7 +1803,11 @@ async fn test_fix_genesis_account_history_seeds_after_clear_and_skips_multishard
     let rocksdb_provider =
         RocksDBBuilder::new(datadir.join("rocksdb")).with_default_tables().build()?;
     let static_files = StaticFileProvider::read_write(datadir.join("static_files"))?;
-    let runtime = reth_tasks::Runtime::with_existing_handle(tokio::runtime::Handle::current())?;
+    let runtime = reth_tasks::RuntimeBuilder::new(
+        reth_tasks::RuntimeConfig::default()
+            .with_tokio(reth_tasks::TokioConfig::existing_handle(tokio::runtime::Handle::current())),
+    )
+    .build()?;
     let provider_factory: ProviderFactory<RaylsNode> =
         ProviderFactory::new(db, rayls_chain_spec, static_files, rocksdb_provider, runtime)?;
     let settings = StorageSettings::v2();

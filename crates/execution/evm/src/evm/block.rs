@@ -16,7 +16,12 @@ use alloy::{
     eips::{eip2935::HISTORY_STORAGE_ADDRESS, eip4788::BEACON_ROOTS_ADDRESS, eip7685::Requests},
     sol_types::SolCall as _,
 };
-use alloy_evm::{block::StateChangeSource, eth::EthTxResult, tx::RecoveredTx as _, Database, Evm};
+use alloy_evm::{
+    block::{StateChangeSource, StateDB},
+    eth::EthTxResult,
+    tx::RecoveredTx as _,
+    Evm,
+};
 use rand::{rngs::StdRng, seq::IteratorRandom, Rng as _, SeedableRng as _};
 use rayls_infrastructure_types::{
     rewards::{build_withdrawals, HybridEpochTally},
@@ -32,14 +37,12 @@ use reth_evm::{
     execute::{BlockAssembler, BlockAssemblerInput},
     FromRecoveredTx, FromTxWithEncoded, OnStateHook,
 };
-use reth_primitives::logs_bloom;
-use reth_primitives_traits::proofs::calculate_withdrawals_root;
+use reth_primitives_traits::{logs_bloom, proofs::calculate_withdrawals_root};
 use reth_provider::BlockExecutionResult;
 use reth_revm::{
     context::result::{ExecutionResult, ResultAndState},
     context_interface::Block as EvmBlockTr,
-    db::states::bundle_state::BundleRetention,
-    DatabaseCommit as _, State,
+    DatabaseCommit as _,
 };
 use std::{collections::BTreeMap, sync::Arc};
 use tracing::{debug, error, info, trace};
@@ -179,12 +182,10 @@ where
     }
 }
 
-impl<'db, Evm, Spec, R, DB> RaylsBlockExecutor<Evm, Spec, R>
+impl<Evm, Spec, R> RaylsBlockExecutor<Evm, Spec, R>
 where
-    DB: Database + 'db,
-    DB::Error: core::fmt::Display,
     Evm: alloy_evm::Evm<
-        DB = &'db mut State<DB>,
+        DB: StateDB,
         Tx: FromRecoveredTx<R::Transaction> + FromTxWithEncoded<R::Transaction>,
     >,
     Spec: EthereumHardforks + RaylsHardforks,
@@ -796,11 +797,10 @@ where
 }
 
 // alloy-evm
-impl<'db, DB, E, Spec, R> BlockExecutor for RaylsBlockExecutor<E, Spec, R>
+impl<E, Spec, R> BlockExecutor for RaylsBlockExecutor<E, Spec, R>
 where
-    DB: Database + 'db,
     E: Evm<
-        DB = &'db mut State<DB>,
+        DB: StateDB,
         Tx: FromRecoveredTx<TransactionSigned> + FromTxWithEncoded<TransactionSigned>,
     >,
     Spec: EthereumHardforks + RaylsHardforks,
@@ -812,17 +812,15 @@ where
     type Result = EthTxResult<<E as Evm>::HaltReason, TxType>;
 
     fn apply_pre_execution_changes(&mut self) -> Result<(), BlockExecutionError> {
-        // Set state clear flag if the block is after the Spurious Dragon hardfork.
-        let state_clear_flag =
-            self.spec.is_spurious_dragon_active_at_block(self.evm.block().number().saturating_to());
-        self.evm.db_mut().set_state_clear_flag(state_clear_flag);
+        // revm 36 has no state clear flag. EIP-161 clearing is always on in the database layer,
+        // which is what this executor asked for before (Spurious Dragon is active from block 0).
 
         // apply any one-shot hardfork state migrations newly activated at this block
         let block_number = self.evm.block().number().saturating_to::<u64>();
         let parent_number = block_number.saturating_sub(1);
         hardforks::apply_activated_migrations(
             &self.spec,
-            &mut *self.evm.db_mut(),
+            self.evm.db_mut(),
             &mut self.state_hook,
             self.receipts.len(),
             parent_number,
@@ -934,8 +932,9 @@ where
                 }
             }
 
-            // merge transitions into bundle state
-            self.evm.db_mut().merge_transitions(BundleRetention::Reverts);
+            // The executor only sees a generic `StateDB` (alloy-evm 0.30), so it cannot call
+            // `State::merge_transitions` here. The caller that owns the `State` does the merge
+            // (see `build_block_from_batch_payload`).
         }
 
         Ok((

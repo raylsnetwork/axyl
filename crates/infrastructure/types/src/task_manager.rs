@@ -340,14 +340,16 @@ impl TaskSpawner {
         }
     }
 
-    /// Spawn a task for the reth [`TaskSpawner`](reth_tasks::TaskSpawner) trait.
+    /// Spawn a tracked task for reth-facing code.
     ///
     /// The reth interface requires a [`JoinHandle`] to be returned while the
     /// [`TaskManager`] needs its own handle for tracking.  We use a single
     /// `tokio::spawn` (or `spawn_blocking`) wrapped in one `select!` with
     /// `local_shutdown`, and bridge a lightweight proxy [`JoinHandle`] back to
     /// the caller via a [`oneshot`](tokio::sync::oneshot) channel.
-    fn spawn_reth_task(
+    ///
+    /// Called directly by the one caller that needs a tracked "blocking future" task.
+    pub fn spawn_reth_task(
         &self,
         name: &str,
         fut: BoxFuture<'static, ()>,
@@ -945,32 +947,6 @@ impl Debug for TaskManager {
     }
 }
 
-impl reth_tasks::TaskSpawner for TaskSpawner {
-    fn spawn_task(&self, fut: BoxFuture<'static, ()>) -> JoinHandle<()> {
-        self.spawn_reth_task("reth-task", fut, false, false)
-    }
-
-    fn spawn_critical_task(
-        &self,
-        name: &'static str,
-        fut: BoxFuture<'static, ()>,
-    ) -> JoinHandle<()> {
-        self.spawn_reth_task(name, fut, true, false)
-    }
-
-    fn spawn_blocking_task(&self, fut: BoxFuture<'static, ()>) -> JoinHandle<()> {
-        self.spawn_reth_task("reth-blocking-task", fut, false, true)
-    }
-
-    fn spawn_critical_blocking_task(
-        &self,
-        name: &'static str,
-        fut: BoxFuture<'static, ()>,
-    ) -> JoinHandle<()> {
-        self.spawn_reth_task(name, fut, true, true)
-    }
-}
-
 /// Indicate a non-normal exit on a a taskmanager join.
 #[derive(Debug, Error)]
 pub enum TaskJoinError {
@@ -1067,48 +1043,51 @@ mod test {
         assert_eq!(spong_block.ping(1).await.unwrap(), 1);
         assert_eq!(spong_block.ping(2).await.unwrap(), 2);
 
-        // Test the reth TaskSpawner trait interface.
-        // Use fully qualified syntax because the inherent methods (which take
-        // a name + future) shadow the trait methods (which take only a future).
-        use reth_tasks::TaskSpawner as RethTaskSpawner;
+        // Test the bridge method that reth-facing code uses.
         let (rsping_crit, mut rspong_crit) = new_ping_pong();
-        RethTaskSpawner::spawn_critical_task(
-            &spawner,
+        spawner.spawn_reth_task(
             "Crit",
             Box::pin(async move {
                 rsping_crit.run().await;
             }),
+            true,
+            false,
         );
         assert_eq!(rspong_crit.ping(1).await.unwrap(), 1);
         assert_eq!(rspong_crit.ping(2).await.unwrap(), 2);
 
         let (rsping_norm, mut rspong_norm) = new_ping_pong();
-        RethTaskSpawner::spawn_task(
-            &spawner,
+        spawner.spawn_reth_task(
+            "reth-task",
             Box::pin(async move {
                 rsping_norm.run().await;
             }),
+            false,
+            false,
         );
         assert_eq!(rspong_norm.ping(1).await.unwrap(), 1);
         assert_eq!(rspong_norm.ping(2).await.unwrap(), 2);
 
         let (rsping_block, mut rspong_block) = new_ping_pong();
-        RethTaskSpawner::spawn_blocking_task(
-            &spawner,
+        spawner.spawn_reth_task(
+            "reth-blocking-task",
             Box::pin(async move {
                 rsping_block.run().await;
             }),
+            false,
+            true,
         );
         assert_eq!(rspong_block.ping(1).await.unwrap(), 1);
         assert_eq!(rspong_block.ping(2).await.unwrap(), 2);
 
         let (rsping_crit_block, mut rspong_crit_block) = new_ping_pong();
-        RethTaskSpawner::spawn_critical_blocking_task(
-            &spawner,
+        spawner.spawn_reth_task(
             "Crit block",
             Box::pin(async move {
                 rsping_crit_block.run().await;
             }),
+            true,
+            true,
         );
         assert_eq!(rspong_crit_block.ping(1).await.unwrap(), 1);
         assert_eq!(rspong_crit_block.ping(2).await.unwrap(), 2);

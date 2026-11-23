@@ -23,8 +23,8 @@ use rayls_infrastructure_types::{
     TransactionTrait as _, TxEip1559, TxHash, TxKind, B256, U256,
 };
 use reth::rpc::server_types::eth::{EthApiError, EthResult, RpcInvalidTransactionError};
-use reth_primitives::transaction::SignedTransaction;
-use reth_tasks::TaskSpawner;
+use reth::primitives::SignedTransaction;
+use crate::TaskSpawner;
 use reth_transaction_pool::{PoolTransaction, TransactionEvent};
 use secp256k1::{
     ecdsa::{RecoverableSignature, RecoveryId, Signature},

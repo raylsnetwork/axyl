@@ -15,7 +15,7 @@ rustc-hash = { workspace = true }
 # direct reth currently for circular deps
 reth = { workspace = true }
 reth-chainspec = { workspace = true }
-reth-tasks = { workspace = true }
+reth-ethereum-primitives = { workspace = true }
 dashmap = { workspace = true }
 derive_builder = { workspace = true }
 futures = { workspace = true }

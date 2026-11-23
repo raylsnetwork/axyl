@@ -27,10 +27,10 @@ use reth_evm::{
     execute::{BlockAssembler, BlockAssemblerInput, BlockBuilder, BlockExecutionOutput},
     ConfigureEvm,
 };
-use reth_primitives::Recovered;
+use reth_primitives_traits::Recovered;
 use reth_provider::{
     providers::OverlayStateProviderFactory, AccountReader as _, DatabaseProviderFactory,
-    LatestStateProvider, StateProviderBox,
+    LatestStateProvider, StateProviderBox, StorageSettingsCache as _,
 };
 use reth_revm::{
     cached::CachedReads, database::StateProviderDatabase,
@@ -129,7 +129,6 @@ impl RethEnv {
         let mut db = State::builder()
             .with_database(cached_reads.as_db_mut(state))
             .with_bundle_update()
-            .without_state_clear()
             .build();
 
         debug!(
@@ -220,6 +219,7 @@ impl RethEnv {
         let evm = self.evm_config.evm_factory.create_evm_with_native_erc20_only(&mut db, evm_env);
         let ctx = self.evm_config.context_for_next_block(&parent_header, payload)?;
         let ctx_for_assembler = ctx.clone();
+        let close_epoch_block = ctx.close_epoch.is_some();
         let mut builder = self.evm_config.create_block_builder(evm, &parent_header, ctx);
 
         // attach state_hook to the executor if Tier 1 is active; the hook
@@ -296,6 +296,13 @@ impl RethEnv {
         let executor = builder.into_executor();
         let (evm, execution_result) = executor.finish()?;
         let (_db_ref, evm_env) = evm.finish();
+
+        // `RaylsBlockExecutor::finish` cannot call `merge_transitions` on an epoch-close block
+        // (see evm/block.rs), so the merge is done here. It keeps the trailing empty revert
+        // entry the bundle had on those blocks.
+        if close_epoch_block {
+            db.merge_transitions(BundleRetention::Reverts);
+        }
 
         // Phase 3: merge all state transitions into the bundle
         db.merge_transitions(BundleRetention::Reverts);
@@ -374,13 +381,21 @@ impl RethEnv {
         // reads of old trie node values, no state root recomputation.
         {
             if let Ok(db_provider) = self.blockchain_provider.database_provider_ro() {
-                let db_cursor_factory = DatabaseTrieCursorFactory::new(db_provider.tx_ref());
-                let cursor_factory =
-                    InMemoryTrieCursorFactory::new(db_cursor_factory, &ancestor_sorted_nodes);
-                if let Ok(changesets) =
+                // `DatabaseTrieCursorFactory` needs a key adapter (packed trie keys on storage
+                // v2, legacy keys on v1). `with_adapter!` picks it from the storage settings.
+                let changesets = reth_trie_db::with_adapter!(db_provider, |A| {
+                    let db_cursor_factory =
+                        DatabaseTrieCursorFactory::<_, A>::new(db_provider.tx_ref());
+                    let cursor_factory =
+                        InMemoryTrieCursorFactory::new(db_cursor_factory, &ancestor_sorted_nodes);
                     compute_trie_changesets(&cursor_factory, &trie_updates_sorted)
-                {
-                    self.changeset_cache.insert(block.hash(), block.number(), Arc::new(changesets));
+                });
+                if let Ok(changesets) = changesets {
+                    // `ChangesetCache::insert` is private in reth 2.0. The public way in is
+                    // `register_pending(hash)` + `resolve(number, changesets)`.
+                    self.changeset_cache
+                        .register_pending(block.hash())
+                        .resolve(block.number(), Arc::new(changesets));
                 }
             }
         }
@@ -444,6 +459,8 @@ impl RethEnv {
             parent_hash,
             parent_state_root,
             transaction_count,
+            // Unknown while building. reth v2.0.0 does not read it.
+            gas_used: 0,
             withdrawals: None,
         };
 
@@ -471,7 +488,12 @@ impl RethEnv {
         drop(processor); // release the mutex before computation
 
         // extract state_hook before capturing handle in the closure
-        let state_hook: Box<dyn reth_evm::OnStateHook> = Box::new(handle.state_hook());
+        // `state_hook()` is `None` when no state root task was spawned.
+        // `PayloadProcessor::spawn` always spawns one.
+        let state_hook: Box<dyn reth_evm::OnStateHook> =
+            Box::new(handle.state_hook().ok_or_else(|| {
+                RaylsRethError::EVMCustom("payload processor returned no state hook".to_string())
+            })?);
 
         // type-erased closure that stops prewarming, then blocks on the sparse
         // trie result, catching panics to allow Tier 2 fallback
@@ -480,7 +502,7 @@ impl RethEnv {
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 handle
                     .state_root()
-                    .map(|outcome| (outcome.state_root, outcome.trie_updates))
+                    .map(|outcome| (outcome.state_root, Arc::unwrap_or_clone(outcome.trie_updates)))
                     .map_err(|e| format!("{e}"))
             }))
             .unwrap_or_else(|panic| Err(format!("sparse trie task panicked: {panic:?}")))

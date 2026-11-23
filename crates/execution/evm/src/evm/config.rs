@@ -18,8 +18,7 @@ use rayls_middleware_rewards::RewardsCounter;
 use reth_chainspec::{EthChainSpec as _, EthereumHardforks as _};
 use reth_evm::{ConfigureEvm, EvmEnv, EvmEnvFor, ExecutionCtxFor};
 use reth_evm_ethereum::RethReceiptBuilder;
-use reth_primitives::{BlockTy, HeaderTy};
-use reth_primitives_traits::constants::MAX_TX_GAS_LIMIT_OSAKA;
+use reth_primitives_traits::{constants::MAX_TX_GAS_LIMIT_OSAKA, BlockTy, HeaderTy};
 use reth_revm::{
     context::{BlockEnv, CfgEnv},
     context_interface::block::BlobExcessGasAndPrice,
@@ -135,6 +134,7 @@ impl ConfigureEvm for RaylsEvmConfig {
             gas_limit: header.gas_limit(),
             basefee: header.base_fee_per_gas().unwrap_or_default(),
             blob_excess_gas_and_price,
+            slot_num: 0,
         };
 
         Ok(EvmEnv { cfg_env, block_env })
@@ -178,6 +178,7 @@ impl ConfigureEvm for RaylsEvmConfig {
                 excess_blob_gas: 0,       // no excess gas for blobs
                 blob_gasprice: u128::MAX, // eip4844 transactions are ignored
             }),
+            slot_num: 0,
         };
 
         let evm_env = EvmEnv::new(cfg, block_env);

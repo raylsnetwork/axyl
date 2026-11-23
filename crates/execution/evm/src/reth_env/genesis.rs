@@ -152,7 +152,6 @@ impl RethEnv {
         let mut db = State::builder()
             .with_database(cache_db)
             .with_bundle_update()
-            .without_state_clear()
             .build();
 
         // deploy blsg1 library (owner nonce 0)

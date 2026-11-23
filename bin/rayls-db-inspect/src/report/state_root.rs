@@ -138,7 +138,7 @@ fn check_node(label: String, datadir: &Path) -> eyre::Result<StateRootNodeView> 
         "open reth db read-only and exclusive (if the node is running, stop it or use a copy)",
     )?;
     let static_files =
-        StaticFileProvider::<EthPrimitives>::read_only(datadir.join("static_files"), false)
+        StaticFileProvider::<EthPrimitives>::read_only(datadir.join("static_files"))
             .wrap_err("open static files read-only")?;
     let tx = db.tx()?;
 

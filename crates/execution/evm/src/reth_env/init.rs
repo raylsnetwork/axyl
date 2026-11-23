@@ -140,7 +140,12 @@ impl RethEnv {
         let chain_spec = Arc::new(builder.build());
         let evm_config = RaylsEvmConfig::new(chain_spec.clone(), rewards_counter.clone());
         let task_spawner = task_manager.get_spawner();
-        let runtime = reth_tasks::Runtime::with_existing_handle(tokio::runtime::Handle::current())?;
+        let runtime = reth_tasks::RuntimeBuilder::new(
+            reth_tasks::RuntimeConfig::default().with_tokio(
+                reth_tasks::TokioConfig::existing_handle(tokio::runtime::Handle::current()),
+            ),
+        )
+        .build()?;
         let provider_factory = Self::init_provider_factory(
             &node_config,
             chain_spec,
@@ -153,6 +158,8 @@ impl RethEnv {
         .await?;
 
         // Apply genesis history fixes (idempotent, no-op on v1 storage).
+        // TODO(#415): these were written for the reth 1.11 storage layout. On reth 2.0 the
+        // storage history is keyed by plain slot, so `fix_genesis_history_with` must go.
         let use_hashed_state = node_config.storage_settings().use_hashed_state();
         Self::fix_genesis_history_with(&provider_factory, use_hashed_state)?;
         Self::fix_genesis_account_history_with(&provider_factory, use_hashed_state)?;
@@ -212,6 +219,7 @@ impl RethEnv {
             provider_factory,
             evm_config,
             task_spawner,
+            reth_runtime: runtime,
             persistence_handle,
             persistence_state,
             payload_processor,
@@ -459,12 +467,14 @@ impl RethEnv {
 
         // non-critical: completing Ok must not trigger TaskManager shutdown
         let (tx, rx) = oneshot::channel();
-        reth_tasks::TaskSpawner::spawn_blocking_task(
-            task_spawner,
+        task_spawner.spawn_reth_task(
+            "reth-blocking-task",
             Box::pin(async move {
                 let (_, result) = pipeline.run_as_fut(Some(unwind_target)).await;
                 let _ = tx.send(result);
             }),
+            false,
+            true,
         );
 
         rx.await?.inspect_err(|err| {

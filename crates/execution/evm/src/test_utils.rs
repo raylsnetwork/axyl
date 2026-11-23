@@ -36,7 +36,7 @@ use rayls_middleware_rewards::RewardsCounter;
 use reth_chainspec::{ChainSpec as RethChainSpec, EthChainSpec};
 use reth_engine_tree::tree::{precompile_cache::PrecompileCacheMap, PayloadProcessor};
 use reth_evm::{execute::Executor as _, ConfigureEvm, EvmFactory as _};
-use reth_primitives::{sign_message, Account};
+use reth_primitives_traits::{crypto::secp256k1::sign_message, Account};
 pub use reth_primitives_traits::proofs::calculate_withdrawals_root;
 use reth_primitives_traits::SignerRecoverable;
 use reth_provider::{AccountReader as _, StateProviderBox, StateProviderFactory};
@@ -103,7 +103,12 @@ impl RethEnv {
         let rewards_counter = rewards.unwrap_or_default();
         let evm_config = RaylsEvmConfig::new(rayls_chain_spec.clone(), rewards_counter.clone());
         let task_spawner = task_manager.get_spawner();
-        let runtime = reth_tasks::Runtime::with_existing_handle(tokio::runtime::Handle::current())?;
+        let runtime = reth_tasks::RuntimeBuilder::new(
+            reth_tasks::RuntimeConfig::default().with_tokio(
+                reth_tasks::TokioConfig::existing_handle(tokio::runtime::Handle::current()),
+            ),
+        )
+        .build()?;
         let provider_factory = Self::init_provider_factory(
             &node_config,
             rayls_chain_spec,
@@ -130,7 +135,7 @@ impl RethEnv {
             )));
         let tree_config = node_config.engine.tree_config();
         let payload_processor = Arc::new(parking_lot::Mutex::new(PayloadProcessor::new(
-            runtime,
+            runtime.clone(),
             evm_config.clone(),
             &tree_config,
             PrecompileCacheMap::default(),
@@ -141,6 +146,7 @@ impl RethEnv {
             provider_factory,
             evm_config,
             task_spawner,
+            reth_runtime: runtime,
             persistence_handle,
             persistence_state,
             payload_processor,

@@ -18,7 +18,7 @@ use reth_engine_tree::{
     engine::{EngineApiRequest, FromEngine},
     tree::{EngineApiTreeHandler, PayloadProcessor},
 };
-use reth_primitives::Recovered;
+use reth_primitives_traits::Recovered;
 use reth_provider::providers::BlockchainProvider;
 use reth_rpc_eth_types::EthResult;
 use reth_trie::updates::TrieUpdates;

@@ -1,8 +1,7 @@
 //! Erc20PrecompileBytecode hardfork: seed STOP bytecode on the native ERC-20 precompile
 //! so EIP-161 end-of-tx cleanup cannot destroy its DynPrecompile-written storage.
 
-use rayls_infrastructure_types::Address;
-use reth_revm::{primitives::HashMap, state::Account as RevmAccount};
+use reth_revm::{primitives::AddressMap, state::Account as RevmAccount};
 
 use super::account_with_code;
 use crate::native_erc20::ERC20_PRECOMPILE_ADDRESS;
@@ -17,8 +16,8 @@ use crate::native_erc20::ERC20_PRECOMPILE_ADDRESS;
 pub(super) const STOP_BYTECODE: &[u8] = &[0x00];
 
 /// Build the revm state map for the Erc20PrecompileBytecode hardfork.
-pub(crate) fn erc20_precompile_bytecode_state() -> HashMap<Address, RevmAccount> {
-    HashMap::from_iter([(ERC20_PRECOMPILE_ADDRESS, account_with_code(STOP_BYTECODE))])
+pub(crate) fn erc20_precompile_bytecode_state() -> AddressMap<RevmAccount> {
+    AddressMap::from_iter([(ERC20_PRECOMPILE_ADDRESS, account_with_code(STOP_BYTECODE))])
 }
 
 #[cfg(test)]
