@@ -335,6 +335,16 @@ impl ColdSegment {
         self.index.read().by_epoch.keys().copied().collect()
     }
 
+    /// Public wrapper for offline analysis tooling: visits every row of `epoch`'s jar in
+    /// ascending row order. See [`Self::for_each_row_in_epoch`].
+    pub fn for_each_row_in_epoch_pub(
+        &self,
+        epoch: Epoch,
+        visit: impl FnMut(u64, &[u8]) -> ColdResult<()>,
+    ) -> ColdResult<()> {
+        self.for_each_row_in_epoch(epoch, visit)
+    }
+
     /// Returns the newest sealed jar's index entry, or `None` if the segment has no jar (the
     /// index is keyed by end key and epochs are monotonic, so the last entry is the newest).
     pub fn last_sealed(&self) -> Option<SealedJar> {
