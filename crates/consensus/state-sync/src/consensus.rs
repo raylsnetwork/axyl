@@ -683,8 +683,12 @@ impl<DB: ReDatabase> WalkSession<DB> {
 
 /// Whether this node finds the network head from peers' certified tips: once the `CertifiedTipV1`
 /// fork is active at the next block to execute, the point every other fork check uses.
-/// `activation` is the fork's block, `None` while it is `Never`. Not before: a peer on an older
-/// release cannot decode the request.
+/// `activation` is the fork's block, `None` while it is `Never`. Not before: until this node has
+/// executed the activation block it cannot tell whether its peers serve certified tips yet, and
+/// the old probe is the one every peer answers, so a lagging node can still catch up past
+/// activation. The cost is that such a node, including one bootstrapping from below the
+/// activation block after the network passed it, can still be forked or stranded by one member
+/// on that probe (#312, #370).
 fn uses_certified_tip(activation: Option<u64>, executed_tip: u64) -> bool {
     activation.is_some_and(|block| executed_tip.saturating_add(1) >= block)
 }
