@@ -17,7 +17,7 @@
 # datadir and its parent need write access. Run `rayls-replay --help` for the full
 # flag set (--consensus-db, --from-block, --to-block, --unwind-to, --storage-v2, ...).
 
-FROM rust:1.91-slim-bookworm AS builder
+FROM rust:1.93-slim-bookworm AS builder
 
 WORKDIR /usr/src/rayls-network
 

@@ -99,7 +99,7 @@ docker build -f etc/docker-network/Dockerfile -t rayls-node .
 # the binary inside the image is /usr/local/bin/rayls
 ```
 
-Prerequisites for a host build: a recent stable Rust toolchain (prod image uses 1.91;
+Prerequisites for a host build: a recent stable Rust toolchain (prod image uses 1.93;
 <https://rustup.rs>) and, on Debian/Ubuntu,
 `build-essential cmake libclang-dev pkg-config libssl-dev libapr1-dev`.
 
