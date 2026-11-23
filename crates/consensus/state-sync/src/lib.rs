@@ -668,9 +668,8 @@ async fn catch_up_consensus_from_to<DB: Database>(
     let mut streamed = 0u64;
     // Only stored rows and the target are streamed. The streamer never asks a peer for a header by
     // number: such a reply proves only its number, and any peer can make one up. The backwards
-    // walk hash-links and BLS-verifies every header it stores, but a stored row can also predate
-    // this process, for example one an older version cached unchecked, so the subscriber still
-    // verifies every header.
+    // walk hash-links and BLS-verifies every header it stores, so the subscriber does not check
+    // them again; only a row an older version cached unchecked reaches it unverified.
     for number in last_consensus_height + 1..=max_consensus_height {
         let consensus_header = if number == max_consensus_height {
             max_consensus.clone()

@@ -217,19 +217,6 @@ fn should_process_consensus_header(number: u64, last_processed: u64) -> bool {
     true
 }
 
-/// Returns true if `number` should start verification while headers up to `last_queued` are still
-/// being verified.
-///
-/// A number already in flight is queued again: the one in flight may fail verification, and this
-/// one may be the honest header at that number. Whether a header is processed is still decided
-/// against `last_processed` once its verification completes, in queue order.
-fn should_queue_consensus_header(number: u64, last_processed: u64, last_queued: u64) -> bool {
-    if number > last_processed && number <= last_queued {
-        return true;
-    }
-    should_process_consensus_header(number, last_queued)
-}
-
 /// The `(epoch, leader round)` of the most recent commit a follower admitted for execution.
 ///
 /// A streamed header must advance this to be a legitimate successor; one that does not is a commit
@@ -310,94 +297,11 @@ impl<DB: Database> Subscriber<DB> {
     /// Max concurrent batch fetches during catchup.
     const MAX_CATCHUP_PIPELINE: usize = 16;
 
-    /// Max headers BLS-verified at once during catchup.
-    const MAX_PARALLEL_VERIFY: usize = 8;
-
-    /// Maximum wait time for committee keys before giving up on a header.
-    const COMMITTEE_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
-
-    /// Interval between retries when waiting for committee keys.
-    const COMMITTEE_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
-
     /// Throttle `try_rejoin_consensus` waiting-gate logs to once per this many headers.
     const REJOIN_LOG_THROTTLE: u64 = 100;
 
     /// Log other-epoch header drops at `info!` once per this many drops.
     const OTHER_EPOCH_LOG_THROTTLE: u64 = 100;
-
-    /// Verify BLS signatures on the consensus header's certificates.
-    ///
-    /// Wait for committee keys if not yet available (triggers epoch record collector).
-    /// Returns the verified header on success, or None if it should be discarded. The caller owns
-    /// the future and drops it on shutdown, which also ends the wait for keys.
-    async fn verify_consensus_certificates(
-        &self,
-        consensus_header: ConsensusHeader,
-    ) -> Option<ConsensusHeader> {
-        let leader_epoch = consensus_header.sub_dag.leader_epoch();
-        let number = consensus_header.number;
-
-        // wait for committee keys, polling until available or timeout
-        let deadline = tokio::time::Instant::now() + Self::COMMITTEE_WAIT_TIMEOUT;
-        let keys = loop {
-            if let Some(keys) = self.config.get_committee_keys_for_epoch(leader_epoch) {
-                break keys;
-            }
-            // trigger epoch record collector for the needed epoch
-            self.consensus_bus.requested_missing_epoch().send_if_modified(|current| {
-                if leader_epoch > *current {
-                    *current = leader_epoch;
-                    true
-                } else {
-                    false
-                }
-            });
-            if tokio::time::Instant::now() >= deadline {
-                warn!(
-                    target: "subscriber",
-                    number,
-                    epoch = leader_epoch,
-                    "timed out waiting for committee keys, discarding header"
-                );
-                return None;
-            }
-            tokio::time::sleep(Self::COMMITTEE_POLL_INTERVAL).await;
-        };
-
-        // BLS pairings take milliseconds per header, so keep them off the async runtime.
-        let verified =
-            tokio::task::spawn_blocking(move || consensus_header.verify_header_with_keys(&keys))
-                .await;
-        match verified {
-            Ok(Ok(verified)) => Some(verified),
-            Ok(Err(e)) => {
-                warn!(
-                    target: "subscriber",
-                    number,
-                    epoch = leader_epoch,
-                    "BLS verification failed, discarding header: {e}"
-                );
-                None
-            }
-            // A panic here used to crash the node; the header is now dropped instead, so keep it
-            // loud enough to reach alerting.
-            Err(e) => {
-                error!(target: "subscriber", number, "BLS verification task failed: {e}");
-                None
-            }
-        }
-    }
-
-    /// Start verifying a header while earlier ones are still in flight. Resolves to the header's
-    /// number and the verified header, or None when it is discarded.
-    fn schedule_verification(
-        &self,
-        consensus_header: ConsensusHeader,
-    ) -> BoxFuture<'static, (u64, Option<ConsensusHeader>)> {
-        let sub = self.clone();
-        let number = consensus_header.number;
-        Box::pin(async move { (number, sub.verify_consensus_certificates(consensus_header).await) })
-    }
 
     /// Catch up to current consensus and then try to rejoin as an active CVV.
     async fn catch_up_rejoin_consensus(
@@ -483,7 +387,8 @@ impl<DB: Database> Subscriber<DB> {
 
     /// Persist a fetched consensus output and forward it to the engine.
     async fn commit_catchup_output(&self, output: ConsensusOutput) -> SubscriberResult<()> {
-        // persist individual certificates for consensus rejoin (BLS-verified before scheduling)
+        // persist individual certificates for consensus rejoin (BLS-verified by the walk before it
+        // stored the header)
         if let Err(e) = self.config.node_storage().write(output.sub_dag.leader.clone()) {
             warn!(target: "subscriber", ?e, "failed to write leader cert to store");
         }
@@ -703,11 +608,6 @@ impl<DB: Database> Subscriber<DB> {
         let mut waiting: FuturesOrdered<
             BoxFuture<'static, SubscriberResult<(ConsensusOutput, u64)>>,
         > = FuturesOrdered::new();
-        // Headers being BLS-verified, in arrival order. Verification runs in parallel; the
-        // dedup, position and watermark checks run in order as each one completes.
-        let mut verifying: FuturesOrdered<BoxFuture<'static, (u64, Option<ConsensusHeader>)>> =
-            FuturesOrdered::new();
-        let mut last_queued_number = last_processed_number;
         let mut channel_closed = false;
         // Deterministic epoch cut: stops the catch-up persisting outputs that belong to the next
         // epoch, the same tracker the live committer drives.
@@ -770,53 +670,7 @@ impl<DB: Database> Subscriber<DB> {
                             );
                         }
                     }
-                    if channel_closed && waiting.is_empty() && verifying.is_empty() {
-                        if !rejoin {
-                            return Ok(());
-                        }
-                        waiting_for_cert_store = true;
-                    }
-                }
-
-                // a verification completed: admit it in arrival order
-                Some((number, verified)) = verifying.next(), if !verifying.is_empty() => {
-                    // decided against the processed watermark, so a header in flight that failed
-                    // verification cannot skip the honest one queued after it
-                    if number > last_processed_number + 1 {
-                        // a header before it was rejected while this one was in flight; it is
-                        // taken again from the stream once that number is processed
-                        debug!(
-                            target: "subscriber",
-                            number,
-                            expected = last_processed_number + 1,
-                            "dropping a verified header queued behind a rejected one"
-                        );
-                    } else if should_process_consensus_header(number, last_processed_number) {
-                        // bind position: a commit replayed at a wrong number does not advance, so
-                        // reject it before execution. advance the watermark only on accept.
-                        match verified {
-                            Some(verified) if accepted_position.advance(&verified.sub_dag) => {
-                                last_processed_number = number;
-                                last_queued_number = last_queued_number.max(number);
-                                waiting.push_back(self.schedule_catchup_fetch(verified));
-                            }
-                            rejected => {
-                                if let Some(verified) = rejected {
-                                    warn!(
-                                        target: "subscriber",
-                                        number,
-                                        epoch = verified.sub_dag.leader_epoch(),
-                                        round = verified.sub_dag.leader_round(),
-                                        "rejecting misplaced consensus sub-dag before execution"
-                                    );
-                                }
-                                // the next number was rejected, so nothing queued after it can be
-                                // processed: take that number again from the stream
-                                last_queued_number = last_processed_number;
-                            }
-                        }
-                    }
-                    if channel_closed && waiting.is_empty() && verifying.is_empty() {
+                    if channel_closed && waiting.is_empty() {
                         if !rejoin {
                             return Ok(());
                         }
@@ -849,9 +703,7 @@ impl<DB: Database> Subscriber<DB> {
                 }
 
                 // accept new headers when pipeline has capacity
-                result = rx_consensus_headers.recv(), if !channel_closed
-                    && waiting.len() + verifying.len() < Self::MAX_CATCHUP_PIPELINE
-                    && verifying.len() < Self::MAX_PARALLEL_VERIFY => {
+                result = rx_consensus_headers.recv(), if !channel_closed && waiting.len() < Self::MAX_CATCHUP_PIPELINE => {
                     match result {
                         Some(consensus_header) => {
                             let number = consensus_header.number;
@@ -874,30 +726,37 @@ impl<DB: Database> Subscriber<DB> {
                                 }
                                 continue;
                             }
-                            // dedup before verifying; the predicate cannot advance the watermark,
-                            // so a header that fails verification cannot skip the honest one.
-                            if !should_queue_consensus_header(
-                                number,
-                                last_processed_number,
-                                last_queued_number,
-                            ) {
+                            // dedup; the predicate cannot advance the watermark, so a rejected
+                            // header cannot skip the honest one.
+                            if !should_process_consensus_header(number, last_processed_number) {
                                 continue;
                             }
                             debug!(
                                 target: "subscriber",
                                 number,
                                 pipeline = waiting.len(),
-                                verifying = verifying.len(),
                                 epoch,
-                                "stream_and_follow: received header, verifying"
+                                "stream_and_follow: received header"
                             );
-                            last_queued_number = last_queued_number.max(number);
-                            verifying.push_back(self.schedule_verification(consensus_header));
+                            // bind position: a commit replayed at a wrong number does not advance,
+                            // so reject it before execution. advance the watermark only on accept.
+                            if !accepted_position.advance(&consensus_header.sub_dag) {
+                                warn!(
+                                    target: "subscriber",
+                                    number,
+                                    epoch,
+                                    round = consensus_header.sub_dag.leader_round(),
+                                    "rejecting misplaced consensus sub-dag before execution"
+                                );
+                                continue;
+                            }
+                            last_processed_number = number;
+                            waiting.push_back(self.schedule_catchup_fetch(consensus_header));
                         }
                         None => {
                             info!(target: "subscriber", "stream_and_follow: channel closed");
                             channel_closed = true;
-                            if waiting.is_empty() && verifying.is_empty() {
+                            if waiting.is_empty() {
                                 if !rejoin {
                                     return Ok(());
                                 }
@@ -1499,33 +1358,6 @@ mod tests {
     #[test]
     fn test_backward_header_rejected() {
         assert!(!should_process_consensus_header(3, 5));
-    }
-
-    #[test]
-    fn test_queue_extends_past_headers_in_flight() {
-        // 11 and 12 are being verified, 10 is processed
-        assert!(should_queue_consensus_header(13, 10, 12));
-        assert!(!should_queue_consensus_header(14, 10, 12), "a gap past the queue tail");
-        assert!(!should_queue_consensus_header(10, 10, 12), "already processed");
-        assert!(!should_queue_consensus_header(9, 10, 12), "already processed");
-    }
-
-    #[test]
-    fn test_queue_accepts_a_replacement_for_a_header_in_flight() {
-        // 11 is being verified and may fail: a second 11 must still get verified
-        assert!(should_queue_consensus_header(11, 10, 11));
-        assert!(should_queue_consensus_header(11, 10, 12));
-        assert!(should_queue_consensus_header(12, 10, 12));
-    }
-
-    #[test]
-    fn test_queue_with_nothing_in_flight_matches_process() {
-        for number in 0..15 {
-            assert_eq!(
-                should_queue_consensus_header(number, 10, 10),
-                should_process_consensus_header(number, 10)
-            );
-        }
     }
 
     #[test]

@@ -1104,7 +1104,7 @@ async fn test_gap_fetch_does_not_forward_bls_valid_tampered_subdag() {
     );
     let tampered_101 = ConsensusHeader { sub_dag: tampered_sub_dag, ..real_101.clone() };
     assert_ne!(tampered_101.digest(), real_101.digest(), "precondition: non-canonical");
-    // Precondition: the subscriber's own check accepts it.
+    // Precondition: it passes BLS, so only the link check can catch it.
     tampered_101
         .clone()
         .verify_header_with_keys(&committee.bls_keys())
@@ -1179,9 +1179,8 @@ async fn test_catch_up_does_not_anchor_on_stale_stored_row() {
     assert!(db.get_consensus_by_number(103).is_none(), "the stale row must be cleared");
 
     // A stored cache row is trusted transitively, so 101, 102 and the stale 103 are forwarded
-    // before the mismatch at 104 is found. Pin that the stale row still reaches the consumer here,
-    // where the real subscriber then rejects it on BLS. Holding cache rows until linked would close
-    // this, tracked in #380.
+    // before the mismatch at 104 is found. Pin that the stale row still reaches the consumer here.
+    // Holding cache rows until linked would close this, tracked in #380.
     let mut forwarded = Vec::new();
     while let Ok(h) = rx.try_recv() {
         forwarded.push(h.digest());

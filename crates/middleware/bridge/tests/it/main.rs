@@ -3,7 +3,6 @@
 #![allow(unused_crate_dependencies)]
 
 mod committee_change;
-mod mixed_epoch_cert;
 
 use rayls_consensus_network::types::{MessageId, NetworkCommand};
 use rayls_consensus_primary::{

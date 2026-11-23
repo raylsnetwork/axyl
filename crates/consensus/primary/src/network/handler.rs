@@ -705,9 +705,10 @@ where
 
         // A vote attests to data availability and structure, not execution state, so it does not
         // wait for execution (waiting only stalls a behind node; fork safety holds because the
-        // commit path re-checks execution and the subscriber BLS-verifies before execution). The
-        // one kept check is a non-blocking breaker: refuse to vote if our own executed block at the
-        // anchor already diverges, so a quorum cannot certify a forked anchor.
+        // commit path re-checks execution and catch-up executes only headers BLS-verified before
+        // they were stored). The one kept check is a non-blocking breaker: refuse to vote if our
+        // own executed block at the anchor already diverges, so a quorum cannot certify a forked
+        // anchor.
         let target = header.latest_execution_block;
         let anchor_forked = anchor_diverges_from_executed(
             &self.consensus_bus.recently_executed_blocks().borrow(),
