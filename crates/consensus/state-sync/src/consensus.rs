@@ -836,8 +836,8 @@ mod tests {
     };
     use rayls_infrastructure_storage::{mem_db::MemDatabase, tables::ConsensusBlocks};
     use rayls_infrastructure_types::{
-        BlsPublicKey, BlsSigner, Certificate, CommittedSubDag, CommitteeLookahead,
-        EpochCertificate, EpochRecord, ReputationScores,
+        AuthorityIdentifier, BlsPublicKey, BlsSigner, Certificate, CommittedSubDag,
+        CommitteeLookahead, EpochCertificate, EpochRecord, HeaderBuilder, ReputationScores,
     };
     use rayls_testing_test_utils_committee::CommitteeFixture;
     use std::{
@@ -1283,6 +1283,88 @@ mod tests {
         assert_eq!(session.walk(chain[&110].digest(), None).await, WalkOutcome::Covered);
         assert_chain_cached(db, &chain);
         assert_eq!(requests.by_hash.load(Ordering::Relaxed), 2, "110 is asked for again by hash");
+    }
+
+    /// A peer serves, as the walk target, a commit whose leader is valid but which also carries a
+    /// certificate a quorum of the committee signed for an author outside it, as a validator that
+    /// joined in the next epoch can build by leaving out its own vote. The walk must refuse it from
+    /// every peer and store nothing, since the subscriber's block-reward lookup fails fatally on
+    /// that author. The real commit at that number is still taken.
+    #[tokio::test(start_paused = true)]
+    async fn walk_does_not_store_a_commit_with_a_certificate_from_outside_the_committee() {
+        let fixture = CommitteeFixture::builder(MemDatabase::default)
+            .randomize_ports(true)
+            .committee_size(NonZeroUsize::new(4).unwrap())
+            .build();
+        let primary = fixture.authorities().next().unwrap();
+        let config = primary.consensus_config();
+        let db = config.node_storage();
+        let leader = fixture.certificate(&fixture.header_from_last_authority());
+        let chain = canonical_tip_and_chain(db, &leader, 101);
+
+        // The joined validator's epoch-1 header, signed by all four members of this committee.
+        let joined = AuthorityIdentifier::dummy_for_test(0xAA);
+        assert!(fixture.committee().authority(&joined).is_none(), "precondition: an outsider");
+        let joined_header = HeaderBuilder::default()
+            .author(joined)
+            .round(3)
+            .epoch(1)
+            .parents(fixture.genesis().collect())
+            .build();
+        let votes: Vec<_> = fixture
+            .votes(&joined_header)
+            .into_iter()
+            .map(|v| (v.author().clone(), *v.signature()))
+            .collect();
+        assert_eq!(votes.len(), 4, "precondition: the whole committee signs");
+        let selfless =
+            Certificate::new_unverified(&fixture.committee(), joined_header, votes).unwrap();
+
+        // Not a parent of the leader, so it is checked on its own.
+        let mut forged = chain[&101].clone();
+        forged.sub_dag = CommittedSubDag::new(
+            vec![selfless],
+            leader.clone(),
+            0,
+            ReputationScores::default(),
+            None,
+        );
+        assert_ne!(forged.digest(), chain[&101].digest(), "precondition: another commit at 101");
+
+        // Every peer serves the forged commit for its hash.
+        let consensus_bus = ConsensusBus::new();
+        let tip_before = consensus_bus.last_consensus_header().borrow().number;
+        let (network, mut requests) =
+            walk_network(BTreeMap::new(), &BTreeMap::from([(101, forged.clone())]), HashMap::new());
+        let session = WalkSession::new(config.clone(), consensus_bus.clone(), network);
+
+        assert_eq!(session.walk(forged.digest(), None).await, WalkOutcome::Incomplete);
+        assert_eq!(
+            requests.hashes(),
+            vec![forged.digest(); 3],
+            "the forged commit is asked for three times and refused each time"
+        );
+        assert_eq!(requests.by_number.load(Ordering::Relaxed), 0, "nothing below is prefetched");
+        assert!(
+            db.get_consensus_by_hash(forged.digest()).is_none(),
+            "the forged commit must not be stored"
+        );
+        assert!(
+            db.get::<ConsensusBlocksCache>(&101).unwrap().is_none(),
+            "nothing may be stored at 101"
+        );
+        assert_eq!(
+            consensus_bus.last_consensus_header().borrow().number,
+            tip_before,
+            "the forged commit must not become the tip"
+        );
+
+        // The real commit at 101, which differs only by the outsider's certificate, is taken.
+        let (network, _) = walk_network(chain.clone(), &chain, HashMap::new());
+        let session = WalkSession::new(config.clone(), consensus_bus.clone(), network);
+        assert_eq!(session.walk(chain[&101].digest(), None).await, WalkOutcome::Covered);
+        assert_chain_cached(db, &chain);
+        assert_eq!(consensus_bus.last_consensus_header().borrow().number, 101);
     }
 
     /// Nothing at or below the session's covered anchor is asked for by number: a walk toward a
