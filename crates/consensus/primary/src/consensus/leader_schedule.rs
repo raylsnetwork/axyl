@@ -91,21 +91,17 @@ impl LeaderSwapTable {
         // Do we have any validators that are not participating?  If so this will be a lot lower
         // than highest_rep.
         let lowest_rep = auths_by_score.last().map(|(_, rep)| *rep).unwrap_or(0);
-        let mean_rep = if auths_by_score.is_empty() {
-            0
-        } else {
-            let mean_rep: u64 = auths_by_score.iter().map(|(_, r)| r).sum();
-            mean_rep / auths_by_score.len() as u64
+        // A set of the right shape can still hold values no honest node computes, since an
+        // authority gains at most one point per committed sub dag. Refuse values that overflow
+        // the standard deviation the same way, instead of aborting the node.
+        let Some(standard_dev) = checked_standard_dev(&auths_by_score) else {
+            error!(
+                target: "consensus::leader_schedule",
+                round,
+                "stored reputation scores overflow the standard deviation, falling back to round-robin: this node may elect different leaders than the committee and should be resynced from a trusted snapshot"
+            );
+            return Self { round, good_nodes: vec![], bad_nodes: HashMap::default() };
         };
-        let mut standard_dev: u64 = auths_by_score
-            .iter()
-            .map(|(_, r)| {
-                let v = *r as i64 - mean_rep as i64;
-                (v * v) as u64
-            })
-            .sum();
-        standard_dev /= auths_by_score.len() as u64;
-        standard_dev = (standard_dev as f64).sqrt() as u64;
         // Generate the "good" and "bad" nodes.  We need to have a bad_nodes_percent_threshold > 0
         // AND we want a reasonable delta between the highest and lowest reputation
         // otherwise we don't tag any node as "bad". Rayls network is running a closed
@@ -242,6 +238,21 @@ impl LeaderSwapTable {
         }
         None
     }
+}
+
+/// The standard deviation of the scores, computed as `LeaderSwapTable::new` always did, or `None`
+/// when a step overflows. A set that does not overflow gets the same value as before, so upgraded
+/// and older nodes build the same table from it.
+fn checked_standard_dev(auths_by_score: &[(AuthorityIdentifier, u64)]) -> Option<u64> {
+    let len = auths_by_score.len() as u64;
+    let sum = auths_by_score.iter().try_fold(0u64, |acc, (_, r)| acc.checked_add(*r))?;
+    let mean_rep = sum.checked_div(len)?;
+    let mut squares = 0u64;
+    for (_, r) in auths_by_score {
+        let v = (*r as i64).checked_sub(mean_rep as i64)?;
+        squares = squares.checked_add(v.checked_mul(v)? as u64)?;
+    }
+    Some(((squares / len) as f64).sqrt() as u64)
 }
 
 /// The LeaderSchedule is responsible for producing the leader schedule across an epoch.

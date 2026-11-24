@@ -30,10 +30,11 @@ impl ReputationScores {
 
         Self { scores_per_authority, final_of_schedule: false }
     }
-    /// Adds the provided `score` to the existing score for the provided `authority`
+    /// Adds the provided `score` to the existing score for the provided `authority`, stopping at
+    /// `u64::MAX`: a set carried over from a stored row may hold any value.
     pub fn add_score(&mut self, authority: &AuthorityIdentifier, score: u64) {
         if let Some(val) = self.scores_per_authority.get_mut(authority) {
-            *val += score;
+            *val = val.saturating_add(score);
         } else {
             self.scores_per_authority.insert(authority.clone(), score);
         }
