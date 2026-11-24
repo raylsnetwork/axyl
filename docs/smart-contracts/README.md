@@ -5,10 +5,17 @@ which one determines the code a new chain executes, and records where the copies
 
 **TL;DR:** the code a new chain runs comes from `rayls-contracts/artifacts/*.json` — contracts 1–8
 and 27 — except the implementations of contracts 2–7, which come from
-`crates/execution/evm/src/evm/hardforks/bytecodes/*_impl.bin`, contracts 28–30, which come from S3, and
-contract 1, whose code `HybridRewards` replaces at block 1. None of it is generated from
-`rayls-contracts/src/**/*.sol` automatically. Three of those six — `DelegationPool`, `RewardDistributor`,
-`FeeAggregator` — are older builds missing functions the source now has.
+`crates/execution/evm/src/evm/hardforks/bytecodes/*_impl.bin`, contracts 28–30, which come from
+`rayls-contracts/deployments/genesis/precompile-config.yaml`, and contract 1, whose code `HybridRewards`
+replaces at block 1. None of it is generated from `rayls-contracts/src/**/*.sol` automatically. Three of
+the six `*_impl.bin` files are behind the source: `DelegationPool` and `RewardDistributor` are older builds
+missing functions the source now has, and `FeeAggregator`'s is not a build of any source state in this repo.
+
+`main` is `76896d7` (v1.5.3, 2026-11-23). Every build behind the tables ran at `e8c4ea1b` (node `1.5.2`,
+2026-11-20); `rayls-contracts/` and `crates/execution/evm/src/evm/hardforks/` are identical between those
+two, so the "of `main`" attributions read against `76896d7` as well. Parts 3–5 were measured in November
+2026 at the blocks each part names. Code equality everywhere means equality after zeroing the solc link and
+immutable windows, which is where the spliced protocol addresses live.
 
 See also `docs/contract-upgrades/README.md` (proxy upgrade vs hardfork decision) and
 `docs/hardforks/` (scheduling mechanics).
@@ -126,17 +133,18 @@ recorded in `rayls-contracts/deployments/deployments.json`. 13 accounts, 69,855 
 
 Provenance is by build: `forge build` of `rayls-contracts/src` at the tag named, compared over the solc link
 and immutable slots, which hold the spliced addresses at runtime. `S2 of main` means that file as checked in
-at `main`; `S1 of <tag>` means a build of `src` at that tag, and a tag range means the source, the pinned
-dependencies and `foundry.toml` are unchanged across it.
+at `main`; `S1 of <tag>` means a build of `src` at that tag. A tag range names the set of tags carrying the
+blob shown — tags are labels, not a commit walk, and the `v0.x` tags hang off a second root that `main` does
+not contain, so the endpoints carry no ancestry. `git ls-tree <tag> <path>` resolves any of them.
 
 #### S2 — `rayls-contracts/artifacts/*.json`
 
 | Contract | In sync with | Action |
 |---|---|---|
 | 1 `ConsensusRegistry` | S1 of `mainnet-v1.0.0` | no — no S4 entry; `HybridRewards` overwrites this code at its fork |
-| 2 `DelegationPool` | S1 of `mainnet-v1.0.0` | no — S4 rewrites the impl at genesis with different bytes |
+| 2 `DelegationPool` | S1 of `mainnet-v1.0.0` | yes — together with S4: this artifact's `initialize` lays out the proxy storage the S4 impl reads |
 | 3 `FeeAggregator` | S1 of `main` | no — S4 rewrites the impl at genesis with different bytes |
-| 4 `RewardDistributor` | S1 of `v0.1.5`–`mainnet-v1.2.0` | no — S4 rewrites the impl at genesis with the same bytes |
+| 4 `RewardDistributor` | S1 of `v0.1.5`–`mainnet-v1.2.0`, blob `3134b71c` | yes — together with S4: this artifact's `initialize` lays out the proxy storage the S4 impl reads |
 | 5 `NativeTokenController` | S1 of `main` | no — S4 rewrites the impl at genesis with the same bytes |
 | 6 `RLS` | S1 of `main` | no — S4 rewrites the impl at genesis with the same bytes |
 | 7 `RLSAccumulator` | S1 of `main` | no — S4 rewrites the impl at genesis with the same bytes |
@@ -156,7 +164,7 @@ dependencies and `foundry.toml` are unchanged across it.
 | 1 `ConsensusRegistry` | not in `bytecodes/` | n/a |
 | 2 `DelegationPool` | S1 of `v0.1.5` | yes — rebuild from S1 of `main` |
 | 3 `FeeAggregator` | not a build of any `.sol` state in this repo | yes — rebuild from S1 of `main` |
-| 4 `RewardDistributor` | S1 of `v0.1.5`–`mainnet-v1.2.0` | yes — rebuild from S1 of `main` |
+| 4 `RewardDistributor` | S1 of `v0.1.5`–`mainnet-v1.2.0`, blob `3134b71c` | yes — rebuild from S1 of `main` |
 | 5 `NativeTokenController` | S1 of `main` | no |
 | 6 `RLS` | S1 of `main` | no |
 | 7 `RLSAccumulator` | S1 of `main` | no |
@@ -172,8 +180,8 @@ S6. The alternative is a hardfork migration (S5).
 | Contract | At fork | In sync with |
 |---|---|---|
 | 1 `ConsensusRegistry` | `HybridRewards` | S1 of `main` |
-| 2 `DelegationPool` | `AdminTransfer` | S4 of `v0.1.2`–`v0.1.3` |
-| 4 `RewardDistributor` | `AdminTransfer` | S4 of `v0.1.2`–`v0.1.3` |
+| 2 `DelegationPool` | `AdminTransfer` | S4 of `v0.1.2`–`v0.1.3`, blob `0d5f70a4` |
+| 4 `RewardDistributor` | `AdminTransfer` | S4 of `v0.1.2`–`v0.1.3`, blob `8d6dd62b` |
 | 2 `DelegationPool` | `Tokenomics` | S4 of `v0.1.4` |
 | 3 `FeeAggregator` | `Tokenomics` | S4 of `v0.1.4` |
 | 4 `RewardDistributor` | `Tokenomics` | S4 of `v0.1.4` |
@@ -182,7 +190,7 @@ S6. The alternative is a hardfork migration (S5).
 | 7 `RLSAccumulator` | `Tokenomics` | S4 of `v0.1.4` |
 | 2 `DelegationPool` | `Uups` | S1 of `v0.1.5` |
 | 3 `FeeAggregator` | `Uups` | not a build of any `.sol` state in this repo |
-| 4 `RewardDistributor` | `Uups` | S1 of `v0.1.5`–`mainnet-v1.2.0` |
+| 4 `RewardDistributor` | `Uups` | S1 of `v0.1.5`–`mainnet-v1.2.0`, blob `3134b71c` |
 | 5 `NativeTokenController` | `Uups` | S1 of `main` |
 | 6 `RLS` | `Uups` | S1 of `main` |
 | 7 `RLSAccumulator` | `Uups` | S1 of `main` |
@@ -296,14 +304,10 @@ RPC reports node `1.4.3`, tag `mainnet-v1.4.3`, which is not an ancestor of `mai
 Contracts 3, 5, 6 and 7 still run the implementations genesis installed; 2 and 4 have been proxy-upgraded
 (S6), with the retired implementations still deployed and byte-identical to S4.
 
-Contracts 3, 5, 6 and 7 run byte-identical code on both chains. Contracts 1 and 8 disagree: mainnet runs
-the generation `main` ships, testnet the one `v0.1.6` replaced. Contracts 2 and 4 run the same code on both,
-at different implementation addresses.
-
 ## Part 5 — Local chain
 
 Measured from `http://localhost:8545` (chain id 487, the `local` network) at block 55 in November 2026. The
-RPC reports node `1.5.2`, built from `main`.
+RPC reports node `1.5.2`, built from `main` at `e8c4ea1b`.
 
 | # | Contract | Local code equals |
 |---|---|---|
