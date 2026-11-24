@@ -540,3 +540,74 @@ fn stored_tampered_final_scores_do_not_crash_leader_schedule_from_store() {
         assert_eq!(schedule.leader(round).id(), expected);
     }
 }
+
+/// A set of the right shape can still hold values that no honest node computes, since an
+/// authority gains at most one point per committed sub dag. Each set below overflows one step of
+/// the standard deviation (the sum, a difference, a square, the sum of squares), which used to
+/// abort the node. It must be refused like a set of the wrong shape.
+#[test]
+fn overflowing_final_scores_are_refused_by_leader_swap_table() {
+    let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+    let committee = fixture.committee();
+    let ids: Vec<AuthorityIdentifier> = fixture.authorities().map(|a| a.id()).collect();
+    assert_eq!(ids.len(), 4);
+
+    for values in [
+        [u64::MAX, 1, 0, 0],
+        [1 << 63, 0, 0, 0],
+        [10_000_000_000, 0, 0, 0],
+        [6_000_000_000, 6_000_000_000, 0, 0],
+    ] {
+        let mut scores = ReputationScores::new(&committee);
+        scores.final_of_schedule = true;
+        for (id, value) in ids.iter().zip(values) {
+            scores.add_score(id, value);
+        }
+
+        let table = LeaderSwapTable::new(&committee, 2, &scores, 33);
+        assert!(table.good_nodes.is_empty(), "{values:?}");
+        assert!(table.bad_nodes.is_empty(), "{values:?}");
+    }
+}
+
+/// The restart path for such a set: a final row stored before the upgrade used to abort
+/// `LeaderSchedule::from_store` on every start.
+#[test]
+fn stored_overflowing_final_scores_do_not_crash_leader_schedule_from_store() {
+    let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+    let committee = fixture.committee();
+    let ids: Vec<AuthorityIdentifier> = fixture.authorities().map(|a| a.id()).collect();
+    let store = MemDatabase::default();
+
+    let mut scores = ReputationScores::new(&committee);
+    scores.final_of_schedule = true;
+    scores.add_score(&ids[0], 10_000_000_000);
+    let leader = Certificate::genesis(&committee).into_iter().next().unwrap();
+    store.write_subdag_for_test(1, CommittedSubDag::new(vec![], leader, 0, scores, None));
+
+    let schedule = LeaderSchedule::from_store(committee, store, 33);
+    assert_eq!(schedule.num_of_bad_nodes(), 0);
+}
+
+/// A stored previous sub dag of the right shape is carried over mid-window, by catch-up and by
+/// Bullshark alike, and the next commit adds a point to it. A score already at `u64::MAX` used to
+/// overflow there.
+#[test]
+fn huge_carried_over_scores_do_not_overflow() {
+    let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+    let committee = fixture.committee();
+    let ids: Vec<AuthorityIdentifier> = fixture.authorities().map(|a| a.id()).collect();
+
+    let (leader_digest, leader) = mock_certificate(&committee, ids[0].clone(), 2, BTreeSet::new());
+    let mut huge = ReputationScores::new(&committee);
+    for id in &ids {
+        huge.add_score(id, u64::MAX);
+    }
+    let previous = CommittedSubDag::new(vec![], leader, 0, huge, None);
+    let (_, child) =
+        mock_certificate(&committee, ids[1].clone(), 3, BTreeSet::from([leader_digest]));
+
+    // Index 4 is mid-window, so the previous scores carry over and ids[1] gains a point.
+    let scores = ReputationScores::resolve(&committee, Some(&previous), &[child], 4, 60);
+    assert_eq!(scores.scores_per_authority[&ids[1]], u64::MAX);
+}
