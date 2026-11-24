@@ -2,28 +2,26 @@
 //!
 //! reth 2.0 runs its own background tasks (transaction validation, pool sub-tasks, RPC) on a
 //! [`reth_tasks::Runtime`]. Our [`TaskManager`] does not see those tasks, so two things are
-//! bridged here:
+//! done here:
 //!
 //! - a panic in a critical reth task stops the node, like a panic in one of our critical tasks
-//! - our shutdown also shuts the reth runtime down, so reth tasks stop in order
+//!   ([`build_reth_runtime`])
+//! - the node shutdown shuts the reth runtime down as its last step, so reth tasks stop in order
+//!   ([`shutdown_reth_runtime`])
 
-use rayls_infrastructure_types::{TaskKind, TaskManager};
+use rayls_infrastructure_types::TaskManager;
 use reth_tasks::{Runtime, RuntimeBuilder, RuntimeConfig, TokioConfig};
 use std::time::Duration;
 use tracing::{debug, warn};
 
 /// Name of the task that watches reth's critical tasks.
 pub(crate) const RETH_RUNTIME_MONITOR_TASK: &str = "reth-runtime-monitor";
-/// Name of the task that shuts the reth runtime down on our shutdown.
-pub(crate) const RETH_RUNTIME_SHUTDOWN_TASK: &str = "reth-runtime-shutdown";
-
-/// How long our shutdown waits for reth's graceful tasks.
-///
-/// Must stay below the task manager's phase stall bound (4s), or a slow reth task would make
-/// the ordered teardown escalate to a forced abort.
+/// How long the node shutdown waits for reth's graceful tasks. It runs after the final flush,
+/// so a task that does not end in time loses nothing.
 const RETH_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// Build the reth [`Runtime`] on the current tokio runtime and tie it to `task_manager`.
+/// Build the reth [`Runtime`] on the current tokio runtime and watch its critical tasks from
+/// `task_manager`.
 ///
 /// MUST be called from within a tokio runtime.
 pub(crate) fn build_reth_runtime(task_manager: &TaskManager) -> eyre::Result<Runtime> {
@@ -36,7 +34,7 @@ pub(crate) fn build_reth_runtime(task_manager: &TaskManager) -> eyre::Result<Run
     Ok(runtime)
 }
 
-/// Tie `runtime` to `task_manager`. See the module docs.
+/// Make a panic in a critical reth task stop the node.
 fn bridge_reth_runtime(runtime: &Runtime, task_manager: &TaskManager) {
     let spawner = task_manager.get_spawner();
 
@@ -46,7 +44,10 @@ fn bridge_reth_runtime(runtime: &Runtime, task_manager: &TaskManager) {
         Some(reth_manager) => {
             spawner.spawn_critical_result_task(RETH_RUNTIME_MONITOR_TASK, async move {
                 match reth_manager.await {
-                    // reth asked for a shutdown itself
+                    // reth's manager ended without a panic: its shutdown signal fired. In
+                    // normal operation only `shutdown_reth_runtime` does that, at the very
+                    // end. If it happens earlier, this critical task ends and the node stops,
+                    // which is intended: the reth tasks are gone.
                     Ok(Ok(())) => Ok(()),
                     Ok(Err(panicked)) => Err(format!("critical reth task panicked: {panicked}")),
                     Err(join_err) => Err(format!("reth task manager stopped: {join_err}")),
@@ -60,31 +61,27 @@ fn bridge_reth_runtime(runtime: &Runtime, task_manager: &TaskManager) {
             );
         }
     }
+}
 
-    // Shutdown bridge. `Drainable`, so it is not cancelled by the shutdown signal it waits for.
-    let shutdown = task_manager.shutdown_subscriber();
+/// Fire reth's shutdown signal and wait, up to a limit, for reth's graceful tasks to end.
+///
+/// This is called explicitly, as the last step of the node shutdown, after the engine has
+/// drained and the final flush is done. It is NOT tied to the shutdown signal or the drop of
+/// a [`TaskManager`]: the engine's manager is dropped early in the node shutdown, while the
+/// engine still executes its last blocks, and the state root work of those blocks runs on
+/// this runtime. reth ends a task at once when it is spawned after the signal.
+pub(crate) async fn shutdown_reth_runtime(runtime: &Runtime) {
     let runtime = runtime.clone();
-    spawner.spawn_classified_task(
-        RETH_RUNTIME_SHUTDOWN_TASK,
-        async move {
-            shutdown.await;
-            // reth waits in a busy loop, keep it off the async workers
-            let finished = tokio::task::spawn_blocking(move || {
-                runtime.graceful_shutdown_with_timeout(RETH_SHUTDOWN_TIMEOUT)
-            })
-            .await;
-            match finished {
-                Ok(true) => debug!(target: "rayls::reth", "reth runtime shut down"),
-                Ok(false) => {
-                    warn!(target: "rayls::reth", "reth runtime shutdown timed out")
-                }
-                Err(err) => {
-                    warn!(target: "rayls::reth", %err, "reth runtime shutdown task failed")
-                }
-            }
-        },
-        TaskKind::Drainable,
-    );
+    // reth waits in a busy loop, keep it off the async workers
+    let finished = tokio::task::spawn_blocking(move || {
+        runtime.graceful_shutdown_with_timeout(RETH_SHUTDOWN_TIMEOUT)
+    })
+    .await;
+    match finished {
+        Ok(true) => debug!(target: "rayls::reth", "reth runtime shut down"),
+        Ok(false) => warn!(target: "rayls::reth", "reth runtime shutdown timed out"),
+        Err(err) => warn!(target: "rayls::reth", %err, "reth runtime shutdown task failed"),
+    }
 }
 
 #[cfg(test)]
@@ -126,19 +123,20 @@ mod tests {
             panic!("not critical");
         });
 
+        // 500ms is far more than the panic bridge needs: the critical-panic test above
+        // returns in a few milliseconds.
         let res =
             tokio::time::timeout(Duration::from_millis(500), task_manager.join(Notifier::new()))
                 .await;
         assert!(res.is_err(), "join must keep waiting: {res:?}");
     }
 
-    /// Our shutdown must reach reth tasks: a task that listens to reth's shutdown signal ends,
-    /// and the join returns in time.
+    /// The explicit shutdown reaches reth tasks: a task that listens to reth's shutdown signal
+    /// ends, and the call returns in time.
     #[tokio::test(flavor = "multi_thread")]
-    async fn task_manager_shutdown_stops_reth_tasks() {
-        let mut task_manager = TaskManager::new("reth runtime shutdown test");
+    async fn explicit_shutdown_stops_reth_tasks() {
+        let task_manager = TaskManager::new("reth runtime shutdown test");
         let runtime = build_reth_runtime(&task_manager).expect("runtime");
-        task_manager.update_tasks();
 
         let (stopped_tx, stopped_rx) = tokio::sync::oneshot::channel();
         runtime.spawn_critical_with_graceful_shutdown_signal("graceful", |shutdown| async move {
@@ -146,16 +144,35 @@ mod tests {
             let _ = stopped_tx.send(());
         });
 
-        let shutdown = Notifier::new();
-        shutdown.notify();
-        tokio::time::timeout(Duration::from_secs(10), task_manager.join(shutdown))
+        tokio::time::timeout(Duration::from_secs(10), shutdown_reth_runtime(&runtime))
             .await
-            .expect("join must return")
-            .expect("clean shutdown");
+            .expect("shutdown must return");
 
         tokio::time::timeout(Duration::from_secs(1), stopped_rx)
             .await
             .expect("the reth task must see the shutdown signal")
             .expect("the reth task must end through its shutdown branch");
+    }
+
+    /// Dropping the task manager must NOT shut the reth runtime down. On the node path the
+    /// engine's manager is dropped while the engine still drains its last blocks, and their
+    /// state root work runs on this runtime.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn dropping_the_task_manager_keeps_the_reth_runtime_running() {
+        let task_manager = TaskManager::new("reth runtime drop test");
+        let runtime = build_reth_runtime(&task_manager).expect("runtime");
+        drop(task_manager);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // a task spawned now still runs to its end
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        runtime.spawn_task(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let _ = done_tx.send(());
+        });
+        tokio::time::timeout(Duration::from_secs(2), done_rx)
+            .await
+            .expect("task must finish")
+            .expect("task must not be cancelled by a shutdown signal");
     }
 }

@@ -256,6 +256,15 @@ impl RethEnv {
     /// Used at epoch boundaries to ensure all blocks are persisted before
     /// clearing the consensus DB. Extracts blocks from [`CanonicalInMemoryState`]
     /// by walking the canonical chain down to `last_persisted_block`.
+    /// Shut reth's task runtime down (pool validation, pool sub-tasks, RPC).
+    ///
+    /// Call this once, as the last step of the node shutdown, after the engine has drained
+    /// and [`Self::flush_persistence`] has returned. Block building and persistence use the
+    /// same runtime, so nothing may execute after this.
+    pub async fn shutdown_reth_runtime(&self) {
+        crate::reth_env::reth_runtime::shutdown_reth_runtime(&self.reth_runtime).await;
+    }
+
     pub async fn flush_persistence(&self) -> RaylsRethResult<()> {
         let flush_persistence_start = std::time::Instant::now();
 

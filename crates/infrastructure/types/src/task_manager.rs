@@ -342,9 +342,12 @@ impl TaskSpawner {
 
     /// Spawn a non-critical task that runs a future on the tokio blocking thread pool.
     ///
-    /// For a future that blocks its thread for a long time (reth's pipeline unwind). The task
-    /// is tracked by the [`TaskManager`] and is cancelled on shutdown. Other tasks are
-    /// unaffected when it resolves.
+    /// For a future that blocks its thread for a long time (reth's pipeline unwind). Other
+    /// tasks are unaffected when it resolves.
+    ///
+    /// The task is tracked as [`TaskKind::Drainable`]: `abort()` cannot stop a blocking task
+    /// that has started, so it is cancelled through the local shutdown signal, which it
+    /// waits on itself. The future is dropped at its next await point after the signal.
     pub fn spawn_blocking_future_task<F, S: ToString>(&self, name: S, future: F)
     where
         F: Future<Output = ()> + Send + 'static,
@@ -360,7 +363,12 @@ impl TaskSpawner {
                 }
             })
         });
-        if let Err(err) = self.new_task_tx.try_send(TaskHandle::new(name.clone(), handle, false)) {
+        if let Err(err) = self.new_task_tx.try_send(TaskHandle::with_kind(
+            name.clone(),
+            handle,
+            false,
+            TaskKind::Drainable,
+        )) {
             tracing::error!(target: "rayls::tasks", "Task error sending joiner for {name}: {err}");
         }
     }
