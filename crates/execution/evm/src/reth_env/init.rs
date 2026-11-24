@@ -473,7 +473,7 @@ impl RethEnv {
     /// Snapshots taken between the RocksDB and MDBX commit phases leave history
     /// shards beyond the canonical tip. Re-execution then panics with `UnsortedInput`
     /// when appending duplicate block numbers to `RoaringTreemap` shards.
-    pub(crate) fn heal_rocksdb_history_after_snapshot(
+    pub(super) fn heal_rocksdb_history_after_snapshot(
         provider_factory: &ProviderFactory<RaylsNode>,
     ) -> eyre::Result<()> {
         let canonical_tip = provider_factory.database_provider_ro()?.last_block_number()?;

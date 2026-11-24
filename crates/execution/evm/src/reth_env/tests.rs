@@ -1754,9 +1754,10 @@ async fn genesis_only_state_is_readable_at_historical_blocks() -> eyre::Result<(
 ///
 /// reth clears both history tables on every start while no block is persisted yet (history
 /// checkpoint 0). On reth 1.11 it did not write the genesis entries back, which lost them
-/// (the reason for `fix_genesis_account_history`). reth 2.0 writes them back. This test pins
-/// that, and it pins the key: the storage entry is under the PLAIN slot, and there is no entry
-/// under the hashed slot, which is what the removed `fix_genesis_history` used to add.
+/// (the reason for `fix_genesis_account_history`). reth 2.0 writes them back. This test deletes
+/// the entries and checks that the start-up check brings them back. It also pins the key: the
+/// storage entry is under the PLAIN slot, and there is no entry under the hashed slot, which
+/// is what the removed `fix_genesis_history` used to add.
 #[tokio::test]
 async fn genesis_history_index_survives_restart_before_first_block() -> eyre::Result<()> {
     use alloy::primitives::keccak256;
@@ -1792,6 +1793,30 @@ async fn genesis_history_index_survives_restart_before_first_block() -> eyre::Re
 
     assert_genesis_index("after genesis init")?;
 
+    // Lose the genesis entries, as a reth 1.11 restart did. Without this step the test would
+    // pass the same way if reth never touched the tables.
+    {
+        use reth_db::{
+            models::{storage_sharded_key::StorageShardedKey, ShardedKey},
+            tables,
+        };
+        let rocksdb = provider_factory.rocksdb_provider();
+        let mut batch = rocksdb.batch();
+        batch.delete::<tables::AccountsHistory>(ShardedKey::last(GENESIS_HISTORY_ADDR))?;
+        batch.delete::<tables::StoragesHistory>(StorageShardedKey::last(
+            GENESIS_HISTORY_ADDR,
+            GENESIS_HISTORY_SLOT,
+        ))?;
+        batch.commit()?;
+        assert!(
+            rocksdb.account_history_shards(GENESIS_HISTORY_ADDR)?.is_empty()
+                && rocksdb
+                    .storage_history_shards(GENESIS_HISTORY_ADDR, GENESIS_HISTORY_SLOT)?
+                    .is_empty(),
+            "the genesis entries are gone before the start-up check"
+        );
+    }
+
     // what every node start runs; with the checkpoint at 0 it clears and re-seeds the tables
     for restart in 1..=2 {
         provider_factory.check_consistency()?;
@@ -1801,82 +1826,100 @@ async fn genesis_history_index_survives_restart_before_first_block() -> eyre::Re
     Ok(())
 }
 
-/// `heal_rocksdb_history_after_snapshot` removes history entries above the tip and keeps the
-/// rest.
-///
-/// A snapshot taken between the RocksDB commit and the MDBX commit has history for blocks the
-/// main database does not have. reth 2.0 ignores such entries on reads, but appending the same
-/// block number again on re-execution still fails. reth's own repair does not cover this
-/// case, so our heal must stay.
-#[tokio::test]
-async fn heal_removes_history_above_the_tip_and_keeps_the_rest() -> eyre::Result<()> {
-    use reth_db::{
-        models::{storage_sharded_key::StorageShardedKey, ShardedKey},
-        tables, BlockNumberList,
-    };
-    use reth_provider::RocksDBProviderFactory;
+/// A small chain for the history tests: a contract that stores the current block number in
+/// slot 1, and a funded sender that calls it.
+struct HistoryChain {
+    reth_env: RethEnv,
+    chain: Arc<RethChainSpec>,
+    factory: TransactionFactory,
+    header: rayls_infrastructure_types::SealedHeader,
+    next_nonce: u64,
+    // keep the node alive for the whole test
+    _task_manager: TaskManager,
+    _tmp_dir: TempDir,
+}
 
-    let tmp_dir = TempDir::new()?;
-    let provider_factory = genesis_storage_stack(tmp_dir.path())?;
+impl HistoryChain {
+    const CONTRACT: Address = Address::new([0x33u8; 20]);
+    const SLOT: B256 = B256::with_last_byte(1);
+    const GENESIS_VALUE: U256 = U256::from_limbs([0xAA, 0, 0, 0]);
 
-    // an account and a slot that exist only in the stale part
-    let stale_only_addr = Address::new([0x22u8; 20]);
-    let stale_only_slot = B256::with_last_byte(7);
-
-    // The tip is block 0. Add history for blocks 5 and 6, as a snapshot would carry it when
-    // RocksDB is ahead of MDBX. The genesis account gets them next to its block 0 entry.
-    {
-        let rocksdb = provider_factory.rocksdb_provider();
-        let mut batch = rocksdb.batch();
-        batch.put::<tables::AccountsHistory>(
-            ShardedKey::last(GENESIS_HISTORY_ADDR),
-            &BlockNumberList::new([0u64, 5, 6]).unwrap(),
-        )?;
-        batch.put::<tables::StoragesHistory>(
-            StorageShardedKey::last(GENESIS_HISTORY_ADDR, GENESIS_HISTORY_SLOT),
-            &BlockNumberList::new([0u64, 5]).unwrap(),
-        )?;
-        batch.put::<tables::AccountsHistory>(
-            ShardedKey::last(stale_only_addr),
-            &BlockNumberList::new([5u64]).unwrap(),
-        )?;
-        batch.put::<tables::StoragesHistory>(
-            StorageShardedKey::last(stale_only_addr, stale_only_slot),
-            &BlockNumberList::new([6u64]).unwrap(),
-        )?;
-        batch.commit()?;
+    async fn new() -> eyre::Result<Self> {
+        // NUMBER PUSH1 1 SSTORE STOP
+        let genesis = rayls_infrastructure_types::test_genesis().extend_accounts([(
+            Self::CONTRACT,
+            GenesisAccount {
+                code: Some(Bytes::from_static(&[0x43, 0x60, 0x01, 0x55, 0x00])),
+                storage: Some(std::collections::BTreeMap::from([(
+                    Self::SLOT,
+                    B256::from(Self::GENESIS_VALUE),
+                )])),
+                ..Default::default()
+            },
+        )]);
+        let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+        let tmp_dir = TempDir::new()?;
+        let task_manager = TaskManager::new("Test Task Manager");
+        let reth_env =
+            RethEnv::new_for_temp_chain(chain.clone(), tmp_dir.path(), &task_manager, None).await?;
+        let header = chain.sealed_genesis_header();
+        Ok(Self {
+            reth_env,
+            chain,
+            // the default `TransactionFactory` address is funded in `test_genesis` at nonce 0
+            factory: TransactionFactory::new(),
+            header,
+            next_nonce: 0,
+            _task_manager: task_manager,
+            _tmp_dir: tmp_dir,
+        })
     }
 
-    RethEnv::heal_rocksdb_history_after_snapshot(&provider_factory)?;
-
-    fn blocks_of<K>(shards: Vec<(K, BlockNumberList)>) -> Vec<u64> {
-        shards.into_iter().flat_map(|(_, blocks)| blocks.iter().collect::<Vec<_>>()).collect()
+    fn sender(&self) -> Address {
+        self.factory.address()
     }
-    let rocksdb = provider_factory.rocksdb_provider();
-    assert_eq!(
-        blocks_of(rocksdb.account_history_shards(GENESIS_HISTORY_ADDR)?),
-        vec![0],
-        "genesis account keeps block 0 and loses the stale blocks"
-    );
-    assert_eq!(
-        blocks_of(rocksdb.storage_history_shards(GENESIS_HISTORY_ADDR, GENESIS_HISTORY_SLOT)?),
-        vec![0],
-        "genesis slot keeps block 0 and loses the stale block"
-    );
-    assert!(
-        blocks_of(rocksdb.account_history_shards(stale_only_addr)?).is_empty(),
-        "an account with only stale history has none left"
-    );
-    assert!(
-        blocks_of(rocksdb.storage_history_shards(stale_only_addr, stale_only_slot)?).is_empty(),
-        "a slot with only stale history has none left"
-    );
 
-    // a second run finds nothing to do
-    RethEnv::heal_rocksdb_history_after_snapshot(&provider_factory)?;
-    assert_eq!(blocks_of(rocksdb.account_history_shards(GENESIS_HISTORY_ADDR)?), vec![0]);
+    /// Build, persist and flush the next block. With `call_contract` it holds one transaction
+    /// from the sender that calls the contract.
+    async fn next_block(&mut self, call_contract: bool) -> eyre::Result<u64> {
+        let number = self.header.number + 1;
+        let txs = if call_contract {
+            self.factory.set_nonce(self.next_nonce);
+            self.next_nonce += 1;
+            vec![self.factory.create_eip1559_encoded(
+                self.chain.clone(),
+                None,
+                self.reth_env.get_gas_price()?,
+                Some(Self::CONTRACT),
+                U256::ZERO,
+                Default::default(),
+            )]
+        } else {
+            vec![]
+        };
+        let mut co = consensus_output_for_tests(2, 0, number);
+        co.close_epoch = false;
+        let payload = RLPayload::new_for_test(self.header.clone(), &co);
+        let block =
+            execute_payload_and_update_canonical_chain(&self.reth_env, payload, txs).await?;
+        assert_eq!(
+            block.recovered_block.body().transactions.len(),
+            usize::from(call_contract),
+            "block {number} must include its transaction"
+        );
+        self.header = block.recovered_block.clone_sealed_header();
+        Ok(number)
+    }
 
-    Ok(())
+    /// Slot value and sender nonce at the end of a historical block.
+    fn state_at(&self, number: u64) -> eyre::Result<(U256, u64)> {
+        use reth_provider::{StateProvider as _, StateProviderFactory as _};
+        let state = self.reth_env.blockchain_provider.history_by_block_number(number)?;
+        Ok((
+            state.storage(Self::CONTRACT, Self::SLOT)?.unwrap_or_default(),
+            state.basic_account(&self.sender())?.map(|a| a.nonce).unwrap_or_default(),
+        ))
+    }
 }
 
 /// History written by normal blocks is still there after the start-up check runs again.
@@ -1891,78 +1934,22 @@ async fn heal_removes_history_above_the_tip_and_keeps_the_rest() -> eyre::Result
 /// is not a full stop and start of the process.
 #[tokio::test]
 async fn block_history_survives_the_start_up_check() -> eyre::Result<()> {
-    use reth_provider::{StateProvider as _, StateProviderFactory as _};
-
-    // a contract that stores the current block number in slot 1: NUMBER PUSH1 1 SSTORE STOP
-    let contract = Address::new([0x33u8; 20]);
-    let slot = B256::with_last_byte(1);
-    let genesis_value = U256::from(0xAAu64);
-    let genesis = rayls_infrastructure_types::test_genesis().extend_accounts([(
-        contract,
-        GenesisAccount {
-            code: Some(Bytes::from_static(&[0x43, 0x60, 0x01, 0x55, 0x00])),
-            storage: Some(std::collections::BTreeMap::from([(slot, B256::from(genesis_value))])),
-            ..Default::default()
-        },
-    )]);
-    let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
-    let tmp_dir = TempDir::new()?;
-    let task_manager = TaskManager::new("Test Task Manager");
-    let reth_env =
-        RethEnv::new_for_temp_chain(chain.clone(), tmp_dir.path(), &task_manager, None).await?;
-
-    // the default `TransactionFactory` address is funded in `test_genesis` at nonce 0
-    let mut factory = TransactionFactory::new();
-    let sender = factory.address();
-
+    let mut chain = HistoryChain::new().await?;
     // blocks 1 and 3 call the contract, blocks 2 and 4 are empty
-    let mut header = chain.sealed_genesis_header();
-    for number in 1..=4u64 {
-        let txs = if number % 2 == 1 {
-            factory.set_nonce(number / 2);
-            vec![factory.create_eip1559_encoded(
-                chain.clone(),
-                None,
-                reth_env.get_gas_price()?,
-                Some(contract),
-                U256::ZERO,
-                Default::default(),
-            )]
-        } else {
-            vec![]
-        };
-        let mut co = consensus_output_for_tests(2, 0, number);
-        co.close_epoch = false;
-        let payload = RLPayload::new_for_test(header, &co);
-        let block = execute_payload_and_update_canonical_chain(&reth_env, payload, txs).await?;
-        assert_eq!(
-            block.recovered_block.body().transactions.len(),
-            (number % 2) as usize,
-            "block {number} must include its transaction"
-        );
-        header = block.recovered_block.clone_sealed_header();
+    for call_contract in [true, false, true, false] {
+        chain.next_block(call_contract).await?;
     }
 
     // slot value and sender nonce at the end of each historical block (the tip is block 4)
     let expected = [
-        (0u64, genesis_value, 0u64),
+        (0u64, HistoryChain::GENESIS_VALUE, 0u64),
         (1, U256::from(1u64), 1),
         (2, U256::from(1u64), 1),
         (3, U256::from(3u64), 2),
     ];
     let assert_history = |when: &str| -> eyre::Result<()> {
         for (number, slot_value, nonce) in expected {
-            let state = reth_env.blockchain_provider.history_by_block_number(number)?;
-            assert_eq!(
-                state.storage(contract, slot)?.unwrap_or_default(),
-                slot_value,
-                "{when}: slot at block {number}"
-            );
-            assert_eq!(
-                state.basic_account(&sender)?.map(|a| a.nonce).unwrap_or_default(),
-                nonce,
-                "{when}: sender nonce at block {number}"
-            );
+            assert_eq!(chain.state_at(number)?, (slot_value, nonce), "{when}: block {number}");
         }
         Ok(())
     };
@@ -1970,10 +1957,105 @@ async fn block_history_survives_the_start_up_check() -> eyre::Result<()> {
     assert_history("before the start-up check")?;
 
     // what every node start runs; it must find nothing to unwind and must not clear history
-    let (rocksdb_unwind, static_file_unwind) = reth_env.provider_factory.check_consistency()?;
-    assert_eq!((rocksdb_unwind, static_file_unwind), (None, None), "nothing to unwind");
+    let unwind = chain.reth_env.provider_factory.check_consistency()?;
+    assert_eq!(unwind, (None, None), "nothing to unwind");
 
     assert_history("after the start-up check")?;
+
+    Ok(())
+}
+
+/// `heal_rocksdb_history_after_snapshot` is still needed on reth 2.0, and it works.
+///
+/// A datadir copied while the node runs can hold a history index (RocksDB) that already knows
+/// blocks the rest of the datadir does not have. The test builds that state on a node with
+/// saved blocks and runs the two start-up steps in their real order:
+///
+/// 1. reth's own check. It only repairs the index when the changeset static files are ahead too.
+///    Here they are not, so it must leave the stale entries in place. This is the part that shows
+///    our heal is still needed.
+/// 2. our heal. It must cut the index back to the tip.
+///
+/// After that the node must be able to build and save the very block the stale entries pointed
+/// to. Without the heal that save fails and the persistence service stops: reth's history
+/// append rejects a block number that is already in the list (`UnsortedInput`). Checked by
+/// running this test once with the heal call removed.
+#[tokio::test]
+async fn heal_is_needed_after_reths_check_and_lets_the_next_block_persist() -> eyre::Result<()> {
+    use reth_db::{
+        models::{storage_sharded_key::StorageShardedKey, ShardedKey},
+        tables, BlockNumberList,
+    };
+    use reth_provider::RocksDBProviderFactory;
+
+    fn blocks_of<K>(shards: Vec<(K, BlockNumberList)>) -> Vec<u64> {
+        shards.into_iter().flat_map(|(_, blocks)| blocks.iter().collect::<Vec<_>>()).collect()
+    }
+
+    let mut chain = HistoryChain::new().await?;
+    for call_contract in [true, false, true, false] {
+        chain.next_block(call_contract).await?;
+    }
+    let (sender, contract, slot) = (chain.sender(), HistoryChain::CONTRACT, HistoryChain::SLOT);
+    let tip = 4u64;
+
+    let account_blocks = |chain: &HistoryChain| -> eyre::Result<Vec<u64>> {
+        Ok(blocks_of(
+            chain.reth_env.provider_factory.rocksdb_provider().account_history_shards(sender)?,
+        ))
+    };
+    let slot_blocks = |chain: &HistoryChain| -> eyre::Result<Vec<u64>> {
+        Ok(blocks_of(
+            chain
+                .reth_env
+                .provider_factory
+                .rocksdb_provider()
+                .storage_history_shards(contract, slot)?,
+        ))
+    };
+
+    // the real history after 4 blocks
+    let real_account_blocks = account_blocks(&chain)?;
+    let real_slot_blocks = slot_blocks(&chain)?;
+    assert!(real_account_blocks.iter().all(|b| *b <= tip) && real_account_blocks.contains(&3));
+    assert!(real_slot_blocks.iter().all(|b| *b <= tip) && real_slot_blocks.contains(&3));
+
+    // Add block 5 to both lists, as a copy would carry it when the index is ahead. Block 5 is
+    // the block the node builds next, and it changes this account and this slot.
+    {
+        let rocksdb = chain.reth_env.provider_factory.rocksdb_provider();
+        let with_stale = |real: &[u64]| {
+            BlockNumberList::new(real.iter().copied().chain([tip + 1])).expect("sorted")
+        };
+        let mut batch = rocksdb.batch();
+        batch.put::<tables::AccountsHistory>(
+            ShardedKey::last(sender),
+            &with_stale(&real_account_blocks),
+        )?;
+        batch.put::<tables::StoragesHistory>(
+            StorageShardedKey::last(contract, slot),
+            &with_stale(&real_slot_blocks),
+        )?;
+        batch.commit()?;
+    }
+
+    // step 1: reth's own start-up check does not repair this case
+    let unwind = chain.reth_env.provider_factory.check_consistency()?;
+    assert_eq!(unwind, (None, None), "reth sees nothing to unwind");
+    assert!(account_blocks(&chain)?.contains(&(tip + 1)), "reth leaves the stale account entry");
+    assert!(slot_blocks(&chain)?.contains(&(tip + 1)), "reth leaves the stale slot entry");
+
+    // step 2: our heal cuts the index back to the tip
+    RethEnv::heal_rocksdb_history_after_snapshot(&chain.reth_env.provider_factory)?;
+    assert_eq!(account_blocks(&chain)?, real_account_blocks, "account history is back to the tip");
+    assert_eq!(slot_blocks(&chain)?, real_slot_blocks, "slot history is back to the tip");
+
+    // the node can now build and save block 5, which touches the healed account and slot
+    assert_eq!(chain.next_block(true).await?, tip + 1);
+    chain.next_block(false).await?;
+    assert_eq!(account_blocks(&chain)?.iter().filter(|b| **b == tip + 1).count(), 1);
+    assert_eq!(slot_blocks(&chain)?.iter().filter(|b| **b == tip + 1).count(), 1);
+    assert_eq!(chain.state_at(tip + 1)?, (U256::from(tip + 1), 3), "block 5 is readable");
 
     Ok(())
 }
