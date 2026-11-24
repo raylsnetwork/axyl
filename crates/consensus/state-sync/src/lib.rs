@@ -22,11 +22,9 @@ use tracing::{debug, error, info, trace, warn};
 mod epoch;
 pub use epoch::{epoch_committee_valid, epoch_record_valid, spawn_epoch_record_collector};
 mod consensus;
-mod row_cleared;
 
 use consensus::spawn_track_recent_consensus;
 pub use consensus::store_consensus_header_in_cache;
-use row_cleared::RowCleared;
 
 /// Populate startup-relevant watch channels on `ConsensusBus` from the DB.
 /// Must run before any consensus task spawns.
@@ -149,15 +147,12 @@ pub fn spawn_state_sync<DB: Database>(
         NodeMode::CvvInactive | NodeMode::Observer => {
             // If we are not an active CVV then follow latest consensus from peers.
             let (config_clone, consensus_bus_clone) = (config.clone(), consensus_bus.clone());
-            // The streamer tells the walk when it clears a stored row.
-            let row_cleared = RowCleared::default();
-            let walk_row_cleared = row_cleared.clone();
             task_manager.spawn_task(
                 "state sync: track latest consensus header from peers",
                 monitored_future!(
                     async move {
                         info!(target: "rayls-consensus-state-sync", "Starting state sync: track latest consensus header from peers");
-                        if let Err(e) = spawn_track_recent_consensus(config_clone, consensus_bus_clone, network, walk_row_cleared).await {
+                        if let Err(e) = spawn_track_recent_consensus(config_clone, consensus_bus_clone, network).await {
                             error!(target: "rayls-consensus-state-sync", "Error tracking latest consensus headers: {e}");
                         }
                     },
@@ -169,7 +164,7 @@ pub fn spawn_state_sync<DB: Database>(
                 monitored_future!(
                     async move {
                         info!(target: "rayls-consensus-state-sync", "Starting state sync: stream consensus header from peers");
-                        if let Err(e) = spawn_stream_consensus_headers(config, consensus_bus, last_streamed_number, row_cleared).await {
+                        if let Err(e) = spawn_stream_consensus_headers(config, consensus_bus, last_streamed_number).await {
                             error!(target: "rayls-consensus-state-sync", "Error streaming consensus headers: {e}");
                         }
                     },
@@ -499,7 +494,6 @@ async fn spawn_stream_consensus_headers<DB: Database>(
     config: ConsensusConfig<DB>,
     consensus_bus: ConsensusBus,
     last_streamed_number: u64,
-    row_cleared: RowCleared,
 ) -> eyre::Result<()> {
     let rx_shutdown = config.shutdown().subscribe();
 
@@ -543,7 +537,7 @@ async fn spawn_stream_consensus_headers<DB: Database>(
                     pending_catch_up_target = attempt_catch_up(
                         &config, &consensus_bus,
                         &mut last_consensus_header, &mut last_consensus_height,
-                        header, "forward streamer", &row_cleared,
+                        header, "forward streamer",
                     ).await;
                 }
             }
@@ -556,7 +550,7 @@ async fn spawn_stream_consensus_headers<DB: Database>(
                         pending_catch_up_target = attempt_catch_up(
                             &config, &consensus_bus,
                             &mut last_consensus_header, &mut last_consensus_height,
-                            target, "forward streamer retry", &row_cleared,
+                            target, "forward streamer retry",
                         ).await;
                     } else {
                         pending_catch_up_target = None;
@@ -588,16 +582,9 @@ async fn attempt_catch_up<DB: Database>(
     last_height: &mut u64,
     target: ConsensusHeader,
     label: &str,
-    row_cleared: &RowCleared,
 ) -> Option<ConsensusHeader> {
-    match catch_up_consensus_from_to(
-        config,
-        consensus_bus,
-        last_header.clone(),
-        target.clone(),
-        row_cleared,
-    )
-    .await
+    match catch_up_consensus_from_to(config, consensus_bus, last_header.clone(), target.clone())
+        .await
     {
         Ok(result) => {
             let pending = if result.number < target.number {
@@ -634,17 +621,15 @@ async fn attempt_catch_up<DB: Database>(
 }
 
 /// Applies consensus output from (exclusive) to max_consensus_height (inclusive).
-/// Returns the last applied ConsensusHeader, or the executed anchor when `from` proves stale.
+/// Returns the last applied ConsensusHeader.
 async fn catch_up_consensus_from_to<DB: Database>(
     config: &ConsensusConfig<DB>,
     consensus_bus: &ConsensusBus,
     from: ConsensusHeader,
     max_consensus: ConsensusHeader,
-    row_cleared: &RowCleared,
 ) -> eyre::Result<ConsensusHeader> {
-    // `from` is the streamer's anchor, seeded from the executed-anchor SSOT and advanced to headers
-    // that linked in an earlier pass. A stored row it advanced onto can still turn out stale; the
-    // mismatch branch below rewinds the anchor when its own child does not link.
+    // `from` is the streamer's anchor, seeded from the executed-anchor SSOT and only ever advanced
+    // to digest-verified headers, so its digest is the true parent of header `from.number + 1`.
     let mut last_parent = from.digest();
 
     let last_consensus_height = from.number;
@@ -714,58 +699,16 @@ async fn catch_up_consensus_from_to<DB: Database>(
         last_parent =
             ConsensusHeader::digest_from_parts(parent_hash, &consensus_header.sub_dag, number);
         if last_parent != consensus_header.digest() {
-            // `number` does not chain onto the header at `number - 1`, so the row at `number - 1`
-            // may be the bad one (a stale row from another fork): a non-canonical cache row is
-            // removed to force the walk to re-fetch it. Never drop a canonical row: a mismatch
-            // there is a real fork (needs an operator restore), and removing history the walk
-            // cannot rebuild loses state silently.
-            let poisoned_parent_number = number - 1;
-            if poisoned_parent_number > last_consensus_height
-                && db
-                    .get::<ConsensusBlocks>(&poisoned_parent_number)
-                    .ok()
-                    .flatten()
-                    .map(|h| h.digest())
-                    != Some(parent_hash)
-            {
-                let _ = db.with_write_txn(|txn| {
-                    let _ = txn.remove::<ConsensusBlocksCache>(&poisoned_parent_number);
-                    let _ = txn.remove::<ConsensusBlockNumbersByDigest>(&parent_hash);
-                    Ok(())
-                });
-                row_cleared.mark();
-            }
+            // `number` does not chain onto the header at `number - 1`. Retry from the same anchor:
+            // the walk replaces a stale stored row on its way down. A mismatch that persists is a
+            // real fork and needs an operator restore.
             warn!(
                 target: "rayls-consensus-state-sync",
                 number,
                 expected = ?last_parent,
                 actual = ?consensus_header.digest(),
-                "consensus header digest mismatch - retrying (a non-canonical poison row is cleared to self-heal; a canonical fork needs a DB restore)"
+                "consensus header digest mismatch - retrying (a canonical fork needs a DB restore)"
             );
-            // The anchor's own child does not link onto it. A canonical anchor stays: the child is
-            // a stale row or a real fork. Any other anchor came from an earlier pass that stopped
-            // on a stored row, and that row may be stale (another fork's row the walk has since
-            // replaced). Every later pass would chain onto it and fail here until a restart, so
-            // rewind to the executed anchor as a restart does, and let the next pass re-read the
-            // repaired rows.
-            if number == last_consensus_height + 1 {
-                let anchor_is_canonical = db
-                    .get::<ConsensusBlocks>(&last_consensus_height)
-                    .ok()
-                    .flatten()
-                    .map(|h| h.digest())
-                    == Some(parent_hash);
-                let executed = consensus_bus.executed_anchor().borrow().clone();
-                if !anchor_is_canonical && executed.number < last_consensus_height {
-                    warn!(
-                        target: "rayls-consensus-state-sync",
-                        anchor = last_consensus_height,
-                        executed = executed.number,
-                        "catch_up_from_to: the anchor's child does not link onto it, rewinding to the executed anchor"
-                    );
-                    return Ok(executed);
-                }
-            }
             return Err(eyre::eyre!("consensus header digest mismatch at number {number}"));
         }
 

@@ -19,8 +19,6 @@ use std::{
 use tokio::sync::watch;
 use tracing::{debug, error, info, warn};
 
-use crate::row_cleared::RowCleared;
-
 const COMMITTEE_KEYS_TIMEOUT: Duration = Duration::from_secs(30);
 const COMMITTEE_KEYS_POLL_INTERVAL: Duration = Duration::from_millis(500);
 /// How long to wait for a gossip tip before actively probing peers for the network head.
@@ -254,8 +252,6 @@ pub(crate) struct WalkSession<DB> {
     /// re-descending. Cleared on an incomplete walk (stale rows may lie below it), then
     /// re-derived.
     covered: Option<B256>,
-    /// Set by the forward streamer when it clears a stored row.
-    row_cleared: RowCleared,
     /// Lowest epoch whose end may still need a checkpoint walk; every epoch below it ends at or
     /// below a header a checkpoint walk already covered.
     next_checkpoint: Epoch,
@@ -280,17 +276,10 @@ impl<DB: ReDatabase> WalkSession<DB> {
             network,
             shutdown,
             covered: None,
-            row_cleared: RowCleared::default(),
             next_checkpoint: 0,
             records_requested: 0,
             divert: None,
         }
-    }
-
-    /// Learn from `row_cleared` when the forward streamer clears a stored row.
-    pub(crate) fn with_row_cleared(mut self, row_cleared: RowCleared) -> Self {
-        self.row_cleared = row_cleared;
-        self
     }
 
     /// Walk backwards from `start_hash` to local coverage, recording the result for the next call.
@@ -309,8 +298,6 @@ impl<DB: ReDatabase> WalkSession<DB> {
             if !self.is_local(start_hash) {
                 return ControlFlow::Continue(());
             }
-            // The streamer may have cleared a row while the epoch ends were walked.
-            self.refresh_coverage().await;
             // Only this walk may divert: the records were asked for once, so the walk to the
             // target after the epoch ends runs to the end.
             let divert = self.divert.take();
@@ -334,25 +321,12 @@ impl<DB: ReDatabase> WalkSession<DB> {
         }
     }
 
-    /// Drop the covered anchor when the forward streamer has cleared a stored row since the last
-    /// check, then recover coverage from the persisted cache when the session has none.
-    ///
-    /// A walk stops at the anchor without checking that the rows below it are still stored, so a
-    /// row the streamer cleared below it would never be fetched again. Derivation stops below
-    /// the cleared row, so the next walk fetches it. The epoch ends are walked again from the
-    /// node's epoch too; the stored ones cost one lookup each.
-    ///
-    /// Without an anchor (fresh task, or a prior walk cleared it), derivation lets this walk stop
-    /// at the top of the cached run rather than re-descending it. It sweeps and hashes every
-    /// cached row, so it runs on a blocking thread to keep the async worker responsive through
-    /// a long catch-up stall; a join failure just leaves the anchor unset and re-derives next
-    /// call.
+    /// Recover coverage from the persisted cache when the session has none (fresh task, or a prior
+    /// walk cleared it), so this walk stops at the top of the cached run rather than re-descending
+    /// it. Derivation sweeps and hashes every cached row, so it runs on a blocking thread to keep
+    /// the async worker responsive through a long catch-up stall; a join failure just leaves the
+    /// anchor unset and re-derives next call.
     async fn refresh_coverage(&mut self) {
-        if self.row_cleared.take() {
-            info!(target: "state-sync", "backwards walk: the streamer cleared a stored row, deriving coverage again");
-            self.covered = None;
-            self.next_checkpoint = 0;
-        }
         if self.covered.is_none() {
             let db = self.config.node_storage().clone();
             self.covered = tokio::task::spawn_blocking(move || derive_covered_anchor(&db))
@@ -785,12 +759,10 @@ pub(crate) async fn spawn_track_recent_consensus<DB: ReDatabase>(
     config: ConsensusConfig<DB>,
     consensus_bus: ConsensusBus,
     network: PrimaryNetworkHandle,
-    row_cleared: RowCleared,
 ) -> eyre::Result<()> {
     let rx_shutdown = config.shutdown().subscribe();
     let mut rx_gossip_update = consensus_bus.last_published_consensus_num_hash().subscribe();
-    let mut session = WalkSession::new(config.clone(), consensus_bus.clone(), network.clone())
-        .with_row_cleared(row_cleared);
+    let mut session = WalkSession::new(config.clone(), consensus_bus.clone(), network.clone());
 
     // Probe at startup so the first walk begins without waiting for a gossip tip.
     let current = consensus_bus.last_consensus_header().borrow().number;
@@ -1283,6 +1255,45 @@ mod tests {
         assert_eq!(session.walk(chain[&110].digest(), None).await, WalkOutcome::Covered);
         assert_chain_cached(db, &chain);
         assert_eq!(requests.by_hash.load(Ordering::Relaxed), 2, "110 is asked for again by hash");
+    }
+
+    /// A stored row with the real parent link but other contents, under a good stored row, is
+    /// replaced by the real header on the way down. The forward streamer relies on this and does
+    /// not clear such a row itself.
+    #[tokio::test]
+    async fn walk_replaces_a_stale_stored_row() {
+        let fixture = CommitteeFixture::builder(MemDatabase::default)
+            .randomize_ports(true)
+            .committee_size(NonZeroUsize::new(4).unwrap())
+            .build();
+        let primary = fixture.authorities().next().unwrap();
+        let config = primary.consensus_config();
+        let db = config.node_storage();
+        let leader = fixture.certificate(&fixture.header_from_last_authority());
+        let chain = canonical_tip_and_chain(db, &leader, 105);
+
+        let stale_103 = ConsensusHeader {
+            parent_hash: chain[&102].digest(),
+            sub_dag: CommittedSubDag::new(
+                vec![],
+                Certificate::default(),
+                0,
+                ReputationScores::default(),
+                None,
+            ),
+            number: 103,
+            extra: B256::default(),
+        };
+        assert_ne!(stale_103.digest(), chain[&103].digest(), "precondition: another fork's row");
+        for header in [&chain[&101], &chain[&102], &stale_103, &chain[&104]] {
+            store_consensus_header_in_cache(db, header);
+        }
+
+        let (network, _requests) = walk_network(chain.clone(), &chain, HashMap::new());
+        let session = WalkSession::new(config.clone(), ConsensusBus::new(), network);
+
+        assert_eq!(session.walk(chain[&105].digest(), None).await, WalkOutcome::Covered);
+        assert_chain_cached(db, &chain);
     }
 
     /// A peer serves, as the walk target, a commit whose leader is valid but which also carries a
