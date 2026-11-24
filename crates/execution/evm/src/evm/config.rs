@@ -209,6 +209,7 @@ impl ConfigureEvm for RaylsEvmConfig {
             difficulty: block.difficulty,
             rewards_counter: self.rewards_counter.clone(),
             close_epoch_tally,
+            migrations_applied: false,
         })
     }
 
@@ -233,6 +234,7 @@ impl ConfigureEvm for RaylsEvmConfig {
             difficulty: U256::from(payload.batch_index << 16 | payload.worker_id as usize),
             rewards_counter: self.rewards_counter.clone(),
             close_epoch_tally,
+            migrations_applied: false,
         })
     }
 }
