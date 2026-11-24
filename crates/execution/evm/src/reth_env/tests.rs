@@ -1416,8 +1416,6 @@ async fn test_close_epochs_with_dynamic_committee() -> eyre::Result<()> {
     Ok(())
 }
 
-/// Fork-boundary test for the `HybridRewards` hardfork.
-///
 /// A one-shot hardfork migration runs at its activation block for every batch index.
 ///
 /// Each batch of a consensus output becomes its own block, so the activation block can be a
@@ -1468,6 +1466,8 @@ async fn migration_applies_when_activation_block_is_not_first_batch() -> eyre::R
     Ok(())
 }
 
+/// Fork-boundary test for the `HybridRewards` hardfork.
+///
 /// With a synthetic schedule activating at `FORK_BLOCK`, drive epoch closes on both sides in a
 /// single run. Genesis deploys the pre-hybrid contract, so a successful close *before* the fork
 /// proves the legacy 1-arg `applyIncentives` matches it, and a successful close *at/after* the

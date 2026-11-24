@@ -213,6 +213,11 @@ impl ConfigureEvm for RaylsEvmConfig {
         })
     }
 
+    /// The returned context has `migrations_applied == false`, so the executor applies
+    /// one-shot hardfork migrations through `commit`. That is only good enough for results
+    /// that are not persisted (RPC trace and simulate). A caller that builds a block to keep
+    /// must apply the migrations on `State` first and set the flag, as
+    /// `RethEnv::build_block_from_batch_payload` does.
     fn context_for_next_block(
         &self,
         parent: &SealedHeader<HeaderTy<Self::Primitives>>,

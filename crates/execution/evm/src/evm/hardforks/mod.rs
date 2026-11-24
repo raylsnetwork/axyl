@@ -23,7 +23,7 @@ use reth_revm::{
     state::{Account as RevmAccount, AccountInfo, AccountStatus, EvmState},
     State,
 };
-use tracing::info;
+use tracing::{info, warn};
 
 /// Build a [`RevmAccount`] holding `bytecode` with `AccountStatus::Touched`.
 pub(super) fn account_with_code(bytecode: &[u8]) -> RevmAccount {
@@ -111,6 +111,20 @@ pub(crate) fn apply_activated_migrations_with_commit<DB: alloy_evm::block::State
                 state.values().all(|account| account.is_touched()),
                 "every migration account must be Touched, or commit drops it"
             );
+            // This is the one case where `commit` does not give the state of the exact path.
+            // It is fine for a trace. It is a bug if a block built this way is persisted.
+            for (address, account) in &state {
+                if account.info.is_empty() && account.storage.values().any(|slot| slot.is_changed())
+                {
+                    warn!(
+                        target: "engine",
+                        %address,
+                        block_number,
+                        "hardfork migration applied through commit drops an empty account \
+                         with storage; this result must not be persisted"
+                    );
+                }
+            }
             db.commit(state);
         },
     )
