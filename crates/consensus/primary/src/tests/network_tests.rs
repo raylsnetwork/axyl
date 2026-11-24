@@ -21,7 +21,7 @@ use rayls_infrastructure_types::{
     CommitteeLookahead, EpochVote, ExecHeader, Hash as _, RaylsReceiver, RaylsSender, SealedHeader,
     Signer as _, TaskManager,
 };
-use rayls_testing_test_utils_committee::CommitteeFixture;
+use rayls_testing_test_utils_committee::{AuthorityFixture, CommitteeFixture};
 use std::collections::{BTreeMap, BTreeSet};
 use tracing::debug;
 
@@ -916,6 +916,99 @@ fn certified_tip_request_and_reply_are_appended_last() {
         rayls_infrastructure_types::decode::<PrimaryResponse>(&old_bytes),
         PrimaryResponse::EpochMismatch { expected: 2, received: 3 }
     );
+}
+
+/// Gossip `signer`'s signed consensus result for header `number` with `hash`, published by the
+/// signer itself.
+async fn gossip_consensus_result(
+    handler: &RequestHandler<MemDatabase>,
+    signer: &AuthorityFixture<MemDatabase>,
+    number: u64,
+    hash: BlockHash,
+) -> eyre::Result<()> {
+    let key = *signer.authority().protocol_key();
+    let digest = ConsensusResult::digest_data(0, 1, number, hash);
+    let signature = signer.keypair().sign(&encode(&to_intent_message(digest)));
+    let result = ConsensusResult { epoch: 0, round: 1, number, hash, validator: key, signature };
+    let data = encode(&PrimaryGossip::Consensus(Box::new(result)));
+    let topic = TopicHash::from_raw(LibP2pConfig::consensus_output_topic());
+    let msg = GossipMessage { source: None, data, sequence_number: None, topic };
+    handler.process_gossip(&msg, key).await?;
+    Ok(())
+}
+
+/// The receiving node (the first authority), one member that signs invented digests, and the
+/// f+1 honest members whose results should reach quorum.
+fn consensus_result_signers(
+    committee: &CommitteeFixture<MemDatabase>,
+) -> (&AuthorityFixture<MemDatabase>, Vec<&AuthorityFixture<MemDatabase>>) {
+    let size = committee.authorities().count();
+    let quorum = size / 3 + 1;
+    assert!(size >= quorum + 2, "room for the receiver, a spammer and f+1 honest members");
+    let mut others = committee.authorities().skip(1);
+    let spammer = others.next().expect("a second authority");
+    (spammer, others.take(quorum).collect())
+}
+
+/// A committee member signing results for invented digests cannot keep the honest f+1 quorum
+/// from forming: its results only push out its own older ones, never the honest partial count.
+#[tokio::test]
+async fn test_consensus_result_spam_cannot_wipe_honest_votes() -> eyre::Result<()> {
+    let TestTypes { committee, handler, consensus_bus, task_manager: _task_manager, .. } =
+        create_test_types();
+    let (spammer, honest) = consensus_result_signers(&committee);
+    let real = BlockHash::random();
+
+    gossip_consensus_result(&handler, honest[0], 5, real).await?;
+    // validly signed by a member, each above the tip so none is deduplicated away
+    for number in 1..=200 {
+        gossip_consensus_result(&handler, spammer, number, BlockHash::random()).await?;
+    }
+    for signer in &honest[1..] {
+        gossip_consensus_result(&handler, signer, 5, real).await?;
+    }
+    assert_eq!(*consensus_bus.last_published_consensus_num_hash().borrow(), (5, real));
+    Ok(())
+}
+
+/// A member that has already moved on to later headers still counts toward an earlier one whose
+/// quorum is still forming, as gossip jitter delivers results out of step.
+#[tokio::test]
+async fn test_consensus_result_counts_a_signer_that_moved_on() -> eyre::Result<()> {
+    let TestTypes { committee, handler, consensus_bus, task_manager: _task_manager, .. } =
+        create_test_types();
+    let (_, honest) = consensus_result_signers(&committee);
+    let five = BlockHash::random();
+
+    gossip_consensus_result(&handler, honest[0], 5, five).await?;
+    gossip_consensus_result(&handler, honest[0], 6, BlockHash::random()).await?;
+    gossip_consensus_result(&handler, honest[0], 7, BlockHash::random()).await?;
+    for signer in &honest[1..] {
+        gossip_consensus_result(&handler, signer, 5, five).await?;
+    }
+    assert_eq!(*consensus_bus.last_published_consensus_num_hash().borrow(), (5, five));
+    Ok(())
+}
+
+/// A quorum drops the results it settled and keeps the ones for later headers, so a later quorum
+/// still counts the members that signed it early.
+#[tokio::test]
+async fn test_consensus_result_quorum_keeps_later_votes() -> eyre::Result<()> {
+    let TestTypes { committee, handler, consensus_bus, task_manager: _task_manager, .. } =
+        create_test_types();
+    let (_, honest) = consensus_result_signers(&committee);
+    let (last, early) = honest.split_last().expect("f+1 honest members");
+    let (five, six) = (BlockHash::random(), BlockHash::random());
+
+    for signer in early {
+        gossip_consensus_result(&handler, signer, 5, five).await?;
+        gossip_consensus_result(&handler, signer, 6, six).await?;
+    }
+    gossip_consensus_result(&handler, last, 5, five).await?;
+    assert_eq!(*consensus_bus.last_published_consensus_num_hash().borrow(), (5, five));
+    gossip_consensus_result(&handler, last, 6, six).await?;
+    assert_eq!(*consensus_bus.last_published_consensus_num_hash().borrow(), (6, six));
+    Ok(())
 }
 
 #[test]

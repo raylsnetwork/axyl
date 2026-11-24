@@ -25,13 +25,13 @@ use rayls_infrastructure_storage::{
 use rayls_infrastructure_types::{
     ensure,
     error::{CertificateError, HeaderError, HeaderResult},
-    now, to_intent_message, try_decode, AuthorityIdentifier, B256Map, BlockHash, BlockNumHash,
-    BlsPublicKey, BlsSignature, Certificate, CertificateDigest, CertifiedTip, ConsensusHeader,
-    Database, Epoch, EpochCertificate, EpochRecord, Hash as _, Header, ProtocolSignature,
-    RaylsSender as _, Round, SignatureVerificationState, Vote, VotesAggregator, B256,
+    now, to_intent_message, try_decode, AuthorityIdentifier, BlockHash, BlockNumHash, BlsPublicKey,
+    BlsSignature, Certificate, CertificateDigest, CertifiedTip, ConsensusHeader, Database, Epoch,
+    EpochCertificate, EpochRecord, Hash as _, Header, ProtocolSignature, RaylsSender as _, Round,
+    SignatureVerificationState, Vote, B256,
 };
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
     sync::Arc,
     time::Duration,
 };
@@ -39,7 +39,8 @@ use tokio::time::Instant;
 use tracing::{debug, error, info, trace, warn};
 
 const MAX_AUTH_LAST_VOTE_ENTRIES: usize = 1000;
-const MAX_CONSENSUS_CERTS_ENTRIES: usize = 100;
+/// How many of its latest consensus results each signer keeps in [`ConsensusVotes`].
+const CONSENSUS_VOTES_PER_SIGNER: usize = 3;
 /// How long `committed_round` must stay flat, while verdicts keep saying behind, before demoting
 /// to `CvvInactive`. Any commit advance resets the clock, so a node catching up or mid epoch/mode
 /// transition never trips it; only one stuck for the whole window does.
@@ -98,6 +99,56 @@ impl BehindTracker {
     }
 }
 
+/// The latest verified consensus results of each signer, counted toward the f+1 gossip quorum.
+///
+/// Each signer keeps only its own last [`CONSENSUS_VOTES_PER_SIGNER`] results. A member that
+/// signs invented digests pushes out its own older results, never another signer's, so it cannot
+/// wipe the honest partial count for the real header. More than one per signer, so a signer that
+/// has moved on to the next header still counts toward the previous one while that quorum forms.
+/// Holds at most that many results per committee key.
+#[derive(Debug, Default)]
+struct ConsensusVotes {
+    by_signer: HashMap<BlsPublicKey, VecDeque<(B256, ConsensusResult)>>,
+}
+
+impl ConsensusVotes {
+    /// Record `result`, already verified, with its `digest` under its signer. True once `quorum`
+    /// signers hold that digest. A repeat of a result the signer already holds counts nothing.
+    fn add(&mut self, digest: B256, result: ConsensusResult, quorum: usize) -> bool {
+        let held = self.by_signer.entry(result.validator).or_default();
+        if held.iter().any(|(d, _)| *d == digest) {
+            return false;
+        }
+        if held.len() == CONSENSUS_VOTES_PER_SIGNER {
+            held.pop_front();
+        }
+        held.push_back((digest, result));
+        self.by_signer.values().filter(|held| held.iter().any(|(d, _)| *d == digest)).count()
+            >= quorum
+    }
+
+    /// The signer and signature of every held result for `digest`.
+    fn signatures(&self, digest: &B256) -> Vec<(BlsPublicKey, BlsSignature)> {
+        self.by_signer
+            .values()
+            .filter_map(|held| held.iter().find(|(d, _)| d == digest))
+            .map(|(_, result)| (result.validator, result.signature))
+            .collect()
+    }
+
+    /// Drop every result at or below `number`: the gossip tip has reached it.
+    fn prune_through(&mut self, number: u64) {
+        self.by_signer.retain(|_, held| {
+            held.retain(|(_, result)| result.number > number);
+            !held.is_empty()
+        });
+    }
+
+    fn clear(&mut self) {
+        self.by_signer.clear();
+    }
+}
+
 /// Handle request types received from peers.
 #[derive(Clone, Debug)]
 pub(crate) struct RequestHandler<DB> {
@@ -108,8 +159,8 @@ pub(crate) struct RequestHandler<DB> {
     requested_parents: Arc<Mutex<BTreeMap<(Round, CertificateDigest), AuthorityIdentifier>>>,
     /// Per-authority vote state for equivocation detection and caching.
     auth_last_vote: Arc<Mutex<AuthEquivocationMap>>,
-    /// Consensus result signers per digest.
-    consensus_certs: Arc<Mutex<B256Map<VotesAggregator<ConsensusResult>>>>,
+    /// The latest consensus results per signer, for the f+1 gossip quorum.
+    consensus_votes: Arc<Mutex<ConsensusVotes>>,
     /// Commit-progress tracker gating demotion to `CvvInactive` (see [`behind_consensus`]).
     behind_tracker: Arc<Mutex<BehindTracker>>,
     /// Signers whose epoch vote was already queued, per epoch: one vote per signer and epoch
@@ -200,7 +251,7 @@ where
             rayls_consensus_state_sync,
             requested_parents: Default::default(),
             auth_last_vote: Default::default(),
-            consensus_certs: Default::default(),
+            consensus_votes: Default::default(),
             behind_tracker: Default::default(),
             epoch_votes_seen: Default::default(),
             pending_records: Default::default(),
@@ -422,39 +473,15 @@ where
                         signature.verify_secure(&to_intent_message(consensus_result_hash), &key),
                         PrimaryNetworkError::UnknownConsensusHeaderCert(hash)
                     );
-                    // per-digest signer tracking prevents single-validator inflation
-                    let enough_sigs = (committee.len() / 3) + 1;
-                    let quorum = {
-                        let mut cache = self.consensus_certs.lock();
-                        if cache.len() > MAX_CONSENSUS_CERTS_ENTRIES
-                            && !cache.contains_key(&consensus_result_hash)
-                        {
-                            cache.clear();
-                        }
-                        let aggregator = cache
-                            .entry(consensus_result_hash)
-                            .or_insert_with(|| VotesAggregator::new(enough_sigs as u64));
-                        match aggregator.append(*result, 1) {
-                            // the signatures that reached it, read before any clear below
-                            Ok(true) => {
-                                let signatures = aggregator
-                                    .votes()
-                                    .iter()
-                                    .map(|vote| (vote.validator, vote.signature))
-                                    .collect::<Vec<_>>();
-                                // a closed epoch's quorum is checked against the stored header
-                                // below; taken out under this lock so later voters for the same
-                                // digest do not repeat that check
-                                if epoch < self.consensus_config.committee().epoch() {
-                                    cache.remove(&consensus_result_hash);
-                                }
-                                Some(signatures)
-                            }
-                            Ok(false) => None,
-                            Err(_) => return Ok(()),
-                        }
+                    let quorum = (committee.len() / 3) + 1;
+                    let signatures = {
+                        let mut votes = self.consensus_votes.lock();
+                        // the signatures that reached it, read under the lock that counted them
+                        votes
+                            .add(consensus_result_hash, *result, quorum)
+                            .then(|| votes.signatures(&consensus_result_hash))
                     };
-                    if let Some(signatures) = quorum {
+                    if let Some(signatures) = signatures {
                         // a node in a later epoch has executed every header of this one, so an
                         // honest result names the header it holds at that number; anything else
                         // is f+1 retired keys forging one, which would otherwise be served as the
@@ -478,13 +505,13 @@ where
                         }
                         self.save_certified_tip(epoch, round, number, hash, signatures);
                         if self.behind_consensus(epoch, round, Some(number)).await {
-                            self.consensus_certs.lock().clear();
+                            self.consensus_votes.lock().clear();
                             return Ok(());
                         }
                         self.consensus_bus
                             .last_published_consensus_num_hash()
                             .send_replace((number, hash));
-                        self.consensus_certs.lock().clear();
+                        self.consensus_votes.lock().prune_through(number);
                     }
                 } else {
                     self.consensus_bus.requested_missing_epoch().send_if_modified(|current| {
