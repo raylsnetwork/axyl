@@ -2,26 +2,44 @@
 //!
 //! reth 2.0 runs its own background tasks (transaction validation, pool sub-tasks, RPC) on a
 //! [`reth_tasks::Runtime`]. Our [`TaskManager`] does not see those tasks, so two things are
-//! done here:
+//! bridged here:
 //!
 //! - a panic in a critical reth task stops the node, like a panic in one of our critical tasks
-//!   ([`build_reth_runtime`])
-//! - the node shutdown shuts the reth runtime down as its last step, so reth tasks stop in order
-//!   ([`shutdown_reth_runtime`])
+//! - when our [`TaskManager`] shuts down, reth's shutdown signal fires, so those reth tasks stop
+//!   with it. This is what happened on reth 1.11, where they ran on our task manager.
+//!
+//! # What the shutdown signal stops, and what it does not
+//!
+//! reth has two ways to start work on a `Runtime`:
+//!
+//! - `spawn_task`, `spawn_critical_task`, `spawn_blocking_task` and the `*_with_signal` forms wrap
+//!   the future so it ends when the shutdown signal fires. Transaction validation, the pool
+//!   sub-tasks and the RPC tasks are started this way.
+//! - `spawn_blocking`, `spawn_blocking_named` and the worker pools do not look at the signal. Block
+//!   building (state root, prewarming, trie hashing) and storage use only these.
+//!
+//! So the signal can fire while the engine still drains its last blocks, which is the case on
+//! SIGTERM: the engine's task manager is dropped before the drain and the final flush. The
+//! tests below pin that plain blocking work still runs after the signal.
 
-use rayls_infrastructure_types::TaskManager;
+use rayls_infrastructure_types::{TaskKind, TaskManager};
 use reth_tasks::{Runtime, RuntimeBuilder, RuntimeConfig, TokioConfig};
 use std::time::Duration;
 use tracing::{debug, warn};
 
 /// Name of the task that watches reth's critical tasks.
 pub(crate) const RETH_RUNTIME_MONITOR_TASK: &str = "reth-runtime-monitor";
-/// How long the node shutdown waits for reth's graceful tasks. It runs after the final flush,
-/// so a task that does not end in time loses nothing.
-const RETH_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
+/// Name of the task that fires reth's shutdown signal on our shutdown.
+pub(crate) const RETH_RUNTIME_SHUTDOWN_TASK: &str = "reth-runtime-shutdown";
 
-/// Build the reth [`Runtime`] on the current tokio runtime and watch its critical tasks from
-/// `task_manager`.
+/// How long our shutdown waits for reth tasks that asked for a graceful shutdown.
+///
+/// Must stay below the task manager's phase stall bound (4s), or a slow reth task would make
+/// the ordered teardown escalate to a forced abort. None of the reth tasks we run asks for a
+/// graceful shutdown today, so the wait normally ends at once.
+const RETH_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Build the reth [`Runtime`] on the current tokio runtime and tie it to `task_manager`.
 ///
 /// MUST be called from within a tokio runtime.
 pub(crate) fn build_reth_runtime(task_manager: &TaskManager) -> eyre::Result<Runtime> {
@@ -34,7 +52,7 @@ pub(crate) fn build_reth_runtime(task_manager: &TaskManager) -> eyre::Result<Run
     Ok(runtime)
 }
 
-/// Make a panic in a critical reth task stop the node.
+/// Tie `runtime` to `task_manager`. See the module docs.
 fn bridge_reth_runtime(runtime: &Runtime, task_manager: &TaskManager) {
     let spawner = task_manager.get_spawner();
 
@@ -44,10 +62,11 @@ fn bridge_reth_runtime(runtime: &Runtime, task_manager: &TaskManager) {
         Some(reth_manager) => {
             spawner.spawn_critical_result_task(RETH_RUNTIME_MONITOR_TASK, async move {
                 match reth_manager.await {
-                    // reth's manager ended without a panic: its shutdown signal fired. In
-                    // normal operation only `shutdown_reth_runtime` does that, at the very
-                    // end. If it happens earlier, this critical task ends and the node stops,
-                    // which is intended: the reth tasks are gone.
+                    // reth's manager ended without a panic: its shutdown signal fired. Only
+                    // the shutdown bridge below does that, and by then this task is already
+                    // cancelled by the same shutdown. If the signal ever fires on its own,
+                    // this critical task ends and the node stops, which is intended: the
+                    // reth tasks are gone.
                     Ok(Ok(())) => Ok(()),
                     Ok(Err(panicked)) => Err(format!("critical reth task panicked: {panicked}")),
                     Err(join_err) => Err(format!("reth task manager stopped: {join_err}")),
@@ -61,27 +80,29 @@ fn bridge_reth_runtime(runtime: &Runtime, task_manager: &TaskManager) {
             );
         }
     }
-}
 
-/// Fire reth's shutdown signal and wait, up to a limit, for reth's graceful tasks to end.
-///
-/// This is called explicitly, as the last step of the node shutdown, after the engine has
-/// drained and the final flush is done. It is NOT tied to the shutdown signal or the drop of
-/// a [`TaskManager`]: the engine's manager is dropped early in the node shutdown, while the
-/// engine still executes its last blocks, and the state root work of those blocks runs on
-/// this runtime. reth ends a task at once when it is spawned after the signal.
-pub(crate) async fn shutdown_reth_runtime(runtime: &Runtime) {
+    // Shutdown bridge. `Drainable`, so it is not cancelled by the shutdown signal it waits
+    // for. The signal fires in the ordered drain of the task manager and when the manager is
+    // dropped; this task covers both.
+    let shutdown = task_manager.shutdown_subscriber();
     let runtime = runtime.clone();
-    // reth waits in a busy loop, keep it off the async workers
-    let finished = tokio::task::spawn_blocking(move || {
-        runtime.graceful_shutdown_with_timeout(RETH_SHUTDOWN_TIMEOUT)
-    })
-    .await;
-    match finished {
-        Ok(true) => debug!(target: "rayls::reth", "reth runtime shut down"),
-        Ok(false) => warn!(target: "rayls::reth", "reth runtime shutdown timed out"),
-        Err(err) => warn!(target: "rayls::reth", %err, "reth runtime shutdown task failed"),
-    }
+    spawner.spawn_classified_task(
+        RETH_RUNTIME_SHUTDOWN_TASK,
+        async move {
+            shutdown.await;
+            // reth waits in a busy loop, keep it off the async workers
+            let finished = tokio::task::spawn_blocking(move || {
+                runtime.graceful_shutdown_with_timeout(RETH_SHUTDOWN_TIMEOUT)
+            })
+            .await;
+            match finished {
+                Ok(true) => debug!(target: "rayls::reth", "reth runtime shut down"),
+                Ok(false) => warn!(target: "rayls::reth", "reth runtime shutdown timed out"),
+                Err(err) => warn!(target: "rayls::reth", %err, "reth runtime shutdown task failed"),
+            }
+        },
+        TaskKind::Drainable,
+    );
 }
 
 #[cfg(test)]
@@ -131,48 +152,113 @@ mod tests {
         assert!(res.is_err(), "join must keep waiting: {res:?}");
     }
 
-    /// The explicit shutdown reaches reth tasks: a task that listens to reth's shutdown signal
-    /// ends, and the call returns in time.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn explicit_shutdown_stops_reth_tasks() {
-        let task_manager = TaskManager::new("reth runtime shutdown test");
-        let runtime = build_reth_runtime(&task_manager).expect("runtime");
-
+    /// Start a reth task that reports when it ends through reth's shutdown signal.
+    fn signal_aware_task(runtime: &Runtime) -> tokio::sync::oneshot::Receiver<()> {
         let (stopped_tx, stopped_rx) = tokio::sync::oneshot::channel();
         runtime.spawn_critical_with_graceful_shutdown_signal("graceful", |shutdown| async move {
             let _guard = shutdown.await;
             let _ = stopped_tx.send(());
         });
+        stopped_rx
+    }
 
-        tokio::time::timeout(Duration::from_secs(10), shutdown_reth_runtime(&runtime))
+    /// Run plain blocking work on the runtime, the way block building does, and return its
+    /// result. Fails the test if the work does not finish.
+    async fn run_plain_blocking_work(runtime: &Runtime) -> u64 {
+        let handle = runtime.spawn_blocking_named("test-plain-work", || 21u64 * 2);
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            tokio::task::spawn_blocking(move || *handle.get()),
+        )
+        .await
+        .expect("plain blocking work must finish")
+        .expect("plain blocking work must not panic")
+    }
+
+    /// The ordered shutdown of our task manager reaches reth tasks, and the join returns in
+    /// time.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn task_manager_shutdown_stops_reth_tasks() {
+        let mut task_manager = TaskManager::new("reth runtime shutdown test");
+        let runtime = build_reth_runtime(&task_manager).expect("runtime");
+        task_manager.update_tasks();
+        let stopped = signal_aware_task(&runtime);
+
+        let shutdown = Notifier::new();
+        shutdown.notify();
+        tokio::time::timeout(Duration::from_secs(10), task_manager.join(shutdown))
             .await
-            .expect("shutdown must return");
+            .expect("join must return")
+            .expect("clean shutdown");
 
-        tokio::time::timeout(Duration::from_secs(1), stopped_rx)
+        tokio::time::timeout(Duration::from_secs(1), stopped)
             .await
             .expect("the reth task must see the shutdown signal")
             .expect("the reth task must end through its shutdown branch");
     }
 
-    /// Dropping the task manager must NOT shut the reth runtime down. On the node path the
-    /// engine's manager is dropped while the engine still drains its last blocks, and their
-    /// state root work runs on this runtime.
+    /// Dropping our task manager also reaches reth tasks. This is the path the node takes on
+    /// SIGTERM, where the engine's manager is dropped and never joined in drain mode.
     #[tokio::test(flavor = "multi_thread")]
-    async fn dropping_the_task_manager_keeps_the_reth_runtime_running() {
+    async fn dropping_the_task_manager_stops_reth_tasks() {
         let task_manager = TaskManager::new("reth runtime drop test");
         let runtime = build_reth_runtime(&task_manager).expect("runtime");
-        drop(task_manager);
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        let stopped = signal_aware_task(&runtime);
 
-        // a task spawned now still runs to its end
-        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        drop(task_manager);
+
+        tokio::time::timeout(Duration::from_secs(5), stopped)
+            .await
+            .expect("the reth task must see the shutdown signal")
+            .expect("the reth task must end through its shutdown branch");
+    }
+
+    /// The fact that makes the early signal safe: after reth's shutdown signal has fired, plain
+    /// blocking work on the runtime still runs to its end. Block building and storage use only
+    /// this kind of work, and on SIGTERM the engine drains its last blocks after the signal.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn plain_blocking_work_still_runs_after_the_shutdown_signal() {
+        let task_manager = TaskManager::new("reth runtime late work test");
+        let runtime = build_reth_runtime(&task_manager).expect("runtime");
+        let stopped = signal_aware_task(&runtime);
+
+        drop(task_manager);
+        tokio::time::timeout(Duration::from_secs(5), stopped)
+            .await
+            .expect("signal fired")
+            .expect("signal fired");
+
+        // the signal has fired: a signal-aware task spawned now ends without running
+        let (ran_tx, ran_rx) = tokio::sync::oneshot::channel::<()>();
         runtime.spawn_task(async move {
             tokio::time::sleep(Duration::from_millis(50)).await;
-            let _ = done_tx.send(());
+            let _ = ran_tx.send(());
         });
-        tokio::time::timeout(Duration::from_secs(2), done_rx)
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), ran_rx).await.expect("resolved").is_err(),
+            "a signal-aware task spawned after the signal must be cancelled"
+        );
+
+        // plain blocking work is not affected
+        assert_eq!(run_plain_blocking_work(&runtime).await, 42);
+    }
+
+    /// The crash path: after a critical reth task panicked, plain blocking work still runs. The
+    /// node then winds down in order and the engine drains its last blocks on this runtime.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn plain_blocking_work_still_runs_after_a_critical_reth_panic() {
+        let mut task_manager = TaskManager::new("reth runtime panic late work test");
+        let runtime = build_reth_runtime(&task_manager).expect("runtime");
+        task_manager.update_tasks();
+
+        runtime.spawn_critical_task("boom", async {
+            panic!("reth task failure");
+        });
+        let res = tokio::time::timeout(Duration::from_secs(10), task_manager.join(Notifier::new()))
             .await
-            .expect("task must finish")
-            .expect("task must not be cancelled by a shutdown signal");
+            .expect("join must return after the reth task panic");
+        assert!(res.is_err(), "the panic must fail the join");
+
+        assert_eq!(run_plain_blocking_work(&runtime).await, 42);
     }
 }

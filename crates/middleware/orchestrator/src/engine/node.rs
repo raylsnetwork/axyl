@@ -183,12 +183,6 @@ impl ExecutionNode {
         guard.get_reth_env()
     }
 
-    /// Shut reth's task runtime down. Last step of the node shutdown, after the final flush.
-    pub async fn shutdown_reth_runtime(&self) {
-        let guard = self.internal.read().await;
-        guard.get_reth_env().shutdown_reth_runtime().await;
-    }
-
     /// Flush all pending blocks to disk synchronously.
     pub async fn flush_persistence(&self) -> eyre::Result<()> {
         let guard = self.internal.read().await;

@@ -645,13 +645,6 @@ where
             Err(_) => error!(target: "engine", "shutdown engine flush panicked"),
         }
 
-        // The engine has drained and both flushes are done, so nothing executes any more.
-        // Only now stop reth's own tasks (pool validation, pool sub-tasks, RPC). Block building
-        // and persistence use the same reth runtime, so this must not run earlier.
-        if AssertUnwindSafe(engine.shutdown_reth_runtime()).catch_unwind().await.is_err() {
-            error!(target: "engine", "reth runtime shutdown panicked");
-        }
-
         metrics_shutdown.notify();
 
         // Reap the node-level tasks. On SIGTERM the `node_join` above was dropped (epochs
