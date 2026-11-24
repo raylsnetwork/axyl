@@ -37,8 +37,8 @@ pub struct RethEnv {
     /// reth's own task runtime, for the reth APIs that take a `reth_tasks::Runtime` (pool
     /// validation, pool maintenance, RPC).
     ///
-    /// TODO(#414): its shutdown and critical-task signals are not bridged to our
-    /// `TaskManager` yet.
+    /// Tied to our `TaskManager`: a panic in a critical reth task stops the node, and our
+    /// shutdown fires reth's shutdown signal. See `reth_env::reth_runtime`.
     pub(crate) reth_runtime: reth_tasks::Runtime,
     /// Handle for sending blocks to reth's background persistence service.
     pub(crate) persistence_handle: RethPersistenceHandle<EthPrimitives>,

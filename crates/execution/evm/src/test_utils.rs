@@ -102,11 +102,7 @@ impl RethEnv {
         let rewards_counter = rewards.unwrap_or_default();
         let evm_config = RaylsEvmConfig::new(rayls_chain_spec.clone(), rewards_counter.clone());
         let task_spawner = task_manager.get_spawner();
-        let runtime =
-            reth_tasks::RuntimeBuilder::new(reth_tasks::RuntimeConfig::default().with_tokio(
-                reth_tasks::TokioConfig::existing_handle(tokio::runtime::Handle::current()),
-            ))
-            .build()?;
+        let runtime = crate::reth_env::reth_runtime::build_reth_runtime(task_manager)?;
         let provider_factory = Self::init_provider_factory(
             &node_config,
             rayls_chain_spec,
