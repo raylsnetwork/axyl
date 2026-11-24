@@ -725,15 +725,15 @@ async fn catch_up_consensus_from_to<DB: Database>(
                 "catch_up_from_to: streaming progress"
             );
         }
-        // Gate streaming on execution so we never outrun it and miss a fork. Bounded so a
-        // target that never executes errors out instead of parking forever; the error is
-        // surfaced to retry.
+        // Gate streaming on execution so we never outrun it and miss a fork. Bounded so a target
+        // that never executes errors out instead of parking forever; the error is surfaced to
+        // retry.
         if let Err(wait_err) = consensus_bus
             .wait_for_execution_bounded(base_execution_block, EXECUTION_STALL_TIMEOUT)
             .await
         {
-            // A genuine `Forked` recurs and needs an operator DB restore: catch-up cannot
-            // rebuild forked committed history.
+            // A genuine `Forked` recurs and needs an operator DB restore: catch-up cannot rebuild
+            // forked committed history.
             let recent = consensus_bus.recently_executed_blocks().borrow();
             let recent_oldest = recent.oldest_block_number();
             let recent_latest = recent.latest_block_num_hash();

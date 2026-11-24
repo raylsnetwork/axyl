@@ -521,8 +521,8 @@ fn chained_header(
     ConsensusHeader { parent_hash, sub_dag, number, extra: B256::default() }
 }
 
-/// Like [`chained_header`] but with a real quorum-signed `leader`, so the by-number BLS check in
-/// catch-up accepts it. One signed leader is reused across a chain: only `parent_hash` and `number`
+/// Like [`chained_header`] but with a real quorum-signed `leader`, so the walk's BLS check accepts
+/// it. One signed leader is reused across a chain: only `parent_hash` and `number`
 /// vary the digest, which is all the digest-chain guard checks.
 fn signed_chained_header(number: u64, parent_hash: B256, leader: &Certificate) -> ConsensusHeader {
     let sub_dag =
