@@ -203,10 +203,11 @@ pub fn spawn_subscriber<DB: Database>(
 /// canonical row at `parent_hash`. A parent in an earlier epoch, or the genesis parent, starts
 /// from fresh scores, as Bullshark does at the first commit of an epoch.
 ///
-/// A same-epoch parent that is simply absent locally (an unusual DB state, e.g. the consensus DB
-/// cleared while the execution DB is ahead) is indistinguishable from the earlier-epoch case and
-/// also starts fresh, which gives the wrong scores for the rest of the window. That mid-window gap
-/// is logged at `error!` so an operator can resync, instead of passing silently.
+/// A same-epoch parent that this node cannot read back by hash (an unusual DB state) also
+/// starts fresh, because the node cannot tell which epoch it was in, and that gives the wrong
+/// scores for the rest of the window. A missing parent other than the genesis parent (the
+/// default header's digest, which no stored row has) is logged at `error!` so an operator can
+/// resync, instead of passing silently.
 fn catchup_reputation_score<DB: ConsensusStore>(
     db: &DB,
     committee: &Committee,
@@ -215,7 +216,7 @@ fn catchup_reputation_score<DB: ConsensusStore>(
     num_sub_dags_per_schedule: u32,
 ) -> ReputationScores {
     let parent = db.get_canonical_consensus_by_hash(parent_hash);
-    if parent.is_none() && parent_hash != B256::default() {
+    if parent.is_none() && parent_hash != ConsensusHeader::default().digest() {
         error!(
             target: "subscriber",
             ?parent_hash,
