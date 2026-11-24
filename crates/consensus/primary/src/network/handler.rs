@@ -105,7 +105,7 @@ impl BehindTracker {
 /// signs invented digests pushes out its own older results, never another signer's, so it cannot
 /// wipe the honest partial count for the real header. More than one per signer, so a signer that
 /// has moved on to the next header still counts toward the previous one while that quorum forms.
-/// Holds at most that many results per committee key.
+/// Holds at most that many results per key it has counted, keys of earlier committees included.
 #[derive(Debug, Default)]
 struct ConsensusVotes {
     by_signer: HashMap<BlsPublicKey, VecDeque<(B256, ConsensusResult)>>,
@@ -508,9 +508,17 @@ where
                             self.consensus_votes.lock().clear();
                             return Ok(());
                         }
-                        self.consensus_bus
-                            .last_published_consensus_num_hash()
-                            .send_replace((number, hash));
+                        // Each gossip message runs in its own task, so a quorum for a lower header
+                        // can get here after a higher one has been published: never go back.
+                        self.consensus_bus.last_published_consensus_num_hash().send_if_modified(
+                            |tip| {
+                                let higher = number > tip.0;
+                                if higher {
+                                    *tip = (number, hash);
+                                }
+                                higher
+                            },
+                        );
                         self.consensus_votes.lock().prune_through(number);
                     }
                 } else {
