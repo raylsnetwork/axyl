@@ -381,8 +381,7 @@ fn run_eip3009_call(
     // The precompile code is seeded in the database (see [`seed_precompile_code`]),
     // matching what `apply_pre_execution_changes` does via the
     // `Erc20PrecompileBytecode` migration in production.
-    let mut state =
-        State::builder().with_database(db).with_bundle_update().build();
+    let mut state = State::builder().with_database(db).with_bundle_update().build();
 
     let env = EvmEnv::new(
         CfgEnv::new().with_spec_and_mainnet_gas_params(SpecId::CANCUN),
@@ -754,8 +753,7 @@ fn full_drain_of_unnormalised_zero_code_hash_account_is_rejected() {
     );
     let db = UnnormalisedZeroCodeHashDb { inner };
 
-    let mut state =
-        State::builder().with_database(db).with_bundle_update().build();
+    let mut state = State::builder().with_database(db).with_bundle_update().build();
 
     let env = EvmEnv::new(
         CfgEnv::new().with_spec_and_mainnet_gas_params(SpecId::CANCUN),
@@ -853,8 +851,7 @@ fn replay_full_drain(guard_active: bool, base_balance: Option<U256>) -> DrainRun
     // Match the production Erc20PrecompileBytecode migration.
     seed_precompile_code(&mut db);
 
-    let mut state =
-        State::builder().with_database(db).with_bundle_update().build();
+    let mut state = State::builder().with_database(db).with_bundle_update().build();
 
     // Guard activates at the block being executed (active) or one block later (pre-fork).
     let guard_block = if guard_active { BLOCK_NUMBER } else { BLOCK_NUMBER + 1 };
@@ -1109,8 +1106,7 @@ fn self_called_transfer_with_authorization_drain_nonce0_allowed() {
     // Precompile account seeded as empty (see `drain` setup).
     db.insert_account_info(ERC20_PRECOMPILE_ADDRESS, AccountInfo::default());
 
-    let mut state =
-        State::builder().with_database(db).with_bundle_update().build();
+    let mut state = State::builder().with_database(db).with_bundle_update().build();
 
     // Guard active at this block.
     let chain_spec = Arc::new(
@@ -1175,8 +1171,7 @@ fn relayer_submitted_transfer_with_authorization_drain_nonce0_rejected() {
     );
     db.insert_account_info(ERC20_PRECOMPILE_ADDRESS, AccountInfo::default());
 
-    let mut state =
-        State::builder().with_database(db).with_bundle_update().build();
+    let mut state = State::builder().with_database(db).with_bundle_update().build();
 
     let chain_spec = Arc::new(
         RaylsChainSpec::builder(test_chain_spec_arc())

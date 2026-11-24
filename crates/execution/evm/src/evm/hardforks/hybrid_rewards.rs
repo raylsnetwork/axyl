@@ -38,9 +38,7 @@
 
 use rayls_infrastructure_config::CONSENSUS_REGISTRY_ADDRESS;
 use reth_errors::BlockExecutionError;
-use reth_revm::{
-    bytecode::Bytecode, primitives::AddressMap, state::Account as RevmAccount,
-};
+use reth_revm::{bytecode::Bytecode, primitives::AddressMap, state::Account as RevmAccount};
 
 use super::account_with_code;
 

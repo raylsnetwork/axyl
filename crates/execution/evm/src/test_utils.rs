@@ -36,9 +36,8 @@ use rayls_middleware_rewards::RewardsCounter;
 use reth_chainspec::{ChainSpec as RethChainSpec, EthChainSpec};
 use reth_engine_tree::tree::{precompile_cache::PrecompileCacheMap, PayloadProcessor};
 use reth_evm::{execute::Executor as _, ConfigureEvm, EvmFactory as _};
-use reth_primitives_traits::{crypto::secp256k1::sign_message, Account};
 pub use reth_primitives_traits::proofs::calculate_withdrawals_root;
-use reth_primitives_traits::SignerRecoverable;
+use reth_primitives_traits::{crypto::secp256k1::sign_message, Account, SignerRecoverable};
 use reth_provider::{AccountReader as _, StateProviderBox, StateProviderFactory};
 use reth_revm::{database::StateProviderDatabase, db::BundleState, State};
 use reth_transaction_pool::{EthPoolTransaction, EthPooledTransaction, PoolTransaction};
@@ -103,12 +102,11 @@ impl RethEnv {
         let rewards_counter = rewards.unwrap_or_default();
         let evm_config = RaylsEvmConfig::new(rayls_chain_spec.clone(), rewards_counter.clone());
         let task_spawner = task_manager.get_spawner();
-        let runtime = reth_tasks::RuntimeBuilder::new(
-            reth_tasks::RuntimeConfig::default().with_tokio(
+        let runtime =
+            reth_tasks::RuntimeBuilder::new(reth_tasks::RuntimeConfig::default().with_tokio(
                 reth_tasks::TokioConfig::existing_handle(tokio::runtime::Handle::current()),
-            ),
-        )
-        .build()?;
+            ))
+            .build()?;
         let provider_factory = Self::init_provider_factory(
             &node_config,
             rayls_chain_spec,
