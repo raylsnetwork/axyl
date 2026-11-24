@@ -13,6 +13,7 @@ pub mod genesis;
 pub mod init;
 pub mod persistence;
 pub mod registry;
+pub(crate) mod reth_runtime;
 pub mod rpc;
 #[cfg(feature = "archive-replay")]
 pub mod solver;

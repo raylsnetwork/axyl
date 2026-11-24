@@ -140,11 +140,7 @@ impl RethEnv {
         let chain_spec = Arc::new(builder.build());
         let evm_config = RaylsEvmConfig::new(chain_spec.clone(), rewards_counter.clone());
         let task_spawner = task_manager.get_spawner();
-        let runtime =
-            reth_tasks::RuntimeBuilder::new(reth_tasks::RuntimeConfig::default().with_tokio(
-                reth_tasks::TokioConfig::existing_handle(tokio::runtime::Handle::current()),
-            ))
-            .build()?;
+        let runtime = crate::reth_env::reth_runtime::build_reth_runtime(task_manager)?;
         let provider_factory = Self::init_provider_factory(
             &node_config,
             chain_spec,
@@ -466,15 +462,10 @@ impl RethEnv {
 
         // non-critical: completing Ok must not trigger TaskManager shutdown
         let (tx, rx) = oneshot::channel();
-        task_spawner.spawn_reth_task(
-            "reth-blocking-task",
-            Box::pin(async move {
-                let (_, result) = pipeline.run_as_fut(Some(unwind_target)).await;
-                let _ = tx.send(result);
-            }),
-            false,
-            true,
-        );
+        task_spawner.spawn_blocking_future_task("reth-blocking-task", async move {
+            let (_, result) = pipeline.run_as_fut(Some(unwind_target)).await;
+            let _ = tx.send(result);
+        });
 
         rx.await?.inspect_err(|err| {
             error!(target: "rayls::reth", unwind_target = %unwind_target, %err, "Pipeline unwind failed")
