@@ -721,11 +721,13 @@ pub(crate) mod pre_execution {
     /// `batch_index`, against a fresh empty [`State`], and return the post-state for assertions.
     ///
     /// Boots no node. `batch_index > 0` makes `first_batch()` false, the case a one-shot hardfork
-    /// migration must still apply on.
+    /// migration must still apply on. `migrations_applied` is the ctx flag that block building
+    /// sets after it applied the migrations itself.
     pub(crate) fn run_pre_execution(
         spec: RaylsChainSpec,
         block_number: u64,
         batch_index: usize,
+        migrations_applied: bool,
     ) -> State<EmptyDBTyped<core::convert::Infallible>> {
         let mut state = State::builder()
             .with_database(EmptyDBTyped::<core::convert::Infallible>::new())
@@ -751,6 +753,7 @@ pub(crate) mod pre_execution {
             difficulty: U256::from(batch_index << 16),
             rewards_counter: RewardsCounter::default(),
             close_epoch_tally: None,
+            migrations_applied,
         };
 
         let mut executor = RaylsBlockExecutor::new(evm, ctx, spec, RethReceiptBuilder::default());

@@ -1416,6 +1416,56 @@ async fn test_close_epochs_with_dynamic_committee() -> eyre::Result<()> {
     Ok(())
 }
 
+/// A one-shot hardfork migration runs at its activation block for every batch index.
+///
+/// Each batch of a consensus output becomes its own block, so the activation block can be a
+/// block that is not the first batch of its output. Some pre-execution system calls only run on
+/// the first batch. The migration must not be tied to them: a skipped migration leaves later
+/// execution running against un-migrated state, and the node diverges.
+#[tokio::test]
+async fn migration_applies_when_activation_block_is_not_first_batch() -> eyre::Result<()> {
+    use crate::{chainspec::RaylsChainSpec, native_erc20::ERC20_PRECOMPILE_ADDRESS};
+    use reth_provider::StateProvider as _;
+
+    const ACTIVATION_BLOCK: u64 = 2;
+
+    let chain = rayls_infrastructure_types::test_chain_spec_arc();
+    let rayls_chain_spec = Arc::new(
+        RaylsChainSpec::builder(chain.clone()).erc20_precompile_bytecode(ACTIVATION_BLOCK).build(),
+    );
+    let tmp_dir = TempDir::new()?;
+    let task_manager = TaskManager::new("Test Task Manager");
+    let reth_env = RethEnv::new_for_temp_chain_with_rayls_spec(
+        chain.clone(),
+        rayls_chain_spec,
+        tmp_dir.path(),
+        &task_manager,
+        None,
+    )
+    .await?;
+
+    // block 1: before the activation block, the precompile account has no code
+    let mut co = consensus_output_for_tests(2, 0, 1);
+    co.close_epoch = false;
+    let payload = RLPayload::new_for_test(chain.sealed_genesis_header(), &co);
+    let block1 = execute_payload_and_update_canonical_chain(&reth_env, payload, vec![]).await?;
+    assert!(
+        reth_env.latest()?.account_code(&ERC20_PRECOMPILE_ADDRESS)?.is_none(),
+        "no bytecode before the activation block"
+    );
+
+    // block 2: the activation block, built as the second batch of its output
+    let mut payload = RLPayload::new_for_test(block1.recovered_block.clone_sealed_header(), &co);
+    payload.batch_index = 1;
+    execute_payload_and_update_canonical_chain(&reth_env, payload, vec![]).await?;
+    assert!(
+        reth_env.latest()?.account_code(&ERC20_PRECOMPILE_ADDRESS)?.is_some(),
+        "the Erc20PrecompileBytecode migration must install bytecode on a non-first batch"
+    );
+
+    Ok(())
+}
+
 /// Fork-boundary test for the `HybridRewards` hardfork.
 ///
 /// With a synthetic schedule activating at `FORK_BLOCK`, drive epoch closes on both sides in a
@@ -1535,6 +1585,16 @@ async fn test_hybrid_rewards_fork_boundary() -> eyre::Result<()> {
     let co = consensus_output_for_tests(2, epoch, 2);
     let payload = RLPayload::new_for_test(header, &co);
     let block2 = execute_payload_and_update_canonical_chain(&reth_env, payload, vec![]).await?;
+    // Revert entries per block in the bundle. A normal block has one. An epoch-close block
+    // has two, the second one empty: the transitions are merged once for the epoch close and
+    // once at the end of block building. This shape is part of what is persisted, so it must
+    // not change without a decision.
+    assert_eq!(block1.execution_output.state.reverts.len(), 1, "normal block");
+    assert_eq!(block2.execution_output.state.reverts.len(), 2, "epoch-close block");
+    assert!(
+        block2.execution_output.state.reverts.last().is_some_and(|r| r.is_empty()),
+        "the extra revert entry of an epoch-close block is empty"
+    );
     header = block2.recovered_block.clone_sealed_header();
     epoch += 1;
     assert_eq!(

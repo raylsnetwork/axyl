@@ -19,9 +19,11 @@ use reth_errors::BlockExecutionError;
 use reth_evm::OnStateHook;
 use reth_revm::{
     bytecode::Bytecode,
-    state::{Account as RevmAccount, AccountInfo, AccountStatus},
+    db::StorageWithOriginalValues,
+    state::{Account as RevmAccount, AccountInfo, AccountStatus, EvmState},
+    State,
 };
-use tracing::info;
+use tracing::{info, warn};
 
 /// Build a [`RevmAccount`] holding `bytecode` with `AccountStatus::Touched`.
 pub(super) fn account_with_code(bytecode: &[u8]) -> RevmAccount {
@@ -34,28 +36,153 @@ pub(super) fn account_with_code(bytecode: &[u8]) -> RevmAccount {
     }
 }
 
-/// Collect newly activated one-shot migrations and apply them to the database.
+/// Collect newly activated one-shot migrations and apply them to revm's [`State`].
+///
+/// This is the path block building uses. It decides what is persisted and hashed into the state
+/// root, so it must not change.
 ///
 /// Each migration pre-loads its accounts into the state cache, copies their real `AccountInfo`
 /// (keeping new bytecode for code-replacement accounts), notifies the state hook, and applies the
 /// change through `CacheAccount::change()` rather than `State::commit()`: commit runs the EIP-161
 /// state-clear logic (`apply_account_state`), which panics when a `Loaded` cache account is
 /// committed with empty `AccountInfo`, and hardfork migrations are not transaction outputs.
+/// `change()` also keeps an account that is still empty after the migration but got storage
+/// (testnet, AdminTransfer, RLS proxy), where `commit` would destroy it.
 ///
-/// TODO(#413): temporary. alloy-evm 0.30 hands the block executor a generic `StateDB`
-/// (`Database + DatabaseCommit`), not `&mut State<DB>`, so the `State`-only calls described
-/// above cannot be made from here. Until #413 moves this call into the block-building code,
-/// the migration reads through `Database::basic` and writes through `DatabaseCommit::commit`.
-/// `commit` runs the EIP-161 branch: an account that is still empty after the merge (nonce 0,
-/// balance 0, no code) is destroyed and its migration storage is dropped, where `change()`
-/// kept it. This gives a different state for testnet block 560,539 (AdminTransfer).
-pub(crate) fn apply_activated_migrations<DB: alloy_evm::block::StateDB>(
+/// The block executor cannot call this: alloy-evm 0.30 gives it a generic `StateDB`, not a
+/// `State`. `RethEnv::build_block_from_batch_payload` calls it before it creates the executor.
+pub(crate) fn apply_activated_migrations<DB: alloy_evm::Database>(
+    spec: &impl RaylsHardforks,
+    db: &mut State<DB>,
+    state_hook: &mut Option<Box<dyn OnStateHook>>,
+    receipt_count: usize,
+    parent_number: u64,
+    block_number: u64,
+) -> Result<(), BlockExecutionError>
+where
+    DB::Error: core::fmt::Display,
+{
+    run_activated_migrations(
+        spec,
+        db,
+        state_hook,
+        receipt_count,
+        parent_number,
+        block_number,
+        |db, address| {
+            db.load_cache_account(address)
+                .map(|cached| cached.account_info())
+                .map_err(|e| e.to_string())
+        },
+        write_through_cache_account,
+    )
+}
+
+/// Collect newly activated one-shot migrations and apply them through
+/// [`DatabaseCommit::commit`].
+///
+/// This is the fallback for callers that run the block executor without our block-building
+/// code and only have a generic `StateDB`: reth's RPC trace and simulate calls. Their result is
+/// returned to the caller and never persisted.
+///
+/// It is NOT equal to [`apply_activated_migrations`] in one case: `commit` runs the EIP-161
+/// state clear, so an account that is still empty after the migration (nonce 0, balance 0, no
+/// code) is destroyed together with the storage the migration gave it. Never use this path to
+/// build a block.
+pub(crate) fn apply_activated_migrations_with_commit<DB: alloy_evm::block::StateDB>(
     spec: &impl RaylsHardforks,
     db: &mut DB,
     state_hook: &mut Option<Box<dyn OnStateHook>>,
     receipt_count: usize,
     parent_number: u64,
     block_number: u64,
+) -> Result<(), BlockExecutionError> {
+    run_activated_migrations(
+        spec,
+        db,
+        state_hook,
+        receipt_count,
+        parent_number,
+        block_number,
+        |db, address| db.basic(address).map_err(|e| e.to_string()),
+        |db, state| {
+            // `commit` silently skips an account that is not marked as touched.
+            debug_assert!(
+                state.values().all(|account| account.is_touched()),
+                "every migration account must be Touched, or commit drops it"
+            );
+            // This is the one case where `commit` does not give the state of the exact path.
+            // It is fine for a trace. It is a bug if a block built this way is persisted.
+            for (address, account) in &state {
+                if account.info.is_empty() && account.storage.values().any(|slot| slot.is_changed())
+                {
+                    warn!(
+                        target: "engine",
+                        %address,
+                        block_number,
+                        "hardfork migration applied through commit drops an empty account \
+                         with storage; this result must not be persisted"
+                    );
+                }
+            }
+            db.commit(state);
+        },
+    )
+}
+
+/// Write a migration to [`State`] without `State::commit()`: register the new bytecode, apply
+/// each account through `CacheAccount::change()` and record the transitions.
+fn write_through_cache_account<DB: alloy_evm::Database>(db: &mut State<DB>, state: EvmState) {
+    // Register new bytecodes in the EVM contracts cache so they can be executed.
+    for (_, account) in state.iter() {
+        if let Some(code) = &account.info.code {
+            db.cache.contracts.insert(account.info.code_hash, code.clone());
+        }
+    }
+
+    // Apply state changes by calling CacheAccount::change() directly.
+    // This bypasses State::commit() / apply_account_state() and its EIP-161 assertions,
+    // while still correctly transitioning cache-account statuses and recording transitions
+    // in the transition state (so changes are persisted to the DB at block finalization).
+    let mut transitions = Vec::with_capacity(state.len());
+    for (address, account) in state {
+        let storage_changes: StorageWithOriginalValues = account
+            .storage
+            .into_iter()
+            .filter(|(_, slot)| slot.is_changed())
+            .map(|(key, slot)| (key, slot.into()))
+            .collect();
+
+        let cache_account = db
+            .cache
+            .accounts
+            .get_mut(&address)
+            .expect("account should be in cache after pre-loading");
+
+        let transition = cache_account.change(account.info, storage_changes);
+        transitions.push((address, transition));
+    }
+
+    // Register transitions so block finalization writes all changes to the DB.
+    db.apply_transition(transitions.into_iter());
+}
+
+/// Shared driver of both entry points: pick the migrations that activate at `block_number`,
+/// build their state, fill in the on-chain account info, notify the state hook, and hand the
+/// result to `write`.
+///
+/// `load` reads the current account info and `write` stores the migration. They are the only
+/// two steps that differ between revm's `State` and a generic `StateDB`.
+#[allow(clippy::too_many_arguments)]
+fn run_activated_migrations<DB: alloy_evm::Database>(
+    spec: &impl RaylsHardforks,
+    db: &mut DB,
+    state_hook: &mut Option<Box<dyn OnStateHook>>,
+    receipt_count: usize,
+    parent_number: u64,
+    block_number: u64,
+    load: impl Fn(&mut DB, alloy::primitives::Address) -> Result<Option<AccountInfo>, String>,
+    write: impl Fn(&mut DB, EvmState),
 ) -> Result<(), BlockExecutionError> {
     let newly_activated_forks = spec.newly_activated_forks(parent_number, block_number);
 
@@ -153,12 +280,12 @@ pub(crate) fn apply_activated_migrations<DB: alloy_evm::block::StateDB>(
         // (e.g. the DelegationPool/RewardDistributor proxy migration) are discarded.
         // We still carry over nonce and balance from the on-chain account.
         for (address, account) in state.iter_mut() {
-            let cached_info = db.basic(*address).map_err(|e| {
+            let on_chain_info = load(db, *address).map_err(|e| {
                 BlockExecutionError::msg(format!(
                     "Hardfork {fork:?}: failed to load account {address} into cache: {e}"
                 ))
             })?;
-            if let Some(info) = cached_info {
+            if let Some(info) = on_chain_info {
                 if account.info.code.is_some() {
                     // Hardfork is replacing the bytecode - keep the new code
                     // but carry over nonce/balance from the on-chain account.
@@ -174,9 +301,7 @@ pub(crate) fn apply_activated_migrations<DB: alloy_evm::block::StateDB>(
             hook.on_state(StateChangeSource::Transaction(receipt_count), &state);
         }
 
-        // TODO(#413): temporary, see the function docs. Only `commit` is reachable through
-        // `StateDB`.
-        db.commit(state);
+        write(db, state);
 
         info!(target: "engine", ?fork, "Hardfork migration applied successfully");
     }
@@ -259,6 +384,125 @@ mod tests {
             !fa.account.as_ref().unwrap().storage.is_empty(),
             "FA should have storage changes from role transfers"
         );
+    }
+
+    /// The RLS proxy gets only a storage slot from AdminTransfer (no code, no balance). On
+    /// testnet the proxy account did not exist at the activation block (560,539), so after the
+    /// migration it is an EIP-161-empty account that holds storage.
+    ///
+    /// The migration must keep that account and its slot. `State::commit` would destroy it
+    /// (state clear), which changes the state root of that block. This is why the migration
+    /// goes through `CacheAccount::change()` and must be called with revm's `State`.
+    #[test]
+    fn admin_transfer_keeps_empty_account_that_only_gets_storage() {
+        use reth_revm::db::{states::bundle_state::BundleRetention, AccountStatus as DbStatus};
+
+        const RLS_TOKEN: Address = address!("07e17e17e17e17e17e17e17e17e17e17e17e17ea");
+        let spec = RaylsChainHardforks::for_network(RaylsNetwork::Testnet);
+        let block = testnet_activation_block(&spec, RaylsHardFork::AdminTransfer);
+        // empty database: the RLS proxy account does not exist before the migration
+        let mut db = build_state();
+        let mut hook: Option<Box<dyn reth_evm::OnStateHook>> = None;
+
+        apply_activated_migrations(&spec, &mut db, &mut hook, 0, block - 1, block)
+            .expect("migration should succeed");
+
+        // cache: the account exists, is empty, and holds the implementation slot
+        let cached = db.cache.accounts.get(&RLS_TOKEN).expect("RLS proxy is in the cache");
+        let account = cached.account.as_ref().expect("RLS proxy account must be kept");
+        assert!(account.info.is_empty(), "the proxy has no code, nonce or balance here");
+        assert_ne!(
+            account.storage.get(&ERC1967_IMPL_SLOT).copied().unwrap_or_default(),
+            U256::ZERO,
+            "the implementation slot must be set"
+        );
+
+        // bundle: this is what is written to the database and hashed into the state root
+        db.merge_transitions(BundleRetention::Reverts);
+        let bundled = db.bundle_state.state.get(&RLS_TOKEN).expect("RLS proxy is in the bundle");
+        assert!(bundled.info.is_some(), "the empty account must be written, not destroyed");
+        assert_ne!(bundled.status, DbStatus::Destroyed);
+        assert_ne!(
+            bundled.storage.get(&ERC1967_IMPL_SLOT).map(|s| s.present_value).unwrap_or_default(),
+            U256::ZERO,
+            "the implementation slot must reach the bundle"
+        );
+    }
+
+    /// The commit fallback (RPC trace and simulate) gives the same accounts as the `State`
+    /// path, except for the one case it is documented not to: the empty account that only gets
+    /// storage is destroyed by the EIP-161 state clear in `commit`. This test pins both facts,
+    /// so the fallback is never taken for an equal replacement of the `State` path.
+    #[test]
+    fn commit_fallback_matches_state_path_except_for_the_empty_storage_account() {
+        use reth_revm::db::states::bundle_state::BundleRetention;
+
+        const RLS_TOKEN: Address = address!("07e17e17e17e17e17e17e17e17e17e17e17e17ea");
+        let spec = RaylsChainHardforks::for_network(RaylsNetwork::Testnet);
+        let block = testnet_activation_block(&spec, RaylsHardFork::AdminTransfer);
+        let mut hook: Option<Box<dyn reth_evm::OnStateHook>> = None;
+
+        let mut exact = build_state();
+        apply_activated_migrations(&spec, &mut exact, &mut hook, 0, block - 1, block)
+            .expect("migration should succeed");
+        exact.merge_transitions(BundleRetention::Reverts);
+
+        let mut fallback = build_state();
+        apply_activated_migrations_with_commit(
+            &spec,
+            &mut fallback,
+            &mut hook,
+            0,
+            block - 1,
+            block,
+        )
+        .expect("migration should succeed");
+        fallback.merge_transitions(BundleRetention::Reverts);
+
+        let mut differing: Vec<Address> = exact
+            .bundle_state
+            .state
+            .iter()
+            .filter(|(address, account)| {
+                !fallback
+                    .bundle_state
+                    .state
+                    .get(*address)
+                    .is_some_and(|f| f.info == account.info && f.storage == account.storage)
+            })
+            .map(|(address, _)| *address)
+            .collect();
+        differing.sort();
+        assert_eq!(differing, vec![RLS_TOKEN], "only the RLS proxy may differ");
+
+        let kept = exact.bundle_state.state.get(&RLS_TOKEN).expect("State path keeps the proxy");
+        assert!(kept.info.is_some());
+        let dropped = fallback.bundle_state.state.get(&RLS_TOKEN);
+        assert!(
+            dropped.is_none_or(|account| account.info.is_none()),
+            "commit destroys the empty account"
+        );
+    }
+
+    /// A migrated contract must be runnable right away: the EVM reads code through
+    /// `Database::basic` and `Database::code_by_hash`, so both must see the new bytecode before
+    /// the block is merged.
+    #[test]
+    fn migrated_code_is_readable_in_the_same_block() {
+        use reth_revm::Database as _;
+
+        let spec = RaylsChainHardforks::for_network(RaylsNetwork::Testnet);
+        let block = testnet_activation_block(&spec, RaylsHardFork::AdminTransfer);
+        let mut db = build_state();
+        let mut hook: Option<Box<dyn reth_evm::OnStateHook>> = None;
+
+        apply_activated_migrations(&spec, &mut db, &mut hook, 0, block - 1, block)
+            .expect("migration should succeed");
+
+        let info = db.basic(DELEGATION_POOL_IMPL).expect("read").expect("impl account exists");
+        assert!(!info.is_empty_code_hash(), "impl must have a code hash");
+        let code = db.code_by_hash(info.code_hash).expect("read");
+        assert!(!code.is_empty(), "new bytecode must be readable by hash in the same block");
     }
 
     #[test]

@@ -1,6 +1,6 @@
 use crate::{
     error::{RaylsRethError, RaylsRethResult},
-    evm::RaylsEvmConfig,
+    evm::{apply_activated_migrations, RaylsEvmConfig},
     reth_env::{
         types::reth_recover_raw_transactions, NonceTooHighDetail, RethEnv, SparseRootFn,
         TxValidationCounts,
@@ -214,22 +214,46 @@ impl RethEnv {
             }
         };
 
+        // split the Tier 1 setup: the state hook is used by the hardfork migrations first and
+        // then handed to the executor
+        let (mut state_hook, sparse_root_fn) = match sparse_setup {
+            Some((state_hook, sparse_root_fn)) => (Some(state_hook), Some(sparse_root_fn)),
+            None => (None, None),
+        };
+
+        // Apply one-shot hardfork state migrations that activate at this block. This runs
+        // here and not in the block executor, because the migrations need revm's `State`
+        // (`CacheAccount::change` + `apply_transition`) and the executor only sees a generic
+        // `StateDB` (alloy-evm 0.30). It must stay before the first system call and the first
+        // transaction.
+        let block_number = parent_header.number + 1;
+        apply_activated_migrations(
+            self.evm_config.chain_spec().as_ref(),
+            &mut db,
+            &mut state_hook,
+            0,
+            parent_header.number,
+            block_number,
+        )
+        .inspect_err(|err| {
+            warn!(target: "engine", %err, "failed to apply hardfork migrations");
+        })?;
+
         // NOTE: gas fix in inspector gated by PrecompileGasFix hardfork
         let evm_env = self.evm_config.next_evm_env(&parent_header, &payload)?;
         let evm = self.evm_config.evm_factory.create_evm_with_native_erc20_only(&mut db, evm_env);
-        let ctx = self.evm_config.context_for_next_block(&parent_header, payload)?;
+        let mut ctx = self.evm_config.context_for_next_block(&parent_header, payload)?;
+        // applied above on `State`; the executor must not apply them a second time
+        ctx.migrations_applied = true;
         let ctx_for_assembler = ctx.clone();
         let close_epoch_block = ctx.close_epoch.is_some();
         let mut builder = self.evm_config.create_block_builder(evm, &parent_header, ctx);
 
         // attach state_hook to the executor if Tier 1 is active; the hook
         // sends per-transaction state diffs to the multiproof/sparse trie task
-        let sparse_root_fn = if let Some((state_hook, sparse_root_fn)) = sparse_setup {
-            builder.executor_mut().set_state_hook(Some(state_hook));
-            Some(sparse_root_fn)
-        } else {
-            None
-        };
+        if state_hook.is_some() {
+            builder.executor_mut().set_state_hook(state_hook);
+        }
 
         builder.apply_pre_execution_changes().inspect_err(|err| {
             warn!(target: "engine", %err, "failed to apply pre-execution changes");
@@ -459,7 +483,8 @@ impl RethEnv {
             parent_hash,
             parent_state_root,
             transaction_count,
-            // Unknown while building. reth v2.0.0 does not read it.
+            // Unknown while building. reth v2.0.0 does not read it. Check again on the next
+            // reth upgrade.
             gas_used: 0,
             withdrawals: None,
         };

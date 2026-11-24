@@ -111,6 +111,12 @@ pub struct RaylsBlockExecutionCtx {
     /// Read by both the system-call site at `finish` and the withdrawals site at
     /// `assemble_block`.
     pub close_epoch_tally: Option<CloseEpochTally>,
+    /// `true` when the caller already applied the one-shot hardfork migrations of this block
+    /// to revm's `State` (block building does, see `RethEnv::build_block_from_batch_payload`).
+    ///
+    /// `false` makes the executor apply them itself in the pre-execution step, through
+    /// `DatabaseCommit::commit`. This is the case for reth's RPC trace and simulate calls.
+    pub migrations_applied: bool,
 }
 
 impl RaylsBlockExecutionCtx {
@@ -815,17 +821,24 @@ where
         // revm 36 has no state clear flag. EIP-161 clearing is always on in the database layer,
         // which is what this executor asked for before (Spurious Dragon is active from block 0).
 
-        // apply any one-shot hardfork state migrations newly activated at this block
-        let block_number = self.evm.block().number().saturating_to::<u64>();
-        let parent_number = block_number.saturating_sub(1);
-        hardforks::apply_activated_migrations(
-            &self.spec,
-            self.evm.db_mut(),
-            &mut self.state_hook,
-            self.receipts.len(),
-            parent_number,
-            block_number,
-        )?;
+        // One-shot hardfork state migrations that activate at this block.
+        //
+        // Block building applies them before it creates this executor, because the exact write
+        // path needs revm's `State` and this executor only sees a generic `StateDB` (alloy-evm
+        // 0.30). Every other caller (reth's RPC trace and simulate calls) gets them here, through
+        // `commit`. See `hardforks::apply_activated_migrations_with_commit` for the difference.
+        if !self.ctx.migrations_applied {
+            let block_number = self.evm.block().number().saturating_to::<u64>();
+            let parent_number = block_number.saturating_sub(1);
+            hardforks::apply_activated_migrations_with_commit(
+                &self.spec,
+                self.evm.db_mut(),
+                &mut self.state_hook,
+                self.receipts.len(),
+                parent_number,
+                block_number,
+            )?;
+        }
 
         // apply system calls and cleanup state
         if self.ctx.first_batch() {
@@ -1072,16 +1085,21 @@ mod tests {
     };
     use rayls_infrastructure_types::test_chain_spec_arc;
 
-    // A skipped activation leaves later system calls and execution running against un-migrated
-    // state, so the node diverges.
-    #[test]
-    fn migration_applies_when_activation_block_is_not_first_batch() {
-        const ACTIVATION_BLOCK: u64 = 2;
-        let spec = RaylsChainSpec::builder(test_chain_spec_arc())
-            .erc20_precompile_bytecode(ACTIVATION_BLOCK)
-            .build();
+    const ACTIVATION_BLOCK: u64 = 2;
 
-        let state = run_pre_execution(spec, ACTIVATION_BLOCK, 1);
+    fn spec() -> RaylsChainSpec {
+        RaylsChainSpec::builder(test_chain_spec_arc())
+            .erc20_precompile_bytecode(ACTIVATION_BLOCK)
+            .build()
+    }
+
+    // Callers that do not go through block building (RPC trace and simulate) leave the flag
+    // off, and the executor must apply the migration itself. A skipped activation leaves later
+    // system calls and execution running against un-migrated state. `batch_index` 1 checks that
+    // the migration is not tied to the first batch of an output.
+    #[test]
+    fn executor_applies_migration_when_the_caller_did_not() {
+        let state = run_pre_execution(spec(), ACTIVATION_BLOCK, 1, false);
 
         let account = state
             .cache
@@ -1095,5 +1113,20 @@ mod tests {
             account.info.code.is_some(),
             "the Erc20PrecompileBytecode migration must install STOP bytecode on a non-first batch",
         );
+    }
+
+    // Block building applies the migration on `State` before it creates the executor and sets
+    // the flag. The executor must then leave it alone, or the migration runs twice.
+    #[test]
+    fn executor_skips_migration_when_the_caller_applied_it() {
+        let state = run_pre_execution(spec(), ACTIVATION_BLOCK, 1, true);
+
+        let has_code = state
+            .cache
+            .accounts
+            .get(&ERC20_PRECOMPILE_ADDRESS)
+            .and_then(|cached| cached.account.as_ref())
+            .is_some_and(|account| account.info.code.is_some());
+        assert!(!has_code, "the executor must not apply a migration the caller already applied");
     }
 }

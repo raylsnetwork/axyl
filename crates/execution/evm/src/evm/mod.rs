@@ -28,6 +28,7 @@ pub(crate) use block::*;
 pub(crate) use config::*;
 pub(crate) use context::*;
 pub(crate) use factory::*;
+pub(crate) use hardforks::apply_activated_migrations;
 
 use crate::evm::handler::RaylsEvmHandler;
 
