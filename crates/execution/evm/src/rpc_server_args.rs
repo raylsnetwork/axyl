@@ -20,7 +20,7 @@ use reth::{
     rpc::builder::{constants, RethRpcModule, RpcModuleSelection},
 };
 use reth_cli_util::parse_ether_value;
-use reth_node_core::args::GasPriceOracleArgs;
+use reth_node_core::args::GasPriceOracleArgs as RethGasPriceOracleArgs;
 
 /// The default IPC endpoint
 #[cfg(windows)]
@@ -197,6 +197,67 @@ pub struct RpcServerArgs {
     pub gpo: GasPriceOracleArgs,
 }
 
+/// Tips below this value (in wei) are ignored by the gas price oracle by default.
+///
+/// This was reth's default up to 1.11. reth 2.0 changed its default to 0. We keep our own
+/// value so a reth upgrade cannot move the fee suggestions of `eth_gasPrice` and
+/// `eth_maxPriorityFeePerGas`.
+pub const DEFAULT_GPO_IGNORE_PRICE_WEI: u64 = 2;
+
+/// Parameters to configure the gas price oracle.
+///
+/// Same flags as reth's `GasPriceOracleArgs`, with our own default for `--gpo.ignoreprice`
+/// (see [`DEFAULT_GPO_IGNORE_PRICE_WEI`]). The other defaults are reth's and are the same in
+/// reth 1.11 and 2.0.
+#[derive(Debug, Clone, Copy, Args, PartialEq, Eq)]
+#[command(next_help_heading = "Gas Price Oracle")]
+pub struct GasPriceOracleArgs {
+    /// Number of recent blocks to check for gas price
+    #[arg(long = "gpo.blocks", default_value_t = constants::gas_oracle::DEFAULT_GAS_PRICE_BLOCKS)]
+    pub blocks: u32,
+
+    /// Gas Price below which gpo will ignore transactions
+    #[arg(long = "gpo.ignoreprice", default_value_t = DEFAULT_GPO_IGNORE_PRICE_WEI)]
+    pub ignore_price: u64,
+
+    /// Maximum transaction priority fee(or gasprice before London Fork) to be recommended by gpo
+    #[arg(long = "gpo.maxprice", default_value_t = constants::gas_oracle::DEFAULT_MAX_GAS_PRICE.to())]
+    pub max_price: u64,
+
+    /// The percentile of gas prices to use for the estimate
+    #[arg(long = "gpo.percentile", default_value_t = constants::gas_oracle::DEFAULT_GAS_PRICE_PERCENTILE)]
+    pub percentile: u32,
+
+    /// The default gas price to use if there are no blocks to use
+    #[arg(long = "gpo.default-suggested-fee")]
+    pub default_suggested_fee: Option<alloy::primitives::U256>,
+}
+
+impl Default for GasPriceOracleArgs {
+    fn default() -> Self {
+        Self {
+            blocks: constants::gas_oracle::DEFAULT_GAS_PRICE_BLOCKS,
+            ignore_price: DEFAULT_GPO_IGNORE_PRICE_WEI,
+            max_price: constants::gas_oracle::DEFAULT_MAX_GAS_PRICE.to(),
+            percentile: constants::gas_oracle::DEFAULT_GAS_PRICE_PERCENTILE,
+            default_suggested_fee: None,
+        }
+    }
+}
+
+impl From<GasPriceOracleArgs> for RethGasPriceOracleArgs {
+    fn from(args: GasPriceOracleArgs) -> Self {
+        let GasPriceOracleArgs {
+            blocks,
+            ignore_price,
+            max_price,
+            percentile,
+            default_suggested_fee,
+        } = args;
+        Self { blocks, ignore_price, max_price, percentile, default_suggested_fee }
+    }
+}
+
 impl Default for RpcServerArgs {
     fn default() -> Self {
         Self {
@@ -264,7 +325,7 @@ impl From<RpcServerArgs> for reth::args::RpcServerArgs {
             rpc_eth_proof_window: v.rpc_eth_proof_window,
             rpc_proof_permits: v.rpc_proof_permits,
             rpc_state_cache: v.rpc_state_cache,
-            gas_price_oracle: v.gpo,
+            gas_price_oracle: v.gpo.into(),
             ..Default::default()
         }
     }
@@ -299,5 +360,57 @@ impl TypedValueParser for RpcModuleSelectionValueParser {
     fn possible_values(&self) -> Option<Box<dyn Iterator<Item = PossibleValue> + '_>> {
         let values = RethRpcModule::all_variant_names().iter().map(PossibleValue::new);
         Some(Box::new(values))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloy::primitives::U256;
+    use clap::Parser;
+
+    /// A helper type to parse Args more easily
+    #[derive(Parser)]
+    struct CommandParser<T: Args> {
+        #[command(flatten)]
+        args: T,
+    }
+
+    /// The gas price oracle ignores tips below 2 wei by default, as on reth 1.11. reth 2.0
+    /// changed its own default to 0, so this value must come from our code.
+    #[test]
+    fn gpo_ignore_price_default_is_kept() {
+        let parsed = CommandParser::<GasPriceOracleArgs>::parse_from(["rayls"]).args;
+        assert_eq!(parsed.ignore_price, 2);
+        assert_eq!(parsed, GasPriceOracleArgs::default(), "clap default and Default agree");
+
+        // the value reaches reth's oracle config
+        let config = RethGasPriceOracleArgs::from(parsed).gas_price_oracle_config();
+        assert_eq!(config.ignore_price, Some(U256::from(2u64)));
+
+        // and it is the default of the whole RPC argument set
+        assert_eq!(RpcServerArgs::default().gpo.ignore_price, 2);
+    }
+
+    /// An operator can still set the value, also to 0.
+    #[test]
+    fn gpo_ignore_price_can_be_set() {
+        let parsed =
+            CommandParser::<GasPriceOracleArgs>::parse_from(["rayls", "--gpo.ignoreprice", "0"])
+                .args;
+        assert_eq!(parsed.ignore_price, 0);
+        let config = RethGasPriceOracleArgs::from(parsed).gas_price_oracle_config();
+        assert_eq!(config.ignore_price, Some(U256::ZERO));
+    }
+
+    /// The other oracle defaults are reth's. They are the same in reth 1.11 and 2.0; this pins
+    /// them so a later reth upgrade cannot move them without a failing test.
+    #[test]
+    fn gpo_other_defaults_are_pinned() {
+        let args = GasPriceOracleArgs::default();
+        assert_eq!(args.blocks, 20);
+        assert_eq!(args.percentile, 60);
+        assert_eq!(args.max_price, 500_000_000_000);
+        assert_eq!(args.default_suggested_fee, None);
     }
 }

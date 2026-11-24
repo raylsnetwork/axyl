@@ -2059,3 +2059,38 @@ async fn heal_is_needed_after_reths_check_and_lets_the_next_block_persist() -> e
 
     Ok(())
 }
+
+/// The persistence threshold `rayls-replay` uses (512) must not reach reth's engine config.
+///
+/// reth 2.0 debug-asserts in `EngineArgs::tree_config` that its backpressure threshold (16 by
+/// default) is above the persistence threshold. With 512 that assert fails in a debug or test
+/// build. `RethEnv::engine_tree_config` builds the config with reth's default persistence
+/// threshold; our own `PersistenceState` takes the real value from the engine arguments.
+#[test]
+fn engine_tree_config_accepts_a_large_persistence_threshold() {
+    use reth_node_core::args::EngineArgs;
+
+    let engine = EngineArgs {
+        persistence_threshold: 512,
+        prewarming_disabled: true,
+        cross_block_cache_size: 123,
+        ..Default::default()
+    };
+
+    // must not panic
+    let tree_config = RethEnv::engine_tree_config(&engine);
+
+    // the thresholds reth's engine tree would read keep reth's defaults
+    assert_eq!(tree_config.persistence_threshold(), 2);
+    assert_eq!(tree_config.persistence_backpressure_threshold(), 16);
+    // every other engine setting is passed on
+    assert!(tree_config.disable_prewarming());
+    assert_eq!(
+        tree_config.cross_block_cache_size(),
+        EngineArgs { persistence_threshold: 2, ..engine.clone() }
+            .tree_config()
+            .cross_block_cache_size()
+    );
+    // our own persistence state still gets the value from the arguments
+    assert_eq!(engine.persistence_threshold, 512);
+}

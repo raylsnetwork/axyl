@@ -191,7 +191,7 @@ impl RethEnv {
         }
 
         // Build TreeConfig from EngineArgs (converts cross_block_cache_size MB → bytes).
-        let tree_config = node_config.engine.tree_config();
+        let tree_config = Self::engine_tree_config(&node_config.engine);
 
         // Construct the payload processor for concurrent state root computation.
         let payload_processor = Arc::new(parking_lot::Mutex::new(PayloadProcessor::new(
@@ -347,6 +347,20 @@ impl RethEnv {
             true,
         )
         .await
+    }
+
+    /// Build reth's `TreeConfig` from the engine arguments, without the persistence threshold.
+    ///
+    /// reth 2.0 has a second threshold, the persistence backpressure threshold (default 16), and
+    /// `EngineArgs::tree_config` debug-asserts that it is above the persistence threshold. Both
+    /// values are only read by reth's engine tree, which we do not run: our own
+    /// `PersistenceState` owns the persistence threshold and takes it from the engine arguments
+    /// directly. So the config is built with reth's default persistence threshold. A large
+    /// `persistence_threshold` (`rayls-replay` uses 512) then cannot trip that assert in a debug
+    /// or test build.
+    pub(super) fn engine_tree_config(engine: &EngineArgs) -> reth_engine_primitives::TreeConfig {
+        EngineArgs { persistence_threshold: DEFAULT_PERSISTENCE_THRESHOLD, ..engine.clone() }
+            .tree_config()
     }
 
     /// Initialize the provider factory with consistency check and auto-repair.
