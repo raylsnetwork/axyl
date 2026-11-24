@@ -113,8 +113,13 @@ struct ConsensusVotes {
 
 impl ConsensusVotes {
     /// Record `result`, already verified, with its `digest` under its signer. True only on the
-    /// result that brings that digest to `quorum` signers, so one task acts on each quorum. A
-    /// repeat of a result the signer already holds counts nothing.
+    /// result that brings that digest to `quorum` signers, so later votes for the same header do
+    /// not act on it again. That is once each time the count climbs to `quorum`: a signer that
+    /// pushes the digest out of its window and sends it again before the quorum is pruned can
+    /// bring the count back to it. That costs one more pass through the quorum: a held-header read
+    /// for a closed epoch, a certified-tip save that keeps a higher stored tip, and a
+    /// `behind_consensus` call. Neither tip can move back. A repeat of a result the signer already
+    /// holds counts nothing.
     fn add(&mut self, digest: B256, result: ConsensusResult, quorum: usize) -> bool {
         let held = self.by_signer.entry(result.validator).or_default();
         if held.iter().any(|(d, _)| *d == digest) {

@@ -12,7 +12,7 @@ use rayls_infrastructure_types::{
     serde::{deserialize_normalized_bounded, roaring_header},
     AuthorityIdentifier, BlockHash, BlsPublicKey, BlsSignature, Certificate, CertificateDigest,
     CertifiedTip, ConsensusHeader, Epoch, EpochCertificate, EpochRecord, EpochVote, Header, Round,
-    Votable, Vote,
+    Vote,
 };
 use roaring::RoaringBitmap;
 use serde::{Deserialize, Serialize};
@@ -38,12 +38,6 @@ pub struct ConsensusResult {
     /// see digest() below, this is a signature over the has of the epoch, round, number and hash
     /// fields
     pub signature: BlsSignature,
-}
-
-impl Votable for ConsensusResult {
-    fn voter_id(&self) -> AuthorityIdentifier {
-        self.validator.into()
-    }
 }
 
 impl ConsensusResult {
