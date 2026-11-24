@@ -112,8 +112,9 @@ struct ConsensusVotes {
 }
 
 impl ConsensusVotes {
-    /// Record `result`, already verified, with its `digest` under its signer. True once `quorum`
-    /// signers hold that digest. A repeat of a result the signer already holds counts nothing.
+    /// Record `result`, already verified, with its `digest` under its signer. True only on the
+    /// result that brings that digest to `quorum` signers, so one task acts on each quorum. A
+    /// repeat of a result the signer already holds counts nothing.
     fn add(&mut self, digest: B256, result: ConsensusResult, quorum: usize) -> bool {
         let held = self.by_signer.entry(result.validator).or_default();
         if held.iter().any(|(d, _)| *d == digest) {
@@ -124,7 +125,7 @@ impl ConsensusVotes {
         }
         held.push_back((digest, result));
         self.by_signer.values().filter(|held| held.iter().any(|(d, _)| *d == digest)).count()
-            >= quorum
+            == quorum
     }
 
     /// The signer and signature of every held result for `digest`.
@@ -1449,9 +1450,10 @@ fn evict_oldest_completed(cache: &mut AuthEquivocationMap, max_entries: usize) {
 
 #[cfg(test)]
 mod tests {
-    use super::{anchor_diverges_from_executed, BehindTracker};
-    use crate::RecentlyExecutedBlocks;
-    use rayls_infrastructure_types::{BlockNumHash, ExecHeader, SealedHeader, B256};
+    use super::{anchor_diverges_from_executed, BehindTracker, ConsensusVotes};
+    use crate::{network::message::ConsensusResult, RecentlyExecutedBlocks};
+    use rand::{rngs::StdRng, SeedableRng};
+    use rayls_infrastructure_types::{BlockNumHash, BlsKeypair, ExecHeader, SealedHeader, B256};
     use std::time::Duration;
 
     fn sealed_at(number: u64) -> SealedHeader {
@@ -1478,6 +1480,25 @@ mod tests {
 
         // anchor ahead of our execution (block 9 not executed): not evidence, vote without waiting.
         assert!(!anchor_diverges_from_executed(&recent, sealed_at(9).num_hash()));
+    }
+
+    /// A digest's quorum is reported once, on the result that reaches it; a repeat counts nothing.
+    #[test]
+    fn consensus_votes_report_each_quorum_once() {
+        let mut rng = StdRng::seed_from_u64(428);
+        let result = |_| ConsensusResult {
+            number: 5,
+            hash: B256::repeat_byte(5),
+            validator: *BlsKeypair::generate(&mut rng).public(),
+            ..Default::default()
+        };
+        let [first, second, third] = [(); 3].map(result);
+        let digest = first.digest();
+        let mut votes = ConsensusVotes::default();
+        assert!(!votes.add(digest, first, 2));
+        assert!(!votes.add(digest, first, 2), "a repeat does not count");
+        assert!(votes.add(digest, second, 2), "the second signer reaches the quorum");
+        assert!(!votes.add(digest, third, 2), "a later signer does not report it again");
     }
 
     // Tests drive the window argument rather than a real clock: a zero window means "any flat
