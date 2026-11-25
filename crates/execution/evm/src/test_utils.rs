@@ -74,10 +74,10 @@ impl RethEnv {
             evm::{initialize_erc20_precompile, RaylsEvmConfig},
             native_erc20::{Erc20Precompile, Erc20TokenConfig, ERC20_PRECOMPILE_ADDRESS},
             persistence,
-            reth_env::RethConfig,
+            reth_env::{RethConfig, TEST_DB_MAX_SIZE},
         };
         use reth_node_core::{
-            args::{DatadirArgs, StorageArgs},
+            args::{DatabaseArgs, DatadirArgs, StorageArgs},
             node_config::NodeConfig,
         };
         use reth_provider::providers::BlockchainProvider;
@@ -96,6 +96,7 @@ impl RethEnv {
             },
             chain,
             storage: StorageArgs { v2: true },
+            db: DatabaseArgs { max_size: Some(TEST_DB_MAX_SIZE), ..Default::default() },
             ..NodeConfig::default()
         };
         let reth_config = RethConfig(node_config.clone());
