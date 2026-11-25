@@ -197,6 +197,74 @@ pub fn open_db_with_consensus_config<Path: AsRef<std::path::Path> + Send>(
     panic!("No DB configured!")
 }
 
+/// Open an existing consensus DB read-only, for `rayls-replay`.
+///
+/// The replay reads its plan from the consensus DB of a source datadir and must not change that
+/// datadir. This open differs from [`open_db`] in three ways:
+/// - MDBX is opened with `MDBX_RDONLY` and `MDBX_EXCLUSIVE` (see [`MdbxDatabase::open_read_only`]).
+///   A database that a running node holds is refused.
+/// - No table is created. The tables are only registered in the mem layer, which a table scan
+///   needs; in MDBX each read opens the table it needs. A read of a table that does not exist in
+///   the file gives an error.
+/// - The cold tier is attached only when its directories exist, because opening a cold store
+///   creates any missing directory. Without a `cold/` directory the hot tables are read alone.
+///
+/// The result is the normal layered type, so reads go mem -> MDBX -> cold as on a node. The mem
+/// layer stays empty and the writer thread has nothing to write. A write on this handle fails
+/// in the writer thread; the replay never writes.
+///
+/// Nothing is repaired. A database that needs an MDBX recovery gives an error that says so.
+#[cfg(all(feature = "reth-libmdbx", not(feature = "redb")))]
+pub fn open_db_read_only<Path: AsRef<std::path::Path>>(
+    store_path: Path,
+) -> eyre::Result<DatabaseType> {
+    let store_path = store_path.as_ref();
+    let persistent_db = MdbxDatabase::open_read_only(store_path, true).map_err(|e| {
+        let text = format!("{e:#}");
+        match rayls_infrastructure_utils::mdbx::read_only_open_problem(&text) {
+            Some(problem) => eyre::eyre!("{}: {problem}", store_path.display()),
+            None => e.wrap_err(format!("open {} read-only", store_path.display())),
+        }
+    })?;
+    let mut db = LayeredDatabase::open(persistent_db);
+    #[cfg(feature = "cold-storage")]
+    {
+        let cold_dir = store_path.join("cold");
+        if cold_dir.is_dir() {
+            // opening a cold store creates a missing segment directory, and a `cold/` with only
+            // one of the two is not something a node leaves behind
+            for segment in ["consensus_blocks", "batches"] {
+                if !cold_dir.join(segment).is_dir() {
+                    eyre::bail!(
+                        "the cold tier at {} is not complete: it has no {segment}/ directory",
+                        cold_dir.display()
+                    );
+                }
+            }
+            let cold = ColdStore::open(&ColdConfig { dir: cold_dir.clone() }).map_err(|e| {
+                eyre::eyre!("open the cold tier at {} failed: {e}", cold_dir.display())
+            })?;
+            db = db.with_cold(std::sync::Arc::new(cold));
+        }
+    }
+    // registers the tables in the mem layer; a no-op on the read-only MDBX below it
+    open_default_tables(&mut db)?;
+    Ok(db)
+}
+
+/// The read-only open exists for the MDBX backend only. With the `redb` feature this gives an
+/// error, so callers compile with every feature set.
+#[cfg(feature = "redb")]
+pub fn open_db_read_only<Path: AsRef<std::path::Path>>(
+    store_path: Path,
+) -> eyre::Result<DatabaseType> {
+    eyre::bail!(
+        "cannot open {} read-only: the read-only open needs the MDBX backend, and this build \
+         uses redb",
+        store_path.as_ref().display()
+    )
+}
+
 /// Concrete cold archiver for the active backend, cfg-selected like [`DatabaseType`].
 ///
 /// The archiver drives the hot-only view of the layered database
@@ -687,6 +755,115 @@ mod test {
             let val = db.get::<TestTable>(&k).expect("Failed to get inserted key");
             assert_eq!(Some(v), val);
         }
+    }
+}
+
+/// The read-only open used by `rayls-replay` (#418).
+#[cfg(all(test, feature = "reth-libmdbx", not(feature = "redb")))]
+mod read_only_open_tests {
+    use super::{
+        open_db, open_db_read_only,
+        tables::{BatchSeqCounter, EpochRecords},
+    };
+    use rayls_infrastructure_types::Database;
+    use std::{collections::BTreeMap, path::Path};
+
+    /// Every file and directory under `dir`: `None` for a directory, the size for `mdbx.lck`
+    /// (MDBX sets the length of its lock file again on every open), size and change time for
+    /// any other file.
+    type FileList = BTreeMap<std::path::PathBuf, Option<(u64, Option<std::time::SystemTime>)>>;
+
+    fn file_list(dir: &Path) -> FileList {
+        fn walk(dir: &Path, out: &mut FileList) {
+            for entry in std::fs::read_dir(dir).expect("read dir") {
+                let path = entry.expect("dir entry").path();
+                let meta = std::fs::metadata(&path).expect("metadata");
+                if meta.is_dir() {
+                    out.insert(path.clone(), None);
+                    walk(&path, out);
+                } else {
+                    let is_lock_file = path.file_name().is_some_and(|name| name == "mdbx.lck");
+                    let changed =
+                        if is_lock_file { None } else { Some(meta.modified().expect("mtime")) };
+                    out.insert(path, Some((meta.len(), changed)));
+                }
+            }
+        }
+        let mut out = FileList::new();
+        walk(dir, &mut out);
+        out
+    }
+
+    /// A consensus DB written by the normal open, with one row, closed again.
+    fn closed_db_with_one_row() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db = open_db(dir.path());
+        db.insert::<BatchSeqCounter>(&7, &42).expect("insert");
+        db.sync_persist().expect("persist");
+        drop(db);
+        dir
+    }
+
+    /// The read-only open reads what the normal open wrote, reads a missing row as `None`,
+    /// refuses a second open, and leaves every file as it was.
+    #[test]
+    fn read_only_open_reads_rows_and_changes_no_file() {
+        let dir = closed_db_with_one_row();
+        // one open and close first, so the list is taken with the lock file in its settled state
+        drop(open_db_read_only(dir.path()).expect("first read-only open"));
+        let before = file_list(dir.path());
+
+        let db = open_db_read_only(dir.path()).expect("read-only open");
+        assert_eq!(db.get::<BatchSeqCounter>(&7).expect("read"), Some(42));
+        assert_eq!(db.get::<BatchSeqCounter>(&8).expect("read"), None);
+        // a table scan, on a table with a row and on an empty one
+        assert_eq!(db.iter::<BatchSeqCounter>().collect::<Vec<_>>(), vec![(7, 42)]);
+        assert_eq!(db.iter::<EpochRecords>().count(), 0);
+        assert!(db.last_record::<EpochRecords>().is_none());
+
+        // exclusive: the same directory cannot be opened again while this handle lives
+        assert!(open_db_read_only(dir.path()).is_err(), "a second open must be refused");
+
+        drop(db);
+        assert_eq!(before, file_list(dir.path()), "the read-only open must not change any file");
+    }
+
+    /// A consensus DB without a `cold/` directory (written before the cold tier existed) opens,
+    /// and the directory is not created.
+    #[cfg(feature = "cold-storage")]
+    #[test]
+    fn read_only_open_does_not_create_the_cold_directory() {
+        let dir = closed_db_with_one_row();
+        std::fs::remove_dir_all(dir.path().join("cold")).expect("remove cold dir");
+
+        let db = open_db_read_only(dir.path()).expect("read-only open without a cold tier");
+        assert_eq!(db.get::<BatchSeqCounter>(&7).expect("read"), Some(42));
+        drop(db);
+
+        assert!(!dir.path().join("cold").exists(), "the cold directory must not be created");
+    }
+
+    /// A `cold/` directory with one segment missing is refused and not completed.
+    #[cfg(feature = "cold-storage")]
+    #[test]
+    fn read_only_open_refuses_a_cold_tier_that_is_not_complete() {
+        let dir = closed_db_with_one_row();
+        std::fs::remove_dir_all(dir.path().join("cold").join("batches")).expect("remove segment");
+
+        let error = open_db_read_only(dir.path()).expect_err("the open must fail");
+        assert!(error.to_string().contains("not complete"), "got: {error:#}");
+        assert!(
+            !dir.path().join("cold").join("batches").exists(),
+            "the missing segment directory must not be created"
+        );
+    }
+
+    /// A directory without a database gives an error and stays empty.
+    #[test]
+    fn read_only_open_refuses_a_directory_without_a_database() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        assert!(open_db_read_only(dir.path()).is_err());
+        assert_eq!(std::fs::read_dir(dir.path()).expect("read dir").count(), 0);
     }
 }
 

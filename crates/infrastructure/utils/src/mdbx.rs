@@ -78,6 +78,45 @@ fn detect_page_size_in(reader: impl Read) -> Option<usize> {
     })
 }
 
+/// Say in plain words why a read-only, exclusive MDBX open failed, when the error text is one of
+/// the known cases. `None` for any other error.
+///
+/// The match is on the error text because the callers get the error through different wrappers
+/// (reth's `DatabaseError`, `eyre`), and all of them keep the text of the MDBX error.
+pub fn read_only_open_problem(error_text: &str) -> Option<&'static str> {
+    // MDBX_BUSY, which reth-libmdbx prints as "another write transaction is running", or EAGAIN
+    // from the file lock when the holder is in this process
+    if error_text.contains("another write transaction is running")
+        || error_text.contains("Resource temporarily unavailable")
+        || error_text.contains("MDBX_BUSY")
+        || error_text.contains("Busy")
+    {
+        return Some(
+            "the database is open in another process (a running node?). Stop it first, or work \
+             on a copy of the files",
+        );
+    }
+    // MDBX_WANNA_RECOVERY
+    if error_text.contains("should be recovered") {
+        return Some(
+            "MDBX refuses to read the database until it is recovered: its last commit was never \
+             synced (the node was killed, or the files were copied from a running node), or the \
+             file is damaged. A read-only open cannot recover it. Make a copy and recover the \
+             copy first (`rayls-db-inspect --recover` for a consensus-db, or one clean start and \
+             stop of the node version that wrote the files)",
+        );
+    }
+    // MDBX_EACCESS, which reth-libmdbx prints as "the environment opened in read-only"
+    if error_text.contains("opened in read-only") || error_text.contains("Permission denied") {
+        return Some(
+            "MDBX did not get the file access it needs. If the directory is not writable and has \
+             no mdbx.lck, MDBX cannot create its lock file: put an empty mdbx.lck next to \
+             mdbx.dat, or make the directory writable",
+        );
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -121,6 +160,25 @@ mod tests {
         for bad in [0, 256, 2048, 12 * 1024, 128 * 1024] {
             assert!(check_page_size(bad).is_err(), "{bad}");
         }
+    }
+
+    /// The known failures of a read-only open get a hint, anything else does not.
+    #[test]
+    fn read_only_open_problem_knows_the_three_cases() {
+        let in_use = read_only_open_problem("open db: another write transaction is running");
+        assert!(in_use.is_some_and(|hint| hint.contains("another process")));
+
+        let recovery = read_only_open_problem(
+            "database should be recovered, but this could not be done in read-only mode",
+        );
+        assert!(recovery.is_some_and(|hint| hint.contains("recovered")));
+
+        let access = read_only_open_problem(
+            "failed to open the database: the environment opened in read-only (13)",
+        );
+        assert!(access.is_some_and(|hint| hint.contains("mdbx.lck")));
+
+        assert_eq!(read_only_open_problem("no such file or directory"), None);
     }
 
     /// Detection reads only the bounded head, so a huge datafile is never loaded whole.

@@ -17,12 +17,13 @@ snapshot. On completion the rebuilt datadir is ready to boot via
 
 ## How it works
 
-The replay is a single-reader, single-writer pipeline over two reth environments:
+The replay is a single-reader, single-writer pipeline:
 
-- **snapshot env** (read-only): the authoritative source. Supplies the canonical
-  header for every block and the committed close-epoch withdrawals tally.
-- **archive env** (read-write): the target. Each block is rebuilt on top of the
-  archive's growing state.
+- **snapshot reader** (read-only): the authoritative source. Supplies the canonical
+  header for every block and the committed close-epoch withdrawals tally. It is not
+  a node environment. See [The snapshot is only read](#the-snapshot-is-only-read).
+- **archive env** (read-write): the target, a full reth environment. Each block is
+  rebuilt on top of the archive's growing state.
 
 ```mermaid
 sequenceDiagram
@@ -31,7 +32,7 @@ sequenceDiagram
     participant Chan as Bounded channel
     participant Exec as Executor loop
     participant Arch as Archive env
-    participant Snap as Snapshot env
+    participant Snap as Snapshot reader
 
     Note over Prod,Snap: plan derivation, overlaps execution
     loop each window
@@ -111,6 +112,39 @@ must be empty; reth initializes its EVM DB from genesis.
 Full per-block detail is written to `<archive-out>/rayls-replay.log` (honors
 `RUST_LOG`). stdout shows calm progress and warnings only.
 
+### The snapshot is only read
+
+The replay does not change the snapshot datadir. This matters most when the
+snapshot was written by an older reth version: start-up code from a newer reth
+(consistency check, history heal, unwind) can damage it.
+
+- `db/` and `consensus-db/` are opened read-only and exclusive (`MDBX_RDONLY`,
+  `MDBX_EXCLUSIVE`). `static_files/` and the consensus cold tier are opened
+  read-only. The snapshot's `rocksdb/` is not opened at all.
+- Nothing is repaired, unwound or created. No table, no directory, no lock file
+  of reth.
+- From `db/` and `static_files/` the replay reads only the headers, the
+  `BlockWithdrawals` table and the `Finish` stage checkpoint. These have the same
+  layout in reth 1.11 and reth 2.0, so a reth 2.0 build can replay a reth 1.11
+  snapshot.
+- The snapshot tip is the `Finish` checkpoint. Headers above it (a node stopped in
+  the middle of a save) are ignored.
+
+What this means when you run it:
+
+- The snapshot must not be in use. A snapshot that a running node holds is
+  refused. Two replays cannot read the same snapshot at the same time.
+- A snapshot that needs a repair is refused with an error that names the problem.
+  Examples: MDBX needs a recovery (the node was killed, or the files were copied
+  from a running node), or the header files end before the last saved block. Fix a
+  copy first, for example with `rayls-db-inspect --recover` for the consensus DB.
+- `--archive-out` must not be the snapshot datadir or a directory inside it.
+- MDBX keeps a lock file, `mdbx.lck`, next to each `mdbx.dat`. It holds no data.
+  A read-only open still sets its length (so its change time moves), and creates
+  it, empty, if the snapshot came without one. On a snapshot directory that is not
+  writable, the lock file must already be there: put an empty `mdbx.lck` next to
+  each `mdbx.dat`.
+
 ### Config resolution
 
 `genesis.yaml` and `parameters.yaml` are read from the snapshot datadir
@@ -120,7 +154,7 @@ no embedded fallback. The committee is read from the on-chain `ConsensusRegistry
 at the archive tip (as the live node does), so no `committee.yaml` is needed and
 committee rotations are tracked.
 
-`--network` selects the baked-in Rayls hardfork schedule applied to both envs
+`--network` selects the baked-in Rayls hardfork schedule the blocks are rebuilt with
 (the node's `--network` flag); its chain-id must match the snapshot genesis or
 the boot refuses. To replay a network that historically ran a different
 schedule, pass `--config-file <PATH> --subnet <NAME>` (the node's network
@@ -152,7 +186,7 @@ resume from the unwound tip. Use this to retry a run that diverged partway.
 | Flag | Default | Description |
 | --- | --- | --- |
 | `--snapshot-datadir <PATH>` | required | Snapshot rayls datadir (`db/`, `consensus-db/`, `genesis/`). |
-| `--archive-out <PATH>` | required | Fresh datadir to rebuild into. |
+| `--archive-out <PATH>` | required | Fresh datadir to rebuild into. Not the snapshot datadir and not inside it. |
 | `--consensus-db <PATH>` | `<snapshot>/consensus-db` | Override consensus DB path. |
 | `--genesis <PATH>` | `<snapshot>/genesis/genesis.yaml` | Override genesis YAML. Must exist (no embedded fallback). |
 | `--parameters <PATH>` | `<snapshot>/parameters.yaml` | Override parameters YAML. Must exist (no embedded fallback). Sets `basefee_address`, critical for state parity. |
@@ -164,7 +198,7 @@ resume from the unwound tip. Use this to retry a run that diverged partway.
 | `--unwind-to <BLOCK>` | off | Unwind the archive to this block and exit. |
 | `--verify-every-block` | off | Verify the state root after every block, not just epoch boundaries. |
 | `--progress-interval <N>` | `500` | Emit a progress line every N blocks. |
-| `--storage-v2 <BOOL>` | `true` | v2 storage layout (`static_files` + RocksDB), matching `--storage.v2` snapshots. |
+| `--storage-v2 <BOOL>` | `true` | Storage layout of the archive that is written: v2 (`static_files` + RocksDB), as nodes run with `--storage.v2`. |
 | `--persistence-threshold <N>` | `512` | Deferred-persistence flush threshold, in blocks. |
 | `--log-file <PATH>` | `<archive-out>/rayls-replay.log` | Full async log file. |
 
@@ -189,7 +223,7 @@ self-contained for Observer boot.
 | `error.rs` | `ReplayError` surface. |
 
 The archive-specific execution support (`new_for_archive_replay`, `unwind_to`,
-the from-leaves heal, and the replay accessors) lives in
+the from-leaves heal, the replay accessors, and the read-only `SnapshotReader`) lives in
 `crates/execution/evm` behind the off-by-default `archive-replay` feature, so the
 live node is unaffected.
 
@@ -200,6 +234,6 @@ live node is unaffected.
   and the schedule-record cross-check (when the snapshot has a record) surface
   the common cases up front; anything they cannot see still diverges state
   silently at the first affected block. `verify_chainspec_compatibility` checks
-  genesis agreement between the two envs.
+  that the archive's genesis block is the snapshot's genesis block.
 - Replay is sequential and CPU-bound on execution plus state-root computation;
   speculative prewarming is disabled because it is wasted work here.

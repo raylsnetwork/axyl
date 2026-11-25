@@ -8361,6 +8361,7 @@ dependencies = [
  "rayls-middleware-rewards",
  "reth-chainspec",
  "serde_yaml",
+ "tempfile",
  "thiserror 1.0.69",
  "tokio",
  "tracing",

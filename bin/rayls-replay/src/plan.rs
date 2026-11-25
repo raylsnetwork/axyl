@@ -2,7 +2,7 @@
 //! deterministic execution plan.
 
 use crate::error::{ReplayError, ReplayResult};
-use rayls_execution_evm::reth_env::RethEnv;
+use rayls_execution_evm::reth_env::SnapshotReader;
 use rayls_infrastructure_storage::tables::Batches;
 use rayls_infrastructure_types::{Address, Batch, Database, SealedHeader, B256};
 use std::collections::BTreeMap;
@@ -61,12 +61,12 @@ impl HeaderDigests {
 /// setup over the window. Returns fewer blocks than requested when the snapshot
 /// tip falls inside the window (the caller's signal to stop).
 pub fn derive_plan_window<DB: Database>(
-    snapshot_evm: &RethEnv,
+    snapshot: &SnapshotReader,
     consensus_store: &DB,
     start: u64,
     end: u64,
 ) -> ReplayResult<Vec<PlanBlock>> {
-    let headers = snapshot_evm
+    let headers = snapshot
         .blocks_for_range(start..=end)
         .map_err(|e| ReplayError::SnapshotEnv(e.to_string()))?;
     if headers.is_empty() {
@@ -111,10 +111,10 @@ pub fn derive_plan_window<DB: Database>(
 /// tally. `build_withdrawals` encodes each leader count as a withdrawal amount,
 /// so the withdrawals are the authoritative tally to reproduce on replay.
 pub(crate) fn snapshot_close_epoch_tally(
-    snapshot_evm: &RethEnv,
+    snapshot: &SnapshotReader,
     block_number: u64,
 ) -> ReplayResult<BTreeMap<Address, u32>> {
-    let withdrawals = snapshot_evm
+    let withdrawals = snapshot
         .block_withdrawals(block_number)
         .map_err(|e| ReplayError::SnapshotEnv(e.to_string()))?
         .ok_or(ReplayError::MissingHeader { block_number })?;

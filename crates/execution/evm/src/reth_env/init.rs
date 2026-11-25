@@ -294,10 +294,15 @@ impl RethEnv {
     /// `rocksdb/` as siblings (matching the standard node's layout).
     ///
     /// Raises the descriptor limit like [`Self::new_for_temp_chain`], for a different reason:
-    /// `rayls-replay` is its own binary, so it never reaches the node's startup call, and it opens
-    /// two envs (archive and snapshot) that walk the whole chain. Jars are never evicted once
-    /// loaded, so descriptors accumulate with the number of block ranges replayed rather than with
-    /// concurrency -- a long rebuild would otherwise run out partway through.
+    /// `rayls-replay` is its own binary, so it never reaches the node's startup call, and it walks
+    /// the whole chain in two datadirs: it writes the archive through this env and reads the
+    /// snapshot through a [`SnapshotReader`](crate::reth_env::SnapshotReader). Jars are never
+    /// evicted once loaded, so descriptors accumulate with the number of block ranges replayed
+    /// rather than with concurrency -- a long rebuild would otherwise run out partway through.
+    ///
+    /// Only for the datadir that is written. The snapshot must not go through this constructor:
+    /// it runs the full node start (consistency check, history heal, unwind), which can change
+    /// the datadir.
     #[cfg(feature = "archive-replay")]
     pub async fn new_for_archive_replay<P: AsRef<Path>>(
         chain: Arc<RethChainSpec>,

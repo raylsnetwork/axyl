@@ -4,7 +4,7 @@
 //! as the replay oracle, and confirms each replayed boundary block matches its
 //! BFT-signed `EpochRecord.parent_state` anchor.
 
-use rayls_execution_evm::reth_env::RethEnv;
+use rayls_execution_evm::reth_env::SnapshotReader;
 use rayls_infrastructure_storage::tables::{EpochCerts, EpochRecords};
 use rayls_infrastructure_types::{Database, Epoch, EpochRecord, SealedHeader, B256};
 use std::collections::BTreeMap;
@@ -123,12 +123,12 @@ pub fn load_epoch_anchors<DB: Database>(
 /// the replay trusts it as the state-root oracle. A disagreement here means the
 /// SNAPSHOT itself committed a fork, independent of any replay computation.
 pub fn cross_check_snapshot(
-    snapshot_evm: &RethEnv,
+    snapshot: &SnapshotReader,
     anchors: &BTreeMap<u64, EpochAnchor>,
 ) -> AgreementSummary {
     let mut summary = AgreementSummary::default();
     for anchor in anchors.values() {
-        match snapshot_evm.sealed_header_by_number(anchor.number) {
+        match snapshot.sealed_header_by_number(anchor.number) {
             Ok(Some(header)) => {
                 summary.checked += 1;
                 if header.hash() == anchor.hash {
