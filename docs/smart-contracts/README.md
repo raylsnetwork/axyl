@@ -184,7 +184,7 @@ Genesis is built by `GenesisArgs::execute` (`crates/infrastructure/network-cli/s
 | 7 `RLSAccumulator` proxy | `—` | `cs` | `cs` | `—` | `cs` | `—` | `—` | contract 27 code from S2; S2 storage |
 | 8 `BlsG1`, derived address | `—` | `c` | `—` | `—` | `—` | `—` | `—` | S2 code; no storage, library |
 | 9 `RewardCurve` | `—` | `—` | `—` | `—` | `—` | `—` | `—` | not deployed |
-| 27 `ERC1967Proxy`, the code of all six proxies | `—` | `c` | `c` | `—` | `—` | `—` | `—` | the code in every proxy row |
+| 27 `ERC1967Proxy`, the code of all six proxies | `—` | `c` | `c` | `—` | `c` | `—` | `—` | the code in every proxy row |
 | 28 `SafeImpl` singleton | `—` | `—` | `cs` | `—` | `—` | `—` | `—` | S3 code; S3 storage, 1 slot |
 | 29 `SafeProxyFactory` | `—` | `—` | `c` | `—` | `—` | `—` | `—` | S3 code; no storage |
 | 30 Safe proxy | `—` | `—` | `cs` | `—` | `—` | `—` | `—` | S3 code; S3 storage, 6 slots and a balance |
