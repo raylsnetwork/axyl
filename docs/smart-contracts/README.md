@@ -143,14 +143,14 @@ the implementation code that executes comes from S3 and then S4.
 
 | Contract | In sync with | Action |
 |---|---|---|
-| 1 `ConsensusRegistry` | S1 of `mainnet-v1.0.0` | no — no S4 entry; `HybridRewards` overwrites this code at its fork |
+| 1 `ConsensusRegistry` | S1 of `mainnet-v1.0.0` | no — replaced at the `HybridRewards` fork |
 | 2 `DelegationPool` | S1 of `mainnet-v1.0.0` | yes — together with S4: this artifact's `initialize` lays out the proxy storage the S4 impl reads |
-| 3 `FeeAggregator` | S1 of `main` | no — S4 installs an older generation at the impl at genesis |
+| 3 `FeeAggregator` | S1 of `main` | no |
 | 4 `RewardDistributor` | S1 of `v0.1.5`–`mainnet-v1.2.0`, blob `3134b71c` | yes — together with S4: this artifact's `initialize` lays out the proxy storage the S4 impl reads |
-| 5 `NativeTokenController` | S1 of `main` | no — S4 installs the same code at the impl at genesis, with its address written in |
-| 6 `RLS` | S1 of `main` | no — S4 installs the same code at the impl at genesis, with its address written in |
-| 7 `RLSAccumulator` | S1 of `main` | no — S4 installs the same code at the impl at genesis, with its address written in |
-| 8 `BlsG1` | S1 of `main` | no — already in sync, and S2 is the only tier that installs it |
+| 5 `NativeTokenController` | S1 of `main` | no |
+| 6 `RLS` | S1 of `main` | no |
+| 7 `RLSAccumulator` | S1 of `main` | no |
+| 8 `BlsG1` | S1 of `main` | no |
 | 9 `RewardCurve` | not in `artifacts/` | n/a |
 
 #### S3 — `rayls-contracts/deployments/genesis/precompile-config.yaml`
@@ -164,9 +164,9 @@ the implementation code that executes comes from S3 and then S4.
 | Contract | In sync with | Action |
 |---|---|---|
 | 1 `ConsensusRegistry` | not in `bytecodes/` | n/a |
-| 2 `DelegationPool` | S1 of `v0.1.5` | yes — rebuild from S1 of `main` |
-| 3 `FeeAggregator` | not a build of any `.sol` state in this repo | yes — rebuild from S1 of `main` |
-| 4 `RewardDistributor` | S1 of `v0.1.5`–`mainnet-v1.2.0`, blob `3134b71c` | yes — rebuild from S1 of `main` |
+| 2 `DelegationPool` | S1 of `v0.1.5` | yes |
+| 3 `FeeAggregator` | not a build of any `.sol` state in this repo | yes |
+| 4 `RewardDistributor` | S1 of `v0.1.5`–`mainnet-v1.2.0`, blob `3134b71c` | yes |
 | 5 `NativeTokenController` | S1 of `main` | no |
 | 6 `RLS` | S1 of `main` | no |
 | 7 `RLSAccumulator` | S1 of `main` | no |
