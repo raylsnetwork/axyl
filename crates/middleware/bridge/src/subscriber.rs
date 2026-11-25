@@ -297,72 +297,11 @@ impl<DB: Database> Subscriber<DB> {
     /// Max concurrent batch fetches during catchup.
     const MAX_CATCHUP_PIPELINE: usize = 16;
 
-    /// Maximum wait time for committee keys before giving up on a header.
-    const COMMITTEE_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
-
-    /// Interval between retries when waiting for committee keys.
-    const COMMITTEE_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
-
     /// Throttle `try_rejoin_consensus` waiting-gate logs to once per this many headers.
     const REJOIN_LOG_THROTTLE: u64 = 100;
 
     /// Log other-epoch header drops at `info!` once per this many drops.
     const OTHER_EPOCH_LOG_THROTTLE: u64 = 100;
-
-    /// Verify BLS signatures on the consensus header's certificates.
-    ///
-    /// Wait for committee keys if not yet available (triggers epoch record collector).
-    /// Returns the verified header on success, or None if it should be discarded.
-    async fn verify_consensus_certificates(
-        &self,
-        consensus_header: ConsensusHeader,
-        shutdown: &Noticer,
-    ) -> Option<ConsensusHeader> {
-        let leader_epoch = consensus_header.sub_dag.leader_epoch();
-        let number = consensus_header.number;
-
-        // wait for committee keys, polling until available or timeout
-        let deadline = tokio::time::Instant::now() + Self::COMMITTEE_WAIT_TIMEOUT;
-        let keys = loop {
-            if let Some(keys) = self.config.get_committee_keys_for_epoch(leader_epoch) {
-                break keys;
-            }
-            if shutdown.noticed() {
-                return None;
-            }
-            // trigger epoch record collector for the needed epoch
-            self.consensus_bus.requested_missing_epoch().send_if_modified(|current| {
-                if leader_epoch > *current {
-                    *current = leader_epoch;
-                    true
-                } else {
-                    false
-                }
-            });
-            if tokio::time::Instant::now() >= deadline {
-                warn!(
-                    target: "subscriber",
-                    number,
-                    epoch = leader_epoch,
-                    "timed out waiting for committee keys, discarding header"
-                );
-                return None;
-            }
-            tokio::time::sleep(Self::COMMITTEE_POLL_INTERVAL).await;
-        };
-
-        consensus_header
-            .verify_header_with_keys(&keys)
-            .inspect_err(|e| {
-                warn!(
-                    target: "subscriber",
-                    number,
-                    epoch = leader_epoch,
-                    "BLS verification failed, discarding header: {e}"
-                );
-            })
-            .ok()
-    }
 
     /// Catch up to current consensus and then try to rejoin as an active CVV.
     async fn catch_up_rejoin_consensus(
@@ -448,7 +387,8 @@ impl<DB: Database> Subscriber<DB> {
 
     /// Persist a fetched consensus output and forward it to the engine.
     async fn commit_catchup_output(&self, output: ConsensusOutput) -> SubscriberResult<()> {
-        // persist individual certificates for consensus rejoin (BLS-verified before scheduling)
+        // persist individual certificates for consensus rejoin (BLS-verified by the walk before it
+        // stored the header)
         if let Err(e) = self.config.node_storage().write(output.sub_dag.leader.clone()) {
             warn!(target: "subscriber", ?e, "failed to write leader cert to store");
         }
@@ -786,8 +726,8 @@ impl<DB: Database> Subscriber<DB> {
                                 }
                                 continue;
                             }
-                            // dedup before verifying; the predicate cannot advance the watermark,
-                            // so a header that fails verification cannot skip the honest one.
+                            // dedup; the predicate cannot advance the watermark, so a rejected
+                            // header cannot skip the honest one.
                             if !should_process_consensus_header(number, last_processed_number) {
                                 continue;
                             }
@@ -796,28 +736,22 @@ impl<DB: Database> Subscriber<DB> {
                                 number,
                                 pipeline = waiting.len(),
                                 epoch,
-                                "stream_and_follow: received header, verifying"
+                                "stream_and_follow: received header"
                             );
-                            let Some(verified) = self
-                                .verify_consensus_certificates(consensus_header, &rx_shutdown)
-                                .await
-                            else {
-                                continue;
-                            };
                             // bind position: a commit replayed at a wrong number does not advance,
                             // so reject it before execution. advance the watermark only on accept.
-                            if !accepted_position.advance(&verified.sub_dag) {
+                            if !accepted_position.advance(&consensus_header.sub_dag) {
                                 warn!(
                                     target: "subscriber",
                                     number,
-                                    epoch = verified.sub_dag.leader_epoch(),
-                                    round = verified.sub_dag.leader_round(),
+                                    epoch,
+                                    round = consensus_header.sub_dag.leader_round(),
                                     "rejecting misplaced consensus sub-dag before execution"
                                 );
                                 continue;
                             }
                             last_processed_number = number;
-                            waiting.push_back(self.schedule_catchup_fetch(verified));
+                            waiting.push_back(self.schedule_catchup_fetch(consensus_header));
                         }
                         None => {
                             info!(target: "subscriber", "stream_and_follow: channel closed");
