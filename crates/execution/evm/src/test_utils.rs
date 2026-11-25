@@ -127,7 +127,7 @@ impl RethEnv {
                 node_config.engine.persistence_threshold,
                 database.clone(),
             )));
-        let tree_config = node_config.engine.tree_config();
+        let tree_config = Self::engine_tree_config(&node_config.engine);
         let payload_processor = Arc::new(parking_lot::Mutex::new(PayloadProcessor::new(
             runtime.clone(),
             evm_config.clone(),
