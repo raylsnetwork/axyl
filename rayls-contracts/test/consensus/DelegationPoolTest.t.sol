@@ -2156,4 +2156,243 @@ contract DelegationPoolTest is Test {
             "pool must remain solvent after slash"
         );
     }
+
+    // =========================================================================
+    // Self-stake accounting (#231)
+    //
+    // Reporting only: a validator's own capital in its own pool is surfaced
+    // separately from third-party delegation. Reward, commission, slashing and
+    // stake-tier maths are deliberately unchanged — the rest of this suite is
+    // what holds that line.
+    // =========================================================================
+
+    /// @dev Validators are not funded by `setUp`, which mints only to delegators.
+    function _fundValidator(address validatorAddress, uint256 amount) internal {
+        rls.mint(validatorAddress, amount);
+        vm.prank(validatorAddress);
+        rls.approve(address(pool), type(uint256).max);
+    }
+
+    function test_selfStake_zeroWhenValidatorHasNotSelfDelegated() public {
+        vm.prank(validator1);
+        pool.registerPool(1000);
+
+        vm.prank(delegator1);
+        pool.delegate(validator1, 100e18);
+
+        assertEq(pool.getSelfDelegatedStake(validator1), 0);
+
+        (uint256 self, uint256 thirdParty, uint256 total) =
+            pool.getDelegationComposition(validator1);
+        assertEq(self, 0);
+        assertEq(thirdParty, 100e18);
+        assertEq(total, 100e18);
+    }
+
+    function test_selfStake_recordedSeparatelyFromThirdParty() public {
+        vm.prank(validator1);
+        pool.registerPool(1000);
+        _fundValidator(validator1, 500e18);
+
+        vm.prank(validator1);
+        pool.delegate(validator1, 300e18);
+        vm.prank(delegator1);
+        pool.delegate(validator1, 100e18);
+        vm.prank(delegator2);
+        pool.delegate(validator1, 50e18);
+
+        assertEq(pool.getSelfDelegatedStake(validator1), 300e18);
+
+        (uint256 self, uint256 thirdParty, uint256 total) =
+            pool.getDelegationComposition(validator1);
+        assertEq(self, 300e18);
+        assertEq(thirdParty, 150e18);
+        assertEq(total, 450e18);
+        assertEq(self + thirdParty, total);
+        assertEq(total, pool.getTotalDelegatedStake(validator1));
+    }
+
+    function test_selfStake_reflectsSlashImmediatelyWithoutDrift() public {
+        vm.prank(validator1);
+        pool.registerPool(1000);
+        _fundValidator(validator1, 500e18);
+
+        vm.prank(validator1);
+        pool.delegate(validator1, 300e18);
+        vm.prank(delegator1);
+        pool.delegate(validator1, 100e18);
+
+        vm.prank(address(registry));
+        pool.applyPoolSlash(validator1, 80e18); // 20% of 400e18, no settle since
+
+        (uint256 self, uint256 thirdParty, uint256 total) =
+            pool.getDelegationComposition(validator1);
+
+        assertEq(total, 320e18);
+        assertEq(self, 240e18); // 300 - 300/400 * 80
+        assertLe(self, total);
+        assertEq(thirdParty, 80e18);
+
+        (uint256 effective, ) = pool.getEffectivePosition(validator1, validator1);
+        assertEq(self, effective);
+    }
+
+    function test_selfStake_decreasesOnUndelegate() public {
+        vm.prank(validator1);
+        pool.registerPool(1000);
+        _fundValidator(validator1, 500e18);
+
+        vm.prank(validator1);
+        pool.delegate(validator1, 300e18);
+        assertEq(pool.getSelfDelegatedStake(validator1), 300e18);
+
+        // unbonding stake leaves the position and the pool total at request time
+        vm.prank(validator1);
+        pool.requestUndelegation(validator1, 100e18);
+
+        assertEq(pool.getSelfDelegatedStake(validator1), 200e18);
+
+        (uint256 self, uint256 thirdParty, uint256 total) =
+            pool.getDelegationComposition(validator1);
+        assertEq(self, 200e18);
+        assertEq(thirdParty, 0);
+        assertEq(self, total);
+    }
+
+    function test_selfStake_unchangedByCompletingUndelegation() public {
+        vm.prank(validator1);
+        pool.registerPool(1000);
+        _fundValidator(validator1, 500e18);
+
+        vm.prank(validator1);
+        pool.delegate(validator1, 300e18);
+        vm.prank(delegator1);
+        pool.delegate(validator1, 100e18);
+
+        vm.prank(validator1);
+        pool.requestUndelegation(validator1, 100e18);
+
+        (uint256 selfBefore, uint256 thirdBefore, uint256 totalBefore) =
+            pool.getDelegationComposition(validator1);
+        assertEq(selfBefore, 200e18);
+
+        registry.setCurrentEpoch(UNBONDING_EPOCHS + 1);
+        uint256 balanceBefore = rls.balanceOf(validator1);
+        vm.prank(validator1);
+        pool.completeUndelegation(validator1);
+
+        // without a real payout the asserts below are vacuous
+        assertEq(rls.balanceOf(validator1) - balanceBefore, 100e18);
+
+        (uint256 selfAfter, uint256 thirdAfter, uint256 totalAfter) =
+            pool.getDelegationComposition(validator1);
+        assertEq(selfAfter, selfBefore);
+        assertEq(thirdAfter, thirdBefore);
+        assertEq(totalAfter, totalBefore);
+    }
+
+    function test_selfStake_countsOpenTierSelfDelegation() public {
+        _wlEnableGate();
+
+        vm.prank(validator1);
+        pool.registerPool(1000);
+        _fundValidator(validator1, 500e18);
+
+        // unverified under an enabled whitelist => Track B
+        vm.prank(validator1);
+        pool.delegate(validator1, 200e18);
+
+        IDelegationPool.DelegatorPosition memory pos =
+            pool.getDelegatorPosition(validator1, validator1);
+        assertTrue(pos.openTier);
+
+        assertEq(pool.getSelfDelegatedStake(validator1), 200e18);
+
+        (uint256 self, , uint256 total) = pool.getDelegationComposition(validator1);
+        assertEq(self, 200e18);
+        assertEq(total, 200e18);
+    }
+
+    /// @dev Per-position slashes round up, so `total - self` runs high, never low.
+    function test_selfStake_thirdPartyRoundsHighNeverShortAfterSlash() public {
+        vm.prank(validator1);
+        pool.registerPool(1000);
+        _fundValidator(validator1, 1_000e18);
+
+        // amounts chosen so the slash divides evenly into neither position
+        vm.prank(validator1);
+        pool.delegate(validator1, 333e18 + 7);
+        vm.prank(delegator1);
+        pool.delegate(validator1, 111e18 + 3);
+
+        vm.prank(address(registry));
+        pool.applyPoolSlash(validator1, 77e18 + 11);
+
+        (uint256 self, uint256 thirdParty, uint256 total) =
+            pool.getDelegationComposition(validator1);
+        (uint256 d1Effective, ) = pool.getEffectivePosition(validator1, delegator1);
+
+        assertLe(self, total);
+        assertEq(self + thirdParty, total);
+        assertGe(thirdParty, d1Effective);
+        assertLe(thirdParty - d1Effective, 1e6); // ceiling rounding stays wei-scale
+    }
+
+    /// @dev Pins the pre-existing over-slash of a position unsettled between slashes.
+    function test_selfStake_repeatedSlashesDivergeFromPositions() public {
+        vm.prank(validator1);
+        pool.registerPool(1000);
+        _fundValidator(validator1, 500e18);
+
+        vm.prank(validator1);
+        pool.delegate(validator1, 300e18);
+        vm.prank(delegator1);
+        pool.delegate(validator1, 100e18);
+
+        vm.prank(address(registry));
+        pool.applyPoolSlash(validator1, 80e18); // 20% of 400e18
+        vm.prank(address(registry));
+        pool.applyPoolSlash(validator1, 64e18); // 20% of what is left
+
+        (uint256 self, uint256 thirdParty, uint256 total) =
+            pool.getDelegationComposition(validator1);
+        (uint256 selfEffective, ) = pool.getEffectivePosition(validator1, validator1);
+        (uint256 d1Effective, ) = pool.getEffectivePosition(validator1, delegator1);
+
+        assertEq(total, 256e18); // 400 -> 320 -> 256
+        assertEq(self, 180e18); // 300 pays 40%, not the compounded 192
+        assertEq(selfEffective, self);
+        assertEq(d1Effective, 60e18);
+        assertLe(self, total);
+        assertEq(self + thirdParty, total);
+        assertEq(thirdParty - d1Effective, 16e18); // the over-slash lands here
+        assertGt(thirdParty - d1Effective, 1e6);
+    }
+
+    /// @dev Both legs are the validator's own money; only its own address counts as self.
+    function test_selfStake_excludesValidatorCapitalFromAnotherAddress() public {
+        vm.prank(validator1);
+        pool.registerPool(1000);
+
+        address validatorOperator = makeAddr("validator1Operator");
+
+        _fundValidator(validator1, 150e18);
+        vm.prank(validator1);
+        assertTrue(rls.transfer(validatorOperator, 50e18));
+        vm.prank(validatorOperator);
+        rls.approve(address(pool), type(uint256).max);
+
+        vm.prank(validator1);
+        pool.delegate(validator1, 100e18);
+        vm.prank(validatorOperator);
+        pool.delegate(validator1, 50e18);
+
+        assertEq(pool.getSelfDelegatedStake(validator1), 100e18);
+
+        (uint256 self, uint256 thirdParty, uint256 total) =
+            pool.getDelegationComposition(validator1);
+        assertEq(self, 100e18);
+        assertEq(thirdParty, 50e18);
+        assertEq(total, 150e18);
+    }
 }

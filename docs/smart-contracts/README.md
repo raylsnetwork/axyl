@@ -4,7 +4,7 @@ The repository contains several copies of the same contracts. This doc inventori
 
 **TL;DR:** the code a new chain runs comes from `rayls-contracts/artifacts/*.json` — contracts 1–8 and 27 — except the implementations of contracts 2–7, which come from `crates/execution/evm/src/evm/hardforks/bytecodes/*_impl.bin`, contracts 28–30, which come from `rayls-contracts/deployments/genesis/precompile-config.yaml`, and contract 1, whose code `HybridRewards` replaces at block 1. None of it is generated from `rayls-contracts/src/**/*.sol` automatically. Three of the six `*_impl.bin` files are behind the source: `DelegationPool` and `RewardDistributor` are older builds missing functions the source now has, and `FeeAggregator`'s is not a build of any source state in this repo.
 
-`main` is `76896d7` (v1.5.3, 2026-11-23). Every build behind the tables ran at `e8c4ea1b` (node `1.5.2`, 2026-11-20); `rayls-contracts/` and `crates/execution/evm/src/evm/hardforks/` are identical between those two, so the "of `main`" attributions read against `76896d7` as well. Parts 3–5 were measured in November 2026 at the blocks each part names. Code equality everywhere means equality after zeroing the solc link and immutable windows, which hold the implementation's own address, baked in at construction.
+`rayls-contracts/` and `crates/execution/evm/src/evm/hardforks/` have not changed since `v1.5.3` (`76896d7`, 2026-11-23) — neither on `main` nor at `e8c4ea1b` (node `1.5.2`, 2026-11-20), where every build behind the tables ran — except that `rayls-contracts/src` here has two more read-only getters on contract 2, `getSelfDelegatedStake` and `getDelegationComposition`, with no storage change. The other eight contracts build byte-identically to `v1.5.3`, so the "S1 of `main`" attributions read against `76896d7` as well. Parts 3–5 were measured in November 2026 at the blocks each part names; contract 2's live code matches `S1` of `v1.5.3`, not of the source here. Code equality everywhere means equality after zeroing the solc link and immutable windows, which hold the implementation's own address, baked in at construction.
 
 See also `docs/contract-upgrades/README.md` (proxy upgrade vs hardfork decision) and `docs/hardforks/` (scheduling mechanics).
 
@@ -134,7 +134,7 @@ This is what the simulation deploys. For contracts 2–5 and 7 it decides only t
 | 8 `BlsG1` | not in `bytecodes/` | n/a |
 | 9 `RewardCurve` | not in `bytecodes/` | n/a |
 
-Rebuilding these binaries decides what a new chain runs: the stale ones are missing functions the source already has — contract 2 lacks 8 of 53, contract 3 lacks 2 of 54 (`initialize`, `setPoolConfig`), contract 4 lacks 6 of 39 (the RewardCurve and target-APY API). Contracts 2–7 sit behind UUPS proxies, so an existing chain keeps the implementation it has and takes the change only through an upgrade transaction — S6. The alternative is a hardfork migration (S5).
+Rebuilding these binaries decides what a new chain runs: the stale ones are missing functions the source already has — contract 2 lacks 10 of 55, contract 3 lacks 2 of 54 (`initialize`, `setPoolConfig`), contract 4 lacks 6 of 39 (the RewardCurve and target-APY API). Contracts 2–7 sit behind UUPS proxies, so an existing chain keeps the implementation it has and takes the change only through an upgrade transaction — S6. The alternative is a hardfork migration (S5).
 
 #### S5 — `crates/execution/evm/src/evm/hardforks/bytecodes/<fork>/*.bin`
 
@@ -208,7 +208,7 @@ Measured from `https://testnet-rpc.rayls.com` (chain id 7295799) at block 25,331
 | # | Contract | Testnet code equals |
 |---|---|---|
 | 1 | `ConsensusRegistry` | S2 at `v0.1.1`–`v0.1.5` |
-| 2 | `DelegationPool` | S1 of `main` |
+| 2 | `DelegationPool` | S1 of `v1.5.3` |
 | 3 | `FeeAggregator` | S2 = S1 of `main` |
 | 4 | `RewardDistributor` | S1 of `testnet-v1.3.0`, identical source at `mainnet-v1.3.0` |
 | 5 | `NativeTokenController` | S2 = S1 = S4 of `main` |
@@ -228,7 +228,7 @@ Measured from `https://mainnet-rpc.rayls.com` (chain id 72957) at block 15,126,7
 | # | Contract | Mainnet code equals |
 |---|---|---|
 | 1 | `ConsensusRegistry` | S2 of `main` |
-| 2 | `DelegationPool` | S1 of `main` |
+| 2 | `DelegationPool` | S1 of `v1.5.3` |
 | 3 | `FeeAggregator` | S4 of `main` |
 | 4 | `RewardDistributor` | S1 of `mainnet-v1.3.0`, identical source at `testnet-v1.3.0` |
 | 5 | `NativeTokenController` | S2 = S1 = S4 of `main` |
@@ -256,4 +256,3 @@ Measured from `http://localhost:8545` (chain id 487, the `local` network) at blo
 | 9 | `RewardCurve` | not deployed |
 
 Contract 1 was read at block 0 too: there it is S2 of `main`, replaced by the `HybridRewards` fixture at block 1. Every proxy points at the implementation address genesis installed, so S6 has not applied.
-

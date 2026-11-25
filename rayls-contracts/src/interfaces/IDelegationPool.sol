@@ -270,6 +270,25 @@ interface IDelegationPool {
         address validatorAddress
     ) external view returns (uint256);
 
+    /// @notice Get a validator's self-delegated stake — its own capital in its own pool
+    /// @dev "Self" is `delegator == validatorAddress`; capital the validator funds from
+    ///      another address counts as third-party.
+    function getSelfDelegatedStake(
+        address validatorAddress
+    ) external view returns (uint256);
+
+    /// @notice Split a validator's delegated backing into its own capital and the rest
+    /// @dev `thirdPartyDelegated` is `total - self`, not a per-holder tally: it also absorbs
+    ///      over-slashed stake no position can withdraw (pre-existing `slashPerShareAccum`
+    ///      defect). Use `getEffectivePosition` for what a holder actually has.
+    function getDelegationComposition(
+        address validatorAddress
+    ) external view returns (
+        uint256 selfDelegated,
+        uint256 thirdPartyDelegated,
+        uint256 totalDelegated
+    );
+
     /// @notice Get a delegator's pending (unclaimed) rewards
     function getPendingRewards(
         address validatorAddress,

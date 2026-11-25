@@ -759,6 +759,37 @@ contract DelegationPool is
     }
 
     /// @inheritdoc IDelegationPool
+    function getSelfDelegatedStake(
+        address validatorAddress
+    ) external view override returns (uint256) {
+        return _getSelfDelegatedStake(validatorAddress);
+    }
+
+    /// @inheritdoc IDelegationPool
+    function getDelegationComposition(
+        address validatorAddress
+    ) external view override returns (
+        uint256 selfDelegated,
+        uint256 thirdPartyDelegated,
+        uint256 totalDelegated
+    ) {
+        ValidatorPool storage pool = _getDelegationPoolStorage().validatorPools[validatorAddress];
+        totalDelegated = pool.totalDelegated + pool.openTierDelegated;
+        selfDelegated = _getSelfDelegatedStake(validatorAddress);
+        // Defensive only: self never exceeds total.
+        thirdPartyDelegated = totalDelegated > selfDelegated
+            ? totalDelegated - selfDelegated
+            : 0;
+    }
+
+    function _getSelfDelegatedStake(
+        address validatorAddress
+    ) internal view returns (uint256) {
+        (uint256 effectiveAmount, ) = _getEffectivePosition(validatorAddress, validatorAddress);
+        return effectiveAmount;
+    }
+
+    /// @inheritdoc IDelegationPool
     function getPendingRewards(
         address validatorAddress,
         address delegator
