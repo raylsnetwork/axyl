@@ -198,10 +198,10 @@ pub fn spawn_subscriber<DB: Database>(
 /// Recomputes the reputation scores of a sub dag received during catch-up.
 ///
 /// The scores a peer sends are not covered by the consensus block digest or any signature, so a
-/// peer can set them to anything. They are recomputed here from covered data instead: the sub
-/// dag's own certificates and leader, and the previous sub dag, read back from this node's
-/// canonical row at `parent_hash`. A parent in an earlier epoch, or the genesis parent, starts
-/// from fresh scores, as Bullshark does at the first commit of an epoch.
+/// peer can set them to anything. They are recomputed here instead, from the sub dag's own
+/// certificates and leader plus the previous sub dag read back from this node's canonical row at
+/// `parent_hash`, whose stored scores carry over. A parent in an earlier epoch, or the genesis
+/// parent, starts from fresh scores, as Bullshark does at the first commit of an epoch.
 ///
 /// A same-epoch parent that this node cannot read back by hash (an unusual DB state) also
 /// starts fresh, because the node cannot tell which epoch it was in, and that gives the wrong

@@ -45,9 +45,9 @@ impl ReputationScores {
         self.scores_per_authority.len() as u64
     }
 
-    /// The scores to store alongside a committed sub dag, computed from data the consensus block
-    /// digest covers: the sub dag's certificates, its leader's nonce, and the previous sub dag of
-    /// the same epoch. Bullshark uses it when committing, and a catching-up node uses it to
+    /// The scores to store alongside a committed sub dag: the previous sub dag's stored scores
+    /// plus points from data the consensus block digest covers (the sub dag's certificates and
+    /// the previous leader). Bullshark uses it when committing, and a catching-up node uses it to
     /// replace the scores a peer sent, which no signature or digest covers.
     ///
     /// The scores reset at the first sub dag of every schedule window (and when there is no
