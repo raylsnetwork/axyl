@@ -82,8 +82,8 @@ through `IRewardCurve`.
 | Tier | What | Path | Count | Consumer |
 |---|---|---|---|---|
 | S1 | Solidity source | `rayls-contracts/src/**/*.sol` | 26 files: contracts 1–9, abstract contracts 10–11, interfaces 12–24, mocks 25–26 | `forge build` → `rayls-contracts/out/` (gitignored) |
-| S2 | Compiled artifacts | `rayls-contracts/artifacts/*.json` | 9 — contracts 1–8 and 27 | `include_str!` in `crates/infrastructure/config/src/genesis.rs` → pre-genesis EVM simulation |
-| S3 | Genesis alloc YAML | `rayls-contracts/deployments/genesis/precompile-config.yaml` | 13 accounts: contracts 2–5 and 7 (proxy and impl each), plus contracts 28–30 | `include_str!`, same file → genesis alloc. Only contracts 28–30 survive genesis |
+| S2 | Compiled artifacts | `rayls-contracts/artifacts/*.json` | 9 files — contracts 1–8 and 27 | `include_str!` in `crates/infrastructure/config/src/genesis.rs` → pre-genesis EVM simulation → `extend_accounts` in `crates/execution/evm/src/reth_env/genesis.rs` |
+| S3 | Genesis alloc YAML | `rayls-contracts/deployments/genesis/precompile-config.yaml` | 13 accounts: contracts 2–5 and 7 (proxy and impl each), plus contracts 28–30 | `include_str!`, same file → genesis alloc. All 13 accounts go in; S4 replaces the five implementations and S2 again replaces the five proxies, so only 28–30 remain |
 | S4 | Genesis override binaries | `crates/execution/evm/src/evm/hardforks/bytecodes/*.bin` | 6 — implementations of contracts 2–7 | `include_bytes!` in `crates/execution/evm/src/reth_env/genesis.rs` → `apply_greenfield_fixes()` |
 | S5 | Hardfork migrations | `crates/execution/evm/src/evm/hardforks/bytecodes/<fork>/*.bin`, plus byte literals in `crates/execution/evm/src/evm/hardforks/*.rs` | 18 fixture files covering contracts 1–7 and 27, plus the STOP byte of 31 | state built in `crates/execution/evm/src/evm/hardforks/*.rs`, applied at an activation block |
 | S6 | UUPS proxy upgrade | none — a transaction sent from `rayls-contracts/script/interactions/upgrade/UpgradeOps.s.sol` | no files in the repository; the deployed code and the event exist only on-chain | operator-initiated; applies only to contracts 2–7, the six upgradable ones |
@@ -103,8 +103,7 @@ A `.sol` change reaches a **new chain** only through the checked-in artifacts an
 or CI job regenerates it, and `git log main -- rayls-contracts/artifacts` contains only the root commit
 of this history ("Porting codebase from old repository", 2026-07-03).
 Re-exporting the selected files from `out/` into `rayls-contracts/artifacts/` and rebuilding the node is
-therefore the only route from S1 to S2 — except `ConsensusRegistry.json`, which is not a build of `main`
-(that compiles to 23,042 B) but the 21,929 B pre-hybrid generation `hybrid_rewards.rs` requires.
+therefore the only route from S1 to S2.
 
 An **existing chain** can be changed two ways:
 
@@ -121,13 +120,13 @@ An **existing chain** can be changed two ways:
 `rayls-contracts/script/GeneratePrecompileGenesisConfig.s.sol`, which broadcasts real deploys in a
 forge VM — contracts 28–30, the implementations and proxies of contracts 2–5 and 7, each proxy run
 through its `initialize` — and writes the resulting code, storage and balance under the addresses
-recorded in `rayls-contracts/deployments/deployments.json`. 13 accounts, 69,855 B of code, 55 slots.
+recorded in `rayls-contracts/deployments/deployments.json`: 13 accounts, 55 storage slots.
 
 | S3 account | Runtime code | Slots |
 |---|---|---|
-| contracts 28–30 | 12,180 / 1,812 / 81 B | 7 — singleton pointer, the single owner `0x0e301bee…f3161`, threshold, module and initialization flags; the governance Safe also carries the file's only balance, 10 native units |
-| implementation of 2–5 and 7 | 17,102 / 16,454 / 11,707 / 4,431 / 5,491 B | 0 — `__self` in this code points at the generator (`0xa8452ec9…c00496`) |
-| proxy of 2–5 and 7 | 122 B each — contract 27 | 4 shared per contract: ERC-1967 implementation slot, `_initialized = 1`, `DEFAULT_ADMIN_ROLE` and `UPGRADER_ROLE` granted to `0x0e301bee…f3161`. Plus initializer arguments: 2 → 7 (delegation bounds, 14 unbonding epochs), 3 → 14 (fee split 5000/0/5000 bps, swap bounds, USDr `0x…0400`), 4 → 5, 5 → 0, 7 → 2 (wiring) |
+| contracts 28–30 | Safe singleton, proxy factory, Safe proxy | 7 — singleton pointer, the single owner `0x0e301bee…f3161`, threshold, module and initialization flags; the governance Safe also carries the file's only balance, 10 native units |
+| implementation of 2–5 and 7 | the S2 artifact with a simulated implementation address written in at the three `__self` sites: `62c20a…6dd7d1` 2, `a8452e…c00496` 3, `d718d5…9869a0` 4, `db8cff…ee3c76` 5, `416c42…d87ae6` 7 | 0 |
+| proxy of 2–5 and 7 | contract 27 | 4 shared per contract: ERC-1967 implementation slot, `_initialized = 1`, `DEFAULT_ADMIN_ROLE` and `UPGRADER_ROLE` granted to `0x0e301bee…f3161`. Plus initializer arguments: 2 → 7 (delegation bounds, 14 unbonding epochs), 3 → 14 (fee split 5000/0/5000 bps, swap bounds, USDr `0x…0400`), 4 → 5, 5 → 0, 7 → 2 (wiring) |
 
 ### Tier freshness against S1
 
@@ -139,15 +138,18 @@ not contain, so the endpoints carry no ancestry. `git ls-tree <tag> <path>` reso
 
 #### S2 — `rayls-contracts/artifacts/*.json`
 
+This is what the simulation deploys. For contracts 2–5 and 7 it decides only the proxies' storage layout:
+the implementation code that executes comes from S3 and then S4.
+
 | Contract | In sync with | Action |
 |---|---|---|
 | 1 `ConsensusRegistry` | S1 of `mainnet-v1.0.0` | no — no S4 entry; `HybridRewards` overwrites this code at its fork |
 | 2 `DelegationPool` | S1 of `mainnet-v1.0.0` | yes — together with S4: this artifact's `initialize` lays out the proxy storage the S4 impl reads |
-| 3 `FeeAggregator` | S1 of `main` | no — S4 rewrites the impl at genesis with different bytes |
+| 3 `FeeAggregator` | S1 of `main` | no — S4 installs an older generation at the impl at genesis |
 | 4 `RewardDistributor` | S1 of `v0.1.5`–`mainnet-v1.2.0`, blob `3134b71c` | yes — together with S4: this artifact's `initialize` lays out the proxy storage the S4 impl reads |
-| 5 `NativeTokenController` | S1 of `main` | no — S4 rewrites the impl at genesis with the same bytes |
-| 6 `RLS` | S1 of `main` | no — S4 rewrites the impl at genesis with the same bytes |
-| 7 `RLSAccumulator` | S1 of `main` | no — S4 rewrites the impl at genesis with the same bytes |
+| 5 `NativeTokenController` | S1 of `main` | no — S4 installs the same code at the impl at genesis, with its address written in |
+| 6 `RLS` | S1 of `main` | no — S4 installs the same code at the impl at genesis, with its address written in |
+| 7 `RLSAccumulator` | S1 of `main` | no — S4 installs the same code at the impl at genesis, with its address written in |
 | 8 `BlsG1` | S1 of `main` | no — already in sync, and S2 is the only tier that installs it |
 | 9 `RewardCurve` | not in `artifacts/` | n/a |
 
@@ -171,8 +173,10 @@ not contain, so the endpoints carry no ancestry. `git ls-tree <tag> <path>` reso
 | 8 `BlsG1` | not in `bytecodes/` | n/a |
 | 9 `RewardCurve` | not in `bytecodes/` | n/a |
 
-Rebuilding these binaries decides what a new chain runs. Contracts 2–7 sit behind UUPS proxies, so an
-existing chain keeps the implementation it has and takes the change only through an upgrade transaction —
+Rebuilding these binaries decides what a new chain runs: the stale ones are missing functions the source
+already has — contract 2 lacks 8 of 53, contract 3 lacks 2 of 54 (`initialize`, `setPoolConfig`), contract 4
+lacks 6 of 39 (the RewardCurve and target-APY API). Contracts 2–7 sit behind UUPS proxies, so an existing
+chain keeps the implementation it has and takes the change only through an upgrade transaction —
 S6. The alternative is a hardfork migration (S5).
 
 #### S5 — `crates/execution/evm/src/evm/hardforks/bytecodes/<fork>/*.bin`
@@ -202,64 +206,51 @@ S6. The alternative is a hardfork migration (S5).
 
 ## Part 2 — New chain
 
-A new chain is `local()` (`crates/execution/evm/src/chainspec/schedule.rs`): every fork at
-`Block(0)` except `Erc20PrecompileBytecode` and `HybridRewards` at `Block(1)`, and
-`UsdrSupplyCorrection` at `Never`. A migration runs on the block where its fork crosses from inactive at
-the parent to active at the block (`newly_activated_forks` in
-`crates/execution/evm/src/chainspec/hardforks.rs`), so block 0 is never a crossing and a `Block(0)`
-fork's body never runs.
+Under `local()`'s schedule (`crates/execution/evm/src/chainspec/schedule.rs`), the only S5 migrations a
+new chain runs are `HybridRewards` and `Erc20PrecompileBytecode`, both at block 1; S5's other fixtures are
+scheduled `Block(0)` and never run.
 
-`GenesisArgs::execute` (`crates/infrastructure/network-cli/src/genesis/mod.rs`):
+Genesis is built by `GenesisArgs::execute` (`crates/infrastructure/network-cli/src/genesis/mod.rs`) in
+four passes over one account map: the pre-genesis simulation (S2), the YAML (S3), the implementation
+binaries (S4), and S2 again — its five proxy accounts re-applied on top. The table is that map read as a
+timeline: left to right is cause, `Block ≥ 0` is the effect, and the last column that writes is what a new
+chain gets. S4 exists because `__self` in an implementation is an immutable — code compiled for the
+simulation's temporary address cannot be repaired afterwards, so a binary compiled for the protocol
+address replaces it.
 
-- **S1** — not used.
-- **S2** — installs contracts 1–8 and 27, built by the pre-genesis simulation.
-- **S3** — updates code and storage at the proxies of 2–5 and 7, and code at their implementations;
-  installs 28–30.
-- **S4** — replaces code and storage at the implementations of 2–7, and adds one storage slot on the
-  proxy of 6.
-- **S2 again** — replaces code and storage at the proxies of 2–5 and 7 with the simulation's accounts,
-  discarding S3's.
-- **S5** — at block 1, `HybridRewards` replaces contract 1's code and `Erc20PrecompileBytecode` installs
-  a STOP byte on contract 31. S5's other 17 fixtures, covering contracts 2–7 and 27, belong to forks
-  `local()` schedules `Block(0)`.
-- **S6** — none.
+| Contract | S1 | S2 | S3 | S4 | S2 again | S5 | S6 | Block ≥ 0 |
+|---|---|---|---|---|---|---|---|---|
+| 1 `ConsensusRegistry` | `—` | `cs` | `—` | `—` | `—` | `c` at 1 | `—` | S2 code → S5's fixture at block 1; S2 storage |
+| 2 `DelegationPool` impl | `—` | `i` | `c` | `cs` | `—` | `—` | `—` | S4 code; S4 storage: initializer lock |
+| 2 `DelegationPool` proxy | `—` | `cs` | `cs` | `—` | `cs` | `—` | `—` | contract 27 code from S2; S2 storage |
+| 3 `FeeAggregator` impl | `—` | `i` | `c` | `cs` | `—` | `—` | `—` | S4 code; S4 storage: initializer lock |
+| 3 `FeeAggregator` proxy | `—` | `cs` | `cs` | `—` | `cs` | `—` | `—` | contract 27 code from S2; S2 storage |
+| 4 `RewardDistributor` impl | `—` | `i` | `c` | `cs` | `—` | `—` | `—` | S4 code; S4 storage: initializer lock |
+| 4 `RewardDistributor` proxy | `—` | `cs` | `cs` | `—` | `cs` | `—` | `—` | contract 27 code from S2; S2 storage |
+| 5 `NativeTokenController` impl | `—` | `i` | `c` | `cs` | `—` | `—` | `—` | S4 code; S4 storage: initializer lock |
+| 5 `NativeTokenController` proxy | `—` | `cs` | `cs` | `—` | `cs` | `—` | `—` | contract 27 code from S2; S2 storage |
+| 6 `RLS` impl | `—` | `c` | `—` | `cs` | `—` | `—` | `—` | S4 code; S4 storage: initializer lock |
+| 6 `RLS` proxy | `—` | `cs` | `—` | `s` | `—` | `—` | `—` | contract 27 code from S2; S2 storage, plus the S4 allowance slot |
+| 7 `RLSAccumulator` impl | `—` | `i` | `c` | `cs` | `—` | `—` | `—` | S4 code; S4 storage: initializer lock |
+| 7 `RLSAccumulator` proxy | `—` | `cs` | `cs` | `—` | `cs` | `—` | `—` | contract 27 code from S2; S2 storage |
+| 8 `BlsG1`, derived address | `—` | `c` | `—` | `—` | `—` | `—` | `—` | S2 code; no storage, library |
+| 9 `RewardCurve` | `—` | `—` | `—` | `—` | `—` | `—` | `—` | not deployed |
+| 27 `ERC1967Proxy`, the code of all six proxies | `—` | `c` | `c` | `—` | `—` | `—` | `—` | the code in every proxy row |
+| 28 `SafeImpl` singleton | `—` | `—` | `cs` | `—` | `—` | `—` | `—` | S3 code; S3 storage, 1 slot |
+| 29 `SafeProxyFactory` | `—` | `—` | `c` | `—` | `—` | `—` | `—` | S3 code; no storage |
+| 30 Safe proxy | `—` | `—` | `cs` | `—` | `—` | `—` | `—` | S3 code; S3 storage, 6 slots and a balance |
+| 31 USDr precompile | `—` | `—` | `—` | `—` | `—` | `c` at 1 | `—` | no code at block 0 → one STOP byte; storage is node state, not EVM |
 
-S4 exists because the simulation cannot deploy at the well-known protocol addresses: `0x…17e1`–`0x…17eD`
-are constants no `CREATE` nonce sequence produces, so it deploys at temporary addresses — wrong `__self`,
-which makes the proxies permanently un-upgradeable, `_initialized` unlocked, and the allowance on the
-proxy of 6 keyed to the temporary accumulator.
+**Legend**
 
-| # | Contract | Final code | Final storage | Matches S1? |
-|---|---|---|---|---|
-| 1 | `ConsensusRegistry` | S5 — `crates/execution/evm/src/evm/hardforks/bytecodes/hybrid_rewards/consensus_registry_deployed.bin` (23,042 B), spliced over S2's 21,929 B at block 1 | S2 | yes, after block 1 |
-| 2 | `DelegationPool` impl | S4 — `crates/execution/evm/src/evm/hardforks/bytecodes/delegation_pool_impl.bin` (15,790 B) | S4 — `_initialized = max` | **no** — 8 of 53 functions absent |
-| 3 | `FeeAggregator` impl | S4 — `crates/execution/evm/src/evm/hardforks/bytecodes/fee_aggregator_impl.bin` (16,402 B) | S4 — `_initialized = max` | **no** — 2 of 54 absent (`initialize`, `setPoolConfig`) |
-| 4 | `RewardDistributor` impl | S4 — `crates/execution/evm/src/evm/hardforks/bytecodes/reward_distributor_impl.bin` (11,707 B) | S4 — `_initialized = max` | **no** — 6 of 39 absent (RewardCurve and target-APY API) |
-| 5 | `NativeTokenController` impl | S4 — `crates/execution/evm/src/evm/hardforks/bytecodes/native_token_controller_impl.bin` (4,431 B) | S4 — `_initialized = max` | yes |
-| 6 | `RLS` impl | S4 — `crates/execution/evm/src/evm/hardforks/bytecodes/rls_impl.bin` (9,977 B) | S4 — `_initialized = max` | yes |
-| 6 | `RLS` proxy | contract 27 (122 B) | S2 (mint, prefunds, ERC-1967 slot) plus the S4 allowance slot | n/a — not declared in `src` |
-| 7 | `RLSAccumulator` impl | S4 — `crates/execution/evm/src/evm/hardforks/bytecodes/rls_accumulator_impl.bin` (5,491 B) | S4 — `_initialized = max` | yes |
-| 2–5, 7 | proxies | contract 27 (122 B) | S2 (simulation), installed after S3 and S4 | n/a — not declared in `src` |
-| 8 | `BlsG1` — derived address, not a constant | S2 — `rayls-contracts/artifacts/BlsG1.json` (7,371 B) | none, library | yes |
-| 27 | `ERC1967Proxy` | S2 — `rayls-contracts/artifacts/ERC1967Proxy.json` (122 B) | n/a | n/a — not declared in `src` |
-| 28–30 | `SafeImpl`, `SafeProxyFactory`, Safe proxy | S3 (12,180 B, 1,812 B, 81 B) | S3 (7 slots) | n/a — not declared in `src` |
-| 31 | USDr precompile | S5 — one STOP byte at block 1; no code at block 0 | node state, not EVM storage | n/a |
-
-Three builds of one contract coexist on a new chain: for contract 2, 15,790 B executes at `…17e9`
-(S4), 17,102 B ran in the simulation that computed its genesis storage (S2), and `main`'s source
-compiles to 18,278 B (S1). Storage is therefore laid out by code that never executes: where the
-generations differ, one decides the layout and the other executes it. Size and selector differences
-between them are real compilation differences.
-
-`crates/execution/evm/src/evm/hardforks/hybrid_rewards.rs` refuses to splice unless the live
-ConsensusRegistry runtime code is exactly 21,929 B — a new chain satisfies this, the current testnet
-does not (22,253 B). `HybridRewards` is `Never` in this repo's `devnet()`, `testnet()` and `mainnet()`
-tables, at `main` and at `testnet-v1.5.2`, but that table is only the default: the schedule
-is read from `networks.<name>.hardforks` in the node's config file
-(`crates/execution/evm/src/network_profile/profile.rs`, validated at boot), so activation on a running
-network is an operator setting this repository cannot observe. The fixture is `main`'s
-`rayls-contracts/src/consensus/ConsensusRegistry.sol`: zeroing its 8 BlsG1 link sites and 12 immutable
-sites in a fresh build reproduces it byte-for-byte.
+| Token | Meaning |
+|---|---|
+| `c`, `s`, `cs` | the pass writes code, storage, or both |
+| `i` | implementation code the simulation seeds so the proxies' `initialize` has something to run against, then discards. That run is what set the proxies' layout; the code never reaches genesis |
+| `—` | the pass writes nothing here |
+| `c` at 1 | code written at block 1 by a hardfork rather than at genesis. On an existing chain the fork may not run: `HybridRewards` first checks the live code's length (`OLD_DEPLOYED_LEN`), and schedules are an operator setting — `networks.<name>.hardforks` in the node's config file (`crates/execution/evm/src/network_profile/profile.rs`) |
+| `→` | in `Block ≥ 0`: what changes at block 1 |
+| contract 6's `s` | the allowance letting contract 4 spend contract 6's token on contract 7's behalf: the simulation files it under a temporary address, so the real slot would be empty without this write |
 
 ## Part 3 — Deployments on testnet
 
@@ -281,8 +272,8 @@ RPC reports node `1.5.2`, tag `testnet-v1.5.2`, which is not an ancestor of `mai
 Contracts 1 and 8 match an S2 generation replaced at `v0.1.6`. The `v0.x` tags hang off a second, older root
 commit (2025-11-26) that `main` does not contain.
 
-DelegationPool, FeeAggregator and RewardDistributor have been proxy-upgraded (S6); the superseded
-implementations at `…17e9`, `…17e8` and `…17e4` remain deployed and byte-identical to S4.
+DelegationPool, FeeAggregator and RewardDistributor — contracts 2, 3 and 4 — have been proxy-upgraded (S6);
+the implementations they replaced are still deployed and byte-identical to S4.
 
 ## Part 4 — Deployments on mainnet
 
