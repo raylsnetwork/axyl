@@ -776,19 +776,12 @@ contract DelegationPool is
         ValidatorPool storage pool = _getDelegationPoolStorage().validatorPools[validatorAddress];
         totalDelegated = pool.totalDelegated + pool.openTierDelegated;
         selfDelegated = _getSelfDelegatedStake(validatorAddress);
-        // Self never exceeds the pool total, so this is a plain remainder; the saturation is
-        // only defence in depth (if it ever fired, self + third would stop adding up to total).
-        // The remainder is not dust: a position unsettled between slashes pays each slash
-        // against its pre-slash stake, so repeated slashes over-slash it and this absorbs the
-        // difference — see the interface note.
+        // Defensive only: self never exceeds total.
         thirdPartyDelegated = totalDelegated > selfDelegated
             ? totalDelegated - selfDelegated
             : 0;
     }
 
-    /// @dev Validator's own effective position in its own pool. Shares `_getEffectivePosition`
-    ///      with every other position read, so self-stake settles on exactly the same slash and
-    ///      reward arithmetic as third-party stake rather than a parallel copy of it.
     function _getSelfDelegatedStake(
         address validatorAddress
     ) internal view returns (uint256) {

@@ -2180,13 +2180,13 @@ contract DelegationPoolTest is Test {
         vm.prank(delegator1);
         pool.delegate(validator1, 100e18);
 
-        assertEq(pool.getSelfDelegatedStake(validator1), 0, "no self-delegation");
+        assertEq(pool.getSelfDelegatedStake(validator1), 0);
 
         (uint256 self, uint256 thirdParty, uint256 total) =
             pool.getDelegationComposition(validator1);
-        assertEq(self, 0, "self must be zero");
-        assertEq(thirdParty, 100e18, "all backing is third-party");
-        assertEq(total, 100e18, "total matches pool");
+        assertEq(self, 0);
+        assertEq(thirdParty, 100e18);
+        assertEq(total, 100e18);
     }
 
     function test_selfStake_recordedSeparatelyFromThirdParty() public {
@@ -2194,7 +2194,6 @@ contract DelegationPoolTest is Test {
         pool.registerPool(1000);
         _fundValidator(validator1, 500e18);
 
-        // validator backs itself, then two outsiders delegate
         vm.prank(validator1);
         pool.delegate(validator1, 300e18);
         vm.prank(delegator1);
@@ -2202,25 +2201,17 @@ contract DelegationPoolTest is Test {
         vm.prank(delegator2);
         pool.delegate(validator1, 50e18);
 
-        assertEq(pool.getSelfDelegatedStake(validator1), 300e18, "own capital");
+        assertEq(pool.getSelfDelegatedStake(validator1), 300e18);
 
         (uint256 self, uint256 thirdParty, uint256 total) =
             pool.getDelegationComposition(validator1);
-        assertEq(self, 300e18, "self portion");
-        assertEq(thirdParty, 150e18, "third-party portion");
-        assertEq(total, 450e18, "total");
-        assertEq(self + thirdParty, total, "split must reconcile");
-        // the pre-existing total view is unchanged by this feature
-        assertEq(total, pool.getTotalDelegatedStake(validator1), "total view unchanged");
+        assertEq(self, 300e18);
+        assertEq(thirdParty, 150e18);
+        assertEq(total, 450e18);
+        assertEq(self + thirdParty, total);
+        assertEq(total, pool.getTotalDelegatedStake(validator1));
     }
 
-    /// @notice The case a stored counter would get wrong.
-    ///
-    /// `applyPoolSlash` reduces the pool totals immediately, but a delegator's
-    /// position only shrinks lazily at its next settlement. A `selfDelegated`
-    /// counter incremented on delegate would keep reporting the pre-slash figure
-    /// across that gap and could even exceed the pool total. Deriving from the
-    /// position settles the slash on read, so the number cannot drift.
     function test_selfStake_reflectsSlashImmediatelyWithoutDrift() public {
         vm.prank(validator1);
         pool.registerPool(1000);
@@ -2231,22 +2222,19 @@ contract DelegationPoolTest is Test {
         vm.prank(delegator1);
         pool.delegate(validator1, 100e18);
 
-        // 20% of the pool is slashed; nobody has touched their position since
         vm.prank(address(registry));
-        pool.applyPoolSlash(validator1, 80e18);
+        pool.applyPoolSlash(validator1, 80e18); // 20% of 400e18, no settle since
 
         (uint256 self, uint256 thirdParty, uint256 total) =
             pool.getDelegationComposition(validator1);
 
-        assertEq(total, 320e18, "pool total reduced by the slash");
-        // self is slashed pro-rata: 300 - (300/400 * 80) = 240
-        assertEq(self, 240e18, "self-stake settles the slash on read");
-        assertLe(self, total, "self can never exceed the pool total");
-        assertEq(thirdParty, 80e18, "third-party portion after slash");
+        assertEq(total, 320e18);
+        assertEq(self, 240e18); // 300 - 300/400 * 80
+        assertLe(self, total);
+        assertEq(thirdParty, 80e18);
 
-        // and it agrees with the generic position view the rest of the pool uses
         (uint256 effective, ) = pool.getEffectivePosition(validator1, validator1);
-        assertEq(self, effective, "must match the canonical position read");
+        assertEq(self, effective);
     }
 
     function test_selfStake_decreasesOnUndelegate() public {
@@ -2256,28 +2244,21 @@ contract DelegationPoolTest is Test {
 
         vm.prank(validator1);
         pool.delegate(validator1, 300e18);
-        assertEq(pool.getSelfDelegatedStake(validator1), 300e18, "before undelegate");
+        assertEq(pool.getSelfDelegatedStake(validator1), 300e18);
 
-        // Unbonding stake leaves both the position and the pool total at request
-        // time, so it stops counting as backing immediately — which is the
-        // behaviour self-stake should inherit rather than special-case.
+        // unbonding stake leaves the position and the pool total at request time
         vm.prank(validator1);
         pool.requestUndelegation(validator1, 100e18);
 
-        assertEq(pool.getSelfDelegatedStake(validator1), 200e18, "after undelegate");
+        assertEq(pool.getSelfDelegatedStake(validator1), 200e18);
 
         (uint256 self, uint256 thirdParty, uint256 total) =
             pool.getDelegationComposition(validator1);
-        assertEq(self, 200e18, "self reduced");
-        assertEq(thirdParty, 0, "no third-party stake");
-        assertEq(self, total, "validator is the only backer");
+        assertEq(self, 200e18);
+        assertEq(thirdParty, 0);
+        assertEq(self, total);
     }
 
-    /// @notice Completing an unbonding must not move the composition again.
-    ///
-    /// The stake left both the position and the pool total back at request time,
-    /// so completion only releases tokens already excluded from these figures.
-    /// Double-counting it here would silently shrink self-stake a second time.
     function test_selfStake_unchangedByCompletingUndelegation() public {
         vm.prank(validator1);
         pool.registerPool(1000);
@@ -2293,29 +2274,23 @@ contract DelegationPoolTest is Test {
 
         (uint256 selfBefore, uint256 thirdBefore, uint256 totalBefore) =
             pool.getDelegationComposition(validator1);
-        assertEq(selfBefore, 200e18, "self already reduced at request time");
+        assertEq(selfBefore, 200e18);
 
-        // serve out the unbonding period and collect
         registry.setCurrentEpoch(UNBONDING_EPOCHS + 1);
         uint256 balanceBefore = rls.balanceOf(validator1);
         vm.prank(validator1);
         pool.completeUndelegation(validator1);
 
-        // the completion really happened — otherwise the assertions below are vacuous
-        assertEq(
-            rls.balanceOf(validator1) - balanceBefore,
-            100e18,
-            "unbonded stake must actually be paid out"
-        );
+        // without a real payout the asserts below are vacuous
+        assertEq(rls.balanceOf(validator1) - balanceBefore, 100e18);
 
         (uint256 selfAfter, uint256 thirdAfter, uint256 totalAfter) =
             pool.getDelegationComposition(validator1);
-        assertEq(selfAfter, selfBefore, "self-stake unchanged by completion");
-        assertEq(thirdAfter, thirdBefore, "third-party unchanged by completion");
-        assertEq(totalAfter, totalBefore, "total unchanged by completion");
+        assertEq(selfAfter, selfBefore);
+        assertEq(thirdAfter, thirdBefore);
+        assertEq(totalAfter, totalBefore);
     }
 
-    /// @notice Self-stake is counted whichever reward track it entered on.
     function test_selfStake_countsOpenTierSelfDelegation() public {
         _wlEnableGate();
 
@@ -2329,21 +2304,16 @@ contract DelegationPoolTest is Test {
 
         IDelegationPool.DelegatorPosition memory pos =
             pool.getDelegatorPosition(validator1, validator1);
-        assertTrue(pos.openTier, "self-delegation landed on the open tier");
+        assertTrue(pos.openTier);
 
-        assertEq(pool.getSelfDelegatedStake(validator1), 200e18, "open-tier self-stake counted");
+        assertEq(pool.getSelfDelegatedStake(validator1), 200e18);
 
         (uint256 self, , uint256 total) = pool.getDelegationComposition(validator1);
-        assertEq(self, 200e18, "self portion");
-        assertEq(total, 200e18, "total spans both tracks");
+        assertEq(self, 200e18);
+        assertEq(total, 200e18);
     }
 
-    /// @notice Pins the direction of the rounding error in `thirdPartyDelegated`.
-    ///
-    /// The figure is derived as `total - self`. Per-position slashes round up
-    /// while the pool total does not, so `self` settles marginally low and the
-    /// remainder runs marginally high. Over a single slash that gap is rounding
-    /// dust; repeated slashes are pinned in the test below.
+    /// @dev Per-position slashes round up, so `total - self` runs high, never low.
     function test_selfStake_thirdPartyRoundsHighNeverShortAfterSlash() public {
         vm.prank(validator1);
         pool.registerPool(1000);
@@ -2362,22 +2332,13 @@ contract DelegationPoolTest is Test {
             pool.getDelegationComposition(validator1);
         (uint256 d1Effective, ) = pool.getEffectivePosition(validator1, delegator1);
 
-        assertLe(self, total, "self can never exceed the pool total");
-        assertEq(self + thirdParty, total, "split reconciles against the total");
-        assertGe(thirdParty, d1Effective, "third-party figure must never come up short");
-        // dust only: bounded by per-position ceiling rounding, not a real discrepancy
-        assertLe(thirdParty - d1Effective, 1e6, "discrepancy must stay wei-scale");
+        assertLe(self, total);
+        assertEq(self + thirdParty, total);
+        assertGe(thirdParty, d1Effective);
+        assertLe(thirdParty - d1Effective, 1e6); // ceiling rounding stays wei-scale
     }
 
-    /// @notice Two slashes with no settle in between push the split far past dust.
-    ///
-    /// `applyPoolSlash` takes its fraction of the stake left in the pool, while a
-    /// position pays the accumulated slash against the stake it had when it last
-    /// settled. Nothing settled here between the two 20% slashes, so self pays 40%
-    /// of 300e18 (180e18) instead of the compounded 192e18, and the remainder
-    /// reports 76e18 against a sole third-party position of 60e18. That
-    /// over-slash is pre-existing slashing behaviour; this pins it so the reported
-    /// split stays honest instead of being read as exact.
+    /// @dev Pins the pre-existing over-slash of a position unsettled between slashes.
     function test_selfStake_repeatedSlashesDivergeFromPositions() public {
         vm.prank(validator1);
         pool.registerPool(1000);
@@ -2398,28 +2359,40 @@ contract DelegationPoolTest is Test {
         (uint256 selfEffective, ) = pool.getEffectivePosition(validator1, validator1);
         (uint256 d1Effective, ) = pool.getEffectivePosition(validator1, delegator1);
 
-        assertEq(total, 256e18, "pool total decays 400 -> 320 -> 256");
-        assertEq(self, 180e18, "self pays the slash sum, not the compounded slash");
-        assertEq(selfEffective, self, "composition must match the position read");
-        assertEq(d1Effective, 60e18, "the only third-party position");
-        assertLe(self, total, "self can never exceed the pool total");
-        assertEq(self + thirdParty, total, "split still reconciles against the total");
-        assertEq(thirdParty - d1Effective, 16e18, "remainder absorbs the over-slash");
-        assertGt(thirdParty - d1Effective, 1e6, "the gap is not wei-scale dust");
+        assertEq(total, 256e18); // 400 -> 320 -> 256
+        assertEq(self, 180e18); // 300 pays 40%, not the compounded 192
+        assertEq(selfEffective, self);
+        assertEq(d1Effective, 60e18);
+        assertLe(self, total);
+        assertEq(self + thirdParty, total);
+        assertEq(thirdParty - d1Effective, 16e18); // the over-slash lands here
+        assertGt(thirdParty - d1Effective, 1e6);
     }
 
-    /// @dev Capital the validator supplies from a different address is not
-    ///      provable as "self" on-chain, so it must report as third-party rather
-    ///      than be guessed at.
+    /// @dev Both legs are the validator's own money; only its own address counts as self.
     function test_selfStake_excludesValidatorCapitalFromAnotherAddress() public {
         vm.prank(validator1);
         pool.registerPool(1000);
 
-        vm.prank(delegator1);
-        pool.delegate(validator1, 100e18);
+        address validatorOperator = makeAddr("validator1Operator");
 
-        (uint256 self, uint256 thirdParty, ) = pool.getDelegationComposition(validator1);
-        assertEq(self, 0, "only delegator == validator counts as self");
-        assertEq(thirdParty, 100e18, "everything else is third-party");
+        _fundValidator(validator1, 150e18);
+        vm.prank(validator1);
+        assertTrue(rls.transfer(validatorOperator, 50e18));
+        vm.prank(validatorOperator);
+        rls.approve(address(pool), type(uint256).max);
+
+        vm.prank(validator1);
+        pool.delegate(validator1, 100e18);
+        vm.prank(validatorOperator);
+        pool.delegate(validator1, 50e18);
+
+        assertEq(pool.getSelfDelegatedStake(validator1), 100e18);
+
+        (uint256 self, uint256 thirdParty, uint256 total) =
+            pool.getDelegationComposition(validator1);
+        assertEq(self, 100e18);
+        assertEq(thirdParty, 50e18);
+        assertEq(total, 150e18);
     }
 }
