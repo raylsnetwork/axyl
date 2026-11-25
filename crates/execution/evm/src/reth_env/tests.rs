@@ -2143,9 +2143,14 @@ async fn replay_env_keeps_a_large_persistence_threshold() -> eyre::Result<()> {
 /// Fixed genesis time for the golden chain. Block `n` has timestamp `GOLDEN_GENESIS_TIME + n`.
 const GOLDEN_GENESIS_TIME: u64 = 1_750_000_000;
 
-/// The golden genesis: the test genesis with a fixed timestamp and four validators, built by the
-/// same two steps the `genesis` command runs (the consensus registry simulation, then the
-/// greenfield overrides).
+/// The golden genesis: the test genesis with a fixed timestamp and four validators, then the
+/// consensus registry simulation and the greenfield fixes.
+///
+/// This is not the genesis the `genesis` command writes. The command runs these two steps too,
+/// but between them it lays the precompile accounts of `PRECOMPILE_CFG_YAML` over the simulation
+/// result, and at the end it puts the five simulated proxies back. Here the precompile accounts
+/// come from `TEST_GENESIS_YAML` and are in place before the simulation. So the test pins what
+/// the node computes from a fixed genesis. It does not pin the output of the command.
 ///
 /// The validator keys are built from fixed secret bytes (the scalars 1 to 4), not from a random
 /// generator: `StdRng` is not promised to give the same numbers in a later `rand` version, and
@@ -2225,7 +2230,13 @@ fn golden_payload(
 /// Genesis hash, and hash, state root, receipts root and gas used of four blocks, against fixed
 /// values.
 ///
-/// The chain uses the hardfork schedule of the local network. What the blocks cover:
+/// The chain uses the hardfork schedule of the local network, as it is in the code. It is not a
+/// frozen copy, on purpose: the test then covers every fork the local network runs. The price
+/// is that a new fork which is active from block 0 on the local network and changes execution
+/// moves the values. Update them in the same change, after checking that the new fork is the
+/// only reason.
+///
+/// What the blocks cover:
 /// - genesis: the pre-genesis EVM simulation that builds the consensus registry state
 /// - block 1: the two one-shot migrations of the local schedule, a transfer, a contract creation
 /// - block 2: a contract call with a storage write and a log, a transfer through the native ERC-20
@@ -2401,6 +2412,16 @@ async fn golden_genesis_and_blocks() -> eyre::Result<()> {
                 "block 1 must run the HybridRewards migration"
             );
         }
+        // Block 3 has no transactions, so the receipt checks above say nothing about it. Check
+        // the epoch close itself: the registry is in epoch 0 up to block 2 and in epoch 1 from
+        // block 3 on.
+        let registry_epoch = reth_env.epoch_state_from_canonical_tip()?.epoch;
+        assert_eq!(
+            registry_epoch,
+            u32::from(header.number >= 3),
+            "block {}: block 3 must close epoch 0, and no other block may close an epoch",
+            header.number
+        );
 
         actual_blocks.push([
             format!("{:?}", header.hash()),
@@ -2419,6 +2440,14 @@ async fn golden_genesis_and_blocks() -> eyre::Result<()> {
             "the contract stored the number of block 2"
         );
     }
+    // A receipt only says that a call did not revert. The receiver must really hold the three
+    // amounts: the transfer of block 1, the precompile transfer of block 2, the transfer of
+    // block 4.
+    assert_eq!(
+        reth_env.latest()?.account_balance(&receiver)?,
+        Some(U256::from(1_000_000u64 + 12_345 + 7)),
+        "the receiver got all three transfers, also the one through the ERC-20 precompile"
+    );
 
     let expected_blocks: Vec<[String; 5]> =
         EXPECTED_BLOCKS.iter().map(|b| b.map(String::from)).collect();
