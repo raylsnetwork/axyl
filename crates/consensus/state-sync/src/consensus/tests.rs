@@ -611,6 +611,104 @@ async fn a_stale_lookahead_does_not_reject_an_honest_tip() {
     config.shutdown().notify();
 }
 
+/// A follower at epoch 2 whose committee also ran epochs 0 and 1, by certified records, with
+/// the fork active.
+fn follower_at_epoch_two() -> (CommitteeFixture<MemDatabase>, ConsensusConfig<MemDatabase>) {
+    let fixture = CommitteeFixture::builder(MemDatabase::default)
+        .randomize_ports(true)
+        .committee_size(NonZeroUsize::new(4).unwrap())
+        .epoch(2)
+        .build();
+    let config = fixture.authorities().next().unwrap().consensus_config();
+    let config = config.with_certified_tip_v1_block(Some(0));
+    let keys: Vec<_> = fixture.authorities().map(|a| *a.authority().protocol_key()).collect();
+    for epoch in 0..2 {
+        let record = EpochRecord {
+            epoch,
+            committee: keys.clone(),
+            next_committee: keys.clone(),
+            ..Default::default()
+        };
+        let cert = EpochCertificate {
+            epoch_hash: record.digest(),
+            signature: Default::default(),
+            signed_authorities: Default::default(),
+        };
+        config.node_storage().save_epoch_record_with_cert(&record, &cert).unwrap();
+    }
+    assert_eq!(config.epoch(), 2, "precondition");
+    (fixture, config)
+}
+
+/// The tip f+1 of the fixture committee sign for `hash` at `number` in `epoch`.
+fn signed_tip(
+    fixture: &CommitteeFixture<MemDatabase>,
+    epoch: Epoch,
+    number: u64,
+    hash: B256,
+) -> CertifiedTip {
+    let keys: Vec<_> = fixture.authorities().map(|a| *a.authority().protocol_key()).collect();
+    let digest = CertifiedTip::digest_data(epoch, 1, number, hash);
+    let signed = fixture.authorities().take(CertifiedTip::quorum(keys.len())).map(|a| {
+        (*a.authority().protocol_key(), a.keypair().sign(&encode(&to_intent_message(digest))))
+    });
+    CertifiedTip::from_signatures(epoch, 1, number, hash, &keys, signed).unwrap()
+}
+
+/// Every connected peer of `config` answers with the tip `tips` gives its position.
+fn serving(
+    fixture: &CommitteeFixture<MemDatabase>,
+    config: &ConsensusConfig<MemDatabase>,
+    tips: impl Fn(usize) -> CertifiedTip,
+) -> PrimaryNetworkHandle {
+    let latest = honest_tip(fixture);
+    let peers = config
+        .committee()
+        .others_primaries_by_id(config.authority_id().as_ref())
+        .into_iter()
+        .enumerate()
+        .map(|(i, (_, key))| Peer::new(key, Some(tips(i)), &latest))
+        .collect();
+    peer_network(peers, vec![]).0
+}
+
+/// A tip from before the previous epoch is dropped even though it verifies: f+1 keys of a
+/// retired committee could sign any number. One from the previous epoch is still taken, so a
+/// chain halted on that epoch's last header can be found.
+#[tokio::test(start_paused = true)]
+async fn a_tip_from_before_the_previous_epoch_is_dropped() {
+    let (fixture, config) = follower_at_epoch_two();
+    let consensus_bus = ConsensusBus::new();
+    let retired = signed_tip(&fixture, 0, 100, B256::repeat_byte(1));
+    let keys = config.get_settled_committee_keys_for_epoch(0).expect("epoch 0 is settled");
+    assert!(retired.verify(&keys), "precondition: it verifies");
+
+    let network = serving(&fixture, &config, |_| retired.clone());
+    assert_eq!(probe_for_head(0, &config, &consensus_bus, &network).await, None);
+
+    let previous = signed_tip(&fixture, 1, 100, B256::repeat_byte(2));
+    let network = serving(&fixture, &config, |_| previous.clone());
+    assert_eq!(
+        probe_for_head(0, &config, &consensus_bus, &network).await,
+        Some((100, previous.hash)),
+        "a tip of the previous epoch is taken"
+    );
+    config.shutdown().notify();
+}
+
+/// A tip from a later epoch ranks above a higher number from an earlier one.
+#[tokio::test(start_paused = true)]
+async fn a_later_epoch_outranks_a_higher_number() {
+    let (fixture, config) = follower_at_epoch_two();
+    let consensus_bus = ConsensusBus::new();
+    let earlier = signed_tip(&fixture, 1, 100, B256::repeat_byte(1));
+    let later = signed_tip(&fixture, 2, 50, B256::repeat_byte(2));
+    let network =
+        serving(&fixture, &config, |i| if i == 0 { later.clone() } else { earlier.clone() });
+    assert_eq!(probe_for_head(0, &config, &consensus_bus, &network).await, Some((50, later.hash)));
+    config.shutdown().notify();
+}
+
 /// Before the fork the follower probes committee members' latest headers as before, and asks
 /// nobody for a certified tip.
 #[tokio::test(start_paused = true)]
