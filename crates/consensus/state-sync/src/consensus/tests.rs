@@ -537,7 +537,8 @@ async fn a_silent_peer_does_not_hold_up_the_probe() {
 
 /// An honest tip from the next epoch is not checked against the lookahead, which can still
 /// list a key ejected since it was read and then fails the tip. The tip waits for the
-/// certified record naming that committee, and the collector is asked for it.
+/// certified record naming that committee, the collector is asked for it, and once it is
+/// stored the tip is taken.
 #[tokio::test(start_paused = true)]
 async fn a_stale_lookahead_does_not_reject_an_honest_tip() {
     let fixture = committee_of_four();
@@ -584,11 +585,29 @@ async fn a_stale_lookahead_does_not_reject_an_honest_tip() {
         .collect();
     let (network, _) = peer_network(peers, vec![]);
     let consensus_bus = ConsensusBus::new();
-    tokio::spawn(spawn_track_recent_consensus(config.clone(), consensus_bus.clone(), network));
+    tokio::spawn(spawn_track_recent_consensus(
+        config.clone(),
+        consensus_bus.clone(),
+        network.clone(),
+    ));
 
     let mut requested = consensus_bus.requested_missing_epoch().subscribe();
     let asked = tokio::time::timeout(Duration::from_secs(5), requested.wait_for(|e| *e >= 1));
     assert!(asked.await.is_ok(), "the collector is asked for the record naming epoch 1");
+
+    // the collector lands the certified record of epoch 1
+    let record = EpochRecord { epoch: 1, committee: keys.clone(), ..Default::default() };
+    let cert = EpochCertificate {
+        epoch_hash: record.digest(),
+        signature: Default::default(),
+        signed_authorities: Default::default(),
+    };
+    config.node_storage().save_epoch_record_with_cert(&record, &cert).unwrap();
+    assert_eq!(
+        probe_for_head(0, &config, &consensus_bus, &network).await,
+        Some((5, hash)),
+        "the same tip is taken once its committee is settled"
+    );
     config.shutdown().notify();
 }
 
