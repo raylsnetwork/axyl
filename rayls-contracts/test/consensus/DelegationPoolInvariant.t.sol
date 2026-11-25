@@ -136,6 +136,12 @@ contract DelegationPoolHandler is Test {
         IDelegationPool.ValidatorPool memory toPool = pool.getValidatorPool(to);
         IDelegationPool.DelegatorPosition memory toPos = pool.getDelegatorPosition(to, d);
 
+        // skip moves transferStake would reject with TierMismatch
+        bool toOpenTier = toPos.amount > 0
+            ? toPos.openTier
+            : (pool.whitelistEnabled() && !pool.isWhitelistVerified(d));
+        if (toOpenTier != fromPos.openTier) return;
+
         uint256 poolRoom = MAX_VALIDATOR_DELEGATION - (toPool.totalDelegated + toPool.openTierDelegated);
         uint256 actorRoom = MAX_DELEGATION - toPos.amount;
         uint256 cap = poolRoom < actorRoom ? poolRoom : actorRoom;

@@ -594,6 +594,8 @@ contract DelegationPool is
             ? toPos.openTier
             : ($.whitelistEnabled && !$.whitelistVerified[msg.sender]);
 
+        if (toOpenTier != fromPos.openTier) revert TierMismatch(fromPos.openTier, toOpenTier);
+
         _settlePosition(toPool, toPos);
 
         // check per-delegator max on the destination (post-settlement amount)
@@ -1046,3 +1048,4 @@ contract DelegationPool is
         pos.slashDebt = newSlashDebt;
     }
 }
+
