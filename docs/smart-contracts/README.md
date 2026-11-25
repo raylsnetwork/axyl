@@ -1,24 +1,12 @@
 # Axyl's Solidity Contract Sources, and What a Fresh Chain Actually Runs
 
-The repository contains several copies of the same contracts. This doc inventories them, specifies
-which one determines the code a new chain executes, and records where the copies disagree.
+The repository contains several copies of the same contracts. This doc inventories them, specifies which one determines the code a new chain executes, and records where the copies disagree.
 
-**TL;DR:** the code a new chain runs comes from `rayls-contracts/artifacts/*.json` — contracts 1–8
-and 27 — except the implementations of contracts 2–7, which come from
-`crates/execution/evm/src/evm/hardforks/bytecodes/*_impl.bin`, contracts 28–30, which come from
-`rayls-contracts/deployments/genesis/precompile-config.yaml`, and contract 1, whose code `HybridRewards`
-replaces at block 1. None of it is generated from `rayls-contracts/src/**/*.sol` automatically. Three of
-the six `*_impl.bin` files are behind the source: `DelegationPool` and `RewardDistributor` are older builds
-missing functions the source now has, and `FeeAggregator`'s is not a build of any source state in this repo.
+**TL;DR:** the code a new chain runs comes from `rayls-contracts/artifacts/*.json` — contracts 1–8 and 27 — except the implementations of contracts 2–7, which come from `crates/execution/evm/src/evm/hardforks/bytecodes/*_impl.bin`, contracts 28–30, which come from `rayls-contracts/deployments/genesis/precompile-config.yaml`, and contract 1, whose code `HybridRewards` replaces at block 1. None of it is generated from `rayls-contracts/src/**/*.sol` automatically. Three of the six `*_impl.bin` files are behind the source: `DelegationPool` and `RewardDistributor` are older builds missing functions the source now has, and `FeeAggregator`'s is not a build of any source state in this repo.
 
-`main` is `76896d7` (v1.5.3, 2026-11-23). Every build behind the tables ran at `e8c4ea1b` (node `1.5.2`,
-2026-11-20); `rayls-contracts/` and `crates/execution/evm/src/evm/hardforks/` are identical between those
-two, so the "of `main`" attributions read against `76896d7` as well. Parts 3–5 were measured in November
-2026 at the blocks each part names. Code equality everywhere means equality after zeroing the solc link and
-immutable windows, which is where the spliced protocol addresses live.
+`main` is `76896d7` (v1.5.3, 2026-11-23). Every build behind the tables ran at `e8c4ea1b` (node `1.5.2`, 2026-11-20); `rayls-contracts/` and `crates/execution/evm/src/evm/hardforks/` are identical between those two, so the "of `main`" attributions read against `76896d7` as well. Parts 3–5 were measured in November 2026 at the blocks each part names. Code equality everywhere means equality after zeroing the solc link and immutable windows, which hold the implementation's own address, baked in at construction.
 
-See also `docs/contract-upgrades/README.md` (proxy upgrade vs hardfork decision) and
-`docs/hardforks/` (scheduling mechanics).
+See also `docs/contract-upgrades/README.md` (proxy upgrade vs hardfork decision) and `docs/hardforks/` (scheduling mechanics).
 
 ---
 
@@ -26,9 +14,7 @@ See also `docs/contract-upgrades/README.md` (proxy upgrade vs hardfork decision)
 
 ### Contract enumeration
 
-Numbering used throughout this doc: **1–9** are the deployable classes declared in
-`rayls-contracts/src`, **10–26** are the remaining `.sol` files there, **27–31** are sources outside
-`rayls-contracts/src` that a chain still executes. Per-tier coverage is in the next section.
+Numbering used throughout this doc: **1–9** are the deployable classes declared in `rayls-contracts/src`, **10–26** are the remaining `.sol` files there, **27–31** are sources outside `rayls-contracts/src` that a chain still executes. Per-tier coverage is in the next section.
 
 | # | Class | UUPS |
 |---|---|---|
@@ -64,8 +50,7 @@ The remaining 17 files in `rayls-contracts/src` produce no bytecode that reaches
 | 25 | `mocks/MockAlgebraDex.sol` | mock | test helper |
 | 26 | `mocks/MockOFTBridge.sol` | mock | test helper |
 
-Contract 9 is deployed on demand by `rayls-contracts/script/interactions/reward-curve/` and reached
-through `IRewardCurve`.
+Contract 9 is deployed on demand by `rayls-contracts/script/interactions/reward-curve/` and reached through `IRewardCurve`.
 
 **External sources** — code a chain executes that is not declared in `rayls-contracts/src`:
 
@@ -88,58 +73,34 @@ through `IRewardCurve`.
 | S5 | Hardfork migrations | `crates/execution/evm/src/evm/hardforks/bytecodes/<fork>/*.bin`, plus byte literals in `crates/execution/evm/src/evm/hardforks/*.rs` | 18 fixture files covering contracts 1–7 and 27, plus the STOP byte of 31 | state built in `crates/execution/evm/src/evm/hardforks/*.rs`, applied at an activation block |
 | S6 | UUPS proxy upgrade | none — a transaction sent from `rayls-contracts/script/interactions/upgrade/UpgradeOps.s.sol` | no files in the repository; the deployed code and the event exist only on-chain | operator-initiated; applies only to contracts 2–7, the six upgradable ones |
 
-S1–S5 are where the code a chain runs comes from: S2 and S4 determine block 0, S5 acts at an
-activation height, and S3 supplies contracts 28–30. S2–S5 are compiled into the node binary and require
-a rebuild to change. S6 is the only tier with no footprint in the repository: the code it installs is
-compiled locally from S1, so its provenance cannot be pinned from the repo — only by hashing the live
-code (see Part 3). Contracts 27–30 come from `rayls-contracts/node_modules` and 31 is node-internal, so
-none of them appears in S1.
+S1–S5 are where the code a chain runs comes from: S2 and S4 determine block 0, S5 acts at an activation height, and S3 supplies contracts 28–30. S2–S5 are compiled into the node binary and require a rebuild to change. S6 is the only tier with no footprint in the repository: the code it installs is compiled locally from S1, so its provenance cannot be pinned from the repo — only by hashing the live code (see Part 3). Contracts 27–30 come from `rayls-contracts/node_modules` and 31 is node-internal, so none of them appears in S1.
 
 ### Propagation paths
 
-A `.sol` change reaches a **new chain** only through the checked-in artifacts and binaries.
-`forge build` writes to the gitignored `rayls-contracts/out/`. The checked-in
-`rayls-contracts/artifacts/*.json` set is a separate hand-exported copy: no script, Makefile target
-or CI job regenerates it, and `git log main -- rayls-contracts/artifacts` contains only the root commit
-of this history ("Porting codebase from old repository", 2026-07-03).
-Re-exporting the selected files from `out/` into `rayls-contracts/artifacts/` and rebuilding the node is
-therefore the only route from S1 to S2.
+A `.sol` change reaches a **new chain** only through the checked-in artifacts and binaries. `forge build` writes to the gitignored `rayls-contracts/out/`. The checked-in `rayls-contracts/artifacts/*.json` set is a separate hand-exported copy: no script, Makefile target or CI job regenerates it, and `git log main -- rayls-contracts/artifacts` contains only the root commit of this history ("Porting codebase from old repository", 2026-07-03). Re-exporting the selected files from `out/` into `rayls-contracts/artifacts/` and rebuilding the node is therefore the only route from S1 to S2.
 
 An **existing chain** can be changed two ways:
 
-- **Hardfork (S5).** The new code ships inside the node binary and is applied at an activation height.
-  Its fixtures are compiled by hand from S1, so it carries the same regeneration problem as S2 and S4.
-- **Proxy upgrade (S6).** A transaction from
-  `rayls-contracts/script/interactions/upgrade/UpgradeOps.s.sol` points a proxy at new code, with no
-  client change. Only contracts 2–7 can receive it: contract 1 has no proxy, and contract 27's code
-  is fixed once the proxy is deployed.
+- **Hardfork (S5).** The new code ships inside the node binary and is applied at an activation height. Its fixtures are compiled by hand from S1, so it carries the same regeneration problem as S2 and S4.
+- **Proxy upgrade (S6).** A transaction from `rayls-contracts/script/interactions/upgrade/UpgradeOps.s.sol` points a proxy at new code, with no client change. Only contracts 2–7 can receive it: contract 1 has no proxy, and contract 27's code is fixed once the proxy is deployed.
 
 ### The genesis alloc YAML (S3)
 
-`rayls-contracts/deployments/genesis/precompile-config.yaml` is generated by
-`rayls-contracts/script/GeneratePrecompileGenesisConfig.s.sol`, which broadcasts real deploys in a
-forge VM — contracts 28–30, the implementations and proxies of contracts 2–5 and 7, each proxy run
-through its `initialize` — and writes the resulting code, storage and balance under the addresses
-recorded in `rayls-contracts/deployments/deployments.json`: 13 accounts, 55 storage slots.
+`rayls-contracts/deployments/genesis/precompile-config.yaml` is generated by `rayls-contracts/script/GeneratePrecompileGenesisConfig.s.sol`, which broadcasts real deploys in a forge VM — contracts 28–30, the implementations and proxies of contracts 2–5 and 7, each proxy run through its `initialize` — and writes the resulting code, storage and balance under the addresses recorded in `rayls-contracts/deployments/deployments.json`: 13 accounts, 55 storage slots.
 
 | S3 account | Runtime code | Slots |
 |---|---|---|
 | contracts 28–30 | Safe singleton, proxy factory, Safe proxy | 7 — singleton pointer, the single owner `0x0e301bee…f3161`, threshold, module and initialization flags; the governance Safe also carries the file's only balance, 10 native units |
-| implementation of 2–5 and 7 | the S2 artifact with a simulated implementation address written in at the three `__self` sites: `62c20a…6dd7d1` 2, `a8452e…c00496` 3, `d718d5…9869a0` 4, `db8cff…ee3c76` 5, `416c42…d87ae6` 7 | 0 |
+| implementation of 2–5 and 7 | the S2 artifact with the forge script's own implementation address written in at the three `__self` sites: `62c20a…6dd7d1` 2, `a8452e…c00496` 3, `d718d5…9869a0` 4, `db8cff…ee3c76` 5, `416c42…d87ae6` 7 | 0 |
 | proxy of 2–5 and 7 | contract 27 | 4 shared per contract: ERC-1967 implementation slot, `_initialized = 1`, `DEFAULT_ADMIN_ROLE` and `UPGRADER_ROLE` granted to `0x0e301bee…f3161`. Plus initializer arguments: 2 → 7 (delegation bounds, 14 unbonding epochs), 3 → 14 (fee split 5000/0/5000 bps, swap bounds, USDr `0x…0400`), 4 → 5, 5 → 0, 7 → 2 (wiring) |
 
 ### Tier freshness against S1
 
-Provenance is by build: `forge build` of `rayls-contracts/src` at the tag named, compared over the solc link
-and immutable slots, which hold the spliced addresses at runtime. `S2 of main` means that file as checked in
-at `main`; `S1 of <tag>` means a build of `src` at that tag. A tag range names the set of tags carrying the
-blob shown — tags are labels, not a commit walk, and the `v0.x` tags hang off a second root that `main` does
-not contain, so the endpoints carry no ancestry. `git ls-tree <tag> <path>` resolves any of them.
+Provenance is by build: `forge build` of `rayls-contracts/src` at the tag named, compared over the solc link and immutable slots, whose values are set when the contract is constructed. `S2 of main` means that file as checked in at `main`; `S1 of <tag>` means a build of `src` at that tag. A tag range names the set of tags carrying the blob shown — tags are labels, not a commit walk, and the `v0.x` tags hang off a second root that `main` does not contain, so the endpoints carry no ancestry. `git ls-tree <tag> <path>` resolves any of them.
 
 #### S2 — `rayls-contracts/artifacts/*.json`
 
-This is what the simulation deploys. For contracts 2–5 and 7 it decides only the proxies' storage layout:
-the implementation code that executes comes from S3 and then S4.
+This is what the simulation deploys. For contracts 2–5 and 7 it decides only the proxies' storage layout: the implementation code that executes comes from S3 and then S4.
 
 | Contract | In sync with | Action |
 |---|---|---|
@@ -173,11 +134,7 @@ the implementation code that executes comes from S3 and then S4.
 | 8 `BlsG1` | not in `bytecodes/` | n/a |
 | 9 `RewardCurve` | not in `bytecodes/` | n/a |
 
-Rebuilding these binaries decides what a new chain runs: the stale ones are missing functions the source
-already has — contract 2 lacks 8 of 53, contract 3 lacks 2 of 54 (`initialize`, `setPoolConfig`), contract 4
-lacks 6 of 39 (the RewardCurve and target-APY API). Contracts 2–7 sit behind UUPS proxies, so an existing
-chain keeps the implementation it has and takes the change only through an upgrade transaction —
-S6. The alternative is a hardfork migration (S5).
+Rebuilding these binaries decides what a new chain runs: the stale ones are missing functions the source already has — contract 2 lacks 8 of 53, contract 3 lacks 2 of 54 (`initialize`, `setPoolConfig`), contract 4 lacks 6 of 39 (the RewardCurve and target-APY API). Contracts 2–7 sit behind UUPS proxies, so an existing chain keeps the implementation it has and takes the change only through an upgrade transaction — S6. The alternative is a hardfork migration (S5).
 
 #### S5 — `crates/execution/evm/src/evm/hardforks/bytecodes/<fork>/*.bin`
 
@@ -206,17 +163,9 @@ S6. The alternative is a hardfork migration (S5).
 
 ## Part 2 — New chain
 
-Under `local()`'s schedule (`crates/execution/evm/src/chainspec/schedule.rs`), the only S5 migrations a
-new chain runs are `HybridRewards` and `Erc20PrecompileBytecode`, both at block 1; S5's other fixtures are
-scheduled `Block(0)` and never run.
+Under `local()`'s schedule (`crates/execution/evm/src/chainspec/schedule.rs`), the only S5 migrations a new chain runs are `HybridRewards` and `Erc20PrecompileBytecode`, both at block 1; S5's other fixtures are scheduled `Block(0)` and never run.
 
-Genesis is built by `GenesisArgs::execute` (`crates/infrastructure/network-cli/src/genesis/mod.rs`) in
-four passes over one account map: the pre-genesis simulation (S2), the YAML (S3), the implementation
-binaries (S4), and S2 again — its five proxy accounts re-applied on top. The table is that map read as a
-timeline: left to right is cause, `Block ≥ 0` is the effect, and the last column that writes is what a new
-chain gets. S4 exists because `__self` in an implementation is an immutable — code compiled for the
-simulation's temporary address cannot be repaired afterwards, so a binary compiled for the protocol
-address replaces it.
+Genesis is built by `GenesisArgs::execute` (`crates/infrastructure/network-cli/src/genesis/mod.rs`) in four passes over one account map: the pre-genesis simulation (S2), the YAML (S3), the implementation binaries (S4), and S2 again — its five proxy accounts re-applied on top. The table is that map read as a timeline: left to right is cause, `Block ≥ 0` is the effect, and the last column that writes is what a new chain gets. S4 exists because an implementation's `__self` is baked into its runtime code when the contract is constructed and cannot be rewritten afterwards: the YAML's copies carry the forge script's throwaway addresses there, so S4 installs runtime code whose `__self` is the protocol address.
 
 | Contract | S1 | S2 | S3 | S4 | S2 again | S5 | S6 | Block ≥ 0 |
 |---|---|---|---|---|---|---|---|---|
@@ -254,8 +203,7 @@ address replaces it.
 
 ## Part 3 — Deployments on testnet
 
-Measured from `https://testnet-rpc.rayls.com` (chain id 7295799) at block 25,331,108 in November 2026. The
-RPC reports node `1.5.2`, tag `testnet-v1.5.2`, which is not an ancestor of `main`.
+Measured from `https://testnet-rpc.rayls.com` (chain id 7295799) at block 25,331,108 in November 2026. The RPC reports node `1.5.2`, tag `testnet-v1.5.2`, which is not an ancestor of `main`.
 
 | # | Contract | Testnet code equals |
 |---|---|---|
@@ -269,16 +217,13 @@ RPC reports node `1.5.2`, tag `testnet-v1.5.2`, which is not an ancestor of `mai
 | 8 | `BlsG1` | S2 at `v0.1.1`–`v0.1.5`, byte-for-byte |
 | 9 | `RewardCurve` | not deployed — no S2 entry, no protocol address, installed by no tier |
 
-Contracts 1 and 8 match an S2 generation replaced at `v0.1.6`. The `v0.x` tags hang off a second, older root
-commit (2025-11-26) that `main` does not contain.
+Contracts 1 and 8 match an S2 generation replaced at `v0.1.6`. The `v0.x` tags hang off a second, older root commit (2025-11-26) that `main` does not contain.
 
-DelegationPool, FeeAggregator and RewardDistributor — contracts 2, 3 and 4 — have been proxy-upgraded (S6);
-the implementations they replaced are still deployed and byte-identical to S4.
+DelegationPool, FeeAggregator and RewardDistributor — contracts 2, 3 and 4 — have been proxy-upgraded (S6); the implementations they replaced are still deployed and byte-identical to S4.
 
 ## Part 4 — Deployments on mainnet
 
-Measured from `https://mainnet-rpc.rayls.com` (chain id 72957) at block 15,126,703 in November 2026. The
-RPC reports node `1.4.3`, tag `mainnet-v1.4.3`, which is not an ancestor of `main`.
+Measured from `https://mainnet-rpc.rayls.com` (chain id 72957) at block 15,126,703 in November 2026. The RPC reports node `1.4.3`, tag `mainnet-v1.4.3`, which is not an ancestor of `main`.
 
 | # | Contract | Mainnet code equals |
 |---|---|---|
@@ -292,13 +237,11 @@ RPC reports node `1.4.3`, tag `mainnet-v1.4.3`, which is not an ancestor of `mai
 | 8 | `BlsG1` | S2 = S1 of `main` |
 | 9 | `RewardCurve` | not deployed |
 
-Contracts 3, 5, 6 and 7 still run the implementations genesis installed; 2 and 4 have been proxy-upgraded
-(S6), with the retired implementations still deployed and byte-identical to S4.
+Contracts 3, 5, 6 and 7 still run the implementations genesis installed; 2 and 4 have been proxy-upgraded (S6), with the retired implementations still deployed and byte-identical to S4.
 
 ## Part 5 — Local chain
 
-Measured from `http://localhost:8545` (chain id 487, the `local` network) at block 55 in November 2026. The
-RPC reports node `1.5.2`, built from `main` at `e8c4ea1b`.
+Measured from `http://localhost:8545` (chain id 487, the `local` network) at block 55 in November 2026. The RPC reports node `1.5.2`, built from `main` at `e8c4ea1b`.
 
 | # | Contract | Local code equals |
 |---|---|---|
@@ -312,5 +255,5 @@ RPC reports node `1.5.2`, built from `main` at `e8c4ea1b`.
 | 8 | `BlsG1` | S2 = S1 of `main` |
 | 9 | `RewardCurve` | not deployed |
 
-Contract 1 was read at block 0 too: there it is S2 of `main`, replaced by the `HybridRewards` fixture at
-block 1. Every proxy points at the implementation address genesis installed, so S6 has not applied.
+Contract 1 was read at block 0 too: there it is S2 of `main`, replaced by the `HybridRewards` fixture at block 1. Every proxy points at the implementation address genesis installed, so S6 has not applied.
+
