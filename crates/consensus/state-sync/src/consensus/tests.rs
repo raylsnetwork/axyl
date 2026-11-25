@@ -709,6 +709,32 @@ async fn a_later_epoch_outranks_a_higher_number() {
     config.shutdown().notify();
 }
 
+/// Within one epoch the higher number wins, even when the lower one answers first.
+#[tokio::test(start_paused = true)]
+async fn within_an_epoch_a_higher_number_outranks_an_earlier_answer() {
+    let (fixture, config) = follower_at_epoch_two();
+    let consensus_bus = ConsensusBus::new();
+    let lower = signed_tip(&fixture, 2, 50, B256::repeat_byte(1));
+    let higher = signed_tip(&fixture, 2, 60, B256::repeat_byte(2));
+    let latest = honest_tip(&fixture);
+    let peers = config
+        .committee()
+        .others_primaries_by_id(config.authority_id().as_ref())
+        .into_iter()
+        .enumerate()
+        .map(|(i, (_, key))| match i {
+            0 => Peer::new(key, Some(lower.clone()), &latest),
+            _ => Peer {
+                delay: Duration::from_millis(100),
+                ..Peer::new(key, Some(higher.clone()), &latest)
+            },
+        })
+        .collect();
+    let (network, _) = peer_network(peers, vec![]);
+    assert_eq!(probe_for_head(0, &config, &consensus_bus, &network).await, Some((60, higher.hash)));
+    config.shutdown().notify();
+}
+
 /// Before the fork the follower probes committee members' latest headers as before, and asks
 /// nobody for a certified tip.
 #[tokio::test(start_paused = true)]
