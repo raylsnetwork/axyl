@@ -793,9 +793,10 @@ async fn certified_tip_is_not_built_over_a_stale_lookahead() -> eyre::Result<()>
 }
 
 /// Early in epoch 2, before any epoch-2 quorum, f+1 keys of the epoch-1 committee sign a header
-/// at the highest number there is. A node in epoch 2 holds every header of epoch 1, so the quorum
-/// is dropped: it is neither served as the certified tip nor published as the gossip tip, where it
-/// would drop every later result. Epoch 1's last header still is, and epoch 2 then moves it on.
+/// that does not exist, at the highest number there is or at a number the node holds. A node in
+/// epoch 2 holds every header of epoch 1, so the quorum is dropped: it is neither served as the
+/// certified tip nor published as the gossip tip, where a high number would drop every later
+/// result. Epoch 1's last header still is, and epoch 2 then moves it on.
 #[tokio::test]
 async fn certified_tip_is_not_pinned_by_a_forged_closed_epoch() -> eyre::Result<()> {
     use rayls_infrastructure_storage::{tables::ConsensusBlocks, EpochStore as _};
@@ -824,7 +825,8 @@ async fn certified_tip_is_not_pinned_by_a_forged_closed_epoch() -> eyre::Result<
         db.save_epoch_record_with_cert(&record, &cert)?;
     }
     // epoch 1 closed on header 10
-    db.insert::<ConsensusBlocks>(&10, &ConsensusHeader { number: 10, ..Default::default() })?;
+    let last = ConsensusHeader { number: 10, ..Default::default() };
+    db.insert::<ConsensusBlocks>(&10, &last)?;
     let consensus_bus = ConsensusBus::new();
     let task_manager = TaskManager::default();
     let synchronizer =
@@ -862,18 +864,19 @@ async fn certified_tip_is_not_pinned_by_a_forged_closed_epoch() -> eyre::Result<
         }
     };
 
-    certify(1, u64::MAX, BlockHash::random()).await?;
-    assert_eq!(served().await, None, "the forged tip is not served");
-    assert_eq!(
-        *consensus_bus.last_published_consensus_num_hash().borrow(),
-        (0, BlockHash::ZERO),
-        "nor published as the gossip tip"
-    );
+    for number in [u64::MAX, 10] {
+        certify(1, number, BlockHash::random()).await?;
+        assert_eq!(served().await, None, "a forged header at {number} is not served");
+        assert_eq!(
+            *consensus_bus.last_published_consensus_num_hash().borrow(),
+            (0, BlockHash::ZERO),
+            "nor published as the gossip tip"
+        );
+    }
 
-    let last = BlockHash::random();
-    certify(1, 10, last).await?;
+    certify(1, 10, last.digest()).await?;
     assert_eq!(served().await, Some((1, 10)), "the closed epoch's last header is");
-    assert_eq!(*consensus_bus.last_published_consensus_num_hash().borrow(), (10, last));
+    assert_eq!(*consensus_bus.last_published_consensus_num_hash().borrow(), (10, last.digest()));
 
     certify(2, 11, BlockHash::random()).await?;
     assert_eq!(served().await, Some((2, 11)), "and the next epoch moves it on");

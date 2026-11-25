@@ -128,9 +128,9 @@ pub(crate) struct RequestHandler<DB> {
 /// Whether a tip certified at `epoch` and `number` replaces the stored one, `saved` as its epoch
 /// and number: only when it is from `floor` or later, and from a later epoch or higher in the
 /// same one. `floor` holds while nothing is stored yet. The epoch comes first: honest numbers
-/// rise across epochs, so a later epoch always wins. A high number forged by f+1 retired keys of
-/// an earlier epoch does not get here: the gossip path drops a quorum from a closed epoch above
-/// the last header this node holds.
+/// rise across epochs, so a later epoch always wins. A header forged by f+1 retired keys of an
+/// earlier epoch does not get here: the gossip path drops a quorum from a closed epoch unless it
+/// names the header this node holds at that number.
 pub(super) fn replaces_certified_tip(
     saved: Option<(Epoch, u64)>,
     floor: Epoch,
@@ -448,22 +448,22 @@ where
                     };
                     if let Some(signatures) = quorum {
                         // a node in a later epoch has executed every header of this one, so an
-                        // honest result is at most the last header it holds; a higher number is
-                        // f+1 retired keys forging one, which would otherwise be served as the
-                        // certified tip and, as the gossip tip, drop every later result above
+                        // honest result names the header it holds at that number; anything else
+                        // is f+1 retired keys forging one, which would otherwise be served as the
+                        // certified tip and, as the gossip tip, drop every later result below it
                         if epoch < self.consensus_config.committee().epoch() {
                             let held = self
                                 .consensus_config
                                 .node_storage()
-                                .last_record::<ConsensusBlocks>()
-                                .map_or(0, |(held, _)| held);
-                            if number > held {
+                                .get::<ConsensusBlocks>(&number)
+                                .ok()
+                                .flatten();
+                            if held.is_none_or(|held| held.digest() != hash) {
                                 warn!(
                                     target: "primary::consensus_result",
                                     epoch,
                                     number,
-                                    held,
-                                    "quorum from a closed epoch above the last header held, dropping"
+                                    "quorum from a closed epoch is not the header held at its number, dropping"
                                 );
                                 return Ok(());
                             }
