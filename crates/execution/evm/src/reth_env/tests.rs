@@ -2134,21 +2134,29 @@ async fn replay_env_keeps_a_large_persistence_threshold() -> eyre::Result<()> {
 // the node computes, the hashes change and the test fails.
 //
 // The same test with the same values passes on reth 1.11 (v1.5.3) and on reth 2.0. The values
-// may only change together with a hardfork, or with a change of the fixed inputs below.
+// may only change together with a hardfork, or with a change of the inputs. The inputs are the
+// values below and three shared fixtures: `test_genesis()` with `TEST_GENESIS_YAML`, the contract
+// bytecodes that the genesis build and the migrations deploy, and the key of
+// `TransactionFactory::new()`.
 // ---------------------------------------------------------------------------------------------
 
 /// Fixed genesis time for the golden chain. Block `n` has timestamp `GOLDEN_GENESIS_TIME + n`.
 const GOLDEN_GENESIS_TIME: u64 = 1_750_000_000;
 
-/// The golden genesis: the test genesis with a fixed timestamp, four validators with seeded
-/// keys, built by the same two steps the `genesis` command runs (the consensus registry
-/// simulation, then the greenfield overrides).
+/// The golden genesis: the test genesis with a fixed timestamp and four validators, built by the
+/// same two steps the `genesis` command runs (the consensus registry simulation, then the
+/// greenfield overrides).
+///
+/// The validator keys are built from fixed secret bytes (the scalars 1 to 4), not from a random
+/// generator: `StdRng` is not promised to give the same numbers in a later `rand` version, and
+/// the keys go into the genesis state.
 fn golden_genesis() -> eyre::Result<rayls_infrastructure_types::Genesis> {
     let validators: Vec<NodeInfo> = (0u8..4)
         .map(|i| {
             let addr = Address::from_slice(&[(i + 1) * 0x11; 20]);
-            let mut rng = StdRng::seed_from_u64(u64::from(i));
-            let bls = BlsKeypair::generate(&mut rng);
+            let mut secret = [0u8; 32];
+            secret[31] = i + 1;
+            let bls = BlsKeypair::from_bytes(&secret).expect("a small scalar is a valid key");
             let pop = generate_proof_of_possession_bls(&bls, &addr).expect("pop generation failed");
             NodeInfo {
                 name: format!("validator-{i}"),
@@ -2224,47 +2232,51 @@ fn golden_payload(
 ///   precompile
 /// - block 3: an epoch close, with its system calls
 /// - block 4: a transfer in the new epoch
+///
+/// Not covered: the reward amounts. The test env has no consensus database behind its rewards
+/// counter, so the epoch close runs with an empty tally. The close pins the system calls and the
+/// committee change, not the reward math.
 #[tokio::test]
 async fn golden_genesis_and_blocks() -> eyre::Result<()> {
     use crate::NetworkProfile;
     use rayls_infrastructure_types::RaylsNetwork;
-    use reth_provider::ReceiptProvider as _;
+    use reth_provider::{ReceiptProvider as _, StateProvider as _};
 
     // genesis hash, genesis state root
     const EXPECTED_GENESIS: [&str; 2] = [
-        "0xc8fbbfb77e1f634fa03dfbd7dd09784dd4654ddcaea8b9996f8dd357819f9a9f",
-        "0x5149016a48a71212404e408c1d3d9882bad3e3d7493d9e2d3fab694868c92e8e",
+        "0x343f67c779d2b6631543451f97880881a9c1bcd12072b5181f0bac7040171617",
+        "0x2d191fa6b14b09efb7932d2c3acbb25ec78da7eefc7ddc08986df8606260a8c5",
     ];
     // per block: hash, state root, receipts root, gas used, transactions
     const EXPECTED_BLOCKS: [[&str; 5]; 4] = [
         // block 1
         [
-            "0x783f71335b49583c556a397dce5b2038d8d8597f36f866e94fa33e7ee12ecbc7",
-            "0x797e774512f64aa2d83a41c230af8b3540774f96505423691577b78d69077747",
+            "0x175c2d005d7c455921c7c1e942f4bfcec3f0c2df1246491bd3520f4e6e3b60bf",
+            "0xc5cb2555fe8737e8703c545ebe9df8ec150b09f434a29d11236d3ec075be21ca",
             "0x7b63442fc3bb636f45608775a000448294c5f3181db035f76b5c78ccb11e6928",
             "76276",
             "2",
         ],
         // block 2
         [
-            "0x7d63577e03cc225b22c145cfbccc615e96e269cf7259f47c2ac95bab72ba17c6",
-            "0x707a5fff6cd0754dbac0ff1e62f524b2dad227d17fbc81d060f6c1f69789af98",
+            "0x62d1d38c68e82370b3d5cff9f6672a845c67049003e2d0f3ec72577499f1365c",
+            "0x3f53b07849ca405108735154b807738875be7e80064315a4a57d4fef160c0206",
             "0x7560ccf08f392a89e26049c789995dc15f0a8cec1a966ca58aa04bcabbae0466",
             "74070",
             "2",
         ],
         // block 3
         [
-            "0xa524a7976e7ce58536a31935d3bb44f6dd595ce6d0eaef04b196556ebce7b270",
-            "0x8f15844e852ed2328eb911df486bbd1fc135d6f298406e58ba74dd3c84f65ba5",
+            "0xef141cf0b9171844dc20a0cfda6d023a82ccf9b3eb1647b6624e943ccc2683c9",
+            "0x6f024e556afa4b506be7fb8b3cc420685f8954ed5b753257f455529d460db8cd",
             "0x56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421",
             "0",
             "0",
         ],
         // block 4
         [
-            "0xcb5c7b1c61eb21e5127e6d049133e84b3eced0cd6831d18346292dd0a3e1341f",
-            "0xc75027fe32ceef60a30c5936cffa251bb788809411b70df2f96ec80f95400ba1",
+            "0x5dbde113bf3ea0a9bcd5339828bc0ea09ef42c28a302d36297af8a2a0b4de5db",
+            "0x32440657f8b0dd5927e51c8f68559146492909d3aaeeeeff8059db44bf749ee7",
             "0xf3e5d7efe2f0cec3853ea3580e632cb94238b6749655d3955fbc81f0c6a8f62a",
             "21000",
             "1",
@@ -2291,6 +2303,13 @@ async fn golden_genesis_and_blocks() -> eyre::Result<()> {
     // the default `TransactionFactory` address is funded in `test_genesis` at nonce 0
     let mut factory = TransactionFactory::new();
     let sender = factory.address();
+    // The key of `TransactionFactory::new()` comes from a seeded `StdRng`. If a `rand` upgrade
+    // changes it, fail here with a clear reason, not with a hash mismatch below.
+    assert_eq!(
+        sender,
+        rayls_infrastructure_types::address!("b14d3c4f5fbfbcfb98af2d330000d49c95b93aa7"),
+        "the key of TransactionFactory::new() changed; the golden values depend on it"
+    );
     let gas_price = reth_env.get_gas_price()?;
     let mut nonce = 0u64;
     let mut tx = |to: Option<Address>, value: U256, input: Bytes| {
@@ -2338,6 +2357,16 @@ async fn golden_genesis_and_blocks() -> eyre::Result<()> {
         (1, 2, None, vec![tx(Some(receiver), U256::from(7u64), Bytes::new())]),
     ];
 
+    // The local schedule runs two one-shot migrations at block 1: one gives the native ERC-20
+    // precompile account its bytecode, one swaps the consensus registry bytecode. Read both
+    // before block 1, to check after it that they really ran.
+    let code_of = |address: Address| -> eyre::Result<Option<Bytes>> {
+        Ok(reth_env.latest()?.account_code(&address)?.map(|code| code.original_bytes()))
+    };
+    assert_eq!(code_of(precompile)?, None, "the precompile account has no code at genesis");
+    let registry_code_at_genesis = code_of(CONSENSUS_REGISTRY_ADDRESS)?;
+    assert!(registry_code_at_genesis.is_some(), "genesis deploys the consensus registry");
+
     let mut header = genesis_header;
     let mut actual_blocks: Vec<[String; 5]> = Vec::new();
     for (epoch, round, close_epoch, txs) in blocks {
@@ -2361,18 +2390,29 @@ async fn golden_genesis_and_blocks() -> eyre::Result<()> {
         assert_eq!(receipts.len(), sent, "block {}: one receipt per transaction", header.number);
         assert!(receipts.iter().all(|r| r.success), "block {}: all succeeded", header.number);
 
+        if header.number == 1 {
+            assert!(
+                code_of(precompile)?.is_some(),
+                "block 1 must run the Erc20PrecompileBytecode migration"
+            );
+            assert_ne!(
+                code_of(CONSENSUS_REGISTRY_ADDRESS)?,
+                registry_code_at_genesis,
+                "block 1 must run the HybridRewards migration"
+            );
+        }
+
         actual_blocks.push([
             format!("{:?}", header.hash()),
             format!("{:?}", header.state_root),
             format!("{:?}", header.receipts_root),
             header.gas_used.to_string(),
-            sent.to_string(),
+            block.recovered_block.body().transactions.len().to_string(),
         ]);
     }
 
     // the contract call in block 2 wrote the block number
     {
-        use reth_provider::StateProvider as _;
         assert_eq!(
             reth_env.latest()?.storage(contract, B256::with_last_byte(1))?,
             Some(U256::from(2u64)),
