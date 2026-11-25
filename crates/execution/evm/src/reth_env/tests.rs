@@ -2125,3 +2125,268 @@ async fn replay_env_keeps_a_large_persistence_threshold() -> eyre::Result<()> {
     assert_eq!(reth_env.persistence_state.lock().persistence_threshold, 512);
     Ok(())
 }
+
+// ---------------------------------------------------------------------------------------------
+// Golden values (#417)
+//
+// Every other test only checks that the node agrees with itself. This one compares a genesis and
+// four blocks with values written down here. If a dependency upgrade or a code change alters what
+// the node computes, the hashes change and the test fails.
+//
+// The same test with the same values passes on reth 1.11 (v1.5.3) and on reth 2.0. The values
+// may only change together with a hardfork, or with a change of the fixed inputs below.
+// ---------------------------------------------------------------------------------------------
+
+/// Fixed genesis time for the golden chain. Block `n` has timestamp `GOLDEN_GENESIS_TIME + n`.
+const GOLDEN_GENESIS_TIME: u64 = 1_750_000_000;
+
+/// The golden genesis: the test genesis with a fixed timestamp, four validators with seeded
+/// keys, built by the same two steps the `genesis` command runs (the consensus registry
+/// simulation, then the greenfield overrides).
+fn golden_genesis() -> eyre::Result<rayls_infrastructure_types::Genesis> {
+    let validators: Vec<NodeInfo> = (0u8..4)
+        .map(|i| {
+            let addr = Address::from_slice(&[(i + 1) * 0x11; 20]);
+            let mut rng = StdRng::seed_from_u64(u64::from(i));
+            let bls = BlsKeypair::generate(&mut rng);
+            let pop = generate_proof_of_possession_bls(&bls, &addr).expect("pop generation failed");
+            NodeInfo {
+                name: format!("validator-{i}"),
+                bls_public_key: *bls.public(),
+                p2p_info: NodeP2pInfo::default(),
+                execution_address: addr,
+                proof_of_possession: pop,
+            }
+        })
+        .collect();
+    let stake_config = ConsensusRegistry::StakeConfig {
+        stakeAmount: U256::from(parse_ether("1_000_000").unwrap()),
+        minWithdrawAmount: U256::from(parse_ether("1_000").unwrap()),
+        epochDuration: 60 * 60 * 24,
+    };
+    let governance = Address::from_slice(&[0x60; 20]);
+
+    let mut base = rayls_infrastructure_types::test_genesis();
+    base.timestamp = GOLDEN_GENESIS_TIME;
+    let base = base.extend_accounts([(
+        governance,
+        GenesisAccount::default().with_balance(U256::from(parse_ether("100_000_000").unwrap())),
+    )]);
+
+    let genesis = RethEnv::create_consensus_registry_genesis_accounts(
+        validators,
+        base,
+        stake_config.clone(),
+        governance,
+        governance,
+        vec![(governance, stake_config.stakeAmount)],
+    )?;
+    let mut alloc: std::collections::BTreeMap<Address, GenesisAccount> =
+        genesis.alloc.iter().map(|(a, g)| (*a, g.clone())).collect();
+    crate::reth_env::genesis::apply_greenfield_fixes(&mut alloc);
+    Ok(genesis.extend_accounts(alloc))
+}
+
+/// A payload with no random and no clock input.
+fn golden_payload(
+    parent: rayls_infrastructure_types::SealedHeader,
+    epoch: u32,
+    round: u32,
+    close_epoch: Option<B256>,
+) -> RLPayload {
+    let number = parent.number + 1;
+    let tag = number as u8;
+    RLPayload {
+        base_fee_per_gas: parent
+            .base_fee_per_gas
+            .unwrap_or(rayls_infrastructure_types::MIN_PROTOCOL_BASE_FEE),
+        gas_limit: parent.gas_limit,
+        parent_header: parent,
+        beneficiary: Address::repeat_byte(0xBE),
+        nonce: (u64::from(epoch) << 32) | u64::from(round),
+        batch_index: 0,
+        timestamp: GOLDEN_GENESIS_TIME + number,
+        batch_digest: B256::repeat_byte(0xB0 + tag),
+        consensus_header_digest: B256::repeat_byte(0xC0 + tag),
+        mix_hash: B256::repeat_byte(0xD0 + tag),
+        close_epoch,
+        worker_id: 0,
+    }
+}
+
+/// Genesis hash, and hash, state root, receipts root and gas used of four blocks, against fixed
+/// values.
+///
+/// The chain uses the hardfork schedule of the local network. What the blocks cover:
+/// - genesis: the pre-genesis EVM simulation that builds the consensus registry state
+/// - block 1: the two one-shot migrations of the local schedule, a transfer, a contract creation
+/// - block 2: a contract call with a storage write and a log, a transfer through the native ERC-20
+///   precompile
+/// - block 3: an epoch close, with its system calls
+/// - block 4: a transfer in the new epoch
+#[tokio::test]
+async fn golden_genesis_and_blocks() -> eyre::Result<()> {
+    use crate::NetworkProfile;
+    use rayls_infrastructure_types::RaylsNetwork;
+    use reth_provider::ReceiptProvider as _;
+
+    // genesis hash, genesis state root
+    const EXPECTED_GENESIS: [&str; 2] = [
+        "0xc8fbbfb77e1f634fa03dfbd7dd09784dd4654ddcaea8b9996f8dd357819f9a9f",
+        "0x5149016a48a71212404e408c1d3d9882bad3e3d7493d9e2d3fab694868c92e8e",
+    ];
+    // per block: hash, state root, receipts root, gas used, transactions
+    const EXPECTED_BLOCKS: [[&str; 5]; 4] = [
+        // block 1
+        [
+            "0x783f71335b49583c556a397dce5b2038d8d8597f36f866e94fa33e7ee12ecbc7",
+            "0x797e774512f64aa2d83a41c230af8b3540774f96505423691577b78d69077747",
+            "0x7b63442fc3bb636f45608775a000448294c5f3181db035f76b5c78ccb11e6928",
+            "76276",
+            "2",
+        ],
+        // block 2
+        [
+            "0x7d63577e03cc225b22c145cfbccc615e96e269cf7259f47c2ac95bab72ba17c6",
+            "0x707a5fff6cd0754dbac0ff1e62f524b2dad227d17fbc81d060f6c1f69789af98",
+            "0x7560ccf08f392a89e26049c789995dc15f0a8cec1a966ca58aa04bcabbae0466",
+            "74070",
+            "2",
+        ],
+        // block 3
+        [
+            "0xa524a7976e7ce58536a31935d3bb44f6dd595ce6d0eaef04b196556ebce7b270",
+            "0x8f15844e852ed2328eb911df486bbd1fc135d6f298406e58ba74dd3c84f65ba5",
+            "0x56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421",
+            "0",
+            "0",
+        ],
+        // block 4
+        [
+            "0xcb5c7b1c61eb21e5127e6d049133e84b3eced0cd6831d18346292dd0a3e1341f",
+            "0xc75027fe32ceef60a30c5936cffa251bb788809411b70df2f96ec80f95400ba1",
+            "0xf3e5d7efe2f0cec3853ea3580e632cb94238b6749655d3955fbc81f0c6a8f62a",
+            "21000",
+            "1",
+        ],
+    ];
+
+    let chain: Arc<RethChainSpec> = Arc::new(golden_genesis()?.into());
+    let profile = NetworkProfile::from_builtin(RaylsNetwork::Local);
+    let tmp_dir = TempDir::new()?;
+    let task_manager = TaskManager::new("Test Task Manager");
+    let reth_env = RethEnv::new_for_temp_chain_with_profile(
+        chain.clone(),
+        tmp_dir.path(),
+        &task_manager,
+        None,
+        &profile,
+    )
+    .await?;
+
+    let genesis_header = chain.sealed_genesis_header();
+    let actual_genesis =
+        [format!("{:?}", genesis_header.hash()), format!("{:?}", genesis_header.state_root)];
+
+    // the default `TransactionFactory` address is funded in `test_genesis` at nonce 0
+    let mut factory = TransactionFactory::new();
+    let sender = factory.address();
+    let gas_price = reth_env.get_gas_price()?;
+    let mut nonce = 0u64;
+    let mut tx = |to: Option<Address>, value: U256, input: Bytes| {
+        factory.set_nonce(nonce);
+        nonce += 1;
+        factory.create_eip1559_encoded(chain.clone(), None, gas_price, to, value, input)
+    };
+
+    // init code that deploys the runtime `NUMBER PUSH1 1 SSTORE PUSH1 0 PUSH1 0 LOG0 STOP`:
+    // PUSH10 <runtime> PUSH1 0 MSTORE PUSH1 10 PUSH1 22 RETURN
+    let init_code = Bytes::from_static(&[
+        0x69, 0x43, 0x60, 0x01, 0x55, 0x60, 0x00, 0x60, 0x00, 0xa0, 0x00, 0x60, 0x00, 0x52, 0x60,
+        0x0a, 0x60, 0x16, 0xf3,
+    ]);
+    let contract = sender.create(1);
+    let receiver = Address::repeat_byte(0xAA);
+    // `transfer(address,uint256)` on the native ERC-20 precompile
+    let precompile = crate::native_erc20::ERC20_PRECOMPILE_ADDRESS;
+    let mut erc20_transfer = vec![0xa9, 0x05, 0x9c, 0xbb];
+    erc20_transfer.extend_from_slice(&[0u8; 12]);
+    erc20_transfer.extend_from_slice(receiver.as_slice());
+    erc20_transfer.extend_from_slice(&U256::from(12_345u64).to_be_bytes::<32>());
+
+    // (epoch, round, close_epoch, transactions)
+    let blocks: Vec<(u32, u32, Option<B256>, Vec<Bytes>)> = vec![
+        (
+            0,
+            2,
+            None,
+            vec![
+                tx(Some(receiver), U256::from(1_000_000u64), Bytes::new()),
+                tx(None, U256::ZERO, init_code),
+            ],
+        ),
+        (
+            0,
+            4,
+            None,
+            vec![
+                tx(Some(contract), U256::ZERO, Bytes::new()),
+                tx(Some(precompile), U256::ZERO, erc20_transfer.into()),
+            ],
+        ),
+        (0, 6, Some(B256::repeat_byte(0xEC)), vec![]),
+        (1, 2, None, vec![tx(Some(receiver), U256::from(7u64), Bytes::new())]),
+    ];
+
+    let mut header = genesis_header;
+    let mut actual_blocks: Vec<[String; 5]> = Vec::new();
+    for (epoch, round, close_epoch, txs) in blocks {
+        let sent = txs.len();
+        let payload = golden_payload(header, epoch, round, close_epoch);
+        let block = execute_payload_and_update_canonical_chain(&reth_env, payload, txs).await?;
+        header = block.recovered_block.clone_sealed_header();
+
+        // every transaction must be in the block and must have succeeded: the values below are
+        // only worth pinning for work that really ran
+        assert_eq!(
+            block.recovered_block.body().transactions.len(),
+            sent,
+            "block {}: all transactions included",
+            header.number
+        );
+        let receipts = reth_env
+            .blockchain_provider
+            .receipts_by_block(header.number.into())?
+            .expect("receipts of a persisted block");
+        assert_eq!(receipts.len(), sent, "block {}: one receipt per transaction", header.number);
+        assert!(receipts.iter().all(|r| r.success), "block {}: all succeeded", header.number);
+
+        actual_blocks.push([
+            format!("{:?}", header.hash()),
+            format!("{:?}", header.state_root),
+            format!("{:?}", header.receipts_root),
+            header.gas_used.to_string(),
+            sent.to_string(),
+        ]);
+    }
+
+    // the contract call in block 2 wrote the block number
+    {
+        use reth_provider::StateProvider as _;
+        assert_eq!(
+            reth_env.latest()?.storage(contract, B256::with_last_byte(1))?,
+            Some(U256::from(2u64)),
+            "the contract stored the number of block 2"
+        );
+    }
+
+    let expected_blocks: Vec<[String; 5]> =
+        EXPECTED_BLOCKS.iter().map(|b| b.map(String::from)).collect();
+    let expected_genesis = EXPECTED_GENESIS.map(String::from);
+    assert!(
+        actual_genesis == expected_genesis && actual_blocks == expected_blocks,
+        "golden values differ.\nactual genesis: {actual_genesis:#?}\nactual blocks: {actual_blocks:#?}"
+    );
+
+    Ok(())
+}
