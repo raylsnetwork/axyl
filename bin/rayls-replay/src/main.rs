@@ -365,9 +365,10 @@ fn verify_outside_snapshot(snapshot: &Path, path: &Path, what: &str) -> eyre::Re
 /// The absolute form of `path` with symlinks resolved. The last parts of the path may not exist
 /// yet (the archive datadir of a first run); they are kept as given.
 ///
-/// A `..` after a part that does not exist yet is an error. Such a path cannot be resolved
-/// before its directories are created, and after that it can point anywhere, also into the
-/// snapshot (`other/new/../../snapshot`).
+/// Two kinds of path cannot be resolved before they are created, and can end up anywhere, also
+/// in the snapshot. Both are an error:
+/// - a `..` after a part that does not exist yet (`other/new/../../snapshot`)
+/// - a symlink whose target does not exist: a file created through it lands at the target
 fn resolve_path(path: &Path) -> eyre::Result<PathBuf> {
     let absolute = std::path::absolute(path)
         .wrap_err_with(|| format!("cannot make {} absolute", path.display()))?;
@@ -376,6 +377,15 @@ fn resolve_path(path: &Path) -> eyre::Result<PathBuf> {
     loop {
         if let Ok(resolved) = std::fs::canonicalize(existing) {
             return Ok(missing.iter().rev().fold(resolved, |acc, part| acc.join(part)));
+        }
+        // `canonicalize` fails on a symlink with a missing target the same way as on a missing
+        // path, so check for it before this part is taken as "not there yet"
+        if std::fs::symlink_metadata(existing).is_ok_and(|meta| meta.file_type().is_symlink()) {
+            return Err(eyre!(
+                "{} is, or goes through, a symlink whose target does not exist, so it cannot be \
+                 checked against the snapshot datadir; pass the real path",
+                path.display()
+            ));
         }
         // `file_name` is `None` for a path that ends in `..`
         let (Some(parent), Some(name)) = (existing.parent(), existing.file_name()) else {
@@ -661,6 +671,14 @@ mod tests {
             std::os::unix::fs::symlink(&snapshot, &link).expect("symlink");
             assert!(check(&snapshot, &link).is_err());
             assert!(check(&snapshot, &link.join("out")).is_err());
+
+            // a symlink whose target does not exist yet: a file created through the link would
+            // land in the snapshot
+            let dangling = root.path().join("dangling.log");
+            std::os::unix::fs::symlink(snapshot.join("new.log"), &dangling).expect("symlink");
+            let error = check(&snapshot, &dangling).expect_err("a dangling symlink is refused");
+            assert!(error.to_string().contains("symlink"), "got: {error}");
+            assert!(check(&snapshot, &dangling.join("deeper")).is_err());
         }
     }
 
