@@ -436,13 +436,21 @@ where
                             .or_insert_with(|| VotesAggregator::new(enough_sigs as u64));
                         match aggregator.append(*result, 1) {
                             // the signatures that reached it, read before any clear below
-                            Ok(reached) => reached.then(|| {
-                                aggregator
+                            Ok(true) => {
+                                let signatures = aggregator
                                     .votes()
                                     .iter()
                                     .map(|vote| (vote.validator, vote.signature))
-                                    .collect::<Vec<_>>()
-                            }),
+                                    .collect::<Vec<_>>();
+                                // a closed epoch's quorum is checked against the stored header
+                                // below; taken out under this lock so later voters for the same
+                                // digest do not repeat that check
+                                if epoch < self.consensus_config.committee().epoch() {
+                                    cache.remove(&consensus_result_hash);
+                                }
+                                Some(signatures)
+                            }
+                            Ok(false) => None,
                             Err(_) => return Ok(()),
                         }
                     };
