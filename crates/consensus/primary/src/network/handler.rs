@@ -16,7 +16,7 @@ use crate::{
     ConsensusBus, NodeMode, RecentlyExecutedBlocks,
 };
 use parking_lot::Mutex;
-use rayls_consensus_network::GossipMessage;
+use rayls_consensus_network::{admission::RequestPermits, GossipMessage};
 use rayls_infrastructure_config::{ConsensusConfig, LibP2pConfig};
 use rayls_infrastructure_storage::{
     tables::ConsensusBlocks, CertScope, CertificateStore, ConsensusStore, EpochStore,
@@ -985,32 +985,45 @@ where
     /// Retrieve missing certificates, bounded by time and chunk size.
     /// MDBX reads are offloaded to `spawn_blocking`.
     ///
+    /// A request we cannot serve is answered empty.
     /// The request is checked for size before any bitmap decoding or storage read.
+    /// `permits` were taken by the network, which limits how many of these jobs run
+    /// at once, per peer and in total. The blocking job holds them until it ends,
+    /// even if the request is cancelled.
     pub(crate) async fn retrieve_missing_certs(
         &self,
         request: MissingCertificatesRequest,
         requested_epoch: Option<Epoch>,
+        permits: RequestPermits,
     ) -> PrimaryNetworkResult<PrimaryResponse> {
         // The epoch the request is served from decides which committee its list is sized for.
-        let scope = fetch_scope(requested_epoch, self.consensus_config.committee().epoch());
-        // A request outside our epoch and the kept tail is answered empty, so its size is not
-        // checked. A peer already in the next epoch names that epoch's committee, which may
-        // be larger.
-        if let Some(scope) = scope {
-            let limit = if requested_epoch.is_none() {
-                unstamped_authority_limit(&self.consensus_config)
-            } else {
-                requested_authority_limit(&self.consensus_config, scope)
-            };
-            let named = request.skip_rounds.named();
-            if named > limit {
-                debug!(target: "primary::handler", authorities = named, limit, "missing-certificates request names too many authorities");
-                return Err(PrimaryNetworkError::TooManyAuthorities(named, limit));
-            }
+        let our_epoch = self.consensus_config.committee().epoch();
+        let Some(scope) = fetch_scope(requested_epoch, our_epoch) else {
+            // We do not serve this epoch, so the requester tries another peer.
+            // The size is not checked, since a next-epoch committee may be larger.
+            // Debug level, since any peer can send this for free.
+            debug!(
+                target: "cert-collector",
+                requested_epoch = ?requested_epoch,
+                our_epoch,
+                "missing-certificates request outside our epoch and the kept tail; answering empty"
+            );
+            return Ok(PrimaryResponse::RequestedCertificates(vec![]));
+        };
+        let limit = if requested_epoch.is_none() {
+            unstamped_authority_limit(&self.consensus_config)
+        } else {
+            requested_authority_limit(&self.consensus_config, scope)
+        };
+        let named = request.skip_rounds.named();
+        if named > limit {
+            debug!(target: "primary::handler", authorities = named, limit, "missing-certificates request names too many authorities");
+            return Err(PrimaryNetworkError::TooManyAuthorities(named, limit));
         }
         let consensus_config = self.consensus_config.clone();
         tokio::task::spawn_blocking(move || {
-            collect_missing_certs_blocking(request, requested_epoch, scope, consensus_config)
+            let _permits = permits;
+            collect_missing_certs_blocking(request, scope, consensus_config)
         })
         .await
         .map_err(|e| PrimaryNetworkError::Internal(format!("cert-collector join error: {e}")))?
@@ -1187,23 +1200,9 @@ const _: () = assert!(MIN_REQUESTED_AUTHORITIES <= MAX_SKIP_ROUND_AUTHORITIES);
 /// Run the cert-collector synchronously inside `spawn_blocking`.
 fn collect_missing_certs_blocking<DB: Database>(
     request: MissingCertificatesRequest,
-    requested_epoch: Option<Epoch>,
-    scope: Option<CertScope>,
+    scope: CertScope,
     consensus_config: ConsensusConfig<DB>,
 ) -> PrimaryNetworkResult<PrimaryResponse> {
-    let our_epoch = consensus_config.committee().epoch();
-    let Some(scope) = scope else {
-        // Either the requester is ahead of us (it closed an epoch we are still finishing, routine
-        // around every boundary) or it asks for an epoch older than the one we kept the tail of.
-        // Neither is served from here; the requester moves on to the next peer.
-        info!(
-            target: "cert-collector",
-            requested_epoch = ?requested_epoch,
-            our_epoch,
-            "missing-certificates request outside our epoch and the kept tail; answering empty"
-        );
-        return Ok(PrimaryResponse::RequestedCertificates(vec![]));
-    };
     let mut collector = CertificateCollector::new(request, consensus_config, scope)?;
 
     let mut missing = Vec::new();

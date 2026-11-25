@@ -108,6 +108,7 @@ impl From<&PrimaryNetworkError> for Option<Penalty> {
                 | CertManagerError::CertificateManagerOneshot
                 | CertManagerError::FatalForwardAcceptedCertificate
                 | CertManagerError::NoCertificateFetched
+                | CertManagerError::PeersBusy
                 | CertManagerError::FutureEpoch { .. }
                 | CertManagerError::FatalAppendParent
                 | CertManagerError::GC(_)

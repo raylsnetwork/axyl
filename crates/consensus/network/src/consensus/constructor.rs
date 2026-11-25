@@ -1,4 +1,5 @@
 use crate::{
+    admission::{AdmissionClass, ClassValues, RequestLimits},
     codec::{RLCodec, RLMessage},
     consensus::{
         behaviour::RLBehavior,
@@ -18,7 +19,7 @@ use rayls_infrastructure_types::{
     BlsSigner, Database, NetworkKeypair, NetworkPublicKey, RaylsSender, TaskSpawner,
 };
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -36,6 +37,7 @@ where
     Events: RaylsSender<NetworkEvent<Req, Res>> + Send + 'static,
 {
     /// Convenience method for spawning a primary network instance.
+    #[allow(clippy::too_many_arguments)]
     pub fn new_for_primary(
         network_config: &NetworkConfig,
         event_stream: Events,
@@ -44,6 +46,7 @@ where
         task_manager: TaskSpawner,
         external_addr: Multiaddr,
         network_metrics: Arc<NetworkMetrics>,
+        admission: Vec<(AdmissionClass, ClassValues)>,
     ) -> NetworkResult<Self> {
         let network_key = key_config.primary_network_keypair().clone();
         Self::new(
@@ -56,10 +59,12 @@ where
             KadStoreType::Primary,
             external_addr,
             network_metrics,
+            admission,
         )
     }
 
     /// Convenience method for spawning a worker network instance.
+    #[allow(clippy::too_many_arguments)]
     pub fn new_for_worker(
         network_config: &NetworkConfig,
         event_stream: Events,
@@ -68,6 +73,7 @@ where
         task_manager: TaskSpawner,
         external_addr: Multiaddr,
         network_metrics: Arc<NetworkMetrics>,
+        admission: Vec<(AdmissionClass, ClassValues)>,
     ) -> NetworkResult<Self> {
         let network_key = key_config.worker_network_keypair().clone();
         Self::new(
@@ -80,6 +86,7 @@ where
             KadStoreType::Worker,
             external_addr,
             network_metrics,
+            admission,
         )
     }
 
@@ -95,6 +102,7 @@ where
         kad_type: KadStoreType,
         external_addr: Multiaddr,
         network_metrics: Arc<NetworkMetrics>,
+        admission: Vec<(AdmissionClass, ClassValues)>,
     ) -> NetworkResult<Self> {
         let gossipsub_config = gossipsub::ConfigBuilder::default()
             .max_transmit_size(2 * 1024 * 1024) // 2 MiB
@@ -250,6 +258,9 @@ where
             KadStoreType::Primary => "primary",
             KadStoreType::Worker => "worker",
         };
+        // Before the first epoch, every peer is an outsider; `NewEpoch` sets the member shares.
+        let request_limits = RequestLimits::new(admission, network_metrics.clone(), network_label);
+        let request_slots = request_limits.for_members(&HashSet::new());
         Ok(Self {
             swarm,
             handle,
@@ -258,6 +269,8 @@ where
             authorized_publishers: Default::default(),
             outbound_requests: Default::default(),
             inbound_requests: Default::default(),
+            request_limits,
+            request_slots,
             kad_record_queries: Default::default(),
             kad_expecting_to_fail_query_ids: Default::default(),
             kad_put_budget: Default::default(),

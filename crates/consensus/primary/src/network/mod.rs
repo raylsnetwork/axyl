@@ -12,16 +12,19 @@ use crate::{
 use handler::RequestHandler;
 #[cfg(test)]
 pub(crate) use message::MAX_SKIP_ROUND_AUTHORITIES;
-pub use message::{MissingCertificatesRequest, PrimaryRequest, PrimaryResponse, SkipRoundList};
+pub use message::{
+    admission_classes, MissingCertificatesRequest, PrimaryRequest, PrimaryResponse, SkipRoundList,
+};
 // Re-exported so downstream crates (state-sync) can build a `PrimaryNetworkHandle` test mock that
 // answers `NetworkCommand`s without taking a direct dependency on the network crate.
 use message::{PrimaryGossip, PrimaryRPCError};
-#[doc(hidden)]
-pub use rayls_consensus_network::{error::NetworkError, types::NetworkCommand};
 use rayls_consensus_network::{
+    admission::RequestPermits,
     types::{IntoResponse as _, NetworkEvent, NetworkHandle, NetworkResult},
     GossipMessage, Penalty, ResponseChannel,
 };
+#[doc(hidden)]
+pub use rayls_consensus_network::{error::NetworkError, types::NetworkCommand};
 use rayls_infrastructure_config::{ConsensusConfig, LibP2pConfig};
 use rayls_infrastructure_network_types::{
     WorkerOthersBatchMessage, WorkerOwnBatchMessage, WorkerToPrimaryClient,
@@ -34,7 +37,7 @@ use rayls_infrastructure_types::{
 };
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
 use tokio::sync::{mpsc, oneshot};
-use tracing::{debug, warn};
+use tracing::{debug, error, warn};
 pub mod handler;
 mod message;
 use crate::network::state::AuthVoteState;
@@ -167,6 +170,9 @@ impl PrimaryNetworkHandle {
             PrimaryResponse::PeerExchange { .. } => Err(NetworkError::RPCError(
                 "Got wrong response, not a vote is peer exchange!".to_string(),
             )),
+            PrimaryResponse::Busy => {
+                Err(NetworkError::RPCError("Got wrong response, not a vote is busy!".to_string()))
+            }
         }
     }
 
@@ -186,6 +192,8 @@ impl PrimaryNetworkHandle {
         let res = res.await??;
         match res {
             PrimaryResponse::RequestedCertificates(certs) => Ok(certs),
+            // A fake busy answer counts only if no other peer answers, when no fallback helps.
+            PrimaryResponse::Busy => Err(NetworkError::PeerBusy),
             PrimaryResponse::Error(PrimaryRPCError(s)) => Err(NetworkError::RPCError(s)),
             _ => Err(NetworkError::RPCError("Got wrong response, not a certificate!".to_string())),
         }
@@ -370,7 +378,7 @@ where
     fn process_network_event(&mut self, event: NetworkEvent<Req, Res>) {
         // match event
         match event {
-            NetworkEvent::Request { peer, request, channel, cancel } => match request {
+            NetworkEvent::Request { peer, request, channel, cancel, permits } => match request {
                 PrimaryRequest::Vote { header, parents } => {
                     self.process_vote_request(
                         peer,
@@ -380,11 +388,17 @@ where
                         cancel,
                     );
                 }
-                PrimaryRequest::MissingCertificates { inner } => {
-                    self.process_request_for_missing_certs(peer, inner, None, channel, cancel)
-                }
+                PrimaryRequest::MissingCertificates { inner } => self
+                    .process_request_for_missing_certs(peer, inner, None, permits, channel, cancel),
                 PrimaryRequest::MissingCertificatesInEpoch { inner, epoch } => self
-                    .process_request_for_missing_certs(peer, inner, Some(epoch), channel, cancel),
+                    .process_request_for_missing_certs(
+                        peer,
+                        inner,
+                        Some(epoch),
+                        permits,
+                        channel,
+                        cancel,
+                    ),
                 PrimaryRequest::ConsensusHeader { number, hash } => {
                     self.process_consensus_output_request(peer, number, hash, channel, cancel)
                 }
@@ -437,21 +451,33 @@ where
     }
 
     /// Attempt to retrieve certificates for a peer that's missing them.
+    ///
+    /// The network took `permits` for this request before forwarding it. The job keeps
+    /// them until its storage scan ends, so a cancelled request still holds its slots
+    /// while the scan runs.
     fn process_request_for_missing_certs(
         &self,
         peer: BlsPublicKey,
         request: MissingCertificatesRequest,
         requested_epoch: Option<Epoch>,
+        permits: Option<RequestPermits>,
         channel: ResponseChannel<PrimaryResponse>,
         cancel: oneshot::Receiver<()>,
     ) {
+        // The network admits this request class and refuses one it has no values for, so a
+        // request without permits is a bug. Dropping the channel fails the request on the
+        // requester's side, with no penalty.
+        let Some(permits) = permits else {
+            error!(target: "primary::network", %peer, "missing-certificates request forwarded without permits");
+            return;
+        };
         // clone for spawned tasks
-        let request_handler = self.request_handler.clone();
         let network_handle = self.network_handle.clone();
+        let request_handler = self.request_handler.clone();
         let task_name = format!("MissingCertsReq-{peer}");
         self.task_spawner.spawn_task(task_name, async move {
             tokio::select! {
-                result = request_handler.retrieve_missing_certs(request, requested_epoch) => {
+                result = request_handler.retrieve_missing_certs(request, requested_epoch, permits) => {
                     // report penalty if any
                     if let Err(ref e) = result {
                         if let Some(penalty) = e.into() {

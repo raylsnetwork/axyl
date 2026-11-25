@@ -1,6 +1,10 @@
 //! Messages sent between workers.
 
-use rayls_consensus_network::{PeerExchangeMap, RLMessage};
+use rayls_consensus_network::{
+    admission::{AdmissionClass, ClassValues},
+    PeerExchangeMap, RLMessage,
+};
+use rayls_infrastructure_config::SyncConfig;
 use rayls_infrastructure_types::{Batch, BlockHash, Bytes, SealedBatch};
 use serde::{Deserialize, Serialize};
 
@@ -14,6 +18,15 @@ pub enum WorkerGossip {
     /// `Vec<Bytes>` is bcs-identical to `Vec<Vec<u8>>` (each element is a length-prefixed byte run
     /// either way), so this is not a wire-shape change: un-upgraded peers decode it unchanged.
     Txn(Vec<Bytes>),
+}
+
+/// The classes the worker network admits, with their values from `sync_config`. None yet.
+///
+/// Handed to the worker swarm when it is built. A new class adds its entry here, the
+/// requests it covers in `WorkerRequest::admission_class`, and a busy answer on
+/// `WorkerResponse`, after every variant older nodes know.
+pub fn admission_classes(_sync_config: &SyncConfig) -> Vec<(AdmissionClass, ClassValues)> {
+    Vec::new()
 }
 
 impl RLMessage for WorkerRequest {

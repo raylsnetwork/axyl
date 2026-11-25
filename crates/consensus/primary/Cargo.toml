@@ -41,6 +41,7 @@ tempfile = { workspace = true, optional = true }
 
 [dev-dependencies]
 async-trait = { workspace = true }
+rayls-consensus-network = { workspace = true, features = ["test-utils"] }
 futures = { workspace = true }
 proptest = { workspace = true }
 tracing = { workspace = true }

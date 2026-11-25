@@ -46,6 +46,11 @@ serde_with = { workspace = true }
 # the system resolver.
 hickory-resolver = { workspace = true }
 
+[features]
+default = []
+# Test-only helpers, such as permits that bypass request admission.
+test-utils = []
+
 [dev-dependencies]
 tempfile = { workspace = true }
 rayls-execution-evm = { workspace = true, features = ["test-utils"] }

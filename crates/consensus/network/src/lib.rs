@@ -3,6 +3,7 @@
 
 #![cfg_attr(docsrs, feature(doc_cfg, doc_auto_cfg))]
 
+pub mod admission;
 mod codec;
 mod consensus;
 pub mod error;
@@ -21,7 +22,7 @@ pub use peers::{PeerExchangeMap, Penalty};
 pub use libp2p::{
     gossipsub::{Message as GossipMessage, TopicHash},
     identity::PeerId,
-    request_response::ResponseChannel,
+    request_response::{OutboundFailure, ResponseChannel},
     Multiaddr,
 };
 #[cfg(test)]
