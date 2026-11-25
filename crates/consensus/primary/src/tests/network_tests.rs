@@ -792,6 +792,94 @@ async fn certified_tip_is_not_built_over_a_stale_lookahead() -> eyre::Result<()>
     Ok(())
 }
 
+/// Early in epoch 2, before any epoch-2 quorum, f+1 keys of the epoch-1 committee sign a header
+/// at the highest number there is. A node in epoch 2 holds every header of epoch 1, so the quorum
+/// is dropped: it is neither served as the certified tip nor published as the gossip tip, where it
+/// would drop every later result. Epoch 1's last header still is, and epoch 2 then moves it on.
+#[tokio::test]
+async fn certified_tip_is_not_pinned_by_a_forged_closed_epoch() -> eyre::Result<()> {
+    use rayls_infrastructure_storage::{tables::ConsensusBlocks, EpochStore as _};
+    use rayls_infrastructure_types::{
+        ConsensusHeader, Database as _, EpochCertificate, EpochRecord,
+    };
+
+    let committee =
+        CommitteeFixture::builder(MemDatabase::default).randomize_ports(true).epoch(2).build();
+    let config = committee.first_authority().consensus_config();
+    let keys: Vec<BlsPublicKey> =
+        committee.authorities().map(|a| *a.authority().protocol_key()).collect();
+    let db = config.node_storage();
+    for epoch in 0..2 {
+        let record = EpochRecord {
+            epoch,
+            committee: keys.clone(),
+            next_committee: keys.clone(),
+            ..Default::default()
+        };
+        let cert = EpochCertificate {
+            epoch_hash: record.digest(),
+            signature: Default::default(),
+            signed_authorities: Default::default(),
+        };
+        db.save_epoch_record_with_cert(&record, &cert)?;
+    }
+    // epoch 1 closed on header 10
+    db.insert::<ConsensusBlocks>(&10, &ConsensusHeader { number: 10, ..Default::default() })?;
+    let consensus_bus = ConsensusBus::new();
+    let task_manager = TaskManager::default();
+    let synchronizer =
+        StateSynchronizer::new(config.clone(), consensus_bus.clone(), task_manager.get_spawner());
+    let handler = RequestHandler::new(config, consensus_bus.clone(), synchronizer);
+
+    let topic = TopicHash::from_raw(LibP2pConfig::consensus_output_topic());
+    let signers: Vec<_> =
+        committee.authorities().skip(1).take(CertifiedTip::quorum(keys.len())).collect();
+    let certify = |epoch, number, hash| {
+        let (handler, signers, topic) = (&handler, &signers, topic.clone());
+        async move {
+            let digest = ConsensusResult::digest_data(epoch, 1, number, hash);
+            for signer in signers {
+                let key = *signer.authority().protocol_key();
+                let signature = signer.keypair().sign(&encode(&to_intent_message(digest)));
+                let result =
+                    ConsensusResult { epoch, round: 1, number, hash, validator: key, signature };
+                let data = encode(&PrimaryGossip::Consensus(Box::new(result)));
+                let msg = GossipMessage {
+                    source: None,
+                    data,
+                    sequence_number: None,
+                    topic: topic.clone(),
+                };
+                handler.process_gossip(&msg, key).await?;
+            }
+            eyre::Ok(())
+        }
+    };
+    let served = || async {
+        match handler.retrieve_certified_tip().await {
+            Ok(PrimaryResponse::CertifiedTip(tip)) => tip.map(|tip| (tip.epoch, tip.number)),
+            other => panic!("not a certified tip reply: {other:?}"),
+        }
+    };
+
+    certify(1, u64::MAX, BlockHash::random()).await?;
+    assert_eq!(served().await, None, "the forged tip is not served");
+    assert_eq!(
+        *consensus_bus.last_published_consensus_num_hash().borrow(),
+        (0, BlockHash::ZERO),
+        "nor published as the gossip tip"
+    );
+
+    let last = BlockHash::random();
+    certify(1, 10, last).await?;
+    assert_eq!(served().await, Some((1, 10)), "the closed epoch's last header is");
+    assert_eq!(*consensus_bus.last_published_consensus_num_hash().borrow(), (10, last));
+
+    certify(2, 11, BlockHash::random()).await?;
+    assert_eq!(served().await, Some((2, 11)), "and the next epoch moves it on");
+    Ok(())
+}
+
 /// The stored certified tip only moves up, and never back to an earlier epoch or below the
 /// floor, even with nothing stored: a retired committee's keys must not pin a forged high number
 /// from their epoch.

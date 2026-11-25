@@ -128,8 +128,9 @@ pub(crate) struct RequestHandler<DB> {
 /// Whether a tip certified at `epoch` and `number` replaces the stored one, `saved` as its epoch
 /// and number: only when it is from `floor` or later, and from a later epoch or higher in the
 /// same one. `floor` holds while nothing is stored yet. The epoch comes first: honest numbers
-/// rise across epochs, so a later epoch always wins, and a high number forged by f+1 retired
-/// keys of an earlier epoch holds only until the first quorum of the next.
+/// rise across epochs, so a later epoch always wins. A high number forged by f+1 retired keys of
+/// an earlier epoch does not get here: the gossip path drops a quorum from a closed epoch above
+/// the last header this node holds.
 pub(super) fn replaces_certified_tip(
     saved: Option<(Epoch, u64)>,
     floor: Epoch,
@@ -446,6 +447,27 @@ where
                         }
                     };
                     if let Some(signatures) = quorum {
+                        // a node in a later epoch has executed every header of this one, so an
+                        // honest result is at most the last header it holds; a higher number is
+                        // f+1 retired keys forging one, which would otherwise be served as the
+                        // certified tip and, as the gossip tip, drop every later result above
+                        if epoch < self.consensus_config.committee().epoch() {
+                            let held = self
+                                .consensus_config
+                                .node_storage()
+                                .last_record::<ConsensusBlocks>()
+                                .map_or(0, |(held, _)| held);
+                            if number > held {
+                                warn!(
+                                    target: "primary::consensus_result",
+                                    epoch,
+                                    number,
+                                    held,
+                                    "quorum from a closed epoch above the last header held, dropping"
+                                );
+                                return Ok(());
+                            }
+                        }
                         self.save_certified_tip(epoch, round, number, hash, signatures);
                         if self.behind_consensus(epoch, round, Some(number)).await {
                             self.consensus_certs.lock().clear();
