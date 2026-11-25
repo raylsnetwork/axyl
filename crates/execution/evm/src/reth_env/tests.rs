@@ -2065,9 +2065,12 @@ async fn heal_is_needed_after_reths_check_and_lets_the_next_block_persist() -> e
 /// reth 2.0 debug-asserts in `EngineArgs::tree_config` that its backpressure threshold (16 by
 /// default) is above the persistence threshold. With 512 that assert fails in a debug or test
 /// build. `RethEnv::engine_tree_config` builds the config with reth's default persistence
-/// threshold; our own `PersistenceState` takes the real value from the engine arguments.
+/// threshold.
 #[test]
 fn engine_tree_config_accepts_a_large_persistence_threshold() {
+    use reth_engine_primitives::{
+        DEFAULT_PERSISTENCE_BACKPRESSURE_THRESHOLD, DEFAULT_PERSISTENCE_THRESHOLD,
+    };
     use reth_node_core::args::EngineArgs;
 
     let engine = EngineArgs {
@@ -2081,16 +2084,44 @@ fn engine_tree_config_accepts_a_large_persistence_threshold() {
     let tree_config = RethEnv::engine_tree_config(&engine);
 
     // the thresholds reth's engine tree would read keep reth's defaults
-    assert_eq!(tree_config.persistence_threshold(), 2);
-    assert_eq!(tree_config.persistence_backpressure_threshold(), 16);
-    // every other engine setting is passed on
-    assert!(tree_config.disable_prewarming());
+    assert_eq!(tree_config.persistence_threshold(), DEFAULT_PERSISTENCE_THRESHOLD);
     assert_eq!(
-        tree_config.cross_block_cache_size(),
-        EngineArgs { persistence_threshold: 2, ..engine.clone() }
-            .tree_config()
-            .cross_block_cache_size()
+        tree_config.persistence_backpressure_threshold(),
+        DEFAULT_PERSISTENCE_BACKPRESSURE_THRESHOLD
     );
-    // our own persistence state still gets the value from the arguments
-    assert_eq!(engine.persistence_threshold, 512);
+    // every other engine setting is passed on (the cache size is given in MB, kept in bytes)
+    assert!(tree_config.disable_prewarming());
+    assert_eq!(tree_config.cross_block_cache_size(), 123 * 1024 * 1024);
+}
+
+/// The env `rayls-replay` builds, with its threshold of 512, starts in a debug build, and our
+/// own persistence state gets the 512.
+///
+/// This is the real path of the fix above: before it, building this env hit reth's
+/// debug-assert.
+#[cfg(feature = "archive-replay")]
+#[tokio::test]
+async fn replay_env_keeps_a_large_persistence_threshold() -> eyre::Result<()> {
+    use crate::NetworkProfile;
+    use reth_chainspec::EthChainSpec as _;
+
+    let chain = rayls_infrastructure_types::test_chain_spec_arc();
+    let profile = NetworkProfile { chain_id: chain.chain().id(), hardforks: Default::default() };
+    let tmp_dir = TempDir::new()?;
+    let task_manager = TaskManager::new("Test Task Manager");
+    let reth_env = RethEnv::new_for_archive_replay(
+        chain,
+        tmp_dir.path(),
+        &task_manager,
+        &profile,
+        None,
+        None,
+        true,
+        Some(512),
+        rayls_middleware_rewards::RewardsCounter::default(),
+    )
+    .await?;
+
+    assert_eq!(reth_env.persistence_state.lock().persistence_threshold, 512);
+    Ok(())
 }

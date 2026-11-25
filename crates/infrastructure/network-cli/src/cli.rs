@@ -159,13 +159,20 @@ impl<Ext: clap::Args + fmt::Debug> Cli<Ext> {
         }
     }
 
+    /// Log files kept when `--log.file.max-files` is not given.
+    ///
+    /// Our own number, not reth's node default, so a reth upgrade cannot move it.
+    const DEFAULT_LOG_FILE_MAX_FILES: usize = 5;
+
     /// Keep file logging on by default.
     ///
-    /// reth 2.0 writes no log file unless `--log.file.max-files` is given or the program asks
-    /// for the node default (5 files). reth 1.11 kept 5 files by default for every command, and
-    /// operators rely on the log file. An explicit `--log.file.max-files 0` still turns it off.
-    pub fn apply_log_file_default(&mut self) {
-        self.logs.apply_node_defaults();
+    /// reth 2.0 writes no log file unless `--log.file.max-files` is given. reth 1.11 kept 5 files
+    /// by default for every command, and operators rely on the log file. This applies to every
+    /// command, as on reth 1.11. An explicit `--log.file.max-files 0` still turns it off.
+    fn apply_log_file_default(&mut self) {
+        if self.logs.log_file_max_files.is_none() {
+            self.logs.log_file_max_files = Some(Self::DEFAULT_LOG_FILE_MAX_FILES);
+        }
     }
 
     /// Initializes tracing with the configured options.

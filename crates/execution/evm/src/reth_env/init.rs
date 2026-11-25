@@ -358,7 +358,14 @@ impl RethEnv {
     /// directly. So the config is built with reth's default persistence threshold. A large
     /// `persistence_threshold` (`rayls-replay` uses 512) then cannot trip that assert in a debug
     /// or test build.
-    pub(super) fn engine_tree_config(engine: &EngineArgs) -> reth_engine_primitives::TreeConfig {
+    ///
+    /// Checked on reth v2.0.0, check again on the next reth upgrade:
+    /// - This config is also given to `PayloadProcessor`. Neither it nor the code it starts reads
+    ///   the two thresholds. Only `engine/tree/src/tree/mod.rs` does.
+    /// - Raising the backpressure threshold through `EngineArgs` does not help: `tree_config` sets
+    ///   the persistence threshold first, and the assert runs inside that setter while the
+    ///   backpressure value is still the default.
+    pub(crate) fn engine_tree_config(engine: &EngineArgs) -> reth_engine_primitives::TreeConfig {
         EngineArgs { persistence_threshold: DEFAULT_PERSISTENCE_THRESHOLD, ..engine.clone() }
             .tree_config()
     }
