@@ -731,15 +731,17 @@ async fn probe_peers_for_certified_tip<DB: ReDatabase>(
     network: &PrimaryNetworkHandle,
 ) -> Option<(u64, B256)> {
     let peers = network.inner_handle().connected_peers().await.ok()?;
-    let mut inflight: FuturesUnordered<_> =
-        peers.into_iter().map(|peer| network.request_certified_tip_from_peer(peer)).collect();
+    let mut inflight: FuturesUnordered<_> = peers
+        .into_iter()
+        .map(|peer| async move { (peer, network.request_certified_tip_from_peer(peer).await) })
+        .collect();
     let floor = config.epoch().saturating_sub(1);
     let mut candidates = Vec::new();
     let _ = tokio::time::timeout(CERTIFIED_TIP_PROBE_DEADLINE, async {
-        while let Some(result) = inflight.next().await {
+        while let Some((peer, result)) = inflight.next().await {
             if let Ok(Some(tip)) = result {
                 if tip.number > current && tip.epoch >= floor {
-                    candidates.push(tip);
+                    candidates.push((peer, tip));
                 }
             }
         }
@@ -747,12 +749,12 @@ async fn probe_peers_for_certified_tip<DB: ReDatabase>(
     .await;
     // epoch first: a high number signed by f+1 retired keys of an earlier epoch must not rank
     // above an honest tip from a later one
-    candidates.sort_by(|a, b| (b.epoch, b.number).cmp(&(a.epoch, a.number)));
-    // whole-struct: a copy with the honest number and hash but a bad signature must not stand
-    // in for the honest ones
-    candidates.dedup();
+    candidates.sort_by(|(_, a), (_, b)| (b.epoch, b.number).cmp(&(a.epoch, a.number)));
+    // the whole tip, not the peer: a copy with the honest number and hash but a bad signature
+    // must not stand in for the honest ones
+    candidates.dedup_by(|(_, a), (_, b)| a == b);
     let mut collector_asked = false;
-    for tip in candidates {
+    for (peer, tip) in candidates {
         // the committee the tip's epoch ran with, never the lookahead: an honest tip fails
         // against a lookahead that still lists a key ejected since it was read
         let Some(committee) = config.get_settled_committee_keys_for_epoch(tip.epoch) else {
@@ -779,6 +781,7 @@ async fn probe_peers_for_certified_tip<DB: ReDatabase>(
         }
         warn!(
             target: "state-sync",
+            %peer,
             number = tip.number,
             epoch = tip.epoch,
             "probe: certified tip did not verify against its committee, skipping"
