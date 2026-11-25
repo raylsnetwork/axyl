@@ -2484,6 +2484,11 @@ impl ClosedSource {
     /// Build genesis and three empty blocks, give block 2 a withdrawals row, then close the
     /// node env. `finish` overwrites the `Finish` stage checkpoint (the node wrote 3).
     async fn build(finish: Option<u64>) -> eyre::Result<Self> {
+        Self::build_with(finish, None).await
+    }
+
+    /// [`Self::build`] with a database page size. `None` is the node's default.
+    async fn build_with(finish: Option<u64>, page_size: Option<usize>) -> eyre::Result<Self> {
         use crate::NetworkProfile;
         use alloy::eips::eip4895::{Withdrawal, Withdrawals};
         use reth_chainspec::EthChainSpec as _;
@@ -2499,6 +2504,16 @@ impl ClosedSource {
         let profile =
             NetworkProfile { chain_id: chain.chain().id(), hardforks: Default::default() };
         let dir = TempDir::new()?;
+        if let Some(page_size) = page_size {
+            // create the datafile first; the node env below then opens it at its own page size
+            use reth::{args::DatabaseArgs, builder::NodeConfig};
+            let config = RethConfig(NodeConfig {
+                db: DatabaseArgs { page_size: Some(page_size), ..Default::default() },
+                ..NodeConfig::default()
+            });
+            let db = RethEnv::new_database(&config, dir.path().join("db"))?;
+            assert_eq!(db.stat()?.page_size() as usize, page_size);
+        }
         let task_manager = TaskManager::new("Test Task Manager");
         let reth_env = RethEnv::new_for_archive_replay(
             chain.clone(),
@@ -2697,6 +2712,20 @@ async fn snapshot_reader_ignores_headers_above_the_checkpoint() -> eyre::Result<
     assert!(reader.header_by_number(3)?.is_none());
     assert!(reader.block_withdrawals(3)?.is_none());
     assert_eq!(reader.blocks_for_range(1..=3)?, source.headers[1..=2]);
+    Ok(())
+}
+
+/// A datafile whose page size is not the page size of this machine opens and reads the same.
+/// 8 KiB differs from both common host page sizes (4 KiB on x86, 16 KiB on Apple silicon).
+#[cfg(feature = "archive-replay")]
+#[tokio::test]
+async fn snapshot_reader_opens_a_datafile_with_another_page_size() -> eyre::Result<()> {
+    let source = ClosedSource::build_with(None, Some(8 * 1024)).await?;
+    let reader = source.open().await?;
+
+    assert_eq!(reader.last_block_number(), 3);
+    assert_eq!(reader.sealed_header_by_number(3)?.as_ref(), Some(&source.headers[3]));
+    assert_eq!(reader.block_withdrawals(2)?, Some(ClosedSource::WITHDRAWALS.to_vec()));
     Ok(())
 }
 

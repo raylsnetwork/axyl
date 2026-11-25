@@ -82,14 +82,14 @@ fn detect_page_size_in(reader: impl Read) -> Option<usize> {
 /// the known cases. `None` for any other error.
 ///
 /// The match is on the error text because the callers get the error through different wrappers
-/// (reth's `DatabaseError`, `eyre`), and all of them keep the text of the MDBX error.
+/// (reth's `DatabaseError`, `eyre`), and all of them keep the text of the MDBX error. The hint
+/// is a guess from that text, so callers put it in front of the original error and keep both.
 pub fn read_only_open_problem(error_text: &str) -> Option<&'static str> {
     // MDBX_BUSY, which reth-libmdbx prints as "another write transaction is running", or EAGAIN
     // from the file lock when the holder is in this process
     if error_text.contains("another write transaction is running")
         || error_text.contains("Resource temporarily unavailable")
         || error_text.contains("MDBX_BUSY")
-        || error_text.contains("Busy")
     {
         return Some(
             "the database is open in another process (a running node?). Stop it first, or work \
@@ -109,9 +109,10 @@ pub fn read_only_open_problem(error_text: &str) -> Option<&'static str> {
     // MDBX_EACCESS, which reth-libmdbx prints as "the environment opened in read-only"
     if error_text.contains("opened in read-only") || error_text.contains("Permission denied") {
         return Some(
-            "MDBX did not get the file access it needs. If the directory is not writable and has \
-             no mdbx.lck, MDBX cannot create its lock file: put an empty mdbx.lck next to \
-             mdbx.dat, or make the directory writable",
+            "MDBX did not get the file access it needs. Check that this user can read mdbx.dat. \
+             If the directory is write-protected and has no mdbx.lck, MDBX cannot create its \
+             lock file: put an empty mdbx.lck next to mdbx.dat, or make the directory writable. \
+             (On a read-only filesystem no lock file is needed.)",
         );
     }
     None
@@ -176,9 +177,11 @@ mod tests {
         let access = read_only_open_problem(
             "failed to open the database: the environment opened in read-only (13)",
         );
-        assert!(access.is_some_and(|hint| hint.contains("mdbx.lck")));
+        assert!(access.is_some_and(|hint| hint.contains("mdbx.lck") && hint.contains("mdbx.dat")));
 
         assert_eq!(read_only_open_problem("no such file or directory"), None);
+        // a path or another error with the word "Busy" in it is not the "in use" case
+        assert_eq!(read_only_open_problem("open /data/BusyBox/db: no such file"), None);
     }
 
     /// Detection reads only the bounded head, so a huge datafile is never loaded whole.

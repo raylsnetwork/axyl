@@ -78,7 +78,12 @@ impl SnapshotReader {
         // never reads a source that still changes.
         // Unbounded: reth's 5 minute limit for read transactions protects a writer in the same
         // process. There is none here.
+        // Page size: found the same way as on a node start (`RethEnv::new_database`), so a
+        // datafile with a damaged first meta page opens here too.
+        let page_size = rayls_infrastructure_utils::mdbx::open_page_size(&db_path, None)
+            .map_err(|e| eyre!("{}: cannot find the page size: {e}", db_path.display()))?;
         let args = DatabaseArguments::default()
+            .with_geometry_page_size(page_size)
             .with_max_read_transaction_duration(Some(MaxReadTransactionDuration::Unbounded))
             .with_exclusive(Some(true));
         let db = open_db_read_only(&db_path, args)
@@ -197,11 +202,12 @@ impl SnapshotReader {
     }
 }
 
-/// Turn the error of a read-only MDBX open into one that says what to do.
+/// Put a line that says what to do in front of the error of a read-only MDBX open, when the
+/// error is a known case. The original error stays in the chain.
 fn explain_read_only_open_error(db_path: &Path, error: eyre::Report) -> eyre::Report {
     let text = format!("{error:#}");
     match rayls_infrastructure_utils::mdbx::read_only_open_problem(&text) {
-        Some(problem) => eyre!("{}: {problem}", db_path.display()),
+        Some(problem) => error.wrap_err(format!("{}: {problem}", db_path.display())),
         None => error.wrap_err(format!("open {} read-only", db_path.display())),
     }
 }

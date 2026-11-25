@@ -13,8 +13,9 @@
 #     rayls-replay:latest \
 #       --snapshot-datadir /snapshot --archive-out /archive --network mainnet
 #
-# The mounted volumes must be writable by uid 1101 (the nonroot user); the output
-# datadir and its parent need write access. Run `rayls-replay --help` for the full
+# The snapshot is only read, so a read-only mount is enough; uid 1101 (the nonroot
+# user) must be able to read it. The output datadir and its parent must be writable
+# by uid 1101. Run `rayls-replay --help` for the full
 # flag set (--consensus-db, --from-block, --to-block, --unwind-to, --storage-v2, ...).
 
 FROM rust:1.93-slim-bookworm AS builder

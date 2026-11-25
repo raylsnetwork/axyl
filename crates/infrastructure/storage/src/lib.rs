@@ -222,7 +222,8 @@ pub fn open_db_read_only<Path: AsRef<std::path::Path>>(
     let persistent_db = MdbxDatabase::open_read_only(store_path, true).map_err(|e| {
         let text = format!("{e:#}");
         match rayls_infrastructure_utils::mdbx::read_only_open_problem(&text) {
-            Some(problem) => eyre::eyre!("{}: {problem}", store_path.display()),
+            // the hint goes in front, the original error stays in the chain
+            Some(problem) => e.wrap_err(format!("{}: {problem}", store_path.display())),
             None => e.wrap_err(format!("open {} read-only", store_path.display())),
         }
     })?;

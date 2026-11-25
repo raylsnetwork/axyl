@@ -364,6 +364,10 @@ fn verify_outside_snapshot(snapshot: &Path, path: &Path, what: &str) -> eyre::Re
 
 /// The absolute form of `path` with symlinks resolved. The last parts of the path may not exist
 /// yet (the archive datadir of a first run); they are kept as given.
+///
+/// A `..` after a part that does not exist yet is an error. Such a path cannot be resolved
+/// before its directories are created, and after that it can point anywhere, also into the
+/// snapshot (`other/new/../../snapshot`).
 fn resolve_path(path: &Path) -> eyre::Result<PathBuf> {
     let absolute = std::path::absolute(path)
         .wrap_err_with(|| format!("cannot make {} absolute", path.display()))?;
@@ -373,13 +377,16 @@ fn resolve_path(path: &Path) -> eyre::Result<PathBuf> {
         if let Ok(resolved) = std::fs::canonicalize(existing) {
             return Ok(missing.iter().rev().fold(resolved, |acc, part| acc.join(part)));
         }
-        match (existing.parent(), existing.file_name()) {
-            (Some(parent), Some(name)) => {
-                missing.push(name.to_owned());
-                existing = parent;
-            }
-            _ => return Ok(absolute),
-        }
+        // `file_name` is `None` for a path that ends in `..`
+        let (Some(parent), Some(name)) = (existing.parent(), existing.file_name()) else {
+            return Err(eyre!(
+                "{} has `..` after a directory that does not exist yet, so it cannot be checked \
+                 against the snapshot datadir; pass a path without `..`",
+                path.display()
+            ));
+        };
+        missing.push(name.to_owned());
+        existing = parent;
     }
 }
 
@@ -638,6 +645,15 @@ mod tests {
         assert!(check(&snapshot, &snapshot.join("out").join("deeper")).is_err());
         // the same directory through `.`
         assert!(check(&snapshot, &snapshot.join(".")).is_err());
+        // through `..` over a directory that exists
+        let other = root.path().join("other");
+        std::fs::create_dir_all(&other).expect("create other");
+        assert!(check(&snapshot, &other.join("..").join("snapshot").join("out")).is_err());
+        // through `..` over a directory that does not exist yet: the path cannot be resolved
+        // now, and once `new` is created it points into the snapshot
+        let error = check(&snapshot, &other.join("new").join("..").join("..").join("snapshot"))
+            .expect_err("`..` after a missing directory is refused");
+        assert!(error.to_string().contains("`..`"), "got: {error}");
 
         #[cfg(unix)]
         {

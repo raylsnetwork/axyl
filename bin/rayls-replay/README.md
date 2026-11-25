@@ -141,9 +141,12 @@ What this means when you run it:
 - `--archive-out` must not be the snapshot datadir or a directory inside it.
 - MDBX keeps a lock file, `mdbx.lck`, next to each `mdbx.dat`. It holds no data.
   A read-only open still sets its length (so its change time moves), and creates
-  it, empty, if the snapshot came without one. On a snapshot directory that is not
-  writable, the lock file must already be there: put an empty `mdbx.lck` next to
-  each `mdbx.dat`.
+  it, empty, if the snapshot came without one.
+- On a read-only filesystem (a read-only mount) the replay works with and without
+  the lock file, and nothing is touched.
+- A snapshot directory that is write-protected by permissions on a writable
+  filesystem is a special case: there the lock file must already exist. Put an
+  empty `mdbx.lck` next to each `mdbx.dat`.
 
 ### Config resolution
 
