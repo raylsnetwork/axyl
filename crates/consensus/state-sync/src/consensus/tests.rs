@@ -745,9 +745,9 @@ async fn walk_requests_the_records_when_the_keys_did_not_need_them() {
     let config = one_epoch_behind(&primary.consensus_config());
     let db = config.node_storage();
     let leader = fixture.certificate(&fixture.header_from_last_authority());
-    let chain = canonical_tip_and_chain(db, &leader, 140);
+    let chain = canonical_tip_and_chain(db, &leader, 200);
     assert_eq!(config.epoch(), 1, "precondition: the node runs epoch 1");
-    assert_eq!(chain[&140].sub_dag.leader_epoch(), 2, "precondition: the target is in epoch 2");
+    assert_eq!(chain[&200].sub_dag.leader_epoch(), 2, "precondition: the target is in epoch 2");
     assert!(
         config.get_committee_keys_for_epoch(2).is_some(),
         "precondition: the target's keys need no record"
@@ -771,12 +771,12 @@ async fn walk_requests_the_records_when_the_keys_did_not_need_them() {
     let (network, mut requests) = walk_network(chain.clone(), &chain, HashMap::new());
     let mut session = WalkSession::new(config.clone(), bus.clone(), network);
 
-    assert!(session.sync_to(chain[&140].digest()).await.is_continue());
+    assert!(session.sync_to(chain[&200].digest()).await.is_continue());
     assert_chain_cached(db, &chain);
     assert_eq!(*bus.requested_missing_epoch().borrow(), 1, "the records up to epoch 1");
     assert_eq!(
         requests.hashes(),
-        vec![chain[&140].digest(), chain[&125].digest()],
+        vec![chain[&200].digest(), chain[&125].digest()],
         "the target, then the end of the epoch in the gap"
     );
 }
@@ -930,7 +930,7 @@ async fn walk_diverts_to_an_epoch_end_when_its_record_lands_mid_walk() {
     let config = one_epoch_behind(&primary.consensus_config());
     let db = config.node_storage();
     let leader = fixture.certificate(&fixture.header_from_last_authority());
-    let chain = canonical_tip_and_chain(db, &leader, 140);
+    let chain = canonical_tip_and_chain(db, &leader, 200);
 
     let (network, mut requests) = walk_network(chain.clone(), &chain, HashMap::new());
     // Stands in for the record collector: stores the records only once the walk has asked
@@ -953,14 +953,14 @@ async fn walk_diverts_to_an_epoch_end_when_its_record_lands_mid_walk() {
     });
     let mut session = WalkSession::new(config.clone(), bus.clone(), network);
 
-    assert!(session.sync_to(chain[&140].digest()).await.is_continue());
+    assert!(session.sync_to(chain[&200].digest()).await.is_continue());
     assert_chain_cached(db, &chain);
     assert_eq!(
         requests.hashes(),
-        vec![chain[&140].digest(), chain[&125].digest()],
+        vec![chain[&200].digest(), chain[&125].digest()],
         "the target, then the end of the epoch in the gap, fetched by hash"
     );
-    assert_eq!(session.covered, Some(chain[&140].digest()));
+    assert_eq!(session.covered, Some(chain[&200].digest()));
 }
 
 /// A diverted walk whose epoch end cannot be fetched falls back to the target, as without
@@ -1060,8 +1060,8 @@ async fn walk_gets_epoch_0_record_for_a_target_in_epoch_1() {
     let config = one_epoch_behind(&primary.consensus_config());
     let db = config.node_storage();
     let leader = fixture.certificate(&fixture.header_from_last_authority());
-    let chain = canonical_tip_and_chain(db, &leader, 140);
-    assert_eq!(chain[&140].sub_dag.leader_epoch(), 1, "precondition: the target is in epoch 1");
+    let chain = canonical_tip_and_chain(db, &leader, 200);
+    assert_eq!(chain[&200].sub_dag.leader_epoch(), 1, "precondition: the target is in epoch 1");
 
     // Stands in for the record collector, which acts only on an epoch above 0 here.
     let bus = ConsensusBus::new();
@@ -1082,11 +1082,11 @@ async fn walk_gets_epoch_0_record_for_a_target_in_epoch_1() {
     let (network, mut requests) = walk_network(chain.clone(), &chain, HashMap::new());
     let mut session = WalkSession::new(config.clone(), bus.clone(), network);
 
-    assert!(session.sync_to(chain[&140].digest()).await.is_continue());
+    assert!(session.sync_to(chain[&200].digest()).await.is_continue());
     assert_chain_cached(db, &chain);
     assert_eq!(
         requests.hashes(),
-        vec![chain[&140].digest(), chain[&110].digest()],
+        vec![chain[&200].digest(), chain[&110].digest()],
         "the target, then epoch 0's end"
     );
 }

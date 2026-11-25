@@ -24,10 +24,8 @@ const COMMITTEE_KEYS_POLL_INTERVAL: Duration = Duration::from_millis(500);
 /// How long to wait for a gossip tip before actively probing peers for the network head.
 const PROBE_INTERVAL: Duration = Duration::from_secs(10);
 
-/// Most headers the backwards walk prefetches by number below a trusted header in one round, and so
-/// the most requests it has in flight at once. Kept small so many nodes catching up together, as
-/// after a stalled network restarts, do not flood the validators.
-const WALK_PREFETCH: u64 = 8;
+/// Headers the walk prefetches per round, and so its most requests in flight at once.
+const WALK_PREFETCH: u64 = 32;
 
 /// Cache a consensus header in persistent storage.
 pub fn store_consensus_header_in_cache<DB: ReDatabase>(db: &DB, header: &ConsensusHeader) {
