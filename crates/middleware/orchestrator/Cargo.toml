@@ -30,6 +30,8 @@ futures = { workspace = true }
 rayls-consensus-network = { workspace = true }
 rayls-execution-evm = { workspace = true }
 consensus-metrics = { workspace = true }
+# installs the global `metrics` recorder before tokio runtime/task metrics reporters start
+reth-node-metrics = { workspace = true }
 prometheus = { workspace = true }
 rayls-consensus-primary-metrics = { workspace = true }
 rayls-consensus-state-sync = { workspace = true }

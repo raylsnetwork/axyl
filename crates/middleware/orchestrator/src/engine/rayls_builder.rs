@@ -3,7 +3,7 @@ use rayls_execution_faucet::FaucetArgs;
 use rayls_infrastructure_config::Config;
 use rayls_infrastructure_storage::mdbx::MdbxConfig;
 use rayls_infrastructure_types::BuildMetadata;
-use std::net::SocketAddr;
+use std::{net::SocketAddr, time::Duration};
 
 /// The struct used to build the execution nodes.
 ///
@@ -26,6 +26,8 @@ pub struct RaylsBuilder {
     ///
     /// The metrics will be served at the given interface and port.
     pub metrics: Option<SocketAddr>,
+    /// Sampling interval for tokio runtime/task metrics; `None` leaves them off.
+    pub tokio_metrics: Option<Duration>,
     /// Optional TCP port to start healthcheck service.
     /// If a port is provided, the healthcheck service will spawn. Otherwise, no healthcheck
     /// service starts.
@@ -79,9 +81,16 @@ impl RaylsBuilder {
             profile,
             opt_faucet_args,
             metrics,
+            tokio_metrics: None,
             healthcheck,
             consensus_db_config,
             build_metadata,
         }
+    }
+
+    /// Report tokio runtime/task metrics at `interval` (`None` leaves them off).
+    pub fn with_tokio_metrics(mut self, interval: Option<Duration>) -> Self {
+        self.tokio_metrics = interval;
+        self
     }
 }

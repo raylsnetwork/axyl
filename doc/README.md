@@ -28,6 +28,10 @@ Start with one of the pages below depending on what you are trying to do.
   up a local 4-validator chain on one machine.
 - [`../etc/docker-network/README.md`](../etc/docker-network/README.md) —
   same network as above, packaged as Docker Compose.
+- [`profiling-poc.md`](profiling-poc.md) — that Docker network with an eBPF
+  profiler (flame graphs per validator) and tokio runtime/task metrics
+  (`--tokio-metrics`): where the node spends CPU and which async tasks block
+  or wait.
 - [`gasless-mode.md`](gasless-mode.md) — how to run / join a fee-free
   network.
 - [`node-lifecycle.md`](node-lifecycle.md) — what a running node is doing

@@ -2,6 +2,7 @@
 // Library for managing all components used by a full-node in a single process.
 
 use rayls_infrastructure_config::RaylsDirs;
+use rayls_infrastructure_types::task_metrics;
 use tokio::runtime::Builder;
 use tracing::instrument;
 pub mod engine;
@@ -43,13 +44,20 @@ where
     let _consensus_db_lock =
         epoch_manager::acquire_consensus_db_lock(&rayls_datadir.consensus_db_path())?;
 
-    let runtime = Builder::new_multi_thread()
-        .thread_name("rayls-network")
-        .enable_io()
-        .enable_time()
-        .build()?;
+    let mut runtime = Builder::new_multi_thread();
+    runtime.thread_name("rayls-network").enable_io().enable_time();
+    if builder.tokio_metrics.is_some() {
+        task_metrics::configure_runtime(&mut runtime);
+    }
+    let runtime = runtime.build()?;
 
     let res = runtime.block_on(async move {
+        if let Some(interval) = builder.tokio_metrics {
+            // reth's recorder must be global before the reporters capture their metric handles;
+            // installing it is idempotent with the `--reth-metrics` server's own call.
+            reth_node_metrics::recorder::install_prometheus_recorder();
+            task_metrics::enable(interval);
+        }
         let (fatal_db_error, _fatal_db_error_rx) = tokio::sync::watch::channel(None);
         let consensus_db = open_consensus_db(
             &rayls_datadir,
