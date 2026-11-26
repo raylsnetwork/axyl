@@ -7,6 +7,7 @@
 pub mod accessors;
 pub mod chain;
 pub mod config;
+mod datadir_format;
 pub mod env;
 pub mod execution;
 pub mod genesis;
