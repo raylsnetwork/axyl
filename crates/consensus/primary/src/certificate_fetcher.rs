@@ -176,6 +176,10 @@ pub(crate) struct CertificateFetcher<DB> {
     /// Suppresses probes until this instant after an epoch-mismatch outcome.
     /// Prevents tight spin when all peers are on a future epoch.
     epoch_mismatch_until: Option<Instant>,
+    /// Set once the network tip is in a later epoch than the fetcher's, and never cleared.
+    /// A tip that is stale or reset at the epoch transition is never in a later epoch, so it
+    /// cannot be set wrongly, and each epoch builds a new fetcher.
+    tip_is_in_future_epoch: bool,
 }
 
 /// Thread-safe internal state of CertificateFetcher shared with its fetch task.
@@ -229,6 +233,7 @@ impl<DB: Database> CertificateFetcher<DB> {
                         consecutive_busy: 0,
                         last_fetch_attempt: None,
                         epoch_mismatch_until: None,
+                        tip_is_in_future_epoch: false,
                     }
                     .run()
                     .await
@@ -377,7 +382,11 @@ impl<DB: Database> CertificateFetcher<DB> {
                     }
                 },
                 // periodic probe when idle; interval adapts per probe_interval()
-                _ = sleep(probe_interval), if self.fetch_certificates_task.is_empty() => {
+                // the latch alone is enough here: it is only set on an inactive node, and a mode
+                // change shuts this fetcher down before the new mode is written
+                _ = sleep(probe_interval),
+                    if self.fetch_certificates_task.is_empty() && !self.tip_is_in_future_epoch =>
+                {
                     info!(
                         target: "primary::cert_fetcher",
                         "periodic probe to discover missing certificates"
@@ -408,8 +417,43 @@ impl<DB: Database> CertificateFetcher<DB> {
         self.probe().await;
     }
 
+    /// True when this node is not an active validator and the network tip is in a later epoch.
+    ///
+    /// An inactive node fetches certificates only to have the live DAG when it rejoins. It
+    /// cannot rejoin in an epoch the network has left, and it clears its certificate tables
+    /// when it moves on, so whatever it fetches there is thrown away. Peers would answer with
+    /// the closed epoch's kept tail, whose oldest parents no one holds any more, so every
+    /// fetch brings back the same certificates. The node replays the epoch from consensus
+    /// headers and fetches again in the live epoch. An active validator still finishing a
+    /// closed epoch keeps fetching: the tail is kept for it.
+    fn replaying_closed_epoch(&mut self) -> bool {
+        if self.consensus_bus.node_mode().borrow().is_active_cvv() {
+            return false;
+        }
+        if !self.tip_is_in_future_epoch {
+            // the latest verified network header, reset at every epoch transition
+            let epoch = self.committee.epoch();
+            let tip_epoch =
+                self.consensus_bus.last_consensus_header().borrow().sub_dag.leader_epoch();
+            self.tip_is_in_future_epoch = tip_epoch > epoch;
+            if self.tip_is_in_future_epoch {
+                info!(
+                    target: "primary::cert_fetcher",
+                    epoch,
+                    tip_epoch,
+                    "network already left this epoch - not fetching certificates while catching up"
+                );
+            }
+        }
+        self.tip_is_in_future_epoch
+    }
+
     /// Probe peers for missing certificates, even with no queued targets.
     async fn probe(&mut self) {
+        if self.replaying_closed_epoch() {
+            return;
+        }
+
         // epoch-mismatch suppression: all peers are on a future epoch so
         // fetching is futile until our epoch advances. sleep the remaining
         // backoff rather than spinning.
