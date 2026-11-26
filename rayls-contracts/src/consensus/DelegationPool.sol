@@ -524,10 +524,8 @@ contract DelegationPool is
     }
 
     /// @inheritdoc IDelegationPool
-    /// @dev No RLS transfer at all — the whole operation is accounting-only within this
-    ///      contract, which is precisely why it can skip the unbonding wait that
+    /// @dev Accounting-only, which is why it can skip the unbonding wait that
     ///      requestUndelegation/completeUndelegation enforce for an actual withdrawal.
-    /// @dev The moved amount must meet `config.minDelegation`, like a new delegation.
     function transferStake(
         address fromValidator,
         address toValidator,
@@ -559,9 +557,6 @@ contract DelegationPool is
 
         DelegatorPosition storage fromPos = $.positions[fromValidator][msg.sender];
 
-        // settle pending rewards/slashes before computing the movable balance
-        _settlePosition(fromPool, fromPos);
-
         uint32 currentEpoch = $.consensusRegistry.getCurrentEpoch();
         // Stored 1-based (currentEpoch + 1): 0 must unambiguously mean "never transferred",
         // and epoch 0 is itself a legitimate real epoch, so storing it raw would make a
@@ -569,6 +564,9 @@ contract DelegationPool is
         // false-positive as already used.
         if (fromPos.lastTransferEpoch == uint64(currentEpoch) + 1)
             revert TransferAlreadyUsedThisEpoch(currentEpoch);
+
+        // settle pending rewards/slashes before computing the movable balance
+        _settlePosition(fromPool, fromPos);
 
         if (fromPos.amount < amount)
             revert InsufficientBalance(amount, fromPos.amount);
@@ -587,14 +585,13 @@ contract DelegationPool is
             fromPool.totalDelegated -= amount;
         }
 
-        // Tier resolution mirrors _delegate: an existing destination position keeps its own
-        // tier, a fresh one follows the caller's whitelist status.
+        // Same rule as _delegate: an existing destination keeps its locked tier, a fresh one
+        // follows the caller's whitelist status. The source tier is not compared, so a fresh
+        // destination may pull the stake into the other track.
         DelegatorPosition storage toPos = $.positions[toValidator][msg.sender];
         bool toOpenTier = toPos.amount > 0
             ? toPos.openTier
             : ($.whitelistEnabled && !$.whitelistVerified[msg.sender]);
-
-        if (toOpenTier != fromPos.openTier) revert TierMismatch(fromPos.openTier, toOpenTier);
 
         _settlePosition(toPool, toPos);
 
@@ -618,8 +615,9 @@ contract DelegationPool is
         toPos.rewardDebt = (toPos.amount * toAccum) / PRECISION;
         // Ceiling division for slashDebt — counterpart to ceiling in _settlePosition
         toPos.slashDebt = (toPos.amount * toPool.slashPerShareAccum + PRECISION - 1) / PRECISION;
-        // Same-epoch reward exclusion applies to moved-in stake exactly as it would to a
-        // fresh delegation.
+        // Same stamp as _delegate, and no stronger: the exclusion only covers settlement inside
+        // the epoch of arrival. `concludeEpoch` increments the epoch before rewards are
+        // distributed, so stake arriving in epoch E still collects epoch E's payout here.
         toPos.lastDelegateEpoch = uint64(currentEpoch);
 
         if (toOpenTier) {
@@ -1006,7 +1004,9 @@ contract DelegationPool is
             effectiveAmount = pos.amount;
         }
 
-        // 2. rewards on post-slash amount — skip same-epoch delegations (sandwich protection)
+        // 2. rewards on post-slash amount — skip positions that arrived in the current epoch
+        //    (sandwich protection). It does not cover the epoch being closed: concludeEpoch
+        //    increments the epoch before the payout is distributed.
         if (pos.lastDelegateEpoch != currentEpoch) {
             uint256 accumulated = (effectiveAmount * accum) / PRECISION;
             if (accumulated > scaledRewardDebt) {
@@ -1048,4 +1048,3 @@ contract DelegationPool is
         pos.slashDebt = newSlashDebt;
     }
 }
-

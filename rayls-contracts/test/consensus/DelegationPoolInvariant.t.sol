@@ -129,23 +129,21 @@ contract DelegationPoolHandler is Test {
         if (from == to) return;
 
         IDelegationPool.DelegatorPosition memory fromPos = pool.getDelegatorPosition(from, d);
-        if (fromPos.amount == 0) return;
         // lastTransferEpoch is stored 1-based; already used this epoch if it equals current+1
         if (fromPos.lastTransferEpoch == registry.getCurrentEpoch() + 1) return;
 
-        IDelegationPool.ValidatorPool memory toPool = pool.getValidatorPool(to);
-        IDelegationPool.DelegatorPosition memory toPos = pool.getDelegatorPosition(to, d);
+        // Bound on the post-slash effective amounts, so the fuzz run keeps exercising transfers
+        // after a slash instead of silently reverting on them.
+        (uint256 fromEffective,) = pool.getEffectivePosition(from, d);
+        (uint256 toEffective,) = pool.getEffectivePosition(to, d);
+        if (fromEffective == 0) return;
 
-        // skip moves transferStake would reject with TierMismatch
-        bool toOpenTier = toPos.amount > 0
-            ? toPos.openTier
-            : (pool.whitelistEnabled() && !pool.isWhitelistVerified(d));
-        if (toOpenTier != fromPos.openTier) return;
+        IDelegationPool.ValidatorPool memory toPool = pool.getValidatorPool(to);
 
         uint256 poolRoom = MAX_VALIDATOR_DELEGATION - (toPool.totalDelegated + toPool.openTierDelegated);
-        uint256 actorRoom = MAX_DELEGATION - toPos.amount;
+        uint256 actorRoom = MAX_DELEGATION - toEffective;
         uint256 cap = poolRoom < actorRoom ? poolRoom : actorRoom;
-        if (cap > fromPos.amount) cap = fromPos.amount;
+        if (cap > fromEffective) cap = fromEffective;
         // transferStake enforces minDelegation; skip sub-floor amounts rather than reverting
         if (cap < MIN_DELEGATION) return;
 

@@ -32,7 +32,7 @@ interface IDelegationPool {
         uint64 undelegateEpoch;
         uint256 undelegateAmount;
         uint256 slashDebt;
-        uint64 lastDelegateEpoch; // epoch of most recent delegation — same-epoch rewards excluded (DP-NEW-002)
+        uint64 lastDelegateEpoch; // arrival epoch; settlement inside it is excluded (DP-NEW-002)
         bool openTier; // immutable after entry; true = Track B (open-tier), false = Track A (whitelisted)
         uint64 lastTransferEpoch; // 1-based: (epoch of most recent transferStake OUT of this position) + 1; 0 = never (#164)
     }
@@ -81,7 +81,6 @@ interface IDelegationPool {
     error ZeroAmount();
     error SameValidator();
     error TransferAlreadyUsedThisEpoch(uint32 currentEpoch);
-    error TierMismatch(bool fromOpenTier, bool toOpenTier);
 
     // events
     event PoolRegistered(address indexed validator, uint256 commissionBps);
@@ -218,10 +217,18 @@ interface IDelegationPool {
     ///      lock on `requestUndelegation`/`completeUndelegation` is completely unaffected: it
     ///      still governs actual withdrawal exactly as before. Rate-limited per SOURCE position
     ///      (`fromValidator`, caller), so a delegator with positions at several validators may
-    ///      transfer out of each of them once in the same epoch.
-    /// @dev The moved `amount` must be at least `config.minDelegation`, the same floor `delegate` applies.
-    /// @dev Tier-preserving: the destination tier must equal the source's, else `TierMismatch`.
-    ///      Switching tracks still requires unbonding and re-delegating.
+    ///      transfer out of each of them once in the same epoch. The scope is deliberate: the same
+    ///      capital may hop A → B → A inside one epoch, and it never earns twice because the
+    ///      source is settled against the pre-payout accumulator.
+    /// @dev The moved `amount` must be at least `config.minDelegation`, the same floor `delegate`
+    ///      applies. The source remainder is not floored: partial undelegations and slashing can
+    ///      already leave a balance below it.
+    /// @dev Tier resolution matches `_delegate`: an existing destination keeps its tier, a fresh
+    ///      one follows the caller's whitelist status, so stake may change track into a fresh pool.
+    /// @dev Like `requestUndelegation` this escapes future `applyPoolSlash` at the source, but at
+    ///      no cost — no unbonding wait, no reward gap. Accepted trade-off.
+    /// @dev Rewards behave like a fresh `delegate()`: stake arriving in epoch E collects epoch E's
+    ///      payout, because epoch close increments the epoch before distributing. No lock-up.
     /// @param fromValidator The validator to move stake away from
     /// @param toValidator The validator to move stake to
     /// @param amount The amount of already-delegated RLS to move (>= `config.minDelegation`)
