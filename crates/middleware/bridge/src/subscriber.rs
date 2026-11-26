@@ -1694,7 +1694,8 @@ mod catchup_reputation_tests {
                 DEFAULT_BAD_NODES_STAKE_THRESHOLD,
             );
             for certificate in certificates {
-                let (_, committed) = bullshark.process_certificate(&mut state, certificate).unwrap();
+                let (_, committed) =
+                    bullshark.process_certificate(&mut state, certificate).unwrap();
                 for expected in committed {
                     number += 1;
                     let mut received = expected.clone();
