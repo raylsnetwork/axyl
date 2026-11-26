@@ -39,6 +39,9 @@ impl RethEnv {
     /// Create a new Reth DB.
     /// Break this out so this can be created upfront and used even on a
     /// restart (when catching up for instance).
+    ///
+    /// This is the one place that opens the execution database for writing. An existing
+    /// database in the storage format of reth 1.x gives an error (see `datadir_format`).
     pub fn new_database<P: AsRef<Path>>(
         reth_config: &RethConfig,
         db_path: P,
@@ -48,7 +51,14 @@ impl RethEnv {
         // reth does not check --db.page-size, so it is checked here for a new datafile.
         db_args.page_size = open_page_size(db_path, db_args.page_size)
             .map_err(|e| eyre::eyre!("invalid --db.page-size: {e}"))?;
+        // A datadir in the storage format of reth 1.x is refused here, before `init_db` writes
+        // to it. If this early check cannot run, the same check runs right after the open.
+        let format_checked =
+            crate::reth_env::datadir_format::check_before_open(db_path, db_args.page_size)?;
         let db = init_db(db_path, db_args.database_args())?;
+        if !format_checked {
+            crate::reth_env::datadir_format::check_open_database(&db, db_path)?;
+        }
         match db.stat() {
             Ok(stat) => {
                 info!(target: "rayls::reth", path = ?db_path, page_size = stat.page_size(), "opened database")

@@ -2755,3 +2755,152 @@ fn snapshot_reader_refuses_a_directory_without_a_database() -> eyre::Result<()> 
     assert_eq!(std::fs::read_dir(dir.path())?.count(), 0, "the directory must stay empty");
     Ok(())
 }
+
+// ---------------------------------------------------------------------------------------------
+// Old storage format guard (#419)
+// ---------------------------------------------------------------------------------------------
+
+/// Write rows with the given raw keys into `AccountsTrie` of a database made by `new_database`,
+/// and close it again.
+fn database_with_trie_keys(dir: &std::path::Path, keys: &[Vec<u8>]) -> eyre::Result<()> {
+    use reth::builder::NodeConfig;
+    use reth_db::{
+        tables,
+        transaction::{DbTx as _, DbTxMut as _},
+        Database as _, RawKey, RawTable, RawValue,
+    };
+
+    let db = RethEnv::new_database(&RethConfig(NodeConfig::default()), dir)?;
+    let tx = db.tx_mut()?;
+    for key in keys {
+        tx.put::<RawTable<tables::AccountsTrie>>(
+            RawKey::from_vec(key.clone()),
+            RawValue::from_vec(vec![0u8; 8]),
+        )?;
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+/// Size and change time of every file in `dir`, without MDBX's lock file (MDBX sets its length
+/// again on every open).
+fn data_files(
+    dir: &std::path::Path,
+) -> eyre::Result<std::collections::BTreeMap<std::path::PathBuf, (u64, std::time::SystemTime)>> {
+    let mut out = std::collections::BTreeMap::new();
+    for entry in std::fs::read_dir(dir)? {
+        let path = entry?.path();
+        if path.file_name().is_some_and(|name| name == "mdbx.lck") {
+            continue;
+        }
+        let meta = std::fs::metadata(&path)?;
+        out.insert(path, (meta.len(), meta.modified()?));
+    }
+    Ok(out)
+}
+
+/// A database with trie keys in the reth 1.x format is refused before it is opened for writing,
+/// and its files stay as they were.
+#[test]
+fn old_format_database_is_refused_and_not_changed() -> eyre::Result<()> {
+    use reth::builder::NodeConfig;
+
+    let dir = TempDir::new()?;
+    // reth 1.x: one byte per step of the path. A real reth 1.11 datadir starts like this.
+    database_with_trie_keys(dir.path(), &[vec![0x00], vec![0x00, 0x01], vec![0x0f]])?;
+    let before = data_files(dir.path())?;
+
+    let error = RethEnv::new_database(&RethConfig(NodeConfig::default()), dir.path())
+        .expect_err("a database in the old format must be refused");
+    let text = error.to_string();
+    assert!(text.contains("storage format of reth 1.x"), "got: {text}");
+    assert!(text.contains("was not changed"), "got: {text}");
+    assert!(text.contains("has 1 bytes"), "the error names the key length it found, got: {text}");
+
+    assert_eq!(before, data_files(dir.path())?, "the refused database must not be changed");
+    Ok(())
+}
+
+/// A database with packed trie keys (reth 2.0), an empty one and a new directory all open.
+#[test]
+fn new_format_database_opens() -> eyre::Result<()> {
+    use reth::builder::NodeConfig;
+    let config = RethConfig(NodeConfig::default());
+
+    // packed keys: always 33 bytes
+    let packed = TempDir::new()?;
+    database_with_trie_keys(packed.path(), &[vec![0x00; 33], vec![0x11; 33]])?;
+    RethEnv::new_database(&config, packed.path())?;
+
+    // no trie rows at all: nothing to judge, so it opens
+    let empty = TempDir::new()?;
+    database_with_trie_keys(empty.path(), &[])?;
+    RethEnv::new_database(&config, empty.path())?;
+
+    // no database yet
+    let fresh = TempDir::new()?;
+    RethEnv::new_database(&config, fresh.path())?;
+    Ok(())
+}
+
+/// One old key among packed ones is enough: the check looks at more than the first row.
+#[test]
+fn old_format_key_after_packed_keys_is_found() -> eyre::Result<()> {
+    use reth::builder::NodeConfig;
+
+    let dir = TempDir::new()?;
+    // sorted by MDBX: the two packed keys first, then the short one
+    database_with_trie_keys(dir.path(), &[vec![0x00; 33], vec![0x01; 33], vec![0x02, 0x03]])?;
+    let error = RethEnv::new_database(&RethConfig(NodeConfig::default()), dir.path())
+        .expect_err("the old key must be found");
+    assert!(error.to_string().contains("has 2 bytes"), "got: {error}");
+    Ok(())
+}
+
+/// The genesis that reth 2.0 writes passes the check, and it has trie rows, so the check really
+/// looked at keys written by reth 2.0.
+#[tokio::test]
+async fn genesis_written_by_this_version_passes_the_format_check() -> eyre::Result<()> {
+    use reth::builder::NodeConfig;
+    use reth_db::{tables, transaction::DbTx as _, Database as _};
+
+    let dir = TempDir::new()?;
+    drop(genesis_storage_stack(dir.path())?);
+
+    let db = RethEnv::new_database(&RethConfig(NodeConfig::default()), dir.path().join("db"))?;
+    assert!(
+        db.tx()?.entries::<tables::AccountsTrie>()? > 0,
+        "the genesis must have trie rows, or this test checks nothing"
+    );
+    Ok(())
+}
+
+/// The check on an open database, used when the read-only check before the open could not run.
+#[test]
+fn old_format_is_also_found_on_an_open_database() -> eyre::Result<()> {
+    use crate::reth_env::datadir_format::check_open_database;
+    use reth_db::{
+        mdbx::DatabaseArguments,
+        tables,
+        transaction::{DbTx as _, DbTxMut as _},
+        Database as _, RawKey, RawTable, RawValue,
+    };
+
+    let dir = TempDir::new()?;
+    // plain reth open, so the old key can be written while the handle stays open
+    let db = reth_db::init_db(dir.path(), DatabaseArguments::default())?;
+    check_open_database(&db, dir.path())?;
+
+    let tx = db.tx_mut()?;
+    tx.put::<RawTable<tables::AccountsTrie>>(
+        RawKey::from_vec(vec![0x00]),
+        RawValue::from_vec(vec![0u8; 8]),
+    )?;
+    tx.commit()?;
+
+    let error = check_open_database(&db, dir.path()).expect_err("the old key must be found");
+    let text = error.to_string();
+    assert!(text.contains("storage format of reth 1.x"), "got: {text}");
+    assert!(text.contains("nothing in it was repaired or unwound"), "got: {text}");
+    Ok(())
+}
