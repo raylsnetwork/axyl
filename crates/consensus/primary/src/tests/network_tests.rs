@@ -968,6 +968,16 @@ async fn test_consensus_result_spam_cannot_wipe_honest_votes() -> eyre::Result<(
         gossip_consensus_result(&handler, signer, 5, real).await?;
     }
     assert_eq!(*consensus_bus.last_published_consensus_num_hash().borrow(), (5, real));
+    // the certified tip is built from the honest signatures alone
+    let keys: Vec<BlsPublicKey> =
+        committee.authorities().map(|a| *a.authority().protocol_key()).collect();
+    let tip = match handler.retrieve_certified_tip().await {
+        Ok(PrimaryResponse::CertifiedTip(Some(tip))) => tip,
+        other => panic!("no certified tip: {other:?}"),
+    };
+    assert_eq!((tip.number, tip.hash), (5, real));
+    assert_eq!(tip.signed_authorities.len() as usize, honest.len());
+    assert!(tip.verify(&keys), "the kept tip verifies against the committee");
     Ok(())
 }
 

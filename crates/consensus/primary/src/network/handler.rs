@@ -31,7 +31,7 @@ use rayls_infrastructure_types::{
     SignatureVerificationState, Vote, B256,
 };
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     sync::Arc,
     time::Duration,
 };
@@ -39,8 +39,10 @@ use tokio::time::Instant;
 use tracing::{debug, error, info, trace, warn};
 
 const MAX_AUTH_LAST_VOTE_ENTRIES: usize = 1000;
-/// How many of its latest consensus results each signer keeps in [`ConsensusVotes`].
-const CONSENSUS_VOTES_PER_SIGNER: usize = 3;
+/// How many of its highest-numbered consensus results each signer keeps in [`ConsensusVotes`]:
+/// how far, in headers, one quorum member's gossip can trail another's before the quorum for a
+/// header stops forming while new headers keep coming.
+const CONSENSUS_VOTES_PER_SIGNER: usize = 8;
 /// How long `committed_round` must stay flat, while verdicts keep saying behind, before demoting
 /// to `CvvInactive`. Any commit advance resets the clock, so a node catching up or mid epoch/mode
 /// transition never trips it; only one stuck for the whole window does.
@@ -99,16 +101,19 @@ impl BehindTracker {
     }
 }
 
-/// The latest verified consensus results of each signer, counted toward the f+1 gossip quorum.
+/// The highest-numbered verified consensus results of each signer, counted toward the f+1 gossip
+/// quorum.
 ///
-/// Each signer keeps only its own last [`CONSENSUS_VOTES_PER_SIGNER`] results. A member that
+/// Each signer keeps only its own [`CONSENSUS_VOTES_PER_SIGNER`] highest-numbered results, by
+/// header number rather than arrival, as gossip can deliver one signer's results out of order and
+/// a late lower one must not push out a higher one still forming its quorum. A member that
 /// signs invented digests pushes out its own older results, never another signer's, so it cannot
 /// wipe the honest partial count for the real header. More than one per signer, so a signer that
 /// has moved on to the next header still counts toward the previous one while that quorum forms.
 /// Holds at most that many results per key it has counted, keys of earlier committees included.
 #[derive(Debug, Default)]
 struct ConsensusVotes {
-    by_signer: HashMap<BlsPublicKey, VecDeque<(B256, ConsensusResult)>>,
+    by_signer: HashMap<BlsPublicKey, Vec<(B256, ConsensusResult)>>,
 }
 
 impl ConsensusVotes {
@@ -119,16 +124,26 @@ impl ConsensusVotes {
     /// bring the count back to it. That costs one more pass through the quorum: a held-header read
     /// for a closed epoch, a certified-tip save that keeps a higher stored tip, and a
     /// `behind_consensus` call. Neither tip can move back. A repeat of a result the signer already
-    /// holds counts nothing.
+    /// holds counts nothing, and so does one numbered at or below all of a full window.
     fn add(&mut self, digest: B256, result: ConsensusResult, quorum: usize) -> bool {
         let held = self.by_signer.entry(result.validator).or_default();
         if held.iter().any(|(d, _)| *d == digest) {
             return false;
         }
         if held.len() == CONSENSUS_VOTES_PER_SIGNER {
-            held.pop_front();
+            let lowest = held
+                .iter()
+                .enumerate()
+                .map(|(at, (_, held))| (at, held.number))
+                .min_by_key(|(_, number)| *number);
+            if let Some((at, number)) = lowest {
+                if result.number <= number {
+                    return false;
+                }
+                held.swap_remove(at);
+            }
         }
-        held.push_back((digest, result));
+        held.push((digest, result));
         self.by_signer.values().filter(|held| held.iter().any(|(d, _)| *d == digest)).count()
             == quorum
     }
@@ -1455,7 +1470,9 @@ fn evict_oldest_completed(cache: &mut AuthEquivocationMap, max_entries: usize) {
 
 #[cfg(test)]
 mod tests {
-    use super::{anchor_diverges_from_executed, BehindTracker, ConsensusVotes};
+    use super::{
+        anchor_diverges_from_executed, BehindTracker, ConsensusVotes, CONSENSUS_VOTES_PER_SIGNER,
+    };
     use crate::{network::message::ConsensusResult, RecentlyExecutedBlocks};
     use rand::{rngs::StdRng, SeedableRng};
     use rayls_infrastructure_types::{BlockNumHash, BlsKeypair, ExecHeader, SealedHeader, B256};
@@ -1504,6 +1521,39 @@ mod tests {
         assert!(!votes.add(digest, first, 2), "a repeat does not count");
         assert!(votes.add(digest, second, 2), "the second signer reaches the quorum");
         assert!(!votes.add(digest, third, 2), "a later signer does not report it again");
+    }
+
+    /// A full window drops the signer's lowest number, whatever order its results arrive in, and
+    /// ignores one lower than all it holds. Pruning drops the published number and keeps the next.
+    #[test]
+    fn consensus_votes_keep_each_signers_highest_numbers() {
+        let mut rng = StdRng::seed_from_u64(435);
+        let [late, other, third] = [(); 3].map(|_| *BlsKeypair::generate(&mut rng).public());
+        let vote = |votes: &mut ConsensusVotes, validator, number: u64, quorum| {
+            let result = ConsensusResult {
+                number,
+                hash: B256::repeat_byte(number as u8),
+                validator,
+                ..Default::default()
+            };
+            votes.add(result.digest(), result, quorum)
+        };
+        let top = CONSENSUS_VOTES_PER_SIGNER as u64 + 2;
+        let mut votes = ConsensusVotes::default();
+        // `late` sends the top header first, then 2.. up to a full window, then the one it skipped
+        vote(&mut votes, late, top, 2);
+        for number in 2..top - 1 {
+            vote(&mut votes, late, number, 2);
+        }
+        vote(&mut votes, late, top - 1, 2);
+        vote(&mut votes, late, 1, 2);
+        assert!(vote(&mut votes, other, top, 2), "the first received, but highest, is kept");
+        assert!(!vote(&mut votes, other, 2, 2), "the lowest was dropped for the late one");
+        assert!(!vote(&mut votes, other, 1, 2), "one below the full window was ignored");
+
+        votes.prune_through(top - 1);
+        assert!(!vote(&mut votes, third, top - 1, 2), "the published number is pruned");
+        assert!(vote(&mut votes, third, top, 3), "the next one is kept");
     }
 
     // Tests drive the window argument rather than a real clock: a zero window means "any flat
