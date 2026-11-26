@@ -1570,11 +1570,12 @@ mod catchup_reputation_tests {
     use super::*;
     use rayls_consensus_primary::{
         consensus::{Bullshark, ConsensusMetrics, ConsensusState, LeaderSchedule, LeaderSwapTable},
-        test_utils::make_certificates_with_slow_nodes,
+        test_utils::{make_certificates_with_epoch, make_certificates_with_slow_nodes},
     };
     use rayls_infrastructure_storage::mem_db::MemDatabase;
     use rayls_infrastructure_types::{Certificate, DEFAULT_BAD_NODES_STAKE_THRESHOLD};
     use rayls_testing_test_utils::CommitteeFixture;
+    use std::collections::BTreeSet;
 
     /// What a peer can send: no authorities, marked final of schedule (#377).
     fn poisoned() -> ReputationScores {
@@ -1662,6 +1663,51 @@ mod catchup_reputation_tests {
             received.reputation_score = local;
             parent_hash = save_row(&db, number, parent_hash, received);
         }
+    }
+
+    /// As above, across an epoch boundary and above epoch 0, where the window position comes from
+    /// the leader nonce (epoch and round). Bullshark starts each epoch with no previous sub dag,
+    /// as `Consensus::spawn` does, while catch-up reads the previous epoch's last row as the
+    /// parent. Epoch 1 ends mid-window, so that row has non-zero scores.
+    #[tokio::test]
+    async fn catchup_scores_match_bullshark_across_an_epoch_boundary() {
+        const WINDOW: u32 = 3;
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let ids: Vec<_> = fixture.authorities().map(|a| a.id()).collect();
+        let db = MemDatabase::default();
+        let mut parent_hash = ConsensusHeader::default().digest();
+        let mut number = 0u64;
+
+        for epoch in [1, 2] {
+            let committee = fixture.committee().advance_epoch_for_test(epoch);
+            let genesis: BTreeSet<_> =
+                Certificate::genesis(&committee).iter().map(|c| c.digest()).collect();
+            let (certificates, _) =
+                make_certificates_with_epoch(&committee, 1..=23, epoch, &genesis, &ids);
+            let metrics = Arc::new(ConsensusMetrics::default());
+            let mut state = ConsensusState::new(metrics.clone(), 50);
+            let mut bullshark = Bullshark::new(
+                committee.clone(),
+                metrics,
+                WINDOW,
+                LeaderSchedule::new(committee.clone(), LeaderSwapTable::default()),
+                DEFAULT_BAD_NODES_STAKE_THRESHOLD,
+            );
+            for certificate in certificates {
+                let (_, committed) = bullshark.process_certificate(&mut state, certificate).unwrap();
+                for expected in committed {
+                    number += 1;
+                    let mut received = expected.clone();
+                    received.reputation_score = poisoned();
+                    let local =
+                        catchup_reputation_score(&db, &committee, parent_hash, &received, WINDOW);
+                    assert_eq!(local, expected.reputation_score, "epoch {epoch} sub dag {number}");
+                    received.reputation_score = local;
+                    parent_hash = save_row(&db, number, parent_hash, received);
+                }
+            }
+        }
+        assert!(number > 4 * WINDOW as u64, "both epochs span several windows");
     }
 
     /// Scores carry over only from a parent of the same epoch. A parent of an earlier epoch, a
