@@ -19,7 +19,8 @@ use rayls_consensus_network::{
 };
 use rayls_infrastructure_storage::{mem_db::MemDatabase, CertificateStore, PayloadStore};
 use rayls_infrastructure_types::{
-    BlsSignature, Certificate, Hash as _, Header, Round, SignatureVerificationState, TaskManager,
+    BlsSignature, Certificate, CommittedSubDag, ConsensusHeader, Epoch, Hash as _, Header,
+    ReputationScores, Round, SignatureVerificationState, TaskManager,
 };
 use rayls_testing_test_utils_committee::CommitteeFixture;
 use std::{collections::BTreeSet, time::Duration};
@@ -545,6 +546,86 @@ impl FetcherUnderTest {
             }
         }
     }
+
+    /// Fail if the fetcher asks for certificates within `period`.
+    async fn assert_no_fetch(&mut self, period: Duration) {
+        sleep(period).await;
+        while let Ok(command) = self.requests.try_recv() {
+            if let NetworkCommand::SendRequest { request, .. } = command {
+                assert!(
+                    !matches!(
+                        request,
+                        PrimaryRequest::MissingCertificates { .. }
+                            | PrimaryRequest::MissingCertificatesInEpoch { .. }
+                    ),
+                    "fetched certificates in an epoch the network has left"
+                );
+            }
+        }
+    }
+
+    /// Publish a network tip whose leader is in `epoch`, as the state-sync walk does.
+    fn set_network_tip(&self, epoch: Epoch) {
+        let mut leader = Certificate::default();
+        leader.header.epoch = epoch;
+        let sub_dag = CommittedSubDag::new(vec![], leader, 1, ReputationScores::default(), None);
+        let tip = ConsensusHeader { sub_dag, number: 1, ..Default::default() };
+        self.consensus_bus.last_consensus_header().send_replace(tip);
+    }
+}
+
+/// Long enough for several periodic probes while catching up.
+const SEVERAL_PROBES: Duration = Duration::from_secs(60);
+
+/// A node catching up does not fetch certificates in an epoch the network has left.
+///
+/// It replays that epoch from consensus headers and cannot rejoin in it. Peers would only
+/// send the epoch's kept tail, whose oldest parents no one holds, again on every fetch.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn a_catching_up_node_does_not_fetch_in_an_epoch_the_network_left() {
+    let fixture = CommitteeFixture::builder(MemDatabase::default).randomize_ports(true).build();
+    let epoch = fixture.committee().epoch();
+    let peers = fixture.committee().size() - 1;
+
+    let mut fetcher = FetcherUnderTest::start(&fixture, vec![], NodeMode::CvvInactive).await;
+    // a tip in the node's own epoch does not stop it; a catching-up node asks every peer at once
+    fetcher.set_network_tip(epoch);
+    let mut replies = vec![];
+    for _ in 0..peers {
+        let (_, reply) = fetcher.next_request().await;
+        replies.push(reply);
+    }
+
+    // the network moves on while the node is still catching up in this epoch
+    fetcher.set_network_tip(epoch + 1);
+    for reply in replies {
+        let _ = reply.send(Ok(PrimaryResponse::RequestedCertificates(vec![])));
+    }
+    fetcher.assert_no_fetch(SEVERAL_PROBES).await;
+}
+
+/// An active validator still finishing an epoch the network has left keeps fetching.
+///
+/// Peers keep the closed epoch's tail for it.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn an_active_node_fetches_in_an_epoch_the_network_left() {
+    let fixture = CommitteeFixture::builder(MemDatabase::default).randomize_ports(true).build();
+    let epoch = fixture.committee().epoch();
+
+    let peers = fixture.committee().size() - 1;
+
+    let mut fetcher = FetcherUnderTest::start(&fixture, vec![], NodeMode::CvvActive).await;
+    // the network moves on; an active node asks one peer at a time, none has anything
+    fetcher.set_network_tip(epoch + 1);
+    for _ in 0..peers {
+        let (_, reply) = fetcher.next_request().await;
+        let _ = reply.send(Ok(PrimaryResponse::RequestedCertificates(vec![])));
+    }
+
+    // a later fetch, which goes through the epoch check, still asks
+    tokio::time::timeout(SEVERAL_PROBES, fetcher.next_request())
+        .await
+        .expect("the active node stopped fetching");
 }
 
 /// A request names only committee members, even when the store holds other origins.
