@@ -54,8 +54,9 @@ What it does:
 4. Records a flood window with the same measurements.
 5. Checks each honest validator's log for any applied penalty, ban, or graylist against the sender.
 
-Options: `-n` validators, `-p` payload (`txns` or `filler`), `-w` window seconds, `-r` publish
-interval ms, `-i` first instance number (RPC ports), `-b` a prebuilt binary, `-d` work directory.
+Options: `-n` validators, `-a` attacker (`validator` or `observer`), `-x` isolate the observer,
+`-p` payload (`txns` or `filler`), `-w` window seconds, `-r` publish interval ms, `-i` first
+instance number (RPC ports), `-b` a prebuilt binary, `-d` work directory.
 See `run.sh -h`.
 
 ## Exit status
@@ -68,12 +69,18 @@ See `run.sh -h`.
 
 ## The attacker does not need a committee seat
 
-The script arms a committee validator because that is the simplest node to add, and a seated member
-is always mapped and never penalized, which isolates the accept-forward-process behaviour. The
-attack does not depend on a seat: any peer the validators connect to and have a BLS mapping for
-reaches the same per-validator processing path, and the mesh-forwarding cost needs no mapping at
-all. To flood from a non-committee node instead, generate an observer with a dialable address, copy
-in the genesis files, and start it with the same `RL_FLOOD_*` environment.
+By default the script arms a committee validator, which is the simplest node to add and is never
+penalized. With `-a observer` the attacker is instead an extra observer node that is not in the
+registry, the committee, or any trusted list. It joins unarmed, follows the chain through the
+baseline, and is then restarted armed to flood. The report lists, per validator, its sessions with
+the observer, how many of those the validator opened itself, and how many of the observer's
+messages it forwarded but dropped for lack of a BLS mapping.
+
+`-x` (with `-a observer`) lowers the peer limit of validators 2..N so the other committee members
+alone fill it. They refuse the observer's connections, and it reaches only validator 1 by itself.
+This tests whether validators that see the flood only through the mesh are spared. They are not:
+they open sessions to the observer on their own, bind its key from its record, and keep that
+binding after the session closes.
 
 ## Unit reproduction
 

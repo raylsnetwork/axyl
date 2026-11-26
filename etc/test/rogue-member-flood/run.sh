@@ -21,9 +21,13 @@ set -uo pipefail
 
 usage() {
     cat <<EOF
-Usage: $0 [-n VALIDATORS] [-p PAYLOAD] [-b BINARY] [-d WORKDIR] [-w WINDOW] [-r RATE_MS] [-i INSTANCE_BASE]
+Usage: $0 [-n VALIDATORS] [-a ATTACKER] [-x] [-p PAYLOAD] [-b BINARY] [-d WORKDIR] [-w WINDOW] [-r RATE_MS] [-i INSTANCE_BASE]
 
-  -n  validators in the committee, at least 4 (default 5); the last one is the attacker
+  -n  validators in the committee, at least 4 (default 5)
+  -a  attacker: validator (the last committee validator floods) or observer (an extra,
+      non-registered observer node joins and floods) (default validator)
+  -x  observer attacker only: validators 2..N are held at their peer limit by the committee
+      alone, so they refuse the observer's connections and it reaches only validator 1 itself
   -p  flood payload: txns (valid signed txns, CPU path) or filler (undecodable, bandwidth path)
       (default txns)
   -b  node binary built with --features txn-flood-hook
@@ -37,15 +41,19 @@ EOF
 }
 
 N=5
+ATTACKER_KIND=validator
+ISOLATE=0
 PAYLOAD=txns
 BIN=""
 WORKDIR=""
 WINDOW=60
 RATE_MS=0
 INSTANCE_BASE=40
-while getopts "n:p:b:d:w:r:i:h" opt; do
+while getopts "n:a:xp:b:d:w:r:i:h" opt; do
     case "$opt" in
         n) N=$OPTARG ;;
+        a) ATTACKER_KIND=$OPTARG ;;
+        x) ISOLATE=1 ;;
         p) PAYLOAD=$OPTARG ;;
         b) BIN=$OPTARG ;;
         d) WORKDIR=$OPTARG ;;
@@ -57,6 +65,9 @@ while getopts "n:p:b:d:w:r:i:h" opt; do
 done
 [[ $N =~ ^[0-9]+$ && $N -ge 4 ]] || { echo "need at least 4 validators"; usage; }
 [[ $PAYLOAD == txns || $PAYLOAD == filler ]] || { echo "payload must be txns or filler"; usage; }
+[[ $ATTACKER_KIND == validator || $ATTACKER_KIND == observer ]] \
+    || { echo "attacker must be validator or observer"; usage; }
+[[ $ISOLATE -eq 0 || $ATTACKER_KIND == observer ]] || { echo "-x needs -a observer"; usage; }
 for value in "$WINDOW" "$RATE_MS" "$INSTANCE_BASE"; do
     [[ $value =~ ^[0-9]+$ ]] || { echo "not a number: $value"; usage; }
 done
@@ -65,7 +76,10 @@ REPO=$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)
 WORKDIR=${WORKDIR:-$REPO/target/rogue-member-flood/$(date -u +%Y%m%dT%H%M%SZ)}
 RUN=$WORKDIR
 
-ATTACKER=$N
+# Nodes 1..N are the committee validators. In observer mode node N+1 is the attacking observer: it
+# is not in the registry, the committee, or any trusted list.
+if [[ $ATTACKER_KIND == observer ]]; then TOTAL=$((N + 1)); else TOTAL=$N; fi
+ATTACKER=$TOTAL
 WARMUP_BLOCKS=20
 CHAIN_ID=0x1e7
 EPOCH_SECS=3600
@@ -125,24 +139,48 @@ lo_rx_bytes() {
     awk '/lo:/ {sub(/^.*lo:[[:space:]]*/, ""); print $1; exit}' /proc/net/dev 2>/dev/null
 }
 
+is_observer() { [[ $1 -gt $N ]]; }
+node_dir() { if is_observer "$1"; then echo "$RUN/observer"; else echo "$RUN/validator-$1"; fi; }
+node_log() { if is_observer "$1"; then echo "$RUN/observer.log"; else echo "$RUN/validator-$1.log"; fi; }
+node_name() { if is_observer "$1"; then echo "observer"; else echo "validator-$1"; fi; }
+
+# A UDP port nothing on this host is bound to, at or above $1.
+free_udp_port() {
+    local p
+    for p in $(seq "$1" $(($1 + 999))); do
+        ss -Hlun "sport = :$p" 2>/dev/null | grep -q . || { echo "$p"; return 0; }
+    done
+    return 1
+}
+
 node_args() {
     local seq=$1
-    NODE_ARGS=(node --datadir "$RUN/validator-$seq" --network local
+    NODE_ARGS=(node --datadir "$(node_dir "$seq")" --network local
         --instance $((INSTANCE_BASE + seq)) --log.stdout.format log-fmt --full --storage.v2
         --db.growth-step 1MB --consensus-db.growth-step 1MB --txpool.minimal-protocol-fee 0
         --gpo.default-suggested-fee 0 -vvv --http --http.addr 127.0.0.1 --http.api all)
+    if [[ $ATTACKER_KIND == observer ]]; then
+        # Shows, per validator, the attacker's messages it forwarded but could not attribute.
+        NODE_ARGS+=(--log.stdout.filter "network::gossip=debug")
+    fi
+    if is_observer "$seq"; then NODE_ARGS+=(--observer); fi
 }
 
-start_validator() {
+start_node() {
     local seq=$1 logfile=$2 flood=${3:-no}
+    local env_args=()
     node_args "$seq"
-    if [[ $flood == flood ]]; then
-        RL_FLOOD=1 RL_FLOOD_PAYLOAD="$RUN/payloads/$PAYLOAD.bin" \
-            RL_FLOOD_INTERVAL_MS="$RATE_MS" RL_FLOOD_WARMUP_SECS=2 \
-            "$BIN" "${NODE_ARGS[@]}" >>"$logfile" 2>&1 &
-    else
-        "$BIN" "${NODE_ARGS[@]}" >>"$logfile" 2>&1 &
+    if is_observer "$seq"; then
+        # The observer advertises only its identity, so validators cannot dial it: every
+        # connection it has is one it opened.
+        env_args+=(PRIMARY_LISTENER_MULTIADDR="/ip4/127.0.0.1/udp/$OBS_PRIMARY_PORT/quic-v1"
+            WORKER_LISTENER_MULTIADDR="/ip4/127.0.0.1/udp/$OBS_WORKER_PORT/quic-v1")
     fi
+    if [[ $flood == flood ]]; then
+        env_args+=(RL_FLOOD=1 RL_FLOOD_PAYLOAD="$RUN/payloads/$PAYLOAD.bin"
+            RL_FLOOD_INTERVAL_MS="$RATE_MS" RL_FLOOD_WARMUP_SECS=2)
+    fi
+    env "${env_args[@]}" "$BIN" "${NODE_ARGS[@]}" >>"$logfile" 2>&1 &
     PIDS[$seq]=$!
 }
 
@@ -171,6 +209,7 @@ wait_for() {
     return 1
 }
 val_reached() { [[ $(max_val_height) -ge $1 ]]; }
+node_reached() { local h; h=$(height "$1"); [[ -n $h && $h -ge $2 ]]; }
 
 generate_payloads() {
     mkdir -p "$RUN/payloads"
@@ -212,6 +251,17 @@ setup_network() {
         cp "$RUN/genesis/genesis.yaml" "$RUN/genesis/committee.yaml" "$RUN/validator-$seq/genesis/"
         cp "$RUN/parameters.yaml" "$RUN/validator-$seq/"
     done
+    if [[ $ATTACKER_KIND == observer ]]; then
+        local obs=$RUN/observer
+        "$BIN" keytool generate observer --datadir "$obs" \
+            --address 0x0000000000000000000000000000000000000000 --advertise-identity-only \
+            >/dev/null 2>&1 || return 1
+        mkdir -p "$obs/genesis"
+        cp "$RUN/genesis/genesis.yaml" "$RUN/genesis/committee.yaml" "$obs/genesis/"
+        cp "$RUN/parameters.yaml" "$obs/"
+        OBS_PRIMARY_PORT=$(free_udp_port 47000) || return 1
+        OBS_WORKER_PORT=$(free_udp_port $((OBS_PRIMARY_PORT + 1))) || return 1
+    fi
 }
 
 # Measure a window: samples CPU per validator and loopback bytes, and the block-production rate.
@@ -221,20 +271,20 @@ measure_window() {
     local h0 h1 lo0 lo1 seq
     declare -A t0 t1
     h0=$(max_val_height); lo0=$(lo_rx_bytes)
-    for seq in $(seq 1 "$N"); do t0[$seq]=$(cpu_ticks "${PIDS[$seq]}"); done
+    for seq in $(seq 1 "$TOTAL"); do t0[$seq]=$(cpu_ticks "${PIDS[$seq]}"); done
     sleep "$secs"
     h1=$(max_val_height); lo1=$(lo_rx_bytes)
-    for seq in $(seq 1 "$N"); do t1[$seq]=$(cpu_ticks "${PIDS[$seq]}"); done
+    for seq in $(seq 1 "$TOTAL"); do t1[$seq]=$(cpu_ticks "${PIDS[$seq]}"); done
 
     local blocks=$((h1 - h0))
     local rate; rate=$(awk "BEGIN{printf \"%.3f\", $blocks/$secs}")
     local lo_mb; lo_mb=$(awk "BEGIN{printf \"%.1f\", ($lo1-$lo0)/1048576}")
     log "[$label] blocks $h0->$h1 = $blocks in ${secs}s (${rate} blk/s); loopback rx ${lo_mb} MiB"
     local max_cpu=0 max_seq=0
-    for seq in $(seq 1 "$N"); do
+    for seq in $(seq 1 "$TOTAL"); do
         local dt=$(( ${t1[$seq]} - ${t0[$seq]} ))
         local pct; pct=$(awk "BEGIN{printf \"%.0f\", $dt*100.0/$CLK_TCK/$secs}")
-        local who="validator-$seq"; [[ $seq -eq $ATTACKER ]] && who="validator-$seq(attacker)"
+        local who; who=$(node_name "$seq"); [[ $seq -eq $ATTACKER ]] && who="$who(attacker)"
         local rss; rss=$(rss_mb "${PIDS[$seq]}")
         log "[$label]   $who CPU ${pct}% (${dt} ticks), RSS ${rss:-?} MiB"
         if [[ $seq -ne $ATTACKER && $pct -gt $max_cpu ]]; then max_cpu=$pct; max_seq=$seq; fi
@@ -249,10 +299,41 @@ measure_window() {
 
 setup_network || fail "network setup failed"
 generate_payloads || fail "payload generation failed"
-log "network: $N validators; attacker is validator $ATTACKER; payload=$PAYLOAD rate=${RATE_MS}ms"
+if [[ $ATTACKER_KIND == observer ]]; then
+    log "network: $N validators; attacker is a non-registered observer$([[ $ISOLATE -eq 1 ]] && echo " (isolated: only validator 1 accepts its connections)"); payload=$PAYLOAD rate=${RATE_MS}ms"
+else
+    log "network: $N validators; attacker is validator $ATTACKER; payload=$PAYLOAD rate=${RATE_MS}ms"
+fi
 
-for seq in $(seq 1 "$N"); do start_validator "$seq" "$RUN/validator-$seq.log"; done
+for seq in $(seq 1 "$N"); do start_node "$seq" "$(node_log "$seq")"; done
 sleep 5
+
+if [[ $ISOLATE -eq 1 ]]; then
+    # A node writes its network config on its first start. Lower the target peer count of
+    # validators 2..N so their peer limit, ceil(target * (1 + excess factor)), is at most N-1:
+    # the other committee members, which are always admitted, fill it, so the observer is refused
+    # (and would be pruned, as a non-validator over target). Then restart them on the new config.
+    # Stop only past block 10: a `--full` node stopped earlier (mid-initialization, or before
+    # block 5) can fail to restart with a storage consistency panic.
+    wait_for 120 val_reached 10 || fail "chain did not reach block 10 before the isolate restart"
+    for seq in $(seq 1 "$N"); do
+        [[ -f "$RUN/validator-$seq/network-config" ]] || fail "validator $seq wrote no network config"
+    done
+    stop_all
+    for seq in $(seq 2 "$N"); do
+        cfg=$RUN/validator-$seq/network-config
+        excess=$(awk '/^  peer_excess_factor:/ {print $2}' "$cfg")
+        target=$(awk "BEGIN{t=int(($N - 1) / (1 + $excess)); while (t > 1 && int(t * (1 + $excess) + 0.999999) > $N - 1) t--; print t}")
+        sed -i "s/^  target_num_peers: .*/  target_num_peers: $target/" "$cfg"
+        grep -q "^  target_num_peers: $target\$" "$cfg" || fail "could not cap validator $seq"
+    done
+    log "isolate: validators 2..$N capped at target peer count $target; they refuse the observer's connections"
+    for seq in $(seq 1 "$N"); do start_node "$seq" "$(node_log "$seq")"; done
+    sleep 5
+    for seq in $(seq 1 "$N"); do
+        kill -0 "${PIDS[$seq]}" 2>/dev/null || fail "validator $seq did not restart; see its log"
+    done
+fi
 for seq in $(seq 1 "$N"); do
     kill -0 "${PIDS[$seq]}" 2>/dev/null || fail "validator $seq did not start; see its log"
 done
@@ -260,14 +341,22 @@ done
 wait_for 300 val_reached "$WARMUP_BLOCKS" || fail "chain did not reach block $WARMUP_BLOCKS"
 log "warm-up done: validators at $(max_val_height)"
 
+if [[ $ATTACKER_KIND == observer ]]; then
+    # Join the observer unarmed and let it follow the chain, so the baseline includes it.
+    start_node "$ATTACKER" "$(node_log "$ATTACKER")"
+    wait_for 300 node_reached "$ATTACKER" "$(max_val_height)" \
+        || fail "observer did not catch up; see $(node_log "$ATTACKER")"
+    log "observer joined and following at $(height "$ATTACKER")"
+fi
+
 # Baseline window with no flood.
 measure_window baseline "$WINDOW"
 
 # Restart the attacker armed to flood, so it rejoins and begins publishing.
 stop_pid "${PIDS[$ATTACKER]}"; unset "PIDS[$ATTACKER]"
-: >"$RUN/validator-$ATTACKER.log"
-start_validator "$ATTACKER" "$RUN/validator-$ATTACKER.log" flood
-log "attacker (validator $ATTACKER) restarted and armed to flood the transaction topic"
+: >"$(node_log "$ATTACKER")"
+start_node "$ATTACKER" "$(node_log "$ATTACKER")" flood
+log "attacker ($(node_name "$ATTACKER")) restarted and armed to flood the transaction topic"
 sleep 20  # let the attacker rejoin the mesh and the flood reach steady state
 
 # Flood window.
@@ -282,7 +371,26 @@ for seq in $(seq 1 "$N"); do
         "$RUN/validator-$seq.log" 2>/dev/null | wc -l)
     PENALTIES=$((PENALTIES + c))
 done
-FLOOD_SENT=$(grep -ac 'TXN FLOOD progress' "$RUN/validator-$ATTACKER.log" 2>/dev/null)
+if [[ $ATTACKER_KIND == observer ]]; then
+    # Per validator: its sessions with the observer (either direction; the observer's own record
+    # binds its key on each), how many of those the validator dialed itself, and the observer's
+    # messages it forwarded but dropped for lack of a BLS mapping (logged, no penalty).
+    obs_ids=$(grep -o '12D3KooW[A-Za-z0-9]*' "$RUN/observer/node-info.yaml" | paste -sd '|')
+    if [[ -z $obs_ids ]]; then
+        log "observer peer ids not found in its node-info.yaml; skipping the per-validator report"
+    fi
+    for seq in $(seq 1 "$N"); do
+        [[ -n $obs_ids ]] || break
+        vlog=$RUN/validator-$seq.log
+        sessions=$(grep -a 'peer CONNECTED' "$vlog" | grep -a -c -E "$obs_ids")
+        dialed=$(grep -a 'new connection established' "$vlog" | grep -a 'Dialer' \
+            | grep -a -c -E "$obs_ids")
+        dropped=$(grep -a 'no BLS mapping for propagation source' "$vlog" \
+            | grep -a -c 'topic=rayls-batch')
+        log "validator-$seq: sessions with the observer $sessions (dialed by the validator $dialed); its messages dropped unattributed $dropped"
+    done
+fi
+FLOOD_SENT=$(grep -ac 'TXN FLOOD progress' "$(node_log "$ATTACKER")" 2>/dev/null)
 FLOOD_SENT=${FLOOD_SENT:-0}
 log "attacker flood progress log lines: $FLOOD_SENT; applied penalty/ban lines in victim logs: $PENALTIES"
 
