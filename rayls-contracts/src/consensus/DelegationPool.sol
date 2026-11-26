@@ -557,14 +557,6 @@ contract DelegationPool is
 
         DelegatorPosition storage fromPos = $.positions[fromValidator][msg.sender];
 
-        uint32 currentEpoch = $.consensusRegistry.getCurrentEpoch();
-        // Stored 1-based (currentEpoch + 1): 0 must unambiguously mean "never transferred",
-        // and epoch 0 is itself a legitimate real epoch, so storing it raw would make a
-        // position's very first transfer at epoch 0 collide with the default and
-        // false-positive as already used.
-        if (fromPos.lastTransferEpoch == uint64(currentEpoch) + 1)
-            revert TransferAlreadyUsedThisEpoch(currentEpoch);
-
         // settle pending rewards/slashes before computing the movable balance
         _settlePosition(fromPool, fromPos);
 
@@ -577,7 +569,6 @@ contract DelegationPool is
         fromPos.rewardDebt = (fromPos.amount * fromAccum) / PRECISION;
         // Ceiling division for slashDebt — counterpart to ceiling in _settlePosition
         fromPos.slashDebt = (fromPos.amount * fromPool.slashPerShareAccum + PRECISION - 1) / PRECISION;
-        fromPos.lastTransferEpoch = uint64(currentEpoch) + 1;
 
         if (fromPos.openTier) {
             fromPool.openTierDelegated -= amount;
@@ -585,13 +576,14 @@ contract DelegationPool is
             fromPool.totalDelegated -= amount;
         }
 
-        // Same rule as _delegate: an existing destination keeps its locked tier, a fresh one
-        // follows the caller's whitelist status. The source tier is not compared, so a fresh
-        // destination may pull the stake into the other track.
+        // A move is not an entry: the stake keeps the track it is on. A destination position that
+        // already exists has its own locked track, so it is checked and the transfer reverts
+        // instead of switching it silently. Fresh destinations inherit the source tier, which is
+        // what keeps Track B holders movable once disableWhitelist() has run.
         DelegatorPosition storage toPos = $.positions[toValidator][msg.sender];
-        bool toOpenTier = toPos.amount > 0
-            ? toPos.openTier
-            : ($.whitelistEnabled && !$.whitelistVerified[msg.sender]);
+        bool toOpenTier = fromPos.openTier;
+        if (toPos.amount > 0 && toPos.openTier != toOpenTier)
+            revert TierMismatch(fromPos.openTier, toPos.openTier);
 
         _settlePosition(toPool, toPos);
 
@@ -618,7 +610,7 @@ contract DelegationPool is
         // Same stamp as _delegate, and no stronger: the exclusion only covers settlement inside
         // the epoch of arrival. `concludeEpoch` increments the epoch before rewards are
         // distributed, so stake arriving in epoch E still collects epoch E's payout here.
-        toPos.lastDelegateEpoch = uint64(currentEpoch);
+        toPos.lastDelegateEpoch = uint64($.consensusRegistry.getCurrentEpoch());
 
         if (toOpenTier) {
             toPool.openTierDelegated += amount;

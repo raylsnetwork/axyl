@@ -34,7 +34,6 @@ interface IDelegationPool {
         uint256 slashDebt;
         uint64 lastDelegateEpoch; // arrival epoch; settlement inside it is excluded (DP-NEW-002)
         bool openTier; // immutable after entry; true = Track B (open-tier), false = Track A (whitelisted)
-        uint64 lastTransferEpoch; // 1-based: (epoch of most recent transferStake OUT of this position) + 1; 0 = never (#164)
     }
 
     /// @notice Pending commission increase awaiting activation
@@ -80,7 +79,7 @@ interface IDelegationPool {
     error ZeroAddress();
     error ZeroAmount();
     error SameValidator();
-    error TransferAlreadyUsedThisEpoch(uint32 currentEpoch);
+    error TierMismatch(bool fromOpenTier, bool toOpenTier);
 
     // events
     event PoolRegistered(address indexed validator, uint256 commissionBps);
@@ -211,20 +210,19 @@ interface IDelegationPool {
     /// @param validatorAddress The validator to complete undelegation from
     function completeUndelegation(address validatorAddress) external;
 
-    /// @notice Move stake from one validator's pool to another, once per epoch per source
-    ///         position, without starting the unbonding period
+    /// @notice Move stake from one validator's pool to another without starting the unbonding period
     /// @dev Pure internal accounting move — no RLS ever leaves the contract, so the unbonding
     ///      lock on `requestUndelegation`/`completeUndelegation` is completely unaffected: it
-    ///      still governs actual withdrawal exactly as before. Rate-limited per SOURCE position
-    ///      (`fromValidator`, caller), so a delegator with positions at several validators may
-    ///      transfer out of each of them once in the same epoch. The scope is deliberate: the same
-    ///      capital may hop A → B → A inside one epoch, and it never earns twice because the
-    ///      source is settled against the pre-payout accumulator.
+    ///      still governs actual withdrawal exactly as before. No frequency limit: a per-position
+    ///      one would protect nothing, since the same capital can hop A → B → A regardless. It also
+    ///      cannot create a double payout — the source is settled against the pre-payout
+    ///      accumulator before the destination is credited.
     /// @dev The moved `amount` must be at least `config.minDelegation`, the same floor `delegate`
     ///      applies. The source remainder is not floored: partial undelegations and slashing can
     ///      already leave a balance below it.
-    /// @dev Tier resolution matches `_delegate`: an existing destination keeps its tier, a fresh
-    ///      one follows the caller's whitelist status, so stake may change track into a fresh pool.
+    /// @dev A move is not an entry, so the stake keeps its track: `TierMismatch` reverts if the
+    ///      destination already holds a position on the other track. Fresh destinations inherit the
+    ///      source tier, which keeps Track B holders movable after `disableWhitelist`.
     /// @dev Like `requestUndelegation` this escapes future `applyPoolSlash` at the source, but at
     ///      no cost — no unbonding wait, no reward gap. Accepted trade-off.
     /// @dev Rewards behave like a fresh `delegate()`: stake arriving in epoch E collects epoch E's

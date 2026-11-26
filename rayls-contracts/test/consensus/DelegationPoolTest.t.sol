@@ -906,7 +906,6 @@ contract DelegationPoolTest is Test {
         IDelegationPool.DelegatorPosition memory fromPos = pool.getDelegatorPosition(validator1, delegator1);
         IDelegationPool.DelegatorPosition memory toPos = pool.getDelegatorPosition(validator2, delegator1);
         assertEq(fromPos.amount, 60e18);
-        assertEq(fromPos.lastTransferEpoch, 6); // stored 1-based: currentEpoch(5) + 1
         assertEq(toPos.amount, 40e18);
         assertEq(toPos.lastDelegateEpoch, 5);
         assertEq(pool.getTotalDelegatedStake(validator1), 60e18);
@@ -964,7 +963,7 @@ contract DelegationPoolTest is Test {
         assertEq(rls.balanceOf(delegator1), 10_000_000e18 - 100e18 + 30e18);
     }
 
-    function test_transferStake_trackAToFreshDestination_gateEnabled_becomesTrackB() public {
+    function test_transferStake_trackAToFreshDestination_gateEnabled_keepsTrackA() public {
         _registerBothValidators();
 
         // legacy Track A position, delegated while the gate was off
@@ -975,7 +974,8 @@ contract DelegationPoolTest is Test {
 
         uint256 poolBalBefore = rls.balanceOf(address(pool));
 
-        // fresh destination for an unverified caller resolves to Track B: the stake changes track
+        // a fresh destination inherits the source track even though the caller is unverified,
+        // so the gate cannot pull existing Track A stake into Track B on a move
         vm.prank(delegator1);
         pool.transferStake(validator1, validator2, 40e18);
 
@@ -984,15 +984,15 @@ contract DelegationPoolTest is Test {
         assertEq(fromPos.amount, 60e18);
         assertFalse(fromPos.openTier);
         assertEq(toPos.amount, 40e18);
-        assertTrue(toPos.openTier);
+        assertFalse(toPos.openTier);
         assertEq(_trackADelegated(validator1), 60e18);
         assertEq(pool.getTotalOpenTierDelegatedStake(validator1), 0);
-        assertEq(_trackADelegated(validator2), 0);
-        assertEq(pool.getTotalOpenTierDelegatedStake(validator2), 40e18);
+        assertEq(_trackADelegated(validator2), 40e18);
+        assertEq(pool.getTotalOpenTierDelegatedStake(validator2), 0);
         assertEq(rls.balanceOf(address(pool)), poolBalBefore);
     }
 
-    function test_transferStake_trackBToFreshDestination_gateDisabled_becomesTrackA() public {
+    function test_transferStake_trackBToFreshDestination_gateDisabled_keepsTrackB() public {
         _registerBothValidators();
         _wlEnableGate();
 
@@ -1004,7 +1004,8 @@ contract DelegationPoolTest is Test {
 
         uint256 poolBalBefore = rls.balanceOf(address(pool));
 
-        // the move that used to revert: Track B holders pinned after disableWhitelist()
+        // the pinning problem without allowing conversion: with the gate off a whitelist-derived
+        // tier would resolve to Track A, but the stake stays where it was
         vm.prank(delegator1);
         pool.transferStake(validator1, validator2, 40e18);
 
@@ -1012,17 +1013,16 @@ contract DelegationPoolTest is Test {
         IDelegationPool.DelegatorPosition memory toPos = pool.getDelegatorPosition(validator2, delegator1);
         assertEq(fromPos.amount, 60e18);
         assertTrue(fromPos.openTier);
-        assertEq(fromPos.lastTransferEpoch, uint64(registry.getCurrentEpoch()) + 1);
         assertEq(toPos.amount, 40e18);
-        assertFalse(toPos.openTier);
+        assertTrue(toPos.openTier);
         assertEq(_trackADelegated(validator1), 0);
         assertEq(pool.getTotalOpenTierDelegatedStake(validator1), 60e18);
-        assertEq(_trackADelegated(validator2), 40e18);
-        assertEq(pool.getTotalOpenTierDelegatedStake(validator2), 0);
+        assertEq(_trackADelegated(validator2), 0);
+        assertEq(pool.getTotalOpenTierDelegatedStake(validator2), 40e18);
         assertEq(rls.balanceOf(address(pool)), poolBalBefore);
     }
 
-    function test_transferStake_trackBSource_intoExistingTrackADestination_keepsDestinationTrack() public {
+    function testRevert_transferStake_trackBSource_intoExistingTrackADestination() public {
         _registerBothValidators();
         _wlEnableGate();
 
@@ -1031,26 +1031,19 @@ contract DelegationPoolTest is Test {
         vm.prank(delegator1);
         pool.delegateWithProof(validator2, 10e18, WL_B1, _wlProofFor(1)); // Track A
 
-        uint256 poolBalBefore = rls.balanceOf(address(pool));
-
         vm.prank(delegator1);
+        vm.expectRevert(abi.encodeWithSelector(IDelegationPool.TierMismatch.selector, true, false));
         pool.transferStake(validator1, validator2, 40e18);
 
-        // an existing destination position keeps its own locked tier, like a _delegate top-up
-        IDelegationPool.DelegatorPosition memory fromPos = pool.getDelegatorPosition(validator1, delegator1);
-        IDelegationPool.DelegatorPosition memory toPos = pool.getDelegatorPosition(validator2, delegator1);
-        assertEq(fromPos.amount, 60e18);
-        assertTrue(fromPos.openTier);
-        assertEq(toPos.amount, 50e18);
-        assertFalse(toPos.openTier);
-        assertEq(_trackADelegated(validator1), 0);
-        assertEq(pool.getTotalOpenTierDelegatedStake(validator1), 60e18);
-        assertEq(_trackADelegated(validator2), 50e18);
-        assertEq(pool.getTotalOpenTierDelegatedStake(validator2), 0);
-        assertEq(rls.balanceOf(address(pool)), poolBalBefore);
+        // an existing destination position has its own locked track, so the whole call reverts
+        // with nothing moved
+        assertEq(pool.getDelegatorPosition(validator1, delegator1).amount, 100e18);
+        assertEq(pool.getDelegatorPosition(validator2, delegator1).amount, 10e18);
+        assertEq(_trackADelegated(validator2), 10e18);
+        assertEq(pool.getTotalOpenTierDelegatedStake(validator1), 100e18);
     }
 
-    function test_transferStake_trackASource_intoExistingTrackBDestination_keepsDestinationTrack() public {
+    function testRevert_transferStake_trackASource_intoExistingTrackBDestination() public {
         _registerBothValidators();
 
         vm.prank(delegator1);
@@ -1060,22 +1053,14 @@ contract DelegationPoolTest is Test {
         vm.prank(delegator1);
         pool.delegate(validator2, 10e18); // unverified -> Track B
 
-        uint256 poolBalBefore = rls.balanceOf(address(pool));
-
         vm.prank(delegator1);
+        vm.expectRevert(abi.encodeWithSelector(IDelegationPool.TierMismatch.selector, false, true));
         pool.transferStake(validator1, validator2, 40e18);
 
-        IDelegationPool.DelegatorPosition memory fromPos = pool.getDelegatorPosition(validator1, delegator1);
-        IDelegationPool.DelegatorPosition memory toPos = pool.getDelegatorPosition(validator2, delegator1);
-        assertEq(fromPos.amount, 60e18);
-        assertFalse(fromPos.openTier);
-        assertEq(toPos.amount, 50e18);
-        assertTrue(toPos.openTier);
-        assertEq(_trackADelegated(validator1), 60e18);
-        assertEq(pool.getTotalOpenTierDelegatedStake(validator1), 0);
-        assertEq(_trackADelegated(validator2), 0);
-        assertEq(pool.getTotalOpenTierDelegatedStake(validator2), 50e18);
-        assertEq(rls.balanceOf(address(pool)), poolBalBefore);
+        assertEq(pool.getDelegatorPosition(validator1, delegator1).amount, 100e18);
+        assertEq(pool.getDelegatorPosition(validator2, delegator1).amount, 10e18);
+        assertEq(_trackADelegated(validator1), 100e18);
+        assertEq(pool.getTotalOpenTierDelegatedStake(validator2), 10e18);
     }
 
     function test_transferStake_verifiedTrackA_intoFreshDestination_gateEnabled() public {
@@ -1116,8 +1101,9 @@ contract DelegationPoolTest is Test {
         vm.prank(delegator1);
         pool.transferStake(validator1, validator2, 40e18);
 
-        // an emptied position is treated as fresh, so its stale Track A flag is ignored; the
-        // unbonding lock and pendingRewards (an absolute amount) carry across the re-resolution
+        // an emptied destination is not an existing position, so its stale Track A flag is never
+        // consulted and the stake keeps the source track; the unbonding lock and pendingRewards
+        // (an absolute amount) carry across untouched
         IDelegationPool.DelegatorPosition memory toPos = pool.getDelegatorPosition(validator2, delegator1);
         assertTrue(toPos.openTier);
         assertEq(toPos.amount, 40e18);
@@ -1375,9 +1361,7 @@ contract DelegationPoolTest is Test {
         );
         smallPool.transferStake(validator1, validator2, 60e18);
 
-        // the source was already stamped and reduced when this reverted, so the whole call must
-        // roll back: no burned epoch allowance and no moved stake
-        assertEq(smallPool.getDelegatorPosition(validator1, delegator1).lastTransferEpoch, 0);
+        // the source was already reduced when this reverted, so the whole call must roll back
         assertEq(smallPool.getDelegatorPosition(validator1, delegator1).amount, 100e18);
         assertEq(smallPool.getTotalDelegatedStake(validator2), 60e18);
     }
@@ -1414,44 +1398,8 @@ contract DelegationPoolTest is Test {
         smallPool.transferStake(validator1, validator2, 100e18);
     }
 
-    function testRevert_transferStake_onceUsedThisEpoch() public {
+    function test_transferStake_noFrequencyLimitWithinOneEpoch() public {
         _registerBothValidators();
-        vm.prank(delegator1);
-        pool.delegate(validator1, 100e18);
-
-        registry.setCurrentEpoch(5);
-
-        vm.prank(delegator1);
-        pool.transferStake(validator1, validator2, 10e18);
-
-        vm.prank(delegator1);
-        vm.expectRevert(abi.encodeWithSelector(IDelegationPool.TransferAlreadyUsedThisEpoch.selector, uint32(5)));
-        pool.transferStake(validator1, validator2, 10e18);
-    }
-
-    function test_transferStake_succeedsAgainNextEpoch() public {
-        _registerBothValidators();
-        vm.prank(delegator1);
-        pool.delegate(validator1, 100e18);
-
-        registry.setCurrentEpoch(5);
-        vm.prank(delegator1);
-        pool.transferStake(validator1, validator2, 10e18);
-
-        registry.setCurrentEpoch(6);
-        vm.prank(delegator1);
-        pool.transferStake(validator1, validator2, 10e18);
-
-        assertEq(pool.getTotalDelegatedStake(validator2), 20e18);
-    }
-
-    function test_transferStake_rateLimitIsPerSourcePosition() public {
-        // a delegator with positions at both validators can transfer OUT of each once,
-        // in the same epoch, since the limit is tracked per source position
-        vm.prank(validator1);
-        pool.registerPool(500);
-        vm.prank(validator2);
-        pool.registerPool(500);
         address validator3 = address(0x1003);
         registry.setValidatorStatus(validator3, IConsensusRegistry.ValidatorStatus.Active);
         registry.setAllowlisted(validator3, true);
@@ -1459,26 +1407,29 @@ contract DelegationPoolTest is Test {
         pool.registerPool(500);
 
         vm.prank(delegator1);
-        pool.delegate(validator1, 50e18);
+        pool.delegate(validator1, 100e18);
         vm.prank(delegator1);
         pool.delegate(validator2, 50e18);
 
         registry.setCurrentEpoch(5);
 
-        // out of validator1 into validator3
-        vm.prank(delegator1);
-        pool.transferStake(validator1, validator3, 10e18);
-        // out of validator2 into validator3, same epoch — different source position, allowed
-        vm.prank(delegator1);
+        // out of the same source twice, then on into a third pool — all inside one epoch
+        vm.startPrank(delegator1);
+        pool.transferStake(validator1, validator2, 10e18);
+        pool.transferStake(validator1, validator2, 10e18);
         pool.transferStake(validator2, validator3, 10e18);
+        vm.stopPrank();
 
-        assertEq(pool.getTotalDelegatedStake(validator3), 20e18);
+        assertEq(pool.getTotalDelegatedStake(validator1), 80e18);
+        assertEq(pool.getTotalDelegatedStake(validator2), 60e18);
+        assertEq(pool.getTotalDelegatedStake(validator3), 10e18);
+        assertEq(rls.balanceOf(address(pool)), 150e18);
     }
 
-    function test_transferStake_chainHopBypassesPerEpochLimit() public {
-        // DECIDED (#164, @lucasrsilva): lastTransferEpoch is stamped only on the source, so the
-        // same capital may chain-hop through several validators in one epoch. Reward-neutral — the
-        // source is settled before the destination is credited. Accepted behaviour, not a bug.
+    function test_transferStake_roundTripAcrossValidatorsInOneEpoch() public {
+        // The same capital tours A → B → C → A inside one epoch. Reward-neutral — every hop settles
+        // the source against the current accumulator before crediting the destination — and it is
+        // why the once-per-epoch limit was dropped: it never applied here anyway.
         _registerBothValidators();
         address validator3 = address(0x1003);
         registry.setValidatorStatus(validator3, IConsensusRegistry.ValidatorStatus.Active);
@@ -1495,21 +1446,16 @@ contract DelegationPoolTest is Test {
         registry.setCurrentEpoch(5);
 
         vm.startPrank(delegator1);
-        pool.transferStake(validator1, validator2, 100e18); // hop 1
-        pool.transferStake(validator2, validator3, 100e18); // hop 2, same epoch — B's position is brand new
+        pool.transferStake(validator1, validator2, 100e18);
+        pool.transferStake(validator2, validator3, 100e18);
+        pool.transferStake(validator3, validator1, 100e18);
         vm.stopPrank();
 
-        // no value created or destroyed — the same 100e18 toured two validators in one epoch
-        assertEq(pool.getTotalDelegatedStake(validator1), 0);
+        // no value created or destroyed
+        assertEq(pool.getTotalDelegatedStake(validator1), 100e18);
         assertEq(pool.getTotalDelegatedStake(validator2), 0);
-        assertEq(pool.getTotalDelegatedStake(validator3), 100e18);
+        assertEq(pool.getTotalDelegatedStake(validator3), 0);
         assertEq(rls.balanceOf(address(pool)), 100e18);
-
-        // validator1's position, having itself been a transfer source this epoch, IS
-        // correctly locked for a same-epoch repeat
-        vm.prank(delegator1);
-        vm.expectRevert(abi.encodeWithSelector(IDelegationPool.TransferAlreadyUsedThisEpoch.selector, uint32(5)));
-        pool.transferStake(validator1, validator2, 1e18);
     }
 
     function test_transferStake_intoPositionWithPendingUndelegation_doesNotTouchLock() public {

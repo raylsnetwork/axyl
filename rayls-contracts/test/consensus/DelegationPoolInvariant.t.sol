@@ -128,10 +128,6 @@ contract DelegationPoolHandler is Test {
         address to = _validator(toSeed);
         if (from == to) return;
 
-        IDelegationPool.DelegatorPosition memory fromPos = pool.getDelegatorPosition(from, d);
-        // lastTransferEpoch is stored 1-based; already used this epoch if it equals current+1
-        if (fromPos.lastTransferEpoch == registry.getCurrentEpoch() + 1) return;
-
         // Bound on the post-slash effective amounts, so the fuzz run keeps exercising transfers
         // after a slash instead of silently reverting on them.
         (uint256 fromEffective,) = pool.getEffectivePosition(from, d);
