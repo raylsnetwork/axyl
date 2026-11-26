@@ -1,14 +1,16 @@
-//! Refuse an execution database in the storage format of reth 1.x.
+//! Refuse an execution database that was written by reth 1.x.
 //!
 //! reth 2.0 changed how some tables are stored: the trie tables use packed keys, and the storage
-//! change sets and the storage history use plain slot keys. reth has no marker for this in the
-//! datadir. Code from reth 2.0 opens a reth 1.x datadir without an error and reads those tables
-//! wrong. So the node must find out by itself, before it uses the datadir.
+//! change sets and the storage history use plain slot keys. Code from reth 2.0 opens a reth 1.x
+//! datadir without an error and reads those tables wrong. So the node must find out by itself,
+//! before it uses the datadir.
 //!
-//! The sign is the key length in the `AccountsTrie` table:
-//! - reth 2.0: every key is a packed path, always [`PACKED_TRIE_KEY_LEN`] bytes
-//! - reth 1.x: one byte per step of the path, so the length varies; the first rows are nodes near
-//!   the top of the trie, with keys of one or two bytes
+//! The sign is reth's own `VersionHistory` table. Every open for writing records the reth
+//! version there when it differs from the last row. A datadir is in the old format when ANY row
+//! names a reth version before [`FIRST_SUPPORTED_RETH_MAJOR`]:
+//! - There is no conversion in place. A datadir that reth 1.x once wrote stays in the old format.
+//! - The last row alone is not enough. A reth 2.0 binary that opens an old datadir for writing adds
+//!   its own row, and from then on the last row names reth 2.0.
 //!
 //! The check runs in [`RethEnv::new_database`](crate::reth_env::RethEnv::new_database), the one
 //! place that opens the execution database for writing. That covers the node start, the schedule
@@ -20,18 +22,13 @@ use reth_db::{
     mdbx::{DatabaseArguments, MaxReadTransactionDuration},
     open_db_read_only, tables,
     transaction::DbTx as _,
-    Database as _, DatabaseEnv, RawTable,
+    Database as _, DatabaseEnv,
 };
 use std::path::Path;
 use tracing::debug;
 
-/// Length of every `AccountsTrie` key in the storage format of reth 2.0: 32 bytes of packed path
-/// and one length byte.
-const PACKED_TRIE_KEY_LEN: usize = 33;
-
-/// How many rows the check reads. In the old format the first row already has another length
-/// (a real reth 1.11 datadir starts with a key of one byte). A few more rows cost nothing.
-const KEYS_TO_CHECK: usize = 16;
+/// The first reth major version that writes the storage format this node reads.
+const FIRST_SUPPORTED_RETH_MAJOR: u64 = 2;
 
 /// Check the datafile at `db_path` before it is opened for writing, with a read-only open.
 ///
@@ -39,7 +36,7 @@ const KEYS_TO_CHECK: usize = 16;
 /// that reth 2.0 no longer has. An old datadir must be refused before that, so that it stays as
 /// it was.
 ///
-/// Returns `Ok(true)` when the format was checked and is fine, and `Ok(false)` when the check
+/// Returns `Ok(true)` when the check ran and found no old version, and `Ok(false)` when it
 /// could not run here: there is no datafile yet, or the read-only open or the table read failed
 /// (the database is in use, needs a recovery, or has no tables yet). In that case the caller
 /// goes on with the normal open and calls [`check_open_database`] right after it. A node start
@@ -65,11 +62,11 @@ pub(crate) fn check_before_open(db_path: &Path, page_size: Option<usize>) -> eyr
             return Ok(false);
         }
     };
-    match old_format_key_len(&db) {
+    match old_reth_version(&db) {
         Ok(None) => Ok(true),
-        Ok(Some(key_len)) => Err(old_format_error(db_path, key_len, false)),
+        Ok(Some(version)) => Err(old_format_error(db_path, &version, false)),
         Err(error) => {
-            debug!(target: "rayls::reth", path = ?db_path, %error, "read-only format check skipped, the trie table could not be read; checking after the normal open");
+            debug!(target: "rayls::reth", path = ?db_path, %error, "read-only format check skipped, the version table could not be read; checking after the normal open");
             Ok(false)
         }
     }
@@ -77,47 +74,69 @@ pub(crate) fn check_before_open(db_path: &Path, page_size: Option<usize>) -> eyr
 
 /// Check a database that is already open. Used when [`check_before_open`] could not run.
 ///
-/// At this point the normal open has made its small writes, but nothing has read the trie
-/// tables yet, and the consistency check, the heal and the unwind have not run.
+/// At this point the normal open has made its small writes, one of them a `VersionHistory` row
+/// for this reth version. That does not hide an old datadir, because any older row counts.
+/// Nothing has read the trie tables yet, and the consistency check, the heal and the unwind
+/// have not run.
 pub(crate) fn check_open_database(db: &DatabaseEnv, db_path: &Path) -> eyre::Result<()> {
-    match old_format_key_len(db)? {
+    match old_reth_version(db)? {
         None => Ok(()),
-        Some(key_len) => Err(old_format_error(db_path, key_len, true)),
+        Some(version) => Err(old_format_error(db_path, &version, true)),
     }
 }
 
-/// The length of the first `AccountsTrie` key that is not in the reth 2.0 format, among the
-/// first [`KEYS_TO_CHECK`] rows. `None` when all of them are, and for an empty table.
-fn old_format_key_len(db: &DatabaseEnv) -> eyre::Result<Option<usize>> {
+/// The first `VersionHistory` row with a reth version before [`FIRST_SUPPORTED_RETH_MAJOR`].
+/// `None` when there is none. A database without rows cannot be judged and gives `None` too.
+fn old_reth_version(db: &DatabaseEnv) -> eyre::Result<Option<String>> {
     let tx = db.tx()?;
-    let mut cursor = tx.cursor_read::<RawTable<tables::AccountsTrie>>()?;
+    let mut cursor = tx.cursor_read::<tables::VersionHistory>()?;
     let mut row = cursor.first()?;
-    for _ in 0..KEYS_TO_CHECK {
-        let Some((key, _)) = row else { break };
-        let key_len = key.raw_key().len();
-        if key_len != PACKED_TRIE_KEY_LEN {
-            return Ok(Some(key_len));
+    while let Some((_, client)) = row {
+        if major_version(&client.version).is_some_and(|major| major < FIRST_SUPPORTED_RETH_MAJOR) {
+            return Ok(Some(client.version));
         }
         row = cursor.next()?;
     }
     Ok(None)
 }
 
+/// The major number of a version like `1.11.0` or `v2.0.0-rc.1`. `None` when the text does not
+/// start with a number; such a row is not counted as old.
+fn major_version(version: &str) -> Option<u64> {
+    let version = version.trim().trim_start_matches('v');
+    let digits = version.split(|c: char| !c.is_ascii_digit()).next()?;
+    digits.parse().ok()
+}
+
 /// The error for a datadir in the old format. `opened_for_writing` says whether the normal open
 /// already ran.
-fn old_format_error(db_path: &Path, key_len: usize, opened_for_writing: bool) -> eyre::Report {
+fn old_format_error(db_path: &Path, version: &str, opened_for_writing: bool) -> eyre::Report {
     let state = if opened_for_writing {
         "The database was opened, but nothing in it was repaired or unwound."
     } else {
         "The datadir was not changed."
     };
     eyre!(
-        "{} is in the storage format of reth 1.x: it was written by an older version of this \
-         node. This version runs on reth 2.0, which stores the trie tables in another format \
-         and would read this datadir wrong. {state} Build a new datadir from it with \
-         `rayls-replay`, which only reads the old one, or sync this node again. (An \
-         AccountsTrie key has {key_len} bytes, the reth 2.0 format has \
-         {PACKED_TRIE_KEY_LEN}.)",
+        "{} was written by reth {version}, so it is in the storage format of reth 1.x. This \
+         version runs on reth {FIRST_SUPPORTED_RETH_MAJOR}.0, which stores the trie tables in \
+         another format and would read this datadir wrong. {state} Build a new datadir from it \
+         with `rayls-replay`, which only reads the old one, or sync this node again.",
         db_path.display()
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::major_version;
+
+    #[test]
+    fn major_version_reads_the_first_number() {
+        assert_eq!(major_version("1.11.0"), Some(1));
+        assert_eq!(major_version("2.0.0"), Some(2));
+        assert_eq!(major_version("v2.1.3-rc.1"), Some(2));
+        assert_eq!(major_version(" 10.4.0 "), Some(10));
+        assert_eq!(major_version("0.9"), Some(0));
+        assert_eq!(major_version(""), None);
+        assert_eq!(major_version("reth"), None);
+    }
 }

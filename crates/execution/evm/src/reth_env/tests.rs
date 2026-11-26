@@ -2760,22 +2760,28 @@ fn snapshot_reader_refuses_a_directory_without_a_database() -> eyre::Result<()> 
 // Old storage format guard (#419)
 // ---------------------------------------------------------------------------------------------
 
-/// Write rows with the given raw keys into `AccountsTrie` of a database made by `new_database`,
-/// and close it again.
-fn database_with_trie_keys(dir: &std::path::Path, keys: &[Vec<u8>]) -> eyre::Result<()> {
-    use reth::builder::NodeConfig;
+/// A reth database at `dir` whose `VersionHistory` holds one row per given reth version, oldest
+/// first, and nothing else. Closed again on return.
+fn database_written_by(dir: &std::path::Path, reth_versions: &[&str]) -> eyre::Result<()> {
     use reth_db::{
+        mdbx::DatabaseArguments,
+        models::ClientVersion,
         tables,
         transaction::{DbTx as _, DbTxMut as _},
-        Database as _, RawKey, RawTable, RawValue,
+        Database as _,
     };
 
-    let db = RethEnv::new_database(&RethConfig(NodeConfig::default()), dir)?;
+    // an empty client version: reth then records no row by itself
+    let db = reth_db::init_db(dir, DatabaseArguments::new(ClientVersion::default()))?;
     let tx = db.tx_mut()?;
-    for key in keys {
-        tx.put::<RawTable<tables::AccountsTrie>>(
-            RawKey::from_vec(key.clone()),
-            RawValue::from_vec(vec![0u8; 8]),
+    for (index, version) in reth_versions.iter().enumerate() {
+        tx.put::<tables::VersionHistory>(
+            1_700_000_000 + index as u64,
+            ClientVersion {
+                version: (*version).to_owned(),
+                git_sha: "0000000".to_owned(),
+                build_timestamp: "test".to_owned(),
+            },
         )?;
     }
     tx.commit()?;
@@ -2799,43 +2805,62 @@ fn data_files(
     Ok(out)
 }
 
-/// A database with trie keys in the reth 1.x format is refused before it is opened for writing,
-/// and its files stay as they were.
+/// A database that reth 1.x wrote is refused before it is opened for writing, and its files stay
+/// as they were.
 #[test]
-fn old_format_database_is_refused_and_not_changed() -> eyre::Result<()> {
+fn database_written_by_reth_1_is_refused_and_not_changed() -> eyre::Result<()> {
     use reth::builder::NodeConfig;
 
     let dir = TempDir::new()?;
-    // reth 1.x: one byte per step of the path. A real reth 1.11 datadir starts like this.
-    database_with_trie_keys(dir.path(), &[vec![0x00], vec![0x00, 0x01], vec![0x0f]])?;
+    // like the real testnet datadir: several rows, all reth 1.11.0
+    database_written_by(dir.path(), &["1.11.0", "1.11.0"])?;
     let before = data_files(dir.path())?;
 
     let error = RethEnv::new_database(&RethConfig(NodeConfig::default()), dir.path())
-        .expect_err("a database in the old format must be refused");
+        .expect_err("a database written by reth 1.x must be refused");
     let text = error.to_string();
+    assert!(text.contains("was written by reth 1.11.0"), "got: {text}");
     assert!(text.contains("storage format of reth 1.x"), "got: {text}");
     assert!(text.contains("was not changed"), "got: {text}");
-    assert!(text.contains("has 1 bytes"), "the error names the key length it found, got: {text}");
 
     assert_eq!(before, data_files(dir.path())?, "the refused database must not be changed");
     Ok(())
 }
 
-/// A database with packed trie keys (reth 2.0), an empty one and a new directory all open.
+/// An old datadir that a reth 2.0 binary once opened for writing has a reth 2.0 row as its last
+/// row. It is still old: any row of reth 1.x counts, not only the last one.
 #[test]
-fn new_format_database_opens() -> eyre::Result<()> {
+fn old_database_with_a_newer_last_row_is_refused() -> eyre::Result<()> {
+    use reth::builder::NodeConfig;
+
+    let dir = TempDir::new()?;
+    database_written_by(dir.path(), &["1.11.0", "2.0.0"])?;
+    let error = RethEnv::new_database(&RethConfig(NodeConfig::default()), dir.path())
+        .expect_err("one reth 1.x row is enough");
+    assert!(error.to_string().contains("was written by reth 1.11.0"), "got: {error}");
+    Ok(())
+}
+
+/// Databases written by reth 2.x, a database without version rows, one with a row that is not
+/// a version, and a new directory all open.
+#[test]
+fn databases_without_a_reth_1_row_open() -> eyre::Result<()> {
     use reth::builder::NodeConfig;
     let config = RethConfig(NodeConfig::default());
 
-    // packed keys: always 33 bytes
-    let packed = TempDir::new()?;
-    database_with_trie_keys(packed.path(), &[vec![0x00; 33], vec![0x11; 33]])?;
-    RethEnv::new_database(&config, packed.path())?;
+    let written_by_2 = TempDir::new()?;
+    database_written_by(written_by_2.path(), &["2.0.0", "2.1.3"])?;
+    RethEnv::new_database(&config, written_by_2.path())?;
 
-    // no trie rows at all: nothing to judge, so it opens
-    let empty = TempDir::new()?;
-    database_with_trie_keys(empty.path(), &[])?;
-    RethEnv::new_database(&config, empty.path())?;
+    // nothing to judge
+    let no_rows = TempDir::new()?;
+    database_written_by(no_rows.path(), &[])?;
+    RethEnv::new_database(&config, no_rows.path())?;
+
+    // a row that does not start with a number is not counted as old
+    let odd_row = TempDir::new()?;
+    database_written_by(odd_row.path(), &["custom-build"])?;
+    RethEnv::new_database(&config, odd_row.path())?;
 
     // no database yet
     let fresh = TempDir::new()?;
@@ -2843,64 +2868,48 @@ fn new_format_database_opens() -> eyre::Result<()> {
     Ok(())
 }
 
-/// One old key among packed ones is enough: the check looks at more than the first row.
+/// The row that this build records is one the check accepts: a database made by `new_database`
+/// opens again, and its version row names a supported reth version. If reth ever changes the
+/// text it records, this fails here and not on a node.
 #[test]
-fn old_format_key_after_packed_keys_is_found() -> eyre::Result<()> {
+fn the_version_row_of_this_build_is_accepted() -> eyre::Result<()> {
     use reth::builder::NodeConfig;
+    use reth_db::{cursor::DbCursorRO as _, tables, transaction::DbTx as _, Database as _};
+    let config = RethConfig(NodeConfig::default());
 
     let dir = TempDir::new()?;
-    // sorted by MDBX: the two packed keys first, then the short one
-    database_with_trie_keys(dir.path(), &[vec![0x00; 33], vec![0x01; 33], vec![0x02, 0x03]])?;
-    let error = RethEnv::new_database(&RethConfig(NodeConfig::default()), dir.path())
-        .expect_err("the old key must be found");
-    assert!(error.to_string().contains("has 2 bytes"), "got: {error}");
-    Ok(())
-}
+    drop(RethEnv::new_database(&config, dir.path())?);
+    let db = RethEnv::new_database(&config, dir.path())?;
 
-/// The genesis that reth 2.0 writes passes the check, and it has trie rows, so the check really
-/// looked at keys written by reth 2.0.
-#[tokio::test]
-async fn genesis_written_by_this_version_passes_the_format_check() -> eyre::Result<()> {
-    use reth::builder::NodeConfig;
-    use reth_db::{tables, transaction::DbTx as _, Database as _};
-
-    let dir = TempDir::new()?;
-    drop(genesis_storage_stack(dir.path())?);
-
-    let db = RethEnv::new_database(&RethConfig(NodeConfig::default()), dir.path().join("db"))?;
-    assert!(
-        db.tx()?.entries::<tables::AccountsTrie>()? > 0,
-        "the genesis must have trie rows, or this test checks nothing"
-    );
+    let (_, client) = db
+        .tx()?
+        .cursor_read::<tables::VersionHistory>()?
+        .last()?
+        .expect("new_database records the reth version of this build");
+    let major: u64 = client.version.split('.').next().unwrap_or_default().parse()?;
+    assert!(major >= 2, "this build records reth {}, expected 2.x or later", client.version);
     Ok(())
 }
 
 /// The check on an open database, used when the read-only check before the open could not run.
+/// By then the normal open has added a row for this reth version; the old row is still found.
 #[test]
-fn old_format_is_also_found_on_an_open_database() -> eyre::Result<()> {
+fn reth_1_row_is_also_found_on_an_open_database() -> eyre::Result<()> {
     use crate::reth_env::datadir_format::check_open_database;
-    use reth_db::{
-        mdbx::DatabaseArguments,
-        tables,
-        transaction::{DbTx as _, DbTxMut as _},
-        Database as _, RawKey, RawTable, RawValue,
-    };
+    use reth_db::mdbx::DatabaseArguments;
 
-    let dir = TempDir::new()?;
-    // plain reth open, so the old key can be written while the handle stays open
-    let db = reth_db::init_db(dir.path(), DatabaseArguments::default())?;
-    check_open_database(&db, dir.path())?;
+    let new = TempDir::new()?;
+    database_written_by(new.path(), &["2.0.0"])?;
+    let db = reth_db::init_db(new.path(), DatabaseArguments::default())?;
+    check_open_database(&db, new.path())?;
+    drop(db);
 
-    let tx = db.tx_mut()?;
-    tx.put::<RawTable<tables::AccountsTrie>>(
-        RawKey::from_vec(vec![0x00]),
-        RawValue::from_vec(vec![0u8; 8]),
-    )?;
-    tx.commit()?;
-
-    let error = check_open_database(&db, dir.path()).expect_err("the old key must be found");
+    let old = TempDir::new()?;
+    database_written_by(old.path(), &["1.11.0", "2.0.0"])?;
+    let db = reth_db::init_db(old.path(), DatabaseArguments::default())?;
+    let error = check_open_database(&db, old.path()).expect_err("the old row must be found");
     let text = error.to_string();
-    assert!(text.contains("storage format of reth 1.x"), "got: {text}");
+    assert!(text.contains("was written by reth 1.11.0"), "got: {text}");
     assert!(text.contains("nothing in it was repaired or unwound"), "got: {text}");
     Ok(())
 }
