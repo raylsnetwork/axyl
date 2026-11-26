@@ -132,8 +132,12 @@ snapshot was written by an older reth version: start-up code from a newer reth
 
 What this means when you run it:
 
-- The snapshot must not be in use. A snapshot that a running node holds is
-  refused. Two replays cannot read the same snapshot at the same time.
+- The snapshot must not be in use. On a writable snapshot directory a snapshot
+  that a running node holds is refused, and so is a second replay on the same
+  snapshot.
+- On a read-only mount MDBX works without its lock file. Two replays can then
+  read the same snapshot at the same time, which is harmless. The check for a
+  running node may not work there either, so make sure no node uses the snapshot.
 - A snapshot that needs a repair is refused with an error that names the problem.
   Examples: MDBX needs a recovery (the node was killed, or the files were copied
   from a running node), or the header files end before the last saved block. Fix a
