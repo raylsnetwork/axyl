@@ -382,6 +382,8 @@ impl<DB: Database> CertificateFetcher<DB> {
                     }
                 },
                 // periodic probe when idle; interval adapts per probe_interval()
+                // the latch alone is enough here: it is only set on an inactive node, and a mode
+                // change shuts this fetcher down before the new mode is written
                 _ = sleep(probe_interval),
                     if self.fetch_certificates_task.is_empty() && !self.tip_is_in_future_epoch =>
                 {

@@ -624,7 +624,6 @@ async fn a_catching_up_node_does_not_fetch_in_an_epoch_the_network_left() {
 async fn an_active_node_fetches_in_an_epoch_the_network_left() {
     let fixture = CommitteeFixture::builder(MemDatabase::default).randomize_ports(true).build();
     let epoch = fixture.committee().epoch();
-
     let peers = fixture.committee().size() - 1;
 
     let mut fetcher = FetcherUnderTest::start(&fixture, vec![], NodeMode::CvvActive).await;
