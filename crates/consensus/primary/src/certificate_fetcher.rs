@@ -176,8 +176,9 @@ pub(crate) struct CertificateFetcher<DB> {
     /// Suppresses probes until this instant after an epoch-mismatch outcome.
     /// Prevents tight spin when all peers are on a future epoch.
     epoch_mismatch_until: Option<Instant>,
-    /// Set once the network tip is in a later epoch than the fetcher's. The tip only moves up
-    /// within an epoch, and each epoch builds a new fetcher.
+    /// Set once the network tip is in a later epoch than the fetcher's, and never cleared.
+    /// A tip that is stale or reset at the epoch transition is never in a later epoch, so it
+    /// cannot be set wrongly, and each epoch builds a new fetcher.
     tip_is_in_future_epoch: bool,
 }
 
@@ -381,7 +382,9 @@ impl<DB: Database> CertificateFetcher<DB> {
                     }
                 },
                 // periodic probe when idle; interval adapts per probe_interval()
-                _ = sleep(probe_interval), if self.fetch_certificates_task.is_empty() => {
+                _ = sleep(probe_interval),
+                    if self.fetch_certificates_task.is_empty() && !self.tip_is_in_future_epoch =>
+                {
                     info!(
                         target: "primary::cert_fetcher",
                         "periodic probe to discover missing certificates"

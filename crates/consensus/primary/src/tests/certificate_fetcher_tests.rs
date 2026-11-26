@@ -467,7 +467,8 @@ struct FetcherUnderTest {
 impl FetcherUnderTest {
     /// Start a fetcher that has round [STORED_ROUND] from every authority, plus `extra`.
     ///
-    /// It then receives a certificate whose parents it lacks, so it starts fetching.
+    /// The network tip is in the node's own epoch, so the node fetches in it. It then receives
+    /// a certificate whose parents it lacks, so it starts fetching.
     async fn start(
         fixture: &CommitteeFixture<MemDatabase>,
         extra: Vec<Certificate>,
@@ -480,6 +481,7 @@ impl FetcherUnderTest {
         let store = primary.consensus_config().node_storage().clone();
         let cb = ConsensusBus::new();
         cb.node_mode().send_replace(mode);
+        publish_network_tip(&cb, fixture.committee().epoch());
         let task_manager = TaskManager::default();
         let synchronizer = StateSynchronizer::new(
             primary.consensus_config(),
@@ -547,10 +549,15 @@ impl FetcherUnderTest {
         }
     }
 
-    /// Fail if the fetcher asks for certificates within `period`.
+    /// Fail if the fetcher asks for certificates within `period`, or has stopped.
     async fn assert_no_fetch(&mut self, period: Duration) {
         sleep(period).await;
-        while let Ok(command) = self.requests.try_recv() {
+        loop {
+            let command = match self.requests.try_recv() {
+                Ok(command) => command,
+                Err(TryRecvError::Empty) => return,
+                Err(TryRecvError::Disconnected) => panic!("fetcher stopped"),
+            };
             if let NetworkCommand::SendRequest { request, .. } = command {
                 assert!(
                     !matches!(
@@ -566,12 +573,17 @@ impl FetcherUnderTest {
 
     /// Publish a network tip whose leader is in `epoch`, as the state-sync walk does.
     fn set_network_tip(&self, epoch: Epoch) {
-        let mut leader = Certificate::default();
-        leader.header.epoch = epoch;
-        let sub_dag = CommittedSubDag::new(vec![], leader, 1, ReputationScores::default(), None);
-        let tip = ConsensusHeader { sub_dag, number: 1, ..Default::default() };
-        self.consensus_bus.last_consensus_header().send_replace(tip);
+        publish_network_tip(&self.consensus_bus, epoch);
     }
+}
+
+/// Publish a network tip whose leader is in `epoch` on `consensus_bus`.
+fn publish_network_tip(consensus_bus: &ConsensusBus, epoch: Epoch) {
+    let mut leader = Certificate::default();
+    leader.header.epoch = epoch;
+    let sub_dag = CommittedSubDag::new(vec![], leader, 1, ReputationScores::default(), None);
+    let tip = ConsensusHeader { sub_dag, number: 1, ..Default::default() };
+    consensus_bus.last_consensus_header().send_replace(tip);
 }
 
 /// Long enough for several periodic probes while catching up.
@@ -589,10 +601,11 @@ async fn a_catching_up_node_does_not_fetch_in_an_epoch_the_network_left() {
 
     let mut fetcher = FetcherUnderTest::start(&fixture, vec![], NodeMode::CvvInactive).await;
     // a tip in the node's own epoch does not stop it; a catching-up node asks every peer at once
-    fetcher.set_network_tip(epoch);
     let mut replies = vec![];
     for _ in 0..peers {
-        let (_, reply) = fetcher.next_request().await;
+        let (_, reply) = tokio::time::timeout(SEVERAL_PROBES, fetcher.next_request())
+            .await
+            .expect("the node did not fetch in its own epoch");
         replies.push(reply);
     }
 
