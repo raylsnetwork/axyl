@@ -64,6 +64,12 @@ hardfork!(
         /// logic with `target_address != bytecode_address`; gating keeps pre-fork blocks replaying
         /// unchanged while new blocks reject the frame.
         Erc20PrecompileDirectCall,
+        /// A following node asks peers for their certified tip, a header hash carrying f+1
+        /// committee signatures, instead of asking committee members for their latest header and
+        /// trusting the single highest answer (#370, #312). Schedule it once every node runs the
+        /// release that serves the certified tip. Gates only how a node finds the head; serving
+        /// the old request stays.
+        CertifiedTipV1,
     }
 );
 
@@ -90,6 +96,7 @@ impl RaylsHardFork {
             Self::EpochCloseSeedV2 => 0x11,
             Self::CertificateFetchEpochV2 => 0x12,
             Self::Erc20PrecompileDirectCall => 0x13,
+            Self::CertifiedTipV1 => 0x14,
         }
     }
 

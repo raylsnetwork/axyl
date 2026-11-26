@@ -19,16 +19,16 @@ use parking_lot::Mutex;
 use rayls_consensus_network::{admission::RequestPermits, GossipMessage};
 use rayls_infrastructure_config::{ConsensusConfig, LibP2pConfig};
 use rayls_infrastructure_storage::{
-    tables::ConsensusBlocks, CertScope, CertificateStore, ConsensusStore, EpochStore,
-    ProposerStore, VoteDigestStore,
+    tables::{CertifiedTips, ConsensusBlocks},
+    CertScope, CertificateStore, ConsensusStore, EpochStore, ProposerStore, VoteDigestStore,
 };
 use rayls_infrastructure_types::{
     ensure,
     error::{CertificateError, HeaderError, HeaderResult},
     now, to_intent_message, try_decode, AuthorityIdentifier, B256Map, BlockHash, BlockNumHash,
-    BlsPublicKey, Certificate, CertificateDigest, ConsensusHeader, Database, Epoch,
-    EpochCertificate, EpochRecord, Hash as _, Header, ProtocolSignature, RaylsSender as _, Round,
-    SignatureVerificationState, Vote, VotesAggregator, B256,
+    BlsPublicKey, BlsSignature, Certificate, CertificateDigest, CertifiedTip, ConsensusHeader,
+    Database, Epoch, EpochCertificate, EpochRecord, Hash as _, Header, ProtocolSignature,
+    RaylsSender as _, Round, SignatureVerificationState, Vote, VotesAggregator, B256,
 };
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
@@ -119,6 +119,27 @@ pub(crate) struct RequestHandler<DB> {
     epoch_votes_seen: Arc<Mutex<BTreeMap<Epoch, HashSet<BlsPublicKey>>>>,
     /// The pending (uncertified) epoch records by digest, as last read from the table.
     pending_records: Arc<Mutex<PendingRecordCache>>,
+    /// Epoch and number of the stored certified tip, seeded from the table. Checked and moved
+    /// in one step with the write, so two quorums completing at once cannot store the lower one
+    /// last.
+    certified_tip_saved: Arc<Mutex<Option<(Epoch, u64)>>>,
+}
+
+/// Whether a tip certified at `epoch` and `number` replaces the stored one, `saved` as its epoch
+/// and number: only when it is from `floor` or later, and from a later epoch or higher in the
+/// same one. `floor` holds while nothing is stored yet. The epoch comes first: honest numbers
+/// rise across epochs, so a later epoch always wins. A header forged by f+1 retired keys of an
+/// earlier epoch does not get here: the gossip path drops a quorum from a closed epoch unless it
+/// names the header this node holds at that number.
+pub(super) fn replaces_certified_tip(
+    saved: Option<(Epoch, u64)>,
+    floor: Epoch,
+    epoch: Epoch,
+    number: u64,
+) -> bool {
+    epoch >= floor
+        && saved
+            .is_none_or(|(saved_epoch, saved_number)| (epoch, number) > (saved_epoch, saved_number))
 }
 
 /// The gossip handler's view of the pending epoch record table.
@@ -161,7 +182,19 @@ where
                 "committee is larger than a missing-certificates request may name, so missing-certificates requests between members will be refused"
             );
         }
+        let certified_tip_saved = match consensus_config.node_storage().get::<CertifiedTips>(&0) {
+            Ok(tip) => tip.map(|tip| (tip.epoch, tip.number)),
+            Err(e) => {
+                warn!(
+                    target: "primary::handler",
+                    %e,
+                    "failed to read the certified tip, only the epoch floor guards the next one"
+                );
+                None
+            }
+        };
         Self {
+            certified_tip_saved: Arc::new(Mutex::new(certified_tip_saved)),
             consensus_config,
             consensus_bus,
             rayls_consensus_state_sync,
@@ -402,11 +435,48 @@ where
                             .entry(consensus_result_hash)
                             .or_insert_with(|| VotesAggregator::new(enough_sigs as u64));
                         match aggregator.append(*result, 1) {
-                            Ok(reached) => reached,
+                            // the signatures that reached it, read before any clear below
+                            Ok(true) => {
+                                let signatures = aggregator
+                                    .votes()
+                                    .iter()
+                                    .map(|vote| (vote.validator, vote.signature))
+                                    .collect::<Vec<_>>();
+                                // a closed epoch's quorum is checked against the stored header
+                                // below; taken out under this lock so later voters for the same
+                                // digest do not repeat that check
+                                if epoch < self.consensus_config.committee().epoch() {
+                                    cache.remove(&consensus_result_hash);
+                                }
+                                Some(signatures)
+                            }
+                            Ok(false) => None,
                             Err(_) => return Ok(()),
                         }
                     };
-                    if quorum {
+                    if let Some(signatures) = quorum {
+                        // a node in a later epoch has executed every header of this one, so an
+                        // honest result names the header it holds at that number; anything else
+                        // is f+1 retired keys forging one, which would otherwise be served as the
+                        // certified tip and, as the gossip tip, drop every later result below it
+                        if epoch < self.consensus_config.committee().epoch() {
+                            let held = self
+                                .consensus_config
+                                .node_storage()
+                                .get::<ConsensusBlocks>(&number)
+                                .ok()
+                                .flatten();
+                            if held.is_none_or(|held| held.digest() != hash) {
+                                warn!(
+                                    target: "primary::consensus_result",
+                                    epoch,
+                                    number,
+                                    "quorum from a closed epoch is not the header held at its number, dropping"
+                                );
+                                return Ok(());
+                            }
+                        }
+                        self.save_certified_tip(epoch, round, number, hash, signatures);
                         if self.behind_consensus(epoch, round, Some(number)).await {
                             self.consensus_certs.lock().clear();
                             return Ok(());
@@ -1043,6 +1113,61 @@ where
         };
 
         Ok(PrimaryResponse::ConsensusHeader(Arc::new(header)))
+    }
+
+    /// Keep the f+1 signatures that just certified a header as this node's certified tip, the
+    /// head it serves to peers. A higher stored tip is kept: gossip only moves forward, but a
+    /// restarted node can hear a lower header reach f+1 before it catches up. So is one from a
+    /// later epoch, and nothing from before the previous epoch is stored even when no row is:
+    /// the row outlives restarts, so f+1 keys of a retired committee could otherwise pin a
+    /// forged high number from their epoch for good. The previous epoch still counts, so a
+    /// chain halted on its last header keeps a tip.
+    ///
+    /// The bitmap indexes the committee the epoch ran with, the one followers verify against,
+    /// never the lookahead the gossip check may have used: a key ejected since the lookahead was
+    /// read would shift every index after it and leave a tip nobody can verify. Nothing is
+    /// stored until that committee is settled.
+    fn save_certified_tip(
+        &self,
+        epoch: Epoch,
+        round: Round,
+        number: u64,
+        hash: BlockHash,
+        signatures: Vec<(BlsPublicKey, BlsSignature)>,
+    ) {
+        let Some(committee) = self.consensus_config.get_settled_committee_keys_for_epoch(epoch)
+        else {
+            return;
+        };
+        let Some(tip) =
+            CertifiedTip::from_signatures(epoch, round, number, hash, &committee, signatures)
+        else {
+            return;
+        };
+        let floor = self.consensus_config.committee().epoch().saturating_sub(1);
+        let mut saved = self.certified_tip_saved.lock();
+        if !replaces_certified_tip(*saved, floor, epoch, number) {
+            return;
+        }
+        match self.consensus_config.node_storage().insert::<CertifiedTips>(&0, &tip) {
+            Ok(()) => *saved = Some((epoch, number)),
+            Err(e) => warn!(
+                target: "primary::consensus_result",
+                number,
+                %e,
+                "failed to save the certified tip"
+            ),
+        }
+    }
+
+    /// Retrieve this node's certified tip from local storage, `None` while it has none.
+    pub(super) async fn retrieve_certified_tip(&self) -> PrimaryNetworkResult<PrimaryResponse> {
+        let tip = self
+            .consensus_config
+            .node_storage()
+            .get::<CertifiedTips>(&0)
+            .map_err(|e| PrimaryNetworkError::Internal(format!("certified tip read: {e}")))?;
+        Ok(PrimaryResponse::CertifiedTip(tip))
     }
 
     /// Retrieve an epoch record from local storage.
