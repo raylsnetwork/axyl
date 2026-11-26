@@ -24,12 +24,51 @@ mod context;
 mod factory;
 mod handler;
 mod hardforks;
+#[cfg(test)]
+mod rls_tests;
 pub(crate) use block::*;
 pub(crate) use config::*;
 pub(crate) use context::*;
 pub(crate) use factory::*;
 
-use crate::evm::handler::RaylsEvmHandler;
+use crate::{
+    evm::handler::{RaylsEvmHandler, RlsGas},
+    rls_flavour,
+};
+use reth_revm::context_interface::result::InvalidTransaction;
+
+/// If `tx` is signed for the RLS chain id, prices its gas in RLS and zeroes the gas price and
+/// value revm sees, so the handler can charge both in RLS instead of USDr.
+///
+/// `simulating` is set for `eth_call` and `eth_estimateGas`, which run without a base fee.
+fn rls_gas(
+    tx: &mut TxEnv,
+    chain_id: u64,
+    usdr_base_fee: u64,
+    simulating: bool,
+) -> Result<Option<RlsGas>, InvalidTransaction> {
+    if !rls_flavour::is_rls(tx.chain_id, chain_id) {
+        return Ok(None);
+    }
+    let base_fee = rls_flavour::rls_base_fee(usdr_base_fee);
+    // `gas_price` is the max fee per gas for EIP-1559 transactions
+    if tx.gas_price < base_fee && !simulating {
+        return Err(InvalidTransaction::GasPriceLessThanBasefee);
+    }
+    // revm cannot see this once the fee fields are zeroed below; same rule as the USDr flavour
+    if tx.gas_priority_fee.is_some_and(|tip| tip > tx.gas_price) {
+        return Err(InvalidTransaction::PriorityFeeGreaterThanMaxFee);
+    }
+    let price = match tx.gas_priority_fee {
+        Some(tip) => tx.gas_price.min(base_fee.saturating_add(tip)),
+        None => tx.gas_price,
+    };
+    let rls = RlsGas { price, max_fee: tx.gas_price, value: tx.value };
+    tx.gas_price = 0;
+    tx.gas_priority_fee = tx.gas_priority_fee.map(|_| 0);
+    tx.value = U256::ZERO;
+    Ok(Some(rls))
+}
 
 /// Rayls EVM implementation.
 ///
@@ -130,9 +169,24 @@ where
         self.cfg.chain_id
     }
 
-    fn transact_raw(&mut self, tx: Self::Tx) -> Result<ResultAndState, Self::Error> {
-        let mut handler = RaylsEvmHandler::default();
-        if self.inspect {
+    fn transact_raw(&mut self, mut tx: Self::Tx) -> Result<ResultAndState, Self::Error> {
+        let simulating = self.cfg.disable_base_fee;
+        let rls = match rls_gas(&mut tx, self.cfg.chain_id, self.block.basefee, simulating) {
+            Ok(rls) => rls,
+            Err(err) => return Err(EVMError::Transaction(err)),
+        };
+        // RLS flavour: CHAINID returns the RLS chain id, and the zero gas price needs no base fee
+        // `rls` is only set on a Rayls network, which always has an RLS chain id
+        let mut chain_id =
+            rls_flavour::rls_chain_id(self.cfg.chain_id).unwrap_or(self.cfg.chain_id);
+        let mut basefee = 0;
+        if rls.is_some() {
+            core::mem::swap(&mut self.cfg.chain_id, &mut chain_id);
+            core::mem::swap(&mut self.block.basefee, &mut basefee);
+        }
+
+        let mut handler = RaylsEvmHandler::with_rls(rls);
+        let res = if self.inspect {
             self.inner.ctx.set_tx(tx);
             handler.inspect_run(&mut self.inner).map(|result| {
                 let state = self.ctx_mut().journal_mut().finalize();
@@ -144,7 +198,13 @@ where
                 let state = self.ctx_mut().journal_mut().finalize();
                 ResultAndState::new(result, state)
             })
+        };
+
+        if rls.is_some() {
+            core::mem::swap(&mut self.cfg.chain_id, &mut chain_id);
+            core::mem::swap(&mut self.block.basefee, &mut basefee);
         }
+        res
     }
 
     fn transact_system_call(
