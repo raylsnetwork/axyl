@@ -3,6 +3,9 @@
 //!
 //! Walks the snapshot's canonical EVM chain block by block, re-executing each on
 //! the archive's growing state and verifying the state root against the snapshot.
+//!
+//! The snapshot is only read. Its execution data comes through a [`SnapshotReader`], which
+//! opens the snapshot read-only and never repairs or unwinds it.
 
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]
 
@@ -13,6 +16,9 @@ use rayls_infrastructure_config as _;
 use rayls_middleware_rewards as _;
 use reth_chainspec as _;
 use serde_yaml as _;
+// only the binary's tests use it
+#[cfg(test)]
+use tempfile as _;
 use tracing_appender as _;
 use tracing_subscriber as _;
 
@@ -32,7 +38,7 @@ use crate::{
     rewards::SnapshotTallyStore,
 };
 use parking_lot::Mutex;
-use rayls_execution_evm::reth_env::RethEnv;
+use rayls_execution_evm::reth_env::{RethEnv, SnapshotReader};
 use rayls_infrastructure_types::{rewards::RewardsCounter, Database, SealedHeader, B256};
 use std::{
     collections::{BTreeMap, HashMap},
@@ -72,20 +78,19 @@ impl Default for ReplayConfig {
     }
 }
 
-/// Pre-flight verification that `snapshot_evm` and `archive_evm` agree on
-/// genesis, which transitively proves their `RaylsChainSpec` hardfork
-/// schedules match. Run this once before `run_replay`.
+/// Pre-flight verification that the snapshot and `archive_evm` agree on the
+/// genesis block. Run this once before `run_replay`.
 ///
-/// Both `RethEnv` instances MUST be initialized with the same `RaylsChainSpec`
-/// (same hardfork activation blocks, same per-fork pinned
-/// bytecode subdirectories). If they disagree on genesis state, block 1's
-/// execution diverges immediately; the explicit check here surfaces the cause
-/// up front rather than at the first state-root mismatch deep in replay.
+/// The archive env builds its genesis from the genesis file and the selected
+/// hardfork schedule. If that genesis differs from the one the snapshot was
+/// built on, block 1's execution diverges immediately; the explicit check here
+/// surfaces the cause up front rather than at the first state-root mismatch
+/// deep in replay.
 pub fn verify_chainspec_compatibility(
-    snapshot_evm: &RethEnv,
+    snapshot: &SnapshotReader,
     archive_evm: &RethEnv,
 ) -> ReplayResult<()> {
-    let snap_genesis = snapshot_evm
+    let snap_genesis = snapshot
         .sealed_header_by_number(0)
         .map_err(|e| ReplayError::SnapshotEnv(e.to_string()))?
         .ok_or(ReplayError::MissingHeader { block_number: 0 })?;
@@ -111,16 +116,15 @@ pub fn verify_chainspec_compatibility(
 /// Run the replay loop. Walks the plan, executes each block, returns the last
 /// successfully executed block number.
 ///
-/// `snapshot_evm` and `archive_evm` MUST be initialized with the same
-/// `RaylsChainSpec` (same hardfork schedule). Call
-/// [`verify_chainspec_compatibility`] before this to catch a mismatch at
-/// genesis rather than during execution.
+/// `archive_evm` MUST be initialized with the genesis and the hardfork schedule
+/// the snapshot was built on. Call [`verify_chainspec_compatibility`] before
+/// this to catch a mismatch at genesis rather than during execution.
 ///
 /// When the `shutdown` watch flips to `true` (by a signal handler), the loop
 /// stops at the next output-group boundary, leaving a fully flushed, resumable
 /// tip. The returned block number is the last committed tip in either case.
 pub async fn run_replay<DB: Database>(
-    snapshot_evm: &RethEnv,
+    snapshot: &SnapshotReader,
     consensus_store: &DB,
     archive_evm: &RethEnv,
     rewards_counter: &RewardsCounter,
@@ -130,8 +134,7 @@ pub async fn run_replay<DB: Database>(
 ) -> ReplayResult<u64> {
     let mut parent = archive_evm.canonical_tip();
     let from = config.from_block.max(parent.number + 1);
-    let snapshot_tip =
-        snapshot_evm.last_block_number().map_err(|e| ReplayError::SnapshotEnv(e.to_string()))?;
+    let snapshot_tip = snapshot.last_block_number();
     let to = match config.to_block {
         Some(requested) if requested > snapshot_tip => {
             warn!(
@@ -157,7 +160,7 @@ pub async fn run_replay<DB: Database>(
     // load the consensus DB's BFT-committed epoch anchors and confirm the
     // snapshot's own execution DB agrees before trusting it as the replay oracle.
     let anchors = load_epoch_anchors(consensus_store, from, to);
-    let agreement = cross_check_snapshot(snapshot_evm, &anchors);
+    let agreement = cross_check_snapshot(snapshot, &anchors);
     if agreement.disagreed > 0 {
         // the snapshot itself committed a fork; replay still runs (locating the
         // divergence is a forensic use case) but every verification downstream
@@ -180,7 +183,7 @@ pub async fn run_replay<DB: Database>(
     // the from-leaves self-heal never re-reads the snapshot per block
     let expected_roots: Arc<Mutex<HashMap<u64, B256>>> = Arc::new(Mutex::new(HashMap::new()));
     let oracle_roots = Arc::clone(&expected_roots);
-    let oracle_snapshot = snapshot_evm.clone();
+    let oracle_snapshot = snapshot.clone();
     archive_evm.set_canonical_root_oracle(Box::new(move |number| {
         oracle_roots.lock().get(&number).copied().or_else(|| {
             oracle_snapshot.header_by_number(number).ok().flatten().map(|h| h.state_root)
@@ -190,7 +193,7 @@ pub async fn run_replay<DB: Database>(
     // producer derives plan blocks ahead on a blocking thread (pure reads),
     // overlapping the executor's block building; bounded channel = backpressure.
     let (tx, mut rx) = mpsc::channel::<ReplayResult<Vec<PlanBlock>>>(PREFETCH_WINDOWS_AHEAD);
-    let producer_snapshot = snapshot_evm.clone();
+    let producer_snapshot = snapshot.clone();
     let producer_store = consensus_store.clone();
     let producer = tokio::task::spawn_blocking(move || {
         produce_plans(&producer_snapshot, &producer_store, from, to, &tx);
@@ -217,7 +220,7 @@ pub async fn run_replay<DB: Database>(
             if group_digest.is_some_and(|d| plan.output_digest != d) {
                 parent = flush_output_group(
                     archive_evm,
-                    snapshot_evm,
+                    snapshot,
                     &group,
                     parent,
                     rewards_counter,
@@ -250,7 +253,7 @@ pub async fn run_replay<DB: Database>(
     if !interrupted && !group.is_empty() {
         parent = flush_output_group(
             archive_evm,
-            snapshot_evm,
+            snapshot,
             &group,
             parent,
             rewards_counter,
@@ -337,7 +340,7 @@ fn format_eta(secs: u64) -> String {
 #[allow(clippy::too_many_arguments)]
 async fn flush_output_group(
     archive_evm: &RethEnv,
-    snapshot_evm: &RethEnv,
+    snapshot: &SnapshotReader,
     group: &[PlanBlock],
     parent: SealedHeader,
     rewards_counter: &RewardsCounter,
@@ -362,7 +365,7 @@ async fn flush_output_group(
     for plan in group {
         if plan.close_epoch.is_some() {
             let (block_epoch, _) = RethEnv::deconstruct_nonce(plan.plan_header.nonce.into());
-            let tally = snapshot_close_epoch_tally(snapshot_evm, plan.plan_header.number)?;
+            let tally = snapshot_close_epoch_tally(snapshot, plan.plan_header.number)?;
             tally_store.insert(block_epoch, tally);
         }
     }
@@ -393,7 +396,7 @@ async fn flush_output_group(
 /// setup; stops early when the consumer drops the receiver or the snapshot tip
 /// is reached.
 fn produce_plans<DB: Database>(
-    snapshot_evm: &RethEnv,
+    snapshot: &SnapshotReader,
     consensus_store: &DB,
     from: u64,
     to: u64,
@@ -402,7 +405,7 @@ fn produce_plans<DB: Database>(
     let mut start = from;
     while start <= to {
         let end = start.saturating_add(PREFETCH_WINDOW - 1).min(to);
-        match derive_plan_window(snapshot_evm, consensus_store, start, end) {
+        match derive_plan_window(snapshot, consensus_store, start, end) {
             Ok(plans) => {
                 let requested = end - start + 1;
                 let got = plans.len() as u64;

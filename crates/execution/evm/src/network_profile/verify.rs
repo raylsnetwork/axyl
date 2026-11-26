@@ -156,7 +156,9 @@ pub struct ScheduleRecordVerification {
 ///
 /// Reads the record at [`RaylsDirs::schedule_record_path`] and the chain's
 /// executed head (a single keyed read over a fresh db handle — no provider
-/// built), then runs [`verify_schedule`] when a record exists. A datadir
+/// built), then runs [`verify_schedule`] when a record exists. The record file
+/// is only read, but the db handle is a normal read-write open; a caller that
+/// must not write to the datadir uses [`verify_datadir_schedule_record_at_head`]. A datadir
 /// without a record yields `record: None` and no moves; what "trust" means is
 /// the caller's decision — the node's boot gate re-records the selected
 /// schedule afterwards, the offline replay only reports and never writes into
@@ -170,7 +172,19 @@ pub fn verify_datadir_schedule_record<P: RaylsDirs + ?Sized>(
 ) -> eyre::Result<ScheduleRecordVerification> {
     // The chain's executed head: reth's `Finish` stage checkpoint.
     let head = RethEnv::best_block_number(reth_config, datadir.reth_db_path())?;
+    verify_datadir_schedule_record_at_head(datadir, head, profile)
+}
 
+/// [`verify_datadir_schedule_record`] for a caller that already knows the executed head.
+///
+/// It reads only the record file and does not open the database. `rayls-replay` uses it for the
+/// source datadir: [`RethEnv::best_block_number`] opens the database for writing, and the replay
+/// must not write to its source.
+pub fn verify_datadir_schedule_record_at_head<P: RaylsDirs + ?Sized>(
+    datadir: &P,
+    head: u64,
+    profile: &NetworkProfile,
+) -> eyre::Result<ScheduleRecordVerification> {
     let path = datadir.schedule_record_path();
     let record = ScheduleRecord::load(&path)?;
     let moves = match &record {

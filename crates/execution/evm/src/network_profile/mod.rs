@@ -29,5 +29,6 @@ pub use profile::NetworkProfile;
 pub use record::ScheduleRecord;
 pub use shape::verify_schedule_shape;
 pub use verify::{
-    verify_datadir_schedule_record, verify_schedule, FutureForkMove, ScheduleRecordVerification,
+    verify_datadir_schedule_record, verify_datadir_schedule_record_at_head, verify_schedule,
+    FutureForkMove, ScheduleRecordVerification,
 };

@@ -2459,3 +2459,299 @@ async fn golden_genesis_and_blocks() -> eyre::Result<()> {
 
     Ok(())
 }
+
+// ---------------------------------------------------------------------------------------------
+// Read-only source reader for `rayls-replay` (#418)
+// ---------------------------------------------------------------------------------------------
+
+/// A closed datadir in the layout of a real node (`db/`, `static_files/`, `rocksdb/`), written by
+/// the full node env, to be opened by [`SnapshotReader`](crate::reth_env::SnapshotReader).
+#[cfg(feature = "archive-replay")]
+struct ClosedSource {
+    dir: TempDir,
+    chain: Arc<RethChainSpec>,
+    /// The sealed headers of blocks `0..=3`, as the full node env read them.
+    headers: Vec<rayls_infrastructure_types::SealedHeader>,
+    /// The withdrawals of block 2, as the full node env read them.
+    withdrawals_of_block_2: Option<Vec<(Address, u64)>>,
+}
+
+#[cfg(feature = "archive-replay")]
+impl ClosedSource {
+    const WITHDRAWALS: [(Address, u64); 2] =
+        [(Address::repeat_byte(0xA1), 7), (Address::repeat_byte(0xA2), 9)];
+
+    /// Build genesis and three empty blocks, give block 2 a withdrawals row, then close the
+    /// node env. `finish` overwrites the `Finish` stage checkpoint (the node wrote 3).
+    async fn build(finish: Option<u64>) -> eyre::Result<Self> {
+        Self::build_with(finish, None).await
+    }
+
+    /// [`Self::build`] with a database page size. `None` is the node's default.
+    async fn build_with(finish: Option<u64>, page_size: Option<usize>) -> eyre::Result<Self> {
+        use crate::NetworkProfile;
+        use alloy::eips::eip4895::{Withdrawal, Withdrawals};
+        use reth_chainspec::EthChainSpec as _;
+        use reth_db::{
+            models::StoredBlockWithdrawals,
+            tables::{BlockWithdrawals, StageCheckpoints},
+            transaction::{DbTx as _, DbTxMut as _},
+            Database as _,
+        };
+        use reth_stages::{StageCheckpoint, StageId};
+
+        let chain = rayls_infrastructure_types::test_chain_spec_arc();
+        let profile =
+            NetworkProfile { chain_id: chain.chain().id(), hardforks: Default::default() };
+        let dir = TempDir::new()?;
+        if let Some(page_size) = page_size {
+            // create the datafile first; the node env below then opens it at its own page size
+            use reth::{args::DatabaseArgs, builder::NodeConfig};
+            let config = RethConfig(NodeConfig {
+                db: DatabaseArgs { page_size: Some(page_size), ..Default::default() },
+                ..NodeConfig::default()
+            });
+            let db = RethEnv::new_database(&config, dir.path().join("db"))?;
+            assert_eq!(db.stat()?.page_size() as usize, page_size);
+        }
+        let task_manager = TaskManager::new("Test Task Manager");
+        let reth_env = RethEnv::new_for_archive_replay(
+            chain.clone(),
+            dir.path(),
+            &task_manager,
+            &profile,
+            None,
+            None,
+            true,
+            None,
+            rayls_middleware_rewards::RewardsCounter::default(),
+        )
+        .await?;
+
+        let mut header = chain.sealed_genesis_header();
+        for number in 1..=3u64 {
+            let mut co = consensus_output_for_tests(2, 0, number);
+            co.close_epoch = false;
+            let payload = RLPayload::new_for_test(header.clone(), &co);
+            let block =
+                execute_payload_and_update_canonical_chain(&reth_env, payload, vec![]).await?;
+            header = block.recovered_block.clone_sealed_header();
+        }
+
+        // reth keeps withdrawals in this table, one row per block that has some
+        let db = reth_env.provider_factory.db_ref().clone();
+        let withdrawals = Withdrawals::new(
+            Self::WITHDRAWALS
+                .iter()
+                .enumerate()
+                .map(|(index, (address, amount))| Withdrawal {
+                    index: index as u64,
+                    validator_index: 0,
+                    address: *address,
+                    amount: *amount,
+                })
+                .collect(),
+        );
+        let tx = db.tx_mut()?;
+        tx.put::<BlockWithdrawals>(2, StoredBlockWithdrawals { withdrawals })?;
+        if let Some(block) = finish {
+            tx.put::<StageCheckpoints>(
+                StageId::Finish.as_str().to_string(),
+                StageCheckpoint::new(block),
+            )?;
+        }
+        tx.commit()?;
+        drop(db);
+
+        let headers = (0..=3u64)
+            .map(|number| {
+                reth_env
+                    .sealed_header_by_number(number)?
+                    .ok_or_else(|| eyre::eyre!("the node env has no header {number}"))
+            })
+            .collect::<eyre::Result<Vec<_>>>()?;
+        let withdrawals_of_block_2 = reth_env.block_withdrawals(2)?;
+
+        drop(reth_env);
+        drop(task_manager);
+        Ok(Self { dir, chain, headers, withdrawals_of_block_2 })
+    }
+
+    /// Open the reader. The open is exclusive, and the node env closes its database a moment
+    /// after it is dropped (its background threads hold it), so wait for that.
+    async fn open(&self) -> eyre::Result<crate::reth_env::SnapshotReader> {
+        let started = std::time::Instant::now();
+        loop {
+            match crate::reth_env::SnapshotReader::open(self.dir.path(), self.chain.clone()) {
+                Ok(reader) => return Ok(reader),
+                Err(e)
+                    if e.to_string().contains("another process")
+                        && started.elapsed() < std::time::Duration::from_secs(20) =>
+                {
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    /// Every file and directory under the datadir: `None` for a directory, size and change time
+    /// for a file.
+    ///
+    /// `mdbx.lck` is listed with its size only. It is MDBX's lock file, not data: MDBX sets its
+    /// length again on every open and close, also a read-only one, which moves the change time
+    /// of the (empty) file.
+    fn file_list(&self) -> eyre::Result<FileList> {
+        fn walk(dir: &std::path::Path, out: &mut FileList) -> eyre::Result<()> {
+            for entry in std::fs::read_dir(dir)? {
+                let path = entry?.path();
+                let meta = std::fs::metadata(&path)?;
+                if meta.is_dir() {
+                    out.insert(path.clone(), None);
+                    walk(&path, out)?;
+                } else {
+                    let is_lock_file = path.file_name().is_some_and(|name| name == "mdbx.lck");
+                    let changed = if is_lock_file { None } else { Some(meta.modified()?) };
+                    out.insert(path, Some((meta.len(), changed)));
+                }
+            }
+            Ok(())
+        }
+        let mut out = FileList::new();
+        walk(self.dir.path(), &mut out)?;
+        Ok(out)
+    }
+}
+
+/// See [`ClosedSource::file_list`].
+#[cfg(feature = "archive-replay")]
+type FileList =
+    std::collections::BTreeMap<std::path::PathBuf, Option<(u64, Option<std::time::SystemTime>)>>;
+
+/// The reader gives the same headers and withdrawals as the full node env, cuts every read at
+/// the tip, refuses a second open, and leaves every file of the datadir as it was.
+#[cfg(feature = "archive-replay")]
+#[tokio::test]
+async fn snapshot_reader_reads_like_the_node_env_and_changes_no_file() -> eyre::Result<()> {
+    let source = ClosedSource::build(None).await?;
+    assert_eq!(
+        source.withdrawals_of_block_2,
+        Some(ClosedSource::WITHDRAWALS.to_vec()),
+        "the full node env must read the withdrawals row, or the comparison below is empty"
+    );
+
+    // one open and close first, so the list below is taken after the node env is fully closed
+    drop(source.open().await?);
+    let before = source.file_list()?;
+
+    let reader = source.open().await?;
+    assert_eq!(reader.last_block_number(), 3);
+
+    for (number, expected) in source.headers.iter().enumerate() {
+        let number = number as u64;
+        let sealed = reader.sealed_header_by_number(number)?.expect("header in the source");
+        assert_eq!(sealed.hash(), expected.hash(), "hash of block {number}");
+        assert_eq!(&sealed, expected, "sealed header of block {number}");
+        assert_eq!(
+            reader.header_by_number(number)?.as_ref(),
+            Some(expected.header()),
+            "header of block {number}"
+        );
+    }
+
+    // nothing above the tip
+    assert!(reader.sealed_header_by_number(4)?.is_none());
+    assert!(reader.header_by_number(4)?.is_none());
+    assert!(reader.block_withdrawals(4)?.is_none());
+
+    // ranges are cut at the tip
+    assert_eq!(reader.blocks_for_range(1..=3)?, source.headers[1..=3]);
+    assert_eq!(reader.blocks_for_range(2..=10)?, source.headers[2..=3]);
+    assert_eq!(reader.blocks_for_range(0..=0)?, source.headers[0..=0]);
+    assert!(reader.blocks_for_range(4..=9)?.is_empty());
+
+    // a block with a row, and blocks without one
+    assert_eq!(reader.block_withdrawals(2)?, source.withdrawals_of_block_2);
+    assert_eq!(reader.block_withdrawals(1)?, Some(Vec::new()));
+    assert_eq!(reader.block_withdrawals(3)?, Some(Vec::new()));
+
+    // a clone shares the open files and reads the same
+    let clone = reader.clone();
+    assert_eq!(clone.sealed_header_by_number(3)?.map(|h| h.hash()), Some(source.headers[3].hash()));
+
+    // the open is exclusive: a second open of the same datadir is refused while this one lives
+    let second = crate::reth_env::SnapshotReader::open(source.dir.path(), source.chain.clone());
+    assert!(second.is_err(), "a second open must be refused");
+
+    drop(clone);
+    drop(reader);
+    let after = source.file_list()?;
+    let changed: Vec<_> = before
+        .iter()
+        .filter(|(path, entry)| after.get(*path) != Some(*entry))
+        .chain(after.iter().filter(|(path, _)| !before.contains_key(*path)))
+        .collect();
+    assert!(
+        changed.is_empty(),
+        "the reader must not change any file, but these differ: {changed:#?}"
+    );
+    Ok(())
+}
+
+/// The tip is the `Finish` checkpoint. Headers above it (a node stopped in the middle of a save)
+/// are not served.
+#[cfg(feature = "archive-replay")]
+#[tokio::test]
+async fn snapshot_reader_ignores_headers_above_the_checkpoint() -> eyre::Result<()> {
+    let source = ClosedSource::build(Some(2)).await?;
+    let reader = source.open().await?;
+
+    assert_eq!(reader.last_block_number(), 2);
+    assert_eq!(reader.sealed_header_by_number(2)?.as_ref(), Some(&source.headers[2]));
+    assert!(reader.sealed_header_by_number(3)?.is_none(), "block 3 is above the checkpoint");
+    assert!(reader.header_by_number(3)?.is_none());
+    assert!(reader.block_withdrawals(3)?.is_none());
+    assert_eq!(reader.blocks_for_range(1..=3)?, source.headers[1..=2]);
+    Ok(())
+}
+
+/// A datafile whose page size is not the page size of this machine opens and reads the same.
+/// 8 KiB differs from both common host page sizes (4 KiB on x86, 16 KiB on Apple silicon).
+#[cfg(feature = "archive-replay")]
+#[tokio::test]
+async fn snapshot_reader_opens_a_datafile_with_another_page_size() -> eyre::Result<()> {
+    let source = ClosedSource::build_with(None, Some(8 * 1024)).await?;
+    let reader = source.open().await?;
+
+    assert_eq!(reader.last_block_number(), 3);
+    assert_eq!(reader.sealed_header_by_number(3)?.as_ref(), Some(&source.headers[3]));
+    assert_eq!(reader.block_withdrawals(2)?, Some(ClosedSource::WITHDRAWALS.to_vec()));
+    Ok(())
+}
+
+/// Headers that end before the checkpoint mean the source is not complete. The reader stops, it
+/// does not repair.
+#[cfg(feature = "archive-replay")]
+#[tokio::test]
+async fn snapshot_reader_refuses_a_source_with_missing_headers() -> eyre::Result<()> {
+    let source = ClosedSource::build(Some(9)).await?;
+    let error = source.open().await.expect_err("the open must fail");
+    assert!(
+        error.to_string().contains("not complete"),
+        "the error must name the problem, got: {error:#}"
+    );
+    Ok(())
+}
+
+/// A directory that is not a node datadir gives a clear error and is not created or filled.
+#[cfg(feature = "archive-replay")]
+#[test]
+fn snapshot_reader_refuses_a_directory_without_a_database() -> eyre::Result<()> {
+    let dir = TempDir::new()?;
+    let chain = rayls_infrastructure_types::test_chain_spec_arc();
+    let error = crate::reth_env::SnapshotReader::open(dir.path(), chain)
+        .expect_err("no database, so no open");
+    assert!(error.to_string().contains("no execution database"), "got: {error:#}");
+    assert_eq!(std::fs::read_dir(dir.path())?.count(), 0, "the directory must stay empty");
+    Ok(())
+}
