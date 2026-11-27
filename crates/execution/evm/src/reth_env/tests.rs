@@ -2913,3 +2913,40 @@ fn reth_1_row_is_also_found_on_an_open_database() -> eyre::Result<()> {
     assert!(text.contains("nothing in it was repaired or unwound"), "got: {text}");
     Ok(())
 }
+
+// ---------------------------------------------------------------------------------------------
+// Offline prune for `rayls-replay --prune-full` (#421)
+// ---------------------------------------------------------------------------------------------
+
+/// The offline prune removes what a node with `--full` would remove, a second run finds nothing
+/// left, and the chain is still there after it.
+#[cfg(feature = "archive-replay")]
+#[tokio::test]
+async fn offline_prune_leaves_nothing_for_a_second_run() -> eyre::Result<()> {
+    let mut chain = HistoryChain::new().await?;
+    // blocks 1 and 3 hold one transaction each
+    for call_contract in [true, false, true, false] {
+        chain.next_block(call_contract).await?;
+    }
+    let tip_before = chain.reth_env.sealed_header_by_number(4)?.expect("block 4");
+
+    let first = chain.reth_env.prune_like_full_node()?;
+    let pruned = |result: &[(String, usize)], segment: &str| {
+        result.iter().find(|(name, _)| name == segment).map(|(_, count)| *count)
+    };
+    // `--full` keeps no transaction senders: one per transaction is removed
+    assert_eq!(pruned(&first, "SenderRecovery"), Some(2), "got: {first:?}");
+    // the chain is far shorter than the distance `--full` keeps, so nothing else is removed
+    // (a segment with nothing to do is not in the list at all)
+    for segment in ["Receipts", "AccountHistory", "StorageHistory"] {
+        assert_eq!(pruned(&first, segment).unwrap_or(0), 0, "{segment}, got: {first:?}");
+    }
+
+    let second = chain.reth_env.prune_like_full_node()?;
+    assert!(second.iter().all(|(_, count)| *count == 0), "nothing left to prune, got: {second:?}");
+
+    // the blocks and the state are untouched
+    assert_eq!(chain.reth_env.sealed_header_by_number(4)?.as_ref(), Some(&tip_before));
+    assert_eq!(chain.state_at(3)?, (U256::from(3u64), 2), "history of recent blocks is kept");
+    Ok(())
+}

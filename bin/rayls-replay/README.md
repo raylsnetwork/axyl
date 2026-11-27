@@ -203,6 +203,7 @@ resume from the unwound tip. Use this to retry a run that diverged partway.
 | `--from-block <N>` | `1` | First block to replay (inclusive). |
 | `--to-block <N>` | snapshot tip | Last block to replay (inclusive). Clamped to the tip. |
 | `--unwind-to <BLOCK>` | off | Unwind the archive to this block and exit. |
+| `--prune-full` | off | Prune the archive once at the end, the way a node with `--full` does. For a datadir a pruned node will start on. |
 | `--verify-every-block` | off | Verify the state root after every block, not just epoch boundaries. |
 | `--progress-interval <N>` | `500` | Emit a progress line every N blocks. |
 | `--storage-v2 <BOOL>` | `true` | Storage layout of the archive that is written: v2 (`static_files` + RocksDB), as nodes run with `--storage.v2`. |
@@ -215,6 +216,16 @@ On success the archive datadir contains the rebuilt EVM `db/` plus the snapshot'
 consensus and config artifacts (`consensus-db/`, `genesis/`, `parameters.yaml`,
 `node-info.yaml`, `node-keys/`, `network-config/`), copied so the datadir is
 self-contained for Observer boot.
+
+### A datadir for a pruned node (`--prune-full`)
+
+A replay writes a full datadir. A node with `--full` (a validator) that starts on it prunes the
+whole chain in one run, right after its first saved block. That run has no limit, and no block
+reaches the disk while it runs. Measured on a laptop: 6 minutes for 15 million blocks and 9
+minutes for 25 million.
+
+With `--prune-full` the replay does that prune itself as its last step. The node then starts
+with nothing left to prune. Do not use the flag for an archive node: it needs the full data.
 
 ## Module layout
 
