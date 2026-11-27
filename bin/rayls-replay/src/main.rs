@@ -102,6 +102,13 @@ struct Cli {
     #[arg(long, value_name = "BLOCK")]
     unwind_to: Option<u64>,
 
+    /// Prune the archive datadir once at the end, the way a node with `--full` does. Use it
+    /// for a datadir that a pruned node (a validator) will start on: without it the node
+    /// prunes the whole chain on its first saved block, which takes minutes and holds back the
+    /// saving of blocks. Do not use it for an archive node.
+    #[arg(long)]
+    prune_full: bool,
+
     /// Verify state root after every block (slow). Default: epoch boundaries only.
     #[arg(long)]
     verify_every_block: bool,
@@ -317,6 +324,23 @@ async fn run(cli: Cli) -> eyre::Result<()> {
             "rayls-replay stopped gracefully; flushed to tip, re-run to resume"
         );
         return Ok(());
+    }
+
+    // a pruned node would do this prune on its first saved block, in one long run
+    if cli.prune_full {
+        let started = std::time::Instant::now();
+        info!(target: "rayls_replay::main", "pruning the archive like a node with --full");
+        let prune_env = archive_evm.clone();
+        let pruned = tokio::task::spawn_blocking(move || prune_env.prune_like_full_node())
+            .await
+            .wrap_err("prune task")?
+            .wrap_err("prune the archive datadir")?;
+        info!(
+            target: "rayls_replay::main",
+            elapsed_secs = started.elapsed().as_secs(),
+            ?pruned,
+            "archive pruned; a node with --full has nothing left to prune at its start"
+        );
     }
 
     // close the DB envs before the copy so no MDBX handle still maps the files;

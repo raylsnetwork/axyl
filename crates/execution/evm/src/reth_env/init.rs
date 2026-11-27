@@ -579,6 +579,48 @@ impl RethEnv {
         Ok(())
     }
 
+    /// Prune the saved chain once, the way a node with `--full` prunes it.
+    ///
+    /// For offline tooling (`rayls-replay --prune-full`). A replay writes a full datadir. A node
+    /// with `--full` that starts on it prunes the whole chain in one run, right after its first
+    /// saved block and on the thread that saves blocks. That run has no limit and takes minutes
+    /// (measured: 6 minutes for 15 million blocks), and no block reaches the disk meanwhile.
+    /// Running the same prune here, offline, leaves nothing for the node to do.
+    ///
+    /// Uses the prune settings of `--full` and reth's pruner with its defaults, the same as the
+    /// node's persistence service. Call it after the last block is flushed to disk. Returns the
+    /// number of pruned entries per segment.
+    #[cfg(feature = "archive-replay")]
+    pub fn prune_like_full_node(&self) -> eyre::Result<Vec<(String, usize)>> {
+        use reth_node_core::args::PruningArgs;
+        use reth_prune::PrunerBuilder;
+
+        let config = PruningArgs { full: true, ..Default::default() }
+            .prune_config(self.node_config.chain.as_ref())
+            .ok_or_else(|| eyre::eyre!("--full gives no prune config"))?;
+        let tip = self.blockchain_provider.database_provider_ro()?.best_block_number()?;
+        let mut pruner =
+            PrunerBuilder::new(config).build_with_provider_factory(self.provider_factory.clone());
+
+        let mut pruned: Vec<(String, usize)> = Vec::new();
+        loop {
+            let output = pruner.run(tip)?;
+            for (segment, segment_output) in &output.segments {
+                let name = format!("{segment:?}");
+                match pruned.iter_mut().find(|(seen, _)| *seen == name) {
+                    Some((_, count)) => *count += segment_output.pruned,
+                    None => pruned.push((name, segment_output.pruned)),
+                }
+            }
+            // the pruner has no limit here, so one run finishes; the loop only guards a change
+            // of that default
+            if output.progress.is_finished() {
+                break;
+            }
+        }
+        Ok(pruned)
+    }
+
     /// Unwind the persisted chain down to `target_block`, reverting MDBX, static
     /// files, and RocksDB so a subsequent run resumes from the target.
     ///
