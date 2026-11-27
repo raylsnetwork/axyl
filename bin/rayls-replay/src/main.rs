@@ -705,4 +705,43 @@ mod tests {
         let root = tempfile::tempdir().expect("temp dir");
         assert!(check(&root.path().join("nope"), root.path()).is_err());
     }
+
+    /// The genesis and parameters files in `chain-configs/` are the real ones: the genesis of
+    /// each network gives the hash of block 0 of that network, and the parameters parse.
+    ///
+    /// The hashes were taken from snapshots of the live networks (#420). A change in how this
+    /// code builds a genesis block, or an edit of one of the files, fails here.
+    #[test]
+    fn chain_configs_give_the_real_genesis_hashes() -> eyre::Result<()> {
+        use reth_chainspec::EthChainSpec as _;
+
+        // network, chain id, hash of block 0 on the live network
+        let networks = [
+            (
+                "mainnet",
+                72_957u64,
+                "0x500426d91e3e8fa5cf39722f8c4ef5765865129b5efbcc25544b39e2acdc3b91",
+            ),
+            (
+                "testnet",
+                7_295_799u64,
+                "0x33b818f13cab5c2e3e7bb589cbd0612e78e1139f3add29f0d5f0d6a03a5c9545",
+            ),
+        ];
+        let configs = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../chain-configs");
+        for (network, chain_id, genesis_hash) in networks {
+            let dir = configs.join(network);
+            let chain = base_chain_spec(&dir.join("genesis.yaml"))?;
+            assert_eq!(chain.chain().id(), chain_id, "{network}: chain id");
+            assert_eq!(
+                format!("{:?}", chain.genesis_hash()),
+                genesis_hash,
+                "{network}: genesis hash"
+            );
+
+            let params = network_params(&dir.join("parameters.yaml"))?;
+            assert!(params.basefee_address.is_some(), "{network}: basefee_address is set");
+        }
+        Ok(())
+    }
 }
