@@ -88,6 +88,22 @@ fn page_size(dat: &Path) -> u64 {
     }
 }
 
+/// The three meta pages, oldest commit first. MDBX writes each commit to the next meta page in
+/// turn, so which page holds the newest one depends on how many commits built the database. The
+/// transaction id sits after the 20-byte page header and the 8-byte magic and version.
+fn meta_pages_oldest_first(dat: &Path, page: u64) -> [u64; 3] {
+    use std::io::Read as _;
+    let mut head = vec![0u8; 3 * page as usize];
+    fs::File::open(dat).unwrap().read_exact(&mut head).unwrap();
+    let txnid = |i: u64| {
+        let at = (i * page) as usize + 28;
+        u64::from_le_bytes(head[at..at + 8].try_into().unwrap())
+    };
+    let mut pages = [0, 1, 2];
+    pages.sort_by_key(|&i| txnid(i));
+    pages
+}
+
 /// Allocated extent of the datafile: MDBX pages live in the first used bytes of the sparse file.
 fn used_bytes(dat: &Path) -> u64 {
     use std::os::unix::fs::MetadataExt as _;
@@ -175,21 +191,31 @@ fn damaged_databases_never_panic_and_stay_readable_where_mdbx_allows() {
     let root = tempfile::tempdir().unwrap();
     let dat_used = used_bytes(&source.join("mdbx.dat"));
     let page = page_size(&source.join("mdbx.dat"));
+    let [oldest, middle, newest] = meta_pages_oldest_first(&source.join("mdbx.dat"), page);
     let _ = Bytes::new();
 
     // (name, damage, must the database still open?)
     let variants: Vec<Variant<'_>> = vec![
         ("intact copy", Box::new(|_| {}), true),
-        // The page size is read from a surviving backup meta page, so the first two open anywhere.
+        // The page size is read from a surviving meta page, so losing older ones still opens.
         (
-            "meta page 0 zeroed",
-            Box::new(move |d| zero_range(&d.join("mdbx.dat"), 0, page as usize)),
+            "oldest meta page zeroed",
+            Box::new(move |d| zero_range(&d.join("mdbx.dat"), oldest * page, page as usize)),
             true,
         ),
         (
-            "meta pages 0 and 1 zeroed",
-            Box::new(move |d| zero_range(&d.join("mdbx.dat"), 0, 2 * page as usize)),
+            "two oldest meta pages zeroed",
+            Box::new(move |d| {
+                zero_range(&d.join("mdbx.dat"), oldest * page, page as usize);
+                zero_range(&d.join("mdbx.dat"), middle * page, page as usize);
+            }),
             true,
+        ),
+        // Losing the newest commit leaves an older one a read-only open refuses until recovered.
+        (
+            "newest meta page zeroed",
+            Box::new(move |d| zero_range(&d.join("mdbx.dat"), newest * page, page as usize)),
+            false,
         ),
         (
             "all three meta pages zeroed",
@@ -329,10 +355,13 @@ fn damaged_databases_never_panic_and_stay_readable_where_mdbx_allows() {
         if *must_open && matches!(outcomes[0].1, Outcome::Error(_)) {
             unexpected_unopenable.push(format!("{name}: {:?}", outcomes[0].1));
         }
-        // A meta-page case that cannot open must fail with a clean "not an MDBX file".
+        // A meta-page case that cannot open must fail cleanly: "not an MDBX file" when every meta
+        // page is gone, a call to recover when only the newest is.
+        let expected =
+            if name.starts_with("newest") { "until it is recovered" } else { "not an MDBX file" };
         if !*must_open
             && name.contains("meta page")
-            && !matches!(&outcomes[0].1, Outcome::Error(e) if e.contains("not an MDBX file"))
+            && !matches!(&outcomes[0].1, Outcome::Error(e) if e.contains(expected))
         {
             bad_meta_errors.push(format!("{name}: {:?}", outcomes[0].1));
         }
@@ -367,7 +396,7 @@ fn damaged_databases_never_panic_and_stay_readable_where_mdbx_allows() {
     );
     assert!(
         bad_meta_errors.is_empty(),
-        "losing every meta page should fail with 'not an MDBX file':\n{}",
+        "a database that lost its meta pages should fail with a clean error:\n{}",
         bad_meta_errors.join("\n")
     );
 }

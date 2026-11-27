@@ -1,7 +1,8 @@
 //! Constants and trait implementations for network compatibility.
 
 use crate::{
-    codec::RLMessage, error::NetworkError, peers::Penalty, GossipMessage, PeerExchangeMap,
+    admission::RequestPermits, codec::RLMessage, error::NetworkError, peers::Penalty,
+    GossipMessage, PeerExchangeMap,
 };
 pub use libp2p::gossipsub::MessageId;
 use libp2p::{
@@ -313,6 +314,8 @@ pub enum NetworkEvent<Req, Res> {
         channel: ResponseChannel<Res>,
         /// The oneshot channel if the request gets cancelled at the network level.
         cancel: oneshot::Receiver<()>,
+        /// The permits taken for a request with an admission class, to keep until its work ends.
+        permits: Option<RequestPermits>,
     },
     /// Gossip message received and propagation source.
     Gossip(GossipMessage, BlsPublicKey),
@@ -552,6 +555,8 @@ where
     NewEpoch {
         /// The epoch committee.
         committee: HashSet<BlsPublicKey>,
+        /// The previous epoch's committee, whose members may still be finishing it.
+        previous: HashSet<BlsPublicKey>,
         /// Every registered validator (committee, lookahead, and each staked key the registry
         /// knows). Node records are kept in the kad store for these keys only.
         registered: HashSet<BlsPublicKey>,
@@ -794,9 +799,10 @@ where
     pub async fn new_epoch(
         &self,
         committee: HashSet<BlsPublicKey>,
+        previous: HashSet<BlsPublicKey>,
         registered: HashSet<BlsPublicKey>,
     ) -> NetworkResult<()> {
-        self.sender.send(NetworkCommand::NewEpoch { committee, registered }).await?;
+        self.sender.send(NetworkCommand::NewEpoch { committee, previous, registered }).await?;
         Ok(())
     }
 

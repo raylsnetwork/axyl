@@ -2,6 +2,7 @@
 
 use super::*;
 use crate::{
+    admission::{AdmissionClass, ClassValues},
     common::{
         create_multiaddr, TestPrimaryRequest, TestPrimaryResponse, TestWorkerRequest,
         TestWorkerResponse, TEST_HEARTBEAT_INTERVAL,
@@ -70,6 +71,7 @@ fn create_test_peers<Req: RLMessage, Res: RLMessage>(
                 KadStoreType::Primary,
                 config.primary_address(),
                 metrics.clone(),
+                Vec::new(),
             )
             .expect("peer1 network created");
 
@@ -144,6 +146,27 @@ where
     Req: RLMessage,
     Res: RLMessage,
 {
+    create_test_types_with_admission(roomy_admission())
+}
+
+/// Values for every class the test request types map, with room for any test: a swarm
+/// refuses a mapped class it has no values for.
+fn roomy_admission() -> Vec<(AdmissionClass, ClassValues)> {
+    let roomy = NonZeroUsize::new(64).expect("non-zero");
+    vec![(
+        AdmissionClass::MissingCertificates,
+        ClassValues { jobs_per_peer: roomy, jobs_others: roomy },
+    )]
+}
+
+/// Like [create_test_types], with peer2's swarm admitting `admission` and peer1 roomy values.
+fn create_test_types_with_admission<Req, Res>(
+    admission: Vec<(AdmissionClass, ClassValues)>,
+) -> TestTypes<Req, Res>
+where
+    Req: RLMessage,
+    Res: RLMessage,
+{
     // custom network config with short heartbeat interval for peer manager
     let mut network_config = NetworkConfig::default();
     network_config.peer_config_mut().heartbeat_interval = TEST_HEARTBEAT_INTERVAL;
@@ -174,6 +197,7 @@ where
             KadStoreType::Primary,
             config_1.primary_address(),
             metrics_1.clone(),
+            roomy_admission(),
         )
         .expect("peer1 network created");
     let network_handle_1 = peer1_network.network_handle();
@@ -198,6 +222,7 @@ where
             KadStoreType::Primary,
             config_2.primary_address(),
             metrics_2.clone(),
+            admission,
         )
         .expect("peer2 network created");
     let network_handle_2 = peer2_network.network_handle();
@@ -275,6 +300,89 @@ async fn test_valid_req_restt() -> eyre::Result<()> {
 
     // expect response
     let response = timeout(max_time, response_from_peer).await?.expect("outbound id recv")?;
+    assert_eq!(response, batch_res);
+
+    Ok(())
+}
+
+/// A request of an admitted class takes a slot in the swarm loop, a request over the limit
+/// is answered busy there, and the slot comes back when the application drops the permits.
+#[tokio::test]
+async fn test_admitted_request_is_refused_busy_at_the_swarm() -> eyre::Result<()> {
+    let one = NonZeroUsize::MIN;
+    // Peer2 admits one missing-batches job per outside peer, one in total.
+    let TestTypes { peer1, peer2, .. } =
+        create_test_types_with_admission::<TestWorkerRequest, TestWorkerResponse>(vec![(
+            AdmissionClass::MissingCertificates,
+            ClassValues { jobs_per_peer: one, jobs_others: one },
+        )]);
+    let NetworkPeer { config: config_1, network_handle: peer1, network, .. } = peer1;
+    tokio::spawn(async move {
+        network.run().await.expect("network run failed!");
+    });
+    let NetworkPeer {
+        config: config_2,
+        network_handle: peer2,
+        network_events: mut network_events_2,
+        network,
+        network_metrics: metrics_2,
+    } = peer2;
+    tokio::spawn(async move {
+        network.run().await.expect("network run failed!");
+    });
+    peer1.start_listening(config_1.primary_address()).await?;
+    peer2.start_listening(config_2.primary_address()).await?;
+    peer1
+        .add_explicit_peer(
+            config_2.key_config().primary_public_key(),
+            config_2.primary_networkkey(),
+            config_2.primary_address(),
+        )
+        .await?;
+    peer1.dial_by_bls(config_2.key_config().primary_public_key()).await?;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let max_time = Duration::from_secs(5);
+    let missing_block = fixture_batch_with_transactions(3).seal_slow();
+    let batch_req = TestWorkerRequest::MissingBatches(vec![missing_block.digest()]);
+    let batch_res = TestWorkerResponse::MissingBatches { batches: vec![missing_block.clone()] };
+    let peer2_bls = config_2.key_config().primary_public_key();
+
+    // The first request is admitted, and reaches the application with its permits.
+    let _first = peer1.send_request(batch_req.clone(), peer2_bls).await?;
+    let first_event = timeout(max_time, network_events_2.recv()).await?.expect("first event");
+    let NetworkEvent::Request { permits: Some(_), .. } = &first_event else {
+        panic!("admitted request forwarded without permits: {first_event:?}");
+    };
+
+    // While the application holds that job, a second request is refused in the swarm loop.
+    let second = peer1.send_request(batch_req.clone(), peer2_bls).await?;
+    let refused = timeout(max_time, second).await?.expect("outbound id recv")?;
+    assert_eq!(refused, TestWorkerResponse::Busy);
+    let refusals = metrics_2
+        .request_admission_busy
+        .with_label_values(&["missing_certificates", "outsider", "primary"])
+        .get();
+    assert_eq!(refusals, 1, "the refusal was not counted");
+
+    // A request of no admitted class is forwarded as it comes, without permits.
+    let _new_batch =
+        peer1.send_request(TestWorkerRequest::NewBatch(missing_block), peer2_bls).await?;
+    let event = timeout(max_time, network_events_2.recv()).await?.expect("new batch event");
+    let NetworkEvent::Request { permits: None, .. } = &event else {
+        panic!("a request without a class carried permits: {event:?}");
+    };
+
+    // Once the application drops the first job, the slot is free again.
+    drop(first_event);
+    let third = peer1.send_request(batch_req.clone(), peer2_bls).await?;
+    let event = timeout(max_time, network_events_2.recv()).await?.expect("third event");
+    let NetworkEvent::Request { request, channel, permits: Some(_), .. } = event else {
+        panic!("the request after the freed slot was not admitted: {event:?}");
+    };
+    assert_eq!(request, batch_req);
+    peer2.send_response(batch_res.clone(), channel).await?;
+    let response = timeout(max_time, third).await?.expect("outbound id recv")?;
     assert_eq!(response, batch_res);
 
     Ok(())
@@ -725,6 +833,112 @@ async fn test_msg_verification_ignores_unauthorized_publisher() -> eyre::Result<
         nvv_metrics.gossip_ignored.with_label_values(&[TEST_TOPIC, "primary"]).get(),
         1,
         "the second publish was counted as ignored"
+    );
+
+    Ok(())
+}
+
+/// A node with no connection to a registered validator still accepts that validator's gossip
+/// relayed by a peer, attributed from the validator's record. Only `relay` listens, so `follower`
+/// learns the `publisher`'s record through `relay` but neither can connect to the other; before
+/// record attribution `follower` ignored every message the validator published.
+///
+/// To `follower` the publisher is registered but not seated, so it is not an important peer and
+/// the `peer_is_important` fallback in `verify_gossip` cannot admit it: both the publisher-list
+/// check and the forwarding lookup have to attribute it from the record.
+#[tokio::test]
+async fn test_relayed_gossip_from_unconnected_registered_validator_is_accepted() -> eyre::Result<()>
+{
+    let mut network_config = NetworkConfig::default();
+    network_config.peer_config_mut().heartbeat_interval = TEST_HEARTBEAT_INTERVAL;
+    // the relay hands the follower's record query the publisher's outbound address, which never
+    // answers; a short handshake fails that dial fast, so the query closes and admits the record
+    // in seconds instead of at the kad query timeout
+    network_config.quic_config_mut().handshake_timeout = Duration::from_secs(1);
+    let (mut relay, mut others, _task_manager) =
+        create_test_peers::<TestWorkerRequest, TestWorkerResponse>(
+            NonZeroUsize::new(3).expect("non-zero"),
+            Some(network_config),
+        );
+    let mut follower = others.pop().expect("follower");
+    let mut publisher = others.pop().expect("publisher");
+    let registered = relay.config.committee_pub_keys();
+    let publisher_bls = publisher.config.key_config().primary_public_key();
+    let publisher_id: PeerId = publisher.config.primary_networkkey().into();
+    let follower_committee: HashSet<_> =
+        registered.iter().filter(|key| **key != publisher_bls).copied().collect();
+    for peer in [&mut relay, &mut publisher, &mut follower] {
+        let network = peer.network.take().expect("network is some");
+        tokio::spawn(async move {
+            let _ = network.run().await;
+        });
+    }
+
+    // only the relay listens, so the other two can reach each other through it alone. Every key
+    // is registered: the relay stores the publisher's record when it connects, and the follower
+    // may attribute from it. The others run the epoch after connecting, since the epoch dials
+    // the committee and would race the dial below.
+    relay.network_handle.start_listening(relay.config.primary_address()).await?;
+    let relay_addr =
+        relay.network_handle.listeners().await?.first().expect("relay listens").clone();
+    relay
+        .network_handle
+        .new_epoch(registered.clone(), Default::default(), registered.clone())
+        .await?;
+    let relay_bls = relay.config.key_config().primary_public_key();
+    let relay_net = relay.config.primary_networkkey();
+    for (peer, committee) in [(&publisher, &registered), (&follower, &follower_committee)] {
+        peer.network_handle
+            .add_trusted_peer_and_dial(relay_bls, relay_net.clone(), relay_addr.clone())
+            .await?;
+        peer.network_handle
+            .new_epoch(committee.clone(), Default::default(), registered.clone())
+            .await?;
+    }
+    // the topic is open to the registered set, as the consensus-output and epoch-vote topics are
+    for peer in [&relay, &publisher, &follower] {
+        peer.network_handle
+            .subscribe_with_publishers(TEST_TOPIC.into(), registered.clone())
+            .await?;
+    }
+
+    // the follower learns the publisher's record from the relay, a third party. The explicit
+    // lookup stands in for the one a node makes for the upcoming committees at each epoch, which
+    // is how it already holds the records of members it does not count as committee yet or any
+    // more. The record is admitted when the query closes. Neither the mesh nor the query is ready
+    // on a schedule, so query and publish until a message gets through; an early query or
+    // publish that finds no peers yet is retried on the next round. Every round also checks the
+    // follower never reached the publisher: a direct connection would bind it through its own
+    // record and pass the test without the record path.
+    let data = Vec::from("relayed from a registered validator".as_bytes());
+    let (msg, bls) = timeout(Duration::from_secs(20), async {
+        loop {
+            if follower.network_handle.connected_peer_ids().await?.contains(&publisher_id) {
+                return Err(eyre!("the follower reached the publisher directly"));
+            }
+            let _ = follower.network_handle.find_authorities(vec![publisher_bls]).await;
+            let _ = publisher.network_handle.publish(TEST_TOPIC.into(), data.clone()).await;
+            let round = tokio::time::sleep(Duration::from_secs(1));
+            tokio::pin!(round);
+            loop {
+                tokio::select! {
+                    _ = &mut round => break,
+                    event = follower._network_events.recv() => match event {
+                        Some(NetworkEvent::Gossip(msg, bls)) => return eyre::Ok((msg, bls)),
+                        Some(_) => continue,
+                        None => return Err(eyre!("follower event stream closed")),
+                    },
+                }
+            }
+        }
+    })
+    .await??;
+    assert_eq!(msg.source, Some(publisher_id));
+    assert_eq!(msg.data, data);
+    assert_eq!(bls, publisher_bls, "attributed to the publisher's key");
+    assert!(
+        !follower.network_handle.connected_peer_ids().await?.contains(&publisher_id),
+        "the follower must not have reached the publisher directly"
     );
 
     Ok(())
@@ -1309,7 +1523,7 @@ async fn test_new_epoch_unbans_committee_members() -> eyre::Result<()> {
     let handle = peer1.clone();
     tokio::spawn(async move {
         handle
-            .new_epoch(committee.clone(), committee)
+            .new_epoch(committee.clone(), Default::default(), committee)
             .await
             .expect("Failed to send NewEpoch command");
     })
@@ -1426,7 +1640,7 @@ async fn test_new_epoch_unbans_committee_member_ip() -> eyre::Result<()> {
             .into_iter()
             .collect();
 
-    target_peer.network_handle.new_epoch(committee.clone(), committee).await?;
+    target_peer.network_handle.new_epoch(committee.clone(), Default::default(), committee).await?;
 
     // wait for connection to establish
     tokio::time::sleep(Duration::from_secs(TEST_HEARTBEAT_INTERVAL)).await;
@@ -1503,7 +1717,7 @@ async fn test_new_epoch_handles_disconnecting_pending_ban() -> eyre::Result<()> 
     let handle = peer1.clone();
     tokio::spawn(async move {
         handle
-            .new_epoch(committee.clone(), committee)
+            .new_epoch(committee.clone(), Default::default(), committee)
             .await
             .expect("Failed to send NewEpoch command");
     })

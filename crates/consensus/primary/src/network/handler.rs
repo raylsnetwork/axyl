@@ -16,26 +16,26 @@ use crate::{
     ConsensusBus, NodeMode, RecentlyExecutedBlocks,
 };
 use parking_lot::Mutex;
-use rayls_consensus_network::GossipMessage;
+use rayls_consensus_network::{admission::RequestPermits, GossipMessage};
 use rayls_infrastructure_config::{ConsensusConfig, LibP2pConfig};
 use rayls_infrastructure_storage::{
-    tables::ConsensusBlocks, CertScope, CertificateStore, ConsensusStore, EpochStore,
-    ProposerStore, VoteDigestStore,
+    tables::{CertifiedTips, ConsensusBlocks},
+    CertScope, CertificateStore, ConsensusStore, EpochStore, ProposerStore, VoteDigestStore,
 };
 use rayls_infrastructure_types::{
     ensure,
     error::{CertificateError, HeaderError, HeaderResult},
     now, to_intent_message, try_decode, AuthorityIdentifier, B256Map, BlockHash, BlockNumHash,
-    BlsPublicKey, Certificate, CertificateDigest, ConsensusHeader, Database, Epoch,
-    EpochCertificate, EpochRecord, Hash as _, Header, ProtocolSignature, RaylsSender as _, Round,
-    SignatureVerificationState, Vote, VotesAggregator,
+    BlsPublicKey, BlsSignature, Certificate, CertificateDigest, CertifiedTip, ConsensusHeader,
+    Database, Epoch, EpochCertificate, EpochRecord, Hash as _, Header, ProtocolSignature,
+    RaylsSender as _, Round, SignatureVerificationState, Vote, VotesAggregator, B256,
 };
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     sync::Arc,
     time::Duration,
 };
-use tokio::{sync::oneshot, time::Instant};
+use tokio::time::Instant;
 use tracing::{debug, error, info, trace, warn};
 
 const MAX_AUTH_LAST_VOTE_ENTRIES: usize = 1000;
@@ -112,6 +112,55 @@ pub(crate) struct RequestHandler<DB> {
     consensus_certs: Arc<Mutex<B256Map<VotesAggregator<ConsensusResult>>>>,
     /// Commit-progress tracker gating demotion to `CvvInactive` (see [`behind_consensus`]).
     behind_tracker: Arc<Mutex<BehindTracker>>,
+    /// Signers whose epoch vote was already queued, per epoch: one vote per signer and epoch
+    /// reaches the collector. Not pruned: a claim is only taken for an epoch whose record is
+    /// pending, so the map is bounded by the pending table, and the handler is rebuilt with it
+    /// at every epoch.
+    epoch_votes_seen: Arc<Mutex<BTreeMap<Epoch, HashSet<BlsPublicKey>>>>,
+    /// The pending (uncertified) epoch records by digest, as last read from the table.
+    pending_records: Arc<Mutex<PendingRecordCache>>,
+    /// Epoch and number of the stored certified tip, seeded from the table. Checked and moved
+    /// in one step with the write, so two quorums completing at once cannot store the lower one
+    /// last.
+    certified_tip_saved: Arc<Mutex<Option<(Epoch, u64)>>>,
+}
+
+/// Whether a tip certified at `epoch` and `number` replaces the stored one, `saved` as its epoch
+/// and number: only when it is from `floor` or later, and from a later epoch or higher in the
+/// same one. `floor` holds while nothing is stored yet. The epoch comes first: honest numbers
+/// rise across epochs, so a later epoch always wins. A header forged by f+1 retired keys of an
+/// earlier epoch does not get here: the gossip path drops a quorum from a closed epoch unless it
+/// names the header this node holds at that number.
+pub(super) fn replaces_certified_tip(
+    saved: Option<(Epoch, u64)>,
+    floor: Epoch,
+    epoch: Epoch,
+    number: u64,
+) -> bool {
+    epoch >= floor
+        && saved
+            .is_none_or(|(saved_epoch, saved_number)| (epoch, number) > (saved_epoch, saved_number))
+}
+
+/// The gossip handler's view of the pending epoch record table.
+///
+/// Reading the table decodes every row's committees, so it is done only when the epoch manager
+/// has written a row since the last read (`pending_epoch_records_changed` on the bus). A vote
+/// for any other digest, which is what a flood of invented digests is, costs one map lookup.
+/// Certification removes a row without bumping the counter, so a hit is confirmed against the
+/// certified records before it is trusted; hits are bounded by the dedup, so that is cheap.
+///
+/// At a normal close the row is written after the epoch's network has been torn down and before
+/// the next one starts, so the handler reads the table once, on its first vote. The counter
+/// matters for the other writer: `recover_partial_transition`, after a crash mid-transition,
+/// writes the row while this epoch's handler is already running, and the bump is what makes
+/// that handler see it.
+#[derive(Debug, Default)]
+struct PendingRecordCache {
+    /// Value of `pending_epoch_records_changed` the map was read at.
+    version: Option<u64>,
+    /// Epoch and committee of each pending record, by digest.
+    by_digest: HashMap<B256, (Epoch, Vec<BlsPublicKey>)>,
 }
 
 impl<DB> RequestHandler<DB>
@@ -133,7 +182,19 @@ where
                 "committee is larger than a missing-certificates request may name, so missing-certificates requests between members will be refused"
             );
         }
+        let certified_tip_saved = match consensus_config.node_storage().get::<CertifiedTips>(&0) {
+            Ok(tip) => tip.map(|tip| (tip.epoch, tip.number)),
+            Err(e) => {
+                warn!(
+                    target: "primary::handler",
+                    %e,
+                    "failed to read the certified tip, only the epoch floor guards the next one"
+                );
+                None
+            }
+        };
         Self {
+            certified_tip_saved: Arc::new(Mutex::new(certified_tip_saved)),
             consensus_config,
             consensus_bus,
             rayls_consensus_state_sync,
@@ -141,6 +202,41 @@ where
             auth_last_vote: Default::default(),
             consensus_certs: Default::default(),
             behind_tracker: Default::default(),
+            epoch_votes_seen: Default::default(),
+            pending_records: Default::default(),
+        }
+    }
+
+    /// The epoch of the pending record with `digest`, and whether `signer` is in its committee,
+    /// from the cached table.
+    fn pending_record(&self, digest: &B256, signer: &BlsPublicKey) -> Option<(Epoch, bool)> {
+        let version = *self.consensus_bus.pending_epoch_records_changed().borrow();
+        let mut cache = self.pending_records.lock();
+        // `<`, not `!=`: a reader that read the counter earlier must not undo a newer read.
+        if cache.version.is_none_or(|read| read < version) {
+            cache.by_digest = self
+                .consensus_config
+                .node_storage()
+                .pending_epoch_records()
+                .into_iter()
+                .map(|record| (record.digest(), (record.epoch, record.committee)))
+                .collect();
+            cache.version = Some(version);
+        }
+        cache.by_digest.get(digest).map(|(epoch, committee)| (*epoch, committee.contains(signer)))
+    }
+
+    /// Claim the one admission a vote by `signer` for `epoch` gets; `false` when it is taken.
+    /// Check and claim in one step, since every gossip message runs on its own task.
+    fn claim_epoch_vote(&self, epoch: Epoch, signer: BlsPublicKey) -> bool {
+        self.epoch_votes_seen.lock().entry(epoch).or_default().insert(signer)
+    }
+
+    /// Give back the admission claimed by [`Self::claim_epoch_vote`]: the queue refused the
+    /// vote, so a republished copy must get another chance.
+    fn release_epoch_vote(&self, epoch: Epoch, signer: &BlsPublicKey) {
+        if let Some(signers) = self.epoch_votes_seen.lock().get_mut(&epoch) {
+            signers.remove(signer);
         }
     }
 
@@ -339,11 +435,48 @@ where
                             .entry(consensus_result_hash)
                             .or_insert_with(|| VotesAggregator::new(enough_sigs as u64));
                         match aggregator.append(*result, 1) {
-                            Ok(reached) => reached,
+                            // the signatures that reached it, read before any clear below
+                            Ok(true) => {
+                                let signatures = aggregator
+                                    .votes()
+                                    .iter()
+                                    .map(|vote| (vote.validator, vote.signature))
+                                    .collect::<Vec<_>>();
+                                // a closed epoch's quorum is checked against the stored header
+                                // below; taken out under this lock so later voters for the same
+                                // digest do not repeat that check
+                                if epoch < self.consensus_config.committee().epoch() {
+                                    cache.remove(&consensus_result_hash);
+                                }
+                                Some(signatures)
+                            }
+                            Ok(false) => None,
                             Err(_) => return Ok(()),
                         }
                     };
-                    if quorum {
+                    if let Some(signatures) = quorum {
+                        // a node in a later epoch has executed every header of this one, so an
+                        // honest result names the header it holds at that number; anything else
+                        // is f+1 retired keys forging one, which would otherwise be served as the
+                        // certified tip and, as the gossip tip, drop every later result below it
+                        if epoch < self.consensus_config.committee().epoch() {
+                            let held = self
+                                .consensus_config
+                                .node_storage()
+                                .get::<ConsensusBlocks>(&number)
+                                .ok()
+                                .flatten();
+                            if held.is_none_or(|held| held.digest() != hash) {
+                                warn!(
+                                    target: "primary::consensus_result",
+                                    epoch,
+                                    number,
+                                    "quorum from a closed epoch is not the header held at its number, dropping"
+                                );
+                                return Ok(());
+                            }
+                        }
+                        self.save_certified_tip(epoch, round, number, hash, signatures);
                         if self.behind_consensus(epoch, round, Some(number)).await {
                             self.consensus_certs.lock().clear();
                             return Ok(());
@@ -376,9 +509,8 @@ where
                     topic.to_string().eq(&LibP2pConfig::epoch_vote_topic()),
                     PrimaryNetworkError::InvalidTopic
                 );
-                // The signer must be the publisher, checked before the vote is queued: the
-                // collector's committee check reads `vote.public_key`, which the publisher
-                // writes, and only runs at the next epoch close.
+                // The signer must be the publisher: `vote.public_key` is what the committee
+                // check below reads, and the publisher writes it.
                 ensure!(
                     vote.public_key == author,
                     PrimaryNetworkError::GossipAuthorMismatch {
@@ -386,12 +518,69 @@ where
                         claimed: Box::new(vote.public_key)
                     }
                 );
-                let (tx, rx) = oneshot::channel();
-                let _ = self.consensus_bus.new_epoch_votes().send((*vote, tx)).await;
-                match rx.await {
-                    Ok(res) => res?,
-                    // do not punish peer for an internal channel issue
-                    Err(e) => error!(target: "primary", "error waiting on epoch vote result: {e}"),
+                // A vote is admitted here or dropped here; nothing waits on the collector. What
+                // reaches the queue is a verified committee signature over the digest of a
+                // record this node holds uncertified, one per signer and epoch, so the queue
+                // holds at most a committee's worth of votes per pending epoch and a flood of
+                // invented digests or repeated copies never gets past this point. A vote that
+                // arrives before this node has built the record is dropped too: the author
+                // republishes at each fallback while it collects and, once certified, at 1, 2
+                // and 4 s after its quorum; a node that missed those asks a peer for the
+                // certificate once its vote count stops moving across a fallback.
+                //
+                // An uncertified record lives in the pending table (one row per epoch still
+                // being certified, normally one) until its certificate is written, which
+                // removes the row in the same transaction: not pending means unknown here or
+                // already certified, and either way the vote is of no use. The table is read
+                // through a cache (see `PendingRecordCache`), so this is a map lookup.
+                // A registered validator outside the committee can send votes for invented
+                // digests at no penalty; each costs a decode, a lock and this lookup.
+                let Some((epoch, is_member)) = self.pending_record(&vote.epoch_hash, &author)
+                else {
+                    debug!(target: "primary", signer = ?author, digest = %vote.epoch_hash, "dropping epoch vote for a record this node does not hold pending");
+                    return Ok(());
+                };
+                ensure!(
+                    is_member,
+                    PrimaryNetworkError::InvalidHeader(HeaderError::UnknownAuthority(format!(
+                        "{author} not in the committee for epoch {epoch}"
+                    )))
+                );
+                // One admission per signer and epoch. The claim is taken before the signature
+                // check and kept on a bad signature: only the signer itself can publish a vote
+                // naming it, so a bad copy spends its own admission, and that caps what a
+                // member can cost this node at one failed verify per epoch. A refused send
+                // gives the claim back so a republished copy is admitted.
+                if !self.claim_epoch_vote(epoch, author) {
+                    debug!(target: "primary", signer = ?author, epoch, "dropping a repeated epoch vote");
+                    return Ok(());
+                }
+                // The cache can lag certification (the row is removed without bumping the
+                // counter), so a hit is confirmed against the certified records, by epoch: the
+                // record certified for it may be another node's, not the one voted for here.
+                // Checked after the claim, so it runs once per signer and epoch, and before the
+                // signature, so a node that is already done pays no verify for the republishes
+                // of members still collecting.
+                if self
+                    .consensus_config
+                    .node_storage()
+                    .get_epoch_by_number(epoch)
+                    .is_some_and(|(_, cert)| cert.is_some())
+                {
+                    debug!(target: "primary", signer = ?author, epoch, "dropping epoch vote for an epoch certified since the table was read");
+                    return Ok(());
+                }
+                ensure!(
+                    vote.check_signature(),
+                    PrimaryNetworkError::InvalidHeader(HeaderError::PeerNotAuthor)
+                );
+                match self.consensus_bus.new_epoch_votes().try_send(*vote) {
+                    Ok(()) => {}
+                    // bounded by committee x pending epochs, so this is a bug, not load
+                    Err(e) => {
+                        self.release_epoch_vote(epoch, &author);
+                        error!(target: "primary", ?e, epoch, "epoch vote queue refused a vote")
+                    }
                 }
             }
         }
@@ -586,9 +775,10 @@ where
 
         // A vote attests to data availability and structure, not execution state, so it does not
         // wait for execution (waiting only stalls a behind node; fork safety holds because the
-        // commit path re-checks execution and the subscriber BLS-verifies before execution). The
-        // one kept check is a non-blocking breaker: refuse to vote if our own executed block at the
-        // anchor already diverges, so a quorum cannot certify a forked anchor.
+        // commit path re-checks execution and catch-up executes only headers BLS-verified before
+        // they were stored). The one kept check is a non-blocking breaker: refuse to vote if our
+        // own executed block at the anchor already diverges, so a quorum cannot certify a forked
+        // anchor.
         let target = header.latest_execution_block;
         let anchor_forked = anchor_diverges_from_executed(
             &self.consensus_bus.recently_executed_blocks().borrow(),
@@ -866,32 +1056,45 @@ where
     /// Retrieve missing certificates, bounded by time and chunk size.
     /// MDBX reads are offloaded to `spawn_blocking`.
     ///
+    /// A request we cannot serve is answered empty.
     /// The request is checked for size before any bitmap decoding or storage read.
+    /// `permits` were taken by the network, which limits how many of these jobs run
+    /// at once, per peer and in total. The blocking job holds them until it ends,
+    /// even if the request is cancelled.
     pub(crate) async fn retrieve_missing_certs(
         &self,
         request: MissingCertificatesRequest,
         requested_epoch: Option<Epoch>,
+        permits: RequestPermits,
     ) -> PrimaryNetworkResult<PrimaryResponse> {
         // The epoch the request is served from decides which committee its list is sized for.
-        let scope = fetch_scope(requested_epoch, self.consensus_config.committee().epoch());
-        // A request outside our epoch and the kept tail is answered empty, so its size is not
-        // checked. A peer already in the next epoch names that epoch's committee, which may
-        // be larger.
-        if let Some(scope) = scope {
-            let limit = if requested_epoch.is_none() {
-                unstamped_authority_limit(&self.consensus_config)
-            } else {
-                requested_authority_limit(&self.consensus_config, scope)
-            };
-            let named = request.skip_rounds.named();
-            if named > limit {
-                debug!(target: "primary::handler", authorities = named, limit, "missing-certificates request names too many authorities");
-                return Err(PrimaryNetworkError::TooManyAuthorities(named, limit));
-            }
+        let our_epoch = self.consensus_config.committee().epoch();
+        let Some(scope) = fetch_scope(requested_epoch, our_epoch) else {
+            // We do not serve this epoch, so the requester tries another peer.
+            // The size is not checked, since a next-epoch committee may be larger.
+            // Debug level, since any peer can send this for free.
+            debug!(
+                target: "cert-collector",
+                requested_epoch = ?requested_epoch,
+                our_epoch,
+                "missing-certificates request outside our epoch and the kept tail; answering empty"
+            );
+            return Ok(PrimaryResponse::RequestedCertificates(vec![]));
+        };
+        let limit = if requested_epoch.is_none() {
+            unstamped_authority_limit(&self.consensus_config)
+        } else {
+            requested_authority_limit(&self.consensus_config, scope)
+        };
+        let named = request.skip_rounds.named();
+        if named > limit {
+            debug!(target: "primary::handler", authorities = named, limit, "missing-certificates request names too many authorities");
+            return Err(PrimaryNetworkError::TooManyAuthorities(named, limit));
         }
         let consensus_config = self.consensus_config.clone();
         tokio::task::spawn_blocking(move || {
-            collect_missing_certs_blocking(request, requested_epoch, scope, consensus_config)
+            let _permits = permits;
+            collect_missing_certs_blocking(request, scope, consensus_config)
         })
         .await
         .map_err(|e| PrimaryNetworkError::Internal(format!("cert-collector join error: {e}")))?
@@ -910,6 +1113,61 @@ where
         };
 
         Ok(PrimaryResponse::ConsensusHeader(Arc::new(header)))
+    }
+
+    /// Keep the f+1 signatures that just certified a header as this node's certified tip, the
+    /// head it serves to peers. A higher stored tip is kept: gossip only moves forward, but a
+    /// restarted node can hear a lower header reach f+1 before it catches up. So is one from a
+    /// later epoch, and nothing from before the previous epoch is stored even when no row is:
+    /// the row outlives restarts, so f+1 keys of a retired committee could otherwise pin a
+    /// forged high number from their epoch for good. The previous epoch still counts, so a
+    /// chain halted on its last header keeps a tip.
+    ///
+    /// The bitmap indexes the committee the epoch ran with, the one followers verify against,
+    /// never the lookahead the gossip check may have used: a key ejected since the lookahead was
+    /// read would shift every index after it and leave a tip nobody can verify. Nothing is
+    /// stored until that committee is settled.
+    fn save_certified_tip(
+        &self,
+        epoch: Epoch,
+        round: Round,
+        number: u64,
+        hash: BlockHash,
+        signatures: Vec<(BlsPublicKey, BlsSignature)>,
+    ) {
+        let Some(committee) = self.consensus_config.get_settled_committee_keys_for_epoch(epoch)
+        else {
+            return;
+        };
+        let Some(tip) =
+            CertifiedTip::from_signatures(epoch, round, number, hash, &committee, signatures)
+        else {
+            return;
+        };
+        let floor = self.consensus_config.committee().epoch().saturating_sub(1);
+        let mut saved = self.certified_tip_saved.lock();
+        if !replaces_certified_tip(*saved, floor, epoch, number) {
+            return;
+        }
+        match self.consensus_config.node_storage().insert::<CertifiedTips>(&0, &tip) {
+            Ok(()) => *saved = Some((epoch, number)),
+            Err(e) => warn!(
+                target: "primary::consensus_result",
+                number,
+                %e,
+                "failed to save the certified tip"
+            ),
+        }
+    }
+
+    /// Retrieve this node's certified tip from local storage, `None` while it has none.
+    pub(super) async fn retrieve_certified_tip(&self) -> PrimaryNetworkResult<PrimaryResponse> {
+        let tip = self
+            .consensus_config
+            .node_storage()
+            .get::<CertifiedTips>(&0)
+            .map_err(|e| PrimaryNetworkError::Internal(format!("certified tip read: {e}")))?;
+        Ok(PrimaryResponse::CertifiedTip(tip))
     }
 
     /// Retrieve an epoch record from local storage.
@@ -1068,23 +1326,9 @@ const _: () = assert!(MIN_REQUESTED_AUTHORITIES <= MAX_SKIP_ROUND_AUTHORITIES);
 /// Run the cert-collector synchronously inside `spawn_blocking`.
 fn collect_missing_certs_blocking<DB: Database>(
     request: MissingCertificatesRequest,
-    requested_epoch: Option<Epoch>,
-    scope: Option<CertScope>,
+    scope: CertScope,
     consensus_config: ConsensusConfig<DB>,
 ) -> PrimaryNetworkResult<PrimaryResponse> {
-    let our_epoch = consensus_config.committee().epoch();
-    let Some(scope) = scope else {
-        // Either the requester is ahead of us (it closed an epoch we are still finishing, routine
-        // around every boundary) or it asks for an epoch older than the one we kept the tail of.
-        // Neither is served from here; the requester moves on to the next peer.
-        info!(
-            target: "cert-collector",
-            requested_epoch = ?requested_epoch,
-            our_epoch,
-            "missing-certificates request outside our epoch and the kept tail; answering empty"
-        );
-        return Ok(PrimaryResponse::RequestedCertificates(vec![]));
-    };
     let mut collector = CertificateCollector::new(request, consensus_config, scope)?;
 
     let mut missing = Vec::new();

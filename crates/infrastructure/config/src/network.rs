@@ -50,6 +50,12 @@ impl NetworkConfig {
         &self.quic_config
     }
 
+    /// Return a mutable reference to the [QuicConfig].
+    #[cfg(feature = "test-utils")]
+    pub fn quic_config_mut(&mut self) -> &mut QuicConfig {
+        &mut self.quic_config
+    }
+
     /// Return a reference to the [PeerConfig].
     pub fn peer_config(&self) -> &PeerConfig {
         &self.peer_config
@@ -232,6 +238,26 @@ pub struct SyncConfig {
     ///
     /// This value is used by `CertificateValidator::requires_direct_verification`
     pub certificate_verification_chunk_size: usize,
+    /// Missing-certificate jobs a node runs at once for one committee member.
+    /// Older config files lack it, so it falls back to the default.
+    #[serde(default = "SyncConfig::default_max_missing_cert_jobs_per_peer")]
+    pub max_missing_cert_jobs_per_peer: NonZeroUsize,
+    /// Missing-certificate jobs a node runs at once, in total, for all peers outside
+    /// the current and previous committees. At 1, a single such peer can take them all.
+    #[serde(default = "SyncConfig::default_max_missing_cert_jobs_others")]
+    pub max_missing_cert_jobs_others: NonZeroUsize,
+}
+
+impl SyncConfig {
+    /// One live lookup per member, plus one it gave up on that is still running.
+    fn default_max_missing_cert_jobs_per_peer() -> NonZeroUsize {
+        NonZeroUsize::new(2).expect("2 is not zero")
+    }
+
+    /// Room for a few validators catching up that a node does not see as members.
+    fn default_max_missing_cert_jobs_others() -> NonZeroUsize {
+        NonZeroUsize::new(4).expect("4 is not zero")
+    }
 }
 
 impl Default for SyncConfig {
@@ -246,6 +272,8 @@ impl Default for SyncConfig {
             max_num_missing_certs_within_gc_round: 50,
             certificate_verification_round_interval: 50,
             certificate_verification_chunk_size: 50,
+            max_missing_cert_jobs_per_peer: SyncConfig::default_max_missing_cert_jobs_per_peer(),
+            max_missing_cert_jobs_others: SyncConfig::default_max_missing_cert_jobs_others(),
         }
     }
 }
@@ -524,5 +552,41 @@ mod protocol_vec {
                 Ok((protocol, support))
             })
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn network_config_without_missing_cert_job_limits_uses_the_defaults() {
+        // Every node already has a network-config file written before these fields.
+        let yaml = serde_yaml::to_string(&NetworkConfig::default()).expect("serializes");
+        let old_file: String = yaml
+            .lines()
+            .filter(|line| !line.contains("max_missing_cert_jobs_"))
+            .map(|line| format!("{line}\n"))
+            .collect();
+        assert_eq!(old_file.lines().count() + 2, yaml.lines().count(), "both fields removed");
+        let config: NetworkConfig = serde_yaml::from_str(&old_file).expect("parses an old file");
+        assert_eq!(config.sync_config().max_missing_cert_jobs_per_peer.get(), 2);
+        assert_eq!(config.sync_config().max_missing_cert_jobs_others.get(), 4);
+    }
+
+    #[test]
+    fn network_config_reads_missing_cert_job_limits_and_refuses_zero() {
+        let yaml = serde_yaml::to_string(&NetworkConfig::default()).expect("serializes");
+        let with = |field: &str, default: usize, value: usize| {
+            let file = yaml.replace(&format!("{field}: {default}"), &format!("{field}: {value}"));
+            assert_ne!(file, yaml, "{field} must be in the file");
+            serde_yaml::from_str::<NetworkConfig>(&file)
+        };
+        let config = with("max_missing_cert_jobs_per_peer", 2, 3).expect("parses 3");
+        assert_eq!(config.sync_config().max_missing_cert_jobs_per_peer.get(), 3);
+        let config = with("max_missing_cert_jobs_others", 4, 6).expect("parses 6");
+        assert_eq!(config.sync_config().max_missing_cert_jobs_others.get(), 6);
+        assert!(with("max_missing_cert_jobs_per_peer", 2, 0).is_err(), "0 must be refused");
+        assert!(with("max_missing_cert_jobs_others", 4, 0).is_err(), "0 must be refused");
     }
 }

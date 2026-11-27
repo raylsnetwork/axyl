@@ -32,7 +32,7 @@ interface IDelegationPool {
         uint64 undelegateEpoch;
         uint256 undelegateAmount;
         uint256 slashDebt;
-        uint64 lastDelegateEpoch; // epoch of most recent delegation — same-epoch rewards excluded (DP-NEW-002)
+        uint64 lastDelegateEpoch; // arrival epoch; settlement inside it is excluded (DP-NEW-002)
         bool openTier; // immutable after entry; true = Track B (open-tier), false = Track A (whitelisted)
     }
 
@@ -78,6 +78,8 @@ interface IDelegationPool {
     error InvalidConfig();
     error ZeroAddress();
     error ZeroAmount();
+    error SameValidator();
+    error TierMismatch(bool fromOpenTier, bool toOpenTier);
 
     // events
     event PoolRegistered(address indexed validator, uint256 commissionBps);
@@ -100,6 +102,12 @@ interface IDelegationPool {
     );
     event UndelegationCompleted(
         address indexed validator,
+        address indexed delegator,
+        uint256 amount
+    );
+    event StakeTransferred(
+        address indexed fromValidator,
+        address indexed toValidator,
         address indexed delegator,
         uint256 amount
     );
@@ -202,6 +210,32 @@ interface IDelegationPool {
     /// @param validatorAddress The validator to complete undelegation from
     function completeUndelegation(address validatorAddress) external;
 
+    /// @notice Move stake from one validator's pool to another without starting the unbonding period
+    /// @dev Pure internal accounting move — no RLS ever leaves the contract, so the unbonding
+    ///      lock on `requestUndelegation`/`completeUndelegation` is completely unaffected: it
+    ///      still governs actual withdrawal exactly as before. No frequency limit: a per-position
+    ///      one would protect nothing, since the same capital can hop A → B → A regardless. It also
+    ///      cannot create a double payout — the source is settled against the pre-payout
+    ///      accumulator before the destination is credited.
+    /// @dev The moved `amount` must be at least `config.minDelegation`, the same floor `delegate`
+    ///      applies. The source remainder is not floored: partial undelegations and slashing can
+    ///      already leave a balance below it.
+    /// @dev A move is not an entry, so the stake keeps its track: `TierMismatch` reverts if the
+    ///      destination already holds a position on the other track. Fresh destinations inherit the
+    ///      source tier, which keeps Track B holders movable after `disableWhitelist`.
+    /// @dev Like `requestUndelegation` this escapes future `applyPoolSlash` at the source, but at
+    ///      no cost — no unbonding wait, no reward gap. Accepted trade-off.
+    /// @dev Rewards behave like a fresh `delegate()`: stake arriving in epoch E collects epoch E's
+    ///      payout, because epoch close increments the epoch before distributing. No lock-up.
+    /// @param fromValidator The validator to move stake away from
+    /// @param toValidator The validator to move stake to
+    /// @param amount The amount of already-delegated RLS to move (>= `config.minDelegation`)
+    function transferStake(
+        address fromValidator,
+        address toValidator,
+        uint256 amount
+    ) external;
+
     /// @notice Claim accumulated delegation rewards from a validator's pool
     /// @param validatorAddress The validator whose pool to claim from
     function claimDelegationRewards(address validatorAddress) external;
@@ -269,6 +303,25 @@ interface IDelegationPool {
     function getTotalOpenTierDelegatedStake(
         address validatorAddress
     ) external view returns (uint256);
+
+    /// @notice Get a validator's self-delegated stake — its own capital in its own pool
+    /// @dev "Self" is `delegator == validatorAddress`; capital the validator funds from
+    ///      another address counts as third-party.
+    function getSelfDelegatedStake(
+        address validatorAddress
+    ) external view returns (uint256);
+
+    /// @notice Split a validator's delegated backing into its own capital and the rest
+    /// @dev `thirdPartyDelegated` is `total - self`, not a per-holder tally: it also absorbs
+    ///      over-slashed stake no position can withdraw (pre-existing `slashPerShareAccum`
+    ///      defect). Use `getEffectivePosition` for what a holder actually has.
+    function getDelegationComposition(
+        address validatorAddress
+    ) external view returns (
+        uint256 selfDelegated,
+        uint256 thirdPartyDelegated,
+        uint256 totalDelegated
+    );
 
     /// @notice Get a delegator's pending (unclaimed) rewards
     function getPendingRewards(

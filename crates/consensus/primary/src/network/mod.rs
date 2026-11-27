@@ -12,29 +12,33 @@ use crate::{
 use handler::RequestHandler;
 #[cfg(test)]
 pub(crate) use message::MAX_SKIP_ROUND_AUTHORITIES;
-pub use message::{MissingCertificatesRequest, PrimaryRequest, PrimaryResponse, SkipRoundList};
+pub use message::{
+    admission_classes, MissingCertificatesRequest, PrimaryRequest, PrimaryResponse, SkipRoundList,
+};
 // Re-exported so downstream crates (state-sync) can build a `PrimaryNetworkHandle` test mock that
 // answers `NetworkCommand`s without taking a direct dependency on the network crate.
 use message::{PrimaryGossip, PrimaryRPCError};
-#[doc(hidden)]
-pub use rayls_consensus_network::{error::NetworkError, types::NetworkCommand};
 use rayls_consensus_network::{
+    admission::RequestPermits,
     types::{IntoResponse as _, NetworkEvent, NetworkHandle, NetworkResult},
     GossipMessage, Penalty, ResponseChannel,
 };
+#[doc(hidden)]
+pub use rayls_consensus_network::{error::NetworkError, types::NetworkCommand};
 use rayls_infrastructure_config::{ConsensusConfig, LibP2pConfig};
 use rayls_infrastructure_network_types::{
     WorkerOthersBatchMessage, WorkerOwnBatchMessage, WorkerToPrimaryClient,
 };
 use rayls_infrastructure_storage::PayloadStore;
 use rayls_infrastructure_types::{
-    encode, AuthorityIdentifier, BlockHash, BlsPublicKey, BlsSignature, Certificate,
-    CertificateDigest, ConsensusHeader, Database, Epoch, EpochCertificate, EpochRecord, EpochVote,
-    Header, RaylsReceiver, RaylsSender, Round, TaskKind, TaskSpawner, Vote,
+    encode, error::HeaderError, AuthorityIdentifier, BlockHash, BlsPublicKey, BlsSignature,
+    Certificate, CertificateDigest, CertifiedTip, ConsensusHeader, Database, Epoch,
+    EpochCertificate, EpochRecord, EpochVote, Header, RaylsReceiver, RaylsSender, Round, TaskKind,
+    TaskSpawner, Vote,
 };
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
 use tokio::sync::{mpsc, oneshot};
-use tracing::{debug, warn};
+use tracing::{debug, error, warn};
 pub mod handler;
 mod message;
 use crate::network::state::AuthVoteState;
@@ -167,6 +171,12 @@ impl PrimaryNetworkHandle {
             PrimaryResponse::PeerExchange { .. } => Err(NetworkError::RPCError(
                 "Got wrong response, not a vote is peer exchange!".to_string(),
             )),
+            PrimaryResponse::Busy => {
+                Err(NetworkError::RPCError("Got wrong response, not a vote is busy!".to_string()))
+            }
+            PrimaryResponse::CertifiedTip(_) => Err(NetworkError::RPCError(
+                "Got wrong response, not a vote is certified tip!".to_string(),
+            )),
         }
     }
 
@@ -186,6 +196,8 @@ impl PrimaryNetworkHandle {
         let res = res.await??;
         match res {
             PrimaryResponse::RequestedCertificates(certs) => Ok(certs),
+            // A fake busy answer counts only if no other peer answers, when no fallback helps.
+            PrimaryResponse::Busy => Err(NetworkError::PeerBusy),
             PrimaryResponse::Error(PrimaryRPCError(s)) => Err(NetworkError::RPCError(s)),
             _ => Err(NetworkError::RPCError("Got wrong response, not a certificate!".to_string())),
         }
@@ -265,6 +277,19 @@ impl PrimaryNetworkHandle {
             }
         }
         Err(NetworkError::RPCError("Could not get the consensus header!".to_string()))
+    }
+
+    /// Request `peer`'s certified tip, `None` while it has none. The caller verifies it against
+    /// the committee of its epoch: one valid answer is enough to trust the head.
+    pub async fn request_certified_tip_from_peer(
+        &self,
+        peer: BlsPublicKey,
+    ) -> NetworkResult<Option<CertifiedTip>> {
+        let res = self.handle.send_request(PrimaryRequest::CertifiedTip, peer).await?;
+        match res.await?? {
+            PrimaryResponse::CertifiedTip(tip) => Ok(tip),
+            _ => Err(NetworkError::RPCError("Peer did not return a certified tip!".to_string())),
+        }
     }
 
     /// Request the certified epoch record for `epoch` from one specific peer.
@@ -370,7 +395,7 @@ where
     fn process_network_event(&mut self, event: NetworkEvent<Req, Res>) {
         // match event
         match event {
-            NetworkEvent::Request { peer, request, channel, cancel } => match request {
+            NetworkEvent::Request { peer, request, channel, cancel, permits } => match request {
                 PrimaryRequest::Vote { header, parents } => {
                     self.process_vote_request(
                         peer,
@@ -380,11 +405,17 @@ where
                         cancel,
                     );
                 }
-                PrimaryRequest::MissingCertificates { inner } => {
-                    self.process_request_for_missing_certs(peer, inner, None, channel, cancel)
-                }
+                PrimaryRequest::MissingCertificates { inner } => self
+                    .process_request_for_missing_certs(peer, inner, None, permits, channel, cancel),
                 PrimaryRequest::MissingCertificatesInEpoch { inner, epoch } => self
-                    .process_request_for_missing_certs(peer, inner, Some(epoch), channel, cancel),
+                    .process_request_for_missing_certs(
+                        peer,
+                        inner,
+                        Some(epoch),
+                        permits,
+                        channel,
+                        cancel,
+                    ),
                 PrimaryRequest::ConsensusHeader { number, hash } => {
                     self.process_consensus_output_request(peer, number, hash, channel, cancel)
                 }
@@ -393,6 +424,9 @@ where
                 }
                 PrimaryRequest::EpochRecord { epoch, hash } => {
                     self.process_epoch_record_request(peer, epoch, hash, channel, cancel)
+                }
+                PrimaryRequest::CertifiedTip => {
+                    self.process_certified_tip_request(peer, channel, cancel)
                 }
             },
             NetworkEvent::Gossip(msg, gossip_source) => {
@@ -437,21 +471,33 @@ where
     }
 
     /// Attempt to retrieve certificates for a peer that's missing them.
+    ///
+    /// The network took `permits` for this request before forwarding it. The job keeps
+    /// them until its storage scan ends, so a cancelled request still holds its slots
+    /// while the scan runs.
     fn process_request_for_missing_certs(
         &self,
         peer: BlsPublicKey,
         request: MissingCertificatesRequest,
         requested_epoch: Option<Epoch>,
+        permits: Option<RequestPermits>,
         channel: ResponseChannel<PrimaryResponse>,
         cancel: oneshot::Receiver<()>,
     ) {
+        // The network admits this request class and refuses one it has no values for, so a
+        // request without permits is a bug. Dropping the channel fails the request on the
+        // requester's side, with no penalty.
+        let Some(permits) = permits else {
+            error!(target: "primary::network", %peer, "missing-certificates request forwarded without permits");
+            return;
+        };
         // clone for spawned tasks
-        let request_handler = self.request_handler.clone();
         let network_handle = self.network_handle.clone();
+        let request_handler = self.request_handler.clone();
         let task_name = format!("MissingCertsReq-{peer}");
         self.task_spawner.spawn_task(task_name, async move {
             tokio::select! {
-                result = request_handler.retrieve_missing_certs(request, requested_epoch) => {
+                result = request_handler.retrieve_missing_certs(request, requested_epoch, permits) => {
                     // report penalty if any
                     if let Err(ref e) = result {
                         if let Some(penalty) = e.into() {
@@ -524,6 +570,28 @@ where
         });
     }
 
+    /// Serve this node's certified tip from the database.
+    fn process_certified_tip_request(
+        &self,
+        peer: BlsPublicKey,
+        channel: ResponseChannel<PrimaryResponse>,
+        cancel: oneshot::Receiver<()>,
+    ) {
+        let request_handler = self.request_handler.clone();
+        let network_handle = self.network_handle.clone();
+        let task_name = format!("CertifiedTipReq-{peer}");
+        self.task_spawner.spawn_task(task_name, async move {
+            tokio::select! {
+                tip = request_handler.retrieve_certified_tip() => {
+                    let response = tip.into_response();
+                    let _ = network_handle.handle.send_response(response, channel).await;
+                }
+                // cancel notification from network layer
+                _ = cancel => (),
+            }
+        });
+    }
+
     /// Process gossip from committee.
     fn process_gossip(&self, msg: GossipMessage, gossip_source: BlsPublicKey) {
         // clone for spawned tasks
@@ -534,12 +602,15 @@ where
         self.task_spawner.spawn_task(task_name, async move {
             if let Err(ref e) = request_handler.process_gossip(&msg, gossip_source).await {
                 // pending certificates are expected when they arrive before parents; a signer
-                // mismatch is one line per forged message from a publisher that may be a
-                // penalty-exempt committee member, so it must not be able to fill the log
+                // mismatch, and an epoch vote from a signer outside the record's committee
+                // (refused before the per-signer dedup), are one line per forged message from a
+                // publisher that may be a penalty-exempt committee member, so they must not be
+                // able to fill the log. The penalty below still applies.
                 if matches!(
                     e,
                     PrimaryNetworkError::Certificate(CertManagerError::Pending(_))
                         | PrimaryNetworkError::GossipAuthorMismatch { .. }
+                        | PrimaryNetworkError::InvalidHeader(HeaderError::UnknownAuthority(_))
                 ) {
                     debug!(target: "primary::network", ?e, "process_gossip");
                 } else {

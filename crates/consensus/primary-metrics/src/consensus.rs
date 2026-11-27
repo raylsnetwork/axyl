@@ -26,6 +26,13 @@ pub struct ConsensusMetrics {
     /// The number of certificates from consensus that were restored and sent to the executor
     /// following a node restart
     pub recovered_consensus_output: IntCounter,
+    /// Epoch records this node certified from a quorum of collected votes
+    pub epoch_certified_by_quorum: IntCounter,
+    /// Epoch records this node certified from a peer's certificate instead of collected votes:
+    /// the fast path at a close it reached late, or a certificate that landed while collecting.
+    /// A certificate for a record other than the one this node built counts here too; the
+    /// collector warns about that case in the log
+    pub epoch_certified_by_fetch: IntCounter,
     /// The latency between two successful commit rounds
     pub commit_rounds_latency: Histogram,
     /// The number of certificates committed per commit round
@@ -99,6 +106,16 @@ impl ConsensusMetrics {
             recovered_consensus_output: register_int_counter_with_registry!(
                 "recovered_consensus_output",
                 "The number of certificates from consensus that were restored and sent to the executor following a node restart",
+                registry
+            )?,
+            epoch_certified_by_quorum: register_int_counter_with_registry!(
+                "epoch_certified_by_quorum",
+                "Epoch records this node certified from a quorum of collected votes",
+                registry
+            )?,
+            epoch_certified_by_fetch: register_int_counter_with_registry!(
+                "epoch_certified_by_fetch",
+                "Epoch records this node certified from a peer's certificate instead of collected votes",
                 registry
             )?,
             commit_rounds_latency: register_histogram_with_registry!(

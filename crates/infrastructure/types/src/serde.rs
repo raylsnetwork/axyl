@@ -163,8 +163,9 @@ fn check_signer_bitmap_block_bound(bytes: &[u8]) -> Result<(), String> {
 ///
 /// Decode applies the signer-bitmap rules: at most [`MAX_SIGNER_BITMAP_BLOCKS`] container(s), at
 /// key 0, holding at most [`MAX_SIGNER_COUNT`] signers (issue #256). Its users are the signer
-/// bitmaps of `Certificate` and `EpochCertificate`; it is not a general roaring serde, and a
-/// bitmap that legitimately spans more blocks or signers (e.g. rounds) must not use it.
+/// bitmaps of `Certificate`, `EpochCertificate` and `CertifiedTip`; it is not a general roaring
+/// serde, and a bitmap that legitimately spans more blocks or signers (e.g. rounds) must not use
+/// it.
 pub(crate) struct SignerBitmapSerde;
 
 impl SerializeAs<RoaringBitmap> for SignerBitmapSerde {
@@ -246,7 +247,7 @@ mod tests {
         check_signer_bitmap_block_bound, roaring_header, RoaringBitmap, MAX_SIGNER_BITMAP_BLOCKS,
         MAX_SIGNER_COUNT,
     };
-    use crate::{Certificate, EpochCertificate};
+    use crate::{Certificate, CertifiedTip, EpochCertificate};
 
     /// Regression for issue #55. This byte sequence — found by the
     /// `bcs_roundtrip` fuzz target — decodes into a `Certificate` whose
@@ -506,6 +507,34 @@ mod tests {
         assert!(
             err.to_string().contains("-block bound"),
             "epoch certificate refused for the wrong reason: {err}"
+        );
+    }
+
+    /// A certified tip arrives from any connected peer and uses the same signer-bitmap decoder; a
+    /// two-block bitmap must be refused there as well.
+    #[test]
+    fn signer_bitmap_certified_tip_two_full_blocks_is_rejected() {
+        let mut signed_authorities = RoaringBitmap::new();
+        signed_authorities.insert_range(0..(2 * BLOCK) as u32);
+        let tip = CertifiedTip {
+            epoch: 0,
+            round: 0,
+            number: 0,
+            hash: Default::default(),
+            signature: Default::default(),
+            signed_authorities,
+        };
+        let bytes = bcs::to_bytes(&tip).expect("encode certified tip");
+        let err = match bcs::from_bytes::<CertifiedTip>(&bytes) {
+            Ok(decoded) => panic!(
+                "certified tip decoded with {} signers, it must be refused",
+                decoded.signed_authorities.len()
+            ),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string().contains("-block bound"),
+            "certified tip refused for the wrong reason: {err}"
         );
     }
 

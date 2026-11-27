@@ -130,6 +130,13 @@ where
             .await
             .rayls_chain_spec()
             .rayls_fork_activation_block(RaylsHardFork::CertificateFetchEpochV2);
+        // state-sync picks how it finds the network head on this fork, against the
+        // executed tip
+        let certified_tip_v1_block = engine
+            .get_reth_env()
+            .await
+            .rayls_chain_spec()
+            .rayls_fork_activation_block(RaylsHardFork::CertifiedTipV1);
 
         // create config for consensus
         let consensus_config = ConsensusConfig::new_for_epoch(
@@ -142,7 +149,8 @@ where
             epoch_boundary,
             self.initial_epoch,
         )?
-        .with_certificate_fetch_epoch_v2_block(certificate_fetch_epoch_v2_block);
+        .with_certificate_fetch_epoch_v2_block(certificate_fetch_epoch_v2_block)
+        .with_certified_tip_v1_block(certified_tip_v1_block);
 
         Ok((consensus_config, next_vals.into_iter().collect()))
     }

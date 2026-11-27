@@ -63,6 +63,9 @@ impl RaylsHardFork {
             // delegate frames into 0x0400, so replaying pre-activation history must keep accepting
             // them.
             ScheduledFork::new(Self::Erc20PrecompileDirectCall, ForkCondition::Never),
+            // Never until SRE schedules an activation block, any one after every node runs a
+            // release that serves its certified tip.
+            ScheduledFork::new(Self::CertifiedTipV1, ForkCondition::Never),
         ]
     }
 
@@ -91,7 +94,9 @@ impl RaylsHardFork {
             ScheduledFork::new(Self::EpochCloseSeedV2, ForkCondition::Block(24_525_000)),
             ScheduledFork::new(Self::CertificateFetchEpochV2, ForkCondition::Block(24_525_000)),
             ScheduledFork::new(Self::Erc20PrecompileDirectCall, ForkCondition::Block(24_525_000)),
-        ]
+            // Never until SRE schedules an activation block, any one after every node runs a
+            // release that serves its certified tip.
+            ScheduledFork::new(Self::CertifiedTipV1, ForkCondition::Never),        ]
     }
 
     /// Mainnet hardfork schedule.
@@ -119,7 +124,9 @@ impl RaylsHardFork {
             ScheduledFork::new(Self::EpochCloseSeedV2, ForkCondition::Block(15_572_000)),
             ScheduledFork::new(Self::CertificateFetchEpochV2, ForkCondition::Block(15_572_000)),
             ScheduledFork::new(Self::Erc20PrecompileDirectCall, ForkCondition::Block(15_572_000)),
-        ]
+            // Never until SRE schedules an activation block, any one after every node runs a
+            // release that serves its certified tip.
+            ScheduledFork::new(Self::CertifiedTipV1, ForkCondition::Never),        ]
     }
 
     /// Local network hardfork schedule
@@ -155,6 +162,7 @@ impl RaylsHardFork {
             ScheduledFork::new(Self::CertificateFetchEpochV2, ForkCondition::Block(0)),
             // Local is ephemeral: activate from genesis so the direct-call guard is exercised.
             ScheduledFork::new(Self::Erc20PrecompileDirectCall, ForkCondition::Block(0)),
+            ScheduledFork::new(Self::CertifiedTipV1, ForkCondition::Block(0)),
         ]
     }
 

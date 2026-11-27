@@ -371,7 +371,10 @@ where
                 if let Some(peer) = self.swarm.behaviour().peer_manager.bound_auth_to_peer(peer) {
                     self.swarm.behaviour_mut().peer_manager.process_penalty(peer, penalty);
                 } else {
-                    warn!(target: "peer-manager", ?peer, "unable to assess penalty for peer");
+                    // debug, not warn: gossip attributed from a registered validator's record
+                    // reaches here once per message for a key with no binding, and a validator
+                    // must not be able to fill the log of every node it is not connected to
+                    debug!(target: "peer-manager", ?peer, "unable to assess penalty for peer");
                 }
             }
             NetworkCommand::DisconnectPeer { peer_id, reply } => {
@@ -383,7 +386,11 @@ where
                 let peers = self.swarm.behaviour_mut().peer_manager.peers_for_exchange();
                 send_or_log_error!(reply, peers, "PeersForExchange");
             }
-            NetworkCommand::NewEpoch { committee, registered } => {
+            NetworkCommand::NewEpoch { committee, previous, registered } => {
+                // Members of this and the previous committee get their own share of each
+                // admitted request class; the previous ones may still be finishing their epoch.
+                let members = committee.union(&previous).copied().collect();
+                self.request_slots = self.request_limits.for_members(&members);
                 // at the start of a new epoch, each node needs to know:
                 // - the current committee, so its members are never banned
                 // - every registered validator, so their node records (and only theirs) are

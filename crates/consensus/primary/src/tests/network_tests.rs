@@ -3,9 +3,9 @@
 use crate::{
     error::PrimaryNetworkError,
     network::{
-        handler::fetch_scope,
+        handler::{fetch_scope, replaces_certified_tip},
         message::{ConsensusResult, PrimaryGossip},
-        MissingCertificatesRequest, PrimaryRequest, RequestHandler,
+        MissingCertificatesRequest, PrimaryRequest, PrimaryResponse, RequestHandler,
     },
     state_sync::StateSynchronizer,
     ConsensusBus,
@@ -13,12 +13,13 @@ use crate::{
 use assert_matches::assert_matches;
 use rayls_consensus_network::{GossipMessage, Penalty, TopicHash};
 use rayls_consensus_primary::test_utils::make_optimal_signed_certificates;
-use rayls_infrastructure_config::LibP2pConfig;
+use rayls_infrastructure_config::{ConsensusConfig, LibP2pConfig};
 use rayls_infrastructure_storage::{mem_db::MemDatabase, CertScope, CertificateStore as _};
 use rayls_infrastructure_types::{
-    encode, error::HeaderError, now, AuthorityIdentifier, BlockHash, BlockHeader, BlockNumHash,
-    BlsPublicKey, Certificate, CertificateDigest, EpochVote, ExecHeader, Hash as _, RaylsReceiver,
-    RaylsSender, SealedHeader, TaskManager,
+    encode, error::HeaderError, now, to_intent_message, AuthorityIdentifier, BlockHash,
+    BlockHeader, BlockNumHash, BlsPublicKey, Certificate, CertificateDigest, CertifiedTip,
+    CommitteeLookahead, EpochVote, ExecHeader, Hash as _, RaylsReceiver, RaylsSender, SealedHeader,
+    Signer as _, TaskManager,
 };
 use rayls_testing_test_utils_committee::CommitteeFixture;
 use std::collections::{BTreeMap, BTreeSet};
@@ -412,9 +413,7 @@ async fn test_primary_batch_gossip_topics() {
 
     task_manager.spawn_task("process-gossip-test", async move {
         let mut rx = consensus_bus.new_epoch_votes().subscribe();
-        while let Some((_, tx)) = rx.recv().await {
-            let _ = tx.send(Ok(()));
-        }
+        while rx.recv().await.is_some() {}
     });
 
     // the default payloads name the default key as their signer, so they are published under it
@@ -461,6 +460,152 @@ async fn test_primary_batch_gossip_topics() {
     assert!(handler.process_gossip(&bad_msg, author).await.is_err());
 }
 
+/// An epoch vote is queued only as a verified committee signature over the digest of a record
+/// this node holds uncertified, once per signer and epoch. Unknown or certified records and
+/// repeats are dropped without a penalty, outsiders and bad signatures are rejected with one,
+/// and the handler never waits on the collector.
+#[tokio::test]
+async fn test_epoch_vote_admission() -> eyre::Result<()> {
+    use rand::{rngs::StdRng, SeedableRng};
+    use rayls_infrastructure_storage::EpochStore as _;
+    use rayls_infrastructure_types::{
+        BlsKeypair, BlsSignature, BlsSigner, EpochCertificate, EpochRecord, Signer as _, B256,
+    };
+    use std::sync::Arc;
+
+    #[derive(Clone)]
+    struct TestSigner(Arc<BlsKeypair>);
+    impl BlsSigner for TestSigner {
+        fn request_signature_direct(&self, msg: &[u8]) -> BlsSignature {
+            self.0.sign(msg)
+        }
+        fn public_key(&self) -> BlsPublicKey {
+            *self.0.public()
+        }
+    }
+
+    let TestTypes { handler, committee, consensus_bus, .. } = create_test_types();
+    let db = committee.first_authority().consensus_config().node_storage().clone();
+    let mut queue = consensus_bus.new_epoch_votes().subscribe();
+    let mut rng = StdRng::seed_from_u64(5);
+    let member = TestSigner(Arc::new(BlsKeypair::generate(&mut rng)));
+    let other_member = TestSigner(Arc::new(BlsKeypair::generate(&mut rng)));
+    let third_member = TestSigner(Arc::new(BlsKeypair::generate(&mut rng)));
+    let fourth_member = TestSigner(Arc::new(BlsKeypair::generate(&mut rng)));
+    let outsider = TestSigner(Arc::new(BlsKeypair::generate(&mut rng)));
+    let topic = TopicHash::from_raw(LibP2pConfig::epoch_vote_topic());
+    let gossip = |vote: EpochVote| GossipMessage {
+        source: None,
+        data: encode(&PrimaryGossip::EpochVote(Box::new(vote))),
+        sequence_number: None,
+        topic: topic.clone(),
+    };
+    let committee_keys = vec![
+        member.public_key(),
+        other_member.public_key(),
+        third_member.public_key(),
+        fourth_member.public_key(),
+    ];
+    // the close writes the uncertified record to the pending table and announces it
+    let pending_written =
+        || consensus_bus.pending_epoch_records_changed().send_modify(|version| *version += 1);
+    let pending = EpochRecord { epoch: 7, committee: committee_keys.clone(), ..Default::default() };
+    db.save_pending_epoch_record(&pending)?;
+    pending_written();
+
+    // a record this node does not hold: dropped, no penalty
+    let unknown = EpochRecord { epoch: 8, committee: committee_keys.clone(), ..Default::default() };
+    handler.process_gossip(&gossip(unknown.sign_vote(&member)), member.public_key()).await?;
+    assert!(queue.try_recv().is_err());
+
+    // not in the record's committee: rejected with a penalty
+    let res =
+        handler.process_gossip(&gossip(pending.sign_vote(&outsider)), outsider.public_key()).await;
+    assert_matches!(Option::<Penalty>::from(&res.unwrap_err()), Some(Penalty::Fatal));
+    assert!(queue.try_recv().is_err());
+
+    // a member's bad signature: rejected with a penalty, and it spends that signer's one
+    // admission for the epoch (only the signer can publish a vote naming it), so a member
+    // cannot cost this node more than one failed verify per epoch
+    let mut forged = pending.sign_vote(&other_member);
+    forged.signature = unknown.sign_vote(&other_member).signature;
+    let res = handler.process_gossip(&gossip(forged), other_member.public_key()).await;
+    assert_matches!(Option::<Penalty>::from(&res.unwrap_err()), Some(Penalty::Fatal));
+    assert!(queue.try_recv().is_err());
+    let valid = pending.sign_vote(&other_member);
+    handler.process_gossip(&gossip(valid), other_member.public_key()).await?;
+    assert!(queue.try_recv().is_err(), "dropped as a repeat after the signer's own bad copy");
+
+    // the member's vote: queued as is, and the handler returned without anyone reading it
+    let vote = pending.sign_vote(&member);
+    handler.process_gossip(&gossip(vote), member.public_key()).await?;
+    assert_eq!(queue.try_recv().ok(), Some(vote));
+
+    // a repeat from the same signer: dropped, no penalty
+    handler.process_gossip(&gossip(vote), member.public_key()).await?;
+    assert!(queue.try_recv().is_err());
+
+    // once the epoch is certified here, further votes for the local record are dropped, even
+    // when the network certified a different record for it. The certificate write removes the
+    // pending row without touching the counter, so the handler's cache still holds the local
+    // record, and the drop comes from the certified-by-epoch check on a hit.
+    let networks =
+        EpochRecord { epoch: 7, parent_hash: B256::repeat_byte(0xAB), ..pending.clone() };
+    assert_ne!(networks.digest(), pending.digest());
+    let cert = EpochCertificate {
+        epoch_hash: networks.digest(),
+        signature: Default::default(),
+        signed_authorities: Default::default(),
+    };
+    db.save_epoch_record_with_cert(&networks, &cert)?;
+    handler
+        .process_gossip(&gossip(pending.sign_vote(&third_member)), third_member.public_key())
+        .await?;
+    assert!(
+        queue.try_recv().is_err(),
+        "epoch certified under another record, stale cache: dropped"
+    );
+    // and once the table is re-read, from the lookup itself: the row is gone
+    let late = EpochRecord { epoch: 9, committee: committee_keys.clone(), ..Default::default() };
+    db.save_pending_epoch_record(&late)?;
+    pending_written();
+    handler
+        .process_gossip(&gossip(pending.sign_vote(&fourth_member)), fourth_member.public_key())
+        .await?;
+    assert!(queue.try_recv().is_err(), "record no longer pending, fresh cache: dropped");
+    handler
+        .process_gossip(&gossip(late.sign_vote(&other_member)), other_member.public_key())
+        .await?;
+    assert!(queue.try_recv().is_ok(), "the same signer's vote for a pending record is queued");
+
+    // a full queue refuses the vote without spending the signer's dedup slot, so a republish
+    // after the collector drains the queue is admitted
+    let filler = late.sign_vote(&other_member);
+    while consensus_bus.new_epoch_votes().try_send(filler).is_ok() {}
+    let vote = late.sign_vote(&member);
+    handler.process_gossip(&gossip(vote), member.public_key()).await?;
+    while queue.try_recv().is_ok() {}
+    handler.process_gossip(&gossip(vote), member.public_key()).await?;
+    assert_eq!(queue.try_recv().ok(), Some(vote), "republished after the refusal: queued");
+
+    // a long stall leaves many epochs pending; dedup still holds for the oldest of them, so a
+    // member cannot flood the queue with repeats of its vote for an early epoch
+    let stalled: Vec<EpochRecord> = (20..30)
+        .map(|epoch| EpochRecord { epoch, committee: committee_keys.clone(), ..Default::default() })
+        .collect();
+    for record in &stalled {
+        db.save_pending_epoch_record(record)?;
+        pending_written();
+        let vote = record.sign_vote(&third_member);
+        handler.process_gossip(&gossip(vote), third_member.public_key()).await?;
+        assert_eq!(queue.try_recv().ok(), Some(vote), "first vote for epoch {}", record.epoch);
+    }
+    let oldest = stalled[0].sign_vote(&third_member);
+    handler.process_gossip(&gossip(oldest), third_member.public_key()).await?;
+    assert!(queue.try_recv().is_err(), "repeat for the oldest of ten pending epochs: dropped");
+    Ok(())
+}
+
 /// A consensus result or epoch vote whose signer is not the peer that published it is rejected
 /// before the committee lookup and the BLS verify, with a Fatal penalty: honest nodes publish
 /// only under their own key, so the mismatch is the publisher's forgery, not a laggard's view.
@@ -505,6 +650,272 @@ async fn test_gossip_signer_must_be_publisher() -> eyre::Result<()> {
         Err(PrimaryNetworkError::GossipAuthorMismatch { .. })
     );
     Ok(())
+}
+
+/// f+1 committee signatures on one header move the gossip tip and are kept as this node's
+/// certified tip, which verifies against the committee and is what the node serves. A lower
+/// header reaching f+1 later, as a restarted node can hear before it catches up, does not replace
+/// a higher one; a higher one does.
+#[tokio::test]
+async fn test_quorum_keeps_certified_tip() -> eyre::Result<()> {
+    let TestTypes { committee, handler, consensus_bus, task_manager: _task_manager, .. } =
+        create_test_types();
+    let keys: Vec<BlsPublicKey> =
+        committee.authorities().map(|a| *a.authority().protocol_key()).collect();
+    // the receiving node is the first authority; f+1 of the others sign
+    let quorum = CertifiedTip::quorum(keys.len());
+    let signers: Vec<_> = committee.authorities().skip(1).take(quorum).collect();
+    let topic = TopicHash::from_raw(LibP2pConfig::consensus_output_topic());
+    let certify = |number: u64, hash: BlockHash| {
+        let handler = &handler;
+        let signers = &signers;
+        let topic = topic.clone();
+        async move {
+            for signer in signers {
+                let key = *signer.authority().protocol_key();
+                let digest = ConsensusResult::digest_data(0, 1, number, hash);
+                let signature = signer.keypair().sign(&encode(&to_intent_message(digest)));
+                let result =
+                    ConsensusResult { epoch: 0, round: 1, number, hash, validator: key, signature };
+                let data = encode(&PrimaryGossip::Consensus(Box::new(result)));
+                let msg = GossipMessage {
+                    source: None,
+                    data,
+                    sequence_number: None,
+                    topic: topic.clone(),
+                };
+                handler.process_gossip(&msg, key).await?;
+            }
+            eyre::Ok(())
+        }
+    };
+    let served = || async {
+        match handler.retrieve_certified_tip().await {
+            Ok(PrimaryResponse::CertifiedTip(tip)) => tip,
+            other => panic!("not a certified tip reply: {other:?}"),
+        }
+    };
+    assert_eq!(served().await, None, "nothing certified yet");
+
+    let five = BlockHash::random();
+    certify(5, five).await?;
+    assert_eq!(*consensus_bus.last_published_consensus_num_hash().borrow(), (5, five));
+    let tip = served().await.expect("certified at quorum");
+    assert_eq!((tip.epoch, tip.round, tip.number, tip.hash), (0, 1, 5, five));
+    assert_eq!(tip.signed_authorities.len() as usize, quorum);
+    assert!(tip.verify(&keys), "the kept tip verifies against the committee");
+
+    // a restarted node's gossip watch starts empty, so a lower header can reach f+1 again
+    consensus_bus.last_published_consensus_num_hash().send_replace((0, BlockHash::ZERO));
+    certify(3, BlockHash::random()).await?;
+    assert_eq!(served().await.map(|tip| tip.hash), Some(five), "a lower tip never replaces it");
+
+    let nine = BlockHash::random();
+    certify(9, nine).await?;
+    assert_eq!(served().await.map(|tip| tip.hash), Some(nine), "a higher tip does");
+
+    // a restarted node seeds the mark from the stored row, so a lower tip still cannot replace it
+    let config = committee.first_authority().consensus_config();
+    let restarted = RequestHandler::new(
+        config.clone(),
+        consensus_bus.clone(),
+        StateSynchronizer::new(config, consensus_bus.clone(), TaskManager::default().get_spawner()),
+    );
+    consensus_bus.last_published_consensus_num_hash().send_replace((0, BlockHash::ZERO));
+    let seven = BlockHash::random();
+    for signer in &signers {
+        let key = *signer.authority().protocol_key();
+        let hash = seven;
+        let digest = ConsensusResult::digest_data(0, 1, 7, hash);
+        let signature = signer.keypair().sign(&encode(&to_intent_message(digest)));
+        let result =
+            ConsensusResult { epoch: 0, round: 1, number: 7, hash, validator: key, signature };
+        let data = encode(&PrimaryGossip::Consensus(Box::new(result)));
+        let msg = GossipMessage { source: None, data, sequence_number: None, topic: topic.clone() };
+        restarted.process_gossip(&msg, key).await?;
+    }
+    assert_eq!(served().await.map(|tip| tip.hash), Some(nine), "kept across a restart");
+    Ok(())
+}
+
+/// f+1 results for the next epoch, checked against a lookahead that still lists a key ejected
+/// since it was read, are not kept as a certified tip: its bitmap would index the lookahead, not
+/// the committee followers verify against. The tip waits until that committee is settled.
+#[tokio::test]
+async fn certified_tip_is_not_built_over_a_stale_lookahead() -> eyre::Result<()> {
+    let committee = CommitteeFixture::builder(MemDatabase::default).randomize_ports(true).build();
+    let base = committee.first_authority().consensus_config();
+    let keys: Vec<BlsPublicKey> =
+        committee.authorities().map(|a| *a.authority().protocol_key()).collect();
+    // an ejected key sorting below every member shifts every bitmap index
+    let ejected = std::iter::repeat_with(|| {
+        let other = CommitteeFixture::builder(MemDatabase::default).build();
+        *other.first_authority().authority().protocol_key()
+    })
+    .find(|key| keys.iter().all(|member| key < member))
+    .expect("a lower key");
+    let mut stale = keys.clone();
+    stale.push(ejected);
+    let config = ConsensusConfig::new_for_epoch(
+        base.config().clone(),
+        base.node_storage().clone(),
+        base.key_config().clone(),
+        base.committee().clone(),
+        CommitteeLookahead::from_entries([(1, stale)]),
+        base.network_config().clone(),
+        u64::MAX,
+        true,
+    )?;
+    assert!(config.get_settled_committee_keys_for_epoch(1).is_none(), "precondition");
+    let consensus_bus = ConsensusBus::new();
+    let task_manager = TaskManager::default();
+    let synchronizer =
+        StateSynchronizer::new(config.clone(), consensus_bus.clone(), task_manager.get_spawner());
+    let handler = RequestHandler::new(config, consensus_bus, synchronizer);
+
+    let topic = TopicHash::from_raw(LibP2pConfig::consensus_output_topic());
+    let hash = BlockHash::random();
+    let digest = ConsensusResult::digest_data(1, 1, 5, hash);
+    for signer in committee.authorities().skip(1).take(CertifiedTip::quorum(keys.len())) {
+        let key = *signer.authority().protocol_key();
+        let signature = signer.keypair().sign(&encode(&to_intent_message(digest)));
+        let result =
+            ConsensusResult { epoch: 1, round: 1, number: 5, hash, validator: key, signature };
+        let data = encode(&PrimaryGossip::Consensus(Box::new(result)));
+        let msg = GossipMessage { source: None, data, sequence_number: None, topic: topic.clone() };
+        handler.process_gossip(&msg, key).await?;
+    }
+    assert_matches!(
+        handler.retrieve_certified_tip().await,
+        Ok(PrimaryResponse::CertifiedTip(None))
+    );
+    Ok(())
+}
+
+/// Early in epoch 2, before any epoch-2 quorum, f+1 keys of the epoch-1 committee sign a header
+/// that does not exist, at the highest number there is or at a number the node holds. A node in
+/// epoch 2 holds every header of epoch 1, so the quorum is dropped: it is neither served as the
+/// certified tip nor published as the gossip tip, where a high number would drop every later
+/// result. Epoch 1's last header still is, and epoch 2 then moves it on.
+#[tokio::test]
+async fn certified_tip_is_not_pinned_by_a_forged_closed_epoch() -> eyre::Result<()> {
+    use rayls_infrastructure_storage::{tables::ConsensusBlocks, EpochStore as _};
+    use rayls_infrastructure_types::{
+        ConsensusHeader, Database as _, EpochCertificate, EpochRecord,
+    };
+
+    let committee =
+        CommitteeFixture::builder(MemDatabase::default).randomize_ports(true).epoch(2).build();
+    let config = committee.first_authority().consensus_config();
+    let keys: Vec<BlsPublicKey> =
+        committee.authorities().map(|a| *a.authority().protocol_key()).collect();
+    let db = config.node_storage();
+    for epoch in 0..2 {
+        let record = EpochRecord {
+            epoch,
+            committee: keys.clone(),
+            next_committee: keys.clone(),
+            ..Default::default()
+        };
+        let cert = EpochCertificate {
+            epoch_hash: record.digest(),
+            signature: Default::default(),
+            signed_authorities: Default::default(),
+        };
+        db.save_epoch_record_with_cert(&record, &cert)?;
+    }
+    // epoch 1 closed on header 10
+    let last = ConsensusHeader { number: 10, ..Default::default() };
+    db.insert::<ConsensusBlocks>(&10, &last)?;
+    let consensus_bus = ConsensusBus::new();
+    let task_manager = TaskManager::default();
+    let synchronizer =
+        StateSynchronizer::new(config.clone(), consensus_bus.clone(), task_manager.get_spawner());
+    let handler = RequestHandler::new(config, consensus_bus.clone(), synchronizer);
+
+    let topic = TopicHash::from_raw(LibP2pConfig::consensus_output_topic());
+    let signers: Vec<_> =
+        committee.authorities().skip(1).take(CertifiedTip::quorum(keys.len())).collect();
+    let certify = |epoch, number, hash| {
+        let (handler, signers, topic) = (&handler, &signers, topic.clone());
+        async move {
+            let digest = ConsensusResult::digest_data(epoch, 1, number, hash);
+            for signer in signers {
+                let key = *signer.authority().protocol_key();
+                let signature = signer.keypair().sign(&encode(&to_intent_message(digest)));
+                let result =
+                    ConsensusResult { epoch, round: 1, number, hash, validator: key, signature };
+                let data = encode(&PrimaryGossip::Consensus(Box::new(result)));
+                let msg = GossipMessage {
+                    source: None,
+                    data,
+                    sequence_number: None,
+                    topic: topic.clone(),
+                };
+                handler.process_gossip(&msg, key).await?;
+            }
+            eyre::Ok(())
+        }
+    };
+    let served = || async {
+        match handler.retrieve_certified_tip().await {
+            Ok(PrimaryResponse::CertifiedTip(tip)) => tip.map(|tip| (tip.epoch, tip.number)),
+            other => panic!("not a certified tip reply: {other:?}"),
+        }
+    };
+
+    for number in [u64::MAX, 10] {
+        certify(1, number, BlockHash::random()).await?;
+        assert_eq!(served().await, None, "a forged header at {number} is not served");
+        assert_eq!(
+            *consensus_bus.last_published_consensus_num_hash().borrow(),
+            (0, BlockHash::ZERO),
+            "nor published as the gossip tip"
+        );
+    }
+
+    certify(1, 10, last.digest()).await?;
+    assert_eq!(served().await, Some((1, 10)), "the closed epoch's last header is");
+    assert_eq!(*consensus_bus.last_published_consensus_num_hash().borrow(), (10, last.digest()));
+
+    certify(2, 11, BlockHash::random()).await?;
+    assert_eq!(served().await, Some((2, 11)), "and the next epoch moves it on");
+    Ok(())
+}
+
+/// The stored certified tip only moves up, and never back to an earlier epoch or below the
+/// floor, even with nothing stored: a retired committee's keys must not pin a forged high number
+/// from their epoch.
+#[test]
+fn certified_tip_only_moves_up_within_or_past_its_epoch() {
+    assert!(replaces_certified_tip(None, 0, 0, 1), "nothing stored yet");
+    assert!(replaces_certified_tip(None, 20, 20, 1), "nothing stored, at the floor");
+    assert!(!replaces_certified_tip(None, 20, 3, 9_999_999), "nothing stored, below the floor");
+    assert!(replaces_certified_tip(Some((20, 5000)), 20, 20, 5001), "higher, same epoch");
+    assert!(replaces_certified_tip(Some((20, 5000)), 20, 21, 5001), "higher, next epoch");
+    assert!(!replaces_certified_tip(Some((20, 5000)), 20, 20, 5000), "the same tip");
+    assert!(!replaces_certified_tip(Some((20, 5000)), 20, 20, 4999), "lower, same epoch");
+    assert!(
+        replaces_certified_tip(Some((20, u64::MAX)), 20, 21, 5001),
+        "a later epoch replaces a forged high number"
+    );
+    assert!(!replaces_certified_tip(Some((20, 5000)), 0, 3, 9_999_999), "earlier epoch");
+}
+
+#[test]
+fn certified_tip_request_and_reply_are_appended_last() {
+    // BCS writes the variant index first; appended variants leave every older index unchanged,
+    // so an older node still decodes everything else and fails only on these
+    assert_eq!(encode(&PrimaryRequest::CertifiedTip)[0], 6);
+    assert_eq!(encode(&PrimaryResponse::CertifiedTip(None))[0], 11);
+    assert_eq!(encode(&PrimaryResponse::Busy)[0], 10, "Busy keeps its variant index");
+    let old = PrimaryResponse::EpochMismatch { expected: 2, received: 3 };
+    let old_bytes = encode(&old);
+    assert_eq!(old_bytes[0], 9, "EpochMismatch keeps its variant index");
+    assert_matches!(
+        rayls_infrastructure_types::decode::<PrimaryResponse>(&old_bytes),
+        PrimaryResponse::EpochMismatch { expected: 2, received: 3 }
+    );
 }
 
 #[test]
