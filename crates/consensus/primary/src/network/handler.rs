@@ -19,7 +19,9 @@ use parking_lot::Mutex;
 use rayls_consensus_network::{admission::RequestPermits, GossipMessage};
 use rayls_infrastructure_config::{ConsensusConfig, LibP2pConfig};
 use rayls_infrastructure_storage::{
-    tables::{CertifiedTips, ConsensusBlocks, EpochRecords},
+    tables::{
+        CertifiedTips, ConsensusBlockNumbersByDigest, ConsensusBlocks, EpochCerts, EpochRecords,
+    },
     CertScope, CertificateStore, ConsensusStore, EpochStore, ProposerStore, VoteDigestStore,
 };
 use rayls_infrastructure_types::{
@@ -472,7 +474,7 @@ where
                 // of them would set the gossip tip, which the epoch switch reset to 0, back to an
                 // old-epoch header that the rejoin check reads as the network head, and reset the
                 // demotion stall clock. A closed epoch's last header is served from its certified
-                // record instead (see `retrieve_certified_tip`).
+                // record instead (see `retrieve_certified_head`).
                 if epoch < self.consensus_config.committee().epoch() {
                     return Ok(());
                 }
@@ -1165,8 +1167,8 @@ where
     /// later epoch, and nothing from before the previous epoch is stored even when no row is:
     /// the row outlives restarts, so f+1 keys of a retired committee could otherwise pin a
     /// forged high number from their epoch for good. Results from an epoch this node has closed
-    /// never get here: that epoch's last header is served from its certified record instead (see
-    /// [`Self::retrieve_certified_tip`]).
+    /// never get here, so the floor only weighs a row stored before the switch; that epoch's last
+    /// header is served from its certified record instead (see [`Self::retrieve_certified_head`]).
     ///
     /// The bitmap indexes the committee the epoch ran with, the one followers verify against,
     /// never the lookahead the gossip check may have used: a key ejected since the lookahead was
@@ -1208,35 +1210,38 @@ where
     /// Retrieve this node's certified head, `None` while it has none: the higher of the f+1 tip it
     /// stored from gossip and the last header of the newest epoch it holds a certified record for
     /// (see [`CertifiedHead::rank`]).
-    pub(super) async fn retrieve_certified_tip(&self) -> PrimaryNetworkResult<PrimaryResponse> {
+    pub(super) async fn retrieve_certified_head(&self) -> PrimaryNetworkResult<PrimaryResponse> {
         let tip = self
             .consensus_config
             .node_storage()
             .get::<CertifiedTips>(&0)
             .map_err(|e| PrimaryNetworkError::Internal(format!("certified tip read: {e}")))?
             .map(CertifiedHead::Quorum);
-        let head = match (tip, self.certified_epoch_end()) {
-            (Some(tip), Some(end)) => Some(if end.rank() > tip.rank() { end } else { tip }),
-            (tip, end) => tip.or(end),
-        };
-        Ok(PrimaryResponse::CertifiedTip(head))
+        let end = self.certified_epoch_end(tip.as_ref().map_or(0, CertifiedHead::epoch));
+        let head = tip.into_iter().chain(end).max_by_key(CertifiedHead::rank);
+        Ok(PrimaryResponse::CertifiedHead(head))
     }
 
-    /// The last header of the newest epoch this node holds a certified record for, as a head a peer
-    /// can catch up to. `None` when that record is not certified yet, or the node does not hold the
-    /// header it names, whose number it serves.
+    /// The last header of the newest epoch this node holds a record for, as a head a peer can catch
+    /// up to, when that epoch is not below `from`: a stored tip from a later epoch outranks it.
+    /// `None` when that record is not certified yet (the epoch-0 placeholder never is), or the node
+    /// does not hold the header it names. The newest record is not always the newest epoch the node
+    /// closed: a node catching up may store records ahead of what it has executed, and serves none.
     ///
     /// An epoch's last results can reach f+1 on neither side of the epoch switch: they can split
     /// between the handler that stops and the one that starts, and the new one does not count them.
     /// So no f+1 tip may name the header an epoch ends on, and a chain halted there could not be
-    /// found from one. The record names it, signed by a super-quorum of the same committee.
-    fn certified_epoch_end(&self) -> Option<CertifiedHead> {
+    /// found from one. The record names it, signed by a super-quorum of the same committee. Its
+    /// number is read from the digest index: not signed, only a hint for the peer.
+    fn certified_epoch_end(&self, from: Epoch) -> Option<CertifiedHead> {
         let db = self.consensus_config.node_storage();
-        let (epoch, _) = db.last_record::<EpochRecords>()?;
-        let (record, Some(certificate)) = db.get_epoch_by_number(epoch)? else {
+        let (epoch, record) = db.last_record::<EpochRecords>()?;
+        if epoch < from {
             return None;
-        };
-        let number = db.get_canonical_consensus_by_hash(record.parent_consensus)?.number;
+        }
+        let certificate = db.get::<EpochCerts>(&record.digest()).ok().flatten()?;
+        let number =
+            db.get::<ConsensusBlockNumbersByDigest>(&record.parent_consensus).ok().flatten()?;
         Some(CertifiedHead::EpochEnd { number, record, certificate })
     }
 

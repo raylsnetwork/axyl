@@ -145,6 +145,10 @@ impl CertifiedHead {
     /// Order heads by: epoch first, so f+1 retired keys signing a high number cannot rank above a
     /// later epoch; then an epoch's end above any header of that epoch, which it is by definition
     /// and which does not trust its unsigned number; then the number.
+    ///
+    /// A peer can lie about an [`Self::EpochEnd`]'s number. That only reorders copies of the same
+    /// hash, because `is_end` ranks above it, and callers act on [`Self::hash`] alone. Never act on
+    /// such a number as if it were signed.
     pub fn rank(&self) -> (Epoch, bool, u64) {
         (self.epoch(), matches!(self, Self::EpochEnd { .. }), self.number())
     }

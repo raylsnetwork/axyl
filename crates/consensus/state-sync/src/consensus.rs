@@ -7,8 +7,8 @@ use rayls_infrastructure_storage::{
     ConsensusStore, EpochStore as _,
 };
 use rayls_infrastructure_types::{
-    BlsPublicKey, ConsensusHeader, ConsensusHeaderChainMeta, Database as ReDatabase, DbTxMut as _,
-    Epoch, Noticer, B256,
+    BlsPublicKey, CertifiedHead, ConsensusHeader, ConsensusHeaderChainMeta, Database as ReDatabase,
+    DbTxMut as _, Epoch, Noticer, B256,
 };
 use std::{
     collections::HashMap,
@@ -718,7 +718,7 @@ async fn probe_for_head<DB: ReDatabase>(
 /// A tip from before this node's previous epoch is dropped: f+1 keys of a retired committee
 /// could sign any number. The previous epoch counts, so a chain halted on its last header can
 /// still be found: a peer that closed that epoch serves its end from the certified record.
-/// The highest head by [`rank`](rayls_infrastructure_types::CertifiedHead::rank) wins, so an
+/// The highest head by [`CertifiedHead::rank`] wins, so an
 /// epoch's end, signed by a super-quorum, ranks above any f+1 tip of the same epoch; its unsigned
 /// number only decides whether it is above `current`, and a peer lying about it can only send the
 /// walk to the real header the hash names. A tip from an epoch whose committee is not settled yet,
@@ -736,7 +736,7 @@ async fn probe_peers_for_certified_tip<DB: ReDatabase>(
     let peers = network.inner_handle().connected_peers().await.ok()?;
     let mut inflight: FuturesUnordered<_> = peers
         .into_iter()
-        .map(|peer| async move { (peer, network.request_certified_tip_from_peer(peer).await) })
+        .map(|peer| async move { (peer, network.request_certified_head_from_peer(peer).await) })
         .collect();
     let floor = config.epoch().saturating_sub(1);
     let mut candidates = Vec::new();
@@ -780,6 +780,15 @@ async fn probe_peers_for_certified_tip<DB: ReDatabase>(
             continue;
         };
         if tip.verify(&committee) {
+            if matches!(tip, CertifiedHead::EpochEnd { .. }) {
+                info!(
+                    target: "state-sync",
+                    %peer,
+                    epoch = tip.epoch(),
+                    claimed_number = tip.number(),
+                    "probe: the head is an epoch's end from its certified record; its number is unsigned"
+                );
+            }
             return Some((tip.number(), tip.hash()));
         }
         warn!(

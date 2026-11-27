@@ -174,7 +174,7 @@ impl PrimaryNetworkHandle {
             PrimaryResponse::Busy => {
                 Err(NetworkError::RPCError("Got wrong response, not a vote is busy!".to_string()))
             }
-            PrimaryResponse::CertifiedTip(_) => Err(NetworkError::RPCError(
+            PrimaryResponse::CertifiedHead(_) => Err(NetworkError::RPCError(
                 "Got wrong response, not a vote is certified tip!".to_string(),
             )),
         }
@@ -281,13 +281,13 @@ impl PrimaryNetworkHandle {
 
     /// Request `peer`'s certified head, `None` while it has none. The caller verifies it against
     /// the committee of its epoch: one valid answer is enough to trust the head.
-    pub async fn request_certified_tip_from_peer(
+    pub async fn request_certified_head_from_peer(
         &self,
         peer: BlsPublicKey,
     ) -> NetworkResult<Option<CertifiedHead>> {
-        let res = self.handle.send_request(PrimaryRequest::CertifiedTip, peer).await?;
+        let res = self.handle.send_request(PrimaryRequest::CertifiedHead, peer).await?;
         match res.await?? {
-            PrimaryResponse::CertifiedTip(tip) => Ok(tip),
+            PrimaryResponse::CertifiedHead(tip) => Ok(tip),
             _ => Err(NetworkError::RPCError("Peer did not return a certified tip!".to_string())),
         }
     }
@@ -425,8 +425,8 @@ where
                 PrimaryRequest::EpochRecord { epoch, hash } => {
                     self.process_epoch_record_request(peer, epoch, hash, channel, cancel)
                 }
-                PrimaryRequest::CertifiedTip => {
-                    self.process_certified_tip_request(peer, channel, cancel)
+                PrimaryRequest::CertifiedHead => {
+                    self.process_certified_head_request(peer, channel, cancel)
                 }
             },
             NetworkEvent::Gossip(msg, gossip_source) => {
@@ -571,7 +571,7 @@ where
     }
 
     /// Serve this node's certified tip from the database.
-    fn process_certified_tip_request(
+    fn process_certified_head_request(
         &self,
         peer: BlsPublicKey,
         channel: ResponseChannel<PrimaryResponse>,
@@ -582,7 +582,7 @@ where
         let task_name = format!("CertifiedTipReq-{peer}");
         self.task_spawner.spawn_task(task_name, async move {
             tokio::select! {
-                tip = request_handler.retrieve_certified_tip() => {
+                tip = request_handler.retrieve_certified_head() => {
                     let response = tip.into_response();
                     let _ = network_handle.handle.send_response(response, channel).await;
                 }

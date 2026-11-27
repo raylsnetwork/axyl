@@ -331,12 +331,12 @@ fn peer_network(
                 NetworkCommand::SendRequest { peer, request, reply } => {
                     let Some(peer) = peers.iter().find(|p| p.key == peer) else { continue };
                     let response = match request {
-                        PrimaryRequest::CertifiedTip => {
+                        PrimaryRequest::CertifiedHead => {
                             counts.certified_tip.fetch_add(1, Ordering::SeqCst);
                             let response = peer
                                 .certified_tip
                                 .clone()
-                                .map(PrimaryResponse::CertifiedTip)
+                                .map(PrimaryResponse::CertifiedHead)
                                 .map_err(|()| unknown());
                             if !peer.delay.is_zero() {
                                 let delay = peer.delay;
@@ -734,6 +734,25 @@ async fn an_epoch_end_from_its_record_outranks_a_tip_of_that_epoch() {
         }
     });
     assert_eq!(probe_for_head(0, &config, &consensus_bus, &network).await, Some((100, end)));
+
+    // a copy of the genuine end with an inflated number names the same header, so the walk goes
+    // to the record's hash either way, and a tip of the next epoch outranks it
+    let inflated = CertifiedHead::EpochEnd {
+        number: u64::MAX,
+        record: record.clone(),
+        certificate: super_quorum_certificate(&fixture, &record),
+    };
+    let later = signed_tip(&fixture, 2, 60, B256::repeat_byte(3));
+    let network = serving_heads(&fixture, &config, |i| match i {
+        0 => CertifiedHead::Quorum(later.clone()),
+        1 => inflated.clone(),
+        _ => head.clone(),
+    });
+    assert_eq!(probe_for_head(0, &config, &consensus_bus, &network).await, Some((60, later.hash)));
+    let network =
+        serving_heads(&fixture, &config, |i| if i == 0 { inflated.clone() } else { head.clone() });
+    let probed = probe_for_head(0, &config, &consensus_bus, &network).await;
+    assert_eq!(probed.map(|(_, hash)| hash), Some(end), "the inflated copy names the same end");
 
     let mut short = super_quorum_certificate(&fixture, &record);
     short.signed_authorities = roaring::RoaringBitmap::from_iter([0u32]);

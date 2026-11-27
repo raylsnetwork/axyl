@@ -690,9 +690,9 @@ async fn test_quorum_keeps_certified_tip() -> eyre::Result<()> {
         }
     };
     let served = || async {
-        match handler.retrieve_certified_tip().await {
-            Ok(PrimaryResponse::CertifiedTip(None)) => None,
-            Ok(PrimaryResponse::CertifiedTip(Some(CertifiedHead::Quorum(tip)))) => Some(tip),
+        match handler.retrieve_certified_head().await {
+            Ok(PrimaryResponse::CertifiedHead(None)) => None,
+            Ok(PrimaryResponse::CertifiedHead(Some(CertifiedHead::Quorum(tip)))) => Some(tip),
             other => panic!("not an f+1 certified tip reply: {other:?}"),
         }
     };
@@ -787,8 +787,8 @@ async fn certified_tip_is_not_built_over_a_stale_lookahead() -> eyre::Result<()>
         handler.process_gossip(&msg, key).await?;
     }
     assert_matches!(
-        handler.retrieve_certified_tip().await,
-        Ok(PrimaryResponse::CertifiedTip(None))
+        handler.retrieve_certified_head().await,
+        Ok(PrimaryResponse::CertifiedHead(None))
     );
     Ok(())
 }
@@ -867,8 +867,8 @@ async fn closed_epoch_results_are_not_counted_and_its_end_is_served_from_the_rec
         }
     };
     let served = || async {
-        match handler.retrieve_certified_tip().await {
-            Ok(PrimaryResponse::CertifiedTip(head)) => head.map(|head| {
+        match handler.retrieve_certified_head().await {
+            Ok(PrimaryResponse::CertifiedHead(head)) => head.map(|head| {
                 (head.epoch(), head.number(), matches!(head, CertifiedHead::EpochEnd { .. }))
             }),
             other => panic!("not a certified tip reply: {other:?}"),
@@ -896,6 +896,78 @@ async fn closed_epoch_results_are_not_counted_and_its_end_is_served_from_the_rec
     Ok(())
 }
 
+/// The epoch end a node serves comes only from a certified record whose header it holds, and
+/// ranks above a stored tip of the same epoch even with a lower number. An uncertified record,
+/// as the epoch-0 placeholder is, or one naming a header the node does not hold, serves nothing,
+/// and the stored tip is served instead.
+#[tokio::test]
+async fn certified_head_serves_an_epoch_end_only_from_a_certified_record_it_holds(
+) -> eyre::Result<()> {
+    use rayls_infrastructure_storage::{
+        tables::{CertifiedTips, ConsensusBlockNumbersByDigest, ConsensusBlocks},
+        EpochStore as _,
+    };
+    use rayls_infrastructure_types::{
+        ConsensusHeader, Database as _, EpochCertificate, EpochRecord,
+    };
+
+    let committee =
+        CommitteeFixture::builder(MemDatabase::default).randomize_ports(true).epoch(2).build();
+    let config = committee.first_authority().consensus_config();
+    let keys: Vec<BlsPublicKey> =
+        committee.authorities().map(|a| *a.authority().protocol_key()).collect();
+    let db = config.node_storage();
+    let held = ConsensusHeader { number: 10, ..Default::default() };
+    db.insert::<ConsensusBlocks>(&10, &held)?;
+    db.insert::<ConsensusBlockNumbersByDigest>(&held.digest(), &10)?;
+    let record = |epoch, parent_consensus| EpochRecord {
+        epoch,
+        committee: keys.clone(),
+        next_committee: keys.clone(),
+        parent_consensus,
+        ..Default::default()
+    };
+    let certify = |record: &EpochRecord| EpochCertificate {
+        epoch_hash: record.digest(),
+        signature: Default::default(),
+        signed_authorities: Default::default(),
+    };
+    let consensus_bus = ConsensusBus::new();
+    let task_manager = TaskManager::default();
+    let synchronizer =
+        StateSynchronizer::new(config.clone(), consensus_bus.clone(), task_manager.get_spawner());
+    let handler = RequestHandler::new(config.clone(), consensus_bus, synchronizer);
+    let served = || async {
+        match handler.retrieve_certified_head().await {
+            Ok(PrimaryResponse::CertifiedHead(head)) => head.map(|head| {
+                (head.epoch(), head.number(), matches!(head, CertifiedHead::EpochEnd { .. }))
+            }),
+            other => panic!("not a certified head reply: {other:?}"),
+        }
+    };
+
+    db.save_epoch_record(&record(0, held.digest()))?;
+    assert_eq!(served().await, None, "an uncertified record, as the epoch-0 placeholder");
+
+    let tip = CertifiedTip {
+        epoch: 1,
+        round: 1,
+        number: 50,
+        hash: BlockHash::random(),
+        signature: Default::default(),
+        signed_authorities: Default::default(),
+    };
+    db.insert::<CertifiedTips>(&0, &tip)?;
+    let unheld = record(1, BlockHash::random());
+    db.save_epoch_record_with_cert(&unheld, &certify(&unheld))?;
+    assert_eq!(served().await, Some((1, 50, false)), "a record whose header it does not hold");
+
+    let ending = record(1, held.digest());
+    db.save_epoch_record_with_cert(&ending, &certify(&ending))?;
+    assert_eq!(served().await, Some((1, 10, true)), "the end outranks a tip of its epoch");
+    Ok(())
+}
+
 /// The stored certified tip only moves up, and never back to an earlier epoch or below the
 /// floor, even with nothing stored: a retired committee's keys must not pin a forged high number
 /// from their epoch.
@@ -919,8 +991,8 @@ fn certified_tip_only_moves_up_within_or_past_its_epoch() {
 fn certified_tip_request_and_reply_are_appended_last() {
     // BCS writes the variant index first; appended variants leave every older index unchanged,
     // so an older node still decodes everything else and fails only on these
-    assert_eq!(encode(&PrimaryRequest::CertifiedTip)[0], 6);
-    assert_eq!(encode(&PrimaryResponse::CertifiedTip(None))[0], 11);
+    assert_eq!(encode(&PrimaryRequest::CertifiedHead)[0], 6);
+    assert_eq!(encode(&PrimaryResponse::CertifiedHead(None))[0], 11);
     assert_eq!(encode(&PrimaryResponse::Busy)[0], 10, "Busy keeps its variant index");
     let old = PrimaryResponse::EpochMismatch { expected: 2, received: 3 };
     let old_bytes = encode(&old);
@@ -984,8 +1056,8 @@ async fn test_consensus_result_spam_cannot_wipe_honest_votes() -> eyre::Result<(
     // the certified tip is built from the honest signatures alone
     let keys: Vec<BlsPublicKey> =
         committee.authorities().map(|a| *a.authority().protocol_key()).collect();
-    let tip = match handler.retrieve_certified_tip().await {
-        Ok(PrimaryResponse::CertifiedTip(Some(CertifiedHead::Quorum(tip)))) => tip,
+    let tip = match handler.retrieve_certified_head().await {
+        Ok(PrimaryResponse::CertifiedHead(Some(CertifiedHead::Quorum(tip)))) => tip,
         other => panic!("no certified tip: {other:?}"),
     };
     assert_eq!((tip.number, tip.hash), (5, real));

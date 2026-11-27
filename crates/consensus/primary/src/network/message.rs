@@ -173,11 +173,12 @@ pub enum PrimaryRequest {
         /// The epoch the request's rounds belong to.
         epoch: Epoch,
     },
-    /// Request the peer's certified tip: the newest consensus header it saw f+1 committee members
-    /// sign. Appended after every older variant for the same reason as
-    /// [`PrimaryRequest::MissingCertificatesInEpoch`]. Sent only once the `CertifiedTipV1` fork is
-    /// active; served regardless.
-    CertifiedTip,
+    /// Request the peer's certified head: the newest consensus header it saw f+1 committee members
+    /// sign, or the last header of the newest epoch it holds a certified record for. Appended
+    /// after every older variant for the same reason as
+    /// [`PrimaryRequest::MissingCertificatesInEpoch`]. Sent only once the `CertifiedTipV1`
+    /// fork is active; served regardless.
+    CertifiedHead,
 }
 
 // unit test for this struct in primary::src::tests::network_tests::test_missing_certs_request
@@ -482,7 +483,7 @@ pub enum PrimaryResponse {
     /// Appended, so the older variants keep their BCS indexes.
     Busy,
     /// The responding peer's certified head, `None` while it has none.
-    CertifiedTip(Option<CertifiedHead>),
+    CertifiedHead(Option<CertifiedHead>),
 }
 
 impl PrimaryResponse {
