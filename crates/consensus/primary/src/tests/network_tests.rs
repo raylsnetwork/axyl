@@ -17,9 +17,9 @@ use rayls_infrastructure_config::{ConsensusConfig, LibP2pConfig};
 use rayls_infrastructure_storage::{mem_db::MemDatabase, CertScope, CertificateStore as _};
 use rayls_infrastructure_types::{
     encode, error::HeaderError, now, to_intent_message, AuthorityIdentifier, BlockHash,
-    BlockHeader, BlockNumHash, BlsPublicKey, Certificate, CertificateDigest, CertifiedTip,
-    CommitteeLookahead, EpochVote, ExecHeader, Hash as _, RaylsReceiver, RaylsSender, SealedHeader,
-    Signer as _, TaskManager,
+    BlockHeader, BlockNumHash, BlsPublicKey, Certificate, CertificateDigest, CertifiedHead,
+    CertifiedTip, CommitteeLookahead, EpochVote, ExecHeader, Hash as _, RaylsReceiver, RaylsSender,
+    SealedHeader, Signer as _, TaskManager,
 };
 use rayls_testing_test_utils_committee::{AuthorityFixture, CommitteeFixture};
 use std::collections::{BTreeMap, BTreeSet};
@@ -691,8 +691,9 @@ async fn test_quorum_keeps_certified_tip() -> eyre::Result<()> {
     };
     let served = || async {
         match handler.retrieve_certified_tip().await {
-            Ok(PrimaryResponse::CertifiedTip(tip)) => tip,
-            other => panic!("not a certified tip reply: {other:?}"),
+            Ok(PrimaryResponse::CertifiedTip(None)) => None,
+            Ok(PrimaryResponse::CertifiedTip(Some(CertifiedHead::Quorum(tip)))) => Some(tip),
+            other => panic!("not an f+1 certified tip reply: {other:?}"),
         }
     };
     assert_eq!(served().await, None, "nothing certified yet");
@@ -792,14 +793,19 @@ async fn certified_tip_is_not_built_over_a_stale_lookahead() -> eyre::Result<()>
     Ok(())
 }
 
-/// Early in epoch 2, before any epoch-2 quorum, f+1 keys of the epoch-1 committee sign a header
-/// that does not exist, at the highest number there is or at a number the node holds. A node in
-/// epoch 2 holds every header of epoch 1, so the quorum is dropped: it is neither served as the
-/// certified tip nor published as the gossip tip, where a high number would drop every later
-/// result. Epoch 1's last header still is, and epoch 2 then moves it on.
+/// Early in epoch 2, before any epoch-2 quorum, f+1 keys of the epoch-1 committee sign epoch-1
+/// results: headers that do not exist, at the highest number there is or at a number the node
+/// holds, and epoch 1's real last header arriving late. A node in epoch 2 counts none of them, so
+/// none moves the gossip tip, which the epoch switch reset. Epoch 1's last header is still served,
+/// from the certified record that names it, whether or not any f+1 quorum for it was counted.
+/// Epoch 2's first quorum then outranks it.
 #[tokio::test]
-async fn certified_tip_is_not_pinned_by_a_forged_closed_epoch() -> eyre::Result<()> {
-    use rayls_infrastructure_storage::{tables::ConsensusBlocks, EpochStore as _};
+async fn closed_epoch_results_are_not_counted_and_its_end_is_served_from_the_record(
+) -> eyre::Result<()> {
+    use rayls_infrastructure_storage::{
+        tables::{ConsensusBlockNumbersByDigest, ConsensusBlocks},
+        EpochStore as _,
+    };
     use rayls_infrastructure_types::{
         ConsensusHeader, Database as _, EpochCertificate, EpochRecord,
     };
@@ -810,11 +816,17 @@ async fn certified_tip_is_not_pinned_by_a_forged_closed_epoch() -> eyre::Result<
     let keys: Vec<BlsPublicKey> =
         committee.authorities().map(|a| *a.authority().protocol_key()).collect();
     let db = config.node_storage();
+    // epoch 1 closed on header 10, which its record names
+    let last = ConsensusHeader { number: 10, ..Default::default() };
+    db.insert::<ConsensusBlocks>(&10, &last)?;
+    db.insert::<ConsensusBlockNumbersByDigest>(&last.digest(), &10)?;
     for epoch in 0..2 {
+        let parent_consensus = if epoch == 1 { last.digest() } else { BlockHash::ZERO };
         let record = EpochRecord {
             epoch,
             committee: keys.clone(),
             next_committee: keys.clone(),
+            parent_consensus,
             ..Default::default()
         };
         let cert = EpochCertificate {
@@ -824,9 +836,6 @@ async fn certified_tip_is_not_pinned_by_a_forged_closed_epoch() -> eyre::Result<
         };
         db.save_epoch_record_with_cert(&record, &cert)?;
     }
-    // epoch 1 closed on header 10
-    let last = ConsensusHeader { number: 10, ..Default::default() };
-    db.insert::<ConsensusBlocks>(&10, &last)?;
     let consensus_bus = ConsensusBus::new();
     let task_manager = TaskManager::default();
     let synchronizer =
@@ -859,27 +868,31 @@ async fn certified_tip_is_not_pinned_by_a_forged_closed_epoch() -> eyre::Result<
     };
     let served = || async {
         match handler.retrieve_certified_tip().await {
-            Ok(PrimaryResponse::CertifiedTip(tip)) => tip.map(|tip| (tip.epoch, tip.number)),
+            Ok(PrimaryResponse::CertifiedTip(head)) => head.map(|head| {
+                (head.epoch(), head.number(), matches!(head, CertifiedHead::EpochEnd { .. }))
+            }),
             other => panic!("not a certified tip reply: {other:?}"),
         }
     };
 
-    for number in [u64::MAX, 10] {
-        certify(1, number, BlockHash::random()).await?;
-        assert_eq!(served().await, None, "a forged header at {number} is not served");
+    let end = Some((1, 10, true));
+    assert_eq!(served().await, end, "the closed epoch's end, from its record");
+    for (number, hash) in
+        [(u64::MAX, BlockHash::random()), (10, BlockHash::random()), (10, last.digest())]
+    {
+        certify(1, number, hash).await?;
+        assert_eq!(served().await, end, "epoch 1's results at {number} change nothing served");
         assert_eq!(
             *consensus_bus.last_published_consensus_num_hash().borrow(),
             (0, BlockHash::ZERO),
-            "nor published as the gossip tip"
+            "nor the gossip tip"
         );
     }
 
-    certify(1, 10, last.digest()).await?;
-    assert_eq!(served().await, Some((1, 10)), "the closed epoch's last header is");
-    assert_eq!(*consensus_bus.last_published_consensus_num_hash().borrow(), (10, last.digest()));
-
-    certify(2, 11, BlockHash::random()).await?;
-    assert_eq!(served().await, Some((2, 11)), "and the next epoch moves it on");
+    let next = BlockHash::random();
+    certify(2, 11, next).await?;
+    assert_eq!(served().await, Some((2, 11, false)), "epoch 2's first quorum outranks it");
+    assert_eq!(*consensus_bus.last_published_consensus_num_hash().borrow(), (11, next));
     Ok(())
 }
 
@@ -972,7 +985,7 @@ async fn test_consensus_result_spam_cannot_wipe_honest_votes() -> eyre::Result<(
     let keys: Vec<BlsPublicKey> =
         committee.authorities().map(|a| *a.authority().protocol_key()).collect();
     let tip = match handler.retrieve_certified_tip().await {
-        Ok(PrimaryResponse::CertifiedTip(Some(tip))) => tip,
+        Ok(PrimaryResponse::CertifiedTip(Some(CertifiedHead::Quorum(tip)))) => tip,
         other => panic!("no certified tip: {other:?}"),
     };
     assert_eq!((tip.number, tip.hash), (5, real));

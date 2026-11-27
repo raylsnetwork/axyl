@@ -11,8 +11,8 @@ use rayls_infrastructure_types::{
     error::HeaderError,
     serde::{deserialize_normalized_bounded, roaring_header},
     AuthorityIdentifier, BlockHash, BlsPublicKey, BlsSignature, Certificate, CertificateDigest,
-    CertifiedTip, ConsensusHeader, Epoch, EpochCertificate, EpochRecord, EpochVote, Header, Round,
-    Vote,
+    CertifiedHead, CertifiedTip, ConsensusHeader, Epoch, EpochCertificate, EpochRecord, EpochVote,
+    Header, Round, Vote,
 };
 use roaring::RoaringBitmap;
 use serde::{Deserialize, Serialize};
@@ -481,8 +481,8 @@ pub enum PrimaryResponse {
     /// Too many jobs are running, so ask another peer and retry later.
     /// Appended, so the older variants keep their BCS indexes.
     Busy,
-    /// The responding peer's certified tip, `None` while it has none.
-    CertifiedTip(Option<CertifiedTip>),
+    /// The responding peer's certified head, `None` while it has none.
+    CertifiedTip(Option<CertifiedHead>),
 }
 
 impl PrimaryResponse {

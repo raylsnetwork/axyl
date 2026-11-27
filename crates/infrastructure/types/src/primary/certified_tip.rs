@@ -2,7 +2,8 @@
 
 use crate::{
     crypto, serde::SignerBitmapSerde, to_intent_message, BlockHash, BlsAggregateSignature,
-    BlsPublicKey, BlsSignature, Epoch, Round, ValidatorAggregateSignature as _, B256,
+    BlsPublicKey, BlsSignature, Epoch, EpochCertificate, EpochRecord, Round,
+    ValidatorAggregateSignature as _, B256,
 };
 use roaring::RoaringBitmap;
 use serde::{Deserialize, Serialize};
@@ -90,6 +91,72 @@ impl CertifiedTip {
         signers.len() >= Self::quorum(committee.len())
             && BlsAggregateSignature::from_signature(&self.signature)
                 .verify_secure(&to_intent_message(self.digest()), &signers)
+    }
+}
+
+/// The head a node serves to a peer looking for where to catch up to.
+///
+/// Either a header f+1 members of its epoch's committee signed as they committed it, or the last
+/// header of a closed epoch, which that epoch's certified record names. The record is signed by a
+/// super-quorum of the same committee, so it proves that header at least as well as an f+1 quorum
+/// would. It covers the header an epoch ends on even when no node counted an f+1 quorum for it:
+/// the closing epoch's last results can land on either side of the epoch switch, or not at all.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub enum CertifiedHead {
+    /// f+1 signatures over the consensus result of one header.
+    Quorum(CertifiedTip),
+    /// The last header of `record.epoch`: `record.parent_consensus`, with `certificate` over the
+    /// record. `number` is the serving node's own, not signed: the hash is what the proof covers.
+    EpochEnd {
+        /// The number of the header the record names.
+        number: u64,
+        /// The record of the closed epoch.
+        record: EpochRecord,
+        /// The certificate over `record`.
+        certificate: EpochCertificate,
+    },
+}
+
+impl CertifiedHead {
+    /// The epoch whose committee signed.
+    pub fn epoch(&self) -> Epoch {
+        match self {
+            Self::Quorum(tip) => tip.epoch,
+            Self::EpochEnd { record, .. } => record.epoch,
+        }
+    }
+
+    /// The consensus header number. Unsigned for [`Self::EpochEnd`].
+    pub fn number(&self) -> u64 {
+        match self {
+            Self::Quorum(tip) => tip.number,
+            Self::EpochEnd { number, .. } => *number,
+        }
+    }
+
+    /// The consensus header hash the proof covers.
+    pub fn hash(&self) -> BlockHash {
+        match self {
+            Self::Quorum(tip) => tip.hash,
+            Self::EpochEnd { record, .. } => record.parent_consensus,
+        }
+    }
+
+    /// Order heads by: epoch first, so f+1 retired keys signing a high number cannot rank above a
+    /// later epoch; then an epoch's end above any header of that epoch, which it is by definition
+    /// and which does not trust its unsigned number; then the number.
+    pub fn rank(&self) -> (Epoch, bool, u64) {
+        (self.epoch(), matches!(self, Self::EpochEnd { .. }), self.number())
+    }
+
+    /// Whether the proof holds against `committee`, the committee of [`Self::epoch`].
+    pub fn verify(&self, committee: &[BlsPublicKey]) -> bool {
+        match self {
+            Self::Quorum(tip) => tip.verify(committee),
+            Self::EpochEnd { record, certificate, .. } => {
+                record.verify_against_committee(&sorted(committee), certificate)
+            }
+        }
     }
 }
 

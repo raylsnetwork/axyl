@@ -19,16 +19,16 @@ use parking_lot::Mutex;
 use rayls_consensus_network::{admission::RequestPermits, GossipMessage};
 use rayls_infrastructure_config::{ConsensusConfig, LibP2pConfig};
 use rayls_infrastructure_storage::{
-    tables::{CertifiedTips, ConsensusBlocks},
+    tables::{CertifiedTips, ConsensusBlocks, EpochRecords},
     CertScope, CertificateStore, ConsensusStore, EpochStore, ProposerStore, VoteDigestStore,
 };
 use rayls_infrastructure_types::{
     ensure,
     error::{CertificateError, HeaderError, HeaderResult},
     now, to_intent_message, try_decode, AuthorityIdentifier, BlockHash, BlockNumHash, BlsPublicKey,
-    BlsSignature, Certificate, CertificateDigest, CertifiedTip, ConsensusHeader, Database, Epoch,
-    EpochCertificate, EpochRecord, Hash as _, Header, ProtocolSignature, RaylsSender as _, Round,
-    SignatureVerificationState, Vote, B256,
+    BlsSignature, Certificate, CertificateDigest, CertifiedHead, CertifiedTip, ConsensusHeader,
+    Database, Epoch, EpochCertificate, EpochRecord, Hash as _, Header, ProtocolSignature,
+    RaylsSender as _, Round, SignatureVerificationState, Vote, B256,
 };
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
@@ -110,7 +110,7 @@ impl BehindTracker {
 /// signs invented digests pushes out its own older results, never another signer's, so it cannot
 /// wipe the honest partial count for the real header. More than one per signer, so a signer that
 /// has moved on to the next header still counts toward the previous one while that quorum forms.
-/// Holds at most that many results per key it has counted, keys of earlier committees included.
+/// Holds at most that many results per key it has counted.
 #[derive(Debug, Default)]
 struct ConsensusVotes {
     by_signer: HashMap<BlsPublicKey, Vec<(B256, ConsensusResult)>>,
@@ -121,10 +121,10 @@ impl ConsensusVotes {
     /// result that brings that digest to `quorum` signers, so later votes for the same header do
     /// not act on it again. That is once each time the count climbs to `quorum`: a signer that
     /// pushes the digest out of its window and sends it again before the quorum is pruned can
-    /// bring the count back to it. That costs one more pass through the quorum: a held-header read
-    /// for a closed epoch, a certified-tip save that keeps a higher stored tip, and a
-    /// `behind_consensus` call. Neither tip can move back. A repeat of a result the signer already
-    /// holds counts nothing, and so does one numbered at or below all of a full window.
+    /// bring the count back to it. That costs one more pass through the quorum: a certified-tip
+    /// save that keeps a higher stored tip, and a `behind_consensus` call. Neither tip can move
+    /// back. A repeat of a result the signer already holds counts nothing, and so does one
+    /// numbered at or below all of a full window.
     fn add(&mut self, digest: B256, result: ConsensusResult, quorum: usize) -> bool {
         let held = self.by_signer.entry(result.validator).or_default();
         if held.iter().any(|(d, _)| *d == digest) {
@@ -467,6 +467,15 @@ where
                 let consensus_result_hash = result.digest();
                 let ConsensusResult { epoch, round, number, hash, validator: key, signature } =
                     *result;
+                // A result from an epoch this node has closed is not counted. The node holds
+                // every header it names, and it says nothing about where the network is now: f+1
+                // of them would set the gossip tip, which the epoch switch reset to 0, back to an
+                // old-epoch header that the rejoin check reads as the network head, and reset the
+                // demotion stall clock. A closed epoch's last header is served from its certified
+                // record instead (see `retrieve_certified_tip`).
+                if epoch < self.consensus_config.committee().epoch() {
+                    return Ok(());
+                }
                 let (old_number, old_hash) =
                     *self.consensus_bus.last_published_consensus_num_hash().borrow();
                 if hash == old_hash || old_number >= number {
@@ -503,27 +512,6 @@ where
                             .then(|| votes.signatures(&consensus_result_hash))
                     };
                     if let Some(signatures) = signatures {
-                        // a node in a later epoch has executed every header of this one, so an
-                        // honest result names the header it holds at that number; anything else
-                        // is f+1 retired keys forging one, which would otherwise be served as the
-                        // certified tip and, as the gossip tip, drop every later result below it
-                        if epoch < self.consensus_config.committee().epoch() {
-                            let held = self
-                                .consensus_config
-                                .node_storage()
-                                .get::<ConsensusBlocks>(&number)
-                                .ok()
-                                .flatten();
-                            if held.is_none_or(|held| held.digest() != hash) {
-                                warn!(
-                                    target: "primary::consensus_result",
-                                    epoch,
-                                    number,
-                                    "quorum from a closed epoch is not the header held at its number, dropping"
-                                );
-                                return Ok(());
-                            }
-                        }
                         self.save_certified_tip(epoch, round, number, hash, signatures);
                         if self.behind_consensus(epoch, round, Some(number)).await {
                             self.consensus_votes.lock().clear();
@@ -1176,8 +1164,9 @@ where
     /// restarted node can hear a lower header reach f+1 before it catches up. So is one from a
     /// later epoch, and nothing from before the previous epoch is stored even when no row is:
     /// the row outlives restarts, so f+1 keys of a retired committee could otherwise pin a
-    /// forged high number from their epoch for good. The previous epoch still counts, so a
-    /// chain halted on its last header keeps a tip.
+    /// forged high number from their epoch for good. Results from an epoch this node has closed
+    /// never get here: that epoch's last header is served from its certified record instead (see
+    /// [`Self::retrieve_certified_tip`]).
     ///
     /// The bitmap indexes the committee the epoch ran with, the one followers verify against,
     /// never the lookahead the gossip check may have used: a key ejected since the lookahead was
@@ -1216,14 +1205,39 @@ where
         }
     }
 
-    /// Retrieve this node's certified tip from local storage, `None` while it has none.
+    /// Retrieve this node's certified head, `None` while it has none: the higher of the f+1 tip it
+    /// stored from gossip and the last header of the newest epoch it holds a certified record for
+    /// (see [`CertifiedHead::rank`]).
     pub(super) async fn retrieve_certified_tip(&self) -> PrimaryNetworkResult<PrimaryResponse> {
         let tip = self
             .consensus_config
             .node_storage()
             .get::<CertifiedTips>(&0)
-            .map_err(|e| PrimaryNetworkError::Internal(format!("certified tip read: {e}")))?;
-        Ok(PrimaryResponse::CertifiedTip(tip))
+            .map_err(|e| PrimaryNetworkError::Internal(format!("certified tip read: {e}")))?
+            .map(CertifiedHead::Quorum);
+        let head = match (tip, self.certified_epoch_end()) {
+            (Some(tip), Some(end)) => Some(if end.rank() > tip.rank() { end } else { tip }),
+            (tip, end) => tip.or(end),
+        };
+        Ok(PrimaryResponse::CertifiedTip(head))
+    }
+
+    /// The last header of the newest epoch this node holds a certified record for, as a head a peer
+    /// can catch up to. `None` when that record is not certified yet, or the node does not hold the
+    /// header it names, whose number it serves.
+    ///
+    /// An epoch's last results can reach f+1 on neither side of the epoch switch: they can split
+    /// between the handler that stops and the one that starts, and the new one does not count them.
+    /// So no f+1 tip may name the header an epoch ends on, and a chain halted there could not be
+    /// found from one. The record names it, signed by a super-quorum of the same committee.
+    fn certified_epoch_end(&self) -> Option<CertifiedHead> {
+        let db = self.consensus_config.node_storage();
+        let (epoch, _) = db.last_record::<EpochRecords>()?;
+        let (record, Some(certificate)) = db.get_epoch_by_number(epoch)? else {
+            return None;
+        };
+        let number = db.get_canonical_consensus_by_hash(record.parent_consensus)?.number;
+        Some(CertifiedHead::EpochEnd { number, record, certificate })
     }
 
     /// Retrieve an epoch record from local storage.

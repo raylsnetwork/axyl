@@ -716,13 +716,16 @@ async fn probe_for_head<DB: ReDatabase>(
 /// asking every peer only guards against peers that are down, on an older release, or behind.
 /// Answers that have not arrived within [`CERTIFIED_TIP_PROBE_DEADLINE`] are not waited for.
 /// A tip from before this node's previous epoch is dropped: f+1 keys of a retired committee
-/// could sign any number, and the previous epoch counts so a chain halted on its last header can
-/// still be found.
-/// A tip from an epoch whose committee is not settled yet, from config or a certified record (the
-/// lookahead does not count), is skipped, and the epoch record collector is asked for the record
-/// after the newest one held: it walks upward as far as peers serve, so a later probe can verify
-/// the tip. Neither waiting here nor requesting the tip's own
-/// epoch, which is unverified: a peer naming a far epoch would hold up the probe or send the
+/// could sign any number. The previous epoch counts, so a chain halted on its last header can
+/// still be found: a peer that closed that epoch serves its end from the certified record.
+/// The highest head by [`rank`](rayls_infrastructure_types::CertifiedHead::rank) wins, so an
+/// epoch's end, signed by a super-quorum, ranks above any f+1 tip of the same epoch; its unsigned
+/// number only decides whether it is above `current`, and a peer lying about it can only send the
+/// walk to the real header the hash names. A tip from an epoch whose committee is not settled yet,
+/// from config or a certified record (the lookahead does not count), is skipped, and the epoch
+/// record collector is asked for the record after the newest one held: it walks upward as far as
+/// peers serve, so a later probe can verify the tip. Neither waiting here nor requesting the tip's
+/// own epoch, which is unverified: a peer naming a far epoch would hold up the probe or send the
 /// collector chasing it.
 async fn probe_peers_for_certified_tip<DB: ReDatabase>(
     current: u64,
@@ -740,7 +743,7 @@ async fn probe_peers_for_certified_tip<DB: ReDatabase>(
     let _ = tokio::time::timeout(CERTIFIED_TIP_PROBE_DEADLINE, async {
         while let Some((peer, result)) = inflight.next().await {
             if let Ok(Some(tip)) = result {
-                if tip.number > current && tip.epoch >= floor {
+                if tip.number() > current && tip.epoch() >= floor {
                     candidates.push((peer, tip));
                 }
             }
@@ -749,7 +752,7 @@ async fn probe_peers_for_certified_tip<DB: ReDatabase>(
     .await;
     // epoch first: a high number signed by f+1 retired keys of an earlier epoch must not rank
     // above an honest tip from a later one
-    candidates.sort_by(|(_, a), (_, b)| (b.epoch, b.number).cmp(&(a.epoch, a.number)));
+    candidates.sort_by_key(|(_, tip)| std::cmp::Reverse(tip.rank()));
     // the whole tip, not the peer: a copy with the honest number and hash but a bad signature
     // must not stand in for the honest ones
     candidates.dedup_by(|(_, a), (_, b)| a == b);
@@ -757,7 +760,7 @@ async fn probe_peers_for_certified_tip<DB: ReDatabase>(
     for (peer, tip) in candidates {
         // the committee the tip's epoch ran with, never the lookahead: an honest tip fails
         // against a lookahead that still lists a key ejected since it was read
-        let Some(committee) = config.get_settled_committee_keys_for_epoch(tip.epoch) else {
+        let Some(committee) = config.get_settled_committee_keys_for_epoch(tip.epoch()) else {
             // the same record is next for every such tip, so ask once
             if !collector_asked {
                 collector_asked = true;
@@ -777,13 +780,13 @@ async fn probe_peers_for_certified_tip<DB: ReDatabase>(
             continue;
         };
         if tip.verify(&committee) {
-            return Some((tip.number, tip.hash));
+            return Some((tip.number(), tip.hash()));
         }
         warn!(
             target: "state-sync",
             %peer,
-            number = tip.number,
-            epoch = tip.epoch,
+            number = tip.number(),
+            epoch = tip.epoch(),
             "probe: certified tip did not verify against its committee, skipping"
         );
     }

@@ -32,7 +32,7 @@ use rayls_infrastructure_network_types::{
 use rayls_infrastructure_storage::PayloadStore;
 use rayls_infrastructure_types::{
     encode, error::HeaderError, AuthorityIdentifier, BlockHash, BlsPublicKey, BlsSignature,
-    Certificate, CertificateDigest, CertifiedTip, ConsensusHeader, Database, Epoch,
+    Certificate, CertificateDigest, CertifiedHead, ConsensusHeader, Database, Epoch,
     EpochCertificate, EpochRecord, EpochVote, Header, RaylsReceiver, RaylsSender, Round, TaskKind,
     TaskSpawner, Vote,
 };
@@ -279,12 +279,12 @@ impl PrimaryNetworkHandle {
         Err(NetworkError::RPCError("Could not get the consensus header!".to_string()))
     }
 
-    /// Request `peer`'s certified tip, `None` while it has none. The caller verifies it against
+    /// Request `peer`'s certified head, `None` while it has none. The caller verifies it against
     /// the committee of its epoch: one valid answer is enough to trust the head.
     pub async fn request_certified_tip_from_peer(
         &self,
         peer: BlsPublicKey,
-    ) -> NetworkResult<Option<CertifiedTip>> {
+    ) -> NetworkResult<Option<CertifiedHead>> {
         let res = self.handle.send_request(PrimaryRequest::CertifiedTip, peer).await?;
         match res.await?? {
             PrimaryResponse::CertifiedTip(tip) => Ok(tip),
