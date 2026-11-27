@@ -742,7 +742,19 @@ async fn probe_peers_for_certified_head<DB: ReDatabase>(
     let mut candidates = Vec::new();
     let _ = tokio::time::timeout(CERTIFIED_HEAD_PROBE_DEADLINE, async {
         while let Some((peer, result)) = inflight.next().await {
-            if let Ok(Some(tip)) = result {
+            if let Ok(Some(mut tip)) = result {
+                // an epoch end's number is the serving peer's word: when this node already holds
+                // the header, its own number stands, so an inflated copy of an end it has passed
+                // is no target, while one above `current` still is (an inactive node republishes
+                // it as its network head)
+                if let CertifiedHead::EpochEnd { number, record, .. } = &mut tip {
+                    let held = config
+                        .node_storage()
+                        .get::<ConsensusBlockNumbersByDigest>(&record.parent_consensus)
+                        .ok()
+                        .flatten();
+                    *number = held.unwrap_or(*number);
+                }
                 if tip.number() > current && tip.epoch() >= floor {
                     candidates.push((peer, tip));
                 }
@@ -781,7 +793,7 @@ async fn probe_peers_for_certified_head<DB: ReDatabase>(
         };
         if tip.verify(&committee) {
             if matches!(tip, CertifiedHead::EpochEnd { .. }) {
-                info!(
+                debug!(
                     target: "state-sync",
                     %peer,
                     epoch = tip.epoch(),

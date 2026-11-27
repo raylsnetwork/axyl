@@ -799,6 +799,33 @@ async fn an_epoch_end_the_node_holds_becomes_its_network_head() {
     assert_eq!(published, end);
 }
 
+/// A peer inflating the number of an epoch end this node already holds cannot make it a target
+/// once the node is past it: the node's own number for the header stands. Below it, the end is
+/// still a target, at that number.
+#[tokio::test(start_paused = true)]
+async fn an_inflated_end_the_node_is_past_is_no_target() {
+    let (fixture, config) = follower_at_epoch_two();
+    let db = config.node_storage();
+    let leader = fixture.certificate(&fixture.header_from_last_authority());
+    // stores header 100 as the canonical tip: the last header of epoch 1
+    let end = canonical_tip_and_chain(db, &leader, 101)[&101].parent_hash;
+    let mut committee = config.get_settled_committee_keys_for_epoch(1).expect("epoch 1 is settled");
+    committee.sort_unstable();
+    let record = EpochRecord { epoch: 1, committee, parent_consensus: end, ..Default::default() };
+    let certificate = super_quorum_certificate(&fixture, &record);
+    let inflated = CertifiedHead::EpochEnd { number: u64::MAX, record, certificate };
+    let network = serving_heads(&fixture, &config, |_| inflated.clone());
+    let consensus_bus = ConsensusBus::new();
+
+    assert_eq!(probe_for_head(150, &config, &consensus_bus, &network).await, None, "past it");
+    assert_eq!(
+        probe_for_head(0, &config, &consensus_bus, &network).await,
+        Some((100, end)),
+        "below it, at its own number"
+    );
+    config.shutdown().notify();
+}
+
 /// A tip from before the previous epoch is dropped even though it verifies: f+1 keys of a
 /// retired committee could sign any number. One from the previous epoch is still taken, so a
 /// chain halted on that epoch's last header can be found.
