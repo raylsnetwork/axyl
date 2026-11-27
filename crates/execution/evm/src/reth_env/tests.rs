@@ -510,7 +510,11 @@ async fn test_genesis_alloc_hashed_and_readable_in_storage_v2() -> eyre::Result<
     let rocksdb_provider =
         RocksDBBuilder::new(datadir.join("rocksdb")).with_default_tables().build()?;
     let static_files = StaticFileProvider::read_write(datadir.join("static_files"))?;
-    let runtime = reth_tasks::Runtime::with_existing_handle(tokio::runtime::Handle::current())?;
+    let runtime =
+        reth_tasks::RuntimeBuilder::new(reth_tasks::RuntimeConfig::default().with_tokio(
+            reth_tasks::TokioConfig::existing_handle(tokio::runtime::Handle::current()),
+        ))
+        .build()?;
     let provider_factory: ProviderFactory<RaylsNode> = ProviderFactory::new(
         db,
         rayls_chain_spec.clone(),
@@ -874,11 +878,8 @@ async fn test_close_epochs() -> eyre::Result<()> {
     // create evm to read custom contract call
     let state = StateProviderDatabase::new(reth_env.latest()?);
     let mut cached_reads = CachedReads::default();
-    let mut db = State::builder()
-        .with_database(cached_reads.as_db_mut(state))
-        .with_bundle_update()
-        .without_state_clear()
-        .build();
+    let mut db =
+        State::builder().with_database(cached_reads.as_db_mut(state)).with_bundle_update().build();
     let mut rayls_evm = reth_env
         .evm_config
         .evm_factory()
@@ -1287,11 +1288,8 @@ async fn test_close_epochs_with_dynamic_committee() -> eyre::Result<()> {
     // Read future committee (3 epochs ahead of the one that is closing)
     let state = StateProviderDatabase::new(reth_env.latest()?);
     let mut cached_reads = CachedReads::default();
-    let mut db = State::builder()
-        .with_database(cached_reads.as_db_mut(state))
-        .with_bundle_update()
-        .without_state_clear()
-        .build();
+    let mut db =
+        State::builder().with_database(cached_reads.as_db_mut(state)).with_bundle_update().build();
     let mut rayls_evm = reth_env
         .evm_config
         .evm_factory()
@@ -1331,11 +1329,8 @@ async fn test_close_epochs_with_dynamic_committee() -> eyre::Result<()> {
     // For now, check the future epoch (epoch 3) which has the 6-validator committee.
     let state = StateProviderDatabase::new(reth_env.latest()?);
     let mut cached_reads = CachedReads::default();
-    let mut db = State::builder()
-        .with_database(cached_reads.as_db_mut(state))
-        .with_bundle_update()
-        .without_state_clear()
-        .build();
+    let mut db =
+        State::builder().with_database(cached_reads.as_db_mut(state)).with_bundle_update().build();
     let mut rayls_evm = reth_env
         .evm_config
         .evm_factory()
@@ -1390,11 +1385,8 @@ async fn test_close_epochs_with_dynamic_committee() -> eyre::Result<()> {
     // validator 2 should now be Exited
     let state = StateProviderDatabase::new(reth_env.latest()?);
     let mut cached_reads = CachedReads::default();
-    let mut db = State::builder()
-        .with_database(cached_reads.as_db_mut(state))
-        .with_bundle_update()
-        .without_state_clear()
-        .build();
+    let mut db =
+        State::builder().with_database(cached_reads.as_db_mut(state)).with_bundle_update().build();
     let mut rayls_evm = reth_env
         .evm_config
         .evm_factory()
@@ -1419,6 +1411,56 @@ async fn test_close_epochs_with_dynamic_committee() -> eyre::Result<()> {
     assert_eq!(
         shrunken_epoch_info.committee, expected_sorted_5,
         "dynamic committee must shrink to 5 after validator 2 exits"
+    );
+
+    Ok(())
+}
+
+/// A one-shot hardfork migration runs at its activation block for every batch index.
+///
+/// Each batch of a consensus output becomes its own block, so the activation block can be a
+/// block that is not the first batch of its output. Some pre-execution system calls only run on
+/// the first batch. The migration must not be tied to them: a skipped migration leaves later
+/// execution running against un-migrated state, and the node diverges.
+#[tokio::test]
+async fn migration_applies_when_activation_block_is_not_first_batch() -> eyre::Result<()> {
+    use crate::{chainspec::RaylsChainSpec, native_erc20::ERC20_PRECOMPILE_ADDRESS};
+    use reth_provider::StateProvider as _;
+
+    const ACTIVATION_BLOCK: u64 = 2;
+
+    let chain = rayls_infrastructure_types::test_chain_spec_arc();
+    let rayls_chain_spec = Arc::new(
+        RaylsChainSpec::builder(chain.clone()).erc20_precompile_bytecode(ACTIVATION_BLOCK).build(),
+    );
+    let tmp_dir = TempDir::new()?;
+    let task_manager = TaskManager::new("Test Task Manager");
+    let reth_env = RethEnv::new_for_temp_chain_with_rayls_spec(
+        chain.clone(),
+        rayls_chain_spec,
+        tmp_dir.path(),
+        &task_manager,
+        None,
+    )
+    .await?;
+
+    // block 1: before the activation block, the precompile account has no code
+    let mut co = consensus_output_for_tests(2, 0, 1);
+    co.close_epoch = false;
+    let payload = RLPayload::new_for_test(chain.sealed_genesis_header(), &co);
+    let block1 = execute_payload_and_update_canonical_chain(&reth_env, payload, vec![]).await?;
+    assert!(
+        reth_env.latest()?.account_code(&ERC20_PRECOMPILE_ADDRESS)?.is_none(),
+        "no bytecode before the activation block"
+    );
+
+    // block 2: the activation block, built as the second batch of its output
+    let mut payload = RLPayload::new_for_test(block1.recovered_block.clone_sealed_header(), &co);
+    payload.batch_index = 1;
+    execute_payload_and_update_canonical_chain(&reth_env, payload, vec![]).await?;
+    assert!(
+        reth_env.latest()?.account_code(&ERC20_PRECOMPILE_ADDRESS)?.is_some(),
+        "the Erc20PrecompileBytecode migration must install bytecode on a non-first batch"
     );
 
     Ok(())
@@ -1543,6 +1585,16 @@ async fn test_hybrid_rewards_fork_boundary() -> eyre::Result<()> {
     let co = consensus_output_for_tests(2, epoch, 2);
     let payload = RLPayload::new_for_test(header, &co);
     let block2 = execute_payload_and_update_canonical_chain(&reth_env, payload, vec![]).await?;
+    // Revert entries per block in the bundle. A normal block has one. An epoch-close block
+    // has two, the second one empty: the transitions are merged once for the epoch close and
+    // once at the end of block building. This shape is part of what is persisted, so it must
+    // not change without a decision.
+    assert_eq!(block1.execution_output.state.reverts.len(), 1, "normal block");
+    assert_eq!(block2.execution_output.state.reverts.len(), 2, "epoch-close block");
+    assert!(
+        block2.execution_output.state.reverts.last().is_some_and(|r| r.is_empty()),
+        "the extra revert entry of an epoch-close block is empty"
+    );
     header = block2.recovered_block.clone_sealed_header();
     epoch += 1;
     assert_eq!(
@@ -1590,271 +1642,1274 @@ fn test_rpc_validator() {
     };
 }
 
-/// Full-DB check for `fix_genesis_history`: build a v2 storage stack, run
-/// canonical genesis init (which writes genesis storage history under the
-/// buggy plain slot), simulate the post-genesis history a replay would append
-/// under the hashed slot, then re-key and assert every case is correct.
-#[cfg(feature = "archive-replay")]
-#[tokio::test]
-async fn test_fix_genesis_history_rekeys_and_preserves_post_genesis() -> eyre::Result<()> {
-    use crate::{reth_env::RethEnv, traits::RaylsNode};
-    use alloy::primitives::keccak256;
-    use reth_db::{models::storage_sharded_key::StorageShardedKey, tables, BlockNumberList};
+/// A genesis account for the genesis-history tests: balance, code and one storage slot. None
+/// of them changes after genesis, so only the genesis history entry can answer a historical
+/// read for it.
+const GENESIS_HISTORY_ADDR: Address = Address::new([0x11u8; 20]);
+const GENESIS_HISTORY_SLOT: B256 = B256::with_last_byte(1);
+const GENESIS_HISTORY_VALUE: U256 = U256::from_limbs([0xAA, 0, 0, 0]);
+const GENESIS_HISTORY_CODE: [u8; 2] = [0x60, 0x00];
+
+fn genesis_with_static_account() -> rayls_infrastructure_types::Genesis {
+    rayls_infrastructure_types::test_genesis().extend_accounts([(
+        GENESIS_HISTORY_ADDR,
+        GenesisAccount {
+            balance: U256::from(1_000u64),
+            code: Some(Bytes::from_static(&GENESIS_HISTORY_CODE)),
+            storage: Some(std::collections::BTreeMap::from([(
+                GENESIS_HISTORY_SLOT,
+                B256::from(GENESIS_HISTORY_VALUE),
+            )])),
+            ..Default::default()
+        },
+    )])
+}
+
+/// A v2 storage stack with genesis written, without the rest of the node.
+fn genesis_storage_stack(
+    datadir: &std::path::Path,
+) -> eyre::Result<reth_provider::ProviderFactory<crate::traits::RaylsNode>> {
     use reth_db_common::init::init_genesis_with_settings;
     use reth_provider::{
         providers::{RocksDBBuilder, StaticFileProvider},
-        ChainSpecProvider, ProviderFactory, RocksDBProviderFactory, StorageSettings,
-        StorageSettingsCache,
+        ProviderFactory, StorageSettings, StorageSettingsCache,
     };
-    use std::collections::BTreeMap;
 
-    // genesis with one account holding three storage slots.
-    let addr = Address::from([0x11u8; 20]);
-    let slot_a = B256::from(U256::from(1u64)); // immutable: no post-genesis history
-    let slot_b = B256::from(U256::from(2u64)); // single-shard mutable
-    let slot_c = B256::from(U256::from(3u64)); // multi-shard mutable
-    let storage = BTreeMap::from([
-        (slot_a, B256::from(U256::from(0xAAu64))),
-        (slot_b, B256::from(U256::from(0xBBu64))),
-        (slot_c, B256::from(U256::from(0xCCu64))),
-    ]);
-    let genesis = rayls_infrastructure_types::test_genesis().extend_accounts([(
-        addr,
-        GenesisAccount {
-            balance: U256::from(1_000u64),
-            storage: Some(storage),
-            ..Default::default()
-        },
-    )]);
-
-    // v2 storage stack + canonical genesis init (writes plain-key history).
-    let tmp_dir = TempDir::new()?;
-    let datadir = tmp_dir.path().to_path_buf();
     let db = Arc::new(reth_db::init_db(
         datadir.join("db"),
         reth_db::mdbx::DatabaseArguments::default(),
     )?);
     let rayls_chain_spec = Arc::new(
-        crate::chainspec::RaylsChainSpec::builder(Arc::new(RethChainSpec::from(genesis))).build(),
+        crate::chainspec::RaylsChainSpec::builder(Arc::new(RethChainSpec::from(
+            genesis_with_static_account(),
+        )))
+        .build(),
     );
     let rocksdb_provider =
         RocksDBBuilder::new(datadir.join("rocksdb")).with_default_tables().build()?;
     let static_files = StaticFileProvider::read_write(datadir.join("static_files"))?;
-    let runtime = reth_tasks::Runtime::with_existing_handle(tokio::runtime::Handle::current())?;
-    let provider_factory: ProviderFactory<RaylsNode> =
+    let runtime =
+        reth_tasks::RuntimeBuilder::new(reth_tasks::RuntimeConfig::default().with_tokio(
+            reth_tasks::TokioConfig::existing_handle(tokio::runtime::Handle::current()),
+        ))
+        .build()?;
+    let provider_factory: ProviderFactory<crate::traits::RaylsNode> =
         ProviderFactory::new(db, rayls_chain_spec, static_files, rocksdb_provider, runtime)?;
     let settings = StorageSettings::v2();
     provider_factory.set_storage_settings_cache(settings);
     init_genesis_with_settings(&provider_factory, settings)?;
-    let _ = provider_factory.chain_spec();
+    Ok(provider_factory)
+}
 
-    let (ha, hb, hc) = (keccak256(slot_a), keccak256(slot_b), keccak256(slot_c));
+/// Genesis state that never changes again is readable at a historical block.
+///
+/// On reth 1.11 this needed two start-up fixes (`fix_genesis_history` and
+/// `fix_genesis_account_history`): the genesis storage history was written under the plain slot
+/// but read under the hashed one, and the genesis account history could be lost. reth 2.0 reads
+/// and writes the plain slot, and both fixes are removed. This test is the proof that a node
+/// without them answers historical reads for genesis-only state, through the real start-up and
+/// block-building path.
+#[tokio::test]
+async fn genesis_only_state_is_readable_at_historical_blocks() -> eyre::Result<()> {
+    use reth_provider::{StateProvider as _, StateProviderFactory as _};
 
-    // Precondition (the bug): genesis history is keyed by the PLAIN slot, so the
-    // hashed keys the v2 read consults carry no genesis entry yet.
-    {
+    let chain: Arc<RethChainSpec> = Arc::new(genesis_with_static_account().into());
+    let tmp_dir = TempDir::new()?;
+    let task_manager = TaskManager::new("Test Task Manager");
+    let reth_env =
+        RethEnv::new_for_temp_chain(chain.clone(), tmp_dir.path(), &task_manager, None).await?;
+
+    // three persisted blocks that do not touch the account
+    let mut header = chain.sealed_genesis_header();
+    for number in 1..=3u64 {
+        let mut co = consensus_output_for_tests(2, 0, number);
+        co.close_epoch = false;
+        let payload = RLPayload::new_for_test(header, &co);
+        let block = execute_payload_and_update_canonical_chain(&reth_env, payload, vec![]).await?;
+        header = block.recovered_block.clone_sealed_header();
+    }
+
+    // blocks 0..=2 are historical now (the tip is 3)
+    for number in 0..=2u64 {
+        let state = reth_env.blockchain_provider.history_by_block_number(number)?;
+        assert_eq!(
+            state.storage(GENESIS_HISTORY_ADDR, GENESIS_HISTORY_SLOT)?,
+            Some(GENESIS_HISTORY_VALUE),
+            "genesis storage at block {number}"
+        );
+        let code = state.account_code(&GENESIS_HISTORY_ADDR)?;
+        assert_eq!(
+            code.map(|c| c.original_bytes()),
+            Some(Bytes::from_static(&GENESIS_HISTORY_CODE)),
+            "genesis code at block {number}"
+        );
+        let account = state.basic_account(&GENESIS_HISTORY_ADDR)?.expect("genesis account");
+        assert_eq!(account.balance, U256::from(1_000u64), "genesis balance at block {number}");
+    }
+
+    Ok(())
+}
+
+/// The genesis history index is right after genesis and stays right over a restart.
+///
+/// reth clears both history tables on every start while no block is persisted yet (history
+/// checkpoint 0). On reth 1.11 it did not write the genesis entries back, which lost them
+/// (the reason for `fix_genesis_account_history`). reth 2.0 writes them back. This test deletes
+/// the entries and checks that the start-up check brings them back. It also pins the key: the
+/// storage entry is under the PLAIN slot, and there is no entry under the hashed slot, which
+/// is what the removed `fix_genesis_history` used to add.
+#[tokio::test]
+async fn genesis_history_index_survives_restart_before_first_block() -> eyre::Result<()> {
+    use alloy::primitives::keccak256;
+    use reth_provider::RocksDBProviderFactory;
+
+    let tmp_dir = TempDir::new()?;
+    let provider_factory = genesis_storage_stack(tmp_dir.path())?;
+
+    let assert_genesis_index = |when: &str| -> eyre::Result<()> {
         let rocksdb = provider_factory.rocksdb_provider();
-        for h in [ha, hb, hc] {
-            let shards = rocksdb.storage_history_shards(addr, h)?;
-            assert!(
-                shards.iter().all(|(_, l)| !l.contains(0u64)),
-                "hashed slot must lack the genesis entry before the fix"
-            );
-        }
         assert!(
-            rocksdb.storage_history_shards(addr, slot_a)?.iter().any(|(_, l)| l.contains(0u64)),
-            "genesis writer put the entry under the plain slot (the bug)"
+            rocksdb
+                .account_history_shards(GENESIS_HISTORY_ADDR)?
+                .iter()
+                .any(|(_, blocks)| blocks.contains(0u64)),
+            "{when}: genesis account must have block 0 in its history"
+        );
+        assert!(
+            rocksdb
+                .storage_history_shards(GENESIS_HISTORY_ADDR, GENESIS_HISTORY_SLOT)?
+                .iter()
+                .any(|(_, blocks)| blocks.contains(0u64)),
+            "{when}: genesis slot must have block 0 under the plain slot key"
+        );
+        assert!(
+            rocksdb
+                .storage_history_shards(GENESIS_HISTORY_ADDR, keccak256(GENESIS_HISTORY_SLOT))?
+                .is_empty(),
+            "{when}: there must be no history under the hashed slot key"
+        );
+        Ok(())
+    };
+
+    assert_genesis_index("after genesis init")?;
+
+    // Lose the genesis entries, as a reth 1.11 restart did. Without this step the test would
+    // pass the same way if reth never touched the tables.
+    {
+        use reth_db::{
+            models::{storage_sharded_key::StorageShardedKey, ShardedKey},
+            tables,
+        };
+        let rocksdb = provider_factory.rocksdb_provider();
+        let mut batch = rocksdb.batch();
+        batch.delete::<tables::AccountsHistory>(ShardedKey::last(GENESIS_HISTORY_ADDR))?;
+        batch.delete::<tables::StoragesHistory>(StorageShardedKey::last(
+            GENESIS_HISTORY_ADDR,
+            GENESIS_HISTORY_SLOT,
+        ))?;
+        batch.commit()?;
+        assert!(
+            rocksdb.account_history_shards(GENESIS_HISTORY_ADDR)?.is_empty()
+                && rocksdb
+                    .storage_history_shards(GENESIS_HISTORY_ADDR, GENESIS_HISTORY_SLOT)?
+                    .is_empty(),
+            "the genesis entries are gone before the start-up check"
         );
     }
 
-    // Simulate post-genesis history under the HASHED keys, as replay's indexer
-    // would append:
-    //   slot_b: one open shard [5] (has room → prepend in place)
-    //   slot_c: a FULL sealed shard [1..=2000] + a full open shard [2001..=4000],
-    //            so prepending block 0 (total 4001) must re-chunk into three
-    //            <=2000 shards (the cascade / overflow case).
+    // what every node start runs; with the checkpoint at 0 it clears and re-seeds the tables
+    for restart in 1..=2 {
+        provider_factory.check_consistency()?;
+        assert_genesis_index(&format!("after restart {restart}"))?;
+    }
+
+    Ok(())
+}
+
+/// A small chain for the history tests: a contract that stores the current block number in
+/// slot 1, and a funded sender that calls it.
+struct HistoryChain {
+    reth_env: RethEnv,
+    chain: Arc<RethChainSpec>,
+    factory: TransactionFactory,
+    header: rayls_infrastructure_types::SealedHeader,
+    next_nonce: u64,
+    // keep the node alive for the whole test
+    _task_manager: TaskManager,
+    _tmp_dir: TempDir,
+}
+
+impl HistoryChain {
+    const CONTRACT: Address = Address::new([0x33u8; 20]);
+    const SLOT: B256 = B256::with_last_byte(1);
+    const GENESIS_VALUE: U256 = U256::from_limbs([0xAA, 0, 0, 0]);
+
+    async fn new() -> eyre::Result<Self> {
+        // NUMBER PUSH1 1 SSTORE STOP
+        let genesis = rayls_infrastructure_types::test_genesis().extend_accounts([(
+            Self::CONTRACT,
+            GenesisAccount {
+                code: Some(Bytes::from_static(&[0x43, 0x60, 0x01, 0x55, 0x00])),
+                storage: Some(std::collections::BTreeMap::from([(
+                    Self::SLOT,
+                    B256::from(Self::GENESIS_VALUE),
+                )])),
+                ..Default::default()
+            },
+        )]);
+        let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+        let tmp_dir = TempDir::new()?;
+        let task_manager = TaskManager::new("Test Task Manager");
+        let reth_env =
+            RethEnv::new_for_temp_chain(chain.clone(), tmp_dir.path(), &task_manager, None).await?;
+        let header = chain.sealed_genesis_header();
+        Ok(Self {
+            reth_env,
+            chain,
+            // the default `TransactionFactory` address is funded in `test_genesis` at nonce 0
+            factory: TransactionFactory::new(),
+            header,
+            next_nonce: 0,
+            _task_manager: task_manager,
+            _tmp_dir: tmp_dir,
+        })
+    }
+
+    fn sender(&self) -> Address {
+        self.factory.address()
+    }
+
+    /// Build, persist and flush the next block. With `call_contract` it holds one transaction
+    /// from the sender that calls the contract.
+    async fn next_block(&mut self, call_contract: bool) -> eyre::Result<u64> {
+        let number = self.header.number + 1;
+        let txs = if call_contract {
+            self.factory.set_nonce(self.next_nonce);
+            self.next_nonce += 1;
+            vec![self.factory.create_eip1559_encoded(
+                self.chain.clone(),
+                None,
+                self.reth_env.get_gas_price()?,
+                Some(Self::CONTRACT),
+                U256::ZERO,
+                Default::default(),
+            )]
+        } else {
+            vec![]
+        };
+        let mut co = consensus_output_for_tests(2, 0, number);
+        co.close_epoch = false;
+        let payload = RLPayload::new_for_test(self.header.clone(), &co);
+        let block =
+            execute_payload_and_update_canonical_chain(&self.reth_env, payload, txs).await?;
+        assert_eq!(
+            block.recovered_block.body().transactions.len(),
+            usize::from(call_contract),
+            "block {number} must include its transaction"
+        );
+        self.header = block.recovered_block.clone_sealed_header();
+        Ok(number)
+    }
+
+    /// Slot value and sender nonce at the end of a historical block.
+    fn state_at(&self, number: u64) -> eyre::Result<(U256, u64)> {
+        use reth_provider::{StateProvider as _, StateProviderFactory as _};
+        let state = self.reth_env.blockchain_provider.history_by_block_number(number)?;
+        Ok((
+            state.storage(Self::CONTRACT, Self::SLOT)?.unwrap_or_default(),
+            state.basic_account(&self.sender())?.map(|a| a.nonce).unwrap_or_default(),
+        ))
+    }
+}
+
+/// History written by normal blocks is still there after the start-up check runs again.
+///
+/// reth's start-up check clears both history tables and re-seeds only genesis while the history
+/// stage checkpoint is 0. Saving a block moves that checkpoint (`save_blocks` updates all stage
+/// checkpoints), so the clear must not run on a node that has saved blocks. If it did, every
+/// restart would drop the history of all blocks. This test builds blocks that change a storage
+/// slot and an account, runs the start-up check, and reads the old values again.
+///
+/// The check is called directly on the open node env. It is the step a node start runs, but it
+/// is not a full stop and start of the process.
+#[tokio::test]
+async fn block_history_survives_the_start_up_check() -> eyre::Result<()> {
+    let mut chain = HistoryChain::new().await?;
+    // blocks 1 and 3 call the contract, blocks 2 and 4 are empty
+    for call_contract in [true, false, true, false] {
+        chain.next_block(call_contract).await?;
+    }
+
+    // slot value and sender nonce at the end of each historical block (the tip is block 4)
+    let expected = [
+        (0u64, HistoryChain::GENESIS_VALUE, 0u64),
+        (1, U256::from(1u64), 1),
+        (2, U256::from(1u64), 1),
+        (3, U256::from(3u64), 2),
+    ];
+    let assert_history = |when: &str| -> eyre::Result<()> {
+        for (number, slot_value, nonce) in expected {
+            assert_eq!(chain.state_at(number)?, (slot_value, nonce), "{when}: block {number}");
+        }
+        Ok(())
+    };
+
+    assert_history("before the start-up check")?;
+
+    // what every node start runs; it must find nothing to unwind and must not clear history
+    let unwind = chain.reth_env.provider_factory.check_consistency()?;
+    assert_eq!(unwind, (None, None), "nothing to unwind");
+
+    assert_history("after the start-up check")?;
+
+    Ok(())
+}
+
+/// `heal_rocksdb_history_after_snapshot` is still needed on reth 2.0, and it works.
+///
+/// A datadir copied while the node runs can hold a history index (RocksDB) that already knows
+/// blocks the rest of the datadir does not have. The test builds that state on a node with
+/// saved blocks and runs the two start-up steps in their real order:
+///
+/// 1. reth's own check. It only repairs the index when the changeset static files are ahead too.
+///    Here they are not, so it must leave the stale entries in place. This is the part that shows
+///    our heal is still needed.
+/// 2. our heal. It must cut the index back to the tip.
+///
+/// After that the node must be able to build and save the very block the stale entries pointed
+/// to. Without the heal that save fails and the persistence service stops: reth's history
+/// append rejects a block number that is already in the list (`UnsortedInput`). Checked by
+/// running this test once with the heal call removed.
+#[tokio::test]
+async fn heal_is_needed_after_reths_check_and_lets_the_next_block_persist() -> eyre::Result<()> {
+    use reth_db::{
+        models::{storage_sharded_key::StorageShardedKey, ShardedKey},
+        tables, BlockNumberList,
+    };
+    use reth_provider::RocksDBProviderFactory;
+
+    fn blocks_of<K>(shards: Vec<(K, BlockNumberList)>) -> Vec<u64> {
+        shards.into_iter().flat_map(|(_, blocks)| blocks.iter().collect::<Vec<_>>()).collect()
+    }
+
+    let mut chain = HistoryChain::new().await?;
+    for call_contract in [true, false, true, false] {
+        chain.next_block(call_contract).await?;
+    }
+    let (sender, contract, slot) = (chain.sender(), HistoryChain::CONTRACT, HistoryChain::SLOT);
+    let tip = 4u64;
+
+    let account_blocks = |chain: &HistoryChain| -> eyre::Result<Vec<u64>> {
+        Ok(blocks_of(
+            chain.reth_env.provider_factory.rocksdb_provider().account_history_shards(sender)?,
+        ))
+    };
+    let slot_blocks = |chain: &HistoryChain| -> eyre::Result<Vec<u64>> {
+        Ok(blocks_of(
+            chain
+                .reth_env
+                .provider_factory
+                .rocksdb_provider()
+                .storage_history_shards(contract, slot)?,
+        ))
+    };
+
+    // the real history after 4 blocks
+    let real_account_blocks = account_blocks(&chain)?;
+    let real_slot_blocks = slot_blocks(&chain)?;
+    assert!(real_account_blocks.iter().all(|b| *b <= tip) && real_account_blocks.contains(&3));
+    assert!(real_slot_blocks.iter().all(|b| *b <= tip) && real_slot_blocks.contains(&3));
+
+    // Add block 5 to both lists, as a copy would carry it when the index is ahead. Block 5 is
+    // the block the node builds next, and it changes this account and this slot.
     {
-        let rocksdb = provider_factory.rocksdb_provider();
+        let rocksdb = chain.reth_env.provider_factory.rocksdb_provider();
+        let with_stale = |real: &[u64]| {
+            BlockNumberList::new(real.iter().copied().chain([tip + 1])).expect("sorted")
+        };
         let mut batch = rocksdb.batch();
-        batch.put::<tables::StoragesHistory>(
-            StorageShardedKey::last(addr, hb),
-            &BlockNumberList::new([5u64]).unwrap(),
+        batch.put::<tables::AccountsHistory>(
+            ShardedKey::last(sender),
+            &with_stale(&real_account_blocks),
         )?;
         batch.put::<tables::StoragesHistory>(
-            StorageShardedKey::new(addr, hc, 2000),
-            &BlockNumberList::new(1u64..=2000).unwrap(),
-        )?;
-        batch.put::<tables::StoragesHistory>(
-            StorageShardedKey::last(addr, hc),
-            &BlockNumberList::new(2001u64..=4000).unwrap(),
+            StorageShardedKey::last(contract, slot),
+            &with_stale(&real_slot_blocks),
         )?;
         batch.commit()?;
     }
 
-    // Run the fix.
-    let fixed = RethEnv::fix_genesis_history_with(&provider_factory, true)?;
-    assert!(fixed > 0, "fix must re-key at least the injected slots");
+    // step 1: reth's own start-up check does not repair this case
+    let unwind = chain.reth_env.provider_factory.check_consistency()?;
+    assert_eq!(unwind, (None, None), "reth sees nothing to unwind");
+    assert!(account_blocks(&chain)?.contains(&(tip + 1)), "reth leaves the stale account entry");
+    assert!(slot_blocks(&chain)?.contains(&(tip + 1)), "reth leaves the stale slot entry");
 
-    let rocksdb = provider_factory.rocksdb_provider();
+    // step 2: our heal cuts the index back to the tip
+    RethEnv::heal_rocksdb_history_after_snapshot(&chain.reth_env.provider_factory)?;
+    assert_eq!(account_blocks(&chain)?, real_account_blocks, "account history is back to the tip");
+    assert_eq!(slot_blocks(&chain)?, real_slot_blocks, "slot history is back to the tip");
 
-    // Strong outcome check (not a loose count): every genesis alloc storage slot
-    // now resolves under its hashed key at block 0. Catches any slot the fix
-    // silently missed. Iterates the alloc from the chain spec (genesis was moved).
-    for (a, account) in provider_factory.chain_spec().genesis().alloc.iter() {
-        let Some(s) = account.storage.as_ref() else { continue };
-        for slot in s.keys() {
-            let shards = rocksdb.storage_history_shards(*a, keccak256(*slot))?;
-            assert!(
-                shards.iter().any(|(_, l)| l.contains(0u64)),
-                "genesis slot {slot} on {a} must carry block 0 under its hashed key after the fix"
-            );
-        }
-    }
-    let blocks = |shards: &[(StorageShardedKey, BlockNumberList)]| -> Vec<u64> {
-        shards.iter().flat_map(|(_, l)| l.iter()).collect()
+    // the node can now build and save block 5, which touches the healed account and slot
+    assert_eq!(chain.next_block(true).await?, tip + 1);
+    chain.next_block(false).await?;
+    assert_eq!(account_blocks(&chain)?.iter().filter(|b| **b == tip + 1).count(), 1);
+    assert_eq!(slot_blocks(&chain)?.iter().filter(|b| **b == tip + 1).count(), 1);
+    assert_eq!(chain.state_at(tip + 1)?, (U256::from(tip + 1), 3), "block 5 is readable");
+
+    Ok(())
+}
+
+/// The persistence threshold `rayls-replay` uses (512) must not reach reth's engine config.
+///
+/// reth 2.0 debug-asserts in `EngineArgs::tree_config` that its backpressure threshold (16 by
+/// default) is above the persistence threshold. With 512 that assert fails in a debug or test
+/// build. `RethEnv::engine_tree_config` builds the config with reth's default persistence
+/// threshold.
+#[test]
+fn engine_tree_config_accepts_a_large_persistence_threshold() {
+    use reth_engine_primitives::{
+        DEFAULT_PERSISTENCE_BACKPRESSURE_THRESHOLD, DEFAULT_PERSISTENCE_THRESHOLD,
+    };
+    use reth_node_core::args::EngineArgs;
+
+    let engine = EngineArgs {
+        persistence_threshold: 512,
+        prewarming_disabled: true,
+        cross_block_cache_size: 123,
+        ..Default::default()
     };
 
-    // slot_a (immutable) -> a fresh open shard [0].
+    // must not panic
+    let tree_config = RethEnv::engine_tree_config(&engine);
+
+    // the thresholds reth's engine tree would read keep reth's defaults
+    assert_eq!(tree_config.persistence_threshold(), DEFAULT_PERSISTENCE_THRESHOLD);
     assert_eq!(
-        blocks(&rocksdb.storage_history_shards(addr, ha)?),
-        vec![0],
-        "immutable genesis slot seeded with block 0"
+        tree_config.persistence_backpressure_threshold(),
+        DEFAULT_PERSISTENCE_BACKPRESSURE_THRESHOLD
+    );
+    // every other engine setting is passed on (the cache size is given in MB, kept in bytes)
+    assert!(tree_config.disable_prewarming());
+    assert_eq!(tree_config.cross_block_cache_size(), 123 * 1024 * 1024);
+}
+
+/// The env `rayls-replay` builds, with its threshold of 512, starts in a debug build, and our
+/// own persistence state gets the 512.
+///
+/// This is the real path of the fix above: before it, building this env hit reth's
+/// debug-assert.
+#[cfg(feature = "archive-replay")]
+#[tokio::test]
+async fn replay_env_keeps_a_large_persistence_threshold() -> eyre::Result<()> {
+    use crate::NetworkProfile;
+    use reth_chainspec::EthChainSpec as _;
+
+    let chain = rayls_infrastructure_types::test_chain_spec_arc();
+    let profile = NetworkProfile { chain_id: chain.chain().id(), hardforks: Default::default() };
+    let tmp_dir = TempDir::new()?;
+    let task_manager = TaskManager::new("Test Task Manager");
+    let reth_env = RethEnv::new_for_archive_replay(
+        chain,
+        tmp_dir.path(),
+        &task_manager,
+        &profile,
+        None,
+        None,
+        true,
+        Some(512),
+        rayls_middleware_rewards::RewardsCounter::default(),
+    )
+    .await?;
+
+    assert_eq!(reth_env.persistence_state.lock().persistence_threshold, 512);
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------------------------
+// Golden values (#417)
+//
+// Every other test only checks that the node agrees with itself. This one compares a genesis and
+// four blocks with values written down here. If a dependency upgrade or a code change alters what
+// the node computes, the hashes change and the test fails.
+//
+// The same test with the same values passes on reth 1.11 (v1.5.3) and on reth 2.0. The values
+// may only change together with a hardfork, or with a change of the inputs. The inputs are the
+// values below and three shared fixtures: `test_genesis()` with `TEST_GENESIS_YAML`, the contract
+// bytecodes that the genesis build and the migrations deploy, and the key of
+// `TransactionFactory::new()`.
+// ---------------------------------------------------------------------------------------------
+
+/// Fixed genesis time for the golden chain. Block `n` has timestamp `GOLDEN_GENESIS_TIME + n`.
+const GOLDEN_GENESIS_TIME: u64 = 1_750_000_000;
+
+/// The golden genesis: the test genesis with a fixed timestamp and four validators, then the
+/// consensus registry simulation and the greenfield fixes.
+///
+/// This is not the genesis the `genesis` command writes. The command runs these two steps too,
+/// but between them it lays the precompile accounts of `PRECOMPILE_CFG_YAML` over the simulation
+/// result, and at the end it puts the five simulated proxies back. Here the precompile accounts
+/// come from `TEST_GENESIS_YAML` and are in place before the simulation. So the test pins what
+/// the node computes from a fixed genesis. It does not pin the output of the command.
+///
+/// The validator keys are built from fixed secret bytes (the scalars 1 to 4), not from a random
+/// generator: `StdRng` is not promised to give the same numbers in a later `rand` version, and
+/// the keys go into the genesis state.
+fn golden_genesis() -> eyre::Result<rayls_infrastructure_types::Genesis> {
+    let validators: Vec<NodeInfo> = (0u8..4)
+        .map(|i| {
+            let addr = Address::from_slice(&[(i + 1) * 0x11; 20]);
+            let mut secret = [0u8; 32];
+            secret[31] = i + 1;
+            let bls = BlsKeypair::from_bytes(&secret).expect("a small scalar is a valid key");
+            let pop = generate_proof_of_possession_bls(&bls, &addr).expect("pop generation failed");
+            NodeInfo {
+                name: format!("validator-{i}"),
+                bls_public_key: *bls.public(),
+                p2p_info: NodeP2pInfo::default(),
+                execution_address: addr,
+                proof_of_possession: pop,
+            }
+        })
+        .collect();
+    let stake_config = ConsensusRegistry::StakeConfig {
+        stakeAmount: U256::from(parse_ether("1_000_000").unwrap()),
+        minWithdrawAmount: U256::from(parse_ether("1_000").unwrap()),
+        epochDuration: 60 * 60 * 24,
+    };
+    let governance = Address::from_slice(&[0x60; 20]);
+
+    let mut base = rayls_infrastructure_types::test_genesis();
+    base.timestamp = GOLDEN_GENESIS_TIME;
+    let base = base.extend_accounts([(
+        governance,
+        GenesisAccount::default().with_balance(U256::from(parse_ether("100_000_000").unwrap())),
+    )]);
+
+    let genesis = RethEnv::create_consensus_registry_genesis_accounts(
+        validators,
+        base,
+        stake_config.clone(),
+        governance,
+        governance,
+        vec![(governance, stake_config.stakeAmount)],
+    )?;
+    let mut alloc: std::collections::BTreeMap<Address, GenesisAccount> =
+        genesis.alloc.iter().map(|(a, g)| (*a, g.clone())).collect();
+    crate::reth_env::genesis::apply_greenfield_fixes(&mut alloc);
+    Ok(genesis.extend_accounts(alloc))
+}
+
+/// A payload with no random and no clock input.
+fn golden_payload(
+    parent: rayls_infrastructure_types::SealedHeader,
+    epoch: u32,
+    round: u32,
+    close_epoch: Option<B256>,
+) -> RLPayload {
+    let number = parent.number + 1;
+    let tag = number as u8;
+    RLPayload {
+        base_fee_per_gas: parent
+            .base_fee_per_gas
+            .unwrap_or(rayls_infrastructure_types::MIN_PROTOCOL_BASE_FEE),
+        gas_limit: parent.gas_limit,
+        parent_header: parent,
+        beneficiary: Address::repeat_byte(0xBE),
+        nonce: (u64::from(epoch) << 32) | u64::from(round),
+        batch_index: 0,
+        timestamp: GOLDEN_GENESIS_TIME + number,
+        batch_digest: B256::repeat_byte(0xB0 + tag),
+        consensus_header_digest: B256::repeat_byte(0xC0 + tag),
+        mix_hash: B256::repeat_byte(0xD0 + tag),
+        close_epoch,
+        worker_id: 0,
+    }
+}
+
+/// Genesis hash, and hash, state root, receipts root and gas used of four blocks, against fixed
+/// values.
+///
+/// The chain uses the hardfork schedule of the local network, as it is in the code. It is not a
+/// frozen copy, on purpose: the test then covers every fork the local network runs. The price
+/// is that a new fork which is active from block 0 on the local network and changes execution
+/// moves the values. Update them in the same change, after checking that the new fork is the
+/// only reason.
+///
+/// What the blocks cover:
+/// - genesis: the pre-genesis EVM simulation that builds the consensus registry state
+/// - block 1: the two one-shot migrations of the local schedule, a transfer, a contract creation
+/// - block 2: a contract call with a storage write and a log, a transfer through the native ERC-20
+///   precompile
+/// - block 3: an epoch close, with its system calls
+/// - block 4: a transfer in the new epoch
+///
+/// Not covered: the reward amounts. The test env has no consensus database behind its rewards
+/// counter, so the epoch close runs with an empty tally. The close pins the system calls and the
+/// committee change, not the reward math.
+#[tokio::test]
+async fn golden_genesis_and_blocks() -> eyre::Result<()> {
+    use crate::NetworkProfile;
+    use rayls_infrastructure_types::RaylsNetwork;
+    use reth_provider::{ReceiptProvider as _, StateProvider as _};
+
+    // genesis hash, genesis state root
+    const EXPECTED_GENESIS: [&str; 2] = [
+        "0x343f67c779d2b6631543451f97880881a9c1bcd12072b5181f0bac7040171617",
+        "0x2d191fa6b14b09efb7932d2c3acbb25ec78da7eefc7ddc08986df8606260a8c5",
+    ];
+    // per block: hash, state root, receipts root, gas used, transactions
+    const EXPECTED_BLOCKS: [[&str; 5]; 4] = [
+        // block 1
+        [
+            "0x175c2d005d7c455921c7c1e942f4bfcec3f0c2df1246491bd3520f4e6e3b60bf",
+            "0xc5cb2555fe8737e8703c545ebe9df8ec150b09f434a29d11236d3ec075be21ca",
+            "0x7b63442fc3bb636f45608775a000448294c5f3181db035f76b5c78ccb11e6928",
+            "76276",
+            "2",
+        ],
+        // block 2
+        [
+            "0x62d1d38c68e82370b3d5cff9f6672a845c67049003e2d0f3ec72577499f1365c",
+            "0x3f53b07849ca405108735154b807738875be7e80064315a4a57d4fef160c0206",
+            "0x7560ccf08f392a89e26049c789995dc15f0a8cec1a966ca58aa04bcabbae0466",
+            "74070",
+            "2",
+        ],
+        // block 3
+        [
+            "0xef141cf0b9171844dc20a0cfda6d023a82ccf9b3eb1647b6624e943ccc2683c9",
+            "0x6f024e556afa4b506be7fb8b3cc420685f8954ed5b753257f455529d460db8cd",
+            "0x56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421",
+            "0",
+            "0",
+        ],
+        // block 4
+        [
+            "0x5dbde113bf3ea0a9bcd5339828bc0ea09ef42c28a302d36297af8a2a0b4de5db",
+            "0x32440657f8b0dd5927e51c8f68559146492909d3aaeeeeff8059db44bf749ee7",
+            "0xf3e5d7efe2f0cec3853ea3580e632cb94238b6749655d3955fbc81f0c6a8f62a",
+            "21000",
+            "1",
+        ],
+    ];
+
+    let chain: Arc<RethChainSpec> = Arc::new(golden_genesis()?.into());
+    let profile = NetworkProfile::from_builtin(RaylsNetwork::Local);
+    let tmp_dir = TempDir::new()?;
+    let task_manager = TaskManager::new("Test Task Manager");
+    let reth_env = RethEnv::new_for_temp_chain_with_profile(
+        chain.clone(),
+        tmp_dir.path(),
+        &task_manager,
+        None,
+        &profile,
+    )
+    .await?;
+
+    let genesis_header = chain.sealed_genesis_header();
+    let actual_genesis =
+        [format!("{:?}", genesis_header.hash()), format!("{:?}", genesis_header.state_root)];
+
+    // the default `TransactionFactory` address is funded in `test_genesis` at nonce 0
+    let mut factory = TransactionFactory::new();
+    let sender = factory.address();
+    // The key of `TransactionFactory::new()` comes from a seeded `StdRng`. If a `rand` upgrade
+    // changes it, fail here with a clear reason, not with a hash mismatch below.
+    assert_eq!(
+        sender,
+        rayls_infrastructure_types::address!("b14d3c4f5fbfbcfb98af2d330000d49c95b93aa7"),
+        "the key of TransactionFactory::new() changed; the golden values depend on it"
+    );
+    let gas_price = reth_env.get_gas_price()?;
+    let mut nonce = 0u64;
+    let mut tx = |to: Option<Address>, value: U256, input: Bytes| {
+        factory.set_nonce(nonce);
+        nonce += 1;
+        factory.create_eip1559_encoded(chain.clone(), None, gas_price, to, value, input)
+    };
+
+    // init code that deploys the runtime `NUMBER PUSH1 1 SSTORE PUSH1 0 PUSH1 0 LOG0 STOP`:
+    // PUSH10 <runtime> PUSH1 0 MSTORE PUSH1 10 PUSH1 22 RETURN
+    let init_code = Bytes::from_static(&[
+        0x69, 0x43, 0x60, 0x01, 0x55, 0x60, 0x00, 0x60, 0x00, 0xa0, 0x00, 0x60, 0x00, 0x52, 0x60,
+        0x0a, 0x60, 0x16, 0xf3,
+    ]);
+    let contract = sender.create(1);
+    let receiver = Address::repeat_byte(0xAA);
+    // `transfer(address,uint256)` on the native ERC-20 precompile
+    let precompile = crate::native_erc20::ERC20_PRECOMPILE_ADDRESS;
+    let mut erc20_transfer = vec![0xa9, 0x05, 0x9c, 0xbb];
+    erc20_transfer.extend_from_slice(&[0u8; 12]);
+    erc20_transfer.extend_from_slice(receiver.as_slice());
+    erc20_transfer.extend_from_slice(&U256::from(12_345u64).to_be_bytes::<32>());
+
+    // (epoch, round, close_epoch, transactions)
+    let blocks: Vec<(u32, u32, Option<B256>, Vec<Bytes>)> = vec![
+        (
+            0,
+            2,
+            None,
+            vec![
+                tx(Some(receiver), U256::from(1_000_000u64), Bytes::new()),
+                tx(None, U256::ZERO, init_code),
+            ],
+        ),
+        (
+            0,
+            4,
+            None,
+            vec![
+                tx(Some(contract), U256::ZERO, Bytes::new()),
+                tx(Some(precompile), U256::ZERO, erc20_transfer.into()),
+            ],
+        ),
+        (0, 6, Some(B256::repeat_byte(0xEC)), vec![]),
+        (1, 2, None, vec![tx(Some(receiver), U256::from(7u64), Bytes::new())]),
+    ];
+
+    // The local schedule runs two one-shot migrations at block 1: one gives the native ERC-20
+    // precompile account its bytecode, one swaps the consensus registry bytecode. Read both
+    // before block 1, to check after it that they really ran.
+    let code_of = |address: Address| -> eyre::Result<Option<Bytes>> {
+        Ok(reth_env.latest()?.account_code(&address)?.map(|code| code.original_bytes()))
+    };
+    assert_eq!(code_of(precompile)?, None, "the precompile account has no code at genesis");
+    let registry_code_at_genesis = code_of(CONSENSUS_REGISTRY_ADDRESS)?;
+    assert!(registry_code_at_genesis.is_some(), "genesis deploys the consensus registry");
+
+    let mut header = genesis_header;
+    let mut actual_blocks: Vec<[String; 5]> = Vec::new();
+    for (epoch, round, close_epoch, txs) in blocks {
+        let sent = txs.len();
+        let payload = golden_payload(header, epoch, round, close_epoch);
+        let block = execute_payload_and_update_canonical_chain(&reth_env, payload, txs).await?;
+        header = block.recovered_block.clone_sealed_header();
+
+        // every transaction must be in the block and must have succeeded: the values below are
+        // only worth pinning for work that really ran
+        assert_eq!(
+            block.recovered_block.body().transactions.len(),
+            sent,
+            "block {}: all transactions included",
+            header.number
+        );
+        let receipts = reth_env
+            .blockchain_provider
+            .receipts_by_block(header.number.into())?
+            .expect("receipts of a persisted block");
+        assert_eq!(receipts.len(), sent, "block {}: one receipt per transaction", header.number);
+        assert!(receipts.iter().all(|r| r.success), "block {}: all succeeded", header.number);
+
+        if header.number == 1 {
+            assert!(
+                code_of(precompile)?.is_some(),
+                "block 1 must run the Erc20PrecompileBytecode migration"
+            );
+            assert_ne!(
+                code_of(CONSENSUS_REGISTRY_ADDRESS)?,
+                registry_code_at_genesis,
+                "block 1 must run the HybridRewards migration"
+            );
+        }
+        // Block 3 has no transactions, so the receipt checks above say nothing about it. Check
+        // the epoch close itself: the registry is in epoch 0 up to block 2 and in epoch 1 from
+        // block 3 on.
+        let registry_epoch = reth_env.epoch_state_from_canonical_tip()?.epoch;
+        assert_eq!(
+            registry_epoch,
+            u32::from(header.number >= 3),
+            "block {}: block 3 must close epoch 0, and no other block may close an epoch",
+            header.number
+        );
+
+        actual_blocks.push([
+            format!("{:?}", header.hash()),
+            format!("{:?}", header.state_root),
+            format!("{:?}", header.receipts_root),
+            header.gas_used.to_string(),
+            block.recovered_block.body().transactions.len().to_string(),
+        ]);
+    }
+
+    // the contract call in block 2 wrote the block number
+    {
+        assert_eq!(
+            reth_env.latest()?.storage(contract, B256::with_last_byte(1))?,
+            Some(U256::from(2u64)),
+            "the contract stored the number of block 2"
+        );
+    }
+    // A receipt only says that a call did not revert. The receiver must really hold the three
+    // amounts: the transfer of block 1, the precompile transfer of block 2, the transfer of
+    // block 4.
+    assert_eq!(
+        reth_env.latest()?.account_balance(&receiver)?,
+        Some(U256::from(1_000_000u64 + 12_345 + 7)),
+        "the receiver got all three transfers, also the one through the ERC-20 precompile"
     );
 
-    // slot_b (single-shard mutable) -> [0, 5]: genesis added, post-genesis kept.
-    assert_eq!(
-        blocks(&rocksdb.storage_history_shards(addr, hb)?),
-        vec![0, 5],
-        "block 5 must survive (no clobber)"
-    );
-
-    // slot_c (full first shard) -> re-chunked so block 0 lands in the earliest
-    // shard, every original block is preserved, and no shard exceeds the limit.
-    let c = rocksdb.storage_history_shards(addr, hc)?; // ascending by highest block
-    assert_eq!(c.len(), 3, "4001 blocks re-chunk into three shards, got {}", c.len());
+    let expected_blocks: Vec<[String; 5]> =
+        EXPECTED_BLOCKS.iter().map(|b| b.map(String::from)).collect();
+    let expected_genesis = EXPECTED_GENESIS.map(String::from);
     assert!(
-        c.iter().all(|(_, l)| (l.len() as usize) <= 2000),
-        "no shard may exceed NUM_OF_INDICES_IN_SHARD (2000)"
-    );
-    assert!(c[0].1.contains(0u64), "genesis block lands in the earliest shard");
-    assert_eq!(
-        c.last().unwrap().0.sharded_key.highest_block_number,
-        u64::MAX,
-        "the last shard is the open (u64::MAX) shard"
-    );
-    assert_eq!(
-        c.iter().flat_map(|(_, l)| l.iter()).collect::<Vec<u64>>(),
-        (0u64..=4000).collect::<Vec<u64>>(),
-        "all blocks preserved, sorted, no duplicates or loss"
-    );
-
-    // Idempotency: a second run is a no-op.
-    let again = RethEnv::fix_genesis_history_with(&provider_factory, true)?;
-    assert_eq!(again, 0, "second run must re-key nothing");
-    assert_eq!(blocks(&rocksdb.storage_history_shards(addr, ha)?), vec![0]);
-    assert_eq!(blocks(&rocksdb.storage_history_shards(addr, hb)?), vec![0, 5]);
-    assert_eq!(
-        blocks(&rocksdb.storage_history_shards(addr, hc)?),
-        (0u64..=4000).collect::<Vec<u64>>(),
-        "re-chunked slot is untouched on the second run"
+        actual_genesis == expected_genesis && actual_blocks == expected_blocks,
+        "golden values differ.\nactual genesis: {actual_genesis:#?}\nactual blocks: {actual_blocks:#?}"
     );
 
     Ok(())
 }
 
-/// Full-DB check for `fix_genesis_account_history`. Unlike storage, account
-/// history has no key mismatch (read and write both use the plain address), so
-/// genesis init already seeds it correctly and the fix is a no-op. It only has
-/// work to do after an `IndexAccountHistoryStage` first-sync clear, which this
-/// test simulates, and multi-shard accounts (post-genesis changesets) are left
-/// untouched.
+// ---------------------------------------------------------------------------------------------
+// Read-only source reader for `rayls-replay` (#418)
+// ---------------------------------------------------------------------------------------------
+
+/// A closed datadir in the layout of a real node (`db/`, `static_files/`, `rocksdb/`), written by
+/// the full node env, to be opened by [`SnapshotReader`](crate::reth_env::SnapshotReader).
 #[cfg(feature = "archive-replay")]
-#[tokio::test]
-async fn test_fix_genesis_account_history_seeds_after_clear_and_skips_multishard(
-) -> eyre::Result<()> {
-    use crate::{reth_env::RethEnv, traits::RaylsNode};
-    use reth_db::{models::ShardedKey, tables, BlockNumberList};
-    use reth_db_common::init::init_genesis_with_settings;
-    use reth_provider::{
-        providers::{RocksDBBuilder, StaticFileProvider},
-        ProviderFactory, RocksDBProviderFactory, StorageSettings, StorageSettingsCache,
-    };
+struct ClosedSource {
+    dir: TempDir,
+    chain: Arc<RethChainSpec>,
+    /// The sealed headers of blocks `0..=3`, as the full node env read them.
+    headers: Vec<rayls_infrastructure_types::SealedHeader>,
+    /// The withdrawals of block 2, as the full node env read them.
+    withdrawals_of_block_2: Option<Vec<(Address, u64)>>,
+}
 
-    let addr = Address::from([0x21u8; 20]); // immutable genesis account
-    let addr2 = Address::from([0x22u8; 20]); // multi-shard (post-genesis changes)
-    let genesis = rayls_infrastructure_types::test_genesis().extend_accounts([
-        (addr, GenesisAccount { balance: U256::from(1u64), ..Default::default() }),
-        (addr2, GenesisAccount { balance: U256::from(2u64), ..Default::default() }),
-    ]);
+#[cfg(feature = "archive-replay")]
+impl ClosedSource {
+    const WITHDRAWALS: [(Address, u64); 2] =
+        [(Address::repeat_byte(0xA1), 7), (Address::repeat_byte(0xA2), 9)];
 
-    let tmp_dir = TempDir::new()?;
-    let datadir = tmp_dir.path().to_path_buf();
-    let db = Arc::new(reth_db::init_db(
-        datadir.join("db"),
-        reth_db::mdbx::DatabaseArguments::default(),
-    )?);
-    let rayls_chain_spec = Arc::new(
-        crate::chainspec::RaylsChainSpec::builder(Arc::new(RethChainSpec::from(genesis))).build(),
-    );
-    let rocksdb_provider =
-        RocksDBBuilder::new(datadir.join("rocksdb")).with_default_tables().build()?;
-    let static_files = StaticFileProvider::read_write(datadir.join("static_files"))?;
-    let runtime = reth_tasks::Runtime::with_existing_handle(tokio::runtime::Handle::current())?;
-    let provider_factory: ProviderFactory<RaylsNode> =
-        ProviderFactory::new(db, rayls_chain_spec, static_files, rocksdb_provider, runtime)?;
-    let settings = StorageSettings::v2();
-    provider_factory.set_storage_settings_cache(settings);
-    init_genesis_with_settings(&provider_factory, settings)?;
-
-    let rocksdb = provider_factory.rocksdb_provider();
-    let last = |a: Address| rocksdb.get::<tables::AccountsHistory>(ShardedKey::last(a));
-
-    // Genesis init already seeds account history correctly (plain address, no
-    // mismatch), so the fix has nothing to do.
-    assert!(
-        last(addr)?.is_some_and(|l| l.contains(0u64)),
-        "genesis init seeds AccountsHistory[addr] = [0]"
-    );
-    assert_eq!(
-        RethEnv::fix_genesis_account_history_with(&provider_factory, true)?,
-        0,
-        "account history already correct at genesis; fix is a no-op"
-    );
-
-    // Simulate IndexAccountHistoryStage's first-sync clear (what a normally-synced
-    // node does), then inject a multi-shard post-genesis account.
-    rocksdb.clear::<tables::AccountsHistory>()?;
-    {
-        let mut batch = rocksdb.batch();
-        batch.put::<tables::AccountsHistory>(
-            ShardedKey::new(addr2, 400u64),
-            &BlockNumberList::new([100u64, 400]).unwrap(),
-        )?;
-        batch.put::<tables::AccountsHistory>(
-            ShardedKey::last(addr2),
-            &BlockNumberList::new([900u64]).unwrap(),
-        )?;
-        batch.commit()?;
+    /// Build genesis and three empty blocks, give block 2 a withdrawals row, then close the
+    /// node env. `finish` overwrites the `Finish` stage checkpoint (the node wrote 3).
+    async fn build(finish: Option<u64>) -> eyre::Result<Self> {
+        Self::build_with(finish, None).await
     }
 
-    // The fix restores block 0 for the cleared immutable account...
-    let seeded = RethEnv::fix_genesis_account_history_with(&provider_factory, true)?;
-    assert!(seeded >= 1, "cleared single-shard genesis accounts are re-seeded");
-    assert!(last(addr)?.is_some_and(|l| l.contains(0u64)), "addr re-seeded with block 0");
+    /// [`Self::build`] with a database page size. `None` is the node's default.
+    async fn build_with(finish: Option<u64>, page_size: Option<usize>) -> eyre::Result<Self> {
+        use crate::NetworkProfile;
+        use alloy::eips::eip4895::{Withdrawal, Withdrawals};
+        use reth_chainspec::EthChainSpec as _;
+        use reth_db::{
+            models::StoredBlockWithdrawals,
+            tables::{BlockWithdrawals, StageCheckpoints},
+            transaction::{DbTx as _, DbTxMut as _},
+            Database as _,
+        };
+        use reth_stages::{StageCheckpoint, StageId};
 
-    // ...but leaves the multi-shard account untouched (assumed correctly indexed).
+        let chain = rayls_infrastructure_types::test_chain_spec_arc();
+        let profile =
+            NetworkProfile { chain_id: chain.chain().id(), hardforks: Default::default() };
+        let dir = TempDir::new()?;
+        if let Some(page_size) = page_size {
+            // create the datafile first; the node env below then opens it at its own page size
+            use reth::{args::DatabaseArgs, builder::NodeConfig};
+            let config = RethConfig(NodeConfig {
+                db: DatabaseArgs { page_size: Some(page_size), ..Default::default() },
+                ..NodeConfig::default()
+            });
+            let db = RethEnv::new_database(&config, dir.path().join("db"))?;
+            assert_eq!(db.stat()?.page_size() as usize, page_size);
+        }
+        let task_manager = TaskManager::new("Test Task Manager");
+        let reth_env = RethEnv::new_for_archive_replay(
+            chain.clone(),
+            dir.path(),
+            &task_manager,
+            &profile,
+            None,
+            None,
+            true,
+            None,
+            rayls_middleware_rewards::RewardsCounter::default(),
+        )
+        .await?;
+
+        let mut header = chain.sealed_genesis_header();
+        for number in 1..=3u64 {
+            let mut co = consensus_output_for_tests(2, 0, number);
+            co.close_epoch = false;
+            let payload = RLPayload::new_for_test(header.clone(), &co);
+            let block =
+                execute_payload_and_update_canonical_chain(&reth_env, payload, vec![]).await?;
+            header = block.recovered_block.clone_sealed_header();
+        }
+
+        // reth keeps withdrawals in this table, one row per block that has some
+        let db = reth_env.provider_factory.db_ref().clone();
+        let withdrawals = Withdrawals::new(
+            Self::WITHDRAWALS
+                .iter()
+                .enumerate()
+                .map(|(index, (address, amount))| Withdrawal {
+                    index: index as u64,
+                    validator_index: 0,
+                    address: *address,
+                    amount: *amount,
+                })
+                .collect(),
+        );
+        let tx = db.tx_mut()?;
+        tx.put::<BlockWithdrawals>(2, StoredBlockWithdrawals { withdrawals })?;
+        if let Some(block) = finish {
+            tx.put::<StageCheckpoints>(
+                StageId::Finish.as_str().to_string(),
+                StageCheckpoint::new(block),
+            )?;
+        }
+        tx.commit()?;
+        drop(db);
+
+        let headers = (0..=3u64)
+            .map(|number| {
+                reth_env
+                    .sealed_header_by_number(number)?
+                    .ok_or_else(|| eyre::eyre!("the node env has no header {number}"))
+            })
+            .collect::<eyre::Result<Vec<_>>>()?;
+        let withdrawals_of_block_2 = reth_env.block_withdrawals(2)?;
+
+        drop(reth_env);
+        drop(task_manager);
+        Ok(Self { dir, chain, headers, withdrawals_of_block_2 })
+    }
+
+    /// Open the reader. The open is exclusive, and the node env closes its database a moment
+    /// after it is dropped (its background threads hold it), so wait for that.
+    async fn open(&self) -> eyre::Result<crate::reth_env::SnapshotReader> {
+        let started = std::time::Instant::now();
+        loop {
+            match crate::reth_env::SnapshotReader::open(self.dir.path(), self.chain.clone()) {
+                Ok(reader) => return Ok(reader),
+                Err(e)
+                    if e.to_string().contains("another process")
+                        && started.elapsed() < std::time::Duration::from_secs(20) =>
+                {
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    /// Every file and directory under the datadir: `None` for a directory, size and change time
+    /// for a file.
+    ///
+    /// `mdbx.lck` is listed with its size only. It is MDBX's lock file, not data: MDBX sets its
+    /// length again on every open and close, also a read-only one, which moves the change time
+    /// of the (empty) file.
+    fn file_list(&self) -> eyre::Result<FileList> {
+        fn walk(dir: &std::path::Path, out: &mut FileList) -> eyre::Result<()> {
+            for entry in std::fs::read_dir(dir)? {
+                let path = entry?.path();
+                let meta = std::fs::metadata(&path)?;
+                if meta.is_dir() {
+                    out.insert(path.clone(), None);
+                    walk(&path, out)?;
+                } else {
+                    let is_lock_file = path.file_name().is_some_and(|name| name == "mdbx.lck");
+                    let changed = if is_lock_file { None } else { Some(meta.modified()?) };
+                    out.insert(path, Some((meta.len(), changed)));
+                }
+            }
+            Ok(())
+        }
+        let mut out = FileList::new();
+        walk(self.dir.path(), &mut out)?;
+        Ok(out)
+    }
+}
+
+/// See [`ClosedSource::file_list`].
+#[cfg(feature = "archive-replay")]
+type FileList =
+    std::collections::BTreeMap<std::path::PathBuf, Option<(u64, Option<std::time::SystemTime>)>>;
+
+/// The reader gives the same headers and withdrawals as the full node env, cuts every read at
+/// the tip, refuses a second open, and leaves every file of the datadir as it was.
+#[cfg(feature = "archive-replay")]
+#[tokio::test]
+async fn snapshot_reader_reads_like_the_node_env_and_changes_no_file() -> eyre::Result<()> {
+    let source = ClosedSource::build(None).await?;
     assert_eq!(
-        last(addr2)?.unwrap().iter().collect::<Vec<u64>>(),
-        vec![900],
-        "multi-shard account's open shard is untouched"
+        source.withdrawals_of_block_2,
+        Some(ClosedSource::WITHDRAWALS.to_vec()),
+        "the full node env must read the withdrawals row, or the comparison below is empty"
     );
+
+    // one open and close first, so the list below is taken after the node env is fully closed
+    drop(source.open().await?);
+    let before = source.file_list()?;
+
+    let reader = source.open().await?;
+    assert_eq!(reader.last_block_number(), 3);
+
+    for (number, expected) in source.headers.iter().enumerate() {
+        let number = number as u64;
+        let sealed = reader.sealed_header_by_number(number)?.expect("header in the source");
+        assert_eq!(sealed.hash(), expected.hash(), "hash of block {number}");
+        assert_eq!(&sealed, expected, "sealed header of block {number}");
+        assert_eq!(
+            reader.header_by_number(number)?.as_ref(),
+            Some(expected.header()),
+            "header of block {number}"
+        );
+    }
+
+    // nothing above the tip
+    assert!(reader.sealed_header_by_number(4)?.is_none());
+    assert!(reader.header_by_number(4)?.is_none());
+    assert!(reader.block_withdrawals(4)?.is_none());
+
+    // ranges are cut at the tip
+    assert_eq!(reader.blocks_for_range(1..=3)?, source.headers[1..=3]);
+    assert_eq!(reader.blocks_for_range(2..=10)?, source.headers[2..=3]);
+    assert_eq!(reader.blocks_for_range(0..=0)?, source.headers[0..=0]);
+    assert!(reader.blocks_for_range(4..=9)?.is_empty());
+
+    // a block with a row, and blocks without one
+    assert_eq!(reader.block_withdrawals(2)?, source.withdrawals_of_block_2);
+    assert_eq!(reader.block_withdrawals(1)?, Some(Vec::new()));
+    assert_eq!(reader.block_withdrawals(3)?, Some(Vec::new()));
+
+    // a clone shares the open files and reads the same
+    let clone = reader.clone();
+    assert_eq!(clone.sealed_header_by_number(3)?.map(|h| h.hash()), Some(source.headers[3].hash()));
+
+    // the open is exclusive: a second open of the same datadir is refused while this one lives
+    let second = crate::reth_env::SnapshotReader::open(source.dir.path(), source.chain.clone());
+    assert!(second.is_err(), "a second open must be refused");
+
+    drop(clone);
+    drop(reader);
+    let after = source.file_list()?;
+    let changed: Vec<_> = before
+        .iter()
+        .filter(|(path, entry)| after.get(*path) != Some(*entry))
+        .chain(after.iter().filter(|(path, _)| !before.contains_key(*path)))
+        .collect();
     assert!(
-        !last(addr2)?.unwrap().contains(0u64),
-        "multi-shard account is not seeded with block 0"
+        changed.is_empty(),
+        "the reader must not change any file, but these differ: {changed:#?}"
     );
+    Ok(())
+}
 
-    // Idempotent.
-    assert_eq!(RethEnv::fix_genesis_account_history_with(&provider_factory, true)?, 0);
+/// The tip is the `Finish` checkpoint. Headers above it (a node stopped in the middle of a save)
+/// are not served.
+#[cfg(feature = "archive-replay")]
+#[tokio::test]
+async fn snapshot_reader_ignores_headers_above_the_checkpoint() -> eyre::Result<()> {
+    let source = ClosedSource::build(Some(2)).await?;
+    let reader = source.open().await?;
 
+    assert_eq!(reader.last_block_number(), 2);
+    assert_eq!(reader.sealed_header_by_number(2)?.as_ref(), Some(&source.headers[2]));
+    assert!(reader.sealed_header_by_number(3)?.is_none(), "block 3 is above the checkpoint");
+    assert!(reader.header_by_number(3)?.is_none());
+    assert!(reader.block_withdrawals(3)?.is_none());
+    assert_eq!(reader.blocks_for_range(1..=3)?, source.headers[1..=2]);
+    Ok(())
+}
+
+/// A datafile whose page size is not the page size of this machine opens and reads the same.
+/// 8 KiB differs from both common host page sizes (4 KiB on x86, 16 KiB on Apple silicon).
+#[cfg(feature = "archive-replay")]
+#[tokio::test]
+async fn snapshot_reader_opens_a_datafile_with_another_page_size() -> eyre::Result<()> {
+    let source = ClosedSource::build_with(None, Some(8 * 1024)).await?;
+    let reader = source.open().await?;
+
+    assert_eq!(reader.last_block_number(), 3);
+    assert_eq!(reader.sealed_header_by_number(3)?.as_ref(), Some(&source.headers[3]));
+    assert_eq!(reader.block_withdrawals(2)?, Some(ClosedSource::WITHDRAWALS.to_vec()));
+    Ok(())
+}
+
+/// Headers that end before the checkpoint mean the source is not complete. The reader stops, it
+/// does not repair.
+#[cfg(feature = "archive-replay")]
+#[tokio::test]
+async fn snapshot_reader_refuses_a_source_with_missing_headers() -> eyre::Result<()> {
+    let source = ClosedSource::build(Some(9)).await?;
+    let error = source.open().await.expect_err("the open must fail");
+    assert!(
+        error.to_string().contains("not complete"),
+        "the error must name the problem, got: {error:#}"
+    );
+    Ok(())
+}
+
+/// A directory that is not a node datadir gives a clear error and is not created or filled.
+#[cfg(feature = "archive-replay")]
+#[test]
+fn snapshot_reader_refuses_a_directory_without_a_database() -> eyre::Result<()> {
+    let dir = TempDir::new()?;
+    let chain = rayls_infrastructure_types::test_chain_spec_arc();
+    let error = crate::reth_env::SnapshotReader::open(dir.path(), chain)
+        .expect_err("no database, so no open");
+    assert!(error.to_string().contains("no execution database"), "got: {error:#}");
+    assert_eq!(std::fs::read_dir(dir.path())?.count(), 0, "the directory must stay empty");
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------------------------
+// Old storage format guard (#419)
+// ---------------------------------------------------------------------------------------------
+
+/// A reth database at `dir` whose `VersionHistory` holds one row per given reth version, oldest
+/// first, and nothing else. Closed again on return.
+fn database_written_by(dir: &std::path::Path, reth_versions: &[&str]) -> eyre::Result<()> {
+    use reth_db::{
+        mdbx::DatabaseArguments,
+        models::ClientVersion,
+        tables,
+        transaction::{DbTx as _, DbTxMut as _},
+        Database as _,
+    };
+
+    // an empty client version: reth then records no row by itself
+    let db = reth_db::init_db(dir, DatabaseArguments::new(ClientVersion::default()))?;
+    let tx = db.tx_mut()?;
+    for (index, version) in reth_versions.iter().enumerate() {
+        tx.put::<tables::VersionHistory>(
+            1_700_000_000 + index as u64,
+            ClientVersion {
+                version: (*version).to_owned(),
+                git_sha: "0000000".to_owned(),
+                build_timestamp: "test".to_owned(),
+            },
+        )?;
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+/// Size and change time of every file in `dir`, without MDBX's lock file (MDBX sets its length
+/// again on every open).
+fn data_files(
+    dir: &std::path::Path,
+) -> eyre::Result<std::collections::BTreeMap<std::path::PathBuf, (u64, std::time::SystemTime)>> {
+    let mut out = std::collections::BTreeMap::new();
+    for entry in std::fs::read_dir(dir)? {
+        let path = entry?.path();
+        if path.file_name().is_some_and(|name| name == "mdbx.lck") {
+            continue;
+        }
+        let meta = std::fs::metadata(&path)?;
+        out.insert(path, (meta.len(), meta.modified()?));
+    }
+    Ok(out)
+}
+
+/// A database that reth 1.x wrote is refused before it is opened for writing, and its files stay
+/// as they were.
+#[test]
+fn database_written_by_reth_1_is_refused_and_not_changed() -> eyre::Result<()> {
+    use reth::builder::NodeConfig;
+
+    let dir = TempDir::new()?;
+    // like the real testnet datadir: several rows, all reth 1.11.0
+    database_written_by(dir.path(), &["1.11.0", "1.11.0"])?;
+    let before = data_files(dir.path())?;
+
+    let error = RethEnv::new_database(&RethConfig(NodeConfig::default()), dir.path())
+        .expect_err("a database written by reth 1.x must be refused");
+    let text = error.to_string();
+    assert!(text.contains("was written by reth 1.11.0"), "got: {text}");
+    assert!(text.contains("storage format of reth 1.x"), "got: {text}");
+    assert!(text.contains("was not changed"), "got: {text}");
+
+    assert_eq!(before, data_files(dir.path())?, "the refused database must not be changed");
+    Ok(())
+}
+
+/// An old datadir that a reth 2.0 binary once opened for writing has a reth 2.0 row as its last
+/// row. It is still old: any row of reth 1.x counts, not only the last one.
+#[test]
+fn old_database_with_a_newer_last_row_is_refused() -> eyre::Result<()> {
+    use reth::builder::NodeConfig;
+
+    let dir = TempDir::new()?;
+    database_written_by(dir.path(), &["1.11.0", "2.0.0"])?;
+    let error = RethEnv::new_database(&RethConfig(NodeConfig::default()), dir.path())
+        .expect_err("one reth 1.x row is enough");
+    assert!(error.to_string().contains("was written by reth 1.11.0"), "got: {error}");
+    Ok(())
+}
+
+/// Databases written by reth 2.x, a database without version rows, one with a row that is not
+/// a version, and a new directory all open.
+#[test]
+fn databases_without_a_reth_1_row_open() -> eyre::Result<()> {
+    use reth::builder::NodeConfig;
+    let config = RethConfig(NodeConfig::default());
+
+    let written_by_2 = TempDir::new()?;
+    database_written_by(written_by_2.path(), &["2.0.0", "2.1.3"])?;
+    RethEnv::new_database(&config, written_by_2.path())?;
+
+    // nothing to judge
+    let no_rows = TempDir::new()?;
+    database_written_by(no_rows.path(), &[])?;
+    RethEnv::new_database(&config, no_rows.path())?;
+
+    // a row that does not start with a number is not counted as old
+    let odd_row = TempDir::new()?;
+    database_written_by(odd_row.path(), &["custom-build"])?;
+    RethEnv::new_database(&config, odd_row.path())?;
+
+    // no database yet
+    let fresh = TempDir::new()?;
+    RethEnv::new_database(&config, fresh.path())?;
+    Ok(())
+}
+
+/// The row that this build records is one the check accepts: a database made by `new_database`
+/// opens again, and its version row names a supported reth version. If reth ever changes the
+/// text it records, this fails here and not on a node.
+#[test]
+fn the_version_row_of_this_build_is_accepted() -> eyre::Result<()> {
+    use reth::builder::NodeConfig;
+    use reth_db::{cursor::DbCursorRO as _, tables, transaction::DbTx as _, Database as _};
+    let config = RethConfig(NodeConfig::default());
+
+    let dir = TempDir::new()?;
+    drop(RethEnv::new_database(&config, dir.path())?);
+    let db = RethEnv::new_database(&config, dir.path())?;
+
+    let (_, client) = db
+        .tx()?
+        .cursor_read::<tables::VersionHistory>()?
+        .last()?
+        .expect("new_database records the reth version of this build");
+    let major: u64 = client.version.split('.').next().unwrap_or_default().parse()?;
+    assert!(major >= 2, "this build records reth {}, expected 2.x or later", client.version);
+    Ok(())
+}
+
+/// The check on an open database, used when the read-only check before the open could not run.
+/// By then the normal open has added a row for this reth version; the old row is still found.
+#[test]
+fn reth_1_row_is_also_found_on_an_open_database() -> eyre::Result<()> {
+    use crate::reth_env::datadir_format::check_open_database;
+    use reth_db::mdbx::DatabaseArguments;
+
+    let new = TempDir::new()?;
+    database_written_by(new.path(), &["2.0.0"])?;
+    let db = reth_db::init_db(new.path(), DatabaseArguments::default())?;
+    check_open_database(&db, new.path())?;
+    drop(db);
+
+    let old = TempDir::new()?;
+    database_written_by(old.path(), &["1.11.0", "2.0.0"])?;
+    let db = reth_db::init_db(old.path(), DatabaseArguments::default())?;
+    let error = check_open_database(&db, old.path()).expect_err("the old row must be found");
+    let text = error.to_string();
+    assert!(text.contains("was written by reth 1.11.0"), "got: {text}");
+    assert!(text.contains("nothing in it was repaired or unwound"), "got: {text}");
     Ok(())
 }

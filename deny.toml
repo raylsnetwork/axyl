@@ -59,6 +59,6 @@ unknown-registry = "warn"
 unknown-git = "warn"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
 allow-git = [
-    # Fork of reth v1.11.0 carrying the reth#28264 backport; see the reth block in Cargo.toml.
+    # Fork of reth v2.0.0 carrying the reth#28264 backport; see the reth block in Cargo.toml.
     "https://github.com/raylsnetwork/reth",
 ]

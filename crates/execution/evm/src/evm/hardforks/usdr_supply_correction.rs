@@ -30,12 +30,11 @@
 //! See `etc/state-sum/README.md` for the full audit methodology and a
 //! reproducible verification script.
 
-use rayls_infrastructure_types::{Address, U256};
+use rayls_infrastructure_types::U256;
 use reth_errors::BlockExecutionError;
 use reth_revm::{
-    primitives::HashMap,
+    primitives::AddressMap,
     state::{Account as RevmAccount, EvmStorageSlot},
-    Database, State,
 };
 
 use super::account_with_code;
@@ -67,11 +66,8 @@ pub(super) const CORRECTION_WEI: U256 = U256::from_be_slice(&[
 /// depends on the current slot value at the activation block — so this
 /// function takes `&mut State<DB>` rather than being a pure factory.
 pub(crate) fn usdr_supply_correction_state<DB: alloy_evm::Database>(
-    db: &mut State<DB>,
-) -> Result<HashMap<Address, RevmAccount>, BlockExecutionError>
-where
-    DB::Error: core::fmt::Display,
-{
+    db: &mut DB,
+) -> Result<AddressMap<RevmAccount>, BlockExecutionError> {
     let slot = total_supply_slot();
     let current = db.storage(ERC20_PRECOMPILE_ADDRESS, slot).map_err(|e| {
         BlockExecutionError::msg(format!(
@@ -92,7 +88,7 @@ where
     // from the cached on-chain account, leaving the STOP byte in place.
     let mut account = account_with_code(STOP_BYTECODE);
     account.storage.insert(slot, EvmStorageSlot::new_changed(current, new_value, 0));
-    let mut state = HashMap::default();
+    let mut state = AddressMap::default();
     state.insert(ERC20_PRECOMPILE_ADDRESS, account);
     Ok(state)
 }
@@ -100,7 +96,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use reth_revm::{db::EmptyDBTyped, state::AccountStatus};
+    use reth_revm::{db::EmptyDBTyped, state::AccountStatus, State};
 
     /// Pin the correction value so accidental edits to the byte array trip a test.
     #[test]

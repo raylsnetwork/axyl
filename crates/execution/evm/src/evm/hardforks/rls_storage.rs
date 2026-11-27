@@ -24,7 +24,7 @@
 use alloy::primitives::address;
 use rayls_infrastructure_types::{Address, U256};
 use reth_revm::{
-    primitives::HashMap,
+    primitives::AddressMap,
     state::{Account as RevmAccount, EvmStorageSlot},
 };
 
@@ -182,8 +182,8 @@ fn set_slot(account: &mut RevmAccount, slot: U256, value: U256) {
 // ── Migration ───────────────────────────────────────────────────────
 
 /// Build the state changes for the RlsStorage hardfork.
-pub(crate) fn rls_storage_state() -> HashMap<Address, RevmAccount> {
-    let mut state = HashMap::default();
+pub(crate) fn rls_storage_state() -> AddressMap<RevmAccount> {
+    let mut state = AddressMap::default();
 
     // ── RLS proxy: deploy bytecode + initialize storage ─────────────
     {

@@ -1059,6 +1059,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "crossbeam-queue"
+version = "0.3.14"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "03e8bd762f7479489c70ed6c768ddca99d7296857de437a68dcb2a94365b3fae"
+dependencies = [
+ "crossbeam-utils",
+]
+
+[[package]]
 name = "crossbeam-utils"
 version = "0.8.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2257,22 +2266,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 
 [[package]]
-name = "op-alloy-consensus"
-version = "0.23.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "736381a95471d23e267263cfcee9e1d96d30b9754a94a2819148f83379de8a86"
-dependencies = [
- "alloy-consensus",
- "alloy-eips",
- "alloy-primitives",
- "alloy-rlp",
- "alloy-serde",
- "derive_more",
- "serde",
- "thiserror",
-]
-
-[[package]]
 name = "page_size"
 version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2532,6 +2525,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "quanta"
+version = "0.12.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f3ab5a9d756f0d97bdc89019bd2e4ea098cf9cde50ee7564dde6b81ccc8f06c7"
+dependencies = [
+ "crossbeam-utils",
+ "libc",
+ "once_cell",
+ "raw-cpuid",
+ "wasi",
+ "web-sys",
+ "winapi",
+]
+
+[[package]]
 name = "quick-error"
 version = "1.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2645,6 +2653,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "raw-cpuid"
+version = "11.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "498cd0dc59d73224351ee52a95fee0f1a617a2eae0e7d9d720cc622c73a54186"
+dependencies = [
+ "bitflags",
+]
+
+[[package]]
 name = "redox_syscall"
 version = "0.5.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2704,8 +2721,9 @@ checksum = "dc897dd8d9e8bd1ed8cdad82b5966c3e0ecae09fb1907d58efaa013543185d0a"
 
 [[package]]
 name = "reth-codecs"
-version = "1.11.0"
-source = "git+https://github.com/raylsnetwork/reth?tag=v1.11.0-rayls.1#9932bbb687a13ab29d50d36d8b6b410f1c59a129"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a96e584e01478c951911946a7864f18e967c1cd90965e136e2d1b51aa3da9126"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
@@ -2714,7 +2732,7 @@ dependencies = [
  "alloy-trie",
  "bytes",
  "modular-bitfield",
- "op-alloy-consensus",
+ "parity-scale-codec",
  "reth-codecs-derive",
  "reth-zstd-compressors",
  "serde",
@@ -2722,8 +2740,9 @@ dependencies = [
 
 [[package]]
 name = "reth-codecs-derive"
-version = "1.11.0"
-source = "git+https://github.com/raylsnetwork/reth?tag=v1.11.0-rayls.1#9932bbb687a13ab29d50d36d8b6b410f1c59a129"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c342ae46f5a886b8bf506205b9501b1032b896defd0f4f156edb423007fef880"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -2732,14 +2751,15 @@ dependencies = [
 
 [[package]]
 name = "reth-db"
-version = "1.11.0"
-source = "git+https://github.com/raylsnetwork/reth?tag=v1.11.0-rayls.1#9932bbb687a13ab29d50d36d8b6b410f1c59a129"
+version = "2.0.0"
+source = "git+https://github.com/raylsnetwork/reth?tag=v2.0.0-rayls.1#4f0785c2bb0b753267179ec5e77f37a744c726db"
 dependencies = [
  "alloy-primitives",
  "derive_more",
  "eyre",
  "metrics",
  "page_size",
+ "quanta",
  "reth-db-api",
  "reth-fs-util",
  "reth-libmdbx",
@@ -2757,18 +2777,16 @@ dependencies = [
 
 [[package]]
 name = "reth-db-api"
-version = "1.11.0"
-source = "git+https://github.com/raylsnetwork/reth?tag=v1.11.0-rayls.1#9932bbb687a13ab29d50d36d8b6b410f1c59a129"
+version = "2.0.0"
+source = "git+https://github.com/raylsnetwork/reth?tag=v2.0.0-rayls.1#4f0785c2bb0b753267179ec5e77f37a744c726db"
 dependencies = [
  "alloy-consensus",
- "alloy-genesis",
  "alloy-primitives",
  "arrayvec",
  "bytes",
  "derive_more",
  "metrics",
  "modular-bitfield",
- "parity-scale-codec",
  "reth-codecs",
  "reth-db-models",
  "reth-ethereum-primitives",
@@ -2783,8 +2801,8 @@ dependencies = [
 
 [[package]]
 name = "reth-db-models"
-version = "1.11.0"
-source = "git+https://github.com/raylsnetwork/reth?tag=v1.11.0-rayls.1#9932bbb687a13ab29d50d36d8b6b410f1c59a129"
+version = "2.0.0"
+source = "git+https://github.com/raylsnetwork/reth?tag=v2.0.0-rayls.1#4f0785c2bb0b753267179ec5e77f37a744c726db"
 dependencies = [
  "alloy-eips",
  "alloy-primitives",
@@ -2797,27 +2815,22 @@ dependencies = [
 
 [[package]]
 name = "reth-ethereum-primitives"
-version = "1.11.0"
-source = "git+https://github.com/raylsnetwork/reth?tag=v1.11.0-rayls.1#9932bbb687a13ab29d50d36d8b6b410f1c59a129"
+version = "2.0.0"
+source = "git+https://github.com/raylsnetwork/reth?tag=v2.0.0-rayls.1#4f0785c2bb0b753267179ec5e77f37a744c726db"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
  "alloy-primitives",
- "alloy-rlp",
  "alloy-rpc-types-eth",
- "alloy-serde",
- "modular-bitfield",
  "reth-codecs",
  "reth-primitives-traits",
- "reth-zstd-compressors",
  "serde",
- "serde_with",
 ]
 
 [[package]]
 name = "reth-fs-util"
-version = "1.11.0"
-source = "git+https://github.com/raylsnetwork/reth?tag=v1.11.0-rayls.1#9932bbb687a13ab29d50d36d8b6b410f1c59a129"
+version = "2.0.0"
+source = "git+https://github.com/raylsnetwork/reth?tag=v2.0.0-rayls.1#4f0785c2bb0b753267179ec5e77f37a744c726db"
 dependencies = [
  "serde",
  "serde_json",
@@ -2826,11 +2839,12 @@ dependencies = [
 
 [[package]]
 name = "reth-libmdbx"
-version = "1.11.0"
-source = "git+https://github.com/raylsnetwork/reth?tag=v1.11.0-rayls.1#9932bbb687a13ab29d50d36d8b6b410f1c59a129"
+version = "2.0.0"
+source = "git+https://github.com/raylsnetwork/reth?tag=v2.0.0-rayls.1#4f0785c2bb0b753267179ec5e77f37a744c726db"
 dependencies = [
  "bitflags",
  "byteorder",
+ "crossbeam-queue",
  "dashmap",
  "derive_more",
  "parking_lot",
@@ -2842,8 +2856,8 @@ dependencies = [
 
 [[package]]
 name = "reth-mdbx-sys"
-version = "1.11.0"
-source = "git+https://github.com/raylsnetwork/reth?tag=v1.11.0-rayls.1#9932bbb687a13ab29d50d36d8b6b410f1c59a129"
+version = "2.0.0"
+source = "git+https://github.com/raylsnetwork/reth?tag=v2.0.0-rayls.1#4f0785c2bb0b753267179ec5e77f37a744c726db"
 dependencies = [
  "bindgen",
  "cc",
@@ -2851,8 +2865,8 @@ dependencies = [
 
 [[package]]
 name = "reth-metrics"
-version = "1.11.0"
-source = "git+https://github.com/raylsnetwork/reth?tag=v1.11.0-rayls.1#9932bbb687a13ab29d50d36d8b6b410f1c59a129"
+version = "2.0.0"
+source = "git+https://github.com/raylsnetwork/reth?tag=v2.0.0-rayls.1#4f0785c2bb0b753267179ec5e77f37a744c726db"
 dependencies = [
  "metrics",
  "metrics-derive",
@@ -2860,8 +2874,8 @@ dependencies = [
 
 [[package]]
 name = "reth-nippy-jar"
-version = "1.11.0"
-source = "git+https://github.com/raylsnetwork/reth?tag=v1.11.0-rayls.1#9932bbb687a13ab29d50d36d8b6b410f1c59a129"
+version = "2.0.0"
+source = "git+https://github.com/raylsnetwork/reth?tag=v2.0.0-rayls.1#4f0785c2bb0b753267179ec5e77f37a744c726db"
 dependencies = [
  "anyhow",
  "bincode",
@@ -2877,8 +2891,9 @@ dependencies = [
 
 [[package]]
 name = "reth-primitives-traits"
-version = "1.11.0"
-source = "git+https://github.com/raylsnetwork/reth?tag=v1.11.0-rayls.1#9932bbb687a13ab29d50d36d8b6b410f1c59a129"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8ca36e245593498020c31e707154fc13391164eb90444da76d67361f646e7669"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
@@ -2887,28 +2902,26 @@ dependencies = [
  "alloy-rlp",
  "alloy-rpc-types-eth",
  "alloy-trie",
- "auto_impl",
  "byteorder",
  "bytes",
  "dashmap",
  "derive_more",
  "modular-bitfield",
  "once_cell",
- "op-alloy-consensus",
+ "quanta",
  "reth-codecs",
  "revm-bytecode",
  "revm-primitives",
  "revm-state",
  "secp256k1 0.30.0",
  "serde",
- "serde_with",
  "thiserror",
 ]
 
 [[package]]
 name = "reth-prune-types"
-version = "1.11.0"
-source = "git+https://github.com/raylsnetwork/reth?tag=v1.11.0-rayls.1#9932bbb687a13ab29d50d36d8b6b410f1c59a129"
+version = "2.0.0"
+source = "git+https://github.com/raylsnetwork/reth?tag=v2.0.0-rayls.1#4f0785c2bb0b753267179ec5e77f37a744c726db"
 dependencies = [
  "alloy-primitives",
  "derive_more",
@@ -2922,8 +2935,8 @@ dependencies = [
 
 [[package]]
 name = "reth-stages-types"
-version = "1.11.0"
-source = "git+https://github.com/raylsnetwork/reth?tag=v1.11.0-rayls.1#9932bbb687a13ab29d50d36d8b6b410f1c59a129"
+version = "2.0.0"
+source = "git+https://github.com/raylsnetwork/reth?tag=v2.0.0-rayls.1#4f0785c2bb0b753267179ec5e77f37a744c726db"
 dependencies = [
  "alloy-primitives",
  "bytes",
@@ -2935,8 +2948,8 @@ dependencies = [
 
 [[package]]
 name = "reth-static-file-types"
-version = "1.11.0"
-source = "git+https://github.com/raylsnetwork/reth?tag=v1.11.0-rayls.1#9932bbb687a13ab29d50d36d8b6b410f1c59a129"
+version = "2.0.0"
+source = "git+https://github.com/raylsnetwork/reth?tag=v2.0.0-rayls.1#4f0785c2bb0b753267179ec5e77f37a744c726db"
 dependencies = [
  "alloy-primitives",
  "derive_more",
@@ -2948,13 +2961,14 @@ dependencies = [
 
 [[package]]
 name = "reth-storage-errors"
-version = "1.11.0"
-source = "git+https://github.com/raylsnetwork/reth?tag=v1.11.0-rayls.1#9932bbb687a13ab29d50d36d8b6b410f1c59a129"
+version = "2.0.0"
+source = "git+https://github.com/raylsnetwork/reth?tag=v2.0.0-rayls.1#4f0785c2bb0b753267179ec5e77f37a744c726db"
 dependencies = [
  "alloy-eips",
  "alloy-primitives",
  "alloy-rlp",
  "derive_more",
+ "reth-codecs",
  "reth-primitives-traits",
  "reth-prune-types",
  "reth-static-file-types",
@@ -2965,8 +2979,8 @@ dependencies = [
 
 [[package]]
 name = "reth-tracing"
-version = "1.11.0"
-source = "git+https://github.com/raylsnetwork/reth?tag=v1.11.0-rayls.1#9932bbb687a13ab29d50d36d8b6b410f1c59a129"
+version = "2.0.0"
+source = "git+https://github.com/raylsnetwork/reth?tag=v2.0.0-rayls.1#4f0785c2bb0b753267179ec5e77f37a744c726db"
 dependencies = [
  "clap",
  "eyre",
@@ -2981,8 +2995,8 @@ dependencies = [
 
 [[package]]
 name = "reth-trie-common"
-version = "1.11.0"
-source = "git+https://github.com/raylsnetwork/reth?tag=v1.11.0-rayls.1#9932bbb687a13ab29d50d36d8b6b410f1c59a129"
+version = "2.0.0"
+source = "git+https://github.com/raylsnetwork/reth?tag=v2.0.0-rayls.1#4f0785c2bb0b753267179ec5e77f37a744c726db"
 dependencies = [
  "alloy-consensus",
  "alloy-primitives",
@@ -3002,17 +3016,18 @@ dependencies = [
 
 [[package]]
 name = "reth-zstd-compressors"
-version = "1.11.0"
-source = "git+https://github.com/raylsnetwork/reth?tag=v1.11.0-rayls.1#9932bbb687a13ab29d50d36d8b6b410f1c59a129"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a621aef55fe4da8935abede9d1d105f227bcb673f212b3575a748a6a2f8f688e"
 dependencies = [
  "zstd",
 ]
 
 [[package]]
 name = "revm-bytecode"
-version = "8.0.0"
+version = "9.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "74d1e5c1eaa44d39d537f668bc5c3409dc01e5c8be954da6c83370bbdf006457"
+checksum = "e86e468df3cf5cf59fa7ef71a3e9ccabb76bb336401ea2c0674f563104cf3c5e"
 dependencies = [
  "bitvec",
  "phf",
@@ -3022,9 +3037,9 @@ dependencies = [
 
 [[package]]
 name = "revm-database"
-version = "10.0.0"
+version = "12.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "529528d0b05fe646be86223032c3e77aa8b05caa2a35447d538c55965956a511"
+checksum = "2c0a7d6da41061f2c50f99a2632571026b23684b5449ff319914151f4449b6c8"
 dependencies = [
  "alloy-eips",
  "revm-bytecode",
@@ -3036,9 +3051,9 @@ dependencies = [
 
 [[package]]
 name = "revm-database-interface"
-version = "9.0.0"
+version = "10.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b7bf93ac5b91347c057610c0d96e923db8c62807e03f036762d03e981feddc1d"
+checksum = "bd497a38a79057b94a049552cb1f925ad15078bc1a479c132aeeebd1d2ccc768"
 dependencies = [
  "auto_impl",
  "either",
@@ -3062,9 +3077,9 @@ dependencies = [
 
 [[package]]
 name = "revm-state"
-version = "9.0.0"
+version = "10.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "311720d4f0f239b041375e7ddafdbd20032a33b7bae718562ea188e188ed9fd3"
+checksum = "d29404707763da607e5d6e4771cb203998c28159279c2f64cc32de08d2814651"
 dependencies = [
  "alloy-eip7928",
  "bitflags",
@@ -3869,9 +3884,9 @@ dependencies = [
 
 [[package]]
 name = "tracing-logfmt"
-version = "0.3.5"
+version = "0.3.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6b1f47d22deb79c3f59fcf2a1f00f60cbdc05462bf17d1cd356c1fefa3f444bd"
+checksum = "a250055a3518b5efba928a18ffac8d32d42ea607a9affff4532144cd5b2e378e"
 dependencies = [
  "time",
  "tracing",
@@ -4142,6 +4157,16 @@ dependencies = [
  "hashbrown 0.15.5",
  "indexmap 2.14.0",
  "semver 1.0.28",
+]
+
+[[package]]
+name = "web-sys"
+version = "0.3.99"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6d621441cfc37b84979402712047321980c178f299193a3589d05b99e8763436"
+dependencies = [
+ "js-sys",
+ "wasm-bindgen",
 ]
 
 [[package]]

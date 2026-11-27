@@ -137,9 +137,8 @@ fn check_node(label: String, datadir: &Path) -> eyre::Result<StateRootNodeView> 
     let db = open_db_read_only(datadir.join("db"), args).wrap_err(
         "open reth db read-only and exclusive (if the node is running, stop it or use a copy)",
     )?;
-    let static_files =
-        StaticFileProvider::<EthPrimitives>::read_only(datadir.join("static_files"), false)
-            .wrap_err("open static files read-only")?;
+    let static_files = StaticFileProvider::<EthPrimitives>::read_only(datadir.join("static_files"))
+        .wrap_err("open static files read-only")?;
     let tx = db.tx()?;
 
     // No fallback to the highest static-file header: reth commits static-file headers before the

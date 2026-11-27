@@ -31,7 +31,7 @@ use alloy::primitives::Bytes;
 use rayls_infrastructure_types::{address, Address, U256};
 use reth_revm::{
     bytecode::Bytecode,
-    primitives::HashMap,
+    primitives::AddressMap,
     state::{Account as RevmAccount, AccountInfo, AccountStatus, EvmStorageSlot},
 };
 
@@ -89,8 +89,8 @@ fn impl_with_code_and_initializer_disabled(bytecode: &[u8]) -> RevmAccount {
 // ── Migration ────────────────────────────────────────────────────────
 
 /// Build the state changes for the UupsFix hardfork.
-pub(crate) fn uups_state() -> HashMap<Address, RevmAccount> {
-    let mut state = HashMap::default();
+pub(crate) fn uups_state() -> AddressMap<RevmAccount> {
+    let mut state = AddressMap::default();
 
     state.insert(
         FEE_AGGREGATOR_IMPL,

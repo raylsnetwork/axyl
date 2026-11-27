@@ -125,7 +125,7 @@ cd axyl
 cargo build --release
 ```
 
-The toolchain is pinned to Rust 1.91 via [`rust-toolchain.toml`](./rust-toolchain.toml). `make pr` runs the same fmt + clippy + test gate as CI (fmt and clippy run on the date-pinned nightly set by the `NIGHTLY` variable in the [`Makefile`](./Makefile) — the same nightly CI uses for the fmt check and fuzzing); `make test` runs the test suite alone.
+The toolchain is pinned to Rust 1.93 via [`rust-toolchain.toml`](./rust-toolchain.toml). `make pr` runs the same fmt + clippy + test gate as CI (fmt and clippy run on the date-pinned nightly set by the `NIGHTLY` variable in the [`Makefile`](./Makefile) — the same nightly CI uses for the fmt check and fuzzing); `make test` runs the test suite alone.
 
 Documentation lives in [`doc/`](doc/):
 
@@ -171,7 +171,7 @@ This repository is a derivative work that incorporates and modifies code from Te
 [fuzz-url]: https://github.com/raylsnetwork/axyl/actions/workflows/nightly-fuzz.yml
 [version-badge]: https://img.shields.io/github/v/tag/raylsnetwork/axyl?label=version
 [version-url]: https://github.com/raylsnetwork/axyl/tags
-[msrv-badge]: https://img.shields.io/badge/MSRV-1.91-orange.svg
+[msrv-badge]: https://img.shields.io/badge/MSRV-1.93-orange.svg
 [msrv-url]: ./rust-toolchain.toml
 [license-badge]: https://img.shields.io/badge/License-BUSL--1.1-blue.svg
 [license-url]: ./LICENSE

@@ -13,7 +13,7 @@ use crate::traits::RaylsNode;
 use alloy::eips::BlockNumHash;
 use reth_config::PruneConfig;
 use reth_db::DatabaseEnv;
-use reth_engine_tree::persistence::PersistenceHandle;
+use reth_engine_tree::persistence::{PersistenceHandle, PersistenceResult};
 use reth_ethereum_primitives::EthPrimitives;
 use reth_exex_types::FinishedExExHeight;
 use reth_provider::ProviderFactory;
@@ -65,7 +65,7 @@ pub(crate) struct PersistenceState {
     /// Last block successfully persisted to disk (number + hash).
     pub(crate) last_persisted_block: BlockNumHash,
     /// In-flight persistence completion to poll.
-    pub(crate) pending_rx: Option<crossbeam_channel::Receiver<Option<BlockNumHash>>>,
+    pub(crate) pending_rx: Option<crossbeam_channel::Receiver<PersistenceResult>>,
     /// When the in-flight persistence was initiated (for elapsed-time logging).
     pub(crate) pending_started_at: Option<Instant>,
     /// Latest finalized block number (to include in next persist).

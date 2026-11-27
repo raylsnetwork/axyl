@@ -24,7 +24,7 @@
 use alloy::primitives::address;
 use rayls_infrastructure_types::{Address, U256};
 use reth_revm::{
-    primitives::HashMap,
+    primitives::AddressMap,
     state::{Account as RevmAccount, AccountStatus, EvmStorageSlot},
 };
 
@@ -243,8 +243,8 @@ fn clear_slot(account: &mut RevmAccount, slot: U256, old_value: U256) {
 /// This handles:
 /// 1. AccessControl role transfers on NativeTokenController and FeeAggregator
 /// 2. Proxy migration of DelegationPool and RewardDistributor
-pub(crate) fn admin_transfer_state() -> HashMap<Address, RevmAccount> {
-    let mut state: HashMap<Address, RevmAccount> = HashMap::default();
+pub(crate) fn admin_transfer_state() -> AddressMap<RevmAccount> {
+    let mut state: AddressMap<RevmAccount> = AddressMap::default();
 
     // ── Part 1: Grant roles to new admin (no revocation of old admin) ──
     //

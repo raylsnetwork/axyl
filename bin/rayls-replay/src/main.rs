@@ -6,12 +6,12 @@
 use clap::Parser;
 use eyre::{eyre, Context};
 use rayls_execution_evm::{
-    reth_env::{RethCommand, RethConfig, RethEnv},
-    verify_datadir_chain_id, verify_datadir_schedule_record, verify_schedule_shape, FileSchedule,
-    NetworkProfile, SelectedSchedule,
+    reth_env::{RethEnv, SnapshotReader},
+    verify_datadir_chain_id, verify_datadir_schedule_record_at_head, verify_schedule_shape,
+    FileSchedule, NetworkProfile, SelectedSchedule,
 };
 use rayls_infrastructure_config::Parameters;
-use rayls_infrastructure_storage::open_db;
+use rayls_infrastructure_storage::open_db_read_only;
 use rayls_infrastructure_types::{
     rewards::RewardsCounter, Address, Genesis, RaylsNetwork, TaskManager,
 };
@@ -36,6 +36,8 @@ use thiserror as _;
 /// Reads the snapshot's reth datadir as a totally-ordered execution plan and
 /// the consensus DB for batch payloads. Re-executes every block on top of a
 /// fresh archive datadir, gating correctness on per-block state-root match.
+/// The snapshot is opened read-only and is never repaired or changed; it must
+/// not be in use by a running node.
 /// On completion the archive datadir is ready to boot via `rayls-network node`
 /// in Observer mode.
 #[derive(Debug, Parser)]
@@ -68,7 +70,7 @@ struct Cli {
     parameters: Option<PathBuf>,
 
     /// Rayls network: `mainnet`, `testnet`, `local`, `devnet` — the same flag as the
-    /// node's `--network`. Selects the baked-in hardfork schedule applied to both envs;
+    /// node's `--network`. Selects the baked-in hardfork schedule the blocks are rebuilt with;
     /// the network's chain-id must match the snapshot genesis or the boot refuses.
     #[arg(long, value_enum, default_value_t = RaylsNetwork::Mainnet)]
     network: RaylsNetwork,
@@ -76,7 +78,7 @@ struct Cli {
     /// Network config file (YAML) holding named subnets, each with a `chain_id` and a
     /// `hardforks` schedule (the same format the node takes via `--config-file`).
     /// With `--subnet`, that subnet's schedule replaces the baked-in `--network` profile
-    /// for both the snapshot and the archive env. Use it when a network historically
+    /// for the rebuild. Use it when a network historically
     /// ran a schedule that differs from its baked-in profile. The subnet's
     /// `chain_id` must match the genesis, and a subnet may not declare a baked-in
     /// network's chain-id (mainnet/testnet run on `--network`, never a config file).
@@ -100,22 +102,6 @@ struct Cli {
     #[arg(long, value_name = "BLOCK")]
     unwind_to: Option<u64>,
 
-    /// Repair genesis history indices on an existing archive, then exit (no
-    /// replay). Idempotent; run with the node stopped. Freshly built archives
-    /// are repaired automatically at the end of a normal replay, so this flag is
-    /// only for archives built before that behaviour existed (e.g. mainnet).
-    /// Fixes two v2 archive issues:
-    ///
-    /// 1. StoragesHistory re-key: reth writes genesis StoragesHistory under plain slots while the
-    ///    v2 read looks up by keccak256(slot), so genesis-seeded storage (e.g. the validator set)
-    ///    returns 0x0 at historical blocks.
-    ///
-    /// 2. AccountsHistory seed: IndexAccountHistoryStage clears AccountsHistory on first sync and
-    ///    never re-inserts accounts whose code/nonce/balance never change after genesis (immutable
-    ///    system contracts). Historical `eth_call` returns empty contract code for those accounts.
-    #[arg(long = "fix-genesis-history")]
-    fix_genesis_history: bool,
-
     /// Verify state root after every block (slow). Default: epoch boundaries only.
     #[arg(long)]
     verify_every_block: bool,
@@ -124,9 +110,9 @@ struct Cli {
     #[arg(long, default_value_t = 500)]
     progress_interval: u64,
 
-    /// Use the v2 storage layout (static_files + RocksDB). Default: true,
-    /// matching production snapshots produced with `--storage.v2`. Set to
-    /// false only if rebuilding from a legacy v1 snapshot.
+    /// Storage layout of the archive datadir that is written: v2 (static_files +
+    /// RocksDB) or the legacy v1. Default: true, the layout production nodes run
+    /// with `--storage.v2`. The snapshot is read the same way for both values.
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     storage_v2: bool,
 
@@ -147,6 +133,10 @@ struct Cli {
 fn main() -> eyre::Result<()> {
     let cli = Cli::parse();
     let log_path = cli.log_file.clone().unwrap_or_else(|| cli.archive_out.join("rayls-replay.log"));
+    // Before the log file is created: by default it goes into the archive datadir, so a wrong
+    // `--archive-out` would already write into the snapshot here.
+    verify_outside_snapshot(&cli.snapshot_datadir, &cli.archive_out, "--archive-out")?;
+    verify_outside_snapshot(&cli.snapshot_datadir, &log_path, "the log file")?;
     let _log_guards = init_tracing(&log_path)?;
     info!(
         target: "rayls_replay::main",
@@ -182,7 +172,7 @@ async fn run(cli: Cli) -> eyre::Result<()> {
     let base_chain = base_chain_spec(&genesis_path)?;
 
     // Select and verify the hardfork schedule exactly like the node's boot gate;
-    // both envs below are built from the selected profile.
+    // the archive env below is built from the selected profile.
     let file_schedule = match (&cli.config_file, &cli.subnet) {
         (Some(path), Some(subnet)) => Some(FileSchedule::load(path, subnet)?),
         _ => None,
@@ -191,8 +181,16 @@ async fn run(cli: Cli) -> eyre::Result<()> {
                                                                                          // Some, and the shape gate keys on profile.chain_id (from the file)
     verify_datadir_chain_id(base_chain.chain().id(), selected.profile.chain_id, &selected.source)?;
 
-    // Read-only: replay never writes into the snapshot datadir.
-    verify_snapshot_schedule_record(&cli.snapshot_datadir, &base_chain, &selected.profile)?;
+    // The snapshot's execution data, read-only: no repair, no unwind, no write. Opened before
+    // the schedule check because that check needs the snapshot's last block.
+    let snapshot = SnapshotReader::open(&cli.snapshot_datadir, Arc::clone(&base_chain))
+        .wrap_err("open snapshot datadir read-only")?;
+
+    verify_snapshot_schedule_record(
+        &cli.snapshot_datadir,
+        snapshot.last_block_number(),
+        &selected.profile,
+    )?;
 
     // The selected schedule must match the relaxed shape of its network
     // family. Mainnet/testnet are excluded inside the gate (frozen in CI and
@@ -217,7 +215,7 @@ async fn run(cli: Cli) -> eyre::Result<()> {
     );
 
     // archive blocks build with the snapshot's committed close-epoch tally,
-    // staged into `tally_store` per close block; snapshot env never builds.
+    // staged into `tally_store` per close block; the snapshot is only read.
     // Hybrid-reward epochs also need the consensus-DB walk, attached to
     // `hybrid_source` once the consensus DB is open below.
     let tally_store = SnapshotTallyStore::default();
@@ -225,7 +223,6 @@ async fn run(cli: Cli) -> eyre::Result<()> {
     let archive_rewards =
         SnapshotRewardsBackend::new(tally_store.clone(), hybrid_source.clone()).into_counter();
 
-    let snapshot_task_manager = TaskManager::default();
     let archive_task_manager = TaskManager::default();
 
     let archive_evm = RethEnv::new_for_archive_replay(
@@ -242,20 +239,7 @@ async fn run(cli: Cli) -> eyre::Result<()> {
     .await
     .wrap_err("open archive reth env")?;
 
-    // maintenance exit: repair genesis history on an existing archive, then exit
-    // before opening the snapshot env (no replay).
-    if cli.fix_genesis_history {
-        archive_evm.fix_genesis_history()?;
-        archive_evm.fix_genesis_account_history()?;
-        info!(
-            target: "rayls_replay::main",
-            archive_out = %cli.archive_out.display(),
-            "genesis-history fix complete"
-        );
-        return Ok(());
-    }
-
-    // unwind exits before opening the snapshot env; only the archive is touched
+    // unwind exits here: it changes only the archive
     if let Some(target) = cli.unwind_to {
         archive_evm
             .unwind_to(target, archive_rewards.clone())
@@ -271,10 +255,11 @@ async fn run(cli: Cli) -> eyre::Result<()> {
     }
 
     // snapshot-only setup: the consensus DB is the replay oracle and is unused by
-    // the fix-genesis and unwind early-return paths above, so open it only once
-    // we know we're actually replaying (avoids touching a dummy/bad path in those
-    // maintenance modes).
-    let consensus_store = open_db(&consensus_db);
+    // the unwind early-return path above, so open it only once we know we're
+    // actually replaying (avoids touching a dummy/bad path in that maintenance mode).
+    // Read-only like the execution data: no table is created, nothing is repaired.
+    let consensus_store =
+        open_db_read_only(&consensus_db).wrap_err("open snapshot consensus DB read-only")?;
 
     // hybrid-reward close blocks recompute participation rounds over the snapshot's
     // consensus DB with a forward, cursor-bounded walk that credits exactly like the
@@ -289,21 +274,7 @@ async fn run(cli: Cli) -> eyre::Result<()> {
         return Err(eyre!("hybrid tally source attached twice"));
     }
 
-    let snapshot_evm = RethEnv::new_for_archive_replay(
-        Arc::clone(&base_chain),
-        &cli.snapshot_datadir,
-        &snapshot_task_manager,
-        &selected.profile,
-        basefee_address,
-        Some(min_base_fee),
-        cli.storage_v2,
-        None,
-        RewardsCounter::default(),
-    )
-    .await
-    .wrap_err("open snapshot reth env")?;
-
-    verify_chainspec_compatibility(&snapshot_evm, &archive_evm)
+    verify_chainspec_compatibility(&snapshot, &archive_evm)
         .map_err(|e| eyre!("chainspec compatibility check failed: {e}"))?;
 
     let config = ReplayConfig {
@@ -321,7 +292,7 @@ async fn run(cli: Cli) -> eyre::Result<()> {
     // requires `hybrid_source.attach(...)` above to have run: the committee installed
     // here (and after every close block) must reach the hybrid walker
     let last = run_replay(
-        &snapshot_evm,
+        &snapshot,
         &consensus_store,
         &archive_evm,
         &archive_rewards,
@@ -348,23 +319,9 @@ async fn run(cli: Cli) -> eyre::Result<()> {
         return Ok(());
     }
 
-    // archive is complete: repair the two genesis-history issues so it boots
-    // correct without a separate --fix-genesis-history pass. The re-key/seed
-    // read-merge with existing history, so running here (after replay) preserves
-    // every post-genesis change; a no-op on v1 archives and on any slot/account
-    // already carrying the genesis block. Only on normal completion — the
-    // graceful-stop path returns above, leaving the archive resumable.
-    archive_evm.fix_genesis_history()?;
-    archive_evm.fix_genesis_account_history()?;
-    info!(
-        target: "rayls_replay::main",
-        archive_out = %cli.archive_out.display(),
-        "genesis-history fix applied to freshly built archive"
-    );
-
     // close the DB envs before the copy so no MDBX handle still maps the files;
     // all three are unused past the flush above
-    drop(snapshot_evm);
+    drop(snapshot);
     drop(archive_evm);
     drop(consensus_store);
 
@@ -384,6 +341,63 @@ async fn run(cli: Cli) -> eyre::Result<()> {
         "rayls-replay complete; archive datadir ready for Observer boot"
     );
     Ok(())
+}
+
+/// Refuse a path the replay writes to if it is the snapshot datadir or lies inside it.
+///
+/// The replay must not change the snapshot. An archive datadir or a log file at or under the
+/// snapshot path would put new files into the snapshot's own directory. `what` names the path
+/// in the error (a flag name).
+fn verify_outside_snapshot(snapshot: &Path, path: &Path, what: &str) -> eyre::Result<()> {
+    let snapshot_abs = std::fs::canonicalize(snapshot)
+        .wrap_err_with(|| format!("snapshot datadir {} cannot be read", snapshot.display()))?;
+    if resolve_path(path)?.starts_with(&snapshot_abs) {
+        return Err(eyre!(
+            "{what} ({}) is the snapshot datadir {} or lies inside it; the replay never writes \
+             into the snapshot, pass a path outside of it",
+            path.display(),
+            snapshot.display()
+        ));
+    }
+    Ok(())
+}
+
+/// The absolute form of `path` with symlinks resolved. The last parts of the path may not exist
+/// yet (the archive datadir of a first run); they are kept as given.
+///
+/// Two kinds of path cannot be resolved before they are created, and can end up anywhere, also
+/// in the snapshot. Both are an error:
+/// - a `..` after a part that does not exist yet (`other/new/../../snapshot`)
+/// - a symlink whose target does not exist: a file created through it lands at the target
+fn resolve_path(path: &Path) -> eyre::Result<PathBuf> {
+    let absolute = std::path::absolute(path)
+        .wrap_err_with(|| format!("cannot make {} absolute", path.display()))?;
+    let mut existing = absolute.as_path();
+    let mut missing = Vec::new();
+    loop {
+        if let Ok(resolved) = std::fs::canonicalize(existing) {
+            return Ok(missing.iter().rev().fold(resolved, |acc, part| acc.join(part)));
+        }
+        // `canonicalize` fails on a symlink with a missing target the same way as on a missing
+        // path, so check for it before this part is taken as "not there yet"
+        if std::fs::symlink_metadata(existing).is_ok_and(|meta| meta.file_type().is_symlink()) {
+            return Err(eyre!(
+                "{} is, or goes through, a symlink whose target does not exist, so it cannot be \
+                 checked against the snapshot datadir; pass the real path",
+                path.display()
+            ));
+        }
+        // `file_name` is `None` for a path that ends in `..`
+        let (Some(parent), Some(name)) = (existing.parent(), existing.file_name()) else {
+            return Err(eyre!(
+                "{} has `..` after a directory that does not exist yet, so it cannot be checked \
+                 against the snapshot datadir; pass a path without `..`",
+                path.display()
+            ));
+        };
+        missing.push(name.to_owned());
+        existing = parent;
+    }
 }
 
 /// Spawn a task that flips `tx` to `true` on the first SIGTERM/SIGINT, so the
@@ -588,17 +602,16 @@ fn init_tracing(
 /// re-records, and there is no record here to update. A snapshot without a
 /// record (taken before the feature) is trusted, like the node's no-record
 /// path, minus the write.
+///
+/// `head` is the snapshot's last block, taken from the read-only reader. The
+/// node's gate reads it through a normal database open, which can write.
 fn verify_snapshot_schedule_record(
     snapshot_datadir: &Path,
-    chain: &Arc<RethChainSpec>,
+    head: u64,
     profile: &NetworkProfile,
 ) -> eyre::Result<()> {
-    // The read/verify is shared with the node's boot gate; the throwaway
-    // `RethConfig` exists only for the executed-head read — the snapshot env
-    // is not built yet.
-    let reth = RethCommand::parse_from(["rayls-replay"]);
-    let node_config = RethConfig::new(reth, None, snapshot_datadir, false, Arc::clone(chain));
-    let verification = verify_datadir_schedule_record(snapshot_datadir, &node_config, profile)?;
+    // the verify step is shared with the node's boot gate
+    let verification = verify_datadir_schedule_record_at_head(snapshot_datadir, head, profile)?;
     if verification.record.is_none() {
         warn!(
             target: "rayls_replay::main",
@@ -616,4 +629,119 @@ fn verify_snapshot_schedule_record(
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn check(snapshot: &Path, path: &Path) -> eyre::Result<()> {
+        verify_outside_snapshot(snapshot, path, "--archive-out")
+    }
+
+    /// A path the replay writes to may not be the snapshot datadir or lie inside it, also when
+    /// the path does not exist yet or is reached through a symlink.
+    #[test]
+    fn a_path_inside_the_snapshot_is_refused() {
+        let root = tempfile::tempdir().expect("temp dir");
+        let snapshot = root.path().join("snapshot");
+        std::fs::create_dir_all(snapshot.join("db")).expect("create snapshot");
+
+        // the same directory; the error names the flag
+        let error = check(&snapshot, &snapshot).expect_err("the snapshot itself is refused");
+        assert!(error.to_string().contains("--archive-out"), "got: {error}");
+        // inside it, existing and not yet existing
+        assert!(check(&snapshot, &snapshot.join("db")).is_err());
+        assert!(check(&snapshot, &snapshot.join("out").join("deeper")).is_err());
+        // the same directory through `.`
+        assert!(check(&snapshot, &snapshot.join(".")).is_err());
+        // through `..` over a directory that exists
+        let other = root.path().join("other");
+        std::fs::create_dir_all(&other).expect("create other");
+        assert!(check(&snapshot, &other.join("..").join("snapshot").join("out")).is_err());
+        // through `..` over a directory that does not exist yet: the path cannot be resolved
+        // now, and once `new` is created it points into the snapshot
+        let error = check(&snapshot, &other.join("new").join("..").join("..").join("snapshot"))
+            .expect_err("`..` after a missing directory is refused");
+        assert!(error.to_string().contains("`..`"), "got: {error}");
+
+        #[cfg(unix)]
+        {
+            let link = root.path().join("link-to-snapshot");
+            std::os::unix::fs::symlink(&snapshot, &link).expect("symlink");
+            assert!(check(&snapshot, &link).is_err());
+            assert!(check(&snapshot, &link.join("out")).is_err());
+
+            // a symlink whose target does not exist yet: a file created through the link would
+            // land in the snapshot
+            let dangling = root.path().join("dangling.log");
+            std::os::unix::fs::symlink(snapshot.join("new.log"), &dangling).expect("symlink");
+            let error = check(&snapshot, &dangling).expect_err("a dangling symlink is refused");
+            assert!(error.to_string().contains("symlink"), "got: {error}");
+            assert!(check(&snapshot, &dangling.join("deeper")).is_err());
+        }
+    }
+
+    /// A path outside the snapshot is accepted, existing or not, also next to the snapshot with
+    /// a name that starts the same way.
+    #[test]
+    fn a_path_outside_the_snapshot_is_accepted() {
+        let root = tempfile::tempdir().expect("temp dir");
+        let snapshot = root.path().join("snapshot");
+        std::fs::create_dir_all(&snapshot).expect("create snapshot");
+        let existing = root.path().join("archive");
+        std::fs::create_dir_all(&existing).expect("create archive");
+
+        check(&snapshot, &existing).expect("existing archive");
+        check(&snapshot, &root.path().join("new").join("archive"))
+            .expect("archive that does not exist yet");
+        check(&snapshot, &root.path().join("snapshot-archive"))
+            .expect("a sibling whose name starts like the snapshot");
+    }
+
+    /// A snapshot path that does not exist is an error, not a pass.
+    #[test]
+    fn missing_snapshot_is_an_error() {
+        let root = tempfile::tempdir().expect("temp dir");
+        assert!(check(&root.path().join("nope"), root.path()).is_err());
+    }
+
+    /// The genesis and parameters files in `chain-configs/` are the real ones: the genesis of
+    /// each network gives the hash of block 0 of that network, and the parameters parse.
+    ///
+    /// The hashes were taken from snapshots of the live networks (#420). A change in how this
+    /// code builds a genesis block, or an edit of one of the files, fails here.
+    #[test]
+    fn chain_configs_give_the_real_genesis_hashes() -> eyre::Result<()> {
+        use reth_chainspec::EthChainSpec as _;
+
+        // network, chain id, hash of block 0 on the live network
+        let networks = [
+            (
+                "mainnet",
+                72_957u64,
+                "0x500426d91e3e8fa5cf39722f8c4ef5765865129b5efbcc25544b39e2acdc3b91",
+            ),
+            (
+                "testnet",
+                7_295_799u64,
+                "0x33b818f13cab5c2e3e7bb589cbd0612e78e1139f3add29f0d5f0d6a03a5c9545",
+            ),
+        ];
+        let configs = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../chain-configs");
+        for (network, chain_id, genesis_hash) in networks {
+            let dir = configs.join(network);
+            let chain = base_chain_spec(&dir.join("genesis.yaml"))?;
+            assert_eq!(chain.chain().id(), chain_id, "{network}: chain id");
+            assert_eq!(
+                format!("{:?}", chain.genesis_hash()),
+                genesis_hash,
+                "{network}: genesis hash"
+            );
+
+            let params = network_params(&dir.join("parameters.yaml"))?;
+            assert!(params.basefee_address.is_some(), "{network}: basefee_address is set");
+        }
+        Ok(())
+    }
 }

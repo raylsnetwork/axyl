@@ -39,6 +39,9 @@ impl RethEnv {
     /// Create a new Reth DB.
     /// Break this out so this can be created upfront and used even on a
     /// restart (when catching up for instance).
+    ///
+    /// This is the one place that opens the execution database for writing. An existing
+    /// database in the storage format of reth 1.x gives an error (see `datadir_format`).
     pub fn new_database<P: AsRef<Path>>(
         reth_config: &RethConfig,
         db_path: P,
@@ -48,7 +51,14 @@ impl RethEnv {
         // reth does not check --db.page-size, so it is checked here for a new datafile.
         db_args.page_size = open_page_size(db_path, db_args.page_size)
             .map_err(|e| eyre::eyre!("invalid --db.page-size: {e}"))?;
+        // A datadir in the storage format of reth 1.x is refused here, before `init_db` writes
+        // to it. If this early check cannot run, the same check runs right after the open.
+        let format_checked =
+            crate::reth_env::datadir_format::check_before_open(db_path, db_args.page_size)?;
         let db = init_db(db_path, db_args.database_args())?;
+        if !format_checked {
+            crate::reth_env::datadir_format::check_open_database(&db, db_path)?;
+        }
         match db.stat() {
             Ok(stat) => {
                 info!(target: "rayls::reth", path = ?db_path, page_size = stat.page_size(), "opened database")
@@ -140,7 +150,7 @@ impl RethEnv {
         let chain_spec = Arc::new(builder.build());
         let evm_config = RaylsEvmConfig::new(chain_spec.clone(), rewards_counter.clone());
         let task_spawner = task_manager.get_spawner();
-        let runtime = reth_tasks::Runtime::with_existing_handle(tokio::runtime::Handle::current())?;
+        let runtime = crate::reth_env::reth_runtime::build_reth_runtime(task_manager)?;
         let provider_factory = Self::init_provider_factory(
             &node_config,
             chain_spec,
@@ -151,11 +161,6 @@ impl RethEnv {
             allow_v1,
         )
         .await?;
-
-        // Apply genesis history fixes (idempotent, no-op on v1 storage).
-        let use_hashed_state = node_config.storage_settings().use_hashed_state();
-        Self::fix_genesis_history_with(&provider_factory, use_hashed_state)?;
-        Self::fix_genesis_account_history_with(&provider_factory, use_hashed_state)?;
 
         let blockchain_provider = BlockchainProvider::new(provider_factory.clone())?;
         set_basefee_address(basefee_address);
@@ -196,7 +201,7 @@ impl RethEnv {
         }
 
         // Build TreeConfig from EngineArgs (converts cross_block_cache_size MB → bytes).
-        let tree_config = node_config.engine.tree_config();
+        let tree_config = Self::engine_tree_config(&node_config.engine);
 
         // Construct the payload processor for concurrent state root computation.
         let payload_processor = Arc::new(parking_lot::Mutex::new(PayloadProcessor::new(
@@ -212,6 +217,7 @@ impl RethEnv {
             provider_factory,
             evm_config,
             task_spawner,
+            reth_runtime: runtime,
             persistence_handle,
             persistence_state,
             payload_processor,
@@ -298,10 +304,15 @@ impl RethEnv {
     /// `rocksdb/` as siblings (matching the standard node's layout).
     ///
     /// Raises the descriptor limit like [`Self::new_for_temp_chain`], for a different reason:
-    /// `rayls-replay` is its own binary, so it never reaches the node's startup call, and it opens
-    /// two envs (archive and snapshot) that walk the whole chain. Jars are never evicted once
-    /// loaded, so descriptors accumulate with the number of block ranges replayed rather than with
-    /// concurrency -- a long rebuild would otherwise run out partway through.
+    /// `rayls-replay` is its own binary, so it never reaches the node's startup call, and it walks
+    /// the whole chain in two datadirs: it writes the archive through this env and reads the
+    /// snapshot through a [`SnapshotReader`](crate::reth_env::SnapshotReader). Jars are never
+    /// evicted once loaded, so descriptors accumulate with the number of block ranges replayed
+    /// rather than with concurrency -- a long rebuild would otherwise run out partway through.
+    ///
+    /// Only for the datadir that is written. The snapshot must not go through this constructor:
+    /// it runs the full node start (consistency check, history heal, unwind), which can change
+    /// the datadir.
     #[cfg(feature = "archive-replay")]
     pub async fn new_for_archive_replay<P: AsRef<Path>>(
         chain: Arc<RethChainSpec>,
@@ -351,6 +362,27 @@ impl RethEnv {
             true,
         )
         .await
+    }
+
+    /// Build reth's `TreeConfig` from the engine arguments, without the persistence threshold.
+    ///
+    /// reth 2.0 has a second threshold, the persistence backpressure threshold (default 16), and
+    /// `EngineArgs::tree_config` debug-asserts that it is above the persistence threshold. Both
+    /// values are only read by reth's engine tree, which we do not run: our own
+    /// `PersistenceState` owns the persistence threshold and takes it from the engine arguments
+    /// directly. So the config is built with reth's default persistence threshold. A large
+    /// `persistence_threshold` (`rayls-replay` uses 512) then cannot trip that assert in a debug
+    /// or test build.
+    ///
+    /// Checked on reth v2.0.0, check again on the next reth upgrade:
+    /// - This config is also given to `PayloadProcessor`. Neither it nor the code it starts reads
+    ///   the two thresholds. Only `engine/tree/src/tree/mod.rs` does.
+    /// - Raising the backpressure threshold through `EngineArgs` does not help: `tree_config` sets
+    ///   the persistence threshold first, and the assert runs inside that setter while the
+    ///   backpressure value is still the default.
+    pub(crate) fn engine_tree_config(engine: &EngineArgs) -> reth_engine_primitives::TreeConfig {
+        EngineArgs { persistence_threshold: DEFAULT_PERSISTENCE_THRESHOLD, ..engine.clone() }
+            .tree_config()
     }
 
     /// Initialize the provider factory with consistency check and auto-repair.
@@ -459,13 +491,10 @@ impl RethEnv {
 
         // non-critical: completing Ok must not trigger TaskManager shutdown
         let (tx, rx) = oneshot::channel();
-        reth_tasks::TaskSpawner::spawn_blocking_task(
-            task_spawner,
-            Box::pin(async move {
-                let (_, result) = pipeline.run_as_fut(Some(unwind_target)).await;
-                let _ = tx.send(result);
-            }),
-        );
+        task_spawner.spawn_blocking_future_task("reth-blocking-task", async move {
+            let (_, result) = pipeline.run_as_fut(Some(unwind_target)).await;
+            let _ = tx.send(result);
+        });
 
         rx.await?.inspect_err(|err| {
             error!(target: "rayls::reth", unwind_target = %unwind_target, %err, "Pipeline unwind failed")
@@ -480,7 +509,7 @@ impl RethEnv {
     /// Snapshots taken between the RocksDB and MDBX commit phases leave history
     /// shards beyond the canonical tip. Re-execution then panics with `UnsortedInput`
     /// when appending duplicate block numbers to `RoaringTreemap` shards.
-    fn heal_rocksdb_history_after_snapshot(
+    pub(super) fn heal_rocksdb_history_after_snapshot(
         provider_factory: &ProviderFactory<RaylsNode>,
     ) -> eyre::Result<()> {
         let canonical_tip = provider_factory.database_provider_ro()?.last_block_number()?;
@@ -585,303 +614,5 @@ impl RethEnv {
         .await?;
         info!(target: "rayls::reth", target_block, "unwind complete");
         Ok(())
-    }
-
-    /// Seed the genesis account history for accounts that produce no changesets.
-    ///
-    /// `IndexAccountHistoryStage` clears `AccountsHistory` on its first run and
-    /// rebuilds from `AccountChangeSets`, so genesis accounts whose
-    /// code/nonce/balance never change again (immutable system contracts) lose
-    /// their block-0 entry entirely — historical `eth_call`/`eth_getCode`
-    /// returns empty for them.
-    ///
-    /// This re-inserts a genesis block-0 entry for every such account via a
-    /// read-merge-write so existing post-genesis shards are preserved. Accounts
-    /// with more than one shard already carry post-genesis changesets and are
-    /// left untouched. Only applicable to v2 (RocksDB). Idempotent.
-    ///
-    /// Limitation: on a node whose `AccountsHistory` was cleared and rebuilt
-    /// from `AccountChangeSets` by `IndexAccountHistoryStage` (a normally-synced
-    /// node — not `rayls-replay`), a *multi-shard* genesis account is skipped here
-    /// and genesis has no changeset to rebuild from, so it never regains its
-    /// block-0 entry. This is a non-issue for replay-built nodes, where that
-    /// stage never runs; account history is written once by genesis init and only
-    /// appended to.
-    pub fn fix_genesis_account_history(&self) -> eyre::Result<()> {
-        Self::fix_genesis_account_history_with(
-            &self.provider_factory,
-            self.node_config.storage_settings().use_hashed_state(),
-        )?;
-        Ok(())
-    }
-
-    /// Testable core of [`Self::fix_genesis_account_history`]. Returns the number
-    /// of accounts seeded.
-    pub(crate) fn fix_genesis_account_history_with(
-        provider_factory: &ProviderFactory<RaylsNode>,
-        use_hashed_state: bool,
-    ) -> eyre::Result<usize> {
-        use reth_db::{models::ShardedKey, BlockNumberList};
-        use reth_provider::RocksDBProviderFactory;
-        use std::collections::{HashMap, HashSet};
-
-        if !use_hashed_state {
-            info!(target: "rayls::reth", "v1 (plain) storage; account history needs no fix");
-            return Ok(0);
-        }
-
-        let chain_spec = provider_factory.chain_spec();
-        let genesis = chain_spec.genesis();
-        let block = chain_spec.genesis_header().number;
-
-        let rocksdb = provider_factory.rocksdb_provider();
-
-        // Per-account prefix scan — mirrors fix_genesis_history_with pattern.
-        // Only scans shards for genesis accounts, not the entire table.
-        let (already_fixed, shard_counts): (HashSet<Address>, HashMap<Address, usize>) = {
-            let mut fixed = HashSet::new();
-            let mut counts: HashMap<Address, usize> = HashMap::new();
-            for addr in genesis.alloc.keys() {
-                let shards = rocksdb.account_history_shards(*addr)?;
-                if shards.is_empty() {
-                    continue;
-                }
-                counts.insert(*addr, shards.len());
-                if shards.iter().any(|(_, list)| list.contains(block)) {
-                    fixed.insert(*addr);
-                }
-            }
-            (fixed, counts)
-        };
-
-        if !already_fixed.is_empty() {
-            info!(
-                target: "rayls::reth",
-                already_fixed = already_fixed.len(),
-                "idempotency: skipping accounts already present in AccountsHistory at genesis block"
-            );
-        }
-
-        // Accounts with more than one shard have post-genesis changesets that were
-        // correctly indexed by IndexAccountHistoryStage.
-        let multi_shard_skipped = genesis
-            .alloc
-            .keys()
-            .filter(|addr| shard_counts.get(*addr).copied().unwrap_or(0) > 1)
-            .count();
-
-        if multi_shard_skipped > 0 {
-            info!(
-                target: "rayls::reth",
-                multi_shard_skipped,
-                "skipping genesis accounts with multiple history shards (post-genesis changesets present)"
-            );
-        }
-
-        let to_fix: Vec<Address> = genesis
-            .alloc
-            .keys()
-            .filter(|addr| {
-                !already_fixed.contains(*addr) && shard_counts.get(*addr).copied().unwrap_or(0) <= 1
-            })
-            .copied()
-            .collect();
-
-        if to_fix.is_empty() {
-            info!(target: "rayls::reth", block, "genesis account history already fully seeded; nothing to do");
-            return Ok(0);
-        }
-
-        let mut batch = rocksdb.batch();
-        for addr in &to_fix {
-            let key = ShardedKey::last(*addr);
-            let existing = rocksdb.get::<reth_db::tables::AccountsHistory>(key.clone())?;
-            let merged = match existing {
-                Some(existing_list) => {
-                    let blocks: Vec<u64> =
-                        core::iter::once(block).chain(existing_list.iter()).collect();
-                    debug_assert!(
-                        blocks.windows(2).all(|w| w[0] < w[1]),
-                        "merged genesis account history must be strictly ascending"
-                    );
-                    BlockNumberList::new(blocks)
-                        .map_err(|e| eyre::eyre!("failed to build block number list: {e}"))?
-                }
-                None => BlockNumberList::new([block]).expect("single block always fits"),
-            };
-            batch.put::<reth_db::tables::AccountsHistory>(key, &merged)?;
-        }
-        batch.commit()?;
-
-        info!(
-            target: "rayls::reth",
-            accounts = to_fix.len(),
-            block,
-            "seeded genesis account history for v2"
-        );
-        Ok(to_fix.len())
-    }
-
-    /// Re-key the genesis storage history to hashed keys so v2 reads
-    /// reconstruct genesis-seeded storage instead of returning 0x0.
-    ///
-    /// reth's genesis writer (`insert_storage_history`) keys `StoragesHistory`
-    /// by the plain slot, but the v2 read looks it up by `keccak256(slot)`, so
-    /// genesis-seeded storage (e.g. the static validator set) reads as
-    /// `NotYetWritten` -> 0x0. This re-emits the genesis block entry under the
-    /// hashed slot.
-    ///
-    /// The entry is **merged into the earliest existing shard** for each
-    /// `(address, hashed slot)` via a read-merge-write, rather than overwriting
-    /// the open (`u64::MAX`) shard. That keeps the post-genesis history of a
-    /// genesis slot that was also modified later (e.g. a balance / registry slot)
-    /// and places block 0 in the shard the historical read consults for early
-    /// blocks. When prepending would push the earliest shard past
-    /// `NUM_OF_INDICES_IN_SHARD` (a hot genesis slot with >= that many
-    /// post-genesis changes), the slot's shards are re-chunked so none exceeds
-    /// the limit. Only applicable to v2 (RocksDB). Idempotent.
-    ///
-    /// This adds the entry under the hashed key; the original plain-slot entry
-    /// written by genesis init is intentionally left in place. It's never read by
-    /// v2 (which looks up the hashed key) and deleting it is avoidable risk for no
-    /// functional gain, so it's kept as harmless dead weight rather than removed.
-    pub fn fix_genesis_history(&self) -> eyre::Result<()> {
-        Self::fix_genesis_history_with(
-            &self.provider_factory,
-            self.node_config.storage_settings().use_hashed_state(),
-        )?;
-        Ok(())
-    }
-
-    /// Testable core of [`Self::fix_genesis_history`]. Returns the number of
-    /// storage slots re-keyed (0 when everything is already correct).
-    pub(crate) fn fix_genesis_history_with(
-        provider_factory: &ProviderFactory<RaylsNode>,
-        use_hashed_state: bool,
-    ) -> eyre::Result<usize> {
-        use alloy::primitives::keccak256;
-        use reth_db::{
-            models::{
-                sharded_key::NUM_OF_INDICES_IN_SHARD, storage_sharded_key::StorageShardedKey,
-            },
-            BlockNumberList,
-        };
-        use reth_provider::RocksDBProviderFactory;
-
-        if !use_hashed_state {
-            info!(target: "rayls::reth", "v1 (plain) storage; genesis history needs no re-key");
-            return Ok(0);
-        }
-
-        let chain_spec = provider_factory.chain_spec();
-        let genesis = chain_spec.genesis();
-        let block = chain_spec.genesis_header().number;
-
-        let rocksdb = provider_factory.rocksdb_provider();
-        let mut batch = rocksdb.batch();
-        let (mut fixed, mut already, mut rechunked) = (0usize, 0usize, 0usize);
-
-        for (addr, account) in genesis.alloc.iter() {
-            let Some(storage) = account.storage.as_ref() else { continue };
-            for slot in storage.keys() {
-                let hashed = keccak256(slot);
-                // All shards for this (address, hashed slot), ascending by highest
-                // block. A cheap per-slot prefix scan, not an O(N) full-table scan.
-                let shards = rocksdb.storage_history_shards(*addr, hashed)?;
-
-                // Idempotency: a prior run already placed the genesis block.
-                if shards.iter().any(|(_, list)| list.contains(block)) {
-                    already += 1;
-                    continue;
-                }
-
-                match shards.first() {
-                    // No history yet (immutable genesis slot, never touched after
-                    // genesis): open a fresh `::last` shard holding just the block.
-                    None => {
-                        let key = StorageShardedKey::last(*addr, hashed);
-                        batch.put::<reth_db::tables::StoragesHistory>(
-                            key,
-                            &BlockNumberList::new([block]).expect("single block always fits"),
-                        )?;
-                    }
-                    Some((earliest_key, earliest_list)) => {
-                        // Fast path: a single shard (the open `::last`) with room —
-                        // prepend the genesis block in place. The read for an early
-                        // block consults this shard, so block 0 belongs here.
-                        if shards.len() == 1
-                            && (earliest_list.len() as usize) < NUM_OF_INDICES_IN_SHARD
-                        {
-                            let blocks: Vec<u64> =
-                                core::iter::once(block).chain(earliest_list.iter()).collect();
-                            let merged = BlockNumberList::new(blocks).map_err(|e| {
-                                eyre::eyre!("failed to build block number list: {e}")
-                            })?;
-                            batch.put::<reth_db::tables::StoragesHistory>(
-                                earliest_key.clone(),
-                                &merged,
-                            )?;
-                        } else {
-                            // Prepending would overflow the earliest shard (a hot
-                            // genesis slot with a full first shard). Gather all of the
-                            // slot's blocks, prepend genesis, delete the old shards and
-                            // re-split into <= NUM_OF_INDICES_IN_SHARD chunks so none
-                            // exceeds the limit. `all` is globally sorted: block 0 is
-                            // smaller than every post-genesis change, and both the shard
-                            // order and each shard's list are ascending.
-                            rechunked += 1;
-                            let mut all: Vec<u64> = core::iter::once(block).collect();
-                            for (_, list) in &shards {
-                                all.extend(list.iter());
-                            }
-                            // `all` must be strictly ascending for BlockNumberList /
-                            // the shard split: genesis block < every post-genesis block,
-                            // storage_history_shards returns shards ascending, and each
-                            // shard's list is ascending. Guard that invariant.
-                            debug_assert!(
-                                all.windows(2).all(|w| w[0] < w[1]),
-                                "re-chunk block list must be strictly ascending"
-                            );
-                            for (key, _) in &shards {
-                                batch.delete::<reth_db::tables::StoragesHistory>(key.clone())?;
-                            }
-                            let mut i = 0;
-                            while i < all.len() {
-                                let end = (i + NUM_OF_INDICES_IN_SHARD).min(all.len());
-                                let chunk = &all[i..end];
-                                let key = if end == all.len() {
-                                    StorageShardedKey::last(*addr, hashed)
-                                } else {
-                                    StorageShardedKey::new(*addr, hashed, chunk[chunk.len() - 1])
-                                };
-                                let list =
-                                    BlockNumberList::new(chunk.iter().copied()).map_err(|e| {
-                                        eyre::eyre!("failed to build block number list: {e}")
-                                    })?;
-                                batch.put::<reth_db::tables::StoragesHistory>(key, &list)?;
-                                i = end;
-                            }
-                        }
-                    }
-                }
-                fixed += 1;
-            }
-        }
-
-        if fixed == 0 {
-            info!(target: "rayls::reth", block, already, "genesis storage history already re-keyed; nothing to do");
-            return Ok(0);
-        }
-        batch.commit()?;
-
-        info!(
-            target: "rayls::reth",
-            slots = fixed,
-            already,
-            rechunked,
-            block,
-            "re-keyed genesis storage history to hashed keys"
-        );
-        Ok(fixed)
     }
 }

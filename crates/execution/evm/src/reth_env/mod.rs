@@ -7,13 +7,17 @@
 pub mod accessors;
 pub mod chain;
 pub mod config;
+mod datadir_format;
 pub mod env;
 pub mod execution;
 pub mod genesis;
 pub mod init;
 pub mod persistence;
 pub mod registry;
+pub(crate) mod reth_runtime;
 pub mod rpc;
+#[cfg(feature = "archive-replay")]
+pub mod snapshot_reader;
 #[cfg(feature = "archive-replay")]
 pub mod solver;
 pub mod types;
@@ -24,6 +28,8 @@ mod tests;
 pub use chain::ChainSpec;
 pub use config::{RethCommand, RethConfig};
 pub use env::RethEnv;
+#[cfg(feature = "archive-replay")]
+pub use snapshot_reader::SnapshotReader;
 pub use types::{
     ExecutedBatchDigestReceiver, FailedTxNotification, NonceTooHighDetail, RethDb, RpcServer,
     SparseRootFn, ToTree, TxValidationCounts,

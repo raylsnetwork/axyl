@@ -842,7 +842,14 @@ impl Database for MdbxDatabase {
         Self: 'txn;
 
     /// Open or create a table and cache its DBI.
+    ///
+    /// On a database opened with [`Self::open_read_only`] this does nothing: a table cannot be
+    /// created there, and each read opens the table it needs (see `get_dbi`). So the layered
+    /// database can register its tables the same way over a read-only database.
     fn open_table<T: Table>(&self) -> eyre::Result<()> {
+        if self.inner.is_read_only()? {
+            return Ok(());
+        }
         let txn = self.inner.begin_rw_txn()?;
         let db = txn.create_db(Some(T::NAME), DatabaseFlags::default())?;
         let dbi = db.dbi();

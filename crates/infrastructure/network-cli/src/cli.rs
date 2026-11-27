@@ -133,6 +133,7 @@ impl<Ext: clap::Args + fmt::Debug> Cli<Ext> {
                 format!("{},{floor}", self.logs.log_stdout_filter)
             };
         }
+        self.apply_log_file_default();
         let _guard = self.init_tracing()?;
 
         match self.command {
@@ -155,6 +156,22 @@ impl<Ext: clap::Args + fmt::Debug> Cli<Ext> {
             Commands::Schedule(command) => command.execute(),
             #[cfg(feature = "dev-single-node-setup")]
             Commands::Dev(command) => command.execute(datadir, passphrase, launcher),
+        }
+    }
+
+    /// Log files kept when `--log.file.max-files` is not given.
+    ///
+    /// Our own number, not reth's node default, so a reth upgrade cannot move it.
+    const DEFAULT_LOG_FILE_MAX_FILES: usize = 5;
+
+    /// Keep file logging on by default.
+    ///
+    /// reth 2.0 writes no log file unless `--log.file.max-files` is given. reth 1.11 kept 5 files
+    /// by default for every command, and operators rely on the log file. This applies to every
+    /// command, as on reth 1.11. An explicit `--log.file.max-files 0` still turns it off.
+    fn apply_log_file_default(&mut self) {
+        if self.logs.log_file_max_files.is_none() {
+            self.logs.log_file_max_files = Some(Self::DEFAULT_LOG_FILE_MAX_FILES);
         }
     }
 
@@ -248,6 +265,24 @@ mod tests {
     use clap::CommandFactory;
     use rayls_execution_evm::ColorMode;
     use rayls_infrastructure_config::Config;
+
+    /// File logging stays on by default (5 files, as on reth 1.11), and an explicit 0 still
+    /// turns it off. reth 2.0 defaults to 0 files when the program does not ask for more.
+    #[test]
+    fn log_file_default_is_kept() {
+        let mut rl = Cli::try_parse_args_from(["rl", "node"]).unwrap();
+        assert_eq!(rl.logs.effective_log_file_max_files(), 0, "reth's own default is no file");
+        rl.apply_log_file_default();
+        assert_eq!(rl.logs.effective_log_file_max_files(), 5);
+
+        let mut rl = Cli::try_parse_args_from(["rl", "node", "--log.file.max-files", "0"]).unwrap();
+        rl.apply_log_file_default();
+        assert_eq!(rl.logs.effective_log_file_max_files(), 0, "an explicit 0 is respected");
+
+        let mut rl = Cli::try_parse_args_from(["rl", "node", "--log.file.max-files", "9"]).unwrap();
+        rl.apply_log_file_default();
+        assert_eq!(rl.logs.effective_log_file_max_files(), 9);
+    }
 
     #[test]
     fn parse_color_mode() {

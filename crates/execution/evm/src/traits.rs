@@ -8,10 +8,7 @@ use alloy::rpc::types::engine::ExecutionPayload;
 use rayls_infrastructure_types::{
     EthPrimitives, NodePrimitives, RecoveredBlock, SealedBlock, SealedHeader,
 };
-use reth::{
-    payload::{EthBuiltPayload, EthPayloadBuilderAttributes},
-    rpc::types::engine::ExecutionData,
-};
+use reth::{payload::EthBuiltPayload, rpc::types::engine::ExecutionData};
 pub use reth_consensus::{Consensus, ConsensusError};
 use reth_consensus::{FullConsensus, HeaderValidator, ReceiptRootBloom};
 use reth_db::DatabaseEnv;
@@ -116,7 +113,6 @@ pub struct DefaultEthPayloadTypes;
 impl PayloadTypes for DefaultEthPayloadTypes {
     type BuiltPayload = EthBuiltPayload;
     type PayloadAttributes = EthPayloadAttributes;
-    type PayloadBuilderAttributes = EthPayloadBuilderAttributes;
     type ExecutionData = ExecutionData;
 
     fn block_to_payload(

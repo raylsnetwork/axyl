@@ -18,7 +18,6 @@ use lru_time_cache::LruCache;
 use rayls_execution_evm::{reth_env::RethEnv, WorkerTxPool};
 use rayls_infrastructure_types::{Address, TxHash};
 use reth::rpc::server_types::eth::{EthApiError, EthResult};
-use reth_tasks::{TaskSpawner, TokioTaskExecutor};
 use secp256k1::constants::PUBLIC_KEY_SIZE;
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
@@ -29,6 +28,44 @@ mod service;
 pub use cli_ext::{parse_u256_from_decimal_value, FaucetArgs};
 pub use rpc_ext::{FaucetRpcExt, FaucetRpcExtApiServer};
 pub(crate) use service::FaucetService;
+
+/// The two task-spawning methods the faucet needs. reth 2.0 removed its `TaskSpawner` trait,
+/// so the faucet has its own.
+pub(crate) trait TaskSpawner: Send + Sync + Unpin + std::fmt::Debug {
+    /// Spawn the task.
+    fn spawn_task(
+        &self,
+        fut: futures::future::BoxFuture<'static, ()>,
+    ) -> tokio::task::JoinHandle<()>;
+
+    /// Spawn the task (the name is unused, as it was in reth's `TokioTaskExecutor`).
+    fn spawn_critical_task(
+        &self,
+        name: &'static str,
+        fut: futures::future::BoxFuture<'static, ()>,
+    ) -> tokio::task::JoinHandle<()>;
+}
+
+/// Spawns on the current tokio runtime with a plain `tokio::task::spawn`.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct TokioTaskExecutor;
+
+impl TaskSpawner for TokioTaskExecutor {
+    fn spawn_task(
+        &self,
+        fut: futures::future::BoxFuture<'static, ()>,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::task::spawn(fut)
+    }
+
+    fn spawn_critical_task(
+        &self,
+        _name: &'static str,
+        fut: futures::future::BoxFuture<'static, ()>,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::task::spawn(fut)
+    }
+}
 
 /// Client to send API requests to Google KMS.
 pub type GoogleKMSClient = GoogleApi<KeyManagementServiceClient<GoogleAuthMiddleware>>;

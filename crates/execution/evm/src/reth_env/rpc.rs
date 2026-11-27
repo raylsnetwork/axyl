@@ -30,7 +30,7 @@ impl RethEnv {
             .with_provider(self.blockchain_provider.clone())
             .with_pool(transaction_pool.clone())
             .with_network(network.clone())
-            .with_executor(Box::new(self.task_spawner.clone()))
+            .with_executor(self.reth_runtime.clone())
             .with_evm_config(self.evm_config.clone())
             // .with_events(self.blockchain_provider.clone())
             // .with_block_executor(self.evm_executor.clone())
@@ -52,11 +52,16 @@ impl RethEnv {
             max_concurrent_db_requests: rpc.rpc_state_cache.max_concurrent_db_requests,
             max_cached_tx_hashes: rpc.rpc_state_cache.max_cached_tx_hashes,
         })
+        // TODO(#416): reth 2.0 changed some defaults (gas oracle, file logging, thread pools).
+        // The ones we want to keep are set back in #416.
         .gas_oracle_config(rpc.gas_price_oracle.gas_price_oracle_config())
         .gas_cap(rpc.rpc_gas_cap.into())
         .max_simulate_blocks(rpc.rpc_max_simulate_blocks)
         .eth_proof_window(rpc.rpc_eth_proof_window)
         .proof_permits(rpc.rpc_proof_permits)
+        // Without this the builder falls back to `Runtime::test()`, a small test runtime with
+        // its own pools.
+        .task_spawner(self.reth_runtime.clone())
         .build();
 
         let engine_events: EventSender<ConsensusEngineEvent<RaylsPrimitives>> = Default::default();

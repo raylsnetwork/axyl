@@ -29,8 +29,8 @@ pub enum ReplayError {
     #[error("genesis hash mismatch: archive {ours:?} != snapshot {expected:?}")]
     GenesisHashMismatch { ours: B256, expected: B256 },
 
-    /// Snapshot's `RethEnv` returned an error.
-    #[error("snapshot env error: {0}")]
+    /// A read from the snapshot failed.
+    #[error("snapshot read error: {0}")]
     SnapshotEnv(String),
 
     /// Archive's `RethEnv` returned an error.

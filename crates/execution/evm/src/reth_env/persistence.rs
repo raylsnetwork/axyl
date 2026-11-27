@@ -5,6 +5,7 @@ use crate::{
 use alloy::consensus::BlockHeader as _;
 use rayls_infrastructure_types::SealedHeader;
 use reth_chain_state::{CanonicalInMemoryState, ExecutedBlock};
+use reth_engine_tree::persistence::PersistenceResult;
 use reth_provider::CanonChainTracker;
 use reth_trie::TrieInput;
 use std::sync::Arc;
@@ -67,7 +68,7 @@ impl RethEnv {
         let mut state = self.persistence_state.lock();
         if let Some(rx) = state.pending_rx.as_mut() {
             match rx.try_recv() {
-                Ok(Some(persisted)) => {
+                Ok(PersistenceResult { last_block: Some(persisted), .. }) => {
                     let elapsed = state.pending_started_at.map(|t| t.elapsed());
                     info!(
                         target: "persistence",
@@ -81,7 +82,7 @@ impl RethEnv {
                     state.pending_rx = None;
                     state.pending_started_at = None;
                 }
-                Ok(None) => {
+                Ok(PersistenceResult { last_block: None, .. }) => {
                     let elapsed = state.pending_started_at.map(|t| t.elapsed());
                     info!(
                         target: "persistence",
@@ -268,13 +269,13 @@ impl RethEnv {
 
             if let Some(rx) = state.pending_rx.take() {
                 match rx.recv() {
-                    Ok(Some(persisted)) => {
+                    Ok(PersistenceResult { last_block: Some(persisted), .. }) => {
                         info!(target: "persistence", ?persisted, "in-flight persistence completed");
                         canonical_in_memory_state.remove_persisted_blocks(persisted);
                         changeset_cache.evict(persisted.number);
                         state.last_persisted_block = persisted;
                     }
-                    Ok(None) => {
+                    Ok(PersistenceResult { last_block: None, .. }) => {
                         info!(target: "persistence", "in-flight persistence completed with no blocks");
                     }
                     Err(e) => {
@@ -299,7 +300,7 @@ impl RethEnv {
                 })?;
 
                 match rx.recv() {
-                    Ok(Some(persisted)) => {
+                    Ok(PersistenceResult { last_block: Some(persisted), .. }) => {
                         info!(
                             target: "persistence",
                             ?persisted,
@@ -310,7 +311,7 @@ impl RethEnv {
                         changeset_cache.evict(persisted.number);
                         state.last_persisted_block = persisted;
                     }
-                    Ok(None) => {
+                    Ok(PersistenceResult { last_block: None, .. }) => {
                         info!(target: "persistence", "flush blocks empty");
                     }
                     Err(e) => {

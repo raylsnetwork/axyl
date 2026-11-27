@@ -34,6 +34,12 @@ pub struct RethEnv {
     pub(crate) evm_config: RaylsEvmConfig,
     /// The type to spawn tasks.
     pub(crate) task_spawner: TaskSpawner,
+    /// reth's own task runtime, for the reth APIs that take a `reth_tasks::Runtime` (pool
+    /// validation, pool maintenance, RPC).
+    ///
+    /// Tied to our `TaskManager`: a panic in a critical reth task stops the node, and our
+    /// shutdown fires reth's shutdown signal. See `reth_env::reth_runtime`.
+    pub(crate) reth_runtime: reth_tasks::Runtime,
     /// Handle for sending blocks to reth's background persistence service.
     pub(crate) persistence_handle: RethPersistenceHandle<EthPrimitives>,
     /// Shared state tracking pending persistence operations.

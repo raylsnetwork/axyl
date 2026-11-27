@@ -187,7 +187,7 @@ impl RethConfig {
 
         // Not using the Reth payload builder.
         let builder = PayloadBuilderArgs {
-            extra_data: "rayls-execution-evm-na".to_string(),
+            extra_data: alloy::primitives::Bytes::from_static(b"rayls-execution-evm-na"),
             gas_limit: Some(ETHEREUM_BLOCK_GAS_LIMIT_56BITS),
             interval: Duration::from_secs(1),
             deadline: Duration::from_secs(1),

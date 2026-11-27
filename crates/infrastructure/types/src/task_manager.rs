@@ -1,7 +1,7 @@
 //! Task manager interface to spawn tasks to the tokio runtime.
 
 use crate::Notifier;
-use futures::{future::BoxFuture, stream::FuturesUnordered, FutureExt, StreamExt};
+use futures::{stream::FuturesUnordered, FutureExt, StreamExt};
 use std::{
     collections::HashMap,
     fmt::{Debug, Display},
@@ -340,53 +340,29 @@ impl TaskSpawner {
         }
     }
 
-    /// Spawn a task for the reth [`TaskSpawner`](reth_tasks::TaskSpawner) trait.
+    /// Spawn a non-critical task that runs a future on the tokio blocking thread pool.
     ///
-    /// The reth interface requires a [`JoinHandle`] to be returned while the
-    /// [`TaskManager`] needs its own handle for tracking.  We use a single
-    /// `tokio::spawn` (or `spawn_blocking`) wrapped in one `select!` with
-    /// `local_shutdown`, and bridge a lightweight proxy [`JoinHandle`] back to
-    /// the caller via a [`oneshot`](tokio::sync::oneshot) channel.
-    fn spawn_reth_task(
-        &self,
-        name: &str,
-        fut: BoxFuture<'static, ()>,
-        critical: bool,
-        blocking: bool,
-    ) -> JoinHandle<()> {
+    /// For a future that blocks its thread for a long time (reth's pipeline unwind). The task
+    /// is tracked by the [`TaskManager`] and is cancelled on shutdown. Other tasks are
+    /// unaffected when it resolves.
+    pub fn spawn_blocking_future_task<F, S: ToString>(&self, name: S, future: F)
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        let name = name.to_string();
         let rx_shutdown = self.local_shutdown.subscribe();
-        let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
-
-        let f = async move {
-            tokio::select! {
-                _ = rx_shutdown => {}
-                _ = fut => {}
-            }
-            let _ = done_tx.send(());
-        };
-
-        // Single spawn — tracked by TaskManager.
-        let tracked_handle = if blocking {
-            let handle = tokio::runtime::Handle::current();
-            tokio::task::spawn_blocking(move || handle.block_on(f))
-        } else {
-            tokio::spawn(f)
-        };
-
-        if let Err(err) = self.new_task_tx.try_send(TaskHandle::with_kind(
-            name.to_string(),
-            tracked_handle,
-            critical,
-            TaskKind::Doomed,
-        )) {
+        let runtime = tokio::runtime::Handle::current();
+        let handle = tokio::task::spawn_blocking(move || {
+            runtime.block_on(async move {
+                tokio::select! {
+                    _ = rx_shutdown => {}
+                    _ = future => {}
+                }
+            })
+        });
+        if let Err(err) = self.new_task_tx.try_send(TaskHandle::new(name.clone(), handle, false)) {
             tracing::error!(target: "rayls::tasks", "Task error sending joiner for {name}: {err}");
         }
-
-        // Lightweight proxy handle for the reth caller.  Completes when the
-        // tracked task finishes (or is aborted, which drops done_tx).
-        tokio::spawn(async move {
-            let _ = done_rx.await;
-        })
     }
 }
 
@@ -945,32 +921,6 @@ impl Debug for TaskManager {
     }
 }
 
-impl reth_tasks::TaskSpawner for TaskSpawner {
-    fn spawn_task(&self, fut: BoxFuture<'static, ()>) -> JoinHandle<()> {
-        self.spawn_reth_task("reth-task", fut, false, false)
-    }
-
-    fn spawn_critical_task(
-        &self,
-        name: &'static str,
-        fut: BoxFuture<'static, ()>,
-    ) -> JoinHandle<()> {
-        self.spawn_reth_task(name, fut, true, false)
-    }
-
-    fn spawn_blocking_task(&self, fut: BoxFuture<'static, ()>) -> JoinHandle<()> {
-        self.spawn_reth_task("reth-blocking-task", fut, false, true)
-    }
-
-    fn spawn_critical_blocking_task(
-        &self,
-        name: &'static str,
-        fut: BoxFuture<'static, ()>,
-    ) -> JoinHandle<()> {
-        self.spawn_reth_task(name, fut, true, true)
-    }
-}
-
 /// Indicate a non-normal exit on a a taskmanager join.
 #[derive(Debug, Error)]
 pub enum TaskJoinError {
@@ -1067,51 +1017,12 @@ mod test {
         assert_eq!(spong_block.ping(1).await.unwrap(), 1);
         assert_eq!(spong_block.ping(2).await.unwrap(), 2);
 
-        // Test the reth TaskSpawner trait interface.
-        // Use fully qualified syntax because the inherent methods (which take
-        // a name + future) shadow the trait methods (which take only a future).
-        use reth_tasks::TaskSpawner as RethTaskSpawner;
-        let (rsping_crit, mut rspong_crit) = new_ping_pong();
-        RethTaskSpawner::spawn_critical_task(
-            &spawner,
-            "Crit",
-            Box::pin(async move {
-                rsping_crit.run().await;
-            }),
-        );
-        assert_eq!(rspong_crit.ping(1).await.unwrap(), 1);
-        assert_eq!(rspong_crit.ping(2).await.unwrap(), 2);
-
-        let (rsping_norm, mut rspong_norm) = new_ping_pong();
-        RethTaskSpawner::spawn_task(
-            &spawner,
-            Box::pin(async move {
-                rsping_norm.run().await;
-            }),
-        );
-        assert_eq!(rspong_norm.ping(1).await.unwrap(), 1);
-        assert_eq!(rspong_norm.ping(2).await.unwrap(), 2);
-
-        let (rsping_block, mut rspong_block) = new_ping_pong();
-        RethTaskSpawner::spawn_blocking_task(
-            &spawner,
-            Box::pin(async move {
-                rsping_block.run().await;
-            }),
-        );
-        assert_eq!(rspong_block.ping(1).await.unwrap(), 1);
-        assert_eq!(rspong_block.ping(2).await.unwrap(), 2);
-
-        let (rsping_crit_block, mut rspong_crit_block) = new_ping_pong();
-        RethTaskSpawner::spawn_critical_blocking_task(
-            &spawner,
-            "Crit block",
-            Box::pin(async move {
-                rsping_crit_block.run().await;
-            }),
-        );
-        assert_eq!(rspong_crit_block.ping(1).await.unwrap(), 1);
-        assert_eq!(rspong_crit_block.ping(2).await.unwrap(), 2);
+        let (sping_block_fut, mut spong_block_fut) = new_ping_pong();
+        spawner.spawn_blocking_future_task("blocking-future", async move {
+            sping_block_fut.run().await;
+        });
+        assert_eq!(spong_block_fut.ping(1).await.unwrap(), 1);
+        assert_eq!(spong_block_fut.ping(2).await.unwrap(), 2);
 
         drop(task_manager);
 
@@ -1124,10 +1035,7 @@ mod test {
         // Note this blocking task is NOT killed when task manager is dropped..
         assert_eq!(spong_block.ping(3).await.unwrap(), 3);
 
-        assert!(rspong_crit.ping(2).await.is_err());
-        assert!(rspong_norm.ping(2).await.is_err());
-        assert!(rspong_block.ping(2).await.is_err());
-        assert!(rspong_crit_block.ping(2).await.is_err());
+        assert!(spong_block_fut.ping(2).await.is_err());
     }
 
     /// Drainable tasks survive `abort_doomed_tasks()` but are killed by `abort_all_tasks()`.

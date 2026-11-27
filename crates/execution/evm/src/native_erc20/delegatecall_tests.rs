@@ -134,7 +134,7 @@ fn seeded_state(delegatecall: bool) -> State<CacheDB<EmptyDBTyped<core::convert:
         AccountInfo { balance: U256::from(10).pow(U256::from(21)), nonce: 0, ..Default::default() },
     );
 
-    State::builder().with_database(cache_db).with_bundle_update().without_state_clear().build()
+    State::builder().with_database(cache_db).with_bundle_update().build()
 }
 
 /// Read `allowance(owner, spender)` out of `0x0400`'s storage in a post-transaction state diff.

@@ -36,11 +36,7 @@ impl RethEnv {
         let state_provider: StateProviderBox = Box::new(LatestStateProvider::new(db_provider));
 
         let state = StateProviderDatabase::new(&state_provider);
-        let mut db = State::builder()
-            .with_database(state)
-            .with_bundle_update()
-            .without_state_clear()
-            .build();
+        let mut db = State::builder().with_database(state).with_bundle_update().build();
         trace!(target: "engine", state=?db.bundle_state, hashes=?db.block_hashes, "retrieving epoch state from canonical tip");
         let mut rayls_evm = self
             .evm_config
@@ -87,11 +83,7 @@ impl RethEnv {
         let db_provider = self.blockchain_provider.database_provider_ro()?;
         let state_provider: StateProviderBox = Box::new(LatestStateProvider::new(db_provider));
         let state = StateProviderDatabase::new(&state_provider);
-        let mut db = State::builder()
-            .with_database(state)
-            .with_bundle_update()
-            .without_state_clear()
-            .build();
+        let mut db = State::builder().with_database(state).with_bundle_update().build();
         let mut rayls_evm = self
             .evm_config
             .evm_factory()
@@ -137,11 +129,7 @@ impl RethEnv {
         let db_provider = self.blockchain_provider.database_provider_ro()?;
         let state_provider: StateProviderBox = Box::new(LatestStateProvider::new(db_provider));
         let state = StateProviderDatabase::new(&state_provider);
-        let mut db = State::builder()
-            .with_database(state)
-            .with_bundle_update()
-            .without_state_clear()
-            .build();
+        let mut db = State::builder().with_database(state).with_bundle_update().build();
         let mut rayls_evm = self
             .evm_config
             .evm_factory()

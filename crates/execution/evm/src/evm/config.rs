@@ -18,8 +18,7 @@ use rayls_middleware_rewards::RewardsCounter;
 use reth_chainspec::{EthChainSpec as _, EthereumHardforks as _};
 use reth_evm::{ConfigureEvm, EvmEnv, EvmEnvFor, ExecutionCtxFor};
 use reth_evm_ethereum::RethReceiptBuilder;
-use reth_primitives::{BlockTy, HeaderTy};
-use reth_primitives_traits::constants::MAX_TX_GAS_LIMIT_OSAKA;
+use reth_primitives_traits::{constants::MAX_TX_GAS_LIMIT_OSAKA, BlockTy, HeaderTy};
 use reth_revm::{
     context::{BlockEnv, CfgEnv},
     context_interface::block::BlobExcessGasAndPrice,
@@ -135,6 +134,7 @@ impl ConfigureEvm for RaylsEvmConfig {
             gas_limit: header.gas_limit(),
             basefee: header.base_fee_per_gas().unwrap_or_default(),
             blob_excess_gas_and_price,
+            slot_num: 0,
         };
 
         Ok(EvmEnv { cfg_env, block_env })
@@ -178,6 +178,7 @@ impl ConfigureEvm for RaylsEvmConfig {
                 excess_blob_gas: 0,       // no excess gas for blobs
                 blob_gasprice: u128::MAX, // eip4844 transactions are ignored
             }),
+            slot_num: 0,
         };
 
         let evm_env = EvmEnv::new(cfg, block_env);
@@ -208,9 +209,15 @@ impl ConfigureEvm for RaylsEvmConfig {
             difficulty: block.difficulty,
             rewards_counter: self.rewards_counter.clone(),
             close_epoch_tally,
+            migrations_applied: false,
         })
     }
 
+    /// The returned context has `migrations_applied == false`, so the executor applies
+    /// one-shot hardfork migrations through `commit`. That is only good enough for results
+    /// that are not persisted (RPC trace and simulate). A caller that builds a block to keep
+    /// must apply the migrations on `State` first and set the flag, as
+    /// `RethEnv::build_block_from_batch_payload` does.
     fn context_for_next_block(
         &self,
         parent: &SealedHeader<HeaderTy<Self::Primitives>>,
@@ -232,6 +239,7 @@ impl ConfigureEvm for RaylsEvmConfig {
             difficulty: U256::from(payload.batch_index << 16 | payload.worker_id as usize),
             rewards_counter: self.rewards_counter.clone(),
             close_epoch_tally,
+            migrations_applied: false,
         })
     }
 }

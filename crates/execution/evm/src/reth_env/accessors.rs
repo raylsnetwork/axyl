@@ -38,6 +38,7 @@ impl RethEnv {
         WorkerTxPool::new(
             &self.node_config,
             &self.task_spawner,
+            &self.reth_runtime,
             &self.blockchain_provider,
             in_flight,
         )
