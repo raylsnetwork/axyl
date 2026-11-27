@@ -19,16 +19,18 @@ use parking_lot::Mutex;
 use rayls_consensus_network::{admission::RequestPermits, GossipMessage};
 use rayls_infrastructure_config::{ConsensusConfig, LibP2pConfig};
 use rayls_infrastructure_storage::{
-    tables::{CertifiedTips, ConsensusBlocks},
+    tables::{
+        CertifiedTips, ConsensusBlockNumbersByDigest, ConsensusBlocks, EpochCerts, EpochRecords,
+    },
     CertScope, CertificateStore, ConsensusStore, EpochStore, ProposerStore, VoteDigestStore,
 };
 use rayls_infrastructure_types::{
     ensure,
     error::{CertificateError, HeaderError, HeaderResult},
-    now, to_intent_message, try_decode, AuthorityIdentifier, B256Map, BlockHash, BlockNumHash,
-    BlsPublicKey, BlsSignature, Certificate, CertificateDigest, CertifiedTip, ConsensusHeader,
+    now, to_intent_message, try_decode, AuthorityIdentifier, BlockHash, BlockNumHash, BlsPublicKey,
+    BlsSignature, Certificate, CertificateDigest, CertifiedHead, CertifiedTip, ConsensusHeader,
     Database, Epoch, EpochCertificate, EpochRecord, Hash as _, Header, ProtocolSignature,
-    RaylsSender as _, Round, SignatureVerificationState, Vote, VotesAggregator, B256,
+    RaylsSender as _, Round, SignatureVerificationState, Vote, B256,
 };
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
@@ -39,7 +41,10 @@ use tokio::time::Instant;
 use tracing::{debug, error, info, trace, warn};
 
 const MAX_AUTH_LAST_VOTE_ENTRIES: usize = 1000;
-const MAX_CONSENSUS_CERTS_ENTRIES: usize = 100;
+/// How many of its highest-numbered consensus results each signer keeps in [`ConsensusVotes`]:
+/// how far, in headers, one quorum member's gossip can trail another's before the quorum for a
+/// header stops forming while new headers keep coming.
+const CONSENSUS_VOTES_PER_SIGNER: usize = 8;
 /// How long `committed_round` must stay flat, while verdicts keep saying behind, before demoting
 /// to `CvvInactive`. Any commit advance resets the clock, so a node catching up or mid epoch/mode
 /// transition never trips it; only one stuck for the whole window does.
@@ -98,6 +103,75 @@ impl BehindTracker {
     }
 }
 
+/// The highest-numbered verified consensus results of each signer, counted toward the f+1 gossip
+/// quorum.
+///
+/// Each signer keeps only its own [`CONSENSUS_VOTES_PER_SIGNER`] highest-numbered results, by
+/// header number rather than arrival, as gossip can deliver one signer's results out of order and
+/// a late lower one must not push out a higher one still forming its quorum. A member that
+/// signs invented digests pushes out its own older results, never another signer's, so it cannot
+/// wipe the honest partial count for the real header. More than one per signer, so a signer that
+/// has moved on to the next header still counts toward the previous one while that quorum forms.
+/// Holds at most that many results per key it has counted.
+#[derive(Debug, Default)]
+struct ConsensusVotes {
+    by_signer: HashMap<BlsPublicKey, Vec<(B256, ConsensusResult)>>,
+}
+
+impl ConsensusVotes {
+    /// Record `result`, already verified, with its `digest` under its signer. True only on the
+    /// result that brings that digest to `quorum` signers, so later votes for the same header do
+    /// not act on it again. That is once each time the count climbs to `quorum`: a signer that
+    /// pushes the digest out of its window and sends it again before the quorum is pruned can
+    /// bring the count back to it. That costs one more pass through the quorum: a certified-tip
+    /// save that keeps a higher stored tip, and a `behind_consensus` call. Neither tip can move
+    /// back. A repeat of a result the signer already holds counts nothing, and so does one
+    /// numbered at or below all of a full window.
+    fn add(&mut self, digest: B256, result: ConsensusResult, quorum: usize) -> bool {
+        let held = self.by_signer.entry(result.validator).or_default();
+        if held.iter().any(|(d, _)| *d == digest) {
+            return false;
+        }
+        if held.len() == CONSENSUS_VOTES_PER_SIGNER {
+            let lowest = held
+                .iter()
+                .enumerate()
+                .map(|(at, (_, held))| (at, held.number))
+                .min_by_key(|(_, number)| *number);
+            if let Some((at, number)) = lowest {
+                if result.number <= number {
+                    return false;
+                }
+                held.swap_remove(at);
+            }
+        }
+        held.push((digest, result));
+        self.by_signer.values().filter(|held| held.iter().any(|(d, _)| *d == digest)).count()
+            == quorum
+    }
+
+    /// The signer and signature of every held result for `digest`.
+    fn signatures(&self, digest: &B256) -> Vec<(BlsPublicKey, BlsSignature)> {
+        self.by_signer
+            .values()
+            .filter_map(|held| held.iter().find(|(d, _)| d == digest))
+            .map(|(_, result)| (result.validator, result.signature))
+            .collect()
+    }
+
+    /// Drop every result at or below `number`: the gossip tip has reached it.
+    fn prune_through(&mut self, number: u64) {
+        self.by_signer.retain(|_, held| {
+            held.retain(|(_, result)| result.number > number);
+            !held.is_empty()
+        });
+    }
+
+    fn clear(&mut self) {
+        self.by_signer.clear();
+    }
+}
+
 /// Handle request types received from peers.
 #[derive(Clone, Debug)]
 pub(crate) struct RequestHandler<DB> {
@@ -108,8 +182,8 @@ pub(crate) struct RequestHandler<DB> {
     requested_parents: Arc<Mutex<BTreeMap<(Round, CertificateDigest), AuthorityIdentifier>>>,
     /// Per-authority vote state for equivocation detection and caching.
     auth_last_vote: Arc<Mutex<AuthEquivocationMap>>,
-    /// Consensus result signers per digest.
-    consensus_certs: Arc<Mutex<B256Map<VotesAggregator<ConsensusResult>>>>,
+    /// The latest consensus results per signer, for the f+1 gossip quorum.
+    consensus_votes: Arc<Mutex<ConsensusVotes>>,
     /// Commit-progress tracker gating demotion to `CvvInactive` (see [`behind_consensus`]).
     behind_tracker: Arc<Mutex<BehindTracker>>,
     /// Signers whose epoch vote was already queued, per epoch: one vote per signer and epoch
@@ -200,7 +274,7 @@ where
             rayls_consensus_state_sync,
             requested_parents: Default::default(),
             auth_last_vote: Default::default(),
-            consensus_certs: Default::default(),
+            consensus_votes: Default::default(),
             behind_tracker: Default::default(),
             epoch_votes_seen: Default::default(),
             pending_records: Default::default(),
@@ -395,6 +469,17 @@ where
                 let consensus_result_hash = result.digest();
                 let ConsensusResult { epoch, round, number, hash, validator: key, signature } =
                     *result;
+                // A result from an epoch this node has closed is not counted. The node holds
+                // every header it names, and it says nothing about where the network is now: f+1
+                // of them would set the gossip tip, which the epoch switch reset to 0, back to an
+                // old-epoch header that the rejoin check reads as the network head, and reset the
+                // demotion stall clock. A closed epoch's last header is served from its certified
+                // record instead (see `retrieve_certified_head`). After the switch that record is
+                // the only source of it, which adds no dependency: a node that did not run the next
+                // epoch reads that epoch's committee from the same certified record.
+                if epoch < self.consensus_config.committee().epoch() {
+                    return Ok(());
+                }
                 let (old_number, old_hash) =
                     *self.consensus_bus.last_published_consensus_num_hash().borrow();
                 if hash == old_hash || old_number >= number {
@@ -422,69 +507,32 @@ where
                         signature.verify_secure(&to_intent_message(consensus_result_hash), &key),
                         PrimaryNetworkError::UnknownConsensusHeaderCert(hash)
                     );
-                    // per-digest signer tracking prevents single-validator inflation
-                    let enough_sigs = (committee.len() / 3) + 1;
-                    let quorum = {
-                        let mut cache = self.consensus_certs.lock();
-                        if cache.len() > MAX_CONSENSUS_CERTS_ENTRIES
-                            && !cache.contains_key(&consensus_result_hash)
-                        {
-                            cache.clear();
-                        }
-                        let aggregator = cache
-                            .entry(consensus_result_hash)
-                            .or_insert_with(|| VotesAggregator::new(enough_sigs as u64));
-                        match aggregator.append(*result, 1) {
-                            // the signatures that reached it, read before any clear below
-                            Ok(true) => {
-                                let signatures = aggregator
-                                    .votes()
-                                    .iter()
-                                    .map(|vote| (vote.validator, vote.signature))
-                                    .collect::<Vec<_>>();
-                                // a closed epoch's quorum is checked against the stored header
-                                // below; taken out under this lock so later voters for the same
-                                // digest do not repeat that check
-                                if epoch < self.consensus_config.committee().epoch() {
-                                    cache.remove(&consensus_result_hash);
-                                }
-                                Some(signatures)
-                            }
-                            Ok(false) => None,
-                            Err(_) => return Ok(()),
-                        }
+                    let quorum = (committee.len() / 3) + 1;
+                    let signatures = {
+                        let mut votes = self.consensus_votes.lock();
+                        // the signatures that reached it, read under the lock that counted them
+                        votes
+                            .add(consensus_result_hash, *result, quorum)
+                            .then(|| votes.signatures(&consensus_result_hash))
                     };
-                    if let Some(signatures) = quorum {
-                        // a node in a later epoch has executed every header of this one, so an
-                        // honest result names the header it holds at that number; anything else
-                        // is f+1 retired keys forging one, which would otherwise be served as the
-                        // certified tip and, as the gossip tip, drop every later result below it
-                        if epoch < self.consensus_config.committee().epoch() {
-                            let held = self
-                                .consensus_config
-                                .node_storage()
-                                .get::<ConsensusBlocks>(&number)
-                                .ok()
-                                .flatten();
-                            if held.is_none_or(|held| held.digest() != hash) {
-                                warn!(
-                                    target: "primary::consensus_result",
-                                    epoch,
-                                    number,
-                                    "quorum from a closed epoch is not the header held at its number, dropping"
-                                );
-                                return Ok(());
-                            }
-                        }
+                    if let Some(signatures) = signatures {
                         self.save_certified_tip(epoch, round, number, hash, signatures);
                         if self.behind_consensus(epoch, round, Some(number)).await {
-                            self.consensus_certs.lock().clear();
+                            self.consensus_votes.lock().clear();
                             return Ok(());
                         }
-                        self.consensus_bus
-                            .last_published_consensus_num_hash()
-                            .send_replace((number, hash));
-                        self.consensus_certs.lock().clear();
+                        // Each gossip message runs in its own task, so a quorum for a lower header
+                        // can get here after a higher one has been published: never go back.
+                        self.consensus_bus.last_published_consensus_num_hash().send_if_modified(
+                            |tip| {
+                                let higher = number > tip.0;
+                                if higher {
+                                    *tip = (number, hash);
+                                }
+                                higher
+                            },
+                        );
+                        self.consensus_votes.lock().prune_through(number);
                     }
                 } else {
                     self.consensus_bus.requested_missing_epoch().send_if_modified(|current| {
@@ -1120,8 +1168,9 @@ where
     /// restarted node can hear a lower header reach f+1 before it catches up. So is one from a
     /// later epoch, and nothing from before the previous epoch is stored even when no row is:
     /// the row outlives restarts, so f+1 keys of a retired committee could otherwise pin a
-    /// forged high number from their epoch for good. The previous epoch still counts, so a
-    /// chain halted on its last header keeps a tip.
+    /// forged high number from their epoch for good. Results from an epoch this node has closed
+    /// never get here, so the floor only weighs a row stored before the switch; that epoch's last
+    /// header is served from its certified record instead (see [`Self::retrieve_certified_head`]).
     ///
     /// The bitmap indexes the committee the epoch ran with, the one followers verify against,
     /// never the lookahead the gossip check may have used: a key ejected since the lookahead was
@@ -1160,14 +1209,48 @@ where
         }
     }
 
-    /// Retrieve this node's certified tip from local storage, `None` while it has none.
-    pub(super) async fn retrieve_certified_tip(&self) -> PrimaryNetworkResult<PrimaryResponse> {
+    /// Retrieve this node's certified head, `None` while it has none: the higher of the f+1 tip it
+    /// stored from gossip and the last header of the newest epoch it holds a certified record for
+    /// (see [`CertifiedHead::rank`]).
+    pub(super) async fn retrieve_certified_head(&self) -> PrimaryNetworkResult<PrimaryResponse> {
         let tip = self
             .consensus_config
             .node_storage()
             .get::<CertifiedTips>(&0)
-            .map_err(|e| PrimaryNetworkError::Internal(format!("certified tip read: {e}")))?;
-        Ok(PrimaryResponse::CertifiedTip(tip))
+            .map_err(|e| PrimaryNetworkError::Internal(format!("certified tip read: {e}")))?
+            .map(CertifiedHead::Quorum);
+        let end = self.certified_epoch_end(tip.as_ref().map_or(0, CertifiedHead::epoch));
+        let head = tip.into_iter().chain(end).max_by_key(CertifiedHead::rank);
+        Ok(PrimaryResponse::CertifiedHead(head))
+    }
+
+    /// The last header of the newest epoch this node holds a record for, as a head a peer can catch
+    /// up to, when that epoch is not below `from`: a stored tip from a later epoch outranks it.
+    /// `None` when that record is not certified yet (the epoch-0 placeholder never is), or the
+    /// header it names has no entry in the digest index. The index also covers headers only cached,
+    /// so a node catching up, whose newest record can be ahead of what it has executed, may serve
+    /// that end too: it is certified, and the number is the one its digest commits to. A newest
+    /// record without an index entry leaves the stored tip alone; no older record is tried.
+    ///
+    /// An epoch's last results can reach f+1 on neither side of the epoch switch: they can split
+    /// between the handler that stops and the one that starts, and the new one does not count them.
+    /// So no f+1 tip may name the header an epoch ends on, and a chain halted there could not be
+    /// found from one. The record names it, signed by a super-quorum of the same committee. Its
+    /// number is read from the digest index: not signed, only a hint for the peer.
+    fn certified_epoch_end(&self, from: Epoch) -> Option<CertifiedHead> {
+        let db = self.consensus_config.node_storage();
+        let (epoch, record) = db.last_record::<EpochRecords>()?;
+        if epoch < from {
+            return None;
+        }
+        let certificate =
+            read_or_warn(epoch, "epoch certificate", db.get::<EpochCerts>(&record.digest()))?;
+        let number = read_or_warn(
+            epoch,
+            "epoch end's number",
+            db.get::<ConsensusBlockNumbersByDigest>(&record.parent_consensus),
+        )?;
+        Some(CertifiedHead::EpochEnd { number, record, certificate })
     }
 
     /// Retrieve an epoch record from local storage.
@@ -1412,11 +1495,23 @@ fn evict_oldest_completed(cache: &mut AuthEquivocationMap, max_entries: usize) {
     trace!(target: "primary::handler", removed = keys.len(), remaining = cache.len(), "evicted old vote cache entries");
 }
 
+/// `result`'s value, with a read error logged and taken as none, for a value whose absence only
+/// means there is less to serve.
+fn read_or_warn<T>(epoch: Epoch, what: &str, result: eyre::Result<Option<T>>) -> Option<T> {
+    result
+        .inspect_err(|e| warn!(target: "primary::handler", epoch, %e, "failed to read the {what}"))
+        .ok()
+        .flatten()
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{anchor_diverges_from_executed, BehindTracker};
-    use crate::RecentlyExecutedBlocks;
-    use rayls_infrastructure_types::{BlockNumHash, ExecHeader, SealedHeader, B256};
+    use super::{
+        anchor_diverges_from_executed, BehindTracker, ConsensusVotes, CONSENSUS_VOTES_PER_SIGNER,
+    };
+    use crate::{network::message::ConsensusResult, RecentlyExecutedBlocks};
+    use rand::{rngs::StdRng, SeedableRng};
+    use rayls_infrastructure_types::{BlockNumHash, BlsKeypair, ExecHeader, SealedHeader, B256};
     use std::time::Duration;
 
     fn sealed_at(number: u64) -> SealedHeader {
@@ -1443,6 +1538,58 @@ mod tests {
 
         // anchor ahead of our execution (block 9 not executed): not evidence, vote without waiting.
         assert!(!anchor_diverges_from_executed(&recent, sealed_at(9).num_hash()));
+    }
+
+    /// A digest's quorum is reported once, on the result that reaches it; a repeat counts nothing.
+    #[test]
+    fn consensus_votes_report_each_quorum_once() {
+        let mut rng = StdRng::seed_from_u64(428);
+        let result = |_| ConsensusResult {
+            number: 5,
+            hash: B256::repeat_byte(5),
+            validator: *BlsKeypair::generate(&mut rng).public(),
+            ..Default::default()
+        };
+        let [first, second, third] = [(); 3].map(result);
+        let digest = first.digest();
+        let mut votes = ConsensusVotes::default();
+        assert!(!votes.add(digest, first, 2));
+        assert!(!votes.add(digest, first, 2), "a repeat does not count");
+        assert!(votes.add(digest, second, 2), "the second signer reaches the quorum");
+        assert!(!votes.add(digest, third, 2), "a later signer does not report it again");
+    }
+
+    /// A full window drops the signer's lowest number, whatever order its results arrive in, and
+    /// ignores one lower than all it holds. Pruning drops the published number and keeps the next.
+    #[test]
+    fn consensus_votes_keep_each_signers_highest_numbers() {
+        let mut rng = StdRng::seed_from_u64(435);
+        let [late, other, third] = [(); 3].map(|_| *BlsKeypair::generate(&mut rng).public());
+        let vote = |votes: &mut ConsensusVotes, validator, number: u64, quorum| {
+            let result = ConsensusResult {
+                number,
+                hash: B256::repeat_byte(number as u8),
+                validator,
+                ..Default::default()
+            };
+            votes.add(result.digest(), result, quorum)
+        };
+        let top = CONSENSUS_VOTES_PER_SIGNER as u64 + 2;
+        let mut votes = ConsensusVotes::default();
+        // `late` sends the top header first, then 2.. up to a full window, then the one it skipped
+        vote(&mut votes, late, top, 2);
+        for number in 2..top - 1 {
+            vote(&mut votes, late, number, 2);
+        }
+        vote(&mut votes, late, top - 1, 2);
+        vote(&mut votes, late, 1, 2);
+        assert!(vote(&mut votes, other, top, 2), "the first received, but highest, is kept");
+        assert!(!vote(&mut votes, other, 2, 2), "the lowest was dropped for the late one");
+        assert!(!vote(&mut votes, other, 1, 2), "one below the full window was ignored");
+
+        votes.prune_through(top - 1);
+        assert!(!vote(&mut votes, third, top - 1, 2), "the published number is pruned");
+        assert!(vote(&mut votes, third, top, 3), "the next one is kept");
     }
 
     // Tests drive the window argument rather than a real clock: a zero window means "any flat

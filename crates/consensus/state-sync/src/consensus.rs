@@ -7,8 +7,8 @@ use rayls_infrastructure_storage::{
     ConsensusStore, EpochStore as _,
 };
 use rayls_infrastructure_types::{
-    BlsPublicKey, ConsensusHeader, ConsensusHeaderChainMeta, Database as ReDatabase, DbTxMut as _,
-    Epoch, Noticer, B256,
+    BlsPublicKey, CertifiedHead, ConsensusHeader, ConsensusHeaderChainMeta, Database as ReDatabase,
+    DbTxMut as _, Epoch, Noticer, B256,
 };
 use std::{
     collections::HashMap,
@@ -25,7 +25,7 @@ const COMMITTEE_KEYS_POLL_INTERVAL: Duration = Duration::from_millis(500);
 const PROBE_INTERVAL: Duration = Duration::from_secs(10);
 /// How long a probe waits for peers' certified tips before ranking the ones that arrived. One
 /// valid tip is enough, so a silent peer must not hold every probe for the request timeout.
-const CERTIFIED_TIP_PROBE_DEADLINE: Duration = Duration::from_secs(3);
+const CERTIFIED_HEAD_PROBE_DEADLINE: Duration = Duration::from_secs(3);
 
 /// Headers the walk prefetches per round, and so its most requests in flight at once.
 const WALK_PREFETCH: u64 = 32;
@@ -705,7 +705,7 @@ async fn probe_for_head<DB: ReDatabase>(
     let executed_tip =
         consensus_bus.recently_executed_blocks().borrow().latest_block_num_hash().number;
     if uses_certified_tip(config.certified_tip_v1_block(), executed_tip) {
-        probe_peers_for_certified_tip(current, config, consensus_bus, network).await
+        probe_peers_for_certified_head(current, config, consensus_bus, network).await
     } else {
         probe_peers_for_latest(current, config, network).await.map(|h| (h.number, h.digest()))
     }
@@ -714,17 +714,20 @@ async fn probe_for_head<DB: ReDatabase>(
 /// Ask every connected peer, observers included, for its certified tip and return the highest
 /// one above `current` that verifies against its epoch's committee. One valid answer is enough;
 /// asking every peer only guards against peers that are down, on an older release, or behind.
-/// Answers that have not arrived within [`CERTIFIED_TIP_PROBE_DEADLINE`] are not waited for.
+/// Answers that have not arrived within [`CERTIFIED_HEAD_PROBE_DEADLINE`] are not waited for.
 /// A tip from before this node's previous epoch is dropped: f+1 keys of a retired committee
-/// could sign any number, and the previous epoch counts so a chain halted on its last header can
-/// still be found.
-/// A tip from an epoch whose committee is not settled yet, from config or a certified record (the
-/// lookahead does not count), is skipped, and the epoch record collector is asked for the record
-/// after the newest one held: it walks upward as far as peers serve, so a later probe can verify
-/// the tip. Neither waiting here nor requesting the tip's own
-/// epoch, which is unverified: a peer naming a far epoch would hold up the probe or send the
+/// could sign any number. The previous epoch counts, so a chain halted on its last header can
+/// still be found: a peer that closed that epoch serves its end from the certified record.
+/// The highest head by [`CertifiedHead::rank`] wins, so an
+/// epoch's end, signed by a super-quorum, ranks above any f+1 tip of the same epoch; its unsigned
+/// number only decides whether it is above `current`, and a peer lying about it can only send the
+/// walk to the real header the hash names. A tip from an epoch whose committee is not settled yet,
+/// from config or a certified record (the lookahead does not count), is skipped, and the epoch
+/// record collector is asked for the record after the newest one held: it walks upward as far as
+/// peers serve, so a later probe can verify the tip. Neither waiting here nor requesting the tip's
+/// own epoch, which is unverified: a peer naming a far epoch would hold up the probe or send the
 /// collector chasing it.
-async fn probe_peers_for_certified_tip<DB: ReDatabase>(
+async fn probe_peers_for_certified_head<DB: ReDatabase>(
     current: u64,
     config: &ConsensusConfig<DB>,
     consensus_bus: &ConsensusBus,
@@ -733,14 +736,26 @@ async fn probe_peers_for_certified_tip<DB: ReDatabase>(
     let peers = network.inner_handle().connected_peers().await.ok()?;
     let mut inflight: FuturesUnordered<_> = peers
         .into_iter()
-        .map(|peer| async move { (peer, network.request_certified_tip_from_peer(peer).await) })
+        .map(|peer| async move { (peer, network.request_certified_head_from_peer(peer).await) })
         .collect();
     let floor = config.epoch().saturating_sub(1);
     let mut candidates = Vec::new();
-    let _ = tokio::time::timeout(CERTIFIED_TIP_PROBE_DEADLINE, async {
+    let _ = tokio::time::timeout(CERTIFIED_HEAD_PROBE_DEADLINE, async {
         while let Some((peer, result)) = inflight.next().await {
-            if let Ok(Some(tip)) = result {
-                if tip.number > current && tip.epoch >= floor {
+            if let Ok(Some(mut tip)) = result {
+                // an epoch end's number is the serving peer's word: when this node already holds
+                // the header, its own number stands, so an inflated copy of an end it has passed
+                // is no target, while one above `current` still is (an inactive node republishes
+                // it as its network head)
+                if let CertifiedHead::EpochEnd { number, record, .. } = &mut tip {
+                    let held = config
+                        .node_storage()
+                        .get::<ConsensusBlockNumbersByDigest>(&record.parent_consensus)
+                        .ok()
+                        .flatten();
+                    *number = held.unwrap_or(*number);
+                }
+                if tip.number() > current && tip.epoch() >= floor {
                     candidates.push((peer, tip));
                 }
             }
@@ -749,7 +764,7 @@ async fn probe_peers_for_certified_tip<DB: ReDatabase>(
     .await;
     // epoch first: a high number signed by f+1 retired keys of an earlier epoch must not rank
     // above an honest tip from a later one
-    candidates.sort_by(|(_, a), (_, b)| (b.epoch, b.number).cmp(&(a.epoch, a.number)));
+    candidates.sort_by_key(|(_, tip)| std::cmp::Reverse(tip.rank()));
     // the whole tip, not the peer: a copy with the honest number and hash but a bad signature
     // must not stand in for the honest ones
     candidates.dedup_by(|(_, a), (_, b)| a == b);
@@ -757,7 +772,7 @@ async fn probe_peers_for_certified_tip<DB: ReDatabase>(
     for (peer, tip) in candidates {
         // the committee the tip's epoch ran with, never the lookahead: an honest tip fails
         // against a lookahead that still lists a key ejected since it was read
-        let Some(committee) = config.get_settled_committee_keys_for_epoch(tip.epoch) else {
+        let Some(committee) = config.get_settled_committee_keys_for_epoch(tip.epoch()) else {
             // the same record is next for every such tip, so ask once
             if !collector_asked {
                 collector_asked = true;
@@ -777,14 +792,23 @@ async fn probe_peers_for_certified_tip<DB: ReDatabase>(
             continue;
         };
         if tip.verify(&committee) {
-            return Some((tip.number, tip.hash));
+            if matches!(tip, CertifiedHead::EpochEnd { .. }) {
+                debug!(
+                    target: "state-sync",
+                    %peer,
+                    epoch = tip.epoch(),
+                    claimed_number = tip.number(),
+                    "probe: the head is an epoch's end from its certified record; its number is unsigned"
+                );
+            }
+            return Some((tip.number(), tip.hash()));
         }
         warn!(
             target: "state-sync",
             %peer,
-            number = tip.number,
-            epoch = tip.epoch,
-            "probe: certified tip did not verify against its committee, skipping"
+            number = tip.number(),
+            epoch = tip.epoch(),
+            "probe: certified head did not verify against its committee, skipping"
         );
     }
     None

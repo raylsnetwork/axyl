@@ -11,8 +11,8 @@ use rayls_infrastructure_types::{
     error::HeaderError,
     serde::{deserialize_normalized_bounded, roaring_header},
     AuthorityIdentifier, BlockHash, BlsPublicKey, BlsSignature, Certificate, CertificateDigest,
-    CertifiedTip, ConsensusHeader, Epoch, EpochCertificate, EpochRecord, EpochVote, Header, Round,
-    Votable, Vote,
+    CertifiedHead, CertifiedTip, ConsensusHeader, Epoch, EpochCertificate, EpochRecord, EpochVote,
+    Header, Round, Vote,
 };
 use roaring::RoaringBitmap;
 use serde::{Deserialize, Serialize};
@@ -38,12 +38,6 @@ pub struct ConsensusResult {
     /// see digest() below, this is a signature over the has of the epoch, round, number and hash
     /// fields
     pub signature: BlsSignature,
-}
-
-impl Votable for ConsensusResult {
-    fn voter_id(&self) -> AuthorityIdentifier {
-        self.validator.into()
-    }
 }
 
 impl ConsensusResult {
@@ -179,11 +173,12 @@ pub enum PrimaryRequest {
         /// The epoch the request's rounds belong to.
         epoch: Epoch,
     },
-    /// Request the peer's certified tip: the newest consensus header it saw f+1 committee members
-    /// sign. Appended after every older variant for the same reason as
-    /// [`PrimaryRequest::MissingCertificatesInEpoch`]. Sent only once the `CertifiedTipV1` fork is
-    /// active; served regardless.
-    CertifiedTip,
+    /// Request the peer's certified head: the newest consensus header it saw f+1 committee members
+    /// sign, or the last header of the newest epoch it holds a certified record for. Appended
+    /// after every older variant for the same reason as
+    /// [`PrimaryRequest::MissingCertificatesInEpoch`]. Sent only once the `CertifiedTipV1`
+    /// fork is active; served regardless.
+    CertifiedHead,
 }
 
 // unit test for this struct in primary::src::tests::network_tests::test_missing_certs_request
@@ -487,8 +482,8 @@ pub enum PrimaryResponse {
     /// Too many jobs are running, so ask another peer and retry later.
     /// Appended, so the older variants keep their BCS indexes.
     Busy,
-    /// The responding peer's certified tip, `None` while it has none.
-    CertifiedTip(Option<CertifiedTip>),
+    /// The responding peer's certified head, `None` while it has none.
+    CertifiedHead(Option<CertifiedHead>),
 }
 
 impl PrimaryResponse {

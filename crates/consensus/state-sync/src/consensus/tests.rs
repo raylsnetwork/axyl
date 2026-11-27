@@ -5,8 +5,9 @@ use rayls_consensus_primary::network::{
 use rayls_infrastructure_storage::{mem_db::MemDatabase, tables::ConsensusBlocks};
 use rayls_infrastructure_types::{
     encode, to_intent_message, AuthorityIdentifier, BlsAggregateSignature, BlsPublicKey,
-    BlsSignature, BlsSigner, Certificate, CertifiedTip, CommittedSubDag, CommitteeLookahead,
-    EpochCertificate, EpochRecord, HeaderBuilder, ReputationScores, Signer as _,
+    BlsSignature, BlsSigner, Certificate, CertifiedHead, CertifiedTip, CommittedSubDag,
+    CommitteeLookahead, EpochCertificate, EpochRecord, HeaderBuilder, ReputationScores,
+    Signer as _,
 };
 use rayls_testing_test_utils_committee::CommitteeFixture;
 use std::{
@@ -283,19 +284,24 @@ fn certified(fixture: &CommitteeFixture<MemDatabase>, header: &ConsensusHeader) 
 /// arrives.
 struct Peer {
     key: BlsPublicKey,
-    certified_tip: Result<Option<CertifiedTip>, ()>,
+    certified_head: Result<Option<CertifiedHead>, ()>,
     latest: ConsensusHeader,
     delay: Duration,
 }
 
 impl Peer {
     fn new(key: BlsPublicKey, tip: Option<CertifiedTip>, latest: &ConsensusHeader) -> Self {
-        Self { key, certified_tip: Ok(tip), latest: latest.clone(), delay: Duration::ZERO }
+        Self::heading(key, tip.map(CertifiedHead::Quorum), latest)
+    }
+
+    /// A peer that serves `head`, an f+1 tip or an epoch's end from its certified record.
+    fn heading(key: BlsPublicKey, head: Option<CertifiedHead>, latest: &ConsensusHeader) -> Self {
+        Self { key, certified_head: Ok(head), latest: latest.clone(), delay: Duration::ZERO }
     }
 
     /// A peer on a release without the certified tip request.
     fn old(key: BlsPublicKey, latest: &ConsensusHeader) -> Self {
-        Self { key, certified_tip: Err(()), latest: latest.clone(), delay: Duration::ZERO }
+        Self { key, certified_head: Err(()), latest: latest.clone(), delay: Duration::ZERO }
     }
 }
 
@@ -303,7 +309,7 @@ impl Peer {
 #[derive(Default)]
 struct Asked {
     latest: AtomicUsize,
-    certified_tip: AtomicUsize,
+    certified_head: AtomicUsize,
 }
 
 /// Connected `peers`, serving every header in `headers` by hash.
@@ -325,12 +331,12 @@ fn peer_network(
                 NetworkCommand::SendRequest { peer, request, reply } => {
                     let Some(peer) = peers.iter().find(|p| p.key == peer) else { continue };
                     let response = match request {
-                        PrimaryRequest::CertifiedTip => {
-                            counts.certified_tip.fetch_add(1, Ordering::SeqCst);
+                        PrimaryRequest::CertifiedHead => {
+                            counts.certified_head.fetch_add(1, Ordering::SeqCst);
                             let response = peer
-                                .certified_tip
+                                .certified_head
                                 .clone()
-                                .map(PrimaryResponse::CertifiedTip)
+                                .map(PrimaryResponse::CertifiedHead)
                                 .map_err(|()| unknown());
                             if !peer.delay.is_zero() {
                                 let delay = peer.delay;
@@ -407,7 +413,7 @@ async fn after_the_fork_one_peer_certified_tip_is_enough() {
     config.shutdown().notify();
     assert_eq!(published, honest.digest());
     assert_eq!(asked.latest.load(Ordering::SeqCst), 0, "no peer is asked for its latest");
-    assert_eq!(asked.certified_tip.load(Ordering::SeqCst), 4, "every peer is asked");
+    assert_eq!(asked.certified_head.load(Ordering::SeqCst), 4, "every peer is asked");
 }
 
 /// #312 after the fork: one member serves a forged copy of the real tip, as its latest header
@@ -530,7 +536,7 @@ async fn a_silent_peer_does_not_hold_up_the_probe() {
     let consensus_bus = ConsensusBus::new();
     tokio::spawn(spawn_track_recent_consensus(config.clone(), consensus_bus.clone(), network));
 
-    let limit = CERTIFIED_TIP_PROBE_DEADLINE + Duration::from_secs(2);
+    let limit = CERTIFIED_HEAD_PROBE_DEADLINE + Duration::from_secs(2);
     assert!(reaches(&consensus_bus, 1, limit).await, "walks to the tip by the deadline");
     config.shutdown().notify();
 }
@@ -661,15 +667,163 @@ fn serving(
     config: &ConsensusConfig<MemDatabase>,
     tips: impl Fn(usize) -> CertifiedTip,
 ) -> PrimaryNetworkHandle {
+    serving_heads(fixture, config, |i| CertifiedHead::Quorum(tips(i)))
+}
+
+/// Every connected peer of `config` answers with the head `heads` gives its position.
+fn serving_heads(
+    fixture: &CommitteeFixture<MemDatabase>,
+    config: &ConsensusConfig<MemDatabase>,
+    heads: impl Fn(usize) -> CertifiedHead,
+) -> PrimaryNetworkHandle {
     let latest = honest_tip(fixture);
     let peers = config
         .committee()
         .others_primaries_by_id(config.authority_id().as_ref())
         .into_iter()
         .enumerate()
-        .map(|(i, (_, key))| Peer::new(key, Some(tips(i)), &latest))
+        .map(|(i, (_, key))| Peer::heading(key, Some(heads(i)), &latest))
         .collect();
     peer_network(peers, vec![]).0
+}
+
+/// A certificate over `record` by a super-quorum of its committee, as its members vote at the
+/// epoch's close.
+fn super_quorum_certificate(
+    fixture: &CommitteeFixture<MemDatabase>,
+    record: &EpochRecord,
+) -> EpochCertificate {
+    let mut signed_authorities = roaring::RoaringBitmap::new();
+    let mut signatures = Vec::new();
+    for (index, key) in record.committee.iter().enumerate().take(record.super_quorum()) {
+        let member = fixture
+            .authorities()
+            .find(|a| a.authority().protocol_key() == key)
+            .expect("a committee member");
+        let config = member.consensus_config();
+        signatures.push(record.sign_vote(config.key_config()).signature);
+        signed_authorities.push(index as u32);
+    }
+    EpochCertificate {
+        epoch_hash: record.digest(),
+        signature: BlsAggregateSignature::aggregate(&signatures, true).unwrap().to_signature(),
+        signed_authorities,
+    }
+}
+
+/// A peer that closed the previous epoch serves its last header from the certified record that
+/// names it, which ranks above any f+1 tip of that epoch, so a chain halted on that header is
+/// found even when no f+1 tip names it. A record without a super-quorum is skipped.
+#[tokio::test(start_paused = true)]
+async fn an_epoch_end_from_its_record_outranks_a_tip_of_that_epoch() {
+    let (fixture, config) = follower_at_epoch_two();
+    let consensus_bus = ConsensusBus::new();
+    let mut committee = config.get_settled_committee_keys_for_epoch(1).expect("epoch 1 is settled");
+    committee.sort_unstable();
+    let end = B256::repeat_byte(7);
+    let record = EpochRecord { epoch: 1, committee, parent_consensus: end, ..Default::default() };
+    let certificate = super_quorum_certificate(&fixture, &record);
+    let head = CertifiedHead::EpochEnd { number: 100, record: record.clone(), certificate };
+    // a higher number, but only an f+1 tip of the same epoch
+    let tip = signed_tip(&fixture, 1, 150, B256::repeat_byte(1));
+    let network = serving_heads(&fixture, &config, |i| {
+        if i == 0 {
+            CertifiedHead::Quorum(tip.clone())
+        } else {
+            head.clone()
+        }
+    });
+    assert_eq!(probe_for_head(0, &config, &consensus_bus, &network).await, Some((100, end)));
+
+    // a copy of the genuine end with an inflated number names the same header, so the walk goes
+    // to the record's hash either way, and a tip of the next epoch outranks it
+    let inflated = CertifiedHead::EpochEnd {
+        number: u64::MAX,
+        record: record.clone(),
+        certificate: super_quorum_certificate(&fixture, &record),
+    };
+    let later = signed_tip(&fixture, 2, 60, B256::repeat_byte(3));
+    let network = serving_heads(&fixture, &config, |i| match i {
+        0 => CertifiedHead::Quorum(later.clone()),
+        1 => inflated.clone(),
+        _ => head.clone(),
+    });
+    assert_eq!(probe_for_head(0, &config, &consensus_bus, &network).await, Some((60, later.hash)));
+    let network =
+        serving_heads(&fixture, &config, |i| if i == 0 { inflated.clone() } else { head.clone() });
+    let probed = probe_for_head(0, &config, &consensus_bus, &network).await;
+    assert_eq!(probed.map(|(_, hash)| hash), Some(end), "the inflated copy names the same end");
+
+    let mut short = super_quorum_certificate(&fixture, &record);
+    short.signed_authorities = roaring::RoaringBitmap::from_iter([0u32]);
+    let forged = CertifiedHead::EpochEnd { number: 100, record, certificate: short };
+    let network = serving_heads(&fixture, &config, |i| {
+        if i == 0 {
+            CertifiedHead::Quorum(tip.clone())
+        } else {
+            forged.clone()
+        }
+    });
+    assert_eq!(
+        probe_for_head(0, &config, &consensus_bus, &network).await,
+        Some((150, tip.hash)),
+        "a record without a super-quorum is skipped"
+    );
+    config.shutdown().notify();
+}
+
+/// An inactive member that closed the previous epoch starts the next one with no network head:
+/// the transition reset it, and a halted epoch forms no quorum to set it. Its peers serve only
+/// that epoch's end, from the certified record. The startup probe walks there, finds the header
+/// held, and republishes it: the head `try_rejoin_consensus` waits for.
+#[tokio::test(start_paused = true)]
+async fn an_epoch_end_the_node_holds_becomes_its_network_head() {
+    let (fixture, config) = follower_at_epoch_two();
+    let db = config.node_storage();
+    let leader = fixture.certificate(&fixture.header_from_last_authority());
+    // stores header 100 as the canonical tip: the last header of epoch 1
+    let end = canonical_tip_and_chain(db, &leader, 101)[&101].parent_hash;
+    let mut committee = config.get_settled_committee_keys_for_epoch(1).expect("epoch 1 is settled");
+    committee.sort_unstable();
+    let record = EpochRecord { epoch: 1, committee, parent_consensus: end, ..Default::default() };
+    let certificate = super_quorum_certificate(&fixture, &record);
+    let head = CertifiedHead::EpochEnd { number: 100, record, certificate };
+    let network = serving_heads(&fixture, &config, |_| head.clone());
+    let consensus_bus = ConsensusBus::new();
+    assert_eq!(consensus_bus.last_consensus_header().borrow().number, 0, "no head yet");
+
+    tokio::spawn(spawn_track_recent_consensus(config.clone(), consensus_bus.clone(), network));
+    assert!(reaches(&consensus_bus, 100, Duration::from_secs(30)).await, "the end is the head");
+    let published = consensus_bus.last_consensus_header().borrow().digest();
+    config.shutdown().notify();
+    assert_eq!(published, end);
+}
+
+/// A peer inflating the number of an epoch end this node already holds cannot make it a target
+/// once the node is past it: the node's own number for the header stands. Below it, the end is
+/// still a target, at that number.
+#[tokio::test(start_paused = true)]
+async fn an_inflated_end_the_node_is_past_is_no_target() {
+    let (fixture, config) = follower_at_epoch_two();
+    let db = config.node_storage();
+    let leader = fixture.certificate(&fixture.header_from_last_authority());
+    // stores header 100 as the canonical tip: the last header of epoch 1
+    let end = canonical_tip_and_chain(db, &leader, 101)[&101].parent_hash;
+    let mut committee = config.get_settled_committee_keys_for_epoch(1).expect("epoch 1 is settled");
+    committee.sort_unstable();
+    let record = EpochRecord { epoch: 1, committee, parent_consensus: end, ..Default::default() };
+    let certificate = super_quorum_certificate(&fixture, &record);
+    let inflated = CertifiedHead::EpochEnd { number: u64::MAX, record, certificate };
+    let network = serving_heads(&fixture, &config, |_| inflated.clone());
+    let consensus_bus = ConsensusBus::new();
+
+    assert_eq!(probe_for_head(150, &config, &consensus_bus, &network).await, None, "past it");
+    assert_eq!(
+        probe_for_head(0, &config, &consensus_bus, &network).await,
+        Some((100, end)),
+        "below it, at its own number"
+    );
+    config.shutdown().notify();
 }
 
 /// A tip from before the previous epoch is dropped even though it verifies: f+1 keys of a
@@ -684,6 +838,20 @@ async fn a_tip_from_before_the_previous_epoch_is_dropped() {
     assert!(retired.verify(&keys), "precondition: it verifies");
 
     let network = serving(&fixture, &config, |_| retired.clone());
+    assert_eq!(probe_for_head(0, &config, &consensus_bus, &network).await, None);
+
+    // an epoch's end from before the previous epoch is dropped the same way, record and all
+    let mut committee = config.get_settled_committee_keys_for_epoch(0).expect("epoch 0 is settled");
+    committee.sort_unstable();
+    let record = EpochRecord {
+        epoch: 0,
+        committee,
+        parent_consensus: B256::repeat_byte(3),
+        ..Default::default()
+    };
+    let certificate = super_quorum_certificate(&fixture, &record);
+    let old_end = CertifiedHead::EpochEnd { number: 100, record, certificate };
+    let network = serving_heads(&fixture, &config, |_| old_end.clone());
     assert_eq!(probe_for_head(0, &config, &consensus_bus, &network).await, None);
 
     let previous = signed_tip(&fixture, 1, 100, B256::repeat_byte(2));
@@ -756,7 +924,7 @@ async fn before_the_fork_the_follower_probes_latest_headers() {
     assert!(reaches(&consensus_bus, 1, Duration::from_secs(5)).await, "walks to the tip");
     config.shutdown().notify();
     assert_eq!(asked.latest.load(Ordering::SeqCst), 3, "every member is probed");
-    assert_eq!(asked.certified_tip.load(Ordering::SeqCst), 0, "no certified tip is asked for");
+    assert_eq!(asked.certified_head.load(Ordering::SeqCst), 0, "no certified tip is asked for");
 }
 
 /// Requests a [`walk_network`] received: fetches by hash and by number, the lowest number
