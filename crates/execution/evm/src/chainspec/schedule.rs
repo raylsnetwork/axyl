@@ -96,7 +96,8 @@ impl RaylsHardFork {
             ScheduledFork::new(Self::Erc20PrecompileDirectCall, ForkCondition::Block(24_525_000)),
             // Never until SRE schedules an activation block, any one after every node runs a
             // release that serves its certified tip.
-            ScheduledFork::new(Self::CertifiedTipV1, ForkCondition::Never),        ]
+            ScheduledFork::new(Self::CertifiedTipV1, ForkCondition::Never),
+        ]
     }
 
     /// Mainnet hardfork schedule.
@@ -126,7 +127,8 @@ impl RaylsHardFork {
             ScheduledFork::new(Self::Erc20PrecompileDirectCall, ForkCondition::Block(15_572_000)),
             // Never until SRE schedules an activation block, any one after every node runs a
             // release that serves its certified tip.
-            ScheduledFork::new(Self::CertifiedTipV1, ForkCondition::Never),        ]
+            ScheduledFork::new(Self::CertifiedTipV1, ForkCondition::Never),
+        ]
     }
 
     /// Local network hardfork schedule
