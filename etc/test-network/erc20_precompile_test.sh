@@ -5,6 +5,8 @@
 #
 # Usage: ./erc20_precompile_test.sh [RPC_URL]
 # Default RPC: http://localhost:8545
+# SKIP_MODULE_CHECKS=1 skips the checks that must sign as MINTING_MODULE when the network rejects it
+# as not whitelisted (the precompile only whitelists a system address, see native_erc20/mod.rs)
 #
 # Requirements:
 # - cast (foundry) installed
@@ -125,6 +127,20 @@ send_tx() {
     local result
     result=$(cast send "$@" --rpc-url "$RPC" --json 2>&1)
     echo "$result" | jq -r '.transactionHash' 2>/dev/null || echo ""
+}
+
+# Only the precompile's whitelisted minting module may mint/burn. With SKIP_MODULE_CHECKS=1, the checks
+# that must sign as MINTING_MODULE are skipped when the network rejects it as not whitelisted. Any
+# other outcome (including RPC errors) still runs them, so real failures are not hidden.
+module_not_whitelisted() {
+    [[ $(cast call "$PRECOMPILE" "mint(address,uint256)" "$FRESH_ADDRESS_1" "1" --from "$MINTING_MODULE" --rpc-url "$RPC" 2>&1) == *"Not whitelisted"* ]]
+}
+
+skip_module_checks() {
+    if [[ "$SKIP_MODULE" != "1" ]]; then
+        return 1
+    fi
+    test_skip "$1 ($MINTING_MODULE is not the whitelisted minting module on this network)"
 }
 
 # Get transaction status
@@ -468,6 +484,8 @@ test_mint() {
         test_fail "mint() from unauthorized reverts" "revert" "$unauth_mint"
     fi
 
+    skip_module_checks "mint() from minting module, mint() to zero address" && return
+
     # Get balance before mint
     local balance_before
     balance_before=$(cast call "$PRECOMPILE" "balanceOf(address)(uint256)" "$FRESH_ADDRESS_2" --rpc-url "$RPC" 2>/dev/null | cut -d' ' -f1)
@@ -543,11 +561,6 @@ test_mint() {
 test_burn() {
     log_section "Burn Tests (Access Controlled)"
 
-    # First mint some tokens to the minting module so it can burn
-    echo "Minting tokens to minting module for burn test..."
-    send_tx "$PRECOMPILE" "mint(address,uint256)" "$MINTING_MODULE" "500000000000000000000" --private-key "$MINTING_MODULE_PK" > /dev/null
-    sleep 2
-
     # Test burn from unauthorized account (should fail)
     local unauth_burn
     unauth_burn=$(cast call "$PRECOMPILE" "burn(uint256)" "1" --from "$ACCOUNT1" --rpc-url "$RPC" 2>&1)
@@ -556,6 +569,13 @@ test_burn() {
     else
         test_fail "burn() from unauthorized reverts" "revert" "$unauth_burn"
     fi
+
+    skip_module_checks "burn() from minting module" && return
+
+    # First mint some tokens to the minting module so it can burn
+    echo "Minting tokens to minting module for burn test..."
+    send_tx "$PRECOMPILE" "mint(address,uint256)" "$MINTING_MODULE" "500000000000000000000" --private-key "$MINTING_MODULE_PK" > /dev/null
+    sleep 2
 
     # Get balance and supply before burn
     local balance_before supply_before
@@ -627,6 +647,8 @@ test_burn_from() {
     else
         test_fail "burnFrom() from unauthorized reverts" "revert" "$unauth_burn"
     fi
+
+    skip_module_checks "burnFrom() from minting module, burnFrom() without allowance" && return
 
     # Get balance, allowance, and supply before burnFrom
     local balance_before allowance_before supply_before
@@ -709,6 +731,11 @@ main() {
 
     check_requirements
     check_rpc
+
+    SKIP_MODULE=0
+    if [[ "${SKIP_MODULE_CHECKS:-0}" == "1" ]] && module_not_whitelisted; then
+        SKIP_MODULE=1
+    fi
 
     # Run all tests
     test_metadata
