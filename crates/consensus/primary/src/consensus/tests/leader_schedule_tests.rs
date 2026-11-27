@@ -445,3 +445,169 @@ async fn test_leader_schedule_from_store() {
 
     assert_ne!(leader_2.id(), new_leader_2.id());
 }
+
+/// A consensus header's `reputation_score` is not covered by the header digest
+/// (`CommittedSubDag::digest` skips it). A peer that serves a header by number or by hash, or
+/// that answers the latest-block probe, can therefore set it to anything while keeping a hash a
+/// following node accepts. `LeaderSwapTable::new` used to divide by `auths_by_score.len()` without
+/// guarding zero, so an empty `scores_per_authority` with `final_of_schedule = true`, which no
+/// honest node ever produces, panicked the node. The set must be refused instead, leaving the
+/// plain round-robin schedule.
+#[test]
+fn tampered_final_scores_are_refused_by_leader_swap_table() {
+    let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+    let committee = fixture.committee();
+
+    // What a peer can serve: marked final (so it is used as the schedule's scores) with no
+    // authorities (so the standard-deviation step divided by zero).
+    let poisoned =
+        ReputationScores { scores_per_authority: Default::default(), final_of_schedule: true };
+
+    let table = LeaderSwapTable::new(&committee, 2, &poisoned, 33);
+    assert_eq!(table.round, 2);
+    assert!(table.good_nodes.is_empty());
+    assert!(table.bad_nodes.is_empty());
+}
+
+/// A non-empty set that misses committee members is refused too, even though it would not divide
+/// by zero: no locally computed set ever has that shape, so it can only come from a peer.
+#[test]
+fn partial_final_scores_are_refused_by_leader_swap_table() {
+    let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+    let committee = fixture.committee();
+    let ids: Vec<AuthorityIdentifier> = fixture.authorities().map(|a| a.id()).collect();
+
+    // One authority with a high score and one with zero: as the only two entries they would
+    // otherwise produce a bad node and a good node.
+    let mut partial =
+        ReputationScores { scores_per_authority: Default::default(), final_of_schedule: true };
+    partial.add_score(&ids[0], 100);
+    partial.add_score(&ids[1], 0);
+
+    let table = LeaderSwapTable::new(&committee, 2, &partial, 33);
+    assert!(table.good_nodes.is_empty());
+    assert!(table.bad_nodes.is_empty());
+}
+
+/// A set of the right size that names an authority outside the committee is refused.
+#[test]
+fn foreign_authority_final_scores_are_refused_by_leader_swap_table() {
+    let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+    let committee = fixture.committee();
+    let ids: Vec<AuthorityIdentifier> = fixture.authorities().map(|a| a.id()).collect();
+
+    // Every member but one scores high and the last scores zero, so without the guard the last
+    // member would be a bad node. The first member's entry is renamed to a foreign authority.
+    let mut scores = ReputationScores::new(&committee);
+    scores.final_of_schedule = true;
+    for id in &ids[..ids.len() - 1] {
+        scores.add_score(id, 100);
+    }
+    let removed = scores.scores_per_authority.remove(&ids[0]).unwrap();
+    scores.scores_per_authority.insert(AuthorityIdentifier::dummy_for_test(0xEE), removed);
+    assert_eq!(scores.total_authorities() as usize, committee.size());
+
+    let table = LeaderSwapTable::new(&committee, 2, &scores, 33);
+    assert!(table.good_nodes.is_empty());
+    assert!(table.bad_nodes.is_empty());
+}
+
+/// End to end on the stored row: a following node that caches a peer's consensus header keeps the
+/// peer's `reputation_score`, and that row is promoted to `ConsensusBlocks`. On the next start,
+/// `LeaderSchedule::from_store` reads the newest final-of-schedule row and builds the swap table
+/// from it. A poisoned row used to make startup panic, and since the row is persisted the node
+/// panicked on every restart until an operator cleared its consensus database. It must now start
+/// with the plain round-robin schedule.
+#[test]
+fn stored_tampered_final_scores_do_not_crash_leader_schedule_from_store() {
+    let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+    let committee = fixture.committee();
+    let store = MemDatabase::default();
+
+    // A committed sub-dag at the committee's epoch, marked final, with an empty score map: what a
+    // peer serves and a following node stores after caching the header.
+    let leader = Certificate::genesis(&committee).into_iter().next().unwrap();
+    let poisoned =
+        ReputationScores { scores_per_authority: Default::default(), final_of_schedule: true };
+    let sub_dag = CommittedSubDag::new(vec![], leader, 0, poisoned, None);
+    store.write_subdag_for_test(1, sub_dag);
+
+    // Startup rebuild of the leader schedule reads that row and falls back to round-robin.
+    let schedule = LeaderSchedule::from_store(committee.clone(), store, 33);
+    assert_eq!(schedule.num_of_bad_nodes(), 0);
+    for round in (2..=2 * committee.size() as Round).step_by(2) {
+        let expected = committee.authorities()[(round as usize / 2 - 1) % committee.size()].id();
+        assert_eq!(schedule.leader(round).id(), expected);
+    }
+}
+
+/// A set of the right shape can still hold values that no honest node computes, since an
+/// authority gains at most one point per committed sub dag. Each set below overflows one step of
+/// the standard deviation (the sum, a difference, a square, the sum of squares), which used to
+/// abort the node. It must be refused like a set of the wrong shape.
+#[test]
+fn overflowing_final_scores_are_refused_by_leader_swap_table() {
+    let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+    let committee = fixture.committee();
+    let ids: Vec<AuthorityIdentifier> = fixture.authorities().map(|a| a.id()).collect();
+    assert_eq!(ids.len(), 4);
+
+    for values in [
+        [u64::MAX, 1, 0, 0],
+        [1 << 63, 0, 0, 0],
+        [10_000_000_000, 0, 0, 0],
+        [6_000_000_000, 6_000_000_000, 0, 0],
+    ] {
+        let mut scores = ReputationScores::new(&committee);
+        scores.final_of_schedule = true;
+        for (id, value) in ids.iter().zip(values) {
+            scores.add_score(id, value);
+        }
+
+        let table = LeaderSwapTable::new(&committee, 2, &scores, 33);
+        assert!(table.good_nodes.is_empty(), "{values:?}");
+        assert!(table.bad_nodes.is_empty(), "{values:?}");
+    }
+}
+
+/// The restart path for such a set: a final row stored before the upgrade used to abort
+/// `LeaderSchedule::from_store` on every start.
+#[test]
+fn stored_overflowing_final_scores_do_not_crash_leader_schedule_from_store() {
+    let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+    let committee = fixture.committee();
+    let ids: Vec<AuthorityIdentifier> = fixture.authorities().map(|a| a.id()).collect();
+    let store = MemDatabase::default();
+
+    let mut scores = ReputationScores::new(&committee);
+    scores.final_of_schedule = true;
+    scores.add_score(&ids[0], 10_000_000_000);
+    let leader = Certificate::genesis(&committee).into_iter().next().unwrap();
+    store.write_subdag_for_test(1, CommittedSubDag::new(vec![], leader, 0, scores, None));
+
+    let schedule = LeaderSchedule::from_store(committee, store, 33);
+    assert_eq!(schedule.num_of_bad_nodes(), 0);
+}
+
+/// A stored previous sub dag of the right shape is carried over mid-window, by catch-up and by
+/// Bullshark alike, and the next commit adds a point to it. A score already at `u64::MAX` used to
+/// overflow there.
+#[test]
+fn huge_carried_over_scores_do_not_overflow() {
+    let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+    let committee = fixture.committee();
+    let ids: Vec<AuthorityIdentifier> = fixture.authorities().map(|a| a.id()).collect();
+
+    let (leader_digest, leader) = mock_certificate(&committee, ids[0].clone(), 2, BTreeSet::new());
+    let mut huge = ReputationScores::new(&committee);
+    for id in &ids {
+        huge.add_score(id, u64::MAX);
+    }
+    let previous = CommittedSubDag::new(vec![], leader, 0, huge, None);
+    let (_, child) =
+        mock_certificate(&committee, ids[1].clone(), 3, BTreeSet::from([leader_digest]));
+
+    // Index 4 is mid-window, so the previous scores carry over and ids[1] gains a point.
+    let scores = ReputationScores::resolve(&committee, Some(&previous), &[child], 4, 60);
+    assert_eq!(scores.scores_per_authority[&ids[1]], u64::MAX);
+}
