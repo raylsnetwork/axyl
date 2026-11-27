@@ -175,7 +175,7 @@ impl PrimaryNetworkHandle {
                 Err(NetworkError::RPCError("Got wrong response, not a vote is busy!".to_string()))
             }
             PrimaryResponse::CertifiedHead(_) => Err(NetworkError::RPCError(
-                "Got wrong response, not a vote is certified tip!".to_string(),
+                "Got wrong response, not a vote is certified head!".to_string(),
             )),
         }
     }
@@ -287,8 +287,8 @@ impl PrimaryNetworkHandle {
     ) -> NetworkResult<Option<CertifiedHead>> {
         let res = self.handle.send_request(PrimaryRequest::CertifiedHead, peer).await?;
         match res.await?? {
-            PrimaryResponse::CertifiedHead(tip) => Ok(tip),
-            _ => Err(NetworkError::RPCError("Peer did not return a certified tip!".to_string())),
+            PrimaryResponse::CertifiedHead(head) => Ok(head),
+            _ => Err(NetworkError::RPCError("Peer did not return a certified head!".to_string())),
         }
     }
 
@@ -570,7 +570,7 @@ where
         });
     }
 
-    /// Serve this node's certified tip from the database.
+    /// Serve this node's certified head from the database.
     fn process_certified_head_request(
         &self,
         peer: BlsPublicKey,
@@ -579,11 +579,11 @@ where
     ) {
         let request_handler = self.request_handler.clone();
         let network_handle = self.network_handle.clone();
-        let task_name = format!("CertifiedTipReq-{peer}");
+        let task_name = format!("CertifiedHeadReq-{peer}");
         self.task_spawner.spawn_task(task_name, async move {
             tokio::select! {
-                tip = request_handler.retrieve_certified_head() => {
-                    let response = tip.into_response();
+                head = request_handler.retrieve_certified_head() => {
+                    let response = head.into_response();
                     let _ = network_handle.handle.send_response(response, channel).await;
                 }
                 // cancel notification from network layer

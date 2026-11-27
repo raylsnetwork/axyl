@@ -904,7 +904,9 @@ async fn closed_epoch_results_are_not_counted_and_its_end_is_served_from_the_rec
 async fn certified_head_serves_an_epoch_end_only_from_a_certified_record_it_holds(
 ) -> eyre::Result<()> {
     use rayls_infrastructure_storage::{
-        tables::{CertifiedTips, ConsensusBlockNumbersByDigest, ConsensusBlocks},
+        tables::{
+            CertifiedTips, ConsensusBlockNumbersByDigest, ConsensusBlocks, ConsensusBlocksCache,
+        },
         EpochStore as _,
     };
     use rayls_infrastructure_types::{
@@ -965,6 +967,14 @@ async fn certified_head_serves_an_epoch_end_only_from_a_certified_record_it_hold
     let ending = record(1, held.digest());
     db.save_epoch_record_with_cert(&ending, &certify(&ending))?;
     assert_eq!(served().await, Some((1, 10, true)), "the end outranks a tip of its epoch");
+
+    // a node catching up holds the end only cached, with its digest indexed: still served
+    let cached = ConsensusHeader { number: 12, ..Default::default() };
+    db.insert::<ConsensusBlocksCache>(&12, &cached)?;
+    db.insert::<ConsensusBlockNumbersByDigest>(&cached.digest(), &12)?;
+    let ahead = record(1, cached.digest());
+    db.save_epoch_record_with_cert(&ahead, &certify(&ahead))?;
+    assert_eq!(served().await, Some((1, 12, true)), "an end it holds only cached");
     Ok(())
 }
 
@@ -988,7 +998,7 @@ fn certified_tip_only_moves_up_within_or_past_its_epoch() {
 }
 
 #[test]
-fn certified_tip_request_and_reply_are_appended_last() {
+fn certified_head_request_and_reply_are_appended_last() {
     // BCS writes the variant index first; appended variants leave every older index unchanged,
     // so an older node still decodes everything else and fails only on these
     assert_eq!(encode(&PrimaryRequest::CertifiedHead)[0], 6);

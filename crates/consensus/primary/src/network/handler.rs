@@ -474,7 +474,9 @@ where
                 // of them would set the gossip tip, which the epoch switch reset to 0, back to an
                 // old-epoch header that the rejoin check reads as the network head, and reset the
                 // demotion stall clock. A closed epoch's last header is served from its certified
-                // record instead (see `retrieve_certified_head`).
+                // record instead (see `retrieve_certified_head`). After the switch that record is
+                // the only source of it, which adds no dependency: a node that did not run the next
+                // epoch reads that epoch's committee from the same certified record.
                 if epoch < self.consensus_config.committee().epoch() {
                     return Ok(());
                 }
@@ -1224,9 +1226,11 @@ where
 
     /// The last header of the newest epoch this node holds a record for, as a head a peer can catch
     /// up to, when that epoch is not below `from`: a stored tip from a later epoch outranks it.
-    /// `None` when that record is not certified yet (the epoch-0 placeholder never is), or the node
-    /// does not hold the header it names. The newest record is not always the newest epoch the node
-    /// closed: a node catching up may store records ahead of what it has executed, and serves none.
+    /// `None` when that record is not certified yet (the epoch-0 placeholder never is), or the
+    /// header it names has no entry in the digest index. The index also covers headers only cached,
+    /// so a node catching up, whose newest record can be ahead of what it has executed, may serve
+    /// that end too: it is certified, and the number is the one its digest commits to. A newest
+    /// record without an index entry leaves the stored tip alone; no older record is tried.
     ///
     /// An epoch's last results can reach f+1 on neither side of the epoch switch: they can split
     /// between the handler that stops and the one that starts, and the new one does not count them.
@@ -1239,9 +1243,13 @@ where
         if epoch < from {
             return None;
         }
-        let certificate = db.get::<EpochCerts>(&record.digest()).ok().flatten()?;
-        let number =
-            db.get::<ConsensusBlockNumbersByDigest>(&record.parent_consensus).ok().flatten()?;
+        let certificate =
+            read_or_warn(epoch, "epoch certificate", db.get::<EpochCerts>(&record.digest()))?;
+        let number = read_or_warn(
+            epoch,
+            "epoch end's number",
+            db.get::<ConsensusBlockNumbersByDigest>(&record.parent_consensus),
+        )?;
         Some(CertifiedHead::EpochEnd { number, record, certificate })
     }
 
@@ -1485,6 +1493,15 @@ fn evict_oldest_completed(cache: &mut AuthEquivocationMap, max_entries: usize) {
         cache.remove(key);
     }
     trace!(target: "primary::handler", removed = keys.len(), remaining = cache.len(), "evicted old vote cache entries");
+}
+
+/// `result`'s value, with a read error logged and taken as none, for a value whose absence only
+/// means there is less to serve.
+fn read_or_warn<T>(epoch: Epoch, what: &str, result: eyre::Result<Option<T>>) -> Option<T> {
+    result
+        .inspect_err(|e| warn!(target: "primary::handler", epoch, %e, "failed to read the {what}"))
+        .ok()
+        .flatten()
 }
 
 #[cfg(test)]

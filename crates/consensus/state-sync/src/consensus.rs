@@ -25,7 +25,7 @@ const COMMITTEE_KEYS_POLL_INTERVAL: Duration = Duration::from_millis(500);
 const PROBE_INTERVAL: Duration = Duration::from_secs(10);
 /// How long a probe waits for peers' certified tips before ranking the ones that arrived. One
 /// valid tip is enough, so a silent peer must not hold every probe for the request timeout.
-const CERTIFIED_TIP_PROBE_DEADLINE: Duration = Duration::from_secs(3);
+const CERTIFIED_HEAD_PROBE_DEADLINE: Duration = Duration::from_secs(3);
 
 /// Headers the walk prefetches per round, and so its most requests in flight at once.
 const WALK_PREFETCH: u64 = 32;
@@ -705,7 +705,7 @@ async fn probe_for_head<DB: ReDatabase>(
     let executed_tip =
         consensus_bus.recently_executed_blocks().borrow().latest_block_num_hash().number;
     if uses_certified_tip(config.certified_tip_v1_block(), executed_tip) {
-        probe_peers_for_certified_tip(current, config, consensus_bus, network).await
+        probe_peers_for_certified_head(current, config, consensus_bus, network).await
     } else {
         probe_peers_for_latest(current, config, network).await.map(|h| (h.number, h.digest()))
     }
@@ -714,7 +714,7 @@ async fn probe_for_head<DB: ReDatabase>(
 /// Ask every connected peer, observers included, for its certified tip and return the highest
 /// one above `current` that verifies against its epoch's committee. One valid answer is enough;
 /// asking every peer only guards against peers that are down, on an older release, or behind.
-/// Answers that have not arrived within [`CERTIFIED_TIP_PROBE_DEADLINE`] are not waited for.
+/// Answers that have not arrived within [`CERTIFIED_HEAD_PROBE_DEADLINE`] are not waited for.
 /// A tip from before this node's previous epoch is dropped: f+1 keys of a retired committee
 /// could sign any number. The previous epoch counts, so a chain halted on its last header can
 /// still be found: a peer that closed that epoch serves its end from the certified record.
@@ -727,7 +727,7 @@ async fn probe_for_head<DB: ReDatabase>(
 /// peers serve, so a later probe can verify the tip. Neither waiting here nor requesting the tip's
 /// own epoch, which is unverified: a peer naming a far epoch would hold up the probe or send the
 /// collector chasing it.
-async fn probe_peers_for_certified_tip<DB: ReDatabase>(
+async fn probe_peers_for_certified_head<DB: ReDatabase>(
     current: u64,
     config: &ConsensusConfig<DB>,
     consensus_bus: &ConsensusBus,
@@ -740,7 +740,7 @@ async fn probe_peers_for_certified_tip<DB: ReDatabase>(
         .collect();
     let floor = config.epoch().saturating_sub(1);
     let mut candidates = Vec::new();
-    let _ = tokio::time::timeout(CERTIFIED_TIP_PROBE_DEADLINE, async {
+    let _ = tokio::time::timeout(CERTIFIED_HEAD_PROBE_DEADLINE, async {
         while let Some((peer, result)) = inflight.next().await {
             if let Ok(Some(tip)) = result {
                 if tip.number() > current && tip.epoch() >= floor {
@@ -796,7 +796,7 @@ async fn probe_peers_for_certified_tip<DB: ReDatabase>(
             %peer,
             number = tip.number(),
             epoch = tip.epoch(),
-            "probe: certified tip did not verify against its committee, skipping"
+            "probe: certified head did not verify against its committee, skipping"
         );
     }
     None

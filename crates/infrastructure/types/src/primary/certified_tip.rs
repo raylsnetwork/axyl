@@ -101,6 +101,8 @@ impl CertifiedTip {
 /// super-quorum of the same committee, so it proves that header at least as well as an f+1 quorum
 /// would. It covers the header an epoch ends on even when no node counted an f+1 quorum for it:
 /// the closing epoch's last results can land on either side of the epoch switch, or not at all.
+///
+/// Sent on the wire, where BCS encodes the variant index: append new variants, never reorder.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum CertifiedHead {
     /// f+1 signatures over the consensus result of one header.
