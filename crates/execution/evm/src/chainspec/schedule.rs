@@ -90,7 +90,11 @@ impl RaylsHardFork {
             ScheduledFork::new(Self::OutputSeqNormalization, ForkCondition::Block(17_300_000)),
             ScheduledFork::new(Self::SenderAffinityLoadBalancing, ForkCondition::Block(17_300_000)),
             ScheduledFork::new(Self::Eip161EmptyAccountGuard, ForkCondition::Block(22_075_500)),
-            // v1.5.2 forks
+            // v1.5.2 forks. Every node must run a release carrying this schedule before this
+            // block: EpochCloseSeedV2 changes epoch-closing block hashes, CertificateFetchEpochV2
+            // switches to a request format older nodes cannot decode, and
+            // Erc20PrecompileDirectCall changes the state transition for delegate frames
+            // into 0x0400.
             ScheduledFork::new(Self::EpochCloseSeedV2, ForkCondition::Block(24_525_000)),
             ScheduledFork::new(Self::CertificateFetchEpochV2, ForkCondition::Block(24_525_000)),
             ScheduledFork::new(Self::Erc20PrecompileDirectCall, ForkCondition::Block(24_525_000)),
@@ -121,7 +125,11 @@ impl RaylsHardFork {
             ScheduledFork::new(Self::OutputSeqNormalization, ForkCondition::Block(12_231_705)),
             ScheduledFork::new(Self::SenderAffinityLoadBalancing, ForkCondition::Block(12_231_705)),
             ScheduledFork::new(Self::Eip161EmptyAccountGuard, ForkCondition::Block(13_832_605)),
-            // v1.5.2 forks
+            // v1.5.2 forks. Every node must run a release carrying this schedule before this
+            // block: EpochCloseSeedV2 changes epoch-closing block hashes, CertificateFetchEpochV2
+            // switches to a request format older nodes cannot decode, and
+            // Erc20PrecompileDirectCall changes the state transition for delegate frames
+            // into 0x0400.
             ScheduledFork::new(Self::EpochCloseSeedV2, ForkCondition::Block(15_572_000)),
             ScheduledFork::new(Self::CertificateFetchEpochV2, ForkCondition::Block(15_572_000)),
             ScheduledFork::new(Self::Erc20PrecompileDirectCall, ForkCondition::Block(15_572_000)),
