@@ -86,8 +86,6 @@ mod schedule {
             (RaylsNetwork::Mainnet, RaylsHardFork::Tokenomics),
             (RaylsNetwork::Mainnet, RaylsHardFork::Uups),
             (RaylsNetwork::Mainnet, RaylsHardFork::HybridRewards),
-            (RaylsNetwork::Mainnet, RaylsHardFork::EpochCloseSeedV2),
-            (RaylsNetwork::Mainnet, RaylsHardFork::CertificateFetchEpochV2),
             (RaylsNetwork::Local, RaylsHardFork::UsdrSupplyCorrection),
         ];
         for (network, fork) in never_forks {
@@ -195,9 +193,9 @@ mod schedule {
                 (RaylsHardFork::OutputSeqNormalization, ForkCondition::Block(12_231_705)),
                 (RaylsHardFork::SenderAffinityLoadBalancing, ForkCondition::Block(12_231_705)),
                 (RaylsHardFork::Eip161EmptyAccountGuard, ForkCondition::Block(13_832_605)),
-                (RaylsHardFork::EpochCloseSeedV2, ForkCondition::Never),
-                (RaylsHardFork::CertificateFetchEpochV2, ForkCondition::Never),
-                (RaylsHardFork::Erc20PrecompileDirectCall, ForkCondition::Never),
+                (RaylsHardFork::EpochCloseSeedV2, ForkCondition::Block(15_572_000)),
+                (RaylsHardFork::CertificateFetchEpochV2, ForkCondition::Block(15_572_000)),
+                (RaylsHardFork::Erc20PrecompileDirectCall, ForkCondition::Block(15_572_000)),
             ],
         );
     }

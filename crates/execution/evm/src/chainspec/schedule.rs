@@ -115,14 +115,10 @@ impl RaylsHardFork {
             ScheduledFork::new(Self::OutputSeqNormalization, ForkCondition::Block(12_231_705)),
             ScheduledFork::new(Self::SenderAffinityLoadBalancing, ForkCondition::Block(12_231_705)),
             ScheduledFork::new(Self::Eip161EmptyAccountGuard, ForkCondition::Block(13_832_605)),
-            // Never until SRE schedules an activation block: changes epoch-closing block hashes.
-            ScheduledFork::new(Self::EpochCloseSeedV2, ForkCondition::Never),
-            // Never until SRE schedules an activation block: switches a network request format,
-            // and nodes that have not upgraded cannot decode the new one.
-            ScheduledFork::new(Self::CertificateFetchEpochV2, ForkCondition::Never),
-            // Never until SRE schedules an activation block: changes the state transition for
-            // delegate frames into 0x0400 (see devnet note).
-            ScheduledFork::new(Self::Erc20PrecompileDirectCall, ForkCondition::Never),
+            // v1.5.2 forks
+            ScheduledFork::new(Self::EpochCloseSeedV2, ForkCondition::Block(15_572_000)),
+            ScheduledFork::new(Self::CertificateFetchEpochV2, ForkCondition::Block(15_572_000)),
+            ScheduledFork::new(Self::Erc20PrecompileDirectCall, ForkCondition::Block(15_572_000)),
         ]
     }
 
